@@ -1,29 +1,73 @@
 # Cosmic Capture Kit
 
+> [!NOTE]
+> Cosmic Capture Kit is currently in the alpha stages. You are free to test this
+> software as-is, and scroll below to find planned features and support.
+
 ![Cosmic Capture Kit capturing its own settings window](res/readme/hero.png)
 
-Native screenshot, screen-recording, and scanner tool for COSMIC-based Linux
-desktops and macOS. Select a region, window, or monitor from a fullscreen
-overlay; capture a still or record video with mic + system audio; touch it up
-in the post-capture editor (covermark, timeline cuts); or scan QR codes,
-barcodes, and text (OCR) straight off the screen. Built in Rust on
-libcosmic/iced.
-
-Deeper docs: [architecture](docs/ARCHITECTURE.md), [CLI flags](CLI.md).
+Cosmic Capture Kit is a cross-platform program for capturing image, voice, and
+video across screen regions, windows, and monitors.
 
 ## Supported platforms
 
 | Platform | Capture backend | Status |
 |---|---|---|
-| Linux: COSMIC | Native compositor screencopy (ext-image-copy-capture) | Supported |
-| Linux: Sway 1.10+ / Hyprland / River (wlroots) | Native screencopy via the same protocol probe | Should work, lightly tested |
-| Linux: KDE Plasma | PipeWire portal | Basic (portal picker dialogs, fewer capture extras) |
-| Linux: GNOME | PipeWire portal | Basic (portal picker dialogs, fewer capture extras) |
-| macOS 13+ | ScreenCaptureKit | Supported |
-| Windows | (planned) | Coming soon |
+| Linux (Wayland): COSMIC | Cosmic Compositor w/extras | Supported |
+| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | Planned | Planned |
+| Linux (Wayland): KDE Plasma | PipeWire portal | Planned |
+| Linux (Wayland): GNOME | PipeWire portal | Planned |
+| macOS 13+ (Apple Silicon) | ScreenCaptureKit Compositor w/extras | Supported |
+| Windows 11 | Planned | Planned |
 
-Support is probed by protocol at launch, not by desktop name; Settings >
-Health shows exactly what your environment offers.
+Capture backend extras, where available, include features such as:
+
+- Freezing pixels on region capture
+- Toggling mouse cursor availability
+- Toggling window transparency
+- Toggling wallpaper visibility
+- Single window aesthetics (focus appearance, colored border, drop shadow,
+  padding, etc)
+
+## Planned Features / Milestones
+
+- [x] Screen capture engine
+  - [x] Encoder setup & configuration
+- [x] Video capture engine
+  - in-recording tools
+    - [ ] mouse clicks
+    - [ ] keypress overlay
+    - [ ] live annotation (with delete)
+- [x] Audio capture engine
+  - [x] Audio cleanup and processing options
+- [x] Preview editor (overlay & window variants)
+  - [x] delete, save, save as, copy
+  - [ ] copy + delete
+  - images
+    - annotation tooling:
+      - [x] covermarks support
+      - [ ] color picker swatch
+      - [ ] arrows
+      - [ ] text (size/resize)
+      - [ ] sequence markers 
+      - [ ] dim except areas 
+      - [ ] pixelate (destructive) 
+      - [ ] blur (destructive) 
+      - [ ] box (fill/outline) 
+      - [ ] draw (line widths) 
+      - [ ] stickers 
+      - [ ] eraser 
+  - videos
+    - editor tooling:
+      - [x] simple cutting tool
+      - [ ] simple transition dropdown (none/crossfade)
+  - cloud uploader targets
+      - [ ] Proton Drive
+      - [ ] OneDrive
+      - [ ] Google Drive
+      - [ ] Dropbox
+      - etc
+    
 
 ## Installation
 
@@ -36,8 +80,6 @@ Health shows exactly what your environment offers.
    Security), then relaunch. Microphone is optional (for recordings with mic).
 3. Updating: the app checks automatically and installs new versions in one
    click from Settings > About.
-
-Homebrew: coming soon.
 
 ### Linux
 
@@ -70,33 +112,28 @@ install -Dm644 res/icons/dev.frosthaven.CosmicCaptureKit.svg \
 Updating: `git pull` and rebuild; the in-app update check links to the
 releases page on Linux.
 
-AUR: coming soon. Flathub: coming soon.
+AUR: coming soon. AppImage: coming soon.
 
 ### Windows
 
-Coming soon. The per-platform plugin scaffold is in place
-(`src/platform/windows/`).
+Coming Soon.
 
 ---
 
 ## License
 
-The source code in this repository is licensed under
-[GPL-3.0-only](LICENSE). The Linux app is free software: use it, build it,
-share it — it's free forever. If it's useful to you, donations via
-[PayPal](https://paypal.me/Frosthaven) are
-appreciated but never required.
+The source code in this repository is licensed under [GPL-3.0-only](LICENSE).
+The Linux app is free software: use it, build it, share it (it's free forever).
+If it's useful to you, donating via [PayPal](https://paypal.me/Frosthaven) will
+support future work but is not required.
 
-Official macOS and Windows releases are paid, separately licensed binary
+Official macOS and Windows releases are separately licensed binary
 builds by the copyright holder. (The author holds the copyright to all code
 in this repository and additionally licenses their own code to themselves
 for those proprietary builds; the GPL grant above applies to everyone else
-and to this repository's contents.)
+and to this repository's contents.).
 
-**Contributions:** by submitting a contribution you agree to license it
-under GPL-3.0-only *and* grant the maintainer the right to include it in
-the proprietary macOS/Windows builds. If you don't want that, please open
-an issue instead of a PR.
+## Contributions & Credits
 
-Icon by [Ashley Ball](https://ashleythedesigner.com/); embedded icon licensing
-lives in [res/icons/ATTRIBUTION.md](res/icons/ATTRIBUTION.md).
+- Icon by [Ashley Ball](https://ashleythedesigner.com/);
+- Embedded icon licensing lives in [res/icons/ATTRIBUTION.md](res/icons/ATTRIBUTION.md).
