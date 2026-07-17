@@ -1,5 +1,7 @@
 # Cosmic Capture Kit
 
+![Cosmic Capture Kit capturing its own settings window](res/readme/hero.png)
+
 Native screenshot, screen-recording, and scanner tool for COSMIC-based Linux
 desktops and macOS. Select a region, window, or monitor from a fullscreen
 overlay; capture a still or record video with mic + system audio; touch it up
@@ -7,8 +9,7 @@ in the post-capture editor (covermark, timeline cuts); or scan QR codes,
 barcodes, and text (OCR) straight off the screen. Built in Rust on
 libcosmic/iced.
 
-Deeper docs: [architecture](docs/ARCHITECTURE.md), [CLI flags](CLI.md),
-[macOS notes](docs/MACOS.md), [releasing](docs/RELEASING.md).
+Deeper docs: [architecture](docs/ARCHITECTURE.md), [CLI flags](CLI.md).
 
 ## Supported platforms
 
