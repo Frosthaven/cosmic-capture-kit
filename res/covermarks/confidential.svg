@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" width="1600" height="1000">
+  <defs>
+    <pattern id="mark" width="560" height="200" patternUnits="userSpaceOnUse"
+             patternTransform="rotate(-45)">
+      <text x="0" y="70" font-family="sans-serif" font-weight="bold" font-size="52"
+            letter-spacing="4" fill="#c01c28" stroke="#ffffff" stroke-width="1.5"
+            paint-order="stroke">CONFIDENTIAL</text>
+      <text x="-280" y="170" font-family="sans-serif" font-weight="bold" font-size="52"
+            letter-spacing="4" fill="#c01c28" stroke="#ffffff" stroke-width="1.5"
+            paint-order="stroke">CONFIDENTIAL</text>
+      <text x="280" y="170" font-family="sans-serif" font-weight="bold" font-size="52"
+            letter-spacing="4" fill="#c01c28" stroke="#ffffff" stroke-width="1.5"
+            paint-order="stroke">CONFIDENTIAL</text>
+    </pattern>
+  </defs>
+  <rect width="1600" height="1000" fill="url(#mark)"/>
+</svg>

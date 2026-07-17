@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the signed Cosmic Capture Kit bundle.
+
+  Microphone (device.audio-input) is the ONLY entitlement required: recording
+  taps the mic through the system audio stack, which the hardened runtime gates
+  on this entitlement. Screen Recording is NOT an entitlement — it is a runtime
+  TCC grant (CGRequestScreenCaptureAccess / the Privacy & Security pane), so no
+  key is needed here. We deliberately add NO JIT / unsigned-executable-memory /
+  disable-library-validation exceptions: the app has no need to weaken the
+  hardened runtime, and every extra exception is friction for notarization.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

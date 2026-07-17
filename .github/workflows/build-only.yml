@@ -1,0 +1,220 @@
+# =============================================================================
+# Build Only  -  MANUAL DISPATCH ONLY
+# =============================================================================
+# Build, sign, notarize, and staple the macOS .dmg and upload it as a WORKFLOW
+# ARTIFACT for manual download. That is ALL it does: no tag, no draft release,
+# no update channel - use "Build For Release" (release-macos.yml) when the
+# build should end in a draft release.
+#
+# The build stages are a copy of release-macos.yml's (minus the draft step);
+# keep the two in sync when a stage changes.
+#
+# SIGNING IS OPTIONAL. If the signing secrets are absent the job still runs and
+# produces an UNSIGNED dmg (useful on your own machine, NOT for friends - macOS
+# Gatekeeper will block an unsigned/un-notarized app on another Mac). When the
+# secrets are present the dmg is Developer-ID signed, notarized, and stapled.
+# =============================================================================
+
+name: Build Only
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Hosted mac runners thrash without this cap (field-proven cap from the retired CI workflow).
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  build:
+    name: Build artifacts (no release)
+    # macos-26 arm64: carries Xcode 26, whose actool lets mac-package.sh build
+    # the full-tile Assets.car icon (DRAGON-143) - macos-15 lacks it and falls
+    # back to the legacy icns (macOS 26 renders that as an inset tile).
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+
+      # librsvg gives mac-package.sh's --icns stage its preferred rasterizer
+      # (rsvg-convert). The script also falls back to ImageMagick `magick`, but
+      # hosted runners do not ship either by default, so install librsvg to be sure.
+      - name: Install icon rasterizer (librsvg)
+        run: brew install librsvg
+
+      # Fetch the static ffmpeg/ffprobe the bundle ships (vendor/ dir is
+      # gitignored). The martin-riedl.de redirect follows "latest" - there is no
+      # version-pinned URL, so the smoke check below is the guard: it fails the
+      # job if the downloaded binaries don't run or lack the VideoToolbox
+      # encoders the mac encode tier needs.
+      - name: Fetch + verify static ffmpeg/ffprobe
+        run: |
+          set -euo pipefail
+          DEST="vendor/ffmpeg/macos-arm64"
+          mkdir -p "$DEST"
+          base="https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release"
+          for b in ffmpeg ffprobe; do
+            echo "::group::download $b"
+            curl -fSL "$base/${b}.zip" -o "$RUNNER_TEMP/${b}.zip"
+            unzip -oq "$RUNNER_TEMP/${b}.zip" -d "$DEST"
+            chmod +x "$DEST/$b"
+            echo "::endgroup::"
+          done
+          echo "::group::ffmpeg -version"
+          "$DEST/ffmpeg" -version | head -3
+          "$DEST/ffprobe" -version | head -1
+          echo "::endgroup::"
+          echo "::group::VideoToolbox encoders"
+          encs="$("$DEST/ffmpeg" -hide_banner -encoders)"
+          echo "$encs" | grep -i videotoolbox
+          echo "$encs" | grep -q h264_videotoolbox \
+            || { echo "::error::h264_videotoolbox missing from fetched ffmpeg"; exit 1; }
+          echo "$encs" | grep -q hevc_videotoolbox \
+            || { echo "::error::hevc_videotoolbox missing from fetched ffmpeg"; exit 1; }
+          echo "::endgroup::"
+
+      # Import the Developer ID cert into a throwaway keychain. If MACOS_CERT_P12
+      # is absent we skip and the later stages produce an UNSIGNED dmg. The
+      # security dance mirrors the proven monday-board-enhancer release workflow.
+      - name: Import signing certificate
+        id: cert
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MACOS_CERT_P12:-}" ] || [ -z "${MACOS_CERT_PASSWORD:-}" ]; then
+            echo "::warning::MACOS_CERT_P12 / MACOS_CERT_PASSWORD not set - building an UNSIGNED dmg (not distributable to other Macs)."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CERT="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN="$RUNNER_TEMP/cck-signing.keychain-db"
+          # A random per-run password for the throwaway keychain.
+          KCPASS="$(openssl rand -base64 24)"
+          echo "::add-mask::$KCPASS"
+          echo -n "$MACOS_CERT_P12" | base64 --decode -o "$CERT"
+          security create-keychain -p "$KCPASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KCPASS" "$KEYCHAIN"
+          security import "$CERT" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          # Word-splitting is intended: the substitution expands to the existing
+          # user keychains, each a separate argument, so our throwaway keychain is
+          # PREPENDED to (not replacing) the search list.
+          # shellcheck disable=SC2046
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          security set-key-partition-list -S apple-tool:,apple: -k "$KCPASS" "$KEYCHAIN" >/dev/null
+          rm -f "$CERT"
+          echo "keychain=$KEYCHAIN" >> "$GITHUB_OUTPUT"
+          # Prefer the explicit secret; otherwise parse the identity out of the keychain.
+          if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+            IDENT="$MACOS_SIGN_IDENTITY"
+          else
+            IDENT="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+              | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -1)"
+          fi
+          [ -n "$IDENT" ] || { echo "::error::could not determine signing identity"; exit 1; }
+          echo "identity=$IDENT" >> "$GITHUB_OUTPUT"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+          echo "Signing identity: $IDENT"
+
+      # Read the version from Cargo.toml (at the checked-out commit), for the
+      # artifact name.
+      - name: Read version
+        id: ver
+        run: |
+          set -euo pipefail
+          V="$(awk '/^\[package\]/{p=1} p&&/^version[[:space:]]*=/{gsub(/["=a-z _]/,""); print; exit}' Cargo.toml)"
+          [ -n "$V" ] || { echo "::error::could not read version from Cargo.toml"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Build → icns → bundle → (sign, only when we imported a cert). The signed
+      # stages run in the throwaway keychain's search list, which the import step
+      # already set as the user default.
+      - name: Build + bundle (+ sign when signed)
+        env:
+          CCK_SIGN_IDENTITY: ${{ steps.cert.outputs.identity }}
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cert.outputs.signed }}" = "true" ]; then
+            ./scripts/mac-package.sh --build --icns --bundle --sign
+          else
+            echo "::warning::no signing cert - bundling UNSIGNED."
+            ./scripts/mac-package.sh --build --icns --bundle
+          fi
+
+      - name: Create dmg
+        run: ./scripts/mac-package.sh --dmg
+
+      # Notarize via direct Apple-ID flags (no keychain profile in CI). Only when
+      # signed AND the NOTARY_* trio is present. mac-package.sh self-polls the
+      # notarytool status (no --wait, which hangs on CI) and staples on success.
+      - name: Notarize + staple
+        id: notarize
+        if: steps.cert.outputs.signed == 'true'
+        env:
+          CCK_NOTARY_APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          CCK_NOTARY_PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+          CCK_NOTARY_TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CCK_NOTARY_APPLE_ID:-}" ] || [ -z "${CCK_NOTARY_PASSWORD:-}" ]; then
+            echo "::warning::NOTARY_APPLE_ID / NOTARY_PASSWORD not set - dmg is SIGNED but NOT notarized (Gatekeeper will still warn on other Macs)."
+            echo "notarized=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ./scripts/mac-package.sh --notarize
+          echo "notarized=true" >> "$GITHUB_OUTPUT"
+
+      # Post-staple verification. Only assert Gatekeeper acceptance when the build
+      # was actually signed AND notarized (spctl rejects otherwise, by design).
+      - name: Verify signature + Gatekeeper
+        if: steps.cert.outputs.signed == 'true'
+        run: |
+          set -euo pipefail
+          # Display-named bundle since DRAGON-143 ("Cosmic Capture Kit.app", from
+          # mac-package.sh's APP_NAME) - keep in sync with scripts/mac-package.sh.
+          APP="target/release/bundle/Cosmic Capture Kit.app"
+          echo "::group::codesign --verify --deep --strict"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          echo "::endgroup::"
+          if [ "${{ steps.notarize.outputs.notarized }}" = "true" ]; then
+            echo "::group::spctl --assess (must PASS post-staple)"
+            spctl --assess --type execute --verbose=2 "$APP"
+            echo "::endgroup::"
+          else
+            echo "spctl assessment skipped - not notarized."
+          fi
+
+      # Name the artifact with version + short sha, and mark
+      # unsigned builds so a downloaded unsigned dmg is never mistaken for shareable.
+      - name: Compute artifact name
+        id: name
+        run: |
+          set -euo pipefail
+          N="CosmicCaptureKit-${{ steps.ver.outputs.version }}-${{ steps.ver.outputs.short_sha }}"
+          [ "${{ steps.cert.outputs.signed }}" = "true" ] || N="${N}-UNSIGNED"
+          echo "name=$N" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dmg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.name.outputs.name }}
+          path: target/CosmicCaptureKit-*.dmg
+          if-no-files-found: error
+
+      # Always tear down the throwaway keychain, success or fail.
+      - name: Delete throwaway keychain
+        if: always() && steps.cert.outputs.keychain != ''
+        run: security delete-keychain "${{ steps.cert.outputs.keychain }}" || true

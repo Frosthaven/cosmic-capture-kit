@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Cosmic Capture Kit
+GenericName=Screen Capture
+Comment=Native COSMIC screen capture, recording, and in-region QR/OCR detection
+Exec=cosmic-capture-kit
+Icon=dev.frosthaven.CosmicCaptureKit
+Terminal=false
+Categories=Utility;Graphics;
+Keywords=screenshot;screen;capture;record;recording;ocr;qr;barcode;
+StartupNotify=true
+StartupWMClass=dev.frosthaven.CosmicCaptureKit

@@ -1,0 +1,10 @@
+pub(super) mod about;
+pub(super) mod audio;
+pub(super) mod capture;
+pub(super) mod general;
+pub(super) mod health;
+pub(super) mod keyboard;
+pub(super) mod recordings;
+pub(super) mod scanner;
+pub(super) mod screenshots;
+pub(super) mod video;

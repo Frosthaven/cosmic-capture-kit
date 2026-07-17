@@ -1,0 +1,391 @@
+[package]
+name = "cosmic-capture-kit"
+version = "0.12.0"
+edition = "2024"
+description = "Native COSMIC capture overlay (region/window/monitor) for screenshots and screen recording: native screencopy capture, clipboard sharing, and in-region QR/barcode + OCR detection."
+license = "GPL-3.0-only"
+repository = "https://github.com/Frosthaven/cosmic-capture-kit"
+
+# Runtime requirement: the `ffmpeg` binary (used to encode recordings). Cargo
+# can't enforce external-binary deps, so it's declared in packaging metadata and
+# probed at runtime (the Recordings tab warns when it's missing). When packaging,
+# add `ffmpeg` to the package's runtime deps — e.g. AUR PKGBUILD `depends=('ffmpeg')`.
+[package.metadata.deb]
+depends = "$auto, ffmpeg"
+
+# ── Portable dependencies (every OS) ──────────────────────────────────────────
+# Pure userland (serde/toml/image/dsp/etc.) or already-cross-platform
+# (libcosmic-on-winit, dirs, chrono). OS-bound crates live in the per-target
+# sections below (DRAGON-94 step-zero partition: without it the whole Wayland +
+# D-Bus stack would compile into the mac/win builds as dead weight that only
+# fails at runtime — no wayland socket, no D-Bus session).
+[dependencies]
+# Zero-copy pixel handoff to iced image Handles (Bytes::from_owner shares the
+# decoded buffer instead of cloning ~30 MB per monitor snapshot / wallpaper).
+bytes = "1.9"
+rustix = { version = "1.1", features = ["fs", "process", "time"] }
+# Only for `_exit(2)` at GUI shutdown (app::run): a raw immediate exit that skips
+# libc atexit/global destructors. libcosmic's wayland backend runs its SCTK event
+# loop on a thread it never joins; that thread tears its windows down (a cosmic
+# corner-radius `destroy`) against the winit-owned display while the main thread is
+# in libc exit() — a use-after-free SIGSEGV in wl_proxy_destroy. `_exit` removes the
+# racy destructor phase entirely. Already in the tree (transitive), so it adds no build.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+ron = "0.8" # legacy state-file READ only (migration); config is written as TOML
+toml = "0.8"
+dirs = "6"
+log = "0.4"
+env_logger = "0.11"
+# Pixel handling for our own screencopy capture: decode the shm buffer into an
+# RgbaImage, apply the frame transform, crop regions, and PNG-encode. Pinned to
+# the same version libcosmic already resolves so it adds no extra build.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+# Direct PNG encode/decode (the same crate `image` already pulls in) so we can write
+# + read a tEXt metadata chunk on saved screenshots, which `image` doesn't expose.
+png = "0.17"
+# Local-time timestamps for capture filenames (capture-YYYY-MM-DD-HH-MM-SS-mmm).
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Used only to block_on the async portal handshake from the `--pw-test` diagnostic
+# CLI route; the GUI drives the same futures through libcosmic's executor instead.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# OCR text detection in region mode shells out to the `tesseract` binary (optional
+# runtime dep, like ffmpeg — the feature shows a hint + no-ops when it's missing).
+#
+# QR code / barcode detection in region mode (pure-Rust ZXing port, no system
+# deps). We feed a luma buffer ourselves, so the `image` feature (and its image
+# crate version) is intentionally left off.
+rxing = { version = "0.9", default-features = false, features = [
+    "decoders",
+    "multi_barcode_readers",
+    "full_barcode_format_support",
+    "encoding_rs",
+    # Result parser: turns a decoded payload into a typed result (URL/MEBKM/MECARD/
+    # vCard/WIFI/geo/tel/email/sms/calendar/…) so we can pick the right click action
+    # instead of hand-rolling format detection. Pulls a few pure-Rust crates only.
+    "client_support",
+] }
+# Real-time microphone noise reduction. Pure-Rust port of Xiph's RNNoise with the
+# trained model embedded in the crate, so it builds straight into our binary (no model
+# files, no C deps, no manual install). Good at non-stationary noise during speech.
+# default-features = false drops the crate's CLI/encoder extras; the denoiser stays.
+nnnoiseless = { version = "0.5", default-features = false }
+# Pure-Rust WebRTC audio processing — its Wiener-filter noise suppressor handles
+# STATIONARY noise (steady hum, fans, hiss) continuously, complementing RNNoise. Being
+# evaluated for sequencing ahead of RNNoise; under test in the `--denoise-test` route.
+sonora = "0.1"
+earshot = "1.1.0"
+# Rasterizing covermark SVGs onto captures (preview editing). The same version
+# libcosmic's renderer already resolves, so it adds no extra build.
+resvg = "0.45"
+
+# ── Linux-only dependencies (COSMIC / Wayland / D-Bus / PipeWire) ──────────────
+# The whole native-Linux capture + services stack. Moved off the top level so the
+# mac/win builds don't drag the Wayland client tree + zbus + pipewire (they COMPILE
+# on mac — plain unix-socket userland — but have no runtime backing there).
+[target.'cfg(target_os = "linux")'.dependencies]
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086" }
+cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "160b086" }
+wayland-client = "0.31.14"
+wayland-protocols = { version = "0.32.12", features = ["client", "staging", "unstable"] }
+# Post-capture sharing, all done in a single-threaded re-exec of ourselves (so we
+# never fork from the GUI threads): clipboard via the Wayland data-control
+# protocol (image/png + file uri-list, persists after we exit — works for native
+# Wayland and XWayland paste targets), notifications + "show in file manager" via
+# D-Bus.
+wl-clipboard-rs = "0.9"
+zbus = "5"
+# XDG desktop portal — folder picker for the save-directory settings. Matches the
+# version libcosmic already resolves.
+ashpd = { version = "0.12", default-features = false, features = ["tokio"] }
+# Portal-based screen recording: request a ScreenCast session (ashpd) and consume
+# the resulting PipeWire stream in-process (no GStreamer / no external capture
+# binary). `pipewire` binds the already-present libpipewire-0.3. Pinned to a git
+# rev because the crates.io release (0.8) predates PipeWire 1.6's SPA changes and
+# fails to build against current headers; main (0.10) builds clean.
+pipewire = { git = "https://gitlab.freedesktop.org/pipewire/pipewire-rs.git", rev = "5dd5dfad56bb0987e4d63af3d6f397e4a132dd9d" }
+# In-process hardware video encoding for the GPU zero-copy recording path (links
+# the system libavcodec/libavutil; version-matched to ffmpeg 8.1). Gated behind the
+# `zero-copy` feature so distros without ffmpeg 8 (Debian/Ubuntu/Pop!_OS LTS) can
+# build without it — the default recorder still pipes frames to the `ffmpeg` binary,
+# which works on ffmpeg 5+. We use the raw `ffi` for hwdevice/hwframes. Linux-only:
+# DRM/dmabuf has no macOS/Windows analog (mac hardware encode = h264_videotoolbox
+# through the bundled ffmpeg binary).
+ffmpeg-next = { version = "8.1.0", optional = true }
+# GPU buffer allocation for the screencopy zero-copy path: cosmic's screencopy
+# reports a DRM render node + the dmabuf formats/modifiers it can produce, and we
+# allocate a matching buffer object here, hand its dmabuf to the compositor to
+# copy each frame into, then feed it straight to the in-process encoder (no CPU
+# readback). default-features = false so we get just the allocator, not the
+# egl/wayland-server/drm interop the defaults pull in. Gated with `zero-copy`.
+gbm = { version = "0.15", default-features = false, optional = true }
+# System-tray (StatusNotifierItem) for the recording controls when the toolbar
+# can't sit in a full-screen capture. The `blocking` API owns its own thread +
+# zbus connection (sync Handle), so it stays off our UI executor entirely.
+ksni = { version = "0.3.5", default-features = false, features = ["tokio", "blocking"] }
+
+[target.'cfg(target_os = "linux")'.dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+rev = "4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+default-features = false
+# `markdown` (DRAGON-177): renders the About page's release notes via
+# `cosmic::widget::markdown` (forwards to iced's markdown widget + pulldown-cmark).
+features = ["desktop", "markdown", "multi-window", "tokio", "wayland", "wgpu", "winit"]
+
+# ── macOS-only dependencies (DRAGON-94) ───────────────────────────────────────
+# Replacements for the Linux services stack. Capture (ScreenCaptureKit via objc2),
+# resident menu-bar shell, and packaging land in later phases; this partition is
+# what lets the crate COMPILE on macOS at all.
+[target.'cfg(target_os = "macos")'.dependencies]
+# Clipboard (NSPasteboard image + file-url) — replaces wl-clipboard-rs.
+arboard = "3"
+# Native folder picker (NSOpenPanel) for the save-directory setting — replaces the
+# ashpd portal picker.
+rfd = "0.15"
+# ScreenCaptureKit capture stack (DRAGON-94 phase 2): stills, per-window/monitor
+# capture, display + window enumeration, cursor sprite. objc2 0.6 / 0.3-line
+# framework crates — the versions winit/libcosmic already resolve on macOS, so no
+# duplicate objc2 tree. `block2` bridges SCK's async completion handlers.
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSResponder",
+    "NSImage",
+    "NSGraphics",
+    "NSGraphicsContext",
+    "NSCursor",
+    "NSEvent",
+    "NSWorkspace",
+    "NSRunningApplication",
+    # DRAGON-153: the by-pid NSRunningApplication constructor (focus the already-open
+    # settings pane from a helper process) is gated on the crate's libc feature.
+    # libc is already a direct dependency, so no new packages land in the lock.
+    "libc",
+    # DRAGON-94 phase 2b: enumerate the app's windows (NSApplication) and, on each
+    # capture overlay (NSWindow), set the full-screen-Space collection behavior, place
+    # its frame, and hide the titlebar chrome we only keep to dodge a winit borderless
+    # crash — the traffic-light buttons (NSButton/NSControl/NSView) go hidden.
+    "NSApplication",
+    "NSWindow",
+    "NSButton",
+    "NSControl",
+    "NSView",
+    # DRAGON-147: trackpad pinch-to-zoom in the preview editor — an
+    # NSMagnificationGestureRecognizer on the preview window's content view
+    # (iced/winit surface no pinch gesture of their own).
+    "NSGestureRecognizer",
+    "NSMagnificationGestureRecognizer",
+    # DRAGON-191: read the system accent (NSColor.controlAccentColor) as the DEFAULT
+    # for the reconstructed Active window-capture border, converted to sRGB via
+    # NSColorSpace.sRGBColorSpace. Additive AppKit headers off the default tree, so no
+    # new packages land in the lock.
+    "NSColor",
+    "NSColorSpace",
+    # DRAGON-130 phase 4: clipboard file-URL copy — general pasteboard write of an
+    # NSURL (NSPasteboardWriting). Pulls objc2-foundation NSArray/NSString/NSData,
+    # all already default-enabled, so no new packages land in the lock.
+    "NSPasteboard",
+    # DRAGON-130 phase 4 (resident menu-bar): the always-present NSStatusItem shown
+    # while resident mode is on — its NSStatusBarButton carries the app glyph, and
+    # its NSMenu (New Capture / Settings / Quit) targets a small objc2 handler that
+    # pushes the selection into a channel the app drains. All additive AppKit headers
+    # off objc2-app-kit's own default tree, so no new packages land in the lock.
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSMenu",
+    "NSMenuItem",
+    # DRAGON-135: an EMPTY unified-style NSToolbar on the settings/permissions
+    # windows makes AppKit centre the traffic lights against the tall CSD header
+    # (the hidden-inset recipe). Additive header feature, no new packages.
+    "NSToolbar",
+    # DRAGON-157: the native folder browser (NSOpenPanel) behind the settings
+    # save-directory icons and the "Save As" panel (NSSavePanel) in the preview
+    # editor — the macOS analogue of the Linux xdg file-chooser portal. NSSavePanel
+    # is an NSPanel subclass (its methods are gated on NSPanel + NSWindow + NSResponder,
+    # the latter two already enabled). All additive AppKit headers, no new packages.
+    "NSPanel",
+    "NSSavePanel",
+    "NSOpenPanel",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFCGTypes",
+    "objc2",
+] }
+# CGImage→RGBA readback (bitmap context) + display geometry (CGDisplayBounds) +
+# the TCC preflight/request calls. SCK already pulls this crate; we just widen the
+# feature set (Cargo unifies additively).
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CGImage",
+    "CGColorSpace",
+    "CGContext",
+    "CGBitmapContext",
+    "CGDirectDisplay",
+    "CGWindow",
+] }
+# System-audio (and, WP5, video) capture over an SCStream (DRAGON-130 phase 3).
+# `default-features = false` throughout: the crates' DEFAULT sets pull heavy,
+# unneeded siblings (block2, objc2-metal, objc2-core-audio) that would churn
+# Cargo.lock — we enable only the exact modules we touch, which unifies additively
+# with objc2-screen-capture-kit's own (narrower) transitive set, so no new packages
+# land in the lock. `dispatch2` (already resolved, via SCK) is the serial
+# sample-handler queue; its default (block2/libc/objc2) matches what SCK already
+# enables.
+#
+# objc2-core-media: CMSampleBuffer + its ASBD/AudioBufferList extraction, CMTime for
+# the (ignored) video frame interval.
+objc2-core-media = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CMBase",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+    "CMSampleBuffer",
+    "CMTime",
+    "objc2-core-audio-types",
+    # WP5 (DRAGON-130): `CMSampleBuffer::image_buffer()` — the video worker's bridge
+    # from a delivered screen sample buffer to its CVPixelBuffer — is gated on this.
+    "objc2-core-video",
+] }
+# objc2-core-audio-types: AudioStreamBasicDescription + AudioBufferList/AudioBuffer +
+# the interleave/float format flags used to normalize SCK's audio layout.
+objc2-core-audio-types = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CoreAudioBaseTypes",
+] }
+# objc2-core-video: the CVPixelBuffer surface the WP5 video worker reads. Kept
+# metal/block2-free here so it doesn't churn the lock. `CVBuffer` gates the pixel-
+# buffer getters (width/height/bytesPerRow/baseAddress) + lock/unlock the worker's
+# BGRA→RGBA copy-out needs.
+objc2-core-video = { version = "0.3", default-features = false, features = [
+    "std",
+    "objc2",
+    "CVBase",
+    "CVBuffer",
+    "CVReturn",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVPixelBufferIOSurface",
+] }
+dispatch2 = "0.3"
+# TCC probes (DRAGON-130 packaging): microphone authorization status +
+# request via AVCaptureDevice (Screen Recording is preflighted through
+# objc2-core-graphics' CGPreflightScreenCaptureAccess instead). Already resolved
+# transitively via objc2-screen-capture-kit, so no new package lands in the lock;
+# `default-features = false` keeps the giant AVFoundation surface out — we enable
+# only AVCaptureDevice (+ AVMediaFormat for the AVMediaTypeAudio constant) and
+# block2 for the async request completion handler.
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVCaptureDevice",
+    "AVMediaFormat",
+    "block2",
+] }
+# DRAGON-130 bundle-gated services: UNUserNotificationCenter — the sticky,
+# click-actionable capture notification the bundled .app posts (unbundled dev
+# binaries keep the osascript degrade — UN APIs throw without a bundle id).
+# `default-features = false`: enable only the notification-center surface we touch
+# (center + mutable content + request + the delegate's response type) plus block2
+# for the authorization / add completion handlers. New lock package (no existing
+# transitive pull), macOS-target-only so the Linux `--locked` build is unaffected.
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "alloc",
+    "block2",
+    "UNUserNotificationCenter",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationTrigger",
+    "UNNotification",
+    "UNNotificationSettings",
+    "UNError",
+] }
+# DRAGON-130 bundle-gated services: SMAppService — the "Launch at login" login
+# item (register/unregister/status). `default-features = false`: only the
+# SMAppService surface + its error/status enums, plus objc2-foundation for the
+# NSError out-param. New lock package, macOS-target-only. register() needs the app
+# to live as a proper bundle in /Applications; an unbundled dev run degrades (the
+# toggle disables + explains) rather than silently failing.
+objc2-service-management = { version = "0.3", default-features = false, features = [
+    "std",
+    "alloc",
+    "objc2",
+    "objc2-foundation",
+    "SMAppService",
+    "SMErrors",
+] }
+# DRAGON-130 phase 4 (resident global hotkey): a process-wide capture hotkey
+# (Cmd+Shift+2) that fires a new session regardless of focus while resident mode
+# is on. Uses Carbon `RegisterEventHotKey` — no app bundle, no Accessibility grant
+# (unlike CGEventTap), delivering into a global crossbeam receiver we drain from the
+# same poll that services the menu bar. macOS-target-only, so the Linux `--locked`
+# build is unaffected (target-gated deps enter Cargo.lock but never build off-target;
+# Linux keeps the xdg-portal GlobalShortcuts path in platform/global_shortcuts.rs).
+global-hotkey = "0.7"
+
+# libcosmic on macOS: winit backend, no wayland, no `desktop` (freedesktop
+# .desktop-file integration is Linux-only). The Xwayland experiment already proved
+# libcosmic falls through to winit cleanly when wayland is absent; this makes that
+# the compiled shape instead of a runtime fallthrough.
+[target.'cfg(target_os = "macos")'.dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+rev = "4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+default-features = false
+# `markdown` (DRAGON-177): renders the About page's release notes via
+# `cosmic::widget::markdown` (forwards to iced's markdown widget + pulldown-cmark).
+features = ["markdown", "multi-window", "tokio", "wgpu", "winit"]
+
+# build.rs compiles the tiny MediaRemote proxy dylib (src/audio/duck_mac/mrduck.m)
+# the preview media-ducker loads under /usr/bin/perl (DRAGON-171). macOS-only —
+# on every other target build.rs is a no-op and this dep never resolves.
+[target.'cfg(target_os = "macos")'.build-dependencies]
+cc = "1.2"
+
+[features]
+# In-process GPU zero-copy encoding (links libavcodec via ffmpeg-next + libgbm).
+# Default-on for rolling distros with ffmpeg 8 (Arch/CachyOS, recent Fedora). Build
+# with `--no-default-features` on older-ffmpeg distros: everything still works, but
+# recording uses only the external `ffmpeg` binary (no in-process zero-copy). On
+# macOS/Windows, ALWAYS build `--no-default-features` — gbm/ffmpeg-next are
+# Linux-only optional deps, so the feature resolves to nothing off-Linux.
+default = ["zero-copy"]
+zero-copy = ["dep:ffmpeg-next", "dep:gbm"]
+
+# Match xdg-desktop-portal-cosmic: unify every cosmic-protocols dep (incl.
+# libcosmic's own) onto the rev its Cargo.lock resolves to.
+[patch."https://github.com/pop-os/cosmic-protocols"]
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c253ec1" }
+cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c253ec1" }
+
+# Optimize dependencies even in dev builds. The capture pipeline leans hard on
+# dependency crates (image/png/miniz_oxide PNG decode+encode, fast_blur for the
+# shadow, Lanczos resize). Built unoptimized those cost seconds per window
+# capture; at opt-level 3 they run an order of magnitude faster. Deps recompile
+# once, then cache.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Our own crate at opt-level 1: the hot pixel loops that live IN this crate
+# (normalize_to_rgba, stitch/composite, crop, the OCR prep) ran 10-30x slower at
+# the default opt 0 — measured 6.7x wall on a full region scan. Level 1 keeps
+# debug info + fast incremental builds while making the debug binary usable as a
+# daily driver. (The real daily driver should still be the release build.)
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+predicates = "3.1.4"
+rstest = "0.26.1"

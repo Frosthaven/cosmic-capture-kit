@@ -1,0 +1,11 @@
+/target
+# Vendored static ffmpeg/ffprobe for the mac build — never committed (huge binaries).
+/vendor/
+**/*.rs.bk
+Cargo.lock.bak
+dependencies.pdf
+
+# transient perf-audit artifacts (see audit-recovery.md)
+/audit.md
+/audit-recovery.md
+/audit/
