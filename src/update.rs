@@ -1,11 +1,16 @@
-//! In-app update channel (DRAGON-175).
+//! In-app update channel (DRAGON-175; channel consolidated in DRAGON-226).
 //!
-//! The app is distributed from a **private** source repo, so the update channel
-//! is a small SEPARATE **public** repo served over GitHub Pages (Pages is not
-//! available for private repos on the free plan). The release workflow publishes
-//! a manifest (`update.json`) plus the macOS `.dmg` there; the app polls the
-//! manifest, compares its `version` against `CARGO_PKG_VERSION`, and (macOS) can
+//! The channel is the PUBLIC repo's GitHub Releases: `scripts/mirror-release.sh`
+//! attaches a manifest (`update.json`) next to the macOS `.dmg` on each public
+//! release, and the app polls the stable `releases/latest/download/update.json`
+//! URL, compares its `version` against `CARGO_PKG_VERSION`, and (macOS) can
 //! download + verify + swap the installed `.app` in one click.
+//!
+//! HISTORY: while the source repo was fully private the channel was a separate
+//! Pages repo (`cosmic-capture-kit-updates`). Installs at <= 0.12.0 still poll
+//! that URL, so the legacy Pages push (`publish-update.yml`) stays alive until
+//! the installed base has crossed onto a release that carries this file — then
+//! the Pages repo retires (see RELEASING.md).
 //!
 //! Everything here is dependency-light on purpose:
 //!   * fetch is a `curl` shell-out (present on macOS and virtually every Linux),
@@ -18,12 +23,12 @@
 //! file bottom. The I/O (curl / hdiutil / the detached swap helper) is not, by
 //! the repo's testing rule.
 
-/// The default public update channel base URL (the SEPARATE public Pages repo;
-/// the private source repo can't host Pages on the free plan). Overridable at
-/// runtime with `CCK_UPDATE_URL` for local E2E testing (point it at a
-/// `file://`/`http://localhost` manifest).
+/// The default update channel: the public repo's latest-release `update.json`
+/// asset (GitHub serves `releases/latest/download/<asset>` as a stable URL for
+/// the newest non-draft release). Overridable at runtime with `CCK_UPDATE_URL`
+/// for local E2E testing (point it at a `file://`/`http://localhost` manifest).
 pub const DEFAULT_MANIFEST_URL: &str =
-    "https://frosthaven.github.io/cosmic-capture-kit-updates/update.json";
+    "https://github.com/Frosthaven/cosmic-capture-kit/releases/latest/download/update.json";
 
 /// Environment override for the manifest URL (dev/testing).
 pub const MANIFEST_URL_ENV: &str = "CCK_UPDATE_URL";
@@ -1061,8 +1066,11 @@ mod tests {
     fn manifest_url_prefers_env_override() {
         // Guard against a polluted env by asserting the default when unset in a
         // child-safe way: we can't unset in a shared process, so just check the
-        // default is what we expect and the resolver is non-empty.
-        assert!(DEFAULT_MANIFEST_URL.contains("cosmic-capture-kit-updates"));
+        // default is what we expect and the resolver is non-empty. The channel is
+        // the PUBLIC repo's latest-release manifest (DRAGON-226) — the stable
+        // `releases/latest/download` form, never the legacy Pages URL.
+        assert!(DEFAULT_MANIFEST_URL.ends_with("/releases/latest/download/update.json"));
+        assert!(DEFAULT_MANIFEST_URL.contains("github.com/Frosthaven/cosmic-capture-kit/"));
         assert!(!manifest_url().is_empty());
     }
 

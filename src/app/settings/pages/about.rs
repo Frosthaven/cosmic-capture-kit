@@ -56,12 +56,17 @@ impl crate::app::App {
             items.push(Item::note(notes));
         }
         items.extend(self.update_items());
-        items.push(Item::new(
+        // Donations live in their own section (DRAGON-226) so support reads as a
+        // deliberate ask, not another row of app metadata.
+        let support = vec![Item::new(
             "Donations",
             "Free forever. Donations help keep development going.",
             donate_button(),
-        ));
-        vec![SectionSpec { title: "About", items }]
+        )];
+        vec![
+            SectionSpec { title: "About this software", items },
+            SectionSpec { title: "Supporting this project", items: support },
+        ]
     }
 
     /// The Version row's right-hand control. Always shows the installed version,
