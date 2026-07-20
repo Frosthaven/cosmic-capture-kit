@@ -378,9 +378,21 @@ pub struct Persisted {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appearance_accent: Option<[f32; 3]>,
     /// Appearance override: corner-rounding style — 0 = round, 1 = slightly round,
-    /// 2 = square. Only consulted while `appearance_use_system` is OFF. Default 0.
-    #[serde(default)]
+    /// 2 = square. Only consulted while `appearance_use_system` is OFF. Default is
+    /// PER-PLATFORM (DRAGON-256): Windows = 1 (slightly round), the native Windows
+    /// look, so turning OFF System Default doesn't drop to fully-round; macOS/Linux
+    /// stay at 0 (round), byte-identical to before.
+    #[serde(default = "default_appearance_roundness")]
     pub appearance_roundness: u8,
+    /// Appearance (DRAGON-289): "Automatic Contrast Boost" — adapt the selected accent
+    /// for optimal contrast. When ON (default) EVERY accent element (fills, lines,
+    /// outlines AND chrome text) uses the contrast-corrected accent (unchanged when the
+    /// picked accent already passes a 4:1 contrast test); when OFF every element uses the
+    /// EXACT picked colour (text forced to match the fills). Only consulted while
+    /// `appearance_use_system` is OFF — System Default forces it ON. Additive field: an
+    /// absent key defaults ON, so no config migration is needed.
+    #[serde(default = "default_true")]
+    pub appearance_contrast_boost: bool,
     /// Region selection box thickness (logical px, 1-8). Drives the viewfinder corner
     /// brackets AND the side lines uniformly so they match. Always applies (NOT gated by
     /// `appearance_use_system`). DRAGON-209. Default 4.
@@ -425,6 +437,21 @@ fn default_active_opacity() -> f32 {
 
 fn default_preview_opacity() -> f32 {
     0.9
+}
+
+/// The customize-mode corner-rounding default (used when `appearance_use_system` is
+/// OFF). PER-PLATFORM (DRAGON-256): Windows defaults to 1 (slightly round) — the
+/// native Windows look — so turning off System Default doesn't drop to fully-round;
+/// macOS/Linux keep 0 (round), byte-identical to before. Both this serde default and
+/// the reset target (`state::defaults()`, which deserializes an empty document) flow
+/// through here, so a fresh install AND a per-setting reset land on the same value.
+#[cfg(target_os = "windows")]
+fn default_appearance_roundness() -> u8 {
+    1
+}
+#[cfg(not(target_os = "windows"))]
+fn default_appearance_roundness() -> u8 {
+    0
 }
 
 fn default_record_fps() -> u32 {

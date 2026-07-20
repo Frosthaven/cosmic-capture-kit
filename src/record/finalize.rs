@@ -9,7 +9,7 @@
 //! intervals → gate filters → amix → mux.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Produce `out_path` from the temp capture, gating each audio channel to the
 /// intervals it was toggled on. Video is stream-copied (no re-encode → no sync
@@ -32,7 +32,7 @@ pub(crate) fn finalize_with_intervals(
     // Copying HEVC into mp4 needs the hvc1 tag for QuickTime/Apple players (h264
     // doesn't). We chose the encoder, so `is_hevc` is known from the plan — no
     // ffprobe needed.
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
         .arg("-i")
         .arg(temp)

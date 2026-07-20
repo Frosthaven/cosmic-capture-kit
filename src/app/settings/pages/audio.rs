@@ -34,10 +34,27 @@ impl crate::app::App {
         // playback follows the system default output, so a picker would do nothing.
         #[cfg(not(target_os = "macos"))]
         {
-            let output_device = if self.dep(DepId::Pactl).is_present() {
+            // Linux enumerates output sinks via pactl (gated when it's missing). Windows
+            // (DRAGON-282) enumerates the ACTIVE WASAPI render endpoints itself (pure COM, no
+            // pactl and no ffmpeg), so its picker is always live — and, unlike Linux, the pick
+            // chooses WHICH output's audio is recorded as system audio (the loopback follows
+            // the chosen endpoint), so it carries a short description saying so.
+            #[cfg(windows)]
+            let can_pick_output = true;
+            #[cfg(not(windows))]
+            let can_pick_output = self.dep(DepId::Pactl).is_present();
+            // DRAGON-282: the chosen endpoint is what gets recorded as system audio; the leading
+            // "System default" entry follows whatever Windows currently has set as its default
+            // output. (Reworded from the pre-282 capture-follows-default phrasing.)
+            #[cfg(windows)]
+            let output_desc =
+                "The chosen output is recorded as system audio. \u{201c}System default\u{201d} follows your Windows default output.";
+            #[cfg(not(windows))]
+            let output_desc = "";
+            let output_device = if can_pick_output {
                 Item::new(
                     "Output device",
-                    "",
+                    output_desc,
                     widget::dropdown(
                         &self.speaker_device_labels,
                         Some(self.speaker_device_index()),

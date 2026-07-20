@@ -166,7 +166,7 @@ fn extract_poster(path: &Path, meta: Option<VideoMeta>) -> Option<widget::image:
     let scale = meta
         .map(|m| playback::scaled_dims(m.w, m.h))
         .map(|(w, h)| format!("scale={w}:{h}"));
-    let mut cmd = std::process::Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-v", "error", "-hwaccel", "auto"]);
     cmd.args(["-i"]).arg(path).args(["-frames:v", "1"]);
     if let Some(vf) = &scale {
@@ -606,69 +606,9 @@ impl App {
             widget::container(Element::new(shader))
                 .center_x(Length::Fill)
                 .into()
-        } else if let Some(poster) = &vid.poster {
-            // The poster was extracted at the playback scale (≤720p): size it to
-            // FILL the fitted box exactly like the live frames, so nothing jumps
-            // at Play and large recordings aren't shown as a small patch.
-            if let Some(m) = vid.meta {
-                let (sw, sh) = playback::scaled_dims(m.w, m.h);
-                let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
-                widget::container(
-                    widget::image(poster.clone())
-                        .content_fit(cosmic::iced::ContentFit::Fill)
-                        .width(Length::Fixed(dw))
-                        .height(Length::Fixed(dh)),
-                )
-                .center_x(Length::Fill)
-                .into()
-            } else {
-                // Probe failed → the poster's pixel size is unknown; show it plain.
-                widget::container(
-                    widget::image(poster.clone()).content_fit(cosmic::iced::ContentFit::ScaleDown),
-                )
-                .center_x(Length::Fill)
-                .max_height(avail_h)
-                .into()
-            }
         } else {
-            // No poster — a film card with the recording's filename.
-            let name = preview
-                .path
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "recording.mp4".to_string());
-            let icon =
-                widget::icon::Icon::from(widget::icon::from_name("video-x-generic-symbolic").size(96));
-            widget::container(
-                widget::column(vec![icon.into(), widget::text(name).size(16).into()])
-                    .spacing(12.0)
-                    .align_x(Alignment::Center),
-            )
-            .center_x(Length::Fill)
-            .max_height(avail_h)
-            .into()
-        };
-        // Covermark ops preview for the POSTER / film-card path (no live frame — that
-        // path already folds the covermark into its own LayerStack above): stack a
-        // covermark-only LayerStack over `content` at the content's display size (the
-        // bake composites the same rasters at source resolution, so this is faithful).
-        let content: Element<'a, Msg> = if vid.frame.is_none()
-            && let Some(frame) = cm_frame
-            && let Some(meta) = vid.meta
-        {
-            let (sw, sh) = playback::scaled_dims(meta.w, meta.h);
-            let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
-            // The covermark overlay draws through the persistent-texture shader (in-place
-            // upload, alpha-blended over the frame) — no atlas churn, so no blink on edit.
-            let layers = LayerStack::new(vec![Layer { key: LayerKey::COVERMARK, frame: frame.clone() }]);
-            let shader = cosmic::iced::widget::shader::Shader::new(layers)
-                .width(Length::Fixed(dw))
-                .height(Length::Fixed(dh));
-            let overlay = widget::container(Element::new(shader)).center_x(Length::Fill);
-            cosmic::iced::widget::stack(vec![content, overlay.into()]).into()
-        } else {
-            content
+            // No live frame: the poster (or a film card), with the covermark applied.
+            self.video_still_content(preview, vid, avail_w, avail_h, cm_frame)
         };
         let (play_icon, play_tip) = if vid.is_playing() {
             ("media-playback-pause-symbolic", "Pause  (P)")
@@ -800,6 +740,105 @@ impl App {
             toolbar,
             tb.glass,
         )
+    }
+
+    /// The video canvas content when NOTHING is playing: the poster (fitted like the live
+    /// frames so nothing jumps at Play), or a film card when the poster is missing — with the
+    /// covermark stacked over it through the persistent-texture shader (in-place upload,
+    /// alpha-blended, no atlas churn). Windows OVERLAY exception (DRAGON-235): iced's
+    /// raster-image pipeline does not composite on the premultiplied transparent surface, so a
+    /// sized poster is drawn through the SAME LayerStack shader instead — with the covermark
+    /// folded into that one stack, so only a single LayerStack ever lives on the surface (two
+    /// would fight over slot pruning). The opaque windowed surface, Linux and macOS compile
+    /// only the portable `widget::image` paths below (byte-identical there).
+    fn video_still_content(
+        &self,
+        preview: &PreviewState,
+        vid: &VideoPreview,
+        avail_w: f32,
+        avail_h: f32,
+        cm_frame: Option<&std::sync::Arc<PixelFrame>>,
+    ) -> Element<'static, Msg> {
+        #[cfg(windows)]
+        if !preview.surface.is_window()
+            && let Some(poster) = &vid.poster
+            && let Some(m) = vid.meta
+            && let Some(pf) = super::layers::rgba_handle_frame(poster)
+        {
+            let (sw, sh) = playback::scaled_dims(m.w, m.h);
+            let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
+            let mut layers = vec![Layer { key: LayerKey::VIDEO, frame: pf }];
+            if let Some(cm) = cm_frame {
+                layers.push(Layer { key: LayerKey::COVERMARK, frame: cm.clone() });
+            }
+            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers))
+                .width(Length::Fixed(dw))
+                .height(Length::Fixed(dh));
+            return widget::container(Element::new(shader)).center_x(Length::Fill).into();
+        }
+        let content: Element<'static, Msg> = if let Some(poster) = &vid.poster {
+            // The poster was extracted at the playback scale (≤720p): size it to
+            // FILL the fitted box exactly like the live frames, so nothing jumps
+            // at Play and large recordings aren't shown as a small patch.
+            if let Some(m) = vid.meta {
+                let (sw, sh) = playback::scaled_dims(m.w, m.h);
+                let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
+                widget::container(
+                    widget::image(poster.clone())
+                        .content_fit(cosmic::iced::ContentFit::Fill)
+                        .width(Length::Fixed(dw))
+                        .height(Length::Fixed(dh)),
+                )
+                .center_x(Length::Fill)
+                .into()
+            } else {
+                // Probe failed → the poster's pixel size is unknown; show it plain.
+                widget::container(
+                    widget::image(poster.clone()).content_fit(cosmic::iced::ContentFit::ScaleDown),
+                )
+                .center_x(Length::Fill)
+                .max_height(avail_h)
+                .into()
+            }
+        } else {
+            // No poster — a film card with the recording's filename.
+            let name = preview
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "recording.mp4".to_string());
+            let icon =
+                widget::icon::Icon::from(widget::icon::from_name("video-x-generic-symbolic").size(96));
+            widget::container(
+                widget::column(vec![icon.into(), widget::text(name).size(16).into()])
+                    .spacing(12.0)
+                    .align_x(Alignment::Center),
+            )
+            .center_x(Length::Fill)
+            .max_height(avail_h)
+            .into()
+        };
+        // Covermark ops preview for the POSTER / film-card path (the Windows overlay poster
+        // above already folded the covermark into its own LayerStack): stack a covermark-only
+        // LayerStack over `content` at the content's display size (the bake composites the
+        // same rasters at source resolution, so this is faithful).
+        if let Some(frame) = cm_frame
+            && let Some(meta) = vid.meta
+        {
+            let (sw, sh) = playback::scaled_dims(meta.w, meta.h);
+            let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
+            // The covermark overlay draws through the persistent-texture shader (in-place
+            // upload, alpha-blended over the frame) — no atlas churn, so no blink on edit.
+            let layers = LayerStack::new(vec![Layer { key: LayerKey::COVERMARK, frame: frame.clone() }]);
+            let shader = cosmic::iced::widget::shader::Shader::new(layers)
+                .width(Length::Fixed(dw))
+                .height(Length::Fixed(dh));
+            let overlay = widget::container(Element::new(shader)).center_x(Length::Fill);
+            cosmic::iced::widget::stack(vec![content, overlay.into()]).into()
+        } else {
+            content
+        }
     }
 }
 

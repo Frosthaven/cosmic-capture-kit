@@ -32,7 +32,7 @@ pub fn inspect(path: &std::path::Path) {
 
 /// The mp4/mkv `comment` tag via ffprobe (empty/`None` if absent or ffprobe missing).
 fn ffprobe_comment(path: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(crate::util::ffprobe_path())
+    let out = crate::util::ffprobe_command()
         .args([
             "-v", "error",
             "-show_entries", "format_tags=comment",

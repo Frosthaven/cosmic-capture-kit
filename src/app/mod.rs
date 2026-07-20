@@ -62,7 +62,6 @@ pub(crate) use theme::theme_is_dark;
 // These are called unqualified via `use super::*;` in application.rs.
 pub(super) use theme::{
     window_radius,
-    active_hint_color,
     wallpaper_path,
 };
 // Theme-level state-mix helpers, called unqualified via `use super::*;` in
@@ -124,6 +123,20 @@ pub fn preview_media_kind(path: &std::path::Path) -> Option<bool> {
     }
 }
 
+/// DRAGON-243 (Windows): the `ICED_PRESENT_MODE` value to force given whatever the
+/// environment already carries. Returns `Some("fifo")` when nothing meaningful is set —
+/// forcing a DWM-COMPOSITED present mode so the transparent capture / preview overlay keeps
+/// its per-pixel alpha across continuous redraws — and `None` when the user (or a debug
+/// session) already chose one, so their value wins. Pure, so the "only when unset" rule is
+/// unit-tested without touching the process environment. See [`run`] for the full rationale.
+#[cfg(windows)]
+fn present_mode_env_override(existing: Option<&str>) -> Option<&'static str> {
+    match existing {
+        Some(v) if !v.trim().is_empty() => None,
+        _ => Some("fifo"),
+    }
+}
+
 pub fn run(startup: Startup) -> cosmic::iced::Result {
     // macOS (DRAGON-150 -> DRAGON-151): the installed bundle carries LSUIElement=true
     // (for the menu-bar DAEMON), so a GUI child spawned from it runs as a
@@ -167,6 +180,36 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
     #[cfg(target_os = "macos")]
     if !(startup.settings_only || startup.permissions_only || startup.preview.is_some()) {
         crate::platform::mac::window::install_overlay_chrome_strip();
+    }
+    // Windows (DRAGON-243): force a DWM-COMPOSITED present mode for every wgpu surface this
+    // process opens. iced_wgpu's default here is `AutoNoVsync` (resolves to Immediate /
+    // Mailbox on the Vulkan backend this machine selects). A fullscreen TRANSPARENT overlay
+    // — the capture overlay and the fullscreen preview overlay — that presents CONTINUOUSLY
+    // (dragging a region, the recording chip's timer, the preview compositing) is then
+    // promoted by Windows to "independent flip" / DirectFlip, which scans the swapchain
+    // buffer out to the display DIRECTLY, bypassing DWM composition and therefore the
+    // window's per-pixel alpha (winit sets transparency via `DwmEnableBlurBehindWindow`).
+    // With DWM bypassed, the surface's premultiplied-black dim/scrim shows as its raw RGB —
+    // OPAQUE black — and the desktop behind it vanishes, while opaque top content (the
+    // accent selection border, the composited media) still shows. It only goes wrong AFTER
+    // the first, still-DWM-composited idle frame, which is exactly the reported "translucent
+    // on open, solid black the moment you move/redraw" symptom (BUG 1) and the opaque
+    // preview surround (BUG 2). `Fifo` (present interval 1) keeps the surface in DWM
+    // composition, so per-pixel alpha survives every redraw. DRAGON-234 verified transparency
+    // on this SAME Vulkan/NVIDIA/PreMultiplied rig only because its check was IDLE (a static
+    // overlay stays DWM-composited); the regression is the continuous-present path. This env
+    // is read ONCE at compositor creation inside `cosmic::app::run` below, so it must be set
+    // first; we are still single-threaded here (that call is what spawns the render/runtime
+    // threads), so the edition-2024 `set_var` is sound. cfg(windows) only — Linux (layer-
+    // shell) and macOS keep their historical present mode byte-for-byte.
+    #[cfg(windows)]
+    if let Some(mode) =
+        present_mode_env_override(std::env::var("ICED_PRESENT_MODE").ok().as_deref())
+    {
+        // SAFETY: single-threaded at this point — `cosmic::app::run` below is the first
+        // thing to spawn the runtime / renderer threads, so no other thread can be reading
+        // the environment concurrently with this write.
+        unsafe { std::env::set_var("ICED_PRESENT_MODE", mode) };
     }
     let settings = cosmic::app::Settings::default()
         .no_main_window(true)
@@ -307,8 +350,33 @@ fn build_window_thumbs(
             if win.rect.2 < 1 || win.rect.3 < 1 {
                 continue;
             }
+            // A window with no captured pixels. On every platform but Windows this is a
+            // window the compositor grab skipped and it drops out of the picker
+            // (byte-identical to before). On Windows (DRAGON-232) a skipped window is one
+            // the bounded `PrintWindow` ladder pre-filtered or timed out (a hung /
+            // uncooperative app, e.g. RustDesk) — it still belongs in the picker, so it
+            // is represented by a neutral placeholder tile instead of vanishing silently.
+            #[cfg(not(windows))]
             let Some(img) = raw.get(&win.id) else {
                 continue;
+            };
+            #[cfg(windows)]
+            let placeholder = if raw.contains_key(&win.id) {
+                None
+            } else {
+                log::info!(
+                    "DRAGON-232 build_window_thumbs: no captured pixels for window {:?} \
+                     (id {}); showing a placeholder tile (grab skipped/timed out)",
+                    win.title,
+                    win.id
+                );
+                Some(crate::platform::windows::placeholder_window_thumb(
+                    &win.id, win.rect.2, win.rect.3,
+                ))
+            };
+            #[cfg(windows)]
+            let Some(img) = raw.get(&win.id).or(placeholder.as_ref()) else {
+                continue; // unreachable: `placeholder` is Some whenever `raw` lacks the id
             };
             // DRAGON-190 (platform-agnostic): trim any dead FULLY-transparent gutter off
             // the raw grab so the picker tile matches the trimmed CAPTURE, then size the
@@ -844,8 +912,23 @@ pub enum DirTarget {
     Recording,
 }
 
-/// Windows: no native folder picker wired yet. Stubbed.
-#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+/// Windows (DRAGON-254): the native Common Item Dialog folder browser (rfd wrapping
+/// `IFileOpenDialog` with `FOS_PICKFOLDERS`). The dialog is modal and owns its own
+/// COM STA apartment, so run it on a dedicated blocking thread and await the pick
+/// over a oneshot — `pick_folder` runs on iced's async executor, and blocking that
+/// thread on a native modal would stall the whole UI (same reasoning as macOS). The
+/// return-to-surface semantics around this are platform-agnostic (see the callers).
+#[cfg(target_os = "windows")]
+async fn pick_folder() -> Option<std::path::PathBuf> {
+    let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::platform::windows::file_panel::pick_folder());
+    });
+    rx.await.ok().flatten()
+}
+
+/// Fallback for any other target: no native folder picker. Stubbed.
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
 async fn pick_folder() -> Option<std::path::PathBuf> {
     None
 }
@@ -879,8 +962,23 @@ async fn pick_folder() -> Option<std::path::PathBuf> {
     files.uris().first()?.to_file_path().ok()
 }
 
-/// Windows: no native save panel wired yet. Stubbed.
-#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+/// Windows (DRAGON-254): the native "Save As" file chooser (rfd wrapping
+/// `IFileSaveDialog`), pre-filled with `suggested_name`. Modal with its own COM STA
+/// apartment, so run it on a dedicated blocking thread and await the pick over a
+/// oneshot (same reasoning as `pick_folder`). Used by the preview window's Save As;
+/// the overlay-vs-window return semantics around the result are platform-agnostic
+/// (see `save_as_dialog` / `SaveAsResult`).
+#[cfg(target_os = "windows")]
+async fn pick_save_path(suggested_name: String) -> Option<std::path::PathBuf> {
+    let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::platform::windows::file_panel::pick_save_file(&suggested_name));
+    });
+    rx.await.ok().flatten()
+}
+
+/// Fallback for any other target: no native save panel. Stubbed.
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
 async fn pick_save_path(_suggested_name: String) -> Option<std::path::PathBuf> {
     None
 }
@@ -1008,20 +1106,63 @@ pub struct EncoderResolve {
     /// The resolved preferred-encoder id. `None` until first resolved; thereafter the
     /// live user choice (SetPreferredEncoder / persist apply set it directly).
     preferred: std::cell::RefCell<Option<String>>,
+    /// Windows (DRAGON-238): whether the OFF-THREAD encoder probe has been kicked. The
+    /// Windows hardware tier probes each encoder with a real ffmpeg encode (seconds), so
+    /// the settings video / Health page must NOT block on the first read — the page peeks
+    /// (`peek`), a background task computes the list, and the result arrives as a message
+    /// (`finish_probe`). Linux/mac keep the synchronous first-read probe (timing untouched).
+    #[cfg(windows)]
+    probing: std::cell::Cell<bool>,
 }
 
 impl EncoderResolve {
+    /// Probe the usable encoders (`ffmpeg -encoders` + the hardware probe-encodes), applying
+    /// the `CCK_HEALTH_FORCE_WARN` review filter. IDENTICAL whether run synchronously
+    /// (Linux/mac first read) or off the UI thread (Windows async probe, DRAGON-238).
+    fn probe_list() -> Vec<crate::encode::EncoderInfo> {
+        let mut e = crate::encode::available_encoders();
+        if std::env::var_os("CCK_HEALTH_FORCE_WARN").is_some() {
+            e.retain(|enc| enc.id == "software");
+        }
+        e
+    }
+
     /// The probed encoder list, resolving (and caching) it on first access. This is
     /// the ONLY place `available_encoders()` runs, so no launch pays the ffmpeg probe
-    /// until the list is genuinely needed.
+    /// until the list is genuinely needed. On Windows this still BLOCKS if reached before
+    /// the off-thread probe filled the cell (e.g. a recording started without opening
+    /// settings) — the settings pages avoid that by peeking instead (`peek`).
     fn list(&self) -> &[crate::encode::EncoderInfo] {
-        self.list.get_or_init(|| {
-            let mut e = crate::encode::available_encoders();
-            if std::env::var_os("CCK_HEALTH_FORCE_WARN").is_some() {
-                e.retain(|enc| enc.id == "software");
-            }
-            e
-        })
+        self.list.get_or_init(Self::probe_list)
+    }
+
+    /// Windows (DRAGON-238): a NON-BLOCKING peek at the probed list — `None` until the
+    /// off-thread probe has finished. The settings video / Health pages use this so the UI
+    /// thread never blocks on the encoder probe.
+    #[cfg(windows)]
+    fn peek(&self) -> Option<&[crate::encode::EncoderInfo]> {
+        self.list.get().map(Vec::as_slice)
+    }
+
+    /// Windows (DRAGON-238): whether an off-thread probe should be kicked now — false if the
+    /// list is already resolved or a probe is already in flight. Sets the in-flight flag as
+    /// a side effect (so a caller that gets `true` owns kicking exactly one task).
+    #[cfg(windows)]
+    fn begin_probe(&self) -> bool {
+        if self.list.get().is_some() || self.probing.get() {
+            return false;
+        }
+        self.probing.set(true);
+        true
+    }
+
+    /// Windows (DRAGON-238): store the off-thread probe result. Idempotent — a racing
+    /// synchronous read (a recording start) may have filled the cell first, in which case
+    /// the async result is dropped. Clears the in-flight flag either way.
+    #[cfg(windows)]
+    fn finish_probe(&self, list: Vec<crate::encode::EncoderInfo>) {
+        let _ = self.list.set(list);
+        self.probing.set(false);
     }
 
     /// The resolved preferred-encoder id, computing it on first access from the probed
@@ -1153,6 +1294,29 @@ pub struct App {
     /// front without stealing focus. Never set off macOS.
     #[cfg(target_os = "macos")]
     mac_preview_preopen: bool,
+    /// Windows (DRAGON-246): set true once the settings window has been CONFIRMED shown
+    /// (`float_and_show` matched its async title and issued `ShowWindow`). Gates the
+    /// `sub_settings_liveness` watchdog so it can NEVER fire during the legitimate
+    /// open-hidden → float-and-show phase — only AFTER the titled window has actually been
+    /// shown does its disappearance mean a genuine vanish-without-`Closed`, at which point
+    /// the watchdog ends the instance so the settings mutex + pid file don't leak. Never
+    /// set off Windows (write-once; the one-shot process exits before it would reset).
+    #[cfg(windows)]
+    settings_shown_confirmed: bool,
+    /// Windows (DRAGON-281): the preview surface whose native show/place has been
+    /// CONFIRMED (finalize succeeded — `show_centered` / `place_overlay` returned true).
+    /// Gates `sub_preview_finalize`: while a preview surface exists whose id is not this,
+    /// the subscription re-drives its finalize every ~80ms. That safety net exists because
+    /// the preview is minted HIDDEN (komorebi opt-out) and shown only by the one-shot
+    /// `window::open` follow-up, which is NOT delivered while cck is a BACKGROUND process
+    /// — the DRAGON-281 case where the user focuses another window during the (click-
+    /// through) countdown, so the capture commits with cck backgrounded and the preview
+    /// HWND stays hidden forever. Timer subscriptions DO pump while backgrounded, so this
+    /// is the reliable re-driver. Storing the id (not a bool) auto-invalidates on a
+    /// re-mint (toggle/swap points `preview.window` at a new id), so the subscription
+    /// re-fires for the fresh surface. Never set off Windows.
+    #[cfg(windows)]
+    preview_shown_confirmed: Option<window::Id>,
     /// Settings window UI state (the toplevel window, nav rail, search, …).
     settings: SettingsState,
     /// Permission-checker window UI state (macOS onboarding surface; only ever
@@ -1191,6 +1355,10 @@ pub struct App {
     /// Appearance override: corner-rounding style (0 round / 1 slightly / 2 square).
     /// Only used while `appearance_use_system` is false.
     appearance_roundness: u8,
+    /// Appearance (DRAGON-289): "Automatic Contrast Boost" — adapt the selected accent
+    /// for optimal contrast so fills, lines, outlines AND chrome text share one colour.
+    /// Only consulted while `appearance_use_system` is false (System Default forces ON).
+    appearance_contrast_boost: bool,
     /// Region selection box thickness (logical px, 1-8), applied to the viewfinder corner
     /// brackets AND side lines uniformly. Always applies (not gated by system appearance).
     /// DRAGON-209.
@@ -1237,8 +1405,9 @@ pub struct App {
     /// Whether a `pactl` binary was found on PATH at launch (audio device
     /// enumeration needs it; otherwise only the system default device is offered).
     /// Unread on macOS (DRAGON-132: mic enumeration gates on ffmpeg there, and there
-    /// is no output picker), where it is always false anyway.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// is no output picker) and on Windows (DRAGON-238: mic = DirectShow/ffmpeg, system
+    /// = WASAPI — the Pactl health row gates on ffmpeg there), where it is always false.
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
     pactl_available: bool,
     /// Whether the NVIDIA driver stack was in the post-update NVML "driver/library
     /// version mismatch" state at launch (kernel module ≠ userspace libraries;
@@ -1297,15 +1466,16 @@ pub struct App {
     /// the WM anyway. `None` when no tiling WM was paused. See `mac::window`.
     #[cfg(target_os = "macos")]
     aerospace_guard: Option<crate::platform::mac::window::AerospaceGuard>,
-    /// macOS (DRAGON-151): the countdown/recording overlays are click-through
-    /// (`recreate_active_overlays` set every overlay to mouse passthrough); while
-    /// true, `sub_passthrough` polls the pointer against each output's toolbar-chip
-    /// rect and re-solidifies just the hovered overlay so the chip stays clickable.
-    #[cfg(target_os = "macos")]
+    /// macOS (DRAGON-151) / Windows (DRAGON-276): the countdown/recording overlays are
+    /// click-through (`recreate_active_overlays` set every overlay to mouse
+    /// passthrough); while true, `sub_passthrough` polls the pointer against each
+    /// output's toolbar-chip rect and re-solidifies just the hovered overlay so the
+    /// chip stays clickable.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     passthrough_active: bool,
-    /// macOS (DRAGON-151): the overlay currently made SOLID because the pointer is
-    /// over its toolbar chip (`None` = all overlays passthrough).
-    #[cfg(target_os = "macos")]
+    /// macOS (DRAGON-151) / Windows (DRAGON-276): the overlay currently made SOLID
+    /// because the pointer is over its toolbar chip (`None` = all overlays passthrough).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     passthrough_solid: Option<window::Id>,
     /// Opacity of the dim outside the region selection (persisted; default 0.70).
     region_overlay_opacity: f32,
@@ -1475,15 +1645,17 @@ pub struct App {
     /// to system audio), alive whenever that channel is armed. `PR_SET_PDEATHSIG`
     /// keeps it from orphaning if we exit.
     sys_meter: Option<std::process::Child>,
-    /// macOS (DRAGON-130 Bug B): the armed-idle system-audio METERING capture. On macOS
-    /// there is no pulse-monitor to run an ffmpeg meter sidecar from, so `sys_meter`
-    /// stays `None` and the speaker button would sit flat while armed-but-not-recording.
-    /// This is a metering-only `MonitorCapture` (an audio-only SCK stream) alive ONLY in
-    /// the armed-idle window: its chunks are discarded (`try_send` drops them) and it
-    /// publishes the sys RMS via `publish_sys_level` on its own thread, exactly like the
-    /// recording capture does. It is STOPPED before a recording's owned capture starts so
-    /// the two never fight over the single SCK system-audio stream.
-    #[cfg(target_os = "macos")]
+    /// macOS (DRAGON-130 Bug B) / Windows (DRAGON-248): the armed-idle system-audio METERING
+    /// capture. Neither platform has a pulse-monitor to run an ffmpeg meter sidecar from, so
+    /// `sys_meter` stays `None` and the speaker button would sit flat while
+    /// armed-but-not-recording (the ONLY platform where the armed sys meter was dead — the
+    /// user's "system meter never shows any volume"). This is a metering-only
+    /// `MonitorCapture` (an audio-only SCK stream on macOS, a WASAPI loopback on Windows)
+    /// alive ONLY in the armed-idle window: its chunks are discarded (`try_send` drops them)
+    /// and it publishes the sys RMS via `publish_sys_level` on its own thread, exactly like
+    /// the recording capture does. It is STOPPED before a recording's owned capture starts so
+    /// the two never fight over the system-audio stream.
+    #[cfg(any(target_os = "macos", windows))]
     sys_idle_meter: Option<(
         crate::audio::capture::MonitorCapture,
         std::sync::mpsc::Receiver<crate::audio::capture::CaptureChunk>,
@@ -1719,7 +1891,13 @@ struct RegionTarget {
 /// A granted portal stream held between the permission grant and the actual start
 /// of recording (it survives the pre-capture countdown). Consumed by the recorder.
 struct HeldStream {
+    // DRAGON-229: the portal fd is a never-constructed TYPE off Linux (pipewire_available
+    // is always false there). Unix keeps `std::os::fd::OwnedFd`; Windows has no
+    // `std::os::fd`, so use its owned handle so the field type resolves.
+    #[cfg(unix)]
     fd: std::os::fd::OwnedFd,
+    #[cfg(windows)]
+    fd: std::os::windows::io::OwnedHandle,
     node_id: u32,
     /// Region crop in stream pixels; `None` for whole monitor/window.
     crop: Option<(u32, u32, u32, u32)>,
@@ -1755,6 +1933,20 @@ mod tests {
         assert_eq!(countdown_index(3), 1);
         assert_eq!(countdown_index(5), 2);
         assert_eq!(countdown_index(10), 3);
+    }
+
+    /// DRAGON-243 (Windows): the transparent-overlay present-mode override forces `fifo`
+    /// only when the user hasn't chosen one — a set value (even whitespace-trimmed
+    /// non-empty) always wins, an unset-or-empty env is forced to the DWM-composited mode.
+    #[cfg(windows)]
+    #[test]
+    fn present_mode_override_forces_fifo_only_when_unset() {
+        assert_eq!(present_mode_env_override(None), Some("fifo"));
+        assert_eq!(present_mode_env_override(Some("")), Some("fifo"));
+        assert_eq!(present_mode_env_override(Some("   ")), Some("fifo"));
+        assert_eq!(present_mode_env_override(Some("immediate")), None);
+        assert_eq!(present_mode_env_override(Some("vsync")), None);
+        assert_eq!(present_mode_env_override(Some("fifo")), None);
     }
 
     #[test]

@@ -80,23 +80,7 @@ impl App {
         let image: Element<'a, Msg> = if ow > 0 && oh > 0 {
             let (avail_w, avail_h) = self.preview_viewport(preview);
             let (dw, dh) = video::fit_dims(ow, oh, avail_w, avail_h);
-            let base = widget::container(
-                widget::image(handle.clone())
-                    .content_fit(cosmic::iced::ContentFit::Fill)
-                    .width(Length::Fixed(dw))
-                    .height(Length::Fixed(dh)),
-            )
-            .center_x(Length::Fill);
-            if let Some(frame) = preview.edit.cm_raster.frame() {
-                let layers = LayerStack::new(vec![Layer { key: LayerKey::COVERMARK, frame: frame.clone() }]);
-                let shader = cosmic::iced::widget::shader::Shader::new(layers)
-                    .width(Length::Fixed(dw))
-                    .height(Length::Fixed(dh));
-                let overlay = widget::container(Element::new(shader)).center_x(Length::Fill);
-                cosmic::iced::widget::stack(vec![base.into(), overlay.into()]).into()
-            } else {
-                base.into()
-            }
+            self.still_media(preview, handle, dw, dh)
         } else {
             // No known dims (rare decode fallback): plain fit, no covermark overlay.
             widget::container(
@@ -163,5 +147,55 @@ impl App {
             toolbar,
             tb.glass,
         )
+    }
+
+    /// The base still (plus the covermark, when applied) for the loaded-image view, fitted
+    /// to `dw`×`dh`. Portable path: a STABLE `widget::image` handle with the covermark
+    /// stacked over it through the persistent-texture shader (the base never re-uploads and
+    /// the covermark's texture updates in place, so neither blinks mid-edit; both sized to
+    /// the same fitted box so they align — the bake still composites at full source
+    /// resolution). Windows OVERLAY exception (DRAGON-235): iced's raster-image pipeline does
+    /// not composite on the premultiplied transparent surface, so the base is drawn through
+    /// the SAME LayerStack shader instead — with the covermark folded into that one stack, so
+    /// only a single LayerStack ever lives on the surface (two would fight over slot pruning).
+    /// The opaque windowed surface, Linux (layer-shell) and macOS keep `widget::image`; those
+    /// platforms compile only the portable path below (byte-identical).
+    fn still_media(
+        &self,
+        preview: &PreviewState,
+        handle: &widget::image::Handle,
+        dw: f32,
+        dh: f32,
+    ) -> Element<'static, Msg> {
+        #[cfg(windows)]
+        if !preview.surface.is_window()
+            && let Some(base) = super::layers::rgba_handle_frame(handle)
+        {
+            let mut layers = vec![Layer { key: LayerKey::VIDEO, frame: base }];
+            if let Some(cm) = preview.edit.cm_raster.frame() {
+                layers.push(Layer { key: LayerKey::COVERMARK, frame: cm.clone() });
+            }
+            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers))
+                .width(Length::Fixed(dw))
+                .height(Length::Fixed(dh));
+            return widget::container(Element::new(shader)).center_x(Length::Fill).into();
+        }
+        let base = widget::container(
+            widget::image(handle.clone())
+                .content_fit(cosmic::iced::ContentFit::Fill)
+                .width(Length::Fixed(dw))
+                .height(Length::Fixed(dh)),
+        )
+        .center_x(Length::Fill);
+        if let Some(frame) = preview.edit.cm_raster.frame() {
+            let layers = LayerStack::new(vec![Layer { key: LayerKey::COVERMARK, frame: frame.clone() }]);
+            let shader = cosmic::iced::widget::shader::Shader::new(layers)
+                .width(Length::Fixed(dw))
+                .height(Length::Fixed(dh));
+            let overlay = widget::container(Element::new(shader)).center_x(Length::Fill);
+            cosmic::iced::widget::stack(vec![base.into(), overlay.into()]).into()
+        } else {
+            base.into()
+        }
     }
 }

@@ -11,7 +11,7 @@
 //! | Open / reveal      | portal OpenURI (xdg-open fallback)         | NSWorkspace / `open`           | `explorer /select`         |
 //! | Wi-Fi join (QR)    | nmcli (copy-password fallback)             | `networksetup` (copy fallback) | `netsh wlan` (copy fallback)|
 //! | Single instance    | flock in the runtime dir (`crate::instance`)| flock                          | named mutex                |
-//! | Media pause (duck) | MPRIS babysitter (`crate::audio::ducking`) | (no public API — gated off)    | WinRT SMTC sessions        |
+//! | Media pause (duck) | MPRIS babysitter (`crate::audio::ducking`) | (no public API — gated off)    | GSMTC babysitter (`crate::audio::ducking`) |
 //!
 //! The Linux implementations live in [`crate::share`] (spawn-side API here; the
 //! `run_*` worker halves stay internal — they execute in a re-exec'd child, an

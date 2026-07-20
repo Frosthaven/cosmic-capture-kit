@@ -82,8 +82,9 @@ pub enum PreviewMsg {
     WindowDrag,
     WindowMaximize,
     /// Only the Linux CSD header draws a minimize button; macOS uses the native
-    /// traffic-light miniaturize instead (DRAGON-146).
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// traffic-light miniaturize (DRAGON-146) and Windows the native DWM caption
+    /// minimize button (DRAGON-284) instead.
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
     WindowMinimize,
     /// Delete the file, then finish.
     Delete,

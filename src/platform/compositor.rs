@@ -68,7 +68,7 @@ pub fn list_toplevels() -> std::collections::HashMap<String, Vec<Toplevel>> {
 /// edge it sits on (the right/lower output), never the one whose right/bottom edge it
 /// grazes. First-match wins, so with overlapping outputs the earliest in `outputs`
 /// order takes the window.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn output_name_for_window(
     rect: (i32, i32, i32, i32),
     outputs: &[crate::platform::backend::OutputDesc],
@@ -87,8 +87,25 @@ fn output_name_for_window(
         .unwrap_or_default()
 }
 
-/// Non-macOS, non-Linux (e.g. a future Windows build): no toplevel enumeration yet.
-#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+/// Windows (DRAGON-229): the toplevel list comes from Win32 `EnumWindows` (the Windows
+/// capture backend), grouped by the output each window's centre sits on via the shared
+/// [`output_name_for_window`] helper — the same shape the Wayland/mac paths return, so
+/// the picker grid + capture-scene model consume it unchanged. Called off the UI thread
+/// (the launch pre-capture worker), so the blocking enumeration is fine here.
+#[cfg(target_os = "windows")]
+pub fn list_toplevels() -> std::collections::HashMap<String, Vec<Toplevel>> {
+    let outputs = crate::platform::windows::output_descs();
+    let mut result: std::collections::HashMap<String, Vec<Toplevel>> =
+        std::collections::HashMap::new();
+    for w in crate::platform::windows::list_windows() {
+        let name = output_name_for_window(w.rect, &outputs);
+        result.entry(name).or_default().push(w);
+    }
+    result
+}
+
+/// Any other target (not Linux / macOS / Windows): no toplevel enumeration.
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
 pub fn list_toplevels() -> std::collections::HashMap<String, Vec<Toplevel>> {
     std::collections::HashMap::new()
 }
@@ -120,13 +137,29 @@ pub fn activate_title(_title: &str) {
 }
 
 /// The file the blocked `--settings` launch touches to ask the live settings pane to
-/// focus itself (`sub_settings_poke` polls it while the pane is open). macOS only.
-#[cfg(target_os = "macos")]
+/// focus itself (`sub_settings_poke` polls it while the pane is open). macOS + Windows
+/// (DRAGON-153 / DRAGON-246): both raise the pane by SELF-activation from the owning
+/// process (cross-process focus is cooperative-only on macOS 14+ and foreground-locked on
+/// Windows), so the launcher only leaves this poke. A pure path in the per-user runtime dir.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn settings_focus_poke_path() -> String {
     format!("{}/cosmic-capture-kit-settings.poke", crate::util::runtime_dir())
 }
 
-#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+/// Windows (DRAGON-246): a blocked second `--settings` launch (the daemon spawns one per
+/// "Settings" click; the in-app gear spawns `--focus-settings`) asks the live holder to come
+/// forward + un-hide its own settings window. Write the poke file the holder polls
+/// (`sub_settings_poke` → `SettingsFocusPoke` → `window::show_and_focus`) — the Windows
+/// analog of the macOS poke above. Cross-process `SetForegroundWindow` is foreground-locked,
+/// so — like macOS — the RELIABLE path is self-activation by the owning process; the launcher
+/// only pokes. No Win32 here (pure fs), so it stays in this shared file; the native un-hide
+/// lives under `platform::windows::window` (strict split).
+#[cfg(target_os = "windows")]
+pub fn activate_title(_title: &str) {
+    let _ = std::fs::write(settings_focus_poke_path(), b"");
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
 pub fn activate_title(_title: &str) {}
 
 #[cfg(test)]

@@ -70,8 +70,23 @@ points to.
     degrade), `pinch.rs`, `screenshot.rs` (mounted at `crate::screenshot`
     off-Linux), `tray.rs`, `daemon.rs`. Read each module's doc comment before
     touching overlay placement or the WM dance.
-  - `windows/README.md` — the honest fill-in scaffold for a future Windows
-    plugin (not compiled).
+  - `windows/` (all `cfg(windows)`) — the Windows plugin (DRAGON-229),
+    operational for stills, the interactive overlay, delivery, screen
+    recording, and named-mutex single-instance. Facet files: `backend.rs`
+    (the `CaptureBackend` impl), `monitors.rs`/`window_list.rs`/
+    `window_capture.rs`/`cursor.rs`/`gdi.rs` (the Win32 still sources — BitBlt /
+    PrintWindow ladder / GetIconInfo), `dpi.rs` (PMv2), `wallpaper.rs`
+    (IDesktopWallpaper), `wm/window.rs` (overlay placement + the komorebi
+    opt-out via `WS_EX_DLGMODALFRAME` before first show), `services.rs`
+    (clipboard / WinRT toast / reveal / `netsh` Wi-Fi), `instance.rs`
+    (named-mutex single-instance + the Toolhelp sibling sweep), and the
+    recording bodies `record_worker.rs` (Windows.Graphics.Capture, mounted at
+    `record::wgc`), `wasapi_loopback.rs`, `named_pipe.rs`, `audio.rs`,
+    `process.rs`. `screenshot.rs` is mounted at `crate::screenshot` off-Linux
+    alongside mac's. Residual work (hardware encoder tiers, residency,
+    packaging) is DRAGON-231; the module map + traps live in `windows/README.md`.
+    The whole `windows/` dir is stripped from the public GPL export (closed
+    split), like `mac/`.
 - `src/state/` — `schema.rs` (the persisted `Persisted` struct) + `store.rs`
   (TOML load/save/migrate, legacy RON read).
 - `src/widgets/` — reusable `iced::Widget`s: `region_selection.rs`,

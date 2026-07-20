@@ -36,6 +36,24 @@ pub(super) fn make_frame_writer(
     let (w0s, h0s) = (w0 as usize, h0 as usize);
     let mut nv12buf = vec![0u8; w0s * h0s * 3 / 2];
     move |w: u32, h: u32, rgba: &[u8], stdin: &mut std::process::ChildStdin| {
+        // DRAGON-277: a capture frame whose byte length is SHORT of its reported `w*h*4` dims
+        // would OOB-panic `rgba_to_nv12` (a band thread indexes past `rgba`) and — because
+        // that panic crosses the scoped-thread join — take the WHOLE app down mid-recording.
+        // That is the Windows "recording crashes instead of preview opening" on the hardware
+        // (NV12) encode path (software passes RGBA through and never converts). Drop any such
+        // malformed frame and keep the recording alive. `RgbaImage::from_raw` already guards
+        // the resize branch; this also guards the same-size direct-use branch below. Portable
+        // (a well-formed frame always has `>= w*h*4` bytes, so Linux/macOS are unaffected).
+        if rgba.len() < (w as usize) * (h as usize) * 4 {
+            log::warn!(
+                "record: dropping malformed frame ({}x{}, {} bytes < {} expected)",
+                w,
+                h,
+                rgba.len(),
+                (w as usize) * (h as usize) * 4
+            );
+            return true;
+        }
         let resized;
         let rgba = if (w, h) != (w0, h0) {
             match RgbaImage::from_raw(w, h, rgba.to_vec()) {
@@ -82,6 +100,7 @@ pub(super) fn make_frame_writer(
 /// immediately, so the covering-tick loop stops instead of hanging. Restoring blocking
 /// mode on drop keeps the subsequent `drop(stdin)` (EOF) and any later error semantics
 /// normal.
+#[cfg(unix)]
 pub(super) struct NonblockingStdin {
     /// The raw fd (owned by the `ChildStdin` the caller still holds — this only borrows
     /// it as an integer, so it does NOT conflict with the caller's `&mut stdin` writes).
@@ -89,6 +108,7 @@ pub(super) struct NonblockingStdin {
     restore: Option<rustix::fs::OFlags>,
 }
 
+#[cfg(unix)]
 impl NonblockingStdin {
     pub(super) fn new(stdin: &ChildStdin) -> Self {
         use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
@@ -105,6 +125,7 @@ impl NonblockingStdin {
     }
 }
 
+#[cfg(unix)]
 impl Drop for NonblockingStdin {
     fn drop(&mut self) {
         if let Some(flags) = self.restore {
@@ -115,6 +136,12 @@ impl Drop for NonblockingStdin {
         }
     }
 }
+
+/// Windows (DRAGON-229 M3): the SAME scoped stdin-non-blocking guard, implemented with
+/// `PIPE_NOWAIT` on ffmpeg's stdin (body under `platform/windows/named_pipe.rs`). Aliased
+/// to `NonblockingStdin` so [`run_video_stop_tail`] names one type on both platforms.
+#[cfg(windows)]
+pub(super) use crate::platform::windows::named_pipe::StdinNoWait as NonblockingStdin;
 
 /// The pure salvage-vs-fail decision every owned worker's stop tail ends with: given
 /// how ffmpeg reaped (`wait_result`), whether the muxer was declared wedged
@@ -260,6 +287,10 @@ fn smoke_check<T>(rx: &std::sync::mpsc::Receiver<T>, budget: std::time::Duration
 }
 
 /// Create a FIFO at `path`, clearing any stale one a prior crash left behind.
+/// POSIX-only: Windows has no `mkfifo` — its audio transport is named pipes (created in
+/// [`try_start_owned_audio`]'s `#[cfg(windows)]` arm via
+/// `crate::platform::windows::named_pipe::create_pipe_server`).
+#[cfg(not(windows))]
 fn mkfifo(path: &std::path::Path) -> bool {
     let _ = std::fs::remove_file(path);
     #[cfg(not(target_os = "macos"))]
@@ -298,14 +329,29 @@ pub(super) struct OwnedAudioStart {
     pub(super) mic_rx: std::sync::mpsc::Receiver<StreamTap>,
     pub(super) monitor: MonitorCapture,
     pub(super) sys_rx: std::sync::mpsc::Receiver<CaptureChunk>,
+    /// Windows (DRAGON-229 M3): the named-pipe SERVER ends created at pre-flight (the
+    /// `\\.\pipe\…` paths above are their client-facing names, passed to ffmpeg). Handed
+    /// to `pump::spawn`, which `ConnectNamedPipe`s them on the pump thread — the analog of
+    /// the POSIX `open_fifo_write_end`. On POSIX the FIFOs are ordinary filesystem paths,
+    /// so no handle is carried.
+    #[cfg(windows)]
+    pub(super) mic_pipe: crate::platform::windows::named_pipe::PipeServer,
+    #[cfg(windows)]
+    pub(super) sys_pipe: crate::platform::windows::named_pipe::PipeServer,
 }
 
 impl OwnedAudioStart {
     pub(super) fn cleanup(self) {
         let _ = self.monitor.stop(); // bounded ≤2s (DRAGON-118)
         drop(self.mic_tap); // bounded drain, its own Drop impl
-        let _ = std::fs::remove_file(&self.mic_fifo_path);
-        let _ = std::fs::remove_file(&self.sys_fifo_path);
+        // POSIX FIFOs are filesystem paths to unlink; Windows named pipes are destroyed by
+        // dropping their server handles (the `#[cfg(windows)]` `mic_pipe`/`sys_pipe` fields
+        // drop with `self`), so there is nothing to remove.
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(&self.mic_fifo_path);
+            let _ = std::fs::remove_file(&self.sys_fifo_path);
+        }
     }
 }
 
@@ -322,15 +368,37 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
     if test_force_owned_failure() {
         return Err("forced failure (test seam)".to_string());
     }
-    let dir = crate::util::runtime_dir();
     let pid = std::process::id();
-    let mic_fifo_path = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.micmix.pcm"));
-    let sys_fifo_path = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.sysmix.pcm"));
-    if !mkfifo(&mic_fifo_path) || !mkfifo(&sys_fifo_path) {
-        let _ = std::fs::remove_file(&mic_fifo_path);
-        let _ = std::fs::remove_file(&sys_fifo_path);
-        return Err("could not create the audio mixer FIFOs".to_string());
-    }
+    // POSIX: two FIFOs in the runtime dir (paths the pump opens later). Windows
+    // (DRAGON-229 M3): two `\\.\pipe\…` named pipes — `create_pipe_server` returns the
+    // server handles immediately (carried into `OwnedAudioStart`), the paths are the
+    // client names ffmpeg opens. Both branches yield the same two path strings the rest of
+    // the pre-flight and the ffmpeg command consume.
+    #[cfg(not(windows))]
+    let (mic_fifo_path, sys_fifo_path) = {
+        let dir = crate::util::runtime_dir();
+        let m = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.micmix.pcm"));
+        let s = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.sysmix.pcm"));
+        if !mkfifo(&m) || !mkfifo(&s) {
+            let _ = std::fs::remove_file(&m);
+            let _ = std::fs::remove_file(&s);
+            return Err("could not create the audio mixer FIFOs".to_string());
+        }
+        (m, s)
+    };
+    #[cfg(windows)]
+    let (mic_fifo_path, sys_fifo_path, mic_pipe, sys_pipe) = {
+        use crate::platform::windows::named_pipe::create_pipe_server;
+        let m = PathBuf::from(format!(r"\\.\pipe\cosmic-capture-kit.{pid}.micmix"));
+        let s = PathBuf::from(format!(r"\\.\pipe\cosmic-capture-kit.{pid}.sysmix"));
+        let Some(mp) = create_pipe_server(&m) else {
+            return Err("could not create the audio mixer named pipe (mic)".to_string());
+        };
+        let Some(sp) = create_pipe_server(&s) else {
+            return Err("could not create the audio mixer named pipe (system)".to_string());
+        };
+        (m, s, mp, sp)
+    };
     let (cfg, speaker) = crate::audio::config::recording_mic_config();
     // The AEC far-end reference (DRAGON-128): with the default speaker ("System
     // (automatic)"), the recording's OWN system capture below monitors the same
@@ -340,6 +408,18 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
     // retired. An EXPLICITLY chosen speaker may differ from the default sink the
     // recording monitors, so that case keeps the dedicated capture (far-end
     // behavior identical to before, per the AEC CAUTION).
+    //
+    // Windows (DRAGON-282): the recording's system capture loops back the CHOSEN output
+    // endpoint (`speaker` is threaded into `MonitorCapture`'s source below), so its tee IS
+    // the correct far-end reference for whatever endpoint is picked — there is no separate
+    // default-sink monitor to diverge from (the Linux case this empty-speaker guard exists
+    // for), and WASAPI has no per-sink `.monitor` dshow source for the dedicated
+    // `spawn_aec_monitor` path anyway. So Windows shares the tee whenever echo is on, which
+    // keeps the far-end fed from the same endpoint the system track records.
+    #[cfg(windows)]
+    let shared_farend =
+        cfg.echo_cancellation.then(crate::audio::filters::aec::new_far_end_ring);
+    #[cfg(not(windows))]
     let shared_farend = (cfg.echo_cancellation && speaker.trim().is_empty())
         .then(crate::audio::filters::aec::new_far_end_ring);
     let Some((mic_tap, mic_rx)) =
@@ -353,9 +433,17 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
         let mut feeder = crate::audio::filters::aec::FarEndFeeder::new(ring);
         Box::new(move |samples: &[f32]| feeder.feed_interleaved_stereo(samples)) as _
     });
-    let Some((monitor, sys_rx)) =
-        MonitorCapture::start(test_monitor_source_override(), farend_tee)
-    else {
+    // System-audio monitor source: the test override (`CCK_TEST_MONITOR_SOURCE`) always
+    // wins (headless E2E). Otherwise, on Windows the persisted Output-device choice
+    // (`speaker`, a WASAPI endpoint id) selects which render endpoint's loopback is recorded
+    // — empty/`"default"` keep the default endpoint (DRAGON-282). On Linux/macOS the monitor
+    // always follows the default sink / SCK display mix (`None`), exactly as before.
+    #[cfg(windows)]
+    let monitor_source = test_monitor_source_override()
+        .or_else(|| crate::platform::windows::wasapi_loopback::specific_endpoint_id(&speaker));
+    #[cfg(not(windows))]
+    let monitor_source = test_monitor_source_override();
+    let Some((monitor, sys_rx)) = MonitorCapture::start(monitor_source, farend_tee) else {
         drop(mic_tap);
         let _ = std::fs::remove_file(&mic_fifo_path);
         let _ = std::fs::remove_file(&sys_fifo_path);
@@ -365,7 +453,18 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
         "media-clock pipeline: mic cleanup latency {:.1}ms",
         mic_tap.processing_latency_ms()
     );
-    let started = OwnedAudioStart { mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx };
+    let started = OwnedAudioStart {
+        mic_fifo_path,
+        sys_fifo_path,
+        mic_tap,
+        mic_rx,
+        monitor,
+        sys_rx,
+        #[cfg(windows)]
+        mic_pipe,
+        #[cfg(windows)]
+        sys_pipe,
+    };
     if !smoke_check(&started.mic_rx, OWNED_AUDIO_SMOKE_BUDGET) {
         started.cleanup();
         return Err("microphone capture produced no audio (mic chain not responding)".to_string());
@@ -383,16 +482,31 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
 #[cfg(test)]
 mod tests {
     use super::salvage_decision;
+    #[cfg(unix)]
     use std::os::unix::process::ExitStatusExt;
+    #[cfg(windows)]
+    use std::os::windows::process::ExitStatusExt;
     use std::process::ExitStatus;
 
+    #[cfg(unix)]
     fn ok(code: i32) -> std::io::Result<ExitStatus> {
         // A raw wait-status whose low byte is 0 encodes a normal exit with `code`.
         Ok(ExitStatus::from_raw(code << 8))
     }
+    #[cfg(windows)]
+    fn ok(code: i32) -> std::io::Result<ExitStatus> {
+        // Windows exit statuses ARE the process exit code directly.
+        Ok(ExitStatus::from_raw(code as u32))
+    }
+    #[cfg(unix)]
     fn killed() -> std::io::Result<ExitStatus> {
         // Low byte non-zero = terminated by signal (SIGKILL = 9): never `success()`.
         Ok(ExitStatus::from_raw(9))
+    }
+    #[cfg(windows)]
+    fn killed() -> std::io::Result<ExitStatus> {
+        // No signals on Windows — a killed ffmpeg surfaces as a non-zero exit code.
+        Ok(ExitStatus::from_raw(1))
     }
 
     #[test]

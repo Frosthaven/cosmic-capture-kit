@@ -7,6 +7,10 @@
 //! avfoundation -list_devices true`; there are no output sinks (system audio comes
 //! from ScreenCaptureKit, not a Pulse sink monitor).
 
+// Linux/macOS shell out to `Command` (pactl / avfoundation-via-ffmpeg). Windows enumerates
+// mics through the platform DirectShow body and system audio through WASAPI, so it spawns
+// nothing here — gate the import off Windows to keep it dead-code clean (DRAGON-238).
+#[cfg(not(windows))]
 use std::process::Command;
 
 /// Whether the `pactl` binary is on `PATH` (Linux audio in/out device enumeration shells
@@ -29,7 +33,7 @@ pub fn pactl_available() -> bool {
 /// abbreviations cosmic-settings applies: "HDMI / DisplayPort" -> "HDMI / DP", "High
 /// Definition Audio" -> "HD Audio", and a trailing " Controller" dropped. Falls back to
 /// the block's own `fallback` description when the port or device name isn't known.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn cosmic_audio_label(port: Option<&str>, device: Option<&str>, fallback: &str) -> String {
     match (port, device) {
         (Some(p), Some(d)) => {
@@ -43,7 +47,7 @@ fn cosmic_audio_label(port: Option<&str>, device: Option<&str>, fallback: &str) 
 }
 
 /// One parsed `pactl list sinks|sources` block.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 #[derive(Default)]
 struct PaDevice {
     name: Option<String>,
@@ -54,7 +58,7 @@ struct PaDevice {
     monitor: bool,
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 impl PaDevice {
     /// Commit this block to `out` as `(name, COSMIC-style label)`, unless it's unnamed
     /// or (when `skip_monitors`) a monitor source. Resets for the next block.
@@ -80,7 +84,7 @@ impl PaDevice {
 /// drops monitor sources (used for the input picker; monitors feed the echo reference /
 /// system-audio path instead). Empty on any failure — the UI then offers only its
 /// "System (automatic)" default. Shells out to `pactl` (from pipewire-pulse).
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn list_pa_devices(object: &str, header: &str, skip_monitors: bool) -> Vec<(String, String)> {
     // Review aid: with CCK_HEALTH_FORCE_WARN, behave as if pactl found nothing, so the
     // device pickers fall back to (and enforce) "System (automatic)" - matching the
@@ -145,7 +149,14 @@ pub fn list_input_sources() -> Vec<(String, String)> {
     {
         list_avfoundation_inputs()
     }
-    #[cfg(not(target_os = "macos"))]
+    // Windows (DRAGON-238): the SAME DirectShow enumeration the recorder consumes, as
+    // `(stable_id, label)` pairs whose id round-trips through `resolve_mic_device` — so a
+    // mic picked in Settings is exactly what a recording captures. No pactl.
+    #[cfg(windows)]
+    {
+        crate::platform::windows::audio::mic_input_sources()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         list_pa_devices("sources", "Source #", true)
     }
@@ -160,7 +171,16 @@ pub fn list_output_sinks() -> Vec<(String, String)> {
     {
         Vec::new()
     }
-    #[cfg(not(target_os = "macos"))]
+    // Windows (DRAGON-282): the ACTIVE WASAPI render endpoints as `(endpoint_id, friendly
+    // name)`. Unlike Linux (which always records the default sink's monitor and uses this
+    // pick only for the AEC far-end), on Windows the loopback follows the CHOSEN endpoint —
+    // so this picks WHICH output's audio is recorded as system audio. Empty on COM failure →
+    // the UI then offers only its "System (automatic)" default (the default endpoint).
+    #[cfg(windows)]
+    {
+        crate::platform::windows::wasapi_loopback::render_endpoints()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         list_pa_devices("sinks", "Sink #", false)
     }
@@ -330,3 +350,9 @@ Error opening input file .";
         );
     }
 }
+
+// DRAGON-282: the Windows output picker now enumerates the real ACTIVE render endpoints via
+// WASAPI (`wasapi_loopback::render_endpoints`), so the recorder can loop back the CHOSEN
+// output. That path is live COM, exercised through the settings UI + the record test; the
+// PURE picker→loopback id mapping (`specific_endpoint_id`) is unit-tested in
+// `platform::windows::wasapi_loopback`.

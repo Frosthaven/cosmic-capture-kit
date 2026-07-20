@@ -296,8 +296,50 @@ impl MonitorCapture {
         Some((Self { stop, samples, dropped, peak_lag_us, thread: Some(thread) }, rx))
     }
 
-    /// Other platforms: no capture client. (Linux and macOS are handled above.)
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    /// Windows (DRAGON-229 M3): an in-process WASAPI LOOPBACK capture of the default
+    /// render endpoint. Spawns a worker thread that owns the (single-thread-affine)
+    /// `IAudioClient`/`IAudioCaptureClient` for the whole session, converts each packet to
+    /// interleaved-stereo-f32 @ 48 kHz, and stamps CONTIGUOUSLY through the SAME
+    /// [`StreamAnchor`] the Linux/mac paths use — feeding the [`CaptureTee`] and delivering
+    /// on the SAME bounded channel. WASAPI exposes no signed device latency to fold in, so
+    /// `samples` stays empty (the pump's latch fails open to 0.0 — the "source that never
+    /// reports" case, exactly like the mac SCK arm). `source` (DRAGON-282) is the chosen
+    /// WASAPI render-endpoint id — the Output-device picker's choice; `None`/empty/`"default"`
+    /// follow the OS default endpoint, and a stale id falls back to the default with a warn.
+    /// `None` return only if the thread can't spawn.
+    #[cfg(windows)]
+    pub(crate) fn start(
+        source: Option<String>,
+        tee: Option<CaptureTee>,
+    ) -> Option<(Self, std::sync::mpsc::Receiver<CaptureChunk>)> {
+        let stop = Arc::new(AtomicBool::new(false));
+        // Stays empty on Windows (no signed device latency) — `median`/
+        // `latest_signed_latency_ms` fail open to 0.0/None, no compensation.
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicU64::new(0));
+        let peak_lag_us = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = std::sync::mpsc::sync_channel::<CaptureChunk>(CAPTURE_CHANNEL_CAPACITY);
+        let thread_stop = stop.clone();
+        let thread_dropped = dropped.clone();
+        let thread_peak_lag = peak_lag_us.clone();
+        let thread = std::thread::Builder::new()
+            .name("cck-monitor-capture".to_string())
+            .spawn(move || {
+                crate::platform::windows::wasapi_loopback::run_capture(
+                    source,
+                    tee,
+                    thread_stop,
+                    thread_dropped,
+                    thread_peak_lag,
+                    tx,
+                )
+            })
+            .ok()?;
+        Some((Self { stop, samples, dropped, peak_lag_us, thread: Some(thread) }, rx))
+    }
+
+    /// Other platforms: no capture client. (Linux, macOS, and Windows are handled above.)
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     pub(crate) fn start(
         _source: Option<String>,
         _tee: Option<CaptureTee>,
@@ -896,6 +938,127 @@ mod sck {
         // Capture over → the overlay's system meter falls flat instead of freezing
         // on the last published window.
         crate::audio::meters::publish_sys_level(0.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows (DRAGON-229 M3): the delivery half of the WASAPI-loopback capture. The
+// OS-facing IAudioClient/IAudioCaptureClient body lives under
+// `platform/windows/wasapi_loopback.rs` (strict split, LOG law 7); this submodule is
+// the pure stamping/tee/meter/send-or-drop sink it drives — a windows-only mirror of
+// the mac `sck::AudioAccum::deliver` (that arm is untouched, so the mac build stays
+// byte-identical). `#[cfg(windows)]` ⇒ compiles to NOTHING on Linux/macOS.
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+pub(crate) mod win_delivery {
+    use super::{delivery_lag_secs, lag_exceeds_warn, CaptureChunk, CaptureTee, StreamAnchor};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::SyncSender;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// Samples per published meter window: 0.1s of interleaved stereo at 48 kHz — the
+    /// Linux/mac meter cadence, so the overlay's system-audio button moves identically.
+    const METER_WINDOW_SAMPLES: usize = 4800 * 2;
+
+    /// The system-track delivery sink the WASAPI worker feeds one interleaved-stereo-f32
+    /// packet at a time. Field-for-field the mac `AudioAccum` (contiguous `StreamAnchor`
+    /// placement, the DRAGON-126 backlog guard, the 0.1s RMS meter, tee-before-delivery,
+    /// send-or-drop) — reused here rather than re-touching the cfg(macos) copy.
+    pub(crate) struct WasapiSink {
+        tx: SyncSender<CaptureChunk>,
+        tee: Option<CaptureTee>,
+        dropped: Arc<AtomicU64>,
+        peak_lag_us: Arc<AtomicU64>,
+        anchor: Option<StreamAnchor>,
+        first_chunk: Option<Instant>,
+        frames_delivered: u64,
+        warned: bool,
+        meter_sq_sum: f64,
+        meter_samples: usize,
+    }
+
+    impl WasapiSink {
+        pub(crate) fn new(
+            tx: SyncSender<CaptureChunk>,
+            tee: Option<CaptureTee>,
+            dropped: Arc<AtomicU64>,
+            peak_lag_us: Arc<AtomicU64>,
+        ) -> Self {
+            Self {
+                tx,
+                tee,
+                dropped,
+                peak_lag_us,
+                anchor: None,
+                first_chunk: None,
+                frames_delivered: 0,
+                warned: false,
+                meter_sq_sum: 0.0,
+                meter_samples: 0,
+            }
+        }
+
+        /// Stamp + deliver one converted interleaved-stereo chunk — the exact shape of
+        /// `pulse::deliver` / `sck::AudioAccum::deliver`: contiguous placement with a
+        /// loud re-anchor on a real discontinuity, the backlog guard, the overlay meter,
+        /// the tee before delivery, and a non-blocking send that counts drops.
+        pub(crate) fn deliver(&mut self, samples: Vec<f32>) {
+            if samples.is_empty() {
+                return;
+            }
+            let frames = samples.len() / 2; // interleaved stereo
+            let now = Instant::now();
+            let capture_wall = {
+                let anchor = self.anchor.get_or_insert_with(|| StreamAnchor::new(frames, now));
+                let before = anchor.reanchor_count();
+                let (stamp, drift) = anchor.stamp(frames, now);
+                if anchor.reanchor_count() > before {
+                    log::warn!(
+                        "system-audio (WASAPI) capture discontinuity: arrivals drifted {:.0} ms \
+                         from the stream's contiguous clock — re-anchoring (#{})",
+                        drift * 1000.0,
+                        anchor.reanchor_count()
+                    );
+                }
+                stamp
+            };
+            let first = *self.first_chunk.get_or_insert(now);
+            self.frames_delivered += frames as u64;
+            let lag =
+                delivery_lag_secs(now.saturating_duration_since(first), self.frames_delivered);
+            if lag > 0.0 {
+                self.peak_lag_us.fetch_max((lag * 1_000_000.0) as u64, Ordering::Relaxed);
+            }
+            if lag_exceeds_warn(lag) && !self.warned {
+                self.warned = true;
+                log::warn!(
+                    "system-audio (WASAPI) capture is running {} ms behind real time — sync \
+                     anchor may be off",
+                    (lag * 1000.0).round()
+                );
+            }
+            self.meter_sq_sum += samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
+            self.meter_samples += samples.len();
+            if self.meter_samples >= METER_WINDOW_SAMPLES {
+                let rms = (self.meter_sq_sum / self.meter_samples as f64).sqrt() as f32;
+                crate::audio::meters::publish_sys_level(crate::audio::meters::level_from_rms(rms));
+                self.meter_sq_sum = 0.0;
+                self.meter_samples = 0;
+            }
+            if let Some(tee) = self.tee.as_mut() {
+                tee(&samples);
+            }
+            if self.tx.try_send(CaptureChunk { samples, capture_wall }).is_err() {
+                let n = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(100) {
+                    log::warn!(
+                        "monitor capture (WASAPI): consumer backlog — {n} chunks dropped so far \
+                         (system audio will have gaps if this keeps up)"
+                    );
+                }
+            }
+        }
     }
 }
 

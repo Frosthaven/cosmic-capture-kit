@@ -45,6 +45,20 @@ pub fn detect() -> Option<PathBuf> {
     crate::platform::mac::wallpaper::wallpaper_path()
 }
 
+/// Windows (DRAGON-229 M1): the per-monitor `IDesktopWallpaper` resolver
+/// (`platform::windows::wallpaper`, which applies the is-a-file + decodable-extension
+/// honesty guard — slideshow / solid-color / `.heic` come back `None`) for the PRIMARY
+/// monitor, falling back to the `SPI_GETDESKWALLPAPER` single path. Cached once per
+/// process (it does COM + monitor enumeration), mirroring the Linux/mac arms, so a
+/// repeated `caps()` probe stays cheap and an off-main-thread caller can't poison it.
+#[cfg(target_os = "windows")]
+pub fn detect() -> Option<PathBuf> {
+    static DETECTED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    DETECTED
+        .get_or_init(crate::platform::windows::wallpaper::wallpaper_path)
+        .clone()
+}
+
 // The per-desktop wallpaper source readers (cosmic-bg RON, GNOME gsettings, KDE
 // appletsrc, sway/hyprland paper configs) moved into the profile modules under
 // `platform::linux::{cosmic,gnome,kde,wlroots}` (DRAGON-220); `detect` walks them

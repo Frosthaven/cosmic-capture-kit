@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-capture-kit"
-version = "0.12.0"
+version = "0.14.0"
 dependencies = [
  "arboard",
  "ashpd 0.12.3",
@@ -1160,6 +1160,8 @@ dependencies = [
  "toml 0.8.23",
  "wayland-client",
  "wayland-protocols",
+ "windows 0.62.2",
+ "winres",
  "wl-clipboard-rs",
  "zbus",
 ]
@@ -7807,6 +7809,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml 0.5.11",
 ]
 
 [[package]]

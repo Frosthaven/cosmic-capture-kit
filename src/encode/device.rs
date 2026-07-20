@@ -6,7 +6,9 @@ use std::process::Command;
 use super::*;
 
 /// A selectable encoder for the UI: stable `id` plus a friendly `label`.
-#[derive(Clone)]
+// `Debug` (DRAGON-238): the probed list rides a `SettingsMsg` on the Windows off-thread
+// encoder probe, and `Msg` derives `Debug` — purely additive on every platform.
+#[derive(Clone, Debug)]
 pub struct EncoderInfo {
     pub id: String,
     pub label: String,
@@ -33,6 +35,44 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
             label: format!("{} (VideoToolbox)", chip_name()),
         });
     }
+    // Windows hardware tier (DRAGON-238): NVENC > AMF > QSV, each offered only when the
+    // encoder is BUILT INTO ffmpeg AND a real probe-encode actually initialises (Windows
+    // has no `/dev` node to sniff — the honest gate is "does the encoder open"). Ranked
+    // before the always-on Software entry. The Linux nvidia/vaapi `/dev` checks below are
+    // inert here (no such nodes on Windows), so there is no double-listing.
+    // The per-adapter GPU model (via DXGI) matches Linux's real-model labels (DRAGON-252);
+    // a missing/unreadable adapter degrades to the historical vendor-only fallback.
+    #[cfg(windows)]
+    {
+        use crate::platform::windows::gpu::adapter_name_for_vendor;
+        if enc.contains("h264_nvenc") && hw_encoder_probe_ok("h264_nvenc") {
+            v.push(EncoderInfo {
+                id: "nvenc".into(),
+                label: format!(
+                    "{} (NVENC)",
+                    adapter_name_for_vendor(0x10DE).unwrap_or_else(|| "NVIDIA".into())
+                ),
+            });
+        }
+        if enc.contains("h264_amf") && hw_encoder_probe_ok("h264_amf") {
+            v.push(EncoderInfo {
+                id: "amf".into(),
+                label: format!(
+                    "{} (AMF)",
+                    adapter_name_for_vendor(0x1002).unwrap_or_else(|| "AMD".into())
+                ),
+            });
+        }
+        if enc.contains("h264_qsv") && hw_encoder_probe_ok("h264_qsv") {
+            v.push(EncoderInfo {
+                id: "qsv".into(),
+                label: format!(
+                    "{} (Intel Quick Sync (QSV))",
+                    adapter_name_for_vendor(0x8086).unwrap_or_else(|| "Intel".into())
+                ),
+            });
+        }
+    }
     if std::path::Path::new("/dev/nvidia0").exists()
         && (enc.contains("hevc_nvenc") || enc.contains("h264_nvenc"))
     {
@@ -48,13 +88,21 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
                 label: format!("{} (VAAPI)", vaapi_name(&dev)),
             });
         }
+    // The CPU model rides the software label for parity with the GPU tiers (DRAGON-252):
+    // Linux reads /proc/cpuinfo (`cpu_name` below), Windows the registry via the platform
+    // shim; both fall back to a plain "CPU". Non-Windows behaviour is byte-identical.
+    #[cfg(windows)]
+    let cpu = crate::platform::windows::gpu::cpu_name().unwrap_or_else(|| "CPU".into());
+    #[cfg(not(windows))]
+    let cpu = cpu_name();
     v.push(EncoderInfo {
         id: "software".into(),
-        label: format!("{} (Software x264)", cpu_name()),
+        label: format!("{cpu} (Software x264)"),
     });
     v
 }
 
+#[cfg(not(windows))]
 fn cpu_name() -> String {
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
@@ -197,7 +245,10 @@ pub fn ffprobe_available() -> bool {
 /// `ffmpeg -encoders` output (empty string if ffmpeg can't be run), used to
 /// detect which hardware encoders are actually built in.
 pub(crate) fn ffmpeg_encoders() -> String {
-    Command::new(crate::util::ffmpeg_path())
+    // Quiet spawn (DRAGON-236): this fires when the Settings video / Health page first
+    // reads the encoder list — a bare ffmpeg spawn flashes a console just before the
+    // settings window appears. Route through the console-free seam.
+    crate::util::ffmpeg_command()
         .args(["-hide_banner", "-encoders"])
         .output()
         .ok()

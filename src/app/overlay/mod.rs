@@ -512,8 +512,22 @@ impl App {
         )
     }
 
-    /// Layer the output's frozen snapshot behind `selection` (freeze mode); a
-    /// no-op when there's no snapshot for this output.
+    /// Layer the output's frozen snapshot behind `selection` when the freeze backdrop
+    /// is active (freeze mode); otherwise return `selection` unchanged so the
+    /// transparent overlay surface composites the LIVE desktop behind it — the
+    /// freeze-off "live" feel, identical on every platform.
+    ///
+    /// DRAGON-234: this is now uniform across all platforms. The Windows M1.5 special
+    /// case (always draw the frozen scene OPAQUELY, on the belief that a transparent
+    /// wgpu surface presents an opaque clear on Windows) is GONE. Empirically the
+    /// winit transparent window (`DwmEnableBlurBehindWindow`, an empty blur region for
+    /// per-pixel alpha) plus the `PreMultiplied` composite-alpha swapchain that
+    /// `iced_wgpu` selects from the Vulkan surface's advertised modes DO composite the
+    /// live desktop through the overlay — so freeze-off shows the live dimmed desktop
+    /// exactly like Linux/mac (verified: a 3s-apart clock advanced through the
+    /// backdrop), and freeze-on shows the opaque launch-instant still (verified: the
+    /// clock stayed fixed). The freeze-off capture still re-grabs LIVE pixels at commit
+    /// (`freezing()` is false, so `capture_flow` takes the live path), unchanged.
     pub(super) fn with_frozen_bg<'a>(
         &'a self,
         o: &OutputState,

@@ -18,9 +18,10 @@ fn config_path() -> Option<PathBuf> {
 
 /// The config file's mtime, if it exists. The Linux resident daemon uses this as
 /// its cheap "did a settings process save new state?" probe (DRAGON-179) — a full
-/// re-read happens only when this changes. Unused off Linux (the mac menu-bar
-/// glyph is an AppKit template image; no tint to follow).
-#[cfg_attr(not(target_os = "linux"), expect(dead_code))]
+/// re-read happens only when this changes; the Windows daemon polls it the same way
+/// to re-tint its tray icon on an accent change (DRAGON-250). Unused on macOS (the
+/// menu-bar glyph is an AppKit template image; no tint to follow).
+#[cfg_attr(not(any(target_os = "linux", target_os = "windows")), expect(dead_code))]
 pub fn config_mtime() -> Option<std::time::SystemTime> {
     std::fs::metadata(config_path()?).ok()?.modified().ok()
 }
@@ -312,10 +313,17 @@ record_fps = 60\n";
         // Uncalibrated by default; an old config (no key) reads the same way.
         assert_eq!(d.av_calibration_base_ms, 0);
         // Appearance (DRAGON-139): follow the system by default, overrides at their
-        // neutral values (automatic mode, no accent override, round style).
+        // neutral values (automatic mode, no accent override). The customize-mode
+        // roundness default is PER-PLATFORM (DRAGON-256): Windows slightly-round (1),
+        // macOS/Linux round (0).
         assert!(d.appearance_use_system);
         assert_eq!(d.appearance_mode, 0);
         assert_eq!(d.appearance_accent, None);
+        // Automatic Contrast Boost (DRAGON-289) defaults ON (absent key ⇒ true).
+        assert!(d.appearance_contrast_boost);
+        #[cfg(target_os = "windows")]
+        assert_eq!(d.appearance_roundness, 1);
+        #[cfg(not(target_os = "windows"))]
         assert_eq!(d.appearance_roundness, 0);
     }
 

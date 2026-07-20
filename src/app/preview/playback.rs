@@ -14,7 +14,11 @@
 //! grants roughly double; audiotoolbox has no buffer knob at all), then anchors the picture
 //! to the audio's own reported position
 //! minus that measured buffer — A/V locked on any Pulse server (and CoreAudio), no assumed
-//! latency (see [`AUDIO_LATENCY_MS`] / [`calibrate_effective_buffer`]).
+//! latency (see [`AUDIO_LATENCY_MS`] / [`calibrate_effective_buffer`]). On Windows the bundled
+//! ffmpeg has no pulse muxer and no audio-output device at all, so the soundtrack is an
+//! `ffplay` sidecar instead (SDL2 → the default output endpoint); ffplay emits no `-progress`,
+//! so the Windows picture rides the bootstrap epoch clock exactly like a no-audio file
+//! (DRAGON-285) — the `spawn_audio` closure's per-platform arms cover all three.
 //!
 //! Large recordings (4K+) get three defenses, modelled on what real players do:
 //! * **Hardware decode, software-safe**: every decode passes `-hwaccel auto`, which is
@@ -42,7 +46,7 @@ use super::VideoMeta;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,21 +69,30 @@ const AUDIO_LATENCY_MS: u64 = 200;
 /// of audio is discarded. Padding a bit MORE than that makes the discarded tail silence, never
 /// the recording's real audio. It must exceed `AUDIO_LATENCY_MS`; the small excess only delays
 /// when the player reports "finished" (the last frame holds that much longer), so keep it tight.
+// Windows renders the soundtrack via an ffplay sidecar with no `-progress` stream, so the
+// whole progress-calibration path below (this pad, the stats/pacing constants, and the
+// reader/calibrator fns) is Linux/macOS-only — honestly gated dead on Windows (DRAGON-285).
+#[cfg_attr(windows, allow(dead_code))]
 const AUDIO_PAD_MS: u64 = AUDIO_LATENCY_MS + 60;
 /// `-stats_period` of the soundtrack's `-progress` stream (seconds): how often ffmpeg reports
 /// its muxed position. Doubles as calibration's mux-start estimate — ffmpeg prints the first
 /// block one period after muxing starts.
+#[cfg_attr(windows, allow(dead_code))]
 const PROGRESS_STATS_PERIOD: f32 = 0.1;
 /// A progress interval advancing `out_time` slower than this multiple of wall time is "paced"
 /// (the sink buffer is full; writes throttle to playout). The startup burst runs at several ×
 /// realtime (audio-only decode is cheap), so the margin is generous in both directions.
+#[cfg_attr(windows, allow(dead_code))]
 const PACED_RATIO_MAX: f32 = 1.3;
 /// Give up calibrating this long after the first progress block (seconds) and settle on the
 /// requested [`AUDIO_LATENCY_MS`] instead — exactly the old fixed-assumption behavior.
+#[cfg_attr(windows, allow(dead_code))]
 const CALIBRATION_DEADLINE_SECS: f32 = 2.5;
 /// Plausibility floor for the calibrated effective buffer (seconds).
+#[cfg_attr(windows, allow(dead_code))]
 const EFFECTIVE_BUFFER_MIN: f32 = 0.05;
 /// Plausibility ceiling for the calibrated effective buffer (seconds).
+#[cfg_attr(windows, allow(dead_code))]
 const EFFECTIVE_BUFFER_MAX: f32 = 1.0;
 /// Decode at most this many frames ahead of the playhead (the smoothing buffer).
 const BUFFER_FRAMES: usize = 16;
@@ -163,7 +176,7 @@ impl Playback {
     /// Probe `path` for dimensions/fps/duration/audio (returns `None` if ffprobe fails or
     /// the file has no readable video stream).
     pub fn probe(path: &Path) -> Option<VideoMeta> {
-        let out = Command::new(crate::util::ffprobe_path())
+        let out = crate::util::ffprobe_command()
             .args([
                 "-v",
                 "error",
@@ -247,45 +260,81 @@ impl Playback {
                 if !meta.has_audio {
                     return None;
                 }
+                // Linux/macOS: ONE ffmpeg renders the soundtrack straight to the OS sink.
                 // `-progress pipe:1 -stats_period ...`: ffmpeg reports its muxed-audio position
                 // (`out_time_us`) to stdout every period; the progress reader below calibrates
                 // the sink's effective buffer from those blocks, then turns them into the
                 // picture's audio-clock anchor (see `poll`). stdout is PIPED for it — the real
-                // audio output is the `-f pulse` sink-input, not stdout.
-                let mut acmd = Command::new(crate::util::ffmpeg_path());
-                acmd.args(["-v", "error", "-progress", "pipe:1", "-stats_period"])
-                    .arg(PROGRESS_STATS_PERIOD.to_string())
-                    .args(["-ss", &format!("{start_sec:.3}"), "-i"])
-                    .arg(&path)
-                    .args(["-vn", "-af", &format!("apad=pad_dur={:.3}", AUDIO_PAD_MS as f32 / 1000.0)]);
-                // Audio sink: PulseAudio on Linux; ffmpeg's `audiotoolbox` output device
-                // on macOS (the trailing arg is the muxer's required-but-unused
-                // "filename" — playback goes to the default output device). audiotoolbox
-                // exposes NO buffer-size knob (`-h muxer=audiotoolbox`: only device
-                // selection), so the `-buffer_duration` REQUEST has no macOS equivalent —
-                // but the request was only ever a hint anyway: the progress reader's
-                // burst-to-paced calibration measures whatever CoreAudio actually buffers
-                // (~0.19s observed, conveniently near the AUDIO_LATENCY_MS
-                // bootstrap/fallback), so the A/V-sync model below is unchanged.
-                #[cfg(not(target_os = "macos"))]
-                acmd.args(["-f", "pulse", "-buffer_duration", &AUDIO_LATENCY_MS.to_string()])
-                    .arg("cosmic-capture-kit");
-                #[cfg(target_os = "macos")]
-                acmd.args(["-f", "audiotoolbox", "default"]);
-                let mut child = acmd
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .ok()?;
-                // Its own thread drains the progress pipe (so a full pipe can't block ffmpeg's
-                // audio writes) and keeps the clock's anchor current.
-                if let Some(progress) = child.stdout.take() {
-                    spawn_progress_reader(progress, start_sec, clock.clone());
+                // audio output is the sink device (`-f pulse`/`-f audiotoolbox`), not stdout.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                {
+                    let mut acmd = crate::util::ffmpeg_command();
+                    acmd.args(["-v", "error", "-progress", "pipe:1", "-stats_period"])
+                        .arg(PROGRESS_STATS_PERIOD.to_string())
+                        .args(["-ss", &format!("{start_sec:.3}"), "-i"])
+                        .arg(&path)
+                        .args(["-vn", "-af", &format!("apad=pad_dur={:.3}", AUDIO_PAD_MS as f32 / 1000.0)]);
+                    // Audio sink: PulseAudio on Linux; ffmpeg's `audiotoolbox` output device
+                    // on macOS (the trailing arg is the muxer's required-but-unused
+                    // "filename" — playback goes to the default output device). audiotoolbox
+                    // exposes NO buffer-size knob (`-h muxer=audiotoolbox`: only device
+                    // selection), so the `-buffer_duration` REQUEST has no macOS equivalent —
+                    // but the request was only ever a hint anyway: the progress reader's
+                    // burst-to-paced calibration measures whatever CoreAudio actually buffers
+                    // (~0.19s observed, conveniently near the AUDIO_LATENCY_MS
+                    // bootstrap/fallback), so the A/V-sync model below is unchanged.
+                    #[cfg(target_os = "linux")]
+                    acmd.args(["-f", "pulse", "-buffer_duration", &AUDIO_LATENCY_MS.to_string()])
+                        .arg("cosmic-capture-kit");
+                    #[cfg(target_os = "macos")]
+                    acmd.args(["-f", "audiotoolbox", "default"]);
+                    let mut child = acmd
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .ok()?;
+                    // Its own thread drains the progress pipe (so a full pipe can't block ffmpeg's
+                    // audio writes) and keeps the clock's anchor current.
+                    if let Some(progress) = child.stdout.take() {
+                        spawn_progress_reader(progress, start_sec, clock.clone());
+                    }
+                    Some(child)
                 }
-                Some(child)
+                // Windows: the bundled ffmpeg has NO pulse muxer and no audio-output device at
+                // all, so it can't be the soundtrack sink (it would exit code 8 instantly). An
+                // `ffplay` sidecar renders to the default output endpoint via SDL2 instead.
+                // ffplay emits no `-progress`, so we wire NO progress reader: `clock.anchor`
+                // stays `None` and the picture rides the bootstrap epoch clock — the exact path
+                // a no-audio file uses, which `poll` already tolerates. A missing ffplay
+                // degrades to silent-but-playing with one warning, never a crash (DRAGON-285).
+                #[cfg(windows)]
+                {
+                    let ffplay = crate::util::ffplay_path();
+                    if !crate::util::tool_available(&ffplay) {
+                        log::warn!(
+                            "ffplay not found ({}) — preview video plays without sound; install \
+                             ffplay or set CCK_FFPLAY to enable preview audio",
+                            ffplay.display()
+                        );
+                        return None;
+                    }
+                    // -nodisp: no SDL window; -vn: audio only; -autoexit: quit at EOF (so the
+                    // generic try_wait drain below reaps it naturally). Routed through
+                    // quiet_command so the console child never flashes/leaves a pane (DRAGON-236).
+                    crate::util::quiet_command(&ffplay)
+                        .args(["-nodisp", "-autoexit", "-vn", "-loglevel", "error", "-ss"])
+                        .arg(format!("{start_sec:.3}"))
+                        .arg("-i")
+                        .arg(&path)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .ok()
+                }
             };
-            let mut vcmd = Command::new(crate::util::ffmpeg_path());
+            let mut vcmd = crate::util::ffmpeg_command();
             // `-hwaccel auto` — the difference between stalling and realtime on 4K,
             // and safe on every box (software fallback by design; module doc).
             vcmd.args(["-v", "error", "-hwaccel", "auto"]);
@@ -480,7 +529,7 @@ impl Drop for Playback {
 pub fn decode_frame_at(path: &Path, meta: VideoMeta, t: f32, accurate: bool) -> Option<Frame> {
     let (w, h) = scaled_dims(meta.w, meta.h);
     let t = t.clamp(0.0, meta.duration.max(0.0));
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     // Same safe hardware decode as playback — scrubbing a 4K file decodes a
     // keyframe run per step, so this matters just as much here.
     cmd.args(["-v", "error", "-hwaccel", "auto"]);
@@ -515,6 +564,7 @@ pub fn decode_frame_at(path: &Path, meta: VideoMeta, t: f32, accurate: bool) -> 
 /// anchor. Drains stdout to EOF so a full progress pipe can never block ffmpeg's audio writes,
 /// and stops UPDATING at `progress=end` — the padded tail then plays out under the last
 /// anchor's wall-time extrapolation (see [`Playback::poll`]).
+#[cfg_attr(windows, allow(dead_code))]
 fn spawn_progress_reader(stdout: ChildStdout, start_sec: f32, clock: Arc<Mutex<Clock>>) {
     std::thread::spawn(move || {
         let mut cur_us: Option<i64> = None;
@@ -572,6 +622,7 @@ fn spawn_progress_reader(stdout: ChildStdout, start_sec: f32, clock: Arc<Mutex<C
 /// `None` = knee unresolved, keep feeding blocks. Past [`CALIBRATION_DEADLINE_SECS`] without
 /// one (a weird stream) it settles on the requested [`AUDIO_LATENCY_MS`] — exactly the
 /// previous fixed-assumption design, never worse than it.
+#[cfg_attr(windows, allow(dead_code))]
 fn calibrate_effective_buffer(wall_offsets: &[f32], out_times: &[f32]) -> Option<f32> {
     let n = wall_offsets.len().min(out_times.len());
     // Pacing ratio of the interval ENDING at block `k` (wall stamps are measured arrivals,
@@ -595,6 +646,7 @@ fn calibrate_effective_buffer(wall_offsets: &[f32], out_times: &[f32]) -> Option
 /// microsecond value (a long-standing misnomer — it is NOT milliseconds), so accept either
 /// key. Returns `None` for any other line, a non-integer value, or an implausible one
 /// (negative — e.g. the `AV_NOPTS` sentinel before the first sample — or beyond a day).
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_progress_out_time_us(line: &str) -> Option<i64> {
     let line = line.trim();
     let v = line
@@ -609,6 +661,7 @@ fn parse_progress_out_time_us(line: &str) -> Option<i64> {
 /// [`calibrate_effective_buffer`], or the requested size as its fallback), because ffmpeg's
 /// blocking writes pace against that buffer once it is full. Clamped at `start_sec` through the
 /// startup transient (muxed < buffer ⇒ nothing audible yet).
+#[cfg_attr(windows, allow(dead_code))]
 fn audible_pos_from_out_time(out_time_us: i64, start_sec: f32, buffer_secs: f32) -> f32 {
     let out_time_secs = out_time_us as f32 / 1_000_000.0;
     start_sec + (out_time_secs - buffer_secs).max(0.0)

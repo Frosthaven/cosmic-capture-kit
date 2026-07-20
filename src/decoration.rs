@@ -11,11 +11,13 @@
 //! `compose::add_border_native_corners`). Adding a new desktop (Windows, another
 //! Linux) needs NO platform-specific border logic now.
 //!
-//! The one theming read that survives is the system ACCENT colour, used ONLY as the
+//! The one theming read that survives is the RESOLVED ACCENT colour, used ONLY as the
 //! DEFAULT for the Active border when the user hasn't pinned a custom colour
-//! (`active_border_color == None`). That is a theming read (the same accent the app
-//! already reads elsewhere), NOT a border reconstruction — it's behind [`accent_rgba`],
-//! one portable function with per-OS branches.
+//! (`active_border_color == None`). That is a theming read (the same accent the app's
+//! own UI paints), NOT a border reconstruction — it's behind [`accent_rgba`], one
+//! portable function reading the applied theme's accent, so the border follows the
+//! full appearance chain (System Default -> manual accent -> fallback) on every OS
+//! (DRAGON-239).
 
 /// One border's draw parameters: a `width` in LOGICAL px (0 = no border) and an RGBA
 /// `color`. Both active and inactive captures use this shape; the compose path scales
@@ -86,41 +88,28 @@ impl WindowBorders {
     }
 }
 
-/// The app's ACCENT colour as RGBA bytes — the DEFAULT for the Active border when the
-/// user hasn't pinned a custom colour. ONE portable function with per-OS branches, all
-/// resolving to the SAME accent the app's own UI shows (General -> Appearance), NOT the
-/// host OS's system accent:
+/// The app's RESOLVED ACCENT colour as RGBA bytes — the DEFAULT for the Active border
+/// when the user hasn't pinned a custom colour. ONE portable function on EVERY OS: the
+/// live applied theme's accent (`cosmic::theme::active()` through the app's accent
+/// seam), i.e. exactly the colour the app's own UI paints (General -> Appearance).
+/// Because [`apply_appearance`](crate::app::theme::apply_appearance) has already
+/// resolved the whole appearance CHAIN into the applied theme, this follows it by
+/// construction on all platforms and all modes (DRAGON-239):
+///   1. System Default  -> the system accent (Windows registry / Linux COSMIC / macOS
+///      libcosmic default);
+///   2. else a manually-pinned accent -> that colour;
+///   3. else -> the base theme's default accent.
 ///
-/// - **macOS**: the live libcosmic theme accent (`cosmic::theme::active()` through the
-///   app's accent seam), matching the colour the settings sliders/swatches paint with.
-///   macOS has no on-disk COSMIC theme dir to read like Linux, and its
-///   `NSColor.controlAccentColor` is a DIFFERENT colour from the app's theme accent, so
-///   reading the active theme is what makes "follow accent" match what the user sees.
-/// - **Linux**: the COSMIC theme accent read off disk — the SAME source the app
-///   already reads for the window hint (`crate::app::theme::active_hint_color`, which
-///   returns `window_hint` when set else the accent). No new dependency.
-/// - **Other**: the app's historical lavender fallback.
+/// Previously this branched per-OS and, off macOS, read the raw SYSTEM accent (Linux)
+/// or a hardcoded lavender (Windows/other), so the border ignored a manual accent
+/// override. Reading the applied theme fixes every platform at once.
+///
+/// A headless CLI process never applies the global theme, so `active()` there is the
+/// default; the composite diagnostic instead resolves the accent from persisted
+/// settings via [`crate::app::theme::resolved_appearance_accent_rgba`] (the same value
+/// this returns once the app is running).
 pub fn accent_rgba() -> [u8; 4] {
-    #[cfg(target_os = "macos")]
-    {
-        // The teal (or whatever) accent the UI actually paints, via the app's accent
-        // seam over the live theme — never the macOS system accent.
-        let c = crate::app::theme::accent(&cosmic::theme::active());
-        [
-            (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
-            (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
-            255,
-        ]
-    }
-    #[cfg(target_os = "linux")]
-    {
-        crate::app::theme::active_hint_color()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        [151, 125, 236, 255]
-    }
+    crate::app::theme::color_to_rgba(crate::app::theme::accent(&cosmic::theme::active()))
 }
 
 /// Derive a captured window's REAL corner radius (in the image's own PHYSICAL

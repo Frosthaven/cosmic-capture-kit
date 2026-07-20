@@ -46,7 +46,14 @@ use cosmic_client_toolkit::sctk::shm::slot::SlotPool;
 use crate::screencopy::{connect, grab_cropped, outputs, pick_format};
 #[cfg(target_os = "linux")]
 use std::io::Write;
+// The portal `fd` only ever exists on the Linux capture path; off-Linux it is a
+// never-constructed TYPE in `PipewireRecordParams` (dead_code-allowed there). Unix
+// keeps `std::os::fd::OwnedFd`; Windows has no `std::os::fd`, so alias its owned
+// handle so the struct field type resolves (DRAGON-229).
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,7 +64,9 @@ mod finalize;
 // sync_probe are pure ffmpeg/audio and stay portable. `owned` holds the portable
 // media-clock owned-path plumbing (frame writer + audio pre-flight) both the Linux
 // workers and the macOS SCK worker reuse.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+// `owned` holds the portable media-clock owned-path plumbing; enabled on Windows too
+// (DRAGON-229 M3), where its POSIX-FIFO seams get named-pipe arms.
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod owned;
 #[cfg(target_os = "linux")]
 mod pipewire;
@@ -68,6 +77,12 @@ mod pump;
 #[cfg(target_os = "macos")]
 #[path = "../platform/mac/screencapturekit/record_worker.rs"]
 mod sck;
+// The WGC worker lives PHYSICALLY under `platform/windows/` (the closed split,
+// DRAGON-229) but stays mounted at `record::wgc` — module paths stable via `#[path]`,
+// exactly like `record::sck`.
+#[cfg(windows)]
+#[path = "../platform/windows/record_worker.rs"]
+mod wgc;
 // LIVE SCK end-to-end proof — `#[ignore]`-gated (needs a display + TCC + ffmpeg).
 #[cfg(all(test, target_os = "macos"))]
 #[path = "../platform/mac/screencapturekit/record_worker_live_tests.rs"]
@@ -90,6 +105,9 @@ mod av_sync_tests;
 mod media_clock_e2e_tests;
 
 pub(crate) use sync_probe::{measure_av_offset, write_sync_clip, SYNC_CLIP_NAME};
+// DRAGON-229 M3: the isolated WGC single-frame grab behind `--test windows-wgc-frame`.
+#[cfg(windows)]
+pub(crate) use wgc::capture_one_frame as wgc_capture_one_frame;
 #[cfg(feature = "zero-copy")]
 pub use zero_copy::screencopy_dmabuf_test;
 
@@ -483,8 +501,16 @@ impl MuxerWatchdog {
                      while being fed its first frame — wedged ffmpeg; killing it so the write \
                      can't hang the recorder (DRAGON-118)"
                 );
+                #[cfg(unix)]
                 if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
                     let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+                #[cfg(windows)]
+                {
+                    // DRAGON-229 M3: OpenProcess(PROCESS_TERMINATE) + TerminateProcess — the
+                    // SIGKILL analog for a wedged WGC-recording ffmpeg whose first-frame
+                    // write is blocking the recorder (body under platform/windows/).
+                    crate::platform::windows::terminate_pid(pid);
                 }
                 f.store(true, Ordering::Relaxed);
             })
@@ -651,6 +677,32 @@ pub enum MacRecordTarget {
     Display(String),
 }
 
+/// The Windows WGC capture target (DRAGON-229 M3) — the Windows analog of
+/// [`MacRecordTarget`]. On Windows every record mode reaches [`start_region_recording`]
+/// through [`RegionRecordParams`]; this says which WGC content item the video worker
+/// attaches to:
+///
+/// - [`Region`](Self::Region): a CROP of the most-overlapped monitor (a
+///   `CopySubresourceRegion` on a `CreateForMonitor` item).
+/// - [`Window`](Self::Window): a specific window by `HWND` decimal id, via WGC's
+///   `CreateForWindow` — occluding windows are NOT recorded and capture follows the
+///   window as it moves.
+/// - [`Display`](Self::Display): a whole monitor (monitor mode) by `\\.\DISPLAYn` name —
+///   the `CreateForMonitor` item at full bounds, no crop.
+///
+/// Windows-only: the field carrying it is `#[cfg(windows)]`, so the Linux/mac workers never
+/// see it and their construction sites stay byte-identical.
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WinRecordTarget {
+    /// Record the `x/y/w/h` rect as a crop of the most-overlapped monitor.
+    Region,
+    /// Record a single window by its `HWND` decimal id (occlusion-independent).
+    Window(String),
+    /// Record the whole monitor named `\\.\DISPLAYn` (monitor mode).
+    Display(String),
+}
+
 /// Parameters for [`start_region_recording`]: the region (global logical coords) +
 /// cursor flag, plus the settings shared with the PipeWire path.
 pub struct RegionRecordParams {
@@ -664,6 +716,11 @@ pub struct RegionRecordParams {
     /// byte-identical (DRAGON-130).
     #[cfg(target_os = "macos")]
     pub mac_target: MacRecordTarget,
+    /// The Windows WGC capture target (region crop / window / display). Windows-only —
+    /// the Linux/mac workers never see this field, so their construction sites stay
+    /// byte-identical (DRAGON-229).
+    #[cfg(windows)]
+    pub win_target: WinRecordTarget,
     pub settings: RecordSettings,
 }
 
@@ -734,11 +791,50 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
 }
 
 /// Start recording a region — unsupported stand-in for platforms with no capture
-/// backend (neither Linux screencopy/PipeWire nor macOS ScreenCaptureKit).
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// backend (neither Linux screencopy/PipeWire, macOS ScreenCaptureKit, nor Windows WGC).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
     let _ = params;
     unsupported_recording("screen recording is not supported on this platform")
+}
+
+/// Start recording a region (global physical coords) to `out_path` at `fps` on Windows
+/// via Windows.Graphics.Capture (DRAGON-229 M3): the WGC video worker (`record::wgc`)
+/// drives the SAME media-clock owned pipeline the Linux/mac workers do (audio pre-flight →
+/// `spawn_ffmpeg_media_clock` → `pump` → finalize). Mirrors the mac
+/// `start_region_recording`'s handle/threading so the app's recording state machine
+/// (poll/stop/preview) works unchanged. Window/Monitor modes reach here as a region rect
+/// too (the app funnels every mode through `RegionRecordParams`); `win_target` selects the
+/// WGC item.
+#[cfg(windows)]
+pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
+    let RegionRecordParams { x, y, w, h, cursor, win_target, settings } = params;
+    let RecordSettings {
+        fps, preferred_encoder, presets, zero_copy, mic, system_audio, bitrate_kbps,
+        audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+    } = settings;
+    // No GPU zero-copy path on Windows: libx264 encodes inside ffmpeg from the RGBA feed
+    // (the Linux DRM/DMA-BUF zero-copy path has no Windows analog).
+    let _ = zero_copy;
+    let shared = RecordShared::new();
+    {
+        // `measured_offset_ms` is intentionally not passed to `record_wgc`: the worker feeds
+        // ffmpeg synchronously on its own thread with no delivery channel to measure lag on
+        // (same reasoning as the Linux screencopy / mac SCK paths).
+        let RecordShared { stop, paused, done, events, dims, .. } = shared.clone_for_worker();
+        std::thread::spawn(move || {
+            let _done_guard = DoneGuard(done.clone());
+            let result = wgc::record_wgc(
+                x, y, w, h, fps.max(1), cursor, &preferred_encoder, &presets, mic,
+                system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res,
+                &out_path, stop, paused, &events, &dims, &metadata, win_target,
+            );
+            if let Ok(mut g) = done.lock() {
+                *g = Some(result);
+            }
+        });
+    }
+    shared.into_handle()
 }
 
 /// Start recording a region (global logical coords) to `out_path` at `fps`.
@@ -857,8 +953,16 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // DRAGON-229: only the not(windows) process-management tests below use these;
+    // the portable `muxer_alive` test does not, so gate the import to match.
+    #[cfg(not(target_os = "windows"))]
     use std::time::{Duration, Instant};
 
+    // DRAGON-229: these process-management tests spawn a Unix `true`/`sleep` child
+    // (absent on Windows → "program not found") and exercise the watchdog SIGKILL,
+    // which is a Windows M0 no-op (recording is off there until M3). Gated off Windows;
+    // Linux + macOS run them unchanged. The `muxer_alive` FS test below stays portable.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn wait_or_kill_reaps_a_finished_child_cleanly() {
         let mut child = std::process::Command::new("true").spawn().unwrap();
@@ -866,6 +970,7 @@ mod tests {
         assert!(status.success());
     }
 
+    #[cfg(not(target_os = "windows"))] // DRAGON-229: Unix `sleep` child; see the group note above
     #[test]
     fn wait_or_kill_kills_a_child_that_outlives_the_deadline() {
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
@@ -894,6 +999,7 @@ mod tests {
     // A `sleep` child stands in for a spawned ffmpeg (as the wait_or_kill tests do);
     // the watchdog kills it iff its "output" file didn't grow past the header in the
     // budget — the same signal that catches an n8.1.2 muxer that never drains stdin.
+    #[cfg(not(target_os = "windows"))] // DRAGON-229: Unix `sleep` child + watchdog SIGKILL; see the group note
     #[test]
     fn muxer_watchdog_kills_a_muxer_that_never_grows_its_file() {
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
@@ -908,6 +1014,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(3), "it must fire promptly (bounded)");
     }
 
+    #[cfg(not(target_os = "windows"))] // DRAGON-229: Unix `sleep` child; see the group note
     #[test]
     fn muxer_watchdog_spares_a_muxer_whose_file_grew() {
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
@@ -923,6 +1030,7 @@ mod tests {
         let _ = std::fs::remove_file(&grown);
     }
 
+    #[cfg(not(target_os = "windows"))] // DRAGON-229: Unix `sleep` child + watchdog SIGKILL; see the group note
     #[test]
     fn muxer_watchdog_pause_gate_defers_the_budget() {
         // Paused time must not count against the watchdog (the owned path feeds a
@@ -948,6 +1056,7 @@ mod tests {
         assert!(wd.fired());
     }
 
+    #[cfg(not(target_os = "windows"))] // DRAGON-229: Unix `sleep` child; see the group note
     #[test]
     fn muxer_watchdog_disarm_prevents_the_kill() {
         let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();

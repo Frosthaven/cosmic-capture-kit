@@ -35,9 +35,11 @@ pub struct TextWord {
 
 /// Whether the `tesseract` OCR binary is on PATH (text scanning requires it).
 pub fn tesseract_available() -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|d| d.join("tesseract").is_file()))
-        .unwrap_or(false)
+    // DRAGON-244: via `tool_available` so the on-disk `EXE_SUFFIX` is honored — on
+    // Windows the binary is `tesseract.exe`, so a bare `tesseract` file check wrongly
+    // reported "not installed" even though the langs probe (which SPAWNS `tesseract`,
+    // resolving `.exe`) found language data. Byte-identical on Linux/macOS (empty suffix).
+    crate::util::tool_available(std::path::Path::new("tesseract"))
 }
 
 /// Whether tesseract has at least one usable LANGUAGE pack installed. The binary
@@ -45,7 +47,7 @@ pub fn tesseract_available() -> bool {
 /// pass fails at runtime. Runs `tesseract --list-langs` (fast), so callers should
 /// cache the result; false when the binary itself is missing.
 pub fn tesseract_langs_available() -> bool {
-    let Ok(out) = std::process::Command::new("tesseract").arg("--list-langs").output() else {
+    let Ok(out) = crate::util::quiet_command("tesseract").arg("--list-langs").output() else {
         return false;
     };
     // Output: a "List of available languages (N):" header, then one language per

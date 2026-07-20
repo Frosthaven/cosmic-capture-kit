@@ -8,8 +8,10 @@ use super::super::row::{Item, SectionSpec};
 const APP_ICON: &[u8] =
     include_bytes!("../../../../res/icons/dev.frosthaven.CosmicCaptureKit.svg");
 
-/// Still the Linux "Get Update" target (releases page); the About page no longer
-/// shows a source-code row (DRAGON-226).
+/// The Linux "Get Update" target (releases page); the About page no longer shows a
+/// source-code row (DRAGON-226). macOS/Windows use the one-click install button
+/// instead, so it's consumed only on the Linux arm of `update_action_button`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const REPO_URL: &str = "https://github.com/Frosthaven/cosmic-capture-kit";
 const ICON_ARTIST_URL: &str = "https://ashleythedesigner.com/";
 /// Donations (DRAGON-226): PayPal is THE donation channel — no other sponsor
@@ -162,30 +164,30 @@ impl crate::app::App {
     }
 }
 
-/// The Version row's action button for an available update. macOS: a suggested
+/// The Version row's action button for an available update. macOS/Windows: a suggested
 /// "Install Update" (one-click install, or a plain "Update Available" label if no
 /// artifact is attached). Linux: "Get Update" opening the releases page (no
 /// one-click there yet, so "Install" would be a lie). The version number is NOT in
 /// the button (DRAGON-187): it reads in the row's description caption instead, so
 /// the button stays a short, fixed action label.
-#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_variables))]
 fn update_action_button<'a>(
     info: &crate::update::UpdateInfo,
     installing: bool,
     width: f32,
 ) -> Element<'a, Msg> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         if info.artifact.is_some() {
             install_button(installing, width)
         } else {
-            // No macOS artifact attached to this release yet: an honest disabled label.
+            // No platform artifact attached to this release yet: an honest disabled label.
             widget::button::suggested(UPDATE_AVAILABLE_LABEL)
                 .width(Length::Fixed(width))
                 .into()
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         // Linux: no one-click install yet, so open the releases page. Honest label.
         widget::button::suggested(GET_UPDATE_LABEL)
@@ -221,13 +223,13 @@ fn notes_markdown_settings() -> widget::markdown::Settings {
 // caption instead), so they stay short, fixed action labels.
 const CHECK_LABEL: &str = "Check for updates";
 const CHECKING_LABEL: &str = "Checking...";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const INSTALL_LABEL: &str = "Install Update";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const INSTALLING_LABEL: &str = "Installing...";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const UPDATE_AVAILABLE_LABEL: &str = "Update Available";
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const GET_UPDATE_LABEL: &str = "Get Update";
 
 /// The shared fixed width for the Version row's action button, sized to the widest
@@ -236,7 +238,7 @@ const GET_UPDATE_LABEL: &str = "Get Update";
 /// unit-tested below. The labels are static now (no version number), so the width
 /// is the same in every state.
 fn action_button_width() -> f32 {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let labels: &[&str] = &[
         CHECK_LABEL,
         CHECKING_LABEL,
@@ -244,7 +246,7 @@ fn action_button_width() -> f32 {
         INSTALLING_LABEL,
         UPDATE_AVAILABLE_LABEL,
     ];
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let labels: &[&str] = &[CHECK_LABEL, CHECKING_LABEL, GET_UPDATE_LABEL];
     fixed_button_width(labels)
 }
@@ -265,31 +267,37 @@ fn fixed_button_width(labels: &[&str]) -> f32 {
 /// The "Check for updates" button (disabled while a check is running). Fixed to the
 /// shared action-slot width so it never reflows as the text swaps (DRAGON-187).
 fn check_button<'a>(checking: bool, width: f32) -> Element<'a, Msg> {
-    let btn = widget::button::standard(if checking { CHECKING_LABEL } else { CHECK_LABEL })
-        .width(Length::Fixed(width));
-    if checking {
-        btn.into()
-    } else {
-        btn.on_press(Msg::Settings(SettingsMsg::CheckForUpdates)).into()
-    }
+    // Paint it in the shared frosted PILL MATERIAL (DRAGON-279) like the other settings
+    // buttons/pills/cards, so on a frosted window (Linux glass / Windows Mica / macOS
+    // vibrancy, DRAGON-268) it reads as translucent glass instead of a solid chip that
+    // doesn't match. Cross-platform: the pill material is a translucent fill everywhere.
+    // Centred within the fixed action width so the label sits mid-button, not
+    // flush-left (DRAGON-268 follow-up). The fixed width is preserved so swapping
+    // "Check for updates" <-> "Checking..." never reflows.
+    crate::app::settings::row::centered_button(
+        None,
+        if checking { CHECKING_LABEL } else { CHECK_LABEL },
+        Length::Fixed(width),
+        crate::app::settings::row::standard_button_class(),
+        (!checking).then_some(Msg::Settings(SettingsMsg::CheckForUpdates)),
+    )
 }
 
-/// The one-click "Install Update" button (macOS), disabled and reading
+/// The one-click "Install Update" button (macOS + Windows), disabled and reading
 /// "Installing..." while an install is running. The version reads in the row's
 /// description caption, not the button (DRAGON-187). Fixed to the shared action-slot
 /// width so it never reflows as the label swaps.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn install_button<'a>(installing: bool, width: f32) -> Element<'a, Msg> {
-    if installing {
-        widget::button::suggested(INSTALLING_LABEL)
-            .width(Length::Fixed(width))
-            .into()
-    } else {
-        widget::button::suggested(INSTALL_LABEL)
-            .width(Length::Fixed(width))
-            .on_press(Msg::Settings(SettingsMsg::InstallUpdate))
-            .into()
-    }
+    // Centred within the fixed action width (DRAGON-268 follow-up), matching the
+    // Check button; the fixed width still prevents any reflow as the label swaps.
+    crate::app::settings::row::centered_button(
+        None,
+        if installing { INSTALLING_LABEL } else { INSTALL_LABEL },
+        Length::Fixed(width),
+        cosmic::theme::Button::Suggested,
+        (!installing).then_some(Msg::Settings(SettingsMsg::InstallUpdate)),
+    )
 }
 
 /// Centered header: the app icon (with the icon-credit badge tucked at its
@@ -410,9 +418,9 @@ mod tests {
         // width is state-independent and must cover each candidate label.
         let width = action_button_width();
         let mut candidates = vec![CHECK_LABEL, CHECKING_LABEL];
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         candidates.extend([INSTALL_LABEL, INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         candidates.push(GET_UPDATE_LABEL);
         for label in candidates {
             assert!(

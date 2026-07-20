@@ -192,6 +192,7 @@ impl cosmic::Application for App {
             persisted.appearance_mode.min(2),
             persisted.appearance_accent,
             persisted.appearance_roundness.min(2),
+            persisted.appearance_contrast_boost,
         ));
         // Post-update relaunch (DRAGON-177): the installer's swap helper relaunches
         // the app bare; consuming the marker turns THIS launch into a settings
@@ -200,13 +201,12 @@ impl cosmic::Application for App {
         // spawns a --settings child; this path covers non-resident relaunches.)
         let post_update = crate::update::take_post_update_marker();
         let settings_only = settings_only || post_update;
-        let config_task = if settings_only {
-            let (id, task) = settings::open_config_window(persisted.settings_size);
-            settings.window = Some(id);
-            Some(task)
-        } else {
-            None
-        };
+        // The launch settings window is minted a message-drain LATER (via
+        // `OpenSettingsAtStartup` below), AFTER the appearance `set_theme` has been
+        // applied, so its first paint carries the resolved accent with no flash
+        // (DRAGON-268 follow-up). We only decide HERE that a settings window is wanted;
+        // the id is minted in the deferred handler.
+        let open_settings_at_startup = settings_only;
         // Permission-checker window state. Opened when `--permissions` was passed, or
         // when a capture launch is missing the Screen Recording grant (`open_permissions`).
         // `only` (like settings) makes closing it end the instance. The window is only
@@ -300,6 +300,10 @@ impl cosmic::Application for App {
                 grab_overlay_closing: None,
                 #[cfg(target_os = "macos")]
                 mac_preview_preopen: false,
+                #[cfg(windows)]
+                settings_shown_confirmed: false,
+                #[cfg(windows)]
+                preview_shown_confirmed: None,
                 settings,
                 permissions,
                 keymap,
@@ -315,6 +319,7 @@ impl cosmic::Application for App {
                 appearance_mode: persisted.appearance_mode.min(2),
                 appearance_accent: persisted.appearance_accent,
                 appearance_roundness: persisted.appearance_roundness.min(2),
+                appearance_contrast_boost: persisted.appearance_contrast_boost,
                 selection_box_thickness: persisted.selection_box_thickness.clamp(1, 8),
                 preview: None,
                 preview_duck: None,
@@ -344,9 +349,9 @@ impl cosmic::Application for App {
                 capture_hotkey: persisted.capture_hotkey.clone(),
                 #[cfg(target_os = "macos")]
                 aerospace_guard: None,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 passthrough_active: false,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 passthrough_solid: None,
                 region_overlay_opacity: persisted.region_overlay_opacity,
                 active_overlay_opacity: persisted.active_overlay_opacity,
@@ -421,7 +426,7 @@ impl cosmic::Application for App {
                 sens_level: 0.0,
                 mic_chain: None,
                 sys_meter: None,
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", windows))]
                 sys_idle_meter: None,
                 noise_reduction: persisted.noise_reduction,
                 mic_device: persisted.mic_device.clone(),
@@ -498,37 +503,28 @@ impl cosmic::Application for App {
                 if let Some(t) = appearance_task {
                     tasks.push(t);
                 }
-                // `--settings`: open the settings window as part of startup.
-                if let Some(t) = config_task {
-                    tasks.push(t);
-                    // DRAGON-177: seed the update state from the on-disk manifest cache
-                    // FIRST - notes, nav tint, and the launch dialog render instantly
-                    // (the daemon-spawned flow wrote this cache seconds earlier; any
-                    // prior successful check wrote it too). The network check follows
-                    // right behind and refreshes the seed.
-                    if let Some(seed) = crate::update::seeded_status_from_cache() {
-                        tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
-                            super::SettingsMsg::UpdateChecked(seed),
-                        ))));
-                    }
-                    // DRAGON-175: a settings window is showing, so kick off a background
-                    // update check (non-blocking; the result lights up the About nav +
-                    // fills the About page). On macOS the settings window is ALWAYS a
-                    // fresh `--settings` process (DRAGON-153), so this is the mac
-                    // settings-open hook; Linux also fires it from `open_settings`.
-                    tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
-                        super::SettingsMsg::CheckForUpdates,
-                    ))));
+                // `--settings`: open the settings window as part of startup — but a
+                // message-drain AFTER `appearance_task` above, so the window's FIRST paint
+                // already carries the launch-resolved accent instead of flashing
+                // libcosmic's default for a frame (DRAGON-268 follow-up). This
+                // `Task::done` and the `set_theme` from `appearance_task` are both queued
+                // here from `init`; a single `update` drain processes them in ORDER — the
+                // theme's global mutation lands first, then `OpenSettingsAtStartup`'s
+                // handler returns the window-open task, so `WindowCreated` reads the
+                // correct global theme when it builds the window's state. The update-cache
+                // seed / check / About routing move INTO that handler (they were batched
+                // alongside the eager open before; ordering vs the window paint is
+                // unchanged, they just ride the same deferred open).
+                if open_settings_at_startup {
                     // Land on About after an update install (marker consumed above, or
                     // the daemon spawned us with CCK_SETTINGS_TAB=about).
-                    let tab_env = std::env::var(crate::update::SETTINGS_TAB_ENV)
-                        .map(|v| v.eq_ignore_ascii_case("about"))
-                        .unwrap_or(false);
-                    if post_update || tab_env {
-                        tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
-                            super::SettingsMsg::ShowAboutPage,
-                        ))));
-                    }
+                    let about = post_update
+                        || std::env::var(crate::update::SETTINGS_TAB_ENV)
+                            .map(|v| v.eq_ignore_ascii_case("about"))
+                            .unwrap_or(false);
+                    tasks.push(Task::done(cosmic::Action::App(Msg::WindowChrome(
+                        super::WindowChromeMsg::OpenSettingsAtStartup { about },
+                    ))));
                 }
                 // `--permissions` / missing-grant routing: open the permission window.
                 if let Some(t) = permissions_task {

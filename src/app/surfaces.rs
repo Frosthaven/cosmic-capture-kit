@@ -4,6 +4,23 @@ impl App {
     /// Destroy every overlay surface (the dummy bottom surface stays alive as the
     /// event-loop anchor so the post-teardown capture tick still fires).
     pub(super) fn destroy_surfaces(&mut self) -> Vec<Task<cosmic::Action<Msg>>> {
+        // Release the capture single-instance lock the moment the overlays are
+        // PERMANENTLY gone (DRAGON-255+: capture committed -> preview, recording
+        // stopped -> preview, or teardown -> exit). That lock exists ONLY to stop a
+        // second trigger from opening a DUPLICATE capture overlay while one is live;
+        // once no overlay is up, this process must not keep blocking new captures.
+        // Without this, a lingering PREVIEW editor (the default post-capture path) held
+        // the lock for the whole process life, so the next daemon "Region" / global
+        // hotkey found the lock held and silently no-op'd — the "nothing happens" bug —
+        // unless "allow multiple instances" was on. `open_settings` already releases it
+        // the same way when a capture becomes a settings window; this extends the SAME
+        // rule to the preview phase, so an open preview OR settings window never blocks
+        // a fresh capture regardless of the "allow multiple instances" setting, on every
+        // platform. Idempotent + a no-op when the lock was never taken (allow-multiple
+        // on); on the exit paths the process dies right after (the mutex/flock
+        // auto-releases anyway), so this only CHANGES behavior for the keep-running
+        // preview transition — exactly the intended fix.
+        crate::instance::release_capture_lock();
         // macOS: the AeroSpace pause exists ONLY to protect the capture overlays, so
         // resume the tiling WM the moment they're permanently gone (capture committed
         // -> preview, recording stopped, teardown) instead of at process exit — the
@@ -16,6 +33,21 @@ impl App {
         {
             crate::platform::mac::window::resume_tiling_wm();
             self.aerospace_guard = None;
+        }
+        // Windows (DRAGON-281): the countdown/recording overlays may have been made
+        // click-through (`recreate_active_overlays` set `passthrough_active`); this is a
+        // PERMANENT overlay close (capture committed → preview, recording stopped → preview,
+        // teardown), so the overlays are gone for good and there is nothing left to hover-
+        // poll. Clear the flag here so `sub_passthrough`'s 60ms tick stops instead of running
+        // forever under the (heavy) preview — the same class of stray-tick-under-preview
+        // pegging `sub_meter_tick` guards against (DRAGON-247). The normal restore-to-region
+        // path (`restore_interactive_overlays`) already clears it; this covers the commit/
+        // teardown paths that never route through there. Windows-gated so mac stays
+        // byte-identical (its passthrough poll idles harmlessly on the empty output list).
+        #[cfg(windows)]
+        {
+            self.passthrough_active = false;
+            self.passthrough_solid = None;
         }
         let cmds: Vec<_> = self
             .outputs
@@ -50,6 +82,29 @@ impl App {
             // a harmless double of the resume above (idempotent by design).
             self.aerospace_guard = None;
         }
+        // Windows (DRAGON-246): GUARANTEE the process actually dies. `cosmic::iced::exit()`
+        // only queues an `Action::Exit` the winit runtime must still process to unwind the
+        // event loop; if a settings child's window was destroyed out-of-band (see
+        // `sub_settings_liveness`) or the runtime otherwise fails to tear down, the process
+        // would linger as a ZOMBIE holding the settings named mutex + pid file — and then
+        // every later daemon "Settings" click finds the lock held and self-exits, so nothing
+        // appears. A short-delay hard-exit thread is the backstop: on the normal path
+        // `iced::exit()` unwinds and `main` returns (terminating this detached thread
+        // mid-sleep) WELL before the grace elapses, so `process::exit` never runs and there
+        // is no added latency; only a wedged runtime reaches it, converting a forever-zombie
+        // into a clean ~1.5s exit. Every `finish_session` caller has already completed its
+        // file/clipboard/notify work (finalize/bake results are awaited before this seam), so
+        // the delayed exit can cut nothing off. Linux/macOS never arm this — their
+        // `iced::exit()` reliably terminates — keeping their behavior byte-identical.
+        #[cfg(windows)]
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            log::warn!(
+                "DRAGON-246: iced::exit() did not terminate the process within the grace \
+                 window — forcing process exit (the settings mutex/pid would otherwise leak)"
+            );
+            std::process::exit(0);
+        });
         cosmic::iced::exit()
     }
 
@@ -427,7 +482,57 @@ impl App {
                 },
             );
         }
-        #[cfg(not(target_os = "macos"))]
+        // DRAGON-229 stage 7: Windows places the overlay natively via SetWindowPos
+        // (winit treats Position::Specific as LOGICAL and over-scales physical coords on
+        // HiDPI), matching THIS process's overlay window by the title = display name.
+        // Retries briefly if the async-set title hasn't landed yet (like the mac path).
+        #[cfg(target_os = "windows")]
+        {
+            const MAX_ATTEMPTS: u8 = 30;
+            const RETRY_MS: u64 = 40;
+            let placed = crate::platform::windows::window::place_overlay(
+                &o.name,
+                o.logical_pos,
+                o.logical_size,
+            );
+            if placed || attempt >= MAX_ATTEMPTS {
+                if attempt >= MAX_ATTEMPTS {
+                    log::warn!(
+                        "overlay for '{}' never matched its window after {MAX_ATTEMPTS} attempts \
+                         — it may be mispositioned",
+                        o.name
+                    );
+                }
+                // DRAGON-280: now the overlay is on-screen (phase 2 done), re-assert HWND_TOPMOST
+                // once. place_overlay's two-phase off-screen->on-screen show can race a fullscreen
+                // app's own topmost / DWM independent-flip state; a cheap z-order-only SetWindowPos
+                // after the present grace pins us above it. No-op if the window is already gone.
+                if placed {
+                    crate::platform::windows::window::reassert_topmost(&o.name);
+                }
+                // DRAGON-276: during a COUNTDOWN or RECORDING the overlay must be click-through
+                // so the user can use the screen being captured (the SELECTION overlay stays
+                // interactive — you drag a region). The overlay is recreated per phase, so this
+                // only ever tags the countdown/recording overlays, never the selection one.
+                if self.countdown.is_some() || self.recording.is_some() {
+                    crate::platform::windows::window::set_click_through(&o.name, true);
+                }
+                Task::none()
+            } else {
+                Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                    },
+                    move |()| {
+                        cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::OverlayOpened(
+                            id,
+                            attempt + 1,
+                        )))
+                    },
+                )
+            }
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             let _ = (o, attempt);
             Task::none()
@@ -454,6 +559,20 @@ impl App {
         let matched =
             crate::platform::mac::window::finalize_preview_window(super::shell::PREVIEW_WINDOW_TITLE);
         if matched {
+            // Window vibrancy (DRAGON-268): the windowed preview (a CSD toplevel) is the mac
+            // analog of Linux's frosted window / Windows' Mica — reveal the winit-inserted
+            // vibrancy by clearing its Metal layer. NEVER the fullscreen OVERLAY preview
+            // (that path never reaches here). Gated on the SAME frosted-windows signal
+            // (`self.glass`, `Some` unless `CCK_NO_GLASS`) AND that this is actually a windowed
+            // preview, exactly like the Windows `frosted_windowed` gate. The chrome already
+            // paints translucent from `self.glass`.
+            let frosted_windowed = self.glass.is_some_and(|g| g.frosted_windows)
+                && self.preview.as_ref().is_some_and(|p| p.surface.is_window());
+            if frosted_windowed {
+                crate::platform::mac::window::enable_window_vibrancy(
+                    super::shell::PREVIEW_WINDOW_TITLE,
+                );
+            }
             // DRAGON-219: a match means this swapped-in window is now placed + focused, so the
             // fullscreen overlay cover that covered the grab (kept until now so the window
             // mapped under it with no flash) has served its purpose — close it. On macOS this
@@ -484,6 +603,134 @@ impl App {
         )
     }
 
+    /// Windows (DRAGON-229 komorebi opt-out + DRAGON-233 fix 6): the windowed preview
+    /// was opened `visible:false`; once its async-set title lands, komorebi-float it
+    /// (`WS_EX_DLGMODALFRAME` before first show), CENTER it on its target monitor's work
+    /// area, and show it — the Windows sibling of the mac finalize above, matched by
+    /// [`super::shell::PREVIEW_WINDOW_TITLE`]. winit opens a new toplevel at the OS
+    /// default cascade (not centered — the user's off-center report), so
+    /// [`crate::platform::windows::window::show_centered`] positions it natively while
+    /// still hidden (no flash), keeping the restyle-before-show opt-out ordering intact.
+    /// The anchor is the capture output when known (`preview_output`), else the display
+    /// under the pointer (`--preview`). Retries briefly if the title hasn't landed yet
+    /// (same 30 x 40ms budget as `configure_overlay`), then gives up loudly. Only acts
+    /// on the current preview window. No `WS_EX_TOOLWINDOW`: it keeps its taskbar button.
+    #[cfg(target_os = "windows")]
+    pub(super) fn finalize_preview_window(&mut self, id: window::Id, attempt: u8) -> Task<cosmic::Action<Msg>> {
+        // Only our current windowed preview qualifies.
+        if self.preview.as_ref().is_none_or(|p| p.window != id) {
+            return Task::none();
+        }
+        const MAX_ATTEMPTS: u8 = 30;
+        const RETRY_MS: u64 = 40;
+        let name = self.preview_output.as_ref().map(|(n, _)| n.clone());
+        let (pos, size) = crate::platform::windows::window::preview_overlay_rect(name.as_deref());
+        let monitor = (pos.0, pos.1, size.0 as i32, size.1 as i32);
+        // Mica applies only to the WINDOWED preview (a CSD toplevel) — never the fullscreen
+        // OVERLAY preview, exactly like Linux excludes its layer-shell overlay from frosting.
+        // Gated on the SAME frosted-windows signal Linux uses (`self.glass`, Some only on
+        // Win11 22H2+ and not `CCK_NO_GLASS`-disabled), so the unified toggle turns it off too.
+        let frosted_windowed = self.glass.is_some_and(|g| g.frosted_windows)
+            && self.preview.as_ref().is_some_and(|p| p.surface.is_window());
+        let shown =
+            crate::platform::windows::window::show_centered(super::shell::PREVIEW_WINDOW_TITLE, monitor);
+        if shown {
+            // DRAGON-281: the native show is confirmed — record it so `sub_preview_finalize`
+            // stops re-driving this finalize (it was the safety net for the one-shot open
+            // follow-up not being delivered while cck was a background process).
+            self.preview_shown_confirmed = Some(id);
+            // Native DWM caption buttons (DRAGON-284): the windowed preview is a CSD toplevel
+            // like settings, so install the native min/max/close over its owned header.
+            // Idempotent (once per HWND); safe under this arm's retry / DRAGON-281 re-drive.
+            // Unconditional (not gated on Mica) — the buttons are chrome, not glass.
+            crate::platform::windows::caption::install_native_caption_buttons(
+                super::shell::PREVIEW_WINDOW_TITLE,
+            );
+            if frosted_windowed {
+                // Mica backdrop (DRAGON-267): the windowed preview is now shown — apply the
+                // DWM Mica material. The chrome already paints translucent from `self.glass`.
+                crate::platform::windows::window::apply_mica(super::shell::PREVIEW_WINDOW_TITLE);
+            }
+        }
+        if shown || attempt >= MAX_ATTEMPTS {
+            if attempt >= MAX_ATTEMPTS {
+                log::warn!(
+                    "preview window never matched its title after {MAX_ATTEMPTS} attempts \
+                     — komorebi may tile it and it may stay hidden"
+                );
+            }
+            Task::none()
+        } else {
+            Task::perform(
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                },
+                move |()| {
+                    cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::PreviewOpened(
+                        id,
+                        attempt + 1,
+                    )))
+                },
+            )
+        }
+    }
+
+    /// Windows (DRAGON-233 fix 5): natively place the fullscreen OVERLAY preview once it
+    /// has opened — the sibling of mac's `finalize_preview_overlay` below. Reuses the
+    /// capture overlay's [`crate::platform::windows::window::place_overlay`]: OR-in
+    /// `WS_EX_DLGMODALFRAME` before the first show (komorebi opt-out, race-free), set the
+    /// exact physical full-display rect topmost, and activate it so the preview hotkeys
+    /// (Save / Copy / Escape) work immediately. Matched by the async-set
+    /// [`super::shell::PREVIEW_OVERLAY_TITLE`], so it polls briefly like the others, then
+    /// gives up loudly. Only acts on the current preview window.
+    #[cfg(target_os = "windows")]
+    pub(super) fn finalize_preview_overlay(
+        &mut self,
+        id: window::Id,
+        pos: (i32, i32),
+        size: (u32, u32),
+        attempt: u8,
+    ) -> Task<cosmic::Action<Msg>> {
+        if self.preview.as_ref().is_none_or(|p| p.window != id) {
+            return Task::none();
+        }
+        const MAX_ATTEMPTS: u8 = 30;
+        const RETRY_MS: u64 = 40;
+        let placed = crate::platform::windows::window::place_overlay(
+            super::shell::PREVIEW_OVERLAY_TITLE,
+            pos,
+            size,
+        );
+        if placed {
+            // DRAGON-281: the overlay is placed + shown — record it so `sub_preview_finalize`
+            // stops re-driving this finalize (the safety net for the one-shot open follow-up
+            // not being delivered while cck was a background process).
+            self.preview_shown_confirmed = Some(id);
+        }
+        if placed || attempt >= MAX_ATTEMPTS {
+            if attempt >= MAX_ATTEMPTS {
+                log::warn!(
+                    "overlay preview never matched its window after {MAX_ATTEMPTS} attempts \
+                     — it may be mispositioned"
+                );
+            }
+            Task::none()
+        } else {
+            Task::perform(
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                },
+                move |()| {
+                    cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::PreviewOverlayOpened(
+                        id,
+                        pos,
+                        size,
+                        attempt + 1,
+                    )))
+                },
+            )
+        }
+    }
 
     /// macOS: natively place the fullscreen OVERLAY preview once it has opened (view
     /// installed): raise it to the shielding level, cover the display's full logical
@@ -576,11 +823,13 @@ impl App {
         }
     }
 
-    /// Windows: the fullscreen overlay preview isn't wired yet (DRAGON-94 phase 2 —
-    /// PlainWindows; macOS grew a real one, `finalize_preview_overlay` above). The
-    /// preview always opens as a normal window there; these inert stubs keep the
-    /// seam total for the compiled-but-unreachable overlay branch.
-    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+    /// Exotic platforms (not Linux / macOS / Windows): no fullscreen overlay preview
+    /// implementation, so these inert stubs keep the seam total for the
+    /// compiled-but-unreachable overlay branch (`preview_surface_for` forces the WINDOW
+    /// there via the cfg! fallback). macOS and Windows both grew a real overlay preview
+    /// (`finalize_preview_overlay`), so they no longer route through here — hence the
+    /// `not(windows)` narrowing (DRAGON-233 fix 5) that keeps them dead-code-free.
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
     pub(super) fn preview_surface(
         &self,
         output: OutputHandle,
@@ -590,7 +839,7 @@ impl App {
         Task::none()
     }
 
-    #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+    #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
     pub(super) fn preview_surface_active(&self, id: window::Id) -> Task<cosmic::Action<Msg>> {
         let _ = id;
         Task::none()
@@ -648,9 +897,18 @@ impl App {
     /// passthrough → winit cursor-hittest → `NSWindow.ignoresMouseEvents`). AppKit has
     /// no per-rect input region, so the toolbar chip stays reachable via a poll
     /// (`sub_passthrough`) that re-solidifies just the overlay whose chip rect the
-    /// pointer is over. Windows keeps the historical always-interactive behavior.
+    /// pointer is over.
+    ///
+    /// Windows (DRAGON-276 root cause): the overlays likewise stay up, and the SAME
+    /// poll shape applies — every overlay window goes click-through here
+    /// (`WS_EX_TRANSPARENT|WS_EX_LAYERED` via [`set_click_through`], matched by title
+    /// like `place_overlay`), and `passthrough_poll` re-solidifies the hovered chip.
+    /// Win32 has no per-rect input region either, so the mac poll is the exact analog.
     #[cfg(not(target_os = "linux"))]
-    #[cfg_attr(target_os = "macos", allow(clippy::needless_return))]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "windows"),
+        allow(clippy::needless_return)
+    )]
     pub(super) fn recreate_active_overlays(&mut self) -> Task<cosmic::Action<Msg>> {
         #[cfg(target_os = "macos")]
         {
@@ -662,7 +920,16 @@ impl App {
                     .map(|o| window::enable_mouse_passthrough(o.id)),
             );
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            self.passthrough_active = true;
+            self.passthrough_solid = None;
+            for o in &self.outputs {
+                crate::platform::windows::window::set_click_through(&o.name, true);
+            }
+            return Task::none();
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         Task::none()
     }
 
@@ -698,11 +965,66 @@ impl App {
         Task::batch(cmds)
     }
 
+    /// Windows (DRAGON-276): the mac hover poll, Win32 form — one `sub_passthrough`
+    /// tick while the countdown/recording overlays are click-through. Find the overlay
+    /// whose toolbar chip is under the pointer (cursor mapped into the overlay's
+    /// LOGICAL space by the platform helper, compared against the same
+    /// `toolbar_layout` rect the view draws) and make just that window solid again;
+    /// the previously solid one (if different) goes back to click-through. The Win32
+    /// ex-style flip is synchronous, so no tasks are minted.
+    #[cfg(target_os = "windows")]
+    pub(super) fn passthrough_poll(&mut self) -> Task<cosmic::Action<Msg>> {
+        if !self.passthrough_active {
+            return Task::none();
+        }
+        let hovered = self.outputs.iter().find_map(|o| {
+            let (r, _) = self.toolbar_layout(o)?;
+            let (lx, ly) =
+                crate::platform::windows::window::cursor_in_window_logical(&o.name)?;
+            r.contains(cosmic::iced::Point::new(lx, ly)).then_some(o.id)
+        });
+        if hovered == self.passthrough_solid {
+            return Task::none();
+        }
+        if let Some(prev) = self.passthrough_solid.take()
+            && let Some(o) = self.outputs.iter().find(|o| o.id == prev)
+        {
+            crate::platform::windows::window::set_click_through(&o.name, true);
+        }
+        if let Some(id) = hovered {
+            if let Some(o) = self.outputs.iter().find(|o| o.id == id) {
+                crate::platform::windows::window::set_click_through(&o.name, false);
+            }
+            self.passthrough_solid = Some(id);
+        }
+        Task::none()
+    }
+
+
     /// Destroy the capture overlay surfaces while keeping the tracked outputs.
     /// The overlay is a `Layer::Overlay` surface, so it stacks *above* the
     /// settings toplevel — hide it while settings is open. Closing settings ends
     /// the instance, so the overlay is never recreated afterwards.
     #[cfg(target_os = "linux")] // macOS hands settings off to a fresh process (DRAGON-153)
+    pub(super) fn hide_overlays(&mut self) -> Task<cosmic::Action<Msg>> {
+        let cmds: Vec<_> = self
+            .outputs
+            .iter()
+            .map(|o| super::shell::close_surface(o.id))
+            .collect();
+        Task::batch(cmds)
+    }
+
+    /// Windows: destroy the capture overlay surfaces when settings opens — the Linux
+    /// `hide_overlays` behaviour (DRAGON-233 fix 2). The capture overlays are
+    /// always-on-top `HWND_TOPMOST` windows, so a settings window opened from the
+    /// in-overlay gear would be minted BEHIND them and never seen — the user's "gear
+    /// flashes, settings never appears, process seems stuck" report. Closing them hands
+    /// settings the screen. Closing settings ends the instance, so the overlays are
+    /// never recreated; the hidden bootstrap window keeps the event loop alive and
+    /// `WindowClosed` on an overlay id is a no-op, so the process does NOT exit here.
+    /// `self.outputs` is kept (like Linux) — the ids are simply never addressed again.
+    #[cfg(target_os = "windows")]
     pub(super) fn hide_overlays(&mut self) -> Task<cosmic::Action<Msg>> {
         let cmds: Vec<_> = self
             .outputs
@@ -741,11 +1063,14 @@ impl App {
         Task::batch(cmds)
     }
 
-    /// macOS: undo `recreate_active_overlays`' click-through — every overlay solid
-    /// and interactive again for region select (a no-op on windows that were never
-    /// made passthrough). Windows: the overlays stayed interactive, nothing to undo.
+    /// macOS/Windows: undo `recreate_active_overlays`' click-through — every overlay
+    /// solid and interactive again for region select (a no-op on windows that were
+    /// never made passthrough).
     #[cfg(not(target_os = "linux"))]
-    #[cfg_attr(target_os = "macos", allow(clippy::needless_return))]
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "windows"),
+        allow(clippy::needless_return)
+    )]
     pub(super) fn restore_interactive_overlays(&mut self) -> Task<cosmic::Action<Msg>> {
         #[cfg(target_os = "macos")]
         {
@@ -757,7 +1082,16 @@ impl App {
                     .map(|o| window::disable_mouse_passthrough(o.id)),
             );
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            self.passthrough_active = false;
+            self.passthrough_solid = None;
+            for o in &self.outputs {
+                crate::platform::windows::window::set_click_through(&o.name, false);
+            }
+            return Task::none();
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         Task::none()
     }
 

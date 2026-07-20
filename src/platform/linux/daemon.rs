@@ -287,7 +287,7 @@ impl ksni::Tray for ResidentTray {
 /// portable [`crate::recording_ui::capture_menu`] model. Used BOTH as the flat idle menu and
 /// as the "Capture Menu" submenu contents while recording, so the two can never drift. Quit
 /// is disabled while recording (it would orphan the child's control surface) and uses the
-/// resident's full "Quit Cosmic Capture Kit" label; the launchers carry the model labels.
+/// resident's full "Quit Cosmic Capture Kit Tray" label; the launchers carry the model labels.
 fn capture_group_items(st: &RecordingState) -> Vec<ksni::MenuItem<ResidentTray>> {
     use ksni::menu::StandardItem;
     let mut items: Vec<ksni::MenuItem<ResidentTray>> = Vec::new();
@@ -297,7 +297,7 @@ fn capture_group_items(st: &RecordingState) -> Vec<ksni::MenuItem<ResidentTray>>
             MenuItemKind::Checkmark(_) | MenuItemKind::Standard => match item.action {
                 CaptureAction::Quit => items.push(
                     StandardItem {
-                        label: "Quit Cosmic Capture Kit".to_string(),
+                        label: "Quit Cosmic Capture Kit Tray".to_string(),
                         enabled: quit_enabled(st),
                         activate: Box::new(|_t: &mut ResidentTray| {
                             // Ask the trigger thread to tear the item down + exit (a menu
@@ -337,7 +337,7 @@ fn capture_group_labels() -> Vec<String> {
     crate::recording_ui::capture_menu()
         .into_iter()
         .map(|item| match item.action {
-            CaptureAction::Quit => "Quit Cosmic Capture Kit".to_string(),
+            CaptureAction::Quit => "Quit Cosmic Capture Kit Tray".to_string(),
             _ => item.label.to_string(),
         })
         .collect()
@@ -600,82 +600,24 @@ pub fn run(daemon_intent: bool) -> ! {
     }
 }
 
-// ── Accent colour (dependency-free COSMIC theme read) ─────────────────────────
+// ── Accent colour ─────────────────────────────────────────────────────────────
 //
-// The recording tray tints its icon with `app::theme::active_hint_color`, but that
-// module pulls in the whole `cosmic` crate (its `use cosmic::Theme`), which the resident
-// must NOT link (it is what the lightweight early-branch avoids). So read the accent
-// straight from the COSMIC theme files here — the SAME files `active_hint_color` reads —
-// with plain std, degrading to the cosmic default lavender when absent (off COSMIC, or a
-// missing theme). This keeps the resident tiny while matching the recording tray's tint.
+// The resident tints its tray icon with the app's RESOLVED accent so it can never
+// disagree with the capture children's chrome (or the Windows daemon, which tints from
+// the same resolver). DRAGON-289 folds the Automatic Contrast Boost into that resolver,
+// so a boosted accent must tint a boosted icon — the plain-std COSMIC-file read this used
+// to do can't reproduce the boost's contrast derivation, so it now goes through the
+// shared `resolved_appearance_accent_rgba` instead. That resolver is HEADLESS (pure theme
+// math + a cosmic-config file read, no iced/wgpu), so the resident stays lightweight.
 
-/// The tray tint (DRAGON-179): the app's EFFECTIVE accent — the persisted Theme
-/// override when "System Default" is off and a custom accent is set, else the
-/// system accent via [`accent_rgb`]. Mirrors `App::tray_accent` so the resident's
-/// icon and the capture children's chrome can never disagree. Plain std + the
-/// existing persisted-state loader (no `cosmic` crate — the resident must stay
-/// lightweight; `main` already calls `state::load` on this path for `resident`).
+/// The tray tint (DRAGON-179 / DRAGON-289): the app's EFFECTIVE, RESOLVED accent —
+/// override-vs-system pick AND the Automatic Contrast Boost, exactly as `App::tray_accent`
+/// and the capture children draw it. Re-reads the persisted state fresh each call (the
+/// resolver loads state internally), so a config saved by a separate settings process is
+/// picked up on the next mtime-gated re-tint tick.
 fn effective_accent_rgb() -> [u8; 3] {
-    let p = crate::state::load();
-    if !p.appearance_use_system
-        && let Some(rgb) = p.appearance_accent
-    {
-        return rgb.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-    }
-    accent_rgb()
-}
-
-/// The app accent colour as an RGB triple: the COSMIC `window_hint` override if set,
-/// else `accent`, else the cosmic default lavender. Reads the theme files directly (no
-/// `cosmic` crate) so the resident stays lightweight; the byte-level result matches
-/// `app::theme::active_hint_color`.
-fn accent_rgb() -> [u8; 3] {
-    if let Some(dir) = cosmic_theme_dir() {
-        if let Ok(t) = std::fs::read_to_string(dir.join("window_hint"))
-            && !t.trim_start().starts_with("None")
-            && let Some(c) = parse_rgb(&t)
-        {
-            return c;
-        }
-        if let Ok(t) = std::fs::read_to_string(dir.join("accent"))
-            && let Some(c) = parse_rgb(&t)
-        {
-            return c;
-        }
-    }
-    // The cosmic default lavender (matches `active_hint_color`'s fallback).
-    [151, 125, 236]
-}
-
-/// The active COSMIC theme's config directory (mode-specific: Dark or Light), if the
-/// mode marker is present. Mirrors `platform::linux::cosmic::theme::cosmic_theme_dir` but self-contained.
-fn cosmic_theme_dir() -> Option<std::path::PathBuf> {
-    let cfg = dirs::config_dir()?;
-    let base = cfg.join("cosmic/com.system76.CosmicTheme.Mode/v1");
-    let is_dark = std::fs::read_to_string(base.join("is_dark"))
-        .ok()
-        .map(|t| t.trim() == "true")
-        .unwrap_or(true);
-    let name = if is_dark { "Dark" } else { "Light" };
-    Some(cfg.join(format!("cosmic/com.system76.CosmicTheme.{name}/v1")))
-}
-
-/// Parse a COSMIC theme colour file (`red: <f>`, `green: <f>`, `blue: <f>` in 0..1) into
-/// an RGB triple (0..255). `None` if any component is missing. Mirrors the `parse_rgb`
-/// closure in `app::theme::active_hint_color`.
-fn parse_rgb(text: &str) -> Option<[u8; 3]> {
-    let read = |key: &str| -> Option<f32> {
-        let i = text.find(key)? + key.len();
-        text[i..]
-            .split(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
-            .find(|s| !s.is_empty())
-            .and_then(|s| s.parse::<f32>().ok())
-    };
-    Some([
-        (read("red:")? * 255.0).round() as u8,
-        (read("green:")? * 255.0).round() as u8,
-        (read("blue:")? * 255.0).round() as u8,
-    ])
+    let [r, g, b, _] = crate::app::theme::resolved_appearance_accent_rgba();
+    [r, g, b]
 }
 
 #[cfg(test)]
@@ -712,7 +654,7 @@ mod tests {
                 "Capture Monitor".to_string(),
                 String::new(), // separator
                 "Settings".to_string(),
-                "Quit Cosmic Capture Kit".to_string(),
+                "Quit Cosmic Capture Kit Tray".to_string(),
             ]
         );
     }
@@ -746,7 +688,7 @@ mod tests {
                 "Capture Monitor".to_string(),
                 String::new(), // separator
                 "Settings".to_string(),
-                "Quit Cosmic Capture Kit".to_string(),
+                "Quit Cosmic Capture Kit Tray".to_string(),
             ]
         );
     }
@@ -780,13 +722,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parse_rgb_reads_cosmic_colour_files() {
-        // A COSMIC accent file is a Rust-debug-ish struct dump; we only need the
-        // red/green/blue components in 0..1.
-        let sample = "Srgba { red: 0.592, green: 0.490, blue: 0.925, alpha: 1.0 }";
-        assert_eq!(parse_rgb(sample), Some([151, 125, 236]));
-        // Missing a component → None (caller falls back).
-        assert_eq!(parse_rgb("red: 0.5 green: 0.5"), None);
-    }
 }

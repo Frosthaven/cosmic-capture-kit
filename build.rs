@@ -21,6 +21,28 @@ fn main() {
         println!("cargo:rustc-link-search=framework=/System/Library/PrivateFrameworks");
         build_mrduck();
     }
+    #[cfg(windows)]
+    embed_windows_icon();
+}
+
+/// DRAGON-233 fix 4: embed the multi-resolution `.ico` into the exe so Explorer, the
+/// Start Menu, the taskbar, and the win-dev-install shortcuts all show the app icon.
+/// winres emits a temp `.rc` and drives the SDK/LLVM `rc`; cosmetic-only, so any
+/// failure (missing asset, no `rc`) is a warning, never a build break. cfg(windows),
+/// so Linux/macOS builds never reference winres.
+#[cfg(windows)]
+fn embed_windows_icon() {
+    let ico = "res/icons/cosmic-capture-kit.windows.ico";
+    println!("cargo:rerun-if-changed={ico}");
+    if !std::path::Path::new(ico).exists() {
+        println!("cargo:warning=windows icon {ico} missing — exe will use the default icon");
+        return;
+    }
+    let mut res = winres::WindowsResource::new();
+    res.set_icon(ico);
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=embedding the windows icon failed ({e}) — default icon used");
+    }
 }
 
 #[cfg(target_os = "macos")]

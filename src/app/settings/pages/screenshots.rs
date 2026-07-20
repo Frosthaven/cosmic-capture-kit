@@ -14,10 +14,11 @@ impl crate::app::App {
                 "Save screenshots to",
                 "",
                 widget::row(vec![
-                    widget::text_input("~/Capture", &self.screenshot_dir)
-                        .on_input(|a0| Msg::Settings(SettingsMsg::SetScreenshotDir(a0)))
-                        .width(Length::Fixed(280.0))
-                        .into(),
+                    crate::widgets::hide_when_clipped(
+                        widget::text_input("~/Capture", &self.screenshot_dir)
+                            .on_input(|a0| Msg::Settings(SettingsMsg::SetScreenshotDir(a0)))
+                            .width(Length::Fixed(280.0)),
+                    ),
                     folder_btn(DirTarget::Screenshot),
                 ])
                 .spacing(6.0)
@@ -197,9 +198,11 @@ impl crate::app::App {
                 Item::new(
                     "Custom overlayed text",
                     format!("Covermark SVG loaded from:\n{}", covermark_dir_display()),
-                    widget::text_input("CONFIGURE TEXT IN SETTINGS", &self.covermark_text)
-                        .on_input(|a0| Msg::Settings(SettingsMsg::SetCovermarkText(a0)))
-                        .width(Length::Fixed(280.0)),
+                    crate::widgets::hide_when_clipped(
+                        widget::text_input("CONFIGURE TEXT IN SETTINGS", &self.covermark_text)
+                            .on_input(|a0| Msg::Settings(SettingsMsg::SetCovermarkText(a0)))
+                            .width(Length::Fixed(280.0)),
+                    ),
                 )
                 .reset_with(
                     self.covermark_text.clone(),
@@ -313,4 +316,72 @@ fn covermark_dir_display() -> String {
         return format!("~/{}", rest.display());
     }
     dir.display().to_string()
+}
+
+#[cfg(test)]
+mod parity_tests {
+    //! DRAGON-234 parity contract for this (shared) Screenshots page.
+    //!
+    //! `screenshots_sections` renders each capture-extra row and the whole "Single
+    //! Window Aesthetics" section by gating on the ACTIVE backend's
+    //! `capture_extras()` bits (freeze / cursor / transparency / wallpaper +
+    //! the freeze discriminator). These tests pin the mac-vs-Windows gap table as an
+    //! executable contract, mirroring the two backend `caps()` shapes (backend.rs
+    //! `MacBackend` + platform/windows/backend.rs `WindowsBackend`). If either backend
+    //! flips a capture bit, reconcile the gap table in .dragon229/W5c-notes.md AND this
+    //! test together — a divergence here means the settings UI parity changed.
+    use crate::platform::backend::{Caps, CaptureExtras};
+
+    /// A backend cap shape parameterised on the only two bits that differ between the
+    /// mac and Windows still backends today; every other capture bit is true on both.
+    fn caps(transparency: bool, wallpaper_compose: bool) -> Caps {
+        Caps {
+            name: "test",
+            screenshot: true,
+            record: true,
+            window_list: true,
+            window_capture: true,
+            cursor_session: true,
+            layer_overlay: false,
+            wallpaper_path: true,
+            freeze: true,
+            transparency,
+            wallpaper_compose,
+            fullscreen_aware: true,
+        }
+    }
+
+    /// macOS ScreenCaptureKit backend: every capture-extra advertised.
+    fn mac_extras() -> CaptureExtras {
+        caps(true, true).capture_extras()
+    }
+
+    /// Windows backend: now byte-identical to macOS — per-window transparency is preserved via
+    /// WGC `CreateForWindow` when "Preserve window transparency" is on (DRAGON-276), so the row
+    /// shows just like mac. (Before, PrintWindow rendered opaque and the row was hidden.)
+    fn windows_extras() -> CaptureExtras {
+        caps(true, true).capture_extras()
+    }
+
+    #[test]
+    fn windows_screenshot_extras_match_mac() {
+        // DRAGON-276: Windows now offers every screenshot extra macOS does, including the
+        // "Preserve window transparency" row — the surfaces render identical rows + the Single
+        // Window Aesthetics section.
+        assert_eq!(windows_extras(), mac_extras());
+    }
+
+    #[test]
+    fn windows_advertises_every_other_screenshot_extra() {
+        let win = windows_extras();
+        // freeze gates the "Freeze pixels" row AND the Single Window Aesthetics section
+        // (focus appearance / active+inactive border / drop shadow / padding); cursor,
+        // wallpaper (wallpaper-behind), and the fullscreen-aware skip all ride the shared
+        // compose pipeline — all already wired on Windows.
+        assert!(win.freeze, "freeze row + aesthetics section");
+        assert!(win.cursor, "preserve mouse cursor row");
+        assert!(win.wallpaper, "preserve wallpaper (wallpaper-behind) row");
+        assert!(win.fullscreen_aware, "fullscreen-window compositing skip");
+        assert!(win.transparency, "preserve window transparency row (WGC, DRAGON-276)");
+    }
 }

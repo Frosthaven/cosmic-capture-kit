@@ -13,6 +13,11 @@
 //! macOS (DRAGON-171) reuses the SAME `--duck` babysitter + pipe-EOF contract; its backend lives in
 //! [`duck_mac`] and pauses/resumes the system Now Playing app via a MediaRemote proxy loaded under
 //! `/usr/bin/perl`. Same safety semantics: pause only what's playing, resume only that, crash-safe.
+//!
+//! Windows (DRAGON-283) reuses the SAME babysitter + pipe-EOF contract too; its backend lives in
+//! [`media_control`] and pauses/resumes every Playing GSMTC (Global System Media Transport Controls)
+//! session via `TryPauseAsync`/`TryPlayAsync`. Same safety semantics: pause only what's playing,
+//! resume only those still paused, crash-safe.
 
 #[cfg(target_os = "linux")]
 use std::io::Read;
@@ -26,6 +31,12 @@ use zbus::blocking::{Connection, Proxy};
 // module path stable via `#[path]`.
 #[path = "../platform/mac/services/duck_mac/mod.rs"]
 mod duck_mac;
+
+#[cfg(windows)]
+// Physically under `platform/windows/` (the closed-platform split, DRAGON-226);
+// module path stable via `#[path]`, mirroring `duck_mac`.
+#[path = "../platform/windows/media_control.rs"]
+mod media_control;
 
 pub(crate) const DUCK_FLAG: &str = "--duck";
 
@@ -55,9 +66,19 @@ impl OtherAudioDuck {
     }
 }
 
+/// Windows (DRAGON-283): spawn the same `--duck` babysitter; its child pauses every
+/// Playing GSMTC session and resumes on our EOF. The crash-safety is the identical
+/// pipe-EOF contract as Linux/macOS.
+#[cfg(windows)]
+impl OtherAudioDuck {
+    pub(crate) fn engage() -> Self {
+        Self { child: media_control::spawn_babysitter() }
+    }
+}
+
 /// Other platforms: no public API to pause arbitrary apps, so media ducking is
 /// capability-off. `engage` is an inert guard.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 impl OtherAudioDuck {
     pub(crate) fn engage() -> Self {
         Self { child: None }
@@ -102,9 +123,16 @@ pub(crate) fn run_duck() {
     duck_mac::run_duck();
 }
 
+/// Windows (DRAGON-283): the `--duck` child pauses every Playing GSMTC session, blocks
+/// on stdin, and resumes those still paused on EOF. See [`media_control`].
+#[cfg(windows)]
+pub(crate) fn run_duck() {
+    media_control::run_duck();
+}
+
 /// Other platforms: no media babysitter — nothing to pause. The `--duck` re-exec
 /// is never spawned here, but the entry point must exist.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) fn run_duck() {}
 
 /// `--duck`: pause every MPRIS player that's currently Playing, then wait for our parent to let go

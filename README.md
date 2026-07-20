@@ -13,12 +13,12 @@ video across screen regions, windows, and monitors.
 
 | Platform | Capture backend | Status |
 |---|---|---|
-| Linux (Wayland): COSMIC | Cosmic Compositor w/extras | Supported |
+| macOS 13+ (Apple Silicon) | ScreenCaptureKit Compositor w/extras | ✅ |
+| Windows 11 | Windows Capture w/extras | ✅ |
+| Linux (Wayland): COSMIC | Cosmic Compositor w/extras | ✅ |
 | Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | Planned | Planned |
 | Linux (Wayland): KDE Plasma | PipeWire portal | Planned |
 | Linux (Wayland): GNOME | PipeWire portal | Planned |
-| macOS 13+ (Apple Silicon) | ScreenCaptureKit Compositor w/extras | Supported |
-| Windows 11 | Planned | Planned |
 
 Capture backend extras, where available, include features such as:
 

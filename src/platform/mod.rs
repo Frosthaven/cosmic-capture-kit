@@ -73,10 +73,12 @@
 //!   `platform::mac::window`, `platform::mac::file_panel`, `platform::mac::sck_stream`, etc.
 //!   all keep their paths (see [`mac`]'s own facet index). `tcc.rs`, `wallpaper.rs`,
 //!   `pinch.rs` stay at the `mac/` root.
-//! - **`platform/windows/`**: README scaffold ONLY, not compiled and not a module. It
-//!   enumerates the real fill-in list (which not(linux) arms currently resolve to mac
-//!   stubs, what has no arm at all) for a future Windows port. See
-//!   `platform/windows/README.md`.
+//! - **`platform/windows/`** (DRAGON-229): the Windows plugin, `#[cfg(windows)] pub mod
+//!   windows;`. Holds `backend.rs` (the `CaptureBackend` impl) + `services.rs` (clipboard
+//!   / open / reveal bodies) behind the strict dispatch-only split; `screenshot.rs` is
+//!   `#[path]`-mounted at `crate::screenshot` from `main.rs`. M0 is compile-and-open
+//!   only (honest stubs); M1 (capture) / M2 (delivery) / M3 (recording) fill the bodies.
+//!   The remaining fill-in list is in `platform/windows/README.md`.
 //!
 //! ## Mount registry
 //!
@@ -90,13 +92,17 @@
 //! |--------------|---------------|-------------|-----|--------|
 //! | `crate::screencopy` | `platform/linux/native/screencopy.rs` | `main.rs` | linux | folder-sort |
 //! | `crate::screenshot` | `platform/linux/native/screenshot.rs` | `main.rs` | linux | folder-sort |
-//! | `crate::screenshot` | `platform/mac/screenshot.rs` | `main.rs` | not(linux) | folder-sort |
+//! | `crate::screenshot` | `platform/mac/screenshot.rs` | `main.rs` | macos | folder-sort |
+//! | `crate::screenshot` | `platform/windows/screenshot.rs` | `main.rs` | windows | closed-split (DRAGON-229) |
 //! | `crate::tray` | `platform/linux/tray.rs` | `main.rs` | linux | folder-sort |
 //! | `crate::tray` | `platform/mac/tray.rs` | `main.rs` | macos | folder-sort |
 //! | `crate::tray` | `platform/tray_stub.rs` | `main.rs` | not(linux/macos) | folder-sort |
 //! | `crate::daemon` | `platform/mac/daemon.rs` | `main.rs` | macos | folder-sort |
+//! | `crate::daemon` | `platform/windows/daemon.rs` | `main.rs` | windows | closed-split (DRAGON-237) |
 //! | `crate::daemon_linux` | `platform/linux/daemon.rs` | `main.rs` | linux | folder-sort |
-//! | `crate::daemon_ipc` | `platform/daemon_ipc.rs` | `main.rs` | any(macos,linux) | folder-sort |
+//! | `crate::tray` | `platform/windows/tray.rs` | `main.rs` | windows | closed-split (DRAGON-237) |
+//! | `crate::daemon_ipc` | `platform/daemon_ipc.rs` | `main.rs` | any(macos,linux,windows) | folder-sort |
+//! | `platform::windows_autostart` | `windows/autostart.rs` | `platform/mod.rs` | windows | closed-split (DRAGON-237) |
 //! | `platform::screencast` | `linux/portal/screencast.rs` | `platform/mod.rs` | linux | folder-sort |
 //! | `platform::screencast` | `screencast_stub.rs` | `platform/mod.rs` | not(linux) | type-stub |
 //! | `platform::pipewire` | `linux/portal/pipewire.rs` | `platform/mod.rs` | linux | folder-sort |
@@ -111,10 +117,14 @@
 //! | `platform::mac::env` | `services/env.rs` | `mac/mod.rs` | macos | facet-sort |
 //! | `platform::mac::file_panel` | `services/file_panel.rs` | `mac/mod.rs` | macos | facet-sort |
 //! | `platform::mac::login_item` | `services/login_item.rs` | `mac/mod.rs` | macos | facet-sort |
+//! | `platform::mac::clipboard` | `services/clipboard.rs` | `mac/mod.rs` | macos | closed-split (DRAGON-230) |
+//! | `platform::mac::notify` | `services/notify.rs` | `mac/mod.rs` | macos | closed-split (DRAGON-230) |
+//! | `platform::mac::open` | `services/open.rs` | `mac/mod.rs` | macos | closed-split (DRAGON-230) |
 //! | `platform::mac::sck_stream` | `screencapturekit/sck_stream.rs` | `mac/mod.rs` | macos | facet-sort |
 //! | `record::sck` | `mac/screencapturekit/record_worker.rs` | `record/mod.rs` | macos | closed-split |
 //! | `record::sck_live_tests` | `mac/screencapturekit/record_worker_live_tests.rs` | `record/mod.rs` | test+macos | closed-split |
 //! | `audio::ducking::duck_mac` | `mac/services/duck_mac/mod.rs` | `audio/ducking.rs` | macos | closed-split |
+//! | `audio::ducking::media_control` | `windows/media_control.rs` | `audio/ducking.rs` | windows | closed-split (DRAGON-283) |
 //!
 //! `closed-split` (DRAGON-226): whole mac-native files homed under `platform/mac/` so
 //! `scripts/publish-public.sh` can strip the closed platform plugins from the public
@@ -159,6 +169,10 @@
 /// Wayland) does NOT mean the window server / client has REPAINTED the window's active vs
 /// inactive chrome yet, so grabbing immediately can catch the wrong (e.g. still-gray) state.
 /// One flat wait is simpler and more predictable than re-grabbing and measuring pixels.
+// The focus-then-capture settle runs on Linux (`capture_window_with_focus`), macOS, and
+// Windows (DRAGON-278 `wm/focus.rs` drives a picked window's focus before the grab); only an
+// exotic other target leaves it dead.
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos", windows)), allow(dead_code))]
 pub const WINDOW_ACTIVATION_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 
 pub mod backend;
@@ -177,6 +191,13 @@ pub mod linux;
 // Wayland screencopy client instead, so this only compiles on macOS.
 #[cfg(target_os = "macos")]
 pub mod mac;
+// The Windows platform plugin (DRAGON-229): the capture backend + desktop-service
+// bodies the shared tree dispatches into (strict closed split — see windows/mod.rs).
+// Windows uses Windows.Graphics.Capture / DXGI, not Wayland or SCK, so this only
+// compiles on Windows. `platform/windows/screenshot.rs` is `#[path]`-mounted at
+// `crate::screenshot` from `main.rs` and is deliberately NOT a submodule here.
+#[cfg(target_os = "windows")]
+pub mod windows;
 // Portal ScreenCast + PipeWire consumers are the Linux capture stack (ashpd /
 // libpipewire). macOS captures via ScreenCaptureKit through the mac backend
 // (DRAGON-94), so the real modules don't compile off-Linux. `screencast` keeps a
@@ -201,3 +222,9 @@ pub(crate) mod pixfmt;
 #[cfg(target_os = "linux")]
 #[path = "linux/autostart.rs"]
 pub mod linux_autostart;
+// Launch-at-login on Windows (DRAGON-237): an `HKCU\...\Run` registry value, the
+// counterpart of `mac::login_item` (SMAppService) and `linux_autostart` (XDG). Drives the
+// resident tray daemon back after a login; wired to the same `resident` setting. Windows-only.
+#[cfg(target_os = "windows")]
+#[path = "windows/autostart.rs"]
+pub mod windows_autostart;

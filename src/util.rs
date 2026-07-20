@@ -99,6 +99,52 @@ pub fn ffprobe_path() -> PathBuf {
     locate_tool("ffprobe", "CCK_FFPROBE")
 }
 
+/// Locate the `ffplay` binary (`CCK_FFPLAY` override → exe-adjacent sidecar → PATH, the
+/// same resolution order as [`ffmpeg_path`]). Windows-only: the preview soundtrack renders
+/// through ffplay (SDL2 → default output endpoint) because the bundled Windows ffmpeg has
+/// no pulse muxer and no audio-output device at all, so it can't be the sink (DRAGON-285).
+/// Linux/macOS use `ffmpeg -f pulse`/`-f audiotoolbox` and never call this.
+#[cfg(windows)]
+pub fn ffplay_path() -> PathBuf {
+    locate_tool("ffplay", "CCK_FFPLAY")
+}
+
+/// Build a [`std::process::Command`] that never pops a console window on Windows
+/// (DRAGON-236). A GUI-subsystem process (DRAGON-233) that spawns a CONSOLE-subsystem
+/// child — ffmpeg, ffprobe, tesseract, curl, netsh, cmd, … — makes Windows allocate a
+/// console for that child; it flashes for a tick, and (when the machine's default
+/// terminal is Windows Terminal) a child that is later KILLED leaves a permanent blank
+/// pane behind. `CREATE_NO_WINDOW` (`0x0800_0000`) means no console is ever created for
+/// the child — killed or not. Piped / redirected / null stdio is UNAFFECTED by the flag,
+/// so every `.output()` / `.status()` / piped `.spawn()` keeps working unchanged. Off
+/// Windows this is a plain `Command::new` — Linux/macOS behaviour is byte-identical
+/// (portable glue, like `EXE_SUFFIX`). Route every runtime tool spawn through this (or
+/// the [`ffmpeg_command`] / [`ffprobe_command`] wrappers); our own re-exec of this GUI
+/// binary needs nothing (it is already GUI-subsystem).
+pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // CREATE_NO_WINDOW: the child gets no console, so it never flashes a window and
+        // (being window-less) can never leave a Windows Terminal pane when killed.
+        cmd.creation_flags(0x0800_0000);
+    }
+    cmd
+}
+
+/// [`quiet_command`] for the resolved ffmpeg binary — the console-free spawn seam for
+/// every runtime ffmpeg invocation (DRAGON-236).
+pub fn ffmpeg_command() -> std::process::Command {
+    quiet_command(ffmpeg_path())
+}
+
+/// [`quiet_command`] for the resolved ffprobe binary (DRAGON-236).
+pub fn ffprobe_command() -> std::process::Command {
+    quiet_command(ffprobe_path())
+}
+
 fn locate_tool(name: &str, env_override: &str) -> PathBuf {
     // An explicit override is taken verbatim (user intent, even if the file is
     // missing — a broken override should fail loudly, not silently fall back).
@@ -158,8 +204,27 @@ pub fn tool_available(tool: &Path) -> bool {
         return tool.is_file();
     }
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|d| d.join(tool).is_file()))
+        .map(|paths| std::env::split_paths(&paths).any(|d| dir_has_tool(&d, tool)))
         .unwrap_or(false)
+}
+
+/// Whether directory `d` contains the bare tool `tool` as a file. On Windows the on-disk
+/// file carries `EXE_SUFFIX` (`ffmpeg.exe`) even though `Command::new("ffmpeg")` resolves it
+/// without — so the bare `d/ffmpeg` never exists and a PATH-only ffmpeg would wrongly read as
+/// "missing" (gating recording). Also probe `d/ffmpeg{EXE_SUFFIX}` to match the runtime spawn
+/// (DRAGON-229). On Linux/macOS `EXE_SUFFIX` is empty, so this is byte-identical to the plain
+/// `d.join(tool).is_file()`.
+fn dir_has_tool(d: &Path, tool: &Path) -> bool {
+    if d.join(tool).is_file() {
+        return true;
+    }
+    let suffix = std::env::consts::EXE_SUFFIX;
+    if !suffix.is_empty() {
+        let mut name = tool.as_os_str().to_os_string();
+        name.push(suffix);
+        return d.join(name).is_file();
+    }
+    false
 }
 
 /// Expand a leading `~/` to the user's home directory; every other path passes through.
@@ -198,6 +263,134 @@ mod tests {
     #[test]
     fn file_uri_prefixes_scheme() {
         assert_eq!(path_to_file_uri(Path::new("/a/b c")), "file:///a/b c");
+    }
+
+    // ── Quiet-spawn seam (DRAGON-236) ─────────────────────────────────────────
+
+    #[test]
+    fn quiet_command_sets_the_program() {
+        // The seam is a thin constructor: same program, ready to chain args/stdio. The
+        // Windows CREATE_NO_WINDOW flag is invisible to `get_program` but proven by the
+        // Windows-only spawn test below.
+        assert_eq!(
+            quiet_command("cck-quiet-probe").get_program(),
+            std::ffi::OsStr::new("cck-quiet-probe")
+        );
+    }
+
+    #[test]
+    fn ffmpeg_and_ffprobe_commands_target_the_resolved_binaries() {
+        assert_eq!(ffmpeg_command().get_program(), ffmpeg_path().as_os_str());
+        assert_eq!(ffprobe_command().get_program(), ffprobe_path().as_os_str());
+    }
+
+    // On Windows, CREATE_NO_WINDOW must NOT break spawning or output capture — the flag
+    // only suppresses the console window; inherited/piped stdio is unaffected. `cmd /C
+    // echo` ships on every Windows install, so this proves the seam still runs a real
+    // console tool and captures its stdout.
+    #[cfg(windows)]
+    #[test]
+    fn quiet_command_still_spawns_and_captures_on_windows() {
+        let out = quiet_command("cmd")
+            .args(["/C", "echo", "cck-quiet-probe"])
+            .output()
+            .expect("cmd should spawn under CREATE_NO_WINDOW");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("cck-quiet-probe"));
+    }
+
+    /// DRAGON-236 regression guard: every runtime spawn of a CONSOLE-subsystem tool must
+    /// go through the quiet-command seam ([`quiet_command`] / [`ffmpeg_command`] /
+    /// [`ffprobe_command`]), never a bare `Command::new`. On Windows a GUI-subsystem
+    /// process that spawns a bare console child pops a window and — when that child is
+    /// killed — LEAVES a blank Windows Terminal pane; `CREATE_NO_WINDOW` prevents both.
+    /// This scans the tree and fails if a bare routed-tool spawn creeps back in outside
+    /// the seam. Excluded: the closed mac/linux platform bodies (cfg-gated OFF Windows,
+    /// keeping their own byte-identical native spawns), dedicated `*_tests.rs` files, each
+    /// file's trailing `#[cfg(test)]` block (test helpers spawn tools directly), and any
+    /// hit whose ENCLOSING fn carries a `cfg(target_os = "macos"|"linux")` (a native body
+    /// inside a shared file, not converted per the platform-isolation law).
+    #[test]
+    fn console_tool_spawns_go_through_the_quiet_seam() {
+        // The exact bare-spawn spellings that must never appear outside the seam.
+        const FORBIDDEN: &[&str] = &[
+            "Command::new(crate::util::ffmpeg_path())",
+            "Command::new(crate::util::ffprobe_path())",
+            "Command::new(\"ffmpeg\")",
+            "Command::new(\"ffprobe\")",
+            "Command::new(\"curl\")",
+            "Command::new(\"tesseract\")",
+            "Command::new(\"netsh\")",
+            "Command::new(\"cmd\")",
+            // NOTE: `pactl` is deliberately NOT guarded — it is the Linux (`not(macos)`)
+            // audio-device path; on Windows it simply FAILS TO START (no pactl.exe), so no
+            // console is ever created and there is nothing to flash or leave behind.
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Whole-file mac/linux platform bodies are cfg-gated OFF Windows and
+                    // keep their own native (byte-identical) spawns — not this class.
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name != "mac" && name != "linux" {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.extension().and_then(|e| e.to_str()) != Some("rs")
+                    || fname == "util.rs" // the seam + this guard's own literals
+                    || fname.ends_with("_tests.rs")
+                {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                // Ignore the trailing `#[cfg(test)]` block: test helpers spawn tools
+                // (true/sleep/real ffmpeg) directly and are not a runtime console flash.
+                let scanned = text.split("#[cfg(test)]").next().unwrap_or(&text);
+                let lines: Vec<&str> = scanned.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    if !FORBIDDEN.iter().any(|p| line.contains(p)) {
+                        continue;
+                    }
+                    // A cfg(macos)/cfg(linux) native body inside a shared file keeps its own
+                    // spawn (byte-identical law — not converted). Attribute the hit to its
+                    // ENCLOSING fn (walk up to the nearest fn declaration) and skip it if that
+                    // fn carries a macos/linux cfg on its attribute lines — robust regardless
+                    // of how far the spawn sits below the cfg (e.g. the mac install flow).
+                    let is_fn_decl = |t: &str| {
+                        let t = t.trim_start();
+                        ["fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn ", "async fn ",
+                         "unsafe fn ", "pub async fn "]
+                            .iter()
+                            .any(|p| t.starts_with(p))
+                    };
+                    let gated = (0..i)
+                        .rev()
+                        .find(|&j| is_fn_decl(lines[j]))
+                        .is_some_and(|fl| {
+                            lines[fl.saturating_sub(4)..=fl].iter().any(|l| {
+                                l.contains("cfg(target_os = \"macos\")")
+                                    || l.contains("cfg(target_os = \"linux\")")
+                            })
+                        });
+                    if !gated {
+                        violations.push(format!("{}:{} {}", path.display(), i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "bare console-tool Command::new outside the quiet-command seam — route via \
+             crate::util::{{quiet_command, ffmpeg_command, ffprobe_command}} (DRAGON-236):\n{}",
+            violations.join("\n")
+        );
     }
 
     #[test]
@@ -256,6 +449,57 @@ mod tests {
         assert!(old.exists(), "existing new location must never absorb a merge");
         assert_eq!(std::fs::read(new.join("config.toml")).expect("kept config"), b"old");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Windows (DRAGON-229): the bundled-ffmpeg story is the PORTABLE exe-adjacent
+    // sidecar candidate (`<exe_dir>\ffmpeg.exe` via EXE_SUFFIX) — no Windows-specific
+    // arm exists in `locate_tool` because none is needed. This pins that resolution
+    // empirically against the REAL locate_tool: a sidecar next to the running (test)
+    // executable wins; with it absent, the bare name (PATH lookup) is returned.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn locate_tool_prefers_exe_adjacent_sidecar_then_path_on_windows() {
+        let exe_dir = std::env::current_exe()
+            .expect("test exe path")
+            .parent()
+            .expect("test exe dir")
+            .to_path_buf();
+        // A tool name no other test (and no PATH entry) uses, so parallel tests and a
+        // real ffmpeg install can't interfere.
+        let name = format!("cck-sidecar-probe-{}", std::process::id());
+        let sidecar = exe_dir.join(format!("{name}.exe"));
+        std::fs::write(&sidecar, b"x").expect("write sidecar next to the test exe");
+        assert_eq!(
+            locate_tool(&name, "CCK_SIDECAR_UNSET_FOR_TEST"),
+            sidecar,
+            "an exe-adjacent sidecar must win over the PATH fallback"
+        );
+        std::fs::remove_file(&sidecar).expect("remove sidecar");
+        assert_eq!(
+            locate_tool(&name, "CCK_SIDECAR_UNSET_FOR_TEST"),
+            PathBuf::from(&name),
+            "without the sidecar the bare name (PATH lookup) must come back"
+        );
+    }
+
+    /// `dir_has_tool` must find a bare tool name whose on-disk file carries the platform
+    /// `EXE_SUFFIX` — on Windows the file is `ffmpeg.exe` but `Command::new("ffmpeg")`
+    /// resolves it without, so a bare-only check wrongly reports it missing and gates
+    /// recording (DRAGON-229). On Linux/macOS (empty suffix) this is the plain bare match.
+    #[test]
+    fn dir_has_tool_matches_exe_suffixed_bare_name() {
+        let dir = std::env::temp_dir().join(format!("cck-toolcheck-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk temp dir");
+        // The on-disk file as the OS ships it (bare on unix, `.exe` on windows).
+        let disk = dir.join(format!("cck-fake-tool{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&disk, b"x").expect("write fake tool");
+        assert!(
+            dir_has_tool(&dir, Path::new("cck-fake-tool")),
+            "the bare tool name must resolve to its EXE_SUFFIX file on disk"
+        );
+        assert!(!dir_has_tool(&dir, Path::new("cck-absent-tool")), "an absent tool is not found");
+        let _ = std::fs::remove_file(&disk);
+        let _ = std::fs::remove_dir(&dir);
     }
 
     // The mac locator must find the checked-out static ffmpeg/ffprobe under

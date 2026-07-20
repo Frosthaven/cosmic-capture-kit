@@ -28,12 +28,21 @@ use image::RgbaImage;
 pub const SCREENCOPY_ID: &str = "screencopy";
 pub const PORTAL_ID: &str = "portal";
 pub const SCK_ID: &str = "sck";
+/// Windows Graphics Capture (DRAGON-229). The stable persisted id for the Windows
+/// native backend, named for its planned capture API (Windows.Graphics.Capture /
+/// DXGI Desktop Duplication) — never rename it (it is stored in config.toml).
+pub const WGC_ID: &str = "wgc";
 
 /// The platform's native backend id — what a saved capture-method choice falls
 /// back to when it doesn't exist in this environment, and the screenshot default.
 pub fn native_backend_id() -> &'static str {
     if cfg!(target_os = "linux") {
         SCREENCOPY_ID
+    } else if cfg!(target_os = "windows") {
+        // DRAGON-229: the `else` below assumed macOS (SCK); Windows gets its own
+        // native id. Linux + macOS selection is unchanged (Linux takes the first
+        // arm, macOS falls through to the `else`).
+        WGC_ID
     } else {
         SCK_ID
     }
@@ -449,6 +458,14 @@ pub fn backends(portal_available: bool, ffmpeg: bool) -> Vec<Box<dyn CaptureBack
 #[cfg(target_os = "macos")]
 pub fn backends(_portal_available: bool, ffmpeg: bool) -> Vec<Box<dyn CaptureBackend>> {
     vec![Box::new(MacBackend { ffmpeg })]
+}
+
+/// Windows: the single Windows-Graphics-Capture backend (`portal_available` is
+/// Linux-only). `WindowsBackend`'s impl lives under `platform/windows/` per the strict
+/// closed split; this is the one-line dispatch that registers it. DRAGON-229.
+#[cfg(target_os = "windows")]
+pub fn backends(_portal_available: bool, ffmpeg: bool) -> Vec<Box<dyn CaptureBackend>> {
+    vec![Box::new(crate::platform::windows::backend::WindowsBackend { ffmpeg })]
 }
 
 /// One "Capture method" dropdown's contents, derived from [`backends`]: the stable

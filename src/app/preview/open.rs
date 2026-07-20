@@ -110,13 +110,18 @@ impl App {
         let force_neutral_overlay = self.mac_preview_preopen;
         #[cfg(not(target_os = "macos"))]
         let force_neutral_overlay = self.window_spinner_neutral;
-        // Windows has no overlay preview yet (DRAGON-94 phase 2b), so it always routes
-        // through the portable resizable WINDOW regardless of the setting. Linux
-        // (layer-shell) and macOS (the shielding-level PlainWindows overlay below)
-        // honor `preview_windowed`. The cfg! folds to `false` on Linux and macOS,
-        // keeping both decisions byte-identical to their platform's rule.
+        // Linux (layer-shell), macOS, and now Windows (DRAGON-233 fix 5 — a real
+        // PlainWindows overlay, below) all honor `preview_windowed`. The cfg! folds to
+        // `false` on all three (it only forces the WINDOW on an exotic platform with no
+        // overlay implementation), so their decisions stay byte-identical to before —
+        // and Windows now switches modes from the appearance toggle instead of always
+        // opening a window.
         if (self.preview_windowed && !force_neutral_overlay)
-            || cfg!(all(not(target_os = "linux"), not(target_os = "macos")))
+            || cfg!(all(
+                not(target_os = "linux"),
+                not(target_os = "macos"),
+                not(target_os = "windows")
+            ))
         {
             // Open sized to the media (aspect-matched, no letterbox), from the caller's hint
             // (a fresh region capture knows its pixel size before the decode) or the already-
@@ -183,7 +188,21 @@ impl App {
                     .set_window_title(super::shell::PREVIEW_OVERLAY_TITLE.to_string(), id);
                 (id, Task::batch([open, title]), size, PreviewSurface::Overlay)
             }
-            #[cfg(not(target_os = "macos"))]
+            // Windows (DRAGON-233 fix 5): the fullscreen OVERLAY preview — a transparent
+            // always-on-top window covering the capture's display (the pointer's for
+            // `--preview --overlay`, which has no capture anchor), placed + shown natively
+            // AFTER open (`shell::preview_overlay_window` → `finalize_preview_overlay` →
+            // `place_overlay`, which OR-s in the komorebi opt-out bit before the show).
+            #[cfg(target_os = "windows")]
+            {
+                let (pos, size) =
+                    crate::platform::windows::window::preview_overlay_rect(output.as_deref());
+                let (id, open) = super::shell::preview_overlay_window(pos, size);
+                let title = self
+                    .set_window_title(super::shell::PREVIEW_OVERLAY_TITLE.to_string(), id);
+                (id, Task::batch([open, title]), size, PreviewSurface::Overlay)
+            }
+            #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
             {
                 let id = window::Id::unique();
                 let task = match output {
@@ -566,7 +585,16 @@ impl App {
             // macOS (DRAGON-146): native traffic lights own close/min/zoom (kept +
             // centred in `finalize_preview_window`), so no CSD window buttons here;
             // native close routes through WindowCloseRequested → preview Cancel.
-            #[cfg(not(target_os = "macos"))]
+            // Windows (DRAGON-284): the native DWM caption buttons (installed post-show in
+            // `finalize_preview_window`) likewise own close/minimize/maximize, so OMIT the
+            // CSD buttons and reserve the trailing `WIN_CAPTION_INSET` spacer so the header
+            // content clears the cluster. Native ✕ → WindowCloseRequested → preview Cancel;
+            // the header double-click → the same native `toggle_maximize` as the max button.
+            #[cfg(windows)]
+            let header = header.end(
+                widget::Space::new().width(Length::Fixed(crate::app::settings::WIN_CAPTION_INSET)),
+            );
+            #[cfg(all(not(target_os = "macos"), not(windows)))]
             let header = header
                 .on_close(Msg::Preview(PreviewMsg::Cancel))
                 .on_maximize(Msg::Preview(PreviewMsg::WindowMaximize))
@@ -593,6 +621,10 @@ impl App {
                 .height(Length::Fill)
                 .class(cosmic::theme::Container::custom(move |theme| {
                     let cosmic = theme.cosmic();
+                    // Windows (DRAGON-276): DWM rounds the window (DWMWCP_ROUND); don't double-
+                    // round the outer container (thick corner). Fill square, DWM rounds. See the
+                    // matching note in `settings::config_window_view`.
+                    #[cfg(not(windows))]
                     let radius = crate::app::theme::rounding(theme).window();
                     cosmic::iced::widget::container::Style {
                         background: Some(Background::Color(crate::app::theme::frost_color(
@@ -602,6 +634,9 @@ impl App {
                         border: Border {
                             color: cosmic.bg_divider().into(),
                             width: 1.0,
+                            #[cfg(windows)]
+                            radius: 0.0.into(),
+                            #[cfg(not(windows))]
                             radius: radius.into(),
                         },
                         ..Default::default()

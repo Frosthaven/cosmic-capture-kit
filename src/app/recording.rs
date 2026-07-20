@@ -172,6 +172,35 @@ impl App {
         self.encoders.set_preferred(id);
     }
 
+    /// Windows (DRAGON-238): kick the encoder probe OFF the UI thread if it hasn't run
+    /// yet, so opening the settings video / Health page never blocks on the `ffmpeg
+    /// -encoders` scan plus the hardware probe-encodes (seconds). The result lands as
+    /// `SettingsMsg::EncodersProbed` and fills the process-wide cache; until then the video
+    /// page shows a placeholder. A no-op if already probed or a probe is already in flight.
+    /// Linux/mac never call this — their first read probes synchronously (timing untouched).
+    #[cfg(windows)]
+    pub(in crate::app) fn kick_encoder_probe(&self) -> Task<cosmic::Action<Msg>> {
+        if !self.encoders.begin_probe() {
+            return Task::none();
+        }
+        Task::perform(
+            async {
+                tokio::task::spawn_blocking(crate::app::EncoderResolve::probe_list)
+                    .await
+                    .unwrap_or_default()
+            },
+            |list| cosmic::Action::App(Msg::Settings(SettingsMsg::EncodersProbed(list))),
+        )
+    }
+
+    /// Windows (DRAGON-238): a non-blocking peek at the probed encoder list (`None` until
+    /// the off-thread probe finishes) — the settings video page renders a placeholder
+    /// until it lands, instead of blocking the UI thread on the first read.
+    #[cfg(windows)]
+    pub(in crate::app) fn encoders_peek(&self) -> Option<&[crate::encode::EncoderInfo]> {
+        self.encoders.peek()
+    }
+
     /// The encoder a recording will actually use right now — software when hardware
     /// encoding is off, otherwise the preferred encoder (resolved to the best
     /// available when it isn't a concrete id). Drives which preset row the settings
@@ -296,11 +325,11 @@ impl App {
         // test running double-captures the device and burns CPU on a preview nobody is
         // looking at during a recording — close it first.
         self.close_mic_test();
-        // macOS (Bug B): release the armed-idle system-audio metering capture BEFORE the
-        // recording's owned SCK capture starts — the single SCK system-audio stream must
-        // not be claimed by two captures at once. The recording capture then owns the
-        // meter (publishing its own RMS); this hands over race-free.
-        #[cfg(target_os = "macos")]
+        // macOS (Bug B) / Windows (DRAGON-248): release the armed-idle system-audio metering
+        // capture BEFORE the recording's owned capture starts — the system-audio stream must
+        // not be claimed by two captures at once. The recording capture then owns the meter
+        // (publishing its own RMS); this hands over race-free.
+        #[cfg(any(target_os = "macos", windows))]
         self.stop_sys_idle_meter();
         // Push the current mic cleanup settings so the recording's ffmpeg captures the
         // cleaned mic (the spawn reads this global, like the mic source).
@@ -388,6 +417,10 @@ impl App {
             // Linux never sees this field (it's cfg'd out), so its literal is unchanged.
             #[cfg(target_os = "macos")]
             mac_target: mac_record_target(&rec),
+            // Windows WGC target (DRAGON-229): the analog of `mac_target` — window /
+            // monitor / region. Linux/mac never see this field (cfg'd out).
+            #[cfg(windows)]
+            win_target: win_record_target(&rec),
             settings: crate::record::RecordSettings {
                 fps: self.record_fps.value,
                 preferred_encoder: preferred_encoder.clone(),
@@ -425,17 +458,15 @@ impl App {
         self.recreate_active_overlays()
     }
 
-    /// The tray glyph tint (DRAGON-179): the app's EFFECTIVE accent — the Theme
-    /// override when "System Default" is off and a custom accent is set, otherwise
-    /// the system trim colour (`active_hint_color`) — so the icon always matches
-    /// the chrome the app actually draws.
+    /// The tray glyph tint (DRAGON-179): the app's EFFECTIVE, RESOLVED accent — the same
+    /// colour the chrome actually draws — so the icon can never disagree with it. Routed
+    /// through [`theme::resolved_appearance_accent_rgba`] (DRAGON-289) so the Automatic
+    /// Contrast Boost applies here in lockstep with the fills/text (and with the resident
+    /// daemon, which tints from the same resolver): a boosted accent tints a boosted icon.
+    /// The resolver already folds in the override-vs-system pick, so this no longer reads
+    /// the raw persisted override directly.
     fn tray_accent(&self) -> [u8; 3] {
-        if !self.appearance_use_system
-            && let Some(rgb) = self.appearance_accent
-        {
-            return rgb.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
-        }
-        let [r, g, b, _] = active_hint_color();
+        let [r, g, b, _] = crate::app::theme::resolved_appearance_accent_rgba();
         [r, g, b]
     }
 
@@ -720,6 +751,23 @@ pub(super) fn mac_record_target(sel: &Selection) -> crate::record::MacRecordTarg
         crate::record::MacRecordTarget::Display(name.clone())
     } else {
         crate::record::MacRecordTarget::Region
+    }
+}
+
+/// Map a resolved [`Selection`] to its Windows WGC recording target (DRAGON-229): a picked
+/// window (`window_id`, an `HWND` decimal string) records that window directly
+/// (occlusion-independent); a monitor selection (`output`, a `\\.\DISPLAYn` name) records
+/// the whole monitor; anything else is a region crop. Window id wins over output (the
+/// precedence is explicit). Mirrors [`mac_record_target`]; the `HWND` id stays a STRING
+/// (isize, wider than u32).
+#[cfg(windows)]
+pub(super) fn win_record_target(sel: &Selection) -> crate::record::WinRecordTarget {
+    if let Some(id) = sel.window_id.as_deref().filter(|s| s.parse::<isize>().is_ok()) {
+        crate::record::WinRecordTarget::Window(id.to_string())
+    } else if let Some(name) = &sel.output {
+        crate::record::WinRecordTarget::Display(name.clone())
+    } else {
+        crate::record::WinRecordTarget::Region
     }
 }
 

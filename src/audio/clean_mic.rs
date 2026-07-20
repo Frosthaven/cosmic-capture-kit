@@ -7,7 +7,7 @@
 //! module used to ALSO export for the legacy recording path; the tap mode is the
 //! only recording consumer now.)
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
 use super::filters::aec::FarEndRing;
@@ -22,12 +22,30 @@ use super::filters::aec::FarEndRing;
 /// `PR_SET_PDEATHSIG` keeps it from orphaning if we exit (Linux only). Returns the child
 /// plus its piped stdout, or None if ffmpeg won't start.
 fn spawn_pulse_pcm(source: &str) -> Option<(Child, std::process::ChildStdout)> {
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-hide_banner", "-loglevel", "error"]);
-    #[cfg(not(target_os = "macos"))]
+    // Linux: PulseAudio source. macOS: an avfoundation device NAME (leading colon =
+    // audio-only). Windows (DRAGON-229 M3): a DirectShow capture device — the stable
+    // ALTERNATIVE name (resolved from the persisted/`default` source by the platform body;
+    // format normalized to mono 48k f32 below, so the DSP chain downstream is untouched).
+    #[cfg(target_os = "linux")]
     cmd.args(["-f", "pulse", "-i", source]);
     #[cfg(target_os = "macos")]
     cmd.args(["-f", "avfoundation", "-i", &format!(":{source}")]);
+    #[cfg(windows)]
+    {
+        let dev = crate::platform::windows::audio::resolve_mic_device(source)?;
+        // `audio_buffer_size` (ms) is THE dshow latency knob: without it, DirectShow hands
+        // ffmpeg the device's DEFAULT capture buffer, typically a multiple of ~500ms, so PCM
+        // arrives in ~500ms bursts — the recording mic's first blocks land hundreds of ms
+        // behind the media clock (dropped as "late") and the on-button meter only refreshes
+        // ~twice a second (DRAGON-248 bug 1: the gradient "barely moves"). A 50ms buffer makes
+        // dshow deliver ~50ms chunks, matching the ~25ms pulse fragments / small avfoundation
+        // buffers the Linux/mac arms get, so the meter animates smoothly and the mic stream
+        // stays close to real time. It is small enough for low latency yet comfortably above a
+        // shared-mode device period, so it does not risk dropouts. (Input option → before `-i`.)
+        cmd.args(["-f", "dshow", "-audio_buffer_size", "50", "-i", &format!("audio={dev}")]);
+    }
     cmd.args(["-ac", "1", "-ar", "48000", "-f", "f32le", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -56,6 +74,11 @@ fn spawn_pulse_pcm(source: &str) -> Option<(Child, std::process::ChildStdout)> {
 /// drains (the DRAGON-118 wedge) — is SIGKILLed so the stop tail can't hang. Returns
 /// whether the graceful path won (the flushed tail made it out).
 fn term_then_wait(child: &mut Child) -> bool {
+    // DRAGON-229: SIGTERM (the graceful "flush your tail and exit" ask) is POSIX-only;
+    // Windows has no signal equivalent, so the bounded wait below simply falls through
+    // to `child.kill()` (TerminateProcess). This mic-cleanup path does not run on
+    // Windows in M0 (no audio capture yet); the M3 audio path revisits graceful stop.
+    #[cfg(unix)]
     if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
         let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
     }

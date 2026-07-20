@@ -73,7 +73,7 @@ pub(crate) struct SyncMeasurement {
 pub(crate) fn video_luma_series(path: &Path, fps_hint: f64) -> Option<Vec<(f64, f32)>> {
     let fps = if fps_hint.is_finite() && fps_hint > 0.0 { fps_hint } else { SAMPLE_FPS };
     let vf = format!("scale={LUMA_W}:{LUMA_H},fps={fps},format=gray");
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-v", "error", "-i"])
         .arg(path)
         .args(["-vf", &vf, "-f", "rawvideo", "pipe:1"]);
@@ -99,7 +99,7 @@ pub(crate) fn video_luma_series(path: &Path, fps_hint: f64) -> Option<Vec<(f64, 
 /// that's what keeps a time-shifted stream's offset measurable (a raw sample
 /// pipe otherwise starts at the first sample, silently dropping it).
 pub(crate) fn audio_rms_series(path: &Path) -> Option<Vec<(f64, f32)>> {
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-v", "error", "-i"])
         .arg(path)
         // a:0, not a: a raw sample pipe can only carry ONE stream.
@@ -149,7 +149,7 @@ fn run_pipe(mut cmd: Command) -> Option<Vec<u8>> {
 
 /// A stream's container start time (seconds) via ffprobe; 0 when absent/unparseable.
 fn stream_start(path: &Path, selector: &str) -> f64 {
-    let out = Command::new(crate::util::ffprobe_path())
+    let out = crate::util::ffprobe_command()
         .args([
             "-v", "error",
             "-select_streams", selector,
@@ -278,7 +278,7 @@ pub(crate) fn write_sync_clip(out: &Path) -> Result<(), String> {
                  enable='between(t,1,1.1)+between(t,2.5,2.6)+between(t,4,4.1)+between(t,5.5,5.6)'";
     let audio = "aevalsrc='0.8*sin(2*PI*1000*t)*(between(t,1,1.08)+between(t,2.5,2.58)\
                  +between(t,4,4.08)+between(t,5.5,5.58))':s=48000:d=6";
-    let status = Command::new(crate::util::ffmpeg_path())
+    let status = crate::util::ffmpeg_command()
         .args(["-v", "error", "-y", "-f", "lavfi", "-i", video, "-f", "lavfi", "-i", audio])
         .args(["-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p"])
         .args(["-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-shortest"])

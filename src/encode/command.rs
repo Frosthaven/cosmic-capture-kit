@@ -84,7 +84,7 @@ pub fn bench_encoder_pipeline(
     let Some(plan) = EncodePlan::for_backend(backend, w, h, presets) else {
         return BenchScore::default();
     };
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     // `-benchmark` prints `bench: utime=…s stime=…s rtime=…s` at info level on
     // exit — the CPU-cost source. `-nostats` keeps the per-frame progress line
     // out of stderr so the drain stays tiny.
@@ -227,7 +227,7 @@ fn build_media_clock_command(
     mic_fifo: &std::path::Path,
     sys_fifo: &std::path::Path,
 ) -> Command {
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     for (k, v) in &plan.env {
         cmd.env(k, v);
@@ -337,7 +337,7 @@ fn build_media_clock_encoded_command(
     mic_fifo: &std::path::Path,
     sys_fifo: &std::path::Path,
 ) -> Command {
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     let demux = if hevc { "hevc" } else { "h264" };
     cmd.args(["-fflags", "+genpts"])

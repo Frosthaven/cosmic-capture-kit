@@ -197,15 +197,16 @@ impl App {
                 self.settings.rebinding = None;
                 Task::none()
             }
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             SettingsMsg::SetResident(b) => {
                 // Residency is a SEPARATE tray/menu-bar RESIDENT process (macOS
-                // `crate::daemon`, Linux `crate::daemon_linux`, DRAGON-173), so flipping
-                // this drives the resident's lifecycle directly — the tray item
-                // appears/disappears immediately, no relaunch. The spawn / SIGTERM
-                // plumbing is portable (a detached bare launch early-branches to the
-                // resident; SIGTERM the resident lock-holder to stop it); only the
-                // launch-at-login backend differs per OS (SMAppService vs XDG autostart).
+                // `crate::daemon`, Linux `crate::daemon_linux`, Windows `crate::daemon`
+                // (DRAGON-237)), so flipping this drives the resident's lifecycle directly —
+                // the tray item appears/disappears immediately, no relaunch. The spawn / quit
+                // plumbing is portable (a detached bare launch early-branches to the resident;
+                // the resident-lock holder is signalled to stop — SIGTERM on unix, a named
+                // event on Windows); only the launch-at-login backend differs per OS
+                // (SMAppService / XDG autostart / HKCU Run).
                 self.resident = b;
                 self.save_state();
                 if b {
@@ -243,6 +244,14 @@ impl App {
                             log::info!("resident on: wrote XDG autostart entry");
                         }
                     }
+                    #[cfg(target_os = "windows")]
+                    if !crate::platform::windows_autostart::is_enabled() {
+                        if let Err(e) = crate::platform::windows_autostart::set(true) {
+                            log::warn!("resident on: autostart registry write failed: {e}");
+                        } else {
+                            log::info!("resident on: wrote HKCU Run autostart value");
+                        }
+                    }
                 } else {
                     // Turn OFF: ask the running resident to exit (SIGTERM the resident-lock
                     // holder) so the tray item disappears now; harmless no-op if none up.
@@ -266,6 +275,14 @@ impl App {
                             log::warn!("resident off: autostart entry remove failed: {e}");
                         } else {
                             log::info!("resident off: removed XDG autostart entry");
+                        }
+                    }
+                    #[cfg(target_os = "windows")]
+                    if crate::platform::windows_autostart::is_enabled() {
+                        if let Err(e) = crate::platform::windows_autostart::set(false) {
+                            log::warn!("resident off: autostart registry remove failed: {e}");
+                        } else {
+                            log::info!("resident off: removed HKCU Run autostart value");
                         }
                     }
                 }
@@ -356,6 +373,15 @@ impl App {
                     self.set_preferred_encoder(id);
                     self.save_state();
                 }
+                Task::none()
+            }
+            // Windows (DRAGON-238): the off-thread encoder probe finished — store the list
+            // (idempotent) and refresh the Health nav icon, since the HwEncoder row only
+            // becomes knowable now. The video/Health pages re-render off the filled cache.
+            #[cfg(windows)]
+            SettingsMsg::EncodersProbed(list) => {
+                self.encoders.finish_probe(list);
+                self.update_health_nav_icon();
                 Task::none()
             }
             SettingsMsg::SetBenchMonitor(i) => {
@@ -610,6 +636,11 @@ impl App {
                 self.save_state();
                 self.apply_appearance_task()
             }
+            SettingsMsg::SetAppearanceContrastBoost(b) => {
+                self.appearance_contrast_boost = b;
+                self.save_state();
+                self.apply_appearance_task()
+            }
             SettingsMsg::ToggleAccentEditor(open) => {
                 if open {
                     // Seed the picker with the current accent so it opens on the live
@@ -676,48 +707,59 @@ impl App {
                 self.save_state();
                 Task::none()
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             SettingsMsg::SetCaptureHotkey(spec) => {
                 // Persist the raw text as typed. The daemon falls back to the default if
-                // it can't be parsed, so a half-typed spec is never dangerous. We restart
-                // the running daemon when the new spec PARSES (a recorded chord or the
-                // restore-default), OR is CLEARED (the "x" — the daemon should come up
-                // with no global hotkey); a merely-invalid spec leaves the daemon on its
-                // last-good key rather than resetting it out from under the user.
+                // it can't be parsed, so a half-typed spec is never dangerous.
                 //
                 // PrintScreen is recordable despite the daemon owning it: while the chord
-                // recorder is armed, `sub_hotkey_suspend_ping` pings the daemon (SIGUSR2)
-                // every ~1s, which UN-registers its PrintScreen (+ F13) Carbon hotkey for
-                // ~3s (extended per ping, auto-resumed on expiry — see `crate::daemon`
-                // SuspendWindow). So a PrintScreen pressed during recording reaches THIS
-                // app and is captured like any other key, then the daemon re-registers a
-                // couple of seconds after recording ends. Restore-default remains as a
-                // no-keypress way to re-select PrintScreen.
-                let apply = crate::daemon::hotkey_spec_is_valid(&spec)
-                    || crate::daemon::hotkey_spec_is_cleared(&spec);
+                // recorder is armed, `sub_hotkey_suspend_ping` pings the daemon (SIGUSR2 on
+                // macOS, the named SUSPEND event on Windows) every ~1s, which UN-registers
+                // its capture hotkey for ~3s (extended per ping, auto-resumed on expiry —
+                // see `crate::daemon` SuspendWindow). So a PrintScreen pressed during
+                // recording reaches THIS app and is captured like any other key, then the
+                // daemon re-registers a couple of seconds after recording ends.
+                // Restore-default remains as a no-keypress way to re-select PrintScreen.
                 self.capture_hotkey = spec;
+                // Persist the new spec. On Windows this is the WHOLE job (DRAGON-259): the
+                // running daemon's config-mtime poll notices the changed spec and re-registers
+                // the global hotkey IN PLACE — no quit, no respawn. The old code SIGTERM'd +
+                // respawned the daemon here, but the Windows single-instance mutex has no
+                // acquire retry, so the respawn raced the still-terminating old daemon, found
+                // the mutex held, and self-exited — the tray VANISHED on every hotkey change.
                 self.save_state();
-                if apply && self.resident {
-                    // Restart-the-daemon (the SetResident plumbing pattern): SIGTERM the
-                    // running daemon so it exits, then spawn a fresh detached daemon that
-                    // re-reads the now-persisted spec at startup. If none is running the
-                    // signal is a harmless no-op and the respawn just brings one up (it
-                    // early-branches to `daemon::run` because `resident` is persisted on).
-                    if crate::instance::signal_daemon_quit() {
-                        log::info!("capture hotkey changed: signalled the daemon to restart");
-                    }
-                    if let Ok(exe) = std::env::current_exe() {
-                        match std::process::Command::new(&exe).spawn() {
-                            Ok(child) => {
-                                log::info!("capture hotkey changed: respawned daemon (pid {})", child.id())
+                // macOS keeps the restart-the-daemon path: its Carbon hotkey can't be
+                // re-registered from this settings process, and its lock retry makes the
+                // respawn race-safe. Restart when the new spec PARSES (a recorded chord or the
+                // restore-default) OR is CLEARED (the "x" — the daemon should come up with no
+                // global hotkey); a merely-invalid spec leaves the daemon on its last-good key
+                // rather than resetting it out from under the user.
+                #[cfg(target_os = "macos")]
+                {
+                    let apply = crate::daemon::hotkey_spec_is_valid(&self.capture_hotkey)
+                        || crate::daemon::hotkey_spec_is_cleared(&self.capture_hotkey);
+                    if apply && self.resident {
+                        // Restart-the-daemon (the SetResident plumbing pattern): SIGTERM the
+                        // running daemon so it exits, then spawn a fresh detached daemon that
+                        // re-reads the now-persisted spec at startup. If none is running the
+                        // signal is a harmless no-op and the respawn just brings one up (it
+                        // early-branches to `daemon::run` because `resident` is persisted on).
+                        if crate::instance::signal_daemon_quit() {
+                            log::info!("capture hotkey changed: signalled the daemon to restart");
+                        }
+                        if let Ok(exe) = std::env::current_exe() {
+                            match std::process::Command::new(&exe).spawn() {
+                                Ok(child) => {
+                                    log::info!("capture hotkey changed: respawned daemon (pid {})", child.id())
+                                }
+                                Err(e) => log::warn!("capture hotkey changed: daemon respawn failed: {e}"),
                             }
-                            Err(e) => log::warn!("capture hotkey changed: daemon respawn failed: {e}"),
                         }
                     }
                 }
                 Task::none()
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             SettingsMsg::BeginCaptureHotkeyRebind => {
                 // Toggle: clicking the row that's already recording cancels it. Clear any
                 // in-app rebind so the two capture modes are never armed at once.
@@ -732,7 +774,7 @@ impl App {
                 }
                 Task::none()
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             SettingsMsg::SuspendDaemonHotkeyPing => {
                 // Fire-and-forget: keep the daemon's hotkey suspended while recording.
                 // Only meaningful with a running daemon; a no-op otherwise.
@@ -877,12 +919,12 @@ impl App {
                 }
                 Task::none()
             }
-            #[cfg_attr(target_os = "macos", allow(clippy::needless_return))]
+            #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(clippy::needless_return))]
             SettingsMsg::UpdateDialogNow => {
                 // Apply the checkbox (Don't remind me again -> notify_updates OFF),
                 // dismiss the dialog, then run the platform update flow using the
-                // dialog's own captured `info`: the macOS one-click install, or the
-                // Linux release-page link. Same flows the About buttons drive (no drift).
+                // dialog's own captured `info`: the macOS/Windows one-click install, or
+                // the Linux release-page link. Same flows the About buttons drive (no drift).
                 let dismissed = self.dismiss_update_dialog();
                 // Land on the About page so the install progress ("Installing...")
                 // and the release notes are in view after the click.
@@ -918,7 +960,36 @@ impl App {
                         },
                     );
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(target_os = "windows")]
+                {
+                    // Windows one-click install (DRAGON-287), keyed off the dialog's own info.
+                    let Some(info) = dismissed.map(|d| d.info) else {
+                        return Task::none();
+                    };
+                    if info.artifact.is_none() || self.update_installing {
+                        return Task::none();
+                    }
+                    self.update_installing = true;
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                crate::update::install_windows(&info)
+                            })
+                            .await
+                            .unwrap_or_else(|_| {
+                                crate::update::InstallOutcome::Failed(
+                                    "The update install could not run.".to_string(),
+                                )
+                            })
+                        },
+                        |outcome| {
+                            cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
+                                outcome,
+                            )))
+                        },
+                    );
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 {
                     // Linux has no one-click yet: open the project releases page, the
                     // exact same destination as the About page's "Open releases" link.
@@ -935,9 +1006,10 @@ impl App {
             // The macOS block ends in `return`, but the `#[cfg(not)]` tail after it
             // makes the block a statement (not the arm's tail expr), so the return is
             // required there; Linux compiles only the tail. Mirrors `seed_outputs_mac`.
-            #[cfg_attr(target_os = "macos", allow(clippy::needless_return))]
+            #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(clippy::needless_return))]
             SettingsMsg::InstallUpdate => {
-                // One-click install (macOS only, no published Linux artifact yet).
+                // One-click install: macOS (dmg swap) + Windows (silent MSI, DRAGON-287).
+                // Linux has no published artifact yet, so it falls through to a no-op.
                 #[cfg(target_os = "macos")]
                 {
                     let crate::update::UpdateStatus::Available(info) = self.update_status.clone()
@@ -967,7 +1039,36 @@ impl App {
                         },
                     );
                 }
-                #[cfg(not(target_os = "macos"))]
+                #[cfg(target_os = "windows")]
+                {
+                    let crate::update::UpdateStatus::Available(info) = self.update_status.clone()
+                    else {
+                        return Task::none();
+                    };
+                    if info.artifact.is_none() || self.update_installing {
+                        return Task::none();
+                    }
+                    self.update_installing = true;
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                crate::update::install_windows(&info)
+                            })
+                            .await
+                            .unwrap_or_else(|_| {
+                                crate::update::InstallOutcome::Failed(
+                                    "The update install could not run.".to_string(),
+                                )
+                            })
+                        },
+                        |outcome| {
+                            cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
+                                outcome,
+                            )))
+                        },
+                    );
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
                 Task::none()
             }
             SettingsMsg::UpdateInstallDone(outcome) => {
@@ -975,10 +1076,10 @@ impl App {
                 match outcome {
                     crate::update::InstallOutcome::Staged => {
                         // The swap helper is armed and waiting for this app AND the
-                        // daemon to fully exit before swapping /Applications and
-                        // relaunching. Signal the daemon to quit (so its lock clears
-                        // and the helper's wait completes), then exit this app.
-                        #[cfg(target_os = "macos")]
+                        // daemon to fully exit before installing (mac: swap /Applications;
+                        // Windows: msiexec) and relaunching. Signal the daemon to quit (so
+                        // its lock clears and the helper's wait completes), then exit this app.
+                        #[cfg(any(target_os = "macos", target_os = "windows"))]
                         crate::instance::signal_daemon_quit();
                         self.quit_now()
                     }
@@ -1039,6 +1140,7 @@ impl App {
             self.appearance_mode,
             self.appearance_accent,
             self.appearance_roundness,
+            self.appearance_contrast_boost,
         )
     }
 }

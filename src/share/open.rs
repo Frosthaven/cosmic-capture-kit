@@ -42,21 +42,32 @@ pub fn run_open_uri(uri: &str) {
     let _ = portal_open_uri(uri);
 }
 
-/// macOS: hand the URI to LaunchServices via `open`.
+/// macOS (DRAGON-230): dispatch to the LaunchServices `open` body under
+/// `platform/mac/` (closed split).
 #[cfg(target_os = "macos")]
 pub fn run_open_uri(uri: &str) {
-    let _ = Command::new("open").arg(uri).spawn();
+    crate::platform::mac::open::run_open_uri(uri);
 }
 
-/// macOS: reveal the file in Finder (`open -R`). Mirrors
-/// `NSWorkspace.activateFileViewerSelecting`, which DRAGON-94 phase 4 may adopt.
+/// Windows (DRAGON-229): dispatch to the shell-launch body under `platform/windows/`
+/// (closed split).
+#[cfg(target_os = "windows")]
+pub fn run_open_uri(uri: &str) {
+    crate::platform::windows::services::run_open_uri(uri);
+}
+
+/// macOS (DRAGON-230): dispatch to the Finder reveal (`open -R`) body under
+/// `platform/mac/` (closed split).
 #[cfg(target_os = "macos")]
 pub fn run_reveal(path: &Path) {
-    if Command::new("open").arg("-R").arg(path).spawn().is_err()
-        && let Some(dir) = path.parent()
-    {
-        let _ = Command::new("open").arg(dir).spawn();
-    }
+    crate::platform::mac::open::run_reveal(path);
+}
+
+/// Windows (DRAGON-229): dispatch to the Explorer reveal body under `platform/windows/`
+/// (closed split).
+#[cfg(target_os = "windows")]
+pub fn run_reveal(path: &Path) {
+    crate::platform::windows::services::run_reveal(path);
 }
 
 /// Open the default file manager with the file highlighted, falling back to

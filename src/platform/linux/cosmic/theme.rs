@@ -54,35 +54,6 @@ pub(crate) fn theme_is_dark() -> bool {
         .unwrap_or(true)
 }
 
-/// The active-window hint colour: `window_hint` if set, else the accent colour
-/// (matching cosmic-comp's `active_window_hint`). RGBA, opaque. Falls back to the
-/// cosmic default lavender. Read for the Linux system-accent default of the
-/// reconstructed Active window-capture border (`crate::decoration::accent_rgba`,
-/// DRAGON-191) and for the resident tray icon tint.
-pub(crate) fn active_hint_color() -> [u8; 4] {
-    let parse_rgb = |t: &str| -> Option<[u8; 4]> {
-        Some([
-            (read_f32_after(t, "red:")? * 255.0).round() as u8,
-            (read_f32_after(t, "green:")? * 255.0).round() as u8,
-            (read_f32_after(t, "blue:")? * 255.0).round() as u8,
-            255,
-        ])
-    };
-    if let Some(dir) = cosmic_theme_dir() {
-        // window_hint overrides the accent when set (not "None").
-        if let Ok(t) = std::fs::read_to_string(dir.join("window_hint"))
-            && !t.trim_start().starts_with("None")
-                && let Some(c) = parse_rgb(&t) {
-                    return c;
-                }
-        if let Ok(t) = std::fs::read_to_string(dir.join("accent"))
-            && let Some(c) = parse_rgb(&t) {
-                return c;
-            }
-    }
-    [151, 125, 236, 255]
-}
-
 // ── Frosted-glass ("liquid glass") config ────────────────────────────────────
 // COSMIC's frosted windows (cosmic-settings → Appearance → Style): the
 // compositor blurs the backdrop behind an opted-in surface, and the theme paints

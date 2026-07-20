@@ -1,3 +1,10 @@
+// DRAGON-233 fix 1: link the Windows binary as a GUI-subsystem app so a launch from
+// Start Menu / the komorebi hotkey / PrintScreen never pops (or flashes) a console
+// window. CLI output for terminal launches is restored explicitly via
+// `platform::windows::console::attach_parent_console` (called first-thing in `main`).
+// A crate-level inner attribute, so it sits above every item; a no-op off Windows.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod app;
 mod audio;
 mod mixer;
@@ -12,8 +19,15 @@ mod screencopy;
 #[cfg(target_os = "linux")]
 #[path = "platform/linux/native/screenshot.rs"]
 mod screenshot;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 #[path = "platform/mac/screenshot.rs"]
+mod screenshot;
+// Windows still-grab layer (DRAGON-229): the mac arm above was `not(linux)` and
+// resolved to ScreenCaptureKit/AppKit code that cannot build on Windows, so it is
+// narrowed to `macos` and Windows mounts its own API-compatible module (M0 stubs,
+// the M1 capture backend fills it in). Same public surface as the mac/Linux modules.
+#[cfg(target_os = "windows")]
+#[path = "platform/windows/screenshot.rs"]
 mod screenshot;
 mod compose;
 mod decoration;
@@ -39,7 +53,15 @@ mod tray;
 #[cfg(target_os = "macos")]
 #[path = "platform/mac/tray.rs"]
 mod tray;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+// Windows (DRAGON-237): the resident tray daemon's IN-RECORDING relay lives here — a real
+// `TraySession` (mounted like the mac/linux one) that connects to the daemon's named pipe
+// and reflects the recording state into the daemon's tray icon. `start_recording` (the
+// own-icon path) returns None, so a non-daemon recording keeps its in-frame toolbar exactly
+// as the stub did. Narrows the no-op stub below to the truly resident-less platforms.
+#[cfg(target_os = "windows")]
+#[path = "platform/windows/tray.rs"]
+mod tray;
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 #[path = "platform/tray_stub.rs"]
 mod tray;
 mod util;
@@ -62,6 +84,14 @@ mod recording_ui;
 #[cfg(target_os = "macos")]
 #[path = "platform/mac/daemon.rs"]
 mod daemon;
+// The resident tray DAEMON (Windows, DRAGON-237): the full-parity port of the mac
+// menu-bar daemon — a tiny Win32-only process (NO iced/wgpu) owning a `Shell_NotifyIcon`
+// tray item with the same three-state icon + menu, a `RegisterHotKey` global capture
+// hotkey, and one-shot capture children. A bare `resident` launch early-branches here
+// (see `main`). cfg(windows) inside the module keeps Linux/mac clean.
+#[cfg(target_os = "windows")]
+#[path = "platform/windows/daemon.rs"]
+mod daemon;
 // The resident system-tray RESIDENT (Linux, DRAGON-173): the full-parity port of the
 // mac daemon — a tiny process (NO iced/wgpu) owning ONE ksni StatusNotifierItem with the
 // same three-state icon + menu, spawning one-shot capture children. A bare `resident`
@@ -74,7 +104,10 @@ mod daemon_linux;
 // + the in-recording actions; the child relays its recording state and receives the
 // resident's menu commands over a Unix socket. Portable — mac AND Linux share the exact
 // same wire protocol + socket path so the surfaces can never drift.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+// Windows joins the IPC (DRAGON-237): the wire protocol (`RecordingState`/`Command`
+// encode/parse) is pure and portable; only the transport differs (Windows named pipe vs
+// the unix socket). The child relay + daemon both speak it, so the surfaces can't drift.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[path = "platform/daemon_ipc.rs"]
 mod daemon_ipc;
 
@@ -111,12 +144,80 @@ fn install_macos_panic_hook() {
     }));
 }
 
+/// Install a Windows crash logger (DRAGON-276): chain a panic hook that appends the panic
+/// message + a backtrace to `~/.config/cosmic-capture-kit/panic.log` before delegating to the
+/// default hook. A shortcut / daemon-spawned capture launch has NO console (GUI subsystem), so
+/// a winit/wgpu panic on the stop→preview path — reported as a silent crash — would otherwise
+/// leave no trace. Kept tiny: append to one file, best-effort I/O, backtrace forced on.
+#[cfg(windows)]
+fn install_windows_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = crate::util::app_config_dir()
+            && std::fs::create_dir_all(&dir).is_ok()
+        {
+            use std::io::Write as _;
+            let bt = std::backtrace::Backtrace::force_capture();
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let thread = std::thread::current();
+            let tname = thread.name().unwrap_or("<unnamed>").to_string();
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("panic.log"))
+            {
+                let _ = writeln!(
+                    f,
+                    "\n===== panic @ unix {ts} (thread {tname}) =====\n{info}\n{bt}"
+                );
+            }
+        }
+        default_hook(info);
+    }));
+}
+
 fn main() -> cosmic::iced::Result {
+    // DRAGON-229: make the process Per-Monitor-Aware-V2 BEFORE any screen measurement
+    // (the CLI `--test` diagnostics + capture run before winit's own DPI-aware call, so
+    // we can't rely on it). Must be the first statement; idempotent w.r.t. winit's later
+    // Once-guarded call. Byte-identical for Linux/mac (cfg-gated one-liner).
+    #[cfg(windows)]
+    platform::windows::dpi::ensure_process_dpi_aware();
+    // DRAGON-233 fix 1: with the GUI subsystem above, a terminal launch has no console
+    // of its own — attach to the parent's (a no-op on a GUI/shortcut launch, which is
+    // what keeps it console-free) so `--help` / `--test` / diagnostics still print.
+    // First-thing, before any output; redirected streams (pipe / file) are preserved.
+    #[cfg(windows)]
+    platform::windows::console::attach_parent_console();
     util::timing_start();
     util::timing_mark("main() entry (after dyld + static init)");
+    // DRAGON-233: the GUI subsystem hides stderr from a shortcut launch, so gate an
+    // opt-in FILE log behind `CCK_LOG_FILE` for on-device diagnosis (used to root-cause
+    // the settings-gear regression). Windows-only + env-gated, so the default init —
+    // and every Linux/mac build — stays byte-identical.
+    #[cfg(windows)]
+    {
+        let env = env_logger::Env::default().default_filter_or("warn");
+        match std::env::var_os("CCK_LOG_FILE").and_then(|p| {
+            std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
+        }) {
+            Some(f) => {
+                env_logger::Builder::from_env(env)
+                    .target(env_logger::Target::Pipe(Box::new(f)))
+                    .init();
+            }
+            None => env_logger::Builder::from_env(env).init(),
+        }
+    }
+    #[cfg(not(windows))]
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     #[cfg(target_os = "macos")]
     install_macos_panic_hook();
+    #[cfg(windows)]
+    install_windows_panic_hook();
     // GUI launches (Spotlight, login item, the resident daemon + every capture child
     // it spawns) inherit launchd's minimal PATH — missing /opt/homebrew/bin etc. — so
     // bare-name tools (tesseract, and the PATH-scan probes behind it) fail to resolve
@@ -208,6 +309,16 @@ fn main() -> cosmic::iced::Result {
         crate::audio::ducking::run_duck();
         return Ok(());
     }
+    // Windows in-app updater (DRAGON-287): the detached MSI swap helper. A temp COPY of this
+    // exe is re-launched as `--update-swap <msi> <installed-exe> <log>`; it waits for the app
+    // + daemon to exit, runs `msiexec /i <msi> /qn` (per-user, no UAC), then relaunches. Runs
+    // HERE — before the resident-daemon early-branch below (which would otherwise mistake this
+    // flagged launch for a bare one) and before any GUI init.
+    #[cfg(windows)]
+    if let Some(i) = args.iter().position(|a| a == platform::windows::update_install::SWAP_FLAG) {
+        platform::windows::update_install::run_swap(&args[i + 1..]);
+        return Ok(());
+    }
     // macOS (DRAGON-130): the AeroSpace death-pipe babysitter child. Runs here in a
     // clean single-threaded child; it blocks on stdin and re-enables the paused tiling
     // WM when the parent exits/crashes (the OS closes the pipe). Absent off macOS
@@ -287,6 +398,37 @@ fn main() -> cosmic::iced::Result {
             daemon_linux::run(daemon_intent); // never returns — runs the tray loop or exits
         }
     }
+    // Windows resident tray DAEMON (DRAGON-237): the full-parity counterpart of the mac /
+    // Linux branches above. A BARE launch (no capture-mode / settings / preview / worker
+    // flag) with the persisted `resident` setting on runs the tiny Win32 tray daemon and
+    // NEVER touches the iced/wgpu stack — the same lightweight technique. Every other launch
+    // falls through to `app::run` exactly as before. `--permissions` is macOS-only, so it is
+    // not in the Windows bare check. Byte-identical to a bare launch when `resident` is off
+    // (the Windows default), so the historical "bare launch opens the capture overlay"
+    // behaviour is unchanged unless the user opts in. The daemon takes its own lock and, if
+    // one is already up, signals it to capture and exits (the mac "capture NOW" UX).
+    #[cfg(target_os = "windows")]
+    {
+        let bare = !args.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "--settings"
+                    | "--region"
+                    | "--window"
+                    | "--monitor"
+                    | "--image"
+                    | "--video"
+                    | "--scan"
+                    | "--scanner"
+                    | "--countdown"
+                    | "--overlay"
+                    | "--preview"
+            )
+        });
+        if bare && state::load().resident {
+            daemon::run(); // never returns — runs the Win32 message loop or exits
+        }
+    }
     // `--preview <file>` opens the preview overlay directly for an existing image/video
     // (no capture overlay, no lock — it's a viewer). Reject unsupported types up front.
     if let Some(p) = after("--preview") {
@@ -325,11 +467,15 @@ fn main() -> cosmic::iced::Result {
         // run alongside it.
         if !instance::acquire_settings_lock() {
             log::info!("settings already open; not opening another");
-            // macOS (DRAGON-153): focus the existing pane instead of vanishing
-            // silently (the daemon's Settings menu item lands here when a pane is
-            // already open). Linux keeps its historical quiet return (the in-app
+            // macOS (DRAGON-153) / Windows (DRAGON-246): don't vanish silently — poke the
+            // live holder to COME FORWARD + un-hide its settings window (the daemon's
+            // "Settings" menu item lands here each click when a pane is already open; the
+            // real Windows bug is the holder's window ending up HIDDEN, so a silent return
+            // leaves it stuck + the mutex held). The holder's `sub_settings_poke` picks up
+            // the poke and self-activates (or exits if its window is truly gone, so this
+            // retry then opens fresh). Linux keeps its historical quiet return (the in-app
             // gear path covers focus there via the --focus-settings helper).
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             platform::compositor::activate_title(app::WINDOW_TITLE);
             return Ok(());
         }

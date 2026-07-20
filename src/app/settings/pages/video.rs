@@ -94,30 +94,47 @@ impl crate::app::App {
         // Video group: frame rate / bitrate / max resolution first, then the encoder
         // and its preset / codec, the downscale note, GPU zero-copy, and the benchmark.
         let mut enc_items = video_items;
-        let encoders = self.encoders();
-        let preferred_encoder = self.preferred_encoder();
-        let selected = encoders
-            .iter()
-            .position(|e| e.id == preferred_encoder);
-        enc_items.push(
-            Item::new(
-                "Encoder",
-                "",
-                widget::dropdown(encoders, selected, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0))),
-            )
-            // Default = the best available encoder (index 0).
-            .reset_with(selected.unwrap_or(0), 0, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0))),
-        );
-        // Surface the hardware-encoder note only when there's a problem; the Health page
-        // lists it regardless.
-        if let Some(note) = self.dep(DepId::HwEncoder).note_if_issue() {
-            enc_items.push(note);
+        // Windows (DRAGON-238): the encoder / preset / codec rows all read the probed
+        // encoder list, which resolves OFF the UI thread (its ffmpeg `-encoders` + hardware
+        // probe-encodes take seconds). Render those rows only once the peek is ready;
+        // otherwise a lightweight "detecting…" placeholder — never the blocking `encoders()`.
+        // Linux/mac probe synchronously on first read (timing untouched).
+        #[cfg(windows)]
+        let encoders_ready = self.encoders_peek().is_some();
+        #[cfg(not(windows))]
+        let encoders_ready = true;
+        if encoders_ready {
+            let encoders = self.encoders();
+            let preferred_encoder = self.preferred_encoder();
+            let selected = encoders
+                .iter()
+                .position(|e| e.id == preferred_encoder);
+            enc_items.push(
+                Item::new(
+                    "Encoder",
+                    "",
+                    widget::dropdown(encoders, selected, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0))),
+                )
+                // Default = the best available encoder (index 0).
+                .reset_with(selected.unwrap_or(0), 0, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0))),
+            );
+            // Surface the hardware-encoder note only when there's a problem; the Health page
+            // lists it regardless.
+            if let Some(note) = self.dep(DepId::HwEncoder).note_if_issue() {
+                enc_items.push(note);
+            }
+            enc_items.push(self.encoder_preset_item());
+            enc_items.push(self.codec_item());
+            // Heads-up if the codec + resolution settings would force a downscale.
+            if let Some(warn) = self.codec_size_warning() {
+                enc_items.push(Item::new("Resolution note", warn, widget::text("")).status(Severity::Warn));
+            }
         }
-        enc_items.push(self.encoder_preset_item());
-        enc_items.push(self.codec_item());
-        // Heads-up if the codec + resolution settings would force a downscale.
-        if let Some(warn) = self.codec_size_warning() {
-            enc_items.push(Item::new("Resolution note", warn, widget::text("")).status(Severity::Warn));
+        #[cfg(windows)]
+        if !encoders_ready {
+            enc_items.push(
+                Item::new("Encoder", "Detecting available encoders…", widget::text("")).dim(),
+            );
         }
         secs.push(SectionSpec {
             title: "Video",

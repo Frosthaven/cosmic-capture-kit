@@ -23,8 +23,12 @@ impl App {
                 self.sub_bench(),
                 self.sub_scan_poll(),
                 self.sub_permission_poll(),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.sub_hotkey_suspend_ping(),
+                #[cfg(windows)]
+                self.sub_settings_liveness(),
+                #[cfg(windows)]
+                self.sub_preview_finalize(),
                 #[cfg(target_os = "macos")]
                 self.sub_preview_pinch(),
                 // DRAGON-212: the frozen-flats grab is deferred on both platforms now.
@@ -33,9 +37,9 @@ impl App {
                 self.sub_cursor_ready(),
                 #[cfg(target_os = "macos")]
                 self.sub_wallpaper_ready(),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.sub_passthrough(),
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.sub_settings_poke(),
             ]
             .into_iter()
@@ -85,12 +89,12 @@ impl App {
         }))
     }
 
-    /// macOS (DRAGON-130): while the "Start Capture" chord recorder is armed, ping the
-    /// resident daemon every ~1s to SUSPEND its global hotkey, so a PrintScreen press
-    /// reaches this app to be recorded instead of spawning a capture. The daemon
-    /// auto-resumes ~3s after the pings stop (see `crate::daemon` SuspendWindow), so no
+    /// macOS (DRAGON-130) / Windows (DRAGON-237): while the "Start Capture" chord recorder is
+    /// armed, ping the resident daemon every ~1s to SUSPEND its global hotkey, so a
+    /// PrintScreen press reaches this app to be recorded instead of spawning a capture. The
+    /// daemon auto-resumes ~3s after the pings stop (see `crate::daemon` SuspendWindow), so no
     /// explicit resume is needed when recording ends or the window closes.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sub_hotkey_suspend_ping(&self) -> Option<Subscription<Msg>> {
         if self.settings.capture_hotkey_rebinding {
             Some(
@@ -102,10 +106,60 @@ impl App {
         }
     }
 
-    /// macOS (DRAGON-151): while the countdown/recording overlays are click-through,
-    /// poll the pointer against the toolbar-chip rects (~60ms — hover latency, not
-    /// animation) so the hovered overlay re-solidifies and the chip stays clickable.
-    #[cfg(target_os = "macos")]
+    /// Windows (DRAGON-246): while the settings window is open AND has been CONFIRMED shown,
+    /// poll (~1s) that its titled top-level still exists in this process. If it vanished
+    /// without an iced `Closed` event — which would leave `finish_session` un-run and this
+    /// --settings child a zombie holding the settings mutex + pid, so every later daemon
+    /// "Settings" click self-exits on the held lock — the tick ends the instance via the
+    /// normal `WindowClosed` path. Off until `settings_shown_confirmed`, so it can never fire
+    /// during the open-hidden → float-and-show phase. No macOS/Linux analog (their settings
+    /// close reliably reaches `WindowClosed`), so it stays byte-identical there.
+    #[cfg(windows)]
+    fn sub_settings_liveness(&self) -> Option<Subscription<Msg>> {
+        if self.settings.window.is_some() && self.settings_shown_confirmed {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_secs(1))
+                    .map(|_| Msg::WindowChrome(WindowChromeMsg::SettingsLivenessTick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Windows (DRAGON-281): while a post-capture preview surface exists whose native
+    /// show/place has NOT been confirmed, re-drive its finalize every ~80ms. The preview is
+    /// minted HIDDEN (komorebi opt-out) and shown only by the one-shot `window::open`
+    /// follow-up (`PreviewOpened`/`PreviewOverlayOpened`) — which is NOT delivered while cck
+    /// is a BACKGROUND process. That happens when the user focuses another window during the
+    /// (click-through, DRAGON-276) countdown: the capture commits with cck backgrounded, and
+    /// the preview HWND stays hidden forever (the "capture saved but the editor never
+    /// appears" bug). Timer subscriptions DO pump while backgrounded (the countdown itself
+    /// fires the same way), so this is the reliable re-driver — the exact shape of
+    /// `sub_settings_liveness` (DRAGON-246). Off the moment `preview_shown_confirmed` matches
+    /// the open surface's id, so it can never keep ticking under the (heavy) preview and peg
+    /// the UI thread (cf. the DRAGON-247 meter-tick note at `sub_meter_tick`). No
+    /// macOS/Linux analog (their open follow-up is delivered), so it stays byte-identical.
+    #[cfg(windows)]
+    fn sub_preview_finalize(&self) -> Option<Subscription<Msg>> {
+        let unconfirmed = self
+            .preview
+            .as_ref()
+            .is_some_and(|p| self.preview_shown_confirmed != Some(p.window));
+        if unconfirmed {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(80))
+                    .map(|_| Msg::WindowChrome(WindowChromeMsg::PreviewFinalizeTick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// macOS (DRAGON-151) / Windows (DRAGON-276): while the countdown/recording
+    /// overlays are click-through, poll the pointer against the toolbar-chip rects
+    /// (~60ms — hover latency, not animation) so the hovered overlay re-solidifies
+    /// and the chip stays clickable.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sub_passthrough(&self) -> Option<Subscription<Msg>> {
         if self.passthrough_active {
             Some(
@@ -117,11 +171,12 @@ impl App {
         }
     }
 
-    /// macOS (DRAGON-153): while the settings pane is open, watch for the focus poke
-    /// file a blocked second `--settings` launch touches (cross-process activation
-    /// is cooperative-only on macOS 14+, so the pane must raise ITSELF). 300ms is
-    /// human-reaction latency for a rare event; the poll is a bare stat.
-    #[cfg(target_os = "macos")]
+    /// macOS (DRAGON-153) / Windows (DRAGON-246): while the settings pane is open, watch for
+    /// the focus poke file a blocked second `--settings` launch touches (cross-process
+    /// activation is cooperative-only on macOS 14+ and foreground-locked on Windows, so the
+    /// pane must raise — and on Windows un-hide — ITSELF). 300ms is human-reaction latency for
+    /// a rare event; the poll is a bare stat.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sub_settings_poke(&self) -> Option<Subscription<Msg>> {
         if self.settings.window.is_some() {
             Some(
@@ -310,14 +365,25 @@ impl App {
     /// Not recording (mutually exclusive with `sub_recording_poll`, mirroring the
     /// original if/else-if) but a channel is armed (green): keep its meter live.
     fn sub_meter_tick(&self) -> Option<Subscription<Msg>> {
-        // macOS also drives the tick for the armed-idle system-audio metering capture
-        // (Bug B) — it publishes the sys level on its own thread and this tick is what
-        // reads it into `self.sys_level` each frame.
-        #[cfg(target_os = "macos")]
+        // macOS/Windows also drive the tick for the armed-idle system-audio metering capture
+        // (Bug B / DRAGON-248) — it publishes the sys level on its own thread and this tick is
+        // what reads it into `self.sys_level` each frame.
+        #[cfg(any(target_os = "macos", windows))]
         let sys_idle = self.sys_idle_meter.is_some();
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", windows)))]
         let sys_idle = false;
+        // Windows (DRAGON-247): the on-button meters live on the capture overlay; once
+        // it is gone and the preview is showing, there is nothing to meter, but the
+        // 100ms MeterTick keeps forcing a full re-render of the (heavy) video preview,
+        // pegging the single UI thread so it never yields to pump Win32 input — the
+        // window goes permanently unresponsive ("froze everything", force-kill). Suppress
+        // the tick under the preview. Windows-only so Linux/macOS stay byte-identical.
+        #[cfg(windows)]
+        let overlay_gone = self.preview.is_some();
+        #[cfg(not(windows))]
+        let overlay_gone = false;
         if self.recording.is_none()
+            && !overlay_gone
             && (self.mic_chain.is_some() || self.sys_meter.is_some() || sys_idle)
         {
             Some(

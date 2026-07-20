@@ -57,10 +57,10 @@ pub enum SettingsMsg {
     /// Settings: toggle allowing multiple instances (takes effect next launch).
     SetAllowMultiple(bool),
     /// Settings: toggle staying resident (the tray/menu-bar RESIDENT process). Emitted
-    /// by the "Keep running in the background" row on both macOS (menu-bar daemon) and
-    /// Linux (ksni tray resident, DRAGON-173); a no-op elsewhere (no resident on other
-    /// platforms), so the variant is gated to the two OSes that construct it.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    /// by the "Keep running in the background" row on macOS (menu-bar daemon), Linux (ksni
+    /// tray resident, DRAGON-173), and Windows (Win32 tray daemon, DRAGON-237); a no-op on
+    /// any platform without a resident, so the variant is gated to the three that construct it.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     SetResident(bool),
     /// Settings: region selection overlay dim opacity.
     SetRegionOpacity(f32),
@@ -90,6 +90,11 @@ pub enum SettingsMsg {
     SetRecordCodec(usize),
     /// Settings: pick the preferred encoder (index into `encoders`).
     SetPreferredEncoder(usize),
+    /// Windows (DRAGON-238): the off-thread encoder probe finished — store the list.
+    /// Kicked when the settings window opens so the video page never blocks on the
+    /// `ffmpeg -encoders` + hardware probe-encodes; fills the process-wide cache.
+    #[cfg(windows)]
+    EncodersProbed(Vec<crate::encode::EncoderInfo>),
     /// Settings: pick which monitor the encoder benchmark tests (index into the
     /// enumerated `bench_monitors`).
     SetBenchMonitor(usize),
@@ -183,6 +188,10 @@ pub enum SettingsMsg {
     SetAppearanceAccent(Option<[f32; 3]>),
     /// Appearance override: corner-rounding style (0 round / 1 slightly / 2 square).
     SetAppearanceRoundness(u8),
+    /// Appearance (DRAGON-289): toggle "Automatic Contrast Boost" — adapt the selected
+    /// accent for optimal contrast (ON) vs use the exact picked colour everywhere (OFF).
+    /// Applied live. Only meaningful while System Default is off.
+    SetAppearanceContrastBoost(bool),
     /// Appearance: open (`true`) / close (`false`) the hand-rolled custom-accent
     /// colour-picker sidebar panel.
     ToggleAccentEditor(bool),
@@ -196,24 +205,24 @@ pub enum SettingsMsg {
     SetShortcut(Action, Shortcut),
     /// Keyboard Shortcuts: clear `action`'s binding (the "x" button).
     UnbindShortcut(Action),
-    /// Keyboard Shortcuts (macOS): edit the resident daemon's global "Start Capture"
+    /// Keyboard Shortcuts (macOS/Windows): edit the resident daemon's global "Start Capture"
     /// hotkey spec (e.g. "PrintScreen", "Cmd+Shift+2"). Persisted; when the spec is
     /// valid and the daemon is running, it is restarted so the new key takes effect.
-    /// macOS-only so Linux's `SettingsMsg` stays byte-identical.
-    #[cfg(target_os = "macos")]
+    /// Gated to the two OSes with a daemon-owned global hotkey so Linux's `SettingsMsg`
+    /// stays byte-identical (Linux's capture key is a COSMIC custom shortcut, not ours).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     SetCaptureHotkey(String),
-    /// Keyboard Shortcuts (macOS): start (or cancel) RECORDING the "Start Capture"
+    /// Keyboard Shortcuts (macOS/Windows): start (or cancel) RECORDING the "Start Capture"
     /// global hotkey — the next chord the user presses is captured, serialized to a
     /// daemon spec, and applied via `SetCaptureHotkey`. Mirrors `BeginRebind` for the
-    /// in-app rows: press the button to begin, press again or Esc to cancel. macOS-only
-    /// so Linux's `SettingsMsg` stays byte-identical.
-    #[cfg(target_os = "macos")]
+    /// in-app rows: press the button to begin, press again or Esc to cancel.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     BeginCaptureHotkeyRebind,
-    /// Keyboard Shortcuts (macOS): while the "Start Capture" chord recorder is armed,
+    /// Keyboard Shortcuts (macOS/Windows): while the "Start Capture" chord recorder is armed,
     /// a ~1s timer sends this so the running daemon SUSPENDS its global hotkey (the key
     /// then reaches this app to be recorded). Fire-and-forget signal; the daemon
-    /// auto-resumes after the pings stop. macOS-only so Linux stays byte-identical.
-    #[cfg(target_os = "macos")]
+    /// auto-resumes after the pings stop.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     SuspendDaemonHotkeyPing,
     /// Health (macOS): open a System Settings > Privacy & Security pane for a TCC
     /// permission (Screen Recording / Microphone) — the honest recovery for a denied

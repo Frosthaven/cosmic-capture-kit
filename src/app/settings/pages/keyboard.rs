@@ -13,12 +13,13 @@ impl crate::app::App {
         // the current section while the group matches, else start a new one.
         let mut secs: Vec<SectionSpec<'_>> = Vec::new();
 
-        // macOS (DRAGON-130): the resident daemon's global "Start Capture" hotkey sits
-        // FIRST, in its own section at the TOP. Unlike the in-app bindings below (iced
-        // key-capture), this is a process-wide OS hotkey owned by the menu-bar daemon,
-        // so it is edited as a validated SPEC string ("PrintScreen", "Cmd+Shift+2", …).
-        // cfg-gated so the Linux page stays byte-identical.
-        #[cfg(target_os = "macos")]
+        // macOS (DRAGON-130) / Windows (DRAGON-237): the resident daemon's global "Start
+        // Capture" hotkey sits FIRST, in its own section at the TOP. Unlike the in-app
+        // bindings below (iced key-capture), this is a process-wide OS hotkey owned by the
+        // tray/menu-bar daemon, so it is edited as a validated SPEC string ("PrintScreen",
+        // "Cmd+Shift+2", …). cfg-gated so the Linux page stays byte-identical (Linux's
+        // capture key is a COSMIC custom shortcut, not owned here).
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             // Byte-for-byte the SAME anatomy as the in-app shortcut rows below (label +
             // chord button + "x" clear), just wired to the daemon's global hotkey instead

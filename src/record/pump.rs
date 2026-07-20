@@ -268,6 +268,7 @@ fn write_pcm(w: &mut dyn Write, samples: &[f32]) -> bool {
 /// whole budget, and the session dies at start. (The legacy path never had the
 /// hazard: clean_mic/system_relay open their FIFOs on their own threads while the
 /// worker writes the first frame immediately after spawn.)
+#[cfg(unix)]
 fn open_fifo_write_end(
     fifo: &std::path::Path,
     budget: Duration,
@@ -295,6 +296,12 @@ fn open_fifo_write_end(
     }
     Some(std::fs::File::from(fd))
 }
+
+// Windows (DRAGON-229 M3): the pump's FIFO write-end rendezvous is the named-pipe
+// `ConnectNamedPipe` (bounded, on the pump thread AFTER video bytes flow — the exact
+// analog of the POSIX `open_fifo_write_end`), implemented in
+// `crate::platform::windows::named_pipe::connect_write_end`. [`spawn`]'s
+// `#[cfg(windows)]` arm calls it with the paired `PipeServer` handle instead of a path.
 
 /// The video-thread half of the pump (see the module doc's threading section): a
 /// cheap, `Arc<Mutex<MediaClock>>`-backed tick counter the owned session's frame
@@ -765,30 +772,47 @@ pub(crate) fn spawn<'scope, 'env>(
     stop: &'env AtomicBool,
     paused: &'env AtomicBool,
     events: &'env Mutex<Vec<ToggleEvent>>,
+    // Windows (DRAGON-229 M3): the paired named-pipe SERVER handles (from
+    // `OwnedAudioStart`) the pump `ConnectNamedPipe`s on its own thread, in place of the
+    // POSIX `open_fifo_write_end(path)`. Only the Windows worker passes these; the
+    // Linux/mac call sites stay byte-identical (the params don't exist off Windows).
+    #[cfg(windows)] mic_pipe: crate::platform::windows::named_pipe::PipeServer,
+    #[cfg(windows)] sys_pipe: crate::platform::windows::named_pipe::PipeServer,
 ) -> Result<(PumpHandle<'scope>, VideoTicker), String> {
     let clock = Arc::new(Mutex::new(MediaClock::new(start)));
     let ticker = VideoTicker { clock: clock.clone(), fps: cfg.fps.max(1), next_tick: 0 };
     let thread_stop = stop;
+    #[cfg(not(windows))]
     let (mic_path, sys_path) = (mic_fifo_path.clone(), sys_fifo_path.clone());
     let spawned = std::thread::Builder::new().name("cck-media-clock-pump".to_string()).spawn_scoped(
         scope,
         move || {
-            // The FIFO rendezvous, on THIS thread (see the fn doc for why). On
+            // The FIFO/named-pipe rendezvous, on THIS thread (see the fn doc for why). On
             // failure: trip `stop` so the video loop winds down, and tear the
             // captures down explicitly — `MonitorCapture` has no `Drop` of its own
             // (see `crate::audio::capture`), so an early return that merely
             // dropped it would leak its background thread; `mic_tap`'s `Drop`
             // handles itself.
-            let Some(mic_fifo) = open_fifo_write_end(&mic_path, FIFO_OPEN_BUDGET, thread_stop)
-            else {
+            #[cfg(not(windows))]
+            let mic_fifo = open_fifo_write_end(&mic_path, FIFO_OPEN_BUDGET, thread_stop);
+            #[cfg(windows)]
+            let mic_fifo = crate::platform::windows::named_pipe::connect_write_end(
+                mic_pipe, FIFO_OPEN_BUDGET, thread_stop,
+            );
+            let Some(mic_fifo) = mic_fifo else {
                 log::warn!("media-clock pump: mic FIFO write end never opened (wedged ffmpeg?)");
                 thread_stop.store(true, Ordering::Relaxed);
                 drop(mic_tap);
                 let _ = monitor.stop();
                 return PumpOut::empty();
             };
-            let Some(sys_fifo) = open_fifo_write_end(&sys_path, FIFO_OPEN_BUDGET, thread_stop)
-            else {
+            #[cfg(not(windows))]
+            let sys_fifo = open_fifo_write_end(&sys_path, FIFO_OPEN_BUDGET, thread_stop);
+            #[cfg(windows)]
+            let sys_fifo = crate::platform::windows::named_pipe::connect_write_end(
+                sys_pipe, FIFO_OPEN_BUDGET, thread_stop,
+            );
+            let Some(sys_fifo) = sys_fifo else {
                 log::warn!("media-clock pump: system FIFO write end never opened (wedged ffmpeg?)");
                 thread_stop.store(true, Ordering::Relaxed);
                 drop(mic_tap);

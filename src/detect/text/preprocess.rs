@@ -34,7 +34,7 @@ pub(super) fn run_ocr(
     }
     // psm 11 (sparse text) suits UI screenshots far better than psm 3's page-layout
     // analysis, which mis-segments icon-interspersed / multi-column UI and garbles text.
-    let out = std::process::Command::new("tesseract")
+    let out = crate::util::quiet_command("tesseract")
         .arg(&path)
         .arg("stdout")
         .args(["--psm", "11", "--dpi", "300", "tsv"])

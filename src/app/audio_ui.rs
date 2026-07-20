@@ -13,9 +13,10 @@ impl App {
             .as_ref()
             .and_then(|t| t.shared.lock().ok().and_then(|g| g.0.back().map(|c| c.0)))
             .unwrap_or(0.0);
-        // macOS (Bug B): keep the armed-idle metering capture's channel drained each tick
-        // so it never backs up (the level is published internally, chunks are discarded).
-        #[cfg(target_os = "macos")]
+        // macOS (Bug B) / Windows (DRAGON-248): keep the armed-idle metering capture's channel
+        // drained each tick so it never backs up (the level is published internally, chunks are
+        // discarded).
+        #[cfg(any(target_os = "macos", windows))]
         self.drain_sys_idle_meter();
         self.sys_level = read_meter_level(AudioChannel::Sys);
     }
@@ -79,9 +80,9 @@ impl App {
             }
             _ => {}
         }
-        // System audio: raw RMS sidecar (no filter chain applies to it). On macOS
+        // System audio: raw RMS sidecar (no filter chain applies to it). On macOS/Windows
         // `spawn_meter(Sys)` returns None by design (no pulse monitor) — the armed-idle
-        // meter is a metering-only SCK capture instead, handled below.
+        // meter is a metering-only SCK/WASAPI capture instead, handled below.
         match (sys, self.sys_meter.is_some()) {
             (true, false) => self.sys_meter = spawn_meter(AudioChannel::Sys),
             (false, true) => {
@@ -92,14 +93,15 @@ impl App {
             }
             _ => {}
         }
-        // macOS (DRAGON-130 Bug B): armed-idle system-audio metering. While the system
-        // channel is armed AND no recording is in flight, run a metering-only
-        // `MonitorCapture` (audio-only SCK) — its chunks are discarded (`try_send` drops
-        // them, nothing reads the receiver), and it publishes the sys RMS to
-        // `SYS_LEVEL_BITS` on its own thread. It MUST be stopped before a recording's own
-        // capture starts (`stop_sys_idle_meter`, called from the record-start path) so
-        // the two never fight over the single SCK system-audio stream.
-        #[cfg(target_os = "macos")]
+        // macOS (DRAGON-130 Bug B) / Windows (DRAGON-248): armed-idle system-audio metering.
+        // While the system channel is armed AND no recording is in flight, run a metering-only
+        // `MonitorCapture` (audio-only SCK on macOS, WASAPI loopback on Windows) — its chunks
+        // are discarded (`try_send` drops them, nothing reads the receiver), and it publishes
+        // the sys RMS to `SYS_LEVEL_BITS` on its own thread. It MUST be stopped before a
+        // recording's own capture starts (`stop_sys_idle_meter`, called from the record-start
+        // path) so the two never fight over the system-audio stream. `source = None` = the
+        // default sink's monitor / default render endpoint (loopback).
+        #[cfg(any(target_os = "macos", windows))]
         {
             let want_idle = sys && self.recording.is_none();
             match (want_idle, self.sys_idle_meter.is_some()) {
@@ -107,7 +109,18 @@ impl App {
                     // Keep the receiver so the meter tick can DRAIN + discard chunks — the
                     // capture publishes the RMS internally (before the channel send), so an
                     // undrained bounded channel would just log "consumer backlog" noise.
-                    self.sys_idle_meter = crate::audio::capture::MonitorCapture::start(None, None);
+                    // Windows (DRAGON-282): loop back the SAME endpoint the recording will
+                    // (the Output-device picker) so the armed-idle meter reflects the chosen
+                    // device live; empty/`"default"` → the default endpoint. macOS ignores
+                    // the source (SCK captures the display mix), so it stays `None` there.
+                    #[cfg(windows)]
+                    let idle_source = crate::platform::windows::wasapi_loopback::specific_endpoint_id(
+                        &self.speaker_device,
+                    );
+                    #[cfg(not(windows))]
+                    let idle_source: Option<String> = None;
+                    self.sys_idle_meter =
+                        crate::audio::capture::MonitorCapture::start(idle_source, None);
                 }
                 (false, true) => self.stop_sys_idle_meter(),
                 _ => {}
@@ -115,12 +128,13 @@ impl App {
         }
     }
 
-    /// macOS (DRAGON-130 Bug B): stop the armed-idle system-audio metering capture, if
-    /// running, and flatten the published level. Called both from `sync_meters` (when the
-    /// channel disarms) and from the record-start path BEFORE the owned capture starts —
-    /// so the metering-only stream is released before the recording claims the SCK
-    /// system-audio stream (they must never run at once). The `stop()` is bounded (≤2s).
-    #[cfg(target_os = "macos")]
+    /// macOS (DRAGON-130 Bug B) / Windows (DRAGON-248): stop the armed-idle system-audio
+    /// metering capture, if running, and flatten the published level. Called both from
+    /// `sync_meters` (when the channel disarms) and from the record-start path BEFORE the
+    /// owned capture starts — so the metering-only stream is released before the recording
+    /// claims the system-audio stream (they must never run at once). The `stop()` is bounded
+    /// (≤2s).
+    #[cfg(any(target_os = "macos", windows))]
     pub(super) fn stop_sys_idle_meter(&mut self) {
         if let Some((c, _rx)) = self.sys_idle_meter.take() {
             let _ = c.stop();
@@ -129,11 +143,11 @@ impl App {
         }
     }
 
-    /// macOS (Bug B): drain + discard the armed-idle metering capture's chunks so its
-    /// bounded channel never fills (an undrained channel logs "consumer backlog" noise).
-    /// The capture publishes the meter level internally; we only need to keep the pipe
+    /// macOS (Bug B) / Windows (DRAGON-248): drain + discard the armed-idle metering capture's
+    /// chunks so its bounded channel never fills (an undrained channel logs "consumer backlog"
+    /// noise). The capture publishes the meter level internally; we only need to keep the pipe
     /// flowing, so the drained chunks are dropped. No-op when the idle meter isn't running.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     pub(super) fn drain_sys_idle_meter(&mut self) {
         if let Some((_, rx)) = self.sys_idle_meter.as_ref() {
             while rx.try_recv().is_ok() {}
@@ -208,8 +222,16 @@ impl App {
     /// Re-enumerate output sinks and rebuild the speaker dropdown labels.
     pub(super) fn refresh_speaker_devices(&mut self) {
         self.speaker_devices = crate::audio::devices::list_output_sinks();
-        self.speaker_device_labels = std::iter::once("System (automatic)".to_string())
-            .chain(self.speaker_devices.iter().map(|(_, d)| d.clone()))
+        // DRAGON-282: on Windows the leading entry is "System default" (it follows the Windows
+        // default output — `GetDefaultAudioEndpoint`), which the row's caption references; Linux
+        // keeps "System (automatic)" (byte-identical). The device names are capped on Windows so
+        // a very long WASAPI render-endpoint name can't push the dropdown past the window width.
+        #[cfg(windows)]
+        let lead = "System default".to_string();
+        #[cfg(not(windows))]
+        let lead = "System (automatic)".to_string();
+        self.speaker_device_labels = std::iter::once(lead)
+            .chain(self.speaker_devices.iter().map(|(_, d)| speaker_display_label(d)))
             .collect();
     }
 
@@ -271,5 +293,45 @@ impl App {
         }
         // The toolbar's mic meter runs the same chain — keep it config-accurate too.
         self.restart_mic_meter();
+    }
+}
+
+/// DRAGON-282: the Output-device dropdown label for one sink. On Windows a very long WASAPI
+/// render-endpoint friendly name is capped (truncated on a char boundary + ellipsis) so it
+/// can't push the dropdown past the settings window width (the reported overflow/crop); the
+/// stored device id is separate, so this display-only cap never affects selection. Linux
+/// keeps the full pactl sink name (it renders fine in the existing layout → byte-identical).
+#[cfg(windows)]
+fn speaker_display_label(name: &str) -> String {
+    const MAX: usize = 42;
+    if name.chars().count() <= MAX {
+        return name.to_string();
+    }
+    let mut s: String = name.chars().take(MAX - 1).collect();
+    s.push('…');
+    s
+}
+
+#[cfg(not(windows))]
+fn speaker_display_label(name: &str) -> String {
+    name.to_string()
+}
+
+#[cfg(all(test, windows))]
+mod speaker_label_tests {
+    use super::speaker_display_label;
+
+    #[test]
+    fn short_names_pass_through_unchanged() {
+        assert_eq!(speaker_display_label("Speakers (Realtek(R) Audio)"), "Speakers (Realtek(R) Audio)");
+    }
+
+    #[test]
+    fn long_names_are_capped_with_an_ellipsis() {
+        let long = "DELL U2720Q (2- NVIDIA High Definition Audio) Digital Output Endpoint";
+        let out = speaker_display_label(long);
+        assert!(out.chars().count() <= 42, "capped to <=42 chars, got {}", out.chars().count());
+        assert!(out.ends_with('…'), "ends with an ellipsis: {out}");
+        assert!(long.starts_with(&out[..out.len() - '…'.len_utf8()]), "keeps the name's prefix");
     }
 }

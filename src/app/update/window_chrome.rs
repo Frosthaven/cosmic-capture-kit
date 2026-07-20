@@ -5,7 +5,37 @@ use super::super::*;
 // `core()` is a `cosmic::Application` trait method — bring the trait into scope.
 use cosmic::Application as _;
 
+/// Settings-window width (logical px) at or above which the left nav rail is
+/// auto-EXPANDED, and below which it auto-COLLAPSES to the icon rail. Applied on
+/// window spawn AND every resize, on all platforms (the rule is width-based and
+/// universal, no cfg fork). Value is the user's reference settings width so the
+/// rail stays expanded at that size and narrowing collapses it. The manual
+/// `ToggleConfigNav` still works between resizes; a resize re-derives from width.
+pub(in crate::app) const NAV_AUTO_COLLAPSE_W: f32 = 990.0;
+
+/// Pure width rule: should the settings nav rail be expanded at this logical
+/// width? (Kept a tiny free fn so the boundary is unit-testable.)
+pub(in crate::app) fn nav_should_open(width: f32) -> bool {
+    width >= NAV_AUTO_COLLAPSE_W
+}
+
 impl App {
+    /// Derive `nav_open` from the width the settings window will actually spawn
+    /// at. Mirrors `open_config_window`'s clamp: the saved width (or the default)
+    /// floored at `MIN_W` (800.0). Call this at every spawn site BEFORE the window
+    /// is minted so the first paint carries the right rail + toggle icon (the icon
+    /// derives from `nav_open` in `config_window_view`, so it follows for free).
+    pub(in crate::app) fn apply_nav_auto_collapse_on_spawn(&mut self) {
+        // Same effective width `open_config_window` computes: saved width, else the
+        // default, floored at MIN_W = 800.0 (kept in sync with open_config_window).
+        let spawn_w = self
+            .settings_size
+            .map(|(w, _)| w as f32)
+            .unwrap_or(800.0)
+            .max(800.0);
+        self.settings.nav_open = nav_should_open(spawn_w);
+    }
+
     pub(in crate::app) fn update_window_chrome(&mut self, message: WindowChromeMsg) -> Task<cosmic::Action<Msg>> {
         match message {
             #[cfg(target_os = "linux")]
@@ -14,15 +44,51 @@ impl App {
             WindowChromeMsg::SeedOutputs => self.seed_outputs_mac(),
             #[cfg(not(target_os = "linux"))]
             WindowChromeMsg::OverlayOpened(id, attempt) => self.configure_overlay(id, attempt),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WindowChromeMsg::PreviewOpened(id, attempt) => self.finalize_preview_window(id, attempt),
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WindowChromeMsg::PreviewOverlayOpened(id, pos, size, attempt) => {
                 self.finalize_preview_overlay(id, pos, size, attempt)
             }
             #[cfg(not(target_os = "linux"))]
             WindowChromeMsg::SeedOverlays => self.seed_overlays_mac(),
             WindowChromeMsg::OpenGear => self.open_settings(),
+            WindowChromeMsg::OpenSettingsAtStartup { about } => {
+                // Startup settings-window mint, deferred one message-drain past the launch
+                // appearance apply so the FIRST paint carries the resolved accent with no
+                // flash (DRAGON-268 follow-up). The `set_theme` queued from `init` was
+                // drained just before this message in the SAME `update` pass, so the global
+                // theme is already the launch-resolved one when the window-open task's
+                // `WindowCreated` builds the window state below. Already-open (a duplicate
+                // drain) is a no-op guard.
+                if self.settings.window.is_some() {
+                    return Task::none();
+                }
+                // Auto-collapse the nav rail by spawn width before minting (icon follows).
+                self.apply_nav_auto_collapse_on_spawn();
+                let (id, task) = settings::open_config_window(self.settings_size);
+                self.settings.window = Some(id);
+                let mut tasks = vec![task];
+                // DRAGON-177: seed the update state from the on-disk manifest cache FIRST
+                // (notes, nav tint, launch dialog render instantly); the network check
+                // follows right behind and refreshes the seed.
+                if let Some(seed) = crate::update::seeded_status_from_cache() {
+                    tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
+                        SettingsMsg::UpdateChecked(seed),
+                    ))));
+                }
+                // DRAGON-175: a settings window is showing, so kick off a background update
+                // check (non-blocking; lights up the About nav + fills the About page).
+                tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
+                    SettingsMsg::CheckForUpdates,
+                ))));
+                if about {
+                    tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
+                        SettingsMsg::ShowAboutPage,
+                    ))));
+                }
+                Task::batch(tasks)
+            }
             WindowChromeMsg::OpenUrl(url) => {
                 crate::platform::services::open_uri(url);
                 Task::none()
@@ -95,14 +161,168 @@ impl App {
                         WindowChromeMsg::MacCenterTitlebar(settings::WINDOW_TITLE, 0),
                     ))),
                 ]);
-                #[cfg(not(target_os = "macos"))]
+                // Windows (DRAGON-229 komorebi opt-out): the settings window was opened
+                // HIDDEN; once its async title lands, komorebi-float + show it — the same
+                // title-polled follow-up shape as the mac titlebar centering above. Batched
+                // with the title task so the poll begins as the title is being applied.
+                #[cfg(windows)]
+                return Task::batch([
+                    title_task,
+                    // DRAGON-238: probe the encoder list OFF the UI thread now (the video
+                    // page's ffmpeg `-encoders` + hardware probe-encodes take seconds); the
+                    // result fills the cache before the user reaches the Video tab.
+                    self.kick_encoder_probe(),
+                    Task::done(cosmic::Action::App(Msg::WindowChrome(
+                        WindowChromeMsg::ConfigWindowFloat(id, 0),
+                    ))),
+                ]);
+                #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
                 title_task
+            }
+            #[cfg(windows)]
+            WindowChromeMsg::ConfigWindowFloat(id, attempt) => {
+                // Only the current settings window qualifies.
+                if self.settings.window != Some(id) {
+                    return Task::none();
+                }
+                // The title is set by an async task and may lag this poll; retry briefly
+                // until `float_and_show` matches it (same 30 x 40ms budget as the overlay's
+                // `configure_overlay`). The window stays HIDDEN until it matches, so
+                // komorebi never sees a `Show` for it — the opt-out is race-free.
+                const MAX_ATTEMPTS: u8 = 30;
+                const RETRY_MS: u64 = 40;
+                if crate::platform::windows::window::float_and_show(settings::WINDOW_TITLE) {
+                    // The window matched its async-set title and was shown → arm the
+                    // liveness watchdog (DRAGON-246): from here on, a disappearance of the
+                    // titled window means a genuine vanish-without-`Closed` (out-of-band
+                    // destroy), and `sub_settings_liveness` ends the instance so the settings
+                    // mutex + pid file never leak. Set ONLY on a real show (not on the
+                    // give-up branch below, where the window may still be hidden), so the
+                    // guard can never fire during the open-hidden → float-and-show phase.
+                    self.settings_shown_confirmed = true;
+                    // Native DWM caption buttons (DRAGON-284): now that the settings window is
+                    // shown, extend the top frame + install the caption subclass so the native
+                    // min/max/close render top-right over our owned header. Idempotent
+                    // (installed once per HWND) so a re-run of this arm is harmless.
+                    // Unconditional (not gated on Mica): the buttons are chrome, not glass.
+                    crate::platform::windows::caption::install_native_caption_buttons(
+                        settings::WINDOW_TITLE,
+                    );
+                    // Mica backdrop (DRAGON-267): now that the settings window is shown,
+                    // apply the DWM Mica material — gated on the SAME frosted-windows signal
+                    // Linux uses (`self.glass` is `Some(frosted_windows)` only on Win11 22H2+
+                    // and not `CCK_NO_GLASS`-disabled), so the unified toggle turns it off too.
+                    // A no-op otherwise. The chrome already paints translucent from `self.glass`.
+                    if self.glass.is_some_and(|g| g.frosted_windows) {
+                        crate::platform::windows::window::apply_mica(settings::WINDOW_TITLE);
+                    }
+                    Task::none()
+                } else if attempt >= MAX_ATTEMPTS {
+                    log::warn!(
+                        "settings window never matched its title after {MAX_ATTEMPTS} \
+                         attempts — komorebi may tile it and it may stay hidden"
+                    );
+                    Task::none()
+                } else {
+                    Task::perform(
+                        async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                        },
+                        move |()| {
+                            cosmic::Action::App(Msg::WindowChrome(
+                                WindowChromeMsg::ConfigWindowFloat(id, attempt + 1),
+                            ))
+                        },
+                    )
+                }
+            }
+            #[cfg(windows)]
+            WindowChromeMsg::PreviewFinalizeTick => {
+                // DRAGON-281: re-drive the preview's native show/place from a timer
+                // subscription (which pumps even while cck is a background process) — the
+                // one-shot `window::open` follow-up that normally triggers the finalize is
+                // NOT delivered when cck lost the foreground mid-countdown, leaving the
+                // preview HWND created but hidden forever. Read the CURRENT open surface and
+                // call the SAME finalize the follow-up would have (`PreviewOpened` →
+                // `finalize_preview_window` for the windowed preview, `PreviewOverlayOpened`
+                // → `finalize_preview_overlay` for the overlay preview). Both no-op once the
+                // window id no longer matches or the show is confirmed; on success they set
+                // `preview_shown_confirmed`, which stops `sub_preview_finalize`. Reading self
+                // (not a captured id) keeps it stale-proof, like `SettingsLivenessTick`.
+                match self.preview.as_ref().map(|p| (p.window, p.surface.is_window())) {
+                    Some((id, true)) => self.finalize_preview_window(id, 0),
+                    Some((id, false)) => {
+                        // Recompute the overlay's target rect exactly as the open path did
+                        // (`preview_overlay_rect(preview_output)`), the same way
+                        // `finalize_preview_window` recomputes it internally.
+                        let name = self.preview_output.as_ref().map(|(n, _)| n.clone());
+                        let (pos, size) =
+                            crate::platform::windows::window::preview_overlay_rect(name.as_deref());
+                        self.finalize_preview_overlay(id, pos, size, 0)
+                    }
+                    None => Task::none(),
+                }
+            }
+            #[cfg(windows)]
+            WindowChromeMsg::SettingsLivenessTick => {
+                // DRAGON-246: periodic watchdog for the "settings window vanished without a
+                // Closed event" zombie. If the settings window is open, was CONFIRMED shown,
+                // and its titled top-level is no longer present in THIS process, it was
+                // destroyed out-of-band — no iced `window::Event::Closed` reached us, so
+                // `WindowClosed` → `finish_session` never ran and this --settings child would
+                // linger holding the settings mutex + pid. Re-dispatch the exact `WindowClosed`
+                // path (save_state + finish_session + the Windows hard-exit backstop) so the
+                // instance ends just as a normal ✕-close would. The pure `settings_should_end`
+                // decision keeps the shown-then-gone vs not-yet-shown logic unit-tested.
+                let title_present =
+                    crate::platform::windows::window::find_by_title(settings::WINDOW_TITLE)
+                        .is_some();
+                if crate::platform::windows::window::settings_should_end(
+                    self.settings.window.is_some(),
+                    self.settings_shown_confirmed,
+                    title_present,
+                ) && let Some(id) = self.settings.window
+                {
+                    log::warn!(
+                        "DRAGON-246: settings window vanished without a Closed event — ending \
+                         the instance (the settings mutex/pid would otherwise leak)"
+                    );
+                    return Task::done(cosmic::Action::App(Msg::WindowChrome(
+                        WindowChromeMsg::WindowClosed(id),
+                    )));
+                }
+                Task::none()
             }
             WindowChromeMsg::ConfigWindowResized(id, w, h) => {
                 // Remember the settings window's size so it reopens at the size it was
                 // closed at (persisted on close).
                 if Some(id) == self.settings.window && w >= 1.0 && h >= 1.0 {
                     self.settings_size = Some((w.round() as u32, h.round() as u32));
+                    // Auto collapse/expand the left nav rail by window width (all
+                    // platforms): narrower than the breakpoint collapses to the icon
+                    // rail, at/above it expands. The toggle icon derives from
+                    // `nav_open` in the view, so it flips for free on the next rebuild.
+                    // A manual `ToggleConfigNav` still works between resizes; a resize
+                    // re-derives from width by design.
+                    self.settings.nav_open = nav_should_open(w);
+                }
+                // PROVISIONAL (DRAGON-268 follow-up, Task 2 — fullscreen-too-bright): a
+                // fullscreen enter/exit fires a resize, so match the settings / windowed-
+                // preview window's backdrop to its fullscreen state here — opaque dark theme
+                // pane in fullscreen (the 0.75 page tint over the bright vibrancy no-backdrop
+                // fallback is what reads too bright), vibrancy restored out of fullscreen.
+                // Idempotent + self-correcting; scoped to our CSD toplevels by title.
+                #[cfg(target_os = "macos")]
+                {
+                    let dark = crate::app::theme::background_base_rgba();
+                    crate::platform::mac::window::match_window_fullscreen_backdrop(
+                        settings::WINDOW_TITLE,
+                        dark,
+                    );
+                    crate::platform::mac::window::match_window_fullscreen_backdrop(
+                        crate::app::shell::PREVIEW_WINDOW_TITLE,
+                        dark,
+                    );
                 }
                 // Learn the preview overlay's monitor size (needed for `--preview`, which
                 // opens on the active output before its size is known). The returned task
@@ -113,14 +333,34 @@ impl App {
                 Some(id) => window::drag(id),
                 None => Task::none(),
             },
-            WindowChromeMsg::ConfigWindowMaximize => match self.settings.window {
-                Some(id) => window::toggle_maximize(id),
-                None => Task::none(),
-            },
-            WindowChromeMsg::ConfigWindowMinimize => match self.settings.window {
-                Some(id) => window::minimize(id, true),
-                None => Task::none(),
-            },
+            WindowChromeMsg::ConfigWindowMaximize => {
+                // Windows (DRAGON-258): the settings window is a frameless, natively-managed
+                // toplevel, so iced's `window::toggle_maximize` is a no-op for it — the CSD
+                // control did nothing. Route to the native Win32 helper (keyed on the same
+                // title the other Windows settings helpers use); keep Linux/mac on iced.
+                #[cfg(windows)]
+                crate::platform::windows::window::toggle_maximize(settings::WINDOW_TITLE);
+                #[cfg(windows)]
+                return Task::none();
+                #[cfg(not(windows))]
+                match self.settings.window {
+                    Some(id) => window::toggle_maximize(id),
+                    None => Task::none(),
+                }
+            }
+            WindowChromeMsg::ConfigWindowMinimize => {
+                // Windows (DRAGON-258): iced's `window::minimize` is likewise a no-op for the
+                // frameless settings toplevel — native `ShowWindow(SW_MINIMIZE)` instead.
+                #[cfg(windows)]
+                crate::platform::windows::window::minimize(settings::WINDOW_TITLE);
+                #[cfg(windows)]
+                return Task::none();
+                #[cfg(not(windows))]
+                match self.settings.window {
+                    Some(id) => window::minimize(id, true),
+                    None => Task::none(),
+                }
+            }
             WindowChromeMsg::PermissionsWindowOpened(id) => {
                 let title_task = self.set_window_title(permissions::WINDOW_TITLE.to_string(), id);
                 // macOS (DRAGON-135): same traffic-light centering as the settings window.
@@ -186,6 +426,15 @@ impl App {
                 const MAX_ATTEMPTS: u8 = 30;
                 const RETRY_MS: u64 = 40;
                 if crate::platform::mac::window::center_titlebar_buttons(title) {
+                    // Window vibrancy (DRAGON-268): the settings window is now up and
+                    // matched — reveal the winit-inserted vibrancy by clearing its Metal
+                    // layer. Gated on the SAME frosted-windows signal Linux/Windows use
+                    // (`self.glass`, `Some(frosted_windows)` unless `CCK_NO_GLASS`), so the
+                    // unified toggle turns it off too. The chrome already paints translucent
+                    // from `self.glass`; a no-op when glass is off.
+                    if self.glass.is_some_and(|g| g.frosted_windows) {
+                        crate::platform::mac::window::enable_window_vibrancy(title);
+                    }
                     Task::none()
                 } else if attempt >= MAX_ATTEMPTS {
                     log::warn!(
@@ -206,7 +455,7 @@ impl App {
                     )
                 }
             }
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             WindowChromeMsg::SettingsFocusPoke => {
                 // A blocked second `--settings` launch asked us to come forward. The
                 // poke tick fires every 300ms while the pane is open; only act when
@@ -215,10 +464,26 @@ impl App {
                 if std::fs::metadata(&poke).is_ok() {
                     let _ = std::fs::remove_file(&poke);
                     if let Some(id) = self.settings.window {
+                        // Windows (DRAGON-246): the pane's window may be HIDDEN / minimized /
+                        // orphaned — the REAL bug: an external `SW_HIDE` or a lost native show
+                        // leaves iced's id valid but the HWND off-screen, while this process
+                        // lives on holding the settings mutex + pid, so every later "Settings"
+                        // click self-exits on the held lock. Natively RESTORE + foreground the
+                        // window FIRST so the `gain_focus` below keys a genuinely visible pane.
+                        #[cfg(windows)]
+                        crate::platform::windows::window::show_and_focus(settings::WINDOW_TITLE);
                         // Activation from the OWNING process with a visible window
                         // sticks (winit's gain_focus does activate + makeKey).
                         return window::gain_focus(id);
                     }
+                    // Windows (DRAGON-246): a poke arrived but this holder has NO settings
+                    // window — it was truly destroyed, not merely hidden — so end the instance
+                    // and let the blocked launcher's retry open a FRESH pane instead of finding
+                    // the mutex still held by a windowless zombie. (On macOS this arm is
+                    // stripped: its self-activation path is only ever poked while a window
+                    // exists, so it keeps the historical `Task::none()` fall-through.)
+                    #[cfg(windows)]
+                    return self.finish_session();
                 }
                 Task::none()
             }
@@ -306,4 +571,23 @@ impl App {
         }
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{nav_should_open, NAV_AUTO_COLLAPSE_W};
+
+    #[test]
+    fn nav_collapses_below_breakpoint_expands_at_or_above() {
+        assert_eq!(NAV_AUTO_COLLAPSE_W, 990.0);
+        // Just below the breakpoint: collapse.
+        assert!(!nav_should_open(989.0));
+        // Exactly the breakpoint: expand.
+        assert!(nav_should_open(990.0));
+        // Just above: expand.
+        assert!(nav_should_open(991.0));
+        // Sanity at extremes.
+        assert!(!nav_should_open(460.0));
+        assert!(nav_should_open(1920.0));
+    }
 }

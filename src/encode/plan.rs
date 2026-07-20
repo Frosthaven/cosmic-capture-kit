@@ -2,7 +2,7 @@
 //! builders that probe the machine (NVENC / VAAPI / software) and choose one. The
 //! command module turns a plan into the actual ffmpeg invocation.
 
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use super::*;
 
@@ -40,6 +40,10 @@ impl EncodePlan {
         match backend {
             "nvenc" | "gpu" => nvenc_plan(w, h, &presets.nvenc, &presets.codec),
             "vaapi" | "cpu" => vaapi_plan(w, h, presets.vaapi_cl, &presets.codec),
+            #[cfg(windows)]
+            "amf" => amf_plan(w, h, &presets.codec),
+            #[cfg(windows)]
+            "qsv" => qsv_plan(w, h, &presets.codec),
             #[cfg(target_os = "macos")]
             "videotoolbox" | "vt" => videotoolbox_plan(w, h, &presets.codec),
             "software" | "sw" | "x264" => Some(software_plan(&presets.x264, &presets.codec, w, h)),
@@ -54,6 +58,10 @@ impl EncodePlan {
         let chosen = match preferred {
             "nvenc" => nvenc_plan(w, h, &presets.nvenc, &presets.codec),
             "vaapi" => vaapi_plan(w, h, presets.vaapi_cl, &presets.codec),
+            #[cfg(windows)]
+            "amf" => amf_plan(w, h, &presets.codec),
+            #[cfg(windows)]
+            "qsv" => qsv_plan(w, h, &presets.codec),
             #[cfg(target_os = "macos")]
             "videotoolbox" => videotoolbox_plan(w, h, &presets.codec),
             "software" => Some(software_plan(&presets.x264, &presets.codec, w, h)),
@@ -62,6 +70,12 @@ impl EncodePlan {
         let chosen = chosen
             .or_else(|| nvenc_plan(w, h, &presets.nvenc, &presets.codec))
             .or_else(|| vaapi_plan(w, h, presets.vaapi_cl, &presets.codec));
+        // Windows (DRAGON-238): the hardware tier is NVENC (tried above) > AMF > QSV, all
+        // before the software fallback. vaapi above always no-ops on Windows (no /dev/dri).
+        #[cfg(windows)]
+        let chosen = chosen
+            .or_else(|| amf_plan(w, h, &presets.codec))
+            .or_else(|| qsv_plan(w, h, &presets.codec));
         // macOS: VideoToolbox is the hardware tier — tried before the software fallback
         // (nvenc/vaapi above always no-op on mac: no /dev/nvidia0, no /dev/dri).
         #[cfg(target_os = "macos")]
@@ -77,34 +91,51 @@ impl EncodePlan {
     /// checks inside each `*_plan` do), so a size-independent probe is exact. A generous
     /// side is passed to the probes so hardware availability, not a size limit, decides.
     ///
-    /// Only the mac SCK worker (`record::sck`) calls this today (the software real-time
-    /// cap is a mac-gated concern); it is dead on Linux, hence the `not(macos)` allow.
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    /// The mac SCK worker (`record::sck`) and the Windows WGC worker (`record::wgc`,
+    /// DRAGON-229) call this (DRAGON-168 encode-size resolution); it is dead only on the
+    /// Linux workers, hence the `not(any(macos, windows))` allow.
+    #[cfg_attr(not(any(target_os = "macos", windows)), expect(dead_code))]
     pub fn resolve_encoder_id<'a>(preferred: &'a str, presets: &Presets) -> &'a str {
         // 1x1 is enough for the availability probes; each `*_plan` returns Some when the
         // hardware + encoder exist (its side checks only matter far above 1px).
-        let (w, h) = (1u32, 1u32);
-        let usable = |id: &str| -> bool {
-            match id {
+        // Windows (DRAGON-238): the hardware tier is NVENC > AMF > QSV — a distinct
+        // fallback order routed through the pure `windows_resolve_encoder_id` ranker.
+        #[cfg(windows)]
+        {
+            let (w, h) = (1u32, 1u32);
+            let usable = |id: &str| match id {
                 "nvenc" => nvenc_plan(w, h, &presets.nvenc, &presets.codec).is_some(),
-                "vaapi" => vaapi_plan(w, h, presets.vaapi_cl, &presets.codec).is_some(),
-                #[cfg(target_os = "macos")]
-                "videotoolbox" => videotoolbox_plan(w, h, &presets.codec).is_some(),
+                "amf" => amf_plan(w, h, &presets.codec).is_some(),
+                "qsv" => qsv_plan(w, h, &presets.codec).is_some(),
                 _ => false,
-            }
-        };
-        match preferred {
-            "nvenc" | "vaapi" | "videotoolbox" if usable(preferred) => return preferred,
-            "software" => return "software",
-            _ => {}
+            };
+            windows_resolve_encoder_id(preferred, &usable)
         }
-        // "auto" / an unavailable preference: the same order `resolve` falls back through.
-        for id in ["nvenc", "vaapi", "videotoolbox"] {
-            if usable(id) {
-                return id;
+        #[cfg(not(windows))]
+        {
+            let (w, h) = (1u32, 1u32);
+            let usable = |id: &str| -> bool {
+                match id {
+                    "nvenc" => nvenc_plan(w, h, &presets.nvenc, &presets.codec).is_some(),
+                    "vaapi" => vaapi_plan(w, h, presets.vaapi_cl, &presets.codec).is_some(),
+                    #[cfg(target_os = "macos")]
+                    "videotoolbox" => videotoolbox_plan(w, h, &presets.codec).is_some(),
+                    _ => false,
+                }
+            };
+            match preferred {
+                "nvenc" | "vaapi" | "videotoolbox" if usable(preferred) => return preferred,
+                "software" => return "software",
+                _ => {}
             }
+            // "auto" / an unavailable preference: the same order `resolve` falls back through.
+            for id in ["nvenc", "vaapi", "videotoolbox"] {
+                if usable(id) {
+                    return id;
+                }
+            }
+            "software"
         }
-        "software"
     }
 }
 
@@ -250,6 +281,14 @@ fn software_plan(x264_preset: &str, codec_choice: &str, w: u32, h: u32) -> Encod
 /// device, the driver stack is in the post-update NVML mismatch state (reboot
 /// pending), or the frame exceeds the codec's max side (H.264 ≤4096, HEVC ≤8192).
 fn nvenc_plan(w: u32, h: u32, nvenc_preset: &str, codec_choice: &str) -> Option<EncodePlan> {
+    // Windows (DRAGON-238): there is no `/dev/nvidia0` to probe — the honest availability
+    // gate is a real probe-encode through the bundled ffmpeg (cached). Success = the NVENC
+    // driver stack initialises; failure degrades to the next encoder, same as Linux.
+    #[cfg(windows)]
+    if !hw_encoder_probe_ok("h264_nvenc") {
+        return None;
+    }
+    #[cfg(not(windows))]
     if !std::path::Path::new("/dev/nvidia0").exists() {
         return None;
     }
@@ -257,6 +296,7 @@ fn nvenc_plan(w: u32, h: u32, nvenc_preset: &str, codec_choice: &str) -> Option<
     // next best encoder rather than fail the recording (the Health page carries the
     // warning + reboot hint). The encoder stays listed/persisted; the state clears
     // on reboot.
+    #[cfg(not(windows))]
     if nvenc_driver_mismatch() {
         return None;
     }
@@ -411,7 +451,7 @@ fn vaapi_supports_qvbr(dev: &str, driver: &str, encoder: &str) -> bool {
     if let Some(&v) = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(encoder) {
         return v;
     }
-    let ok = Command::new(crate::util::ffmpeg_path())
+    let ok = crate::util::ffmpeg_command()
         .args([
             "-hide_banner", "-loglevel", "error",
             "-vaapi_device", dev,
@@ -459,6 +499,133 @@ pub(crate) fn vaapi_device() -> Option<(String, String)> {
         return Some((format!("/dev/dri/{node}"), libva.to_string()));
     }
     None
+}
+
+// ── Windows hardware encoder tier (DRAGON-238) ──────────────────────────────────────
+//
+// Windows exposes NVIDIA/AMD/Intel H.264 encoders through the bundled ffmpeg binary
+// (`h264_nvenc` / `h264_amf` / `h264_qsv`). Unlike Linux (device-node checks) there is no
+// `/dev` node to sniff, so the honest availability gate is a real probe-encode: an encoder
+// present in the build but with no working driver FAILS the probe and degrades to the next
+// tier, never a broken recording. These mirror the existing cfg(macos) VideoToolbox arm's
+// shape and reuse `pick_h264_or_hevc` / the `EncodePlan` fields exactly like the other
+// hardware plans; only the encoder names + the probe gate differ.
+
+/// Whether `encoder` (an ffmpeg encoder name like `h264_nvenc`) can actually INITIALISE on
+/// this machine — a throwaway 2-frame encode of a tiny synthetic source to `-f null`.
+/// Success = the hardware + driver are present and working. Cached per encoder name so a
+/// recording start (or the settings/Health page) never re-spawns the probe. Mirrors
+/// `vaapi_supports_qvbr`'s cached-probe idiom; routed through the console-free
+/// `util::ffmpeg_command` seam (DRAGON-236).
+#[cfg(windows)]
+pub(crate) fn hw_encoder_probe_ok(encoder: &str) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(&v) = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(encoder) {
+        return v;
+    }
+    let ok = crate::util::ffmpeg_command()
+        .args([
+            "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=256x256:r=5:d=1",
+            "-c:v", encoder,
+            "-frames:v", "2", "-f", "null", "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(encoder.to_string(), ok);
+    ok
+}
+
+/// AMD AMF hardware encoder (`h264_amf` / `hevc_amf`), fed NV12 (our own threaded BT.709
+/// conversion). `None` unless the probe-encode initialises AND the encoder is in the build
+/// and the frame fits the codec's max side (H.264 ≤4096, HEVC ≤8192). `-quality speed`
+/// selects AMF's low-latency preset; the `-b:v` bitrate target/cap is added in spawn_ffmpeg
+/// (AMF is bitrate-based, so `quality_rc` is false).
+#[cfg(windows)]
+fn amf_plan(w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
+    if !hw_encoder_probe_ok("h264_amf") {
+        return None;
+    }
+    let encoders = ffmpeg_encoders();
+    let side = w.max(h);
+    let want_hevc = match codec_choice {
+        "hevc" => true,
+        "h264" => false,
+        _ => side > 4096,
+    };
+    let h264 = || vstr(&["-c:v", "h264_amf", "-quality", "speed"]);
+    let hevc = || vstr(&["-c:v", "hevc_amf", "-quality", "speed", "-tag:v", "hvc1"]);
+    let h264_ok = side <= 4096 && encoders.contains("h264_amf");
+    let hevc_ok = side <= 8192 && encoders.contains("hevc_amf");
+    let codec = pick_h264_or_hevc(want_hevc, h264_ok, hevc_ok, h264, hevc)?;
+    Some(EncodePlan {
+        pre: Vec::new(),
+        codec,
+        env: Vec::new(),
+        vf: None,
+        color_tags: false,
+        nv12: true,
+        quality_rc: false,
+    })
+}
+
+/// Intel Quick Sync (QSV) hardware encoder (`h264_qsv` / `hevc_qsv`), fed NV12. `None`
+/// unless the probe-encode initialises AND the encoder is in the build and the frame fits
+/// the codec's max side. `-preset veryfast` matches the real-time capture pipeline; the
+/// bitrate target/cap is added in spawn_ffmpeg (QSV is bitrate-based here, so `quality_rc`
+/// is false).
+#[cfg(windows)]
+fn qsv_plan(w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
+    if !hw_encoder_probe_ok("h264_qsv") {
+        return None;
+    }
+    let encoders = ffmpeg_encoders();
+    let side = w.max(h);
+    let want_hevc = match codec_choice {
+        "hevc" => true,
+        "h264" => false,
+        _ => side > 4096,
+    };
+    let h264 = || vstr(&["-c:v", "h264_qsv", "-preset", "veryfast"]);
+    let hevc = || vstr(&["-c:v", "hevc_qsv", "-preset", "veryfast", "-tag:v", "hvc1"]);
+    let h264_ok = side <= 4096 && encoders.contains("h264_qsv");
+    let hevc_ok = side <= 8192 && encoders.contains("hevc_qsv");
+    let codec = pick_h264_or_hevc(want_hevc, h264_ok, hevc_ok, h264, hevc)?;
+    Some(EncodePlan {
+        pre: Vec::new(),
+        codec,
+        env: Vec::new(),
+        vf: None,
+        color_tags: false,
+        nv12: true,
+        quality_rc: false,
+    })
+}
+
+/// The Windows hardware-encoder preference order (DRAGON-238): honour the user's
+/// `preferred` when it's usable, else fall back NVENC → AMF → QSV → software. Pure over a
+/// `usable` predicate so the ranking is unit-testable without spawning ffmpeg — the real
+/// [`EncodePlan::resolve_encoder_id`] feeds it the probe-backed predicate.
+#[cfg(windows)]
+fn windows_resolve_encoder_id<'a>(preferred: &'a str, usable: &dyn Fn(&str) -> bool) -> &'a str {
+    match preferred {
+        "nvenc" | "amf" | "qsv" if usable(preferred) => preferred,
+        "software" => "software",
+        // "auto" / an unavailable preference: the ranked hardware order, then software.
+        _ => ["nvenc", "amf", "qsv"]
+            .into_iter()
+            .find(|id| usable(id))
+            .unwrap_or("software"),
+    }
 }
 
 #[cfg(test)]
@@ -552,6 +719,57 @@ mod tests {
         assert!(!p.codec.iter().any(|a| a == "not-a-preset"));
     }
 
+    // DRAGON-238: the Windows hardware-encoder ranker (NVENC > AMF > QSV > software) is a
+    // pure island — inject the `usable` predicate so no ffmpeg is spawned.
+    #[cfg(windows)]
+    mod windows_tier {
+        use super::super::windows_resolve_encoder_id;
+
+        /// Build a `usable` predicate that returns true only for the listed ids.
+        fn only(avail: &'static [&'static str]) -> impl Fn(&str) -> bool {
+            move |id: &str| avail.contains(&id)
+        }
+
+        #[test]
+        fn honours_a_usable_preference() {
+            let u = only(&["nvenc", "amf", "qsv"]);
+            assert_eq!(windows_resolve_encoder_id("amf", &u), "amf");
+            assert_eq!(windows_resolve_encoder_id("qsv", &u), "qsv");
+            assert_eq!(windows_resolve_encoder_id("nvenc", &u), "nvenc");
+        }
+
+        #[test]
+        fn software_preference_is_always_honoured() {
+            let u = only(&["nvenc", "amf", "qsv"]);
+            assert_eq!(windows_resolve_encoder_id("software", &u), "software");
+        }
+
+        #[test]
+        fn an_unusable_preference_falls_back_in_rank_order() {
+            // Preferred amf but only qsv works -> the fallback picks the best available.
+            let u = only(&["qsv"]);
+            assert_eq!(windows_resolve_encoder_id("amf", &u), "qsv");
+            // Preferred nvenc, only amf + qsv work -> amf (ranked above qsv).
+            let u = only(&["amf", "qsv"]);
+            assert_eq!(windows_resolve_encoder_id("nvenc", &u), "amf");
+        }
+
+        #[test]
+        fn auto_picks_the_ranked_best_available() {
+            assert_eq!(windows_resolve_encoder_id("auto", &only(&["nvenc", "amf", "qsv"])), "nvenc");
+            assert_eq!(windows_resolve_encoder_id("auto", &only(&["amf", "qsv"])), "amf");
+            assert_eq!(windows_resolve_encoder_id("auto", &only(&["qsv"])), "qsv");
+            assert_eq!(windows_resolve_encoder_id("", &only(&["qsv"])), "qsv");
+        }
+
+        #[test]
+        fn nothing_usable_is_software() {
+            let none = only(&[]);
+            assert_eq!(windows_resolve_encoder_id("nvenc", &none), "software");
+            assert_eq!(windows_resolve_encoder_id("auto", &none), "software");
+        }
+    }
+
     // The VideoToolbox tests drive the pure `videotoolbox_plan_with` core (encoder set
     // injected) so they never spawn ffmpeg — matching the "no live probes in unit tests"
     // rule while still asserting the exact args the hardware plan emits.
@@ -630,7 +848,7 @@ mod tests {
         // A 1-frame testsrc2 encode through the given `-c:v …` args to `-f null`. Returns
         // whether ffmpeg exited 0 (the encoder opened + wrote a packet). Mirrors the shape
         // the recorder builds: `-realtime true` + an explicit `-b:v`.
-        Command::new(crate::util::ffmpeg_path())
+        std::process::Command::new(crate::util::ffmpeg_path())
             .args(["-hide_banner", "-loglevel", "error"])
             .args(["-f", "lavfi", "-i", &format!("testsrc2=size={w}x{h}:rate=30")])
             .args(["-frames:v", "3"])

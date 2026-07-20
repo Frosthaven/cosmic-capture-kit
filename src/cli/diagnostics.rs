@@ -39,11 +39,48 @@ pub fn run_test(name: &str, rest: &[String]) {
         #[cfg(target_os = "macos")]
         "mac-rec-bench" => mac_rec_bench(rest),
         #[cfg(target_os = "macos")]
+        "mac-wallpaper" => mac_wallpaper_test(arg(0)),
+        #[cfg(target_os = "macos")]
+        "mac-window-composite" => mac_window_composite_test(arg(0)),
+        #[cfg(target_os = "macos")]
         "mac-list-windows" => {
             for line in crate::platform::mac::dump_windows() {
                 println!("{line}");
             }
         }
+        // DRAGON-229 M1 Windows capture checkpoints (W1-SPEC §7). Each dispatches into
+        // the Windows plugin primitives (`crate::screenshot` / `platform::windows`) and
+        // does portable PNG/print glue — the mac-route pattern.
+        #[cfg(target_os = "windows")]
+        "windows-monitors" => windows_monitors_test(),
+        #[cfg(target_os = "windows")]
+        "windows-shot-output" => windows_shot_output_test(arg(0)),
+        #[cfg(target_os = "windows")]
+        "windows-list" => windows_list_test(),
+        #[cfg(target_os = "windows")]
+        "windows-shot-window" => windows_shot_window_test(arg(0)),
+        #[cfg(target_os = "windows")]
+        "windows-thumbs" => windows_thumbs_test(),
+        #[cfg(target_os = "windows")]
+        "windows-cursor" => windows_cursor_test(),
+        #[cfg(target_os = "windows")]
+        "windows-wallpaper" => windows_wallpaper_test(arg(0)),
+        #[cfg(target_os = "windows")]
+        "windows-window-composite" => windows_window_composite_test(arg(0), arg(1)),
+        #[cfg(target_os = "windows")]
+        "windows-shot-region" => {
+            windows_shot_region_test(arg(0), arg(1), arg(2), arg(3))
+        }
+        // DRAGON-229 M3 recording checkpoints (W3-SPEC §8). S1: one WGC frame → PNG. S2/S4:
+        // a real recording (monitor mode) through the owned media-clock pipeline.
+        #[cfg(target_os = "windows")]
+        "windows-wgc-frame" => windows_wgc_frame_test(arg(0), arg(1), arg(2), arg(3), arg(4)),
+        #[cfg(target_os = "windows")]
+        "windows-record" => windows_record_test(rest),
+        // DRAGON-282: the ACTIVE WASAPI render endpoints (id + friendly name) the Output-device
+        // picker offers and the recorder loops back — the enumeration proof.
+        #[cfg(target_os = "windows")]
+        "windows-audio-endpoints" => windows_audio_endpoints_test(),
         "bench-encoders" => {
             let w: u32 = arg(0).parse().unwrap_or(3840);
             let h: u32 = arg(1).parse().unwrap_or(2160);
@@ -547,6 +584,349 @@ fn mac_focus_shot_test(arg0: &str) {
             }
         }
         _ => eprintln!("mac-focus-shot: a capture returned None (TCC missing?)."),
+    }
+}
+
+/// `--test mac-wallpaper [display-name]` (DRAGON-291): the empirical proof for the
+/// wallpaper backdrop behind a window captured from another AeroSpace workspace. For the
+/// named display (or the main display if omitted) it runs BOTH backdrop sources the
+/// `composite_over_wallpaper` ladder uses and reports which one yields a real wallpaper:
+///
+///   (a) the SCK `capture_wallpaper` grab: width/height, fraction opaque, fraction
+///       near-black, per-channel min/max/mean, a coarse variance, and the composite
+///       path's own black-vs-content VERDICT (`content` / `uniform-black` /
+///       `transparent` / `empty`) — then saves the grab to a PNG.
+///   (b) the FILE fallback: `wallpaper::detect()` -> `wallpaper_crop` to the display
+///       size (the AeroSpace/SCK-independent path) — reports success + saves a PNG.
+///
+/// A UNIFORM near-black SCK grab (verdict `uniform-black`) is the DRAGON-291 failure the
+/// fix now rejects so the composite falls through to (b). Requires the Screen Recording
+/// grant for (a); (b) only needs the NSWorkspace desktop-picture URL.
+#[cfg(target_os = "macos")]
+fn mac_wallpaper_test(name: &str) {
+    use image::RgbaImage;
+
+    // Warm CoreGraphics (first bare-CLI SCK grab aborts otherwise) + enumerate displays.
+    let descs = crate::platform::mac::output_descs();
+    if descs.is_empty() {
+        eprintln!(
+            "mac-wallpaper: no displays returned. Screen Recording permission is likely not \
+             granted (System Settings > Privacy & Security > Screen Recording: enable this \
+             binary, then RESTART it)."
+        );
+        return;
+    }
+    println!("displays ({}):", descs.len());
+    for d in &descs {
+        println!(
+            "  {} {}x{} at {},{}",
+            d.name, d.logical_size.0, d.logical_size.1, d.logical_pos.0, d.logical_pos.1
+        );
+    }
+    // Target: the requested display, else the primary (CGMainDisplayID), else the first.
+    let main_name = format!("Display-{}", crate::platform::mac::main_display_id());
+    let target = if !name.is_empty() {
+        name.to_string()
+    } else if descs.iter().any(|d| d.name == main_name) {
+        main_name
+    } else {
+        descs[0].name.clone()
+    };
+    let (log_w, log_h) = descs
+        .iter()
+        .find(|d| d.name == target)
+        .map(|d| d.logical_size)
+        .unwrap_or((0, 0));
+    println!("\ntarget display: {target} ({log_w}x{log_h} logical)");
+
+    // Per-channel pixel stats over a full-frame scan (this is a diagnostic; cost is fine).
+    fn stats(img: &RgbaImage) {
+        let n = (img.width() as u64) * (img.height() as u64);
+        if n == 0 {
+            println!("  (empty image)");
+            return;
+        }
+        let (mut opaque, mut near_black) = (0u64, 0u64);
+        let mut lo = [255u8; 3];
+        let mut hi = [0u8; 3];
+        let mut sum = [0u64; 3];
+        for p in img.pixels() {
+            if p[3] != 0 {
+                opaque += 1;
+            }
+            let max_c = p[0].max(p[1]).max(p[2]);
+            if p[3] != 0 && max_c <= 8 {
+                near_black += 1;
+            }
+            for c in 0..3 {
+                lo[c] = lo[c].min(p[c]);
+                hi[c] = hi[c].max(p[c]);
+                sum[c] += p[c] as u64;
+            }
+        }
+        let mean = [sum[0] / n, sum[1] / n, sum[2] / n];
+        // Coarse variance proxy: the largest per-channel (max - min) spread.
+        let spread = (0..3).map(|c| hi[c].saturating_sub(lo[c])).max().unwrap_or(0);
+        println!(
+            "  pixels={n} opaque={:.4} near_black={:.4}",
+            opaque as f64 / n as f64,
+            near_black as f64 / n as f64
+        );
+        println!("  channel min={lo:?} max={hi:?} mean={mean:?} spread(max-min)={spread}");
+    }
+
+    // (a) The SCK capture_wallpaper grab.
+    println!("\n(a) SCK capture_wallpaper({target}):");
+    match crate::platform::mac::capture_wallpaper(&target) {
+        Some(wp) => {
+            println!("  grab: {}x{}", wp.width(), wp.height());
+            stats(&wp);
+            let verdict = crate::screenshot::wallpaper_grab_verdict(&wp);
+            println!("  composite verdict: {verdict}  (content => used as backdrop; anything else => file fallback)");
+            let path = std::env::temp_dir().join("cosmic-capture-kit-wallpaper-sck.png");
+            match wp.save(&path) {
+                Ok(()) => println!("  saved -> {}", path.display()),
+                Err(e) => eprintln!("  save failed: {e}"),
+            }
+        }
+        None => println!("  capture_wallpaper returned None (Screen Recording grant missing?)"),
+    }
+
+    // (b) The FILE fallback: NSWorkspace desktop picture -> wallpaper_crop to display size.
+    println!("\n(b) FILE fallback (wallpaper::detect -> wallpaper_crop):");
+    match crate::wallpaper::detect() {
+        Some(path) => {
+            println!("  desktop-picture file: {}", path.display());
+            let (pw, ph) = if log_w > 0 && log_h > 0 {
+                (log_w as u32, log_h as u32)
+            } else {
+                (1920, 1080)
+            };
+            match crate::wallpaper::wallpaper_crop(&path, false, pw, ph, 0, 0, pw, ph) {
+                Some(bg) => {
+                    println!("  wallpaper_crop -> {}x{}", bg.width(), bg.height());
+                    stats(&bg);
+                    let verdict = crate::screenshot::wallpaper_grab_verdict(&bg);
+                    println!("  (classifier on the FILE result: {verdict} — expect `content` for a real wallpaper)");
+                    let out = std::env::temp_dir().join("cosmic-capture-kit-wallpaper-file.png");
+                    match bg.save(&out) {
+                        Ok(()) => println!("  saved -> {}", out.display()),
+                        Err(e) => eprintln!("  save failed: {e}"),
+                    }
+                }
+                None => println!(
+                    "  wallpaper_crop returned None — the file could not be decoded/placed. \
+                     If this happens the AeroSpace fix would NOT hold (no backdrop source)."
+                ),
+            }
+        }
+        None => println!(
+            "  wallpaper::detect returned None — no decodable desktop-picture URL \
+             (dynamic .heic / rotating folder / solid color resolve to None by design). \
+             If this happens the AeroSpace fix would NOT hold."
+        ),
+    }
+
+    // (c) The EXCLUDE-based SCK grab (DRAGON-186 Phase 5c) as a SECONDARY SCK backdrop
+    //     source that does NOT depend on the wallpaper-window title allow-list matching,
+    //     so it can recover a backdrop when (a) misses on an AeroSpace transition and (b)
+    //     is unavailable. Verdict + PNG for comparison.
+    println!("\n(c) EXCLUDE-based SCK grab (Phase 5c fallback source):");
+    match crate::platform::mac::capture_wallpaper_excluding(&target) {
+        Some(wp) => {
+            println!("  grab: {}x{}", wp.width(), wp.height());
+            stats(&wp);
+            let verdict = crate::screenshot::wallpaper_grab_verdict(&wp);
+            println!("  composite verdict: {verdict}");
+            let out = std::env::temp_dir().join("cosmic-capture-kit-wallpaper-exclude.png");
+            match wp.save(&out) {
+                Ok(()) => println!("  saved -> {}", out.display()),
+                Err(e) => eprintln!("  save failed: {e}"),
+            }
+        }
+        None => println!("  capture_wallpaper_excluding returned None"),
+    }
+}
+
+/// `--test mac-window-composite <window-id>` (DRAGON-268): the non-interactive reproduction
+/// of the wallpaper-behind-window composite, so the crop/scale math can be inspected with
+/// REAL numbers. Builds a `WindowCaptureJob` for the given window id with wallpaper-compose
+/// ON and transparency ON, runs the real `run()`, and logs EVERY composite number: the
+/// resolved display, the derived scale, out_w/out_h, the raw grab dims + backing scale, the
+/// decorated (bordered+padded) dims used as the crop w/h, the crop rect (raw + nudged), and
+/// whether the decorated window EXCEEDS the display (the old stretch trigger). It also saves
+/// the composite PNG, a direct `capture_wallpaper` grab, and a direct footprint crop of the
+/// SAME rect so the wallpaper strip can be compared against an undistorted reference.
+///
+/// Defaults for the job fields that a real capture would read from settings/overlay
+/// (documented so the numbers are reproducible): wallpaper ON, transparency ON, shadow ON,
+/// `pad_logical = 50` (the shipped default window padding), `window_radius = 12`, an Active
+/// border resolved from the persisted appearance accent, `dark = true`. These mirror the
+/// running app's window-capture defaults so the composite geometry matches a live capture.
+#[cfg(target_os = "macos")]
+fn mac_window_composite_test(id: &str) {
+    use crate::platform::mac;
+    if id.is_empty() {
+        eprintln!("usage: --test mac-window-composite <window-id>  (ids from --test mac-list-windows)");
+        return;
+    }
+    // Warm CoreGraphics (first bare-CLI SCK grab aborts otherwise) + enumerate displays.
+    let descs = mac::output_descs();
+    if descs.is_empty() {
+        eprintln!(
+            "mac-window-composite: no displays returned. Screen Recording permission is likely \
+             not granted (grant this binary + RESTART)."
+        );
+        return;
+    }
+    let Some((wx, wy, ww, wh)) = mac::window_logical_rect(id) else {
+        eprintln!("mac-window-composite: window id {id} not found (frame lookup failed)");
+        return;
+    };
+    println!("window {id}: logical rect origin=({wx},{wy}) size=({ww}x{wh})");
+    let sel = crate::selection::Selection {
+        x: wx,
+        y: wy,
+        width: ww.max(1) as u32,
+        height: wh.max(1) as u32,
+        output: None,
+        window_id: Some(id.to_string()),
+    };
+
+    // ── Reproduce run()'s decoration math to LOG the geometry (kept in lock-step with
+    //    WindowCaptureJob::run + composite_over_wallpaper). ──────────────────────────
+    let Some(raw) = crate::screenshot::window(id, false) else {
+        eprintln!("mac-window-composite: raw window grab returned None (grant missing?)");
+        return;
+    };
+    let scale = raw.width() as f32 / sel.width.max(1) as f32;
+    println!(
+        "raw window grab: {}x{}  derived backing scale = {} / {} = {scale}",
+        raw.width(),
+        raw.height(),
+        raw.width(),
+        sel.width
+    );
+
+    // The shipped window-capture defaults (documented above).
+    let pad_logical: f32 = 50.0;
+    let window_radius: f32 = 12.0;
+    let dark = true;
+    let active_default = crate::app::theme::resolved_appearance_accent_rgba();
+    let borders =
+        crate::decoration::WindowBorders::resolve(Some(active_default), 3, [65, 69, 80, 255], 1);
+    let border = borders.active;
+    let bw_logical = border.to_compose().map(|(w, _)| w).unwrap_or(0.0);
+    let margin_logical = (pad_logical - bw_logical).max(0.0);
+    let total_margin_logical = bw_logical + margin_logical;
+    // Physical dims of the decorated window = window + 2*border + 2*margin (shadow uses the
+    // SAME 2*margin canvas as pad_transparent), i.e. rw/rh the crop is taken at.
+    let bw_px = (bw_logical * scale).round().max(1.0) as i32;
+    let margin_px = (margin_logical * scale).round() as i32;
+    let decorated_w = raw.width() as i32 + 2 * bw_px + 2 * margin_px;
+    let decorated_h = raw.height() as i32 + 2 * bw_px + 2 * margin_px;
+    println!(
+        "decoration: pad_logical={pad_logical} border_logical={bw_logical} margin_logical={margin_logical} \
+         total_margin_logical={total_margin_logical}"
+    );
+    println!(
+        "decoration (physical): border={bw_px}px margin={margin_px}px -> decorated (crop rw x rh) = {decorated_w}x{decorated_h}"
+    );
+
+    // Resolve the display the window centre sits on (the composite's own containment test).
+    let cx = sel.x + sel.width as i32 / 2;
+    let cy = sel.y + sel.height as i32 / 2;
+    let resolved = descs
+        .iter()
+        .find(|d| {
+            let ((ox, oy), (ow, oh)) = (d.logical_pos, d.logical_size);
+            cx >= ox && cx < ox + ow && cy >= oy && cy < oy + oh
+        })
+        .or_else(|| descs.first());
+    let Some(d) = resolved else {
+        eprintln!("mac-window-composite: could not resolve a display for the window centre");
+        return;
+    };
+    let display = (d.name.clone(), d.logical_pos, d.logical_size);
+    println!(
+        "resolved display: {} logical pos=({},{}) size=({}x{})",
+        d.name, d.logical_pos.0, d.logical_pos.1, d.logical_size.0, d.logical_size.1
+    );
+    let g = crate::screenshot::wallpaper_composite_geom(
+        display.clone(),
+        sel.x,
+        sel.y,
+        total_margin_logical,
+        scale,
+        decorated_w,
+        decorated_h,
+    );
+    println!("── composite geometry ──");
+    println!("  scale={}", g.scale);
+    println!("  out_w x out_h = {} x {}", g.out_w, g.out_h);
+    println!("  bnd (border_logical rounded) = {}px", g.bnd_physical);
+    println!("  rw x rh (decorated crop) = {} x {}", g.rw, g.rh);
+    println!("  rx_raw,ry_raw = {},{}   rx,ry (nudged) = {},{}", g.rx_raw, g.ry_raw, g.rx, g.ry);
+    println!(
+        "  OVERSIZE (decorated exceeds display): {}  ({}x{} vs {}x{})",
+        g.oversize, g.rw, g.rh, g.out_w, g.out_h
+    );
+
+    // Save a direct wallpaper grab + the direct footprint crop of the SAME rect (the
+    // undistorted reference the composite's wallpaper strip must match).
+    match mac::capture_wallpaper(&d.name) {
+        Some(wp) => {
+            let p = std::env::temp_dir().join("cck-window-composite-wallpaper.png");
+            let _ = wp.save(&p);
+            println!("  capture_wallpaper: {}x{} -> {}", wp.width(), wp.height(), p.display());
+            if let Some(strip) = crate::screenshot::wallpaper_footprint_ref(
+                &wp, g.out_w, g.out_h, g.rx, g.ry, g.rw as u32, g.rh as u32,
+            ) {
+                let sp = std::env::temp_dir().join("cck-window-composite-wp-footprint.png");
+                let _ = strip.save(&sp);
+                println!(
+                    "  direct footprint crop (undistorted reference): {}x{} -> {}",
+                    strip.width(), strip.height(), sp.display()
+                );
+            }
+        }
+        None => println!("  capture_wallpaper returned None (grant missing?)"),
+    }
+
+    // ── Run the REAL composite through the job. ──────────────────────────────────────
+    let frozen_geom: Vec<_> = descs
+        .iter()
+        .map(|o| (o.name.clone(), o.logical_pos, o.logical_size))
+        .collect();
+    let job = crate::screenshot::WindowCaptureJob {
+        id: id.to_string(),
+        cursor: false,
+        sel,
+        capture_transparency: true,
+        capture_wallpaper: true,
+        window_radius,
+        border,
+        window_shadow: true,
+        pad_logical,
+        dark,
+        frozen_geom,
+        frozen_px: None,
+        cursor_overlay: None,
+    };
+    match job.run() {
+        Some(img) => {
+            let p = std::env::temp_dir().join(format!("cck-window-composite-{id}.png"));
+            match img.save(&p) {
+                Ok(()) => println!(
+                    "composite output: {}x{} -> {}",
+                    img.width(),
+                    img.height(),
+                    p.display()
+                ),
+                Err(e) => eprintln!("mac-window-composite: save failed: {e}"),
+            }
+        }
+        None => eprintln!("mac-window-composite({id}): run() returned None (grab failed)"),
     }
 }
 
@@ -1108,7 +1488,25 @@ fn print_test_help() {
     eprint!(
         "mac-shot [display-name]           SCK still + window/cursor probe -> PNG in tmp\n\
          mac-active-shot                   grab the frontmost app's window + score its traffic lights (DRAGON-189)\n\
-         mac-focus-shot [windowID]         focus a non-front window, verify, re-grab; before/after traffic-light score (DRAGON-189)\n"
+         mac-focus-shot [windowID]         focus a non-front window, verify, re-grab; before/after traffic-light score (DRAGON-189)\n\
+         mac-wallpaper [display-name]      SCK wallpaper grab + FILE fallback: pixel stats, black-vs-content verdict -> PNG pair (DRAGON-291)\n"
+    );
+    // DRAGON-229/241: the Windows capture + recording checkpoints (W1-SPEC §7 / W3-SPEC §8),
+    // one line per `windows-*` match arm above.
+    #[cfg(target_os = "windows")]
+    eprint!(
+        "windows-monitors                  DPI awareness + each monitor's geometry + DPI\n\
+         windows-shot-output [name]        a full-monitor BitBlt flat -> PNG\n\
+         windows-list                      the toplevel window list (id, rect, active, title)\n\
+         windows-shot-window <hwnd>        one window's pixels (PrintWindow ladder) -> PNG\n\
+         windows-thumbs                    time the FULL bounded window pre-capture (picker grab); reports skips\n\
+         windows-cursor                    the cursor sprite (alpha + position + hotspot + scale) -> PNG\n\
+         windows-wallpaper [name]          detect() + the per-output wallpaper resolver -> PNG\n\
+         windows-window-composite <hwnd> [black]  single-window-on-wallpaper composite -> PNG\n\
+         windows-shot-region <x> <y> <w> <h>  a stitched region flat -> PNG\n\
+         windows-wgc-frame <monitor|window|region> [args]  grab one WGC frame -> PNG\n\
+         windows-record <secs> [mic] [nosys] [pause] [enc]  record via the owned media-clock pipeline -> mp4\n\
+         windows-audio-endpoints           list the ACTIVE WASAPI render endpoints (id + name) the Output picker offers\n"
     );
 }
 
@@ -1645,7 +2043,16 @@ fn mic_rec_test() {
         gate_threshold: 0.5,
         advanced_vad: false,
     };
+    // DRAGON-241: `/tmp` doesn't exist for a native Windows process (it resolves to a
+    // nonexistent `<drive>:\tmp`, so the raw/out writes below would fail), so use the
+    // real per-user temp dir there — the same place the `windows-*` tests write. Linux
+    // and macOS keep the historical `/tmp` path byte-for-byte.
+    #[cfg(not(target_os = "windows"))]
     let out = "/tmp/cck-rectest.mp4";
+    #[cfg(target_os = "windows")]
+    let out_buf = std::env::temp_dir().join("cck-rectest.mp4");
+    #[cfg(target_os = "windows")]
+    let out = out_buf.to_str().expect("temp dir path is valid UTF-8");
     let _ = std::fs::remove_file(out);
     let (w, h, fps) = (320u32, 240u32, 30u32);
 
@@ -1672,7 +2079,12 @@ fn mic_rec_test() {
         return;
     }
     let dur = samples.len() as f64 / SR as f64;
+    #[cfg(not(target_os = "windows"))]
     let mic_raw = std::path::Path::new("/tmp/cck-mic-tap-raw.f32");
+    #[cfg(target_os = "windows")]
+    let mic_raw_buf = std::env::temp_dir().join("cck-mic-tap-raw.f32");
+    #[cfg(target_os = "windows")]
+    let mic_raw = mic_raw_buf.as_path();
     let raw_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
     if let Err(e) = std::fs::write(mic_raw, &raw_bytes) {
         eprintln!("mic-rec-test: could not write the cleaned mic's raw PCM temp file: {e}");
@@ -1681,11 +2093,11 @@ fn mic_rec_test() {
 
     // Mux the already-fully-captured cleaned mic (a plain file input now, not a
     // live FIFO) against a synthetic video + the live system monitor.
-    let mut cmd = std::process::Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-hide_banner", "-loglevel", "error", "-y"]);
     cmd.args(["-f", "lavfi", "-i", &format!("color=c=black:s={w}x{h}:r={fps}:d={dur:.3}")]);
     cmd.args(["-f", "f32le", "-ar", "48000", "-ac", "1", "-i"]).arg(mic_raw);
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     {
         cmd.args(["-thread_queue_size", "1024", "-f", "pulse", "-i", "@DEFAULT_MONITOR@"]);
         cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0"]);
@@ -1694,6 +2106,40 @@ fn mic_rec_test() {
             "-metadata:s:a:0", "title=mic", "-metadata:s:a:1", "title=system",
             "-shortest",
         ]);
+    }
+    // Windows (DRAGON-241): there is no pulse monitor. Exercise the SAME WASAPI-loopback
+    // seam the real recorder drives (`audio::capture::MonitorCapture`'s `#[cfg(windows)]`
+    // arm) — capture ~`dur`s of the default render endpoint's loopback into a raw f32le
+    // stereo file, then mux it beside the mic as a plain input (a non-silent system track
+    // when audio is playing, an honestly-silent one otherwise). If loopback can't start or
+    // delivers nothing, fall back to a mic-only mux with a clear message.
+    #[cfg(target_os = "windows")]
+    {
+        let sys_raw = std::env::temp_dir().join("cck-sys-loopback-raw.f32");
+        match capture_system_loopback(&sys_raw, dur) {
+            Some(peak) => {
+                eprintln!(
+                    "mic-rec-test: WASAPI loopback captured system audio (peak {peak:.4}, {})",
+                    if peak > 0.0001 { "non-silent" } else { "silent — nothing was playing" }
+                );
+                cmd.args(["-f", "f32le", "-ar", "48000", "-ac", "2", "-i"]).arg(&sys_raw);
+                cmd.args(["-map", "0:v:0", "-map", "1:a:0", "-map", "2:a:0"]);
+                cmd.args([
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "192k",
+                    "-metadata:s:a:0", "title=mic", "-metadata:s:a:1", "title=system",
+                    "-shortest",
+                ]);
+            }
+            None => {
+                eprintln!("mic-rec-test: WASAPI loopback unavailable; writing a mic-only mux");
+                cmd.args(["-map", "0:v:0", "-map", "1:a:0"]);
+                cmd.args([
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "192k",
+                    "-metadata:s:a:0", "title=mic",
+                    "-shortest",
+                ]);
+            }
+        }
     }
     // macOS: there is no pulse monitor to grab a live system track from (and no
     // standalone system capture at all outside a recording's owned SCK stream), so
@@ -1712,7 +2158,7 @@ fn mic_rec_test() {
     let status = cmd.status();
     let _ = std::fs::remove_file(mic_raw);
     eprintln!("mic-rec-test: ffmpeg exited {status:?} ({dur:.2}s of cleaned mic captured)");
-    let probe = std::process::Command::new(crate::util::ffprobe_path())
+    let probe = crate::util::ffprobe_command()
         .args([
             "-v", "error", "-show_entries",
             "stream=index,codec_type,channels,channel_layout:stream_tags=title",
@@ -1723,6 +2169,36 @@ fn mic_rec_test() {
         Ok(o) => println!("{}", String::from_utf8_lossy(&o.stdout)),
         Err(e) => eprintln!("mic-rec-test: ffprobe failed: {e}"),
     }
+}
+
+/// Capture ~`secs` of the default render endpoint's WASAPI loopback — the SAME seam the
+/// real recorder drives ([`crate::audio::capture::MonitorCapture`]'s `#[cfg(windows)]`
+/// arm) — into a raw interleaved-stereo f32le file at `path`, for the Windows `mic-rec`
+/// mux. Returns the peak absolute sample (so the caller can honestly report
+/// silent-vs-non-silent), or `None` if loopback can't start or delivered nothing (the
+/// caller then muxes mic-only). DRAGON-241.
+#[cfg(target_os = "windows")]
+fn capture_system_loopback(path: &std::path::Path, secs: f64) -> Option<f32> {
+    use std::time::{Duration, Instant};
+    let (capture, rx) = crate::audio::capture::MonitorCapture::start(None, None)?;
+    // Stereo @ 48 kHz → 2 samples per frame.
+    let want = (48_000.0 * 2.0 * secs) as usize;
+    let mut samples: Vec<f32> = Vec::with_capacity(want);
+    let deadline = Instant::now() + Duration::from_secs_f64(secs + 1.0);
+    while samples.len() < want && Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(chunk) => samples.extend_from_slice(&chunk.samples),
+            Err(_) => break,
+        }
+    }
+    let _ = capture.stop();
+    if samples.is_empty() {
+        return None;
+    }
+    let peak = samples.iter().copied().map(f32::abs).fold(0f32, f32::max);
+    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    std::fs::write(path, &bytes).ok()?;
+    Some(peak)
 }
 
 /// Headless diagnostic: exercise the native gather + screencopy paths and print
@@ -1813,5 +2289,478 @@ fn selftest() {
             }
             None => eprintln!("capture_output({name}): FAILED (no image)"),
         }
+    }
+}
+
+// ── DRAGON-229 M1: Windows capture checkpoints (W1-SPEC §7) ───────────────────────
+// Each saves its PNG under the temp dir and prints the absolute path. These call only
+// the Windows plugin primitives (`crate::screenshot` / `platform::windows`) + portable
+// PNG/print glue — the same shape as the mac routes above (strict split honored).
+
+/// A filesystem-safe slug of a display name (`\\.\DISPLAY1` → `-----DISPLAY1`).
+#[cfg(target_os = "windows")]
+fn win_slug(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// `--test windows-monitors`: DPI awareness + every monitor's physical geometry + DPI.
+#[cfg(target_os = "windows")]
+fn windows_monitors_test() {
+    println!(
+        "thread DPI awareness: {} (want per-monitor)",
+        crate::platform::windows::dpi::thread_dpi_awareness_str()
+    );
+    let lines = crate::platform::windows::monitor_report();
+    println!("monitors ({}):", lines.len());
+    for line in &lines {
+        println!("  {line}");
+    }
+    if lines.is_empty() {
+        println!("(no monitors — headless session?)");
+    }
+}
+
+/// `--test windows-shot-output [name]`: a full-monitor BitBlt flat → PNG.
+#[cfg(target_os = "windows")]
+fn windows_shot_output_test(name: &str) {
+    let descs = crate::screenshot::output_descs();
+    let target = if name.is_empty() {
+        descs
+            .iter()
+            .find(|d| d.logical_pos == (0, 0))
+            .or_else(|| descs.first())
+            .map(|d| d.name.clone())
+    } else {
+        Some(name.to_string())
+    };
+    let Some(target) = target else {
+        eprintln!("windows-shot-output: no monitors");
+        return;
+    };
+    match crate::screenshot::output(&target, None) {
+        Some(img) => {
+            let p = std::env::temp_dir().join(format!("cck-win-output-{}.png", win_slug(&target)));
+            match img.save(&p) {
+                Ok(()) => println!(
+                    "captured {target}: {}x{} -> {}",
+                    img.width(),
+                    img.height(),
+                    p.display()
+                ),
+                Err(e) => eprintln!("windows-shot-output: save failed: {e}"),
+            }
+        }
+        None => eprintln!("windows-shot-output({target}): FAILED"),
+    }
+}
+
+/// `--test windows-list`: the toplevel window list (id, rect, active, title).
+#[cfg(target_os = "windows")]
+fn windows_list_test() {
+    let wins = crate::platform::windows::list_windows();
+    println!("windows ({}):", wins.len());
+    for w in &wins {
+        let (x, y, ww, wh) = w.rect;
+        println!(
+            "  id={} rect=({x},{y},{ww},{wh}) active={} title={:?}",
+            w.id, w.active, w.title
+        );
+    }
+}
+
+/// `--test windows-shot-window <hwnd>`: one window's pixels (PrintWindow ladder) → PNG.
+#[cfg(target_os = "windows")]
+fn windows_shot_window_test(id: &str) {
+    if id.is_empty() {
+        eprintln!("usage: --test windows-shot-window <hwnd-decimal>");
+        return;
+    }
+    match crate::screenshot::window(id, false) {
+        Some(img) => {
+            let p = std::env::temp_dir().join(format!("cck-win-window-{id}.png"));
+            match img.save(&p) {
+                Ok(()) => println!(
+                    "captured window {id}: {}x{} -> {}",
+                    img.width(),
+                    img.height(),
+                    p.display()
+                ),
+                Err(e) => eprintln!("windows-shot-window: save failed: {e}"),
+            }
+        }
+        None => eprintln!(
+            "windows-shot-window({id}): None — bad grab on an OCCLUDED GPU-composited \
+             window (WGC rescue is M3), or an invalid hwnd. See the DRAGON-229 log line."
+        ),
+    }
+}
+
+/// `--test windows-thumbs`: run the FULL window pre-capture enumeration
+/// (`screenshot::windows` over every listed toplevel) — the exact path window MODE runs
+/// at launch, and the one that used to hang forever on a single uncooperative window
+/// (DRAGON-232). Times the whole bounded grab and reports each window as OK (real pixels)
+/// or SKIP (pre-filtered / timed out → a placeholder tile in the live picker). A bounded
+/// total elapsed with the process exiting cleanly is the headless proof the picker now
+/// populates; run it with a hung/remote app (e.g. RustDesk) open to exercise a skip.
+#[cfg(target_os = "windows")]
+fn windows_thumbs_test() {
+    let wins = crate::platform::windows::list_windows();
+    let ids: Vec<String> = wins.iter().map(|w| w.id.clone()).collect();
+    println!("enumerating {} windows; running the bounded per-window grab...", ids.len());
+    let t0 = std::time::Instant::now();
+    let raw = crate::screenshot::windows(&ids);
+    let elapsed = t0.elapsed();
+    let skipped = ids.len().saturating_sub(raw.len());
+    println!(
+        "screenshot::windows: {} grabbed / {skipped} skipped in {:.2}s",
+        raw.len(),
+        elapsed.as_secs_f64()
+    );
+    for w in &wins {
+        match raw.get(&w.id) {
+            Some(img) => {
+                println!("  OK   id={} {}x{} title={:?}", w.id, img.width(), img.height(), w.title)
+            }
+            None => println!("  SKIP id={} -> placeholder tile title={:?}", w.id, w.title),
+        }
+    }
+}
+
+/// `--test windows-cursor`: the cursor sprite (real alpha) → PNG + position/hotspot/scale.
+#[cfg(target_os = "windows")]
+fn windows_cursor_test() {
+    match crate::screenshot::capture_cursor() {
+        Some((img, pos, hot, scale)) => {
+            let p = std::env::temp_dir().join("cck-win-cursor.png");
+            let ok = img.save(&p).is_ok();
+            println!(
+                "cursor: {}x{} at {:?} hotspot {:?} sprite_scale={:.3} saved={ok} -> {}",
+                img.width(),
+                img.height(),
+                pos,
+                hot,
+                scale,
+                p.display()
+            );
+        }
+        None => println!("cursor: none (hidden?)"),
+    }
+}
+
+/// `--test windows-wallpaper [name]`: `detect()` + the per-output resolver (honest None
+/// under slideshow / solid color / undecodable), decoding a copy to confirm.
+#[cfg(target_os = "windows")]
+fn windows_wallpaper_test(name: &str) {
+    println!("detect() (primary / cap): {:?}", crate::wallpaper::detect());
+    let descs = crate::screenshot::output_descs();
+    let target = if name.is_empty() {
+        descs.first().map(|d| d.name.clone())
+    } else {
+        Some(name.to_string())
+    };
+    let Some(target) = target else {
+        eprintln!("windows-wallpaper: no monitors");
+        return;
+    };
+    match crate::platform::windows::wallpaper::wallpaper_for_output(&target) {
+        Some((path, stretch)) => {
+            println!("wallpaper_for_output({target}): {} (stretch={stretch})", path.display());
+            if let Some(wp) = crate::wallpaper::decode_wallpaper(&path) {
+                let p = std::env::temp_dir()
+                    .join(format!("cck-win-wallpaper-{}.png", win_slug(&target)));
+                let ok = wp.save(&p).is_ok();
+                println!("  decoded {}x{} saved={ok} -> {}", wp.width(), wp.height(), p.display());
+            }
+        }
+        None => println!(
+            "wallpaper_for_output({target}): None (slideshow / solid color / undecodable — honest)"
+        ),
+    }
+}
+
+/// `--test windows-window-composite <hwnd> [black]`: the FINAL PROOF — the full
+/// decorate/compose/wallpaper pipeline (single-window-on-wallpaper). `black` = the
+/// wallpaper-OFF variant (window over black).
+#[cfg(target_os = "windows")]
+fn windows_window_composite_test(id: &str, mode: &str) {
+    if id.is_empty() {
+        eprintln!("usage: --test windows-window-composite <hwnd> [black]");
+        return;
+    }
+    let Some(win) = crate::platform::windows::list_windows().into_iter().find(|w| w.id == id) else {
+        eprintln!("windows-window-composite: hwnd {id} not in the window list");
+        return;
+    };
+    let (x, y, w, h) = win.rect;
+    let sel = crate::selection::Selection {
+        x,
+        y,
+        width: w as u32,
+        height: h as u32,
+        output: None,
+        window_id: Some(id.to_string()),
+    };
+    let wallpaper = mode != "black";
+    // The Active-border DEFAULT follows the resolved appearance accent (DRAGON-239).
+    // A CLI process never applies the global theme, so pass the accent resolved from
+    // the PERSISTED appearance settings explicitly — the same colour the running app's
+    // `None -> accent_rgba()` (applied theme) would draw — so the pixel proof is
+    // faithful. An explicit `active_border_color` in config would win in the app; the
+    // diag proves the auto/default path.
+    let active_default = crate::app::theme::resolved_appearance_accent_rgba();
+    println!("windows-window-composite: resolved active-border accent = {active_default:?}");
+    let borders =
+        crate::decoration::WindowBorders::resolve(Some(active_default), 3, [65, 69, 80, 255], 1);
+    let frozen_geom: Vec<_> = crate::screenshot::output_descs()
+        .into_iter()
+        .map(|o| (o.name, o.logical_pos, o.logical_size))
+        .collect();
+    let job = crate::screenshot::WindowCaptureJob {
+        id: id.to_string(),
+        cursor: false,
+        sel,
+        capture_transparency: false,
+        capture_wallpaper: wallpaper,
+        window_radius: 12.0,
+        border: borders.active,
+        window_shadow: true,
+        pad_logical: 24.0,
+        dark: true,
+        frozen_geom,
+        frozen_px: None,
+        // DRAGON-278: this diagnostic composites a live grab, not an activated focus-grab.
+        active_grab: None,
+        cursor_overlay: None,
+    };
+    match job.run() {
+        Some(img) => {
+            let tag = if wallpaper { "wp" } else { "black" };
+            let p = std::env::temp_dir().join(format!("cck-win-composite-{id}-{tag}.png"));
+            match img.save(&p) {
+                Ok(()) => println!(
+                    "composite {id} (wallpaper={wallpaper}): {}x{} -> {}",
+                    img.width(),
+                    img.height(),
+                    p.display()
+                ),
+                Err(e) => eprintln!("windows-window-composite: save failed: {e}"),
+            }
+        }
+        None => eprintln!("windows-window-composite({id}): FAILED (window grab returned None)"),
+    }
+}
+
+/// `--test windows-wgc-frame <monitor|window|region> [args]`: grab ONE WGC frame and save
+/// it as a PNG — the S1 checkpoint (isolated WGC video de-risk). `monitor [name]` (default
+/// primary), `window <hwnd>`, or `region <x> <y> <w> <h>`.
+#[cfg(target_os = "windows")]
+fn windows_wgc_frame_test(kind: &str, a: &str, b: &str, c: &str, d: &str) {
+    use crate::record::WinRecordTarget;
+    let (target, x, y, w, h) = match kind {
+        "window" => {
+            if a.is_empty() {
+                eprintln!("usage: --test windows-wgc-frame window <hwnd-decimal>");
+                return;
+            }
+            (WinRecordTarget::Window(a.to_string()), 0, 0, 0, 0)
+        }
+        "region" => {
+            let x: i32 = a.parse().unwrap_or(0);
+            let y: i32 = b.parse().unwrap_or(0);
+            let w: u32 = c.parse().unwrap_or(0);
+            let h: u32 = d.parse().unwrap_or(0);
+            if w == 0 || h == 0 {
+                eprintln!("usage: --test windows-wgc-frame region <x> <y> <w> <h>");
+                return;
+            }
+            (WinRecordTarget::Region, x, y, w, h)
+        }
+        _ => {
+            let descs = crate::screenshot::output_descs();
+            let name = if a.is_empty() {
+                descs
+                    .iter()
+                    .find(|d| d.logical_pos == (0, 0))
+                    .or_else(|| descs.first())
+                    .map(|d| d.name.clone())
+            } else {
+                Some(a.to_string())
+            };
+            let Some(name) = name else {
+                eprintln!("windows-wgc-frame: no monitors");
+                return;
+            };
+            (WinRecordTarget::Display(name), 0, 0, 0, 0)
+        }
+    };
+    match crate::record::wgc_capture_one_frame(target, x, y, w, h, false) {
+        Ok((fw, fh, bytes)) => {
+            let Some(img) = image::RgbaImage::from_raw(fw, fh, bytes) else {
+                eprintln!("windows-wgc-frame: malformed frame buffer");
+                return;
+            };
+            let p = std::env::temp_dir().join(format!("cck-wgc-frame-{kind}.png"));
+            match img.save(&p) {
+                Ok(()) => println!("wgc frame ({kind}): {fw}x{fh} -> {}", p.display()),
+                Err(e) => eprintln!("windows-wgc-frame: save failed: {e}"),
+            }
+        }
+        Err(e) => eprintln!("windows-wgc-frame({kind}): FAILED — {e}"),
+    }
+}
+
+/// `--test windows-record <secs> [mic] [nosys] [pause] [nvenc|amf|qsv|software]`: record the
+/// primary monitor for `secs` through the full owned pipeline (WGC + named-pipe audio +
+/// WASAPI system + the chosen encoder) and print the finalized file. S2/S4 checkpoint (+
+/// DRAGON-238 encoder-tier proof). `mic` enables the mic track, `nosys` gates the system
+/// track OFF (it is still captured for the pre-flight), `pause` pauses at the midpoint for
+/// 2s (the media-clock freeze check). The trailing encoder id (default `software`) sets the
+/// preferred encoder; the RESOLVED id is logged so "picks nvenc when preferred" is provable
+/// headlessly (a machine without the hardware degrades honestly to software).
+#[cfg(target_os = "windows")]
+fn windows_record_test(rest: &[String]) {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let secs: u64 = rest.first().and_then(|s| s.parse().ok()).unwrap_or(5);
+    let want_pause = rest.iter().any(|a| a == "pause");
+    let mic = rest.iter().any(|a| a == "mic");
+    let sys = !rest.iter().any(|a| a == "nosys");
+    // Optional trailing encoder id (DRAGON-238); default software. Log what `resolve`
+    // actually picks — the honest availability gate degrades an unusable encoder to software.
+    let enc = rest
+        .iter()
+        .find(|a| matches!(a.as_str(), "nvenc" | "amf" | "qsv" | "software"))
+        .cloned()
+        .unwrap_or_else(|| "software".to_string());
+    let presets = crate::encode::Presets::default();
+    let resolved = crate::encode::EncodePlan::resolve_encoder_id(&enc, &presets);
+    eprintln!("windows-record: preferred encoder={enc} -> resolved={resolved}");
+    let descs = crate::screenshot::output_descs();
+    let Some(name) = descs
+        .iter()
+        .find(|d| d.logical_pos == (0, 0))
+        .or_else(|| descs.first())
+        .map(|d| d.name.clone())
+    else {
+        eprintln!("windows-record: no monitors");
+        return;
+    };
+    let out = std::env::temp_dir().join(format!("cck-winrec-{}.mp4", std::process::id()));
+    let _ = std::fs::remove_file(&out);
+    // DRAGON-272: `region` drives the REGION worker (a WGC crop of the most-overlapped
+    // monitor) instead of a whole-display capture, to reproduce the region-recording stop
+    // path headlessly. A fixed 800x600 crop at (100,100).
+    let region = rest.iter().any(|a| a == "region");
+    let (rx, ry, rw, rh, target) = if region {
+        (100, 100, 800, 600, crate::record::WinRecordTarget::Region)
+    } else {
+        (0, 0, 0, 0, crate::record::WinRecordTarget::Display(name.clone()))
+    };
+    let params = crate::record::RegionRecordParams {
+        x: rx,
+        y: ry,
+        w: rw,
+        h: rh,
+        cursor: true,
+        win_target: target,
+        settings: crate::record::RecordSettings {
+            fps: 30,
+            preferred_encoder: enc.clone(),
+            presets,
+            zero_copy: false,
+            mic,
+            system_audio: sys,
+            bitrate_kbps: 8000,
+            audio_offset_ms: 0,
+            auto_device_compensation: true,
+            max_res: (0, 0),
+            metadata: "Cosmic Capture Kit | windows-record test".to_string(),
+            out_path: out.clone(),
+        },
+    };
+    eprintln!(
+        "windows-record: {}, {secs}s, mic={mic} sys={sys} pause={want_pause} -> {}",
+        if region { format!("REGION {rw}x{rh}@({rx},{ry}) of {name}") } else { format!("monitor {name}") },
+        out.display()
+    );
+    let handle = crate::record::start_region_recording(params);
+    let start = Instant::now();
+    let mut did_pause = false;
+    while start.elapsed().as_secs() < secs {
+        if handle.done.lock().map(|g| g.is_some()).unwrap_or(false) {
+            break; // early failure (e.g. audio pre-flight)
+        }
+        if want_pause && !did_pause && start.elapsed().as_secs_f64() >= secs as f64 / 2.0 {
+            handle.paused.store(true, Ordering::Relaxed);
+            eprintln!("windows-record: paused at {:.1}s", start.elapsed().as_secs_f64());
+            std::thread::sleep(Duration::from_secs(2));
+            handle.paused.store(false, Ordering::Relaxed);
+            did_pause = true;
+            eprintln!("windows-record: resumed");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    handle.stop.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        if let Ok(g) = handle.done.lock()
+            && let Some(res) = g.as_ref()
+        {
+            match res {
+                Ok(p) => println!("windows-record: DONE -> {}", p.display()),
+                Err(e) => eprintln!("windows-record: FAILED — {e}"),
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!("windows-record: TIMEOUT waiting for finalize");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// `--test windows-audio-endpoints` (DRAGON-282): list every ACTIVE WASAPI render endpoint
+/// (`id`, friendly name) the Output-device picker offers and `MonitorCapture` loops back.
+/// The enumeration proof — and a live picker of what a persisted `speaker_device` id can be.
+#[cfg(target_os = "windows")]
+fn windows_audio_endpoints_test() {
+    let eps = crate::platform::windows::wasapi_loopback::render_endpoints();
+    println!("active render endpoints ({}):", eps.len());
+    for (id, name) in &eps {
+        println!("  {name}\n      id = {id}");
+    }
+    if eps.is_empty() {
+        println!("(none — COM enumeration failed or no active render devices)");
+    }
+    println!("\n\"System (automatic)\" (empty id) records the OS default endpoint.");
+}
+
+/// `--test windows-shot-region <x> <y> <w> <h>`: a stitched region flat → PNG (for
+/// mixed-DPI / negative-origin cross-monitor stitch verification).
+#[cfg(target_os = "windows")]
+fn windows_shot_region_test(xs: &str, ys: &str, ws: &str, hs: &str) {
+    let x: i32 = xs.parse().unwrap_or(0);
+    let y: i32 = ys.parse().unwrap_or(0);
+    let w: u32 = ws.parse().unwrap_or(0);
+    let h: u32 = hs.parse().unwrap_or(0);
+    if w == 0 || h == 0 {
+        eprintln!("usage: --test windows-shot-region <x> <y> <w> <h>");
+        return;
+    }
+    match crate::screenshot::region(x, y, w, h, None) {
+        Some(img) => {
+            let p = std::env::temp_dir().join(format!("cck-win-region-{x}_{y}_{w}x{h}.png"));
+            match img.save(&p) {
+                Ok(()) => println!(
+                    "region ({x},{y},{w},{h}): {}x{} -> {}",
+                    img.width(),
+                    img.height(),
+                    p.display()
+                ),
+                Err(e) => eprintln!("windows-shot-region: save failed: {e}"),
+            }
+        }
+        None => eprintln!("windows-shot-region: FAILED (off every monitor?)"),
     }
 }

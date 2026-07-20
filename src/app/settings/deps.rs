@@ -137,12 +137,24 @@ impl Dep {
 impl crate::app::App {
     /// A friendly label for the best available hardware video encoder, if any.
     fn hw_encoder_label(&self) -> Option<&str> {
-        self.encoders()
-            .iter()
+        // Windows (DRAGON-238): the encoder list is probed OFF the UI thread; PEEK it (never
+        // the blocking `encoders()`), so the Health page can't freeze on the ffmpeg
+        // `-encoders` + hardware probe-encodes. `None` until the probe lands — the row then
+        // reads "no hardware encoder" for that brief window and updates when the result Msg
+        // arrives (`update_health_nav_icon`).
+        #[cfg(windows)]
+        let list = self.encoders.peek()?;
+        #[cfg(not(windows))]
+        let list = self.encoders();
+        list.iter()
             .find(|e| {
-                e.id.contains("nvenc")
+                let hw = e.id.contains("nvenc")
                     || e.id.contains("vaapi")
-                    || e.id.contains("videotoolbox")
+                    || e.id.contains("videotoolbox");
+                // Windows hardware tier (DRAGON-238): NVENC (matched above) / AMF / QSV.
+                #[cfg(windows)]
+                let hw = hw || e.id.contains("qsv") || e.id.contains("amf");
+                hw
             })
             .map(|e| e.label.as_str())
     }
@@ -258,7 +270,21 @@ impl crate::app::App {
                     "Listing microphones needs ffmpeg; the system default microphone is \
                      used until it is available.",
                 );
-                #[cfg(not(target_os = "macos"))]
+                // Windows (DRAGON-238): there is no pactl/PulseAudio. Microphone selection
+                // works through DirectShow (enumerated via ffmpeg, like macOS's avfoundation
+                // path), and system audio is captured from the default output via WASAPI
+                // loopback — so this gates on ffmpeg, never pactl, and reports that reality.
+                #[cfg(windows)]
+                let (name, present, ok, missing) = (
+                    "audio device selection",
+                    self.ffmpeg_available,
+                    "A specific microphone can be selected (DirectShow). System audio is \
+                     captured from the default output (WASAPI loopback), which also serves \
+                     as the playback endpoint, so there is no output device to choose.",
+                    "Listing microphones needs ffmpeg; the system default microphone is \
+                     used until it is available.",
+                );
+                #[cfg(not(any(target_os = "macos", windows)))]
                 let (name, present, ok, missing) = (
                     "pactl",
                     self.pactl_available,

@@ -63,6 +63,15 @@ impl App {
         crate::platform::backend::MacBackend { ffmpeg: self.ffmpeg_available }.caps()
     }
 
+    /// Windows (DRAGON-229): the Windows-Graphics-Capture backend is the only one, so
+    /// it is always active. Its impl lives under `platform/windows/` (closed split);
+    /// this dispatches to it.
+    #[cfg(target_os = "windows")]
+    pub(super) fn active_screenshot_caps(&self) -> crate::platform::backend::Caps {
+        use crate::platform::backend::CaptureBackend;
+        crate::platform::windows::backend::WindowsBackend { ffmpeg: self.ffmpeg_available }.caps()
+    }
+
     /// The persisted capture-extra preferences as one set (DRAGON-186).
     /// `fullscreen_aware` has no user toggle (a behavior capability), so it
     /// passes through as `true` and the capability alone decides.

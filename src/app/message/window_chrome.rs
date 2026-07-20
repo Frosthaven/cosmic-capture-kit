@@ -30,27 +30,45 @@ pub enum WindowChromeMsg {
     /// incremented count to poll briefly until the overlay can be matched + placed.
     #[cfg(not(target_os = "linux"))]
     OverlayOpened(window::Id, u8),
-    /// macOS (DRAGON-130 crash-dodge): the windowed preview finished opening. Fired
+    /// macOS (DRAGON-130 crash-dodge) / Windows (DRAGON-229 komorebi opt-out): the
+    /// windowed preview finished opening (Windows: opened HIDDEN, floated + shown by
+    /// `finalize_preview_window`'s Windows arm). Fired
     /// then — not batched with open — so the native titlebar-button strip runs only
     /// once the view is installed (running it mid-creation races winit and panics).
     /// The `u8` is the poll attempt (starts at 0): the NSWindow title is set by an
     /// async task and may not have landed yet, so `finalize_preview_window` re-emits
     /// this with an incremented count to briefly poll until the window can be matched.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     PreviewOpened(window::Id, u8),
-    /// macOS: the fullscreen OVERLAY preview window finished opening. Carries the
-    /// target display's global logical rect (pos, size) so the retry re-emits are
-    /// self-contained, plus the poll attempt — the same title-lag poll shape as
-    /// `PreviewOpened` (see `finalize_preview_overlay`).
-    #[cfg(target_os = "macos")]
+    /// macOS / Windows (DRAGON-233 fix 5): the fullscreen OVERLAY preview window
+    /// finished opening. Carries the target display's global physical rect (pos, size)
+    /// so the retry re-emits are self-contained, plus the poll attempt — the same
+    /// title-lag poll shape as `PreviewOpened` (see `finalize_preview_overlay`).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     PreviewOverlayOpened(window::Id, (i32, i32), (u32, u32), u8),
     /// macOS/Windows: mint the per-display capture overlays. Dispatched by
     /// `seed_outputs_mac` after the tiling-WM wait: a no-op by default (the DRAGON-154
     /// chrome strip opts the overlays out of AeroSpace entirely), or the completed
     /// off-thread pause when the CCK_AEROSPACE_PAUSE escape hatch is engaged.
+    // Windows seeds overlays synchronously (`seed_outputs_mac`'s `not(macos)` arm calls
+    // `seed_overlays_mac` directly); only macOS routes through this message after the
+    // off-thread tiling-WM pause, so on Windows the variant is matched but never built. DRAGON-229.
     #[cfg(not(target_os = "linux"))]
+    #[cfg_attr(windows, allow(dead_code))]
     SeedOverlays,
     OpenGear,
+    /// Startup-only: mint the settings window a message-drain AFTER the launch
+    /// appearance theme has been applied, so the window's FIRST paint already
+    /// carries the resolved accent (System Default -> OS accent included) instead
+    /// of flashing libcosmic's default accent for a frame (DRAGON-268 follow-up).
+    /// The appearance `set_theme` command and this message are both queued from
+    /// `init`; a single `update` drain processes them in order — the theme's global
+    /// mutation lands first, then this handler returns the window-open task, so
+    /// `WindowCreated` reads the correct global theme when it builds the window's
+    /// state. `post_update` / `about` route the freshly-opened window to the About
+    /// page (the same follow-ups the eager open used to batch). `about` already folds
+    /// in the post-update marker + `CCK_SETTINGS_TAB=about`. All platforms.
+    OpenSettingsAtStartup { about: bool },
     /// Open a URL in the default browser (e.g. the ground-loop help link).
     OpenUrl(&'static str),
     /// Open a dynamically-sourced URL (a markdown release-note link, DRAGON-177,
@@ -69,19 +87,47 @@ pub enum WindowChromeMsg {
     CancelReset,
     /// The settings toplevel window finished opening.
     ConfigWindowOpened(window::Id),
+    /// Windows (DRAGON-229 komorebi opt-out): poll to komorebi-float + show the settings
+    /// window once its async-set title lands — the Windows analog of the mac
+    /// `MacCenterTitlebar` poll (both are title-matched, kicked from `ConfigWindowOpened`,
+    /// and re-emit with an incremented attempt until the window can be matched). The
+    /// window is opened `visible:false`, so it stays hidden — komorebi sees no `Show` —
+    /// until `float_and_show` marks it ineligible and shows it. `(id, attempt)`.
+    #[cfg(windows)]
+    ConfigWindowFloat(window::Id, u8),
+    /// Windows (DRAGON-246): a periodic liveness tick while the settings window is open and
+    /// has been CONFIRMED shown. Checks the titled top-level still exists in this process; if
+    /// it vanished WITHOUT an iced `Closed` event (an out-of-band destroy that would leave
+    /// `finish_session` un-run and this --settings child a zombie holding the settings
+    /// mutex/pid), it ends the instance via the normal `WindowClosed` path. Fired by
+    /// `sub_settings_liveness`, which is off until the window is confirmed shown so this can
+    /// never fire during the open-hidden → float-and-show phase.
+    #[cfg(windows)]
+    SettingsLivenessTick,
+    /// Windows (DRAGON-281): a periodic tick (fired by `sub_preview_finalize`) while a
+    /// post-capture preview surface exists whose native show/place has NOT been confirmed.
+    /// Re-drives the correct finalize for the CURRENT open surface (windowed vs overlay) —
+    /// the reliable re-driver when the one-shot `window::open` follow-up was never delivered
+    /// because cck lost the foreground mid-countdown, leaving the preview HWND created but
+    /// hidden. Parameterless (like `SettingsLivenessTick`) so it never carries a stale id;
+    /// the handler reads `self.preview`. Stops the moment `preview_shown_confirmed` matches.
+    #[cfg(windows)]
+    PreviewFinalizeTick,
     /// A window was resized (logical w, h) — used to remember the settings size.
     ConfigWindowResized(window::Id, f32, f32),
     /// Close the settings window (header ✕ / Done). On macOS the native traffic
-    /// lights own close/minimize (DRAGON-135), so these two CSD variants are only
-    /// constructed on Linux; the handlers stay platform-uniform.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    /// lights (DRAGON-135) and on Windows the native DWM caption buttons (DRAGON-284)
+    /// own close/minimize, so these two CSD variants are only constructed on Linux;
+    /// the handlers stay platform-uniform.
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
     CloseConfigWindow,
     /// Settings window titlebar: drag to move.
     ConfigWindowDrag,
-    /// Settings window titlebar: toggle maximize (button + double-click).
+    /// Settings window titlebar: toggle maximize (CSD button + double-click; on Windows
+    /// only the double-click, which routes to the native `toggle_maximize`, DRAGON-284).
     ConfigWindowMaximize,
     /// Settings window titlebar: minimize.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
     ConfigWindowMinimize,
     /// The permission-checker toplevel window finished opening (macOS onboarding
     /// surface; the window is only ever minted on macOS, so this never fires on
@@ -115,10 +161,11 @@ pub enum WindowChromeMsg {
     /// on). Never emitted on Linux (layer-shell keyboard focus is on-demand there).
     #[cfg(target_os = "macos")]
     CursorEnteredWindow(window::Id),
-    /// macOS (DRAGON-153): a blocked second `--settings` launch touched the focus
-    /// poke file — bring this (live) settings pane to the front. Fired by
+    /// macOS (DRAGON-153) / Windows (DRAGON-246): a blocked second `--settings` launch
+    /// touched the focus poke file — bring this (live) settings pane to the front, un-hiding
+    /// it natively on Windows (the pane's window may be HIDDEN/orphaned). Fired by
     /// `sub_settings_poke` while the pane is open.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     SettingsFocusPoke,
     /// A window asked to close (✕ / WM) — only acted on for the settings window.
     WindowCloseRequested(window::Id),

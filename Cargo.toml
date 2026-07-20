@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.12.0"
+version = "0.14.0"
 edition = "2024"
 description = "Native COSMIC capture overlay (region/window/monitor) for screenshots and screen recording: native screencopy capture, clipboard sharing, and in-region QR/barcode + OCR detection."
 license = "GPL-3.0-only"
@@ -23,7 +23,6 @@ depends = "$auto, ffmpeg"
 # Zero-copy pixel handoff to iced image Handles (Bytes::from_owner shares the
 # decoded buffer instead of cloning ~30 MB per monitor snapshot / wallpaper).
 bytes = "1.9"
-rustix = { version = "1.1", features = ["fs", "process", "time"] }
 # Only for `_exit(2)` at GUI shutdown (app::run): a raw immediate exit that skips
 # libc atexit/global destructors. libcosmic's wayland backend runs its SCTK event
 # loop on a thread it never joins; that thread tears its windows down (a cosmic
@@ -78,6 +77,16 @@ earshot = "1.1.0"
 # Rasterizing covermark SVGs onto captures (preview editing). The same version
 # libcosmic's renderer already resolves, so it adds no extra build.
 resvg = "0.45"
+
+# ── Unix-only dependencies (POSIX fd/lock/signal primitives) ──────────────────
+# rustix backs the FIFO/fd plumbing (record::owned/pump, audio meters), the flock
+# single-instance locks (instance.rs), and the resident SIGUSR/SIGTERM plumbing —
+# all POSIX-only. It does NOT build on Windows with these features (fs/process/time
+# are unix syscalls), so it moves off the portable table (DRAGON-229); the Windows
+# arms of those call sites are cfg(unix)-gated with honest stubs. Version + features
+# are IDENTICAL to the former portable entry, so Linux/macOS resolution is unchanged.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs", "process", "time"] }
 
 # ── Linux-only dependencies (COSMIC / Wayland / D-Bus / PipeWire) ──────────────
 # The whole native-Linux capture + services stack. Moved off the top level so the
@@ -348,6 +357,105 @@ features = ["markdown", "multi-window", "tokio", "wgpu", "winit"]
 # on every other target build.rs is a no-op and this dep never resolves.
 [target.'cfg(target_os = "macos")'.build-dependencies]
 cc = "1.2"
+
+# ── Windows-only dependencies (DRAGON-229) ────────────────────────────────────
+# The Windows variant reuses the mac partition's shape: libcosmic on the winit
+# backend (no wayland, no `desktop`), arboard for the clipboard, rfd for the native
+# folder picker. The heavy capture/recording stacks (WGC/DXGI, Media Foundation)
+# land in later milestones; this partition is what lets the crate COMPILE + open the
+# settings window on Windows at all. The `windows`/`windows-sys` crates are added
+# per-feature as the capture milestones need them (M0 needs none — the stubs are
+# honest Err/None with no OS calls).
+[target.'cfg(windows)'.dependencies]
+# Clipboard (CF_DIB image + file list) — replaces wl-clipboard-rs, same as mac.
+arboard = "3"
+# Native folder picker (IFileDialog) for the save-directory setting — replaces the
+# ashpd portal picker, same crate the mac partition uses.
+rfd = "0.15"
+# Win32 bindings for the M1 capture backend (DRAGON-229): GDI BitBlt monitor flats,
+# PrintWindow per-window grabs, EnumWindows + DWM window list, GetCursorInfo cursor,
+# GetDpiForMonitor DPI, and the IDesktopWallpaper COM wallpaper resolver. Pinned to
+# "0.62" so it UNIFIES with the `windows 0.62.2` already resolved via wgpu (no second
+# major tree). Feature set is minimal-and-grown: only the Win32 modules M1 calls.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",           # BitBlt, EnumDisplayMonitors, GetMonitorInfoW, CreateDIBSection, GetDIBits, DrawIconEx
+    "Win32_UI_WindowsAndMessaging", # EnumWindows, PrintWindow, GetWindowText, GetCursorInfo, GetIconInfo, GetForegroundWindow, IsWindowVisible, SetWindowPos
+    "Win32_UI_HiDpi",               # SetProcessDpiAwarenessContext, GetDpiForMonitor, GetDpiForWindow
+    "Win32_Graphics_Dwm",           # DwmGetWindowAttribute (DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS); DwmSetWindowAttribute + DWMWA_SYSTEMBACKDROP_TYPE Mica (DRAGON-267); DwmDefWindowProc + DwmExtendFrameIntoClientArea + DWMWA_CAPTION_BUTTON_BOUNDS native caption buttons (DRAGON-284)
+    "Win32_UI_Controls",            # DRAGON-284: MARGINS (DwmExtendFrameIntoClientArea) + SetWindowSubclass/DefSubclassProc/RemoveWindowSubclass live under UI::Shell (already enabled) but MARGINS is here
+    "Win32_Storage_Xps",            # PrintWindow + PRINT_WINDOW_FLAGS (their crate home)
+    "Win32_UI_Shell",               # IDesktopWallpaper + CLSID_DesktopWallpaper
+    "Win32_System_Com",             # CoInitializeEx, CoCreateInstance
+    "Win32_System_Threading",       # OpenProcess, QueryFullProcessImageNameW (owner label), CreateMutexW (single-instance, DRAGON-229 W4)
+    "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot process sweep for close_other_instances (DRAGON-229 W4)
+    # M2 delivery (DRAGON-229): the WinRT capture toast (clipboard image + file list go
+    # through arboard). Compile-time-only feature flags on the already-resolved
+    # `windows 0.62` — no new Cargo.lock package lands.
+    "UI_Notifications",             # WinRT ToastNotificationManager/ToastNotification/ToastNotifier
+    "Data_Xml_Dom",                 # WinRT XmlDocument for the toast payload
+    # M3 recording (DRAGON-229): Windows.Graphics.Capture (WGC) video worker, WASAPI
+    # loopback system audio, named-pipe audio transport, dshow mic, and the muxer
+    # watchdog's TerminateProcess. All compile-time-only flags on the SAME `windows
+    # 0.62` — no new Cargo.lock package lands (verified byte-identical, like M2).
+    "Foundation",                       # WinRT TypedEventHandler / IInspectable (FrameArrived)
+    "Graphics_Capture",                 # Direct3D11CaptureFramePool, GraphicsCaptureItem/Session/Frame
+    "Graphics_DirectX",                 # DirectXPixelFormat (R8G8B8A8UIntNormalized)
+    "Graphics_DirectX_Direct3D11",      # IDirect3DDevice/IDirect3DSurface (WinRT D3D interop)
+    "Win32_Graphics_Direct3D",          # D3D_DRIVER_TYPE_HARDWARE, feature levels
+    "Win32_Graphics_Direct3D11",        # D3D11CreateDevice, ID3D11Device/Context/Texture2D, staging Map
+    "Win32_Graphics_Dxgi",              # IDXGIDevice (wrap as IDirect3DDevice)
+    "Win32_Graphics_Dxgi_Common",       # DXGI_FORMAT
+    "Win32_System_WinRT",               # RoInitialize / IInspectable interop
+    "Win32_System_WinRT_Direct3D11",    # CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess
+    "Win32_System_WinRT_Graphics_Capture", # IGraphicsCaptureItemInterop (CreateForMonitor/CreateForWindow)
+    "Win32_System_Com_StructuredStorage",  # PROPVARIANT for IMMDevice::Activate
+    "Win32_System_Variant",                # VARIANT (IMMDevice::Activate's PROPVARIANT gate)
+    "Win32_System_Pipes",               # CreateNamedPipeW/ConnectNamedPipe/SetNamedPipeHandleState/DisconnectNamedPipe
+    "Win32_Storage_FileSystem",         # WriteFile/FlushFileBuffers/PIPE_ACCESS_* on the named-pipe transport
+    "Win32_System_IO",                  # OVERLAPPED / GetOverlappedResult / CancelIoEx (bounded pipe connect)
+    "Win32_Media_Audio",                # WASAPI: IMMDeviceEnumerator/IAudioClient/IAudioCaptureClient (loopback)
+    "Win32_Media_Audio_Endpoints",      # WASAPI endpoint interfaces (IMMDevice/WAVEFORMATEXTENSIBLE)
+    "Win32_UI_Shell_PropertiesSystem",  # DRAGON-282: IMMDevice::OpenPropertyStore -> IPropertyStore for the render-endpoint friendly names (PROPERTYKEY is in Foundation; PROPVARIANT::Display reads the name)
+    # DRAGON-233 fix 1: GUI-subsystem console attach — AttachConsole(ATTACH_PARENT_PROCESS)
+    # + GetStdHandle/SetStdHandle so terminal launches still print CLI output (console.rs).
+    # A compile-time-only flag on the already-resolved `windows 0.62` — no new lock package.
+    "Win32_System_Console",
+    # DRAGON-237 resident mode (menu-bar-daemon parity): the tiny Win32 tray daemon.
+    # All compile-time-only feature flags on the SAME already-resolved `windows 0.62`
+    # (verified byte-identical, like M2/M3) — no new Cargo.lock package lands.
+    "Win32_UI_Input_KeyboardAndMouse", # RegisterHotKey/UnregisterHotKey + VIRTUAL_KEY/HOT_KEY_MODIFIERS (the global capture hotkey)
+    "Win32_System_LibraryLoader",      # GetModuleHandleW (the message-window class hInstance)
+    "Win32_System_Registry",           # HKCU\...\Run launch-at-login (autostart.rs)
+    # DRAGON-283 "pause other media during preview": the GSMTC ducker child enumerates
+    # System Media Transport Controls sessions and pauses/resumes the Playing ones.
+    # Compile-time-only flags on the SAME already-resolved `windows 0.62` — no new
+    # Cargo.lock package lands. `Foundation` (above) already provides the blocking
+    # async `.get()`; `Foundation_Collections` is the `IVectorView` GetSessions returns.
+    "Media_Control",                    # GlobalSystemMediaTransportControlsSessionManager/Session + PlaybackStatus
+    "Foundation_Collections",           # IVectorView<GlobalSystemMediaTransportControlsSession> (Size/GetAt)
+]
+
+# DRAGON-233 fix 4: embed the multi-resolution .ico into the exe so Explorer / the
+# Start Menu / taskbar show the app icon (build.rs's windows arm calls set_icon).
+# winres drives the SDK/LLVM `rc`; Windows-target-only (mirrors the mac `cc`
+# build-dep), so the Linux `--locked` build never compiles it. New lock packages —
+# target-gated, so an off-Windows build resolves but does not build them.
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+# libcosmic on Windows: winit backend, no wayland, no `desktop` (freedesktop
+# .desktop-file integration is Linux-only) — identical feature set to the macOS
+# partition, pinned to the SAME git rev so no second libcosmic/iced tree resolves.
+[target.'cfg(windows)'.dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+rev = "4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+default-features = false
+# `markdown` (DRAGON-177): renders the About page's release notes via
+# `cosmic::widget::markdown` (forwards to iced's markdown widget + pulldown-cmark).
+features = ["markdown", "multi-window", "tokio", "wgpu", "winit"]
 
 [features]
 # In-process GPU zero-copy encoding (links libavcodec via ffmpeg-next + libgbm).

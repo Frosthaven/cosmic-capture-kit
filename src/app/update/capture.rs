@@ -189,9 +189,9 @@ impl App {
             // macOS (DRAGON-151): re-solidify the overlay whose toolbar chip is under
             // the pointer; everything else stays click-through. Linux never constructs
             // this message (layer-shell input zones do this natively).
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             CaptureMsg::PassthroughPoll => self.passthrough_poll(),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
             CaptureMsg::PassthroughPoll => Task::none(),
             CaptureMsg::SetHover(h) => {
                 self.hover = h;

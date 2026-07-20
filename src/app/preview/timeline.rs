@@ -313,7 +313,7 @@ impl Timeline {
 /// the SOURCE duration. `None` when the file has no decodable audio. Runs
 /// off-thread (spawned from the `PosterReady` handler).
 pub(super) fn extract_waveform(path: &Path) -> Option<Vec<(f32, f32)>> {
-    let out = std::process::Command::new(crate::util::ffmpeg_path())
+    let out = crate::util::ffmpeg_command()
         .args(["-v", "error"])
         .arg("-i")
         .arg(path)

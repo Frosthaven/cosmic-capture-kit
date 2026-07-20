@@ -520,6 +520,15 @@ pub(crate) fn window(identifier: &str, cursor: bool) -> Option<RgbaImage> {
     capture_source(&conn, &mut queue, &mut data, &CaptureSource::Toplevel(handle), cursor)
 }
 
+/// Whether the window `identifier` is TRULY fullscreen beyond what the portable
+/// [`crate::app::capture_flow::is_fullscreen`] geometry gate can already tell. On COSMIC a
+/// fullscreen toplevel's rect equals its output rect, so the geometry gate is sufficient
+/// and this refinement is a no-op (`false`) — the macOS Space-type override
+/// (`platform/mac`) is the only place it matters. DRAGON-186 follow-up.
+pub(crate) fn window_is_fullscreen(_identifier: &str) -> bool {
+    false
+}
+
 /// Capture the active-workspace windows intersecting a region (global logical
 /// coords) and composite them — i.e. the same area as a region/monitor grab but
 /// with the wallpaper (and anything behind the windows) excluded. Background is

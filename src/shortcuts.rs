@@ -339,9 +339,9 @@ impl NamedKey {
     /// hotkey SPEC (the `global-hotkey` parser's vocabulary — see
     /// [`crate::daemon`]). Distinct from [`Self::xdg_name`] (libxkbcommon keysyms):
     /// e.g. Enter is `"Enter"` here but `"Return"` there, PrintScreen is
-    /// `"PrintScreen"` here but `"Print"` there. Only ever used on macOS, but kept
-    /// here beside the other names so the key table stays in one place.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// `"PrintScreen"` here but `"Print"` there. Used on macOS + Windows (the daemon-hotkey
+    /// OSes), but kept here beside the other names so the key table stays in one place.
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     fn daemon_name(self) -> &'static str {
         match self {
             NamedKey::Escape => "Escape",
@@ -728,11 +728,12 @@ impl Shortcut {
     ///
     /// This is the inverse of the daemon's `hotkey_spec::parse`, so
     /// `parse(chord.daemon_spec())` round-trips (a bare PrintScreen additionally
-    /// yields the F13 alias inside `parse`, which is expected and harmless). Every
-    /// chord `from_event` can produce is serializable, so this never fails; it
-    /// returns `String` rather than `Option` for that reason. Only built on macOS,
-    /// but kept here beside `label`/`xdg_trigger` so all the spellings live together.
-    #[cfg(target_os = "macos")]
+    /// yields the F13 alias inside the macOS `parse`, which is expected and harmless; the
+    /// Windows parser maps PrintScreen straight to `VK_SNAPSHOT`). Every chord `from_event`
+    /// can produce is serializable, so this never fails; it returns `String` rather than
+    /// `Option` for that reason. Built on macOS + Windows (the two daemon-hotkey OSes), but
+    /// kept here beside `label`/`xdg_trigger` so all the spellings live together.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub fn daemon_spec(&self) -> String {
         let mut s = String::new();
         if self.logo {

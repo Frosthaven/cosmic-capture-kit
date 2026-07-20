@@ -122,6 +122,7 @@ impl App {
             appearance_mode: self.appearance_mode,
             appearance_accent: self.appearance_accent,
             appearance_roundness: self.appearance_roundness,
+            appearance_contrast_boost: self.appearance_contrast_boost,
             selection_box_thickness: self.selection_box_thickness,
             notify_updates: self.notify_updates,
         }
@@ -208,6 +209,7 @@ impl App {
         self.appearance_mode = p.appearance_mode.min(2);
         self.appearance_accent = p.appearance_accent;
         self.appearance_roundness = p.appearance_roundness.min(2);
+        self.appearance_contrast_boost = p.appearance_contrast_boost;
         self.selection_box_thickness = p.selection_box_thickness.clamp(1, 8);
         self.notify_updates = p.notify_updates;
     }
@@ -251,6 +253,7 @@ impl App {
                         p.appearance_mode = d.appearance_mode;
                         p.appearance_accent = d.appearance_accent;
                         p.appearance_roundness = d.appearance_roundness;
+                        p.appearance_contrast_boost = d.appearance_contrast_boost;
                         p.selection_box_thickness = d.selection_box_thickness;
                     }
                 }

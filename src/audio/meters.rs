@@ -3,7 +3,7 @@
 //! that maps the last reading onto the 0..1 meter scale for the UI's on-button meters.
 
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 
 use crate::record::AudioChannel;
 
@@ -28,12 +28,12 @@ fn meter_level_path(chan: AudioChannel) -> PathBuf {
 /// so it's a long-lived sibling process — `PR_SET_PDEATHSIG` ensures it's killed if
 /// we exit or are signalled, so it can never orphan.
 pub fn spawn_meter(chan: AudioChannel) -> Option<Child> {
-    // macOS has no pulse monitors, so there is NO standalone capture to meter the
-    // system channel from — and starting a second SCK audio stream just for metering
-    // would fight the recording's own capture. Its level is instead PUBLISHED by the
-    // owned recording capture (see [`publish_sys_level`] / `audio::capture`'s sck
-    // module); while merely armed (not recording) the meter honestly stays flat.
-    #[cfg(target_os = "macos")]
+    // macOS/Windows have no pulse monitor, so there is NO standalone capture to meter the
+    // system channel from — a second SCK/WASAPI audio stream just for metering would fight
+    // the recording's own capture. Its level is instead PUBLISHED by the owned recording
+    // capture (see [`publish_sys_level`] / `audio::capture`'s sck/win_delivery module);
+    // while merely armed (not recording) the meter honestly stays flat.
+    #[cfg(any(target_os = "macos", windows))]
     if chan == AudioChannel::Sys {
         return None;
     }
@@ -50,15 +50,32 @@ pub fn spawn_meter(chan: AudioChannel) -> Option<Child> {
          ametadata=mode=print:key=lavfi.astats.Overall.RMS_level:file={}:direct=1",
         path.display()
     );
-    let mut cmd = Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     // Capture input: PulseAudio on Linux; on macOS the mic is an avfoundation device
     // name (mirroring `clean_mic::spawn_pulse_pcm`'s arm — the leading colon selects
-    // an audio-only device).
-    #[cfg(not(target_os = "macos"))]
+    // an audio-only device); on Windows a DirectShow device (its stable alternative
+    // name, resolved by the platform body — the SAME seam the recording mic uses).
+    //
+    // DRAGON-229 W4: in PRACTICE `spawn_meter` is only ever called with the SYSTEM
+    // channel (`audio_ui::sync_meters`), which returns None above on Windows/macOS — the
+    // MIC on-button meter runs the FULL input chain instead (`spawn_mic_chain` ->
+    // `clean_mic::spawn_mic_test`, dshow on Windows), so the armed mic meter already
+    // animates honestly there. This Mic arm is kept correct-by-construction regardless:
+    // the old `not(macos)` pulse arm would have opened a nonexistent PulseAudio on
+    // Windows if ever reached; the dshow arm mirrors `clean_mic` so it never can.
+    #[cfg(target_os = "linux")]
     cmd.args(["-f", "pulse", "-i", source.as_str()]);
     #[cfg(target_os = "macos")]
     cmd.args(["-f", "avfoundation", "-i", &format!(":{source}")]);
+    #[cfg(windows)]
+    {
+        let dev = crate::platform::windows::audio::resolve_mic_device(source.as_str())?;
+        // `audio_buffer_size` (ms): the dshow latency knob — deliver ~50ms chunks instead of
+        // the device default (~500ms bursts), so a metered channel animates smoothly. Mirrors
+        // `clean_mic::spawn_pulse_pcm`'s Windows arm (DRAGON-248). Input option → before `-i`.
+        cmd.args(["-f", "dshow", "-audio_buffer_size", "50", "-i", &format!("audio={dev}")]);
+    }
     cmd.args(["-af", &af, "-f", "null", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -86,18 +103,18 @@ pub fn stop_meter(chan: AudioChannel, child: &mut Child) {
     let _ = std::fs::remove_file(meter_level_path(chan));
 }
 
-/// macOS: the system channel's live level (0..1 meter scale, f32 bits) as published
-/// by the owned recording capture — the process-local stand-in for the Linux
+/// macOS/Windows: the system channel's live level (0..1 meter scale, f32 bits) as
+/// published by the owned recording capture — the process-local stand-in for the Linux
 /// sidecar's level file. 0 whenever no capture is running.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 static SYS_LEVEL_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// macOS: publish the system channel's current meter level (0..1). Called by the
-/// owned SCK system-audio capture (`audio::capture`'s sck module) per 0.1s RMS
-/// window while a recording runs, and with 0.0 when the capture stops — there is no
-/// pulse monitor to run a metering sidecar against on macOS, and a SECOND SCK audio
-/// stream just for metering would fight the recording's own.
-#[cfg(target_os = "macos")]
+/// macOS/Windows: publish the system channel's current meter level (0..1). Called by the
+/// owned SCK/WASAPI system-audio capture (`audio::capture`'s sck/win_delivery module) per
+/// 0.1s RMS window while a recording runs, and with 0.0 when the capture stops — there is
+/// no pulse monitor to run a metering sidecar against, and a SECOND system-audio stream
+/// just for metering would fight the recording's own.
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn publish_sys_level(level: f32) {
     SYS_LEVEL_BITS.store(
         level.clamp(0.0, 1.0).to_bits(),
@@ -108,7 +125,7 @@ pub(crate) fn publish_sys_level(level: f32) {
 /// Map an RMS amplitude (linear, 0..1 full scale) onto the meters' 0..1 scale —
 /// the same ~-60..0 dBFS window [`read_meter_level`] maps the Linux sidecar's
 /// `RMS_level` readings through.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn level_from_rms(rms: f32) -> f32 {
     if rms <= 0.0 {
         return 0.0;
@@ -121,9 +138,9 @@ pub(crate) fn level_from_rms(rms: f32) -> f32 {
 /// last RMS_level line, mapped from a ~-60..0 dBFS range). `None` when there's no
 /// reading yet (returns 0 so the meter is empty).
 pub fn read_meter_level(chan: AudioChannel) -> f32 {
-    // macOS: no sidecar/level file for the system channel — read the level the owned
-    // SCK capture publishes while a recording runs (see [`publish_sys_level`]).
-    #[cfg(target_os = "macos")]
+    // macOS/Windows: no sidecar/level file for the system channel — read the level the
+    // owned SCK/WASAPI capture publishes while a recording runs (see [`publish_sys_level`]).
+    #[cfg(any(target_os = "macos", windows))]
     if chan == AudioChannel::Sys {
         return f32::from_bits(SYS_LEVEL_BITS.load(std::sync::atomic::Ordering::Relaxed));
     }
@@ -160,8 +177,11 @@ fn read_tail(path: &std::path::Path, n: u64) -> Option<Vec<u8>> {
     Some(buf)
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod mac_tests {
+// The published-level path (`level_from_rms` / `publish_sys_level` / the `Sys` arm of
+// `read_meter_level`) is compiled on macOS AND Windows (DRAGON-248: Windows now runs the
+// armed-idle + recording sys meter through it too), so its tests run on both.
+#[cfg(all(test, any(target_os = "macos", windows)))]
+mod published_level_tests {
     use super::*;
 
     #[test]

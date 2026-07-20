@@ -59,13 +59,20 @@ pub(crate) fn mode_wants_dark(mode: u8) -> bool {
 /// - macOS: `AppleInterfaceStyle` via `NSUserDefaults` (libcosmic has no mac
 ///   dark signal, so Automatic would otherwise be stuck dark) — see
 ///   `crate::platform::mac::appearance`.
-/// - Windows: future; falls to the default arm for now.
+/// - Windows: the app theme via the registry (`AppsUseLightTheme`, 0 = dark) —
+///   see `crate::platform::windows::appearance` (DRAGON-239). Without this,
+///   Automatic / System Default fell to the arm below, which off COSMIC pinned
+///   Windows to dark regardless of the OS setting.
 pub(crate) fn system_is_dark() -> bool {
     #[cfg(target_os = "macos")]
     {
         crate::platform::mac::appearance::system_is_dark()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::appearance::system_is_dark()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         // MUST read the system's own mode, never the process theme: once an
         // override theme is applied, `cosmic::theme::active()` IS the override, so
@@ -81,8 +88,11 @@ pub(crate) fn system_is_dark() -> bool {
     }
 }
 
-/// Build + apply the process-global theme for the current appearance settings,
-/// as a `Task` the caller returns from `update` (or batches into `init`).
+/// Build the process-global theme for the given appearance settings and RETURN it
+/// (the pure builder; [`apply_appearance`] wraps this in `set_theme`). Split out so
+/// the SAME resolved theme — and thus its resolved accent — can be read headlessly
+/// (the CLI diag / [`resolved_appearance_accent_rgba`]) where the runtime never
+/// applies the global theme.
 ///
 /// **Portability contract (do not regress with a Linux-only read):** when
 /// `use_system` is ON we simply follow `cosmic::theme::system_preference()`.
@@ -93,38 +103,99 @@ pub(crate) fn system_is_dark() -> bool {
 /// accent/roundness overrides compose onto the same base the user actually sees.
 /// The dark/light choice comes from [`mode_wants_dark`] (the portable
 /// [`system_is_dark`] seam for Automatic), never a raw cosmic-config read here.
-pub(crate) fn apply_appearance<M: Send + 'static>(
+pub(crate) fn resolve_appearance_theme(
     use_system: bool,
     mode: u8,
     accent: Option<[f32; 3]>,
     roundness: u8,
-) -> Task<cosmic::Action<M>> {
+    contrast_boost: bool,
+) -> cosmic::Theme {
+    // Automatic Contrast Boost (DRAGON-289): unify EVERY accent element — fills, lines,
+    // outlines AND chrome text — on ONE colour. Under System Default the boost is forced
+    // ON (its toggle is hidden), matching how the platform-native accent handles its own
+    // contrast; when customizing, the persisted `contrast_boost` decides.
+    let boost = contrast_boost || use_system;
     if use_system {
-        // NOT system_preference(): that reads cosmic-config's ThemeMode, which
-        // doesn't exist off COSMIC (macOS: always dark, ignoring the real
-        // AppleInterfaceStyle). Route the dark/light pick through the portable
-        // [`system_is_dark`] seam instead — on Linux ThemeMode is exactly what
-        // that seam reads, so the result is identical there (DRAGON-144).
-        let dark = system_is_dark();
-        let t = if dark { cosmic::theme::system_dark() } else { cosmic::theme::system_light() };
-        // Off COSMIC even the "system" themes are default-filled cosmic-config
-        // entries that BUILD DARK (the same failure the override path verifies
-        // against below), so check the output and fall back to libcosmic's
-        // built-in palette; on a healthy COSMIC config the output always
-        // agrees and the real system theme passes through untouched.
-        let t = if t.cosmic().is_dark == dark {
-            t
-        } else {
-            cosmic::Theme::custom(std::sync::Arc::new(
-                if dark { ThemeBuilder::dark() } else { ThemeBuilder::light() }.build(),
-            ))
-        };
-        return cosmic::command::set_theme(t);
+        // Platform-native "System Default" (DRAGON-239): Windows and macOS have no
+        // COSMIC system theme to follow, so system-default resolves to an OS-native
+        // accent + corner rounding (see [`native_system_default`]) over libcosmic's
+        // built-in dark/light base — the same base the Linux arm below falls back to
+        // off COSMIC, so the composed result is honest there. The dark/light choice
+        // is the portable [`system_is_dark`] seam (Windows now the registry app
+        // theme; macOS AppleInterfaceStyle). Linux keeps following the real COSMIC
+        // system theme in the arm below, BYTE-IDENTICAL to before this ticket save
+        // for the contrast-boost unify, which is a no-op when the accent already
+        // passes 4:1.
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        {
+            let (native_accent, native_roundness) = native_system_default();
+            let dark = system_is_dark();
+            let build = |acc: Option<[f32; 3]>| -> cosmic::cosmic_theme::Theme {
+                let mut b = if dark { ThemeBuilder::dark() } else { ThemeBuilder::light() };
+                if let Some([r, g, bl]) = acc {
+                    b = b.accent(cosmic::cosmic_theme::palette::Srgb::new(r, g, bl));
+                }
+                b.corner_radii(CornerRadii::from(roundness_from_u8(native_roundness))).build()
+            };
+            let built = build(native_accent);
+            let final_theme = apply_contrast_boost(built, boost, |acc| build(Some(acc)));
+            return cosmic::Theme::custom(std::sync::Arc::new(final_theme));
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+        {
+            // NOT system_preference(): that reads cosmic-config's ThemeMode, which
+            // doesn't exist off COSMIC (macOS: always dark, ignoring the real
+            // AppleInterfaceStyle). Route the dark/light pick through the portable
+            // [`system_is_dark`] seam instead — on Linux ThemeMode is exactly what
+            // that seam reads, so the result is identical there (DRAGON-144).
+            let dark = system_is_dark();
+            let t = if dark { cosmic::theme::system_dark() } else { cosmic::theme::system_light() };
+            // Off COSMIC even the "system" themes are default-filled cosmic-config
+            // entries that BUILD DARK (the same failure the override path verifies
+            // against below), so check the output and fall back to libcosmic's
+            // built-in palette; on a healthy COSMIC config the output always
+            // agrees and the real system theme passes through untouched.
+            let t = if t.cosmic().is_dark == dark {
+                t
+            } else {
+                cosmic::Theme::custom(std::sync::Arc::new(
+                    if dark { ThemeBuilder::dark() } else { ThemeBuilder::light() }.build(),
+                ))
+            };
+            // Contrast boost (forced ON under System Default): unify fills onto the
+            // contrast-corrected accent. No-op — and BYTE-IDENTICAL to before this
+            // ticket — when the COSMIC accent already passes 4:1 (the boosted value
+            // equals the base), which every default COSMIC accent does; only a
+            // genuinely low-contrast custom accent triggers a rebuild from the SAME
+            // COSMIC config the system theme reads (so mode/rounding are preserved).
+            let base = t.cosmic().accent_color();
+            let boosted = t.cosmic().accent_text_color();
+            if boost && base != boosted {
+                let builder = if dark {
+                    ThemeBuilder::dark_config().ok().and_then(|c| ThemeBuilder::get_entry(&c).ok())
+                } else {
+                    ThemeBuilder::light_config().ok().and_then(|c| ThemeBuilder::get_entry(&c).ok())
+                };
+                if let Some(b) = builder {
+                    let mut rebuilt = b
+                        .accent(cosmic::cosmic_theme::palette::Srgb::new(
+                            boosted.red,
+                            boosted.green,
+                            boosted.blue,
+                        ))
+                        .build();
+                    rebuilt.accent_text = Some(rebuilt.accent.base);
+                    return cosmic::Theme::custom(std::sync::Arc::new(rebuilt));
+                }
+            }
+            return t;
+        }
     }
     let dark = mode_wants_dark(mode);
     // Best-effort system-theme base; fall back to libcosmic's built-in default
-    // (the expected path off a COSMIC desktop, not an error edge).
-    let builder = if dark {
+    // (the expected path off a COSMIC desktop, not an error edge). `ThemeBuilder` is
+    // `Clone`, so the two-pass boost below reuses this base without re-reading config.
+    let base_builder = if dark {
         ThemeBuilder::dark_config()
             .ok()
             .and_then(|c| ThemeBuilder::get_entry(&c).ok())
@@ -135,24 +206,165 @@ pub(crate) fn apply_appearance<M: Send + 'static>(
             .and_then(|c| ThemeBuilder::get_entry(&c).ok())
             .unwrap_or_else(ThemeBuilder::light)
     };
-    let decorate = |mut b: ThemeBuilder| {
-        if let Some([r, g, bl]) = accent {
-            b = b.accent(cosmic::cosmic_theme::palette::Srgb::new(r, g, bl));
+    // DRAGON-255b: with NO manual accent override (`None`), "reset accent" resolves to
+    // the OS-native accent instead of libcosmic's built-in default — so on Windows
+    // clearing the accent matches the real system accent (registry), and on macOS the
+    // built-in default (its native accent IS `None`). macOS is byte-identical (its
+    // native accent is `None`, so `None` stays `None`); Linux has no
+    // `native_system_default` and already composes on the COSMIC base accent, so it
+    // keeps applying no override here — also byte-identical. Computed once (the closure
+    // below runs up to twice) so the registry read happens at most once per resolve.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let effective_accent = accent.or_else(|| native_system_default().0);
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let effective_accent = accent;
+    // Build the theme with a substituted accent (mode + rounding preserved). Verify the
+    // OUTPUT against the requested mode (DRAGON-144): cosmic-config returns a
+    // DEFAULT-FILLED entry — which builds DARK — instead of an error when the theme
+    // files don't exist (macOS/Windows always; a COSMIC system with no saved theme), so
+    // the built-in fallback above never fired and Light mode silently rendered dark.
+    // When the build disagrees, rebuild from libcosmic's built-in palette, which is what
+    // those systems actually render; a healthy COSMIC config always agrees.
+    let build = |acc: Option<[f32; 3]>| -> cosmic::cosmic_theme::Theme {
+        let decorate = |mut b: ThemeBuilder| {
+            if let Some([r, g, bl]) = acc {
+                b = b.accent(cosmic::cosmic_theme::palette::Srgb::new(r, g, bl));
+            }
+            b.corner_radii(CornerRadii::from(roundness_from_u8(roundness)))
+        };
+        let mut built = decorate(base_builder.clone()).build();
+        if built.is_dark != dark {
+            built = decorate(if dark { ThemeBuilder::dark() } else { ThemeBuilder::light() }).build();
         }
-        b.corner_radii(CornerRadii::from(roundness_from_u8(roundness)))
+        built
     };
-    let mut built = decorate(builder).build();
-    // Verify the OUTPUT against the requested mode (DRAGON-144): cosmic-config
-    // returns a DEFAULT-FILLED entry — which builds DARK — instead of an error
-    // when the theme files don't exist (macOS/Windows always; a COSMIC system
-    // with no saved theme), so the built-in fallback above never fired and
-    // Light mode silently rendered dark. When the build disagrees, rebuild from
-    // libcosmic's built-in palette, which is what those systems actually render;
-    // a healthy COSMIC config always agrees and is untouched.
-    if built.is_dark != dark {
-        built = decorate(if dark { ThemeBuilder::dark() } else { ThemeBuilder::light() }).build();
+    let built = build(effective_accent);
+    let final_theme = apply_contrast_boost(built, boost, |acc| build(Some(acc)));
+    cosmic::Theme::custom(std::sync::Arc::new(final_theme))
+}
+
+/// Apply the Automatic Contrast Boost policy to a freshly built theme (DRAGON-289), the
+/// pure heart of the one-accent unify. `built` is the theme built with the PICKED
+/// accent; `rebuild(rgb)` rebuilds the SAME base (mode/rounding preserved) with a
+/// substituted accent.
+///
+/// - **Boost ON**: read `built`'s [`accent_text_color`](cosmic::cosmic_theme::Theme::accent_text_color)
+///   — the contrast-corrected accent when the picked one fails a 4:1 test against the
+///   surface, else the picked accent UNCHANGED — and rebuild so `accent.base`/hover/
+///   pressed (every fill, line and outline) derive from it too. When it already passes
+///   (corrected == picked) the rebuild is skipped (it would reproduce `built`).
+/// - **Boost OFF**: keep the picked build untouched (fills stay the exact picked colour).
+///
+/// In BOTH cases `accent_text` is pinned to the FINAL `accent.base`, so chrome TEXT
+/// (active nav links, tab titles) draws in exactly the same colour as the fills — the
+/// split libcosmic normally keeps between `accent_text_color()` and `accent.base` can
+/// never reappear. Boost off therefore forces text down to the raw picked colour even
+/// when it is low-contrast; boost on lifts everything to the corrected colour.
+fn apply_contrast_boost(
+    built: cosmic::cosmic_theme::Theme,
+    boost: bool,
+    rebuild: impl FnOnce([f32; 3]) -> cosmic::cosmic_theme::Theme,
+) -> cosmic::cosmic_theme::Theme {
+    let mut theme = if boost {
+        let base = built.accent_color();
+        let boosted = built.accent_text_color();
+        // Equal (exactly — both are `accent.base`) when the picked accent already passes
+        // contrast, so `accent_text` was `None`; skip the rebuild in that case.
+        if base == boosted {
+            built
+        } else {
+            rebuild([boosted.red, boosted.green, boosted.blue])
+        }
+    } else {
+        built
+    };
+    theme.accent_text = Some(theme.accent.base);
+    theme
+}
+
+/// Build + apply the process-global theme for the current appearance settings, as a
+/// `Task` the caller returns from `update` (or batches into `init`). The thin apply
+/// wrapper over [`resolve_appearance_theme`] (which holds the whole build + its
+/// portability contract) — behaviour is byte-identical to the pre-split function.
+pub(crate) fn apply_appearance<M: Send + 'static>(
+    use_system: bool,
+    mode: u8,
+    accent: Option<[f32; 3]>,
+    roundness: u8,
+    contrast_boost: bool,
+) -> Task<cosmic::Action<M>> {
+    cosmic::command::set_theme(resolve_appearance_theme(
+        use_system,
+        mode,
+        accent,
+        roundness,
+        contrast_boost,
+    ))
+}
+
+/// The RESOLVED appearance accent as opaque RGBA — the value the unset Active
+/// window-border follows (`crate::decoration::accent_rgba`), computed from the
+/// PERSISTED appearance settings via [`resolve_appearance_theme`]. Equal to
+/// `accent(&cosmic::theme::active())` after [`apply_appearance`] has run (both read
+/// the same resolved theme's accent), but runtime-independent, so a headless CLI
+/// process — where the global theme is never applied — resolves the SAME colour the
+/// running app draws. Used by the Windows composite diagnostic to verify the border;
+/// the mac/Linux composite diags could adopt it, so it stays compiled everywhere.
+/// (Windows AND Linux consume it now: the Windows composite diag + both the Windows
+/// and Linux resident daemons tint their tray from it, so the boost drives the tray
+/// in lockstep — DRAGON-289; only macOS, whose tray icon is template-tinted with no
+/// accent, leaves it unused.)
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
+pub(crate) fn resolved_appearance_accent_rgba() -> [u8; 4] {
+    let p = crate::state::load();
+    let theme = resolve_appearance_theme(
+        p.appearance_use_system,
+        p.appearance_mode.min(2),
+        p.appearance_accent,
+        p.appearance_roundness.min(2),
+        p.appearance_contrast_boost,
+    );
+    color_to_rgba(accent(&theme))
+}
+
+/// An iced [`Color`] as opaque 8-bit RGBA (the `image::Rgba` byte order), clamped.
+/// The shared accent→border-colour encoding.
+pub(crate) fn color_to_rgba(c: Color) -> [u8; 4] {
+    [
+        (c.r.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.g.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.b.clamp(0.0, 1.0) * 255.0).round() as u8,
+        255,
+    ]
+}
+
+/// The platform-native "System Default" appearance for OSes that have no COSMIC
+/// system theme to follow (DRAGON-239): `(accent override, roundness byte)`, fed to
+/// the `use_system` build in [`apply_appearance`]. The dark/light base is chosen
+/// separately by [`system_is_dark`]; this picks only the accent + rounding.
+///
+/// - **Windows**: the OS accent ("trim") colour read from the registry (the closed
+///   platform body `crate::platform::windows::appearance::accent_rgb`; `None` if it
+///   can't be read, keeping libcosmic's default accent) + FULLY-round corners
+///   (roundness byte 0) — fully-round is the app's System-Default look on every
+///   non-COSMIC OS (COSMIC follows its own rounding config instead).
+/// - **macOS**: the OS accent read from `NSColor.controlAccentColor`, converted to
+///   sRGB (the closed platform body `crate::platform::mac::appearance::accent_rgb`;
+///   when the accent is "Multicolor", the macOS default, it pins Apple's default blue
+///   #047AFF, and `None` keeps libcosmic's default accent) + FULLY-round corners
+///   (roundness byte 0).
+///
+/// Linux never calls this (it follows the real COSMIC theme in [`apply_appearance`]).
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn native_system_default() -> (Option<[f32; 3]>, u8) {
+    #[cfg(target_os = "windows")]
+    {
+        (crate::platform::windows::appearance::accent_rgb(), 0)
     }
-    cosmic::command::set_theme(cosmic::Theme::custom(std::sync::Arc::new(built)))
+    #[cfg(target_os = "macos")]
+    {
+        (crate::platform::mac::appearance::accent_rgb(), 0)
+    }
 }
 
 // ── The rounding seam ────────────────────────────────────────────────────────
@@ -194,6 +406,21 @@ impl Rounding {
     /// rendering clamps it to half the segment, so "round" reads as a capsule.
     pub(crate) fn xl1(&self) -> f32 {
         self.xl[0]
+    }
+
+    /// The button token, but with each corner capped at `max` px. The quad
+    /// renderer already clamps a radius to half the SHORTER axis, so the raw
+    /// `xl` (160 under "round") reads as a clean pill on a SHORT-and-wide
+    /// control (its half-height wins). It only balloons on a control that is
+    /// TALL relative to its width — e.g. the capture toolbar's stacked
+    /// kind+timer group, where the delay chip wraps below the kind trio — where
+    /// half the taller axis becomes a near-square blob. Capping at the standard
+    /// group half-height keeps every short group byte-identical (their clamp was
+    /// already `max`) while taming the tall stacked one. "Slightly round"/
+    /// "square" (xl = 8/2) fall through untouched, so the roundness preference is
+    /// still honoured.
+    pub(crate) fn xl_capped(&self, max: f32) -> [f32; 4] {
+        self.xl.map(|r| r.min(max))
     }
 
     /// The rounding cosmic-comp draws on WINDOW corners: `radius_s + 4` (when
@@ -361,29 +588,20 @@ pub(crate) fn theme_is_dark() -> bool {
     {
         crate::platform::linux::cosmic::theme::theme_is_dark()
     }
-    // Other (e.g. a future Windows build): no COSMIC config dir, so the reader's
-    // `unwrap_or(true)` default — dark — is the historical result.
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    // Windows (DRAGON-239): the active theme now follows the OS light/dark setting
+    // (System Default resolves through `system_is_dark`), so the drop-shadow opacity
+    // must track it too — the registry app-theme probe, exactly as macOS does above.
+    // (Historically this arm returned a hardcoded `true`; correct only because the
+    // Windows theme was itself pinned dark until this ticket.)
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::appearance::system_is_dark()
+    }
+    // Other: no COSMIC config dir, so the reader's `unwrap_or(true)` default — dark
+    // — is the historical result.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         true
-    }
-}
-
-/// The active-window hint colour: `window_hint` if set, else the accent colour
-/// (matching cosmic-comp's `active_window_hint`). RGBA, opaque. Falls back to the
-/// cosmic default lavender. Read for the Linux system-accent default of the
-/// reconstructed Active window-capture border (`crate::decoration::accent_rgba`,
-/// DRAGON-191) and for the resident tray icon tint.
-pub(crate) fn active_hint_color() -> [u8; 4] {
-    #[cfg(target_os = "linux")]
-    {
-        crate::platform::linux::cosmic::theme::active_hint_color()
-    }
-    // Off COSMIC no theme dir is read, so the reader fell through to the cosmic
-    // default lavender — the historical value.
-    #[cfg(not(target_os = "linux"))]
-    {
-        [151, 125, 236, 255]
     }
 }
 
@@ -503,18 +721,119 @@ pub(crate) fn glass_config() -> Option<GlassConfig> {
     {
         crate::platform::linux::cosmic::theme::glass_config()
     }
-    #[cfg(not(target_os = "linux"))]
+    // Windows (DRAGON-267): the Mica backdrop is the frosted-windows analog.
+    #[cfg(windows)]
+    {
+        windows_glass_config()
+    }
+    // macOS (DRAGON-268): window vibrancy is the frosted-windows analog — winit's
+    // `blur` enrolls an NSVisualEffectView and `platform::mac::window` clears the Metal
+    // layer over it. Its own arm now, so the final `None` arm covers only the remaining
+    // platforms (no frosted-windows support yet), keeping their opaque look unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        macos_glass_config()
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
         None
     }
 }
 
-/// Whether to enroll a fresh toplevel WINDOW in the compositor's backdrop blur:
-/// the user has frosted windows on ([`glass_config`]). Portable by the seam —
-/// `None` off COSMIC / macOS (no v2 theme config) yields `false`, so the window
-/// opens un-enrolled and fully opaque exactly as before. (The winit `blur` flag
-/// is macOS window vibrancy on mac, a separate effect tracked under DRAGON-166;
-/// gating here keeps that off.)
+/// The frosted-surface opacity the Windows chrome paints at OVER the DWM Mica material
+/// (DRAGON-267). Mica IS visible — the windows render alpha-composited (verified via a WGC
+/// capture, which sees the DWM layer that a GDI BitBlt screenshot does not; that BitBlt
+/// blindness is what earlier made this look like a no-op — DRAGON-275). `frost_color` paints
+/// the chrome at this alpha over the Mica backdrop: **0.0 = the pure Mica material shows**
+/// (heavily-blurred, desaturated desktop tint — the truest Mica look), higher values lay more
+/// of the flat theme colour over it (0.85 was a restrained, very subtle glass). User picked
+/// 0.0 for the full Mica effect (DRAGON-275).
+#[cfg(windows)]
+const MICA_SURFACE_ALPHA: f32 = 0.0;
+
+/// The Windows frosted-windows config (DRAGON-267) — the Mica-backdrop equivalent of the
+/// Linux COSMIC frosted-glass read. On Win11 22H2+ (where DWM's `DWMWA_SYSTEMBACKDROP_TYPE`
+/// Mica material is supported) this returns `Some` with `frosted_windows` ON, so the SHARED
+/// translucent-chrome painting (`frost_color`, the settings/preview chrome closures) and
+/// [`glass_windows_enabled`] behave exactly like Linux's frosted glass; the native DWM
+/// material itself is applied post-show by `platform::windows::window::apply_mica`. Below
+/// 22H2 (Mica unsupported) it is `None` — a graceful no-op keeping today's opaque look.
+/// Honors the SAME `CCK_NO_GLASS=1` kill-switch as the Linux reader so the frosted-windows
+/// toggle is unified across platforms. `strength_ordinal` is unused off Linux (only the
+/// COSMIC capture-glass reproduction consumes it), so a `0` placeholder.
+#[cfg(windows)]
+fn windows_glass_config() -> Option<GlassConfig> {
+    if std::env::var_os("CCK_NO_GLASS").is_some_and(|v| v == "1") {
+        return None;
+    }
+    if !crate::platform::windows::window::mica_supported() {
+        return None;
+    }
+    Some(GlassConfig { strength_ordinal: 0, alpha: MICA_SURFACE_ALPHA, frosted_windows: true })
+}
+
+/// The frosted-surface opacity the macOS chrome paints at OVER the window vibrancy
+/// (DRAGON-268). The vibrancy material comes from a winit-inserted NSVisualEffectView
+/// behind a cleared Metal layer (`platform::mac::window::enable_window_vibrancy`), and
+/// `frost_color` paints the page/chrome background at this alpha over it: 0.0 = the pure
+/// vibrancy shows, higher values lay more of the flat theme colour over it.
+///
+/// Unlike Windows (where DWM Mica fills the whole window, so `MICA_SURFACE_ALPHA = 0.0`
+/// reads as a solid frosted pane), macOS vibrancy behind a fully-transparent page reads as
+/// a see-through hole, so the mac page needs a translucent theme tint painted over the
+/// vibrancy to read as a frosted PANEL rather than clear glass. This value is that tint's
+/// opacity; tune it up for a more solid pane, down for more of the raw desktop blur.
+#[cfg(target_os = "macos")]
+const MAC_SURFACE_ALPHA: f32 = 0.75;
+
+/// The active theme's opaque background base as straight-alpha `[r, g, b, a]` u8 — the DARK
+/// (or light) pane color the fullscreen backdrop fix paints an opaque NSWindow with, so the
+/// page tint composites over a proper theme pane instead of the bright vibrancy no-backdrop
+/// fallback (DRAGON-268 follow-up, Task 2). Reads the live `cosmic::theme::active()`.
+#[cfg(target_os = "macos")]
+pub(crate) fn background_base_rgba() -> [u8; 4] {
+    let bg: Color = cosmic::theme::active().cosmic().background.base.into();
+    let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [c(bg.r), c(bg.g), c(bg.b), 255]
+}
+
+/// The macOS frosted-windows config (DRAGON-268) — the window-vibrancy equivalent of the
+/// Linux COSMIC frosted-glass read / the Windows Mica read. Vibrancy is available on our
+/// whole macOS floor (`vibrancy_supported` is always `true`), so this returns `Some` with
+/// `frosted_windows` ON unless the SAME `CCK_NO_GLASS=1` kill-switch the Linux/Windows
+/// readers honor is set — so the frosted-windows toggle is unified across platforms. The
+/// SHARED translucent-chrome painting (`frost_color`, the settings/preview chrome closures)
+/// and [`glass_windows_enabled`] then behave exactly like Linux's frosted glass; the native
+/// vibrancy itself is enrolled by winit's `blur` at window creation and revealed post-show
+/// by `platform::mac::window::enable_window_vibrancy`. `strength_ordinal` is unused off
+/// Linux (only the COSMIC capture-glass reproduction consumes it), so a `0` placeholder.
+#[cfg(target_os = "macos")]
+fn macos_glass_config() -> Option<GlassConfig> {
+    if std::env::var_os("CCK_NO_GLASS").is_some_and(|v| v == "1") {
+        return None;
+    }
+    if !crate::platform::mac::window::vibrancy_supported() {
+        return None;
+    }
+    Some(GlassConfig { strength_ordinal: 0, alpha: MAC_SURFACE_ALPHA, frosted_windows: true })
+}
+
+/// Whether to enroll a fresh toplevel WINDOW in the frosted-windows material: the
+/// user has frosted windows on ([`glass_config`]). Portable by the seam — `None` off
+/// COSMIC (no v2 theme config) yields `false`, so the window opens un-enrolled and
+/// fully opaque exactly as before.
+///
+/// On Linux this is the compositor's backdrop blur (winit `blur`); on macOS
+/// (DRAGON-268) winit's `blur` flag is the window vibrancy (an NSVisualEffectView), so
+/// this ALSO gates the mac `blur` — AND the mac `transparent` flag, so the Metal layer
+/// is non-opaque enough for the vibrancy to show (`platform::mac::window` finishes the
+/// job post-show).
+// DRAGON-267: on Windows the settings/preview windows take their material from a DWM Mica
+// backdrop, NOT winit's `blur` (a Windows `blur:true` is a legacy accent-policy blur-behind
+// that competes with `DWMWA_SYSTEMBACKDROP_TYPE`), so both `blur:` call sites are
+// `cfg(not(windows))` and this seam has no Windows caller — honestly gated as dead there
+// while staying live on Linux/macOS.
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn glass_windows_enabled() -> bool {
     glass_config().is_some_and(|g| g.frosted_windows)
 }
@@ -533,6 +852,44 @@ pub(crate) fn frost_color(mut c: Color, glass: Option<GlassConfig>) -> Color {
         c.a = g.alpha;
     }
     c
+}
+
+/// The fill alpha of the settings window's **section/option cards** (DRAGON-279).
+/// Distinct from [`MICA_SURFACE_ALPHA`] / [`frost_color`], which drive the WINDOW
+/// base + nav rail to (near-)full transparency. Tuned to the Fluent card weight
+/// (user reference: Win11 Settings "Bluetooth devices" card, dark, 2026-07-19): a
+/// NEARLY-SOLID neutral panel with only a HINT of the backdrop bleeding through — not
+/// a sheer veil. High alpha is deliberate: the card fill is the (neutral, dark-gray)
+/// component base, so a near-opaque fill reads as a crisp lighter panel the way Win11
+/// cards do, whereas a low alpha let the (more saturated than Win11 Mica) backdrop
+/// dominate and the card read as ghostly tinted glass.
+///
+/// STRUCTURE VERDICT (2026-07-19, sampled from the reference): the Win11 card is ONE
+/// UNIFORM fill — the section body AND the toggle/device rows all measure the SAME
+/// The settings window's interior surfaces — item-row cards AND standard buttons —
+/// paint the SAME material as the nav rail's active pill (user decision 2026-07-19,
+/// "make it easy": one material for pills, rows, and buttons, so they always move
+/// together): libcosmic's segmented-button active fill, `palette.neutral_5` at
+/// these alphas. UNCONDITIONAL on every platform — the backdrop bleeds through
+/// wherever one exists (Windows Mica, COSMIC frosted windows; mac blur when it
+/// lands) and blends over the opaque window base where none does yet.
+///
+/// `PILL_ALPHA` (0.2) is exactly the nav pill's active alpha. Buttons rest at the
+/// same 0.2 and bump on interaction so they still read as controls; a button
+/// sitting INSIDE a row stacks its fill over the row's (0.2 over 0.2), which is
+/// the Fluent layering the user hypothesized — heavier by construction, and it
+/// tracks any retune of the shared material automatically.
+pub(crate) const PILL_ALPHA: f32 = 0.2;
+pub(crate) const PILL_HOVER_ALPHA: f32 = 0.3;
+pub(crate) const PILL_PRESSED_ALPHA: f32 = 0.35;
+pub(crate) const PILL_DISABLED_ALPHA: f32 = 0.1;
+
+/// The shared pill material at `alpha`: `palette.neutral_5` — the exact token the
+/// nav rail's active pill uses (libcosmic segmented_button active =
+/// `neutral_5.with_alpha(0.2)`).
+pub(crate) fn pill_fill(theme: &cosmic::Theme, alpha: f32) -> Color {
+    let n = theme.cosmic().palette.neutral_5;
+    Color::from_rgba(n.red, n.green, n.blue, alpha)
 }
 
 /// The desktop wallpaper image path, wherever this session keeps it (the
@@ -642,6 +999,20 @@ mod tests {
         assert_eq!(fb.s, d.radius_s);
         assert_eq!(fb.m, d.radius_m);
         assert_eq!(fb.xl, d.radius_xl);
+    }
+
+    #[test]
+    fn xl_capped_tames_round_but_leaves_slightly_round_and_square() {
+        // "round" (xl = 160) is capped down to the small-control ceiling so the
+        // stacked capture-toolbar group stops ballooning into a blob.
+        let round = Rounding::FALLBACK; // xl = [160; 4]
+        assert_eq!(round.xl_capped(22.0), [22.0; 4]);
+        // "slightly round" (xl = 8) and "square" (xl = 2) already sit under the
+        // ceiling, so the roundness preference passes through untouched.
+        let slightly = Rounding { xs: [2.0; 4], s: [8.0; 4], m: [8.0; 4], xl: [8.0; 4] };
+        assert_eq!(slightly.xl_capped(22.0), [8.0; 4]);
+        let square = Rounding { xs: [2.0; 4], s: [2.0; 4], m: [2.0; 4], xl: [2.0; 4] };
+        assert_eq!(square.xl_capped(22.0), [2.0; 4]);
     }
 
     #[test]
@@ -790,5 +1161,101 @@ mod tests {
         let rgb = [0.13_f32, 0.52, 0.94];
         let srgb = cosmic::cosmic_theme::palette::Srgb::new(rgb[0], rgb[1], rgb[2]);
         assert_eq!([srgb.red, srgb.green, srgb.blue], rgb);
+    }
+
+    // ── Platform-native System Default (DRAGON-239) ──────────────────────────
+    // The per-platform selection fed to the `use_system` build: Windows =
+    // slightly-round (1), macOS = fully-round (0). Runs on the OS it's compiled
+    // for (Windows via `--no-default-features`); Linux never compiles the fn.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    #[test]
+    fn native_system_default_selects_platform_roundness() {
+        let (_accent, roundness) = native_system_default();
+        #[cfg(target_os = "windows")]
+        assert_eq!(roundness, 1, "Windows System Default = slightly round");
+        #[cfg(target_os = "macos")]
+        assert_eq!(roundness, 0, "macOS System Default = fully round");
+    }
+
+    #[test]
+    fn color_to_rgba_encodes_opaque_bytes() {
+        assert_eq!(color_to_rgba(Color::from_rgb(0.0, 120.0 / 255.0, 212.0 / 255.0)), [0, 120, 212, 255]);
+        // Alpha is always forced to 255 (an opaque border) regardless of the Color's
+        // own alpha; components round to the nearest byte. (The `.clamp` in the body
+        // guards a hand-built out-of-range Color, which iced won't let us construct
+        // here — its own debug asserts enforce 0..=1 — so we exercise valid inputs.)
+        assert_eq!(color_to_rgba(Color::from_rgba(1.0, 0.5, 0.0, 0.3)), [255, 128, 0, 255]);
+    }
+
+    #[test]
+    fn resolve_appearance_theme_routes_the_manual_accent() {
+        // The border DEFAULT follows the resolved theme accent. A manual override
+        // accent must flow into the built theme's accent; different manuals differ,
+        // and each leans toward its dominant channel — robust to cosmic-theme's exact
+        // accent derivation (we assert direction, not an exact byte). Boost OFF so the
+        // fills stay the raw picked colour (boost could lift a low-contrast pick).
+        let red = accent(&resolve_appearance_theme(false, 1, Some([0.90, 0.10, 0.10]), 0, false));
+        let blue = accent(&resolve_appearance_theme(false, 1, Some([0.10, 0.10, 0.90]), 0, false));
+        assert_ne!((red.r, red.g, red.b), (blue.r, blue.g, blue.b));
+        assert!(red.r > red.b, "a red manual accent stays red-dominant: {red:?}");
+        assert!(blue.b > blue.r, "a blue manual accent stays blue-dominant: {blue:?}");
+    }
+
+    // ── Automatic Contrast Boost (DRAGON-289) ────────────────────────────────
+    // Force dark mode (1) so the derivation path is deterministic regardless of the
+    // host's system light/dark preference.
+
+    fn luma(c: Color) -> f32 {
+        0.299 * c.r + 0.587 * c.g + 0.114 * c.b
+    }
+
+    #[test]
+    fn contrast_boost_off_unifies_text_with_the_fill_accent() {
+        // Boost OFF: chrome text (accent_text) is forced to EXACTLY the fill accent
+        // (accent.base), so the historical libcosmic split can't show — even for a
+        // deliberately low-contrast pick (dark red on a dark surface).
+        let t = resolve_appearance_theme(false, 1, Some([0.25, 0.0, 0.0]), 0, false);
+        let fill = accent(&t);
+        let text = accent_text(&t);
+        assert_eq!(
+            (fill.r, fill.g, fill.b),
+            (text.r, text.g, text.b),
+            "boost off: text must equal the fill accent"
+        );
+    }
+
+    #[test]
+    fn contrast_boost_on_lifts_a_low_contrast_accent_and_unifies() {
+        // A dark-red accent fails 4:1 against the dark surface, so boost ON lifts the
+        // WHOLE accent (fills + text) to the brighter contrast-corrected variant, while
+        // boost OFF leaves the fill at the raw dark pick. Both stay unified (text==fill).
+        let dark_red = Some([0.25, 0.0, 0.0]);
+        let off = resolve_appearance_theme(false, 1, dark_red, 0, false);
+        let on = resolve_appearance_theme(false, 1, dark_red, 0, true);
+        // Unified in both cases.
+        for (label, th) in [("off", &off), ("on", &on)] {
+            let f = accent(th);
+            let x = accent_text(th);
+            assert_eq!((f.r, f.g, f.b), (x.r, x.g, x.b), "{label}: text must equal fill");
+        }
+        // Boost lifted the fill to a brighter accent.
+        assert!(
+            luma(accent(&on)) > luma(accent(&off)),
+            "boost on must brighten a low-contrast accent: on={:?} off={:?}",
+            accent(&on),
+            accent(&off),
+        );
+    }
+
+    #[test]
+    fn contrast_boost_leaves_a_high_contrast_accent_unchanged() {
+        // A bright accent already passes 4:1 on the dark surface, so boost is a no-op:
+        // the fill accent is (essentially) the same with the boost on or off, and stays
+        // unified with the text either way.
+        let bright = Some([0.85, 0.85, 0.90]);
+        let off = accent(&resolve_appearance_theme(false, 1, bright, 0, false));
+        let on = accent(&resolve_appearance_theme(false, 1, bright, 0, true));
+        let d = (on.r - off.r).abs() + (on.g - off.g).abs() + (on.b - off.b).abs();
+        assert!(d < 0.02, "boost must not shift a high-contrast accent: on={on:?} off={off:?}");
     }
 }

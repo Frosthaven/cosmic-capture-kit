@@ -12,17 +12,29 @@
 //!   settings pane is open across all instances, even when "allow multiple
 //!   instances" is on. It is held for the process lifetime on success.
 
+// DRAGON-229: rustix (POSIX flock) is unix-only; the Windows lock functions below
+// have their own (M0 fail-open) arms and never touch it. Unix selection unchanged.
+#[cfg(unix)]
 use rustix::fs::{FlockOperation, flock};
+// DRAGON-229: both the flock `File` and the `Mutex` static that holds it are unix-only;
+// Windows keeps its named-mutex handles inside `platform::windows::instance` instead.
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::sync::Mutex;
 
 /// Holds the capture single-instance lock. Unlike the settings lock it can be
 /// released at runtime: when an instance switches into the settings window it is
 /// no longer "capturing", so it gives up this lock and another capture instance
 /// may launch (even with "allow multiple instances" off).
+///
+/// DRAGON-229: unix-only — this holds the flock `File`. Windows holds its capture NAMED
+/// MUTEX handle inside `platform::windows::instance` instead (strict split).
+#[cfg(unix)]
 static CAPTURE_LOCK: Mutex<Option<File>> = Mutex::new(None);
 
 /// Path to the capture single-instance lock file.
+#[cfg(unix)]
 fn capture_lock_path() -> String {
     format!("{}/cosmic-capture-kit.lock", crate::util::runtime_dir())
 }
@@ -34,6 +46,7 @@ fn capture_lock_path() -> String {
 /// separate single-instance lock ([`acquire_daemon_lock`]), so the capture lock is
 /// the plain "don't open two overlays" gate on every OS — capture children spawned
 /// by the daemon take it exactly like any one-shot capture instance would.
+#[cfg(unix)]
 pub(crate) fn acquire_lock() -> bool {
     let file = match File::create(capture_lock_path()) {
         Ok(f) => f,
@@ -50,6 +63,15 @@ pub(crate) fn acquire_lock() -> bool {
         }
         Err(_) => false, // another instance already holds it
     }
+}
+
+/// Windows (DRAGON-229): the named-mutex capture guard. Body under
+/// `platform::windows::instance` (strict split). Returns false if another capture
+/// instance already holds the mutex; fails OPEN if the mutex can't be created, matching
+/// the unix lock-file-create fail-open.
+#[cfg(windows)]
+pub(crate) fn acquire_lock() -> bool {
+    crate::platform::windows::instance::acquire_lock()
 }
 
 // ── Resident single-instance lock + pid (macOS daemon / Linux resident) ───────
@@ -92,6 +114,14 @@ fn daemon_lock_path() -> String {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn acquire_daemon_lock() -> bool {
     acquire_daemon_lock_attempts(31)
+}
+
+/// Windows (DRAGON-237): the daemon single-instance guard. Body under
+/// `platform::windows::instance` (strict split — a named mutex + a recorded pid). Returns
+/// false if another daemon already holds it; fails OPEN if the mutex can't be created.
+#[cfg(windows)]
+pub(crate) fn acquire_daemon_lock() -> bool {
+    crate::platform::windows::instance::acquire_daemon_lock()
 }
 
 /// Single-attempt variant (DRAGON-180): a CAPTURE-intent bare launch (the global
@@ -171,6 +201,14 @@ pub(crate) fn signal_existing_capture() -> bool {
     }
 }
 
+/// Windows (DRAGON-237): the "capture NOW" second-launch UX. Body under
+/// `platform::windows::instance` (strict split — pulses the daemon's named capture event).
+/// Returns true if a running daemon was signalled.
+#[cfg(windows)]
+pub(crate) fn signal_existing_capture() -> bool {
+    crate::platform::windows::instance::signal_existing_capture()
+}
+
 /// Resident UX (DRAGON-130/173): ask the running resident (macOS daemon / Linux
 /// resident) to EXIT (SIGTERM the daemon-lock holder), used by `SetResident(false)`
 /// in the settings UI so the tray/menu-bar item disappears immediately. AppKit
@@ -189,6 +227,15 @@ pub(crate) fn signal_daemon_quit() -> bool {
         Some(p) => rustix::process::kill_process(p, rustix::process::Signal::TERM).is_ok(),
         None => false,
     }
+}
+
+/// Windows (DRAGON-237): ask the running daemon to EXIT (tear its tray icon down + quit),
+/// used by `SetResident(false)` / a capture-hotkey change. Body under
+/// `platform::windows::instance` (strict split — pulses the daemon's named quit event).
+/// Returns true if a running daemon was signalled.
+#[cfg(windows)]
+pub(crate) fn signal_daemon_quit() -> bool {
+    crate::platform::windows::instance::signal_daemon_quit()
 }
 
 /// macOS (DRAGON-130, chord recorder): ask the running resident daemon to SUSPEND its
@@ -213,18 +260,34 @@ pub(crate) fn signal_daemon_suspend_hotkey() -> bool {
     }
 }
 
+/// Windows (DRAGON-237, chord recorder): ask the running daemon to SUSPEND its global
+/// "Start Capture" hotkey briefly so a PrintScreen press reaches the settings recorder
+/// instead of spawning a capture. Body under `platform::windows::instance` (strict split —
+/// pulses the daemon's named suspend event); the daemon auto-resumes after the pings stop.
+/// Returns true if a running daemon was signalled.
+#[cfg(windows)]
+pub(crate) fn signal_daemon_suspend_hotkey() -> bool {
+    crate::platform::windows::instance::signal_daemon_suspend_hotkey()
+}
+
 /// Release the capture single-instance lock. Called when this instance becomes a
 /// settings window, so another capture instance may now launch.
 #[cfg_attr(target_os = "macos", allow(dead_code))] // mac hands settings off to a fresh process (DRAGON-153)
 pub fn release_capture_lock() {
+    #[cfg(unix)]
     if let Ok(mut g) = CAPTURE_LOCK.lock() {
         *g = None; // dropping the File closes the fd and releases the flock
     }
+    // Windows (DRAGON-229): close the capture named-mutex handle so another capture
+    // instance may create it fresh (strict split — body under platform::windows).
+    #[cfg(windows)]
+    crate::platform::windows::instance::release_capture_lock();
 }
 
 /// Acquire the *settings* single-instance lock so only one settings pane can be
 /// open across all instances, regardless of "allow multiple instances". Held for
 /// the process lifetime on success (closing settings ends the process anyway).
+#[cfg(unix)]
 pub fn acquire_settings_lock() -> bool {
     let dir = crate::util::runtime_dir();
     // Open WITHOUT truncating: `File::create` would wipe the HOLDER's recorded pid
@@ -254,7 +317,20 @@ pub fn acquire_settings_lock() -> bool {
     }
 }
 
+/// Windows (DRAGON-229): the named-mutex settings guard. Body under
+/// `platform::windows::instance` (strict split); on success it also records the holder
+/// pid so the sibling sweep can spare THIS settings window. Returns false if a settings
+/// pane is already open somewhere; fails OPEN if the mutex can't be created.
+#[cfg(windows)]
+pub fn acquire_settings_lock() -> bool {
+    crate::platform::windows::instance::acquire_settings_lock()
+}
+
 /// The pid recorded by the settings-lock holder (the open settings window), if any.
+/// DRAGON-229: consumed only by `is_settings_instance` (Linux `/proc` sweep) and the
+/// macOS focus-the-pane path, neither of which exists on Windows, so it is
+/// `not(windows)`-gated to stay dead-code-free there.
+#[cfg(not(windows))]
 pub(crate) fn settings_lock_pid() -> Option<u32> {
     let dir = crate::util::runtime_dir();
     std::fs::read_to_string(format!("{dir}/cosmic-capture-kit-settings.lock"))
@@ -269,6 +345,7 @@ pub(crate) fn settings_lock_pid() -> Option<u32> {
 ///
 /// Settings windows are deliberately spared: a settings pane is its own thing (often
 /// a separate `--settings` process), and ending a capture must never close it.
+#[cfg(not(windows))]
 pub fn close_other_instances() {
     let Ok(self_exe) = std::env::current_exe() else {
         return;
@@ -309,10 +386,21 @@ pub fn close_other_instances() {
     }
 }
 
+/// Windows (DRAGON-229): the Toolhelp sibling-capture sweep. Body under
+/// `platform::windows::instance` (strict split) — matches siblings by full exe path,
+/// spares the settings window (its recorded pid), and force-terminates the rest (the
+/// analog of the Linux uncaught SIGTERM). Only matters with "allow multiple instances" on.
+#[cfg(windows)]
+pub fn close_other_instances() {
+    crate::platform::windows::instance::close_other_instances();
+}
+
 /// Whether `pid` is the resident daemon: the daemon-lock holder, or a process
 /// launched with the literal `resident` argument (the autostart / toggle-on shape;
 /// also covers a restarting daemon that hasn't won the lock yet). Never swept by
-/// [`close_other_instances`].
+/// [`close_other_instances`]. `not(windows)`: the daemon-lock pid + `/proc` sweep it
+/// serves are Linux/macOS-only.
+#[cfg(not(windows))]
 fn is_resident_instance(pid: u32) -> bool {
     if daemon_lock_pid() == Some(pid) {
         return true;
@@ -325,6 +413,8 @@ fn is_resident_instance(pid: u32) -> bool {
 /// Whether `pid` is a settings window — either launched with `--settings` (cmdline)
 /// or the instance that became the settings pane via the gear button (it owns the
 /// settings lock and recorded its pid there). Such instances are never auto-closed.
+/// `not(windows)`: only the `/proc` sweep in [`close_other_instances`] calls it.
+#[cfg(not(windows))]
 fn is_settings_instance(pid: u32) -> bool {
     if settings_lock_pid() == Some(pid) {
         return true;

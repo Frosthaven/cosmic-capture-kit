@@ -1,7 +1,7 @@
 //! General settings page section builder.
 
 use super::super::*;
-use super::super::row::{num_input, opacity_slider, toggle, Item, SectionSpec};
+use super::super::row::{num_input, opacity_slider, reset_button, toggle, Item, SectionSpec};
 
 impl crate::app::App {
     /// Every General-page section (both in-page tabs concatenated). The single
@@ -39,16 +39,20 @@ impl crate::app::App {
                     ];
                     // Stay resident: keep the tray/menu-bar RESIDENT process alive so a
                     // capture is always one click away. macOS (DRAGON-130) is a menu-bar
+                    // daemon with a global hotkey; Windows (DRAGON-237) is a Win32 tray
                     // daemon with a global hotkey; Linux (DRAGON-173) is a ksni tray
                     // resident (PrintScreen stays a COSMIC custom shortcut, so the resident
                     // adds the always-available tray launchers + recording controls, not a
-                    // global hotkey). One portable `resident` setting drives both; the row
-                    // is gated to the two OSes that have a resident.
-                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    // global hotkey). One portable `resident` setting drives all; the row
+                    // is gated to the OSes that have a resident.
+                    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
                     {
                         #[cfg(target_os = "macos")]
                         let desc = "Cosmic Capture Kit will remain in the background, enabling \
                                     global hotkey use and faster launch.";
+                        #[cfg(target_os = "windows")]
+                        let desc = "Cosmic Capture Kit will keep a tray icon running in the \
+                                    background, enabling the global capture hotkey and faster launch.";
                         #[cfg(target_os = "linux")]
                         let desc = "Cosmic Capture Kit will keep a tray icon running in the \
                                     background for quick capture and recording controls.";
@@ -222,11 +226,32 @@ impl crate::app::App {
                     );
                     // Accent Color: the active theme's 9 accent swatches (read live),
                     // plus a custom-color swatch / "+" opening the picker sidebar.
+                    // DRAGON-268: rendered as a FULL-WIDTH block so the "Accent" label
+                    // sits on its own line with the swatches WRAPPING beneath it (a
+                    // `flex_row` that reflows as the window narrows), rather than inline
+                    // in the right-hand control slot. The reset affordance is drawn into
+                    // the block header here (the full-width note ignores `Item::reset`).
+                    items.push(Item::full_width(
+                        "Accent",
+                        "",
+                        self.accent_swatches(self.appearance_accent != d.appearance_accent),
+                    ));
+                    // Automatic Contrast Boost (DRAGON-289): sits directly under the
+                    // accent row it modifies. Hidden under System Default (boost is forced
+                    // ON there), so it only shows while customizing.
                     items.push(
-                        Item::new("Accent", "", self.accent_swatches())
-                            .reset_with(self.appearance_accent, d.appearance_accent, |a0| {
-                                Msg::Settings(SettingsMsg::SetAppearanceAccent(a0))
+                        Item::new(
+                            "Automatic Contrast Boost",
+                            "Adapts your selected accent color for optimal contrast",
+                            toggle(self.appearance_contrast_boost, |a0| {
+                                Msg::Settings(SettingsMsg::SetAppearanceContrastBoost(a0))
                             }),
+                        )
+                        .reset_with(
+                            self.appearance_contrast_boost,
+                            d.appearance_contrast_boost,
+                            |a0| Msg::Settings(SettingsMsg::SetAppearanceContrastBoost(a0)),
+                        ),
                     );
                     // Style: three corner-rounding previews.
                     items.push(
@@ -290,11 +315,14 @@ impl crate::app::App {
         secs
     }
 
-    /// The Accent Color row content (DRAGON-139): the active theme's 9 accent
-    /// swatches (read live from the palette), plus a custom-colour swatch (when the
-    /// override is a non-palette colour) or a "+" button — both open the picker
-    /// sidebar. Rendered as one full-width `Item::note`.
-    fn accent_swatches(&self) -> Element<'_, Msg> {
+    /// The Accent Color block content (DRAGON-139 / DRAGON-268): the "Accent" label
+    /// on its own line (with the reset affordance), and BELOW it the active theme's 9
+    /// accent swatches (read live from the palette) plus a leading "System Default"
+    /// swatch and a trailing custom-colour swatch / "+" opener. Rendered as one
+    /// full-width block ([`Item::full_width`]); the swatches sit in a `flex_row` so
+    /// they WRAP onto more lines as the settings window narrows. `changed` is whether
+    /// the accent differs from its default (drives the reset icon's stand-out state).
+    fn accent_swatches(&self, changed: bool) -> Element<'_, Msg> {
         let active = cosmic::theme::active();
         let pal = &active.cosmic().palette;
         let palette: [cosmic::iced::Color; 9] = [
@@ -309,14 +337,35 @@ impl crate::app::App {
             srgba_to_color(pal.accent_warm_grey),
         ];
         let current = self.appearance_accent;
-        let mut row: Vec<Element<'_, Msg>> = palette
-            .iter()
-            .map(|&c| {
-                let rgb = [c.r, c.g, c.b];
-                let selected = current.is_some_and(|cur| approx_rgb(cur, rgb));
-                accent_swatch(c, selected, Msg::Settings(SettingsMsg::SetAppearanceAccent(Some(rgb))))
-            })
-            .collect();
+        // DRAGON-255b: a LEADING "System Default" swatch that clears the accent
+        // override (`None`). `None` resolves to the platform's system accent (Windows
+        // registry / macOS built-in / Linux COSMIC), so preview it with EXACTLY that
+        // colour — resolved with `None` regardless of any current custom accent — and
+        // mark it selected when no override is set. Shared UI (Windows + Linux).
+        // The swatch shows the RAW colour it represents — the actual system accent that
+        // clearing the override (`None`) would pick — NOT the Automatic Contrast Boost's
+        // adjusted variant (DRAGON-289 refinement: the picker always previews the literal
+        // colour; the boost only affects the accent AS DRAWN by the chrome). So resolve
+        // with the boost OFF here regardless of the toggle. The 9 palette swatches below
+        // read fixed `palette.accent_*` entries (the boost never touches those), and the
+        // custom swatch reads the raw persisted value — all raw by construction.
+        let system_default_color = theme::accent(&theme::resolve_appearance_theme(
+            false,
+            self.appearance_mode.min(2),
+            None,
+            self.appearance_roundness.min(2),
+            false,
+        ));
+        let mut row: Vec<Element<'_, Msg>> = vec![accent_swatch(
+            system_default_color,
+            current.is_none(),
+            Msg::Settings(SettingsMsg::SetAppearanceAccent(None)),
+        )];
+        row.extend(palette.iter().map(|&c| {
+            let rgb = [c.r, c.g, c.b];
+            let selected = current.is_some_and(|cur| approx_rgb(cur, rgb));
+            accent_swatch(c, selected, Msg::Settings(SettingsMsg::SetAppearanceAccent(Some(rgb))))
+        }));
         // The custom entry: a filled swatch when the override is a non-palette colour
         // (selected), otherwise the "+" opener.
         let custom_is_selected = current.is_some_and(|cur| !palette.iter().any(|c| approx_rgb(cur, [c.r, c.g, c.b])));
@@ -341,11 +390,29 @@ impl crate::app::App {
             .on_press(Msg::Settings(SettingsMsg::ToggleAccentEditor(true)))
             .into()
         });
-        // A plain row, NOT `flex_row`: as a settings-row CONTROL the element sits in
-        // a Shrink context, where FlexRow's taffy layout measures to nothing and the
-        // swatches vanish entirely (DRAGON-152) — the Style previews right below
-        // render through `widget::row` and were never affected.
-        widget::row(row).spacing(12.0).align_y(Alignment::Center).into()
+        // DRAGON-268: the swatches WRAP as the window narrows, so they render through
+        // `flex_row` (taffy flex-wrap) rather than a plain non-wrapping `widget::row`.
+        // The DRAGON-152 trap — FlexRow measuring to nothing — only bit when it was the
+        // right-hand CONTROL of a settings row (a Shrink context, so its taffy min-size
+        // took an unbounded max width). Here the block is a FULL-WIDTH note whose
+        // header/swatches sit under a `Length::Fill` container, so the flex row is
+        // handed a bounded max width and reflows correctly.
+        let swatches = widget::flex_row(row).spacing(12).align_items(Alignment::Center);
+
+        // The "Accent" label on its own line, with the reset icon trailing it, then the
+        // wrapping swatches beneath. The full-width note ignores `Item::reset`, so the
+        // reset button is drawn here in the header.
+        let header = widget::row(vec![
+            widget::text::body("Accent").font(cosmic::font::bold()).into(),
+            widget::space::Space::new().width(Length::Fill).into(),
+            reset_button(Msg::Settings(SettingsMsg::SetAppearanceAccent(None)), changed),
+        ])
+        .align_y(Alignment::Center);
+
+        widget::column(vec![header.into(), swatches.into()])
+            .spacing(8.0)
+            .width(Length::Fill)
+            .into()
     }
 }
 

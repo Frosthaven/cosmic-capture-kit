@@ -18,21 +18,22 @@ pub fn copy_to_clipboard(path: &Path, is_video: bool) {
     spawn_self(if is_video { COPY_FILE } else { COPY_IMAGE }, path);
 }
 
-/// macOS: NSPasteboard writes persist after we exit, so the copy happens INLINE
-/// here — no foreground-owner worker (`run_copy` stays a no-op). A screenshot goes
-/// on as decoded RGBA image data (`arboard`); a recording — or any non-image path
-/// — as a `file://` URL (NSPasteboard `writeObjects:`). Fire-and-forget: every
-/// failure is logged, never panics (call sites surface no error).
+/// macOS (DRAGON-230): dispatch to the clipboard body under `platform/mac/` (closed
+/// split). A screenshot goes on as decoded RGBA image data, a recording (or any
+/// non-image path) as a `file://` URL; like Windows the write persists after we exit,
+/// so the copy is INLINE here and `run_copy` stays a no-op.
 #[cfg(target_os = "macos")]
 pub fn copy_to_clipboard(path: &Path, is_video: bool) {
-    let result = if is_video || !is_image_path(path) {
-        mac::copy_file_url(path)
-    } else {
-        mac::copy_image(path)
-    };
-    if let Err(e) = result {
-        log::warn!("macOS clipboard copy failed ({}): {e}", path.display());
-    }
+    crate::platform::mac::clipboard::copy_to_clipboard(path, is_video);
+}
+
+/// Windows (DRAGON-229): dispatch to the clipboard body under `platform/windows/`
+/// (closed split). A still image goes on as image data (PNG + CF_DIBV5), a recording
+/// as a CF_HDROP file list; like macOS the write persists after we exit, so the copy
+/// is INLINE here and `run_copy` stays a no-op.
+#[cfg(target_os = "windows")]
+pub fn copy_to_clipboard(path: &Path, is_video: bool) {
+    crate::platform::windows::services::copy_to_clipboard(path, is_video);
 }
 
 /// Copy plain text to the clipboard (detached; persists after we exit). The text
@@ -50,80 +51,19 @@ pub fn copy_text(text: &str) {
     }
 }
 
-/// macOS: `arboard` text write, inline (persists after exit). Fire-and-forget.
+/// macOS (DRAGON-230): dispatch to the arboard text write under `platform/mac/`
+/// (closed split). Inline; persists after exit, so `run_copy_text` stays a no-op.
 #[cfg(target_os = "macos")]
 pub fn copy_text(text: &str) {
-    if let Err(e) = mac::copy_text(text) {
-        log::warn!("macOS clipboard text copy failed: {e}");
-    }
+    crate::platform::mac::clipboard::copy_text(text);
 }
 
-/// Whether `path` names an image the still-image clipboard path can decode. Pure
-/// extension classifier (the decodable set the `image` crate is built with here:
-/// PNG/JPEG/WebP); anything else copies as a file URL instead.
-#[cfg(target_os = "macos")]
-fn is_image_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .is_some_and(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "webp"))
-}
-
-/// macOS inline clipboard writes. NSPasteboard is not main-thread-bound, so these
-/// run synchronously on the caller's (update-loop) thread without a MainThreadMarker.
-#[cfg(target_os = "macos")]
-mod mac {
-    use std::borrow::Cow;
-    use std::path::Path;
-
-    /// Copy a still image onto the pasteboard as raw RGBA (`arboard::set_image`).
-    /// Decodes with the `image` crate the app already uses — nothing new is added.
-    pub fn copy_image(path: &Path) -> Result<(), String> {
-        let img = image::open(path)
-            .map_err(|e| format!("decode {}: {e}", path.display()))?
-            .to_rgba8();
-        let (width, height) = (img.width() as usize, img.height() as usize);
-        let data = arboard::ImageData {
-            width,
-            height,
-            bytes: Cow::Owned(img.into_raw()),
-        };
-        arboard::Clipboard::new()
-            .map_err(|e| format!("clipboard open: {e}"))?
-            .set_image(data)
-            .map_err(|e| format!("set_image: {e}"))
-    }
-
-    /// Copy `path` as a `file://` URL onto the general pasteboard (NSURL
-    /// `fileURLWithPath` + `writeObjects:`). Persists after we exit.
-    pub fn copy_file_url(path: &Path) -> Result<(), String> {
-        use objc2::runtime::ProtocolObject;
-        use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
-        use objc2_foundation::{NSArray, NSString, NSURL};
-
-        // Absolute path so Finder/paste targets resolve it regardless of cwd.
-        let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let s = abs.to_str().ok_or_else(|| "non-utf8 path".to_string())?;
-        let ns_path = NSString::from_str(s);
-        let url = NSURL::fileURLWithPath(&ns_path);
-        let writer: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*url);
-        let objects = NSArray::from_slice(&[writer]);
-        let pb = NSPasteboard::generalPasteboard();
-        pb.clearContents();
-        if pb.writeObjects(&objects) {
-            Ok(())
-        } else {
-            Err("NSPasteboard writeObjects returned false".to_string())
-        }
-    }
-
-    /// Copy plain text (`arboard::set_text`).
-    pub fn copy_text(text: &str) -> Result<(), String> {
-        arboard::Clipboard::new()
-            .map_err(|e| format!("clipboard open: {e}"))?
-            .set_text(text.to_owned())
-            .map_err(|e| format!("set_text: {e}"))
-    }
+/// Windows (DRAGON-229): dispatch to the arboard text write under `platform/windows/`
+/// (closed split). Like macOS, the write persists after we exit, so `run_copy_text`
+/// stays a no-op.
+#[cfg(target_os = "windows")]
+pub fn copy_text(text: &str) {
+    crate::platform::windows::services::copy_text(text);
 }
 
 /// macOS/Windows: the copy already happened INLINE in the spawn-side functions
@@ -180,24 +120,4 @@ pub fn run_copy_text(path: &Path) {
     let mut opts = Options::new();
     opts.foreground(true);
     let _ = opts.copy(Source::Bytes(bytes.into_boxed_slice()), MimeType::Text);
-}
-
-#[cfg(all(test, target_os = "macos"))]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn image_paths_recognized_case_insensitively() {
-        for p in ["/a/b/shot.png", "/a/b/shot.PNG", "/x.jpg", "/x.JPEG", "/y.webp"] {
-            assert!(is_image_path(Path::new(p)), "{p} should be an image path");
-        }
-    }
-
-    #[test]
-    fn non_image_paths_rejected() {
-        for p in ["/a/rec.mp4", "/a/rec.mov", "/a/notes.txt", "/a/noext", "/a/.png/dir"] {
-            assert!(!is_image_path(Path::new(p)), "{p} should not be an image path");
-        }
-    }
 }

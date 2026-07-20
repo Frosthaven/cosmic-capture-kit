@@ -40,13 +40,13 @@ impl App {
     ) -> Task<cosmic::Action<Msg>> {
         use crate::shortcuts::Context;
         use cosmic::iced::keyboard::{key::Named, Key};
-        // macOS (DRAGON-130): the "Start Capture" global-hotkey row records the next
-        // chord the same way an in-app rebind row does, but the captured chord is
-        // serialized to the daemon's SPEC string and flows through `SetCaptureHotkey`
+        // macOS (DRAGON-130) / Windows (DRAGON-237): the "Start Capture" global-hotkey row
+        // records the next chord the same way an in-app rebind row does, but the captured
+        // chord is serialized to the daemon's SPEC string and flows through `SetCaptureHotkey`
         // (persist + restart the daemon) rather than into the keymap. Takes priority
         // like the in-app rebind below; the two are never active at once (each row's
         // button cancels the other's mode by starting its own).
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if self.settings.capture_hotkey_rebinding {
             if key == Key::Named(Named::Escape) {
                 self.settings.capture_hotkey_rebinding = false; // Esc cancels capture

@@ -36,11 +36,15 @@ pub enum CaptureMsg {
     /// worker. `None` = a spinner was already pre-opened as the defocus focus-sink, so
     /// this is a no-op (no second spinner). Sent on both platforms for a window pick.
     WindowGrabbed(Option<(u32, u32)>),
-    /// macOS (DRAGON-151): while the countdown/recording overlays are click-through,
-    /// poll the pointer against each output's toolbar-chip rect and re-solidify just
-    /// the hovered overlay (all others stay passthrough). Fired by `sub_passthrough`.
-    /// Never constructed on Linux (layer-shell input zones handle this natively).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// macOS (DRAGON-151) / Windows (DRAGON-276): while the countdown/recording
+    /// overlays are click-through, poll the pointer against each output's toolbar-chip
+    /// rect and re-solidify just the hovered overlay (all others stay passthrough).
+    /// Fired by `sub_passthrough`. Never constructed on Linux (layer-shell input
+    /// zones handle this natively).
+    #[cfg_attr(
+        not(any(target_os = "macos", target_os = "windows")),
+        allow(dead_code)
+    )]
     PassthroughPoll,
     /// Pointer entered/left a floating overlay button.
     SetHover(Hover),

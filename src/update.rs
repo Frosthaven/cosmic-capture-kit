@@ -3,8 +3,10 @@
 //! The channel is the PUBLIC repo's GitHub Releases: `scripts/mirror-release.sh`
 //! attaches a manifest (`update.json`) next to the macOS `.dmg` on each public
 //! release, and the app polls the stable `releases/latest/download/update.json`
-//! URL, compares its `version` against `CARGO_PKG_VERSION`, and (macOS) can
-//! download + verify + swap the installed `.app` in one click.
+//! URL, compares its `version` against `CARGO_PKG_VERSION`, and can install in one
+//! click: macOS downloads/verifies/swaps the `.app`; Windows downloads/verifies then
+//! runs a silent per-user `.msi` install (DRAGON-287; the Windows body lives in
+//! `crate::platform::windows::update_install`).
 //!
 //! HISTORY: while the source repo was fully private the channel was a separate
 //! Pages repo (`cosmic-capture-kit-updates`). Installs at <= 0.12.0 still poll
@@ -35,9 +37,9 @@ pub const MANIFEST_URL_ENV: &str = "CCK_UPDATE_URL";
 
 /// The project page the "Update Now" launch dialog opens on Linux (no one-click
 /// install there yet), matching the About page's "Open releases" link destination.
-/// Only the non-macOS launch-dialog path consumes it; on macOS the one-click flow is
-/// used instead, so it's dead there (compiled everywhere so the plumbing can't drift).
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+/// Only the Linux launch-dialog path consumes it; macOS/Windows use the one-click
+/// flow instead, so it's dead there (compiled everywhere so the plumbing can't drift).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const RELEASES_URL: &str = "https://github.com/Frosthaven/cosmic-capture-kit";
 
 /// Env var a spawner sets so a settings child opens on a specific tab. "about"
@@ -76,10 +78,11 @@ pub fn seeded_status_from_cache() -> Option<UpdateStatus> {
 /// Write the post-update marker: the installer drops it just before the swap
 /// helper relaunches the app, and the relaunch consumes it to land the user on
 /// Settings > About (the new version's "What's new" front and center).
-/// Only the macOS one-click install flow writes it today; compiled (and
+/// The macOS one-click install flow and the Windows MSI updater
+/// (`crate::platform::windows::update_install`) both write it; compiled (and
 /// type-checked) everywhere on purpose.
-#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
-fn write_post_update_marker() {
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), expect(dead_code))]
+pub(crate) fn write_post_update_marker() {
     if let Some(path) = state_file("post-update") {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -123,11 +126,16 @@ pub fn check_floor_remainder(
     floor.saturating_sub(elapsed)
 }
 
-/// The platform key this build looks for in the manifest's `platforms` map.
+/// The platform key this build looks for in the manifest's `platforms` map. It is
+/// the JSON object key under `"platforms"` (see [`platform_object`]): the Windows
+/// `.msi` artifact lands at `platforms.windows.{url,sha256,size}` (DRAGON-287),
+/// exactly the shape [`Manifest::parse_platform`] slices for `macos`/`linux`.
 pub const PLATFORM_KEY: &str = if cfg!(target_os = "macos") {
     "macos"
 } else if cfg!(target_os = "linux") {
     "linux"
+} else if cfg!(target_os = "windows") {
+    "windows"
 } else {
     "unknown"
 };
@@ -312,11 +320,17 @@ pub fn dialog_for_status(
 /// network race is handled by RETRIES instead (see
 /// [`DAEMON_STARTUP_CHECK_RETRIES`]): a failed first check is retried after a
 /// backoff, so a daemon that beat the network still lands the notice.
+// Consumed only by `notify_daemon_startup_if_update_available` (Linux/mac daemon) + the
+// pure tests below; Windows ships no resident daemon, so it's dead in the bin there. DRAGON-229.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub const DAEMON_STARTUP_CHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Retry schedule for the daemon startup check when the fetch FAILS (network
 /// not up yet, typical right after login). Each entry is a wait before the
 /// next attempt. Up-to-date / Available results never retry; only failures do.
+// Consumed only by the Linux/mac daemon startup path + the pure tests below (no Windows
+// resident daemon), so it's dead in the Windows bin build. DRAGON-229.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub const DAEMON_STARTUP_CHECK_RETRIES: [std::time::Duration; 2] = [
     std::time::Duration::from_secs(15),
     std::time::Duration::from_secs(45),
@@ -330,6 +344,9 @@ pub const DAEMON_STARTUP_CHECK_RETRIES: [std::time::Duration; 2] = [
 /// every other combination (setting off, or any non-Available status) is a
 /// silent no-op. Mirrors [`dialog_for_status`]'s gate so the daemon and the
 /// settings window agree on when a notice is warranted. Pure + unit-tested.
+// Consumed only by `notify_daemon_startup_if_update_available` (Linux/mac daemon) + the pure
+// tests below; Windows ships no resident daemon, so it's dead in the bin there. DRAGON-229.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub fn should_notify_on_daemon_startup(status: &UpdateStatus, notify_updates: bool) -> bool {
     notify_updates && status.is_available()
 }
@@ -444,7 +461,11 @@ pub fn check_now() -> UpdateStatus {
 
 /// `curl -fsSL --max-time 10 <url>` -> body, or a short error reason.
 fn fetch_text(url: &str) -> Result<String, String> {
-    let out = std::process::Command::new("curl")
+    // Quiet spawn (DRAGON-236): `curl` (present on Windows 10+) is console-subsystem and
+    // this fires on every settings launch (the auto update check) — a bare spawn flashes a
+    // console before the settings window. Route through the console-free seam. Byte-identical
+    // off Windows.
+    let out = crate::util::quiet_command("curl")
         .args(["-fsSL", "--max-time", "10", url])
         .output()
         .map_err(|_| "Could not run curl to check for updates.".to_string())?;
@@ -476,10 +497,11 @@ fn file_sha256(path: &std::path::Path) -> Result<String, String> {
 
 /// The outcome of the blocking install work, handed back to the UI so it can
 /// either trigger the app's own exit (success) or show the error (failure).
-/// Constructed only by the macOS install flow; the type (and its Linux match in
-/// `update_settings`) is compiled everywhere so the message plumbing can't drift.
+/// Constructed by the macOS one-click install and the Windows MSI updater
+/// (DRAGON-287); the type (and its Linux match in `update_settings`) is compiled
+/// everywhere so the message plumbing can't drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub enum InstallOutcome {
     /// The new `.app` is staged and a detached helper is armed to swap + relaunch
     /// once this process (and the daemon) exit. The caller must now quit.
@@ -500,6 +522,16 @@ pub fn install_macos(info: &UpdateInfo) -> InstallOutcome {
         Ok(()) => InstallOutcome::Staged,
         Err(e) => InstallOutcome::Failed(e),
     }
+}
+
+/// Run the full Windows one-click install for `info`, BLOCKING (DRAGON-287). Downloads
+/// the `.msi`, verifies its sha256, writes the post-update marker, and spawns a detached
+/// swap helper that installs silently (`msiexec /qn`, per-user — no UAC) and relaunches;
+/// returns [`InstallOutcome::Staged`] (the caller then signals the daemon to quit + exits).
+/// One-line dispatch into the closed Windows body (strict split — LOG law 7).
+#[cfg(target_os = "windows")]
+pub fn install_windows(info: &UpdateInfo) -> InstallOutcome {
+    crate::platform::windows::update_install::install(info)
 }
 
 #[cfg(target_os = "macos")]
@@ -918,6 +950,35 @@ mod tests {
     }
 
     #[test]
+    fn manifest_parses_windows_entry_and_stays_backward_compatible() {
+        // DRAGON-287: a manifest carrying BOTH mac and windows artifacts resolves the
+        // windows one for the windows key (url + sha lowercased + size), independent of
+        // the host running the test.
+        let both = r#"{
+          "version": "0.13.0",
+          "notes": "Windows MSI + background updates.",
+          "published": "2026-07-19",
+          "platforms": {
+            "macos":   { "url": "https://example.com/CosmicCaptureKit-0.13.0.dmg", "sha256": "AA", "size": 111 },
+            "windows": { "url": "https://example.com/CosmicCaptureKit-0.13.0.msi", "sha256": "BBCD", "size": 222 }
+          }
+        }"#;
+        let w = Manifest::parse_platform(both, "windows").expect("parse windows");
+        let a = w.artifact.expect("windows artifact");
+        assert_eq!(a.url, "https://example.com/CosmicCaptureKit-0.13.0.msi");
+        assert_eq!(a.sha256, "bbcd"); // lowercased on parse
+        assert_eq!(a.size, 222);
+        // The same manifest still resolves the mac entry (both coexist).
+        assert!(Manifest::parse_platform(both, "macos").unwrap().artifact.is_some());
+        // A mac-ONLY manifest yields no windows artifact — no update offered on Windows,
+        // yet it still parses (backward compat with the pre-Windows channel).
+        let mac_only = r#"{"version":"0.13.0","notes":"n","published":"d","platforms":{"macos":{"url":"u","sha256":"a","size":1}}}"#;
+        let m = Manifest::parse_platform(mac_only, "windows").expect("parse mac-only for windows");
+        assert_eq!(m.version, "0.13.0");
+        assert!(m.artifact.is_none());
+    }
+
+    #[test]
     fn manifest_rejects_missing_version() {
         assert!(Manifest::parse_platform(r#"{"notes":"x"}"#, "macos").is_none());
         assert!(Manifest::parse_platform(r#"{"version":""}"#, "macos").is_none());
@@ -1060,6 +1121,26 @@ mod tests {
             DAEMON_STARTUP_CHECK_RETRIES.iter().all(|d| *d >= std::time::Duration::from_secs(10)),
             "retries back off enough to outlast a slow desktop/network bring-up"
         );
+    }
+
+    // DRAGON-241: PLATFORM_KEY must be the JSON object key under `platforms` for THIS
+    // build (what `platform_object` slices), so an artifact can resolve. Windows used to
+    // fall through to "unknown" and could never match one.
+    #[test]
+    fn platform_key_is_the_manifest_json_key() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(PLATFORM_KEY, "windows");
+        #[cfg(target_os = "macos")]
+        assert_eq!(PLATFORM_KEY, "macos");
+        #[cfg(target_os = "linux")]
+        assert_eq!(PLATFORM_KEY, "linux");
+        // Whatever the key is, a manifest carrying an artifact under it must parse for
+        // this platform (proves the value is a usable `platforms.<key>` selector).
+        let json = format!(
+            r#"{{"version":"9.9.9","notes":"","published":"","platforms":{{"{PLATFORM_KEY}":{{"url":"https://example.com/a","sha256":"","size":1}}}}}}"#
+        );
+        let m = Manifest::parse(&json).expect("parse for this platform's key");
+        assert!(m.artifact.is_some(), "artifact under PLATFORM_KEY must resolve");
     }
 
     #[test]

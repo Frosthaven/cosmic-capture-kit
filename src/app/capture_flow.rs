@@ -12,6 +12,9 @@ use super::*;
 /// (`begin_capture` → `destroy_surfaces`, before the window flow's
 /// focus-then-grab — DRAGON-194), and the countdown / recording phases re-mint
 /// their own surfaces with their own interactivity.
+// Only `overlay_pick_exclusive` (Linux) consumes it; the pure tests below keep it alive
+// off Linux, so the bin build is dead there (Windows has no exclusive-grab step). DRAGON-229.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn picking_phase(countdown: bool, capture_live: bool, recording: bool) -> bool {
     !countdown && !capture_live && !recording
 }
@@ -168,8 +171,55 @@ impl App {
     /// the tick down to the capture.
     pub(super) fn enter_countdown(&mut self, sel: Selection, secs: u8) -> Task<cosmic::Action<Msg>> {
         self.countdown = Some(secs);
+        // DRAGON-278 follow-up (user spec a): for a WINDOW capture styled ACTIVE, focus the
+        // target the MOMENT the countdown starts — so it is already active while the timer
+        // runs and its title-bar / Mica activation has the whole countdown to settle (the
+        // fire re-focuses in case focus was stolen mid-countdown). No-op for region/monitor
+        // picks and for Inactive-styled window picks (the fire-time defocus handles those).
+        self.focus_target_at_countdown_start(&sel);
         self.pending = Some(sel);
         self.recreate_active_overlays()
+    }
+
+    /// DRAGON-278 follow-up: at COUNTDOWN START, drive the picked window's REAL focus to
+    /// ACTIVE so its native chrome (Mica / title bar / accent border) is already the active
+    /// appearance while the timer counts down (user spec a). Only fires for a WINDOW capture
+    /// whose "Window focus appearance" is ACTIVE — an Inactive-styled capture must NOT be
+    /// focused here (the fire-time [`window_focus_grab`] Defocus arm drives that intent). The
+    /// platform focus call is bounded but up to ~700ms, so it runs OFF the UI thread (the
+    /// countdown overlay keeps ticking). Best-effort — a failure just means the fire-time
+    /// re-focus does the work with a fresh (shorter) settle.
+    ///
+    /// Windows + macOS only: both put the countdown overlay in a click-through
+    /// (`passthrough`) state where the user is expected to arrange the shot in other windows,
+    /// so focusing the target fits that model. **Linux is deferred** (left byte-identical):
+    /// its countdown overlay holds keyboard (Exclusive/OnDemand) for Escape, and activating
+    /// a foreign toplevel there while the overlay is mapped fights cosmic-comp's own
+    /// post-overlay focus restoration — the exact raciness the fire-time `activate_until`
+    /// re-issue loop exists to tame POST-teardown. The Linux fire path (DRAGON-194) already
+    /// focuses+grabs correctly; only the countdown-start pre-focus is skipped there.
+    fn focus_target_at_countdown_start(&self, sel: &Selection) {
+        let Some(id) = sel.window_id.as_deref() else {
+            return;
+        };
+        if window_focus_intent(self.window_single_active) != WindowFocusIntent::Focus {
+            return;
+        }
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            let id = id.to_string();
+            std::thread::spawn(move || {
+                #[cfg(windows)]
+                let _ = crate::platform::windows::focus_window(&id);
+                #[cfg(target_os = "macos")]
+                let _ = crate::platform::mac::focus_window(&id);
+            });
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            // Linux + other: deferred (see the doc comment) — no pre-focus.
+            let _ = id;
+        }
     }
 
     /// Tear down the overlay and arm the pixel-capture tick. Capturing while the
@@ -845,11 +895,27 @@ impl App {
         // there is no background to show). Region/monitor captures don't carry a
         // single owning window here, so this is a window-mode behavior; identical on
         // COSMIC and macOS (both feed `is_fullscreen` the same global-logical rects).
+        // The fullscreen verdict has TWO inputs, ORed:
+        //   1. The portable GEOMETRY gate — the window rect fills its output rect (within
+        //      tol). Sufficient on COSMIC/Windows, where a fullscreen toplevel's rect equals
+        //      its output rect.
+        //   2. A per-platform OVERRIDE (`window_is_fullscreen`). On macOS the geometry gate
+        //      MISSES native fullscreen: on a notched Mac a fullscreen window sits below the
+        //      menu-bar safe area (measured live: origin=0,44 size=2048x1286 on a 2048x1330
+        //      display), so its rect never fills the display bounds — AND a maximized/zoomed
+        //      window is geometrically identical. The mac arm resolves it via the window's
+        //      Space TYPE (a fullscreen window is on a dedicated fullscreen Space, a zoomed
+        //      one on the normal desktop Space); Linux/Windows return `false` here, so their
+        //      behavior is byte-identical to the geometry-only gate.
         let fullscreen_window = extras.fullscreen_aware
             && sel.window_id.is_some()
-            && self
+            && (self
                 .output_rect_for_window(&sel)
-                .is_some_and(|out| is_fullscreen((sel.x, sel.y, sel.width as i32, sel.height as i32), out, 2));
+                .is_some_and(|out| is_fullscreen((sel.x, sel.y, sel.width as i32, sel.height as i32), out, 2))
+                || sel
+                    .window_id
+                    .as_deref()
+                    .is_some_and(crate::screenshot::window_is_fullscreen));
 
         // Window borders: two explicit user-configured borders (DRAGON-191) drawn via
         // the portable alpha-dilation mechanism — an ACTIVE border for the focused /
@@ -924,14 +990,22 @@ impl App {
             // Active -> focus it (colored mac traffic lights / active CSD titlebar), Inactive
             // -> defocus it (gray / dimmed). The freshly-grabbed pixels win over the
             // PreActivation/FrozenScene/Live precedence for the committed window; every OTHER
-            // window stays frozen. Delayed shots grab the LIVE post-delay screen, so they
-            // never pre-focus.
+            // window stays frozen. (DRAGON-278 follow-up: a WINDOW pick drives focus even under
+            // a countdown now — see below; only region/monitor delayed shots skip pre-focus,
+            // and they take the region/monitor branch, not this one.)
             // DRAGON-215: the DRAGON-194 focus-then-grab is a seconds-long (Linux) /
-            // ~700ms (macOS) wait; run it OFF the UI thread (in the capture worker) so the
-            // iced loop keeps pumping and the just-torn-down overlay actually presents
-            // instead of freezing full-screen. `None` for a delayed shot (grabs the live
-            // post-delay screen, never pre-focuses) or an unsupported platform.
-            let focus_grab = if !self.capture_live { self.window_focus_grab(id) } else { None };
+            // ~700ms (macOS) / bounded-settle (Windows) wait; run it OFF the UI thread (in the
+            // capture worker) so the iced loop keeps pumping and the just-torn-down overlay
+            // actually presents instead of freezing full-screen. `None` only on an unsupported
+            // platform (`window_focus_grab` returns None there).
+            // DRAGON-278 follow-up (user spec b): a WINDOW capture ALWAYS drives + re-grabs the
+            // target's focus at fire — EVEN under a countdown. Focus may have been stolen while
+            // the timer ran, so the fire re-focuses (the countdown-start pre-focus above just
+            // gave the Mica a head start to settle). This intentionally REPLACES the old
+            // `!capture_live` skip for window mode: region/monitor delayed shots (which grab the
+            // live post-delay screen, no pre-focus) go through the region/monitor branch below,
+            // so their frozen-scene/live semantics are unchanged.
+            let focus_grab = self.window_focus_grab(id, extras.transparency);
             // The FALLBACK pixel source, chosen + cloned on the UI thread (cheap map
             // lookups + a one-shot memcpy, not a focus-dependent wait): the pre-activation
             // active-window pixels, else the freeze scene's per-window pixels, else `None`
@@ -984,6 +1058,11 @@ impl App {
                 // Assigned in the worker: the off-thread focus grab (if any) OR the
                 // UI-chosen fallback. `None` here so the field exists; never the final value.
                 frozen_px: None,
+                // DRAGON-278 (Windows only): the off-thread ACTIVATED grab, assigned by the
+                // worker below. It wins FIRST in `run()` without touching the frozen/live
+                // precedence; the field exists only on the Windows job struct.
+                #[cfg(windows)]
+                active_grab: None,
                 // A window capture stamps the cursor ONLY for a DELAYED shot (user rule,
                 // DRAGON-214): with a countdown, `frozen_cursor` was swapped above for the
                 // CAPTURE-MOMENT sprite and belongs in the picture (still containment-
@@ -1012,7 +1091,18 @@ impl App {
                 let _ = grab_tx.send(());
                 // 3. Decorate + composite + save (already off-thread pre-215).
                 let mut job = job;
-                job.frozen_px = active.or(fallback_px);
+                // DRAGON-278: on Windows the activated grab rides its OWN field so it wins in
+                // run() WITHOUT reordering the wgc→frozen→PrintWindow precedence; elsewhere it
+                // takes over the frozen_px slot (mac/Linux — byte-identical to before).
+                #[cfg(windows)]
+                {
+                    job.active_grab = active;
+                    job.frozen_px = fallback_px;
+                }
+                #[cfg(not(windows))]
+                {
+                    job.frozen_px = active.or(fallback_px);
+                }
                 let ok = job
                     .run()
                     .map(|img| crate::media::png::save_png(&img, &path, &meta))
@@ -1204,10 +1294,14 @@ impl App {
     fn window_focus_grab(
         &self,
         id: &str,
+        transparency: bool,
     ) -> Option<Box<dyn FnOnce() -> Option<image::RgbaImage> + Send>> {
         let intent = window_focus_intent(self.window_single_active);
         #[cfg(target_os = "linux")]
         {
+            // Linux drives focus via the Wayland toplevel activate; transparency is chosen
+            // downstream in the worker, not at the focus grab.
+            let _ = transparency;
             let id = id.to_string();
             // Owned so the closure needs no `&self`: the frozen toplevel ids (the defocus
             // target search space) and the pre-launch focused window.
@@ -1220,15 +1314,33 @@ impl App {
         }
         #[cfg(target_os = "macos")]
         {
+            // macOS grabs via SCK, which carries per-window alpha unconditionally; the
+            // transparency choice is applied downstream, not at the focus grab.
+            let _ = transparency;
             let id = id.to_string();
             Some(Box::new(move || match intent {
                 WindowFocusIntent::Focus => crate::platform::mac::capture_window_active(&id),
                 WindowFocusIntent::Defocus => crate::platform::mac::capture_window_inactive(&id),
             }))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
         {
-            let _ = (id, intent);
+            // DRAGON-278: Windows grabs the window ITSELF right after driving its focus, so
+            // it needs the transparency choice at grab time (WGC vs PrintWindow) — threaded in
+            // from the caller's already-computed extras, never re-derived in the closure.
+            let id = id.to_string();
+            Some(Box::new(move || match intent {
+                WindowFocusIntent::Focus => {
+                    crate::platform::windows::capture_window_active(&id, transparency)
+                }
+                WindowFocusIntent::Defocus => {
+                    crate::platform::windows::capture_window_inactive(&id, transparency)
+                }
+            }))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        {
+            let _ = (id, intent, transparency);
             None
         }
     }
@@ -1809,6 +1921,36 @@ mod fullscreen_tests {
         let out = (-601, -1800, 3200, 1800);
         assert!(!is_fullscreen((1009, -1750, 1570, 1729), out, 2));
         assert!(!is_fullscreen((-581, -1750, 1570, 1729), out, 2));
+    }
+
+    // DRAGON-186 follow-up — the NOTCHED built-in display case the geometry gate CANNOT
+    // catch. Measured live on a 2048x1330 notch Mac: a native-fullscreen TextEdit reported
+    // origin=0,44 size=2048x1286 (the fullscreen window sits BELOW the menu-bar safe area,
+    // so it never fills the whole display bounds). Unlike the DRAGON-186 external-display
+    // case above (where win == out exactly), here the geometry gate returns FALSE — which
+    // is exactly why the mac path needs the Space-TYPE override (`window_is_fullscreen`).
+    #[test]
+    fn notched_mac_fullscreen_window_misses_the_geometry_gate() {
+        let win = (0, 44, 2048, 1286);
+        let out = (0, 0, 2048, 1330);
+        // 44px inset on the top edge, 44px short on height — far beyond tol=2.
+        assert!(!is_fullscreen(win, out, 2));
+    }
+
+    // ...and a MAXIMIZED (zoomed) window on the same notch Mac is GEOMETRICALLY IDENTICAL to
+    // the fullscreen one (measured live: both origin=0,44 size=2048x1286), so no tolerance
+    // bump could separate them without also catching a zoomed window. The Space TYPE is the
+    // only discriminator — hence the override rather than a mac-specific tolerance.
+    #[test]
+    fn notched_mac_zoomed_window_is_geometrically_identical_to_fullscreen() {
+        let out = (0, 0, 2048, 1330);
+        let zoomed = (0, 44, 2048, 1286);
+        let fullscreen = (0, 44, 2048, 1286);
+        assert_eq!(zoomed, fullscreen);
+        // Both fail the geometry gate the same way; only the Space-type override tells them
+        // apart (proven live via `spaces::fullscreen_space_ids`).
+        assert!(!is_fullscreen(zoomed, out, 2));
+        assert!(!is_fullscreen(fullscreen, out, 2));
     }
 }
 

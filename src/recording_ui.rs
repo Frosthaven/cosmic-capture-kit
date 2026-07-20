@@ -30,6 +30,11 @@
 /// centre dot. Recording but paused: brackets plus centre pause bars. A tiny enum so
 /// the decision is unit-testable without any rasterizer or AppKit and the drawing code
 /// has one switch.
+//
+// The three-state icon model + SVGs (this enum through `icon_svg`) are consumed by the
+// Linux and macOS tray/daemon status items only; Windows ships no tray/daemon, so they're
+// dead in the Windows bin build (the pure tests below still exercise them). DRAGON-229.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconState {
     /// Corner brackets only (no recording in progress).
@@ -42,6 +47,7 @@ pub enum IconState {
 
 /// The icon state for a `(recording, paused)` pair (see [`IconState`]). A paused
 /// recording is still "in progress", so it maps to [`IconState::Paused`], not `Idle`.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))] // Linux/mac tray/daemon only (DRAGON-229)
 pub fn icon_state(recording: bool, paused: bool) -> IconState {
     match (recording, paused) {
         (false, _) => IconState::Idle,
@@ -73,17 +79,21 @@ pub fn pause_label(paused: bool) -> &'static str {
 /// The idle icon: the viewfinder corner brackets only (one path, four subpaths; each
 /// corner is the rounded-rect's 4.5-radius arc plus a 1px straight stub on both sides,
 /// so the curved corners survive with the edges cut away).
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))] // Linux/mac tray/daemon only (DRAGON-229)
 pub const ICON_BORDER: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3.2 8.7 L3.2 7.7 A4.5 4.5 0 0 1 7.7 3.2 L8.7 3.2 M15.3 3.2 L16.3 3.2 A4.5 4.5 0 0 1 20.8 7.7 L20.8 8.7 M20.8 15.3 L20.8 16.3 A4.5 4.5 0 0 1 16.3 20.8 L15.3 20.8 M8.7 20.8 L7.7 20.8 A4.5 4.5 0 0 1 3.2 16.3 L3.2 15.3" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round"/></svg>"##;
 
 /// The recording icon: the same corner brackets plus a solid centre dot.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))] // Linux/mac tray/daemon only (DRAGON-229)
 pub const ICON_BORDER_DOT: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3.2 8.7 L3.2 7.7 A4.5 4.5 0 0 1 7.7 3.2 L8.7 3.2 M15.3 3.2 L16.3 3.2 A4.5 4.5 0 0 1 20.8 7.7 L20.8 8.7 M20.8 15.3 L20.8 16.3 A4.5 4.5 0 0 1 16.3 20.8 L15.3 20.8 M8.7 20.8 L7.7 20.8 A4.5 4.5 0 0 1 3.2 16.3 L3.2 15.3" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="5" fill="#000"/></svg>"##;
 
 /// The paused icon: the same corner brackets plus centre pause bars (sized to the same
 /// visual weight as the recording dot).
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))] // Linux/mac tray/daemon only (DRAGON-229)
 pub const ICON_BORDER_PAUSE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3.2 8.7 L3.2 7.7 A4.5 4.5 0 0 1 7.7 3.2 L8.7 3.2 M15.3 3.2 L16.3 3.2 A4.5 4.5 0 0 1 20.8 7.7 L20.8 8.7 M20.8 15.3 L20.8 16.3 A4.5 4.5 0 0 1 16.3 20.8 L15.3 20.8 M8.7 20.8 L7.7 20.8 A4.5 4.5 0 0 1 3.2 16.3 L3.2 15.3" fill="none" stroke="#000" stroke-width="2.2" stroke-linecap="round"/><rect x="8.1" y="7.2" width="2.7" height="9.6" rx="1.35" fill="#000"/><rect x="13.2" y="7.2" width="2.7" height="9.6" rx="1.35" fill="#000"/></svg>"##;
 
 /// The SVG source for a given icon state (see [`IconState`]). Pure so the three-state
 /// choice is unit-testable without any rasterizer or AppKit.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))] // Linux/mac tray/daemon only (DRAGON-229)
 pub fn icon_svg(state: IconState) -> &'static str {
     match state {
         IconState::Idle => ICON_BORDER,
@@ -295,16 +305,25 @@ impl CaptureAction {
     }
 }
 
-/// Spawn the full app as a DETACHED one-shot child with `flag`. Detached (`setsid`) so the
-/// child owns its own session/process group — it cannot be reaped as our child (no SIGCHLD
-/// churn) and the launcher process survives the child exiting/crashing (and vice versa).
-/// Best-effort: a spawn failure just logs. This is the ONE spawn path every recording
-/// control surface uses — the daemon, the resident, and the child-owned recording trays
-/// (`crate::tray` on Linux + macOS), so a "Capture Menu" launch is byte-identical everywhere. Unix
-/// only (the recording surfaces exist on mac + Linux); other platforms never call it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+/// Spawn the full app as a DETACHED one-shot child with `flag`. Detached (`setsid` on unix;
+/// CREATE_NO_WINDOW + no-wait on Windows) so the child owns its own session — it cannot be
+/// reaped as our child (no SIGCHLD churn) and the launcher process survives the child
+/// exiting/crashing (and vice versa). Best-effort: a spawn failure just logs. This is the ONE
+/// spawn path every recording control surface uses — the mac daemon, the Linux resident, the
+/// Windows tray daemon (DRAGON-237), and the child-owned recording trays (`crate::tray`), so
+/// a "Capture Menu" launch is byte-identical everywhere. Present on mac + Linux + Windows
+/// (the platforms with a resident/tray surface); other platforms never call it.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn spawn_capture_child(flag: &str) {
     spawn_capture_child_with_env(flag, &[]);
+}
+
+/// Windows body of [`spawn_capture_child_with_env`] (DRAGON-237): the detach mechanism is
+/// platform logic, so it lives under `platform/windows/` behind this thin dispatch (strict
+/// split). Same contract as the unix body — a detached one-shot child, best-effort.
+#[cfg(windows)]
+pub fn spawn_capture_child_with_env(flag: &str, envs: &[(&str, &str)]) {
+    crate::platform::windows::process::spawn_detached_child(flag, envs);
 }
 
 /// [`spawn_capture_child`] with extra environment variables for the child (e.g.

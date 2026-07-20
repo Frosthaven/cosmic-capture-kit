@@ -45,11 +45,16 @@ fn nv12_band(rgba: &[u8], w: usize, start: usize, rows: usize, yp: &mut [u8], uv
             dst[x] = (((47 * rr + 157 * gg + 16 * bb + 128) >> 8) + 16) as u8;
         }
     }
-    for r in (0..rows).step_by(2) {
+    // Truncating chroma bounds (DRAGON-277): UV is 2x2-subsampled, so an odd trailing
+    // row/column has no complete sample pair. Capture paths feed even dims (the workers
+    // evenize — h264/NV12 require it) — but if an odd dim ever slips through, skip the
+    // trailing row/column instead of indexing one past the end (the band slices are
+    // floor-sized, so the historical full-range loops walked off `dst`/`uvp`).
+    for r in (0..(rows & !1)).step_by(2) {
         let src = &rgba[(start + r) * w * 4..];
         let dst = &mut uvp[(r / 2) * w..(r / 2) * w + w];
         let mut o = 0;
-        for x in (0..w).step_by(2) {
+        for x in (0..(w & !1)).step_by(2) {
             let p = x * 4;
             let (rr, gg, bb) = (src[p] as i32, src[p + 1] as i32, src[p + 2] as i32);
             let u = (((-26 * rr - 87 * gg + 112 * bb + 128) >> 8) + 128).clamp(0, 255);
@@ -76,5 +81,17 @@ mod tests {
 
         rgba_to_nv12(&[255u8; 2 * 2 * 4], 2, 2, &mut out); // white
         assert_eq!(&out[..4], &[235, 235, 235, 235], "white luma = 235 (limited range)");
+    }
+
+    #[test]
+    fn rgba_to_nv12_odd_dims_do_not_panic() {
+        // DRAGON-277: a hand-drawn odd-sized region used to walk the UV write one past
+        // the row slice (`len is 787 but the index is 787`) and take the recording down.
+        // Odd dims are truncated at the chroma loops now; the call must simply complete.
+        for (w, h) in [(3usize, 3usize), (5, 4), (4, 5), (787, 3)] {
+            let rgba = vec![128u8; w * h * 4];
+            let mut out = vec![0u8; w * h * 3 / 2];
+            rgba_to_nv12(&rgba, w, h, &mut out);
+        }
     }
 }

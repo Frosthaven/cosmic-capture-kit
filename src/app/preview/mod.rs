@@ -286,6 +286,17 @@ impl App {
                 let refit = match self.preview.as_ref() {
                     Some(p) if p.surface.is_window() => {
                         let out = self.preview_output.as_ref().map(|(_, o)| *o);
+                        // Windows (DRAGON-288): an external `--preview` has no capture anchor,
+                        // so `out` is None and the shared fit below would native-size the
+                        // window (spilling a large picture off-screen). Fall back to the
+                        // preview window's LIVE monitor so the media is bounded to it, exactly
+                        // like the open fit — additive, Linux/mac keep `out` unchanged.
+                        #[cfg(windows)]
+                        let out = out.or_else(|| {
+                            crate::platform::windows::window::preview_window_monitor_size(
+                                super::shell::PREVIEW_WINDOW_TITLE,
+                            )
+                        });
                         // Logical (backing-scale-divided) size, so a hidpi capture
                         // re-fits to its true on-screen size (rule 6).
                         let target = p.sizing_media_points();
@@ -298,6 +309,20 @@ impl App {
                         ((want.0 - p.monitor.0 as f32).abs() > 2.0
                             || (want.1 - p.monitor.1 as f32).abs() > 2.0)
                             .then(|| {
+                                // Windows (DRAGON-288): resize NATIVELY, then clamp+center to
+                                // the window's live monitor WORK area so the re-fit can never
+                                // exceed the monitor (the shared `window::resize` keeps the
+                                // top-left and would push an over-tall fit into a dead zone).
+                                // Linux/mac keep iced's `window::resize` byte-identical.
+                                #[cfg(windows)]
+                                {
+                                    crate::platform::windows::window::resize_fit_clamped(
+                                        super::shell::PREVIEW_WINDOW_TITLE,
+                                        (want.0.round().max(1.0) as u32, want.1.round().max(1.0) as u32),
+                                    );
+                                    Task::none()
+                                }
+                                #[cfg(not(windows))]
                                 window::resize(
                                     p.window,
                                     cosmic::iced::Size::new(want.0, want.1),
@@ -696,6 +721,16 @@ impl App {
                 let refit = match (self.preview.as_ref(), meta) {
                     (Some(p), Some(_)) if p.surface.is_window() => {
                         let out = self.preview_output.as_ref().map(|(_, o)| *o);
+                        // Windows (DRAGON-288): an external `--preview` video has no capture
+                        // anchor (`out` None) — bound the fit to the preview window's LIVE
+                        // monitor instead of native-sizing it off-screen. Additive; Linux/mac
+                        // keep `out` unchanged.
+                        #[cfg(windows)]
+                        let out = out.or_else(|| {
+                            crate::platform::windows::window::preview_window_monitor_size(
+                                super::shell::PREVIEW_WINDOW_TITLE,
+                            )
+                        });
                         // Logical (backing-scale-divided) footprint so a Retina recording
                         // re-fits to its true on-screen size, matching the open fit.
                         let target = p.sizing_media_points();
@@ -705,6 +740,18 @@ impl App {
                         ((want.0 - p.monitor.0 as f32).abs() > 2.0
                             || (want.1 - p.monitor.1 as f32).abs() > 2.0)
                             .then(|| {
+                                // Windows (DRAGON-288): resize NATIVELY + clamp+center to the
+                                // window's live monitor WORK area (see the image path above);
+                                // Linux/mac keep iced's `window::resize` byte-identical.
+                                #[cfg(windows)]
+                                {
+                                    crate::platform::windows::window::resize_fit_clamped(
+                                        super::shell::PREVIEW_WINDOW_TITLE,
+                                        (want.0.round().max(1.0) as u32, want.1.round().max(1.0) as u32),
+                                    );
+                                    Task::none()
+                                }
+                                #[cfg(not(windows))]
                                 window::resize(
                                     p.window,
                                     cosmic::iced::Size::new(want.0, want.1),
@@ -784,14 +831,33 @@ impl App {
                 Some(p) => window::drag(p.window),
                 None => Task::none(),
             },
-            PreviewMsg::WindowMaximize => match self.preview.as_ref() {
-                Some(p) => window::toggle_maximize(p.window),
-                None => Task::none(),
-            },
-            PreviewMsg::WindowMinimize => match self.preview.as_ref() {
-                Some(p) => window::minimize(p.window, true),
-                None => Task::none(),
-            },
+            PreviewMsg::WindowMaximize => {
+                // Windows (DRAGON-258): the windowed preview is a frameless, natively-managed
+                // toplevel, so iced's `window::toggle_maximize` is a no-op for it. Route to the
+                // native Win32 helper keyed on the preview window title; keep Linux/mac on iced.
+                #[cfg(windows)]
+                crate::platform::windows::window::toggle_maximize(super::shell::PREVIEW_WINDOW_TITLE);
+                #[cfg(windows)]
+                return Task::none();
+                #[cfg(not(windows))]
+                match self.preview.as_ref() {
+                    Some(p) => window::toggle_maximize(p.window),
+                    None => Task::none(),
+                }
+            }
+            PreviewMsg::WindowMinimize => {
+                // Windows (DRAGON-258): iced's `window::minimize` is likewise a no-op for the
+                // frameless preview toplevel — native `ShowWindow(SW_MINIMIZE)` instead.
+                #[cfg(windows)]
+                crate::platform::windows::window::minimize(super::shell::PREVIEW_WINDOW_TITLE);
+                #[cfg(windows)]
+                return Task::none();
+                #[cfg(not(windows))]
+                match self.preview.as_ref() {
+                    Some(p) => window::minimize(p.window, true),
+                    None => Task::none(),
+                }
+            }
             PreviewMsg::Delete => {
                 // Never delete a pre-existing `--preview` file (no trash button there).
                 if self.preview.as_ref().is_some_and(|p| p.external) {

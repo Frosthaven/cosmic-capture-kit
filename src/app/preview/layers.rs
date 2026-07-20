@@ -363,6 +363,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Windows (DRAGON-235): lift an iced RGBA image handle back into a [`PixelFrame`] so a
+/// still base / video poster can be drawn through this persistent-texture shader instead of
+/// `widget::image`. iced's raster-image pipeline does NOT composite on the premultiplied
+/// transparent OVERLAY surface (empirically: the identical opaque pixels show through the
+/// opaque windowed surface but vanish on the overlay; the shader — same ALPHA_BLENDING —
+/// composites them correctly). Returns `None` for a non-RGBA handle (e.g. a decode that fell
+/// back to `Handle::from_path`), leaving the caller on `widget::image`. Copies the pixels
+/// (the shader owns its upload buffer); called only for the STATIC overlay preview (a still,
+/// or a paused poster), never per playback frame.
+#[cfg(windows)]
+pub(super) fn rgba_handle_frame(handle: &cosmic::widget::image::Handle) -> Option<Arc<PixelFrame>> {
+    match handle {
+        cosmic::widget::image::Handle::Rgba { width, height, pixels, .. } => {
+            Some(PixelFrame::new(pixels.to_vec(), *width, *height))
+        }
+        _ => None,
+    }
+}
+
 /// The CPU-side producer state a dynamic layer needs to coalesce off-thread refreshes:
 /// at most one raster in flight at a time, with overlapping requests collapsed into a
 /// single re-run once it lands, and stale results (superseded before they finished)
@@ -428,6 +447,24 @@ mod tests {
 
     fn dummy_frame() -> Arc<PixelFrame> {
         PixelFrame::new(vec![0, 0, 0, 0], 1, 1)
+    }
+
+    /// DRAGON-235: an RGBA handle lifts back into a `PixelFrame` (dims + pixels preserved) so
+    /// the Windows overlay can draw it through the shader; a non-RGBA handle (e.g. a path
+    /// decode fallback) yields `None`, leaving the caller on `widget::image`.
+    #[cfg(windows)]
+    #[test]
+    fn rgba_handle_frame_lifts_rgba_and_rejects_path() {
+        use cosmic::widget::image::Handle;
+        let pixels = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        let frame = rgba_handle_frame(&Handle::from_rgba(2, 1, pixels.clone()))
+            .expect("an rgba handle lifts to a PixelFrame");
+        assert_eq!((frame.w, frame.h), (2, 1));
+        assert_eq!(frame.rgba, pixels);
+        assert!(
+            rgba_handle_frame(&Handle::from_path("does-not-exist.png")).is_none(),
+            "a non-RGBA (path) handle must not lift — the caller keeps widget::image"
+        );
     }
 
     #[test]

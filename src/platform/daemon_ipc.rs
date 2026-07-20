@@ -156,9 +156,22 @@ pub fn icon_state(state: &RecordingState) -> IconState {
 /// The socket the resident (macOS daemon / Linux resident) listens on and the recording
 /// child connects to. One path per user runtime dir, matching `instance.rs`'s lock-file
 /// convention. Portable (DRAGON-173): the Linux resident and its recording children speak
-/// the exact same protocol over the exact same socket, so this is not platform-gated.
+/// the exact same protocol over the exact same socket. `not(windows)`: Windows carries the
+/// SAME wire protocol but over a NAMED PIPE (there is no std Unix socket on Windows), so it
+/// uses [`pipe_name`] instead.
+#[cfg(not(windows))]
 pub fn socket_path() -> String {
     format!("{}/cosmic-capture-kit-recording.sock", crate::util::runtime_dir())
+}
+
+/// Windows (DRAGON-237): the named pipe the resident tray daemon listens on and a recording
+/// child connects to — the transport analog of [`socket_path`], carrying the identical
+/// newline-delimited [`RecordingState`]/[`Command`] wire protocol. `Local\`-scoped by the
+/// `\\.\pipe\` convention (the whole pipe namespace is machine-local); one name for the
+/// whole login session, like the unix socket is one per runtime dir.
+#[cfg(windows)]
+pub fn pipe_name() -> &'static str {
+    r"\\.\pipe\cosmic-capture-kit-recording"
 }
 
 #[cfg(test)]

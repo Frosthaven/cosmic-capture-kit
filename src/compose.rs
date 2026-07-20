@@ -54,17 +54,81 @@ pub fn finish_window(mut img: RgbaImage, radius: u32, keep_transparency: bool) -
     img
 }
 
+/// Opacify a captured window's translucent BODY while PRESERVING its native rounded
+/// corner outline (DRAGON-268). SCK delivers a window's native rounded corners as
+/// transparent corner pixels (alpha ramping 0 -> body alpha across the squircle arc),
+/// and a translucent window carries a sub-255 body alpha across the interior. Flattening
+/// EVERY pixel to opaque (the old `flatten_opaque` here) squared the corners AND colored
+/// the corner pixels, so the concentric border (which dilates this alpha) traced a
+/// rectangle and the squared corner pixels read as a second, boxy border.
+///
+/// Instead: fill every pixel to opaque (so a translucent body gets an opaque backing,
+/// which is what "Preserve transparency OFF" means), THEN re-carve the four native corner
+/// arcs, bounded to a corner block of the detected corner radius. Inside each block the
+/// original arc alpha is NORMALISED by the body alpha, so a filled corner-block pixel
+/// (orig == body) stays fully opaque while the arc + its anti-aliasing keep their exact
+/// native squircle shape (orig 0 -> 0, half-covered -> 128). The border still hugs the
+/// real rounded corner and the corners stay rounded; the downstream `on_black` /
+/// `composite_over_wallpaper` supplies the opaque interior colour behind the now-opaque
+/// body.
+///
+/// A window with no readable rounded corner (square / opaque-cornered) has nothing to
+/// restore, so it is simply flattened opaque (identical to the old behaviour there).
+#[cfg(target_os = "macos")]
+fn opacify_body_keep_corners(img: &mut RgbaImage) {
+    let (w, h) = (img.width(), img.height());
+    // The corner span (physical px) from the captured alpha arc, read while the window
+    // still carries its native corner alpha. None -> square / opaque corners: nothing to
+    // restore, so a plain opaque flatten (the old behaviour) is correct there.
+    let Some(r) = crate::decoration::corner_radius_from_alpha(img) else {
+        flatten_opaque(img);
+        return;
+    };
+    let r = (r.round() as u32).min(w).min(h);
+    if r == 0 {
+        flatten_opaque(img);
+        return;
+    }
+    // The BODY alpha is the largest alpha present (opaque body -> 255; a uniformly
+    // translucent body -> its own value). Inside each corner block the native arc ramps
+    // 0 -> body across the squircle; NORMALISING by the body alpha turns that ramp into a
+    // 0 -> 255 coverage mask, so a filled corner-block pixel (orig == body) becomes fully
+    // opaque (the translucency is filled) while the arc + its anti-aliasing keep their
+    // exact shape (orig 0 -> 0, a half-covered AA pixel -> 128). This is what keeps the
+    // native squircle outline AND opacifies the interior at once.
+    let body = img.pixels().map(|p| p[3]).max().unwrap_or(255).max(1);
+    let orig_alpha: Vec<u8> = img.pixels().map(|p| p[3]).collect();
+    let body_f = body as f32;
+    flatten_opaque(img);
+    let mut restore = |ox: u32, oy: u32| {
+        for y in oy..(oy + r).min(h) {
+            for x in ox..(ox + r).min(w) {
+                let a = orig_alpha[(y * w + x) as usize] as f32;
+                img.get_pixel_mut(x, y)[3] = ((a / body_f) * 255.0).round().min(255.0) as u8;
+            }
+        }
+    };
+    restore(0, 0);
+    restore(w.saturating_sub(r), 0);
+    restore(0, h.saturating_sub(r));
+    restore(w.saturating_sub(r), h.saturating_sub(r));
+}
+
 /// Post-process a captured window whose corners are ALREADY native (delivered
-/// pre-rounded as alpha — the macOS SCK single-window grab), so it only optionally
-/// flattens transparency and skips [`round_corners`] entirely. Rounding a
-/// natively-rounded window a second time would eat a ring of real pixels at the
-/// corners; on macOS the corners come free (DRAGON-186 Phase 5). `#[cfg(macos)]`
-/// keeps the Linux build byte-identical (Linux screencopy delivers SQUARE corners,
-/// so it always rounds via [`finish_window`]).
+/// pre-rounded as alpha — the macOS SCK single-window grab), so it skips
+/// [`round_corners`] entirely. Rounding a natively-rounded window a second time would
+/// eat a ring of real pixels at the corners; on macOS the corners come free
+/// (DRAGON-186 Phase 5). When `keep_transparency` is false, the window's translucent
+/// BODY is opacified but the native rounded corner OUTLINE is PRESERVED
+/// (DRAGON-268) via [`opacify_body_keep_corners`] — the downstream `on_black` /
+/// `composite_over_wallpaper` supplies the opaque interior backing, and the border
+/// still traces the real rounded corners instead of squaring them.
+/// `#[cfg(macos)]` keeps the Linux build byte-identical (Linux screencopy delivers
+/// SQUARE corners, so it always rounds via [`finish_window`]).
 #[cfg(target_os = "macos")]
 pub fn finish_window_native_corners(mut img: RgbaImage, keep_transparency: bool) -> RgbaImage {
     if !keep_transparency {
-        flatten_opaque(&mut img);
+        opacify_body_keep_corners(&mut img);
     }
     img
 }
@@ -259,10 +323,11 @@ pub fn on_black(img: RgbaImage) -> RgbaImage {
 /// matches how cosmic shows the translucent window.
 ///
 /// Callers: the wallpaper-behind-window composite in `screenshot.rs` (Wayland
-/// path) and, since DRAGON-186 Phase 2, the macOS `platform/mac/screenshot.rs` window-over-
-/// wallpaper composite. `#[cfg(any(linux, macos))]` keeps the Linux build
-/// byte-identical (the same fn, same body) while making it visible on macOS.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// path), the macOS `platform/mac/screenshot.rs` window-over-wallpaper composite
+/// (DRAGON-186 Phase 2), and the Windows `platform/windows/screenshot.rs` one
+/// (DRAGON-229 M1). `#[cfg(any(linux, macos, windows))]` keeps the Linux/mac builds
+/// byte-identical (the same fn, same body) while making it visible on Windows.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub fn over(mut bottom: RgbaImage, top: &RgbaImage) -> RgbaImage {
     image::imageops::overlay(&mut bottom, top, 0, 0);
     bottom
@@ -431,6 +496,83 @@ mod native_border_tests {
         let win = RgbaImage::from_pixel(20, 20, image::Rgba([0, 0, 0, 0]));
         let out = add_border_native_corners(win, 4, [151, 125, 236, 255]);
         assert!(out.pixels().all(|p| p.0[3] == 0), "no ring around an empty window");
+    }
+
+    // DRAGON-268: transparency OFF must NOT square the native rounded corner. Finish an
+    // opaque-body window (transparent rounded top-left corner) with keep_transparency
+    // false, then draw the border and composite on black; the corner region must stay
+    // rounded (the outline follows the alpha, the extreme corner pixel is NOT the ring
+    // colour), while the interior is opaque and the border traces the corner.
+    #[test]
+    fn transparency_off_keeps_native_rounded_corner_outline() {
+        let radius = 12u32;
+        let body = [200u8, 100, 50, 255];
+        let win = rounded_window(60, 60, radius); // opaque body, transparent TL corner
+        // Finish with transparency OFF: the corner alpha (rounded outline) must survive.
+        let fin = finish_window_native_corners(win.clone(), false);
+        // The extreme top-left corner pixel is OUTSIDE the arc, so it stays transparent
+        // (NOT flattened to opaque). This is the regression: the old flatten made it 255.
+        assert_eq!(fin.get_pixel(0, 0)[3], 0, "native rounded corner NOT squared to opaque");
+        // A deep-interior pixel is opaque (body unchanged; opaque body stays opaque).
+        assert_eq!(fin.get_pixel(40, 40)[3], 255, "interior stays opaque");
+
+        // Now the border + on_black, as run() does for wallpaper OFF + transparency OFF.
+        let bw = 4u32;
+        let ring = [151u8, 125, 236, 255];
+        let bordered = add_border_native_corners(fin, bw, ring);
+        let out = on_black(bordered);
+        // The whole result is opaque after on_black (opaque interior backing).
+        assert!(out.pixels().all(|p| p.0[3] == 255), "on_black yields a fully opaque result");
+        // The extreme outer corner of the canvas is OUTSIDE the concentric ring's arc, so
+        // it must be black (the on_black backing), NOT the ring colour — i.e. the ring is
+        // rounded, not a square box. (Canvas is 60+2*bw square; (0,0) is the far corner.)
+        assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255], "outer corner is black, ring is rounded not boxed");
+        // The ring colour IS drawn somewhere (the border exists and traces the window).
+        assert!(out.pixels().any(|p| p.0 == ring), "the rounded border ring is present");
+        // Deep interior (window body offset by the border) shows the body colour, not the
+        // ring and not black — the interior is intact and opaque.
+        assert_eq!(out.get_pixel(bw + 40, bw + 40).0, body, "interior body intact and opaque");
+    }
+
+    // DRAGON-268: a TRANSLUCENT-body window (alpha 128 body, transparent rounded corner)
+    // with transparency OFF has its body FILLED to opaque (that is what the toggle means)
+    // while the native rounded corner outline is still preserved.
+    #[test]
+    fn transparency_off_opacifies_translucent_body_but_keeps_corner() {
+        let radius = 10u32;
+        // Opaque-ALPHA body would be 255; make it translucent 128 and round the TL corner
+        // to a fraction of that body alpha (the native ramp is proportional to the body).
+        let mut win = RgbaImage::from_pixel(50, 50, image::Rgba([10, 180, 60, 128]));
+        let rf = radius as f32;
+        for y in 0..radius {
+            for x in 0..radius {
+                let dx = rf - x as f32;
+                let dy = rf - y as f32;
+                if dx * dx + dy * dy > rf * rf {
+                    // Outside the arc: fully transparent corner.
+                    win.put_pixel(x, y, image::Rgba([0, 0, 0, 0]));
+                }
+            }
+        }
+        let fin = finish_window_native_corners(win, false);
+        // A CENTRE body pixel (away from every corner block) was 128 -> filled to 255
+        // (opacified: the translucency is filled, which is what transparency OFF means).
+        assert_eq!(fin.get_pixel(25, 25)[3], 255, "translucent body filled to opaque");
+        // The native corner is still transparent (rounded outline preserved).
+        assert_eq!(fin.get_pixel(0, 0)[3], 0, "rounded corner preserved on a translucent window");
+        // A pixel INSIDE the corner block but INSIDE the arc (covered body, orig 128) is
+        // ALSO filled opaque -- the fill reaches the corner-block interior, it does not
+        // leave a translucent patch in the corners.
+        assert_eq!(fin.get_pixel(9, 9)[3], 255, "corner-block interior filled opaque, no translucent patch");
+    }
+
+    // Regression guard: transparency ON leaves the finished image byte-identical to the
+    // input (no opacify, no rounding) — the ON path is unchanged from before DRAGON-268.
+    #[test]
+    fn transparency_on_is_unchanged() {
+        let win = rounded_window(40, 40, 8);
+        let out = finish_window_native_corners(win.clone(), true);
+        assert_eq!(out.as_raw(), win.as_raw(), "transparency ON returns the window untouched");
     }
 }
 

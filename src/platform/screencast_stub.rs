@@ -9,7 +9,13 @@
 //! macOS — `pipewire_available` is always false, so the portal path is never taken.
 #![allow(dead_code)]
 
+// This stub's `CastSession.fd` is a never-constructed TYPE off Linux (the portal is
+// Linux-only). Unix keeps `std::os::fd::OwnedFd`; Windows has no `std::os::fd`, so
+// alias its owned handle so the field type resolves (DRAGON-229).
+#[cfg(unix)]
 use std::os::fd::OwnedFd;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle as OwnedFd;
 
 /// One stream the portal granted (PipeWire node id + monitor geometry).
 pub struct StreamInfo {

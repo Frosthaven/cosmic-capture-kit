@@ -33,13 +33,13 @@ impl crate::app::App {
         if !required.is_empty() {
             secs.push(SectionSpec {
                 title: "Required",
-                items: required.iter().map(Dep::row).collect(),
+                items: required.iter().map(|d| d.row()).collect(),
             });
         }
         if !optional.is_empty() {
             secs.push(SectionSpec {
                 title: "Optional features",
-                items: optional.iter().map(Dep::row).collect(),
+                items: optional.iter().map(|d| d.row()).collect(),
             });
         }
 

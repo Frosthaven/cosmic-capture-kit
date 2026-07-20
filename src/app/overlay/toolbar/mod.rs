@@ -263,8 +263,12 @@ impl App {
                 background: Some(Background::Color(c.background.component.base.into())),
                 border: Border {
                     // The button token: groups round like the buttons they hold
-                    // (a capsule under the "round" preference).
-                    radius: crate::app::theme::rounding(theme).xl.into(),
+                    // (a capsule under the "round" preference). Capped at the group
+                    // half-height so it matches the stacked kind+timer group and
+                    // never over-rounds; byte-identical for this short group.
+                    radius: crate::app::theme::rounding(theme)
+                        .xl_capped(GROUP_H_BASE / 2.0)
+                        .into(),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -496,7 +500,15 @@ impl App {
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(c.background.component.base.into())),
                     border: Border {
-                        radius: crate::app::theme::rounding(theme).xl.into(),
+                        // Cap at the standard group half-height so the STACKED
+                        // kind+timer group (taller than wide once the delay chip
+                        // wraps below the kind trio) rounds like the horizontal
+                        // groups instead of ballooning into a blob under the
+                        // "round" preference. Byte-identical for every short group
+                        // (their clamp was already this value); see `xl_capped`.
+                        radius: crate::app::theme::rounding(theme)
+                            .xl_capped(GROUP_H_BASE / 2.0)
+                            .into(),
                         ..Default::default()
                     },
                     ..Default::default()

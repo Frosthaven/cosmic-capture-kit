@@ -32,6 +32,16 @@ pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit";
 /// comfortable gap before the first CSD control).
 #[cfg(target_os = "macos")]
 pub(super) const TRAFFIC_LIGHTS_INSET: f32 = 72.0;
+/// Windows (DRAGON-284): LOGICAL width reserved at the header's TRAILING edge for the native
+/// DWM caption-button cluster (minimize / maximize / close, top-right — the Windows mirror of
+/// mac's leading `TRAFFIC_LIGHTS_INSET`). The Win11 cluster is ~3 × ~46px = ~138px; 146
+/// leaves a small gap so the header title/content never slides under the buttons. A LOGICAL
+/// value, so it's DPI-correct (the physical cluster scales with DPI, and the header lays out
+/// in logical units). Verified on device against the live
+/// [`crate::platform::windows::caption::caption_inset_logical`] (`DWMWA_CAPTION_BUTTON_BOUNDS`
+/// ÷ DPI scale), logged at install time; tune this constant if that measurement differs.
+#[cfg(windows)]
+pub(super) const WIN_CAPTION_INSET: f32 = 146.0;
 /// macOS: the compact header icon buttons' halo (padding around the 16px glyph)
 /// and resulting box size — half the Linux halo, per the tighter hover boxes the
 /// traffic lights sit beside. Tuned live on-device.
@@ -207,11 +217,11 @@ pub struct SettingsState {
     pub border_picker: widget::ColorPickerModel,
     /// DRAGON-191: which border the picker sidebar is editing, or `None` when closed.
     pub border_editor: Option<crate::app::BorderColorTarget>,
-    /// macOS (DRAGON-130): whether the "Start Capture" global-hotkey row is CAPTURING
-    /// the next keypress (the button-recording flow, mirroring `rebinding` but for the
-    /// daemon's OS hotkey rather than an in-app [`crate::shortcuts::Action`]). cfg-gated
-    /// so the Linux settings state stays byte-identical.
-    #[cfg(target_os = "macos")]
+    /// macOS (DRAGON-130) / Windows (DRAGON-237): whether the "Start Capture" global-hotkey
+    /// row is CAPTURING the next keypress (the button-recording flow, mirroring `rebinding`
+    /// but for the daemon's OS hotkey rather than an in-app [`crate::shortcuts::Action`]).
+    /// cfg-gated to the daemon-hotkey OSes so the Linux settings state stays byte-identical.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub capture_hotkey_rebinding: bool,
 }
 
@@ -355,7 +365,7 @@ impl SettingsState {
             accent_editor_open: false,
             border_picker: widget::ColorPickerModel::new("Hex", "RGB", None, None),
             border_editor: None,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             capture_hotkey_rebinding: false,
         }
     }
@@ -469,11 +479,14 @@ impl SettingsState {
 pub(super) fn open_config_window(
     saved: Option<(u32, u32)>,
 ) -> (window::Id, Task<cosmic::Action<Msg>>) {
-    const MIN_W: f32 = 460.0;
-    const MIN_H: f32 = 380.0;
+    // Minimum settings-window size (DRAGON-268 follow-up): the window can never open or
+    // resize smaller than this, on all platforms. Kept in sync with
+    // `App::apply_nav_auto_collapse_on_spawn`'s spawn-width floor in update/window_chrome.rs.
+    const MIN_W: f32 = 800.0;
+    const MIN_H: f32 = 600.0;
     let (mut w, mut h) = saved
         .map(|(w, h)| (w as f32, h as f32))
-        .unwrap_or((760.0, 580.0));
+        .unwrap_or((MIN_W, MIN_H));
     // Clamp to the largest monitor so the settings window never opens off-screen.
     // Wayland-side sizing (screencopy); macOS lets AppKit place/clamp the window.
     #[cfg(target_os = "linux")]
@@ -489,7 +502,18 @@ pub(super) fn open_config_window(
     // None), so the window opens un-enrolled and opaque exactly as before.
     // `config_window_view`'s chrome paints translucent (`theme::frost_color`) so
     // the blur shows through.
+    //
+    // Windows (DRAGON-267 A/B): the material comes from a DWM **Mica** backdrop
+    // (`DWMWA_SYSTEMBACKDROP_TYPE`, applied post-show in the `ConfigWindowFloat`
+    // handler), NOT from winit's `blur`. winit maps `blur:true` on Windows to a
+    // legacy DWM blur-behind (an `SetWindowCompositionAttribute` accent policy)
+    // that COMPETES with — and overrides — the system backdrop, so Mica would
+    // never render. So we do NOT enroll winit blur on Windows; the window still
+    // opens `transparent:true` below (the alpha-composited substrate Mica needs).
+    #[cfg(not(windows))]
     let blur = crate::app::theme::glass_windows_enabled();
+    #[cfg(windows)]
+    let blur = false;
     let (id, task) = window::open(window::Settings {
         size: cosmic::iced::Size::new(w, h),
         blur,
@@ -505,14 +529,19 @@ pub(super) fn open_config_window(
         decorations: true,
         #[cfg(not(target_os = "macos"))]
         decorations: false,
-        // macOS (DRAGON-146): OPAQUE so the WindowServer masks the window at the
-        // native corner radius (20pt with the unified toolbar) and reports it via
-        // SkyLight, so JankyBorders (and any border tool) hugs the corner. This is
-        // the NSWindow's own opacity (winit's `transparent` flag), the one lever
-        // that changes the reported radius — the CAMetalLayer's opacity does not.
-        // The capture overlays stay transparent (they need it); this is per-window.
+        // macOS (DRAGON-146 / DRAGON-268): OPAQUE by default so the WindowServer masks
+        // the window at the native corner radius (20pt with the unified toolbar) and
+        // reports it via SkyLight, so JankyBorders (and any border tool) hugs the
+        // corner (the NSWindow's own opacity — winit's `transparent` flag — is the one
+        // lever that changes the reported radius; the CAMetalLayer's opacity does not).
+        // BUT window vibrancy (DRAGON-268) needs a NON-opaque window for the frosted
+        // material behind the content to show, so when frosted windows are ON we open
+        // transparent; this REVERSES DRAGON-146 (the corner/border-tool tradeoff is
+        // accepted pending live mac testing, DRAGON-268 Blocker 1) only in the glass
+        // case, keeping the default (glass off) opaque + native-corner-reporting. The
+        // capture overlays are a separate path (always transparent).
         #[cfg(target_os = "macos")]
-        transparent: false,
+        transparent: crate::app::theme::glass_windows_enabled(),
         #[cfg(not(target_os = "macos"))]
         transparent: true,
         exit_on_close_request: false,
@@ -534,6 +563,15 @@ pub(super) fn open_config_window(
         },
         #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         platform_specific: cosmic::iced::window::settings::PlatformSpecific::default(),
+        // Windows (DRAGON-229, KOMOREBI.md §7): open HIDDEN so the user's tiling WM
+        // (komorebi) sees no `Show` event at creation; the `ConfigWindowOpened` handler's
+        // Windows arm marks it komorebi-ineligible (WS_EX_DLGMODALFRAME) and shows it
+        // natively (`ConfigWindowFloat` poll → `float_and_show`), so komorebi's first
+        // sight of it is already ineligible and it is never tiled. Not the process's first
+        // window — the hidden bootstrap surface owns the event loop — so hiding it can't
+        // stall iced. mac / Linux keep the default (visible): they open directly.
+        #[cfg(windows)]
+        visible: false,
         ..Default::default()
     });
     (id, task.map(|id| cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::ConfigWindowOpened(id)))))
@@ -594,6 +632,8 @@ impl App {
             // check (DRAGON-175) so the nav lights up + the About page fills in
             // without ever delaying the window opening.
             self.update_about_nav_icon();
+            // Auto-collapse the nav rail by spawn width before minting (icon follows).
+            self.apply_nav_auto_collapse_on_spawn();
             let (id, task) = open_config_window(self.settings_size);
             self.settings.window = Some(id);
             let check = self.update_settings(SettingsMsg::CheckForUpdates);
@@ -700,7 +740,19 @@ impl App {
             .start(widget::Space::new().width(Length::Fixed(TRAFFIC_LIGHTS_INSET)))
             .start(toggle_nav)
             .start(search);
-        #[cfg(not(target_os = "macos"))]
+        // Windows (DRAGON-284): the native DWM caption buttons (min/max/close, top-right)
+        // own close/minimize/maximize, so the CSD window buttons are OMITTED (no `.on_close`/
+        // `.on_maximize`/`.on_minimize`). Close routes native ✕ → `WindowCloseRequested`;
+        // maximize via the native button OR the header double-click (both → the native
+        // `toggle_maximize`). A trailing `WIN_CAPTION_INSET` spacer reserves the cluster's
+        // width so the header title/content never slides under the buttons. The native
+        // buttons are installed post-show in the `ConfigWindowFloat` handler.
+        #[cfg(windows)]
+        let header = header
+            .start(toggle_nav)
+            .start(search)
+            .end(widget::Space::new().width(Length::Fixed(WIN_CAPTION_INSET)));
+        #[cfg(all(not(target_os = "macos"), not(windows)))]
         let header = header
             .start(toggle_nav)
             .start(search)
@@ -709,7 +761,19 @@ impl App {
             .on_minimize(Msg::WindowChrome(WindowChromeMsg::ConfigWindowMinimize));
 
         // --- Page content (sections), or global search results ---
-        let inner: Element<'_, Msg> = if searching {
+        // A page is a PINNED head (the page title + any in-page tab strip) stacked
+        // over a SCROLLABLE body (the section groups + the per-page reset button), so
+        // the title/tabs stay fixed at the top and only the content below scrolls
+        // (DRAGON-268 follow-up). `head` is `None` for the global-search view (there
+        // is no single title/tab strip there — the whole result list scrolls).
+        //
+        // Both the head and the scrolled body get the SAME centering + max-width +
+        // horizontal padding, so a scrolled row lines up exactly under the pinned
+        // title/tabs. Only the vertical padding differs (the head owns the top inset;
+        // the body owns the bottom inset), so the scroll seam sits between them.
+        let head: Option<Element<'_, Msg>>;
+        let body_inner: Element<'_, Msg>;
+        if searching {
             let q = self.settings.search.trim().to_lowercase();
             let mut col: Vec<Element<'_, Msg>> = Vec::new();
             for tab in [
@@ -729,15 +793,20 @@ impl App {
             if col.is_empty() {
                 col.push(widget::text::body("No matching settings.").into());
             }
-            widget::settings::view_column(col).into()
+            head = None;
+            body_inner = widget::settings::view_column(col).into();
         } else {
-            let mut col: Vec<Element<'_, Msg>> =
+            // The pinned head: the page title, plus the in-page tab strip for the
+            // tabbed pages. Built as its own `view_column` so its title/tab spacing
+            // matches the section spacing below.
+            let mut head_col: Vec<Element<'_, Msg>> =
                 vec![widget::text::title3(Self::page_name(active)).into()];
+            let mut col: Vec<Element<'_, Msg>> = Vec::new();
             match active {
                 ConfigTab::General => {
                     // The General page splits into two in-page tabs (DRAGON-138): the
                     // horizontal strip selects which section subset renders below it.
-                    col.push(self.tab_strip(&self.settings.general_tab, |e| {
+                    head_col.push(self.tab_strip(&self.settings.general_tab, |e| {
                         Msg::Settings(SettingsMsg::SetGeneralTab(e))
                     }));
                     let specs = match self.settings.active_general_tab() {
@@ -749,7 +818,7 @@ impl App {
                 ConfigTab::CaptureModes => {
                     // Scanner / Screenshots / Screen Recordings, split into in-page tabs
                     // (DRAGON-140) — the strip selects which page's sections render below.
-                    col.push(self.tab_strip(&self.settings.capture_tab, |e| {
+                    head_col.push(self.tab_strip(&self.settings.capture_tab, |e| {
                         Msg::Settings(SettingsMsg::SetCaptureTab(e))
                     }));
                     let specs = match self.settings.active_capture_tab() {
@@ -762,7 +831,7 @@ impl App {
                 ConfigTab::AudioVideo => {
                     // Audio / Video, split into in-page tabs (DRAGON-141) — the strip
                     // selects which page's sections render below.
-                    col.push(self.tab_strip(&self.settings.audio_video_tab, |e| {
+                    head_col.push(self.tab_strip(&self.settings.audio_video_tab, |e| {
                         Msg::Settings(SettingsMsg::SetAudioVideoTab(e))
                     }));
                     let specs = match self.settings.active_audio_video_tab() {
@@ -775,7 +844,7 @@ impl App {
                     // Capture / Recording / Preview, split into in-page tabs
                     // (DRAGON-142) — the strip selects which shortcut sections
                     // render below (`ShortcutsTab::for_group` on the section title).
-                    col.push(self.tab_strip(&self.settings.shortcuts_tab, |e| {
+                    head_col.push(self.tab_strip(&self.settings.shortcuts_tab, |e| {
                         Msg::Settings(SettingsMsg::SetShortcutsTab(e))
                     }));
                     let tab = self.settings.active_shortcuts_tab();
@@ -791,34 +860,63 @@ impl App {
             // A standalone "Reset to defaults" (this page) below the groups. The
             // About and Health pages are read-only, so they get no reset button.
             if active != ConfigTab::About && active != ConfigTab::Health {
+                // A content-sized "Reset to defaults" chip at the column's leading edge
+                // (NOT centred in the column, per the user). Its icon + label are centred
+                // WITHIN the chip via the helper, which for a Shrink width just hugs the
+                // content and keeps them vertically centred.
                 col.push(
-                    widget::button::standard("Reset to defaults")
-                        .leading_icon(widget::icon::from_name("edit-undo-symbolic"))
-                        .spacing(8)
-                        .on_press(Msg::WindowChrome(WindowChromeMsg::RequestReset(ResetScope::Page(active))))
-                        .into(),
+                    row::centered_button(
+                        Some("edit-undo-symbolic"),
+                        "Reset to defaults",
+                        Length::Shrink,
+                        row::standard_button_class(),
+                        Some(Msg::WindowChrome(WindowChromeMsg::RequestReset(ResetScope::Page(active)))),
+                    ),
                 );
             }
-            widget::settings::view_column(col).into()
-        };
-        // Center the content with a max width + generous padding, like cosmic-settings.
-        // It sits directly on the window background (no separate content panel).
-        let content = widget::scrollable(
+            head = Some(widget::settings::view_column(head_col).into());
+            body_inner = widget::settings::view_column(col).into();
+        }
+        // Center a page element with a max width + generous horizontal padding, like
+        // cosmic-settings. It sits directly on the window background (no separate
+        // content panel). `top`/`bottom` are supplied per element so the pinned head
+        // owns the top inset and the scrolled body owns the bottom inset. An inner
+        // `fn` (not a closure) keeps the element lifetime explicit — the invariant
+        // `Container<'a>` return can't infer through an elided-lifetime closure.
+        fn centered<'a>(el: Element<'a, Msg>, top: f32, bottom: f32) -> Element<'a, Msg> {
             widget::container(
-                widget::container(inner)
+                widget::container(el)
                     .max_width(820.0)
                     .padding(cosmic::iced::Padding {
-                        top: 8.0,
+                        top,
                         right: 24.0,
-                        bottom: 24.0,
+                        bottom,
                         left: 24.0,
                     }),
             )
             .center_x(Length::Fill)
-            .width(Length::Fill),
-        )
-        .height(Length::Fill)
-        .width(Length::Fill);
+            .width(Length::Fill)
+            .into()
+        }
+        // The scrollable body fills the remaining vertical space below the pinned
+        // head (`Length::Fill`), so ONLY the section content scrolls.
+        let scroll_body = widget::scrollable(centered(body_inner, 8.0, 24.0))
+            .height(Length::Fill)
+            .width(Length::Fill);
+        let content: Element<'_, Msg> = if let Some(head) = head {
+            // Tabbed / titled page: the head (title + tabs) is PINNED at the top; the
+            // body scrolls beneath it. The head owns the 8px top inset plus an 8px bottom
+            // gap so the tab strip's underline clears the first scrolled row (an opaque
+            // backdrop was tried and rejected: on a translucent window a second material
+            // layer only darkens the chrome, and it did not occlude anyway).
+            widget::column(vec![centered(head, 8.0, 8.0), scroll_body.into()])
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            // Global search: no single head, the whole result list scrolls.
+            scroll_body.into()
+        };
 
         // --- Nav rail: full panel when expanded, icon-only rail when collapsed ---
         let nav_panel: Element<'_, Msg> = if self.settings.nav_open {
@@ -827,24 +925,46 @@ impl App {
             // A `standard` button can't be made full-width (its width only sizes the
             // inner row, not the outer button), so build a custom one whose own width
             // is Fill — that stretches it to the nav pane.
-            let factory = widget::button::custom(
-                widget::row(vec![
-                    widget::icon::from_name("edit-undo-symbolic").icon().size(16).into(),
-                    widget::text("Factory reset").into(),
-                ])
-                .spacing(8)
-                .align_y(Alignment::Center),
-            )
-            .class(cosmic::theme::Button::Standard)
-            .width(Length::Fill)
-            .on_press(Msg::WindowChrome(WindowChromeMsg::RequestReset(ResetScope::Factory)));
+            // Full-width; the helper centres the icon + label within it (a bare
+            // leading row hangs the text at the button's left edge). DRAGON-268
+            // follow-up: user wants this centred.
+            let factory = row::centered_button(
+                Some("edit-undo-symbolic"),
+                "Factory reset",
+                Length::Fill,
+                row::standard_button_class(),
+                Some(Msg::WindowChrome(WindowChromeMsg::RequestReset(ResetScope::Factory))),
+            );
+            // The nav rail's list (DRAGON-279): its container fill — libcosmic's opaque
+            // `nav_bar_style` (`primary.base`) — is overridden to FULLY TRANSPARENT so the
+            // window backdrop shows straight through the rail (the selected/hover pills are
+            // the inner segmented button, unaffected). UNCONDITIONAL on every platform
+            // (user decision 2026-07-19; see `theme::frost_component`).
+            let nav_widget = widget::nav_bar(&self.settings.nav, |a0| Msg::WindowChrome(WindowChromeMsg::SetConfigTab(a0)));
+            let nav_list: Element<'_, Msg> = nav_widget
+                .into_container()
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    let cosmic = theme.cosmic();
+                    cosmic::iced::widget::container::Style {
+                        icon_color: Some(cosmic.on_bg_color().into()),
+                        text_color: Some(cosmic.on_bg_color().into()),
+                        background: Some(Background::Color(cosmic::iced::Color::TRANSPARENT)),
+                        border: Border {
+                            width: 0.0,
+                            color: cosmic::iced::Color::TRANSPARENT,
+                            radius: cosmic.corner_radii.radius_s.into(),
+                        },
+                        ..Default::default()
+                    }
+                }))
+                .into();
             widget::container(
                 widget::column(vec![
-                    widget::scrollable(widget::nav_bar(&self.settings.nav, |a0| Msg::WindowChrome(WindowChromeMsg::SetConfigTab(a0))))
+                    widget::scrollable(nav_list)
                         .height(Length::Fill)
                         .width(Length::Fill)
                         .into(),
-                    factory.into(),
+                    factory,
                 ])
                 .spacing(8.0)
                 .width(Length::Fill)
@@ -908,12 +1028,12 @@ impl App {
                     left: 6.0,
                 })
                 .class(cosmic::theme::Container::custom(move |theme| {
-                    let cosmic = theme.cosmic();
+                    // DRAGON-279: the collapsed rail is FULLY transparent (matching the
+                    // expanded rail), so the backdrop shows through regardless of the
+                    // window's glass alpha. UNCONDITIONAL on every platform (user decision
+                    // 2026-07-19; see `theme::frost_component`).
                     cosmic::iced::widget::container::Style {
-                        background: Some(Background::Color(theme::frost_color(
-                            cosmic.primary.base.into(),
-                            glass,
-                        ))),
+                        background: Some(Background::Color(cosmic::iced::Color::TRANSPARENT)),
                         border: Border {
                             radius: theme::rounding(theme).s.into(),
                             ..Default::default()
@@ -928,7 +1048,7 @@ impl App {
         // The framework context drawer doesn't render on this secondary window on our
         // libcosmic rev (only the main window is wrapped), so the custom-accent picker
         // is a hand-rolled right sidebar rendered inline here (DRAGON-139).
-        let mut body_row = vec![nav_panel, content.into()];
+        let mut body_row = vec![nav_panel, content];
         if self.settings.accent_editor_open {
             body_row.push(self.accent_picker_panel());
         }
@@ -965,7 +1085,19 @@ impl App {
             .height(Length::Fill)
             .class(cosmic::theme::Container::custom(move |theme| {
                 let cosmic = theme.cosmic();
+                // Windows (DRAGON-276): DWM already rounds the window (DWMWCP_ROUND, DRAGON-274),
+                // so rounding this outer container too paints a SECOND, differently-sized corner
+                // inside DWM's — the "thick double corner". Fill SQUARE and let DWM do the single
+                // rounding. Linux keeps the app-drawn radius (its window edge is the app's).
+                #[cfg(target_os = "linux")]
                 let radius = theme::rounding(theme).window();
+                // macOS: the settings toplevel uses NATIVE decorations (DRAGON-135), so its
+                // rounded window edge is drawn by AppKit at the fixed system corner radius, NOT
+                // the app's roundness preference. Tracing that OS corner (not
+                // `rounding().window()`, which under the "round" preset curves on a much larger
+                // arc) is what keeps the 1px border a smooth curve instead of jagged segments.
+                #[cfg(target_os = "macos")]
+                let radius = [crate::platform::mac::window::native_window_corner_radius(); 4];
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(theme::frost_color(
                         cosmic.background.base.into(),
@@ -974,6 +1106,9 @@ impl App {
                     border: Border {
                         color: cosmic.bg_divider().into(),
                         width: 1.0,
+                        #[cfg(windows)]
+                        radius: 0.0.into(),
+                        #[cfg(not(windows))]
                         radius: radius.into(),
                     },
                     ..Default::default()
@@ -1107,7 +1242,7 @@ impl App {
     ) -> Vec<Element<'a, Msg>> {
         let mut out: Vec<Element<'_, Msg>> = Vec::new();
         for spec in specs {
-            let mut sec = widget::settings::section().title(spec.title);
+            let mut rows: Vec<Element<'a, Msg>> = Vec::new();
             let mut any = false;
             // A query that matches the SECTION title keeps the whole section (all its
             // items), mirroring cosmic-settings' search (which checks section title +
@@ -1132,9 +1267,9 @@ impl App {
                         // Full-width inline status line (icon + message); no controls.
                         let line: Element<'_, Msg> =
                             it.desc_el.unwrap_or_else(|| widget::text("").into());
-                        sec = sec.add(widget::settings::item_row(vec![
+                        rows.push(widget::settings::item_row(vec![
                             widget::container(line).width(Length::Fill).into(),
-                        ]));
+                        ]).into());
                         any = true;
                         continue;
                     }
@@ -1214,15 +1349,74 @@ impl App {
                         .width(Length::Fill)
                         .into()
                     };
-                    sec = sec.add(widget::settings::item_row(vec![label, control.into()]));
+                    rows.push(widget::settings::item_row(vec![label, control.into()]).into());
                     any = true;
                 }
             }
             if any {
-                out.push(cosmic::Element::from(sec));
+                out.push(self.section_card(spec.title, rows));
             }
         }
         out
+    }
+
+    /// Assemble a rendered section's rows into a titled group of PILL-MATERIAL row
+    /// cards (DRAGON-279) with transparent 1px seams so the backdrop shows between
+    /// rows.
+    fn section_card<'a>(&self, title: &'a str, rows: Vec<Element<'a, Msg>>) -> Element<'a, Msg> {
+        // Hand-build what libcosmic's `From<Section>` produces — a heading above the
+        // rows — but with EACH ROW painting its own fill in the shared PILL MATERIAL
+        // (DRAGON-279, user 2026-07-19: rows/buttons/nav pill are ONE material,
+        // `theme::pill_fill` at `PILL_ALPHA`), joined by 1px genuinely-TRANSPARENT
+        // seams so the window backdrop shows between rows (a same-fill gap inside one
+        // painted card was invisible — the user wants visible separation, no drawn
+        // line). Per-item presentation matches `ListColumn::into_element` exactly
+        // (min-height-32 `content_row` + `space_xxs`/`space_m` padding); the heading
+        // sits on the bare backdrop like Win11's group titles.
+        let sp = cosmic::theme::spacing();
+        let item_padding: cosmic::iced::Padding = [sp.space_xxs, sp.space_m].into();
+        let n = rows.len();
+        let wrapped: Vec<Element<'a, Msg>> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, content)| {
+                // `ListColumn`'s `content_row`: the row content beside a 32px-tall spacer
+                // (min row height), vertically centred, then the item padding.
+                let row = widget::row(vec![
+                    widget::container(content).width(Length::Fill).into(),
+                    widget::space::vertical().height(Length::Fixed(32.0)).into(),
+                ])
+                .align_y(Alignment::Center)
+                .padding(item_padding)
+                .width(Length::Fill);
+                // Group-aware rounding (user 2026-07-19): only the group's OUTER corners
+                // curve — first row rounds its top pair, last row its bottom pair,
+                // middle rows stay square — so the stack reads as one card sliced by
+                // the transparent seams (the Win11 grouped-row shape).
+                let (first, last) = (i == 0, i + 1 == n);
+                widget::container(row)
+                    .class(cosmic::theme::Container::custom(move |theme| {
+                        let r = theme.cosmic().corner_radii.radius_s[0];
+                        let (top, bottom) = (if first { r } else { 0.0 }, if last { r } else { 0.0 });
+                        cosmic::iced::widget::container::Style {
+                            background: Some(Background::Color(theme::pill_fill(
+                                theme,
+                                theme::PILL_ALPHA,
+                            ))),
+                            border: Border {
+                                radius: [top, top, bottom, bottom].into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    }))
+                    .into()
+            })
+            .collect();
+        let list = widget::column(wrapped).width(Length::Fill).spacing(1.0);
+        widget::column(vec![widget::text::heading(title).into(), list.into()])
+            .spacing(8.0)
+            .into()
     }
 
     /// Activate the nav entry for `tab` programmatically (flows that jump the

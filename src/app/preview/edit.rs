@@ -507,7 +507,7 @@ pub fn bake_video(src: &Path, dst: &Path, cm: Option<&Covermark>, video: &VideoB
         }
         None => None,
     };
-    let mut cmd = std::process::Command::new(crate::util::ffmpeg_path());
+    let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-y", "-v", "error", "-i"]).arg(src);
     if let Some(p) = &overlay_png {
         cmd.arg("-i").arg(p);

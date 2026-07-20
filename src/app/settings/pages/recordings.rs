@@ -27,10 +27,11 @@ impl crate::app::App {
                 "Save recordings to",
                 "",
                 widget::row(vec![
-                    widget::text_input("~/Capture", &self.record_dir)
-                        .on_input(|a0| Msg::Settings(SettingsMsg::SetRecordDir(a0)))
-                        .width(Length::Fixed(280.0))
-                        .into(),
+                    crate::widgets::hide_when_clipped(
+                        widget::text_input("~/Capture", &self.record_dir)
+                            .on_input(|a0| Msg::Settings(SettingsMsg::SetRecordDir(a0)))
+                            .width(Length::Fixed(280.0)),
+                    ),
                     folder_btn(DirTarget::Recording),
                 ])
                 .spacing(6.0)
