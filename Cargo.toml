@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 description = "Native COSMIC capture overlay (region/window/monitor) for screenshots and screen recording: native screencopy capture, clipboard sharing, and in-region QR/barcode + OCR detection."
 license = "GPL-3.0-only"

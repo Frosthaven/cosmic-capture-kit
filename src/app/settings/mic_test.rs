@@ -446,10 +446,11 @@ const SENS_WIDTH: f32 = 280.0;
 /// crosses the green.
 pub(super) fn sensitivity_control(level: f32, threshold: f32, dark: bool) -> Element<'static, Msg> {
     widget::column(vec![
-        widget::slider(0.0..=1.0, threshold, |a0| Msg::Settings(SettingsMsg::SetInputSensitivity(a0)))
-            .step(0.01_f32)
-            .width(Length::Fixed(SENS_WIDTH))
-            .into(),
+        crate::widgets::arrow_cursor::arrow_cursor(
+            widget::slider(0.0..=1.0, threshold, |a0| Msg::Settings(SettingsMsg::SetInputSensitivity(a0)))
+                .step(0.01_f32)
+                .width(Length::Fixed(SENS_WIDTH)),
+        ),
         cosmic::widget::Canvas::new(SensitivityBar { level, threshold, dark })
             .width(Length::Fixed(SENS_WIDTH))
             .height(Length::Fixed(12.0))

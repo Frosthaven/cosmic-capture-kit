@@ -42,14 +42,15 @@ impl crate::app::App {
                     "Text matching strictness",
                     "",
                     widget::row(vec![
-                        widget::slider(
-                            0.0..=60.0,
-                            self.text_confidence,
-                            |a0| Msg::Detect(DetectMsg::SetTextConfidence(a0)),
-                        )
-                        .step(1.0_f32)
-                        .width(Length::Fixed(200.0))
-                        .into(),
+                        crate::widgets::arrow_cursor::arrow_cursor(
+                            widget::slider(
+                                0.0..=60.0,
+                                self.text_confidence,
+                                |a0| Msg::Detect(DetectMsg::SetTextConfidence(a0)),
+                            )
+                            .step(1.0_f32)
+                            .width(Length::Fixed(200.0)),
+                        ),
                         widget::text(format!("{:.0}", self.text_confidence))
                             .size(13)
                             .into(),

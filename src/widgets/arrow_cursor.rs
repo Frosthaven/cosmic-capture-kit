@@ -147,13 +147,97 @@ impl<'a, Msg> Widget<Msg, cosmic::Theme, cosmic::Renderer> for ArrowCursor<'a, M
         viewport: &Rectangle,
         translation: cosmic::iced::core::Vector,
     ) -> Option<overlay::Element<'b, Msg, cosmic::Theme, cosmic::Renderer>> {
-        self.content.as_widget_mut().overlay(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            viewport,
-            translation,
-        )
+        self.content
+            .as_widget_mut()
+            .overlay(&mut tree.children[0], layout, renderer, viewport, translation)
+            // Wrap the popup overlay (e.g. a dropdown's open menu) so ITS items show the
+            // arrow too — the widget's own `mouse_interaction` above doesn't cover the overlay.
+            .map(|inner| overlay::Element::new(Box::new(ArrowOverlay { inner })))
+    }
+}
+
+/// Overlay twin of [`ArrowCursor`] for popup layers (a dropdown's open menu, etc.):
+/// remaps a `Pointer` interaction to the plain arrow, passes everything else through, and
+/// recurses into any nested overlay.
+struct ArrowOverlay<'a, Msg> {
+    inner: overlay::Element<'a, Msg, cosmic::Theme, cosmic::Renderer>,
+}
+
+impl<Msg> cosmic::iced::core::Overlay<Msg, cosmic::Theme, cosmic::Renderer>
+    for ArrowOverlay<'_, Msg>
+{
+    fn layout(&mut self, renderer: &cosmic::Renderer, bounds: Size) -> layout::Node {
+        self.inner.as_overlay_mut().layout(renderer, bounds)
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut cosmic::Renderer,
+        theme: &cosmic::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        self.inner
+            .as_overlay()
+            .draw(renderer, theme, style, layout, cursor);
+    }
+
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        operation: &mut dyn Operation<()>,
+    ) {
+        self.inner
+            .as_overlay_mut()
+            .operate(layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Msg>,
+    ) {
+        self.inner
+            .as_overlay_mut()
+            .update(event, layout, cursor, renderer, clipboard, shell);
+    }
+
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &cosmic::Renderer,
+    ) -> mouse::Interaction {
+        let inner = self
+            .inner
+            .as_overlay()
+            .mouse_interaction(layout, cursor, renderer);
+        if inner == mouse::Interaction::Pointer {
+            mouse::Interaction::None
+        } else {
+            inner
+        }
+    }
+
+    fn overlay<'c>(
+        &'c mut self,
+        layout: Layout<'c>,
+        renderer: &cosmic::Renderer,
+    ) -> Option<overlay::Element<'c, Msg, cosmic::Theme, cosmic::Renderer>> {
+        self.inner
+            .as_overlay_mut()
+            .overlay(layout, renderer)
+            .map(|inner| overlay::Element::new(Box::new(ArrowOverlay { inner })))
+    }
+
+    fn index(&self) -> f32 {
+        self.inner.as_overlay().index()
     }
 }
 

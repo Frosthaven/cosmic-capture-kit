@@ -496,10 +496,11 @@ pub(super) fn num_input<'a>(
 /// An opacity slider (0–100%) with its percentage readout, as a row control.
 pub(super) fn opacity_slider<'a>(value: f32, msg: fn(f32) -> Msg) -> Element<'a, Msg> {
     widget::row(vec![
-        widget::slider(0.0..=1.0, value, msg)
-            .step(0.01_f32)
-            .width(Length::Fixed(200.0))
-            .into(),
+        crate::widgets::arrow_cursor::arrow_cursor(
+            widget::slider(0.0..=1.0, value, msg)
+                .step(0.01_f32)
+                .width(Length::Fixed(200.0)),
+        ),
         // Fixed-width, right-aligned readout so the slider never shifts as the
         // percentage text changes width (e.g. "5%" -> "100%").
         widget::container(widget::text(format!("{:.0}%", value * 100.0)).size(13))

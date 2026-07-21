@@ -291,10 +291,11 @@ fn border_swatch_class(color: cosmic::iced::Color) -> cosmic::theme::Button {
 /// A 0-10px border-width slider with its px readout, as a row control.
 fn border_width_slider<'a>(value: u32, msg: fn(u32) -> Msg) -> Element<'a, Msg> {
     widget::row(vec![
-        widget::slider(0..=10, value, msg)
-            .step(1u32)
-            .width(Length::Fixed(160.0))
-            .into(),
+        crate::widgets::arrow_cursor::arrow_cursor(
+            widget::slider(0..=10, value, msg)
+                .step(1u32)
+                .width(Length::Fixed(160.0)),
+        ),
         // Fixed-width readout so the slider never shifts as the number's width changes.
         widget::container(widget::text(format!("{value}px")).size(13))
             .width(Length::Fixed(36.0))

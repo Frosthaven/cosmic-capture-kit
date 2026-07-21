@@ -323,14 +323,6 @@ impl App {
                         crate::app::shell::PREVIEW_WINDOW_TITLE,
                         dark,
                     );
-                    // DRAGON-268: the smooth-corner CALayer mask is frame-based, so re-fit it
-                    // to the new content bounds on every resize (a no-op unless glass is on).
-                    crate::platform::mac::window::refresh_window_corner_mask(
-                        settings::WINDOW_TITLE,
-                    );
-                    crate::platform::mac::window::refresh_window_corner_mask(
-                        crate::app::shell::PREVIEW_WINDOW_TITLE,
-                    );
                     // DRAGON-268 follow-up (fullscreen header vanish): learn whether each
                     // CSD toplevel is in native fullscreen NOW (a fullscreen enter/exit
                     // fires this resize), so the view can drop the traffic-light inset (the

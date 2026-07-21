@@ -575,9 +575,12 @@ impl Tb {
             .on_release(Msg::Preview(PreviewMsg::CommitCovermarkEdit))
             .width(Length::Fixed(80.0 * SLIDER_SCALE));
         widget::container(
-            widget::row(vec![glyph.into(), slider.into()])
-                .spacing(6.0)
-                .align_y(Alignment::Center),
+            widget::row(vec![
+                glyph.into(),
+                crate::widgets::arrow_cursor::arrow_cursor(slider),
+            ])
+            .spacing(6.0)
+            .align_y(Alignment::Center),
         )
         .height(Length::Fixed(self.icon_box() + 2.0 * self.btn_pad()))
         .align_y(Alignment::Center)

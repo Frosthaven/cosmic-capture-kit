@@ -969,23 +969,26 @@ impl App {
             // the inner segmented button, unaffected). UNCONDITIONAL on every platform
             // (user decision 2026-07-19; see `theme::frost_component`).
             let nav_widget = widget::nav_bar(&self.settings.nav, |a0| Msg::WindowChrome(WindowChromeMsg::SetConfigTab(a0)));
-            let nav_list: Element<'_, Msg> = nav_widget
-                .into_container()
-                .class(cosmic::theme::Container::custom(move |theme| {
-                    let cosmic = theme.cosmic();
-                    cosmic::iced::widget::container::Style {
-                        icon_color: Some(cosmic.on_bg_color().into()),
-                        text_color: Some(cosmic.on_bg_color().into()),
-                        background: Some(Background::Color(cosmic::iced::Color::TRANSPARENT)),
-                        border: Border {
-                            width: 0.0,
-                            color: cosmic::iced::Color::TRANSPARENT,
-                            radius: cosmic.corner_radii.radius_s.into(),
-                        },
-                        ..Default::default()
-                    }
-                }))
-                .into();
+            // Wrapped in `arrow_cursor` so the rail's page items show the arrow, not the
+            // hand, on hover (house style: only URL links get the hand).
+            let nav_list: Element<'_, Msg> = crate::widgets::arrow_cursor::arrow_cursor(
+                nav_widget
+                    .into_container()
+                    .class(cosmic::theme::Container::custom(move |theme| {
+                        let cosmic = theme.cosmic();
+                        cosmic::iced::widget::container::Style {
+                            icon_color: Some(cosmic.on_bg_color().into()),
+                            text_color: Some(cosmic.on_bg_color().into()),
+                            background: Some(Background::Color(cosmic::iced::Color::TRANSPARENT)),
+                            border: Border {
+                                width: 0.0,
+                                color: cosmic::iced::Color::TRANSPARENT,
+                                radius: cosmic.corner_radii.radius_s.into(),
+                            },
+                            ..Default::default()
+                        }
+                    })),
+            );
             widget::container(
                 widget::column(vec![
                     widget::scrollable(nav_list)
@@ -1118,13 +1121,14 @@ impl App {
                 // rounding. Linux keeps the app-drawn radius (its window edge is the app's).
                 #[cfg(target_os = "linux")]
                 let radius = theme::rounding(theme).window();
-                // macOS: the settings toplevel uses NATIVE decorations (DRAGON-135), so its
-                // rounded window edge is drawn by AppKit at the fixed system corner radius, NOT
-                // the app's roundness preference. Tracing that OS corner (not
-                // `rounding().window()`, which under the "round" preset curves on a much larger
-                // arc) is what keeps the 1px border a smooth curve instead of jagged segments.
+                // macOS (like Windows/DRAGON-276): the settings toplevel is NATIVE-decorated
+                // (DRAGON-135), so the macOS window server draws + rounds the window frame at
+                // the system radius and clips the content to it. Rounding THIS container too
+                // paints a SECOND, slightly-mismatched corner inside the OS frame's — the
+                // "double corner" fringe. Fill SQUARE and let the window server do the single
+                // rounding (the border's square corners are clipped away by the OS frame).
                 #[cfg(target_os = "macos")]
-                let radius = [crate::platform::mac::window::native_window_corner_radius(); 4];
+                let radius = [0.0f32; 4];
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(theme::frost_color(
                         cosmic.background.base.into(),
@@ -1132,6 +1136,13 @@ impl App {
                     ))),
                     border: Border {
                         color: cosmic.bg_divider().into(),
+                        // macOS: NO app border. The window server draws the frame edge + shadow
+                        // (like every native window); a 1px app stroke, clipped by the OS corner
+                        // round, is exactly the bright corner FRINGE the user saw in captures
+                        // (measured: a ~60-bright bg_divider line tracing the OS-rounded corner).
+                        #[cfg(target_os = "macos")]
+                        width: 0.0,
+                        #[cfg(not(target_os = "macos"))]
                         width: 1.0,
                         #[cfg(windows)]
                         radius: 0.0.into(),

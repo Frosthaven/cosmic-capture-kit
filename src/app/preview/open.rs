@@ -621,10 +621,13 @@ impl App {
                 .height(Length::Fill)
                 .class(cosmic::theme::Container::custom(move |theme| {
                     let cosmic = theme.cosmic();
-                    // Windows (DRAGON-276): DWM rounds the window (DWMWCP_ROUND); don't double-
-                    // round the outer container (thick corner). Fill square, DWM rounds. See the
-                    // matching note in `settings::config_window_view`.
-                    #[cfg(not(windows))]
+                    // Windows (DRAGON-276) + macOS: the compositor / window server rounds the
+                    // window and clips the content to it; don't double-round the outer container
+                    // (thick corner) or draw a 1px app border (which reads as a corner fringe).
+                    // Fill SQUARE and draw no border; the OS owns the edge. Linux keeps the
+                    // app-drawn radius + border (its window edge is the app's). See the matching
+                    // note in `settings::config_window_view`.
+                    #[cfg(target_os = "linux")]
                     let radius = crate::app::theme::rounding(theme).window();
                     cosmic::iced::widget::container::Style {
                         background: Some(Background::Color(crate::app::theme::frost_color(
@@ -633,10 +636,13 @@ impl App {
                         ))),
                         border: Border {
                             color: cosmic.bg_divider().into(),
+                            #[cfg(target_os = "macos")]
+                            width: 0.0,
+                            #[cfg(not(target_os = "macos"))]
                             width: 1.0,
-                            #[cfg(windows)]
+                            #[cfg(not(target_os = "linux"))]
                             radius: 0.0.into(),
-                            #[cfg(not(windows))]
+                            #[cfg(target_os = "linux")]
                             radius: radius.into(),
                         },
                         ..Default::default()
