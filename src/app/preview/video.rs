@@ -190,15 +190,17 @@ fn extract_poster(path: &Path, meta: Option<VideoMeta>) -> Option<widget::image:
 /// right-click text/code menus.
 fn timeline_menu(t: f32, can_delete: bool) -> Element<'static, Msg> {
     let item = |label: &'static str, msg: PreviewMsg| {
-        widget::button::custom(widget::text(label).size(14))
-            .padding(cosmic::iced::Padding::from([6.0, 14.0]))
-            .width(Length::Fill)
-            .on_press(Msg::Preview(msg))
-            .class(cosmic::theme::Button::Text)
+        crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::custom(widget::text(label).size(14))
+                .padding(cosmic::iced::Padding::from([6.0, 14.0]))
+                .width(Length::Fill)
+                .on_press(Msg::Preview(msg))
+                .class(cosmic::theme::Button::Text),
+        )
     };
-    let mut items = vec![item("Cut here", PreviewMsg::TimelineCut(t)).into()];
+    let mut items = vec![item("Cut here", PreviewMsg::TimelineCut(t))];
     if can_delete {
-        items.push(item("Delete segment", PreviewMsg::TimelineDelete).into());
+        items.push(item("Delete segment", PreviewMsg::TimelineDelete));
     }
     widget::container(widget::column(items))
         .width(Length::Fixed(150.0))

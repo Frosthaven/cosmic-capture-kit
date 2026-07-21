@@ -574,6 +574,7 @@ mod native_border_tests {
         let out = finish_window_native_corners(win.clone(), true);
         assert_eq!(out.as_raw(), win.as_raw(), "transparency ON returns the window untouched");
     }
+
 }
 
 /// DRAGON-190 trim tests — NOT macOS-gated: `trim_transparent_gutter` is platform-

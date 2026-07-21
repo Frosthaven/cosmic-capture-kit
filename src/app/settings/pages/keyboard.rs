@@ -50,7 +50,10 @@ impl crate::app::App {
                 clear = clear
                     .on_press(Msg::Settings(SettingsMsg::SetCaptureHotkey(String::new())));
             }
-            let control = widget::row(vec![keybind.into(), clear.into()])
+            let control = widget::row(vec![
+                crate::widgets::arrow_cursor::arrow_cursor(keybind),
+                crate::widgets::arrow_cursor::arrow_cursor(clear),
+            ])
                 .spacing(4.0)
                 .align_y(Alignment::Center);
             // Restore-default (row reset slot, same style/position as every neighbor):
@@ -87,7 +90,10 @@ impl crate::app::App {
             if binding.is_some() {
                 clear = clear.on_press(Msg::Settings(SettingsMsg::UnbindShortcut(action)));
             }
-            let control = widget::row(vec![keybind.into(), clear.into()])
+            let control = widget::row(vec![
+                crate::widgets::arrow_cursor::arrow_cursor(keybind),
+                crate::widgets::arrow_cursor::arrow_cursor(clear),
+            ])
                 .spacing(4.0)
                 .align_y(Alignment::Center);
             let item = Item::new(action.label(), action.description(), control).reset_to(

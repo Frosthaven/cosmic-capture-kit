@@ -51,14 +51,16 @@ impl Tb {
         let icon = widget::icon::Icon::from(widget::icon::from_name(name).size(64))
             .width(Length::Fixed(self.icon_box()))
             .height(Length::Fixed(self.icon_box()));
-        let button = widget::button::custom(
-            widget::container(icon)
-                .width(Length::Fill)
-                .align_x(Alignment::Center),
-        )
-        .class(cosmic::theme::Button::Icon)
-        .on_press(Msg::Preview(msg))
-        .padding(self.btn_pad());
+        let button = crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::custom(
+                widget::container(icon)
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center),
+            )
+            .class(cosmic::theme::Button::Icon)
+            .on_press(Msg::Preview(msg))
+            .padding(self.btn_pad()),
+        );
         widget::tooltip(button, widget::text(tip).size(12), pos).into()
     }
 
@@ -407,17 +409,19 @@ impl Tb {
                 };
                 cosmic::widget::svg::Style { color: Some(color) }
             })));
-        let btn = widget::button::custom(
-            widget::container(icon)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::Center)
-                .align_y(Alignment::Center),
-        )
-        .selected(on)
-        .class(cosmic::theme::Button::Icon)
-        .on_press(Msg::Preview(msg))
-        .padding(self.btn_pad());
+        let btn = crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::custom(
+                widget::container(icon)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center),
+            )
+            .selected(on)
+            .class(cosmic::theme::Button::Icon)
+            .on_press(Msg::Preview(msg))
+            .padding(self.btn_pad()),
+        );
         let wrapped = widget::container(btn).class(cosmic::theme::Container::Custom(Box::new(
             move |theme| {
                 cosmic::iced::widget::container::Style {
@@ -466,18 +470,20 @@ impl Tb {
         let style = move |t: &cosmic::Theme, hovered: bool| {
             crate::app::theme::segment_style(t, active, hovered, round_left, round_right)
         };
-        let btn = widget::button::custom(
-            widget::container(glyph).width(Length::Fill).align_x(Alignment::Center),
-        )
-        .class(cosmic::theme::Button::Custom {
-            active: Box::new(move |_, t| style(t, false)),
-            disabled: Box::new(move |t| style(t, false)),
-            hovered: Box::new(move |_, t| style(t, true)),
-            pressed: Box::new(move |_, t| style(t, true)),
-        })
-        .on_press(Msg::Preview(msg))
-        .width(Length::Fixed(self.icon_box() + 2.0 * self.btn_pad()))
-        .padding(self.btn_pad());
+        let btn = crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::custom(
+                widget::container(glyph).width(Length::Fill).align_x(Alignment::Center),
+            )
+            .class(cosmic::theme::Button::Custom {
+                active: Box::new(move |_, t| style(t, false)),
+                disabled: Box::new(move |t| style(t, false)),
+                hovered: Box::new(move |_, t| style(t, true)),
+                pressed: Box::new(move |_, t| style(t, true)),
+            })
+            .on_press(Msg::Preview(msg))
+            .width(Length::Fixed(self.icon_box() + 2.0 * self.btn_pad()))
+            .padding(self.btn_pad()),
+        );
         widget::tooltip(btn, tip, widget::tooltip::Position::Top).into()
     }
 
@@ -524,12 +530,13 @@ impl Tb {
                 .class(cosmic::theme::Svg::custom(|theme| cosmic::widget::svg::Style {
                     color: Some(crate::app::theme::subdued(theme)),
                 }));
-            return widget::button::custom(
-                widget::container(glyph).width(Length::Fill).align_x(Alignment::Center),
-            )
-            .class(cosmic::theme::Button::Icon)
-            .padding(self.btn_pad())
-            .into();
+            return crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(
+                    widget::container(glyph).width(Length::Fill).align_x(Alignment::Center),
+                )
+                .class(cosmic::theme::Button::Icon)
+                .padding(self.btn_pad()),
+            );
         }
         // Enabled: a normal icon button; the caller picks where the tooltip goes
         // (below for the top edit toolbar, above for the bottom transport strip).
@@ -608,7 +615,19 @@ impl App {
         let mut right: Vec<Element<'a, Msg>> =
             tb.info_group(preview.size, preview.external).into_iter().collect();
         right.push(tb.share_group());
-        if !preview.surface.is_window() {
+        // The Close (x) button is drawn for the OVERLAY preview (no native window
+        // chrome) and normally omitted for the WINDOWED preview (its native
+        // traffic-light close does the job). DRAGON-268 follow-up (fullscreen header
+        // vanish): in NATIVE fullscreen the windowed preview's traffic lights auto-hide,
+        // so without the app-drawn Close the user has no reachable way to leave the
+        // preview — add it back in that state. macOS-only signal (`preview_fullscreen`,
+        // set from the resize handler); off macOS the windowed preview never enters this
+        // arm, so the historical omit-when-windowed behavior is byte-identical.
+        #[cfg(target_os = "macos")]
+        let show_close = !preview.surface.is_window() || self.preview_fullscreen;
+        #[cfg(not(target_os = "macos"))]
+        let show_close = !preview.surface.is_window();
+        if show_close {
             right.push(tb.cancel_group());
         }
         toolbar_row(left, Vec::new(), right)

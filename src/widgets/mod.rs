@@ -1,5 +1,6 @@
 //! Custom libcosmic `Widget` implementations.
 
+pub mod arrow_cursor;
 pub mod drag_area;
 pub mod hide_when_clipped;
 pub mod output_selection;

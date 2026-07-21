@@ -110,11 +110,12 @@ impl App {
                 .spacing(4.0)
                 .align_x(Alignment::Center);
             items.push(
-                widget::button::custom(card)
-                    .class(picker_card_class(selected))
-                    .padding(6.0)
-                    .on_press(Msg::Preview(PreviewMsg::PickerPick(i)))
-                    .into(),
+                crate::widgets::arrow_cursor::arrow_cursor(
+                    widget::button::custom(card)
+                        .class(picker_card_class(selected))
+                        .padding(6.0)
+                        .on_press(Msg::Preview(PreviewMsg::PickerPick(i))),
+                ),
             );
         }
         // A popover panel (not a button group): panel rounding, so the tall

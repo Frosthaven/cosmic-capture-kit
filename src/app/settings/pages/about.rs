@@ -182,9 +182,9 @@ fn update_action_button<'a>(
             install_button(installing, width)
         } else {
             // No platform artifact attached to this release yet: an honest disabled label.
-            widget::button::suggested(UPDATE_AVAILABLE_LABEL)
-                .width(Length::Fixed(width))
-                .into()
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::suggested(UPDATE_AVAILABLE_LABEL).width(Length::Fixed(width)),
+            )
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

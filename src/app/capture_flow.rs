@@ -1005,19 +1005,37 @@ impl App {
             // `!capture_live` skip for window mode: region/monitor delayed shots (which grab the
             // live post-delay screen, no pre-focus) go through the region/monitor branch below,
             // so their frozen-scene/live semantics are unchanged.
-            let focus_grab = self.window_focus_grab(id, extras.transparency);
+            // DRAGON-292 (EXPERIMENT, opt-in behind CCK_MAC_WALLPAPER_BACKDROP=1): a macOS
+            // single-window capture must run the LIVE wallpaper-backdrop sequence
+            // (`WindowCaptureJob::run`'s experiment arm), which is reached ONLY when
+            // `frozen_px` is None. The worker sets `frozen_px = active.or(fallback_px)`, so we
+            // must suppress BOTH the off-thread focus grab AND the cached/frozen fallback
+            // pixels here — otherwise `frozen_px` is `Some(...)` and the experiment never runs.
+            // The experiment sequence raises (focuses) the target itself (step 2), so dropping
+            // the separate focus grab loses nothing. Env unset -> both keep their normal values
+            // and the default path is byte-identical.
+            let backdrop_experiment = wallpaper_backdrop_experiment_active();
+            let focus_grab = if backdrop_experiment {
+                None
+            } else {
+                self.window_focus_grab(id, extras.transparency)
+            };
             // The FALLBACK pixel source, chosen + cloned on the UI thread (cheap map
             // lookups + a one-shot memcpy, not a focus-dependent wait): the pre-activation
             // active-window pixels, else the freeze scene's per-window pixels, else `None`
             // (the worker grabs the toplevel live). The off-thread `focus_grab` result,
             // when it lands, WINS over this (`active.or(fallback_px)` in the worker).
-            let fallback_px = match window_pixel_source(
-                self.active_win_px.contains_key(id),
-                frozen && self.frozen_win_px.contains_key(id),
-            ) {
-                WindowPixelSource::PreActivation => self.active_win_px.get(id).cloned(),
-                WindowPixelSource::FrozenScene => self.frozen_win_px.get(id).cloned(),
-                WindowPixelSource::Live => None,
+            let fallback_px = if backdrop_experiment {
+                None
+            } else {
+                match window_pixel_source(
+                    self.active_win_px.contains_key(id),
+                    frozen && self.frozen_win_px.contains_key(id),
+                ) {
+                    WindowPixelSource::PreActivation => self.active_win_px.get(id).cloned(),
+                    WindowPixelSource::FrozenScene => self.frozen_win_px.get(id).cloned(),
+                    WindowPixelSource::Live => None,
+                }
             };
             let job = crate::screenshot::WindowCaptureJob {
                 id: id.clone(),
@@ -1063,6 +1081,14 @@ impl App {
                 // precedence; the field exists only on the Windows job struct.
                 #[cfg(windows)]
                 active_grab: None,
+                // DRAGON-292 (macOS wallpaper-backdrop EXPERIMENT, opt-in behind
+                // CCK_MAC_WALLPAPER_BACKDROP=1): the "Window focus appearance" intent, so the
+                // experiment renders the target in its ACTIVE (focused) or INACTIVE (defocused)
+                // appearance to MATCH the border it draws (`border` above is
+                // `borders.for_active(self.window_single_active)`). The field exists only on the
+                // mac job struct; the experiment reads it in `run()`. Env unset -> unused.
+                #[cfg(target_os = "macos")]
+                backdrop_active: self.window_single_active,
                 // A window capture stamps the cursor ONLY for a DELAYED shot (user rule,
                 // DRAGON-214): with a countdown, `frozen_cursor` was swapped above for the
                 // CAPTURE-MOMENT sprite and belongs in the picture (still containment-
@@ -1343,6 +1369,23 @@ impl App {
             let _ = (id, intent, transparency);
             None
         }
+    }
+}
+
+/// Whether the DRAGON-292 macOS wallpaper-backdrop recomposite is active for this window
+/// capture: on macOS this is the DEFAULT (see `wallpaper_backdrop::enabled` — the
+/// `CCK_MAC_WALLPAPER_BACKDROP=0` escape hatch disables it). When true, a single-window
+/// capture suppresses the cached/frozen/focus-grab pixel sources so `WindowCaptureJob::run`
+/// reaches its live recomposite arm (which raises the target and grabs it over a floated
+/// wallpaper backdrop). Always `false` off macOS, so every non-mac build is byte-identical.
+fn wallpaper_backdrop_experiment_active() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::mac::wallpaper_backdrop::enabled()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
     }
 }
 

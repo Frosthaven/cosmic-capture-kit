@@ -118,11 +118,11 @@ impl crate::app::App {
                 Item::new(
                     "Window focus appearance",
                     "",
-                    widget::dropdown(
+                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                         &WINDOW_FOCUS_APPEARANCES,
                         Some(focus_idx),
                         |a0| Msg::Settings(SettingsMsg::SetWindowFocusAppearance(a0)),
-                    ),
+                    )),
                 )
                 .reset_with(focus_idx, def_focus, |a0| Msg::Settings(SettingsMsg::SetWindowFocusAppearance(a0))),
                 // Active border: colour swatch (follows the accent when unpinned) + width
@@ -259,13 +259,14 @@ fn border_swatch<'a>(color: [u8; 4], target: crate::app::BorderColorTarget) -> E
         color[1] as f32 / 255.0,
         color[2] as f32 / 255.0,
     );
-    widget::button::custom(widget::space::Space::new().width(Length::Fill).height(Length::Fill))
-        .width(Length::Fixed(BORDER_SWATCH))
-        .height(Length::Fixed(BORDER_SWATCH))
-        .padding(0)
-        .class(border_swatch_class(c))
-        .on_press(Msg::Settings(SettingsMsg::ToggleBorderColorEditor(target, true)))
-        .into()
+    crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::custom(widget::space::Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fixed(BORDER_SWATCH))
+            .height(Length::Fixed(BORDER_SWATCH))
+            .padding(0)
+            .class(border_swatch_class(c))
+            .on_press(Msg::Settings(SettingsMsg::ToggleBorderColorEditor(target, true))),
+    )
 }
 
 fn border_swatch_style(color: cosmic::iced::Color, theme: &cosmic::Theme) -> cosmic::widget::button::Style {

@@ -323,6 +323,28 @@ impl App {
                         crate::app::shell::PREVIEW_WINDOW_TITLE,
                         dark,
                     );
+                    // DRAGON-268: the smooth-corner CALayer mask is frame-based, so re-fit it
+                    // to the new content bounds on every resize (a no-op unless glass is on).
+                    crate::platform::mac::window::refresh_window_corner_mask(
+                        settings::WINDOW_TITLE,
+                    );
+                    crate::platform::mac::window::refresh_window_corner_mask(
+                        crate::app::shell::PREVIEW_WINDOW_TITLE,
+                    );
+                    // DRAGON-268 follow-up (fullscreen header vanish): learn whether each
+                    // CSD toplevel is in native fullscreen NOW (a fullscreen enter/exit
+                    // fires this resize), so the view can drop the traffic-light inset (the
+                    // lights auto-hide in fullscreen) and keep the preview's Close reachable.
+                    // The `match_...backdrop` calls above already detached the auto-hiding
+                    // toolbar so the app's own header renders flush at the fullscreen top.
+                    self.settings_fullscreen =
+                        crate::platform::mac::window::window_is_fullscreen_by_title(
+                            settings::WINDOW_TITLE,
+                        );
+                    self.preview_fullscreen =
+                        crate::platform::mac::window::window_is_fullscreen_by_title(
+                            crate::app::shell::PREVIEW_WINDOW_TITLE,
+                        );
                 }
                 // Learn the preview overlay's monitor size (needed for `--preview`, which
                 // opens on the active output before its size is known). The returned task

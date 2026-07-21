@@ -280,11 +280,12 @@ impl App {
                             ..Default::default()
                         },
                     ));
-                    widget::button::custom(text)
-                        .width(Length::Fill)
-                        .class(cosmic::theme::Button::Text)
-                        .on_press(Msg::Preview(PreviewMsg::ZoomPreset(i)))
-                        .into()
+                    crate::widgets::arrow_cursor::arrow_cursor(
+                        widget::button::custom(text)
+                            .width(Length::Fill)
+                            .class(cosmic::theme::Button::Text)
+                            .on_press(Msg::Preview(PreviewMsg::ZoomPreset(i))),
+                    )
                 })
                 .collect();
             let menu = widget::container(widget::column(items).spacing(2.0))

@@ -55,11 +55,11 @@ impl crate::app::App {
                 Item::new(
                     "Output device",
                     output_desc,
-                    widget::dropdown(
+                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                         &self.speaker_device_labels,
                         Some(self.speaker_device_index()),
                         |a0| Msg::Settings(SettingsMsg::SetSpeakerDevice(a0)),
-                    ),
+                    )),
                 )
                 .reset_with(self.speaker_device_index(), 0usize, |a0| Msg::Settings(SettingsMsg::SetSpeakerDevice(a0)))
             } else {
@@ -75,11 +75,11 @@ impl crate::app::App {
             Item::new(
                 "Input device",
                 "",
-                widget::dropdown(
+                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                     &self.mic_device_labels,
                     Some(self.mic_device_index()),
                     |a0| Msg::Settings(SettingsMsg::SetMicDevice(a0)),
-                ),
+                )),
             )
             .reset_with(self.mic_device_index(), 0usize, |a0| Msg::Settings(SettingsMsg::SetMicDevice(a0)))
         } else {
@@ -156,7 +156,7 @@ impl crate::app::App {
         filters.push(Item::new(
             "Microphone test",
             "",
-            widget::button::standard("Test Microphone").on_press(Msg::Settings(SettingsMsg::OpenMicTest)),
+            crate::widgets::arrow_cursor::arrow_cursor(widget::button::standard("Test Microphone").on_press(Msg::Settings(SettingsMsg::OpenMicTest))),
         ));
         secs.push(SectionSpec { title: "Input", items: filters });
 

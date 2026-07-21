@@ -172,32 +172,36 @@ pub(super) struct SectionSpec<'a> {
 }
 
 /// A toggle control (used as the right-aligned control of a settings row).
+/// Wrapped in `arrow_cursor` so it shows the arrow, not the hand, on hover (house
+/// style: only URL links get the hand).
 pub(super) fn toggle<'a>(on: bool, msg: fn(bool) -> Msg) -> Element<'a, Msg> {
-    widget::toggler(on).on_toggle(msg).into()
+    crate::widgets::arrow_cursor::arrow_cursor(widget::toggler(on).on_toggle(msg))
 }
 
 /// The "choose folder" button used next to a path field. Translucent fill
 /// (see [`standard_button_class`]).
 pub(super) fn folder_btn<'a>(target: DirTarget) -> Element<'a, Msg> {
-    widget::button::custom(
-        widget::icon::Icon::from(widget::icon::from_name("folder-open-symbolic").size(16))
-            .width(Length::Fixed(20.0))
-            .height(Length::Fixed(20.0)),
+    crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::custom(
+            widget::icon::Icon::from(widget::icon::from_name("folder-open-symbolic").size(16))
+                .width(Length::Fixed(20.0))
+                .height(Length::Fixed(20.0)),
+        )
+        .class(standard_button_class())
+        .on_press(Msg::Settings(SettingsMsg::PickDir(target)))
+        .padding(8.0),
     )
-    .class(standard_button_class())
-    .on_press(Msg::Settings(SettingsMsg::PickDir(target)))
-    .padding(8.0)
-    .into()
 }
 
 /// A standard text button used as a settings row's control — e.g. a Health row's
 /// remediation action ("Open Settings" / "Request"). `msg` fires on press.
 /// Translucent fill (see [`standard_button_class`]).
 pub(super) fn action_button<'a>(label: &'a str, msg: Msg) -> Element<'a, Msg> {
-    widget::button::standard(label)
-        .class(standard_button_class())
-        .on_press(msg)
-        .into()
+    crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::standard(label)
+            .class(standard_button_class())
+            .on_press(msg),
+    )
 }
 
 /// A text button whose icon + label are CENTERED within the button's width, rather
@@ -248,8 +252,8 @@ pub(super) fn centered_button<'a>(
     .height(Length::Fixed(h))
     .width(width);
     match on_press {
-        Some(msg) => btn.on_press(msg).into(),
-        None => btn.into(),
+        Some(msg) => crate::widgets::arrow_cursor::arrow_cursor(btn.on_press(msg)),
+        None => crate::widgets::arrow_cursor::arrow_cursor(btn),
     }
 }
 
@@ -327,14 +331,14 @@ pub(super) fn reset_button(msg: Msg, changed: bool) -> Element<'static, Msg> {
         // Only interactive when there's something to reset: clickable, hoverable,
         // with a tooltip.
         widget::tooltip(
-            btn.on_press(msg),
+            crate::widgets::arrow_cursor::arrow_cursor(btn.on_press(msg)),
             widget::text("Reset to default").size(12),
             widget::tooltip::Position::Top,
         )
         .into()
     } else {
         // At default: a disabled (non-hoverable, non-clickable) subdued icon.
-        btn.into()
+        crate::widgets::arrow_cursor::arrow_cursor(btn)
     }
 }
 

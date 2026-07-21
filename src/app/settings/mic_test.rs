@@ -518,7 +518,7 @@ impl App {
         ];
         col.push(pad(widget::row(vec![
             widget::Space::new().width(Length::Fill).height(Length::Fixed(0.0)).into(),
-            widget::button::standard("Close").on_press(Msg::Settings(SettingsMsg::CloseMicTest)).into(),
+            crate::widgets::arrow_cursor::arrow_cursor(widget::button::standard("Close").on_press(Msg::Settings(SettingsMsg::CloseMicTest))),
         ])
         .into()));
         let card = widget::container(widget::column(col).spacing(14.0))

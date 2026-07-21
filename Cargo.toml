@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2024"
 description = "Native COSMIC capture overlay (region/window/monitor) for screenshots and screen recording: native screencopy capture, clipboard sharing, and in-region QR/barcode + OCR detection."
 license = "GPL-3.0-only"
@@ -182,6 +182,14 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSButton",
     "NSControl",
     "NSView",
+    # DRAGON-292 (experiment, CCK_MAC_WALLPAPER_BACKDROP): a floated backdrop NSWindow
+    # whose content view is an NSImageView showing the desktop wallpaper (or a black fill
+    # for a fullscreen target), so a single-window grab composites the target's REAL OS
+    # frost/vibrancy against it on screen. `NSCell` carries the `NSImageScaling` enum the
+    # image view fills with. Additive AppKit headers off the default tree, so no new
+    # packages land in the lock.
+    "NSImageView",
+    "NSCell",
     # DRAGON-147: trackpad pinch-to-zoom in the preview editor — an
     # NSMagnificationGestureRecognizer on the preview window's content view
     # (iced/winit surface no pinch gesture of their own).

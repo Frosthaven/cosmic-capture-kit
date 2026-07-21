@@ -40,11 +40,11 @@ impl crate::app::App {
                     Item::new(
                         "Max resolution",
                         "",
-                        widget::dropdown(
+                        crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                             &RES_LABELS,
                             Some(self.record_res_preset as usize),
                             |a0| Msg::Settings(SettingsMsg::SetRecordResPreset(a0)),
-                        ),
+                        )),
                     )
                     .reset_with(
                         self.record_res_preset as usize,
@@ -113,7 +113,7 @@ impl crate::app::App {
                 Item::new(
                     "Encoder",
                     "",
-                    widget::dropdown(encoders, selected, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0))),
+                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(encoders, selected, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0)))),
                 )
                 // Default = the best available encoder (index 0).
                 .reset_with(selected.unwrap_or(0), 0, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0))),
@@ -173,9 +173,9 @@ impl crate::app::App {
             exp_items.push(Item::new(
                 "Benchmark monitor",
                 "The encoder benchmark tests this monitor's true capture resolution.",
-                widget::dropdown(labels, Some(selected), |i| {
+                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(labels, Some(selected), |i| {
                     Msg::Settings(SettingsMsg::SetBenchMonitor(i))
-                }),
+                })),
             ));
         }
         exp_items.push(Item::new(
@@ -183,7 +183,7 @@ impl crate::app::App {
             "Encoders that appear in green can sustain your currently configured frame \
              rate. Encoders that use fewer cores will leave more processing for other \
              programs.",
-            widget::button::standard("Run benchmark").on_press(Msg::Settings(SettingsMsg::RunBenchmark)),
+            crate::widgets::arrow_cursor::arrow_cursor(widget::button::standard("Run benchmark").on_press(Msg::Settings(SettingsMsg::RunBenchmark))),
         ));
         if let Some(b) = self.bench.as_ref().and_then(|b| b.lock().ok()) {
             if b.finished {

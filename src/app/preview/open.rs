@@ -690,12 +690,14 @@ impl App {
         .interaction(cosmic::iced::mouse::Interaction::Idle)
         .into();
         let buttons: Element<'a, Msg> = widget::row(vec![
-            widget::button::standard("Cancel")
-                .on_press(Msg::Preview(PreviewMsg::CancelOverwrite))
-                .into(),
-            widget::button::destructive("Overwrite")
-                .on_press(Msg::Preview(PreviewMsg::ConfirmOverwrite))
-                .into(),
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::standard("Cancel")
+                    .on_press(Msg::Preview(PreviewMsg::CancelOverwrite)),
+            ),
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::destructive("Overwrite")
+                    .on_press(Msg::Preview(PreviewMsg::ConfirmOverwrite)),
+            ),
         ])
         .spacing(8.0)
         .into();
@@ -756,7 +758,22 @@ impl App {
     }
 
     /// Loading state: a centred spinner + a playful status line (picked from the kind's
-    /// message set), with just the close (x) group below so the wait is cancellable.
+    /// message set), with the close (x) cancel group below so the wait is cancellable — this
+    /// portable view is what mac (its existing X affordance) and Windows both show, so the SAME
+    /// X abort is present on both platforms. The X fires `PreviewMsg::Cancel` — the SAME abort
+    /// the Esc hotkey triggers (`keyboard.rs`: `Action::PreviewCancel -> PreviewMsg::Cancel`),
+    /// which routes through `finish_session` for a clean one-shot teardown (focus / menu-bar /
+    /// window-order state restored, then exit). It stays clickable even while the window
+    /// focus-then-grab is slow/hung because that grab runs OFF the UI thread
+    /// (`window_focus_grab`'s `Send` closure on the capture worker, DRAGON-215), so the iced
+    /// loop keeps pumping this surface's events.
+    ///
+    /// The whole loading content is wrapped in a `mouse_area` that SWALLOWS stray background
+    /// presses (`Ignore`), so while windows are being rearranged behind this overlay a click
+    /// off the cancel affordance can never fall through to a window underneath — only the X is
+    /// interactive. On macOS/Windows the surface is itself an opaque, full-display winit window
+    /// (never a click-through layer), so it already eats all pointer events; the swallow is the
+    /// portable belt-and-suspenders that matches `overwrite_dialog`.
     pub(super) fn preview_loading_view(&self, preview: &PreviewState, tb: Tb) -> Element<'_, Msg> {
         let msgs: &[&str] = match &preview.kind {
             PreviewKind::Image(_) => &PREVIEW_LOADING_MESSAGES,
@@ -770,9 +787,15 @@ impl App {
         ])
         .spacing(20.0)
         .align_x(Alignment::Center);
-        widget::column(vec![status.into(), tb.cancel_group()])
+        let content = widget::column(vec![status.into(), tb.cancel_group()])
             .spacing(20.0)
-            .align_x(Alignment::Center)
+            .align_x(Alignment::Center);
+        // Swallow any press that lands off the cancel affordance so it can't reach a window
+        // being rearranged behind the overlay. `Interaction::Idle` keeps the normal cursor over
+        // the dead area (the X provides its own pointer feedback).
+        widget::mouse_area(content)
+            .on_press(Msg::WindowChrome(WindowChromeMsg::Ignore))
+            .interaction(cosmic::iced::mouse::Interaction::Idle)
             .into()
     }
 

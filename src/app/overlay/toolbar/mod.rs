@@ -182,12 +182,14 @@ impl App {
             // Natural padding keeps the icon at its proper size (forcing the height
             // scaled/clipped it); the width is fixed horizontally and fills when
             // stacked so the buttons share the group evenly.
-            widget::button::custom(mode_icon(name, true))
-                .selected(active)
-                .class(cosmic::theme::Button::Icon)
-                .on_press_maybe(msg)
-                .width(btn_width)
-                .padding(BTN_PAD)
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(mode_icon(name, true))
+                    .selected(active)
+                    .class(cosmic::theme::Button::Icon)
+                    .on_press_maybe(msg)
+                    .width(btn_width)
+                    .padding(BTN_PAD),
+            )
         };
         // Photo/video: a SEGMENTED pair (one control, two joined halves) rather than
         // two free-standing buttons — the active half is filled accent with an
@@ -206,28 +208,32 @@ impl App {
             let seg_style = move |t: &cosmic::Theme, hovered: bool| {
                 crate::app::theme::segment_style(t, active, hovered, round_left, round_right)
             };
-            widget::button::custom(
-                widget::container(icon)
-                    .width(Length::Fill)
-                    .align_x(Alignment::Center),
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(
+                    widget::container(icon)
+                        .width(Length::Fill)
+                        .align_x(Alignment::Center),
+                )
+                .class(cosmic::theme::Button::Custom {
+                    active: Box::new(move |_, t| seg_style(t, false)),
+                    disabled: Box::new(move |t| seg_style(t, false)),
+                    hovered: Box::new(move |_, t| seg_style(t, true)),
+                    pressed: Box::new(move |_, t| seg_style(t, true)),
+                })
+                .on_press(msg)
+                .width(btn_width)
+                .padding(BTN_PAD),
             )
-            .class(cosmic::theme::Button::Custom {
-                active: Box::new(move |_, t| seg_style(t, false)),
-                disabled: Box::new(move |t| seg_style(t, false)),
-                hovered: Box::new(move |_, t| seg_style(t, true)),
-                pressed: Box::new(move |_, t| seg_style(t, true)),
-            })
-            .on_press(msg)
-            .width(btn_width)
-            .padding(BTN_PAD)
         };
         // Neutral icon button (settings/close) — same footprint as a mode button.
         let action_btn = |name: &'static str, msg: Msg| {
-            widget::button::custom(mode_icon(name, false))
-                .class(cosmic::theme::Button::Icon)
-                .on_press(msg)
-                .width(btn_width)
-                .padding(BTN_PAD)
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(mode_icon(name, false))
+                    .class(cosmic::theme::Button::Icon)
+                    .on_press(msg)
+                    .width(btn_width)
+                    .padding(BTN_PAD),
+            )
         };
         let mode_group = widget::container(
             widget::row(vec![
@@ -235,20 +241,17 @@ impl App {
                     "screenshot-selection-symbolic",
                     Mode::Region,
                     self.mode == Mode::Region,
-                )
-                .into(),
+                ),
                 mode_btn(
                     "screenshot-window-symbolic",
                     Mode::Window,
                     self.mode == Mode::Window,
-                )
-                .into(),
+                ),
                 mode_btn(
                     "screenshot-screen-symbolic",
                     Mode::Monitor,
                     self.mode == Mode::Monitor,
-                )
-                .into(),
+                ),
             ])
             .spacing(2.0)
             .width(row_width)
@@ -285,24 +288,21 @@ impl App {
                 Msg::Capture(CaptureMsg::SetKind(Kind::Scanner)),
                 true,
                 false,
-            )
-            .into(),
+            ),
             kind_btn(
                 "camera-photo-symbolic",
                 self.kind == Kind::Image,
                 Msg::Capture(CaptureMsg::SetKind(Kind::Image)),
                 false,
                 false,
-            )
-            .into(),
+            ),
             kind_btn(
                 "camera-video-symbolic",
                 self.kind == Kind::Video,
                 Msg::Capture(CaptureMsg::SetKind(Kind::Video)),
                 false,
                 true,
-            )
-            .into(),
+            ),
         ])
         .spacing(0.0)
         .align_y(Alignment::Center)
@@ -444,29 +444,30 @@ impl App {
         })
         .on_enter(Msg::Capture(CaptureMsg::SetHover(Hover::Cancel)))
         .on_exit(Msg::Capture(CaptureMsg::SetHover(Hover::None)))
-        .interaction(cosmic::iced::mouse::Interaction::Pointer);
+        .interaction(cosmic::iced::mouse::Interaction::Idle);
 
         let delay_el: Element<'_, Msg> = if self.delay_menu_open && !active {
             let items: Vec<Element<'_, Msg>> = DELAYS
                 .iter()
                 .enumerate()
                 .map(|(i, (_, s))| {
-                    widget::button::custom(
-                        widget::text(format!("{s:02}"))
-                            .font(cosmic::iced::Font::MONOSPACE)
-                            .size(16)
-                            // Match the chip: theme foreground, not the text-button accent.
-                            .class(cosmic::theme::Text::Custom(|t| {
-                                cosmic::iced::widget::text::Style {
-                                    color: Some(t.cosmic().background.component.on.into()),
-                                    ..Default::default()
-                                }
-                            })),
+                    crate::widgets::arrow_cursor::arrow_cursor(
+                        widget::button::custom(
+                            widget::text(format!("{s:02}"))
+                                .font(cosmic::iced::Font::MONOSPACE)
+                                .size(16)
+                                // Match the chip: theme foreground, not the text-button accent.
+                                .class(cosmic::theme::Text::Custom(|t| {
+                                    cosmic::iced::widget::text::Style {
+                                        color: Some(t.cosmic().background.component.on.into()),
+                                        ..Default::default()
+                                    }
+                                })),
+                        )
+                        .on_press(Msg::Capture(CaptureMsg::PickDelay(i)))
+                        .width(Length::Fill)
+                        .class(cosmic::theme::Button::Text),
                     )
-                    .on_press(Msg::Capture(CaptureMsg::PickDelay(i)))
-                    .width(Length::Fill)
-                    .class(cosmic::theme::Button::Text)
-                    .into()
                 })
                 .collect();
             let menu = widget::container(widget::column(items).spacing(2.0))
@@ -527,11 +528,11 @@ impl App {
                 "media-playback-pause-symbolic"
             };
             widget::row(vec![
-                action_btn(pause_icon, Msg::Recording(RecordingMsg::TogglePause)).into(),
+                action_btn(pause_icon, Msg::Recording(RecordingMsg::TogglePause)),
                 delay_el,
                 // Delete glyph (not a plain close): cancelling DISCARDS the recording,
                 // matching the preview's delete button.
-                action_btn("edit-delete-symbolic", Msg::Recording(RecordingMsg::CancelRecording)).into(),
+                action_btn("edit-delete-symbolic", Msg::Recording(RecordingMsg::CancelRecording)),
             ])
             .spacing(4.0)
             .width(row_width)
@@ -575,8 +576,8 @@ impl App {
         // Group 4: settings + close.
         let util_group = widget::container(
             widget::row(vec![
-                action_btn("emblem-system-symbolic", Msg::WindowChrome(WindowChromeMsg::OpenGear)).into(),
-                action_btn("window-close-symbolic", Msg::WindowChrome(WindowChromeMsg::Quit)).into(),
+                action_btn("emblem-system-symbolic", Msg::WindowChrome(WindowChromeMsg::OpenGear)),
+                action_btn("window-close-symbolic", Msg::WindowChrome(WindowChromeMsg::Quit)),
             ])
             .spacing(2.0)
             .width(row_width)
@@ -618,18 +619,20 @@ impl App {
                     };
                     cosmic::widget::svg::Style { color: Some(color) }
                 })));
-            let btn = widget::button::custom(
-                widget::container(icon)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .align_x(Alignment::Center)
-                    .align_y(Alignment::Center),
-            )
-            .selected(on && !metering)
-            .class(cosmic::theme::Button::Icon)
-            .on_press_maybe(msg)
-            .width(btn_width)
-            .padding(BTN_PAD);
+            let btn = crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(
+                    widget::container(icon)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .align_x(Alignment::Center)
+                        .align_y(Alignment::Center),
+                )
+                .selected(on && !metering)
+                .class(cosmic::theme::Button::Icon)
+                .on_press_maybe(msg)
+                .width(btn_width)
+                .padding(BTN_PAD),
+            );
             // One wrapper for both adornments: the live meter fill (when armed) and a
             // 1px trim ring — accent while ON, the subdued wash while off (so the
             // outline is always present, only its strength changes). The border draws

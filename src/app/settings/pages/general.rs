@@ -75,11 +75,11 @@ impl crate::app::App {
                         Item::new(
                             "Preview editor appearance mode",
                             "",
-                            widget::dropdown(
+                            crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                                 &PREVIEW_APPEARANCES,
                                 Some(usize::from(self.preview_windowed)),
                                 |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                            ),
+                            )),
                         )
                         .reset_with(
                             usize::from(self.preview_windowed),
@@ -214,11 +214,11 @@ impl crate::app::App {
                         Item::new(
                             "Light/dark mode",
                             "Automatic follows the system's light or dark preference.",
-                            widget::dropdown(
+                            crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                                 &["Automatic", "Dark", "Light"],
                                 Some(self.appearance_mode.min(2) as usize),
                                 |i| Msg::Settings(SettingsMsg::SetAppearanceMode(i as u8)),
-                            ),
+                            )),
                         )
                         .reset_with(self.appearance_mode, d.appearance_mode, |a0| {
                             Msg::Settings(SettingsMsg::SetAppearanceMode(a0))
@@ -376,19 +376,20 @@ impl crate::app::App {
                 Msg::Settings(SettingsMsg::ToggleAccentEditor(true)),
             )
         } else {
-            widget::button::custom(
-                widget::container(
-                    widget::icon::from_name("list-add-symbolic").icon().size(16),
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(
+                    widget::container(
+                        widget::icon::from_name("list-add-symbolic").icon().size(16),
+                    )
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill),
                 )
-                .center_x(Length::Fill)
-                .center_y(Length::Fill),
+                .width(Length::Fixed(SWATCH))
+                .height(Length::Fixed(SWATCH))
+                .padding(0)
+                .class(cosmic::theme::Button::Standard)
+                .on_press(Msg::Settings(SettingsMsg::ToggleAccentEditor(true))),
             )
-            .width(Length::Fixed(SWATCH))
-            .height(Length::Fixed(SWATCH))
-            .padding(0)
-            .class(cosmic::theme::Button::Standard)
-            .on_press(Msg::Settings(SettingsMsg::ToggleAccentEditor(true)))
-            .into()
         });
         // DRAGON-268: the swatches WRAP as the window narrows, so they render through
         // `flex_row` (taffy flex-wrap) rather than a plain non-wrapping `widget::row`.
@@ -438,13 +439,14 @@ fn approx_rgb(a: [f32; 3], b: [f32; 3]) -> bool {
 /// One accent swatch button: a fixed square filled with `color`, with an accent
 /// ring when `selected`. `msg` fires on press.
 fn accent_swatch<'a>(color: cosmic::iced::Color, selected: bool, msg: Msg) -> Element<'a, Msg> {
-    widget::button::custom(widget::space::Space::new().width(Length::Fill).height(Length::Fill))
-        .width(Length::Fixed(SWATCH))
-        .height(Length::Fixed(SWATCH))
-        .padding(0)
-        .class(swatch_class(color, selected))
-        .on_press(msg)
-        .into()
+    crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::custom(widget::space::Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fixed(SWATCH))
+            .height(Length::Fixed(SWATCH))
+            .padding(0)
+            .class(swatch_class(color, selected))
+            .on_press(msg),
+    )
 }
 
 fn swatch_style(
@@ -508,7 +510,7 @@ fn style_previews<'a>(current: u8) -> Element<'a, Msg> {
         .padding(0)
         .class(style_preview_class(radius, current == value))
         .on_press(Msg::Settings(SettingsMsg::SetAppearanceRoundness(value)));
-        widget::column(vec![btn.into(), widget::text::caption(label).into()])
+        widget::column(vec![crate::widgets::arrow_cursor::arrow_cursor(btn), widget::text::caption(label).into()])
             .spacing(6.0)
             .align_x(Alignment::Center)
             .into()

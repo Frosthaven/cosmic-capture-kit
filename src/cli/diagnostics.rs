@@ -912,6 +912,8 @@ fn mac_window_composite_test(id: &str) {
         frozen_geom,
         frozen_px: None,
         cursor_overlay: None,
+        // DRAGON-292: this diagnostic reproduces the ACTIVE-appearance composite.
+        backdrop_active: true,
     };
     match job.run() {
         Some(img) => {

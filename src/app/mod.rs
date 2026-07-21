@@ -1710,6 +1710,22 @@ pub struct App {
     /// compositor blur enrolled on them shows through. `None` off COSMIC / when
     /// frosted windows are off → fully-opaque chrome, today's look.
     glass: Option<crate::app::theme::GlassConfig>,
+    /// macOS (DRAGON-268 follow-up): whether the settings toplevel is in NATIVE
+    /// fullscreen right now (green traffic-light). Set from the `ConfigWindowResized`
+    /// handler (a fullscreen enter/exit fires a resize), read by `config_window_view`
+    /// so the CSD header adapts: the traffic lights auto-hide in fullscreen, so the
+    /// 72px leading inset reserved for them collapses to 0 and the app's own nav
+    /// toggle / search sit flush left where the lights were. Off macOS this field
+    /// does not exist (the whole feature is cfg-gated) so other platforms stay
+    /// byte-identical.
+    #[cfg(target_os = "macos")]
+    settings_fullscreen: bool,
+    /// macOS: whether the WINDOWED-preview toplevel is in native fullscreen right
+    /// now (mirror of `settings_fullscreen` for the preview editor). Read by
+    /// `preview_view` so the preview toolbar keeps a reachable Close button in
+    /// fullscreen (the native traffic-light close is auto-hidden there).
+    #[cfg(target_os = "macos")]
+    preview_fullscreen: bool,
     /// Per-output wallpaper handles, pre-resolved to ready-to-upload handles by the
     /// background pre-capture thread, so entering window mode never blocks the UI
     /// thread decoding/grabbing a full-size image. Keyed by output name (the same

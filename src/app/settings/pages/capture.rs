@@ -32,11 +32,11 @@ impl crate::app::App {
                 Item::new(
                     "Encoder quality preset",
                     "",
-                    widget::dropdown(
+                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                         &crate::encode::NVENC_PRESET_LABELS,
                         Some(sel),
                         |a0| Msg::Settings(SettingsMsg::SetNvencPreset(a0)),
-                    ),
+                    )),
                 )
                 .reset_with(sel, def, |a0| Msg::Settings(SettingsMsg::SetNvencPreset(a0)))
             }
@@ -52,11 +52,11 @@ impl crate::app::App {
                 Item::new(
                     "Encoder quality preset",
                     "",
-                    widget::dropdown(
+                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                         &crate::encode::X264_PRESET_LABELS,
                         Some(sel),
                         |a0| Msg::Settings(SettingsMsg::SetX264Preset(a0)),
-                    ),
+                    )),
                 )
                 .reset_with(sel, def, |a0| Msg::Settings(SettingsMsg::SetX264Preset(a0)))
             }
@@ -72,11 +72,11 @@ impl crate::app::App {
                 Item::new(
                     "Encoder quality preset",
                     "",
-                    widget::dropdown(
+                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
                         &crate::encode::VAAPI_CL_LABELS,
                         Some(sel),
                         |a0| Msg::Settings(SettingsMsg::SetVaapiPreset(a0)),
-                    ),
+                    )),
                 )
                 .reset_with(sel, def, |a0| Msg::Settings(SettingsMsg::SetVaapiPreset(a0)))
             }
@@ -113,7 +113,7 @@ impl crate::app::App {
         Item::new(
             "Video codec",
             "",
-            widget::dropdown(&crate::encode::CODEC_LABELS, Some(sel), |a0| Msg::Settings(SettingsMsg::SetRecordCodec(a0))),
+            crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(&crate::encode::CODEC_LABELS, Some(sel), |a0| Msg::Settings(SettingsMsg::SetRecordCodec(a0)))),
         )
         .reset_with(sel, def, |a0| Msg::Settings(SettingsMsg::SetRecordCodec(a0)))
     }
@@ -214,7 +214,7 @@ impl crate::app::App {
             Item::new(
                 "Capture method",
                 "",
-                widget::dropdown(&methods.labels, cur, move |i| setter(ids[i].to_string())),
+                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(&methods.labels, cur, move |i| setter(ids[i].to_string()))),
             )
             .reset_with(selected.to_string(), default_id, setter),
         ];
@@ -243,7 +243,7 @@ impl crate::app::App {
                         "{noun} reuse the screen access you previously granted. Forget it to be \
                          asked again next time.\n\n{portal_note}"
                     ),
-                    widget::button::standard("Forget").on_press(Msg::Settings(SettingsMsg::ResetScreencastPermission)),
+                    crate::widgets::arrow_cursor::arrow_cursor(widget::button::standard("Forget").on_press(Msg::Settings(SettingsMsg::ResetScreencastPermission))),
                 ));
             } else {
                 let t = self.pipewire_source_types;

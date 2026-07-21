@@ -664,20 +664,22 @@ impl App {
         // its glyph, so use button::custom with a fill+center container holding a 16px
         // symbolic icon (matching the rail's glyph size) to both hit 44px and centre.
         #[cfg(not(target_os = "macos"))]
-        let toggle_nav = widget::button::custom(
-            widget::container(toggle_icon)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                // Nudge 1px right of centre: 2px left padding makes the centred icon's
-                // gaps 15px left / 13px right (1px more left, 1px less right).
-                .padding([0, 0, 0, 2]),
-        )
-        .class(cosmic::theme::Button::NavToggle)
-        .selected(focused)
-        .padding(0)
-        .width(Length::Fixed(44.0))
-        .height(Length::Fixed(36.0))
-        .on_press(Msg::WindowChrome(WindowChromeMsg::ToggleConfigNav));
+        let toggle_nav = crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::custom(
+                widget::container(toggle_icon)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    // Nudge 1px right of centre: 2px left padding makes the centred icon's
+                    // gaps 15px left / 13px right (1px more left, 1px less right).
+                    .padding([0, 0, 0, 2]),
+            )
+            .class(cosmic::theme::Button::NavToggle)
+            .selected(focused)
+            .padding(0)
+            .width(Length::Fixed(44.0))
+            .height(Length::Fixed(36.0))
+            .on_press(Msg::WindowChrome(WindowChromeMsg::ToggleConfigNav)),
+        );
         // macOS (DRAGON-135): next to the traffic lights the rail-width NavToggle box
         // reads as dead space, so the toggle is a COMPACT box instead — the 16px glyph
         // with a MAC_HEADER_GLYPH_HALO halo, standard Icon class (the theme's medium
@@ -685,17 +687,19 @@ impl App {
         // the lights' centreline (tuned live on-device).
         #[cfg(target_os = "macos")]
         let toggle_nav = widget::container(
-            widget::button::custom(
-                widget::container(toggle_icon)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill),
-            )
-            .class(cosmic::theme::Button::Icon)
-            .selected(focused)
-            .padding(0)
-            .width(Length::Fixed(MAC_HEADER_BTN))
-            .height(Length::Fixed(MAC_HEADER_BTN))
-            .on_press(Msg::WindowChrome(WindowChromeMsg::ToggleConfigNav)),
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(
+                    widget::container(toggle_icon)
+                        .center_x(Length::Fill)
+                        .center_y(Length::Fill),
+                )
+                .class(cosmic::theme::Button::Icon)
+                .selected(focused)
+                .padding(0)
+                .width(Length::Fixed(MAC_HEADER_BTN))
+                .height(Length::Fixed(MAC_HEADER_BTN))
+                .on_press(Msg::WindowChrome(WindowChromeMsg::ToggleConfigNav)),
+            ),
         )
         .height(Length::Fill)
         .align_y(cosmic::iced::Alignment::Start);
@@ -713,14 +717,16 @@ impl App {
             // traffic-light alignment (a symmetric halo, nothing hanging below).
             #[cfg(target_os = "macos")]
             {
-                widget::container(btn.padding(MAC_HEADER_GLYPH_HALO))
-                    .height(Length::Fill)
-                    .align_y(cosmic::iced::Alignment::Start)
-                    .into()
+                widget::container(crate::widgets::arrow_cursor::arrow_cursor(
+                    btn.padding(MAC_HEADER_GLYPH_HALO),
+                ))
+                .height(Length::Fill)
+                .align_y(cosmic::iced::Alignment::Start)
+                .into()
             }
             #[cfg(not(target_os = "macos"))]
             {
-                btn.padding(8).into()
+                crate::widgets::arrow_cursor::arrow_cursor(btn.padding(8))
             }
         };
         let header = widget::header_bar()
@@ -735,9 +741,23 @@ impl App {
         // minimize/zoom are native. Vertical alignment against the lights comes from
         // the toolbar style in `center_titlebar_buttons`, not padding here (growing
         // a child of the centre-aligned header row just clips it).
+        //
+        // DRAGON-268 follow-up (fullscreen header vanish): in NATIVE fullscreen the
+        // traffic lights auto-hide (they only drop down on a mouse-to-top), so the
+        // 72px inset reserved for them is dead space that pushes the nav toggle /
+        // search needlessly right. Collapse the inset to 0 in fullscreen so the app's
+        // own header controls sit flush at the leading edge where the lights were. The
+        // native toolbar-detach in `match_window_fullscreen_backdrop` is what keeps the
+        // buttons visible at all in fullscreen; this just seats them correctly.
+        #[cfg(target_os = "macos")]
+        let lead_inset = if self.settings_fullscreen {
+            0.0
+        } else {
+            TRAFFIC_LIGHTS_INSET
+        };
         #[cfg(target_os = "macos")]
         let header = header
-            .start(widget::Space::new().width(Length::Fixed(TRAFFIC_LIGHTS_INSET)))
+            .start(widget::Space::new().width(Length::Fixed(lead_inset)))
             .start(toggle_nav)
             .start(search);
         // Windows (DRAGON-284): the native DWM caption buttons (min/max/close, top-right)
@@ -799,8 +819,16 @@ impl App {
             // The pinned head: the page title, plus the in-page tab strip for the
             // tabbed pages. Built as its own `view_column` so its title/tab spacing
             // matches the section spacing below.
+            // The title fills the width so the CENTERED helper's inner max-width box is
+            // always the full 820 (not shrunk to the title's own width): on tabbed pages
+            // the tab strip already stretches the head to 820, so a fill title is a no-op
+            // there; on the non-tabbed Health/About pages the head is JUST the title, so
+            // without this the box hugs the title and `center_x` centres it — this keeps
+            // Health/About titles LEFT-aligned exactly like the tabbed pages (DRAGON-268).
             let mut head_col: Vec<Element<'_, Msg>> =
-                vec![widget::text::title3(Self::page_name(active)).into()];
+                vec![widget::text::title3(Self::page_name(active))
+                    .width(Length::Fill)
+                    .into()];
             let mut col: Vec<Element<'_, Msg>> = Vec::new();
             match active {
                 ConfigTab::General => {
@@ -995,15 +1023,14 @@ impl App {
                     } else {
                         (Self::page_icon(tab), rail_button_class(tab == active))
                     };
-                    rail.push(
+                    rail.push(crate::widgets::arrow_cursor::arrow_cursor(
                         widget::button::icon(widget::icon::from_name(icon_name))
                             .class(class)
                             .tooltip(Self::page_name(tab))
                             .on_press(Msg::WindowChrome(WindowChromeMsg::SetConfigTab(entity)))
                             .width(Length::Fixed(32.0))
-                            .height(Length::Fixed(32.0))
-                            .into(),
-                    );
+                            .height(Length::Fixed(32.0)),
+                    ));
                 }
             }
             let factory = widget::button::icon(widget::icon::from_name("edit-undo-symbolic"))
@@ -1016,7 +1043,7 @@ impl App {
                     widget::scrollable(widget::column(rail).spacing(xxs))
                         .height(Length::Fill)
                         .into(),
-                    factory.into(),
+                    crate::widgets::arrow_cursor::arrow_cursor(factory),
                 ])
                 .spacing(xxs),
             )
@@ -1158,8 +1185,8 @@ impl App {
         let dialog = widget::dialog()
             .title(title)
             .body(body)
-            .primary_action(widget::button::destructive("Reset").on_press(Msg::WindowChrome(WindowChromeMsg::ConfirmReset)))
-            .secondary_action(widget::button::text("Cancel").on_press(Msg::WindowChrome(WindowChromeMsg::CancelReset)));
+            .primary_action(crate::widgets::arrow_cursor::arrow_cursor(widget::button::destructive("Reset").on_press(Msg::WindowChrome(WindowChromeMsg::ConfirmReset))))
+            .secondary_action(crate::widgets::arrow_cursor::arrow_cursor(widget::button::text("Cancel").on_press(Msg::WindowChrome(WindowChromeMsg::CancelReset))));
         let centered: Element<'_, Msg> = widget::container(dialog)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
@@ -1181,9 +1208,12 @@ impl App {
             return window;
         };
         // The "Don't remind me again" checkbox — two-way bound to the dialog state.
-        let remind = widget::checkbox(dialog.dont_remind)
-            .label("Don't remind me again")
-            .on_toggle(|c| Msg::Settings(SettingsMsg::UpdateDialogRemindToggled(c)));
+        // Wrapped so it shows the arrow, not the hand, on hover (house style).
+        let remind = crate::widgets::arrow_cursor::arrow_cursor(
+            widget::checkbox(dialog.dont_remind)
+                .label("Don't remind me again")
+                .on_toggle(|c| Msg::Settings(SettingsMsg::UpdateDialogRemindToggled(c))),
+        );
         let card = widget::dialog()
             .title("Update available")
             .body(
@@ -1191,14 +1221,14 @@ impl App {
                  update from the About page in settings.",
             )
             .control(remind)
-            .primary_action(
+            .primary_action(crate::widgets::arrow_cursor::arrow_cursor(
                 widget::button::suggested("Update Now")
                     .on_press(Msg::Settings(SettingsMsg::UpdateDialogNow)),
-            )
-            .secondary_action(
+            ))
+            .secondary_action(crate::widgets::arrow_cursor::arrow_cursor(
                 widget::button::text("Update Later")
                     .on_press(Msg::Settings(SettingsMsg::UpdateDialogLater)),
-            );
+            ));
         // A click-absorbing scrim behind the card. Unlike the reset modal, an
         // outside click does NOT dismiss (the user must choose an explicit action so
         // the checkbox decision is deliberate), so the backdrop is inert.
@@ -1467,11 +1497,12 @@ impl App {
         on_activate: fn(widget::segmented_button::Entity) -> Msg,
     ) -> Element<'a, Msg> {
         let gap = cosmic::theme::active().cosmic().space_xxs();
-        widget::tab_bar::horizontal(model)
-            .button_alignment(Alignment::Center)
-            .button_spacing(gap)
-            .on_activate(on_activate)
-            .into()
+        crate::widgets::arrow_cursor::arrow_cursor(
+            widget::tab_bar::horizontal(model)
+                .button_alignment(Alignment::Center)
+                .button_spacing(gap)
+                .on_activate(on_activate),
+        )
     }
 
     /// The hand-rolled custom-accent colour-picker sidebar (DRAGON-139) — a

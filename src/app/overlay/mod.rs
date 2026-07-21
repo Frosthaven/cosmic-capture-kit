@@ -109,9 +109,28 @@ impl App {
     // Window mode: cosmic-screenshot's picker — each window button is sized to
     // its (ScaleDown) thumbnail inside a width-proportional, centered slot, laid
     // over the wallpaper. Matches xdg-desktop-portal-cosmic's widget exactly.
+    /// Top inset (logical points) the window picker must leave clear so its content
+    /// never renders behind a notched MacBook's camera cutout (DRAGON-270). On macOS
+    /// this is `NSScreen.safeAreaInsets.top` for this output's display (0 on a
+    /// non-notched panel); every other platform has no notch, so it is a compile-time 0.
+    fn picker_top_inset(&self, o: &OutputState) -> f32 {
+        #[cfg(target_os = "macos")]
+        {
+            crate::platform::mac::notch_top_inset(&o.name) as f32
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = o;
+            0.0
+        }
+    }
+
     pub(super) fn window_view(&self, o: &OutputState) -> Element<'_, Msg> {
         let empty: &[WindowThumb] = &[];
         let thumbs = self.windows.get(&o.name).map(|v| v.as_slice()).unwrap_or(empty);
+        // Push the picker content down below a notched display's camera cutout so
+        // thumbnails / chrome never sit behind it (0 on non-notched + non-mac).
+        let notch_top = self.picker_top_inset(o);
 
         // The spinner overlay stays up through the warmup frames after windows
         // load, so the picker (built below) renders behind it and is fully ready
@@ -131,6 +150,11 @@ impl App {
                 .height(Length::Fill)
                 .align_x(Alignment::Center)
                 .align_y(Alignment::Center)
+                // Keep the centred message clear of a notched display's cutout band.
+                .padding(cosmic::iced::Padding {
+                    top: notch_top,
+                    ..cosmic::iced::Padding::ZERO
+                })
                 .into()
         } else {
             // Lay the windows out at their TRUE relative sizes: ONE scale factor for all
@@ -153,7 +177,9 @@ impl App {
                 + toolbar::layout::BOTTOM_MARGIN
                 + crate::app::layout::BADGE_GAP;
             let avail_w = (pw - 48.0).max(1.0);
-            let avail_h = (ph - 24.0 - toolbar_reserve).max(1.0);
+            // The notch band eats into the top of the usable height (added to the top
+            // padding below), so the tile-scale budget must exclude it too.
+            let avail_h = (ph - 24.0 - notch_top - toolbar_reserve).max(1.0);
             // Size the tiles from `layout_size` (the TRIMMED content size on macOS, so a
             // dead transparent gutter never inflates the slot — DRAGON-190; equals the
             // frame size elsewhere), while the click below still passes the raw `rect`.
@@ -206,9 +232,10 @@ impl App {
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
             // 24px on three sides; the bottom reserves the toolbar band so the centred grid
-            // sits entirely above it.
+            // sits entirely above it. The top also clears a notched display's cutout band
+            // (`notch_top`, 0 on non-notched + non-mac) so the grid never rides under it.
             .padding(cosmic::iced::Padding {
-                top: 24.0,
+                top: 24.0 + notch_top,
                 right: 24.0,
                 bottom: toolbar_reserve,
                 left: 24.0,

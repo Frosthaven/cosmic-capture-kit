@@ -444,6 +444,10 @@ impl cosmic::Application for App {
                 mic_test_modal_open: false,
                 window_radius: radius,
                 glass,
+                #[cfg(target_os = "macos")]
+                settings_fullscreen: false,
+                #[cfg(target_os = "macos")]
+                preview_fullscreen: false,
                 wallpaper_handles: HashMap::new(),
                 origin_window: None,
                 frozen_win_px: HashMap::new(),
