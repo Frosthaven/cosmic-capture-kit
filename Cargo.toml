@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.15.1"
+version = "0.16.1"
 edition = "2024"
 description = "Native COSMIC capture overlay (region/window/monitor) for screenshots and screen recording: native screencopy capture, clipboard sharing, and in-region QR/barcode + OCR detection."
 license = "GPL-3.0-only"
@@ -190,6 +190,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     # packages land in the lock.
     "NSImageView",
     "NSCell",
+    # DRAGON-293: NSVisualEffectView + a rounded maskImage for clean vibrant window corners
+    # (replaces winit's private CGS window-blur, which fringes at the non-opaque rounded edge;
+    # needs the winit [patch] fork so the reparented WinitView is still found).
+    "NSVisualEffectView",
     # DRAGON-147: trackpad pinch-to-zoom in the preview editor — an
     # NSMagnificationGestureRecognizer on the preview window's content view
     # (iced/winit surface no pinch gesture of their own).
@@ -480,6 +484,20 @@ zero-copy = ["dep:ffmpeg-next", "dep:gbm"]
 [patch."https://github.com/pop-os/cosmic-protocols"]
 cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c253ec1" }
 cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c253ec1" }
+
+# DRAGON-293: patch the winit workspace to our fork carrying the WindowDelegate::view() fix
+# (it finds the WinitView even when it's nested inside a masked NSVisualEffectView backdrop),
+# which lets the macOS settings/preview windows have clean rounded vibrancy corners with no
+# edge fringe. Every desktop winit-* member is patched to the SAME fork source so the workspace
+# resolves to one place (patching a single member would duplicate winit-core and fail to build).
+[patch."https://github.com/pop-os/winit.git"]
+winit = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
+winit-appkit = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
+winit-common = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
+winit-core = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
+winit-wayland = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
+winit-x11 = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
+winit-win32 = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
 
 # Optimize dependencies even in dev builds. The capture pipeline leans hard on
 # dependency crates (image/png/miniz_oxide PNG decode+encode, fast_blur for the

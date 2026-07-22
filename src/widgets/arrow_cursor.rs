@@ -10,8 +10,10 @@
 //!
 //! It is a pure pass-through: every `Widget` method delegates to the content
 //! unchanged EXCEPT [`mouse_interaction`](Widget::mouse_interaction), which maps a
-//! `Pointer` result to `None` (arrow) and passes every other interaction (text
-//! I-beam, resize, grab, …) through untouched.
+//! `Pointer` result to `Idle` (the DEFAULT arrow) and passes every other interaction
+//! (text I-beam, resize, grab, …) through untouched. It must be `Idle`, not `None`:
+//! `None` DEFERS (the cursor keeps whatever it was on enter), so a wrapped button
+//! wouldn't re-assert the arrow; `Idle` explicitly sets the default arrow.
 
 use cosmic::iced::core::widget::{Operation, Tree};
 use cosmic::iced::core::{
@@ -112,7 +114,7 @@ impl<'a, Msg> Widget<Msg, cosmic::Theme, cosmic::Renderer> for ArrowCursor<'a, M
         );
         // The whole point: the hand becomes the arrow; everything else is untouched.
         if inner == mouse::Interaction::Pointer {
-            mouse::Interaction::None
+            mouse::Interaction::Idle
         } else {
             inner
         }
@@ -219,7 +221,7 @@ impl<Msg> cosmic::iced::core::Overlay<Msg, cosmic::Theme, cosmic::Renderer>
             .as_overlay()
             .mouse_interaction(layout, cursor, renderer);
         if inner == mouse::Interaction::Pointer {
-            mouse::Interaction::None
+            mouse::Interaction::Idle
         } else {
             inner
         }

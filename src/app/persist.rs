@@ -59,13 +59,17 @@ impl App {
             },
             allow_multiple: self.allow_multiple,
             resident: self.resident,
+            autostart_on_login: self.autostart_on_login,
             capture_hotkey: self.capture_hotkey.clone(),
+            capture_active_window_hotkey: self.capture_active_window_hotkey.clone(),
+            capture_active_monitor_hotkey: self.capture_active_monitor_hotkey.clone(),
             // Not cached on App (they're one-time lifecycle markers, not live
             // settings): carry whatever's on disk forward so a normal save never
             // clobbers them. Only init's first-run flow / the daemon's login-item
             // seed write them (directly).
             mac_first_run_seen: crate::state::load().mac_first_run_seen,
             mac_login_item_seeded: crate::state::load().mac_login_item_seeded,
+            win_login_item_seeded: crate::state::load().win_login_item_seeded,
             region_overlay_opacity: self.region_overlay_opacity,
             active_overlay_opacity: self.active_overlay_opacity,
             preview_overlay_opacity: self.preview_overlay_opacity,
@@ -150,7 +154,10 @@ impl App {
         self.freeze = p.freeze;
         self.allow_multiple = p.allow_multiple;
         self.resident = p.resident;
+        self.autostart_on_login = p.autostart_on_login;
         self.capture_hotkey = p.capture_hotkey.clone();
+        self.capture_active_window_hotkey = p.capture_active_window_hotkey.clone();
+        self.capture_active_monitor_hotkey = p.capture_active_monitor_hotkey.clone();
         self.region_overlay_opacity = p.region_overlay_opacity.clamp(0.0, 1.0);
         self.active_overlay_opacity = p.active_overlay_opacity.clamp(0.0, 1.0);
         self.preview_overlay_opacity = p.preview_overlay_opacity.clamp(0.0, 1.0);
@@ -241,6 +248,7 @@ impl App {
                     settings::GeneralTab::Settings => {
                         p.allow_multiple = d.allow_multiple;
                         p.resident = d.resident;
+                        p.autostart_on_login = d.autostart_on_login;
                         p.copy_to_clipboard = d.copy_to_clipboard;
                         p.clipboard_max_mb = d.clipboard_max_mb;
                         p.preview_after_capture = d.preview_after_capture;
@@ -336,9 +344,13 @@ impl App {
                 let tab = self.settings.active_shortcuts_tab();
                 p.shortcuts
                     .retain(|(a, _)| settings::ShortcutsTab::for_group(a.group()) != tab);
-                // The macOS global "Start Capture" hotkey row lives on the Capture tab.
+                // The macOS/Windows global capture hotkey rows (DRAGON-295: all three) live
+                // on the Capture tab, so a Capture-tab reset restores each to its default
+                // (all UNSET now).
                 if tab == settings::ShortcutsTab::Capture {
                     p.capture_hotkey = d.capture_hotkey.clone();
+                    p.capture_active_window_hotkey = d.capture_active_window_hotkey.clone();
+                    p.capture_active_monitor_hotkey = d.capture_active_monitor_hotkey.clone();
                 }
             }
             // About and Health are read-only (nothing to reset).

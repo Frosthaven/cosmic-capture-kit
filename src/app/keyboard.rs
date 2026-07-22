@@ -47,17 +47,18 @@ impl App {
         // like the in-app rebind below; the two are never active at once (each row's
         // button cancels the other's mode by starting its own).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if self.settings.capture_hotkey_rebinding {
+        if let Some(slot) = self.settings.capture_hotkey_rebinding {
             if key == Key::Named(Named::Escape) {
-                self.settings.capture_hotkey_rebinding = false; // Esc cancels capture
+                self.settings.capture_hotkey_rebinding = None; // Esc cancels capture
                 return Task::none();
             }
             if let Some(sc) = crate::shortcuts::Shortcut::from_event(modifiers, &key) {
                 // Serialize to the daemon spec and route through the SAME message the
-                // former text field used, so persist + daemon-restart are unchanged.
-                self.settings.capture_hotkey_rebinding = false;
+                // former text field used, so persist + daemon-restart are unchanged. The
+                // captured chord targets the slot the armed row belongs to (DRAGON-295).
+                self.settings.capture_hotkey_rebinding = None;
                 let spec = sc.daemon_spec();
-                return self.update(Msg::Settings(SettingsMsg::SetCaptureHotkey(spec)));
+                return self.update(Msg::Settings(SettingsMsg::SetCaptureHotkey(slot, spec)));
             }
             // A bare modifier press: keep waiting for a real key.
             return Task::none();

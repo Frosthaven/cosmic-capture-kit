@@ -172,6 +172,21 @@ impl App {
             }
             return Task::none();
         }
+        // DRAGON-295: an IMMEDIATE picker-free capture (`--active-window` / `--active-monitor`,
+        // typically from a daemon global hotkey). Resolve the target NOW and drive it straight
+        // through the capture pipeline, minting NO overlay windows. On a failure to resolve
+        // (no frontmost window, no display under the cursor) we fall through to the normal
+        // overlay so the user can still pick. macOS/Windows only; Linux never sets `immediate`.
+        #[cfg(not(target_os = "linux"))]
+        if let Some(imm) = self.startup_immediate.take() {
+            if let Some(task) = self.immediate_capture(imm) {
+                return task;
+            }
+            log::warn!(
+                "immediate capture ({imm:?}) could not resolve a target; \
+                 falling back to the picker overlay"
+            );
+        }
         // Tiling-WM handling (DRAGON-154): by default AeroSpace never manages the
         // overlays at all (the pre-order-front chrome strip opts them out of its
         // detection), so there is nothing to pause. The legacy whole-session pause
@@ -447,6 +462,10 @@ impl App {
             const MAX_ATTEMPTS: u8 = 30;
             const RETRY_MS: u64 = 40;
             if crate::platform::mac::window::place_overlay(&o.name, o.logical_pos, o.logical_size) {
+                // Opt the overlay out of the user's tiling WM via the portable seam. The
+                // pre-order-front chrome strip already classified it as an AeroSpace popup;
+                // this backstops that title-scoped, through the shared entry point.
+                crate::platform::opt_out_of_tiling(&o.name);
                 // Placed. A tiling WM never manages the overlay (the DRAGON-154
                 // chrome-strip opt-out, or the escape-hatch pause), so nothing
                 // re-homes it — no burst needed. DRAGON-204: mark placed so the view
@@ -494,6 +513,11 @@ impl App {
                 &o.name,
                 o.logical_pos,
                 o.logical_size,
+                // DRAGON-298: a transient capture SELECTOR must show NO taskbar button (clears
+                // the winit-set WS_EX_APPWINDOW that overrides its WS_EX_TOOLWINDOW).
+                false,
+                // The selector needs keyboard focus for Escape / shortcuts.
+                true,
             );
             if placed || attempt >= MAX_ATTEMPTS {
                 if attempt >= MAX_ATTEMPTS {
@@ -508,6 +532,10 @@ impl App {
                 // app's own topmost / DWM independent-flip state; a cheap z-order-only SetWindowPos
                 // after the present grace pins us above it. No-op if the window is already gone.
                 if placed {
+                    // Opt the overlay out of the user's tiling WM via the portable seam.
+                    // `place_overlay` already set the komorebi bit pre-show; this is the
+                    // idempotent, title-scoped confirmation through the shared entry point.
+                    crate::platform::opt_out_of_tiling(&o.name);
                     crate::platform::windows::window::reassert_topmost(&o.name);
                 }
                 // DRAGON-276: during a COUNTDOWN or RECORDING the overlay must be click-through
@@ -603,10 +631,10 @@ impl App {
         )
     }
 
-    /// Windows (DRAGON-229 komorebi opt-out + DRAGON-233 fix 6): the windowed preview
-    /// was opened `visible:false`; once its async-set title lands, komorebi-float it
-    /// (`WS_EX_DLGMODALFRAME` before first show), CENTER it on its target monitor's work
-    /// area, and show it — the Windows sibling of the mac finalize above, matched by
+    /// Windows (DRAGON-233 fix 6): the windowed preview was opened `visible:false`; once its
+    /// async-set title lands, CENTER it on its target monitor's work area and show it — the
+    /// Windows sibling of the mac finalize above. DRAGON-302: no komorebi opt-out, so a tiling
+    /// WM tiles it like a normal window (the tiler then owns placement). Matched by
     /// [`super::shell::PREVIEW_WINDOW_TITLE`]. winit opens a new toplevel at the OS
     /// default cascade (not centered — the user's off-center report), so
     /// [`crate::platform::windows::window::show_centered`] positions it natively while
@@ -650,6 +678,15 @@ impl App {
                 // Mica backdrop (DRAGON-267): the windowed preview is now shown — apply the
                 // DWM Mica material. The chrome already paints translucent from `self.glass`.
                 crate::platform::windows::window::apply_mica(super::shell::PREVIEW_WINDOW_TITLE);
+            }
+            // DRAGON-305: a WINDOWED single-window capture pre-opened the fullscreen BLOCKER cover
+            // to hide the grab/compose, then swapped it for THIS window (`swap_neutral_spinner_to_window`,
+            // which set `grab_overlay_closing`). The window mapped UNDER the cover (still painting
+            // `grab_cover_view`) with no desktop flash; now it is shown + placed, so the cover has
+            // served its purpose — close it. The mac sibling closes it here too (surfaces.rs); no-op
+            // for a normal (non-swap) preview open, where nothing is pending.
+            if let Some(cover) = self.grab_overlay_closing.take() {
+                return super::shell::close_surface(cover);
             }
         }
         if shown || attempt >= MAX_ATTEMPTS {
@@ -700,6 +737,12 @@ impl App {
             super::shell::PREVIEW_OVERLAY_TITLE,
             pos,
             size,
+            // DRAGON-298: the preview editor KEEPS its taskbar button (leave WS_EX_APPWINDOW set).
+            true,
+            // DRAGON-305: a normal overlay preview activates for its hotkeys; the pre-open BLOCKER
+            // cover (`win_preview_preopen`) shows NON-ACTIVATING so it can't steal the target's
+            // foreground during the concurrent grab. It is swapped for the real window afterward.
+            !self.win_preview_preopen,
         );
         if placed {
             // DRAGON-281: the overlay is placed + shown — record it so `sub_preview_finalize`

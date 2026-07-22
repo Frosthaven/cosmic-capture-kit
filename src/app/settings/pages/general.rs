@@ -47,23 +47,36 @@ impl crate::app::App {
                     // is gated to the OSes that have a resident.
                     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
                     {
-                        #[cfg(target_os = "macos")]
-                        let desc = "Cosmic Capture Kit will remain in the background, enabling \
-                                    global hotkey use and faster launch.";
-                        #[cfg(target_os = "windows")]
-                        let desc = "Cosmic Capture Kit will keep a tray icon running in the \
-                                    background, enabling the global capture hotkey and faster launch.";
-                        #[cfg(target_os = "linux")]
-                        let desc = "Cosmic Capture Kit will keep a tray icon running in the \
-                                    background for quick capture and recording controls.";
                         items.push(
                             Item::new(
-                                "Keep running in the background",
-                                desc,
+                                "Keep system tray icon",
+                                "Cosmic Capture Kit will remain in the system tray for easily \
+                                 launching capture sessions.",
                                 toggle(self.resident, |a0| Msg::Settings(SettingsMsg::SetResident(a0))),
                             )
                             .reset_with(self.resident, d.resident, |a0| Msg::Settings(SettingsMsg::SetResident(a0))),
                         );
+                        // DRAGON-296: launch-at-login. GATED by the tray toggle — the OS only
+                        // relaunches the resident if there's a resident to run, so the row is
+                        // hidden while "Keep system tray icon" is off (the login item is also
+                        // force-unregistered there by `reconcile_login_item`). Sits directly
+                        // below the tray row it depends on.
+                        if self.resident {
+                            items.push(
+                                Item::new(
+                                    "Automatically start on login",
+                                    "",
+                                    toggle(self.autostart_on_login, |a0| {
+                                        Msg::Settings(SettingsMsg::SetAutostartOnLogin(a0))
+                                    }),
+                                )
+                                .reset_with(
+                                    self.autostart_on_login,
+                                    d.autostart_on_login,
+                                    |a0| Msg::Settings(SettingsMsg::SetAutostartOnLogin(a0)),
+                                ),
+                            );
+                        }
                     }
                     items
                 },

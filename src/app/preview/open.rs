@@ -108,7 +108,11 @@ impl App {
         // shielding-level cover). Windows never sets either, keeping its decision byte-identical.
         #[cfg(target_os = "macos")]
         let force_neutral_overlay = self.mac_preview_preopen;
-        #[cfg(not(target_os = "macos"))]
+        // Windows (DRAGON-305): a WINDOWED window pick pre-opens the fullscreen blocker cover; force
+        // the overlay branch while that pre-open is pending (the non-activating shielding cover).
+        #[cfg(windows)]
+        let force_neutral_overlay = self.win_preview_preopen;
+        #[cfg(not(any(target_os = "macos", windows)))]
         let force_neutral_overlay = self.window_spinner_neutral;
         // Linux (layer-shell), macOS, and now Windows (DRAGON-233 fix 5 — a real
         // PlainWindows overlay, below) all honor `preview_windowed`. The cfg! folds to
@@ -578,7 +582,7 @@ impl App {
             // border. The transparent surface only shows through outside the rounded corners.
             let focused = self.core.focused_window() == Some(preview.window);
             let header = widget::header_bar()
-                .title("Cosmic Capture Kit - Preview")
+                .title(super::shell::PREVIEW_WINDOW_TITLE)
                 .focused(focused)
                 .on_drag(Msg::Preview(PreviewMsg::WindowDrag))
                 .on_double_click(Msg::Preview(PreviewMsg::WindowMaximize));

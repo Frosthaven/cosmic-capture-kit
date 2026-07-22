@@ -41,6 +41,21 @@ impl cosmic::Application for App {
         // Recordings + meters read the mic source from this global; set it from the
         // persisted choice now so it applies even if settings is never opened.
         crate::audio::config::set_mic_source(&persisted.mic_device);
+        // COSMIC float exception (DRAGON-301 review): if the windowed preview is set to FLOAT
+        // (`preview_float_cosmic`), RE-ASSERT the tiling exception at startup — well before any
+        // preview window maps — so an existing user's pre-rename ("… - Preview") exception is
+        // MIGRATED to the renamed title eagerly. Without this the migration only ran on the next
+        // float-toggle (its sole writer), so after an upgrade the preview would TILE until the
+        // user re-toggled. Routed through the same seam as the toggle handler (which passes the
+        // title from the single source of truth); idempotent once the exception already carries
+        // the new title, and internally a no-op off COSMIC.
+        #[cfg(target_os = "linux")]
+        if persisted.preview_float_cosmic {
+            crate::platform::linux::cosmic::quirks::set_cosmic_preview_float(
+                super::shell::PREVIEW_WINDOW_TITLE,
+                true,
+            );
+        }
         // First-run / missing-permission routing (macOS, DRAGON-130): a capture
         // launch that lacks the Screen Recording grant would only produce a blank
         // capture, so instead of proceeding we open the dedicated permission-checker
@@ -116,7 +131,17 @@ impl cosmic::Application for App {
         let launch_mode = if startup.kind == Some(Kind::Scanner) {
             Mode::Region
         } else {
-            startup.mode.unwrap_or(Mode::Region)
+            // DRAGON-295: an immediate capture pins the pipeline mode to match its target
+            // (active-window → Window so the window-capture path runs; active-monitor →
+            // Monitor) even though no overlay is shown. Otherwise the explicit `--mode` /
+            // the default Region applies.
+            match startup.immediate {
+                #[cfg(not(target_os = "linux"))]
+                Some(ImmediateCapture::ActiveWindow) => Mode::Window,
+                #[cfg(not(target_os = "linux"))]
+                Some(ImmediateCapture::ActiveMonitor) => Mode::Monitor,
+                _ => startup.mode.unwrap_or(Mode::Region),
+            }
         };
         let (precapture, frozen, frozen_slot, wallpaper_slot, cursor_slot) = acquire_scene(
             scene_active,
@@ -301,7 +326,11 @@ impl cosmic::Application for App {
                 #[cfg(target_os = "macos")]
                 mac_preview_preopen: false,
                 #[cfg(windows)]
+                win_preview_preopen: false,
+                #[cfg(windows)]
                 settings_shown_confirmed: false,
+                #[cfg(windows)]
+                settings_size_ready: false,
                 #[cfg(windows)]
                 preview_shown_confirmed: None,
                 settings,
@@ -327,6 +356,8 @@ impl cosmic::Application for App {
                 preview_output_scale: 1.0,
                 startup_preview,
                 preview_mode,
+                #[cfg(not(target_os = "linux"))]
+                startup_immediate: startup.immediate,
                 settings_size: persisted.settings_size,
                 ffmpeg_available,
                 ffprobe_available: crate::encode::ffprobe_available(),
@@ -346,7 +377,10 @@ impl cosmic::Application for App {
                 window_padding_px: NumField::new(persisted.window_padding_px),
                 allow_multiple: persisted.allow_multiple,
                 resident: persisted.resident,
+                autostart_on_login: persisted.autostart_on_login,
                 capture_hotkey: persisted.capture_hotkey.clone(),
+                capture_active_window_hotkey: persisted.capture_active_window_hotkey.clone(),
+                capture_active_monitor_hotkey: persisted.capture_active_monitor_hotkey.clone(),
                 #[cfg(target_os = "macos")]
                 aerospace_guard: None,
                 #[cfg(any(target_os = "macos", target_os = "windows"))]

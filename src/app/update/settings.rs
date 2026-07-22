@@ -224,68 +224,28 @@ impl App {
                             Err(e) => log::warn!("resident on: resident spawn failed: {e}"),
                         }
                     }
-                    // Launch-at-login is assumed TRUE whenever background mode is on (no
-                    // separate toggle, DRAGON-158): register it so the resident comes back
-                    // after a reboot/login. macOS uses SMAppService; Linux writes an XDG
-                    // autostart `.desktop`. Best-effort: log on failure, never panic.
-                    #[cfg(target_os = "macos")]
-                    if !crate::platform::mac::login_item::is_enabled() {
-                        if let Err(e) = crate::platform::mac::login_item::set(true) {
-                            log::warn!("resident on: login-item register failed: {e}");
-                        } else {
-                            log::info!("resident on: registered login item");
-                        }
-                    }
-                    #[cfg(target_os = "linux")]
-                    if !crate::platform::linux_autostart::is_enabled() {
-                        if let Err(e) = crate::platform::linux_autostart::set(true) {
-                            log::warn!("resident on: autostart entry write failed: {e}");
-                        } else {
-                            log::info!("resident on: wrote XDG autostart entry");
-                        }
-                    }
-                    #[cfg(target_os = "windows")]
-                    if !crate::platform::windows_autostart::is_enabled() {
-                        if let Err(e) = crate::platform::windows_autostart::set(true) {
-                            log::warn!("resident on: autostart registry write failed: {e}");
-                        } else {
-                            log::info!("resident on: wrote HKCU Run autostart value");
-                        }
-                    }
                 } else {
                     // Turn OFF: ask the running resident to exit (SIGTERM the resident-lock
                     // holder) so the tray item disappears now; harmless no-op if none up.
                     if crate::instance::signal_daemon_quit() {
                         log::info!("resident off: signalled the resident to exit");
                     }
-                    // Launch-at-login only makes sense in resident mode (DRAGON-158): turn
-                    // it off too, else the OS keeps launching the resident at login.
-                    // Best-effort: log on failure, never panic.
-                    #[cfg(target_os = "macos")]
-                    if crate::platform::mac::login_item::is_enabled() {
-                        if let Err(e) = crate::platform::mac::login_item::set(false) {
-                            log::warn!("resident off: login-item unregister failed: {e}");
-                        } else {
-                            log::info!("resident off: unregistered login item");
-                        }
-                    }
-                    #[cfg(target_os = "linux")]
-                    if crate::platform::linux_autostart::is_enabled() {
-                        if let Err(e) = crate::platform::linux_autostart::set(false) {
-                            log::warn!("resident off: autostart entry remove failed: {e}");
-                        } else {
-                            log::info!("resident off: removed XDG autostart entry");
-                        }
-                    }
-                    #[cfg(target_os = "windows")]
-                    if crate::platform::windows_autostart::is_enabled() {
-                        if let Err(e) = crate::platform::windows_autostart::set(false) {
-                            log::warn!("resident off: autostart registry remove failed: {e}");
-                        } else {
-                            log::info!("resident off: removed HKCU Run autostart value");
-                        }
-                    }
                 }
+                // Launch-at-login is driven by BOTH toggles now (DRAGON-296): the OS login
+                // item is registered iff the tray is on AND autostart is on. Turning the tray
+                // off unregisters it (the login item makes no sense with no resident to launch);
+                // turning it on registers it when the user hasn't opted autostart off.
+                self.reconcile_login_item();
+                Task::none()
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+            SettingsMsg::SetAutostartOnLogin(b) => {
+                // The "Automatically start on login" toggle (DRAGON-296). Only ever visible
+                // while the tray is on (the row is hidden otherwise), so this just persists the
+                // preference and re-derives the OS login-item state from both toggles.
+                self.autostart_on_login = b;
+                self.save_state();
+                self.reconcile_login_item();
                 Task::none()
             }
             SettingsMsg::SetRegionOpacity(v) => {
@@ -450,8 +410,13 @@ impl App {
                 // The writer lives in the Linux-only COSMIC profile now (DRAGON-220);
                 // off Linux it was already an internal no-op, so gating the call is
                 // byte-identical (the setter + save_state above still run everywhere).
+                // The written title is routed from the single source of truth (DRAGON-301); the
+                // writer also migrates a pre-rename ("… - Preview") exception to it.
                 #[cfg(target_os = "linux")]
-                crate::platform::linux::cosmic::quirks::set_cosmic_preview_float(b);
+                crate::platform::linux::cosmic::quirks::set_cosmic_preview_float(
+                    crate::app::shell::PREVIEW_WINDOW_TITLE,
+                    b,
+                );
                 Task::none()
             }
             SettingsMsg::PickDir(target) => {
@@ -708,19 +673,24 @@ impl App {
                 Task::none()
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            SettingsMsg::SetCaptureHotkey(spec) => {
-                // Persist the raw text as typed. The daemon falls back to the default if
-                // it can't be parsed, so a half-typed spec is never dangerous.
+            SettingsMsg::SetCaptureHotkey(slot, spec) => {
+                // Persist the raw text as typed. The daemon falls back to nothing if it
+                // can't be parsed, so a half-typed spec is never dangerous.
                 //
                 // PrintScreen is recordable despite the daemon owning it: while the chord
                 // recorder is armed, `sub_hotkey_suspend_ping` pings the daemon (SIGUSR2 on
                 // macOS, the named SUSPEND event on Windows) every ~1s, which UN-registers
-                // its capture hotkey for ~3s (extended per ping, auto-resumed on expiry —
+                // its capture hotkeys for ~3s (extended per ping, auto-resumed on expiry —
                 // see `crate::daemon` SuspendWindow). So a PrintScreen pressed during
                 // recording reaches THIS app and is captured like any other key, then the
                 // daemon re-registers a couple of seconds after recording ends.
-                // Restore-default remains as a no-keypress way to re-select PrintScreen.
-                self.capture_hotkey = spec;
+                // DRAGON-295: route the spec to the slot the row edits (All In One / Active
+                // Window / Active Monitor); each is an independent persisted spec.
+                *self.capture_hotkey_slot_mut(slot) = spec;
+                // On Windows `slot` is consumed only by the mut-setter above (the daemon's
+                // config poll re-registers all slots); silence the unused warning there.
+                #[cfg(target_os = "windows")]
+                let _ = slot;
                 // Persist the new spec. On Windows this is the WHOLE job (DRAGON-259): the
                 // running daemon's config-mtime poll notices the changed spec and re-registers
                 // the global hotkey IN PLACE — no quit, no respawn. The old code SIGTERM'd +
@@ -736,8 +706,9 @@ impl App {
                 // rather than resetting it out from under the user.
                 #[cfg(target_os = "macos")]
                 {
-                    let apply = crate::daemon::hotkey_spec_is_valid(&self.capture_hotkey)
-                        || crate::daemon::hotkey_spec_is_cleared(&self.capture_hotkey);
+                    let changed = self.capture_hotkey_slot(slot);
+                    let apply = crate::daemon::hotkey_spec_is_valid(changed)
+                        || crate::daemon::hotkey_spec_is_cleared(changed);
                     if apply && self.resident {
                         // Restart-the-daemon (the SetResident plumbing pattern): SIGTERM the
                         // running daemon so it exits, then spawn a fresh detached daemon that
@@ -760,25 +731,31 @@ impl App {
                 Task::none()
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            SettingsMsg::BeginCaptureHotkeyRebind => {
-                // Toggle: clicking the row that's already recording cancels it. Clear any
-                // in-app rebind so the two capture modes are never armed at once.
+            SettingsMsg::BeginCaptureHotkeyRebind(slot) => {
+                // Toggle: clicking the row that's already recording THIS slot cancels it;
+                // clicking a different row moves the recorder to it. Clear any in-app rebind
+                // so the two capture modes are never armed at once.
                 self.settings.rebinding = None;
-                self.settings.capture_hotkey_rebinding = !self.settings.capture_hotkey_rebinding;
-                // Just armed: send an IMMEDIATE suspend ping so the daemon un-registers
-                // its hotkey NOW (PrintScreen becomes recordable) rather than after the
-                // first ~1s timer tick. The `sub_hotkey_suspend_ping` subscription keeps
-                // it extended thereafter; the daemon auto-resumes once pings stop.
-                if self.settings.capture_hotkey_rebinding && self.resident {
+                self.settings.capture_hotkey_rebinding =
+                    if self.settings.capture_hotkey_rebinding == Some(slot) {
+                        None
+                    } else {
+                        Some(slot)
+                    };
+                // Just armed: send an IMMEDIATE suspend ping so the daemon un-registers its
+                // hotkeys NOW (PrintScreen becomes recordable) rather than after the first
+                // ~1s timer tick. The `sub_hotkey_suspend_ping` subscription keeps it
+                // extended thereafter; the daemon auto-resumes once pings stop.
+                if self.settings.capture_hotkey_rebinding.is_some() && self.resident {
                     crate::instance::signal_daemon_suspend_hotkey();
                 }
                 Task::none()
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             SettingsMsg::SuspendDaemonHotkeyPing => {
-                // Fire-and-forget: keep the daemon's hotkey suspended while recording.
+                // Fire-and-forget: keep the daemon's hotkeys suspended while recording.
                 // Only meaningful with a running daemon; a no-op otherwise.
-                if self.settings.capture_hotkey_rebinding && self.resident {
+                if self.settings.capture_hotkey_rebinding.is_some() && self.resident {
                     crate::instance::signal_daemon_suspend_hotkey();
                 }
                 Task::none()
@@ -1093,6 +1070,71 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// macOS/Windows (DRAGON-295): the persisted spec string for one of the three global
+    /// capture-hotkey slots. Central accessor so the message handler + settings row + the
+    /// daemon-restart decision all read the same field per slot. Only the macOS
+    /// daemon-restart decision reads it (Windows re-registers via the daemon's config poll,
+    /// so it needs only the mut setter), so it is honestly dead off macOS.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(in crate::app) fn capture_hotkey_slot(&self, slot: crate::app::CaptureHotkeySlot) -> &str {
+        match slot {
+            crate::app::CaptureHotkeySlot::AllInOne => &self.capture_hotkey,
+            crate::app::CaptureHotkeySlot::ActiveWindow => &self.capture_active_window_hotkey,
+            crate::app::CaptureHotkeySlot::ActiveMonitor => &self.capture_active_monitor_hotkey,
+        }
+    }
+
+    /// Mutable counterpart to [`Self::capture_hotkey_slot`] (DRAGON-295).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(in crate::app) fn capture_hotkey_slot_mut(
+        &mut self,
+        slot: crate::app::CaptureHotkeySlot,
+    ) -> &mut String {
+        match slot {
+            crate::app::CaptureHotkeySlot::AllInOne => &mut self.capture_hotkey,
+            crate::app::CaptureHotkeySlot::ActiveWindow => &mut self.capture_active_window_hotkey,
+            crate::app::CaptureHotkeySlot::ActiveMonitor => &mut self.capture_active_monitor_hotkey,
+        }
+    }
+
+    /// Reconcile the OS "launch at login" item with the current settings (DRAGON-296).
+    ///
+    /// The single place both the "Keep system tray icon" (`resident`) handler and the
+    /// "Automatically start on login" (`autostart_on_login`) handler route through, so the
+    /// desired login-item state is derived from ONE rule in ONE spot: the item is registered
+    /// iff `resident && autostart_on_login` (a resident to launch, and the user opted in),
+    /// and unregistered otherwise. Platform-agnostic on the outside — each OS's login-item
+    /// backend hides behind a `is_enabled()`/`set(bool)` seam with the SAME signature
+    /// (macOS `SMAppService`, Linux XDG autostart `.desktop`, Windows HKCU `Run`), so this
+    /// body is byte-identical across platforms bar the `#[cfg]`-selected module path.
+    /// Best-effort: only writes when the current state differs, logs on failure, never panics.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    pub(in crate::app) fn reconcile_login_item(&self) {
+        let want = self.resident && self.autostart_on_login;
+        // Each seam exposes `is_enabled()` (query the OS/file/registry) + `set(bool)`
+        // (register/unregister), returning an honest `Result<(), String>`. Cfg-select the
+        // one for this OS; the reconcile logic below is shared.
+        #[cfg(target_os = "macos")]
+        use crate::platform::mac::login_item as login;
+        #[cfg(target_os = "linux")]
+        use crate::platform::linux_autostart as login;
+        #[cfg(target_os = "windows")]
+        use crate::platform::windows_autostart as login;
+        if login::is_enabled() == want {
+            return; // already in the desired state; no write.
+        }
+        match login::set(want) {
+            Ok(()) => log::info!(
+                "login item reconciled: {} (resident={}, autostart={})",
+                if want { "registered" } else { "unregistered" },
+                self.resident,
+                self.autostart_on_login
+            ),
+            Err(e) => log::warn!("login item reconcile ({want}) failed: {e}"),
         }
     }
 

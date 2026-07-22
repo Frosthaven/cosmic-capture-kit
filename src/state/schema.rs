@@ -116,9 +116,10 @@ pub struct Persisted {
     /// Options not listed here fall back to `covermark_zoom` / `covermark_opacity`.
     #[serde(default)]
     pub covermark_prefs: Vec<CovermarkPref>,
-    /// Preview editor appearance: `true` = a resizable window, `false` = the fullscreen
-    /// overlay (default). Chosen under Settings → General → Capture Preview.
-    #[serde(default)]
+    /// Preview editor appearance: `true` = a resizable window (default), `false` = the
+    /// fullscreen overlay. Chosen under Settings → General → Capture Preview. Existing
+    /// users keep whatever they saved; only a fresh install picks up the windowed default.
+    #[serde(default = "default_true")]
     pub preview_windowed: bool,
     /// Automatically close the preview editor after a Save / Save As / Copy (default
     /// on — the historical always-close behaviour, now optional).
@@ -134,12 +135,22 @@ pub struct Persisted {
     pub allow_multiple: bool,
     /// Keep the resident tray/menu-bar process running so a capture is always one click
     /// away. On macOS (DRAGON-130) that is the menu-bar daemon (the global capture hotkey
-    /// is dead without it, so it defaults ON there, DRAGON-134); on Linux (DRAGON-173) it
-    /// is the ksni tray resident, which defaults OFF (opt-in — the one-shot model still
-    /// exits, and PrintScreen is a COSMIC custom shortcut, so nothing breaks without it).
-    /// ONE portable setting; the settings toggle now shows on both OSes.
+    /// is dead without it, so it defaults ON there, DRAGON-134); on Windows (DRAGON-296) it
+    /// is the Win32 tray daemon that owns the same global capture hotkey, so it ALSO defaults
+    /// ON there now, matching macOS; on Linux (DRAGON-173) it is the ksni tray resident, which
+    /// defaults OFF (opt-in — the one-shot model still exits, and PrintScreen is a COSMIC
+    /// custom shortcut, so nothing breaks without it). ONE portable setting; the settings
+    /// toggle now shows on all OSes.
     #[serde(default = "default_resident")]
     pub resident: bool,
+    /// Launch the resident at login (DRAGON-296): register the OS login item / autostart
+    /// entry so the tray resident comes back after a reboot/login. GATED by `resident` — the
+    /// settings row is hidden when the tray is off, and the actual login item is registered
+    /// only when BOTH this and `resident` are on (see `App::reconcile_login_item`). Default
+    /// ON. An additive serde-defaulted field (absent key ⇒ `true`), so old configs load
+    /// without a store-version bump.
+    #[serde(default = "default_true")]
+    pub autostart_on_login: bool,
     /// macOS (DRAGON-134): whether the one-time launch-at-login seeding has run.
     /// The first BUNDLED daemon startup registers the SMAppService login item
     /// (launch-at-login defaults on, for the same hotkey reason as `resident`)
@@ -147,15 +158,43 @@ pub struct Persisted {
     /// so an explicit opt-out is never overridden. Linux never reads it.
     #[serde(default)]
     pub mac_login_item_seeded: bool,
-    /// macOS (DRAGON-130): the global "Start Capture" hotkey the resident daemon
-    /// registers, as a spec string (e.g. "PrintScreen", "F13", "Cmd+Shift+2").
-    /// Default "PrintScreen" (the user's Linux capture key); a bare "PrintScreen"
-    /// also registers F13, since a PC keyboard's PrintScreen surfaces as F13 on
-    /// macOS. Parsed by `daemon::hotkey_spec`; an unparseable value falls back to
-    /// the default at registration. Linux ignores this (its capture key is a COSMIC
-    /// custom shortcut, not owned here); the settings row is macOS-only.
+    /// Windows (DRAGON-296): the Windows analog of `mac_login_item_seeded`. The first tray-daemon
+    /// startup registers the HKCU `Run` login item (launch-at-login defaults on, since the tray's
+    /// global capture hotkey needs the daemon — the same reason `resident` defaults on) and sets
+    /// this; after that the registry entry and the settings toggle own the state, so an explicit
+    /// opt-out is never re-seeded. An additive serde-defaulted field (absent key ⇒ `false`), so
+    /// old configs load without a store-version bump. macOS/Linux never read it.
+    #[serde(default)]
+    pub win_login_item_seeded: bool,
+    /// macOS/Windows (DRAGON-130 / DRAGON-295): the global "Capture All In One" hotkey
+    /// the resident daemon registers, as a spec string (e.g. "PrintScreen", "F13",
+    /// "Cmd+Shift+2"). Opens the full capture overlay (region/window/monitor picker).
+    /// Default UNSET (empty) since DRAGON-295 — a fresh install ships with NO global
+    /// capture hotkey, and the three capture actions are opt-in. A bare "PrintScreen"
+    /// also registers F13, since a PC keyboard's PrintScreen surfaces as F13 on macOS.
+    /// Parsed by `daemon::hotkey_spec`; an unparseable value falls back to the default
+    /// at registration. EXISTING users keep whatever value their config already holds
+    /// (the field is always serialized, so an upgrade preserves the old "PrintScreen").
+    /// Linux ignores this (its capture key is a COSMIC custom shortcut, not owned here);
+    /// the settings row is macOS/Windows-only.
     #[serde(default = "default_capture_hotkey")]
     pub capture_hotkey: String,
+    /// macOS/Windows (DRAGON-295): the global "Capture Active Window" hotkey the resident
+    /// daemon registers, as a spec string (same vocabulary as `capture_hotkey`).
+    /// Immediately captures the frontmost/active window with NO picker overlay. Default
+    /// UNSET (empty). A serde-defaulted additive field, so old configs load with it
+    /// absent (no store-version bump). Linux ignores it; the settings row is macOS/
+    /// Windows-only.
+    #[serde(default = "default_capture_active_window_hotkey")]
+    pub capture_active_window_hotkey: String,
+    /// macOS/Windows (DRAGON-295): the global "Capture Active Monitor" hotkey the resident
+    /// daemon registers, as a spec string (same vocabulary as `capture_hotkey`).
+    /// Immediately captures the monitor under the cursor with NO picker overlay. Default
+    /// UNSET (empty). A serde-defaulted additive field, so old configs load with it
+    /// absent (no store-version bump). Linux ignores it; the settings row is macOS/
+    /// Windows-only.
+    #[serde(default = "default_capture_active_monitor_hotkey")]
+    pub capture_active_monitor_hotkey: String,
     /// macOS (DRAGON-130): whether the first-run Screen Recording permission prompt
     /// has already been fired. On the first ever capture launch, if the grant is
     /// absent, the app requests it once (the OS dialog) and sets this so it never
@@ -513,9 +552,10 @@ fn default_true() -> bool {
 }
 
 fn default_resident() -> bool {
-    // The macOS global capture hotkey only works while the resident daemon runs,
-    // so residency defaults on there; Linux stays one-shot.
-    cfg!(target_os = "macos")
+    // The macOS AND Windows (DRAGON-296) global capture hotkeys only work while the resident
+    // daemon runs, so residency defaults on there; Linux stays one-shot (PrintScreen is a
+    // COSMIC custom shortcut, not owned by a daemon).
+    cfg!(any(target_os = "macos", target_os = "windows"))
 }
 
 fn default_record_backend() -> String {
@@ -533,10 +573,24 @@ fn default_screenshot_backend() -> String {
     crate::platform::backend::native_backend_id().to_string()
 }
 
-/// The default "Start Capture" global hotkey spec (the resident daemon's key). See
-/// [`Persisted::capture_hotkey`]. Public so the daemon can fall back to it.
+/// The default "Capture All In One" global hotkey spec (the resident daemon's main key).
+/// See [`Persisted::capture_hotkey`]. UNSET (empty) since DRAGON-295: a fresh install ships
+/// with no global capture hotkey; the three capture actions are opt-in. Public so the daemon
+/// can fall back to it (an empty fallback registers nothing, which is the intended "no key").
 pub fn default_capture_hotkey() -> String {
-    "PrintScreen".to_string()
+    String::new()
+}
+
+/// The default "Capture Active Window" global hotkey spec. UNSET (empty) — opt-in
+/// (DRAGON-295). See [`Persisted::capture_active_window_hotkey`].
+pub fn default_capture_active_window_hotkey() -> String {
+    String::new()
+}
+
+/// The default "Capture Active Monitor" global hotkey spec. UNSET (empty) — opt-in
+/// (DRAGON-295). See [`Persisted::capture_active_monitor_hotkey`].
+pub fn default_capture_active_monitor_hotkey() -> String {
+    String::new()
 }
 
 fn default_window_padding_px() -> u32 {

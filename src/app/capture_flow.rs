@@ -72,6 +72,70 @@ impl App {
         self.run_capture(sel)
     }
 
+    /// DRAGON-295 (macOS/Windows): run an IMMEDIATE, picker-free capture — the frontmost
+    /// window (`ActiveWindow`) or the monitor under the cursor (`ActiveMonitor`) — by
+    /// resolving the target's screen rect NOW and driving it straight through the normal
+    /// capture pipeline ([`Self::run_capture`]), minting NO overlay. Returns `None` when the
+    /// target can't be resolved (no frontmost window, no display under the cursor), so the
+    /// caller can fall back to the picker overlay. The pipeline mode was already pinned to
+    /// Window / Monitor in `init` so the right worker (window-focus grab vs monitor grab)
+    /// runs. Never called on Linux (its capture keys are COSMIC custom shortcuts).
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn immediate_capture(
+        &mut self,
+        imm: ImmediateCapture,
+    ) -> Option<Task<cosmic::Action<Msg>>> {
+        let sel = match imm {
+            ImmediateCapture::ActiveWindow => {
+                // The frontmost app's front window: its global rect + stable id feed a
+                // window `Selection` (the same shape a picker commit produces).
+                #[cfg(target_os = "macos")]
+                let win = crate::platform::mac::active_window();
+                // Windows: the foreground window (GetForegroundWindow + its DWM frame + a
+                // stable HWND id) as a `Toplevel`, the analogue of mac's `active_window`.
+                #[cfg(windows)]
+                let win = crate::platform::windows::active_window();
+                let win = win?;
+                let (x, y, w, h) = win.rect;
+                Selection {
+                    x,
+                    y,
+                    width: w.max(0) as u32,
+                    height: h.max(0) as u32,
+                    output: None,
+                    window_id: Some(win.id),
+                }
+            }
+            ImmediateCapture::ActiveMonitor => {
+                // The display under the pointer (fall back to the primary at origin when the
+                // pointer maps to none), as a monitor `Selection` keyed by the output name.
+                #[cfg(target_os = "macos")]
+                let (pointer, descs) = (
+                    Some(crate::platform::mac::global_pointer_position()),
+                    crate::screenshot::output_descs(),
+                );
+                // Windows: the cursor position (GetCursorPos, physical coords) + the live
+                // display list, mirroring the mac arm — `monitor_for_pointer` picks the
+                // display the cursor sits on.
+                #[cfg(windows)]
+                let (pointer, descs) = (
+                    crate::platform::windows::cursor_position(),
+                    crate::screenshot::output_descs(),
+                );
+                let desc = monitor_for_pointer(pointer, &descs)?;
+                Selection {
+                    x: desc.logical_pos.0,
+                    y: desc.logical_pos.1,
+                    width: desc.logical_size.0.max(0) as u32,
+                    height: desc.logical_size.1.max(0) as u32,
+                    output: Some(desc.name),
+                    window_id: None,
+                }
+            }
+        };
+        Some(self.run_capture(sel))
+    }
+
     pub(super) fn run_capture(&mut self, sel: Selection) -> Task<cosmic::Action<Msg>> {
         // Delayed shots grab LIVE pixels (the delay exists to change the screen),
         // so a freeze snapshot is bypassed for them. Scanner captures never delay
@@ -293,6 +357,13 @@ impl App {
         {
             self.mac_preview_preopen = mac_preopen;
         }
+        // DRAGON-305 (Windows): mirror the mac pre-open — a WINDOWED window pick covers the grab
+        // with the fullscreen blocker (forced overlay via `win_preview_preopen`), placed
+        // non-activating so the target's active grab is undisturbed.
+        #[cfg(windows)]
+        {
+            self.win_preview_preopen = mac_preopen;
+        }
         let preview_pre_open =
             immediate && (sel.window_id.is_none() || self.window_defocus_uses_spinner(&sel));
         let preview_open = if neutral_spinner || preview_pre_open || mac_preopen {
@@ -394,8 +465,28 @@ impl App {
     /// whole-monitor grab, else the output containing the selection's centre (falling
     /// back to any output).
     pub(super) fn output_for_selection(&self, sel: &Selection) -> Option<(OutputHandle, (u32, u32))> {
-        self.output_for_selection_state(sel)
-            .map(|o| (o.output.clone(), o.logical_size))
+        if let Some(o) = self.output_for_selection_state(sel) {
+            return Some((o.output.clone(), o.logical_size));
+        }
+        // DRAGON-304: a picker-free IMMEDIATE capture (`--active-window` / `--active-monitor`)
+        // returns before any overlay is minted, so `self.outputs` is EMPTY and the state
+        // lookup above finds nothing — which left `preview_output` `None`, so the post-capture
+        // preview never opened (present_capture fell through to a silent share): the reported
+        // "monitor does nothing" bug. Resolve the output from a LIVE display query instead. Off
+        // Linux the `OutputHandle` IS the output name, so this hands the preview a real monitor
+        // to open on. Linux never takes the immediate path and keeps its WlOutput-handle
+        // behaviour byte-identical (this fallback is cfg'd out there).
+        #[cfg(not(target_os = "linux"))]
+        {
+            output_desc_for_selection(sel).map(|d| {
+                (
+                    d.name,
+                    (d.logical_size.0.max(0) as u32, d.logical_size.1.max(0) as u32),
+                )
+            })
+        }
+        #[cfg(target_os = "linux")]
+        None
     }
 
     /// The backing scale (physical / logical) of the output a `sel` sits on — the
@@ -622,9 +713,26 @@ impl App {
         window_pick_preopen_decision(immediate, sel.window_id.is_some(), self.preview_after_capture)
     }
 
-    /// Off macOS the window pre-open is Linux's focus-neutral overlay (handled above) or
-    /// nothing; this mac-only pre-open never fires.
-    #[cfg(not(target_os = "macos"))]
+    /// DRAGON-305 (Windows): a WINDOWED single-window capture pre-opens its fullscreen loading
+    /// BLOCKER (spinner + cancel X) to cover the whole grab + compose/save, then swaps it for the
+    /// real preview window when the composed dims land — the macOS windowed flow. Gated on
+    /// `preview_windowed`: overlay-preview mode already shows the fullscreen blocker after the
+    /// grab, so it needs no pre-open. The cover is placed NON-ACTIVATING (see `win_preview_preopen`),
+    /// so — like macOS's order-front-non-key — it never disturbs the target's foreground/active
+    /// chrome the grab depends on.
+    #[cfg(windows)]
+    fn window_pick_preopens_window(&self, sel: &Selection, immediate: bool) -> bool {
+        windows_window_pick_preopens(
+            immediate,
+            sel.window_id.is_some(),
+            self.preview_after_capture,
+            self.preview_windowed,
+        )
+    }
+
+    /// Off macOS/Windows the window pre-open is Linux's focus-neutral overlay (handled above) or
+    /// nothing; this pre-open never fires.
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[allow(clippy::unused_self)]
     fn window_pick_preopens_window(&self, _sel: &Selection, _immediate: bool) -> bool {
         false
@@ -1570,15 +1678,30 @@ fn window_pick_neutral_spinner_decision(
 /// neither disturbs the picked window's key/frontmost state the grab depends on. Fires when
 /// the commit is immediate, it's a window pick, and the preview is enabled. There is no
 /// defocus-sink term — macOS has no single-toplevel spinner focus-sink. Portable pure logic
-/// (tested on every platform); only the macOS caller consults it, so it is dead code
-/// elsewhere.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// (tested on every platform); the macOS and Windows callers consult it (DRAGON-305), so it is
+/// dead code only on Linux + exotic targets.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 fn window_pick_preopen_decision(
     immediate: bool,
     is_window_pick: bool,
     preview_enabled: bool,
 ) -> bool {
     immediate && is_window_pick && preview_enabled
+}
+
+/// DRAGON-305: the pure decision behind the Windows [`App::window_pick_preopens_window`] arm. A
+/// single-window capture pre-opens the fullscreen loading BLOCKER cover (spinner + cancel X) —
+/// but ONLY when the post-capture editor is WINDOWED (`windowed`): overlay-preview mode already
+/// shows the fullscreen blocker after the grab, so it needs no pre-open. Otherwise it is exactly
+/// [`window_pick_preopen_decision`] (immediate window pick with preview enabled). Windows-only.
+#[cfg(windows)]
+fn windows_window_pick_preopens(
+    immediate: bool,
+    is_window_pick: bool,
+    preview_enabled: bool,
+    windowed: bool,
+) -> bool {
+    windowed && window_pick_preopen_decision(immediate, is_window_pick, preview_enabled)
 }
 
 /// The [`WindowFocusIntent`] for a single-window capture given the persisted
@@ -1610,6 +1733,78 @@ pub(super) fn defocus_activation_target(
         return Some(o.to_string());
     }
     candidates.iter().find(|c| c.as_str() != picked).cloned()
+}
+
+/// DRAGON-295: the [`crate::platform::backend::OutputDesc`] the pointer sits on, for the
+/// picker-free "Capture Active Monitor" hotkey. Returns the display whose logical bounds
+/// contain `pointer`; when the pointer maps to none (or is unknown), falls back to the
+/// primary display (logical origin `(0, 0)`), else the first listed. `None` only when there
+/// are NO displays. Pure (takes the pointer + the display list), so it unit-tests without
+/// any window server. Not built on Linux (its capture keys are COSMIC custom shortcuts).
+#[cfg(not(target_os = "linux"))]
+pub(super) fn monitor_for_pointer(
+    pointer: Option<(i32, i32)>,
+    descs: &[crate::platform::backend::OutputDesc],
+) -> Option<crate::platform::backend::OutputDesc> {
+    if descs.is_empty() {
+        return None;
+    }
+    if let Some((px, py)) = pointer
+        && let Some(hit) = descs.iter().find(|d| {
+            let (ox, oy) = d.logical_pos;
+            let (w, h) = d.logical_size;
+            px >= ox && px < ox + w && py >= oy && py < oy + h
+        })
+    {
+        return Some(hit.clone());
+    }
+    // No display under the pointer: prefer the primary (origin), else the first.
+    descs
+        .iter()
+        .find(|d| d.logical_pos == (0, 0))
+        .or_else(|| descs.first())
+        .cloned()
+}
+
+/// DRAGON-304: the [`crate::platform::backend::OutputDesc`] a selection sits on, chosen from
+/// a display list — by NAME for a whole-monitor grab, else the display whose logical bounds
+/// contain the selection's centre, else the primary (logical origin `(0, 0)`), else the
+/// first. Pure (takes the list), so the immediate-capture output resolution unit-tests
+/// without any window server. Not built on Linux (its capture keys are COSMIC custom
+/// shortcuts, so the picker-free immediate path never runs there).
+#[cfg(not(target_os = "linux"))]
+fn output_desc_for_selection_in(
+    sel: &Selection,
+    descs: &[crate::platform::backend::OutputDesc],
+) -> Option<crate::platform::backend::OutputDesc> {
+    if descs.is_empty() {
+        return None;
+    }
+    if let Some(name) = &sel.output
+        && let Some(d) = descs.iter().find(|d| &d.name == name)
+    {
+        return Some(d.clone());
+    }
+    let cx = sel.x + sel.width as i32 / 2;
+    let cy = sel.y + sel.height as i32 / 2;
+    descs
+        .iter()
+        .find(|d| {
+            let (ox, oy) = d.logical_pos;
+            let (w, h) = d.logical_size;
+            cx >= ox && cx < ox + w && cy >= oy && cy < oy + h
+        })
+        .or_else(|| descs.iter().find(|d| d.logical_pos == (0, 0)))
+        .or_else(|| descs.first())
+        .cloned()
+}
+
+/// DRAGON-304: [`output_desc_for_selection_in`] against a LIVE display query — the resolver
+/// the picker-free immediate capture uses because its overlays (and thus `self.outputs`) are
+/// never minted. Non-Linux only (the immediate path never runs on Linux).
+#[cfg(not(target_os = "linux"))]
+fn output_desc_for_selection(sel: &Selection) -> Option<crate::platform::backend::OutputDesc> {
+    output_desc_for_selection_in(sel, &crate::screenshot::output_descs())
 }
 
 #[cfg(test)]
@@ -1681,6 +1876,141 @@ mod window_focus_intent_tests {
     }
 }
 
+// DRAGON-295: the pure "monitor under the pointer" resolver for the picker-free
+// "Capture Active Monitor" hotkey. Not built on Linux (its capture keys are COSMIC
+// shortcuts, so `monitor_for_pointer` is never compiled there).
+#[cfg(all(test, not(target_os = "linux")))]
+mod monitor_for_pointer_tests {
+    use super::monitor_for_pointer;
+    use crate::platform::backend::OutputDesc;
+
+    fn desc(name: &str, pos: (i32, i32), size: (i32, i32)) -> OutputDesc {
+        OutputDesc { name: name.to_string(), logical_pos: pos, logical_size: size }
+    }
+
+    #[test]
+    fn picks_the_display_containing_the_pointer() {
+        let descs = vec![
+            desc("A", (0, 0), (1920, 1080)),
+            desc("B", (1920, 0), (2560, 1440)),
+        ];
+        // A pointer on the right monitor resolves to B.
+        assert_eq!(
+            monitor_for_pointer(Some((2000, 200)), &descs).unwrap().name,
+            "B"
+        );
+        // A pointer on the left monitor resolves to A.
+        assert_eq!(monitor_for_pointer(Some((10, 10)), &descs).unwrap().name, "A");
+    }
+
+    #[test]
+    fn falls_back_to_primary_when_pointer_maps_to_none() {
+        let descs = vec![
+            desc("B", (1920, 0), (2560, 1440)),
+            desc("A", (0, 0), (1920, 1080)),
+        ];
+        // A pointer off every display, or an unknown pointer, prefers the primary (origin).
+        assert_eq!(monitor_for_pointer(Some((-500, -500)), &descs).unwrap().name, "A");
+        assert_eq!(monitor_for_pointer(None, &descs).unwrap().name, "A");
+    }
+
+    #[test]
+    fn falls_back_to_first_when_no_primary() {
+        let descs = vec![desc("B", (1920, 0), (2560, 1440))];
+        // No display at the origin: the first listed wins.
+        assert_eq!(monitor_for_pointer(None, &descs).unwrap().name, "B");
+    }
+
+    #[test]
+    fn no_displays_yields_none() {
+        assert!(monitor_for_pointer(Some((0, 0)), &[]).is_none());
+    }
+
+    #[test]
+    fn boundary_is_half_open() {
+        let descs = vec![
+            desc("A", (0, 0), (100, 100)),
+            desc("B", (100, 0), (100, 100)),
+        ];
+        // The right edge of A (x=100) belongs to B (half-open [ox, ox+w)).
+        assert_eq!(monitor_for_pointer(Some((100, 50)), &descs).unwrap().name, "B");
+        assert_eq!(monitor_for_pointer(Some((99, 50)), &descs).unwrap().name, "A");
+    }
+}
+
+// DRAGON-304: the pure output resolver the picker-free immediate capture uses when
+// `self.outputs` is empty (no overlays minted). Non-Linux only (mirrors the immediate path).
+#[cfg(all(test, not(target_os = "linux")))]
+mod output_desc_for_selection_tests {
+    use super::{output_desc_for_selection_in, Selection};
+    use crate::platform::backend::OutputDesc;
+
+    fn desc(name: &str, pos: (i32, i32), size: (i32, i32)) -> OutputDesc {
+        OutputDesc { name: name.to_string(), logical_pos: pos, logical_size: size }
+    }
+
+    fn monitor_sel(output: Option<&str>, x: i32, y: i32, w: u32, h: u32) -> Selection {
+        Selection {
+            x,
+            y,
+            width: w,
+            height: h,
+            output: output.map(str::to_string),
+            window_id: None,
+        }
+    }
+
+    #[test]
+    fn named_monitor_selection_resolves_by_name() {
+        let descs = vec![
+            desc("A", (0, 0), (1920, 1080)),
+            desc("B", (1920, 0), (2560, 1440)),
+        ];
+        // An `--active-monitor` shot carries the output NAME; it wins regardless of geometry.
+        let sel = monitor_sel(Some("B"), 1920, 0, 2560, 1440);
+        assert_eq!(output_desc_for_selection_in(&sel, &descs).unwrap().name, "B");
+    }
+
+    #[test]
+    fn window_selection_resolves_by_centre() {
+        let descs = vec![
+            desc("A", (0, 0), (1920, 1080)),
+            desc("B", (1920, 0), (2560, 1440)),
+        ];
+        // A window (no output name) at x=2400 sits on B — resolved by its centre.
+        let sel = monitor_sel(None, 2200, 200, 400, 300);
+        assert_eq!(output_desc_for_selection_in(&sel, &descs).unwrap().name, "B");
+    }
+
+    #[test]
+    fn offscreen_selection_falls_back_to_primary_then_first() {
+        let descs = vec![
+            desc("B", (1920, 0), (2560, 1440)),
+            desc("A", (0, 0), (1920, 1080)),
+        ];
+        // A selection off every display prefers the PRIMARY (logical origin).
+        let sel = monitor_sel(None, -5000, -5000, 100, 100);
+        assert_eq!(output_desc_for_selection_in(&sel, &descs).unwrap().name, "A");
+        // With no display at the origin, the first listed wins.
+        let no_primary = vec![desc("B", (1920, 0), (2560, 1440))];
+        assert_eq!(output_desc_for_selection_in(&sel, &no_primary).unwrap().name, "B");
+    }
+
+    #[test]
+    fn unknown_name_falls_through_to_geometry() {
+        let descs = vec![desc("A", (0, 0), (1920, 1080))];
+        // A stale/unknown output name doesn't match, so it resolves by centre (then primary).
+        let sel = monitor_sel(Some("GONE"), 100, 100, 200, 200);
+        assert_eq!(output_desc_for_selection_in(&sel, &descs).unwrap().name, "A");
+    }
+
+    #[test]
+    fn no_displays_yields_none() {
+        let sel = monitor_sel(Some("A"), 0, 0, 100, 100);
+        assert!(output_desc_for_selection_in(&sel, &[]).is_none());
+    }
+}
+
 // DRAGON-216: the focus-neutral-spinner pre-open decision (Linux overlay only).
 #[cfg(all(test, target_os = "linux"))]
 mod neutral_spinner_tests {
@@ -1737,6 +2067,33 @@ mod mac_preopen_tests {
         assert!(!decide(false, true, true)); // delayed
         assert!(!decide(true, false, true)); // region/monitor
         assert!(!decide(true, true, false)); // preview off
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_preopen_tests {
+    use super::windows_window_pick_preopens as decide;
+
+    // DRAGON-305: a WINDOWED immediate window pick with preview on pre-opens the fullscreen
+    // blocker cover.
+    #[test]
+    fn windowed_window_pick_pre_opens() {
+        assert!(decide(true, true, true, true));
+    }
+
+    // Overlay-preview mode (windowed = false) does NOT pre-open — it already shows the fullscreen
+    // blocker after the grab.
+    #[test]
+    fn overlay_mode_defers() {
+        assert!(!decide(true, true, true, false));
+    }
+
+    // The base misses (delayed / non-window / preview-off) still defer even in windowed mode.
+    #[test]
+    fn base_misses_defer_even_when_windowed() {
+        assert!(!decide(false, true, true, true)); // delayed
+        assert!(!decide(true, false, true, true)); // region/monitor
+        assert!(!decide(true, true, false, true)); // preview off
     }
 }
 

@@ -4,6 +4,22 @@ use crate::app::DirTarget;
 use crate::shortcuts::{Action, Shortcut};
 use cosmic::widget::color_picker::ColorPickerUpdate;
 
+/// macOS/Windows (DRAGON-295): which of the three resident-daemon global capture hotkeys
+/// a settings row edits. Each is an independent spec string persisted separately (see the
+/// `capture_*_hotkey` fields); the daemon registers each that is set. Gated to the two OSes
+/// with a daemon-owned global hotkey so Linux's `SettingsMsg` stays byte-identical.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureHotkeySlot {
+    /// "Capture All In One" — opens the full region/window/monitor picker overlay
+    /// (the former single "Start Capture" hotkey).
+    AllInOne,
+    /// "Capture Active Window" — immediately captures the frontmost window, no picker.
+    ActiveWindow,
+    /// "Capture Active Monitor" — immediately captures the monitor under the cursor, no picker.
+    ActiveMonitor,
+}
+
 /// Which window-capture border a colour-picker edit targets (DRAGON-191).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorderColorTarget {
@@ -57,11 +73,18 @@ pub enum SettingsMsg {
     /// Settings: toggle allowing multiple instances (takes effect next launch).
     SetAllowMultiple(bool),
     /// Settings: toggle staying resident (the tray/menu-bar RESIDENT process). Emitted
-    /// by the "Keep running in the background" row on macOS (menu-bar daemon), Linux (ksni
+    /// by the "Keep system tray icon" row on macOS (menu-bar daemon), Linux (ksni
     /// tray resident, DRAGON-173), and Windows (Win32 tray daemon, DRAGON-237); a no-op on
     /// any platform without a resident, so the variant is gated to the three that construct it.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     SetResident(bool),
+    /// Settings (DRAGON-296): toggle "Automatically start on login" — persist
+    /// `autostart_on_login` and reconcile the OS login item (registered iff the tray is on
+    /// AND this is on). Emitted by the row directly below "Keep system tray icon", which is
+    /// hidden while the tray is off. Gated to the three OSes with a resident (same set as
+    /// `SetResident`), so Linux/other `SettingsMsg` shapes stay byte-identical elsewhere.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    SetAutostartOnLogin(bool),
     /// Settings: region selection overlay dim opacity.
     SetRegionOpacity(f32),
     /// Settings: active (countdown/recording) overlay dim + line opacity.
@@ -205,19 +228,21 @@ pub enum SettingsMsg {
     SetShortcut(Action, Shortcut),
     /// Keyboard Shortcuts: clear `action`'s binding (the "x" button).
     UnbindShortcut(Action),
-    /// Keyboard Shortcuts (macOS/Windows): edit the resident daemon's global "Start Capture"
-    /// hotkey spec (e.g. "PrintScreen", "Cmd+Shift+2"). Persisted; when the spec is
-    /// valid and the daemon is running, it is restarted so the new key takes effect.
-    /// Gated to the two OSes with a daemon-owned global hotkey so Linux's `SettingsMsg`
-    /// stays byte-identical (Linux's capture key is a COSMIC custom shortcut, not ours).
+    /// Keyboard Shortcuts (macOS/Windows): edit one of the resident daemon's three global
+    /// capture hotkey specs (DRAGON-295 — the `slot` picks which: All In One / Active Window
+    /// / Active Monitor), e.g. "PrintScreen", "Cmd+Shift+2". Persisted; when the daemon is
+    /// running, it is restarted so the new keys take effect. Gated to the two OSes with a
+    /// daemon-owned global hotkey so Linux's `SettingsMsg` stays byte-identical (Linux's
+    /// capture key is a COSMIC custom shortcut, not ours).
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    SetCaptureHotkey(String),
-    /// Keyboard Shortcuts (macOS/Windows): start (or cancel) RECORDING the "Start Capture"
-    /// global hotkey — the next chord the user presses is captured, serialized to a
-    /// daemon spec, and applied via `SetCaptureHotkey`. Mirrors `BeginRebind` for the
-    /// in-app rows: press the button to begin, press again or Esc to cancel.
+    SetCaptureHotkey(CaptureHotkeySlot, String),
+    /// Keyboard Shortcuts (macOS/Windows): start (or cancel) RECORDING one of the three
+    /// global capture hotkeys (DRAGON-295 — the `slot` picks which) — the next chord the
+    /// user presses is captured, serialized to a daemon spec, and applied via
+    /// `SetCaptureHotkey`. Mirrors `BeginRebind` for the in-app rows: press the button to
+    /// begin, press again or Esc to cancel.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    BeginCaptureHotkeyRebind,
+    BeginCaptureHotkeyRebind(CaptureHotkeySlot),
     /// Keyboard Shortcuts (macOS/Windows): while the "Start Capture" chord recorder is armed,
     /// a ~1s timer sends this so the running daemon SUSPENDS its global hotkey (the key
     /// then reaches this app to be recorded). Fire-and-forget signal; the daemon

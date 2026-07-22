@@ -13,58 +13,83 @@ impl crate::app::App {
         // the current section while the group matches, else start a new one.
         let mut secs: Vec<SectionSpec<'_>> = Vec::new();
 
-        // macOS (DRAGON-130) / Windows (DRAGON-237): the resident daemon's global "Start
-        // Capture" hotkey sits FIRST, in its own section at the TOP. Unlike the in-app
-        // bindings below (iced key-capture), this is a process-wide OS hotkey owned by the
-        // tray/menu-bar daemon, so it is edited as a validated SPEC string ("PrintScreen",
-        // "Cmd+Shift+2", …). cfg-gated so the Linux page stays byte-identical (Linux's
-        // capture key is a COSMIC custom shortcut, not owned here).
+        // macOS (DRAGON-130) / Windows (DRAGON-237) / DRAGON-295: the resident daemon's three
+        // global capture hotkeys sit FIRST, in their own section at the TOP. Unlike the in-app
+        // bindings below (iced key-capture), these are process-wide OS hotkeys owned by the
+        // tray/menu-bar daemon, so each is edited as a validated SPEC string ("PrintScreen",
+        // "Cmd+Shift+2", …). All three default UNSET (opt-in). cfg-gated so the Linux page
+        // stays byte-identical (Linux's capture key is a COSMIC custom shortcut, not owned here).
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            // Byte-for-byte the SAME anatomy as the in-app shortcut rows below (label +
-            // chord button + "x" clear), just wired to the daemon's global hotkey instead
-            // of an in-app `Action`. No helper line (leanest rows have none): the
-            // PrintScreen-swallow caveat is documented in `App::handle_key` /
-            // `SetCaptureHotkey`, NOT in UI text.
-            let d = crate::state::defaults();
-            let capturing = self.settings.capture_hotkey_rebinding;
-            // The current chord verbatim (the spec IS what the daemon parses), or
-            // "Unbound" when cleared to empty — exactly like a neighbor with no binding.
-            let label = if capturing {
-                "Press a key…".to_string()
-            } else if self.capture_hotkey.is_empty() {
-                "Unbound".to_string()
-            } else {
-                self.capture_hotkey.clone()
-            };
-            let keybind = widget::button::standard(label)
-                .on_press(Msg::Settings(SettingsMsg::BeginCaptureHotkeyRebind));
-            // The same "x" clear widget/position/semantics as the neighbors: clearing sets
-            // an EMPTY spec (no hotkey registered until set again). Disabled when already
-            // empty, matching how a neighbor disables clear with nothing to unbind.
-            let mut clear = widget::button::icon(
-                widget::icon::from_name("window-close-symbolic").size(14),
-            )
-            .padding(6);
-            if !self.capture_hotkey.is_empty() {
-                clear = clear
-                    .on_press(Msg::Settings(SettingsMsg::SetCaptureHotkey(String::new())));
-            }
-            let control = widget::row(vec![
-                crate::widgets::arrow_cursor::arrow_cursor(keybind),
-                crate::widgets::arrow_cursor::arrow_cursor(clear),
-            ])
-                .spacing(4.0)
-                .align_y(Alignment::Center);
-            // Restore-default (row reset slot, same style/position as every neighbor):
-            // re-selects PrintScreen WITHOUT recording a keypress.
-            let item = Item::new("Start Capture", "", control).reset_to(
-                Msg::Settings(SettingsMsg::SetCaptureHotkey(d.capture_hotkey.clone())),
-                self.capture_hotkey != d.capture_hotkey,
-            );
+            use crate::app::CaptureHotkeySlot;
+            // One row per slot, byte-for-byte the SAME anatomy as the in-app shortcut rows
+            // below (label + chord button + "x" clear), just wired to a daemon global hotkey
+            // slot instead of an in-app `Action`.
+            let items: Vec<Item<'_>> = [
+                (CaptureHotkeySlot::AllInOne, "Capture All In One", self.capture_hotkey.as_str()),
+                (
+                    CaptureHotkeySlot::ActiveWindow,
+                    "Capture Active Window",
+                    self.capture_active_window_hotkey.as_str(),
+                ),
+                (
+                    CaptureHotkeySlot::ActiveMonitor,
+                    "Capture Active Monitor",
+                    self.capture_active_monitor_hotkey.as_str(),
+                ),
+            ]
+            .into_iter()
+            .map(|(slot, label_text, spec)| {
+                let capturing = self.settings.capture_hotkey_rebinding == Some(slot);
+                // The current chord rendered as native modifier SYMBOLS on macOS (DRAGON-294:
+                // ⌃⌥⇧⌘), or Windows-native modifier NAMES on Windows (Ctrl/Alt/Shift/Win — the
+                // logo token reads "Win", not the serialized "Cmd"); "Unbound" when cleared.
+                let label = if capturing {
+                    "Press a key…".to_string()
+                } else if spec.is_empty() {
+                    "Unbound".to_string()
+                } else {
+                    #[cfg(target_os = "macos")]
+                    {
+                        crate::shortcuts::mac_symbolic_spec(spec)
+                    }
+                    #[cfg(windows)]
+                    {
+                        crate::shortcuts::win_readable_spec(spec)
+                    }
+                };
+                let keybind = widget::button::standard(label)
+                    .on_press(Msg::Settings(SettingsMsg::BeginCaptureHotkeyRebind(slot)));
+                // The same "x" clear widget/position/semantics as the neighbors: clearing
+                // sets an EMPTY spec (no hotkey registered until set again). Disabled when
+                // already empty, matching how a neighbor disables clear with nothing to unbind.
+                let mut clear = widget::button::icon(
+                    widget::icon::from_name("window-close-symbolic").size(14),
+                )
+                .padding(6);
+                if !spec.is_empty() {
+                    clear = clear.on_press(Msg::Settings(SettingsMsg::SetCaptureHotkey(
+                        slot,
+                        String::new(),
+                    )));
+                }
+                let control = widget::row(vec![
+                    crate::widgets::arrow_cursor::arrow_cursor(keybind),
+                    crate::widgets::arrow_cursor::arrow_cursor(clear),
+                ])
+                    .spacing(4.0)
+                    .align_y(Alignment::Center);
+                // All three default UNSET, so the row reset slot re-clears WITHOUT recording
+                // a keypress; shown only when the row currently holds a value.
+                Item::new(label_text, "", control).reset_to(
+                    Msg::Settings(SettingsMsg::SetCaptureHotkey(slot, String::new())),
+                    !spec.is_empty(),
+                )
+            })
+            .collect();
             secs.push(SectionSpec {
                 title: "Global",
-                items: vec![item],
+                items,
             });
         }
 

@@ -149,15 +149,22 @@ pub(super) fn overlay_window(
     (id, open)
 }
 
-/// The windowed preview's NSWindow title. Shared so the open path and the macOS
-/// native finalize (`finalize_preview_window`) match the SAME window by title.
-pub(super) const PREVIEW_WINDOW_TITLE: &str = "Cosmic Capture Kit - Preview";
+/// The windowed preview editor's window title (DRAGON-301) — THE single source of truth for it:
+/// the window's OS title (`set_window_title`), the CSD header bar title, the title the native
+/// finalize/placement helpers match on (macOS `finalize_preview_window`, Windows
+/// `show_centered`/caption/mica), and the title a tiling-WM float rule keys on (see the README)
+/// all route through this const. Shared so the open path and the native finalize match the SAME
+/// window by title.
+pub(super) const PREVIEW_WINDOW_TITLE: &str = "Cosmic Capture Kit - Preview Editor";
 
 /// The fullscreen OVERLAY preview's (hidden) window title — distinct from both
 /// [`PREVIEW_WINDOW_TITLE`] and the capture overlays' display-name titles, so the
 /// native finalize (`finalize_preview_overlay`) can never match a still-closing
 /// capture overlay from the same session. macOS (DRAGON-94) and Windows (DRAGON-233
-/// fix 5) both mint a real overlay-preview window matched by this title.
+/// fix 5) both mint a real overlay-preview window matched by this title. NOT derived from
+/// [`PREVIEW_WINDOW_TITLE`] (a separate literal, out of DRAGON-301's rename scope); it shares the
+/// "… - Preview" prefix with the renamed editor title, but title matching is EXACT (or the
+/// annotation-tolerant `title_matches`), so the two never cross-resolve.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(super) const PREVIEW_OVERLAY_TITLE: &str = "Cosmic Capture Kit - Preview Overlay";
 
@@ -331,14 +338,17 @@ pub(super) fn preview_window(
         decorations: true,
         #[cfg(not(target_os = "macos"))]
         decorations: false,
-        // macOS (DRAGON-146 / DRAGON-268): opaque by default for the native masked
-        // corner (see `settings::open_config_window`), but transparent when frosted
-        // windows are ON so the DRAGON-268 window vibrancy behind the content can show
-        // — the same corner/border-tool tradeoff, accepted in the glass case pending
-        // live mac testing (DRAGON-268 Blocker 1). The FULLSCREEN overlay preview
+        // macOS (DRAGON-146 / DRAGON-293): ALWAYS open opaque. A fully transparent
+        // (clearColor) window reports its server corner radii as 0, so border tools
+        // (JankyBorders) trace a tight fallback corner — and JankyBorders reads the radius
+        // ONCE, when the window first appears, so the radius must be right at creation. Glass
+        // does NOT need a transparent WINDOW: it needs a non-opaque one (`setOpaque(false)`)
+        // with the masked vibrancy view behind the content, both applied in
+        // `enable_window_vibrancy` after open (which sets a near-clear, not clear, background
+        // so the real ~20pt corner radius survives). The FULLSCREEN overlay preview
         // (`preview_surface`) is a separate path (always transparent, edge-to-edge).
         #[cfg(target_os = "macos")]
-        transparent: crate::app::theme::glass_windows_enabled(),
+        transparent: false,
         #[cfg(not(target_os = "macos"))]
         transparent: true,
         exit_on_close_request: false,
@@ -360,20 +370,21 @@ pub(super) fn preview_window(
         },
         #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         platform_specific: cosmic::iced::window::settings::PlatformSpecific::default(),
-        // Windows (DRAGON-229, KOMOREBI.md §7): open the preview HIDDEN so the user's
-        // tiling WM (komorebi) sees no `Show` event at creation. `finalize_preview_window`
-        // (the Windows arm) then marks it komorebi-ineligible (WS_EX_DLGMODALFRAME) and
-        // shows it natively, so komorebi's first sight of the window is already ineligible
-        // and it never tiles it — the same pre-show recipe as the capture overlay. mac
-        // keeps the default (visible): it opens directly and only re-styles the titlebar.
+        // Windows (DRAGON-233): open the preview HIDDEN so it is shown only once its
+        // async-set title has landed. `finalize_preview_window` (the Windows arm) centers +
+        // shows it natively. DRAGON-302: no komorebi opt-out, so a tiling WM tiles the preview
+        // window like a normal window (matching mac/Linux; a user who prefers it floating adds
+        // a WM float rule, see the README). mac keeps the default (visible): it opens directly
+        // and only re-styles the titlebar.
         #[cfg(windows)]
         visible: false,
         ..Default::default()
     });
     // macOS: after the view is installed, natively strip the titlebar buttons; Windows:
-    // komorebi-float + native-show the hidden window (both by the async-set title, so
-    // both poll via `PreviewOpened` → `finalize_preview_window`). Doing it mid-creation
-    // races winit and aborts, hence the post-open follow-up. Linux is a no-op.
+    // center + native-show the hidden window (DRAGON-302: no komorebi opt-out, so a tiling
+    // WM tiles it like a normal window; both by the async-set title, so both poll via
+    // `PreviewOpened` → `finalize_preview_window`). Doing it mid-creation races winit and
+    // aborts, hence the post-open follow-up. Linux is a no-op.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     let done = task.map(|id| {
         cosmic::Action::App(Msg::WindowChrome(super::WindowChromeMsg::PreviewOpened(id, 0)))

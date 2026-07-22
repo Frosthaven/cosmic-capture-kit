@@ -133,3 +133,76 @@ impl InputProcessor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{InputConfig, InputProcessor, FRAME};
+    use crate::audio::filters::duck::Ducker;
+    use crate::audio::meter::rms;
+
+    /// DRAGON-297 defect 3 — EVIDENCE (not reasoning): drive realistic, fairly LOUD room
+    /// noise through the ACTUAL recording cleanup chain (`InputProcessor` with the default
+    /// recording config the app builds — noise reduction + AEC + AGC + auto voice-gate +
+    /// advanced VAD) and show the voice gate closes it to silence. That is WHY the ducker's
+    /// post-AGC sidechain tap (`record::pump::push_mic_tap` → `duck::feed_sidechain`) is
+    /// safe: the gate removes non-voice BEFORE the AGC can boost it, and the AGC cannot
+    /// amplify the gate's exact-zero silence — so noise the chain removes can never duck the
+    /// system track, and the coordinator's "gate-leak + AGC-boost" path does not occur for
+    /// non-voice input. Feeding the cleaned output straight into a real `Ducker` closes the
+    /// loop: the system track stays untouched.
+    #[test]
+    fn realistic_room_noise_is_gated_and_never_ducks_through_the_real_chain() {
+        let cfg = InputConfig {
+            noise_suppression: true,
+            echo_cancellation: true,
+            auto_gain: true,
+            gate: true,
+            gate_auto: true,
+            gate_threshold: 0.5,
+            advanced_vad: true,
+        };
+        let mut proc = InputProcessor::new(cfg);
+        let mut duck = Ducker::new();
+        // Deterministic white noise at ~-35 dBFS RMS: a loud, realistic keyboard/fan floor
+        // (uniform +/-0.03 has RMS ~0.017). Far above the ducker's ~-45 dBFS open threshold,
+        // so a raw (un-gated) tap WOULD duck — the point is that the chain gates it away.
+        let mut st: u32 = 0x9E37_79B9;
+        let mut noise = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            ((st as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.03
+        };
+        let render = [0.0f32; FRAME]; // no speaker bleed to cancel
+        let (mut late_open, mut worst_sys, mut worst_clean) = (false, 1.0f32, 0.0f32);
+        for i in 0..250 {
+            let mut inp = [0.0f32; FRAME];
+            for s in inp.iter_mut() {
+                *s = noise();
+            }
+            proc.feed_render(&render);
+            let mut pcm = [0.0f32; FRAME];
+            let m = proc.process(&inp, Some(&mut pcm));
+            // The ducker sees exactly what the pump feeds it: the cleaned, post-gate tap.
+            duck.feed_sidechain(&pcm, true);
+            let mut sys = vec![1.0f32; FRAME * 2];
+            duck.process(&mut sys, 2);
+            // Skip the gate's initial ~250 ms close ramp; measure the settled state.
+            if i >= 100 {
+                late_open |= m.open;
+                worst_clean = worst_clean.max(rms(&pcm));
+                worst_sys = worst_sys.min(sys.iter().cloned().fold(1.0f32, f32::min));
+            }
+        }
+        assert!(!late_open, "the voice gate opened on pure noise — it must stay closed");
+        assert!(
+            worst_clean < 0.005_623,
+            "noise leaked past the gate into the ducker's sidechain (cleaned RMS {worst_clean})"
+        );
+        assert!(
+            worst_sys > 0.999,
+            "realistic room noise ducked the system track (min gain {worst_sys}) — the \
+             cleanup chain must prevent this before the ducker ever sees it"
+        );
+    }
+}

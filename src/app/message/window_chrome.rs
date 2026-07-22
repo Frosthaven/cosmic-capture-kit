@@ -87,14 +87,21 @@ pub enum WindowChromeMsg {
     CancelReset,
     /// The settings toplevel window finished opening.
     ConfigWindowOpened(window::Id),
-    /// Windows (DRAGON-229 komorebi opt-out): poll to komorebi-float + show the settings
-    /// window once its async-set title lands — the Windows analog of the mac
-    /// `MacCenterTitlebar` poll (both are title-matched, kicked from `ConfigWindowOpened`,
-    /// and re-emit with an incremented attempt until the window can be matched). The
-    /// window is opened `visible:false`, so it stays hidden — komorebi sees no `Show` —
-    /// until `float_and_show` marks it ineligible and shows it. `(id, attempt)`.
+    /// Windows: poll to SHOW the settings window once its async-set title lands — the Windows
+    /// analog of the mac `MacCenterTitlebar` poll (both are title-matched, kicked from
+    /// `ConfigWindowOpened`, and re-emit with an incremented attempt until the window can be
+    /// matched). The window is opened `visible:false` so it stays hidden until the title lands,
+    /// then `show_titled` shows it. DRAGON-302: no komorebi opt-out is set, so a tiling WM
+    /// manages it like a normal window (it tiles by default). `(id, attempt)`.
     #[cfg(windows)]
     ConfigWindowFloat(window::Id, u8),
+    /// Windows (DRAGON-299): fired a beat after the settings window's native show to mark its
+    /// size SETTLED — winit's one-time post-show stomp (to a sub-min sliver) has passed and been
+    /// re-asserted by the resize handler, so flip `settings_size_ready` on and start tracking
+    /// USER resizes into the remembered size. Doing it late (after the stomp + re-assert resizes
+    /// are consumed while tracking is off) keeps the persisted size drift-free across reopens.
+    #[cfg(windows)]
+    ConfigWindowResettle(window::Id),
     /// Windows (DRAGON-246): a periodic liveness tick while the settings window is open and
     /// has been CONFIRMED shown. Checks the titled top-level still exists in this process; if
     /// it vanished WITHOUT an iced `Closed` event (an out-of-band destroy that would leave

@@ -772,19 +772,6 @@ fn windows_glass_config() -> Option<GlassConfig> {
     Some(GlassConfig { strength_ordinal: 0, alpha: MICA_SURFACE_ALPHA, frosted_windows: true })
 }
 
-/// The frosted-surface opacity the macOS chrome paints at OVER the window vibrancy
-/// (DRAGON-268). The vibrancy material comes from a winit-inserted NSVisualEffectView
-/// behind a cleared Metal layer (`platform::mac::window::enable_window_vibrancy`), and
-/// `frost_color` paints the page/chrome background at this alpha over it: 0.0 = the pure
-/// vibrancy shows, higher values lay more of the flat theme colour over it.
-///
-/// Unlike Windows (where DWM Mica fills the whole window, so `MICA_SURFACE_ALPHA = 0.0`
-/// reads as a solid frosted pane), macOS vibrancy behind a fully-transparent page reads as
-/// a see-through hole, so the mac page needs a translucent theme tint painted over the
-/// vibrancy to read as a frosted PANEL rather than clear glass. This value is that tint's
-/// opacity; tune it up for a more solid pane, down for more of the raw desktop blur.
-#[cfg(target_os = "macos")]
-const MAC_SURFACE_ALPHA: f32 = 0.75;
 
 /// The active theme's opaque background base as straight-alpha `[r, g, b, a]` u8 — the DARK
 /// (or light) pane color the fullscreen backdrop fix paints an opaque NSWindow with, so the
@@ -815,7 +802,13 @@ fn macos_glass_config() -> Option<GlassConfig> {
     if !crate::platform::mac::window::vibrancy_supported() {
         return None;
     }
-    Some(GlassConfig { strength_ordinal: 0, alpha: MAC_SURFACE_ALPHA, frosted_windows: true })
+    Some(GlassConfig {
+        strength_ordinal: 0,
+        // MAC-SPECIFIC surface alpha (reduced so the masked NSVisualEffectView vibrancy shows
+        // through); the value lives at the mac seam, not here (DRAGON-293).
+        alpha: crate::platform::mac::window::vibrancy_surface_alpha(),
+        frosted_windows: true,
+    })
 }
 
 /// Whether to enroll a fresh toplevel WINDOW in the frosted-windows material: the
@@ -1164,16 +1157,14 @@ mod tests {
     }
 
     // ── Platform-native System Default (DRAGON-239) ──────────────────────────
-    // The per-platform selection fed to the `use_system` build: Windows =
-    // slightly-round (1), macOS = fully-round (0). Runs on the OS it's compiled
-    // for (Windows via `--no-default-features`); Linux never compiles the fn.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    // The per-platform selection fed to the `use_system` build. Fully-round (0)
+    // is now the deliberate System-Default look on every non-COSMIC OS (see the
+    // fn doc); the old Windows assert (slightly-round, 1) predated that and went
+    // stale. macOS-gated per user decision. Linux never compiles the fn.
+    #[cfg(target_os = "macos")]
     #[test]
     fn native_system_default_selects_platform_roundness() {
         let (_accent, roundness) = native_system_default();
-        #[cfg(target_os = "windows")]
-        assert_eq!(roundness, 1, "Windows System Default = slightly round");
-        #[cfg(target_os = "macos")]
         assert_eq!(roundness, 0, "macOS System Default = fully round");
     }
 

@@ -36,6 +36,16 @@ impl App {
         self.settings.nav_open = nav_should_open(spawn_w);
     }
 
+    /// Adopt a settings-window resize `(w, h)` (logical px) as the remembered size, and
+    /// re-derive the left nav rail from the width. Auto collapse/expand (all platforms):
+    /// narrower than the breakpoint collapses to the icon rail, at/above it expands. The toggle
+    /// icon derives from `nav_open` in the view, so it flips for free on the next rebuild; a
+    /// manual `ToggleConfigNav` still works between resizes (a resize re-derives from width).
+    fn adopt_settings_size(&mut self, w: f32, h: f32) {
+        self.settings_size = Some((w.round() as u32, h.round() as u32));
+        self.settings.nav_open = nav_should_open(w);
+    }
+
     pub(in crate::app) fn update_window_chrome(&mut self, message: WindowChromeMsg) -> Task<cosmic::Action<Msg>> {
         match message {
             #[cfg(target_os = "linux")]
@@ -161,10 +171,11 @@ impl App {
                         WindowChromeMsg::MacCenterTitlebar(settings::WINDOW_TITLE, 0),
                     ))),
                 ]);
-                // Windows (DRAGON-229 komorebi opt-out): the settings window was opened
-                // HIDDEN; once its async title lands, komorebi-float + show it — the same
-                // title-polled follow-up shape as the mac titlebar centering above. Batched
-                // with the title task so the poll begins as the title is being applied.
+                // Windows: the settings window was opened HIDDEN; once its async title lands,
+                // SHOW it (DRAGON-302: no komorebi opt-out, so a tiling WM tiles it like a
+                // normal window) — the same title-polled follow-up shape as the mac titlebar
+                // centering above. Batched with the title task so the poll begins as the title
+                // is being applied.
                 #[cfg(windows)]
                 return Task::batch([
                     title_task,
@@ -186,12 +197,12 @@ impl App {
                     return Task::none();
                 }
                 // The title is set by an async task and may lag this poll; retry briefly
-                // until `float_and_show` matches it (same 30 x 40ms budget as the overlay's
-                // `configure_overlay`). The window stays HIDDEN until it matches, so
-                // komorebi never sees a `Show` for it — the opt-out is race-free.
+                // until `show_titled` matches it (same 30 x 40ms budget as the overlay's
+                // `configure_overlay`). The window stays HIDDEN until the title matches, then
+                // it is shown; a tiling WM tiles it on that first show (DRAGON-302).
                 const MAX_ATTEMPTS: u8 = 30;
                 const RETRY_MS: u64 = 40;
-                if crate::platform::windows::window::float_and_show(settings::WINDOW_TITLE) {
+                if crate::platform::windows::window::show_titled(settings::WINDOW_TITLE) {
                     // The window matched its async-set title and was shown → arm the
                     // liveness watchdog (DRAGON-246): from here on, a disappearance of the
                     // titled window means a genuine vanish-without-`Closed` (out-of-band
@@ -216,7 +227,21 @@ impl App {
                     if self.glass.is_some_and(|g| g.frosted_windows) {
                         crate::platform::windows::window::apply_mica(settings::WINDOW_TITLE);
                     }
-                    Task::none()
+                    // DRAGON-299: winit stomps the natively-shown settings window's size to a
+                    // sub-min sliver a beat AFTER this show (it soft-sizes a window shown via
+                    // native `ShowWindow`). The `ConfigWindowResized` handler re-asserts the
+                    // intended size on that stomp; schedule the SETTLE that flips resize-tracking
+                    // on once the stomp + re-assert resizes have been consumed (drift-free).
+                    Task::perform(
+                        async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        },
+                        move |()| {
+                            cosmic::Action::App(Msg::WindowChrome(
+                                WindowChromeMsg::ConfigWindowResettle(id),
+                            ))
+                        },
+                    )
                 } else if attempt >= MAX_ATTEMPTS {
                     log::warn!(
                         "settings window never matched its title after {MAX_ATTEMPTS} \
@@ -235,6 +260,17 @@ impl App {
                         },
                     )
                 }
+            }
+            #[cfg(windows)]
+            WindowChromeMsg::ConfigWindowResettle(id) => {
+                // DRAGON-299: the one-time post-show winit stomp has settled (the resize handler
+                // re-asserted the intended size on it, and that re-assert's resize was consumed
+                // while tracking was off). Flip tracking on so subsequent USER resizes update the
+                // remembered size; guard on the current window so a stale timer can't arm it.
+                if self.settings.window == Some(id) {
+                    self.settings_size_ready = true;
+                }
+                Task::none()
             }
             #[cfg(windows)]
             WindowChromeMsg::PreviewFinalizeTick => {
@@ -297,14 +333,40 @@ impl App {
                 // Remember the settings window's size so it reopens at the size it was
                 // closed at (persisted on close).
                 if Some(id) == self.settings.window && w >= 1.0 && h >= 1.0 {
-                    self.settings_size = Some((w.round() as u32, h.round() as u32));
-                    // Auto collapse/expand the left nav rail by window width (all
-                    // platforms): narrower than the breakpoint collapses to the icon
-                    // rail, at/above it expands. The toggle icon derives from
-                    // `nav_open` in the view, so it flips for free on the next rebuild.
-                    // A manual `ToggleConfigNav` still works between resizes; a resize
-                    // re-derives from width by design.
-                    self.settings.nav_open = nav_should_open(w);
+                    // Windows (DRAGON-299): the settings window opens hidden + is shown natively,
+                    // and winit STOMPS its size to a sub-minimum sliver a beat after that show (it
+                    // soft-sizes a window shown via native `ShowWindow`; see `show_titled`). Two
+                    // guards, both keyed off the enforced minimum (a real USER resize can never go
+                    // below it — the resize border enforces min_size — so nothing below is ever
+                    // legitimate):
+                    //   * ANY sub-min resize is the stomp — NEVER adopt it; re-assert the intended
+                    //     (persisted, unpolluted) size natively. Unconditional on `settings_size_ready`
+                    //     so it can't race the settle timer (the stomp may land either side of it).
+                    //   * a ≥min resize is adopted only once the window has SETTLED
+                    //     (`settings_size_ready`, flipped by `ConfigWindowResettle`) — before that
+                    //     it's an open-time transient (incl. the re-assert's own resize), ignored so
+                    //     none is persisted as the remembered size.
+                    // mac/Linux open the settings window visible + compositor-managed (no such
+                    // stomp), so they adopt every resize as before.
+                    #[cfg(windows)]
+                    {
+                        if w < settings::MIN_W || h < settings::MIN_H {
+                            let (tw, th) = self
+                                .settings_size
+                                .map(|(a, b)| {
+                                    (a.max(settings::MIN_W as u32), b.max(settings::MIN_H as u32))
+                                })
+                                .unwrap_or((settings::MIN_W as u32, settings::MIN_H as u32));
+                            crate::platform::windows::window::resize_settings_to(
+                                settings::WINDOW_TITLE,
+                                (tw, th),
+                            );
+                        } else if self.settings_size_ready {
+                            self.adopt_settings_size(w, h);
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    self.adopt_settings_size(w, h);
                 }
                 // PROVISIONAL (DRAGON-268 follow-up, Task 2 — fullscreen-too-bright): a
                 // fullscreen enter/exit fires a resize, so match the settings / windowed-

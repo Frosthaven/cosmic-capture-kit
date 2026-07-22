@@ -284,10 +284,13 @@ record_fps = 60\n";
         assert_eq!(d.config_version, 7);
         // DRAGON-174: the new toolbar-hiding setting defaults OFF (do not hide).
         assert!(!d.hide_toolbar_fullscreen);
-        // Residency defaults on where the global hotkey needs the daemon (macOS);
-        // Linux stays one-shot. The login-item seed marker always starts unset.
-        assert_eq!(d.resident, cfg!(target_os = "macos"));
+        // Residency defaults on where the global hotkey needs the daemon (macOS AND Windows,
+        // DRAGON-296); Linux stays one-shot. The login-item seed markers always start unset.
+        assert_eq!(d.resident, cfg!(any(target_os = "macos", target_os = "windows")));
+        // DRAGON-296: launch-at-login defaults ON (gated by `resident` at reconcile time).
+        assert!(d.autostart_on_login);
         assert!(!d.mac_login_item_seeded);
+        assert!(!d.win_login_item_seeded);
         // Fresh backend-id defaults mirror the retired booleans' defaults per platform.
         assert_eq!(d.screenshot_backend, crate::platform::backend::native_backend_id());
         #[cfg(target_os = "linux")]
@@ -427,6 +430,27 @@ record_fps = 60\n";
         let q: Persisted = toml::from_str(&s).expect("parse back");
         assert_eq!(q.region, None);
         assert_eq!(q.settings_size, None);
+    }
+
+    // DRAGON-296: the Windows tray daemon owns the global capture hotkey, so residency defaults
+    // ON there (matching macOS); the one-time login-item seed marker starts unset, must survive a
+    // save (so the seed never re-runs and re-overrides an explicit opt-out), and loads as false
+    // from an old config that predates the field.
+    #[test]
+    fn windows_resident_defaults_on_and_seed_marker_round_trips() {
+        let d = defaults();
+        #[cfg(windows)]
+        assert!(d.resident, "Windows residency defaults on (DRAGON-296)");
+        #[cfg(target_os = "linux")]
+        assert!(!d.resident, "Linux stays one-shot");
+        assert!(!d.win_login_item_seeded, "the seed marker starts unset");
+        let mut p = defaults();
+        p.win_login_item_seeded = true;
+        let s = toml::to_string(&p).expect("serialize");
+        let q: Persisted = toml::from_str(&s).expect("parse back");
+        assert!(q.win_login_item_seeded, "a set marker survives a save round trip");
+        let old: Persisted = toml::from_str("record_dir = \"~/Videos\"").expect("parse");
+        assert!(!old.win_login_item_seeded, "an old config without the key loads false");
     }
 
     #[test]

@@ -81,7 +81,22 @@ Capture backend extras, where available, include features such as:
 3. Updating: the app checks automatically and installs new versions in one
    click from Settings > About.
 
-### Linux
+### Windows 11
+
+1. Download the latest `.msi` from
+   [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases) and run
+   it. It installs per-user (no admin prompt) to
+   `%LOCALAPPDATA%\Programs\cosmic-capture-kit`, bundles ffmpeg, and adds Start
+   Menu shortcuts (Cosmic Capture Kit, and Cosmic Capture Kit Settings), so
+   there is nothing else to install.
+2. The installer is not code-signed yet, so on first run SmartScreen may show
+   "Windows protected your PC". Click More info, then Run anyway.
+3. Microphone is optional (for recordings with mic). If it is not picked up,
+   enable it under Settings > Privacy & security > Microphone.
+4. Updating: the app checks automatically and installs new versions silently in
+   the background (Settings > About).
+
+### Linux (Wayland): COSMIC
 
 Build from source for now (packaged channels are on the way):
 
@@ -114,9 +129,112 @@ releases page on Linux.
 
 AUR: coming soon. AppImage: coming soon.
 
-### Windows
+---
 
-Coming Soon.
+## Tiling window managers
+
+Under a tiling window manager the **capture overlays float automatically**. The app
+tags them so AeroSpace (macOS), komorebi (Windows), and COSMIC's tiler (Linux) leave
+them alone, since a capture overlay has to cover a whole display rather than a tile. No
+configuration is needed for that.
+
+The **Settings** and **preview editor** windows are ordinary windows, so a tiling WM
+tiles them by default. If you would rather they float, add a floating rule for your WM.
+The two windows have separate titles, so you can float just one of them or both:
+
+* Settings window: title `Cosmic Capture Kit - Settings`
+* Preview editor window: title `Cosmic Capture Kit - Preview Editor`
+* Both share application id `dev.frosthaven.CosmicCaptureKit`
+
+<details>
+<summary><b>AeroSpace (macOS)</b></summary>
+
+Add to `~/.config/aerospace/aerospace.toml`, then run `aerospace reload-config`. Match on
+`app-id` to float BOTH windows, or on `window-title-regex-substring` to float just one. The two
+titles are distinct (neither is a substring of the other), so a single-window rule needs no
+anchoring:
+
+```toml
+# Both windows float:
+[[on-window-detected]]
+if.app-id = 'dev.frosthaven.CosmicCaptureKit'
+run = ['layout floating']
+
+# ...or float only ONE. Use instead of the app-id rule above, not alongside it:
+
+# Settings only:
+[[on-window-detected]]
+if.window-title-regex-substring = 'Cosmic Capture Kit - Settings'
+run = ['layout floating']
+
+# Preview only:
+[[on-window-detected]]
+if.window-title-regex-substring = 'Cosmic Capture Kit - Preview Editor'
+run = ['layout floating']
+```
+
+</details>
+
+<details>
+<summary><b>komorebi (Windows)</b></summary>
+
+Edit your `komorebi.json` static config (by default `%USERPROFILE%\komorebi.json`) and add
+the windows to `floating_applications`. komorebi reloads the file when you save it, or run
+`komorebic reload-configuration`. The `Equals` strategy matches the exact title, so the two
+entries never collide. Include both to float both windows, or just one to float only that
+window:
+
+```json
+{
+  "floating_applications": [
+    { "kind": "Title", "id": "Cosmic Capture Kit - Settings", "matching_strategy": "Equals" },
+    { "kind": "Title", "id": "Cosmic Capture Kit - Preview Editor", "matching_strategy": "Equals" }
+  ]
+}
+```
+
+`floating_applications` is the current key; the older `float_rules` config and the
+`komorebic float-rule` CLI are deprecated.
+
+</details>
+
+<details>
+<summary><b>COSMIC desktop (Linux)</b></summary>
+
+COSMIC tiles both windows by default. There are two ways to make them float:
+
+* **Preview editor, in-app toggle:** enable the windowed editor, then in the app under
+  Settings > General turn on *"Float the preview window (don't tile)"*. The app writes the
+  COSMIC exception for you. This covers the preview window only.
+
+* **Manual, for the Settings window or fine control:** COSMIC has no per-application
+  float-rule GUI yet, so edit its tiling-exception file directly (changes apply live, no
+  logout needed):
+
+  ```
+  ~/.config/cosmic/com.system76.CosmicSettings.WindowRules/v1/tiling_exception_custom
+  ```
+
+  Both `appid` and `title` are matched as regular expressions (unanchored, so they match as
+  a substring), and both must match. The shared `Cosmic Capture Kit` prefix is a substring of
+  both window titles, so it floats BOTH; the two full titles are distinct, so a single-window
+  rule needs no anchoring:
+
+  ```
+  [
+      // Both windows float (this title substring matches both):
+      (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit"),
+  ]
+  ```
+
+  To float only ONE, use one of these as the `title` instead:
+
+  * Settings only: `"Cosmic Capture Kit - Settings"`
+  * Preview only: `"Cosmic Capture Kit - Preview Editor"`
+
+You can also float the focused window ad-hoc with `Super + G` (no config).
+
+</details>
 
 ---
 

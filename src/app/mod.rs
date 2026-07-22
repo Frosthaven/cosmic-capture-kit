@@ -102,6 +102,11 @@ pub struct Startup {
     /// Pre-capture countdown seconds (`--countdown <secs>`) — an EXACT value that may
     /// not match a UI preset (e.g. 7). `None` uses the persisted delay.
     pub countdown_secs: Option<u64>,
+    /// DRAGON-295 (macOS/Windows): an IMMEDIATE capture that skips the interactive picker
+    /// overlay entirely — `--active-window` grabs the frontmost window, `--active-monitor`
+    /// grabs the monitor under the cursor. `None` = the normal overlay launch. The seed
+    /// step (`seed_outputs_mac`) consumes this instead of minting overlays.
+    pub immediate: Option<ImmediateCapture>,
     /// Override the preview appearance for this launch: `Some(true)` = windowed,
     /// `Some(false)` = overlay. `--preview` defaults to windowed unless `--overlay` is
     /// also given; `None` uses the persisted setting.
@@ -181,6 +186,12 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
     if !(startup.settings_only || startup.permissions_only || startup.preview.is_some()) {
         crate::platform::mac::window::install_overlay_chrome_strip();
     }
+    // DRAGON-303: on macOS 26 an NSGlassContainerView in the titlebar swallows clicks meant
+    // for content under the transparent titlebar, so the settings / preview CSD header's
+    // collapse / search buttons stop responding in fullscreen. Install the hit-test passthrough
+    // for EVERY launch (settings / preview included, unlike the capture-only chrome strip).
+    #[cfg(target_os = "macos")]
+    crate::platform::mac::window::install_glass_container_click_through();
     // Windows (DRAGON-243): force a DWM-COMPOSITED present mode for every wgpu surface this
     // process opens. iced_wgpu's default here is `AutoNoVsync` (resolves to Immediate /
     // Mailbox on the Vulkan backend this machine selects). A fullscreen TRANSPARENT overlay
@@ -258,6 +269,19 @@ pub enum Mode {
     Region,
     Window,
     Monitor,
+}
+
+/// DRAGON-295: an immediate, picker-free capture requested from the CLI / a daemon global
+/// hotkey. Unlike [`Mode`] (which is a picker mode inside the overlay), these skip the
+/// overlay: the target is resolved at launch (frontmost window / monitor under cursor) and
+/// captured straight through the normal capture pipeline. macOS/Windows only; Linux never
+/// constructs it (its capture keys are COSMIC custom shortcuts, not owned here).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImmediateCapture {
+    /// The frontmost/active window, no picker.
+    ActiveWindow,
+    /// The monitor under the cursor, no picker.
+    ActiveMonitor,
 }
 
 impl std::fmt::Debug for Mode {
@@ -1294,8 +1318,20 @@ pub struct App {
     /// front without stealing focus. Never set off macOS.
     #[cfg(target_os = "macos")]
     mac_preview_preopen: bool,
+    /// Windows (DRAGON-305): a WINDOWED single-window capture PRE-OPENED its fullscreen loading
+    /// BLOCKER (the overlay preview spinner + cancel X) to cover the whole off-thread
+    /// active-appearance grab + compose/save — the analog of macOS's `mac_preview_preopen`. The
+    /// cover is placed NON-ACTIVATING ([`crate::platform::windows::window::place_overlay`] with
+    /// `activate=false`) so it never steals the target window's foreground during the grab (which
+    /// would capture its INACTIVE chrome). While set, `preview_surface_for` forces the fullscreen
+    /// overlay even though the editor is Windowed; `WindowGrabbed` clears it and arms
+    /// `windowed_swap_pending` so `present_capture` swaps the cover for the real preview window
+    /// once the composed dims land. Never set off Windows, nor in overlay-preview mode (which
+    /// already shows the fullscreen blocker after the grab).
+    #[cfg(windows)]
+    win_preview_preopen: bool,
     /// Windows (DRAGON-246): set true once the settings window has been CONFIRMED shown
-    /// (`float_and_show` matched its async title and issued `ShowWindow`). Gates the
+    /// (`show_titled` matched its async title and issued `ShowWindow`). Gates the
     /// `sub_settings_liveness` watchdog so it can NEVER fire during the legitimate
     /// open-hidden → float-and-show phase — only AFTER the titled window has actually been
     /// shown does its disappearance mean a genuine vanish-without-`Closed`, at which point
@@ -1303,6 +1339,16 @@ pub struct App {
     /// set off Windows (write-once; the one-shot process exits before it would reset).
     #[cfg(windows)]
     settings_shown_confirmed: bool,
+    /// Windows (DRAGON-299): `false` from the settings window's open until its size has SETTLED
+    /// (`ConfigWindowResettle`, a beat after the native show). The settings window opens hidden
+    /// and is shown via native `ShowWindow`, so winit soft-sizes it and STOMPS it to a sub-min
+    /// sliver once on that first show; while this is `false` the resize handler IGNORES the
+    /// open-time transient resizes (so a transient can never be persisted as the remembered
+    /// size) and re-asserts the intended size on the stomp. Once `true`, real USER resizes are
+    /// tracked into `settings_size`. Never set off Windows (their settings window opens visible,
+    /// compositor-managed, with no such stomp — they track every resize as before).
+    #[cfg(windows)]
+    settings_size_ready: bool,
     /// Windows (DRAGON-281): the preview surface whose native show/place has been
     /// CONFIRMED (finalize succeeded — `show_centered` / `place_overlay` returned true).
     /// Gates `sub_preview_finalize`: while a preview surface exists whose id is not this,
@@ -1392,6 +1438,13 @@ pub struct App {
     startup_preview: Option<(std::path::PathBuf, bool)>,
     /// Whether this is a `--preview` launch — suppresses the capture overlays entirely.
     preview_mode: bool,
+    /// DRAGON-295 (macOS/Windows): an IMMEDIATE picker-free capture requested at launch
+    /// (`--active-window` / `--active-monitor`). Consumed by `seed_outputs_mac` instead of
+    /// minting the capture overlays — the target is resolved and captured straight through.
+    /// `None` for a normal overlay launch (every path stays byte-identical then). Never set
+    /// on Linux (its capture keys are COSMIC shortcuts).
+    #[cfg(not(target_os = "linux"))]
+    startup_immediate: Option<ImmediateCapture>,
     /// Last known settings-window size (logical w, h), persisted so the window
     /// reopens at the size it was closed at (clamped to the monitor).
     settings_size: Option<(u32, u32)>,
@@ -1453,12 +1506,28 @@ pub struct App {
     /// off). Read by `finish_session` on macOS; Linux keeps the one-shot model
     /// and never consults it.
     resident: bool,
-    /// macOS (DRAGON-130): the resident daemon's global "Start Capture" hotkey spec
-    /// (e.g. "PrintScreen", "Cmd+Shift+2"); persisted, default "PrintScreen". Edited
-    /// on the Shortcuts settings page (macOS-only row); the daemon reads it from disk
-    /// at startup. Carried on `App` only to round-trip it through save and drive the
-    /// settings row; Linux never registers it (its capture key is a COSMIC shortcut).
+    /// Launch the resident at login (DRAGON-296): when this AND `resident` are both on, the
+    /// OS login item / autostart entry is registered so the tray comes back after a login.
+    /// Persisted, default on; the settings row is hidden while `resident` is off. Both
+    /// toggles route through `reconcile_login_item`, which computes the desired state as
+    /// `resident && autostart_on_login`.
+    autostart_on_login: bool,
+    /// macOS/Windows (DRAGON-130 / DRAGON-295): the resident daemon's global "Capture All
+    /// In One" hotkey spec (e.g. "PrintScreen", "Cmd+Shift+2"); persisted, default UNSET.
+    /// Opens the full capture overlay. Edited on the Shortcuts settings page (macOS/Windows
+    /// row); the daemon reads it from disk at startup. Carried on `App` only to round-trip
+    /// it through save and drive the settings row; Linux never registers it (its capture
+    /// key is a COSMIC shortcut).
     capture_hotkey: String,
+    /// macOS/Windows (DRAGON-295): the resident daemon's global "Capture Active Window"
+    /// hotkey spec; persisted, default UNSET. Immediately captures the frontmost window,
+    /// no picker. Same round-trip/settings-row role as `capture_hotkey`; Linux never reads it.
+    capture_active_window_hotkey: String,
+    /// macOS/Windows (DRAGON-295): the resident daemon's global "Capture Active Monitor"
+    /// hotkey spec; persisted, default UNSET. Immediately captures the monitor under the
+    /// cursor, no picker. Same round-trip/settings-row role as `capture_hotkey`; Linux
+    /// never reads it.
+    capture_active_monitor_hotkey: String,
     /// macOS (DRAGON-130): the death-pipe babysitter guard held for a capture session
     /// that paused a tiling WM (AeroSpace). Armed once the pause completes
     /// (`seed_overlays_mac`), dropped on session end (`finish_session`/`quit_now` +
@@ -1924,6 +1993,8 @@ pub use message::{
     BorderColorTarget, CaptureMsg, RecordingMsg, DetectMsg, SettingsMsg, PermissionsMsg,
     WindowChromeMsg, PreviewMsg, VideoMeta,
 };
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub use message::CaptureHotkeySlot;
 
 #[derive(Debug, Clone)]
 pub enum Msg {

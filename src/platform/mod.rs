@@ -228,3 +228,30 @@ pub mod linux_autostart;
 #[cfg(target_os = "windows")]
 #[path = "windows/autostart.rs"]
 pub mod windows_autostart;
+
+/// Opt OUR-app window titled `title` OUT of automatic tiling by the user's tiling window
+/// manager — AeroSpace on macOS, komorebi on Windows — where possible. This is the single
+/// portable entry point for per-window tiling opt-out: each platform implements its own
+/// `opt_out_of_tiling` arm, and every arm is scoped to OUR OWN windows (matched by our
+/// process AND the exact title), so it can never grab another app's window. Idempotent; a
+/// no-op where there is no tiling WM. To keep a window un-tiled, call this instead of
+/// reaching into a platform module; the capture overlays are the first consumers.
+///
+/// macOS timing: the AeroSpace opt-out must land before the window's first AX exposure, so
+/// the mac arm keeps a pre-order-front `orderFront:` swizzle that strips our above-normal
+/// overlays automatically; calling this additionally installs that swizzle and strips a
+/// matching already-visible window as a backstop. On Windows the komorebi bit likewise
+/// wants to be set before first show — the overlays' `place_overlay` does that directly;
+/// this seam is the general entry point.
+///
+/// No Linux/COSMIC arm: the capture overlays are layer-shell surfaces COSMIC never tiles,
+/// and a real toplevel that wants to float opts out via `linux::cosmic::quirks`' persisted
+/// WindowRules config write (a different lifecycle, not a per-open call). Hence the seam is
+/// scoped to the two platforms where opting a live window out of tiling is a per-window op.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn opt_out_of_tiling(title: &str) {
+    #[cfg(target_os = "macos")]
+    crate::platform::mac::window::opt_out_of_tiling(title);
+    #[cfg(target_os = "windows")]
+    crate::platform::windows::window::opt_out_of_tiling(title);
+}

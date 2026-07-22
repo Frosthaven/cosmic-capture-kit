@@ -23,15 +23,32 @@ pub(super) use mic_test::MIC_WAVE_COLUMNS;
 // Bring row helpers into this module's scope for rendered_sections.
 use self::row::{reset_button, severity_caption, severity_title, Severity, SectionSpec};
 
-/// The settings window title — also used to find/focus an already-open settings
-/// window in another instance.
-pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit";
+/// The settings window title (DRAGON-301) — THE single source of truth for it: the window's OS
+/// title (`set_window_title`), the CSD header bar title, the title the native Windows helpers
+/// (`show_titled`/`find_by_title`/caption/mica) + the mac titlebar centering match on, and the
+/// title a tiling-WM float rule keys on (see the README) all route through this const. Also used
+/// to find/focus an already-open settings window in another instance.
+pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Settings";
+
+/// Minimum settings-window size (logical px): the window can never open or resize smaller than
+/// this, on all platforms (DRAGON-268 follow-up). Kept in sync with
+/// `App::apply_nav_auto_collapse_on_spawn`'s spawn-width floor in update/window_chrome.rs.
+/// DRAGON-299: the Windows resize handler also treats a resize BELOW this as winit's spurious
+/// post-show stomp (never a real user resize — the resize border enforces the minimum).
+pub(crate) const MIN_W: f32 = 800.0;
+pub(crate) const MIN_H: f32 = 600.0;
 
 /// macOS (DRAGON-135): width reserved at the header's leading edge for the native
 /// traffic-light buttons (they end around x=62 in a standard window; 72 leaves a
 /// comfortable gap before the first CSD control).
 #[cfg(target_os = "macos")]
 pub(super) const TRAFFIC_LIGHTS_INSET: f32 = 72.0;
+/// macOS (DRAGON-303): vertical inset applied ABOVE the header in fullscreen, so the collapse /
+/// search controls clear the screen's top-edge menu-bar / titlebar auto-reveal zone (which
+/// otherwise storms mouse enter/exit there and cancels their clicks). Sized to clear a notched
+/// menu bar with margin.
+#[cfg(target_os = "macos")]
+const FULLSCREEN_TOP_INSET: f32 = 44.0;
 /// Windows (DRAGON-284): LOGICAL width reserved at the header's TRAILING edge for the native
 /// DWM caption-button cluster (minimize / maximize / close, top-right — the Windows mirror of
 /// mac's leading `TRAFFIC_LIGHTS_INSET`). The Win11 cluster is ~3 × ~46px = ~138px; 146
@@ -217,12 +234,13 @@ pub struct SettingsState {
     pub border_picker: widget::ColorPickerModel,
     /// DRAGON-191: which border the picker sidebar is editing, or `None` when closed.
     pub border_editor: Option<crate::app::BorderColorTarget>,
-    /// macOS (DRAGON-130) / Windows (DRAGON-237): whether the "Start Capture" global-hotkey
-    /// row is CAPTURING the next keypress (the button-recording flow, mirroring `rebinding`
-    /// but for the daemon's OS hotkey rather than an in-app [`crate::shortcuts::Action`]).
-    /// cfg-gated to the daemon-hotkey OSes so the Linux settings state stays byte-identical.
+    /// macOS (DRAGON-130) / Windows (DRAGON-237) / DRAGON-295: which of the three global
+    /// capture-hotkey rows is CAPTURING the next keypress (the button-recording flow,
+    /// mirroring `rebinding` but for a daemon OS hotkey slot rather than an in-app
+    /// [`crate::shortcuts::Action`]), or `None` when none is armed. cfg-gated to the
+    /// daemon-hotkey OSes so the Linux settings state stays byte-identical.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub capture_hotkey_rebinding: bool,
+    pub capture_hotkey_rebinding: Option<crate::app::CaptureHotkeySlot>,
 }
 
 impl Default for SettingsState {
@@ -366,7 +384,7 @@ impl SettingsState {
             border_picker: widget::ColorPickerModel::new("Hex", "RGB", None, None),
             border_editor: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
-            capture_hotkey_rebinding: false,
+            capture_hotkey_rebinding: None,
         }
     }
 
@@ -479,11 +497,8 @@ impl SettingsState {
 pub(super) fn open_config_window(
     saved: Option<(u32, u32)>,
 ) -> (window::Id, Task<cosmic::Action<Msg>>) {
-    // Minimum settings-window size (DRAGON-268 follow-up): the window can never open or
-    // resize smaller than this, on all platforms. Kept in sync with
-    // `App::apply_nav_auto_collapse_on_spawn`'s spawn-width floor in update/window_chrome.rs.
-    const MIN_W: f32 = 800.0;
-    const MIN_H: f32 = 600.0;
+    // Minimum settings-window size: the window can never open or resize smaller than this
+    // (the module-level [`MIN_W`]/[`MIN_H`]).
     let (mut w, mut h) = saved
         .map(|(w, h)| (w as f32, h as f32))
         .unwrap_or((MIN_W, MIN_H));
@@ -534,14 +549,14 @@ pub(super) fn open_config_window(
         // reports it via SkyLight, so JankyBorders (and any border tool) hugs the
         // corner (the NSWindow's own opacity — winit's `transparent` flag — is the one
         // lever that changes the reported radius; the CAMetalLayer's opacity does not).
-        // BUT window vibrancy (DRAGON-268) needs a NON-opaque window for the frosted
-        // material behind the content to show, so when frosted windows are ON we open
-        // transparent; this REVERSES DRAGON-146 (the corner/border-tool tradeoff is
-        // accepted pending live mac testing, DRAGON-268 Blocker 1) only in the glass
-        // case, keeping the default (glass off) opaque + native-corner-reporting. The
-        // capture overlays are a separate path (always transparent).
+        // DRAGON-293: ALWAYS open opaque, even for glass. A fully transparent (clearColor)
+        // window reports server corner radii of 0, and border tools (JankyBorders) read the
+        // radius ONCE at first appearance, so it must be correct at creation. Glass needs a
+        // NON-opaque window (`setOpaque(false)`), NOT a transparent one: `enable_window_vibrancy`
+        // makes it non-opaque with a near-clear (not clear) background after open, keeping the
+        // real ~20pt corner. The capture overlays are a separate path (always transparent).
         #[cfg(target_os = "macos")]
-        transparent: crate::app::theme::glass_windows_enabled(),
+        transparent: false,
         #[cfg(not(target_os = "macos"))]
         transparent: true,
         exit_on_close_request: false,
@@ -563,15 +578,20 @@ pub(super) fn open_config_window(
         },
         #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         platform_specific: cosmic::iced::window::settings::PlatformSpecific::default(),
-        // Windows (DRAGON-229, KOMOREBI.md §7): open HIDDEN so the user's tiling WM
-        // (komorebi) sees no `Show` event at creation; the `ConfigWindowOpened` handler's
-        // Windows arm marks it komorebi-ineligible (WS_EX_DLGMODALFRAME) and shows it
-        // natively (`ConfigWindowFloat` poll → `float_and_show`), so komorebi's first
-        // sight of it is already ineligible and it is never tiled. Not the process's first
-        // window — the hidden bootstrap surface owns the event loop — so hiding it can't
-        // stall iced. mac / Linux keep the default (visible): they open directly.
+        // Windows (DRAGON-299): open VISIBLE (winit-managed), like mac/Linux. It USED to open
+        // HIDDEN and be shown via a native `ShowWindow` (`show_titled`) once its async title
+        // landed — but a window shown that way (bypassing winit's own `set_visible`) has its size
+        // STOMPED by winit to a sub-min sliver a beat after the show, which both broke "remember
+        // the size" AND collapsed the wgpu surface toward a 0-width client → a fatal wgpu error.
+        // Opening visible sidesteps the whole native-show path: winit sizes + shows the window
+        // itself with no stomp. DRAGON-302: no komorebi opt-out is set, so a tiling WM tiles it
+        // like a normal window (matching mac/Linux); a user who prefers it floating adds a WM
+        // float rule (see the README). The one trade-off vs. open-hidden is that komorebi now sees
+        // the window a frame before its async title lands, so a title-keyed float rule applies a
+        // beat late (komorebi re-evaluates on the title change) — a brief tile-then-float, far
+        // better than a slivered/crashing window.
         #[cfg(windows)]
-        visible: false,
+        visible: true,
         ..Default::default()
     });
     (id, task.map(|id| cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::ConfigWindowOpened(id)))))
@@ -1103,6 +1123,26 @@ impl App {
         // The whole window is an opaque rounded background with a hairline border;
         // the transparent surface only shows through outside the rounded corners.
         // Mirrors the cosmic framework's outer window container.
+        // DRAGON-303: in macOS fullscreen the header sits at the screen's top edge, inside the
+        // menu-bar / titlebar auto-reveal zone. macOS oscillates mouse enter/exit at that edge,
+        // and each exit reads as "pointer left the window", which cancels clicks on the collapse /
+        // search buttons (hover works, click does not). Inset the window below that reveal zone in
+        // fullscreen so those controls sit in clean, clickable space.
+        #[cfg(target_os = "macos")]
+        let stacked = {
+            let mut items: Vec<Element<'_, Msg>> = Vec::new();
+            if self.settings_fullscreen {
+                items.push(
+                    widget::Space::new()
+                        .height(Length::Fixed(FULLSCREEN_TOP_INSET))
+                        .into(),
+                );
+            }
+            items.push(header.into());
+            items.push(body.into());
+            widget::column(items).width(Length::Fill).height(Length::Fill)
+        };
+        #[cfg(not(target_os = "macos"))]
         let stacked = widget::column(vec![header.into(), body.into()])
             .width(Length::Fill)
             .height(Length::Fill);

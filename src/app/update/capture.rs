@@ -161,6 +161,17 @@ impl App {
                         window::gain_focus(id)
                     };
                 }
+                // DRAGON-305 (Windows): the fullscreen blocker cover was pre-opened NON-ACTIVATING
+                // (so it couldn't steal the target's foreground during the active-appearance grab).
+                // The grab is done, so — like the mac windowed arm — DEFER the cover→window swap to
+                // `present_capture`, where the COMPOSED dims are known (the window then opens once at
+                // its correct size); the cover keeps painting `grab_cover_view` until the window maps.
+                // Only WINDOWED picks pre-open (`win_preview_preopen`), so there is no overlay arm here.
+                #[cfg(windows)]
+                if std::mem::take(&mut self.win_preview_preopen) {
+                    self.windowed_swap_pending = true;
+                    return Task::none();
+                }
                 // DRAGON-215: the off-thread window focus-then-grab finished. Raise the
                 // preview spinner NOW (after the grab, so its focus steal can't clobber the
                 // DRAGON-194 focus the grab depended on) to cover the remaining compose/

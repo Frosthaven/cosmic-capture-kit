@@ -96,7 +96,7 @@ impl App {
     /// explicit resume is needed when recording ends or the window closes.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn sub_hotkey_suspend_ping(&self) -> Option<Subscription<Msg>> {
-        if self.settings.capture_hotkey_rebinding {
+        if self.settings.capture_hotkey_rebinding.is_some() {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_secs(1))
                     .map(|_| Msg::Settings(SettingsMsg::SuspendDaemonHotkeyPing)),

@@ -348,6 +348,9 @@ fn main() -> cosmic::iced::Result {
                     | "--region"
                     | "--window"
                     | "--monitor"
+                    | "--all-in-one"
+                    | "--active-window"
+                    | "--active-monitor"
                     | "--image"
                     | "--video"
                     | "--scan"
@@ -403,10 +406,11 @@ fn main() -> cosmic::iced::Result {
     // flag) with the persisted `resident` setting on runs the tiny Win32 tray daemon and
     // NEVER touches the iced/wgpu stack — the same lightweight technique. Every other launch
     // falls through to `app::run` exactly as before. `--permissions` is macOS-only, so it is
-    // not in the Windows bare check. Byte-identical to a bare launch when `resident` is off
-    // (the Windows default), so the historical "bare launch opens the capture overlay"
-    // behaviour is unchanged unless the user opts in. The daemon takes its own lock and, if
-    // one is already up, signals it to capture and exits (the mac "capture NOW" UX).
+    // not in the Windows bare check. DRAGON-296: `resident` now defaults ON on Windows (matching
+    // macOS — the tray owns the global capture hotkey), so a fresh install's bare launch runs the
+    // daemon; a user who turns the tray off falls through to the historical "bare launch opens the
+    // capture overlay" behaviour. The daemon takes its own lock and, if one is already up, signals
+    // it to capture and exits (the mac "capture NOW" UX).
     #[cfg(target_os = "windows")]
     {
         let bare = !args.iter().any(|a| {
@@ -416,6 +420,9 @@ fn main() -> cosmic::iced::Result {
                     | "--region"
                     | "--window"
                     | "--monitor"
+                    | "--all-in-one"
+                    | "--active-window"
+                    | "--active-monitor"
                     | "--image"
                     | "--video"
                     | "--scan"
@@ -495,6 +502,17 @@ fn main() -> cosmic::iced::Result {
     // Capture-mode flags: launch straight into a mode / kind / countdown. Absent
     // flags leave the fields `None`, so a bare launch is byte-identical to before.
     let has = |flag: &str| args.iter().any(|a| a == flag);
+    // DRAGON-295: the picker-free immediate captures (a daemon global hotkey / direct CLI).
+    // `--all-in-one` just opens the normal overlay (no `immediate`); it exists so the daemon
+    // has a distinct flag from the mode flags and the bare-check treats it as a capture
+    // launch. macOS/Windows resolve the target; Linux never spawns these (byte-identical).
+    let immediate = if has("--active-window") {
+        Some(app::ImmediateCapture::ActiveWindow)
+    } else if has("--active-monitor") {
+        Some(app::ImmediateCapture::ActiveMonitor)
+    } else {
+        None
+    };
     let mode = if has("--monitor") {
         Some(app::Mode::Monitor)
     } else if has("--window") {
@@ -526,6 +544,7 @@ fn main() -> cosmic::iced::Result {
         mode,
         kind,
         countdown_secs,
+        immediate,
         preview_windowed: None,
     })
 }
@@ -542,6 +561,9 @@ Launch (opens the capture overlay by default):\n\
     --region                Start in region-select mode (default)\n\
     --window                Start in window-select mode\n\
     --monitor               Start in monitor-select mode\n\
+    --all-in-one            Open the full capture picker overlay\n\
+    --active-window         Capture the active window immediately (no picker)\n\
+    --active-monitor        Capture the monitor under the cursor immediately (no picker)\n\
     --image                 Capture a screenshot (default)\n\
     --video                 Capture a screen recording\n\
     --scan                  Start the QR/OCR scanner (forces region)\n\

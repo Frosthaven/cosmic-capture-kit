@@ -812,6 +812,111 @@ impl Shortcut {
     }
 }
 
+/// macOS (DRAGON-294): render a daemon "Start Capture" hotkey SPEC string (the form
+/// `Shortcut::daemon_spec` produces / the daemon parses — e.g. `"Cmd+Shift+2"`,
+/// `"Ctrl+Alt+K"`, `"PrintScreen"`) into the native macOS modifier SYMBOLS: Control ⌃,
+/// Option/Alt ⌥, Shift ⇧, Command ⌘, keeping the platform ORDER ⌃⌥⇧⌘ regardless of how
+/// the spec was written. So `Ctrl+Alt+Shift+1` → `⌃⌥⇧1` and `Cmd+Shift+2` → `⌘⇧2`. The
+/// key token is passed through mostly verbatim (uppercased for a bare letter), with a few
+/// named keys mapped to their glyphs to match `Shortcut::label`. This is the ONE mac
+/// formatter every keybind DISPLAY routes through on macOS; Windows/Linux keep the plain
+/// spec text (this is never called there). Pure, so it unit-tests without any AppKit.
+///
+/// An empty spec (the cleared / unset state) yields an empty string — the caller decides
+/// what to show for "no binding" (e.g. "Unbound"). Unknown tokens pass through unchanged,
+/// so a spec this can't fully classify still renders legibly rather than being dropped.
+#[cfg(target_os = "macos")]
+pub fn mac_symbolic_spec(spec: &str) -> String {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return String::new();
+    }
+    // Split into `+`-joined tokens, classify each as a modifier or the key. Collect the
+    // modifiers as a set so they can be re-emitted in the canonical ⌃⌥⇧⌘ order (the spec
+    // may list them in any order), and keep the non-modifier tokens as the key text.
+    let (mut ctrl, mut alt, mut shift, mut logo) = (false, false, false, false);
+    let mut key_parts: Vec<String> = Vec::new();
+    for tok in spec.split('+') {
+        let t = tok.trim();
+        if t.is_empty() {
+            // A literal "+" key (a spec like "Cmd++"): an empty split segment between two
+            // separators. Render it as the plus sign rather than dropping it.
+            key_parts.push("+".to_string());
+            continue;
+        }
+        match t.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "option" | "opt" => alt = true,
+            "shift" => shift = true,
+            "cmd" | "command" | "super" | "logo" | "win" => logo = true,
+            _ => key_parts.push(mac_key_glyph(t)),
+        }
+    }
+    let mut out = String::new();
+    if ctrl {
+        out.push('⌃');
+    }
+    if alt {
+        out.push('⌥');
+    }
+    if shift {
+        out.push('⇧');
+    }
+    if logo {
+        out.push('⌘');
+    }
+    out.push_str(&key_parts.join(""));
+    out
+}
+
+/// Windows (DRAGON-294): render a daemon capture-hotkey SPEC string (the form
+/// `Shortcut::daemon_spec` produces — e.g. "Cmd+Shift+2", "Ctrl+Alt+K", "PrintScreen") with
+/// Windows-native modifier NAMES. The one that matters: the logo/command token — which
+/// `daemon_spec` always serializes as "Cmd" (logo → Cmd, shared with macOS) — reads as "Win"
+/// on Windows, where users never call it "Cmd". Ctrl/Alt/Shift keep their text and the key
+/// token passes through verbatim, so "Cmd+Shift+2" shows as "Win+Shift+2" and the common
+/// "Ctrl+Alt+K" is unchanged. Pure, so it unit-tests without any Win32. macOS uses
+/// `mac_symbolic_spec` instead; Linux never shows daemon hotkeys (COSMIC custom shortcut).
+#[cfg(windows)]
+pub fn win_readable_spec(spec: &str) -> String {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return String::new();
+    }
+    spec.split('+')
+        .map(|tok| match tok.trim().to_ascii_lowercase().as_str() {
+            "cmd" | "command" | "super" | "logo" | "win" | "meta" => "Win",
+            "ctrl" | "control" => "Ctrl",
+            "alt" | "option" | "opt" => "Alt",
+            "shift" => "Shift",
+            // The key token (or an unknown / empty "+"-key segment): pass through verbatim.
+            _ => tok,
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// The macOS display glyph/text for a spec KEY token (not a modifier). Arrow names map to
+/// arrow glyphs (matching `NamedKey::label`); a bare single letter is uppercased; every
+/// other token (digits, symbols, F-keys, PrintScreen, Enter, …) passes through verbatim.
+#[cfg(target_os = "macos")]
+fn mac_key_glyph(tok: &str) -> String {
+    match tok.to_ascii_lowercase().as_str() {
+        "arrowup" | "up" => "↑".to_string(),
+        "arrowdown" | "down" => "↓".to_string(),
+        "arrowleft" | "left" => "←".to_string(),
+        "arrowright" | "right" => "→".to_string(),
+        _ => {
+            let mut chars = tok.chars();
+            // A single character (letter/symbol): uppercase it, matching `Shortcut::label`.
+            if let (Some(c), None) = (chars.next(), chars.clone().next()) {
+                return c.to_uppercase().to_string();
+            }
+            tok.to_string()
+        }
+    }
+}
+
 /// The live `Action → Shortcut` table. The single source of truth for matching key
 /// events and for the settings UI; persisted as a list of overrides from default.
 #[derive(Clone, Debug)]
@@ -1129,5 +1234,88 @@ mod tests {
         let mut km2 = Keymap::defaults();
         km2.apply_overrides(&ov);
         assert_eq!(km2.action_for(Context::Overlay, Modifiers::CTRL, &ch("k")), Some(Action::SelectAllText));
+    }
+}
+
+/// DRAGON-294: the macOS daemon-spec → modifier-symbol formatter. Pure, so it tests without
+/// any AppKit. The vocabulary matches `daemon_spec` / the daemon parser, case-insensitively.
+#[cfg(all(test, target_os = "macos"))]
+mod mac_symbolic_spec_tests {
+    use super::mac_symbolic_spec;
+
+    #[test]
+    fn every_modifier_renders_its_glyph_in_canonical_order() {
+        // Written out of order in the spec; rendered in the platform order ⌃⌥⇧⌘ — the SAME
+        // order `Shortcut::label` uses (Command LAST), so e.g. "Save As" reads ⇧⌘S in both.
+        assert_eq!(mac_symbolic_spec("Cmd+Shift+Alt+Ctrl+K"), "⌃⌥⇧⌘K");
+        assert_eq!(mac_symbolic_spec("Ctrl+Alt+Shift+1"), "⌃⌥⇧1");
+        assert_eq!(mac_symbolic_spec("Cmd+Shift+2"), "⇧⌘2");
+    }
+
+    #[test]
+    fn modifier_aliases_and_case_insensitive() {
+        // Command/Super → ⌘, Option → ⌥, Control → ⌃, all case-insensitive.
+        assert_eq!(mac_symbolic_spec("command+shift+s"), "⇧⌘S");
+        assert_eq!(mac_symbolic_spec("super+9"), "⌘9");
+        assert_eq!(mac_symbolic_spec("option+k"), "⌥K");
+        assert_eq!(mac_symbolic_spec("control+c"), "⌃C");
+    }
+
+    #[test]
+    fn bare_keys_pass_through() {
+        // Named keys / F-keys / PrintScreen have no modifiers and render verbatim.
+        assert_eq!(mac_symbolic_spec("PrintScreen"), "PrintScreen");
+        assert_eq!(mac_symbolic_spec("F13"), "F13");
+        assert_eq!(mac_symbolic_spec("a"), "A"); // single letter uppercased
+        assert_eq!(mac_symbolic_spec("Enter"), "Enter");
+    }
+
+    #[test]
+    fn arrow_names_render_as_glyphs() {
+        assert_eq!(mac_symbolic_spec("Cmd+ArrowUp"), "⌘↑");
+        assert_eq!(mac_symbolic_spec("ArrowDown"), "↓");
+    }
+
+    #[test]
+    fn empty_spec_is_empty() {
+        assert_eq!(mac_symbolic_spec(""), "");
+        assert_eq!(mac_symbolic_spec("   "), "");
+    }
+}
+
+/// DRAGON-294 (Windows): the daemon capture-hotkey spec renders with Windows modifier NAMES
+/// — the logo token "Cmd" (as `daemon_spec` serializes it) reads "Win", not "Cmd". Pure, so
+/// it tests without any Win32. Vocabulary matches `daemon_spec` / the daemon parser.
+#[cfg(all(test, windows))]
+mod win_readable_spec_tests {
+    use super::win_readable_spec;
+
+    #[test]
+    fn logo_token_reads_win_not_cmd() {
+        // The reported issue: `daemon_spec` serializes the logo/Win key as "Cmd", which is
+        // mac terminology — on Windows it must read "Win".
+        assert_eq!(win_readable_spec("Cmd+Shift+2"), "Win+Shift+2");
+        // Every logo alias the daemon parser accepts collapses to "Win".
+        assert_eq!(win_readable_spec("command+9"), "Win+9");
+        assert_eq!(win_readable_spec("super+k"), "Win+k");
+        assert_eq!(win_readable_spec("win+a"), "Win+a");
+        assert_eq!(win_readable_spec("meta+f1"), "Win+f1");
+    }
+
+    #[test]
+    fn common_modifiers_stay_text_and_key_passes_through() {
+        // The common Windows chord (no logo key) is unchanged bar canonical modifier casing.
+        assert_eq!(win_readable_spec("Ctrl+Alt+K"), "Ctrl+Alt+K");
+        assert_eq!(win_readable_spec("ctrl+alt+shift+1"), "Ctrl+Alt+Shift+1");
+        assert_eq!(win_readable_spec("option+j"), "Alt+j");
+        // A bare key / named key passes through verbatim (no modifiers to rewrite).
+        assert_eq!(win_readable_spec("PrintScreen"), "PrintScreen");
+        assert_eq!(win_readable_spec("F13"), "F13");
+    }
+
+    #[test]
+    fn empty_is_empty() {
+        assert_eq!(win_readable_spec(""), "");
+        assert_eq!(win_readable_spec("   "), "");
     }
 }

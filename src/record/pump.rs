@@ -1135,6 +1135,65 @@ mod tests {
     }
 
     #[test]
+    fn a_mid_session_mic_toggle_off_releases_the_duck() {
+        // DRAGON-297 defect 1: the ducker keys on the mic's CURRENT toggle state, not only
+        // its state at t=0. A mic armed at start (so the ducker exists and ducked on speech)
+        // but toggled OFF mid-session must RELEASE — its now-muted speech is cut from the
+        // file at finalize, so continuing to duck to it would carve holes in the system track.
+        let t0 = base();
+        let mut pump = ducked_pump_after_speech(t0, true); // armed; hold engaged by speech
+        // First prove it IS ducking while the mic is live: a 0.3s system chunk (14_400
+        // stereo frames) drops to the ducked gain once the 0.1s attack completes.
+        pump.push_sys_chunk(vec![1.0; 28_800], t0, 0.0); // media 0..0.3
+        // Now toggle the mic OFF and keep "speaking" into the muted channel: feed_sidechain
+        // with live=false must never re-arm the hold, so it drains over the hold + release.
+        pump.push_toggle(t0 + secs(0.6), AudioChannel::Mic, false);
+        for i in 0..150 {
+            let at = t0 + Duration::from_millis(600 + i * 10);
+            pump.push_mic_tap(StreamTap::new(vec![0.5; 480], at, at));
+        }
+        // A later 1.0s system chunk (48_000 stereo frames) at media 3..4 must have fully
+        // RELEASED back to unity by its end.
+        pump.push_sys_chunk(vec![1.0; 96_000], t0 + secs(3.0), 0.0);
+        let out = pump.mixer.render(4.0);
+        let sys = &out.tracks[TRACK_SYS];
+        // The live-mic chunk: frame 12_000 (media 0.25, well past the 0.1s attack) sits at
+        // the ducked gain (~-12 dB).
+        assert!(sys[24_000] < 0.5, "the live-mic chunk must duck (got {})", sys[24_000]);
+        // The post-toggle chunk's final frame is back at unity.
+        let last = sys[sys.len() - 1];
+        assert!(
+            (last - 1.0).abs() < 1e-6,
+            "a mic toggled OFF mid-session must release the duck, not keep ducking on its \
+             muted speech (got {last}, DRAGON-297)"
+        );
+    }
+
+    #[test]
+    fn gated_silence_mic_taps_never_duck_the_system_track() {
+        // DRAGON-297 defect 3: the sidechain IS the cleaned, post-gate mic tap, so noise the
+        // cleanup chain removes reaches the ducker as digital silence — a closed voice gate
+        // can never duck the system track no matter how loud the raw room noise was.
+        let t0 = base();
+        let clock = Arc::new(Mutex::new(MediaClock::new(t0)));
+        let (writer_tx, _writer_rx) = std::sync::mpsc::channel::<PcmStep>();
+        let mut c = cfg(30);
+        c.duck_system = true;
+        c.mic_on0 = true;
+        let mut pump = MediaClockPump::new(clock, &c, writer_tx);
+        for i in 0..50 {
+            let at = t0 + Duration::from_millis(i * 10);
+            pump.push_mic_tap(StreamTap::new(vec![0.0; 480], at, at)); // gated silence
+        }
+        pump.push_sys_chunk(vec![1.0; 28_800], t0, 0.0);
+        let out = pump.mixer.render(1.0);
+        assert!(
+            out.tracks[TRACK_SYS][..28_800].iter().all(|&s| s == 1.0),
+            "gated-silence mic taps (cleaned-away noise) must never duck the system track"
+        );
+    }
+
+    #[test]
     fn set_paused_is_a_no_op_when_state_does_not_change() {
         let t0 = base();
         let PumpRig { mut pump, .. } = pump_with_fakes(t0, 30);
