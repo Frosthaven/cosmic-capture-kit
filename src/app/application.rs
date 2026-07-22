@@ -38,6 +38,13 @@ impl cosmic::Application for App {
         // one, so we can choose smart capture-method defaults once.
         let first_launch = !crate::state::file_exists();
         let persisted = crate::state::load();
+        // DRAGON-309: snapshot the TRIGGER display's NAME NOW, at the very top of init — before
+        // the picker overlay is shown, before the user moves the cursor to the target monitor to
+        // draw a region / pick a window, and before our layer-shell overlay grabs focus. This is
+        // the monitor active when the capture was initiated; sampling it at capture COMMIT would
+        // read the TARGET monitor instead. The daemon press-time env (CCK_ACTIVE_DISPLAY) wins
+        // off Linux; on Linux it's the focused toplevel's output. Resolved to a rect at commit.
+        let trigger_display = crate::platform::snapshot_trigger_display_name();
         // Recordings + meters read the mic source from this global; set it from the
         // persisted choice now so it applies even if settings is never opened.
         crate::audio::config::set_mic_source(&persisted.mic_device);
@@ -136,9 +143,7 @@ impl cosmic::Application for App {
             // Monitor) even though no overlay is shown. Otherwise the explicit `--mode` /
             // the default Region applies.
             match startup.immediate {
-                #[cfg(not(target_os = "linux"))]
                 Some(ImmediateCapture::ActiveWindow) => Mode::Window,
-                #[cfg(not(target_os = "linux"))]
                 Some(ImmediateCapture::ActiveMonitor) => Mode::Monitor,
                 _ => startup.mode.unwrap_or(Mode::Region),
             }
@@ -352,11 +357,12 @@ impl cosmic::Application for App {
                 selection_box_thickness: persisted.selection_box_thickness.clamp(1, 8),
                 preview: None,
                 preview_duck: None,
+                trigger_display,
                 preview_output: None,
                 preview_output_scale: 1.0,
+                preview_open_size: None,
                 startup_preview,
                 preview_mode,
-                #[cfg(not(target_os = "linux"))]
                 startup_immediate: startup.immediate,
                 settings_size: persisted.settings_size,
                 ffmpeg_available,

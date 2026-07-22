@@ -27,6 +27,14 @@ pub enum PermissionsMsg {
     /// constructs it.
     #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     Relaunch,
+    /// Restart the resident menu-bar daemon so it picks up a freshly-granted
+    /// Accessibility permission (DRAGON-311). The daemon is a SEPARATE long-running
+    /// process that resolves the focused window via the AX API; SIGTERM it and respawn
+    /// a fresh daemon that re-reads the (now-granted) trust on startup. This process
+    /// (the permissions window) stays open so the user sees the card stay green. macOS
+    /// only, but un-cfg'd so the Linux handler type-checks; only the mac view builds it.
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    RestartDaemon,
     /// The live-status poll tick (fired ~1s while the window is open): kick off the
     /// prompt-free re-probe as a `Task` so grants flip in place. The probe may briefly
     /// block on an async settings query, so it runs OFF the UI thread and folds its

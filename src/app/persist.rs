@@ -68,6 +68,7 @@ impl App {
             // clobbers them. Only init's first-run flow / the daemon's login-item
             // seed write them (directly).
             mac_first_run_seen: crate::state::load().mac_first_run_seen,
+            mac_accessibility_prompt_seen: crate::state::load().mac_accessibility_prompt_seen,
             mac_login_item_seeded: crate::state::load().mac_login_item_seeded,
             win_login_item_seeded: crate::state::load().win_login_item_seeded,
             region_overlay_opacity: self.region_overlay_opacity,

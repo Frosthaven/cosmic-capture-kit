@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-capture-kit"
-version = "0.16.1"
+version = "0.17.0"
 dependencies = [
  "arboard",
  "ashpd 0.12.3",

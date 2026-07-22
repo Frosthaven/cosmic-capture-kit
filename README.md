@@ -6,68 +6,115 @@
 
 ![Cosmic Capture Kit capturing its own settings window](res/readme/hero.png)
 
-Cosmic Capture Kit is a cross-platform program for capturing image, voice, and
-video across screen regions, windows, and monitors.
+Cross-platform screen region, window, and monitor capture with support for glass
+windows, image, video, voice, QR, barcodes, OCR text and more. 
 
-## Supported platforms
+## Supported Core Platforms
 
-| Platform | Capture backend | Status |
-|---|---|---|
-| macOS 13+ (Apple Silicon) | ScreenCaptureKit Compositor w/extras | ✅ |
-| Windows 11 | Windows Capture w/extras | ✅ |
-| Linux (Wayland): COSMIC | Cosmic Compositor w/extras | ✅ |
-| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | Planned | Planned |
-| Linux (Wayland): KDE Plasma | PipeWire portal | Planned |
-| Linux (Wayland): GNOME | PipeWire portal | Planned |
+These are the platforms currently planned for support, along with their current
+status.
 
-Capture backend extras, where available, include features such as:
+| Platform                                                 | Capture backend                     | Status  |
+| -------------------------------------------------------- | ----------------------------------- | ------- |
+| macOS 13+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      |
+| Windows 11                                               | Windows Capture                     | ✅      |
+| Linux (Wayland): COSMIC                                  | Cosmic Compositor / PipeWire Portal | ✅      |
+| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | TBD                                 | Planned |
+| Linux (Wayland): KDE Plasma                              | TBD                                 | Planned |
+| Linux (Wayland): GNOME                                   | TBD                                 | Planned |
 
-- Freezing pixels on region capture
-- Toggling mouse cursor availability
-- Toggling window transparency
-- Toggling wallpaper visibility
-- Single window aesthetics (focus appearance, colored border, drop shadow,
-  padding, etc)
+## Supported Compositor Extras
 
-## Planned Features / Milestones
+These features require platform-specific functionality. One example is on macOS,
+where capturing windows with their glass effects is not possible using the
+available APIs - clever recompositing tricks are required.
 
-- [x] Screen capture engine
-  - [x] Encoder setup & configuration
-- [x] Video capture engine
-  - in-recording tools
-    - [ ] mouse clicks
-    - [ ] keypress overlay
-    - [ ] live annotation (with delete)
-- [x] Audio capture engine
-  - [x] Audio cleanup and processing options
-- [x] Preview editor (overlay & window variants)
-  - [x] delete, save, save as, copy
-  - [ ] copy + delete
-  - images
-    - annotation tooling:
-      - [x] covermarks support
-      - [ ] color picker swatch
-      - [ ] arrows
-      - [ ] text (size/resize)
-      - [ ] sequence markers 
-      - [ ] dim except areas 
-      - [ ] pixelate (destructive) 
-      - [ ] blur (destructive) 
-      - [ ] box (fill/outline) 
-      - [ ] draw (line widths) 
-      - [ ] stickers 
-      - [ ] eraser 
-  - videos
-    - editor tooling:
-      - [x] simple cutting tool
-      - [ ] simple transition dropdown (none/crossfade)
-  - cloud uploader targets
-      - [ ] Proton Drive
-      - [ ] OneDrive
-      - [ ] Google Drive
-      - [ ] Dropbox
-      - etc
-    
+| Platform                                                 | Freeze Pixels for Region Select | Toggle Mouse Cursor | Toggle Window Transparency | Toggle Wallpaper | Single Window Aesthetics (neon border, etc) |
+| -------------------------------------------------------- | ------------------------------- | ------------------- | -------------------------- | ---------------- | ------------------------------------------- |
+| macOS 13+ (Apple Silicon)                                | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
+| Windows 11                                               | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
+| Linux (Wayland): COSMIC                                  | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
+| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | TBD                             | TBD                 | TBD                        | TBD              | TBD                                         |
+| Linux (Wayland): KDE Plasma                              | TBD                             | TBD                 | TBD                        | TBD              | TBD                                         |
+| Linux (Wayland): GNOME                                   | TBD                             | TBD                 | TBD                        | TBD              | TBD                                         |
+
+## Supported Features
+
+These are cross-platform features that are currently planned for the project
+along with their statuses.
+
+| Feature                                    | Status |
+| ------------------------------------------ | ------ |
+| Screen capture engine                      | ✅     |
+| Video capture engine                       | ✅     |
+| Audio capture engine                       | ✅     |
+| Preview editor (overlay & window variants) | ✅     |
+| System tray daemon                         | ✅     |
+
+### Screen capture engine
+
+| Feature                       | Status |
+| ----------------------------- | ------ |
+| Encoder setup & configuration | ✅     |
+
+### Video capture engine
+
+#### In-recording tools
+
+| Feature                       | Status  |
+| ----------------------------- | ------- |
+| mouse clicks                  | Planned |
+| keypress overlay              | TBD     |
+| live annotation (with delete) | TBD     |
+
+### Audio capture engine
+
+| Feature                              | Status |
+| ------------------------------------ | ------ |
+| Audio cleanup and processing options | ✅     |
+
+### Preview editor (overlay & window variants)
+
+| Feature       | Status  |
+| ------------- | ------- |
+| delete        | ✅      |
+| save          | ✅      |
+| save as       | ✅      |
+| copy          | ✅      |
+| copy + delete | Planned |
+
+#### Image annotation tooling
+
+| Feature                | Status  |
+| ---------------------- | ------- |
+| covermarks support     | ✅      |
+| color picker swatch    | Planned |
+| arrows                 | Planned |
+| text (size/resize)     | Planned |
+| sequence markers       | Planned |
+| dim except areas       | Planned |
+| pixelate (destructive) | Planned |
+| blur (destructive)     | Planned |
+| box (fill/outline)     | Planned |
+| draw (line widths)     | Planned |
+| stickers               | Planned |
+| eraser                 | Planned |
+
+#### Video editor tooling
+
+| Feature                                     | Status  |
+| ------------------------------------------- | ------- |
+| simple cutting tool                         | ✅      |
+| simple transition dropdown (none/crossfade) | Planned |
+
+#### Cloud uploader targets
+
+| Feature      | Status  |
+| ------------ | ------- |
+| Proton Drive | Planned |
+| OneDrive     | Planned |
+| Google Drive | Planned |
+| Dropbox      | Planned |
 
 ## Installation
 
@@ -106,41 +153,23 @@ cd cosmic-capture-kit
 cargo build --release
 ```
 
-The default GPU zero-copy feature needs ffmpeg 8 headers (Arch, CachyOS,
-recent Fedora); on older-ffmpeg distros build with
-`--no-default-features` (recording still works through the `ffmpeg` binary).
+The experimental GPU zero-copy feature needs ffmpeg 8 headers (Arch, CachyOS,
+recent Fedora)
+
 Runtime dependencies: `ffmpeg` (screen recording), `tesseract` (OCR,
 optional).
 
-Install the desktop entry + icon, then point a keybind at the binary (COSMIC:
-Settings > Input Devices > Keyboard > Shortcuts > Custom). Flags like
-`--window --video`, `--scan`, and `--settings` make one-press flows; see
-[CLI.md](CLI.md).
-
-```sh
-install -Dm644 res/dev.frosthaven.CosmicCaptureKit.desktop \
-  ~/.local/share/applications/dev.frosthaven.CosmicCaptureKit.desktop
-install -Dm644 res/icons/dev.frosthaven.CosmicCaptureKit.svg \
-  ~/.local/share/icons/hicolor/scalable/apps/dev.frosthaven.CosmicCaptureKit.svg
-```
-
 Updating: `git pull` and rebuild; the in-app update check links to the
 releases page on Linux.
-
-AUR: coming soon. AppImage: coming soon.
 
 ---
 
 ## Tiling window managers
 
-Under a tiling window manager the **capture overlays float automatically**. The app
-tags them so AeroSpace (macOS), komorebi (Windows), and COSMIC's tiler (Linux) leave
-them alone, since a capture overlay has to cover a whole display rather than a tile. No
-configuration is needed for that.
-
-The **Settings** and **preview editor** windows are ordinary windows, so a tiling WM
-tiles them by default. If you would rather they float, add a floating rule for your WM.
-The two windows have separate titles, so you can float just one of them or both:
+Cosmic Capture Kit makes an effort to play nicely with a few popular tiling
+window managers. The overlay tools will bypass tiling, while the preview editor
+and the settings window will not by default. You can change the behavior of the
+settings window and the preview editor by using the information below.
 
 * Settings window: title `Cosmic Capture Kit - Settings`
 * Preview editor window: title `Cosmic Capture Kit - Preview Editor`
@@ -155,19 +184,10 @@ titles are distinct (neither is a substring of the other), so a single-window ru
 anchoring:
 
 ```toml
-# Both windows float:
-[[on-window-detected]]
-if.app-id = 'dev.frosthaven.CosmicCaptureKit'
-run = ['layout floating']
-
-# ...or float only ONE. Use instead of the app-id rule above, not alongside it:
-
-# Settings only:
 [[on-window-detected]]
 if.window-title-regex-substring = 'Cosmic Capture Kit - Settings'
 run = ['layout floating']
 
-# Preview only:
 [[on-window-detected]]
 if.window-title-regex-substring = 'Cosmic Capture Kit - Preview Editor'
 run = ['layout floating']
@@ -193,23 +213,10 @@ window:
 }
 ```
 
-`floating_applications` is the current key; the older `float_rules` config and the
-`komorebic float-rule` CLI are deprecated.
-
 </details>
 
 <details>
 <summary><b>COSMIC desktop (Linux)</b></summary>
-
-COSMIC tiles both windows by default. There are two ways to make them float:
-
-* **Preview editor, in-app toggle:** enable the windowed editor, then in the app under
-  Settings > General turn on *"Float the preview window (don't tile)"*. The app writes the
-  COSMIC exception for you. This covers the preview window only.
-
-* **Manual, for the Settings window or fine control:** COSMIC has no per-application
-  float-rule GUI yet, so edit its tiling-exception file directly (changes apply live, no
-  logout needed):
 
   ```
   ~/.config/cosmic/com.system76.CosmicSettings.WindowRules/v1/tiling_exception_custom
@@ -222,17 +229,10 @@ COSMIC tiles both windows by default. There are two ways to make them float:
 
   ```
   [
-      // Both windows float (this title substring matches both):
-      (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit"),
+      (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit - Settings"),
+      (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit - Preview Editor"),
   ]
   ```
-
-  To float only ONE, use one of these as the `title` instead:
-
-  * Settings only: `"Cosmic Capture Kit - Settings"`
-  * Preview only: `"Cosmic Capture Kit - Preview Editor"`
-
-You can also float the focused window ad-hoc with `Super + G` (no config).
 
 </details>
 
@@ -245,11 +245,11 @@ The Linux app is free software: use it, build it, share it (it's free forever).
 If it's useful to you, donating via [PayPal](https://paypal.me/Frosthaven) will
 support future work but is not required.
 
-Official macOS and Windows releases are separately licensed binary
-builds by the copyright holder. (The author holds the copyright to all code
-in this repository and additionally licenses their own code to themselves
-for those proprietary builds; the GPL grant above applies to everyone else
-and to this repository's contents.).
+Official macOS and Windows releases are separately licensed binary builds by the
+copyright holder. (The author holds the copyright to all code in this repository
+and additionally licenses their own code to themselves for those proprietary
+builds; the GPL grant above applies to everyone else and to this repository's
+contents.).
 
 ## Contributions & Credits
 

@@ -299,17 +299,22 @@ mod tests {
         assert!(String::from_utf8_lossy(&out.stdout).contains("cck-quiet-probe"));
     }
 
-    /// DRAGON-236 regression guard: every runtime spawn of a CONSOLE-subsystem tool must
-    /// go through the quiet-command seam ([`quiet_command`] / [`ffmpeg_command`] /
+    /// DRAGON-236 regression guard: every spawn of a CONSOLE-subsystem tool must go
+    /// through the quiet-command seam ([`quiet_command`] / [`ffmpeg_command`] /
     /// [`ffprobe_command`]), never a bare `Command::new`. On Windows a GUI-subsystem
     /// process that spawns a bare console child pops a window and — when that child is
     /// killed — LEAVES a blank Windows Terminal pane; `CREATE_NO_WINDOW` prevents both.
     /// This scans the tree and fails if a bare routed-tool spawn creeps back in outside
-    /// the seam. Excluded: the closed mac/linux platform bodies (cfg-gated OFF Windows,
-    /// keeping their own byte-identical native spawns), dedicated `*_tests.rs` files, each
-    /// file's trailing `#[cfg(test)]` block (test helpers spawn tools directly), and any
-    /// hit whose ENCLOSING fn carries a `cfg(target_os = "macos"|"linux")` (a native body
-    /// inside a shared file, not converted per the platform-isolation law).
+    /// the seam. TEST code is scanned too: the original exemption ("test helpers … not
+    /// a runtime console flash") was DISPROVEN 2026-07-22 — under a console-less parent
+    /// (IDE runners, agent harnesses, CI wrappers) every console child a test spawns
+    /// allocates a brand-new visible console (an EnumWindows watcher counted one
+    /// Windows Terminal pane per ffmpeg/ffprobe spawn during `av_sync_tests`), so tests
+    /// route through the seam like everything else. Excluded: the closed mac/linux
+    /// platform bodies (cfg-gated OFF Windows, keeping their own byte-identical native
+    /// spawns) and any hit whose ENCLOSING fn carries a `cfg(target_os =
+    /// "macos"|"linux")` (a native body inside a shared file, not converted per the
+    /// platform-isolation law).
     #[test]
     fn console_tool_spawns_go_through_the_quiet_seam() {
         // The exact bare-spawn spellings that must never appear outside the seam.
@@ -345,15 +350,14 @@ mod tests {
                 let fname = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if path.extension().and_then(|e| e.to_str()) != Some("rs")
                     || fname == "util.rs" // the seam + this guard's own literals
-                    || fname.ends_with("_tests.rs")
                 {
                     continue;
                 }
+                // `#[cfg(test)]` blocks and `*_tests.rs` files are scanned like
+                // everything else: a test-spawned console child flashes a console
+                // under a console-less parent just as a runtime one does.
                 let Ok(text) = std::fs::read_to_string(&path) else { continue };
-                // Ignore the trailing `#[cfg(test)]` block: test helpers spawn tools
-                // (true/sleep/real ffmpeg) directly and are not a runtime console flash.
-                let scanned = text.split("#[cfg(test)]").next().unwrap_or(&text);
-                let lines: Vec<&str> = scanned.lines().collect();
+                let lines: Vec<&str> = text.lines().collect();
                 for (i, line) in lines.iter().enumerate() {
                     if !FORBIDDEN.iter().any(|p| line.contains(p)) {
                         continue;

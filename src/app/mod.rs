@@ -41,6 +41,12 @@ mod num_field;
 mod persist;
 mod recording;
 mod capture_flow;
+// The pointer→monitor resolver is shared with the pickerless daemon handoff seam
+// (`platform::cursor_display_name`, DRAGON-309); re-export it out of the private
+// `capture_flow` module so `platform` can reach it. Not built on Linux (no capture-hotkey
+// daemon and no global pointer there).
+#[cfg(not(target_os = "linux"))]
+pub(crate) use capture_flow::monitor_for_pointer;
 mod preview;
 mod audio_ui;
 mod shell;
@@ -1330,23 +1336,23 @@ pub struct App {
     /// already shows the fullscreen blocker after the grab).
     #[cfg(windows)]
     win_preview_preopen: bool,
-    /// Windows (DRAGON-246): set true once the settings window has been CONFIRMED shown
-    /// (`show_titled` matched its async title and issued `ShowWindow`). Gates the
-    /// `sub_settings_liveness` watchdog so it can NEVER fire during the legitimate
-    /// open-hidden → float-and-show phase — only AFTER the titled window has actually been
-    /// shown does its disappearance mean a genuine vanish-without-`Closed`, at which point
+    /// Windows (DRAGON-246): set true once the settings window has been CONFIRMED matched
+    /// (`center_settings_window` matched the born-set title, centered + natively showed it).
+    /// Gates the `sub_settings_liveness` watchdog so it can NEVER fire during the legitimate
+    /// open-hidden → center-and-show phase — only AFTER the titled window has actually been
+    /// matched does its disappearance mean a genuine vanish-without-`Closed`, at which point
     /// the watchdog ends the instance so the settings mutex + pid file don't leak. Never
     /// set off Windows (write-once; the one-shot process exits before it would reset).
     #[cfg(windows)]
     settings_shown_confirmed: bool,
-    /// Windows (DRAGON-299): `false` from the settings window's open until its size has SETTLED
-    /// (`ConfigWindowResettle`, a beat after the native show). The settings window opens hidden
-    /// and is shown via native `ShowWindow`, so winit soft-sizes it and STOMPS it to a sub-min
-    /// sliver once on that first show; while this is `false` the resize handler IGNORES the
-    /// open-time transient resizes (so a transient can never be persisted as the remembered
-    /// size) and re-asserts the intended size on the stomp. Once `true`, real USER resizes are
-    /// tracked into `settings_size`. Never set off Windows (their settings window opens visible,
-    /// compositor-managed, with no such stomp — they track every resize as before).
+    /// Windows (DRAGON-299/313): `false` from the settings window's open until its size has SETTLED
+    /// (`ConfigWindowResettle`, a beat after the show). The window opens hidden and is centered +
+    /// natively shown on the first poll now that the title is born-set (`center_settings_window`,
+    /// the preview's `show_centered` twin), so the DRAGON-299 sub-min size STOMP is not observed;
+    /// while this is `false` the resize handler still DEFENSIVELY ignores open-time transient resizes
+    /// (so a transient can never be persisted as the remembered size) and re-asserts on any sub-min.
+    /// Once `true`, real USER resizes are tracked into `settings_size`. Never set off Windows (their
+    /// settings window opens visible, compositor-managed, with no such stomp — track every resize).
     #[cfg(windows)]
     settings_size_ready: bool,
     /// Windows (DRAGON-281): the preview surface whose native show/place has been
@@ -1420,6 +1426,14 @@ pub struct App {
     /// While a preview with a soundtrack is open, the guard pausing OTHER apps' media
     /// (Spotify/browsers/…). Dropped when the overlay closes → those players resume.
     preview_duck: Option<crate::audio::ducking::OtherAudioDuck>,
+    /// DRAGON-309: the TRIGGER display's NAME, snapshotted ONCE at launch (in `App::init`,
+    /// before the picker overlay is shown / the cursor moves to the target / our overlay grabs
+    /// focus). This is the monitor active when the capture was INITIATED, and drives where the
+    /// post-capture preview opens — regardless of where the user moves to pick the target.
+    /// `active_trigger_display()` resolves it to `(OutputHandle, size)` at commit (off Linux via
+    /// `output_descs()`, on Linux by matching the name into `self.outputs`). `None` when nothing
+    /// resolved at launch (then the selection's output is used, keeping DRAGON-304 behavior).
+    trigger_display: Option<String>,
     /// The monitor (output + its logical size) the in-flight capture is on — captured
     /// before the overlay (and `self.outputs`) is torn down, so the post-capture preview
     /// can open a fullscreen overlay there and scale the image within it.
@@ -1433,6 +1447,14 @@ pub struct App {
     /// macOS `NSScreen.backingScaleFactor` used by [`Self::preview_source_scale`]).
     /// Always `1.0` on 1× outputs (every field stays byte-identical there).
     preview_output_scale: f32,
+    /// The windowed preview's INTENDED open size (logical points), captured when the window
+    /// is minted (`preview_surface_for`) so the macOS native finalize can re-assert it after
+    /// moving the window to the trigger monitor (DRAGON-309). winit births the window on the
+    /// capture/active monitor, where macOS clamps its height to that (possibly smaller) screen
+    /// before we relocate it — the clamp otherwise sticks. Kept SEPARATE from
+    /// `PreviewState.monitor` (which a resize event overwrites with the clamped size before
+    /// finalize runs, so it can't be trusted here). Consumed only on macOS; harmless elsewhere.
+    preview_open_size: Option<(u32, u32)>,
     /// `--preview <file>` launch: the file (and whether it's a video) to open straight
     /// into the preview overlay once an output appears. Taken once consumed.
     startup_preview: Option<(std::path::PathBuf, bool)>,
@@ -1443,7 +1465,10 @@ pub struct App {
     /// minting the capture overlays — the target is resolved and captured straight through.
     /// `None` for a normal overlay launch (every path stays byte-identical then). Never set
     /// on Linux (its capture keys are COSMIC shortcuts).
-    #[cfg(not(target_os = "linux"))]
+    /// DRAGON-295: the picker-free immediate capture requested by the launch flag
+    /// (`--active-window` / `--active-monitor`), consumed once when the first output lands
+    /// (mac/Windows in `seed_outputs_mac`, Linux in `on_output`). Portable so all three
+    /// platforms can drive it; Linux resolves the target via the cctk Activated toplevel.
     startup_immediate: Option<ImmediateCapture>,
     /// Last known settings-window size (logical w, h), persisted so the window
     /// reopens at the size it was closed at (clamped to the monitor).

@@ -255,3 +255,95 @@ pub fn opt_out_of_tiling(title: &str) {
     #[cfg(target_os = "windows")]
     crate::platform::windows::window::opt_out_of_tiling(title);
 }
+
+/// Env var carrying the TRIGGER display's name from a pickerless daemon spawn to the
+/// capture child (DRAGON-309). A hotkey / tray daemon (macOS + Windows) has no picker
+/// overlay to read an active output from, so it resolves the CURSOR's monitor AT PRESS
+/// TIME — while the pointer is still where the user pressed — and hands its name here,
+/// the same env-handoff mechanism `CCK_ACTIVE_WIN_ID` uses for the active window. The
+/// child seeds its trigger display (where the post-capture preview opens) from it. Off
+/// Linux the value is a display NAME string (the `OutputHandle`); Linux has no global
+/// pointer and no capture-hotkey daemon, so it never sets or reads this. Cross-platform
+/// const so the daemon producer and the child consumer agree by one name.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub const ENV_TRIGGER_DISPLAY: &str = "CCK_ACTIVE_DISPLAY";
+
+/// The display name the CURSOR sits on RIGHT NOW, for a pickerless daemon spawn to hand
+/// the capture child via [`ENV_TRIGGER_DISPLAY`] (DRAGON-309). Resolves the pointer's
+/// monitor from the live display list (`monitor_for_pointer` semantics: the display under
+/// the pointer, else the primary, else the first). `None` only when there are no displays.
+/// macOS reads the global pointer (`NSEvent.mouseLocation`); Windows `GetCursorPos`. Linux
+/// has no global pointer and no capture-hotkey daemon, so this seam is not built there.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn cursor_display_name() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let (pointer, descs) = (
+        Some(crate::platform::mac::global_pointer_position()),
+        crate::platform::mac::output_descs(),
+    );
+    #[cfg(target_os = "windows")]
+    let (pointer, descs) = (
+        crate::platform::windows::cursor_position(),
+        crate::platform::windows::output_descs(),
+    );
+    crate::app::monitor_for_pointer(pointer, &descs).map(|d| d.name)
+}
+
+/// Snapshot the TRIGGER display's NAME at LAUNCH (DRAGON-309), BEFORE the picker overlay is
+/// shown / before the user moves the cursor to draw a region or pick a window and before our
+/// layer-shell overlay grabs focus. This is THE authoritative "monitor active when the
+/// capture was initiated" value: sampling it at capture COMMIT is wrong, because by then the
+/// cursor sits on the TARGET monitor and the focused window is our own overlay. Stored on the
+/// `App` and returned by `active_trigger_display()` at commit (resolved to a rect then).
+///
+/// - **macOS / Windows**: the daemon press-time handoff [`ENV_TRIGGER_DISPLAY`] wins (a hotkey
+///   / tray launch), else the CURSOR's monitor sampled RIGHT NOW at init (a direct launch — the
+///   cursor is still on the trigger monitor before any picker UI appears).
+/// - **Linux (COSMIC)**: Wayland has no global pointer and no capture-hotkey daemon, so the
+///   active display is the FOCUSED toplevel's output (`list_toplevels`, the `active` toplevel)
+///   sampled at init, before our overlay takes focus. Just the name; the rect resolves later.
+///
+/// `None` when nothing resolves (no displays / no focused toplevel) — the caller then falls
+/// back to the selection's output, keeping the DRAGON-304 immediate-capture behavior.
+pub fn snapshot_trigger_display_name() -> Option<String> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        std::env::var(ENV_TRIGGER_DISPLAY)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(cursor_display_name)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::compositor::list_toplevels()
+            .into_iter()
+            .find_map(|(output, tops)| tops.iter().any(|t| t.active).then_some(output))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// The CURRENT display of OUR OWN window titled `title`, as an `OutputHandle` NAME
+/// (DRAGON-309). Used when the windowed preview editor is toggled to the fullscreen
+/// overlay: the user may have DRAGGED the window to another monitor since it opened, so
+/// the overlay must spawn where the window ACTUALLY is now, not on the stored capture-time
+/// display. Each platform reads the window's live monitor natively: macOS matches the
+/// `NSWindow`'s `screen` to its `Display-<id>`; Windows `MonitorFromWindow` to the device
+/// name. `None` when the window isn't found (fall back to the capture-time display).
+///
+/// Off Linux only: on Linux the preview is a layer-shell / CSD toplevel whose output the
+/// compositor owns; the toggle keeps its existing (capture-time) anchor there (see the
+/// caller's Linux note), so this seam is scoped to the two String-`OutputHandle` platforms.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn window_current_display(title: &str) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::mac::window::window_current_display(title)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::window::window_current_display(title)
+    }
+}

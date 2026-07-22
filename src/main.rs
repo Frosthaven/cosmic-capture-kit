@@ -383,6 +383,12 @@ fn main() -> cosmic::iced::Result {
                     | "--region"
                     | "--window"
                     | "--monitor"
+                    // DRAGON-295: the picker-free immediate captures + All In One are GUI
+                    // capture launches (a COSMIC custom shortcut runs them), NOT resident
+                    // triggers — treat them as non-bare so they reach `app::run`.
+                    | "--all-in-one"
+                    | "--active-window"
+                    | "--active-monitor"
                     | "--image"
                     | "--video"
                     | "--scan"

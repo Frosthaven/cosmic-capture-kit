@@ -25,7 +25,7 @@ use self::row::{reset_button, severity_caption, severity_title, Severity, Sectio
 
 /// The settings window title (DRAGON-301) — THE single source of truth for it: the window's OS
 /// title (`set_window_title`), the CSD header bar title, the title the native Windows helpers
-/// (`show_titled`/`find_by_title`/caption/mica) + the mac titlebar centering match on, and the
+/// (`center_settings_window`/`find_by_title`/caption/mica) + the mac titlebar centering match on, and the
 /// title a tiling-WM float rule keys on (see the README) all route through this const. Also used
 /// to find/focus an already-open settings window in another instance.
 pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Settings";
@@ -578,20 +578,33 @@ pub(super) fn open_config_window(
         },
         #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         platform_specific: cosmic::iced::window::settings::PlatformSpecific::default(),
-        // Windows (DRAGON-299): open VISIBLE (winit-managed), like mac/Linux. It USED to open
-        // HIDDEN and be shown via a native `ShowWindow` (`show_titled`) once its async title
-        // landed — but a window shown that way (bypassing winit's own `set_visible`) has its size
-        // STOMPED by winit to a sub-min sliver a beat after the show, which both broke "remember
-        // the size" AND collapsed the wgpu surface toward a 0-width client → a fatal wgpu error.
-        // Opening visible sidesteps the whole native-show path: winit sizes + shows the window
-        // itself with no stomp. DRAGON-302: no komorebi opt-out is set, so a tiling WM tiles it
-        // like a normal window (matching mac/Linux); a user who prefers it floating adds a WM
-        // float rule (see the README). The one trade-off vs. open-hidden is that komorebi now sees
-        // the window a frame before its async title lands, so a title-keyed float rule applies a
-        // beat late (komorebi re-evaluates on the title change) — a brief tile-then-float, far
-        // better than a slivered/crashing window.
+        // Windows: open the settings window HIDDEN + BORN TITLED (DRAGON-313). Two coupled reasons:
+        //   * BORN TITLED — `open_settings` / `OpenSettingsAtStartup` seed the OS title into the
+        //     framework's per-window title map BEFORE this open task runs, so iced hands winit
+        //     `with_title` at `CreateWindowExW`. komorebi (0.1.41) decides tiling eligibility ONCE,
+        //     on a window's first SHOW WinEvent; a titleless window there is rejected forever.
+        //   * open HIDDEN (`visible:false`) — iced fires the `Opened` event (→ `ConfigWindowFloat`)
+        //     while the window is still hidden (its `set_visible` is skipped when `make_visible`
+        //     is false), giving us a hook to CENTER it BEFORE it is shown. `ConfigWindowFloat` →
+        //     `center_settings_window` centers the hidden window, then natively `SW_SHOW`s it — the
+        //     SETTINGS twin of the windowed preview's `show_centered`. komorebi's first titled SHOW
+        //     sees the already-centered window and tiles it from there; nothing repositions it AFTER
+        //     the show, so the tiler's placement wins cleanly and non-tiling users keep the centered
+        //     open (DRAGON-313 fix2 — the earlier open-VISIBLE path centered POST-show and yanked a
+        //     just-tiled window back to center, fighting the tiler until it re-enforced or, worse,
+        //     never did — a stuck-centered window komorebi still reported as tiled).
+        // The native `SW_SHOW` is safe here (unlike DRAGON-299's crash): DRAGON-299 blamed a native
+        // show for a sub-min winit size-stomp → wgpu 0-width collapse → crash and switched to
+        // open-VISIBLE, but that predated the born-title fix. The title now lands at
+        // `CreateWindowExW`, so `center_settings_window` matches + shows on the FIRST poll with the
+        // window already fully sized — the exact condition the preview's identical `show_centered`
+        // runs under with no stomp/crash. The sub-min re-assert in `ConfigWindowResized` stays a
+        // defensive net. An open-VISIBLE + winit `set_mode` show was also tried and rejected: a
+        // hidden window shown that way never gets a clean redraw cycle and paints a blank/white nav
+        // region. DRAGON-302: no komorebi opt-out, so a tiling WM manages it like any normal window
+        // (a user who prefers it floating adds a WM float rule — see the README).
         #[cfg(windows)]
-        visible: true,
+        visible: false,
         ..Default::default()
     });
     (id, task.map(|id| cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::ConfigWindowOpened(id)))))
@@ -656,6 +669,20 @@ impl App {
             self.apply_nav_auto_collapse_on_spawn();
             let (id, task) = open_config_window(self.settings_size);
             self.settings.window = Some(id);
+            // Windows (DRAGON-313): SEED the window's OS title into the framework's per-window
+            // title map NOW — synchronously, before the returned `window::open` task is processed
+            // by the runtime — so iced builds the winit toplevel already carrying it (winit
+            // `with_title` → `CreateWindowExW` lpWindowName, sourced from `program.title(id)`, which
+            // reads that map). komorebi (0.1.41) decides a window's tiling eligibility ONCE, when it
+            // processes the window's first SHOW WinEvent; a titleless window at that instant is
+            // rejected and never re-evaluated, so the settings window (opened VISIBLE since
+            // DRAGON-299) stayed invisible to komorebi. Born-titled ⇒ komorebi's first sight already
+            // carries the title. Only the synchronous map insert matters here; the returned async
+            // set_title is dropped because `ConfigWindowOpened` re-sets the same title (and iced's
+            // own title-sync re-asserts it from the map). mac/Linux never take this branch, so their
+            // async-only title path stays byte-identical.
+            #[cfg(windows)]
+            let _ = self.set_window_title(WINDOW_TITLE.to_string(), id);
             let check = self.update_settings(SettingsMsg::CheckForUpdates);
             Task::batch([task, self.hide_overlays(), check])
         }

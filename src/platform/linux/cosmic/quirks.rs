@@ -41,6 +41,11 @@ struct TilingException {
 /// de-duplicated on every write (all matching entries are stripped first, then exactly
 /// one is re-added when enabling). Preserves the user's other exceptions, and never
 /// clobbers a file it can't parse. No-op off COSMIC.
+///
+/// Currently UNUSED: DRAGON-301 pointed `set_cosmic_preview_float` at `write_tiling_exception`
+/// directly (to carry the legacy-title migration), orphaning this general-title wrapper. Kept
+/// as the general form for any title so a future non-preview float rule reuses it in one place.
+#[allow(dead_code)]
 pub fn set_tiling_exception(title: &str, enable: bool) {
     write_tiling_exception(title, &[], enable);
 }

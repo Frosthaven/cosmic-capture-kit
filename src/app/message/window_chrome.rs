@@ -87,12 +87,14 @@ pub enum WindowChromeMsg {
     CancelReset,
     /// The settings toplevel window finished opening.
     ConfigWindowOpened(window::Id),
-    /// Windows: poll to SHOW the settings window once its async-set title lands — the Windows
-    /// analog of the mac `MacCenterTitlebar` poll (both are title-matched, kicked from
+    /// Windows: poll to CENTER-then-SHOW the settings window once its born-set title matches — the
+    /// Windows analog of the mac `MacCenterTitlebar` poll (both are title-matched, kicked from
     /// `ConfigWindowOpened`, and re-emit with an incremented attempt until the window can be
-    /// matched). The window is opened `visible:false` so it stays hidden until the title lands,
-    /// then `show_titled` shows it. DRAGON-302: no komorebi opt-out is set, so a tiling WM
-    /// manages it like a normal window (it tiles by default). `(id, attempt)`.
+    /// matched). The window is opened `visible:false` so it stays hidden while
+    /// `center_settings_window` centers it, then it is natively shown (`SW_SHOW`, DRAGON-313 fix2)
+    /// — komorebi's first titled SHOW sees it already centered and tiles from there. DRAGON-302: no
+    /// komorebi opt-out is set, so a tiling WM manages it like a normal window (it tiles by
+    /// default). `(id, attempt)`.
     #[cfg(windows)]
     ConfigWindowFloat(window::Id, u8),
     /// Windows (DRAGON-299): fired a beat after the settings window's native show to mark its

@@ -124,6 +124,12 @@ pub struct Probe {
     pub microphone: Option<PermStatus>,
     /// Notifications status — `Some` only when bundled + the query answered.
     pub notifications: Option<PermStatus>,
+    /// Accessibility (DRAGON-311): preflight (granted / not-granted). Like Screen
+    /// Recording the preflight is boolean, so `accessibility_request_spent` decides
+    /// whether a not-granted state reads as NotDetermined vs Denied. OPTIONAL.
+    pub accessibility_granted: bool,
+    /// Whether the Accessibility prompt is spent (`mac_accessibility_prompt_seen`).
+    pub accessibility_request_spent: bool,
 }
 
 /// All UI state for the permission-checker window, grouped so `App` carries a single
@@ -204,6 +210,26 @@ fn probe_with(include_notifications: bool) -> Probe {
         screen_request_spent: force_danger || crate::state::load().mac_first_run_seen,
         microphone,
         notifications,
+        // Accessibility is OPTIONAL, so FORCE_WARN (not FORCE_DANGER) drives it missing
+        // + prompt spent ⇒ amber Denied (Open Settings), matching how FORCE_WARN
+        // exercises the other optional cards' remediation button.
+        accessibility_granted: !force_warn && tcc::accessibility_granted(),
+        accessibility_request_spent: force_warn || crate::state::load().mac_accessibility_prompt_seen,
+    }
+}
+
+/// The Accessibility card's status from a [`Probe`]. Mirrors [`screen_status`]:
+/// granted ⇒ Granted; else the boolean preflight can't tell NotDetermined from Denied,
+/// so the spent flag decides (unspent ⇒ NotDetermined / offer Request, spent ⇒ Denied
+/// / offer Open Settings). OPTIONAL, so the view colours a missing state amber, not red.
+#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+pub fn accessibility_status(probe: &Probe) -> PermStatus {
+    if probe.accessibility_granted {
+        PermStatus::Granted
+    } else if probe.accessibility_request_spent {
+        PermStatus::Denied
+    } else {
+        PermStatus::NotDetermined
     }
 }
 
@@ -238,12 +264,14 @@ pub fn screen_status(probe: &Probe) -> PermStatus {
 /// daemon startup. True when EITHER the required Screen Recording grant is missing
 /// (`!screen_granted` — regardless of NotDetermined vs Denied, since it is required
 /// and a missing grant only yields blank captures), OR an OPTIONAL permission is
-/// still NotDetermined (never prompted): microphone NotDetermined, or notifications
+/// still NotDetermined (never prompted): microphone NotDetermined, notifications
 /// NotDetermined when the notification card is present (`Some`; `None` = unbundled /
-/// query unanswered = hidden card, never a reason to open).
+/// query unanswered = hidden card, never a reason to open), or Accessibility
+/// NotDetermined (never prompted — worth one prompt so "Capture Active Window" can
+/// target the focused window).
 ///
-/// Explicitly DENIED optional permissions (mic / notifications) deliberately do NOT
-/// trigger this — a user who declined the mic or notifications must not be nagged.
+/// Explicitly DENIED optional permissions (mic / notifications / accessibility)
+/// deliberately do NOT trigger this — a user who declined one must not be nagged.
 /// Only the required Screen Recording keeps forcing the window once every optional
 /// permission has been addressed (granted or denied).
 ///
@@ -262,10 +290,12 @@ pub fn should_auto_open(
     screen_granted: bool,
     mic: PermStatus,
     notifications: Option<PermStatus>,
+    accessibility: PermStatus,
 ) -> bool {
     !screen_granted
         || mic == PermStatus::NotDetermined
         || notifications == Some(PermStatus::NotDetermined)
+        || accessibility == PermStatus::NotDetermined
 }
 
 /// [`should_auto_open`] over a live [`Probe`] snapshot — the form both auto-open sites
@@ -278,6 +308,7 @@ pub fn should_auto_open_probe(probe: &Probe) -> bool {
         probe.screen_granted,
         probe.microphone.unwrap_or(PermStatus::NotDetermined),
         probe.notifications,
+        accessibility_status(probe),
     )
 }
 
@@ -336,6 +367,11 @@ pub enum Permission {
     ScreenRecording,
     Microphone,
     Notifications,
+    /// Accessibility (DRAGON-311, OPTIONAL): lets "Capture Active Window" / "Capture
+    /// Active Monitor" resolve the FOCUSED window (and capture it in its active
+    /// appearance) via the AX API. Absent, capture degrades gracefully to a z-order
+    /// guess, so its lack never routes/forces the window like Screen Recording does.
+    Accessibility,
 }
 
 #[cfg(test)]
@@ -365,42 +401,56 @@ mod tests {
     #[test]
     fn auto_open_when_screen_missing_regardless_of_optionals() {
         // Screen missing is required → open, whatever the optional cards say (even all
-        // granted, even all denied).
-        assert!(should_auto_open(false, PermStatus::Granted, Some(PermStatus::Granted)));
-        assert!(should_auto_open(false, PermStatus::Denied, Some(PermStatus::Denied)));
-        assert!(should_auto_open(false, PermStatus::NotDetermined, None));
+        // granted, even all denied). Accessibility addressed (Granted) so only the
+        // screen grant drives these.
+        assert!(should_auto_open(false, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Granted));
+        assert!(should_auto_open(false, PermStatus::Denied, Some(PermStatus::Denied), PermStatus::Denied));
+        assert!(should_auto_open(false, PermStatus::NotDetermined, None, PermStatus::Granted));
     }
 
     #[test]
     fn auto_open_when_an_optional_is_not_determined() {
         // Screen granted but a never-prompted optional → open (offer the prompt once).
-        assert!(should_auto_open(true, PermStatus::NotDetermined, Some(PermStatus::Granted)));
-        assert!(should_auto_open(true, PermStatus::Granted, Some(PermStatus::NotDetermined)));
-        assert!(should_auto_open(true, PermStatus::NotDetermined, None));
+        assert!(should_auto_open(true, PermStatus::NotDetermined, Some(PermStatus::Granted), PermStatus::Granted));
+        assert!(should_auto_open(true, PermStatus::Granted, Some(PermStatus::NotDetermined), PermStatus::Granted));
+        assert!(should_auto_open(true, PermStatus::NotDetermined, None, PermStatus::Granted));
+        // Accessibility never-prompted alone (mic/notif addressed) → open.
+        assert!(should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::NotDetermined));
     }
 
     #[test]
     fn no_auto_open_when_everything_addressed() {
         // Screen granted and every optional addressed (granted OR denied) → stay shut.
-        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted)));
-        assert!(!should_auto_open(true, PermStatus::Granted, None));
+        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Granted));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted));
     }
 
     #[test]
     fn denied_optionals_do_not_nag() {
-        // The key decision: a user who DECLINED mic / notifications is not re-nagged
-        // while Screen Recording is granted.
-        assert!(!should_auto_open(true, PermStatus::Denied, Some(PermStatus::Denied)));
-        assert!(!should_auto_open(true, PermStatus::Denied, Some(PermStatus::Granted)));
-        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Denied)));
-        assert!(!should_auto_open(true, PermStatus::Denied, None));
+        // The key decision: a user who DECLINED mic / notifications / accessibility is
+        // not re-nagged while Screen Recording is granted.
+        assert!(!should_auto_open(true, PermStatus::Denied, Some(PermStatus::Denied), PermStatus::Denied));
+        assert!(!should_auto_open(true, PermStatus::Denied, Some(PermStatus::Granted), PermStatus::Granted));
+        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Denied), PermStatus::Granted));
+        assert!(!should_auto_open(true, PermStatus::Denied, None, PermStatus::Granted));
+        // Declined accessibility alone is not a reason to nag.
+        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Denied));
+    }
+
+    #[test]
+    fn accessibility_not_determined_opens_once() {
+        // Never-prompted Accessibility (everything else addressed) → open to offer the
+        // one prompt; declined does not, mirroring the other optionals.
+        assert!(should_auto_open(true, PermStatus::Granted, None, PermStatus::NotDetermined));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Denied));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted));
     }
 
     #[test]
     fn hidden_notification_card_is_never_a_reason_to_open() {
         // Notifications None (unbundled / unanswered) must not trigger the window on
         // its own — only Some(NotDetermined) does.
-        assert!(!should_auto_open(true, PermStatus::Granted, None));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted));
     }
 
     // DRAGON-201: the launch-routing probe skips the (blocking) notification query, so
@@ -411,23 +461,24 @@ mod tests {
     #[test]
     fn routing_without_notifications_still_opens_on_missing_screen_recording() {
         // Screen Recording missing → open, regardless of the (absent) notification status.
-        assert!(should_auto_open(false, PermStatus::Granted, None));
-        assert!(should_auto_open(false, PermStatus::Denied, None));
-        assert!(should_auto_open(false, PermStatus::NotDetermined, None));
+        assert!(should_auto_open(false, PermStatus::Granted, None, PermStatus::Granted));
+        assert!(should_auto_open(false, PermStatus::Denied, None, PermStatus::Granted));
+        assert!(should_auto_open(false, PermStatus::NotDetermined, None, PermStatus::Granted));
     }
 
     #[test]
     fn routing_without_notifications_opens_on_never_prompted_mic() {
         // Screen granted, mic never prompted → still worth one prompt.
-        assert!(should_auto_open(true, PermStatus::NotDetermined, None));
+        assert!(should_auto_open(true, PermStatus::NotDetermined, None, PermStatus::Granted));
     }
 
     #[test]
     fn routing_without_notifications_stays_shut_when_screen_and_mic_addressed() {
         // Screen granted + mic addressed (granted or denied), notifications absent from
-        // the fast probe → launch is NOT gated on a possibly-NotDetermined notification.
-        assert!(!should_auto_open(true, PermStatus::Granted, None));
-        assert!(!should_auto_open(true, PermStatus::Denied, None));
+        // the fast probe, accessibility addressed → launch is NOT gated on a
+        // possibly-NotDetermined notification.
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted));
+        assert!(!should_auto_open(true, PermStatus::Denied, None, PermStatus::Granted));
     }
 
     #[test]

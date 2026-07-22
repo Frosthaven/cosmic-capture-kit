@@ -195,6 +195,22 @@ impl App {
             ));
         }
 
+        // Accessibility (optional, DRAGON-311). Boolean preflight like Screen Recording,
+        // so `accessibility_request_spent` decides Request-vs-Open-Settings for a
+        // not-granted state. `input-keyboard-symbolic` is in libcosmic's embedded subset
+        // and reads as "controls another app", fitting the AX focus-resolution role.
+        out.push(self.permission_card(
+            Permission::Accessibility,
+            "Accessibility",
+            "input-keyboard-symbolic",
+            "Optional. Lets Capture Active Window and Capture Active Monitor target the \
+             window you are actually focused on, and capture it in its active appearance. \
+             Without it, capture may target the wrong window when an app has several open.",
+            accessibility_status(p),
+            false,
+            p.accessibility_request_spent,
+        ));
+
         out
     }
 
@@ -270,6 +286,20 @@ impl App {
                     .leading_icon(widget::icon::from_name("view-refresh-symbolic"))
                     .spacing(6)
                     .on_press(Msg::Permissions(PermissionsMsg::Relaunch))
+                    .into(),
+            );
+        }
+        // Accessibility: the resident menu-bar daemon is the process that resolves the
+        // focused window, and it is separate from this window. `AXIsProcessTrusted()`
+        // re-reads live, but restarting the daemon guarantees the running one picks up a
+        // fresh grant now. Offer it whenever the grant is present (a no-op if no daemon
+        // is running).
+        if perm == Permission::Accessibility && status == PermStatus::Granted {
+            buttons.push(
+                widget::button::standard("Restart Background Helper")
+                    .leading_icon(widget::icon::from_name("view-refresh-symbolic"))
+                    .spacing(6)
+                    .on_press(Msg::Permissions(PermissionsMsg::RestartDaemon))
                     .into(),
             );
         }

@@ -48,6 +48,8 @@ pub fn run_test(name: &str, rest: &[String]) {
                 println!("{line}");
             }
         }
+        #[cfg(target_os = "macos")]
+        "mac-active-window" => mac_active_window_test(),
         // DRAGON-229 M1 Windows capture checkpoints (W1-SPEC §7). Each dispatches into
         // the Windows plugin primitives (`crate::screenshot` / `platform::windows`) and
         // does portable PNG/print glue — the mac-route pattern.
@@ -1005,6 +1007,38 @@ fn mac_active_shot_test() {
     );
 }
 
+/// `--test mac-active-window` (DRAGON-295 follow-up): print what `active_window()` resolves as
+/// the picker-free "Capture Active Window" target, alongside the frontmost app's `AXFocusedWindow`
+/// id and its full owned-window list (z-order). Proves the resolved id is the FOCUSED window, not
+/// merely the first z-ordered one: open TWO windows of the same app, focus the one that is NOT
+/// first in the list, and confirm the resolved id follows the focus.
+#[cfg(target_os = "macos")]
+fn mac_active_window_test() {
+    use crate::platform::mac;
+    let _ = mac::output_descs(); // CG warmup
+    let front_pid = mac::frontmost_app_pid();
+    println!("frontmost app pid: {front_pid:?}");
+    if let Some(pid) = front_pid {
+        match mac::focus::app_focused_window_id(pid) {
+            Some(id) => println!("AXFocusedWindow id: {id}  (Accessibility granted)"),
+            None => println!(
+                "AXFocusedWindow id: <none>  (Accessibility not granted, or no focused window)"
+            ),
+        }
+        println!("owned windows (z-order, front first):");
+        for (i, w) in mac::list_windows_owned_by(pid).into_iter().enumerate() {
+            println!("  [{i}] id={} title={:?} rect={:?}", w.id, w.title, w.rect);
+        }
+    }
+    match mac::active_window() {
+        Some(w) => println!(
+            "active_window() RESOLVED -> id={} title={:?} rect={:?}",
+            w.id, w.title, w.rect
+        ),
+        None => println!("active_window() RESOLVED -> None"),
+    }
+}
+
 /// `--test mac-grab-id <windowID> [out.png]` (DRAGON-189): grab ONE specific window by its
 /// `windowID` right now (whatever the current frontmost app is) and score its traffic-light
 /// region. Used to prove a target window renders GRAY when it is NOT the frontmost/key
@@ -1491,7 +1525,8 @@ fn print_test_help() {
         "mac-shot [display-name]           SCK still + window/cursor probe -> PNG in tmp\n\
          mac-active-shot                   grab the frontmost app's window + score its traffic lights (DRAGON-189)\n\
          mac-focus-shot [windowID]         focus a non-front window, verify, re-grab; before/after traffic-light score (DRAGON-189)\n\
-         mac-wallpaper [display-name]      SCK wallpaper grab + FILE fallback: pixel stats, black-vs-content verdict -> PNG pair (DRAGON-291)\n"
+         mac-wallpaper [display-name]      SCK wallpaper grab + FILE fallback: pixel stats, black-vs-content verdict -> PNG pair (DRAGON-291)\n\
+         mac-active-window                 what active_window() resolves vs AXFocusedWindow + the owned-window z-order (DRAGON-295)\n"
     );
     // DRAGON-229/241: the Windows capture + recording checkpoints (W1-SPEC §7 / W3-SPEC §8),
     // one line per `windows-*` match arm above.

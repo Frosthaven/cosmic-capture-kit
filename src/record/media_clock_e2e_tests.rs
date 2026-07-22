@@ -94,7 +94,7 @@ const H: u32 = 180;
 /// plus a pactl reachability check this suite additionally needs.
 fn have_e2e_tools() -> bool {
     let responds_version = |tool: std::path::PathBuf| {
-        Command::new(tool)
+        crate::util::quiet_command(tool)
             .arg("-version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -196,7 +196,7 @@ impl BeepPlayer {
         } else {
             format!("0.05*sin(2*PI*300*t) + 0.8*sin(2*PI*1000*t)*({beeps})")
         };
-        let child = Command::new(crate::util::ffmpeg_path())
+        let child = crate::util::ffmpeg_command()
             .args(["-hide_banner", "-loglevel", "error"])
             .args(["-f", "lavfi", "-i", &format!("aevalsrc='{expr}':s=48000:d={duration_secs}")])
             .args(["-f", "pulse", "-device", sink, "cck-e2e-beep"])
@@ -263,7 +263,7 @@ fn rising_edge_near(series: &[(f64, f32)], threshold: f32, expected: f64, window
 
 /// ffprobe: total packet count on `stream` (`"v:0"`, `"a:0"`, ...).
 fn probe_packet_count(path: &std::path::Path, stream: &str) -> Option<usize> {
-    let out = Command::new(crate::util::ffprobe_path())
+    let out = crate::util::ffprobe_command()
         .args(["-v", "error", "-select_streams", stream])
         .args(["-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0"])
         .arg(path)
@@ -275,7 +275,7 @@ fn probe_packet_count(path: &std::path::Path, stream: &str) -> Option<usize> {
 
 /// ffprobe: every video packet's PTS (seconds), in container order.
 fn probe_video_pts(path: &std::path::Path) -> Vec<f64> {
-    let Ok(out) = Command::new(crate::util::ffprobe_path())
+    let Ok(out) = crate::util::ffprobe_command()
         .args(["-v", "error", "-select_streams", "v:0"])
         .args(["-show_entries", "packet=pts_time", "-of", "csv=p=0"])
         .arg(path)
@@ -292,7 +292,7 @@ fn probe_video_pts(path: &std::path::Path) -> Vec<f64> {
 
 /// ffprobe: container duration (seconds).
 fn probe_duration(path: &std::path::Path) -> Option<f64> {
-    let out = Command::new(crate::util::ffprobe_path())
+    let out = crate::util::ffprobe_command()
         .args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
         .arg(path)
         .stdin(Stdio::null())
@@ -713,7 +713,7 @@ fn media_clock_owned_path_reports_an_actionable_error_on_forced_failure() {
 /// Decode `path`'s first audio stream to mono f32 @ 48kHz — the continuity E2E's
 /// sample-level view (the RMS series is far too coarse to see placement seams).
 fn audio_mono_f32(path: &std::path::Path) -> Option<Vec<f32>> {
-    let out = Command::new(crate::util::ffmpeg_path())
+    let out = crate::util::ffmpeg_command()
         .args(["-v", "error", "-i"])
         .arg(path)
         .args(["-map", "a:0", "-ac", "1", "-ar", "48000", "-f", "f32le", "pipe:1"])
@@ -830,7 +830,7 @@ fn media_clock_early_long_pause_e2e() {
 
 /// ffprobe: one stream's duration (seconds).
 fn probe_stream_duration(path: &std::path::Path, stream: &str) -> Option<f64> {
-    let out = Command::new(crate::util::ffprobe_path())
+    let out = crate::util::ffprobe_command()
         .args(["-v", "error", "-select_streams", stream])
         .args(["-show_entries", "stream=duration", "-of", "csv=p=0"])
         .arg(path)

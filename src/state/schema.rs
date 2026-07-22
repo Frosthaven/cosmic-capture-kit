@@ -202,6 +202,14 @@ pub struct Persisted {
     /// Linux never reads it (the field just rides along, always false).
     #[serde(default)]
     pub mac_first_run_seen: bool,
+    /// macOS (DRAGON-311): whether the Accessibility permission prompt has already
+    /// been fired from the permissions helper. Accessibility is OPTIONAL (capture is
+    /// never blocked without it), but its preflight is boolean like Screen Recording's,
+    /// so once the prompt is spent a missing grant reads as Denied (Open Settings) and
+    /// the card stops offering Request. A serde-defaulted additive bool, so old configs
+    /// load with it absent (no store-version bump). Default false; Linux never reads it.
+    #[serde(default)]
+    pub mac_accessibility_prompt_seen: bool,
     /// Opacity (0..1) of the black dim drawn outside the region selection.
     #[serde(default = "default_region_opacity")]
     pub region_overlay_opacity: f32,

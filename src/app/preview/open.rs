@@ -53,34 +53,19 @@ impl App {
         open_task
     }
 
-    /// The SOURCE display's point→pixel backing scale for a capture anchored to
-    /// `output`, stored on the [`PreviewState`] so the WINDOW open-fit divides the
-    /// capture's PHYSICAL pixels back into the LOGICAL points it occupied on screen
-    /// (a Retina grab opens at true on-screen size, not 2×). Linux (and any capture
-    /// with no known output) is always `1.0` — the compositor's screencopy already
-    /// lands logical-sized, and `1.0` keeps the sizing math byte-identical there.
-    pub(super) fn preview_source_scale(&self, output: Option<&OutputHandle>) -> f32 {
-        #[cfg(target_os = "macos")]
-        if let Some(name) = output {
-            return crate::platform::mac::scale_for(name)
-                .map(|s| s as f32)
-                .filter(|s| *s > 0.0)
-                .unwrap_or(1.0);
-        }
-        let _ = output;
-        // Linux (DRAGON-221): the capture output's buffer scale, cached from
-        // `output_for_selection` before the overlay tore `self.outputs` down. `1.0`
-        // on 1× displays (and for `--preview`, which sets `source_scale = 1.0`
-        // directly), so the sizing math stays byte-identical there. Every other
-        // platform is `1.0`.
-        #[cfg(target_os = "linux")]
-        {
-            self.preview_output_scale
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            1.0
-        }
+    /// The CAPTURE SOURCE display's point→pixel backing scale, cached into
+    /// `preview_output_scale` at capture time (`scale_for_selection`), used by the WINDOW
+    /// open-fit to divide the capture's PHYSICAL pixels back into the LOGICAL points it
+    /// occupied on screen (a Retina grab opens at true on-screen size, not 2×). This is the
+    /// SELECTION's monitor scale, NOT the trigger display the preview now opens on
+    /// (DRAGON-309): the media is physical pixels of the display it was grabbed from, so
+    /// reading the TRIGGER's scale here (as this used to on macOS, via the passed `output`)
+    /// shrank cross-display captures — a 1× grab shown on a 2× trigger opened half-size.
+    /// Linux (and any capture with no known output, incl. `--preview`) resolves `1.0`, so the
+    /// sizing math stays byte-identical there. `_output` is retained for call-site symmetry.
+    pub(super) fn preview_source_scale(&self, _output: Option<&OutputHandle>) -> f32 {
+        let s = self.preview_output_scale;
+        if s > 0.0 { s } else { 1.0 }
     }
 
     /// Create the preview surface per the appearance setting: a resizable WINDOW when
@@ -158,6 +143,11 @@ impl App {
                     (capture_monitor.1 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
                 ),
             };
+            // DRAGON-309: remember the intended open size so the macOS native finalize can
+            // re-assert it after moving the window to the trigger monitor (winit births it on
+            // the capture/active monitor, where macOS may clamp its height to a smaller screen
+            // before we relocate it). Kept off `PreviewState.monitor`, which a resize overwrites.
+            self.preview_open_size = Some((w.round().max(1.0) as u32, h.round().max(1.0) as u32));
             // The windowed preview is only minted AFTER the grab (a window pick covers the
             // grab with the fullscreen overlay, then swaps to this window, DRAGON-219), so it
             // always opens visible and takes focus normally.
@@ -291,6 +281,23 @@ impl App {
                 Some((o, m)) => (Some(o), m),
                 None => (None, fallback_monitor),
             }
+        };
+        // DRAGON-309 behavior 2: toggling a WINDOWED editor to the fullscreen OVERLAY must open
+        // on the monitor the WINDOW is CURRENTLY on — the user may have dragged it to another
+        // display since it opened, so the stored capture-time anchor (`preview_output`) is
+        // wrong. Query the window's live monitor and override the anchor with it. Off Linux
+        // only (the OutputHandle is a display-name String there; on Linux the compositor owns
+        // the layer-shell/toplevel output and the toggle keeps the capture-time anchor). Only
+        // on the windowed->overlay direction (`old_surface` is the window, the flip is heading
+        // to overlay); the reverse (overlay->window) and `--preview` keep their anchors.
+        #[cfg(not(target_os = "linux"))]
+        let (output, monitor) = if !external && old_surface.is_window() && !self.preview_windowed {
+            match crate::platform::window_current_display(super::shell::PREVIEW_WINDOW_TITLE) {
+                Some(name) => (Some(name), monitor),
+                None => (output, monitor),
+            }
+        } else {
+            (output, monitor)
         };
         // preview_surface_for reads the now-flipped `preview_windowed`, so this mints the
         // OTHER kind of surface.

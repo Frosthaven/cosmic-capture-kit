@@ -30,7 +30,7 @@
 use super::finalize::finalize_with_intervals;
 use super::sync_probe::{audio_rms_series, beep_times, measure_av_offset, SyncMeasurement};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::OnceLock;
 
 /// Metadata line handed to finalize (no `codec=auto`, so it passes through untouched
@@ -51,7 +51,7 @@ const POS_TOL: f64 = 0.060;
 /// and the fixture build both need them; either missing means the verification can't run.
 fn have_ffmpeg() -> bool {
     let responds = |tool: PathBuf| {
-        Command::new(tool)
+        crate::util::quiet_command(tool)
             .arg("-version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -99,7 +99,7 @@ fn build_fixture() -> Fixture {
                  enable='between(t,1.5,1.6)+between(t,3,3.1)'";
     let audio = "aevalsrc='0.8*sin(2*PI*1000*t)*(between(t,1.5,1.58)+between(t,3,3.08))':\
                  s=48000:d=4";
-    let status = Command::new(crate::util::ffmpeg_path())
+    let status = crate::util::ffmpeg_command()
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(["-f", "lavfi", "-i", video])
         .args(["-f", "lavfi", "-i", audio])
@@ -169,7 +169,7 @@ fn measure(path: &Path) -> SyncMeasurement {
 /// Decoded frame count of `path`'s video stream, via ffprobe. Container-agnostic proof
 /// that a stream-copy preserved the video exactly (frames / fps = duration).
 fn video_frame_count(path: &Path) -> u64 {
-    let out = Command::new(crate::util::ffprobe_path())
+    let out = crate::util::ffprobe_command()
         .args([
             "-v", "error", "-select_streams", "v:0", "-count_frames",
             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0",

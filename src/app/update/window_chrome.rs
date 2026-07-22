@@ -78,6 +78,15 @@ impl App {
                 self.apply_nav_auto_collapse_on_spawn();
                 let (id, task) = settings::open_config_window(self.settings_size);
                 self.settings.window = Some(id);
+                // Windows (DRAGON-313): seed the OS title into the framework's per-window title map
+                // NOW — before the returned open task runs — so the winit toplevel is BORN TITLED
+                // (`with_title` at `CreateWindowExW`, read from `program.title(id)`), and komorebi's
+                // first SHOW WinEvent already carries the title (see `open_settings` / the
+                // `open_config_window` note). Only the synchronous map insert matters; the returned
+                // async set_title is dropped (`ConfigWindowOpened` re-sets it). mac/Linux keep their
+                // async-only title path, byte-identical.
+                #[cfg(windows)]
+                let _ = self.set_window_title(settings::WINDOW_TITLE.to_string(), id);
                 let mut tasks = vec![task];
                 // DRAGON-177: seed the update state from the on-disk manifest cache FIRST
                 // (notes, nav tint, launch dialog render instantly); the network check
@@ -171,11 +180,12 @@ impl App {
                         WindowChromeMsg::MacCenterTitlebar(settings::WINDOW_TITLE, 0),
                     ))),
                 ]);
-                // Windows: the settings window was opened HIDDEN; once its async title lands,
-                // SHOW it (DRAGON-302: no komorebi opt-out, so a tiling WM tiles it like a
-                // normal window) — the same title-polled follow-up shape as the mac titlebar
-                // centering above. Batched with the title task so the poll begins as the title
-                // is being applied.
+                // Windows: the settings window opens HIDDEN + BORN TITLED (DRAGON-313).
+                // `ConfigWindowFloat` runs the title-polled follow-up to CENTER the still-hidden
+                // window then natively show it (`SW_SHOW`, like the preview's `show_centered`),
+                // install the native caption buttons + Mica, and settle the size — the same
+                // title-polled follow-up shape as the mac titlebar centering above. Batched with the
+                // title task so the poll begins as the title is being (re-)applied.
                 #[cfg(windows)]
                 return Task::batch([
                     title_task,
@@ -196,42 +206,44 @@ impl App {
                 if self.settings.window != Some(id) {
                     return Task::none();
                 }
-                // The title is set by an async task and may lag this poll; retry briefly
-                // until `show_titled` matches it (same 30 x 40ms budget as the overlay's
-                // `configure_overlay`). The window stays HIDDEN until the title matches, then
-                // it is shown; a tiling WM tiles it on that first show (DRAGON-302).
+                // The window is created HIDDEN + BORN TITLED (DRAGON-313 fix2), so this poll runs
+                // BEFORE it is shown. The title is set at creation but may lag this first poll by a
+                // tick; retry briefly until `center_settings_window` matches it (same 30 x 40ms
+                // budget as the overlay's `configure_overlay`). On match it CENTERS the still-hidden
+                // window and NATIVELY shows it (`SW_SHOW`) — the settings twin of the preview's
+                // `show_centered`. komorebi's first titled SHOW then sees the already-centered window
+                // and tiles it; because nothing repositions it after the show, the tiler's placement
+                // wins cleanly (the earlier open-VISIBLE path centered POST-show and fought it).
                 const MAX_ATTEMPTS: u8 = 30;
                 const RETRY_MS: u64 = 40;
-                if crate::platform::windows::window::show_titled(settings::WINDOW_TITLE) {
-                    // The window matched its async-set title and was shown → arm the
+                if crate::platform::windows::window::center_settings_window(settings::WINDOW_TITLE) {
+                    // The window matched its born-set title and was centered + shown → arm the
                     // liveness watchdog (DRAGON-246): from here on, a disappearance of the
                     // titled window means a genuine vanish-without-`Closed` (out-of-band
                     // destroy), and `sub_settings_liveness` ends the instance so the settings
-                    // mutex + pid file never leak. Set ONLY on a real show (not on the
-                    // give-up branch below, where the window may still be hidden), so the
-                    // guard can never fire during the open-hidden → float-and-show phase.
+                    // mutex + pid file never leak. Set ONLY on a real match (not on the
+                    // give-up branch below, where the window may not exist), so the
+                    // guard can never fire during the open-hidden → center-and-show phase.
                     self.settings_shown_confirmed = true;
-                    // Native DWM caption buttons (DRAGON-284): now that the settings window is
-                    // shown, extend the top frame + install the caption subclass so the native
-                    // min/max/close render top-right over our owned header. Idempotent
-                    // (installed once per HWND) so a re-run of this arm is harmless.
-                    // Unconditional (not gated on Mica): the buttons are chrome, not glass.
+                    // Native DWM caption buttons (DRAGON-284): now that the settings window is shown,
+                    // extend the top frame + install the caption subclass so the native min/max/close
+                    // render top-right over our owned header. Idempotent (once per HWND). The caption
+                    // carve completes the ±0 size round-trip `center_settings_window` pre-inflated for.
                     crate::platform::windows::caption::install_native_caption_buttons(
                         settings::WINDOW_TITLE,
                     );
-                    // Mica backdrop (DRAGON-267): now that the settings window is shown,
-                    // apply the DWM Mica material — gated on the SAME frosted-windows signal
-                    // Linux uses (`self.glass` is `Some(frosted_windows)` only on Win11 22H2+
-                    // and not `CCK_NO_GLASS`-disabled), so the unified toggle turns it off too.
-                    // A no-op otherwise. The chrome already paints translucent from `self.glass`.
+                    // Mica backdrop (DRAGON-267): apply the DWM Mica material — gated on the SAME
+                    // frosted-windows signal Linux uses (`self.glass` is `Some(frosted_windows)` only
+                    // on Win11 22H2+ and not `CCK_NO_GLASS`-disabled), so the unified toggle turns it
+                    // off too. A no-op otherwise. The chrome already paints translucent from `self.glass`.
                     if self.glass.is_some_and(|g| g.frosted_windows) {
                         crate::platform::windows::window::apply_mica(settings::WINDOW_TITLE);
                     }
-                    // DRAGON-299: winit stomps the natively-shown settings window's size to a
-                    // sub-min sliver a beat AFTER this show (it soft-sizes a window shown via
-                    // native `ShowWindow`). The `ConfigWindowResized` handler re-asserts the
-                    // intended size on that stomp; schedule the SETTLE that flips resize-tracking
-                    // on once the stomp + re-assert resizes have been consumed (drift-free).
+                    // DRAGON-299/313: the sub-min re-assert in `ConfigWindowResized` remains a
+                    // defensive net against any post-show winit soft-size; schedule the SETTLE that
+                    // flips resize-tracking on once any open-time transient resizes have been consumed
+                    // (drift-free). `center_settings_window`'s `SW_SHOW` already activated the window,
+                    // so no separate focus command is needed.
                     Task::perform(
                         async move {
                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -245,7 +257,7 @@ impl App {
                 } else if attempt >= MAX_ATTEMPTS {
                     log::warn!(
                         "settings window never matched its title after {MAX_ATTEMPTS} \
-                         attempts — komorebi may tile it and it may stay hidden"
+                         attempts — it may stay hidden"
                     );
                     Task::none()
                 } else {
@@ -333,18 +345,18 @@ impl App {
                 // Remember the settings window's size so it reopens at the size it was
                 // closed at (persisted on close).
                 if Some(id) == self.settings.window && w >= 1.0 && h >= 1.0 {
-                    // Windows (DRAGON-299): the settings window opens hidden + is shown natively,
-                    // and winit STOMPS its size to a sub-minimum sliver a beat after that show (it
-                    // soft-sizes a window shown via native `ShowWindow`; see `show_titled`). Two
-                    // guards, both keyed off the enforced minimum (a real USER resize can never go
-                    // below it — the resize border enforces min_size — so nothing below is ever
-                    // legitimate):
-                    //   * ANY sub-min resize is the stomp — NEVER adopt it; re-assert the intended
-                    //     (persisted, unpolluted) size natively. Unconditional on `settings_size_ready`
-                    //     so it can't race the settle timer (the stomp may land either side of it).
+                    // Windows (DRAGON-299/313): the settings window opens hidden and is centered +
+                    // natively shown (`center_settings_window`, the preview's `show_centered` twin)
+                    // on the FIRST poll now that the title is born-set, so the DRAGON-299 sub-min
+                    // size STOMP is not observed. These two guards remain as a DEFENSIVE net, both
+                    // keyed off the enforced minimum (a real USER resize can never go below it — the
+                    // resize border enforces min_size — so nothing below is ever legitimate):
+                    //   * ANY sub-min resize is treated as a stomp — NEVER adopt it; re-assert the
+                    //     intended (persisted, unpolluted) size natively. Unconditional on
+                    //     `settings_size_ready` so it can't race the settle timer.
                     //   * a ≥min resize is adopted only once the window has SETTLED
                     //     (`settings_size_ready`, flipped by `ConfigWindowResettle`) — before that
-                    //     it's an open-time transient (incl. the re-assert's own resize), ignored so
+                    //     it's an open-time transient (incl. any re-assert's own resize), ignored so
                     //     none is persisted as the remembered size.
                     // mac/Linux open the settings window visible + compositor-managed (no such
                     // stomp), so they adopt every resize as before.

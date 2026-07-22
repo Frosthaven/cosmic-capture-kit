@@ -29,7 +29,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 fn ffprobe_json(path: &std::path::Path) -> String {
-    let out = std::process::Command::new(crate::util::ffprobe_path())
+    let out = crate::util::ffprobe_command()
         .args([
             "-v", "error", "-show_entries",
             "stream=codec_type,codec_name,duration,width:format=duration", "-of", "json",
@@ -56,7 +56,7 @@ fn duration_after(json: &str, marker: &str) -> Option<f64> {
 /// Whether ffmpeg/ffprobe are usable — the live tests LOUDLY skip (never a silent pass)
 /// when they aren't, mirroring the suite convention.
 fn have_ffmpeg() -> bool {
-    std::process::Command::new(crate::util::ffmpeg_path())
+    crate::util::ffmpeg_command()
         .arg("-version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -165,7 +165,7 @@ fn record_target(params: RegionRecordParams, secs: u64) -> std::path::PathBuf {
 /// a regressed one (stale-feed re-feeding one old frame) freezes for nearly all of it.
 /// Dependency-free parse of ffmpeg's stderr freeze markers (mirrors the SCK live test).
 fn freeze_profile(path: &std::path::Path, noise: &str, min_dur: f64) -> (f64, f64) {
-    let out = std::process::Command::new(crate::util::ffmpeg_path())
+    let out = crate::util::ffmpeg_command()
         .args(["-hide_banner", "-nostats", "-i"])
         .arg(path)
         .args([

@@ -659,11 +659,14 @@ impl App {
             rec.stop
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        // Remember the recording's monitor before the overlay (and `self.outputs`) is
-        // torn down, so the preview can open a fullscreen overlay on it. The finalize
+        // DRAGON-309: open the finalized-recording preview on the TRIGGER display (the monitor
+        // active when the recording was initiated), NOT the recorded region's monitor, matching
+        // the still-capture path. Fall back to the selection's output when the trigger can't be
+        // resolved. Captured before the overlay (and `self.outputs`) tears down; the finalize
         // pass is a file op (no live-screen read), so the preview overlay is safe to show.
         if let Some(sel) = self.pending.clone() {
-            self.preview_output = self.output_for_selection(&sel);
+            self.preview_output =
+                self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
             self.preview_output_scale = self.scale_for_selection(&sel);
         }
         let mut cmds = self.destroy_surfaces();

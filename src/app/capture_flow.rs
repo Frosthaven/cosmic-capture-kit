@@ -80,21 +80,35 @@ impl App {
     /// caller can fall back to the picker overlay. The pipeline mode was already pinned to
     /// Window / Monitor in `init` so the right worker (window-focus grab vs monitor grab)
     /// runs. Never called on Linux (its capture keys are COSMIC custom shortcuts).
-    #[cfg(not(target_os = "linux"))]
     pub(super) fn immediate_capture(
         &mut self,
         imm: ImmediateCapture,
     ) -> Option<Task<cosmic::Action<Msg>>> {
         let sel = match imm {
             ImmediateCapture::ActiveWindow => {
-                // The frontmost app's front window: its global rect + stable id feed a
-                // window `Selection` (the same shape a picker commit produces).
+                // The active window's global rect + stable id feed a window `Selection` (the
+                // same shape a picker commit produces). DRAGON-295 fix: prefer the window the
+                // DAEMON resolved at hotkey-PRESS time (target still frontmost) and handed off
+                // via env, re-reading its current rect; a freshly-booted child resolving
+                // frontmost ITSELF runs ~hundreds of ms too late (target already deactivated),
+                // which resolved nothing and fell back to the window PICKER. A direct
+                // `--active-window` CLI launch with no handoff resolves live.
                 #[cfg(target_os = "macos")]
-                let win = crate::platform::mac::active_window();
+                let win = crate::platform::mac::active_window::immediate_active_window();
                 // Windows: the foreground window (GetForegroundWindow + its DWM frame + a
-                // stable HWND id) as a `Toplevel`, the analogue of mac's `active_window`.
+                // stable HWND id) as a `Toplevel`, the analogue of mac's `active_window`, with
+                // the same daemon-handoff preference.
                 #[cfg(windows)]
-                let win = crate::platform::windows::active_window();
+                let win = crate::platform::windows::immediate_active_window();
+                // Linux (COSMIC): the cctk toplevel currently carrying the compositor's
+                // Activated state (DRAGON-295). No daemon handoff is needed — a COSMIC custom
+                // shortcut launches the capture app directly — and it is resolved from
+                // `on_output`, before any overlay is minted, so the target still holds Activated.
+                #[cfg(target_os = "linux")]
+                let win = crate::platform::compositor::list_toplevels()
+                    .into_values()
+                    .flatten()
+                    .find(|t| t.active);
                 let win = win?;
                 let (x, y, w, h) = win.rect;
                 Selection {
@@ -122,14 +136,25 @@ impl App {
                     crate::platform::windows::cursor_position(),
                     crate::screenshot::output_descs(),
                 );
-                let desc = monitor_for_pointer(pointer, &descs)?;
-                Selection {
-                    x: desc.logical_pos.0,
-                    y: desc.logical_pos.1,
-                    width: desc.logical_size.0.max(0) as u32,
-                    height: desc.logical_size.1.max(0) as u32,
-                    output: Some(desc.name),
-                    window_id: None,
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let desc = monitor_for_pointer(pointer, &descs)?;
+                    Selection {
+                        x: desc.logical_pos.0,
+                        y: desc.logical_pos.1,
+                        width: desc.logical_size.0.max(0) as u32,
+                        height: desc.logical_size.1.max(0) as u32,
+                        output: Some(desc.name),
+                        window_id: None,
+                    }
+                }
+                // Linux (COSMIC): Wayland exposes no global pointer position, so the monitor
+                // under the cursor is unresolvable here; fall back to the picker overlay. The
+                // `return None` (no semicolon) is the arm's diverging tail, so it type-unifies
+                // with the `Selection` the other arms produce.
+                #[cfg(target_os = "linux")]
+                {
+                    return None
                 }
             }
         };
@@ -313,9 +338,14 @@ impl App {
         // `capturing`, so the second fire is a no-op. Live region/monitor grabs keep
         // waiting for the tick (the overlay must be gone before we read the screen).
         let immediate = sel.window_id.is_some() || (self.freezing() && !self.capture_live);
-        // Remember the capture's monitor before the overlay (and `self.outputs`) is torn
-        // down, so a post-capture preview can open a fullscreen overlay on that monitor.
-        self.preview_output = self.output_for_selection(&sel);
+        // DRAGON-309: the post-capture preview opens on the TRIGGER display (the monitor
+        // active when the capture was initiated), NOT the selection's monitor — so picking a
+        // target on another display still lands the preview back where the user started. Fall
+        // back to the selection's output when the trigger can't be resolved (keeps the
+        // DRAGON-304 immediate-capture behavior). Captured before the overlay (and
+        // `self.outputs`) tears down, so the fullscreen preview overlay can open there.
+        self.preview_output =
+            self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
         self.preview_output_scale = self.scale_for_selection(&sel);
         // Immediate captures (a window grab, or a freeze crop) don't read the live
         // composited screen, so we can show the preview overlay (a spinner) the instant
@@ -489,16 +519,32 @@ impl App {
         None
     }
 
-    /// The backing scale (physical / logical) of the output a `sel` sits on — the
-    /// value cached into `preview_output_scale` so the windowed preview opens logical-
-    /// sized on scaled COSMIC displays (DRAGON-221). `1.0` on 1× outputs and on macOS
-    /// (which reads the backing scale live from `NSScreen` instead).
+    /// The backing scale (physical / logical) of the CAPTURE SOURCE output a `sel` sits on —
+    /// cached into `preview_output_scale` and used to divide the captured media's PHYSICAL
+    /// pixels down to the LOGICAL points it occupied on screen so the windowed preview opens
+    /// at true on-screen size (DRAGON-221). This is the SELECTION's monitor, NOT the trigger
+    /// display the preview opens on (DRAGON-309): the media is physical pixels of the display
+    /// it was grabbed from, so only that display's scale undoes its Retina factor. `1.0` on
+    /// 1× outputs (and on Windows).
     pub(super) fn scale_for_selection(&self, sel: &Selection) -> f32 {
         #[cfg(target_os = "linux")]
         {
             self.output_for_selection_state(sel).map(|o| o.scale).unwrap_or(1.0)
         }
-        #[cfg(not(target_os = "linux"))]
+        // macOS: read the SOURCE display's live NSScreen backing scale by name.
+        // `output_for_selection` resolves the selection's monitor even when `self.outputs` is
+        // empty (the immediate-capture path, DRAGON-304), so a window / monitor grab on a
+        // Retina display divides correctly regardless of which display triggered the capture.
+        #[cfg(target_os = "macos")]
+        {
+            self.output_for_selection(sel)
+                .as_ref()
+                .and_then(|(name, _)| crate::platform::mac::scale_for(name))
+                .map(|s| s as f32)
+                .filter(|s| *s > 0.0)
+                .unwrap_or(1.0)
+        }
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
         {
             let _ = sel;
             1.0
@@ -524,6 +570,52 @@ impl App {
                 cx >= lx && cx < lx + lw as i32 && cy >= ly && cy < ly + lh as i32
             })
             .or_else(|| self.outputs.first())
+    }
+
+    /// The TRIGGER display (DRAGON-309): the monitor that was ACTIVE when this capture was
+    /// INITIATED, as `(OutputHandle, logical_size)` — where the post-capture preview should
+    /// open, REGARDLESS of where the picked target (region / window / monitor) lands. Distinct
+    /// from [`Self::output_for_selection`], which follows the SELECTION and so opens the
+    /// preview on the wrong monitor when the user picks a target on a different display.
+    ///
+    /// The trigger display's NAME was SNAPSHOTTED at launch into [`Self::trigger_display`]
+    /// (`platform::snapshot_trigger_display_name`, before any picker UI / cursor move / focus
+    /// steal). Here we only RESOLVE that stored name to a rect — never re-sample the live
+    /// cursor / focus (which by commit time point at the TARGET, not the trigger):
+    /// - **Off Linux**: size the named display from the live `output_descs()` list. A
+    ///   stale/unknown name still opens — the placement seams re-resolve the rect by name and
+    ///   fall back to the pointer.
+    /// - **Linux (COSMIC)**: match the stored name into `self.outputs` for its `WlOutput`
+    ///   handle + logical size; fall back to the primary (first) output when the name is
+    ///   unknown or none was captured.
+    ///
+    /// `None` when nothing resolves — the caller then falls back to
+    /// [`Self::output_for_selection`], keeping the DRAGON-304 immediate-capture behavior.
+    pub(super) fn active_trigger_display(&self) -> Option<(OutputHandle, (u32, u32))> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let name = self.trigger_display.clone()?;
+            // Size the display from the live list; a stale/unknown name still opens (the
+            // placement seams re-resolve the rect by name and fall back to the pointer).
+            let size = crate::screenshot::output_descs()
+                .into_iter()
+                .find(|d| d.name == name)
+                .map(|d| (d.logical_size.0.max(0) as u32, d.logical_size.1.max(0) as u32))
+                .unwrap_or((0, 0));
+            Some((name, size))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // The launch-snapshotted focused-toplevel output name, matched into `self.outputs`
+            // (empty at init, populated by commit) for its WlOutput handle + logical size.
+            if let Some(name) = self.trigger_display.as_deref()
+                && let Some(o) = self.outputs.iter().find(|o| o.name == name)
+            {
+                return Some((o.output.clone(), o.logical_size));
+            }
+            // No captured / resolvable trigger output: the primary (first) output.
+            self.outputs.first().map(|o| (o.output.clone(), o.logical_size))
+        }
     }
 
     /// Finish a capture: it's already saved. Copy it to the clipboard when that's
@@ -1123,10 +1215,18 @@ impl App {
             // the separate focus grab loses nothing. Env unset -> both keep their normal values
             // and the default path is byte-identical.
             let backdrop_experiment = wallpaper_backdrop_experiment_active();
+            // DRAGON-308 (Windows): float an opaque backdrop below a GLASS window during the
+            // grab so its acrylic composites against the wallpaper (not the user's other
+            // windows). `None` on mac/Linux (the Windows-only helper is cfg'd out), where the
+            // focus grab already isolates the window's own alpha; consumed by the Windows arm.
+            #[cfg(windows)]
+            let backdrop = window_backdrop_kind(extras.transparency, extras.wallpaper, fullscreen_window);
+            #[cfg(not(windows))]
+            let backdrop: Option<bool> = None;
             let focus_grab = if backdrop_experiment {
                 None
             } else {
-                self.window_focus_grab(id, extras.transparency)
+                self.window_focus_grab(id, extras.transparency, backdrop)
             };
             // The FALLBACK pixel source, chosen + cloned on the UI thread (cheap map
             // lookups + a one-shot memcpy, not a focus-dependent wait): the pre-activation
@@ -1429,13 +1529,17 @@ impl App {
         &self,
         id: &str,
         transparency: bool,
+        // DRAGON-308 (Windows): whether to float a backdrop below the glass window during the
+        // grab (`Some(true)`=wallpaper, `Some(false)`=black, `None`=none). Consumed only by the
+        // Windows arm; mac/Linux ignore it (their grab already isolates the window's own alpha).
+        backdrop: Option<bool>,
     ) -> Option<Box<dyn FnOnce() -> Option<image::RgbaImage> + Send>> {
         let intent = window_focus_intent(self.window_single_active);
         #[cfg(target_os = "linux")]
         {
             // Linux drives focus via the Wayland toplevel activate; transparency is chosen
             // downstream in the worker, not at the focus grab.
-            let _ = transparency;
+            let _ = (transparency, backdrop);
             let id = id.to_string();
             // Owned so the closure needs no `&self`: the frozen toplevel ids (the defocus
             // target search space) and the pre-launch focused window.
@@ -1449,8 +1553,10 @@ impl App {
         #[cfg(target_os = "macos")]
         {
             // macOS grabs via SCK, which carries per-window alpha unconditionally; the
-            // transparency choice is applied downstream, not at the focus grab.
-            let _ = transparency;
+            // transparency choice is applied downstream, not at the focus grab. The mac
+            // wallpaper-backdrop recomposite is a SEPARATE path (`wm/wallpaper_backdrop`),
+            // so the Windows `backdrop` decision is unused here.
+            let _ = (transparency, backdrop);
             let id = id.to_string();
             Some(Box::new(move || match intent {
                 WindowFocusIntent::Focus => crate::platform::mac::capture_window_active(&id),
@@ -1462,22 +1568,37 @@ impl App {
             // DRAGON-278: Windows grabs the window ITSELF right after driving its focus, so
             // it needs the transparency choice at grab time (WGC vs PrintWindow) — threaded in
             // from the caller's already-computed extras, never re-derived in the closure.
+            // DRAGON-308: the backdrop float/grab floats its OWN opaque loader cover synchronously
+            // (`engage_loader_cover`), so no cover state needs threading in from the UI thread.
             let id = id.to_string();
             Some(Box::new(move || match intent {
                 WindowFocusIntent::Focus => {
-                    crate::platform::windows::capture_window_active(&id, transparency)
+                    crate::platform::windows::capture_window_active(&id, transparency, backdrop)
                 }
                 WindowFocusIntent::Defocus => {
-                    crate::platform::windows::capture_window_inactive(&id, transparency)
+                    crate::platform::windows::capture_window_inactive(&id, transparency, backdrop)
                 }
             }))
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
-            let _ = (id, intent, transparency);
+            let _ = (id, intent, transparency, backdrop);
             None
         }
     }
+}
+
+/// DRAGON-308 (Windows): whether to float an opaque backdrop below a picked GLASS window
+/// during the grab so its acrylic composites against the wallpaper, not the user's other
+/// windows — `Some(true)` = the aligned desktop wallpaper, `Some(false)` = solid black,
+/// `None` = float nothing. Only a transparency-PRESERVING grab has glass in the capture to
+/// fix (an opaque PrintWindow grab renders the window in isolation), and a FULLSCREEN window
+/// fills its output so there is no glass/wallpaper-behind — so both suppress the float. When
+/// wallpaper is on we float the wallpaper (the ticket's ask); when off we float black so the
+/// glass still never leaks the user's other windows. Pure so the decision is unit-testable.
+#[cfg(windows)]
+pub(super) fn window_backdrop_kind(transparency: bool, wallpaper: bool, fullscreen: bool) -> Option<bool> {
+    (transparency && !fullscreen).then_some(wallpaper)
 }
 
 /// Whether the DRAGON-292 macOS wallpaper-backdrop recomposite is active for this window
@@ -1742,7 +1863,7 @@ pub(super) fn defocus_activation_target(
 /// are NO displays. Pure (takes the pointer + the display list), so it unit-tests without
 /// any window server. Not built on Linux (its capture keys are COSMIC custom shortcuts).
 #[cfg(not(target_os = "linux"))]
-pub(super) fn monitor_for_pointer(
+pub(crate) fn monitor_for_pointer(
     pointer: Option<(i32, i32)>,
     descs: &[crate::platform::backend::OutputDesc],
 ) -> Option<crate::platform::backend::OutputDesc> {
@@ -2094,6 +2215,36 @@ mod windows_preopen_tests {
         assert!(!decide(false, true, true, true)); // delayed
         assert!(!decide(true, false, true, true)); // region/monitor
         assert!(!decide(true, true, false, true)); // preview off
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_backdrop_kind_tests {
+    use super::window_backdrop_kind as kind;
+
+    // DRAGON-308: a transparency-preserving (glass) grab floats the WALLPAPER backdrop when
+    // "preserve wallpaper" is on, and BLACK when it is off (so the glass never leaks other
+    // windows either way).
+    #[test]
+    fn glass_grab_floats_wallpaper_or_black() {
+        assert_eq!(kind(true, true, false), Some(true)); // glass + wallpaper → wallpaper
+        assert_eq!(kind(true, false, false), Some(false)); // glass + no wallpaper → black
+    }
+
+    // An OPAQUE (transparency-off) grab renders the window in isolation — no glass to fix — so
+    // it floats nothing, regardless of the wallpaper setting.
+    #[test]
+    fn opaque_grab_floats_nothing() {
+        assert_eq!(kind(false, true, false), None);
+        assert_eq!(kind(false, false, false), None);
+    }
+
+    // A FULLSCREEN window fills its output (no glass / wallpaper-behind), so it floats nothing
+    // even with transparency on.
+    #[test]
+    fn fullscreen_floats_nothing() {
+        assert_eq!(kind(true, true, true), None);
+        assert_eq!(kind(true, false, true), None);
     }
 }
 

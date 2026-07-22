@@ -584,8 +584,20 @@ impl App {
         // The windowed preview is only ever minted AFTER the grab (a window pick covers the
         // grab with the fullscreen overlay, then swaps to this window, DRAGON-219), so it
         // always takes focus for real here — there is no order-front-only pre-open phase.
-        let matched =
-            crate::platform::mac::window::finalize_preview_window(super::shell::PREVIEW_WINDOW_TITLE);
+        // DRAGON-309: resolve the TRIGGER monitor's rect from `preview_output` (the same
+        // by-output-name lookup as the overlay preview) and hand it in so the NSWindow is
+        // repositioned CENTERED on that monitor — winit's default cascade lands it on the
+        // active display, which for a cross-display capture is the wrong one. `--preview`
+        // (no capture anchor) passes `None` and keeps winit's placement.
+        let monitor = self
+            .preview_output
+            .as_ref()
+            .map(|(n, _)| crate::platform::mac::overlay_preview_rect(Some(n.as_str())));
+        let matched = crate::platform::mac::window::finalize_preview_window(
+            super::shell::PREVIEW_WINDOW_TITLE,
+            monitor,
+            self.preview_open_size,
+        );
         if matched {
             // Window vibrancy (DRAGON-268): the windowed preview (a CSD toplevel) is the mac
             // analog of Linux's frosted window / Windows' Mica — reveal the winit-inserted
@@ -1203,6 +1215,24 @@ impl App {
                     #[cfg(target_os = "macos")]
                     placed: std::cell::Cell::new(false),
                 });
+                // Linux (DRAGON-295): a picker-free IMMEDIATE capture (`--active-window`). The
+                // output is now registered (its geometry feeds the window-over-wallpaper
+                // composite), so resolve the active toplevel and drive it straight through the
+                // capture pipeline via `run_capture`, minting NO overlay. `take()` makes this
+                // one-shot (later outputs fall through to the picker). On a failure to resolve
+                // (no Activated toplevel), fall through to the normal overlay below so the user
+                // can still pick. macOS/Windows do this in `seed_outputs_mac`; Linux mints its
+                // overlay here in `on_output`, so the immediate check lives here.
+                #[cfg(target_os = "linux")]
+                if let Some(imm) = self.startup_immediate.take() {
+                    if let Some(task) = self.immediate_capture(imm) {
+                        return task;
+                    }
+                    log::warn!(
+                        "immediate capture ({imm:?}) could not resolve a target; \
+                         falling back to the picker overlay"
+                    );
+                }
                 // No auto-seeded region: monitors without a region show a "begin
                 // drawing" hint instead, and the user draws where they want.
                 // Full-input overlay for the interactive UI. DRAGON-228: the picking
