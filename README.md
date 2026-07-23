@@ -9,7 +9,15 @@
 Cross-platform screen region, window, and monitor capture with support for glass
 windows, image, video, voice, QR, barcodes, OCR text and more. 
 
-## Supported Core Platforms
+## Current Support Status
+
+| Legend | Meaning          |
+| ------ | ---------------- |
+| ✅     | Completed        |
+| 📅     | Planned          |
+| ❓     | To be determined |
+
+### Supported Operating Systems
 
 These are the platforms currently planned for support, along with their current
 status.
@@ -19,11 +27,11 @@ status.
 | macOS 13+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      |
 | Windows 11                                               | Windows Capture                     | ✅      |
 | Linux (Wayland): COSMIC                                  | Cosmic Compositor / PipeWire Portal | ✅      |
-| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | TBD                                 | Planned |
-| Linux (Wayland): KDE Plasma                              | TBD                                 | Planned |
-| Linux (Wayland): GNOME                                   | TBD                                 | Planned |
+| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | ❓                                  | 📅      |
+| Linux (Wayland): KDE Plasma                              | ❓                                  | 📅      |
+| Linux (Wayland): GNOME                                   | ❓                                  | 📅      |
 
-## Supported Compositor Extras
+### Supported Compositor Extras
 
 These features require platform-specific functionality. One example is on macOS,
 where capturing windows with their glass effects is not possible using the
@@ -34,87 +42,57 @@ available APIs - clever recompositing tricks are required.
 | macOS 13+ (Apple Silicon)                                | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
 | Windows 11                                               | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
 | Linux (Wayland): COSMIC                                  | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
-| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | TBD                             | TBD                 | TBD                        | TBD              | TBD                                         |
-| Linux (Wayland): KDE Plasma                              | TBD                             | TBD                 | TBD                        | TBD              | TBD                                         |
-| Linux (Wayland): GNOME                                   | TBD                             | TBD                 | TBD                        | TBD              | TBD                                         |
+| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
+| Linux (Wayland): KDE Plasma                              | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
+| Linux (Wayland): GNOME                                   | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
+| Linux (X11)                                              | ❓                              | ❓                  | ❓                         | ❓               | ❓                                          |
 
-## Supported Features
+### Supported Features
 
 These are cross-platform features that are currently planned for the project
 along with their statuses.
 
-| Feature                                    | Status |
-| ------------------------------------------ | ------ |
-| Screen capture engine                      | ✅     |
-| Video capture engine                       | ✅     |
-| Audio capture engine                       | ✅     |
-| Preview editor (overlay & window variants) | ✅     |
-| System tray daemon                         | ✅     |
-
-### Screen capture engine
-
-| Feature                       | Status |
-| ----------------------------- | ------ |
-| Encoder setup & configuration | ✅     |
-
-### Video capture engine
-
-#### In-recording tools
-
-| Feature                       | Status  |
-| ----------------------------- | ------- |
-| mouse clicks                  | Planned |
-| keypress overlay              | TBD     |
-| live annotation (with delete) | TBD     |
-
-### Audio capture engine
-
-| Feature                              | Status |
-| ------------------------------------ | ------ |
-| Audio cleanup and processing options | ✅     |
-
-### Preview editor (overlay & window variants)
-
-| Feature       | Status  |
-| ------------- | ------- |
-| delete        | ✅      |
-| save          | ✅      |
-| save as       | ✅      |
-| copy          | ✅      |
-| copy + delete | Planned |
-
-#### Image annotation tooling
-
-| Feature                | Status  |
-| ---------------------- | ------- |
-| covermarks support     | ✅      |
-| color picker swatch    | Planned |
-| arrows                 | Planned |
-| text (size/resize)     | Planned |
-| sequence markers       | Planned |
-| dim except areas       | Planned |
-| pixelate (destructive) | Planned |
-| blur (destructive)     | Planned |
-| box (fill/outline)     | Planned |
-| draw (line widths)     | Planned |
-| stickers               | Planned |
-| eraser                 | Planned |
-
-#### Video editor tooling
-
-| Feature                                     | Status  |
-| ------------------------------------------- | ------- |
-| simple cutting tool                         | ✅      |
-| simple transition dropdown (none/crossfade) | Planned |
-
-#### Cloud uploader targets
-
-| Feature      | Status  |
-| ------------ | ------- |
-| Proton Drive | Planned |
-| OneDrive     | Planned |
-| Google Drive | Planned |
-| Dropbox      | Planned |
+| Feature                                             | Status  |
+| --------------------------------------------------- | ------- |
+| Core: Image capture                                 | ✅      |
+| Core: Video capture                                 | ✅      |
+| Core: Audio capture                                 | ✅      |
+| Core: Audio cleanup & mixing pipeline               | ✅      |
+| Core: Encoder setup & configuration                 | ✅      |
+| Core: Preview editor (windowed)                     | ✅      |
+| Core: Preview editor (overlay)                      | ✅      |
+| Core: System tray daemon                            | ✅      |
+| Preview editor (shared): Clipboard toggle           | ✅      |
+| Preview editor (shared): Delete                     | ✅      |
+| Preview editor (shared): Save                       | ✅      |
+| Preview editor (shared): Save as                    | ✅      |
+| Preview editor (shared): Copy                       | ✅      |
+| Preview editor (images): Covermarks                 | ✅      |
+| Preview editor (images): Color selector             | 📅      |
+| Preview editor (images): Arrows                     | 📅      |
+| Preview editor (images): Text w/size                | 📅      |
+| Preview editor (images): Numbered marks             | 📅      |
+| Preview editor (images): Dim/spotlight              | 📅      |
+| Preview editor (images): Destructive pixelate       | 📅      |
+| Preview editor (images): Destructive blur           | 📅      |
+| Preview editor (images): Box fill/outline           | 📅      |
+| Preview editor (images): Draw w/line widths         | 📅      |
+| Preview editor (images): Sticker tool               | 📅      |
+| Preview editor (images): Eraser tool                | 📅      |
+| Preview editor (videos): Simple cutting tool        | ✅      |
+| Preview editor (videos): Simple transition dropdown | ✅      |
+| Recording controls: Toggle mic                      | ✅      |
+| Recording controls: Toggle speaker                  | ✅      |
+| Recording controls: Pause recording                 | ✅      |
+| Recording controls: Delete/cancel recording         | ✅      |
+| Recording controls: Mouse click effects             | 📅      |
+| Recording controls: Keypress overlay                | ❓      |
+| Recording controls: Live annotation tools           | ❓      |
+| Cloud account support: Proton Drive                 | 📅      |
+| Cloud account support: OneDrive                     | 📅      |
+| Cloud account support: Google Drive                 | 📅      |
+| Cloud account support: Dropbox                      | 📅      |
+| Cloud account support: SFTP                         | 📅      |
 
 ## Installation
 
@@ -150,17 +128,15 @@ Build from source for now (packaged channels are on the way):
 ```sh
 git clone https://github.com/Frosthaven/cosmic-capture-kit
 cd cosmic-capture-kit
-cargo build --release
+cargo build --release # or cargo install --path .
 ```
 
-The experimental GPU zero-copy feature needs ffmpeg 8 headers (Arch, CachyOS,
-recent Fedora)
+#### Dependencies
 
-Runtime dependencies: `ffmpeg` (screen recording), `tesseract` (OCR,
-optional).
-
-Updating: `git pull` and rebuild; the in-app update check links to the
-releases page on Linux.
+| Library     | Required | Notes                                                                           |
+| ----------- | -------- | ------------------------------------------------------------------------------- |
+| `ffmpeg`    | Yes      | If you have `ffmpeg` 8 headers, you can take advantage of zero-copy recordings. |
+| `tesseract` | No       | Enables OCR support in the scanner (don't forget to install a language pack).   |
 
 ---
 
@@ -178,10 +154,9 @@ settings window and the preview editor by using the information below.
 <details>
 <summary><b>AeroSpace (macOS)</b></summary>
 
-Add to `~/.config/aerospace/aerospace.toml`, then run `aerospace reload-config`. Match on
-`app-id` to float BOTH windows, or on `window-title-regex-substring` to float just one. The two
-titles are distinct (neither is a substring of the other), so a single-window rule needs no
-anchoring:
+```
+~/.config/aerospace/aerospace.toml
+``
 
 ```toml
 [[on-window-detected]]
@@ -198,11 +173,9 @@ run = ['layout floating']
 <details>
 <summary><b>komorebi (Windows)</b></summary>
 
-Edit your `komorebi.json` static config (by default `%USERPROFILE%\komorebi.json`) and add
-the windows to `floating_applications`. komorebi reloads the file when you save it, or run
-`komorebic reload-configuration`. The `Equals` strategy matches the exact title, so the two
-entries never collide. Include both to float both windows, or just one to float only that
-window:
+```
+%USERPROFILE%\komorebi.json
+```
 
 ```json
 {
@@ -218,21 +191,16 @@ window:
 <details>
 <summary><b>COSMIC desktop (Linux)</b></summary>
 
-  ```
-  ~/.config/cosmic/com.system76.CosmicSettings.WindowRules/v1/tiling_exception_custom
-  ```
+```
+~/.config/cosmic/com.system76.CosmicSettings.WindowRules/v1/tiling_exception_custom
+```
 
-  Both `appid` and `title` are matched as regular expressions (unanchored, so they match as
-  a substring), and both must match. The shared `Cosmic Capture Kit` prefix is a substring of
-  both window titles, so it floats BOTH; the two full titles are distinct, so a single-window
-  rule needs no anchoring:
-
-  ```
-  [
-      (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit - Settings"),
-      (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit - Preview Editor"),
-  ]
-  ```
+```
+[
+  (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit - Settings"),
+  (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit - Preview Editor"),
+]
+```
 
 </details>
 
