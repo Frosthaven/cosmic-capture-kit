@@ -402,23 +402,6 @@ impl App {
                 self.save_state();
                 Task::none()
             }
-            SettingsMsg::SetPreviewFloatCosmic(b) => {
-                self.preview_float_cosmic = b;
-                self.save_state();
-                // Register / remove the COSMIC tiling exception so the change takes
-                // effect on the next windowed preview (idempotent; no-op off COSMIC).
-                // The writer lives in the Linux-only COSMIC profile now (DRAGON-220);
-                // off Linux it was already an internal no-op, so gating the call is
-                // byte-identical (the setter + save_state above still run everywhere).
-                // The written title is routed from the single source of truth (DRAGON-301); the
-                // writer also migrates a pre-rename ("… - Preview") exception to it.
-                #[cfg(target_os = "linux")]
-                crate::platform::linux::cosmic::quirks::set_cosmic_preview_float(
-                    crate::app::shell::PREVIEW_WINDOW_TITLE,
-                    b,
-                );
-                Task::none()
-            }
             SettingsMsg::PickDir(target) => {
                 // The file chooser is opened from the settings window (its own
                 // toplevel), so we don't touch the capture overlay at all here.

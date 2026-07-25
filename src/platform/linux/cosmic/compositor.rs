@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::wl_seat::WlSeat;
-use wayland_client::{Connection, QueueHandle, WEnum};
+use wayland_client::{Connection, Proxy, QueueHandle, WEnum};
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
 use wayland_protocols::ext::workspace::v1::client::ext_workspace_handle_v1;
 
@@ -269,6 +269,135 @@ fn activate_where(pred: impl Fn(&ToplevelInfo) -> bool) {
     data.toplevel_manager_state.manager.activate(&handle, &seat);
     let _ = conn.flush();
     let _ = queue.roundtrip(&mut data);
+}
+
+/// EXPERIMENTAL (DRAGON-317): move the toplevel titled `title` to the ACTIVE
+/// workspace of the output named `output_name`, via the cosmic toplevel-management
+/// protocol's `move_to_ext_workspace(toplevel, workspace, output)` request. This is
+/// the ONLY client-side lever that can relocate a mapped xdg_toplevel to another
+/// output on COSMIC — an xdg_toplevel cannot choose its own output, and cosmic-comp
+/// maps a fresh window on the seat's active (pointer) output, not the capture-origin
+/// one. Used to re-home the WINDOWED preview editor onto the trigger monitor after
+/// it maps (the overlay preview already pins its output at layer-surface creation).
+///
+/// FLOATING RETENTION — the key caveat (verified against cosmic-comp `Shell::move_window`,
+/// src/shell/mod.rs @ 15ed782e): on move the destination LAYER is chosen SOLELY by the
+/// destination workspace's `tiling_enabled` flag; the window's own floating tiling-exception
+/// rule is NOT consulted (that only applies at INITIAL map). So the preview stays floating
+/// on the trigger monitor ONLY when that monitor's active workspace is NOT auto-tiling
+/// (the COSMIC default). On an auto-tiling destination workspace the moved window is
+/// force-tiled regardless of any float rule — the DRAGON-222 blocker, which no client-side
+/// sequence can dodge (the clean fix is compositor-side: preserve the source layer in
+/// `move_window`).
+///
+/// Runs on its own throwaway Wayland connection (like [`activate`]) so it never
+/// touches libcosmic's event loop, and is fire-and-forget from a detached thread —
+/// the settle + poll loop below blocks up to ~2.4s. Returns whether the move request
+/// was actually sent (target found, not already on the output, manager ≥ v4).
+#[allow(clippy::mutable_key_type)]
+pub fn move_toplevel_to_output(title: &str, output_name: &str) -> bool {
+    let Ok(conn) = Connection::connect_to_env() else {
+        return false;
+    };
+    let Ok((globals, mut queue)) = registry_queue_init::<WaylandState>(&conn) else {
+        return false;
+    };
+    let qh = queue.handle();
+    let registry_state = RegistryState::new(&globals);
+    let output_state = OutputState::new(&globals, &qh);
+    let workspace_state = WorkspaceState::new(&registry_state, &qh);
+    let toplevel_info_state = ToplevelInfoState::new(&registry_state, &qh);
+    let toplevel_manager_state = ToplevelManagerState::new(&registry_state, &qh);
+    let seat_state = SeatState::new(&globals, &qh);
+    let mut data = WaylandState {
+        registry_state,
+        output_state,
+        workspace_state,
+        toplevel_info_state,
+        toplevel_manager_state,
+        seat_state,
+    };
+    // The preview toplevel's title is set asynchronously after its surface maps, so poll
+    // (not just settle a count): dispatch over a real-time window until a toplevel with
+    // our exact title has been enumerated with a cosmic handle, up to ~2.4s.
+    let mut found = false;
+    for _ in 0..80 {
+        if queue.roundtrip(&mut data).is_err() {
+            return false;
+        }
+        found = data
+            .toplevel_info_state
+            .toplevels()
+            .any(|t| t.title == title && t.cosmic_toplevel.is_some());
+        if found {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    if !found {
+        return false;
+    }
+
+    // move_to_ext_workspace is a v4 request; a manager bound below it would make the call
+    // a protocol violation (killing the connection), so bail cleanly on an older host.
+    if data.toplevel_manager_state.manager.version() < 4 {
+        log::debug!(
+            "DRAGON-317: zcosmic_toplevel_manager_v1 < v4 — no move_to_ext_workspace, \
+             preview stays on the pointer's monitor"
+        );
+        return false;
+    }
+
+    // Resolve the target output by name.
+    let Some(target_output) = data.output_state.outputs().find(|o| {
+        data.output_state
+            .info(o)
+            .and_then(|i| i.name)
+            .is_some_and(|n| n == output_name)
+    }) else {
+        return false;
+    };
+
+    // The active workspace on the target output: the group owning that output, then the
+    // member workspace flagged Active.
+    let Some(target_workspace) = data
+        .workspace_state
+        .workspace_groups()
+        .find(|g| g.outputs.contains(&target_output))
+        .and_then(|g| {
+            g.workspaces.iter().find(|h| {
+                data.workspace_state
+                    .workspace_info(h)
+                    .is_some_and(|w| w.state.contains(ext_workspace_handle_v1::State::Active))
+            })
+        })
+        .cloned()
+    else {
+        return false;
+    };
+
+    // Our toplevel handle — and skip if it's already (partly) on the target output, so a
+    // preview that happened to map on the right monitor isn't needlessly remapped.
+    let Some(handle) = data.toplevel_info_state.toplevels().find_map(|t| {
+        if t.title != title {
+            return None;
+        }
+        if t.geometry.keys().any(|o| o == &target_output) {
+            return None; // already there
+        }
+        t.cosmic_toplevel.clone()
+    }) else {
+        return false;
+    };
+
+    data.toplevel_manager_state.manager.move_to_ext_workspace(
+        &handle,
+        &target_workspace,
+        &target_output,
+    );
+    let _ = conn.flush();
+    let _ = queue.roundtrip(&mut data);
+    true
 }
 
 /// DRAGON-194 follow-up: activate the toplevel `target_id` and WAIT (bounded,

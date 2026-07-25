@@ -638,4 +638,22 @@ record_fps = 60\n";
         assert_eq!(p.record_dir, "~/Videos", "other settings survive");
         assert!(!p.hide_toolbar_fullscreen, "the retired key does not set the new one");
     }
+
+    #[test]
+    fn old_preview_float_cosmic_key_is_ignored_on_load() {
+        // DRAGON-317 removed the `preview_float_cosmic` setting. An existing config still
+        // carries the key; serde must silently DROP it (no `deny_unknown_fields`, so an
+        // unknown key is ignored) and every other setting must survive — a stale key must
+        // never fail the whole parse (which `load()` answers with `defaults()`, wiping all
+        // settings). Covers BOTH on-disk formats: TOML (current) and legacy RON.
+        let toml_on_disk = "record_dir = \"~/Videos\"\npreview_float_cosmic = true\n";
+        let p: super::Persisted =
+            toml::from_str(toml_on_disk).expect("an old preview_float_cosmic key must not fail");
+        assert_eq!(p.record_dir, "~/Videos", "other settings survive the retired key");
+
+        let ron_on_disk = "(record_dir: \"~/Videos\", preview_float_cosmic: true)";
+        let q: super::Persisted =
+            ron::from_str(ron_on_disk).expect("a legacy RON preview_float_cosmic key must not fail");
+        assert_eq!(q.record_dir, "~/Videos", "other settings survive in RON too");
+    }
 }

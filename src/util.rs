@@ -81,10 +81,9 @@ pub fn runtime_dir() -> String {
         .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())
 }
 
-// `is_cosmic()` and the COSMIC preview-float tiling-exception writer
-// (`set_cosmic_preview_float`) moved into the COSMIC desktop profile
-// (`platform::linux::cosmic` + `platform::linux::cosmic::quirks`) with the rest
-// of the per-desktop COSMIC config knowledge (DRAGON-220).
+// `is_cosmic()` moved into the COSMIC desktop profile
+// (`platform::linux::cosmic`) with the rest of the per-desktop COSMIC config
+// knowledge (DRAGON-220).
 
 /// Locate the `ffmpeg` binary: explicit override (`CCK_FFMPEG`) → on macOS, the `.app`
 /// bundle's `Resources/` sidecar and the checked-out dev vendor dir → a bundled sidecar

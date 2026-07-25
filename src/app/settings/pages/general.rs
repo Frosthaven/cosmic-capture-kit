@@ -100,31 +100,6 @@ impl crate::app::App {
                             |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
                         ),
                     ];
-                    // COSMIC only, and only when the windowed appearance is chosen: let
-                    // the preview window float instead of auto-tiling (registers a COSMIC
-                    // tiling exception scoped to the preview window's title). The COSMIC
-                    // check lives in the Linux-only COSMIC profile now (DRAGON-220); off
-                    // Linux it was always false (the row never appeared), so a cfg-selected
-                    // `false` keeps this byte-identical while the branch stays compiled.
-                    #[cfg(target_os = "linux")]
-                    let is_cosmic = crate::platform::linux::cosmic::is_cosmic();
-                    #[cfg(not(target_os = "linux"))]
-                    let is_cosmic = false;
-                    if self.preview_windowed && is_cosmic {
-                        items.push(
-                            Item::new(
-                                "Float the preview window (don't tile)",
-                                "Register a COSMIC tiling exception so the preview window \
-                                 opens floating instead of being tiled.",
-                                toggle(self.preview_float_cosmic, |a0| Msg::Settings(SettingsMsg::SetPreviewFloatCosmic(a0))),
-                            )
-                            .reset_with(
-                                self.preview_float_cosmic,
-                                d.preview_float_cosmic,
-                                |a0| Msg::Settings(SettingsMsg::SetPreviewFloatCosmic(a0)),
-                            ),
-                        );
-                    }
                     items.push(
                         Item::new(
                             "Automatically close the preview editor on save or copy",

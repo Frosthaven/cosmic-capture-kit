@@ -45,15 +45,15 @@ const EDGE_BREAK: i32 = 40;
 // pixel-exact. A small selection scales the corner arms down (keeping MIN_SEG of line), then
 // falls back to a plain fully-connected rectangle when even a stub won't fit.
 const EDGE_THICK: f32 = 1.0; // inner-edge inset reference (no hairline is drawn at it)
-const DEFAULT_BOX_THICK: f32 = 4.0; // DRAGON-209 default box thickness (corners + lines, matched)
-const CORNER_ARM: f32 = 33.0; // corner arm length ceiling (scales down on small boxes)
+const DEFAULT_BOX_THICK: f32 = 2.0; // DRAGON-209 default box thickness (corners + lines, matched)
+const CORNER_ARM: f32 = 16.5; // corner arm length ceiling (scales down on small boxes)
 const CORNER_RADIUS: f32 = 6.0; // outer-corner rounding
 const CORNER_TIP: f32 = 4.0; // arm-tip / line-end rounding
 // Rounding applied to the line ends / arm tips: the tip value, but pointy ONLY when NO
 // rounding at all is chosen — if EITHER the tip or the outer radius is set, the ends stay
 // rounded (falling back to the radius when the tip alone is zero).
 const END_ROUND: f32 = if CORNER_TIP > 0.0 { CORNER_TIP } else { CORNER_RADIUS };
-const EDGE_GAP: f32 = 7.0; // DRAGON-209: gap between a corner bracket and the side line
+const EDGE_GAP: f32 = 5.0; // DRAGON-209: gap between a corner bracket and the side line
 const MIN_SEG: f32 = 8.0; // arms shrink to keep at least this much line per side
 const MIN_ARM: f32 = 7.0; // below this the brackets are dropped for a plain box
 const GRAB_PAD: f32 = 6.0; // hit-zone padding past the resize targets

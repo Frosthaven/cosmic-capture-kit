@@ -160,8 +160,6 @@ pub enum SettingsMsg {
     SetPreviewWindowed(bool),
     /// Settings: auto-close the preview editor after a save/copy.
     SetAutoClosePreview(bool),
-    /// Settings: COSMIC-only tiling exception so the windowed preview floats.
-    SetPreviewFloatCosmic(bool),
     /// Settings: open the folder picker for a save directory, then apply it.
     PickDir(DirTarget),
     DirPicked(DirTarget, Option<std::path::PathBuf>),

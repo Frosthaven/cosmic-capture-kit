@@ -125,10 +125,6 @@ pub struct Persisted {
     /// on — the historical always-close behaviour, now optional).
     #[serde(default = "default_true")]
     pub auto_close_preview: bool,
-    /// COSMIC only: register a tiling exception so the windowed preview floats instead
-    /// of auto-tiling (default off). Only meaningful with `preview_windowed` on COSMIC.
-    #[serde(default)]
-    pub preview_float_cosmic: bool,
     /// Whether to permit more than one overlay instance at a time (default off:
     /// a second launch is suppressed by the single-instance lock).
     #[serde(default)]
@@ -621,7 +617,7 @@ fn default_inactive_border_width() -> u32 {
 
 /// Default region selection box thickness (px). DRAGON-209.
 fn default_selection_box_thickness() -> u32 {
-    4
+    2
 }
 
 /// Default INACTIVE window-capture border colour (0xff414550 = the user's prior

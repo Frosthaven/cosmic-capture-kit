@@ -667,6 +667,15 @@ impl App {
         if let Some(sel) = self.pending.clone() {
             self.preview_output =
                 self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
+            // DRAGON-317 (diagnostic): cache the target output NAME before `destroy_surfaces`
+            // (below) clears `self.outputs`.
+            #[cfg(target_os = "linux")]
+            {
+                let name = self.preview_output.as_ref().and_then(|(out, _)| {
+                    self.outputs.iter().find(|o| &o.output == out).map(|o| o.name.clone())
+                });
+                self.preview_output_name = name;
+            }
             self.preview_output_scale = self.scale_for_selection(&sel);
         }
         let mut cmds = self.destroy_surfaces();

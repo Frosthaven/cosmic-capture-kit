@@ -1388,8 +1388,6 @@ pub struct App {
     preview_windowed: bool,
     /// Auto-close the preview editor after a Save / Save As / Copy (setting; default on).
     auto_close_preview: bool,
-    /// COSMIC-only: float the windowed preview via a tiling exception (persisted).
-    preview_float_cosmic: bool,
     /// Mute other apps' audio while a video preview with sound is playing (restored on close).
     mute_others_during_preview: bool,
     /// Duck the recorded system audio while the mic hears speech (DRAGON-128; persisted).
@@ -1438,6 +1436,14 @@ pub struct App {
     /// before the overlay (and `self.outputs`) is torn down, so the post-capture preview
     /// can open a fullscreen overlay there and scale the image within it.
     preview_output: Option<(OutputHandle, (u32, u32))>,
+    /// DRAGON-317 (diagnostic): the NAME of `preview_output`, resolved from `self.outputs`
+    /// at the same pre-teardown moment `preview_output` is set — because `destroy_surfaces`
+    /// CLEARS `self.outputs` during capture, so by preview-open time the WlOutput in
+    /// `preview_output` can no longer be name-matched. The windowed-preview re-home
+    /// (`preview_resized`) needs this stable name to tell `move_toplevel_to_output` which
+    /// output to target across its throwaway Wayland connection. Linux-only.
+    #[cfg(target_os = "linux")]
+    preview_output_name: Option<String>,
     /// The point→pixel backing scale of `preview_output` — the capture output's
     /// physical-pixels-per-logical-point (COSMIC integer OR fractional scaling). Cached
     /// with `preview_output` (before the overlay tears `self.outputs` down) so the

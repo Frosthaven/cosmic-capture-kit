@@ -245,9 +245,10 @@ pub mod windows_autostart;
 /// this seam is the general entry point.
 ///
 /// No Linux/COSMIC arm: the capture overlays are layer-shell surfaces COSMIC never tiles,
-/// and a real toplevel that wants to float opts out via `linux::cosmic::quirks`' persisted
-/// WindowRules config write (a different lifecycle, not a per-open call). Hence the seam is
-/// scoped to the two platforms where opting a live window out of tiling is a per-window op.
+/// and a real toplevel that wants to float opts out via a user-managed COSMIC WindowRules
+/// tiling exception (documented in the README, alongside the AeroSpace/komorebi rules — not
+/// an app-written config). Hence the seam is scoped to the two platforms where opting a live
+/// window out of tiling is a per-window op.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn opt_out_of_tiling(title: &str) {
     #[cfg(target_os = "macos")]

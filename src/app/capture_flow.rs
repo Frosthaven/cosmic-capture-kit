@@ -148,13 +148,36 @@ impl App {
                         window_id: None,
                     }
                 }
-                // Linux (COSMIC): Wayland exposes no global pointer position, so the monitor
-                // under the cursor is unresolvable here; fall back to the picker overlay. The
-                // `return None` (no semicolon) is the arm's diverging tail, so it type-unifies
-                // with the `Selection` the other arms produce.
+                // Linux (COSMIC): Wayland exposes NO global pointer position without a mapped
+                // surface (the only pointer-position path is a per-output ext-image-copy cursor
+                // session — too heavy, and not guaranteed on cosmic-comp, for a one-shot launch),
+                // so the "active monitor" is resolved as the output holding the currently-ACTIVE
+                // toplevel: the same cctk `Activated` flag the ActiveWindow arm above keys on.
+                // The active window's CENTRE is the point fed to `monitor_for_pointer` (which
+                // returns the output containing a point, else the primary) — the monitor the
+                // focused window lives on IS the active monitor. An idle desktop with no active
+                // toplevel yields no centre, so it resolves to the primary output. Result: the
+                // same monitor `Selection` (keyed by output name) the other platforms produce,
+                // so `run_capture` + the preview open drive it identically. `?` on an empty
+                // display list falls the caller back to the picker overlay. DRAGON-317.
                 #[cfg(target_os = "linux")]
                 {
-                    return None
+                    let tops: Vec<(crate::platform::compositor::WinRect, bool)> =
+                        crate::platform::compositor::list_toplevels()
+                            .into_values()
+                            .flatten()
+                            .map(|t| (t.rect, t.active))
+                            .collect();
+                    let descs = crate::screenshot::output_descs();
+                    let desc = monitor_for_pointer(active_toplevel_centre(&tops), &descs)?;
+                    Selection {
+                        x: desc.logical_pos.0,
+                        y: desc.logical_pos.1,
+                        width: desc.logical_size.0.max(0) as u32,
+                        height: desc.logical_size.1.max(0) as u32,
+                        output: Some(desc.name),
+                        window_id: None,
+                    }
                 }
             }
         };
@@ -346,6 +369,16 @@ impl App {
         // `self.outputs`) tears down, so the fullscreen preview overlay can open there.
         self.preview_output =
             self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
+        // DRAGON-317 (diagnostic): resolve + cache the target output's NAME NOW, before
+        // `destroy_surfaces` (below) clears `self.outputs` — the windowed-preview re-home
+        // can't derive it post-teardown.
+        #[cfg(target_os = "linux")]
+        {
+            let name = self.preview_output.as_ref().and_then(|(out, _)| {
+                self.outputs.iter().find(|o| &o.output == out).map(|o| o.name.clone())
+            });
+            self.preview_output_name = name;
+        }
         self.preview_output_scale = self.scale_for_selection(&sel);
         // Immediate captures (a window grab, or a freeze crop) don't read the live
         // composited screen, so we can show the preview overlay (a spinner) the instant
@@ -1861,8 +1894,13 @@ pub(super) fn defocus_activation_target(
 /// contain `pointer`; when the pointer maps to none (or is unknown), falls back to the
 /// primary display (logical origin `(0, 0)`), else the first listed. `None` only when there
 /// are NO displays. Pure (takes the pointer + the display list), so it unit-tests without
-/// any window server. Not built on Linux (its capture keys are COSMIC custom shortcuts).
-#[cfg(not(target_os = "linux"))]
+/// any window server.
+///
+/// DRAGON-317: also used on Linux, where Wayland exposes no global pointer position — the
+/// [`ImmediateCapture::ActiveMonitor`] arm feeds it the ACTIVE toplevel's centre (via
+/// [`active_toplevel_centre`]) instead of a real pointer, so the monitor holding the focused
+/// window resolves as the active monitor. The geometry is identical either way (a point,
+/// else the primary output).
 pub(crate) fn monitor_for_pointer(
     pointer: Option<(i32, i32)>,
     descs: &[crate::platform::backend::OutputDesc],
@@ -1885,6 +1923,27 @@ pub(crate) fn monitor_for_pointer(
         .find(|d| d.logical_pos == (0, 0))
         .or_else(|| descs.first())
         .cloned()
+}
+
+/// DRAGON-317 (Linux): the CENTRE (global logical coords) of the ACTIVE toplevel among
+/// `toplevels` — each given as `(rect, active)` where `rect` is the global-logical
+/// `(x, y, w, h)` [`WinRect`](crate::platform::compositor::WinRect) and `active` is the
+/// cctk `Activated` flag. This is the point the picker-free "Capture Active Monitor"
+/// resolution feeds to [`monitor_for_pointer`], because Wayland exposes no global pointer
+/// position: the monitor holding the focused window IS the active monitor. The centre is
+/// `(x + w / 2, y + h / 2)` (integer truncation). `None` when NOTHING is active (an
+/// empty/idle desktop) — which resolves to the primary output downstream. First active
+/// wins (the compositor marks exactly one toplevel `Activated`, but a window spanning
+/// outputs appears once per output, so any of its copies serves). Pure (rects only), so
+/// it unit-tests without cctk.
+#[cfg(target_os = "linux")]
+pub(crate) fn active_toplevel_centre(
+    toplevels: &[(crate::platform::compositor::WinRect, bool)],
+) -> Option<(i32, i32)> {
+    toplevels
+        .iter()
+        .find(|(_, active)| *active)
+        .map(|((x, y, w, h), _)| (x + w / 2, y + h / 2))
 }
 
 /// DRAGON-304: the [`crate::platform::backend::OutputDesc`] a selection sits on, chosen from
@@ -1998,9 +2057,9 @@ mod window_focus_intent_tests {
 }
 
 // DRAGON-295: the pure "monitor under the pointer" resolver for the picker-free
-// "Capture Active Monitor" hotkey. Not built on Linux (its capture keys are COSMIC
-// shortcuts, so `monitor_for_pointer` is never compiled there).
-#[cfg(all(test, not(target_os = "linux")))]
+// "Capture Active Monitor" hotkey. Compiled (and tested) on every platform now — Linux
+// feeds it the active toplevel's centre (DRAGON-317).
+#[cfg(test)]
 mod monitor_for_pointer_tests {
     use super::monitor_for_pointer;
     use crate::platform::backend::OutputDesc;
@@ -2056,6 +2115,55 @@ mod monitor_for_pointer_tests {
         // The right edge of A (x=100) belongs to B (half-open [ox, ox+w)).
         assert_eq!(monitor_for_pointer(Some((100, 50)), &descs).unwrap().name, "B");
         assert_eq!(monitor_for_pointer(Some((99, 50)), &descs).unwrap().name, "A");
+    }
+}
+
+// DRAGON-317: the pure "centre of the active toplevel" resolver the Linux picker-free
+// "Capture Active Monitor" arm feeds to `monitor_for_pointer` (Wayland has no global
+// pointer). Linux-only (the helper is cfg'd to Linux).
+#[cfg(all(test, target_os = "linux"))]
+mod active_toplevel_centre_tests {
+    use super::active_toplevel_centre;
+
+    #[test]
+    fn picks_the_active_toplevels_centre() {
+        // Two toplevels; only the second is active. Its centre (global logical coords)
+        // is returned: x = 1920 + 800/2 = 2320, y = 100 + 600/2 = 400.
+        let tops = [((0, 0, 1000, 800), false), ((1920, 100, 800, 600), true)];
+        assert_eq!(active_toplevel_centre(&tops), Some((2320, 400)));
+    }
+
+    #[test]
+    fn first_active_wins_when_several_report_active() {
+        // A window spanning outputs appears once per output (both marked active); the
+        // FIRST is taken. Centre of (0,0,400,400) = (200, 200).
+        let tops = [((0, 0, 400, 400), true), ((400, 0, 400, 400), true)];
+        assert_eq!(active_toplevel_centre(&tops), Some((200, 200)));
+    }
+
+    #[test]
+    fn no_active_toplevel_yields_none() {
+        // An idle desktop (nothing Activated) resolves to the primary output downstream.
+        let tops = [((0, 0, 1000, 800), false), ((1000, 0, 1000, 800), false)];
+        assert_eq!(active_toplevel_centre(&tops), None);
+        // And an empty list (no toplevels at all) is likewise None.
+        assert_eq!(active_toplevel_centre(&[]), None);
+    }
+
+    #[test]
+    fn centre_uses_integer_truncation() {
+        // Odd dimensions truncate toward zero, matching the inline `x + w / 2` arithmetic:
+        // x = 10 + 15/2 = 10 + 7 = 17, y = 20 + 9/2 = 20 + 4 = 24.
+        let tops = [((10, 20, 15, 9), true)];
+        assert_eq!(active_toplevel_centre(&tops), Some((17, 24)));
+    }
+
+    #[test]
+    fn handles_negative_coordinate_outputs() {
+        // A window on a monitor left-of / above the primary sits at negative globals.
+        // Centre of (-1600, -200, 400, 200) = (-1400, -100).
+        let tops = [((-1600, -200, 400, 200), true)];
+        assert_eq!(active_toplevel_centre(&tops), Some((-1400, -100)));
     }
 }
 

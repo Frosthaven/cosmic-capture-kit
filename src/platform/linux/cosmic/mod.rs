@@ -8,16 +8,13 @@
 //!   toplevel-management activation),
 //! - [`theme`]: the `~/.config/cosmic` `com.system76.CosmicTheme.*` file readers
 //!   (corner radii, window-hint colour, frosted-glass alpha map),
-//! - [`wallpaper`]: `com.system76.CosmicBackground` RON reader,
-//! - [`quirks`]: the `com.system76.CosmicSettings.WindowRules` tiling-exception
-//!   writer that floats the preview window.
+//! - [`wallpaper`]: `com.system76.CosmicBackground` RON reader.
 //!
 //! Future COSMIC-only integrations (a native compositor-blur enrollment beyond
 //! the current `window::Settings.blur` path, cosmic-config live watchers) slot in
 //! here rather than sprinkling `is_cosmic()` checks through the portable core.
 
 pub mod compositor;
-pub mod quirks;
 pub mod theme;
 pub mod wallpaper;
 
@@ -39,6 +36,12 @@ impl DesktopProfile for CosmicProfile {
 /// `XDG_CURRENT_DESKTOP` (a colon-separated list) / `XDG_SESSION_DESKTOP`, asking the
 /// ONE detection core ([`super::detect_from`]: the same case-insensitive colon-split
 /// match, COSMIC checked first) whether those vars resolve to the "cosmic" profile id.
+///
+/// Currently UNUSED (DRAGON-317): the preview-window float toggle that consulted it was
+/// removed — the COSMIC tiling exception is now a user-managed WindowRules entry documented
+/// in the README, so nothing in-app gates on COSMIC. Kept as THE one desktop-detection entry
+/// point for any future COSMIC-only branch, alongside its detection-core doc above.
+#[allow(dead_code)]
 pub fn is_cosmic() -> bool {
     let current = std::env::var("XDG_CURRENT_DESKTOP").ok();
     let session = std::env::var("XDG_SESSION_DESKTOP").ok();

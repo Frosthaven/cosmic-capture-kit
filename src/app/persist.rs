@@ -120,7 +120,6 @@ impl App {
             preview_after_capture: self.preview_after_capture,
             preview_windowed: self.preview_windowed,
             auto_close_preview: self.auto_close_preview,
-            preview_float_cosmic: self.preview_float_cosmic,
             mute_others_during_preview: self.mute_others_during_preview,
             duck_system_audio: self.duck_system_audio,
             appearance_use_system: self.appearance_use_system,
@@ -210,7 +209,6 @@ impl App {
         self.preview_after_capture = p.preview_after_capture;
         self.preview_windowed = p.preview_windowed;
         self.auto_close_preview = p.auto_close_preview;
-        self.preview_float_cosmic = p.preview_float_cosmic;
         self.mute_others_during_preview = p.mute_others_during_preview;
         self.duck_system_audio = p.duck_system_audio;
         self.appearance_use_system = p.appearance_use_system;

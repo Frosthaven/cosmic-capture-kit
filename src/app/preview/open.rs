@@ -446,6 +446,12 @@ impl App {
         if self.preview.as_ref().is_none_or(|p| p.window != id) {
             return Task::none();
         }
+        // This configure is the WINDOW's FIRST map iff the transient max-size hint was still
+        // pending (set at mint, cleared here exactly once) — the signal DRAGON-317's re-home
+        // below piggybacks on (Linux-only, so gated to stay warning-clean elsewhere).
+        #[cfg(target_os = "linux")]
+        let first_window_configure =
+            self.preview.as_ref().is_some_and(|p| p.max_hint_pending);
         let clear_hint = match self.preview.as_mut() {
             Some(p) if p.max_hint_pending => {
                 p.max_hint_pending = false;
@@ -453,6 +459,35 @@ impl App {
             }
             _ => Task::none(),
         };
+        // DRAGON-317 (Linux windowed): the first map of the preview WINDOW. cosmic-comp maps a
+        // fresh xdg_toplevel on the seat's active (pointer) output, NOT the capture-origin
+        // monitor — and an xdg_toplevel cannot self-place, so the ONLY client-side lever is the
+        // toplevel-management `move_to_ext_workspace` request (see
+        // `platform::compositor::move_toplevel_to_output`). Re-home the freshly-mapped preview
+        // window onto the trigger monitor's active workspace, once, off the UI thread.
+        //
+        // The target output is read from the PRE-TEARDOWN-cached `preview_output_name`, NOT from
+        // `self.outputs`: by the time this configure fires `self.outputs` has been EMPTIED —
+        // `destroy_surfaces` (surfaces.rs) clears it while tearing down the capture overlays,
+        // which happens during the grab, before the preview surface is ever minted (see the
+        // `output_rect_for_window` note in capture_flow.rs: "self.outputs is ALSO empty by
+        // then"). An earlier version derived the name from `self.outputs` here and silently did
+        // nothing every time — do NOT reintroduce that dependency. `preview_output_name` is None
+        // for `--preview` and unknown-origin sessions (no re-home, byte-identical to before);
+        // single-monitor is a no-op via the helper's own "already on target output" skip.
+        // CAVEAT: the move preserves floating ONLY if the destination workspace isn't
+        // auto-tiling (see the helper's doc); an auto-tiling workspace force-tiles the moved
+        // window regardless — the DRAGON-222 blocker. The OVERLAY preview is untouched (it
+        // already pins its output at layer-surface creation).
+        #[cfg(target_os = "linux")]
+        if first_window_configure
+            && let Some(name) = self.preview_output_name.clone()
+        {
+            let title = super::super::shell::PREVIEW_WINDOW_TITLE.to_string();
+            std::thread::spawn(move || {
+                crate::platform::compositor::move_toplevel_to_output(&title, &name);
+            });
+        }
         // The stored zoom is FIT-relative, so a plain resize would change the displayed size
         // while the % readout stayed put. Preserve the native scale across the resize (except
         // "Fit to screen", which re-fits to the new width) so 100% stays 100%.

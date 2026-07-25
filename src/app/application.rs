@@ -48,21 +48,6 @@ impl cosmic::Application for App {
         // Recordings + meters read the mic source from this global; set it from the
         // persisted choice now so it applies even if settings is never opened.
         crate::audio::config::set_mic_source(&persisted.mic_device);
-        // COSMIC float exception (DRAGON-301 review): if the windowed preview is set to FLOAT
-        // (`preview_float_cosmic`), RE-ASSERT the tiling exception at startup — well before any
-        // preview window maps — so an existing user's pre-rename ("… - Preview") exception is
-        // MIGRATED to the renamed title eagerly. Without this the migration only ran on the next
-        // float-toggle (its sole writer), so after an upgrade the preview would TILE until the
-        // user re-toggled. Routed through the same seam as the toggle handler (which passes the
-        // title from the single source of truth); idempotent once the exception already carries
-        // the new title, and internally a no-op off COSMIC.
-        #[cfg(target_os = "linux")]
-        if persisted.preview_float_cosmic {
-            crate::platform::linux::cosmic::quirks::set_cosmic_preview_float(
-                super::shell::PREVIEW_WINDOW_TITLE,
-                true,
-            );
-        }
         // First-run / missing-permission routing (macOS, DRAGON-130): a capture
         // launch that lacks the Screen Recording grant would only produce a blank
         // capture, so instead of proceeding we open the dedicated permission-checker
@@ -346,7 +331,6 @@ impl cosmic::Application for App {
                 // `--preview` (windowed unless `--overlay`) overrides the persisted setting.
                 preview_windowed: startup.preview_windowed.unwrap_or(persisted.preview_windowed),
                 auto_close_preview: persisted.auto_close_preview,
-                preview_float_cosmic: persisted.preview_float_cosmic,
                 mute_others_during_preview: persisted.mute_others_during_preview,
                 duck_system_audio: persisted.duck_system_audio,
                 appearance_use_system: persisted.appearance_use_system,
@@ -359,6 +343,8 @@ impl cosmic::Application for App {
                 preview_duck: None,
                 trigger_display,
                 preview_output: None,
+                #[cfg(target_os = "linux")]
+                preview_output_name: None,
                 preview_output_scale: 1.0,
                 preview_open_size: None,
                 startup_preview,
