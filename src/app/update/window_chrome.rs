@@ -119,6 +119,35 @@ impl App {
             WindowChromeMsg::Ignore => Task::none(),
             WindowChromeMsg::KeyPressed(modifiers, key) => self.handle_key(modifiers, key),
             WindowChromeMsg::KeyReleased(modifiers, key) => {
+                // DRAGON-325: some keys are delivered only on RELEASE, never on press — most
+                // notably PrintScreen (`VK_SNAPSHOT`), which Windows delivers as `WM_KEYUP`
+                // with no matching `WM_KEYDOWN`, so winit/iced emit only a `KeyReleased` for
+                // it. The chord recorders (the "Start Capture" global-hotkey row + the in-app
+                // rebind row) live in `handle_key`, which is driven off `KeyPressed`, so such a
+                // key could never be recorded. Mirror cosmic-settings, which finalizes chord
+                // recording on key RELEASE for exactly this reason: while a recorder is armed,
+                // also route the RELEASE into the same recorder. This is a cross-platform
+                // correctness improvement (any release-only key, any OS), not a Windows patch.
+                //
+                // Safe for ordinary keys: a key that delivered a press was already recorded on
+                // that press (which disarmed the recorder), so by release the mode is cleared
+                // and this routing is skipped — only genuinely release-only keys reach the
+                // recorder this way, and never twice. Gated on "a recorder is armed" so a
+                // release NEVER re-fires a bound action (those dispatch on press only), and
+                // recorder-armed is a distinct mode from a live push-to-talk session below.
+                //
+                // The condition must match the recorder branches `handle_key` actually has on
+                // this platform, so a routed release always lands in one and returns early
+                // rather than falling through to action dispatch: the in-app `rebinding` branch
+                // is cross-platform; the `capture_hotkey_rebinding` (daemon-hotkey) branch
+                // exists only on macOS/Windows, so its term is cfg-scoped to match.
+                let recorder_armed = self.settings.rebinding.is_some();
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                let recorder_armed =
+                    recorder_armed || self.settings.capture_hotkey_rebinding.is_some();
+                if recorder_armed {
+                    return self.handle_key(modifiers, key);
+                }
                 // Push-to-talk release: re-mute the mic when the held mic key is let go.
                 if self.ptt_held
                     && self
@@ -592,6 +621,29 @@ impl App {
                 } else {
                     Task::none()
                 }
+            }
+            #[cfg(target_os = "linux")]
+            WindowChromeMsg::CursorEnteredWindow(id) => {
+                // DRAGON-317 regression fix: learn the pointer's OUTPUT the FIRST time the
+                // cursor enters one of OUR per-display capture overlays — the reliable
+                // "monitor the user is on when the capture was initiated" signal (cosmic-comp
+                // maps the overlay under the cursor, so its wl_pointer enter names the
+                // pointer's output). This supersedes the launch focused-toplevel guess, which
+                // wrongly points at the focused window's monitor when the user is working on a
+                // different, empty one. Selection phase only (mirrors the macOS guard); only
+                // OUR overlay windows count; first-enter wins so a later drag onto another
+                // monitor's overlay never overwrites the origin. No focus change here —
+                // layer-shell overlays own their keyboard grab on demand.
+                if self.capture_pointer_output.is_none()
+                    && self.countdown.is_none()
+                    && self.recording.is_none()
+                    && !self.capture_live
+                    && let Some(name) =
+                        self.outputs.iter().find(|o| o.id == id).map(|o| o.name.clone())
+                {
+                    self.capture_pointer_output = Some(name);
+                }
+                Task::none()
             }
             WindowChromeMsg::WindowCloseRequested(id) => {
                 if Some(id) == self.settings.window || Some(id) == self.permissions.window {

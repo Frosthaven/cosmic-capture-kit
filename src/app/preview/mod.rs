@@ -18,6 +18,7 @@
 use super::*;
 use std::path::PathBuf;
 
+mod annotate;
 mod chrome;
 mod covermark;
 mod edit;
@@ -36,8 +37,10 @@ pub use image::ImagePreview;
 pub use video::VideoPreview;
 pub use layers::PixelFrame;
 pub use edit::covermark_dir;
+pub(crate) use annotate::AnnotId;
 
-use edit::{Covermark, CovermarkKind, EditState, Picker, ShareIntent};
+use annotate::Reorder;
+use edit::{Covermark, CovermarkKind, EditKind, EditState, Picker, ShareIntent};
 // The split-out halves of this module (DRAGON-115), glob-imported back so the
 // `use super::*;` at the top of every sibling keeps resolving the same names.
 use chrome::*;
@@ -268,6 +271,10 @@ impl App {
                     if let Some(o) = &original {
                         // Aspect for the covermark preview raster (stacked over the image).
                         edit.frame = o.dimensions();
+                        // Cache the base pixels for the real-time effects shader (DRAGON-330):
+                        // one copy on decode, uploaded once to the GPU (seq-guarded) thereafter.
+                        let (w, h) = o.dimensions();
+                        edit.fx_base = Some(PixelFrame::new(o.as_raw().clone(), w, h));
                     }
                     img.image = Some(handle);
                     img.original = original;
@@ -331,43 +338,71 @@ impl App {
                     }
                     _ => None,
                 };
+                // The DISPLAY effects layer (DRAGON-330) is built on demand from the retained
+                // base whenever an effect is drawn/edited — a fresh capture has no annotations
+                // yet, so nothing to composite here.
                 // Keep the window focused as the spinner gives way to the image (the surface
                 // teardown behind the load could otherwise steal focus).
                 Task::batch([refit.unwrap_or_else(Task::none), self.focus_preview_window()])
             }
             PreviewMsg::Covermark => {
+                // Toggle the covermark flyout. Open with the APPLIED mark highlighted (its
+                // keyboard index), falling back to the "None" card (index 0).
                 let text = self.covermark_text.clone();
                 if let Some(p) = &mut self.preview {
-                    p.edit.picker = match p.edit.picker {
-                        Some(_) => None,
-                        None => {
-                            // A leading "None" card (disable) then the real covermarks.
-                            let mut entries = vec![None];
-                            entries.extend(edit::covermark_entries(&text).into_iter().map(Some));
-                            Some(Picker { entries, selected: 0 })
-                        }
-                    };
-                }
-                Task::none()
-            }
-            PreviewMsg::PickerNav(delta) => {
-                if let Some(PreviewState { edit: EditState { picker: Some(pk), .. }, .. }) =
-                    &mut self.preview
-                    && !pk.entries.is_empty()
-                {
-                    let len = pk.entries.len() as i32;
-                    pk.selected = ((pk.selected as i32 + delta).rem_euclid(len)) as usize;
-                }
-                Task::none()
-            }
-            PreviewMsg::PickerApply => {
-                let idx = match &self.preview {
-                    Some(PreviewState { edit: EditState { picker: Some(pk), .. }, .. }) => {
-                        pk.selected
+                    if p.edit.flyout_kind() == Some(edit::FlyoutKind::Covermark) {
+                        p.edit.close_flyout();
+                    } else {
+                        let mut entries = vec![None];
+                        entries.extend(edit::covermark_entries(&text).into_iter().map(Some));
+                        let selected = match p.edit.covermark.as_ref().map(|c| &c.kind) {
+                            Some(kind) => {
+                                entries.iter().position(|e| e.as_ref() == Some(kind)).unwrap_or(0)
+                            }
+                            None => 0,
+                        };
+                        let len = entries.len();
+                        p.edit.picker = Some(Picker { entries });
+                        p.edit.open_flyout(edit::FlyoutKind::Covermark, Some(selected), len);
                     }
-                    _ => return Task::none(),
-                };
-                self.update_preview(PreviewMsg::PickerPick(idx))
+                }
+                Task::none()
+            }
+            // ── Shared toolbar-flyout keyboard nav (covermark picker + color palette) ────
+            PreviewMsg::FlyoutNav(delta) => {
+                if let Some(p) = &mut self.preview
+                    && let Some(f) = &mut p.edit.flyout
+                {
+                    f.nav(delta);
+                }
+                Task::none()
+            }
+            PreviewMsg::FlyoutApply => {
+                let recents = self.annot_recent_colors.clone();
+                let flyout = self.preview.as_ref().and_then(|p| p.edit.flyout);
+                match flyout {
+                    Some(edit::FlyoutNav { kind: edit::FlyoutKind::Covermark, selected: Some(i), .. }) => {
+                        self.update_preview(PreviewMsg::PickerPick(i))
+                    }
+                    Some(edit::FlyoutNav { kind: edit::FlyoutKind::Color, selected: Some(i), .. }) => {
+                        match annotate::palette_entries(&recents).get(i) {
+                            Some(annotate::PaletteEntry::Color(c)) => {
+                                self.update_preview(PreviewMsg::SetAnnotColor(*c))
+                            }
+                            Some(annotate::PaletteEntry::Custom) => {
+                                self.update_preview(PreviewMsg::AnnotColorEditor(true))
+                            }
+                            None => Task::none(),
+                        }
+                    }
+                    _ => Task::none(),
+                }
+            }
+            PreviewMsg::FlyoutClose => {
+                if let Some(p) = &mut self.preview {
+                    p.edit.close_flyout();
+                }
+                Task::none()
             }
             PreviewMsg::PickerPick(idx) => {
                 // Each covermark choice is a toggle: picking the one already applied
@@ -399,16 +434,10 @@ impl App {
                     }
                 };
                 if let Some(p) = &mut self.preview {
-                    p.edit.picker = None;
+                    p.edit.close_flyout();
                     p.edit.set_covermark(next);
                 }
                 self.refresh_edit_display()
-            }
-            PreviewMsg::PickerClose => {
-                if let Some(p) = &mut self.preview {
-                    p.edit.picker = None;
-                }
-                Task::none()
             }
             #[cfg(target_os = "macos")]
             PreviewMsg::PinchPoll => {
@@ -427,10 +456,15 @@ impl App {
             PreviewMsg::Zoom(step, ux, uy) => {
                 // Zoom toward the cursor (keep the point under it fixed), then edge-snap.
                 let maxz = self.preview.as_ref().map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
+                let minz = self.preview.as_ref().map(|p| self.min_view_zoom(p)).unwrap_or(Viewport::MIN);
+                let visual = self.preview.as_ref().map(|p| self.preview_visual_scale(p)).unwrap_or(1.0);
                 if let Some(p) = &mut self.preview {
                     let z0 = p.view.zoom;
                     let pan0 = p.view.pan;
-                    let z1 = (z0 * (1.0 + 0.12 * step)).clamp(Viewport::MIN, maxz);
+                    let z1 = viewport::snap_to_hundred(
+                        (z0 * (1.0 + 0.12 * step)).clamp(minz, maxz),
+                        visual,
+                    );
                     let ratio = z1 / z0;
                     p.view.zoom = z1;
                     p.view.pan = if z1 <= Viewport::FIT {
@@ -438,7 +472,8 @@ impl App {
                     } else {
                         (ux * (1.0 - ratio) + pan0.0 * ratio, uy * (1.0 - ratio) + pan0.1 * ratio)
                     };
-                    p.view.zoom_preset = None;
+                    let z100 = viewport::preset_zoom(Some(1.0), visual);
+                    p.view.zoom_preset = if (z1 - z100).abs() < 1e-3 { Some(1) } else { None };
                 }
                 // Edge-snap the pan to the (new-zoom) bounds so it can't go out of view.
                 let b = self.preview.as_ref().map(|p| self.preview_pan_bounds(p));
@@ -448,15 +483,21 @@ impl App {
                     p.view.pan.0 = p.view.pan.0.clamp(minx, maxx);
                     p.view.pan.1 = p.view.pan.1.clamp(miny, maxy);
                 }
-                Task::none()
+                // Sharpen the covermark for the new zoom (no-op when unchanged / no mark).
+                self.refresh_covermark_for_zoom()
             }
             PreviewMsg::SetViewZoom(z) => {
                 let maxz = self.preview.as_ref().map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
+                let minz = self.preview.as_ref().map(|p| self.min_view_zoom(p)).unwrap_or(Viewport::MIN);
+                let visual = self.preview.as_ref().map(|p| self.preview_visual_scale(p)).unwrap_or(1.0);
                 if let Some(p) = &mut self.preview {
-                    p.view.set_zoom(z.min(maxz));
-                    p.view.zoom_preset = None;
+                    // Clamp to the 50%-display floor, then magnetically snap to exactly 100%.
+                    let snapped = viewport::snap_to_hundred(z.clamp(minz, maxz), visual);
+                    p.view.set_zoom(snapped);
+                    let z100 = viewport::preset_zoom(Some(1.0), visual);
+                    p.view.zoom_preset = if (p.view.zoom - z100).abs() < 1e-3 { Some(1) } else { None };
                 }
-                Task::none()
+                self.refresh_covermark_for_zoom()
             }
             PreviewMsg::ZoomPreset(i) => {
                 // Presets are in VISUAL terms (100% = natural on-screen size); convert to the
@@ -480,7 +521,7 @@ impl App {
                         p.view.zoom_preset = Some(i);
                     }
                 }
-                Task::none()
+                self.refresh_covermark_for_zoom()
             }
             PreviewMsg::ToggleZoomMenu => {
                 if let Some(p) = &mut self.preview {
@@ -506,21 +547,31 @@ impl App {
                 }
                 Task::none()
             }
+            PreviewMsg::TogglePanMode => {
+                // The `V` hotkey: flip pan mode. The pointer/pan seg-toggle button reads
+                // the same `view.pan_mode`, so UI + hotkey stay in sync.
+                if let Some(p) = &mut self.preview {
+                    p.view.pan_mode = !p.view.pan_mode;
+                }
+                Task::none()
+            }
             PreviewMsg::SetZoom(zoom) => {
-                // Live slider drag: update the value (so the thumb + eventual bake track it)
-                // but DON'T re-raster yet — that happens once on release (CommitCovermarkEdit),
-                // so dragging doesn't churn the GPU texture.
+                // Live slider drag: update the value AND re-raster LIVE through the shared
+                // live-slider path — the covermark re-renders continuously while dragging,
+                // debounced by the RasterSlot's coalescing (one raster in flight, ticks collapse
+                // to one pending re-run), so a fast drag never thrashes the GPU.
                 if let Some(p) = &mut self.preview
                     && p.edit.covermark.is_some()
                 {
                     p.edit.set_zoom(zoom);
                     self.remember_covermark_pref();
                     self.save_state();
+                    return self.refresh_live_edit(edit::LiveEdit::Covermark);
                 }
                 Task::none()
             }
             PreviewMsg::SetOpacity(opacity) => {
-                // Live slider drag: value only; re-raster on release (see SetZoom).
+                // Live slider drag: value + LIVE coalesced re-raster (see SetZoom).
                 if let Some(p) = &mut self.preview
                     && let Some(cm) = &mut p.edit.covermark
                 {
@@ -528,36 +579,77 @@ impl App {
                     p.edit.cm_raster.invalidate();
                     self.remember_covermark_pref();
                     self.save_state();
+                    return self.refresh_live_edit(edit::LiveEdit::Covermark);
                 }
                 Task::none()
             }
-            PreviewMsg::CommitCovermarkEdit => self.refresh_edit_display(),
+            // Slider RELEASE: a final settle through the same shared path (renders the last value
+            // in case the trailing tick coalesced).
+            PreviewMsg::CommitCovermarkEdit => self.refresh_live_edit(edit::LiveEdit::Covermark),
+            PreviewMsg::SetDim(dim) => {
+                // Live slider drag: update the global dim; the GPU dim pass re-renders from the
+                // model on the next view build (no off-thread raster). Latch the pre-drag value
+                // on the FIRST tick so the whole drag coalesces into ONE undo entry on release.
+                if let Some(p) = &mut self.preview {
+                    if p.edit.dim_drag_start.is_none() {
+                        p.edit.dim_drag_start = Some(p.edit.dim);
+                    }
+                    p.edit.dim = dim.clamp(0.0, 1.0);
+                }
+                Task::none()
+            }
+            PreviewMsg::CommitDimEdit => {
+                // Slider RELEASE: push ONE undo entry for the whole drag if the value moved.
+                if let Some(p) = &mut self.preview
+                    && let Some(start) = p.edit.dim_drag_start.take()
+                    && (start - p.edit.dim).abs() > f32::EPSILON
+                {
+                    p.edit.push_dim(start);
+                }
+                Task::none()
+            }
             PreviewMsg::Undo => {
-                // The shared history walks covermark AND timeline edits; only a
-                // covermark change needs the async raster refresh (a timeline
-                // change redraws on the next view for free).
-                if let Some(PreviewState { kind, edit, .. }) = &mut self.preview {
+                // The shared history walks covermark, timeline AND annotation edits; only a
+                // covermark change needs its async raster refreshed (timeline + annotation
+                // changes redraw on the next view build for free — annotations as vectors).
+                let kind = if let Some(PreviewState { kind, edit, .. }) = &mut self.preview {
                     let tl = match kind {
                         PreviewKind::Video(vid) => vid.timeline.as_mut(),
                         PreviewKind::Image(_) => None,
                     };
-                    if edit.undo(tl) {
-                        return self.refresh_edit_display();
-                    }
+                    edit.undo(tl)
+                } else {
+                    None
+                };
+                match kind {
+                    Some(EditKind::Covermark) => self.refresh_edit_display(),
+                    // Box/arrow redraw as vectors for free (DRAGON-324); the effect layer
+                    // (highlight/pixelate/blur) re-renders through the GPU shader from the
+                    // restored model on the next view build (DRAGON-330). A dim change likewise
+                    // re-renders via the GPU dim pass for free (DRAGON-329).
+                    Some(EditKind::Annotations) | Some(EditKind::Dim) => Task::none(),
+                    _ => Task::none(),
                 }
-                Task::none()
             }
             PreviewMsg::Redo => {
-                if let Some(PreviewState { kind, edit, .. }) = &mut self.preview {
+                let kind = if let Some(PreviewState { kind, edit, .. }) = &mut self.preview {
                     let tl = match kind {
                         PreviewKind::Video(vid) => vid.timeline.as_mut(),
                         PreviewKind::Image(_) => None,
                     };
-                    if edit.redo(tl) {
-                        return self.refresh_edit_display();
-                    }
+                    edit.redo(tl)
+                } else {
+                    None
+                };
+                match kind {
+                    Some(EditKind::Covermark) => self.refresh_edit_display(),
+                    // Box/arrow redraw as vectors for free (DRAGON-324); the effect layer
+                    // (highlight/pixelate/blur) re-renders through the GPU shader from the
+                    // restored model on the next view build (DRAGON-330). A dim change likewise
+                    // re-renders via the GPU dim pass for free (DRAGON-329).
+                    Some(EditKind::Annotations) | Some(EditKind::Dim) => Task::none(),
+                    _ => Task::none(),
                 }
-                Task::none()
             }
             PreviewMsg::CovermarkRasterReady(generation, frame) => {
                 // The covermark overlay raster (stacked over the base image/video via the
@@ -571,6 +663,180 @@ impl App {
                     .unwrap_or(false);
                 if again {
                     return self.refresh_edit_display();
+                }
+                Task::none()
+            }
+            // ── Annotation editor (IMAGES only) ──────────────────────────────────────
+            PreviewMsg::SelectTool(tool) => {
+                // If a box-family annotation (Box Outline / Highlight / Box Highlight) is selected
+                // and the user picks a DIFFERENT one of those three tools, CONVERT the selected
+                // item in place (real-time, one undo entry) rather than only arming the tool for
+                // the next draw. No-op for every other selection/tool combination.
+                self.convert_selected_annotation_kind(tool);
+                // Only ever SETS a tool — clicking/hotkeying the active tool is a no-op (no
+                // re-click-to-neutral). Persist so the next preview opens with it.
+                if let Some(p) = &mut self.preview {
+                    p.edit.tool = Some(tool);
+                }
+                self.annot_tool = Some(tool);
+                self.save_state();
+                Task::none()
+            }
+            PreviewMsg::SetAnnotColor(color) => {
+                if let Some(p) = &mut self.preview {
+                    p.edit.annot_color = Some(color);
+                    p.edit.close_flyout();
+                }
+                // Picking a color also recolors the SELECTED colorable item immediately (one
+                // undo entry) — same effect as the right-click "Set to current color".
+                self.recolor_selected_annotation(color);
+                // Persist so the next preview opens with this color.
+                self.annot_color = Some(color);
+                self.save_state();
+                // Recoloring a highlight re-renders through the GPU shader on the next view
+                // build (DRAGON-330).
+                Task::none()
+            }
+            PreviewMsg::SetAnnotStrokeW(w) => {
+                self.apply_annot_stroke_w(w);
+                Task::none()
+            }
+            PreviewMsg::CycleAnnotStrokeW => {
+                // The `L` hotkey: advance to the next width preset (2 → 5 → 8 → 2), applying to
+                // the selection + persisting, exactly like clicking the next segment.
+                let current = self
+                    .preview
+                    .as_ref()
+                    .map(|p| p.edit.stroke())
+                    .unwrap_or(annotate::DEFAULT_ANNOT_STROKE);
+                self.apply_annot_stroke_w(annotate::cycle_stroke_width(current));
+                Task::none()
+            }
+            PreviewMsg::ToggleAnnotPalette => {
+                // Toggle the COLOR palette flyout. Open with the ACTIVE color highlighted
+                // (matched across ALL swatches, incl. the custom MRU); no highlight if the
+                // active color isn't present.
+                let entries = annotate::palette_entries(&self.annot_recent_colors);
+                if let Some(p) = &mut self.preview {
+                    if p.edit.flyout_kind() == Some(edit::FlyoutKind::Color) {
+                        p.edit.close_flyout();
+                    } else {
+                        let current =
+                            p.edit.annot_color.unwrap_or_else(annotate::default_annot_color);
+                        let sel = entries.iter().position(|e| e.matches_color(current));
+                        p.edit.picker = None;
+                        p.edit.open_flyout(edit::FlyoutKind::Color, sel, entries.len());
+                    }
+                }
+                Task::none()
+            }
+            PreviewMsg::AnnotColorEditor(open) => {
+                if let Some(p) = &mut self.preview {
+                    if open {
+                        // Seed the wheel from the current color; close the palette flyout.
+                        let bytes =
+                            p.edit.annot_color.unwrap_or_else(annotate::default_annot_color);
+                        let init = cosmic::iced::Color::from_rgb(
+                            bytes[0] as f32 / 255.0,
+                            bytes[1] as f32 / 255.0,
+                            bytes[2] as f32 / 255.0,
+                        );
+                        p.edit.annot_picker = Some(cosmic::widget::ColorPickerModel::new(
+                            "Hex",
+                            "RGB",
+                            None,
+                            Some(init),
+                        ));
+                        p.edit.close_flyout();
+                    } else {
+                        p.edit.annot_picker = None;
+                    }
+                }
+                Task::none()
+            }
+            PreviewMsg::AnnotColorPickerUpdate(u) => {
+                if let Some(p) = &mut self.preview
+                    && let Some(model) = &mut p.edit.annot_picker
+                {
+                    // Drive the libcosmic picker; its returned Task only ever writes the hex to
+                    // the clipboard (the copy button), which is fine to run.
+                    return model.update::<Msg>(u).map(cosmic::Action::App);
+                }
+                Task::none()
+            }
+            PreviewMsg::AnnotColorApply => {
+                // Read the wheel's current color, apply + persist + push the MRU + close.
+                let picked = self
+                    .preview
+                    .as_ref()
+                    .and_then(|p| p.edit.annot_picker.as_ref())
+                    .and_then(|m| m.get_applied_color())
+                    .map(|c| {
+                        [
+                            (c.r * 255.0).round() as u8,
+                            (c.g * 255.0).round() as u8,
+                            (c.b * 255.0).round() as u8,
+                            255,
+                        ]
+                    });
+                if let Some(p) = &mut self.preview {
+                    p.edit.annot_picker = None;
+                    if let Some(c) = picked {
+                        p.edit.annot_color = Some(c);
+                    }
+                }
+                if let Some(c) = picked {
+                    // Applying a custom wheel color also recolors the SELECTED colorable item.
+                    self.recolor_selected_annotation(c);
+                    self.annot_color = Some(c);
+                    self.push_recent_color(c);
+                    self.save_state();
+                }
+                // A recolored highlight re-renders through the GPU shader (DRAGON-330).
+                Task::none()
+            }
+            PreviewMsg::SelectAnnotation(id) => {
+                if let Some(p) = &mut self.preview {
+                    p.edit.selected = id;
+                    p.edit.annot_menu = None;
+                }
+                Task::none()
+            }
+            PreviewMsg::AnnotDrawBegin(tool, x, y) => self.annot_draw_begin(tool, x, y),
+            PreviewMsg::AnnotGrabBegin(grab, x, y) => self.annot_grab_begin(grab, x, y),
+            PreviewMsg::AnnotGestureTo(x, y) => self.annot_gesture_to(x, y),
+            PreviewMsg::AnnotGestureEnd => self.annot_gesture_end(),
+            PreviewMsg::DeleteSelected => self.annot_delete_selected(),
+            PreviewMsg::DuplicateSelected => self.duplicate_selected_annotation(),
+            PreviewMsg::SetSelectedColor => {
+                // Recolor the selected colorable item to the CURRENT annotation color (one undo
+                // entry) — a highlight keeps its 45% tint at the new hue; pixelate/blur (no
+                // color) are skipped. Shares the recolor path with picking a color while selected.
+                let color = self
+                    .preview
+                    .as_ref()
+                    .and_then(|p| p.edit.annot_color)
+                    .unwrap_or_else(annotate::default_annot_color);
+                if let Some(p) = &mut self.preview {
+                    p.edit.annot_menu = None;
+                }
+                self.recolor_selected_annotation(color);
+                // Recoloring a highlight re-renders through the GPU shader (DRAGON-330).
+                Task::none()
+            }
+            PreviewMsg::RaiseSelected => self.annot_reorder(Reorder::Up),
+            PreviewMsg::LowerSelected => self.annot_reorder(Reorder::Down),
+            PreviewMsg::SelectionToFront => self.annot_reorder(Reorder::Front),
+            PreviewMsg::SelectionToBack => self.annot_reorder(Reorder::Back),
+            PreviewMsg::AnnotMenuOpen(x, y) => {
+                if let Some(p) = &mut self.preview {
+                    p.edit.annot_menu = Some((x, y));
+                }
+                Task::none()
+            }
+            PreviewMsg::AnnotMenuClose => {
+                if let Some(p) = &mut self.preview {
+                    p.edit.annot_menu = None;
                 }
                 Task::none()
             }
@@ -600,6 +866,14 @@ impl App {
                                     p.edit.covermark = None;
                                     p.edit.undo_stack.clear();
                                     p.edit.redo_stack.clear();
+                                    // Annotations are baked into the file now — clear the
+                                    // scene so the re-decoded baseline (which already shows
+                                    // them) isn't double-marked.
+                                    p.edit.annotations.clear();
+                                    p.edit.selected = None;
+                                    p.edit.gesture = None;
+                                    p.edit.annot_snapshot = None;
+                                    p.edit.annot_menu = None;
                                     // Timeline cuts are in the file now — the old
                                     // spans/probe describe a recording that no longer
                                     // exists. Drop them; the keep-open re-probe below
@@ -896,7 +1170,7 @@ impl App {
                 // document (undo/redo intact), so the working file must SURVIVE the
                 // save — copy semantics, never a move (see `SaveAsBaked`).
                 let keep_open = !self.auto_close_preview;
-                let (src, covermark, video, is_video) = match self.preview.as_ref() {
+                let (src, covermark, annotations, annot_curve, dim, video, is_video) = match self.preview.as_ref() {
                     Some(p) => {
                         let Some(src) = p.path.clone() else {
                             return self.finish_session();
@@ -917,14 +1191,15 @@ impl App {
                                     .map(|t| t.spans.clone()),
                             }),
                         };
-                        (src, p.edit.covermark.clone(), video, is_video)
+                        // Annotations + dim are IMAGES only; a video never accumulates them.
+                        (src, p.edit.covermark.clone(), p.edit.annotations.clone(), p.edit.curve_radius(), p.edit.dim, video, is_video)
                     }
                     None => return self.finish_session(),
                 };
                 // Only bake when there's something to apply AND we can (video needs meta).
                 let cuts = video.as_ref().is_some_and(|v| v.keep.is_some());
-                let can_bake =
-                    (covermark.is_some() || cuts) && (!is_video || video.is_some());
+                let can_bake = (covermark.is_some() || cuts || !annotations.is_empty() || dim > 0.0)
+                    && (!is_video || video.is_some());
                 // Export in the BACKGROUND: bake straight to the destination (behind the
                 // processing notification), or plainly move/copy when nothing needs baking.
                 // Await it via a task only so the app stays alive until the file lands.
@@ -935,7 +1210,14 @@ impl App {
                     let ok = if can_bake {
                         let result = crate::share::with_processing_notification(|| match &video {
                             Some(v) => edit::bake_video(&src, &dest, covermark.as_ref(), v),
-                            None => edit::bake_image(&src, &dest, covermark.as_ref()),
+                            None => edit::bake_image(
+                                &src,
+                                &dest,
+                                covermark.as_ref(),
+                                &annotations,
+                                annot_curve,
+                                dim,
+                            ),
                         });
                         // Log the real io::Error here — it's about to be discarded to a bool.
                         if let Err(e) = &result {

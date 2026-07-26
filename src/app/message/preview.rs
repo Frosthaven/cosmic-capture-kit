@@ -1,6 +1,8 @@
 //! `PreviewMsg` — actions of the post-capture preview overlay.
 
+use crate::app::AnnotId;
 use crate::app::PixelFrame;
+use crate::widgets::annotation_canvas::{Grab, Tool};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -91,16 +93,17 @@ pub enum PreviewMsg {
     /// The decoded image is ready — replace the loading spinner with it. Carries the
     /// raw pixels too, so preview edits recomposite from the untouched original.
     ImageReady(cosmic::widget::image::Handle, Option<Arc<::image::RgbaImage>>),
-    /// Open/close the covermark picker.
+    /// Open/close the covermark picker flyout.
     Covermark,
-    /// Move the covermark picker's keyboard selection by ±1.
-    PickerNav(i32),
-    /// Apply the picker's keyboard-selected covermark.
-    PickerApply,
-    /// Apply a specific picker entry (mouse click).
+    /// Apply a specific covermark picker entry (mouse click).
     PickerPick(usize),
-    /// Close the picker without applying.
-    PickerClose,
+    // ── Shared toolbar-flyout keyboard nav (covermark picker + color palette) ─────────
+    /// Move the OPEN flyout's keyboard highlight by ±1 (wraps).
+    FlyoutNav(i32),
+    /// Apply the OPEN flyout's highlighted entry (Enter).
+    FlyoutApply,
+    /// Close the OPEN flyout without applying (Esc / outside click).
+    FlyoutClose,
     /// Zoom the displayed image by a wheel step (+ = in, ctrl+scroll), toward the cursor:
     /// `(step, cursor_dx, cursor_dy)` where the deltas are the cursor's offset from the
     /// viewport centre (screen px).
@@ -119,6 +122,9 @@ pub enum PreviewMsg {
     Pan(f32, f32),
     /// Switch the preview pointer tool: `false` = normal pointer, `true` = pan (grabby hand).
     SetPanMode(bool),
+    /// Toggle between selection/interact and PAN mode (the `V` hotkey) — flips
+    /// `view.pan_mode`, kept in sync with the pointer/pan seg-toggle button.
+    TogglePanMode,
     /// Set the active covermark's zoom (0 = default cover fit). Live from the slider —
     /// updates the value only; the (blink-free) re-raster happens on `CommitCovermarkEdit`.
     SetZoom(f32),
@@ -127,6 +133,11 @@ pub enum PreviewMsg {
     /// A covermark slider was released — re-raster the covermark overlay now (debounced so
     /// dragging doesn't churn the GPU texture).
     CommitCovermarkEdit,
+    /// Set the global dim amount (0..1) — the dim/spotlight slider (DRAGON-329). Live from the
+    /// slider; renders straight from the model via the GPU dim pass (no raster to debounce).
+    SetDim(f32),
+    /// The dim slider was released — coalesce the whole drag into ONE undo entry.
+    CommitDimEdit,
     /// Undo the most recent covermark change.
     Undo,
     /// Redo the most recently undone covermark change.
@@ -144,4 +155,54 @@ pub enum PreviewMsg {
     /// A recording's poster frame + probed metadata finished (`None` poster = none could
     /// be made; `None` meta = ffprobe failed, so playback/scrub stay disabled).
     PosterReady(Option<cosmic::widget::image::Handle>, Option<VideoMeta>),
+
+    // ── Annotation editor (DRAGON-321; IMAGES only) ──────────────────────────────────
+    /// Switch the active annotation tool (Select / Arrow / Box).
+    SelectTool(Tool),
+    /// Set the current annotation color (applies to NEW shapes).
+    SetAnnotColor([u8; 4]),
+    /// Set the current annotation stroke width (SOURCE px; applies to NEW box/arrow shapes
+    /// and re-strokes the SELECTED box/arrow). Driven by the width toggle group.
+    SetAnnotStrokeW(f32),
+    /// Cycle the annotation stroke width to the next preset (2 → 5 → 8 → 2), the `L` hotkey.
+    CycleAnnotStrokeW,
+    /// Open/close the color-swatch palette popover.
+    ToggleAnnotPalette,
+    /// Open (`true`) / close (`false`) the custom color-wheel picker, from the palette's "+".
+    AnnotColorEditor(bool),
+    /// A libcosmic color-picker interaction (wheel drag, hue slider, hex/rgb input): routed
+    /// straight into the open [`cosmic::widget::ColorPickerModel`].
+    AnnotColorPickerUpdate(cosmic::widget::color_picker::ColorPickerUpdate),
+    /// Apply the color-wheel picker's color (Apply button): read the model's color, set
+    /// `annot_color`, push the MRU, persist, and close.
+    AnnotColorApply,
+    /// Select (`Some`) or deselect (`None`) an annotation.
+    SelectAnnotation(Option<AnnotId>),
+    /// Begin drawing a new shape of `tool` at image point `(x, y)` (source px).
+    AnnotDrawBegin(Tool, f32, f32),
+    /// Begin manipulating the selected item (grab kind + press image point).
+    AnnotGrabBegin(Grab, f32, f32),
+    /// Live drag update to image point `(x, y)`.
+    AnnotGestureTo(f32, f32),
+    /// The active canvas gesture committed (pointer released after a real drag).
+    AnnotGestureEnd,
+    /// Delete the selected annotation.
+    DeleteSelected,
+    /// Duplicate the selected annotation, offset toward the frame center. One undo entry.
+    DuplicateSelected,
+    /// Set the selected annotation's color to the CURRENT annotation color (any kind;
+    /// a highlight keeps its translucent fill with the new hue). One undo entry.
+    SetSelectedColor,
+    /// Raise the selected annotation one step in the z-stack.
+    RaiseSelected,
+    /// Lower the selected annotation one step.
+    LowerSelected,
+    /// Bring the selected annotation to the front (top).
+    SelectionToFront,
+    /// Send the selected annotation to the back (bottom).
+    SelectionToBack,
+    /// Open the annotation context menu at widget-local `(x, y)`.
+    AnnotMenuOpen(f32, f32),
+    /// Dismiss the annotation context menu.
+    AnnotMenuClose,
 }

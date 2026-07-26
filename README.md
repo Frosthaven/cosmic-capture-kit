@@ -30,6 +30,7 @@ status.
 | Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | ❓                                  | 📅      |
 | Linux (Wayland): KDE Plasma                              | ❓                                  | 📅      |
 | Linux (Wayland): GNOME                                   | ❓                                  | 📅      |
+| Linux (X11)                                              | ❓                                  | ❓      |
 
 ### Supported Compositor Extras
 
@@ -45,7 +46,6 @@ available APIs - clever recompositing tricks are required.
 | Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
 | Linux (Wayland): KDE Plasma                              | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
 | Linux (Wayland): GNOME                                   | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
-| Linux (X11)                                              | ❓                              | ❓                  | ❓                         | ❓               | ❓                                          |
 
 ### Supported Features
 
@@ -68,15 +68,17 @@ along with their statuses.
 | Preview editor (shared): Save as                    | ✅      |
 | Preview editor (shared): Copy                       | ✅      |
 | Preview editor (images): Covermarks                 | ✅      |
-| Preview editor (images): Color selector             | 📅      |
-| Preview editor (images): Arrows                     | 📅      |
+| Preview editor (images): Color selector             | ✅      |
+| Preview editor (images): Arrows                     | ✅      |
+| Preview editor (images): Highlighter                | ✅      |
 | Preview editor (images): Text w/size                | 📅      |
 | Preview editor (images): Numbered marks             | 📅      |
-| Preview editor (images): Dim/spotlight              | 📅      |
-| Preview editor (images): Destructive pixelate       | 📅      |
-| Preview editor (images): Destructive blur           | 📅      |
-| Preview editor (images): Box fill/outline           | 📅      |
-| Preview editor (images): Draw w/line widths         | 📅      |
+| Preview editor (images): Dim/spotlight              | ✅      |
+| Preview editor (images): Destructive pixelate       | ✅      |
+| Preview editor (images): Destructive blur           | ✅      |
+| Preview editor (images): Box fill/outline           | ✅      |
+| Preview editor (images): Box highlight              | ✅      |
+| Preview editor (images): Pencil w/line widths       | 📅      |
 | Preview editor (images): Sticker tool               | 📅      |
 | Preview editor (images): Eraser tool                | 📅      |
 | Preview editor (videos): Simple cutting tool        | ✅      |
@@ -103,8 +105,6 @@ along with their statuses.
    drag the app to Applications.
 2. First launch: grant Screen Recording (System Settings > Privacy &
    Security), then relaunch. Microphone is optional (for recordings with mic).
-3. Updating: the app checks automatically and installs new versions in one
-   click from Settings > About.
 
 ### Windows 11
 
@@ -116,20 +116,39 @@ along with their statuses.
    there is nothing else to install.
 2. The installer is not code-signed yet, so on first run SmartScreen may show
    "Windows protected your PC". Click More info, then Run anyway.
-3. Microphone is optional (for recordings with mic). If it is not picked up,
-   enable it under Settings > Privacy & security > Microphone.
-4. Updating: the app checks automatically and installs new versions silently in
-   the background (Settings > About).
 
 ### Linux (Wayland): COSMIC
 
-Build from source for now (packaged channels are on the way):
+Build from source for now (packaged channels are on the way).
+
+#### Build from source
 
 ```sh
 git clone https://github.com/Frosthaven/cosmic-capture-kit
 cd cosmic-capture-kit
-cargo build --release # or cargo install --path .
+cargo build --release
 ```
+
+#### Install from source
+
+Install the built binary onto your `PATH` (`~/.cargo/bin`) so shortcuts and the
+terminal can launch it by name instead of a full path:
+
+```sh
+cargo install --path .
+```
+
+#### Shortcuts
+
+Cosmic Capture Kit ships with no keybindings of its own — add your own in
+**Settings → Keyboard → Shortcuts → Custom shortcuts**, pointing each at one of
+these commands:
+
+| Command                               | Suggested keys           |
+| ------------------------------------- | ------------------------ |
+| `cosmic-capture-kit --region`         | `Alt+Shift+1`            |
+| `cosmic-capture-kit --active-window`  | `Alt+Shift+2`            |
+| `cosmic-capture-kit --active-monitor` | `Alt+Shift+3`            |
 
 #### Dependencies
 

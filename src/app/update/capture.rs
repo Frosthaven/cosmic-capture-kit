@@ -31,7 +31,22 @@ impl App {
                 }
                 Task::none()
             }
+            CaptureMsg::ExternalRecordingTick => {
+                // DRAGON-322: refresh the cross-process recording flag; if a recording
+                // just started elsewhere while we sit in video mode, fall back to image
+                // so we can't launch a second recording.
+                self.external_recording = crate::instance::any_other_recording();
+                if self.external_recording && self.kind == Kind::Video {
+                    self.kind = Kind::Image;
+                    self.sync_meters();
+                }
+                Task::none()
+            }
             CaptureMsg::SetKind(k) => {
+                // DRAGON-322: never enter video mode while another instance is recording.
+                if k == Kind::Video && self.external_recording {
+                    return Task::none();
+                }
                 if self.kind == Kind::Scanner && k != Kind::Scanner {
                     // Leaving scanner: the processed marks stay CACHED (their region
                     // keys too), so returning shows them instantly without a rescan;
@@ -344,6 +359,26 @@ impl App {
                 self.run_capture(sel)
             }
             CaptureMsg::DoPixelCapture => self.do_pixel_capture(),
+            CaptureMsg::RunImmediate => {
+                // Linux: the deferred overlay-less immediate capture, now that
+                // the full output list has settled into `self.outputs`. Resolve + drive it;
+                // if it can't resolve a target, mint the picker overlays instead so the user
+                // can still pick (the deferral suppressed the picker while it was pending).
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(imm) = self.startup_immediate.take() {
+                        if let Some(task) = self.immediate_capture(imm) {
+                            return task;
+                        }
+                        log::warn!(
+                            "immediate capture ({imm:?}) could not resolve a target; \
+                             falling back to the picker overlay"
+                        );
+                        return self.mint_startup_pickers();
+                    }
+                }
+                Task::none()
+            }
             CaptureMsg::CopySelection => {
                 // Region quick-action: capture the CURRENTLY drawn selection, force-copy
                 // it, skip the preview, and finish. No-op with nothing drawn (the keymap

@@ -183,7 +183,7 @@ pub(super) fn toggle<'a>(on: bool, msg: fn(bool) -> Msg) -> Element<'a, Msg> {
 pub(super) fn folder_btn<'a>(target: DirTarget) -> Element<'a, Msg> {
     crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::custom(
-            widget::icon::Icon::from(widget::icon::from_name("folder-open-symbolic").size(16))
+            widget::icon::icon(crate::widgets::icons::handle("folder-open-symbolic"))
                 .width(Length::Fixed(20.0))
                 .height(Length::Fixed(20.0)),
         )
@@ -237,7 +237,7 @@ pub(super) fn centered_button<'a>(
     };
     let mut inner = widget::row::with_capacity(2).spacing(8).align_y(Alignment::Center);
     if let Some(name) = icon {
-        inner = inner.push(widget::icon::from_name(name).icon().size(16));
+        inner = inner.push(crate::widgets::icons::handle(name).icon().size(16));
     }
     inner = inner.push(widget::text(label));
     let btn = widget::button::custom(
@@ -324,7 +324,7 @@ fn standard_frost_style(
 /// default value, so pressing it goes through the normal update path. `changed`
 /// (the value differs from default) makes it stand out in the accent colour.
 pub(super) fn reset_button(msg: Msg, changed: bool) -> Element<'static, Msg> {
-    let btn = widget::button::icon(widget::icon::from_name("edit-undo-symbolic").size(14))
+    let btn = widget::button::icon(crate::widgets::icons::handle("edit-undo-symbolic"))
         .padding(4)
         .class(reset_class(changed));
     if changed {
@@ -429,7 +429,7 @@ pub(super) fn severity_caption<'a>(sev: Severity, s: impl Into<Cow<'a, str>> + '
 /// control slot. Symbolic icons inherit the SVG colour filter, so this tints the
 /// glyph to the canonical severity colour.
 pub(super) fn status_icon<'a>(sev: Severity) -> Element<'a, Msg> {
-    widget::icon::from_name(sev.icon_name())
+    crate::widgets::icons::handle(sev.icon_name())
         .icon()
         .size(16)
         .class(cosmic::theme::Svg::custom(move |theme| cosmic::widget::svg::Style {

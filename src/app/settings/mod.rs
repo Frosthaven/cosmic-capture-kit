@@ -128,6 +128,7 @@ pub enum CaptureTab {
 pub enum AudioVideoTab {
     Audio,
     Video,
+    Mixing,
 }
 
 /// The Keyboard Shortcuts page's in-page tabs (DRAGON-142): a horizontal strip
@@ -154,7 +155,9 @@ impl ShortcutsTab {
             "Recording" => ShortcutsTab::Recording,
             // The post-capture Preview Editor's two groups (DRAGON-158):
             // action shortcuts + the video editor's transport shortcuts.
-            "Action Shortcuts" | "Video Editor Shortcuts" => ShortcutsTab::Preview,
+            "Action Shortcuts" | "Image Editor Shortcuts" | "Video Editor Shortcuts" => {
+                ShortcutsTab::Preview
+            }
             // Global (the macOS Start Capture hotkey), OCR Text Recognition,
             // Region Selection — the capture overlay / app-wide contexts.
             _ => ShortcutsTab::Capture,
@@ -255,29 +258,29 @@ impl SettingsState {
         let general = nav
             .insert()
             .text("General")
-            .icon(widget::icon::from_name("preferences-system-symbolic"))
+            .icon(crate::widgets::icons::handle("preferences-system-symbolic").icon())
             .data(ConfigTab::General)
             .id();
         let capture_modes = nav
             .insert()
             .text("Capture Modes")
-            .icon(widget::icon::from_name("accessories-screenshot-symbolic"))
+            .icon(crate::widgets::icons::handle("accessories-screenshot-symbolic").icon())
             .data(ConfigTab::CaptureModes)
             .id();
         nav.insert()
             .text("Audio & Video")
-            .icon(widget::icon::from_name("applications-multimedia-symbolic"))
+            .icon(crate::widgets::icons::handle("applications-multimedia-symbolic").icon())
             .data(ConfigTab::AudioVideo);
         nav.insert()
             .text("Keyboard Shortcuts")
-            .icon(widget::icon::from_name("input-keyboard-symbolic"))
+            .icon(crate::widgets::icons::handle("input-keyboard-symbolic").icon())
             .data(ConfigTab::Shortcuts);
         // The icon here is a placeholder; `update_health_nav_icon` replaces it with a
         // severity-tinted glyph before the nav is ever shown.
         let health = nav
             .insert()
             .text("Health")
-            .icon(widget::icon::from_name("emblem-ok-symbolic"))
+            .icon(crate::widgets::icons::handle("emblem-ok-symbolic").icon())
             .data(ConfigTab::Health)
             .id();
         // The icon here is a placeholder; `update_about_nav_icon` replaces it with a
@@ -285,7 +288,7 @@ impl SettingsState {
         let about = nav
             .insert()
             .text("About")
-            .icon(widget::icon::from_name("help-about-symbolic"))
+            .icon(crate::widgets::icons::handle("help-about-symbolic").icon())
             .data(ConfigTab::About)
             .id();
         nav.activate(general);
@@ -295,13 +298,13 @@ impl SettingsState {
         let general_tab_settings = general_tab
             .insert()
             .text("Settings")
-            .icon(widget::icon::from_name("emblem-system-symbolic"))
+            .icon(crate::widgets::icons::handle("emblem-system-symbolic").icon())
             .data(GeneralTab::Settings)
             .id();
         general_tab
             .insert()
             .text("Appearance")
-            .icon(widget::icon::from_name("applications-graphics-symbolic"))
+            .icon(crate::widgets::icons::handle("applications-graphics-symbolic").icon())
             .data(GeneralTab::Appearance);
         general_tab.activate(general_tab_settings);
         // The Capture Modes page's in-page tab strip (DRAGON-140). Each tab carries
@@ -311,18 +314,18 @@ impl SettingsState {
         let capture_tab_scanner = capture_tab
             .insert()
             .text("Scanner")
-            .icon(widget::icon::from_name("document-properties-symbolic"))
+            .icon(crate::widgets::icons::handle("document-properties-symbolic").icon())
             .data(CaptureTab::Scanner)
             .id();
         capture_tab
             .insert()
             .text("Screenshots")
-            .icon(widget::icon::from_name("camera-photo-symbolic"))
+            .icon(crate::widgets::icons::handle("camera-photo-symbolic").icon())
             .data(CaptureTab::Screenshots);
         capture_tab
             .insert()
             .text("Screen Recordings")
-            .icon(widget::icon::from_name("camera-video-symbolic"))
+            .icon(crate::widgets::icons::handle("camera-video-symbolic").icon())
             .data(CaptureTab::Recordings);
         capture_tab.activate(capture_tab_scanner);
         // The Audio & Video page's in-page tab strip (DRAGON-141). Each tab carries
@@ -332,14 +335,19 @@ impl SettingsState {
         let audio_video_tab_audio = audio_video_tab
             .insert()
             .text("Audio")
-            .icon(widget::icon::from_name("audio-input-microphone-symbolic"))
+            .icon(crate::widgets::icons::handle("audio-x-generic-symbolic").icon())
             .data(AudioVideoTab::Audio)
             .id();
         audio_video_tab
             .insert()
             .text("Video")
-            .icon(widget::icon::from_name("video-display-symbolic"))
+            .icon(crate::widgets::icons::handle("video-x-generic-symbolic").icon())
             .data(AudioVideoTab::Video);
+        audio_video_tab
+            .insert()
+            .text("Mixing")
+            .icon(crate::widgets::icons::handle("object-merge-symbolic").icon())
+            .data(AudioVideoTab::Mixing);
         audio_video_tab.activate(audio_video_tab_audio);
         // The Keyboard Shortcuts page's in-page tab strip (DRAGON-142): the page's
         // sections split along the app's usage phases; the window always opens on the
@@ -348,18 +356,18 @@ impl SettingsState {
         let shortcuts_tab_capture = shortcuts_tab
             .insert()
             .text("Capture")
-            .icon(widget::icon::from_name("camera-photo-symbolic"))
+            .icon(crate::widgets::icons::handle("camera-photo-symbolic").icon())
             .data(ShortcutsTab::Capture)
             .id();
         shortcuts_tab
             .insert()
             .text("Recording")
-            .icon(widget::icon::from_name("media-record-symbolic"))
+            .icon(crate::widgets::icons::handle("media-record-symbolic").icon())
             .data(ShortcutsTab::Recording);
         shortcuts_tab
             .insert()
             .text("Preview Editor")
-            .icon(widget::icon::from_name("image-x-generic-symbolic"))
+            .icon(crate::widgets::icons::handle("image-x-generic-symbolic").icon())
             .data(ShortcutsTab::Preview);
         shortcuts_tab.activate(shortcuts_tab_capture);
         Self {
@@ -699,10 +707,13 @@ impl App {
         let glass = self.glass;
 
         // --- CSD header bar: nav hamburger + search + window controls ---
-        let toggle_icon = widget::icon::from_name(if self.settings.nav_open {
-            "navbar-open-symbolic"
-        } else {
+        // When the nav is OPEN show the COLLAPSE glyph (panel-left-close), and when it's
+        // collapsed show the EXPAND glyph (panel-left-open) — the icon signals the ACTION the
+        // click performs, not the current state.
+        let toggle_icon = crate::widgets::icons::handle(if self.settings.nav_open {
             "navbar-closed-symbolic"
+        } else {
+            "navbar-open-symbolic"
         })
         .icon()
         .size(16);
@@ -751,14 +762,40 @@ impl App {
         .height(Length::Fill)
         .align_y(cosmic::iced::Alignment::Start);
         let search: Element<'_, Msg> = if self.settings.search_active {
-            widget::text_input::search_input("Search settings", &self.settings.search)
+            // A plain text_input reproducing libcosmic's `search_input` styling (Search style,
+            // `[0, space_xxs]` padding, 16px leading magnifier + trailing clear) but drawing
+            // the glyphs through OUR Lucide icon set (`icons::handle`) rather than the
+            // libcosmic built-ins: `system-search-symbolic` → Lucide `search`,
+            // `window-close-symbolic` → Lucide `x`. The trailing clear button carries the same
+            // `ConfigSearchClear` action libcosmic's `on_clear` wires up.
+            let spacing = cosmic::theme::active().cosmic().space_xxs();
+            widget::text_input("Search settings", &self.settings.search)
+                .padding([0, spacing])
+                .style(cosmic::theme::TextInput::Search)
+                .leading_icon(
+                    widget::container(
+                        widget::icon::icon(crate::widgets::icons::handle("system-search-symbolic"))
+                            .size(16),
+                    )
+                    .padding(8)
+                    .into(),
+                )
+                .trailing_icon(
+                    widget::button::custom(
+                        widget::icon::icon(crate::widgets::icons::handle("window-close-symbolic"))
+                            .size(16),
+                    )
+                    .class(cosmic::theme::Button::Icon)
+                    .on_press(Msg::WindowChrome(WindowChromeMsg::ConfigSearchClear))
+                    .padding(8)
+                    .into(),
+                )
                 .width(Length::Fixed(240.0))
                 .id(self.settings.search_id.clone())
                 .on_input(|a0| Msg::WindowChrome(WindowChromeMsg::ConfigSearchInput(a0)))
-                .on_clear(Msg::WindowChrome(WindowChromeMsg::ConfigSearchClear))
                 .into()
         } else {
-            let btn = widget::button::icon(widget::icon::from_name("system-search-symbolic"))
+            let btn = widget::button::icon(crate::widgets::icons::handle("system-search-symbolic"))
                 .on_press(Msg::WindowChrome(WindowChromeMsg::ConfigSearchActivate));
             // macOS: same compact top-pinned box as the nav toggle, for the same
             // traffic-light alignment (a symmetric halo, nothing hanging below).
@@ -912,6 +949,7 @@ impl App {
                     let specs = match self.settings.active_audio_video_tab() {
                         AudioVideoTab::Audio => self.audio_sections(),
                         AudioVideoTab::Video => self.video_sections(),
+                        AudioVideoTab::Mixing => self.mixing_sections(),
                     };
                     col.extend(self.render_specs(specs, None));
                 }
@@ -1074,7 +1112,7 @@ impl App {
                         (Self::page_icon(tab), rail_button_class(tab == active))
                     };
                     rail.push(crate::widgets::arrow_cursor::arrow_cursor(
-                        widget::button::icon(widget::icon::from_name(icon_name))
+                        widget::button::icon(crate::widgets::icons::handle(icon_name))
                             .class(class)
                             .tooltip(Self::page_name(tab))
                             .on_press(Msg::WindowChrome(WindowChromeMsg::SetConfigTab(entity)))
@@ -1083,7 +1121,7 @@ impl App {
                     ));
                 }
             }
-            let factory = widget::button::icon(widget::icon::from_name("edit-undo-symbolic"))
+            let factory = widget::button::icon(crate::widgets::icons::handle("edit-undo-symbolic"))
                 .tooltip("Factory reset")
                 .on_press(Msg::WindowChrome(WindowChromeMsg::RequestReset(ResetScope::Factory)))
                 .width(Length::Fixed(32.0))

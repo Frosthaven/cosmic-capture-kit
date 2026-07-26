@@ -1,18 +1,21 @@
 # Bundled icon attribution
 
-Cosmic Capture Kit ships a small set of SVG icons compiled into the binary
-(`include_bytes!`) so they render on platforms where the system icon theme does
-not provide them — notably macOS, where `cosmic::widget::icon::from_name` resolves
-only against libcosmic's embedded `cosmic-icons` subset (no freedesktop theme dirs
-exist). Every other icon the app uses is a name that libcosmic already embeds.
+Cosmic Capture Kit compiles its entire UI icon set into the binary
+(`include_bytes!`) from [Lucide](https://lucide.dev) (DRAGON-324). Bundling every
+glyph makes icon resolution platform-independent: the app no longer depends on a
+system freedesktop icon theme or on the subset libcosmic embeds, so icons render
+identically on Linux, macOS, and Windows. The resolver
+(`src/widgets/icons.rs`) maps each app icon name to the Lucide glyph that best fits
+what the control does.
 
-| File | Icon name | Upstream | License |
-| --- | --- | --- | --- |
-| `cosmic/screenshot-selection-symbolic.svg` | `screenshot-selection-symbolic` | [pop-os/xdg-desktop-portal-cosmic](https://github.com/pop-os/xdg-desktop-portal-cosmic) (`data/icons/scalable/actions/`) | CC-BY-SA-4.0 |
-| `cosmic/screenshot-window-symbolic.svg` | `screenshot-window-symbolic` | [pop-os/xdg-desktop-portal-cosmic](https://github.com/pop-os/xdg-desktop-portal-cosmic) (`data/icons/scalable/actions/`) | CC-BY-SA-4.0 |
-| `cosmic/screenshot-screen-symbolic.svg` | `screenshot-screen-symbolic` | [pop-os/xdg-desktop-portal-cosmic](https://github.com/pop-os/xdg-desktop-portal-cosmic) (`data/icons/scalable/actions/`) | CC-BY-SA-4.0 |
-| `local/object-move-symbolic.svg` | `object-move-symbolic` | Original work for this project (the preview pan/grab tool). Named for the freedesktop `object-move-symbolic` slot the Linux system theme fills; that name is NOT in libcosmic's embedded bundle, and — as of this writing — no longer ships in the current GNOME `adwaita-icon-theme`, `cosmic-icons`, or Yaru, so a project-owned symbolic glyph (a 4-way move arrow, `currentColor`) is bundled instead. | Same as this project (GPL-3.0) |
+| Files | Upstream | License |
+| --- | --- | --- |
+| `lucide/*.svg` | [lucide-icons/lucide](https://github.com/lucide-icons/lucide) | ISC / MIT |
 
-The `cosmic-icons` upstream (which libcosmic embeds) is CC-BY-SA-4.0; the screenshot
-trio above are vendored from the COSMIC portal package that ships them on Linux, so
-the app looks identical there and on macOS.
+Lucide is distributed under the ISC License (a permissive MIT-equivalent). The SVGs
+stroke with `currentColor`, so they are marked symbolic and tinted with the active
+foreground/accent color like a native symbolic icon.
+
+Not icons: the app/window brand art (`dev.frosthaven.CosmicCaptureKit*.svg`,
+`cosmic-capture-kit*.windows.ico`) is original project artwork, and the macOS
+menu-bar tray uses native SF Symbols (see `src/platform/mac/tray.rs`).

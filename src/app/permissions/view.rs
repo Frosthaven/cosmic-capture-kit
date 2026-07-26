@@ -181,11 +181,8 @@ impl App {
             out.push(self.permission_card(
                 Permission::Notifications,
                 "Notifications",
-                // `preferences-system-notifications-symbolic` is NOT in libcosmic's
-                // 619-name embedded cosmic-icons subset, so `from_name` renders it blank
-                // on macOS (no system icon theme). `notification-symbolic` (a banner
-                // glyph, matching this card's "banner when a capture is saved" wording)
-                // IS embedded, so it resolves on both platforms.
+                // `notification-symbolic` → the bundled Lucide `bell` (DRAGON-324): a banner
+                // glyph matching this card's "banner when a capture is saved" wording.
                 "notification-symbolic",
                 "Optional. Shows a banner when a capture is saved, whose click reveals the \
                  file in Finder.",
@@ -248,7 +245,7 @@ impl App {
 
         // Header row: icon + name (left), pill (right).
         let head = widget::row(vec![
-            widget::icon::from_name(icon).icon().size(18).into(),
+            crate::widgets::icons::handle(icon).icon().size(18).into(),
             widget::text::body(name).font(cosmic::font::bold()).width(Length::Fill).into(),
             pill.into(),
         ])
@@ -283,7 +280,7 @@ impl App {
         if perm == Permission::ScreenRecording && status == PermStatus::Granted {
             buttons.push(
                 widget::button::standard("Relaunch")
-                    .leading_icon(widget::icon::from_name("view-refresh-symbolic"))
+                    .leading_icon(crate::widgets::icons::handle("view-refresh-symbolic"))
                     .spacing(6)
                     .on_press(Msg::Permissions(PermissionsMsg::Relaunch))
                     .into(),
@@ -297,7 +294,7 @@ impl App {
         if perm == Permission::Accessibility && status == PermStatus::Granted {
             buttons.push(
                 widget::button::standard("Restart Background Helper")
-                    .leading_icon(widget::icon::from_name("view-refresh-symbolic"))
+                    .leading_icon(crate::widgets::icons::handle("view-refresh-symbolic"))
                     .spacing(6)
                     .on_press(Msg::Permissions(PermissionsMsg::RestartDaemon))
                     .into(),

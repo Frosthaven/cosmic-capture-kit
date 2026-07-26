@@ -337,8 +337,10 @@ impl App {
         // Same idiom for the system-track ducking flag (DRAGON-128): the pump reads
         // this global when it's configured.
         crate::audio::config::set_recording_duck_system(self.duck_system_audio);
-        // Close any other instances so only this overlay records.
-        crate::instance::close_other_instances();
+        // Close any other instances so only this overlay records. DRAGON-322: under
+        // allow-multiple a preview / recording sibling is spared, so this recording can
+        // coexist with a concurrent capture (record a tutorial of the tool in use).
+        crate::instance::close_other_instances(self.allow_multiple);
         // Recording starts (after any countdown) → restore focus to the window we
         // expect: the captured window when we picked one (screencopy window mode),
         // otherwise whatever was focused before we launched (origin_window — also the
@@ -387,6 +389,9 @@ impl App {
             },
         });
         self.recording = Some(handle);
+        // DRAGON-322: advertise the live recording cross-process so a fresh capture
+        // overlay disables its video kind and the sibling sweep spares us.
+        crate::instance::set_recording_marker(true);
         self.recording_started = Some(std::time::Instant::now());
         self.recording_paused_at = None;
         self.recording_paused_accum = std::time::Duration::ZERO;
@@ -443,6 +448,9 @@ impl App {
             },
         });
         self.recording = Some(handle);
+        // DRAGON-322: advertise the live recording cross-process so a fresh capture
+        // overlay disables its video kind and the sibling sweep spares us.
+        crate::instance::set_recording_marker(true);
         self.recording_started = Some(std::time::Instant::now());
         self.recording_paused_at = None;
         self.recording_paused_accum = std::time::Duration::ZERO;
@@ -667,14 +675,15 @@ impl App {
         if let Some(sel) = self.pending.clone() {
             self.preview_output =
                 self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
-            // DRAGON-317 (diagnostic): cache the target output NAME before `destroy_surfaces`
-            // (below) clears `self.outputs`.
+            // DRAGON-317 regression fix: the windowed-preview re-home target is the RELIABLE
+            // capture-origin monitor ONLY — the pointer's output from the capture overlay's
+            // first pointer-enter (`capture_pointer_output`), not the focused-toplevel guess;
+            // None suppresses the move so cosmic-comp's native pointer-output placement stands.
+            // Cached before `destroy_surfaces` (below) clears `self.outputs`. Mirrors the
+            // still-capture path in `capture_flow.rs`.
             #[cfg(target_os = "linux")]
             {
-                let name = self.preview_output.as_ref().and_then(|(out, _)| {
-                    self.outputs.iter().find(|o| &o.output == out).map(|o| o.name.clone())
-                });
-                self.preview_output_name = name;
+                self.preview_output_name = self.capture_pointer_output.clone();
             }
             self.preview_output_scale = self.scale_for_selection(&sel);
         }

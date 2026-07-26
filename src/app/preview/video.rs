@@ -612,11 +612,13 @@ impl App {
             // No live frame: the poster (or a film card), with the covermark applied.
             self.video_still_content(preview, vid, avail_w, avail_h, cm_frame)
         };
-        let (play_icon, play_tip) = if vid.is_playing() {
-            ("media-playback-pause-symbolic", "Pause  (P)")
+        let (play_icon, play_name) = if vid.is_playing() {
+            ("media-playback-pause-symbolic", "Pause")
         } else {
-            ("media-playback-start-symbolic", "Play  (P)")
+            ("media-playback-start-symbolic", "Play")
         };
+        // The tooltip carries the LIVE Play/Pause hotkey from the keymap.
+        let play_tip = action_tip(play_name, crate::shortcuts::Action::PreviewPlay, &self.keymap);
         // Left: do-not-train + covermark tools. (Save / Save As / Copy, size + Delete,
         // appearance, and Close live on top; play now lives with the seek bar.)
         // `Vec<Element<'static, _>>` is a subtype of `Vec<Element<'a, _>>` (Element
@@ -693,27 +695,35 @@ impl App {
                 ))
                 .size(12)
                 .font(cosmic::font::mono());
+                // The transport strip sits below the canvas, so its tooltips rise above.
+                let seg_pos = widget::tooltip::Position::Top;
                 let tools = widget::row(vec![
                     tb.seg_toggle(
                         "input-mouse-symbolic",
                         !tl.razor,
                         PreviewMsg::TimelineRazor(false),
-                        "Pointer: click to seek, click a segment to select",
+                        "Pointer: click to seek, click a segment to select".to_string(),
                         true,
                         false,
+                        seg_pos,
                     ),
                     tb.seg_toggle(
                         "edit-cut-symbolic",
                         tl.razor,
                         PreviewMsg::TimelineRazor(true),
-                        "Razor: click the timeline to cut it",
+                        "Scissor: click the timeline to cut it".to_string(),
                         false,
                         true,
+                        seg_pos,
                     ),
                 ]);
                 let del = tb.history_button(
                     "edit-delete-symbolic",
-                    "Delete selected segments  (Del)",
+                    action_tip(
+                        "Delete selected segments",
+                        crate::shortcuts::Action::PreviewDeleteSegment,
+                        &self.keymap,
+                    ),
                     PreviewMsg::TimelineDelete,
                     !tl.selected.is_empty(),
                     widget::tooltip::Position::Top,
@@ -811,7 +821,7 @@ impl App {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "recording.mp4".to_string());
             let icon =
-                widget::icon::Icon::from(widget::icon::from_name("video-x-generic-symbolic").size(96));
+                widget::icon::icon(crate::widgets::icons::handle("video-x-generic-symbolic")).size(96);
             widget::container(
                 widget::column(vec![icon.into(), widget::text(name).size(16).into()])
                     .spacing(12.0)

@@ -7,8 +7,10 @@
 //! original (image) or stacks the covermark over the frame (video), so nothing is
 //! lost until the user commits by sharing.
 
+use super::annotate::{AnnotGesture, AnnotColor, AnnotId, AnnotationItem};
 use super::layers::RasterSlot;
 use super::timeline::{Span, Timeline};
+use crate::widgets::annotation_canvas::Tool;
 use ::image::RgbaImage;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,13 +83,45 @@ pub enum ShareIntent {
     Copy,
 }
 
-/// The covermark picker's state while open (a dropdown under the covermark button).
+/// The covermark picker's entries while open (a dropdown under the covermark button). The
+/// keyboard highlight/nav lives in the SHARED [`FlyoutNav`] (see [`EditState::flyout`]).
 pub struct Picker {
     /// The choices, in display order. `None` is the "None" (disable) card, always
     /// first; `Some(kind)` are the real covermarks.
     pub entries: Vec<Option<CovermarkKind>>,
-    /// Keyboard-selected index.
-    pub selected: usize,
+}
+
+/// Which keyboard-navigable toolbar flyout is open. Both flyouts drive the SAME small state
+/// machine ([`FlyoutNav`]) + the same `preview_modal_key` dispatch; only the entry LIST and
+/// the apply ACTION differ per kind. A future third flyout adds a variant + its panel +
+/// entry list + a hotkey, reusing all the open/nav/select/display plumbing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlyoutKind {
+    /// The covermark picker (bottom bar).
+    Covermark,
+    /// The annotation color palette (top bar).
+    Color,
+}
+
+/// The shared open/nav state of a toolbar flyout: which one is open, the highlighted entry
+/// index (`None` = nothing highlighted yet), and the entry count (for wrap-around).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FlyoutNav {
+    pub kind: FlyoutKind,
+    pub selected: Option<usize>,
+    pub len: usize,
+}
+
+impl FlyoutNav {
+    /// Move the highlight by `delta`, wrapping. From "no highlight", +1 → first, −1 → last.
+    pub fn nav(&mut self, delta: i32) {
+        if self.len == 0 {
+            return;
+        }
+        let n = self.len as i32;
+        let base = self.selected.map(|s| s as i32).unwrap_or(if delta >= 0 { -1 } else { 0 });
+        self.selected = Some(((base + delta).rem_euclid(n)) as usize);
+    }
 }
 
 /// One undoable preview edit — the SHARED history holds both kinds in order,
@@ -99,6 +133,44 @@ pub enum EditOp {
     Covermark(Option<Covermark>),
     /// A timeline cut/delete: the kept spans BEFORE the change.
     Timeline(Vec<Span>),
+    /// An annotation-scene change (add/move/resize/delete/reorder): the whole scene
+    /// BEFORE the change. A continuous drag pushes ONE entry on gesture-commit.
+    Annotations(Vec<AnnotationItem>),
+    /// A global dim change (DRAGON-329): the dim value (0..1) BEFORE the change. One entry per
+    /// slider DRAG (coalesced via [`EditState::dim_drag_start`]), like an annotation gesture.
+    Dim(f32),
+}
+
+/// Which display artifact an undo/redo step touched, so the caller refreshes the right
+/// raster: a covermark or annotation re-raster is owed; a timeline change redraws for free.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EditKind {
+    Covermark,
+    Timeline,
+    Annotations,
+    /// A global dim change — redraws for free through the GPU dim pass on the next view build.
+    Dim,
+}
+
+/// A LIVE, debounced preview edit driven by a DRAGGING slider — the shared live-slider path
+/// (covermark zoom/opacity today; any future RASTER-backed slider after). The dim/spotlight
+/// slider (DRAGON-329) is NOT here: the dim renders straight from the model through the GPU
+/// dim pass every view build (like the annotation effects), so it needs no off-thread raster.
+/// Every raster-backed slider wires up identically, so no debounce is hand-rolled per control:
+///   * each drag TICK updates the model value, then calls [`super::App::refresh_live_edit`],
+///     which kicks a COALESCED off-thread re-raster of that edit's [`RasterSlot`]. The slot's
+///     begin/finish coalescing IS the debounce — at most one raster is ever in flight, and
+///     however many ticks arrive while it runs collapse into exactly ONE pending re-run — so a
+///     fast drag re-renders CONTINUOUSLY without thrashing the GPU, and blink-free (the
+///     persistent-texture shader updates in place).
+///   * RELEASE fires the same refresh once more, so the final settled value is always rendered.
+///
+/// Add a live edit: add a variant here plus its raster-slot arm in
+/// [`super::App::refresh_live_edit`]; the slider + handler wiring is then identical.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LiveEdit {
+    /// The covermark overlay — its zoom + opacity sliders share the one `cm_raster` slot.
+    Covermark,
 }
 
 /// The preview's edit state — shared by image and video previews.
@@ -110,8 +182,12 @@ pub struct EditState {
     pub undo_stack: Vec<EditOp>,
     /// Redone-from states (redo pops from here). Cleared by any new edit.
     pub redo_stack: Vec<EditOp>,
-    /// The covermark picker dropdown, when open.
+    /// The covermark picker dropdown's entries, when open (paired with a `flyout` of kind
+    /// `Covermark`).
     pub picker: Option<Picker>,
+    /// The SHARED keyboard-nav state of whichever toolbar flyout is open (covermark picker
+    /// or color palette). Drives the highlight + arrow/Enter/Esc dispatch for both.
+    pub flyout: Option<FlyoutNav>,
     /// A bake (export re-encode) is in flight; share/delete inputs are held off.
     pub baking: bool,
     /// The share action to run when the in-flight bake completes.
@@ -126,15 +202,152 @@ pub struct EditState {
     /// off-thread, coalesced/staleness-tracked by the slot itself. Shared by image + video
     /// previews.
     pub cm_raster: RasterSlot,
+    /// The pixel dimensions the covermark raster was last produced at (DRAGON-324). The
+    /// covermark raster resolution scales with the view zoom so a magnified mark stays crisp;
+    /// this lets a zoom step SKIP a re-raster when the wanted resolution is unchanged.
+    pub cm_raster_px: (u32, u32),
     /// The capture's pixel dimensions (set once probed/decoded) so preview rasters
     /// match the bake's aspect.
     pub frame: (u32, u32),
+
+    // ── Annotation editor (DRAGON-321; IMAGES only) ──────────────────────────────────
+    /// The annotation scene, in SOURCE-pixel coords. Z-order IS the vector order (later
+    /// = on top).
+    pub annotations: Vec<AnnotationItem>,
+    /// The active annotation DRAW tool: `Some(Arrow | Box)` draws on an empty-canvas drag;
+    /// `None` (the default) is NEUTRAL — existing items are still fully selectable /
+    /// movable / resizable and an empty click deselects, but an empty drag draws nothing.
+    pub tool: Option<Tool>,
+    /// The current annotation color (`None` = the accent default, resolved when a shape
+    /// is created so the off-thread raster never reads the theme).
+    pub annot_color: Option<AnnotColor>,
+    /// The SHARED stroke width (SOURCE px) seeded onto every new box AND arrow — the single
+    /// source of truth a future width control drives. `0.0` means
+    /// [`super::annotate::DEFAULT_ANNOT_STROKE`].
+    pub annot_stroke_w: f32,
+    /// The SHARED ABSOLUTE corner radius (SOURCE px) both the box (corner radius) and arrow
+    /// (round caps when > 0) read. `0.0` means [`super::annotate::DEFAULT_ANNOT_CURVE_RADIUS`]
+    /// (there is no way to set a deliberate sharp `0.0` yet, so the fallback is safe).
+    pub annot_curve_radius: f32,
+    /// The selected annotation, if any (drives chrome + Delete/reorder/Esc handling).
+    pub selected: Option<AnnotId>,
+    /// The in-flight pointer gesture (draw / move / resize), if any.
+    pub gesture: Option<AnnotGesture>,
+    /// The pre-gesture scene snapshot, pushed as ONE undo entry on gesture-commit.
+    pub annot_snapshot: Option<Vec<AnnotationItem>>,
+    /// The custom-color WHEEL picker's live model. `Some` = the picker is open — it owns the
+    /// interactive hue/saturation-value spectrum + hex/rgb input (libcosmic's own
+    /// cross-platform color picker). `None` (the `Default`) = closed.
+    pub annot_picker: Option<cosmic::widget::ColorPickerModel>,
+    /// The annotation right-click context menu anchor (widget-local point), when open.
+    pub annot_menu: Option<(f32, f32)>,
+    /// Monotonic id source for new annotations.
+    pub next_annot_id: u64,
+    /// The base picture pixels as a GPU-uploadable frame (DRAGON-330), cached once on decode so
+    /// the real-time effects shader ([`crate::widgets::annotation_fx`]) can seed its ping-pong
+    /// from the retained original without re-copying every view build. `None` when the decode
+    /// fell back to a path handle (no retained pixels) — effects then appear only on export.
+    pub fx_base: Option<Arc<super::layers::PixelFrame>>,
+
+    // ── Global dim / spotlight (DRAGON-329; IMAGES only) ─────────────────────────────────
+    /// The global dim amount (0..1): `0` = no dim (byte-identical to no dim), higher = darker.
+    /// Punched out to full brightness inside the knockout rects (spotlight / box / highlight /
+    /// box-highlight). ALWAYS starts at 0 (never persisted across previews). Renders via the GPU
+    /// dim pass on display and [`super::annotate::apply_dim`] on bake.
+    pub dim: f32,
+    /// The dim value at the START of the active slider drag, `Some` while dragging — so a whole
+    /// drag coalesces into ONE undo entry (pushed on release; the mirror of `annot_snapshot`).
+    pub dim_drag_start: Option<f32>,
 }
 
 impl EditState {
-    /// Whether a covermark is applied (drives bake-before-share and button states).
+    /// Whether an edit needs a bake before sharing: a covermark, a non-empty annotation scene
+    /// (any spotlight is an item, so this counts it), OR a non-zero global dim (DRAGON-329) —
+    /// any would be silently dropped otherwise.
     pub fn dirty(&self) -> bool {
-        self.covermark.is_some()
+        self.covermark.is_some() || !self.annotations.is_empty() || self.dim > 0.0
+    }
+
+    /// The kind of toolbar flyout currently open (covermark picker / color palette), if any.
+    pub fn flyout_kind(&self) -> Option<FlyoutKind> {
+        self.flyout.map(|f| f.kind)
+    }
+
+    /// The open flyout's highlighted entry index, if any.
+    pub fn flyout_selected(&self) -> Option<usize> {
+        self.flyout.and_then(|f| f.selected)
+    }
+
+    /// Open a flyout of `kind`, highlighting `selected`, over `len` entries.
+    pub fn open_flyout(&mut self, kind: FlyoutKind, selected: Option<usize>, len: usize) {
+        self.flyout = Some(FlyoutNav { kind, selected, len });
+    }
+
+    /// Close any open flyout (covermark picker or color palette) + drop covermark entries.
+    pub fn close_flyout(&mut self) {
+        self.flyout = None;
+        self.picker = None;
+    }
+
+    /// The SHARED stroke width for new annotations (SOURCE px), falling back to the default.
+    pub fn stroke(&self) -> f32 {
+        if self.annot_stroke_w > 0.0 {
+            self.annot_stroke_w
+        } else {
+            super::annotate::DEFAULT_ANNOT_STROKE
+        }
+    }
+
+    /// The SHARED absolute corner radius (SOURCE px) both shapes rasterize with, falling
+    /// back to the default.
+    pub fn curve_radius(&self) -> f32 {
+        if self.annot_curve_radius > 0.0 {
+            self.annot_curve_radius
+        } else {
+            super::annotate::DEFAULT_ANNOT_CURVE_RADIUS
+        }
+    }
+
+    /// Mint the next annotation id.
+    pub fn next_annot_id(&mut self) -> AnnotId {
+        self.next_annot_id += 1;
+        AnnotId(self.next_annot_id)
+    }
+
+    /// Record an annotation mutation in the shared history: push the PRE-EDIT scene and
+    /// clear redo, mirroring [`Self::push_timeline`].
+    pub fn push_annotations(&mut self, prev: Vec<AnnotationItem>) {
+        self.undo_stack.push(EditOp::Annotations(prev));
+        self.redo_stack.clear();
+    }
+
+    /// Record a global-dim change (DRAGON-329) in the shared history: push the PRE-DRAG value
+    /// and clear redo, mirroring [`Self::push_annotations`]. `prev` is the dim BEFORE the drag.
+    pub fn push_dim(&mut self, prev: f32) {
+        self.undo_stack.push(EditOp::Dim(prev));
+        self.redo_stack.clear();
+    }
+
+    /// Holistic spotlight/dim rule (DRAGON-329): a spotlight knocks a hole in the dim, so with no
+    /// dim it would be INVISIBLE. Whenever ≥1 spotlight EXISTS on the canvas and the frame isn't
+    /// dimmed yet, seed a dim (30% transparent) as its own undo entry — so a spotlight always
+    /// reads however it came to exist (drawn, converted from another box, or duplicated). No-op
+    /// once any dim is present (so the user can still slide it wherever they want afterward).
+    pub fn ensure_dim_for_spotlights(&mut self) {
+        const SPOTLIGHT_SEED_DIM: f32 = 0.7; // 30% transparent on the reversed slider
+        if self.dim > 0.0 {
+            return;
+        }
+        let has_spotlight = self
+            .annotations
+            .iter()
+            .any(|it| matches!(it.kind, super::annotate::AnnotKind::Spotlight { .. }));
+        if !has_spotlight {
+            return;
+        }
+        let prev = self.dim;
+        self.push_dim(prev);
+        self.dim = SPOTLIGHT_SEED_DIM;
     }
 
     pub fn can_undo(&self) -> bool {
@@ -176,53 +389,75 @@ impl EditState {
         self.covermark.as_ref().map(|c| c.zoom).unwrap_or(0.0)
     }
 
-    /// Undo the most recent edit — covermark or timeline, whichever was made
-    /// last. `timeline` is the video preview's timeline when there is one (an
-    /// image preview passes `None`; it never accumulates timeline ops). Returns
-    /// whether the COVERMARK changed (the caller then refreshes its raster —
-    /// timeline changes redraw for free on the next view).
-    pub fn undo(&mut self, timeline: Option<&mut Timeline>) -> bool {
+    /// Undo the most recent edit — covermark, timeline, or annotation, whichever was
+    /// made last. `timeline` is the video preview's timeline when there is one (an image
+    /// preview passes `None`; it never accumulates timeline ops). Returns which artifact
+    /// changed so the caller refreshes the owed raster (`None` = the stack was empty). Only a
+    /// covermark change owes a raster refresh now — annotations redraw as vectors for free.
+    pub fn undo(&mut self, timeline: Option<&mut Timeline>) -> Option<EditKind> {
         match self.undo_stack.pop() {
             Some(EditOp::Covermark(prev)) => {
                 self.redo_stack.push(EditOp::Covermark(self.covermark.clone()));
                 self.covermark = prev;
                 self.cm_raster.invalidate();
-                true
+                Some(EditKind::Covermark)
             }
             Some(EditOp::Timeline(prev)) => {
                 if let Some(tl) = timeline {
                     self.redo_stack.push(EditOp::Timeline(tl.spans.clone()));
                     tl.restore(prev);
                 }
-                false
+                Some(EditKind::Timeline)
             }
-            None => false,
+            Some(EditOp::Annotations(prev)) => {
+                self.redo_stack.push(EditOp::Annotations(self.annotations.clone()));
+                self.annotations = prev;
+                self.selected = None;
+                Some(EditKind::Annotations)
+            }
+            Some(EditOp::Dim(prev)) => {
+                self.redo_stack.push(EditOp::Dim(self.dim));
+                self.dim = prev;
+                Some(EditKind::Dim)
+            }
+            None => None,
         }
     }
 
-    /// Redo the most recently undone edit (either kind). Returns whether the
-    /// covermark changed, as [`Self::undo`].
-    pub fn redo(&mut self, timeline: Option<&mut Timeline>) -> bool {
+    /// Redo the most recently undone edit (any kind). Returns which artifact changed, as
+    /// [`Self::undo`].
+    pub fn redo(&mut self, timeline: Option<&mut Timeline>) -> Option<EditKind> {
         match self.redo_stack.pop() {
             Some(EditOp::Covermark(next)) => {
                 self.undo_stack.push(EditOp::Covermark(self.covermark.clone()));
                 self.covermark = next;
                 self.cm_raster.invalidate();
-                true
+                Some(EditKind::Covermark)
             }
             Some(EditOp::Timeline(next)) => {
                 if let Some(tl) = timeline {
                     self.undo_stack.push(EditOp::Timeline(tl.spans.clone()));
                     tl.restore(next);
                 }
-                false
+                Some(EditKind::Timeline)
             }
-            None => false,
+            Some(EditOp::Annotations(next)) => {
+                self.undo_stack.push(EditOp::Annotations(self.annotations.clone()));
+                self.annotations = next;
+                self.selected = None;
+                Some(EditKind::Annotations)
+            }
+            Some(EditOp::Dim(next)) => {
+                self.undo_stack.push(EditOp::Dim(self.dim));
+                self.dim = next;
+                Some(EditKind::Dim)
+            }
+            None => None,
         }
     }
 
     /// The display-preview raster size for the current frame (a ≤1024 box at the
-    /// capture's aspect), used by the async video-overlay recomposite.
+    /// capture's aspect) — the baseline covermark raster resolution at fit zoom.
     pub fn preview_raster_size(&self) -> (u32, u32) {
         let (fw, fh) = match self.frame {
             (0, _) | (_, 0) => (1280u32, 800u32),
@@ -230,6 +465,22 @@ impl EditState {
         };
         let scale = (1024.0 / fw as f32).min(1024.0 / fh as f32).min(1.0);
         (((fw as f32 * scale) as u32).max(1), ((fh as f32 * scale) as u32).max(1))
+    }
+
+    /// The covermark display raster resolution at the current `view_zoom` (DRAGON-324): the
+    /// ≤1024 baseline at fit zoom, growing PROPORTIONALLY as you zoom in — capped at the full
+    /// source frame (beyond which there is no detail to gain, and it matches the bake exactly).
+    /// So a magnified covermark re-rasters sharper instead of sampling a soft preview texture.
+    pub fn covermark_raster_size(&self, view_zoom: f32) -> (u32, u32) {
+        let (fw, fh) = match self.frame {
+            (0, _) | (_, 0) => (1280u32, 800u32),
+            f => f,
+        };
+        let (pw, ph) = self.preview_raster_size();
+        let z = view_zoom.max(1.0);
+        let w = ((pw as f32 * z).round() as u32).clamp(pw, fw);
+        let h = ((ph as f32 * z).round() as u32).clamp(ph, fh);
+        (w, h)
     }
 }
 
@@ -412,16 +663,53 @@ pub fn apply_covermark(base: &mut RgbaImage, cm: Option<&Covermark>) {
     }
 }
 
-/// Bake the covermark onto an image, reading `src` and writing the result to `dst`
+/// Bake the pending edits onto an image, reading `src` and writing the result to `dst`
 /// (they may be the same path for an in-place Save, or differ so Copy can produce an
-/// edited file WITHOUT touching the saved original). Returns `dst`'s size. `cm.is_some()`
-/// must hold (the only image edit).
-pub fn bake_image(src: &Path, dst: &Path, cm: Option<&Covermark>) -> std::io::Result<u64> {
+/// edited file WITHOUT touching the saved original). Returns `dst`'s size. At least one
+/// of a covermark or a non-empty annotation scene must hold (the image edits).
+///
+/// Compositing order (DRAGON-330 true-layer stack) — display and bake share the ONE core:
+/// 0. the global DIM (DRAGON-329) darkens the base at the very bottom, punched out by the
+///    knockout rects (spotlight / box / highlight / box-highlight) via
+///    [`super::annotate::apply_dim`] — a no-op when `dim == 0`;
+/// 1. the region EFFECTS (highlight / pixelate / blur) composite in true scene z-order via
+///    [`super::annotate::apply_effects`], each reading the content accumulated below it;
+/// 2. the covermark (privacy mark) as a source-over overlay;
+/// 3. the box/arrow annotation scene ON TOP (the active markup, above the privacy mark) —
+///    all at full source resolution, position-aware.
+pub fn bake_image(
+    src: &Path,
+    dst: &Path,
+    cm: Option<&Covermark>,
+    annotations: &[AnnotationItem],
+    curve: f32,
+    dim: f32,
+) -> std::io::Result<u64> {
     let err = |e: String| std::io::Error::other(e);
     let dst_png = super::ext_of(dst).as_deref() == Some("png");
-    if cm.is_some() {
+    if cm.is_some() || !annotations.is_empty() || dim > 0.0 {
         let mut rgba = ::image::open(src).map_err(|e| err(e.to_string()))?.into_rgba8();
+        // The PRISTINE full-res source, used ONLY to size the content-aware pixelate cell — the
+        // SAME analysis source the GPU display uses (its retained base pixels), so display + bake
+        // pick identical blocks. Cloned only when a pixelate item is present (otherwise unused).
+        let analysis = annotations
+            .iter()
+            .any(|it| matches!(it.kind, super::annotate::AnnotKind::Pixelate { .. }))
+            .then(|| rgba.clone());
+        // The global dim darkens the base FIRST (the hard floor), punched out inside the
+        // knockout rects; a `dim == 0` bake is byte-identical (apply_dim returns early).
+        let knockouts = super::annotate::knockout_rects(annotations);
+        super::annotate::apply_dim(&mut rgba, dim, &knockouts, curve);
+        // The region effects composite in true z-order — the SAME `apply_effects` core the
+        // real-time GPU display shader mirrors (DRAGON-330), so what the user saw is what saves.
+        // An effect-free scene is a no-op, keeping the covermark-only / annotation-only bakes
+        // byte-identical. The pixelate cell size reads the pristine `analysis` (pre-dim) source;
+        // with no pixelate item `analysis` is None and a 1×1 placeholder is passed but never read.
+        let placeholder = ::image::RgbaImage::new(1, 1);
+        let analysis_ref = analysis.as_ref().unwrap_or(&placeholder);
+        super::annotate::apply_effects(&mut rgba, analysis_ref, annotations, curve);
         apply_covermark(&mut rgba, cm);
+        super::annotate::apply_annotations(&mut rgba, annotations, curve);
         if dst_png {
             rgba.save_with_format(dst, ::image::ImageFormat::Png).map_err(|e| err(e.to_string()))?;
         } else {
@@ -561,6 +849,45 @@ pub fn bake_video(src: &Path, dst: &Path, cm: Option<&Covermark>, video: &VideoB
 mod tests {
     use super::*;
 
+    #[test]
+    fn flyout_nav_wraps_and_starts_from_no_highlight() {
+        let mut f = FlyoutNav { kind: FlyoutKind::Color, selected: None, len: 4 };
+        f.nav(1);
+        assert_eq!(f.selected, Some(0), "None + forward → first");
+        f.nav(-1);
+        assert_eq!(f.selected, Some(3), "0 - 1 wraps to last");
+        f.nav(1);
+        assert_eq!(f.selected, Some(0), "last + 1 wraps to first");
+        // Covermark uses the same nav; None - 1 → last.
+        let mut g = FlyoutNav { kind: FlyoutKind::Covermark, selected: None, len: 3 };
+        g.nav(-1);
+        assert_eq!(g.selected, Some(2));
+        // Empty is a no-op (never a divide/panic).
+        let mut h = FlyoutNav { kind: FlyoutKind::Color, selected: None, len: 0 };
+        h.nav(1);
+        assert_eq!(h.selected, None);
+    }
+
+    #[test]
+    fn covermark_raster_size_scales_with_zoom_capped_at_frame() {
+        // DRAGON-324: the covermark display raster grows with the view zoom (crisp when
+        // magnified) but never past the source frame.
+        let mut e = EditState { frame: (4000, 2000), ..Default::default() };
+        let base = e.preview_raster_size();
+        assert_eq!(base, (1024, 512), "≤1024 box preserving aspect");
+        // At or below fit zoom, the baseline resolution.
+        assert_eq!(e.covermark_raster_size(1.0), base);
+        assert_eq!(e.covermark_raster_size(0.5), base, "zoom-out never shrinks below baseline");
+        // Zooming in grows proportionally...
+        assert_eq!(e.covermark_raster_size(2.0), (2048, 1024));
+        // ...capped at the full source frame at high zoom.
+        assert_eq!(e.covermark_raster_size(100.0), (4000, 2000));
+        // A zero/unknown frame falls back to a sane default (never a 0-size raster).
+        e.frame = (0, 0);
+        let (w, h) = e.covermark_raster_size(3.0);
+        assert!(w > 0 && h > 0);
+    }
+
     fn flat(w: u32, h: u32, v: u8) -> RgbaImage {
         RgbaImage::from_pixel(w, h, ::image::Rgba([v, v, v, 255]))
     }
@@ -603,11 +930,11 @@ mod tests {
         assert!(!edit.can_undo() && !edit.can_redo());
         edit.set_covermark(Some(Covermark { kind: CovermarkKind::Confidential, zoom: 0.0, opacity: 1.0 }));
         assert!(edit.dirty() && edit.can_undo() && !edit.can_redo());
-        assert!(edit.undo(None));
+        assert_eq!(edit.undo(None), Some(EditKind::Covermark));
         assert!(!edit.dirty() && edit.can_redo());
-        assert!(edit.redo(None));
+        assert_eq!(edit.redo(None), Some(EditKind::Covermark));
         assert!(edit.dirty());
-        assert!(!edit.redo(None), "redo with an empty stack must be a no-op");
+        assert_eq!(edit.redo(None), None, "redo with an empty stack must be a no-op");
         // Zoom adjusts in place without adding history.
         let undo_depth = edit.undo_stack.len();
         edit.set_zoom(1.5);
@@ -629,27 +956,84 @@ mod tests {
         edit.push_timeline(prev);
         assert!(tl.edited());
         // Undo walks newest-first: delete, then cut, then covermark.
-        assert!(!edit.undo(Some(&mut tl)), "timeline undo must not report a covermark change");
+        assert_eq!(
+            edit.undo(Some(&mut tl)),
+            Some(EditKind::Timeline),
+            "timeline undo must not report a covermark change"
+        );
         assert_eq!(tl.spans.len(), 2);
         assert!(!tl.edited(), "undoing the delete restores the content");
-        assert!(!edit.undo(Some(&mut tl)));
+        assert_eq!(edit.undo(Some(&mut tl)), Some(EditKind::Timeline));
         assert_eq!(tl.spans.len(), 1, "undoing the cut re-joins the spans");
-        assert!(edit.undo(Some(&mut tl)), "covermark undo reports the change");
+        assert_eq!(edit.undo(Some(&mut tl)), Some(EditKind::Covermark), "covermark undo reports the change");
         assert!(!edit.dirty());
         // Redo replays in order: covermark, cut, delete.
-        assert!(edit.redo(Some(&mut tl)));
+        assert_eq!(edit.redo(Some(&mut tl)), Some(EditKind::Covermark));
         assert!(edit.dirty());
-        assert!(!edit.redo(Some(&mut tl)));
+        assert_eq!(edit.redo(Some(&mut tl)), Some(EditKind::Timeline));
         assert_eq!(tl.spans.len(), 2);
-        assert!(!edit.redo(Some(&mut tl)));
+        assert_eq!(edit.redo(Some(&mut tl)), Some(EditKind::Timeline));
         assert!(tl.edited());
         assert!(!edit.can_redo());
         // A fresh timeline edit clears redo, like a fresh covermark choice.
-        // (This undo pops the timeline delete — no covermark change reported.)
-        assert!(!edit.undo(Some(&mut tl)));
+        // (This undo pops the timeline delete — a timeline change, not covermark.)
+        assert_eq!(edit.undo(Some(&mut tl)), Some(EditKind::Timeline));
         assert!(edit.can_redo());
         edit.push_timeline(tl.spans.clone());
         assert!(!edit.can_redo());
+    }
+
+    #[test]
+    fn dim_is_dirty_and_joins_the_shared_undo_history() {
+        // DRAGON-329: a non-zero global dim is a bakeable edit; its slider commits ONE undo
+        // entry that interleaves with the rest of the shared history.
+        let mut edit = EditState::default();
+        assert!(!edit.dirty(), "a fresh editor with dim 0 is clean");
+        // A drag: pre-value latched, value moved, ONE entry pushed on commit.
+        edit.dim = 0.5;
+        edit.push_dim(0.0);
+        assert!(edit.dirty(), "a non-zero dim needs a bake");
+        assert!(edit.can_undo());
+        // Undo restores the pre-drag dim and reports a Dim change (no raster owed).
+        assert_eq!(edit.undo(None), Some(EditKind::Dim));
+        assert_eq!(edit.dim, 0.0);
+        assert!(!edit.dirty());
+        // Redo replays it.
+        assert_eq!(edit.redo(None), Some(EditKind::Dim));
+        assert_eq!(edit.dim, 0.5);
+        // A fresh edit clears the redo stack, like any other op.
+        edit.push_dim(0.5);
+        assert!(!edit.can_redo());
+    }
+
+    #[test]
+    fn ensure_dim_for_spotlights_seeds_only_when_a_spotlight_exists() {
+        use crate::app::preview::annotate::{AnnotId, AnnotKind, AnnotRect, AnnotationItem};
+        let rect = AnnotRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        let mut edit = EditState::default();
+        // Nothing on the canvas → no-op.
+        edit.ensure_dim_for_spotlights();
+        assert_eq!(edit.dim, 0.0);
+        // A non-spotlight annotation → still no dim.
+        edit.annotations.push(AnnotationItem {
+            id: AnnotId(1),
+            color: [255, 0, 0, 255],
+            kind: AnnotKind::Box { rect, stroke_w: 4.0, fill: None },
+        });
+        edit.ensure_dim_for_spotlights();
+        assert_eq!(edit.dim, 0.0, "a box doesn't dim");
+        // A spotlight with no dim → seed 0.7, as one undo entry.
+        edit.annotations.push(AnnotationItem {
+            id: AnnotId(2),
+            color: [0, 0, 0, 255],
+            kind: AnnotKind::Spotlight { rect },
+        });
+        edit.ensure_dim_for_spotlights();
+        assert_eq!(edit.dim, 0.7, "a spotlight seeds the dim");
+        assert!(edit.can_undo(), "the seed is undoable");
+        // Idempotent once dimmed — never fights a dim the user has already set.
+        edit.ensure_dim_for_spotlights();
+        assert_eq!(edit.dim, 0.7);
     }
 
     #[test]

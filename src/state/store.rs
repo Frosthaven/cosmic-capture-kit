@@ -274,7 +274,7 @@ record_fps = 60\n";
     #[test]
     fn fresh_defaults_use_serde() {
         let d = defaults();
-        assert_eq!(d.text_confidence, 25.0);
+        assert_eq!(d.text_confidence, 20.0);
         assert_eq!(d.region_overlay_opacity, 0.66);
         assert_eq!(d.record_fps, 30);
         assert!(d.copy_to_clipboard);

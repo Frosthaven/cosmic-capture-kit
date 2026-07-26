@@ -165,10 +165,11 @@ pub enum WindowChromeMsg {
     ConfigSearchInput(String),
     /// Clear + collapse the header search field.
     ConfigSearchClear,
-    /// macOS: the pointer entered a window — if it's a capture overlay, keyboard
-    /// focus follows it (Escape / shortcuts work on whichever display the user is
-    /// on). Never emitted on Linux (layer-shell keyboard focus is on-demand there).
-    #[cfg(target_os = "macos")]
+    /// The pointer entered a window. macOS: if it's a capture overlay, keyboard focus
+    /// follows it (Escape / shortcuts work on whichever display the user is on). Linux
+    /// (DRAGON-317 regression fix): the first enter of a capture overlay records the pointer's
+    /// output — the reliable capture-origin monitor for the post-capture preview.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     CursorEnteredWindow(window::Id),
     /// macOS (DRAGON-153) / Windows (DRAGON-246): a blocked second `--settings` launch
     /// touched the focus poke file — bring this (live) settings pane to the front, un-hiding

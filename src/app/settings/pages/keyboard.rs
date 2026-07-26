@@ -64,7 +64,7 @@ impl crate::app::App {
                 // sets an EMPTY spec (no hotkey registered until set again). Disabled when
                 // already empty, matching how a neighbor disables clear with nothing to unbind.
                 let mut clear = widget::button::icon(
-                    widget::icon::from_name("window-close-symbolic").size(14),
+                    crate::widgets::icons::handle("window-close-symbolic"),
                 )
                 .padding(6);
                 if !spec.is_empty() {
@@ -109,7 +109,7 @@ impl crate::app::App {
             // An "x" to clear the binding, sitting right next to it like a button group.
             // Disabled (no press) when there's nothing to unbind.
             let mut clear = widget::button::icon(
-                widget::icon::from_name("window-close-symbolic").size(14),
+                crate::widgets::icons::handle("window-close-symbolic"),
             )
             .padding(6);
             if binding.is_some() {

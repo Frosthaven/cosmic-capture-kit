@@ -338,6 +338,141 @@ pub(crate) fn settings_lock_pid() -> Option<u32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+// ── Runtime state markers (DRAGON-322) ───────────────────────────────────────
+//
+// With "allow multiple instances" ON a RECORDING session and a fresh capture — or a
+// SELF-CAPTURE of CCK's own preview-editor window — coexist as independent processes.
+// Two things then need cross-process knowledge the single-instance locks don't carry:
+//
+//   * the sibling sweep [`close_other_instances`] must SPARE a sibling that is
+//     recording or showing a preview — those are real workspaces the user wants kept,
+//     not the stale selector overlays the sweep exists to collapse; and
+//   * a freshly-launched capture overlay must know a recording is ALREADY live so it
+//     can DISABLE the video capture kind (only one recording at a time; a still image
+//     capture may still run alongside it).
+//
+// Each protected instance advertises its state with a per-pid sidecar file under the
+// runtime dir (the audio-meter per-pid convention, `audio/meters.rs`): created on
+// entering the state, removed on leaving it / at exit. Per-pid so several
+// allow-multiple instances never collide. A crash can leave a STALE marker, so the
+// one consumer that reads markers for pids it hasn't already proven live
+// ([`any_other_recording`]) re-checks liveness and sweeps dead-pid files; the sweep
+// only ever queries markers for a pid it already found LIVE, so it needs no probe.
+// Plain files (portable `std::fs`), so the whole mechanism is byte-identical on Linux,
+// macOS and Windows — only the liveness probe below is per-platform.
+
+/// Marker suffix: this pid has a recording in progress (incl. paused).
+const RECORDING_MARKER: &str = "recording";
+/// Marker suffix: this pid has a preview editor open.
+const PREVIEW_MARKER: &str = "preview";
+
+/// Per-pid state-marker sidecar path (`{runtime}/cosmic-capture-kit.<pid>.<suffix>`).
+fn state_marker_path(pid: u32, suffix: &str) -> String {
+    format!("{}/cosmic-capture-kit.{pid}.{suffix}", crate::util::runtime_dir())
+}
+
+/// Create (`active`) or remove this instance's RECORDING marker. Set when a recording
+/// actually starts, cleared when it ends (even though this process lives on into the
+/// video preview) so other overlays re-enable the video kind promptly.
+pub(crate) fn set_recording_marker(active: bool) {
+    set_self_marker(RECORDING_MARKER, active);
+}
+
+/// Create (`active`) or remove this instance's PREVIEW-open marker. Set when a preview
+/// editor opens, cleared at `finish_session` (a preview close ends the process).
+pub(crate) fn set_preview_marker(active: bool) {
+    set_self_marker(PREVIEW_MARKER, active);
+}
+
+fn set_self_marker(suffix: &str, active: bool) {
+    let path = state_marker_path(std::process::id(), suffix);
+    if active {
+        let _ = std::fs::File::create(&path);
+    } else {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Whether the capture overlay should SPARE a sibling instance from the collapse sweep,
+/// as a pure function of the setting + that sibling's observed state. With "allow
+/// multiple instances" ON a recording or preview sibling is a live workspace to keep;
+/// a bare selector sibling still gets collapsed. With it OFF the historical
+/// single-instance collapse applies (nothing extra is spared), so a fresh capture still
+/// replaces an existing preview exactly as before.
+pub fn should_spare_sibling(allow_multiple: bool, recording: bool, preview: bool) -> bool {
+    allow_multiple && (recording || preview)
+}
+
+/// Whether the VIDEO capture kind should be offered. Disabled while another instance is
+/// already recording (only one recording at a time; still image capture stays allowed).
+pub fn video_capture_allowed(external_recording: bool) -> bool {
+    !external_recording
+}
+
+/// Whether a fresh capture launch should run as its OWN independent instance rather than
+/// stepping aside for / signalling the existing one. Purely the "allow multiple
+/// instances" setting today; a named seam so the launch decision is documented + tested
+/// in one place.
+pub fn wants_own_instance(allow_multiple: bool) -> bool {
+    allow_multiple
+}
+
+/// Whether ANOTHER live instance currently has a recording in progress (its recording
+/// marker exists and its pid is still alive). Consumed by the capture overlay to DISABLE
+/// the video kind while a recording runs elsewhere. Sweeps markers left behind by dead
+/// pids as it scans, so a crashed recorder can't wedge the toggle off forever.
+pub(crate) fn any_other_recording() -> bool {
+    let dir = crate::util::runtime_dir();
+    let self_pid = std::process::id();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    let suffix = format!(".{RECORDING_MARKER}");
+    let mut found = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("cosmic-capture-kit.") else {
+            continue;
+        };
+        let Some(pid_str) = rest.strip_suffix(&suffix) else {
+            continue;
+        };
+        let Some(pid) = pid_str.parse::<u32>().ok() else {
+            continue;
+        };
+        if pid == self_pid {
+            continue;
+        }
+        if pid_is_live(pid) {
+            found = true;
+        } else {
+            // Stale marker from a crashed recorder — sweep it so the toggle re-enables.
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    found
+}
+
+/// Whether `pid` is a live process. Linux reads `/proc/<pid>`; other unix uses a
+/// signal-0 probe (`ESRCH` = gone, `EPERM` = alive but not ours); Windows delegates to
+/// the platform body. Best-effort — a false "live" only keeps the video toggle disabled
+/// a little longer, never a hard failure.
+#[cfg(target_os = "linux")]
+fn pid_is_live(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_is_live(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 delivers nothing; it only probes existence/permission.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+#[cfg(windows)]
+fn pid_is_live(pid: u32) -> bool {
+    crate::platform::windows::instance::pid_is_live(pid)
+}
+
 /// Terminate every OTHER running CAPTURE instance of this binary (used when a capture
 /// is committed, so a multi-instance session collapses to just the one that fired).
 /// Matches by executable path via `/proc/<pid>/exe`; signalling a dead pid is a
@@ -345,8 +480,14 @@ pub(crate) fn settings_lock_pid() -> Option<u32> {
 ///
 /// Settings windows are deliberately spared: a settings pane is its own thing (often
 /// a separate `--settings` process), and ending a capture must never close it.
+///
+/// DRAGON-322: with `allow_multiple` on, a RECORDING or PREVIEW sibling is also spared
+/// (its per-pid state marker) so a recording session + a capture — including a
+/// self-capture of the open preview — coexist. With it off, nothing extra is spared and
+/// the historical single-instance collapse (a fresh capture replaces the old preview) is
+/// byte-identical.
 #[cfg(not(windows))]
-pub fn close_other_instances() {
+pub fn close_other_instances(allow_multiple: bool) {
     let Ok(self_exe) = std::env::current_exe() else {
         return;
     };
@@ -371,6 +512,16 @@ pub fn close_other_instances() {
         if is_settings_instance(pid) {
             continue; // never close a settings window
         }
+        // DRAGON-322: keep a live recording / preview sibling under allow-multiple.
+        let recording =
+            std::path::Path::new(&state_marker_path(pid, RECORDING_MARKER)).exists();
+        let preview = std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists();
+        if should_spare_sibling(allow_multiple, recording, preview) {
+            log::info!(
+                "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview})"
+            );
+            continue;
+        }
         // Never close the resident daemon either (DRAGON-183): it is the SAME
         // executable, so the exe-path match above catches it — and committing a
         // capture must not tear down the tray resident (which may even have
@@ -390,9 +541,25 @@ pub fn close_other_instances() {
 /// `platform::windows::instance` (strict split) — matches siblings by full exe path,
 /// spares the settings window (its recorded pid), and force-terminates the rest (the
 /// analog of the Linux uncaught SIGTERM). Only matters with "allow multiple instances" on.
+///
+/// DRAGON-322: `allow_multiple` is threaded through so the Windows body can SPARE a
+/// recording / preview sibling (its per-pid state marker) exactly like the unix body,
+/// keeping a recording session + a concurrent capture alive.
 #[cfg(windows)]
-pub fn close_other_instances() {
-    crate::platform::windows::instance::close_other_instances();
+pub fn close_other_instances(allow_multiple: bool) {
+    crate::platform::windows::instance::close_other_instances(allow_multiple);
+}
+
+/// DRAGON-322: whether `pid`'s per-pid RECORDING / PREVIEW marker exists. The predicate
+/// the Windows sibling sweep uses (its pids come from a live Toolhelp snapshot, so no
+/// liveness probe is needed here). Windows-only — the unix sweep inlines the same two
+/// `Path::exists` checks against [`state_marker_path`].
+#[cfg(windows)]
+pub(crate) fn marker_flags(pid: u32) -> (bool, bool) {
+    (
+        std::path::Path::new(&state_marker_path(pid, RECORDING_MARKER)).exists(),
+        std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists(),
+    )
 }
 
 /// Whether `pid` is the resident daemon: the daemon-lock holder, or a process
@@ -422,4 +589,52 @@ fn is_settings_instance(pid: u32) -> bool {
     std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|b| b.split(|&c| c == 0).any(|a| a == b"--settings"))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wants_own_instance_follows_the_setting() {
+        // The launch decision (DRAGON-322): only "allow multiple instances" makes a
+        // fresh capture run as its own process instead of stepping aside.
+        assert!(!wants_own_instance(false));
+        assert!(wants_own_instance(true));
+    }
+
+    #[test]
+    fn spare_only_protected_siblings_under_allow_multiple() {
+        // Setting OFF: never spare — the historical single-instance collapse (a fresh
+        // capture replaces the old preview) is preserved for every sibling state.
+        for &rec in &[false, true] {
+            for &prev in &[false, true] {
+                assert!(
+                    !should_spare_sibling(false, rec, prev),
+                    "allow_multiple off must never spare (rec={rec} prev={prev})"
+                );
+            }
+        }
+        // Setting ON: spare exactly the recording / preview siblings; a bare selector
+        // sibling (neither marker) still collapses so a committed shot wins the screen.
+        assert!(!should_spare_sibling(true, false, false));
+        assert!(should_spare_sibling(true, true, false)); // recording session
+        assert!(should_spare_sibling(true, false, true)); // open preview (self-capture)
+        assert!(should_spare_sibling(true, true, true));
+    }
+
+    #[test]
+    fn video_kind_gated_on_external_recording() {
+        assert!(video_capture_allowed(false)); // nobody recording -> video offered
+        assert!(!video_capture_allowed(true)); // another instance recording -> disabled
+    }
+
+    #[test]
+    fn state_marker_path_is_per_pid_and_named() {
+        let rec = state_marker_path(4242, RECORDING_MARKER);
+        let prev = state_marker_path(4242, PREVIEW_MARKER);
+        assert!(rec.ends_with("cosmic-capture-kit.4242.recording"), "{rec}");
+        assert!(prev.ends_with("cosmic-capture-kit.4242.preview"), "{prev}");
+        assert_ne!(rec, prev);
+    }
 }

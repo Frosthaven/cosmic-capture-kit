@@ -272,8 +272,8 @@ pub(super) fn preview_overlay_window(
 /// The windowed preview's floor size — small enough to sit on a compact monitor, large
 /// enough that every top/bottom toolbar control stays laid out without clipping. Shared by
 /// the window `min_size` and the fit-to-media sizing so they agree.
-pub(super) const PREVIEW_MIN_W: f32 = 792.0;
-pub(super) const PREVIEW_MIN_H: f32 = 440.0;
+pub(super) const PREVIEW_MIN_W: f32 = 795.0;
+pub(super) const PREVIEW_MIN_H: f32 = 545.0;
 
 /// The post-capture preview as a normal RESIZABLE WINDOW (the "Windowed" appearance)
 /// instead of the fullscreen overlay — so it can be moved / resized / min / maximized.

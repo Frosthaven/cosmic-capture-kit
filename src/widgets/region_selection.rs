@@ -149,6 +149,10 @@ struct State {
     last_click: Option<(std::time::Instant, (i32, i32))>,
     /// Consecutive-click count for the current click streak (1=single, 2=double, …).
     click_count: u32,
+    /// When the pointer last entered the surface, driving the post-enter cursor re-assert (DRAGON-331;
+    /// see [`crate::widgets::cursor_reassert`]) — the crosshair over the dimmed canvas otherwise stays
+    /// the default until an unrelated cursor change (hovering a handle/mark) forces a re-issue.
+    entered_at: Option<std::time::Instant>,
 }
 
 fn corner_cursor(c: Corner) -> mouse::Interaction {
@@ -452,6 +456,12 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
             return mouse::Interaction::default();
         }
         let state = tree.state.downcast_ref::<State>();
+        // Fresh-enter re-assert dip (DRAGON-331; see `crate::widgets::cursor_reassert`): briefly
+        // return the default just before the deadline so the deadline redraw RE-issues `set_cursor`
+        // for the crosshair past cosmic-comp's post-enter drop.
+        if crate::widgets::cursor_reassert::in_dip(state.entered_at) {
+            return mouse::Interaction::default();
+        }
         match state.grab {
             Grab::Resize(c) => return corner_cursor(c),
             Grab::ResizeEdge(e) => return edge_cursor(e),
@@ -504,6 +514,9 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
         }
         let bounds = layout.bounds();
         let state = tree.state.downcast_mut::<State>();
+        // Post-enter cursor re-assert (DRAGON-331; see `crate::widgets::cursor_reassert`): maintain
+        // the entry stamp + schedule the dip/deadline redraws. Non-consuming.
+        crate::widgets::cursor_reassert::arm(&mut state.entered_at, event, shell);
         let to_global = |p: Point| (p.x as i32 + self.origin.0, p.y as i32 + self.origin.1);
         match event {
             // Right-click on a word opens its copy menu.

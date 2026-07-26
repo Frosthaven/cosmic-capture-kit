@@ -367,7 +367,7 @@ impl crate::app::App {
             crate::widgets::arrow_cursor::arrow_cursor(
                 widget::button::custom(
                     widget::container(
-                        widget::icon::from_name("list-add-symbolic").icon().size(16),
+                        crate::widgets::icons::handle("list-add-symbolic").icon().size(16),
                     )
                     .center_x(Length::Fill)
                     .center_y(Length::Fill),

@@ -1141,13 +1141,13 @@ impl App {
     /// rail's live state.
     pub(in crate::app) fn update_about_nav_icon(&mut self) {
         let icon = if self.update_status.is_available() {
-            cosmic::widget::icon::from_name(crate::app::settings::ABOUT_UPDATE_ICON)
+            crate::widgets::icons::handle(crate::app::settings::ABOUT_UPDATE_ICON)
                 .icon()
                 .class(cosmic::theme::Svg::custom(|theme| cosmic::widget::svg::Style {
                     color: Some(theme::success(theme)),
                 }))
         } else {
-            cosmic::widget::icon::from_name("help-about-symbolic").icon()
+            crate::widgets::icons::handle("help-about-symbolic").icon()
         };
         self.settings.nav.icon_set(self.settings.about, icon);
     }

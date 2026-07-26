@@ -38,9 +38,22 @@ struct State {
 const SB: f32 = 8.0; // scrollbar thickness (track + thumb)
 const SB_MIN: f32 = 24.0; // minimum thumb length
 const SB_HIT: f32 = 6.0; // extra px each side for an easier grab
-/// Inset from the right / bottom edge so the scrollbar clears the window's resize border
-/// (the compositor grabs the outer strip for resize before the app sees the click).
-const SB_EDGE: f32 = 8.0;
+/// Fit tolerance (px): the displayed picture size (`content_px`) is fitted app-side against a
+/// preview_viewport ESTIMATE, which can miss the widget's REAL draw-time bounds by a few px
+/// (chrome-height rounding, DRAGON-221). Left unchecked, that few-px excess at zoom≈1.0 spawns a
+/// PHANTOM vertical scrollbar, whose reserved strip cascades into a phantom horizontal one — so
+/// the content clips ~8px short on BOTH axes even though the picture visually fits (drawn effects
+/// bleed past the un-clipped zoom-1 path; the selection chrome clips early). An overflow smaller
+/// than a scrollbar's own width is not usefully scrollable anyway, so we treat the picture as
+/// fitting until it exceeds the viewport by more than this slop. Genuine zoom overflow is orders
+/// of magnitude larger, so real scrollbars are unaffected.
+const FIT_SLOP: f32 = 12.0;
+/// Inset from the right / bottom edge. Kept at ZERO so the scrollbar sits FLUSH against the
+/// window edge — no gap to its right/below, and (since the content boundary is
+/// `edge - SB - SB_EDGE`) nothing renders into an outer gap. COSMIC's CSD resize grab is an
+/// invisible region at/just outside the client edge, so a flush bar doesn't steal it. A
+/// non-zero value here would reintroduce the gap uniformly across every consumer below.
+const SB_EDGE: f32 = 0.0;
 /// The full strip a visible scrollbar reserves from the content (thickness + edge inset) —
 /// the single source of truth shared with the preview overlay's canvas-viewport sizing, so
 /// its zoom/pan math reserves exactly what this widget draws.
@@ -54,11 +67,21 @@ fn overflow_of(content_px: (f32, f32), zoom: f32, bounds: Rectangle) -> (bool, b
     let cw = content_px.0 * zoom;
     let ch = content_px.1 * zoom;
     let strip = SB + SB_EDGE;
-    let h0 = cw > bounds.width + 0.5;
-    let v0 = ch > bounds.height + 0.5;
-    let h = cw > bounds.width - if v0 { strip } else { 0.0 } + 0.5;
-    let v = ch > bounds.height - if h0 { strip } else { 0.0 } + 0.5;
+    // FIT_SLOP absorbs the app-side fit estimate error so a few-px excess at zoom≈1 never spawns
+    // a phantom bar (and its cascade); genuine zoom overflow clears it by a wide margin.
+    let h0 = cw > bounds.width + FIT_SLOP;
+    let v0 = ch > bounds.height + FIT_SLOP;
+    let h = cw > bounds.width - if v0 { strip } else { 0.0 } + FIT_SLOP;
+    let v = ch > bounds.height - if h0 { strip } else { 0.0 } + FIT_SLOP;
     (h, v)
+}
+
+/// The content rectangle for a `content_px`×`zoom` picture in `bounds` — the full bounds
+/// minus the scrollbar strips (right for the vertical bar, bottom for the horizontal one).
+/// Exposed so the annotation canvas can share the EXACT boundary ZoomPan draws + clips to
+/// (its scrollbar strips, content clip, and hit-testing all agree with the scrollbars).
+pub(crate) fn content_bounds(content_px: (f32, f32), zoom: f32, bounds: Rectangle) -> Rectangle {
+    content_bounds_of(content_px, zoom, bounds)
 }
 
 /// The content rectangle for a `content_px`×`zoom` picture in `bounds` — the full bounds
@@ -509,13 +532,38 @@ impl<'a, Msg: Clone + 'a> Widget<Msg, cosmic::Theme, cosmic::Renderer> for ZoomP
             return;
         }
         let transform = self.transform(bounds);
+        let cb = self.content_bounds(bounds);
+        // The visible content rect expressed in the CHILD's OWN (pre-transform) coordinate space.
+        // WHY: the child draws under `transform`, and any nested `with_layer(viewport)` it performs
+        // — notably `iced::widget::stack`, which wraps every layer ABOVE the first — re-multiplies
+        // the passed viewport by the active transform at push time, and iced's `push_clip` does NOT
+        // intersect a nested clip with its parent. So passing the raw window viewport lets those
+        // upper layers (our highlight/pixelate/blur SHADER passes) ESCAPE this content clip and
+        // bleed over the scrollbars, while the base image — drawn as the stack's first layer, with
+        // no extra `with_layer` — clips correctly. Passing `cb` pre-divided by the transform makes
+        // that re-multiplication land back exactly on `cb`, clipping the shader passes too.
+        // Inverse of `q' = zoom*q + (tx,ty)` (see `transform`): `q = (q' - (tx,ty)) / zoom`.
+        let child_vp = if self.zoom.abs() > f32::EPSILON {
+            let cx = bounds.x + bounds.width / 2.0;
+            let cy = bounds.y + bounds.height / 2.0;
+            let tx = cx * (1.0 - self.zoom) + self.pan.0;
+            let ty = cy * (1.0 - self.zoom) + self.pan.1;
+            Rectangle {
+                x: (cb.x - tx) / self.zoom,
+                y: (cb.y - ty) / self.zoom,
+                width: cb.width / self.zoom,
+                height: cb.height / self.zoom,
+            }
+        } else {
+            cb
+        };
         // Clip the content (image + any covermark/shader layers) to everything EXCEPT the
         // scrollbar strips, so nothing draws into the scrollbar area.
-        renderer.with_layer(self.content_bounds(bounds), |r| {
+        renderer.with_layer(cb, |r| {
             r.with_transformation(transform, |r| {
                 self.content
                     .as_widget()
-                    .draw(&tree.children[0], r, theme, style, layout, cursor, viewport);
+                    .draw(&tree.children[0], r, theme, style, layout, cursor, &child_vp);
             });
         });
         // A fresh layer on TOP for the scrollbars themselves.
@@ -578,6 +626,25 @@ mod tests {
         assert_eq!(overflow_of((100.0, 600.0), 1.0, bounds), (false, true));
         let cb = content_bounds_of((100.0, 600.0), 1.0, bounds);
         assert_eq!((cb.width, cb.height), (300.0 - SCROLLBAR_TOTAL, 300.0));
+    }
+
+    #[test]
+    fn marginal_fit_estimate_error_spawns_no_phantom_bars_at_zoom_one() {
+        // Real repro (captured from a live draw session): the app-side fit made `content_px` 5px TALLER than the
+        // widget's actual bounds. Pre-fix that tipped a vertical bar whose reserved strip cascaded
+        // into a horizontal one — both phantom. With FIT_SLOP the picture is treated as fitting.
+        let bounds = r(0.0, 0.0, 2044.0, 1142.8);
+        assert_eq!(overflow_of((2043.5, 1147.8), 1.0, bounds), (false, false));
+        let cb = content_bounds_of((2043.5, 1147.8), 1.0, bounds);
+        assert_eq!((cb.width, cb.height), (2044.0, 1142.8), "no strip reserved");
+    }
+
+    #[test]
+    fn overflow_beyond_the_fit_slop_still_shows_a_bar() {
+        // The slop must not swallow a genuine overflow: exceed the viewport by more than FIT_SLOP
+        // and the bar returns (here a tall picture past the vertical tolerance).
+        let bounds = r(0.0, 0.0, 300.0, 300.0);
+        assert_eq!(overflow_of((100.0, 300.0 + FIT_SLOP + 1.0), 1.0, bounds), (false, true));
     }
 
     #[test]

@@ -7,6 +7,19 @@ use super::*;
 
 
 impl App {
+    /// A fresh [`EditState`] seeded with the PERSISTED annotation defaults (the last-used
+    /// stroke color + tool), so every new preview opens the way the user left the
+    /// annotation controls (DRAGON-321). `None` color → the accent-complement default;
+    /// `None` tool → neutral.
+    pub(super) fn new_edit_state(&self) -> EditState {
+        EditState {
+            annot_color: self.annot_color,
+            tool: self.annot_tool,
+            annot_stroke_w: self.annot_stroke_w,
+            ..EditState::default()
+        }
+    }
+
     /// Open the preview overlay *now* with a loading spinner (no content, no path yet),
     /// for captures whose grab doesn't read the live composited screen (a window grab, a
     /// freeze crop, or a finished recording finalizing off-thread). The user sees the
@@ -46,7 +59,7 @@ impl App {
             source_scale,
             loading_msg: random_loading_msg(),
             kind,
-            edit: EditState::default(),
+            edit: self.new_edit_state(),
             view: Viewport::default(),
         });
         self.engage_preview_duck(with_audio);
@@ -85,6 +98,11 @@ impl App {
         media_hint: Option<(u32, u32)>,
         extra_h: f32,
     ) -> (window::Id, Task<cosmic::Action<Msg>>, (u32, u32), PreviewSurface) {
+        // DRAGON-322: a preview editor is opening — advertise it cross-process (the single
+        // mint choke point every preview-open routes through) so a concurrent capture's
+        // sibling sweep spares this process (self-capture keeps the existing preview open).
+        // Cleared at `finish_session` (a preview close ends the process).
+        crate::instance::set_preview_marker(true);
         // A window pick pre-opens its spinner as the FULLSCREEN overlay even in WINDOWED mode
         // (the only focus-safe cover), then swaps it for the real window at `WindowGrabbed`.
         // Force the overlay branch while that pre-open is pending, regardless of
@@ -115,8 +133,9 @@ impl App {
             // Open sized to the media (aspect-matched, no letterbox), from the caller's hint
             // (a fresh region capture knows its pixel size before the decode) or the already-
             // loaded content (toggling to windowed). Only fall back to ~80% of the monitor
-            // when the size is genuinely unknown (a pre-opened spinner still decoding), since
-            // the compositor won't shrink an over-large window after the fact.
+            // width / 90% of its height when the size is genuinely unknown (a pre-opened
+            // spinner still decoding), since the compositor won't shrink an over-large
+            // window after the fact.
             let media = media_hint
                 // Videos size to their captured footprint (the encode upscales back
                 // into it); stills to their decoded pixels — the same precedence as
@@ -130,17 +149,18 @@ impl App {
             let source_scale = self.preview_source_scale(output.as_ref());
             let media = media.map(|px| sizing::to_points(px, source_scale));
             // Both platforms size through the SAME `windowed_fit_size`, which caps the
-            // window at 80% of the monitor height (rule 3, DRAGON-221) so it clears the
+            // window at 90% of the monitor height (rule 3, DRAGON-221) so it clears the
             // Dock / menu bar / panels neither compositor can measure client-side —
             // macOS won't shrink an over-large window after open, and this keeps the
             // request inside the usable area up front. Only fall back to ~80% of the
-            // monitor when the size is genuinely unknown (a pre-opened spinner still
-            // decoding), since the compositor won't shrink an over-large window later.
+            // monitor width / 90% of its height when the size is genuinely unknown (a
+            // pre-opened spinner still decoding), since the compositor won't shrink an
+            // over-large window later.
             let (w, h) = match media {
                 Some(m) => windowed_fit_size(m, Some(capture_monitor), extra_h),
                 None => (
                     (capture_monitor.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
-                    (capture_monitor.1 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
+                    (capture_monitor.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
                 ),
             };
             // DRAGON-309: remember the intended open size so the macOS native finalize can
@@ -371,7 +391,7 @@ impl App {
             source_scale,
             loading_msg: random_loading_msg(),
             kind,
-            edit: EditState::default(),
+            edit: self.new_edit_state(),
             view: Viewport::default(),
         });
         // Post-capture overlay just opened — pause other media now if this recording has audio.
@@ -424,7 +444,7 @@ impl App {
             source_scale: 1.0,
             loading_msg: random_loading_msg(),
             kind,
-            edit: EditState::default(),
+            edit: self.new_edit_state(),
             view: Viewport::default(),
         });
         // `--preview` is a viewer for an arbitrary file; we can't know if it has sound without
@@ -460,33 +480,55 @@ impl App {
             _ => Task::none(),
         };
         // DRAGON-317 (Linux windowed): the first map of the preview WINDOW. cosmic-comp maps a
-        // fresh xdg_toplevel on the seat's active (pointer) output, NOT the capture-origin
-        // monitor — and an xdg_toplevel cannot self-place, so the ONLY client-side lever is the
-        // toplevel-management `move_to_ext_workspace` request (see
-        // `platform::compositor::move_toplevel_to_output`). Re-home the freshly-mapped preview
-        // window onto the trigger monitor's active workspace, once, off the UI thread.
+        // fresh xdg_toplevel on the seat's ACTIVE (pointer) output (`Shell::map_window` →
+        // `seat.active_output()`, updated on pointer motion) — and an xdg_toplevel cannot
+        // self-place, so the ONLY client-side lever to relocate it is the toplevel-management
+        // `move_to_ext_workspace` request (see `platform::compositor::move_toplevel_to_output`).
         //
-        // The target output is read from the PRE-TEARDOWN-cached `preview_output_name`, NOT from
-        // `self.outputs`: by the time this configure fires `self.outputs` has been EMPTIED —
-        // `destroy_surfaces` (surfaces.rs) clears it while tearing down the capture overlays,
-        // which happens during the grab, before the preview surface is ever minted (see the
-        // `output_rect_for_window` note in capture_flow.rs: "self.outputs is ALSO empty by
-        // then"). An earlier version derived the name from `self.outputs` here and silently did
-        // nothing every time — do NOT reintroduce that dependency. `preview_output_name` is None
-        // for `--preview` and unknown-origin sessions (no re-home, byte-identical to before);
-        // single-monitor is a no-op via the helper's own "already on target output" skip.
+        // The move target is `preview_output_name`, cached PRE-TEARDOWN (`self.outputs` is
+        // EMPTIED by `destroy_surfaces` before this configure fires). Its value is the RELIABLE
+        // capture-origin monitor: the CURSOR's output. The interactive picker learns it from the
+        // capture overlay's first pointer-enter (`capture_pointer_output`); an overlay-less
+        // IMMEDIATE capture (`--active-*`) resolves the SAME field from the momentary
+        // `pointer_output()` probe. So for immediate captures the move now FIRES, targeting the
+        // cursor's monitor — a no-op via the helper's own "already on target output" skip
+        // whenever cosmic-comp already mapped the fresh window on the pointer's output (the
+        // common case). It stays None only for `--preview` (no capture) or a probe/overlay miss,
+        // where we SUPPRESS the move and leave cosmic-comp's native pointer-output placement
+        // untouched. The DRAGON-317 regression was setting this target from the launch
+        // FOCUSED-TOPLEVEL guess: when the focused window sat on a different, empty-of-the-user
+        // monitor, the move dragged the correctly-placed preview there. Do NOT reintroduce a
+        // focused-toplevel/primary fallback for the move target.
         // CAVEAT: the move preserves floating ONLY if the destination workspace isn't
         // auto-tiling (see the helper's doc); an auto-tiling workspace force-tiles the moved
         // window regardless — the DRAGON-222 blocker. The OVERLAY preview is untouched (it
         // already pins its output at layer-surface creation).
         #[cfg(target_os = "linux")]
-        if first_window_configure
-            && let Some(name) = self.preview_output_name.clone()
-        {
-            let title = super::super::shell::PREVIEW_WINDOW_TITLE.to_string();
-            std::thread::spawn(move || {
-                crate::platform::compositor::move_toplevel_to_output(&title, &name);
-            });
+        if first_window_configure {
+            match self.preview_output_name.clone() {
+                // A RELIABLE capture-origin monitor — the cursor's output (overlay pointer-enter
+                // for the picker, or the `pointer_output()` probe for an immediate capture):
+                // re-home the freshly-mapped window there. The helper no-ops when the window
+                // already mapped on that output (the common single-/same-monitor case).
+                Some(name) => {
+                    let title = super::super::shell::PREVIEW_WINDOW_TITLE.to_string();
+                    std::thread::spawn(move || {
+                        crate::platform::compositor::move_toplevel_to_output(&title, &name);
+                    });
+                }
+                // No reliable origin (`--preview`, or the cursor output never resolved):
+                // SUPPRESS the move and leave cosmic-comp's native pointer-output placement
+                // (already where the user is) untouched. Do NOT fall back to the
+                // focused-toplevel/primary output here — that fallback WAS the DRAGON-317
+                // regression (the preview flew onto the focused window's monitor instead of the
+                // one the user was on).
+                None => {
+                    log::debug!(
+                        "preview re-home suppressed: no reliable capture-origin output \
+                         (keeping cosmic-comp's native pointer-output placement)"
+                    );
+                }
+            }
         }
         // The stored zoom is FIT-relative, so a plain resize would change the displayed size
         // while the % readout stayed put. Preserve the native scale across the resize (except
@@ -607,7 +649,12 @@ impl App {
         // toolbars, titlebar, and image-background margins. The fullscreen overlay is a
         // layer-shell surface and is NEVER frosted (DRAGON-166), so glass is None there.
         let glass = if preview.surface.is_window() { self.glass } else { None };
-        let tb = Tb { scale: preview.surface.btn_scale(), glass };
+        // Suppress every toolbar tooltip while a flyout (the color palette or the covermark
+        // picker) is open, so a hovered tooltip never draws split across the flyout (an
+        // overlay layer-batching artifact). Normal tooltips otherwise.
+        let suppress_tooltips =
+            preview.edit.flyout.is_some() || preview.edit.annot_picker.is_some();
+        let tb = Tb { scale: preview.surface.btn_scale(), glass, suppress_tooltips };
         let content: Element<'_, Msg> = if preview.is_loading() {
             self.preview_loading_view(preview, tb)
         } else {
@@ -839,7 +886,7 @@ impl App {
         ])
         .spacing(20.0)
         .align_x(Alignment::Center);
-        let content = widget::column(vec![status.into(), tb.cancel_group()])
+        let content = widget::column(vec![status.into(), tb.cancel_group(&self.keymap)])
             .spacing(20.0)
             .align_x(Alignment::Center);
         // Swallow any press that lands off the cancel affordance so it can't reach a window

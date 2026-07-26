@@ -8,6 +8,11 @@ use crate::selection::GlobalRect;
 pub enum CaptureMsg {
     SetMode(Mode),
     SetKind(Kind),
+    /// DRAGON-322: ~1s poll while a capture overlay is up — re-check whether another
+    /// instance is recording (`crate::instance::any_other_recording`) and refresh
+    /// `external_recording`, so the video kind disables/re-enables live if a recording
+    /// starts or ends elsewhere while this overlay is open.
+    ExternalRecordingTick,
     /// Monitor mode: the cursor is over this output's overlay — set it as the single
     /// hovered output (drives the whole-monitor highlight). Whichever overlay the cursor
     /// is in wins, so it reassigns cleanly across monitors (no cursor-left dependence).
@@ -63,6 +68,13 @@ pub enum CaptureMsg {
     CaptureWindow { id: String, rect: WinRect },
     /// Fires one tick after teardown: grab pixels now that the overlay is gone.
     DoPixelCapture,
+    /// Linux: run a DEFERRED overlay-less immediate capture
+    /// (`--active-window` / `--active-monitor`). Kicked once, a short settle after the FIRST
+    /// output registers, so the REST of the outputs have populated `self.outputs` first —
+    /// the cursor-output probe + the preview then resolve on the monitor the cursor is on.
+    /// Only constructed on Linux (mac/Windows resolve immediately in `seed_outputs_mac`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    RunImmediate,
     /// Region quick-action (default primary+C in region-draw mode): capture the
     /// CURRENT drawn selection, force-copy it to the clipboard (regardless of the
     /// persisted "copy to clipboard" setting), skip the preview, and finish the

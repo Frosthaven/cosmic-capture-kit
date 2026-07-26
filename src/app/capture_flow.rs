@@ -84,6 +84,25 @@ impl App {
         &mut self,
         imm: ImmediateCapture,
     ) -> Option<Task<cosmic::Action<Msg>>> {
+        // Linux: an overlay-less immediate capture mints NO picker overlay, so — unlike the
+        // interactive path — nothing fills `capture_pointer_output` from an overlay's
+        // pointer-enter. Learn the cursor's output DIRECTLY from the momentary transparent
+        // per-output probe (`platform::compositor::pointer_output`, same wl_pointer-enter
+        // signal) and store it in that SAME field, so every shared downstream path (the
+        // active-monitor selection, the preview's trigger display, the windowed 80% cap, the
+        // re-home) follows the cursor exactly as mac/Windows do with their real global cursor
+        // position. Resolved once per session. `None` (probe unavailable / no enter) degrades
+        // to the primary-output / single-window fallbacks below.
+        #[cfg(target_os = "linux")]
+        if self.capture_pointer_output.is_none() {
+            self.capture_pointer_output = crate::platform::compositor::pointer_output();
+            if self.capture_pointer_output.is_none() {
+                log::debug!(
+                    "immediate capture: cursor-output probe did not resolve; monitor/window \
+                     selection falls back to the primary output / single window"
+                );
+            }
+        }
         let sel = match imm {
             ImmediateCapture::ActiveWindow => {
                 // The active window's global rect + stable id feed a window `Selection` (the
@@ -100,15 +119,27 @@ impl App {
                 // the same daemon-handoff preference.
                 #[cfg(windows)]
                 let win = crate::platform::windows::immediate_active_window();
-                // Linux (COSMIC): the cctk toplevel currently carrying the compositor's
-                // Activated state (DRAGON-295). No daemon handoff is needed — a COSMIC custom
-                // shortcut launches the capture app directly — and it is resolved from
-                // `on_output`, before any overlay is minted, so the target still holds Activated.
+                // Linux (COSMIC): normally the cctk toplevel carrying the compositor's
+                // `Activated` state (no daemon handoff needed — a COSMIC custom shortcut
+                // launches the capture app directly). But when NOTHING is `Activated` — the
+                // user's keyboard focus sits on an empty desktop / a different monitor, so no
+                // window holds activation (the confirmed "shows the picker instead of
+                // capturing" cause) — `pick_immediate_window` falls back through the SHARED
+                // cursor-output signal (a window on the cursor's monitor) then the single
+                // existing window, yielding `None` (→ picker) only for a genuinely ambiguous
+                // multi-window idle desktop.
                 #[cfg(target_os = "linux")]
-                let win = crate::platform::compositor::list_toplevels()
-                    .into_values()
-                    .flatten()
-                    .find(|t| t.active);
+                let win = {
+                    let per_output = crate::platform::compositor::list_toplevels();
+                    let flat: Vec<(String, crate::platform::compositor::Toplevel)> = per_output
+                        .iter()
+                        .flat_map(|(out, tops)| {
+                            let out = out.clone();
+                            tops.iter().map(move |t| (out.clone(), t.clone()))
+                        })
+                        .collect();
+                    pick_immediate_window(&flat, self.capture_pointer_output.as_deref())
+                };
                 let win = win?;
                 let (x, y, w, h) = win.rect;
                 Selection {
@@ -121,67 +152,60 @@ impl App {
                 }
             }
             ImmediateCapture::ActiveMonitor => {
-                // The display under the pointer (fall back to the primary at origin when the
-                // pointer maps to none), as a monitor `Selection` keyed by the output name.
-                #[cfg(target_os = "macos")]
-                let (pointer, descs) = (
-                    Some(crate::platform::mac::global_pointer_position()),
-                    crate::screenshot::output_descs(),
-                );
-                // Windows: the cursor position (GetCursorPos, physical coords) + the live
-                // display list, mirroring the mac arm — `monitor_for_pointer` picks the
-                // display the cursor sits on.
-                #[cfg(windows)]
-                let (pointer, descs) = (
-                    crate::platform::windows::cursor_position(),
-                    crate::screenshot::output_descs(),
-                );
-                #[cfg(not(target_os = "linux"))]
-                {
-                    let desc = monitor_for_pointer(pointer, &descs)?;
-                    Selection {
-                        x: desc.logical_pos.0,
-                        y: desc.logical_pos.1,
-                        width: desc.logical_size.0.max(0) as u32,
-                        height: desc.logical_size.1.max(0) as u32,
-                        output: Some(desc.name),
-                        window_id: None,
-                    }
-                }
-                // Linux (COSMIC): Wayland exposes NO global pointer position without a mapped
-                // surface (the only pointer-position path is a per-output ext-image-copy cursor
-                // session — too heavy, and not guaranteed on cosmic-comp, for a one-shot launch),
-                // so the "active monitor" is resolved as the output holding the currently-ACTIVE
-                // toplevel: the same cctk `Activated` flag the ActiveWindow arm above keys on.
-                // The active window's CENTRE is the point fed to `monitor_for_pointer` (which
-                // returns the output containing a point, else the primary) — the monitor the
-                // focused window lives on IS the active monitor. An idle desktop with no active
-                // toplevel yields no centre, so it resolves to the primary output. Result: the
-                // same monitor `Selection` (keyed by output name) the other platforms produce,
-                // so `run_capture` + the preview open drive it identically. `?` on an empty
-                // display list falls the caller back to the picker overlay. DRAGON-317.
-                #[cfg(target_os = "linux")]
-                {
-                    let tops: Vec<(crate::platform::compositor::WinRect, bool)> =
-                        crate::platform::compositor::list_toplevels()
-                            .into_values()
-                            .flatten()
-                            .map(|t| (t.rect, t.active))
-                            .collect();
-                    let descs = crate::screenshot::output_descs();
-                    let desc = monitor_for_pointer(active_toplevel_centre(&tops), &descs)?;
-                    Selection {
-                        x: desc.logical_pos.0,
-                        y: desc.logical_pos.1,
-                        width: desc.logical_size.0.max(0) as u32,
-                        height: desc.logical_size.1.max(0) as u32,
-                        output: Some(desc.name),
-                        window_id: None,
-                    }
+                // The display under the cursor, resolved through ONE shared path on every
+                // platform: [`Self::immediate_cursor_monitor`] wraps the per-platform "where
+                // is the cursor" seam and hands the SAME `OutputDesc` to the SAME `Selection`
+                // construction below. `?` on an empty display list falls the caller back to
+                // the picker overlay.
+                let descs = crate::screenshot::output_descs();
+                let desc = self.immediate_cursor_monitor(&descs)?;
+                Selection {
+                    x: desc.logical_pos.0,
+                    y: desc.logical_pos.1,
+                    width: desc.logical_size.0.max(0) as u32,
+                    height: desc.logical_size.1.max(0) as u32,
+                    output: Some(desc.name),
+                    window_id: None,
                 }
             }
         };
         Some(self.run_capture(sel))
+    }
+
+    /// The [`OutputDesc`](crate::platform::backend::OutputDesc) the CURSOR sits
+    /// on, for the picker-free "Capture Active Monitor" — the ONE shared resolver every
+    /// platform's [`ImmediateCapture::ActiveMonitor`] arm now flows through. The only
+    /// per-platform part is "how do I know where the cursor is":
+    /// - **macOS / Windows** feed a REAL global cursor position into the shared
+    ///   [`monitor_for_pointer`] (byte-identical to the pre-cursor-probe arms).
+    /// - **Linux (COSMIC)** has no global pointer position, so it uses the cursor's OUTPUT
+    ///   learned by the momentary transparent probe (cached in `capture_pointer_output`,
+    ///   resolved at the top of [`Self::immediate_capture`]), matched by name into the live
+    ///   display list; when the probe couldn't resolve it, it defers to the same
+    ///   primary-output fallback `monitor_for_pointer(None, …)` yields. This REPLACES the
+    ///   old focused-window heuristic (the active toplevel's centre) that captured the
+    ///   monitor holding the focused window instead of the one the user's cursor was on.
+    fn immediate_cursor_monitor(
+        &self,
+        descs: &[crate::platform::backend::OutputDesc],
+    ) -> Option<crate::platform::backend::OutputDesc> {
+        #[cfg(target_os = "macos")]
+        {
+            monitor_for_pointer(Some(crate::platform::mac::global_pointer_position()), descs)
+        }
+        #[cfg(windows)]
+        {
+            monitor_for_pointer(crate::platform::windows::cursor_position(), descs)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(name) = self.capture_pointer_output.as_deref()
+                && let Some(d) = descs.iter().find(|d| d.name == name)
+            {
+                return Some(d.clone());
+            }
+            monitor_for_pointer(None, descs)
+        }
     }
 
     pub(super) fn run_capture(&mut self, sel: Selection) -> Task<cosmic::Action<Msg>> {
@@ -369,15 +393,17 @@ impl App {
         // `self.outputs`) tears down, so the fullscreen preview overlay can open there.
         self.preview_output =
             self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
-        // DRAGON-317 (diagnostic): resolve + cache the target output's NAME NOW, before
-        // `destroy_surfaces` (below) clears `self.outputs` — the windowed-preview re-home
-        // can't derive it post-teardown.
+        // DRAGON-317 regression fix: the windowed-preview re-home target is the RELIABLE
+        // capture-origin monitor ONLY — the pointer's output learned from the capture
+        // overlay's first pointer-enter (`capture_pointer_output`), NOT the launch
+        // focused-toplevel guess. When that reliable signal is absent (no overlay was
+        // entered), we leave `preview_output_name` None so NO move fires and cosmic-comp's
+        // native placement (the fresh window maps on the pointer's own output — already where
+        // the user is) stands, instead of dragging the preview onto the focused window's
+        // monitor. Cached NOW, before `destroy_surfaces` (below) clears `self.outputs`.
         #[cfg(target_os = "linux")]
         {
-            let name = self.preview_output.as_ref().and_then(|(out, _)| {
-                self.outputs.iter().find(|o| &o.output == out).map(|o| o.name.clone())
-            });
-            self.preview_output_name = name;
+            self.preview_output_name = self.capture_pointer_output.clone();
         }
         self.preview_output_scale = self.scale_for_selection(&sel);
         // Immediate captures (a window grab, or a freeze crop) don't read the live
@@ -557,8 +583,9 @@ impl App {
     /// pixels down to the LOGICAL points it occupied on screen so the windowed preview opens
     /// at true on-screen size (DRAGON-221). This is the SELECTION's monitor, NOT the trigger
     /// display the preview opens on (DRAGON-309): the media is physical pixels of the display
-    /// it was grabbed from, so only that display's scale undoes its Retina factor. `1.0` on
-    /// 1× outputs (and on Windows).
+    /// it was grabbed from, so only that display's scale undoes its Retina/DPI factor. `1.0`
+    /// on 100%/1× outputs — COSMIC fractional scale, Windows per-monitor DPI (DRAGON-131), and
+    /// mac backing scale each resolve their own display's factor.
     pub(super) fn scale_for_selection(&self, sel: &Selection) -> f32 {
         #[cfg(target_os = "linux")]
         {
@@ -577,7 +604,22 @@ impl App {
                 .filter(|s| *s > 0.0)
                 .unwrap_or(1.0)
         }
-        #[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
+        // Windows (DRAGON-131): read the SELECTION monitor's per-monitor DPI scale
+        // (`GetDpiForMonitor` → `dpi / 96`) by name. Under Per-Monitor-Aware-V2 the capture
+        // is PHYSICAL pixels; dividing by this recovers the logical points the grab occupied,
+        // so the windowed preview opens at true on-screen size on a 150%/200% display, not
+        // dpi× too large. `output_for_selection` resolves the monitor even when `self.outputs`
+        // is empty (the immediate-capture path), matching macOS. `1.0` on 100% monitors, so
+        // every field stays byte-identical there.
+        #[cfg(target_os = "windows")]
+        {
+            self.output_for_selection(sel)
+                .as_ref()
+                .and_then(|(name, _)| crate::platform::windows::scale_for(name))
+                .filter(|s| *s > 0.0)
+                .unwrap_or(1.0)
+        }
+        #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
         {
             let _ = sel;
             1.0
@@ -639,7 +681,20 @@ impl App {
         }
         #[cfg(target_os = "linux")]
         {
-            // The launch-snapshotted focused-toplevel output name, matched into `self.outputs`
+            // DRAGON-317 regression fix: prefer the pointer's output learned from the capture
+            // overlay's FIRST pointer-enter — the monitor the user was actually on when the
+            // picker appeared. This is the RELIABLE origin signal cosmic-comp itself uses to
+            // place windows (it maps our overlay under the cursor, so the wl_pointer enter
+            // names the pointer's output). The launch-snapshotted FOCUSED-toplevel output is a
+            // strictly worse guess — it points at the focused window's monitor even when the
+            // user is working on a different, empty one (the reported regression) — so it is
+            // only the fallback now.
+            if let Some(name) = self.capture_pointer_output.as_deref()
+                && let Some(o) = self.outputs.iter().find(|o| o.name == name)
+            {
+                return Some((o.output.clone(), o.logical_size));
+            }
+            // Fallback: the launch focused-toplevel output name, matched into `self.outputs`
             // (empty at init, populated by commit) for its WlOutput handle + logical size.
             if let Some(name) = self.trigger_display.as_deref()
                 && let Some(o) = self.outputs.iter().find(|o| o.name == name)
@@ -1061,8 +1116,10 @@ impl App {
         let sel = inset_region(sel);
 
         // Committing a capture collapses a multi-instance session: tear down any
-        // other overlays so only this shot proceeds.
-        crate::instance::close_other_instances();
+        // other overlays so only this shot proceeds. DRAGON-322: under allow-multiple a
+        // recording / preview sibling is spared, so a still capture can run alongside a
+        // recording and a self-capture keeps the existing preview open.
+        crate::instance::close_other_instances(self.allow_multiple);
 
         // Destination path (shared by both the screencopy and PipeWire paths).
         let raw_dir = if self.screenshot_dir.trim().is_empty() {
@@ -1896,11 +1953,10 @@ pub(super) fn defocus_activation_target(
 /// are NO displays. Pure (takes the pointer + the display list), so it unit-tests without
 /// any window server.
 ///
-/// DRAGON-317: also used on Linux, where Wayland exposes no global pointer position — the
-/// [`ImmediateCapture::ActiveMonitor`] arm feeds it the ACTIVE toplevel's centre (via
-/// [`active_toplevel_centre`]) instead of a real pointer, so the monitor holding the focused
-/// window resolves as the active monitor. The geometry is identical either way (a point,
-/// else the primary output).
+/// On Linux the "pointer" is resolved from the momentary cursor-output probe
+/// (`capture_pointer_output`) rather than a live coordinate, but the same fallback branch
+/// (`pointer == None` → primary output) is what [`App::immediate_cursor_monitor`] leans on
+/// when the probe can't resolve the cursor's monitor. The geometry is identical either way.
 pub(crate) fn monitor_for_pointer(
     pointer: Option<(i32, i32)>,
     descs: &[crate::platform::backend::OutputDesc],
@@ -1925,25 +1981,56 @@ pub(crate) fn monitor_for_pointer(
         .cloned()
 }
 
-/// DRAGON-317 (Linux): the CENTRE (global logical coords) of the ACTIVE toplevel among
-/// `toplevels` — each given as `(rect, active)` where `rect` is the global-logical
-/// `(x, y, w, h)` [`WinRect`](crate::platform::compositor::WinRect) and `active` is the
-/// cctk `Activated` flag. This is the point the picker-free "Capture Active Monitor"
-/// resolution feeds to [`monitor_for_pointer`], because Wayland exposes no global pointer
-/// position: the monitor holding the focused window IS the active monitor. The centre is
-/// `(x + w / 2, y + h / 2)` (integer truncation). `None` when NOTHING is active (an
-/// empty/idle desktop) — which resolves to the primary output downstream. First active
-/// wins (the compositor marks exactly one toplevel `Activated`, but a window spanning
-/// outputs appears once per output, so any of its copies serves). Pure (rects only), so
-/// it unit-tests without cctk.
+/// Linux: pick the toplevel a picker-free `--active-window` should capture,
+/// from the flattened `(output_name, toplevel)` enumeration plus the cursor's output. The
+/// rule, in priority order:
+///
+/// 1. **Any `Activated` toplevel** — the normal case, the compositor's focused window.
+/// 2. **A window on the CURSOR's output** — when NOTHING is `Activated` (keyboard focus on
+///    an empty desktop / a different monitor, so no window holds the compositor's activation
+///    state, the confirmed cause of the "shows the picker" bug), prefer a window on the
+///    monitor the user's cursor is actually on. cctk exposes NO z-order, so with ≥2 windows
+///    on that monitor we can't know the frontmost; pick the LOWEST `id` as a stable,
+///    heuristic tie-break (deterministic run-to-run rather than HashMap/enumeration order).
+/// 3. **The single existing window** — if exactly ONE distinct window (by id) exists
+///    anywhere, it is unambiguously the one to capture even with no activation and no cursor
+///    match (the user's one-window-on-another-monitor case).
+/// 4. Otherwise `None` — a genuinely ambiguous idle desktop (multiple windows, none active,
+///    none under the cursor) falls the caller back to the window picker.
+///
+/// Pure (plain names + [`Toplevel`](crate::platform::compositor::Toplevel)s), so it
+/// unit-tests without cctk.
 #[cfg(target_os = "linux")]
-pub(crate) fn active_toplevel_centre(
-    toplevels: &[(crate::platform::compositor::WinRect, bool)],
-) -> Option<(i32, i32)> {
-    toplevels
-        .iter()
-        .find(|(_, active)| *active)
-        .map(|((x, y, w, h), _)| (x + w / 2, y + h / 2))
+pub(crate) fn pick_immediate_window(
+    windows: &[(String, crate::platform::compositor::Toplevel)],
+    cursor_output: Option<&str>,
+) -> Option<crate::platform::compositor::Toplevel> {
+    // 1. The Activated window.
+    if let Some((_, t)) = windows.iter().find(|(_, t)| t.active) {
+        return Some(t.clone());
+    }
+    // 2. A window on the cursor's output. z-order is unavailable, so break ties by the
+    //    LOWEST id — a stable choice independent of the HashMap/enumeration order the flat
+    //    list arrives in (never `find`, which would pick an arbitrary run-to-run window).
+    if let Some(name) = cursor_output
+        && let Some((_, t)) = windows
+            .iter()
+            .filter(|(out, _)| out == name)
+            .min_by(|(_, a), (_, b)| a.id.cmp(&b.id))
+    {
+        return Some(t.clone());
+    }
+    // 3. Exactly one distinct window overall (a window spanning outputs appears once per
+    //    output key, so dedupe by id before counting).
+    let mut ids = std::collections::HashSet::new();
+    for (_, t) in windows {
+        ids.insert(t.id.as_str());
+    }
+    if ids.len() == 1 {
+        return windows.first().map(|(_, t)| t.clone());
+    }
+    // 4. Ambiguous — let the caller show the picker.
+    None
 }
 
 /// DRAGON-304: the [`crate::platform::backend::OutputDesc`] a selection sits on, chosen from
@@ -2118,52 +2205,84 @@ mod monitor_for_pointer_tests {
     }
 }
 
-// DRAGON-317: the pure "centre of the active toplevel" resolver the Linux picker-free
-// "Capture Active Monitor" arm feeds to `monitor_for_pointer` (Wayland has no global
-// pointer). Linux-only (the helper is cfg'd to Linux).
+// The pure `--active-window` picker (Activated → cursor's output → single
+// window → picker). Linux-only (the helper is cfg'd to Linux).
 #[cfg(all(test, target_os = "linux"))]
-mod active_toplevel_centre_tests {
-    use super::active_toplevel_centre;
+mod pick_immediate_window_tests {
+    use super::pick_immediate_window;
+    use crate::platform::compositor::Toplevel;
 
-    #[test]
-    fn picks_the_active_toplevels_centre() {
-        // Two toplevels; only the second is active. Its centre (global logical coords)
-        // is returned: x = 1920 + 800/2 = 2320, y = 100 + 600/2 = 400.
-        let tops = [((0, 0, 1000, 800), false), ((1920, 100, 800, 600), true)];
-        assert_eq!(active_toplevel_centre(&tops), Some((2320, 400)));
+    fn win(id: &str, active: bool) -> Toplevel {
+        Toplevel { rect: (0, 0, 100, 100), id: id.to_string(), active, title: id.to_string() }
+    }
+
+    fn on(output: &str, id: &str, active: bool) -> (String, Toplevel) {
+        (output.to_string(), win(id, active))
     }
 
     #[test]
-    fn first_active_wins_when_several_report_active() {
-        // A window spanning outputs appears once per output (both marked active); the
-        // FIRST is taken. Centre of (0,0,400,400) = (200, 200).
-        let tops = [((0, 0, 400, 400), true), ((400, 0, 400, 400), true)];
-        assert_eq!(active_toplevel_centre(&tops), Some((200, 200)));
+    fn prefers_the_activated_window() {
+        // The Activated window wins regardless of the cursor's output.
+        let ws = [on("HDMI-A-2", "a", false), on("DP-3", "b", true)];
+        assert_eq!(pick_immediate_window(&ws, Some("HDMI-A-2")).unwrap().id, "b");
     }
 
     #[test]
-    fn no_active_toplevel_yields_none() {
-        // An idle desktop (nothing Activated) resolves to the primary output downstream.
-        let tops = [((0, 0, 1000, 800), false), ((1000, 0, 1000, 800), false)];
-        assert_eq!(active_toplevel_centre(&tops), None);
-        // And an empty list (no toplevels at all) is likewise None.
-        assert_eq!(active_toplevel_centre(&[]), None);
+    fn falls_back_to_a_window_on_the_cursor_output() {
+        // Nothing Activated; two windows on two monitors. The cursor's monitor decides.
+        let ws = [on("HDMI-A-2", "a", false), on("DP-3", "b", false)];
+        assert_eq!(pick_immediate_window(&ws, Some("DP-3")).unwrap().id, "b");
+        assert_eq!(pick_immediate_window(&ws, Some("HDMI-A-2")).unwrap().id, "a");
     }
 
     #[test]
-    fn centre_uses_integer_truncation() {
-        // Odd dimensions truncate toward zero, matching the inline `x + w / 2` arithmetic:
-        // x = 10 + 15/2 = 10 + 7 = 17, y = 20 + 9/2 = 20 + 4 = 24.
-        let tops = [((10, 20, 15, 9), true)];
-        assert_eq!(active_toplevel_centre(&tops), Some((17, 24)));
+    fn multi_window_on_cursor_output_breaks_ties_by_lowest_id_deterministically() {
+        // Nothing Activated; the cursor's monitor holds THREE windows (z-order unavailable).
+        // The pick is the LOWEST id ("a"), regardless of the order they appear in the flat
+        // list — so it never varies with HashMap/enumeration order run-to-run.
+        let forward = [
+            on("DP-3", "c", false),
+            on("DP-3", "a", false),
+            on("DP-3", "b", false),
+            on("HDMI-A-2", "z", false),
+        ];
+        let reversed = [
+            on("HDMI-A-2", "z", false),
+            on("DP-3", "b", false),
+            on("DP-3", "a", false),
+            on("DP-3", "c", false),
+        ];
+        assert_eq!(pick_immediate_window(&forward, Some("DP-3")).unwrap().id, "a");
+        assert_eq!(pick_immediate_window(&reversed, Some("DP-3")).unwrap().id, "a");
     }
 
     #[test]
-    fn handles_negative_coordinate_outputs() {
-        // A window on a monitor left-of / above the primary sits at negative globals.
-        // Centre of (-1600, -200, 400, 200) = (-1400, -100).
-        let tops = [((-1600, -200, 400, 200), true)];
-        assert_eq!(active_toplevel_centre(&tops), Some((-1400, -100)));
+    fn single_window_captured_even_off_the_cursor_monitor() {
+        // The user's repro: one window on the small monitor, cursor on the empty large one
+        // (nothing Activated, no window on the cursor's output). The lone window is
+        // unambiguous, so it is captured instead of showing the picker.
+        let ws = [on("HDMI-A-2", "only", false)];
+        assert_eq!(pick_immediate_window(&ws, Some("DP-3")).unwrap().id, "only");
+        // Same when the cursor output is unknown (probe failed).
+        assert_eq!(pick_immediate_window(&ws, None).unwrap().id, "only");
+    }
+
+    #[test]
+    fn one_window_spanning_outputs_is_still_single() {
+        // A window spanning two outputs appears once per output key (same id); it dedupes
+        // to one distinct window, so the "single window" rule captures it.
+        let ws = [on("HDMI-A-2", "span", false), on("DP-3", "span", false)];
+        assert_eq!(pick_immediate_window(&ws, None).unwrap().id, "span");
+    }
+
+    #[test]
+    fn ambiguous_multi_window_idle_desktop_yields_none() {
+        // Multiple distinct windows, none Activated, none on the cursor's output → None
+        // (the caller shows the picker). Cursor on a third, empty monitor.
+        let ws = [on("HDMI-A-2", "a", false), on("HDMI-A-2", "b", false)];
+        assert!(pick_immediate_window(&ws, Some("DP-9")).is_none());
+        // No windows at all is also None.
+        assert!(pick_immediate_window(&[], Some("DP-3")).is_none());
     }
 }
 

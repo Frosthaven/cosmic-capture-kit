@@ -156,12 +156,22 @@ impl crate::app::App {
         filters.push(Item::new(
             "Microphone test",
             "",
-            crate::widgets::arrow_cursor::arrow_cursor(widget::button::standard("Test Microphone").on_press(Msg::Settings(SettingsMsg::OpenMicTest))),
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::standard("Test Microphone")
+                    .leading_icon(crate::widgets::icons::handle("audio-input-microphone-symbolic"))
+                    .on_press(Msg::Settings(SettingsMsg::OpenMicTest)),
+            ),
         ));
         secs.push(SectionSpec { title: "Input", items: filters });
 
-        // Mixing: how the captured audio lines up with the video (and other players).
-        // The manual offset only applies (and only shows) when auto-sync is off.
+        secs
+    }
+
+    /// Mixing settings tab (the Audio & Video page's third tab): how the captured audio lines
+    /// up with the video (and other players) — pause-others, system-audio ducking, and A/V
+    /// sync. The manual offset only applies (and only shows) when auto-sync is off.
+    pub(in crate::app::settings) fn mixing_sections(&self) -> Vec<SectionSpec<'_>> {
+        let d = crate::state::defaults();
         let mut mixing = vec![
             Item::new(
                 "Pause other media during preview editor",
@@ -185,7 +195,7 @@ impl crate::app::App {
                 |a0| Msg::Settings(SettingsMsg::SetDuckSystemAudio(a0)),
             ),
             Item::new(
-                "Automatically sync with video",
+                "Automatically sync audio with video",
                 "",
                 toggle(self.audio_sync_auto, |a0| Msg::Recording(RecordingMsg::SetAudioSyncAuto(a0))),
             )
@@ -206,7 +216,6 @@ impl crate::app::App {
                 ),
             );
         }
-        secs.push(SectionSpec { title: "Mixing", items: mixing });
-        secs
+        vec![SectionSpec { title: "Mixing", items: mixing }]
     }
 }

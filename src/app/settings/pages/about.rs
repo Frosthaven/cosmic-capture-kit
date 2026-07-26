@@ -384,6 +384,7 @@ fn badge_class() -> cosmic::theme::Button {
 /// button, opening the PayPal page. No PayPal trademark art.
 fn donate_button() -> Element<'static, Msg> {
     widget::button::suggested("Donate")
+        .leading_icon(crate::widgets::icons::handle("donate-symbolic"))
         .on_press(Msg::WindowChrome(WindowChromeMsg::OpenUrl(DONATE_URL)))
         .into()
 }

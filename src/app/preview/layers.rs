@@ -51,6 +51,12 @@ impl PixelFrame {
             seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
         })
     }
+
+    /// The unique sequence id, so a consumer outside this module (e.g. the `annotation_fx`
+    /// effects shader) can skip a GPU re-upload when the frame hasn't changed.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
 }
 
 impl std::fmt::Debug for PixelFrame {
@@ -73,7 +79,9 @@ pub struct LayerKey(pub u32);
 impl LayerKey {
     /// The playing/scrubbed video frame.
     pub const VIDEO: LayerKey = LayerKey(0);
-    /// The covermark overlay raster.
+    /// The covermark overlay raster. (The region effects — highlight / pixelate / blur — are
+    /// NOT a raster layer: they render in real time through the `annotation_fx` GPU shader,
+    /// DRAGON-330; box/arrow stay vector geometry drawn by the `AnnotationCanvas`.)
     pub const COVERMARK: LayerKey = LayerKey(1);
 }
 

@@ -496,7 +496,7 @@ fn main() -> cosmic::iced::Result {
         // A permission-checker launch takes no capture lock either — it captures
         // nothing. Multiple can't stack usefully, but there's no shared pane lock to
         // contend (unlike settings), so just proceed.
-    } else if !state::load().allow_multiple && !instance::acquire_lock() {
+    } else if !instance::wants_own_instance(state::load().allow_multiple) && !instance::acquire_lock() {
         // Another capture instance already holds the lock — don't open a duplicate
         // overlay. The macOS resident "capture NOW on second launch" UX lives in the
         // daemon now (a bare resident launch early-branches to `daemon::run`, which

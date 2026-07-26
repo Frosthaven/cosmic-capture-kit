@@ -31,6 +31,7 @@ pub struct Toplevel {
 #[cfg(target_os = "linux")]
 pub use crate::platform::linux::cosmic::compositor::{
     activate, activate_title, activate_until, list_toplevels, move_toplevel_to_output,
+    pointer_output,
 };
 
 /// macOS/Windows: no Wayland toplevel-info. The window list + activation move

@@ -478,7 +478,6 @@ pub(crate) fn segment_style(
     round_left: bool,
     round_right: bool,
 ) -> cosmic::widget::button::Style {
-    let c = t.cosmic();
     let r = rounding(t).xl1();
     let rl = if round_left { r } else { 0.0 };
     let rr = if round_right { r } else { 0.0 };
@@ -490,18 +489,23 @@ pub(crate) fn segment_style(
         a
     } else if hovered {
         // A fixed blend toward the foreground, strong enough to separate from
-        // BOTH the group base and the segment's resting divider fill (in light
-        // mode those sit within a few percent of each other, which washed the
-        // hover out entirely).
+        // BOTH the group base and the segment's resting fill.
         state_mix(t, 0.35)
     } else {
-        c.background.component.divider.into()
+        // An OPAQUE resting fill (a low blend toward the foreground) rather than the
+        // theme's translucent `component.divider`: the divider's alpha let the frosted
+        // preview toolbars show through, washing the inactive segment out to near-invisible
+        // (the image editor's pointer/pan toggle on the glass bar especially). An opaque
+        // fill reads clearly on every backing while staying clearly below the accent-filled
+        // active state. Shared by both preview toggles + the capture mode selector, so all
+        // three stay consistent. Bumped 0.12 -> 0.2 so unselected items read stronger against
+        // the glass (still clearly below the accent-filled active state).
+        state_mix(t, 0.2)
     };
-    let icon_color = if active {
-        on_accent(t)
-    } else {
-        c.background.component.base.into()
-    };
+    // Uniform icon color across the whole group: the unselected glyphs match the SELECTED one
+    // (`on_accent`) instead of the subdued component base, so every button-group icon reads the
+    // same color app-wide (user request) — the segment fill alone signals selection.
+    let icon_color = on_accent(t);
     cosmic::widget::button::Style {
         background: Some(cosmic::iced::Background::Color(bg)),
         border_radius: [rl, rr, rr, rl].into(),

@@ -28,7 +28,7 @@
 /// client-side. Applied to the fit bound on BOTH platforms — the single knob that
 /// replaced macOS's old `visibleFrame × 0.95` downscale and Linux's reliance on the
 /// compositor's own 2/3 reshape.
-pub(crate) const USABLE_H_FRAC: f32 = 0.8;
+pub(crate) const USABLE_H_FRAC: f32 = 0.9;
 
 /// Convert PHYSICAL capture pixels to the LOGICAL points the picture occupied on its
 /// SOURCE display: `physical / source_scale`, rounded, never zero. `source_scale <=
@@ -65,7 +65,7 @@ pub(crate) fn spawn_window_size(
     // Largest canvas scale that never upscales past native (rule 2)...
     let mut scale = 1.0_f32;
     if let Some((sw, sh)) = monitor {
-        // ...and fits the usable monitor minus chrome: full width, 80%-of-height
+        // ...and fits the usable monitor minus chrome: full width, 90%-of-height
         // (rule 3). Scaling both axes by this SAME factor preserves the aspect (rule 4).
         let bound_w = (sw as f32 - chrome.0).max(1.0);
         let bound_h = (sh as f32 * usable_h_frac - chrome.1).max(1.0);
@@ -120,15 +120,15 @@ mod tests {
         assert!(h - CHROME.1 <= 480.0 + 0.5 || h == MIN.1);
     }
 
-    /// Rule 3: a full-monitor-tall capture is capped at 80% of the monitor height.
+    /// Rule 3: a full-monitor-tall capture is capped at 90% of the monitor height.
     #[test]
-    fn caps_height_at_80_percent_of_the_monitor() {
+    fn caps_height_at_90_percent_of_the_monitor() {
         for (mon, media) in [((2560u32, 1440u32), (2560u32, 1440u32)), ((3840, 2160), (3840, 2160))] {
             let (_, h) = spawn_window_size(media, Some(mon), CHROME, MIN, USABLE_H_FRAC);
             let cap = mon.1 as f32 * USABLE_H_FRAC;
-            assert!(h <= cap + 0.5, "height {h} exceeded 80% cap {cap} on monitor {mon:?}");
+            assert!(h <= cap + 0.5, "height {h} exceeded 90% cap {cap} on monitor {mon:?}");
             // The canvas fills that budget (minus chrome), not less.
-            assert!(h >= cap - 0.5, "height {h} did not reach the 80% budget {cap}");
+            assert!(h >= cap - 0.5, "height {h} did not reach the 90% budget {cap}");
         }
     }
 

@@ -121,6 +121,8 @@ pub struct Startup {
 
 // Re-exported so the message enum can carry a decoded shader frame across a task.
 pub(crate) use preview::PixelFrame;
+// Re-exported so the message enum can carry an annotation id.
+pub(crate) use preview::AnnotId;
 
 /// Classify a `--preview` file by extension: `Some(true)` = video, `Some(false)` =
 /// image, `None` = unsupported. Used by the CLI to reject non-previewable files.
@@ -1444,6 +1446,24 @@ pub struct App {
     /// output to target across its throwaway Wayland connection. Linux-only.
     #[cfg(target_os = "linux")]
     preview_output_name: Option<String>,
+    /// DRAGON-317 regression fix (Linux): the NAME of the output the CURSOR (hence the user)
+    /// is actually on when the capture is initiated — the RELIABLE "capture-origin monitor"
+    /// signal. Two fill paths, same field: the interactive picker records the output whose
+    /// per-display capture OVERLAY first received the pointer (`CursorEntered`; cosmic-comp
+    /// maps our layer-shell overlay under the cursor, so its `wl_pointer` enter names the
+    /// pointer's output), and an overlay-less IMMEDIATE capture (`--active-*`, which mints no
+    /// overlay) resolves it via the momentary `pointer_output()` probe (the same
+    /// `wl_pointer`-enter signal). It SUPERSEDES the launch-time focused-toplevel guess
+    /// (`trigger_display`), which points at the focused window's monitor even when the user is
+    /// working on a DIFFERENT, empty one (the reported regression: preview flew to the small
+    /// monitor holding the only focused window instead of the large monitor the user was on).
+    /// It drives BOTH the preview's trigger-display resolution (`active_trigger_display`) and —
+    /// as the SOLE source of `preview_output_name` — the windowed-preview re-home target. `None`
+    /// only for `--preview` or when neither path resolved (no overlay entered AND the probe
+    /// missed), which SUPPRESSES the re-home so cosmic-comp's native pointer-output placement
+    /// (already where the user is) stands. First resolution wins. Linux-only.
+    #[cfg(target_os = "linux")]
+    capture_pointer_output: Option<String>,
     /// The point→pixel backing scale of `preview_output` — the capture output's
     /// physical-pixels-per-logical-point (COSMIC integer OR fractional scaling). Cached
     /// with `preview_output` (before the overlay tears `self.outputs` down) so the
@@ -1476,6 +1496,12 @@ pub struct App {
     /// (mac/Windows in `seed_outputs_mac`, Linux in `on_output`). Portable so all three
     /// platforms can drive it; Linux resolves the target via the cctk Activated toplevel.
     startup_immediate: Option<ImmediateCapture>,
+    /// Linux: whether the deferred immediate capture has already been kicked.
+    /// The first output event schedules `CaptureMsg::RunImmediate` a short settle later (so
+    /// the remaining outputs register into `self.outputs` first); this guard stops later
+    /// output events from kicking it again. Linux-only (mac/Windows resolve immediately).
+    #[cfg(target_os = "linux")]
+    immediate_kicked: bool,
     /// Last known settings-window size (logical w, h), persisted so the window
     /// reopens at the size it was closed at (clamped to the monitor).
     settings_size: Option<(u32, u32)>,
@@ -1684,6 +1710,11 @@ pub struct App {
     /// Set when the user cancels a recording: the worker is stopped, then the
     /// finalized file is deleted (no save, no notification).
     recording_cancelled: bool,
+    /// DRAGON-322: whether ANOTHER instance currently has a recording in progress
+    /// (seeded from [`crate::instance::any_other_recording`] at launch, refreshed by
+    /// `sub_external_recording`). While true the video capture kind is disabled — only
+    /// one recording at a time — so a still capture can run alongside a recording.
+    external_recording: bool,
     /// Where screenshots are saved (persisted; `~` expanded).
     screenshot_dir: String,
     /// Copy a capture to the clipboard when it's at or under the size limit
@@ -1852,6 +1883,18 @@ pub struct App {
     /// Per-option remembered (zoom, opacity), keyed by `CovermarkKind::pref_key` — each
     /// covermark option keeps its own last-used scale + opacity (persisted).
     covermark_prefs: HashMap<String, (f32, f32)>,
+    /// Persisted last-selected annotation stroke color (RGBA); `None` = the accent-complement
+    /// default. Seeds `EditState::annot_color` on every preview open (DRAGON-321).
+    annot_color: Option<[u8; 4]>,
+    /// Persisted last-selected annotation tool; `None` = neutral. Seeds `EditState::tool`
+    /// on every preview open (DRAGON-321).
+    annot_tool: Option<crate::widgets::annotation_canvas::Tool>,
+    /// Persisted last-selected annotation stroke width (SOURCE px), 5px default. Seeds
+    /// `EditState::annot_stroke_w` on every preview open and new box/arrow shapes.
+    annot_stroke_w: f32,
+    /// Persisted last-5 CUSTOM annotation colors (most-recent-first), shown as MRU swatches
+    /// in the color flyout (DRAGON-321).
+    annot_recent_colors: Vec<[u8; 4]>,
     /// Per-output frozen snapshots. Grabbed on a DEFERRED thread on BOTH platforms
     /// (DRAGON-148 option C / DRAGON-212) and landed here via `CaptureMsg::FrozenReady` —
     /// empty until then, so every reader handles the not-ready window (see `freezing`).

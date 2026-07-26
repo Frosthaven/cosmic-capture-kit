@@ -441,7 +441,7 @@ impl crate::app::App {
     /// open, portal probe).
     pub(in crate::app) fn update_health_nav_icon(&mut self) {
         let sev = self.health_level();
-        let icon = cosmic::widget::icon::from_name(sev.icon_name())
+        let icon = crate::widgets::icons::handle(sev.icon_name())
             .icon()
             .class(cosmic::theme::Svg::custom(move |theme| {
                 cosmic::widget::svg::Style { color: Some(sev.color(theme)) }

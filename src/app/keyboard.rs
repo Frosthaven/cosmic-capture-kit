@@ -25,6 +25,31 @@ impl App {
             Action::PreviewUndo => Msg::Preview(PreviewMsg::Undo),
             Action::PreviewRedo => Msg::Preview(PreviewMsg::Redo),
             Action::PreviewDeleteSegment => Msg::Preview(PreviewMsg::TimelineDelete),
+            Action::PreviewAnnotArrow => {
+                Msg::Preview(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Arrow))
+            }
+            Action::PreviewAnnotBox => {
+                Msg::Preview(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Rect))
+            }
+            Action::PreviewAnnotHighlight => Msg::Preview(PreviewMsg::SelectTool(
+                crate::widgets::annotation_canvas::Tool::Highlight,
+            )),
+            Action::PreviewAnnotBoxHighlight => Msg::Preview(PreviewMsg::SelectTool(
+                crate::widgets::annotation_canvas::Tool::BoxHighlight,
+            )),
+            Action::PreviewAnnotPixelate => Msg::Preview(PreviewMsg::SelectTool(
+                crate::widgets::annotation_canvas::Tool::Pixelate,
+            )),
+            Action::PreviewAnnotBlur => Msg::Preview(PreviewMsg::SelectTool(
+                crate::widgets::annotation_canvas::Tool::Blur,
+            )),
+            Action::PreviewAnnotSpotlight => Msg::Preview(PreviewMsg::SelectTool(
+                crate::widgets::annotation_canvas::Tool::Spotlight,
+            )),
+            Action::PreviewAnnotDuplicate => Msg::Preview(PreviewMsg::DuplicateSelected),
+            Action::PreviewAnnotStrokeCycle => Msg::Preview(PreviewMsg::CycleAnnotStrokeW),
+            Action::PreviewColorFlyout => Msg::Preview(PreviewMsg::ToggleAnnotPalette),
+            Action::PreviewTogglePan => Msg::Preview(PreviewMsg::TogglePanMode),
             Action::RecordStop => Msg::Recording(RecordingMsg::StopRecording),
             Action::RecordToggleMic => Msg::Recording(RecordingMsg::ToggleMic),
             Action::RecordToggleSystemAudio => Msg::Recording(RecordingMsg::ToggleSystemAudio),
@@ -205,22 +230,44 @@ impl App {
                 _ => Task::none(),
             };
         }
-        // The covermark picker is modal within the preview: arrows move the
-        // selection, Enter applies, Esc closes — before the keymap sees anything.
-        if p.edit.picker.is_some() {
+        // The custom color-wheel picker is modal: Esc closes it — before the shared flyout /
+        // keymap dispatch. Enter is left to the picker's own hex/RGB text input (its submit
+        // commits the typed value); the Apply button applies.
+        if p.edit.annot_picker.is_some()
+            && let Key::Named(Named::Escape) = &key
+        {
+            return self.update(Msg::Preview(PreviewMsg::AnnotColorEditor(false)));
+        }
+        // The SHARED keyboard-navigable flyout dispatch (covermark picker OR color palette):
+        // arrows move the highlight, Enter applies, Esc closes — before the keymap sees it.
+        if p.edit.flyout.is_some() {
             let msg = match &key {
                 Key::Named(Named::ArrowLeft) | Key::Named(Named::ArrowUp) => {
-                    Some(PreviewMsg::PickerNav(-1))
+                    Some(PreviewMsg::FlyoutNav(-1))
                 }
                 Key::Named(Named::ArrowRight) | Key::Named(Named::ArrowDown) => {
-                    Some(PreviewMsg::PickerNav(1))
+                    Some(PreviewMsg::FlyoutNav(1))
                 }
-                Key::Named(Named::Enter) => Some(PreviewMsg::PickerApply),
-                Key::Named(Named::Escape) => Some(PreviewMsg::PickerClose),
+                Key::Named(Named::Enter) => Some(PreviewMsg::FlyoutApply),
+                Key::Named(Named::Escape) => Some(PreviewMsg::FlyoutClose),
                 _ => None,
             };
             if let Some(msg) = msg {
                 return self.update(Msg::Preview(msg));
+            }
+        }
+        // Annotation selection: when a shape is selected, Esc deselects (before falling
+        // through to Close/Cancel) and Delete/Backspace removes it (before the timeline's
+        // Delete). No selection → both fall through to their normal keymap actions.
+        if self.preview.as_ref().is_some_and(|p| p.edit.selected.is_some()) {
+            match &key {
+                Key::Named(Named::Escape) => {
+                    return self.update(Msg::Preview(PreviewMsg::SelectAnnotation(None)));
+                }
+                Key::Named(Named::Delete) | Key::Named(Named::Backspace) => {
+                    return self.update(Msg::Preview(PreviewMsg::DeleteSelected));
+                }
+                _ => {}
             }
         }
         match self.keymap.action_for(Context::Preview, modifiers, &key) {

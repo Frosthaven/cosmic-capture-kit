@@ -183,7 +183,11 @@ impl crate::app::App {
             "Encoders that appear in green can sustain your currently configured frame \
              rate. Encoders that use fewer cores will leave more processing for other \
              programs.",
-            crate::widgets::arrow_cursor::arrow_cursor(widget::button::standard("Run benchmark").on_press(Msg::Settings(SettingsMsg::RunBenchmark))),
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::standard("Run benchmark")
+                    .leading_icon(crate::widgets::icons::handle("speedometer-symbolic"))
+                    .on_press(Msg::Settings(SettingsMsg::RunBenchmark)),
+            ),
         ));
         if let Some(b) = self.bench.as_ref().and_then(|b| b.lock().ok()) {
             if b.finished {

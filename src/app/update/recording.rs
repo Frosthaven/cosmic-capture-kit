@@ -51,6 +51,10 @@ impl App {
                             }
                         }
                         self.recording = None;
+                        // DRAGON-322: the recording ended (this process lives on into the
+                        // video preview) — drop the cross-process marker now so other
+                        // overlays re-enable their video kind promptly.
+                        crate::instance::set_recording_marker(false);
                         self.recording_started = None;
                         self.recording_paused_at = None;
                         self.recording_paused_accum = std::time::Duration::ZERO;

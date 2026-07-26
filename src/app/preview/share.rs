@@ -47,11 +47,13 @@ impl App {
         } else {
             (PreviewKind::Image(ImagePreview::loading()), image::decode_task(path.clone()))
         };
+        // Compute the seeded edit state before borrowing `self.preview` mutably.
+        let edit = self.new_edit_state();
         if let Some(p) = &mut self.preview {
             p.path = Some(path);
             p.size = Some(size);
             p.kind = kind;
-            p.edit = EditState::default();
+            p.edit = edit;
             p.view = Viewport::default();
             // The new file is its own thing — no captured footprint to target.
             p.display_dims = None;
@@ -130,6 +132,10 @@ impl App {
         }
         let src = p.path.clone()?;
         let covermark = p.edit.covermark.clone();
+        // Annotations are IMAGES only (a video preview never accumulates them).
+        let annotations = p.edit.annotations.clone();
+        let annot_curve = p.edit.curve_radius();
+        let dim = p.edit.dim;
         let video = match &p.kind {
             PreviewKind::Image(_) => None,
             // A video bake needs the probed metadata (overlay raster size, audio
@@ -169,7 +175,9 @@ impl App {
         std::thread::spawn(move || {
             let result = crate::share::with_processing_notification(|| match &video {
                 Some(v) => edit::bake_video(&src, &dst, covermark.as_ref(), v),
-                None => edit::bake_image(&src, &dst, covermark.as_ref()),
+                None => {
+                    edit::bake_image(&src, &dst, covermark.as_ref(), &annotations, annot_curve, dim)
+                }
             });
             // Log the real io::Error here — it's about to be discarded to an Option
             // (BakeDone's eventual log::warn! has no error left to report).

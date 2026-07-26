@@ -195,6 +195,285 @@ pub fn list_toplevels() -> HashMap<String, Vec<Toplevel>> {
     result
 }
 
+// ============================================================================
+// Cursor-output probe: the reliable per-output cursor signal for an
+// overlay-less IMMEDIATE capture (`--active-monitor` / `--active-window`).
+//
+// Wayland exposes NO global pointer position without a mapped surface, so — exactly
+// like the interactive picker's `capture_pointer_output` (a real capture overlay's
+// first `wl_pointer` enter) — we momentarily mint ONE transparent, focus-neutral
+// layer surface PER OUTPUT (`Layer::Overlay`, `KeyboardInteractivity::None`), let
+// the compositor route the pointer to whichever surface the cursor sits over, and
+// read that surface's output name off the first `wl_pointer.enter`. The surfaces are
+// fully transparent (invisible — no flicker) and torn down the instant we resolve;
+// keyboard-None means the currently-Activated toplevel is NOT deactivated (so the
+// `--active-window` arm still sees it). Runs on its own throwaway Wayland connection
+// (like `list_toplevels`), so it never touches libcosmic's event loop.
+// ============================================================================
+
+use cosmic_client_toolkit::sctk::compositor::{CompositorHandler, CompositorState};
+use cosmic_client_toolkit::sctk::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use cosmic_client_toolkit::sctk::shell::wlr_layer::{
+    Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
+    LayerSurfaceConfigure,
+};
+use cosmic_client_toolkit::sctk::shell::WaylandSurface;
+use cosmic_client_toolkit::sctk::shm::{slot::SlotPool, Shm, ShmHandler};
+use wayland_client::protocol::{wl_pointer, wl_shm};
+
+/// One momentary transparent probe surface pinned to a specific output.
+struct ProbeSurface {
+    layer: LayerSurface,
+    output_name: String,
+    logical_size: (i32, i32),
+    drawn: bool,
+}
+
+struct PointerProbe {
+    registry_state: RegistryState,
+    output_state: OutputState,
+    seat_state: SeatState,
+    shm: Shm,
+    pool: SlotPool,
+    surfaces: Vec<ProbeSurface>,
+    pointer: Option<wl_pointer::WlPointer>,
+    /// The output name the cursor first entered — the answer.
+    entered: Option<String>,
+}
+
+impl PointerProbe {
+    /// Attach a fully-transparent buffer to `idx`'s surface (once), mapping it so the
+    /// compositor will route the pointer to it. Transparent = invisible = no flicker.
+    fn draw(&mut self, idx: usize) {
+        let (lw, lh) = self.surfaces[idx].logical_size;
+        let (w, h) = (lw.max(1), lh.max(1));
+        let stride = w * 4;
+        let Ok((buffer, canvas)) =
+            self.pool.create_buffer(w, h, stride, wl_shm::Format::Argb8888)
+        else {
+            return;
+        };
+        // Argb8888, all zero => fully transparent.
+        canvas.fill(0);
+        let surface = self.surfaces[idx].layer.wl_surface();
+        surface.damage_buffer(0, 0, w, h);
+        if buffer.attach_to(surface).is_ok() {
+            self.surfaces[idx].layer.commit();
+            self.surfaces[idx].drawn = true;
+        }
+    }
+}
+
+impl ProvidesRegistryState for PointerProbe {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+    sctk::registry_handlers![OutputState, SeatState];
+}
+
+impl OutputHandler for PointerProbe {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlOutput) {}
+}
+
+impl SeatHandler for PointerProbe {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer
+            && self.pointer.is_none()
+            && let Ok(ptr) = self.seat_state.get_pointer(qh, &seat)
+        {
+            self.pointer = Some(ptr);
+        }
+    }
+    fn remove_capability(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat, _: Capability) {}
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: WlSeat) {}
+}
+
+impl CompositorHandler for PointerProbe {
+    fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wayland_client::protocol::wl_surface::WlSurface, _: i32) {}
+    fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wayland_client::protocol::wl_surface::WlSurface, _: wayland_client::protocol::wl_output::Transform) {}
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wayland_client::protocol::wl_surface::WlSurface, _: u32) {}
+    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wayland_client::protocol::wl_surface::WlSurface, _: &WlOutput) {}
+    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wayland_client::protocol::wl_surface::WlSurface, _: &WlOutput) {}
+}
+
+impl LayerShellHandler for PointerProbe {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {}
+    fn configure(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        layer: &LayerSurface,
+        _: LayerSurfaceConfigure,
+        _: u32,
+    ) {
+        if let Some(idx) = self
+            .surfaces
+            .iter()
+            .position(|s| s.layer.wl_surface() == layer.wl_surface())
+            && !self.surfaces[idx].drawn
+        {
+            self.draw(idx);
+        }
+    }
+}
+
+impl PointerHandler for PointerProbe {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            if !matches!(event.kind, PointerEventKind::Enter { .. }) {
+                continue;
+            }
+            if let Some(s) = self.surfaces.iter().find(|s| *s.layer.wl_surface() == event.surface) {
+                self.entered = Some(s.output_name.clone());
+                return;
+            }
+        }
+    }
+}
+
+impl ShmHandler for PointerProbe {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
+sctk::delegate_compositor!(PointerProbe);
+sctk::delegate_output!(PointerProbe);
+sctk::delegate_shm!(PointerProbe);
+sctk::delegate_seat!(PointerProbe);
+sctk::delegate_pointer!(PointerProbe);
+sctk::delegate_layer!(PointerProbe);
+sctk::delegate_registry!(PointerProbe);
+
+/// The NAME of the output the pointer currently sits on, or `None` when it can't be
+/// resolved (layer-shell/shm unavailable, no outputs, or no pointer enter within the
+/// budget — the caller then falls back to the primary output / single window).
+///
+/// WHY a probe at all: an overlay-less immediate capture (`--active-monitor` /
+/// `--active-window`) mints NO picker surface, and Wayland exposes NO global pointer
+/// position without a mapped surface. So we momentarily mint ONE transparent,
+/// focus-neutral (`KeyboardInteractivity::None`) `Layer::Overlay` surface PER OUTPUT,
+/// let the compositor route the pointer to whichever surface the cursor is over, and read
+/// that surface's output off the first `wl_pointer.enter` — the SAME signal the
+/// interactive picker learns as `capture_pointer_output` (its real overlay's first
+/// pointer-enter). Focus-None means the currently-`Activated` toplevel is NOT deactivated,
+/// so the `--active-window` arm still sees it. The surfaces are fully transparent
+/// (invisible) and torn down (dropped) the instant we resolve. Runs on its own throwaway
+/// connection, so it never touches libcosmic's event loop; blocks up to ~350ms.
+pub fn pointer_output() -> Option<String> {
+    let Ok(conn) = Connection::connect_to_env() else {
+        return None;
+    };
+    let Ok((globals, mut queue)) = registry_queue_init::<PointerProbe>(&conn) else {
+        return None;
+    };
+    let qh = queue.handle();
+    let registry_state = RegistryState::new(&globals);
+    let output_state = OutputState::new(&globals, &qh);
+    let seat_state = SeatState::new(&globals, &qh);
+    let (Ok(compositor), Ok(layer_shell), Ok(shm)) = (
+        CompositorState::bind(&globals, &qh),
+        LayerShell::bind(&globals, &qh),
+        Shm::bind(&globals, &qh),
+    ) else {
+        return None;
+    };
+    let Ok(pool) = SlotPool::new(256, &shm) else {
+        return None;
+    };
+    let mut probe = PointerProbe {
+        registry_state,
+        output_state,
+        seat_state,
+        shm,
+        pool,
+        surfaces: Vec::new(),
+        pointer: None,
+        entered: None,
+    };
+    // Settle the output + seat enumeration before minting surfaces.
+    for _ in 0..20 {
+        if queue.roundtrip(&mut probe).is_err() {
+            return None;
+        }
+        if probe.output_state.outputs().next().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // One transparent Overlay-layer surface per named output, pinned to that output.
+    let outputs: Vec<(WlOutput, String, (i32, i32))> = probe
+        .output_state
+        .outputs()
+        .filter_map(|o| {
+            let info = probe.output_state.info(&o)?;
+            let name = info.name.clone()?;
+            let size = info.logical_size?;
+            Some((o, name, size))
+        })
+        .collect();
+    if outputs.is_empty() {
+        return None;
+    }
+    for (output, name, size) in outputs {
+        let surface = compositor.create_surface(&qh);
+        let layer = layer_shell.create_layer_surface(
+            &qh,
+            surface,
+            Layer::Overlay,
+            Some("cck-cursor-probe"),
+            Some(&output),
+        );
+        // Pin to the output's top-left and size it to the whole output so the pointer,
+        // wherever it is on that output, lands on this surface. Focus-neutral.
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+        layer.set_size(size.0.max(1) as u32, size.1.max(1) as u32);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.set_exclusive_zone(-1);
+        layer.commit();
+        probe.surfaces.push(ProbeSurface {
+            layer,
+            output_name: name,
+            logical_size: size,
+            drawn: false,
+        });
+    }
+
+    // Dispatch until the pointer enters one of the probe surfaces (or the budget lapses).
+    for _ in 0..35 {
+        if queue.roundtrip(&mut probe).is_err() {
+            break;
+        }
+        if probe.entered.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    probe.entered
+}
+
 /// Focus/activate the toplevel with this stable `identifier`, returning focus to
 /// the monitor we launched on so the annotation window opens where expected.
 /// No-op if the window or a seat can't be found.

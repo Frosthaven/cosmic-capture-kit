@@ -12,6 +12,7 @@ impl App {
             [
                 self.sub_global_events(),
                 self.sub_countdown(),
+                self.sub_external_recording(),
                 self.sub_toast(),
                 self.sub_pixel_capture(),
                 self.sub_loading_tick(),
@@ -62,7 +63,10 @@ impl App {
             Event::Window(window::Event::Closed) => Some(Msg::WindowChrome(WindowChromeMsg::WindowClosed(id))),
             // macOS: keyboard focus follows the pointer across the per-display capture
             // overlays (guarded to overlay windows, selection phase only, in `update`).
-            #[cfg(target_os = "macos")]
+            // Linux (DRAGON-317 regression fix): the SAME event is how we learn the pointer's
+            // output — the reliable capture-origin monitor — from the overlay the cursor first
+            // enters (cosmic-comp maps our overlay under the cursor, so its enter names it).
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             Event::Mouse(cosmic::iced::mouse::Event::CursorEntered) => {
                 Some(Msg::WindowChrome(WindowChromeMsg::CursorEnteredWindow(id)))
             }
@@ -194,6 +198,27 @@ impl App {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_secs(1))
                     .map(|_| Msg::Capture(CaptureMsg::Tick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// DRAGON-322: while a capture-selection overlay is up (not recording/previewing
+    /// ourselves), poll ~1s whether ANOTHER instance is recording, so the video kind
+    /// disables/re-enables live if a recording starts or ends elsewhere. Cheap (a
+    /// runtime-dir scan); idle the rest of the time (no overlay ⇒ no tick).
+    fn sub_external_recording(&self) -> Option<Subscription<Msg>> {
+        let selecting = self.recording.is_none()
+            && self.preview.is_none()
+            && self.countdown.is_none()
+            && self.capturing.is_none()
+            && !self.settings.only
+            && !self.outputs.is_empty();
+        if selecting {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_secs(1))
+                    .map(|_| Msg::Capture(CaptureMsg::ExternalRecordingTick)),
             )
         } else {
             None

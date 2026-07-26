@@ -72,6 +72,28 @@ pub enum Action {
     PreviewFrameNext,
     /// Preview: delete the selected timeline segment (default Delete).
     PreviewDeleteSegment,
+    /// Preview: the Arrow annotation tool (default A).
+    PreviewAnnotArrow,
+    /// Preview: the Box (rectangle) annotation tool (default B).
+    PreviewAnnotBox,
+    /// Preview: the Highlight (multiply box) annotation tool (default H).
+    PreviewAnnotHighlight,
+    /// Preview: the Box-Highlight (highlight fill + box outline) annotation tool (default G).
+    PreviewAnnotBoxHighlight,
+    /// Preview: the Pixelate (destructive redaction) annotation tool (default M).
+    PreviewAnnotPixelate,
+    /// Preview: the Blur (destructive redaction) annotation tool (default U, for "blUr").
+    PreviewAnnotBlur,
+    /// Preview: the Spotlight (dim knockout) annotation tool (default S) — DRAGON-329.
+    PreviewAnnotSpotlight,
+    /// Preview: duplicate the selected annotation, offset toward the frame center (default D).
+    PreviewAnnotDuplicate,
+    /// Preview: cycle the annotation stroke width to the next preset, wrapping (default L).
+    PreviewAnnotStrokeCycle,
+    /// Preview: open the annotation color flyout (default C).
+    PreviewColorFlyout,
+    /// Preview: toggle between selection/interact and PAN (hand) mode (default V).
+    PreviewTogglePan,
     /// Recording: stop + save the in-progress recording (default Enter).
     RecordStop,
     /// Recording: toggle the microphone channel (default M).
@@ -83,9 +105,10 @@ pub enum Action {
 impl Action {
     /// Every action, in display + match order. Preview actions are grouped so the
     /// settings page's contiguous-group builder yields "Action Shortcuts" (save /
-    /// copy / close / delete / covermark / undo / redo) then "Video Editor
-    /// Shortcuts" (play / frame step / delete segment).
-    pub const ALL: [Action; 19] = [
+    /// copy / close / delete / covermark / undo / redo), then "Image Editor
+    /// Shortcuts" (annotation tools / color / pan), then "Video Editor Shortcuts"
+    /// (play / frame step / delete segment) — image above video.
+    pub const ALL: [Action; 30] = [
         Action::SelectAllText,
         Action::DeselectText,
         Action::CopyText,
@@ -98,6 +121,17 @@ impl Action {
         Action::PreviewCovermark,
         Action::PreviewUndo,
         Action::PreviewRedo,
+        Action::PreviewAnnotArrow,
+        Action::PreviewAnnotBox,
+        Action::PreviewAnnotHighlight,
+        Action::PreviewAnnotBoxHighlight,
+        Action::PreviewAnnotPixelate,
+        Action::PreviewAnnotBlur,
+        Action::PreviewAnnotSpotlight,
+        Action::PreviewAnnotDuplicate,
+        Action::PreviewAnnotStrokeCycle,
+        Action::PreviewColorFlyout,
+        Action::PreviewTogglePan,
         Action::PreviewPlay,
         Action::PreviewFramePrev,
         Action::PreviewFrameNext,
@@ -126,6 +160,17 @@ impl Action {
             Action::PreviewUndo => "Undo",
             Action::PreviewRedo => "Redo",
             Action::PreviewDeleteSegment => "Delete segment",
+            Action::PreviewAnnotArrow => "Arrow tool",
+            Action::PreviewAnnotBox => "Box tool",
+            Action::PreviewAnnotHighlight => "Highlight tool",
+            Action::PreviewAnnotBoxHighlight => "Box Highlight tool",
+            Action::PreviewAnnotPixelate => "Pixelate tool",
+            Action::PreviewAnnotBlur => "Blur tool",
+            Action::PreviewAnnotSpotlight => "Spotlight tool",
+            Action::PreviewAnnotDuplicate => "Duplicate annotation",
+            Action::PreviewAnnotStrokeCycle => "Cycle line width",
+            Action::PreviewColorFlyout => "Color",
+            Action::PreviewTogglePan => "Toggle pan mode",
             Action::RecordStop => "Stop and save recording",
             Action::RecordToggleMic => "Toggle Microphone",
             Action::RecordToggleSystemAudio => "Toggle system audio",
@@ -155,6 +200,17 @@ impl Action {
             Action::PreviewFramePrev => "Step to the previous frame.",
             Action::PreviewFrameNext => "Step to the next frame.",
             Action::PreviewDeleteSegment => "Delete the selected timeline segment.",
+            Action::PreviewAnnotArrow => "Draw an arrow.",
+            Action::PreviewAnnotBox => "Draw a rectangle.",
+            Action::PreviewAnnotHighlight => "Draw a multiply-blended highlight box.",
+            Action::PreviewAnnotBoxHighlight => "Draw a highlight box with an outline.",
+            Action::PreviewAnnotPixelate => "Pixelate a region (destructive redaction).",
+            Action::PreviewAnnotBlur => "Blur a region (destructive redaction).",
+            Action::PreviewAnnotSpotlight => "Draw a spotlight that dims everything outside it.",
+            Action::PreviewAnnotDuplicate => "Duplicate the selected annotation.",
+            Action::PreviewAnnotStrokeCycle => "Cycle the line width.",
+            Action::PreviewColorFlyout => "Open the annotation color picker.",
+            Action::PreviewTogglePan => "Toggle between selection and pan (hand) mode.",
             Action::RecordStop => "",
             Action::RecordToggleMic => "",
             Action::RecordToggleSystemAudio => "",
@@ -181,6 +237,17 @@ impl Action {
             | Action::PreviewFramePrev
             | Action::PreviewFrameNext
             | Action::PreviewDeleteSegment => "Video Editor Shortcuts",
+            Action::PreviewAnnotArrow
+            | Action::PreviewAnnotBox
+            | Action::PreviewAnnotHighlight
+            | Action::PreviewAnnotBoxHighlight
+            | Action::PreviewAnnotPixelate
+            | Action::PreviewAnnotBlur
+            | Action::PreviewAnnotSpotlight
+            | Action::PreviewAnnotStrokeCycle
+            | Action::PreviewAnnotDuplicate
+            | Action::PreviewColorFlyout
+            | Action::PreviewTogglePan => "Image Editor Shortcuts",
             Action::RecordStop
             | Action::RecordToggleMic
             | Action::RecordToggleSystemAudio => "Recording",
@@ -205,7 +272,18 @@ impl Action {
             | Action::PreviewCovermark
             | Action::PreviewUndo
             | Action::PreviewRedo
-            | Action::PreviewDeleteSegment => Context::Preview,
+            | Action::PreviewDeleteSegment
+            | Action::PreviewAnnotArrow
+            | Action::PreviewAnnotBox
+            | Action::PreviewAnnotHighlight
+            | Action::PreviewAnnotBoxHighlight
+            | Action::PreviewAnnotPixelate
+            | Action::PreviewAnnotBlur
+            | Action::PreviewAnnotSpotlight
+            | Action::PreviewAnnotStrokeCycle
+            | Action::PreviewAnnotDuplicate
+            | Action::PreviewColorFlyout
+            | Action::PreviewTogglePan => Context::Preview,
             Action::RecordStop
             | Action::RecordToggleMic
             | Action::RecordToggleSystemAudio => Context::Recording,
@@ -231,6 +309,17 @@ impl Action {
             Action::PreviewUndo => Shortcut::primary_char('z'),
             Action::PreviewRedo => Shortcut::primary_shift_char('z'),
             Action::PreviewDeleteSegment => Shortcut::named(NamedKey::Delete),
+            Action::PreviewAnnotArrow => Shortcut::char('a'),
+            Action::PreviewAnnotBox => Shortcut::char('b'),
+            Action::PreviewAnnotHighlight => Shortcut::char('h'),
+            Action::PreviewAnnotBoxHighlight => Shortcut::char('g'),
+            Action::PreviewAnnotPixelate => Shortcut::char('m'),
+            Action::PreviewAnnotBlur => Shortcut::char('u'),
+            Action::PreviewAnnotSpotlight => Shortcut::char('s'),
+            Action::PreviewAnnotDuplicate => Shortcut::char('d'),
+            Action::PreviewAnnotStrokeCycle => Shortcut::char('l'),
+            Action::PreviewColorFlyout => Shortcut::char('c'),
+            Action::PreviewTogglePan => Shortcut::char('v'),
             Action::RecordStop => Shortcut::named(NamedKey::Enter),
             Action::RecordToggleMic => Shortcut::char('m'),
             Action::RecordToggleSystemAudio => Shortcut::char('s'),

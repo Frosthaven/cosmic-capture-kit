@@ -32,10 +32,12 @@ impl Default for Viewport {
 }
 
 impl Viewport {
-    /// The zoom range, as a multiple of the FIT size. The floor is fit (1.0) — no zooming
-    /// out below the whole-picture fit. The ceiling is a hard cap; the effective max is the
-    /// 200%-visual limit (see `App::max_view_zoom`), which is what actually bounds zoom.
-    pub(super) const MIN: f32 = 1.0;
+    /// The zoom range, as a multiple of the FIT size. The floor is HALF the fit (0.5) — the
+    /// user can zoom OUT to half the whole-picture-fit size (DRAGON: preview-editor polish).
+    /// Below fit the picture is smaller than the viewport, so it just recentres (no pan). The
+    /// ceiling is a hard cap; the effective max is the 200%-visual limit (see
+    /// `App::max_view_zoom`), which is what actually bounds zoom-IN.
+    pub(super) const MIN: f32 = 0.5;
     pub(super) const MAX: f32 = 64.0;
     /// The "fit" multiplier (whole picture visible) — the recentre point.
     pub(super) const FIT: f32 = 1.0;
@@ -57,7 +59,7 @@ impl Viewport {
 /// (physical 1:1 would read `200%`); on Linux / 1× panels a visual fraction equals a native
 /// fraction, so these are byte-identical to the pre-visual-units behaviour.
 pub(super) const ZOOM_PRESET_LABELS: [&str; 5] =
-    ["Fit to screen", "100%", "125%", "150%", "200%"];
+    ["Fit", "100%", "125%", "150%", "200%"];
 
 /// The presets as VISUAL fractions (`1.0` = natural on-screen size). Converted to the
 /// viewport's fit-relative multiplier via `visual_scale` (see [`App::preview_visual_scale`]).
@@ -89,6 +91,17 @@ pub(super) fn preset_zoom(visual_frac: Option<f32>, visual_scale: f32) -> f32 {
 /// 100% is the picture's true on-screen size regardless of capture DPI.
 pub(super) fn displayed_percent(zoom: f32, visual_scale: f32) -> i32 {
     (zoom * visual_scale * 100.0).round() as i32
+}
+
+/// Snap a slider/scroll zoom to EXACTLY 100% on-screen (natural size) when it lands within a
+/// couple display-percent of it — a magnetic detent so the user can hit 100% precisely.
+/// Returns the input unchanged when it isn't near 100%.
+pub(super) fn snap_to_hundred(zoom: f32, visual_scale: f32) -> f32 {
+    if (zoom * visual_scale * 100.0 - 100.0).abs() <= 2.5 {
+        preset_zoom(Some(1.0), visual_scale) // the zoom whose displayed% == 100
+    } else {
+        zoom
+    }
 }
 
 impl App {
@@ -149,9 +162,16 @@ impl App {
         // what is genuinely left.
         let transport = preview_transport_h(preview);
         if preview.surface.is_window() {
+            // The window canvas is `Length::Fill` (the REAL space left by the native header +
+            // toolbars), but we fit the image using this estimated height. If `chrome_h()`'s
+            // header estimate (`header_px()`) under-counts libcosmic's real header by a few px,
+            // the fit lands a hair too tall and the image's top/bottom rows clip. A small guard
+            // keeps the fit just inside the real canvas (imperceptible, and only the windowed
+            // path — the overlay's Fixed-height column is exact and stays untouched).
+            const WINDOW_FIT_GUARD: f32 = 8.0;
             return (
                 (preview.monitor.0 as f32).max(1.0),
-                (self.preview_content_height(preview) - transport).max(1.0),
+                (self.preview_content_height(preview) - transport - WINDOW_FIT_GUARD).max(1.0),
             );
         }
         let avail = (
@@ -201,28 +221,40 @@ impl App {
         (2.0 / self.preview_visual_scale(preview)).max(Viewport::FIT)
     }
 
+    /// The zoom FLOOR: the multiplier whose DISPLAYED percent is 50% (`0.5 / visual_scale`),
+    /// capped at fit so a picture whose fit already reads below 50% can still be shown whole.
+    /// Zooming OUT bottoms out at 50% on-screen regardless of how far the fit downscaled the
+    /// capture — a large grab fits at e.g. 78%, and half of THAT would read 39%, not 50%.
+    pub(super) fn min_view_zoom(&self, preview: &PreviewState) -> f32 {
+        (0.5 / self.preview_visual_scale(preview)).min(Viewport::FIT)
+    }
+
     /// The bottom-center zoom scale: a slider (fit → max) plus a preset dropdown
     /// (Fit / 1:1 / % levels). Shown for images (which pan/zoom via [`ZoomPan`]).
     pub(super) fn zoom_control(&self, preview: &PreviewState, tb: Tb) -> Element<'static, Msg> {
-        const COMBO_W: f32 = 150.0;
+        // Slashed from the former 150px (which was sized for the long "Fit to screen"): the
+        // preset labels are now short ("Fit", "100%"…"200%"), so most of that was dead space.
+        // The floor is set by the widest label ("200%") plus the dropdown chevron.
+        const COMBO_W: f32 = 72.0;
         let z = preview.view.zoom;
         let visual = self.preview_visual_scale(preview);
         let max_zoom = self.max_view_zoom(preview);
-        let slider = widget::slider(Viewport::MIN..=max_zoom, z.min(max_zoom), |v| {
-            Msg::Preview(PreviewMsg::SetViewZoom(v))
+        // The slider runs in DISPLAY percent (not the raw zoom multiplier) so the 100% mark is a
+        // CONSTANT breakpoint — `.breakpoints` draws a notch there AND gravitates the thumb to
+        // exactly 100% when dragged near it (the detent cosmic-settings uses). The callback maps
+        // percent back to the fit-relative zoom.
+        let min_pct = displayed_percent(self.min_view_zoom(preview), visual) as f32;
+        let max_pct = displayed_percent(max_zoom, visual) as f32;
+        let cur_pct = (displayed_percent(z, visual) as f32).clamp(min_pct, max_pct);
+        let vscale = visual;
+        let slider = widget::slider(min_pct..=max_pct, cur_pct, move |pct| {
+            Msg::Preview(PreviewMsg::SetViewZoom(pct / (vscale * 100.0)))
         })
-        .step(0.01f32)
+        .step(1.0f32)
+        .breakpoints(&[100.0])
         .width(Length::Fixed(120.0));
-        // Live zoom readout to the LEFT of the slider — the displayed VISUAL fraction
-        // (zoom × visual_scale): 100% is the picture's true on-screen size, matching what
-        // the user saw when capturing (a 2× Retina grab reads 100% at natural size, not
-        // 50%). Fixed-width monospace so the slider doesn't shift as digits change.
-        let pct = displayed_percent(z, visual);
-        let percent = widget::text(format!("{pct}%"))
-            .size(14)
-            .font(cosmic::font::mono())
-            .width(Length::Fixed(46.0))
-            .align_x(cosmic::iced::alignment::Horizontal::Right);
+        // (The live percent readout that used to sit LEFT of the slider was removed — the combo
+        // to the right already shows the current zoom as a preset label or "N%".)
         // A fixed-width combo: the button shows the CURRENT zoom (a preset label, or the live
         // "N%" for an in-between slider/scroll zoom) so it never blanks; clicking opens the
         // preset menu. Fixed width so it never resizes as the label changes.
@@ -239,13 +271,15 @@ impl App {
             widget::container(
                 widget::row(vec![
                     widget::text(label).size(14).width(Length::Fill).into(),
-                    widget::icon::from_name("pan-down-symbolic").size(16).into(),
+                    crate::widgets::icons::handle("pan-down-symbolic").icon().size(14).into(),
                 ])
                 .align_y(Alignment::Center),
             )
             .width(Length::Fixed(COMBO_W))
             .height(Length::Fixed(tb.icon_box() + 2.0 * tb.btn_pad()))
-            .padding([0.0, tb.btn_pad()])
+            // Tighter than a button's `btn_pad`: the narrowed combo needs the room for its
+            // label + chevron.
+            .padding([0.0, tb.btn_pad() * 0.5])
             .align_y(Alignment::Center)
             .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
                 let c = theme.cosmic();
@@ -311,7 +345,7 @@ impl App {
         } else {
             button.into()
         };
-        widget::row(vec![percent.into(), slider.into(), combo])
+        widget::row(vec![slider.into(), combo])
             .spacing(8.0)
             .align_y(Alignment::Center)
             .into()
@@ -332,9 +366,31 @@ mod tests {
     #[test]
     fn set_zoom_clamps_to_the_floor_and_drops_pan() {
         let mut v = Viewport { pan: (10.0, 10.0), ..Viewport::default() };
+        // The floor is now HALF the fit (0.5) — a zoom-out request past it clamps to 0.5,
+        // and being at/below fit recentres (drops any pan).
         v.set_zoom(0.1);
-        assert_eq!(v.zoom, 1.0);
+        assert_eq!(v.zoom, 0.5);
         assert_eq!(v.pan, (0.0, 0.0));
+    }
+
+    /// Zooming OUT to exactly 50% is reachable, and anything below it clamps up to 0.5.
+    /// Below fit the picture is smaller than the viewport, so the pan recentres.
+    #[test]
+    fn set_zoom_allows_fifty_percent_and_recentres_below_fit() {
+        let mut v = Viewport { pan: (7.0, 9.0), ..Viewport::default() };
+        v.set_zoom(0.5);
+        assert_eq!(v.zoom, 0.5, "50% (half the fit) is reachable");
+        assert_eq!(v.pan, (0.0, 0.0), "below fit recentres");
+        // A 0.75 zoom is between the new floor and fit — kept as-is, pan still recentred.
+        let mut v2 = Viewport { pan: (7.0, 9.0), ..Viewport::default() };
+        v2.set_zoom(0.75);
+        assert_eq!(v2.zoom, 0.75);
+        assert_eq!(v2.pan, (0.0, 0.0));
+        // Below the floor clamps up to 0.5.
+        let mut v3 = Viewport::default();
+        v3.set_zoom(0.2);
+        assert_eq!(v3.zoom, Viewport::MIN);
+        assert_eq!(Viewport::MIN, 0.5);
     }
 
     #[test]
@@ -381,6 +437,19 @@ mod tests {
         assert_eq!(displayed_percent(1.0, visual_scale(1.0, 1.0)), 100);
         // 1× capture shrunk to fit at 0.5 → 50 (old behaviour, unchanged at scale 1).
         assert_eq!(displayed_percent(1.0, visual_scale(0.5, 1.0)), 50);
+    }
+
+    #[test]
+    fn snap_to_hundred_is_magnetic_only_near_100() {
+        // A large grab fitted at 78% on-screen (visual_scale 0.78).
+        let vs = visual_scale(0.78, 1.0);
+        let z100 = preset_zoom(Some(1.0), vs); // the zoom whose displayed% == 100
+        // Within a couple percent of 100 snaps to exactly 100.
+        assert_eq!(displayed_percent(snap_to_hundred(z100 * 1.02, vs), vs), 100);
+        assert_eq!(displayed_percent(snap_to_hundred(z100 * 0.98, vs), vs), 100);
+        // Far from 100 (a 50%-ish zoom) is left untouched.
+        let far = 0.5 / vs;
+        assert!((snap_to_hundred(far, vs) - far).abs() < 1e-6);
     }
 
     /// The reset / "100%" preset targets natural on-screen size: `preset_zoom(Some(1.0), s)

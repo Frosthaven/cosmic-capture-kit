@@ -250,6 +250,11 @@ impl cosmic::Application for App {
         let mut keymap = crate::shortcuts::Keymap::defaults();
         keymap.apply_overrides(&persisted.shortcuts);
         let ffmpeg_available = crate::encode::ffmpeg_available();
+        // DRAGON-322: is another instance already recording? A cheap runtime-dir scan at
+        // launch; drives the video-kind disable + the initial kind coercion below. A
+        // settings/preview launch never shows the capture kind toggle, so the value is
+        // simply unused there.
+        let external_recording = crate::instance::any_other_recording();
         // Benchmark monitor dropdown (DRAGON-163): enumerate connected monitors + their
         // TRUE capture footprint once, only for the settings window (the sole place the
         // benchmark lives; a capture launch never needs this and must not pay the probe).
@@ -273,8 +278,19 @@ impl cosmic::Application for App {
                 outputs: Vec::new(),
                 // CLI overrides (`--region`/`--window`/`--monitor`, `--image`/
                 // `--video`/`--scan`, `--countdown`) fall back to the defaults. A
-                // Scanner kind forces Region mode (its capture invariant).
-                kind: startup.kind.unwrap_or(Kind::Image),
+                // Scanner kind forces Region mode (its capture invariant). DRAGON-322:
+                // a video kind is coerced to image when another instance is already
+                // recording (only one recording at a time), so a `--video` launch (or the
+                // persisted default) can't start a second recording alongside one.
+                kind: {
+                    let k = startup.kind.unwrap_or(Kind::Image);
+                    if k == Kind::Video && external_recording {
+                        Kind::Image
+                    } else {
+                        k
+                    }
+                },
+                external_recording,
                 mode: launch_mode,
                 // A CLI `--countdown` seconds value overrides the delay exactly (see
                 // countdown_override); delay_idx still points at the nearest preset so
@@ -345,11 +361,15 @@ impl cosmic::Application for App {
                 preview_output: None,
                 #[cfg(target_os = "linux")]
                 preview_output_name: None,
+                #[cfg(target_os = "linux")]
+                capture_pointer_output: None,
                 preview_output_scale: 1.0,
                 preview_open_size: None,
                 startup_preview,
                 preview_mode,
                 startup_immediate: startup.immediate,
+                #[cfg(target_os = "linux")]
+                immediate_kicked: false,
                 settings_size: persisted.settings_size,
                 ffmpeg_available,
                 ffprobe_available: crate::encode::ffprobe_available(),
@@ -447,6 +467,13 @@ impl cosmic::Application for App {
                     .into_iter()
                     .map(|p| (p.key, (p.zoom, p.opacity)))
                     .collect(),
+                annot_color: persisted.annot_color,
+                annot_tool: persisted
+                    .annot_tool
+                    .as_deref()
+                    .and_then(crate::widgets::annotation_canvas::Tool::from_str),
+                annot_stroke_w: persisted.annot_stroke_w,
+                annot_recent_colors: persisted.annot_recent_colors,
                 mic_level: 0.0,
                 sys_level: 0.0,
                 sens_level: 0.0,

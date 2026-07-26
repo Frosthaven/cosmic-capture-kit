@@ -116,6 +116,22 @@ pub struct Persisted {
     /// Options not listed here fall back to `covermark_zoom` / `covermark_opacity`.
     #[serde(default)]
     pub covermark_prefs: Vec<CovermarkPref>,
+    /// The last-selected annotation stroke color (RGBA), so a fresh preview opens with it.
+    /// `None` = fall back to the accent complement (the default). DRAGON-321.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annot_color: Option<[u8; 4]>,
+    /// The last-selected annotation tool ("arrow" | "box"). `None` / unknown = neutral
+    /// (no draw tool). DRAGON-321.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annot_tool: Option<String>,
+    /// The last-selected annotation stroke width (SOURCE px), so a fresh preview opens with
+    /// it and new box/arrow shapes seed from it. Defaults to `DEFAULT_ANNOT_STROKE` (5px).
+    #[serde(default = "default_annot_stroke_w")]
+    pub annot_stroke_w: f32,
+    /// The last 5 CUSTOM annotation colors chosen (most-recent-first, RGBA), shown as MRU
+    /// swatches in the color flyout. DRAGON-321.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annot_recent_colors: Vec<[u8; 4]>,
     /// Preview editor appearance: `true` = a resizable window (default), `false` = the
     /// fullscreen overlay. Chosen under Settings → General → Capture Preview. Existing
     /// users keep whatever they saved; only a fresh install picks up the windowed default.
@@ -270,7 +286,7 @@ pub struct Persisted {
     #[serde(default = "default_true")]
     pub scan_text: bool,
     /// Minimum OCR word confidence (0–100) to keep; word-like tokens are rescued down
-    /// to ~0.4× this. Default 25.
+    /// to ~0.4× this. Default 20.
     #[serde(default = "default_text_confidence")]
     pub text_confidence: f32,
     /// Directory recordings are saved to (`~` is expanded). Default
@@ -470,6 +486,10 @@ fn default_covermark_opacity() -> f32 {
     0.195
 }
 
+fn default_annot_stroke_w() -> f32 {
+    5.0
+}
+
 fn default_region_opacity() -> f32 {
     0.66
 }
@@ -540,7 +560,7 @@ fn default_audio_sync_offset() -> i32 {
 }
 
 fn default_text_confidence() -> f32 {
-    25.0
+    20.0
 }
 
 fn default_preferred_encoder() -> String {

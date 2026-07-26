@@ -3,48 +3,9 @@ pub(super) mod layout;
 use super::super::*;
 use layout::V_W;
 
-/// Resolve an icon NAME to a handle, intercepting the names libcosmic's embedded
-/// `cosmic-icons` subset does NOT provide (so `from_name` would render blank on a
-/// platform without a system icon theme — macOS) and serving those from SVGs
-/// vendored into this repo. Every other name falls through to libcosmic's embedded
-/// lookup, byte-identically to a bare `from_name(name).handle()`.
-///
-/// - The COSMIC screenshot mode icons (region/window/monitor) ship with
-///   xdg-desktop-portal-cosmic on COSMIC systems, not with `cosmic-icons`, so
-///   `from_name` finds them on COSMIC (system theme) but not on macOS. Vendored from
-///   pop-os/xdg-desktop-portal-cosmic (`data/icons/scalable/actions/`).
-/// - `object-move-symbolic` (the preview pan/grab tool) is filled by the system theme
-///   on Linux but is absent from BOTH `cosmic-icons` and current upstream Adwaita, so
-///   a project-owned symbolic glyph is bundled (see `res/icons/ATTRIBUTION.md`).
-///
-/// Shared (`pub(crate)`) so the preview chrome routes its vendored-name buttons
-/// through the same seam instead of each carrying its own `include_bytes!`.
-pub(crate) fn vendored_icon_handle(name: &str) -> cosmic::widget::icon::Handle {
-    use cosmic::widget::icon;
-    // `.symbolic(true)` is required: it marks the handle as a symbolic icon so cosmic
-    // applies the widget's tint color (the `mode_icon` active/inactive class). Without
-    // it the `currentColor` SVG renders with no tint — effectively invisible.
-    match name {
-        "screenshot-selection-symbolic" => icon::from_svg_bytes(
-            include_bytes!("../../../../res/icons/cosmic/screenshot-selection-symbolic.svg")
-                .as_slice(),
-        )
-        .symbolic(true),
-        "screenshot-window-symbolic" => icon::from_svg_bytes(
-            include_bytes!("../../../../res/icons/cosmic/screenshot-window-symbolic.svg").as_slice(),
-        )
-        .symbolic(true),
-        "screenshot-screen-symbolic" => icon::from_svg_bytes(
-            include_bytes!("../../../../res/icons/cosmic/screenshot-screen-symbolic.svg").as_slice(),
-        )
-        .symbolic(true),
-        "object-move-symbolic" => icon::from_svg_bytes(
-            include_bytes!("../../../../res/icons/local/object-move-symbolic.svg").as_slice(),
-        )
-        .symbolic(true),
-        _ => icon::from_name(name).handle(),
-    }
-}
+// Icon resolution now lives in the shared Lucide resolver `crate::widgets::icons::handle`
+// (DRAGON-324): every glyph is bundled, so the old per-name "is it in the embedded set?"
+// workaround (`vendored_icon_handle`) is gone and resolution is platform-independent.
 
 /// The timer/record chip's icon+text row — the shared shape behind the recording
 /// elapsed time, the countdown remaining time, and the idle delay readout (each a
@@ -64,7 +25,7 @@ fn render_chip(
     spacing: f32,
 ) -> Element<'static, Msg> {
     let white_icon = |name: &'static str, size: f32| -> Element<'static, Msg> {
-        widget::icon::icon(vendored_icon_handle(name))
+        widget::icon::icon(crate::widgets::icons::handle(name))
             .size(64)
             .width(Length::Fixed(size))
             .height(Length::Fixed(size))
@@ -146,7 +107,7 @@ impl App {
         // button stretched to fill its (stacked) group keeps the glyph at its true
         // size and centered instead of stretching it.
         let mode_icon = |name: &'static str, active: bool| {
-            let icon = widget::icon::icon(vendored_icon_handle(name))
+            let icon = widget::icon::icon(crate::widgets::icons::handle(name))
                 .size(64)
                 .width(Length::Fixed(ICON_BOX))
                 .height(Length::Fixed(ICON_BOX))
@@ -195,11 +156,11 @@ impl App {
         // two free-standing buttons — the active half is filled accent with an
         // on-accent glyph, the other half sits flat on the group with a subdued
         // glyph, and only the pair's outer corners are rounded.
-        let kind_btn = |name: &'static str, active: bool, msg: Msg, round_left: bool, round_right: bool| {
+        let kind_btn = |name: &'static str, active: bool, msg: Msg, round_left: bool, round_right: bool, enabled: bool| {
             // Default icon class: the button's per-state `icon_color` (below) colours
             // it, so the glyph can react to hover — an Svg::Custom class can't see
             // hover state.
-            let icon = widget::icon::icon(vendored_icon_handle(name))
+            let icon = widget::icon::icon(crate::widgets::icons::handle(name))
                 .size(64)
                 .width(Length::Fixed(ICON_BOX))
                 .height(Length::Fixed(ICON_BOX));
@@ -220,7 +181,10 @@ impl App {
                     hovered: Box::new(move |_, t| seg_style(t, true)),
                     pressed: Box::new(move |_, t| seg_style(t, true)),
                 })
-                .on_press(msg)
+                // DRAGON-322: `enabled=false` (video kind while another instance records)
+                // leaves NO on-press handler, so the segment is inert (the disabled class
+                // renders it in the subdued/inactive look — reads as not-selectable).
+                .on_press_maybe(enabled.then_some(msg))
                 .width(btn_width)
                 .padding(BTN_PAD),
             )
@@ -288,6 +252,7 @@ impl App {
                 Msg::Capture(CaptureMsg::SetKind(Kind::Scanner)),
                 true,
                 false,
+                true,
             ),
             kind_btn(
                 "camera-photo-symbolic",
@@ -295,6 +260,7 @@ impl App {
                 Msg::Capture(CaptureMsg::SetKind(Kind::Image)),
                 false,
                 false,
+                true,
             ),
             kind_btn(
                 "camera-video-symbolic",
@@ -302,6 +268,9 @@ impl App {
                 Msg::Capture(CaptureMsg::SetKind(Kind::Video)),
                 false,
                 true,
+                // DRAGON-322: disabled while another instance is recording (only one
+                // recording at a time; still image capture stays available).
+                crate::instance::video_capture_allowed(self.external_recording),
             ),
         ])
         .spacing(0.0)
@@ -604,7 +573,7 @@ impl App {
                           level: Option<f32>|
          -> Element<'static, Msg> {
             let metering = level.is_some();
-            let icon = widget::icon::Icon::from(widget::icon::from_name(name).size(64))
+            let icon = widget::icon::icon(crate::widgets::icons::handle(name))
                 .width(Length::Fixed(ICON_BOX))
                 .height(Length::Fixed(ICON_BOX))
                 .class(cosmic::theme::Svg::Custom(Rc::new(move |t: &cosmic::Theme| {

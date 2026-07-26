@@ -57,6 +57,10 @@ impl App {
                 prefs.sort_by(|a, b| a.key.cmp(&b.key));
                 prefs
             },
+            annot_color: self.annot_color,
+            annot_tool: self.annot_tool.map(|t| t.as_str().to_string()),
+            annot_stroke_w: self.annot_stroke_w,
+            annot_recent_colors: self.annot_recent_colors.clone(),
             allow_multiple: self.allow_multiple,
             resident: self.resident,
             autostart_on_login: self.autostart_on_login,
@@ -217,6 +221,13 @@ impl App {
         self.appearance_roundness = p.appearance_roundness.min(2);
         self.appearance_contrast_boost = p.appearance_contrast_boost;
         self.selection_box_thickness = p.selection_box_thickness.clamp(1, 8);
+        self.annot_color = p.annot_color;
+        self.annot_tool = p
+            .annot_tool
+            .as_deref()
+            .and_then(crate::widgets::annotation_canvas::Tool::from_str);
+        self.annot_stroke_w = p.annot_stroke_w;
+        self.annot_recent_colors = p.annot_recent_colors;
         self.notify_updates = p.notify_updates;
     }
 
@@ -306,9 +317,6 @@ impl App {
                 // resets ONLY the visible tab's settings, not both.
                 match self.settings.active_audio_video_tab() {
                     settings::AudioVideoTab::Audio => {
-                        p.audio_sync_offset_ms = d.audio_sync_offset_ms;
-                        p.audio_sync_auto = d.audio_sync_auto;
-                        p.av_calibration_base_ms = d.av_calibration_base_ms;
                         p.mic_device = d.mic_device.clone();
                         p.noise_reduction = d.noise_reduction;
                         p.speaker_device = d.speaker_device.clone();
@@ -317,8 +325,13 @@ impl App {
                         p.input_sensitivity = d.input_sensitivity;
                         p.auto_gain = d.auto_gain;
                         p.advanced_vad = d.advanced_vad;
+                    }
+                    settings::AudioVideoTab::Mixing => {
                         p.mute_others_during_preview = d.mute_others_during_preview;
                         p.duck_system_audio = d.duck_system_audio;
+                        p.audio_sync_auto = d.audio_sync_auto;
+                        p.audio_sync_offset_ms = d.audio_sync_offset_ms;
+                        p.av_calibration_base_ms = d.av_calibration_base_ms;
                     }
                     settings::AudioVideoTab::Video => {
                         p.record_fps = d.record_fps;

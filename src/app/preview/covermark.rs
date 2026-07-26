@@ -45,17 +45,18 @@ impl App {
     pub(super) fn covermark_picker(
         &self,
         picker: &Picker,
+        selected_idx: Option<usize>,
         active: Option<&CovermarkKind>,
         tb: Tb,
     ) -> Element<'static, Msg> {
         let mut items: Vec<Element<'static, Msg>> = Vec::new();
         for (i, entry) in picker.entries.iter().enumerate() {
-            let selected = i == picker.selected;
+            let selected = selected_idx == Some(i);
             // The thumbnail: real covermarks render their SVG; the "None" card shows a
             // subdued X (an enable/disable list, so None disables).
             let thumb: Element<'static, Msg> = match entry {
                 None => widget::container(
-                    widget::icon::Icon::from(widget::icon::from_name("window-close-symbolic").size(32))
+                    widget::icon::icon(crate::widgets::icons::handle("window-close-symbolic")).size(32)
                         .class(cosmic::theme::Svg::custom(|t| cosmic::widget::svg::Style {
                             color: Some(crate::app::theme::subdued(t)),
                         })),
@@ -118,9 +119,16 @@ impl App {
                 ),
             );
         }
-        // A popover panel (not a button group): panel rounding, so the tall
-        // card strip keeps its corners under the "round" preference.
-        tb.tool_panel(items)
+        // A popover panel (not a button group): panel rounding, so the tall card strip keeps
+        // its corners under the "round" preference. The card row is pinned to a FIXED height
+        // (`COVERMARK_PANEL_ROW_H`) so the upward flyout can offset itself by the panel's exact
+        // height and land flush with the button top on every surface kind (cards center within
+        // it). Built directly (not via `tool_panel`) so that height reaches the row.
+        let row = widget::row(items)
+            .spacing(2.0)
+            .align_y(Alignment::Center)
+            .height(Length::Fixed(super::chrome::COVERMARK_PANEL_ROW_H));
+        tb.panel_container(row)
     }
 
     /// Store the active covermark's current zoom + opacity as THIS option's remembered
@@ -138,6 +146,17 @@ impl App {
         self.covermark_prefs.insert(key, (zoom, opacity));
         self.covermark_zoom = zoom;
         self.covermark_opacity = opacity;
+    }
+
+    /// Kick a COALESCED live-preview re-raster for `edit` — the SHARED live-slider path (see
+    /// [`super::edit::LiveEdit`]). Called on every drag tick AND on release; the target
+    /// [`layers::RasterSlot`]'s coalescing debounces a fast drag to one raster in flight + one
+    /// pending re-run. Every live-adjustable edit routes through here, so the debounce is never
+    /// hand-rolled per slider; a new one (dim/spotlight, DRAGON-329) adds a match arm.
+    pub(super) fn refresh_live_edit(&mut self, edit: super::edit::LiveEdit) -> Task<cosmic::Action<Msg>> {
+        match edit {
+            super::edit::LiveEdit::Covermark => self.refresh_edit_display(),
+        }
     }
 
     /// Re-raster the covermark OVERLAY for the current covermark, OFF-THREAD and COALESCED
@@ -159,7 +178,10 @@ impl App {
             // once that raster lands (see the `CovermarkRasterReady` handler below).
             return Task::none();
         };
-        let (pw, ph) = p.edit.preview_raster_size();
+        // Size the raster to the CURRENT zoom (capped at the source frame) so a magnified
+        // covermark stays crisp (DRAGON-324); remember it so a no-op zoom skips a re-raster.
+        let (pw, ph) = p.edit.covermark_raster_size(p.view.zoom);
+        p.edit.cm_raster_px = (pw, ph);
         let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
         std::thread::spawn(move || {
             let frame = edit::rasterize_preview(&covermark, pw, ph).map(|img| {
@@ -174,5 +196,22 @@ impl App {
                 res.ok().flatten(),
             )))
         })
+    }
+
+    /// Re-raster the covermark at the CURRENT view zoom when a mark is applied AND the zoom
+    /// now wants a DIFFERENT resolution than the last raster (DRAGON-324). Called after every
+    /// zoom change so a magnified covermark sharpens toward the source resolution — without
+    /// re-rastering on a zoom step that doesn't change the wanted resolution (e.g. already at
+    /// the source cap, or below fit). No covermark → nothing to do.
+    pub(super) fn refresh_covermark_for_zoom(&mut self) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview.as_ref() else {
+            return Task::none();
+        };
+        if p.edit.covermark.is_none()
+            || p.edit.covermark_raster_size(p.view.zoom) == p.edit.cm_raster_px
+        {
+            return Task::none();
+        }
+        self.refresh_edit_display()
     }
 }

@@ -74,6 +74,11 @@ impl App {
         // resident relay to idle). Explicit even though the process exits right after, so
         // an own item never lingers a frame and the resident sees the clean disconnect.
         self.drop_session_icon();
+        // DRAGON-322: drop this instance's cross-process state markers before we exit so a
+        // recording/preview marker never lingers past the process (a stale marker is also
+        // swept by `any_other_recording`'s liveness check, this is the tidy path). Idempotent.
+        crate::instance::set_recording_marker(false);
+        crate::instance::set_preview_marker(false);
         #[cfg(target_os = "macos")]
         {
             crate::platform::mac::window::resume_tiling_wm();
@@ -173,10 +178,13 @@ impl App {
             return Task::none();
         }
         // DRAGON-295: an IMMEDIATE picker-free capture (`--active-window` / `--active-monitor`,
-        // typically from a daemon global hotkey). Resolve the target NOW and drive it straight
-        // through the capture pipeline, minting NO overlay windows. On a failure to resolve
-        // (no frontmost window, no display under the cursor) we fall through to the normal
-        // overlay so the user can still pick. macOS/Windows only; Linux never sets `immediate`.
+        // typically from a daemon global hotkey). Resolve the target NOW (mac/Windows read a real
+        // global cursor position) and drive it straight through the capture pipeline, minting NO
+        // overlay windows. On a failure to resolve (no frontmost window, no display under the
+        // cursor) we fall through to the normal overlay so the user can still pick. This
+        // immediate-in-`seed_outputs_mac` path is macOS/Windows ONLY: Linux ALSO sets `immediate`,
+        // but resolves it via the `on_output` → deferred `RunImmediate` flow (it needs the full
+        // output list + the `pointer_output()` cursor probe first), not here.
         #[cfg(not(target_os = "linux"))]
         if let Some(imm) = self.startup_immediate.take() {
             if let Some(task) = self.immediate_capture(imm) {
@@ -1162,6 +1170,33 @@ impl App {
     }
 
     #[cfg(target_os = "linux")]
+    /// Linux: mint the interactive picker overlays for every registered output
+    /// — the fallback when a DEFERRED immediate capture couldn't resolve a target (the
+    /// deferral suppressed the per-output picker mint in `on_output`). Mirrors that mint: the
+    /// picking phase takes Exclusive keyboard, else OnDemand.
+    #[cfg(target_os = "linux")]
+    pub(super) fn mint_startup_pickers(&mut self) -> Task<cosmic::Action<Msg>> {
+        use cosmic_client_toolkit::sctk::shell::wlr_layer::KeyboardInteractivity;
+        let kb = if self.overlay_pick_exclusive() {
+            KeyboardInteractivity::Exclusive
+        } else {
+            KeyboardInteractivity::OnDemand
+        };
+        let plans: Vec<(OutputHandle, window::Id)> =
+            self.outputs.iter().map(|o| (o.output.clone(), o.id)).collect();
+        Task::batch(
+            plans
+                .into_iter()
+                .map(|(output, id)| super::shell::overlay_surface_with(output, id, None, kb)),
+        )
+    }
+
+    // Wayland `OutputEvent` hotplug handler — Linux-only (macOS/Windows seed outputs via
+    // `seed_outputs_mac`). Uses Linux-gated `OutputEvent` + `shell::overlay_surface_with` +
+    // `overlay_pick_exclusive`, so the DEFINITION must be gated too, not just its caller
+    // (`update_window_chrome`'s `WindowChromeMsg::Output` arm) — otherwise it still compiles on
+    // macOS and fails to resolve those Linux-only items.
+    #[cfg(target_os = "linux")]
     pub(super) fn on_output(&mut self, ev: OutputEvent, output: OutputHandle) -> Task<cosmic::Action<Msg>> {
         // `--settings` is a standalone window with no capture overlays.
         if self.settings.only {
@@ -1215,23 +1250,29 @@ impl App {
                     #[cfg(target_os = "macos")]
                     placed: std::cell::Cell::new(false),
                 });
-                // Linux (DRAGON-295): a picker-free IMMEDIATE capture (`--active-window`). The
-                // output is now registered (its geometry feeds the window-over-wallpaper
-                // composite), so resolve the active toplevel and drive it straight through the
-                // capture pipeline via `run_capture`, minting NO overlay. `take()` makes this
-                // one-shot (later outputs fall through to the picker). On a failure to resolve
-                // (no Activated toplevel), fall through to the normal overlay below so the user
-                // can still pick. macOS/Windows do this in `seed_outputs_mac`; Linux mints its
-                // overlay here in `on_output`, so the immediate check lives here.
+                // Linux: a picker-free IMMEDIATE capture (`--active-window` /
+                // `--active-monitor`). This event carries only ONE output, but the capture's
+                // cursor-output probe + the post-capture preview need the COMPLETE output list
+                // (to resolve the cursor's monitor + open/size the preview there). So DEFER: on
+                // the FIRST such event, schedule `RunImmediate` a short settle later — the rest
+                // of the outputs register into `self.outputs` in the meantime — and mint NO
+                // picker overlay while it is pending. `immediate_kicked` makes the kick
+                // one-shot; later output events just register (below). macOS/Windows resolve
+                // immediately in `seed_outputs_mac` (they read a real global cursor position).
                 #[cfg(target_os = "linux")]
-                if let Some(imm) = self.startup_immediate.take() {
-                    if let Some(task) = self.immediate_capture(imm) {
-                        return task;
+                if self.startup_immediate.is_some() {
+                    if !self.immediate_kicked {
+                        self.immediate_kicked = true;
+                        return Task::perform(
+                            async {
+                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                            },
+                            |()| cosmic::Action::App(Msg::Capture(CaptureMsg::RunImmediate)),
+                        );
                     }
-                    log::warn!(
-                        "immediate capture ({imm:?}) could not resolve a target; \
-                         falling back to the picker overlay"
-                    );
+                    // Already kicked — this output only needed registering (done above). Do
+                    // NOT mint a picker while the deferred immediate capture is pending.
+                    return Task::none();
                 }
                 // No auto-seeded region: monitors without a region show a "begin
                 // drawing" hint instead, and the user draws where they want.

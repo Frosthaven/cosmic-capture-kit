@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.17.1"
+version = "0.18.0"
 edition = "2024"
 description = "Cross-platform screen region, window, and monitor capture with support for glass windows, image, video, voice, QR, barcodes, OCR text and more."
 license = "GPL-3.0-only"
@@ -521,5 +521,8 @@ lto = "thin"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+# Pinned to the exact naga wgpu bundles so the WGSL-validation test parses with the SAME
+# front-end the GPU uses (shaders only compile at runtime, so this test is the headless gate).
+naga = { version = "=28.0.0", features = ["wgsl-in"] }
 predicates = "3.1.4"
 rstest = "0.26.1"
