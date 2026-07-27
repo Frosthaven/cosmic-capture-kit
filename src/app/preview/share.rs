@@ -13,21 +13,27 @@ impl App {
     /// unusable. A cancelled dialog re-mints the overlay on the still-loaded capture
     /// ([`Self::reopen_preview_surface`], DRAGON-157). A normal WINDOW can show the
     /// chooser over itself, so it stays open.
-    pub(super) fn save_as_dialog(&mut self) -> Task<cosmic::Action<Msg>> {
-        self.stop_preview_playback();
-        let name = self
-            .preview
-            .as_ref()
+    pub(super) fn save_as_dialog(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        self.stop_preview_playback(id);
+        let name = self.preview_for(id)
             .and_then(|p| p.path.as_ref())
             .and_then(|path| path.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "capture".to_string());
-        let hide = match self.preview.as_ref() {
-            Some(p) if !p.surface.is_window() => p.surface.close(p.window),
+        let hide = match self.preview_for(id) {
+            Some(p) if !p.surface.is_window() => {
+                let close = p.surface.close(p.window);
+                // The document stays loaded but its surface is gone until the dialog
+                // resolves — record that so a later close doesn't double-destroy it.
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.surface_open = false;
+                }
+                close
+            }
             _ => Task::none(),
         };
-        let pick = Task::perform(super::pick_save_path(name), |opt| {
-            cosmic::Action::App(Msg::Preview(PreviewMsg::SaveAsResult(opt)))
+        let pick = Task::perform(super::pick_save_path(name), move |opt| {
+            cosmic::Action::App(Msg::Preview(id, PreviewMsg::SaveAsResult(opt)))
         });
         Task::batch([hide, pick])
     }
@@ -36,20 +42,19 @@ impl App {
     /// by a keep-open Save As that committed edits into the working file itself, where
     /// the stale edit state must not double-apply). Resets the edit state and
     /// re-decodes the new file as the working document.
-    pub(super) fn reload_preview_in_place(
-        &mut self,
+    pub(super) fn reload_preview_in_place(&mut self, id: window::Id,
         path: PathBuf,
         size: u64,
         is_video: bool,
     ) -> Task<cosmic::Action<Msg>> {
         let (kind, task) = if is_video {
-            (PreviewKind::Video(VideoPreview::loading()), video::poster_task(path.clone()))
+            (PreviewKind::Video(VideoPreview::loading()), video::poster_task(id, path.clone()))
         } else {
-            (PreviewKind::Image(ImagePreview::loading()), image::decode_task(path.clone()))
+            (PreviewKind::Image(ImagePreview::loading()), image::decode_task(id, path.clone()))
         };
-        // Compute the seeded edit state before borrowing `self.preview` mutably.
+        // Compute the seeded edit state before borrowing the preview mutably.
         let edit = self.new_edit_state();
-        if let Some(p) = &mut self.preview {
+        if let Some(p) = self.preview_for_mut(id) {
             p.path = Some(path);
             p.size = Some(size);
             p.kind = kind;
@@ -68,9 +73,11 @@ impl App {
     /// Save As dialog and the dialog was CANCELLED: the capture and every edit are
     /// still in memory, so the overlay comes back instead of the session exiting
     /// (DRAGON-157). Falls back to ending the session when no preview state exists.
-    pub(super) fn reopen_preview_surface(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_ref() else {
-            return self.finish_session();
+    pub(super) fn reopen_preview_surface(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for(id) else {
+            // The document vanished while its dialog was up: close it (which ends the
+            // process only if nothing else is open — DRAGON-336 phase 2).
+            return self.close_preview(id);
         };
         let external = p.external;
         let fallback_monitor = p.monitor;
@@ -84,30 +91,22 @@ impl App {
                 None => (None, fallback_monitor),
             }
         };
-        let extra_h = self
-            .preview
-            .as_ref()
+        let extra_h = self.preview_for(id)
             .map(|p| transport_h_for(&p.kind, PreviewSurface::Window))
             .unwrap_or(0.0);
         let (new_id, open_task, new_monitor, surface) =
-            self.preview_surface_for(output, monitor, None, extra_h);
-        if let Some(p) = self.preview.as_mut() {
-            p.window = new_id;
-            p.monitor = new_monitor;
-            p.surface = surface;
-            // A freshly-minted window carries the transient max_size hint again.
-            p.max_hint_pending = surface.is_window();
-        }
+            self.preview_surface_for(Some(id), output, monitor, None, extra_h);
+        self.repoint_preview(id, new_id, surface, new_monitor);
         open_task
     }
 
     /// After a Save / Copy: close the preview editor (the historical behaviour) when
     /// `auto_close_preview` is on, otherwise keep it open so the user can keep working
     /// on the capture. Always stops inline playback + resumes ducked media first.
-    pub(super) fn finish_or_keep_preview(&mut self) -> Task<cosmic::Action<Msg>> {
-        self.stop_preview_playback();
+    pub(super) fn finish_or_keep_preview(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        self.stop_preview_playback(id);
         if self.auto_close_preview {
-            self.finish_session()
+            self.close_preview(id)
         } else {
             Task::none()
         }
@@ -122,11 +121,11 @@ impl App {
     /// notification spans the re-encode. Save/Save As write the capture in place; Copy
     /// writes a throwaway TEMP and copies that, so copying never persists edits to the
     /// saved file.
-    pub(super) fn begin_bake(&mut self, intent: ShareIntent) -> Option<Task<cosmic::Action<Msg>>> {
+    pub(super) fn begin_bake(&mut self, id: window::Id, intent: ShareIntent) -> Option<Task<cosmic::Action<Msg>>> {
         // When the editor stays open after a share, DON'T tear the surface down for the
         // bake — it re-renders in place and BakeDone reloads the committed result.
         let keep_open = !self.auto_close_preview;
-        let p = self.preview.as_mut()?;
+        let p = self.preview_for_mut(id)?;
         if !p.dirty() || p.edit.baking {
             return None;
         }
@@ -170,7 +169,14 @@ impl App {
         p.edit.pending_output = Some(dst.clone());
         // Vanish the overlay right away — the work continues in the background — UNLESS
         // the editor is staying open, in which case it re-renders in place.
-        let hide = if keep_open { Task::none() } else { p.surface.close(p.window) };
+        let hide = if keep_open {
+            Task::none()
+        } else {
+            // The surface vanishes for the bake while the document stays loaded; flag it
+            // so `close_preview` doesn't destroy an already-dead surface at BakeDone.
+            p.surface_open = false;
+            p.surface.close(p.window)
+        };
         let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
         std::thread::spawn(move || {
             let result = crate::share::with_processing_notification(|| match &video {
@@ -186,8 +192,8 @@ impl App {
             }
             let _ = tx.send(result.ok());
         });
-        let bake = Task::perform(rx, |res| {
-            cosmic::Action::App(Msg::Preview(PreviewMsg::BakeDone(res.ok().flatten())))
+        let bake = Task::perform(rx, move |res| {
+            cosmic::Action::App(Msg::Preview(id, PreviewMsg::BakeDone(res.ok().flatten())))
         });
         Some(Task::batch([hide, bake]))
     }

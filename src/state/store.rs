@@ -656,4 +656,33 @@ record_fps = 60\n";
             ron::from_str(ron_on_disk).expect("a legacy RON preview_float_cosmic key must not fail");
         assert_eq!(q.record_dir, "~/Videos", "other settings survive in RON too");
     }
+
+    #[test]
+    fn old_allow_multiple_key_is_ignored_on_load() {
+        // DRAGON-351 removed the `allow_multiple` ("Allow multiple capture instances")
+        // setting — the behaviour is unconditional now. EVERY existing config carries the
+        // key (it was always serialized, both values), so serde must silently DROP it: an
+        // unknown key must never fail the parse, because `load()` answers a failed parse
+        // with `defaults()`, which would wipe every other setting. Same treatment as the
+        // retired `recording_tray` / `preview_float_cosmic` keys, and both on-disk formats
+        // are covered: TOML (current) and legacy RON.
+        for value in ["true", "false"] {
+            let toml_on_disk =
+                format!("record_dir = \"~/Videos\"\nallow_multiple = {value}\nrecord_fps = 60\n");
+            let p: super::Persisted = toml::from_str(&toml_on_disk)
+                .unwrap_or_else(|e| panic!("a retired allow_multiple = {value} must not fail: {e}"));
+            assert_eq!(p.record_dir, "~/Videos", "other settings survive the retired key");
+            assert_eq!(p.record_fps, 60, "settings written AFTER the retired key survive too");
+        }
+
+        let ron_on_disk = "(record_dir: \"~/Videos\", allow_multiple: true, record_fps: 60)";
+        let q: super::Persisted =
+            ron::from_str(ron_on_disk).expect("a legacy RON allow_multiple key must not fail");
+        assert_eq!(q.record_dir, "~/Videos", "other settings survive in RON too");
+        assert_eq!(q.record_fps, 60);
+
+        // And the key is never WRITTEN again: a fresh save carries no trace of it.
+        let s = toml::to_string(&defaults()).expect("serialize");
+        assert!(!s.contains("allow_multiple"), "got: {s}");
+    }
 }

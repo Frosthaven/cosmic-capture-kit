@@ -36,10 +36,37 @@
 //! sliding-window box mean vs the bake's block-mean bilinear upsample) — it must VISUALLY
 //! match, especially redaction coverage. The CPU `apply_effects` bake stays the exact save
 //! path with its unit tests.
+//!
+//! # Why every piece of GPU state here is keyed by WINDOW
+//! iced stores a shader `Pipeline` by the primitive's `TypeId` ALONE, and the `Engine`
+//! holding that storage is cloned (an `Arc`) into each window's renderer — so there is
+//! exactly ONE [`EffectsPipeline`] per PROCESS however many windows draw effects. Everything
+//! that is per-preview therefore lives in a [`WindowFx`] looked up by `window::Id`: the base
+//! texture, the ping-pong accumulators (and their dims), the uniform-buffer pool, the
+//! per-frame pass plan, and the on-screen blit bounds. Sharing them would have two previews
+//! destroy/recreate each other's base every frame (differing dims) and cross-write the plan
+//! and viewport. Only the truly device-level things — the two render pipelines, the bind
+//! group layout, the sampler, the texture format — stay shared, since they depend on nothing
+//! but the device and the surface format.
+//!
+//! This is deliberately state SEPARATION rather than a claim about iced's per-window
+//! prepare→render ordering (which cannot be verified headlessly): a window's `prepare`
+//! writes only its own entry and its `render` reads only its own entry, so ANY interleaving
+//! across windows is safe. The one ordering fact still relied on is intra-window and is
+//! iced's own contract — a primitive's `prepare` precedes its `render` for the same frame.
+//!
+//! As with the layer stack, at most ONE `EffectsFx` may be mounted per window: a second one
+//! in the same window would overwrite the first's plan. (Today `still_media` mounts exactly
+//! one.) A CLOSED window's entry IS reclaimed: the next `prepare` of any surviving preview
+//! evicts it (see [`EffectsPrimitive::live`]). That eviction has to ride the primitive
+//! because iced's pipeline storage exposes no external handle — app code cannot reach in
+//! here to free anything, and a closed window never prepares again to free its own.
 
 use cosmic::iced::widget::shader::{self, Viewport};
 use cosmic::iced::wgpu;
+use cosmic::iced::window;
 use cosmic::iced::{Rectangle, mouse};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::app::PixelFrame;
@@ -117,6 +144,11 @@ pub struct FxConst {
 /// The `shader::Program` placed in the view: the base pixels + the region effects in z-order,
 /// plus the source + fitted-display dims and the shared corner curve.
 pub struct EffectsFx {
+    /// The preview window this shader belongs to — the key for all of its GPU state (the
+    /// pipeline is process-wide; see the module doc).
+    window: window::Id,
+    /// Every preview window currently OPEN — see [`EffectsPrimitive::live`].
+    live: Vec<window::Id>,
     base: Arc<PixelFrame>,
     items: Vec<FxItem>,
     /// Source pixel dims (the effect geometry's coordinate space).
@@ -137,6 +169,8 @@ pub struct EffectsFx {
 impl EffectsFx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        window: window::Id,
+        live: Vec<window::Id>,
         base: Arc<PixelFrame>,
         items: Vec<FxItem>,
         source: (f32, f32),
@@ -146,7 +180,7 @@ impl EffectsFx {
         dim: f32,
         knockouts: Vec<[f32; 4]>,
     ) -> Self {
-        Self { base, items, source, display, curve_radius, consts, dim, knockouts }
+        Self { window, live, base, items, source, display, curve_radius, consts, dim, knockouts }
     }
 }
 
@@ -155,6 +189,8 @@ impl<Message> shader::Program<Message> for EffectsFx {
     type Primitive = EffectsPrimitive;
     fn draw(&self, _s: &(), _c: mouse::Cursor, _b: Rectangle) -> EffectsPrimitive {
         EffectsPrimitive {
+            window: self.window,
+            live: self.live.clone(),
             base: self.base.clone(),
             items: self.items.clone(),
             source: self.source,
@@ -168,6 +204,18 @@ impl<Message> shader::Program<Message> for EffectsFx {
 }
 
 pub struct EffectsPrimitive {
+    /// The owning preview window — selects this primitive's [`WindowFx`] state.
+    window: window::Id,
+    /// Every preview window OPEN at the moment this primitive's view was built — the input
+    /// to the closed-window eviction in [`EffectsPipeline::prepare`].
+    ///
+    /// It has to travel on the primitive because iced's `primitive::Storage` exposes no
+    /// external handle: app code cannot reach into the pipeline to drop a closed preview's
+    /// base/ping-pong textures and uniform pool, so the only way in is a primitive that is
+    /// being prepared. It is the set of OPEN previews, NOT of drawn ones — which is exactly
+    /// what stops a just-opened preview (open, not yet prepared) from being evicted by
+    /// another window's prepare.
+    live: Vec<window::Id>,
     base: Arc<PixelFrame>,
     items: Vec<FxItem>,
     source: (f32, f32),
@@ -213,7 +261,8 @@ impl shader::Primitive for EffectsPrimitive {
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
     ) {
-        pipeline.render(encoder, target, clip_bounds);
+        // Replays only THIS window's plan — never another preview's (see the module doc).
+        pipeline.render(self.window, encoder, target, clip_bounds);
     }
 }
 
@@ -241,15 +290,12 @@ struct BaseTex {
     dims: (u32, u32),
 }
 
-/// Persistent GPU state across frames: the two pipelines (offscreen replace, final alpha
-/// blend), the base texture, the two ping-pong textures, a pool of uniform buffers, and the
-/// per-frame pass plan built in `prepare` and consumed in `render`.
-pub struct EffectsPipeline {
-    pipeline_offscreen: wgpu::RenderPipeline,
-    pipeline_final: wgpu::RenderPipeline,
-    bgl: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
-    tex_format: wgpu::TextureFormat,
+/// ONE preview window's effect state. Every field here is per-window because the pipeline
+/// owning it is process-wide (module doc): the base texture and the ping-pong accumulators
+/// are sized to THAT preview's source, and the plan + blit bounds describe THAT window's
+/// current frame. Starts empty (nothing allocated until the window first draws effects).
+#[derive(Default)]
+struct WindowFx {
     base: Option<BaseTex>,
     ping: Vec<wgpu::Texture>,
     ping_views: Vec<wgpu::TextureView>,
@@ -260,6 +306,36 @@ pub struct EffectsPipeline {
     plan: Vec<PassPlan>,
     /// The primitive's on-screen physical bounds (the final blit viewport).
     phys_bounds: Rectangle,
+}
+
+/// Persistent GPU state across frames: the DEVICE-level shared bits (the two pipelines —
+/// offscreen replace, final alpha blend — the bind group layout, the sampler, the texture
+/// format), plus one [`WindowFx`] per preview window holding everything that is per-preview
+/// (base texture, ping-pong accumulators, uniform pool, pass plan, blit bounds). iced keys
+/// this whole struct by primitive TYPE only and shares it across every window's renderer, so
+/// the `windows` map is what keeps two previews from trampling each other.
+pub struct EffectsPipeline {
+    pipeline_offscreen: wgpu::RenderPipeline,
+    pipeline_final: wgpu::RenderPipeline,
+    bgl: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    tex_format: wgpu::TextureFormat,
+    windows: HashMap<window::Id, WindowFx>,
+}
+
+/// The eviction predicate for [`EffectsPipeline::windows`], split out as pure logic so it
+/// is unit-testable without a GPU: does `window`'s [`WindowFx`] survive a prepare issued by
+/// `drawing`, given that `live` are the preview windows currently OPEN?
+///
+/// An entry is dropped ONLY when its window is definitely gone. Three things keep it:
+/// * it is the window doing the drawing (trivially alive, whatever `live` claims);
+/// * it is in `live` — and `live` is the set of OPEN previews, not of DRAWN ones, which is
+///   precisely what protects a preview that has opened but not yet been prepared from being
+///   wiped by another window's prepare;
+/// * `live` is EMPTY, i.e. unknown. An absent set must never be read as "everything is
+///   closed", so it disables eviction rather than clearing the map.
+fn window_fx_survives(window: window::Id, drawing: window::Id, live: &[window::Id]) -> bool {
+    window == drawing || live.is_empty() || live.contains(&window)
 }
 
 impl shader::Pipeline for EffectsPipeline {
@@ -330,20 +406,20 @@ impl shader::Pipeline for EffectsPipeline {
             bgl,
             sampler,
             tex_format: tex_format(format),
-            base: None,
-            ping: Vec::new(),
-            ping_views: Vec::new(),
-            ping_dims: (0, 0),
-            uniforms: Vec::new(),
-            plan: Vec::new(),
-            phys_bounds: Rectangle::with_size(cosmic::iced::Size::new(0.0, 0.0)),
+            windows: HashMap::new(),
         }
     }
 }
 
-impl EffectsPipeline {
+impl WindowFx {
     /// (Re)upload the base texture when its frame changed (dims change forces a new texture).
-    fn ensure_base(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &PixelFrame) {
+    fn ensure_base(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &PixelFrame,
+        tex_format: wgpu::TextureFormat,
+    ) {
         let (w, h) = (frame.w.max(1), frame.h.max(1));
         let fresh = match &self.base {
             Some(b) => b.dims != (w, h),
@@ -356,7 +432,7 @@ impl EffectsPipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.tex_format,
+                format: tex_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -389,7 +465,7 @@ impl EffectsPipeline {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: self.tex_format,
+                format: tex_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -449,10 +525,14 @@ impl EffectsPipeline {
             }));
         }
     }
+}
 
-    /// Build this frame's pass plan + write every uniform. All GPU allocation happens here
-    /// (`render` gets no device), so `prepare` creates the textures/buffers/bind-groups and
-    /// records the plan the encoder replays.
+impl EffectsPipeline {
+    /// Build this frame's pass plan + write every uniform, in the OWNING WINDOW's state. All
+    /// GPU allocation happens here (`render` gets no device), so `prepare` creates the
+    /// textures/buffers/bind-groups and records the plan the encoder replays. Nothing outside
+    /// `prim.window`'s [`WindowFx`] (plus the shared device-level pipeline/sampler/layout) is
+    /// read or written, so a concurrent preview's state cannot be disturbed.
     fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -461,7 +541,17 @@ impl EffectsPipeline {
         bounds: &Rectangle,
         viewport: &Viewport,
     ) {
-        self.plan.clear();
+        // Reclaim CLOSED previews' state first (base texture + both accumulators + the
+        // uniform pool + the stale plan): nothing else can, since a closed window never
+        // prepares again and app code cannot reach into iced's pipeline storage. Runs on
+        // EVERY prepare — it is a handful of `window::Id` comparisons over a map with one
+        // entry per open preview, and doing it here means the VRAM goes back the first time
+        // any surviving preview redraws.
+        self.windows.retain(|w, _| window_fx_survives(*w, prim.window, &prim.live));
+        // Disjoint field borrows: the shared device-level bits alongside this window's state.
+        let (bgl, sampler, tex_format) = (&self.bgl, &self.sampler, self.tex_format);
+        let wfx = self.windows.entry(prim.window).or_default();
+        wfx.plan.clear();
         let effects = prim.items.len();
         // DRAGON-329: the shader also runs for a global dim (even with no region effects — a
         // dim-only or spotlight-only scene). Nothing to draw only when BOTH are absent, keeping
@@ -492,12 +582,12 @@ impl EffectsPipeline {
         let py = (bounds.y * sf).floor();
         let pr = ((bounds.x + bounds.width) * sf).ceil();
         let pb = ((bounds.y + bounds.height) * sf).ceil();
-        self.phys_bounds = Rectangle { x: px, y: py, width: pr - px, height: pb - py };
+        wfx.phys_bounds = Rectangle { x: px, y: py, width: pr - px, height: pb - py };
 
-        self.ensure_base(device, queue, &prim.base);
-        self.ensure_ping(device, tex_w, tex_h);
+        wfx.ensure_base(device, queue, &prim.base, tex_format);
+        wfx.ensure_ping(device, tex_w, tex_h);
         // seed + (optional dim) + one per effect + final blit.
-        self.ensure_uniforms(device, effects + 2 + dim_on as usize);
+        wfx.ensure_uniforms(device, effects + 2 + dim_on as usize);
 
         // Texture-space scale: SOURCE px → offscreen px (aspect-preserving fit ⇒ isotropic).
         let s = tex_w as f32 / prim.source.0.max(1.0);
@@ -590,7 +680,7 @@ impl EffectsPipeline {
             }
             queue.write_buffer(buf, 0, &b);
         };
-        let base_view = &self.base.as_ref().expect("base uploaded above").view;
+        let base_view = &wfx.base.as_ref().expect("base uploaded above").view;
 
         // DIM-ONLY fast path (the common spotlight case): with NO destructive effect, the dim is
         // just a darkening. Skip the seed/accumulator entirely and paint a translucent-black
@@ -598,10 +688,10 @@ impl EffectsPipeline {
         // never resampled, so it stays as sharp as `widget::image`, only darkened. Matches the
         // bake's `apply_dim` (base × (1 − dim) outside knockouts).
         if effects == 0 && dim_on {
-            let ubo = &self.uniforms[0];
+            let ubo = &wfx.uniforms[0];
             write_dim(queue, ubo, 6, prim.dim, prim.curve_radius * s, &prim.knockouts);
-            let bg = mk_bg(device, &self.bgl, &self.sampler, ubo, base_view);
-            self.plan.push(PassPlan { bind_group: bg, target: PassTarget::Surface });
+            let bg = mk_bg(device, bgl, sampler, ubo, base_view);
+            wfx.plan.push(PassPlan { bind_group: bg, target: PassTarget::Surface });
             return;
         }
 
@@ -611,21 +701,21 @@ impl EffectsPipeline {
         // effect final blit so the effects composite on top of the dimmed base.
         let mut next_u = 0usize;
         if dim_on {
-            let ubo = &self.uniforms[next_u];
+            let ubo = &wfx.uniforms[next_u];
             write_dim(queue, ubo, 6, prim.dim, prim.curve_radius * s, &prim.knockouts);
-            let bg = mk_bg(device, &self.bgl, &self.sampler, ubo, base_view);
-            self.plan.push(PassPlan { bind_group: bg, target: PassTarget::Surface });
+            let bg = mk_bg(device, bgl, sampler, ubo, base_view);
+            wfx.plan.push(PassPlan { bind_group: bg, target: PassTarget::Surface });
             next_u += 1;
         }
 
         // seed: base → ping[0] WITH the knockout-aware dim baked in (coverage 0). Effects then read
         // already-dimmed content and don't self-dim. dim==0 ⇒ an undimmed 1:1 copy (byte-identical).
         write(
-            queue, &self.uniforms[next_u], 0, 0, [0.0; 4], [0.0; 4], 0.0, 0.0, prim.dim,
+            queue, &wfx.uniforms[next_u], 0, 0, [0.0; 4], [0.0; 4], 0.0, 0.0, prim.dim,
             prim.curve_radius * s,
         );
-        let seed_bg = mk_bg(device, &self.bgl, &self.sampler, &self.uniforms[next_u], base_view);
-        self.plan.push(PassPlan { bind_group: seed_bg, target: PassTarget::Ping(0) });
+        let seed_bg = mk_bg(device, bgl, sampler, &wfx.uniforms[next_u], base_view);
+        wfx.plan.push(PassPlan { bind_group: seed_bg, target: PassTarget::Ping(0) });
         next_u += 1;
         let mut cur = 0usize;
 
@@ -647,7 +737,7 @@ impl EffectsPipeline {
                 }
                 _ => [0.0; 4],
             };
-            let ubo = &self.uniforms[next_u];
+            let ubo = &wfx.uniforms[next_u];
             // Pixelate gets SQUARE edges (own radius 0); every other effect follows the scene curve.
             // The knockout test always uses the scene curve so a redaction un-dims cleanly inside a
             // rounded spotlight regardless of its own corner style.
@@ -664,10 +754,10 @@ impl EffectsPipeline {
             let passes =
                 if item.effect == FxEffect::Blur { prim.consts.blur_passes.max(1) } else { 1 };
             for _ in 0..passes {
-                let src = &self.ping_views[cur];
+                let src = &wfx.ping_views[cur];
                 let dst = 1 - cur;
-                let bg = mk_bg(device, &self.bgl, &self.sampler, ubo, src);
-                self.plan.push(PassPlan { bind_group: bg, target: PassTarget::Ping(dst) });
+                let bg = mk_bg(device, bgl, sampler, ubo, src);
+                wfx.plan.push(PassPlan { bind_group: bg, target: PassTarget::Ping(dst) });
                 cur = dst;
             }
             next_u += 1;
@@ -676,31 +766,37 @@ impl EffectsPipeline {
         // final: the last accumulated ping → the surface, over the base + dim overlay. Its alpha
         // is the effects' coverage, so ONLY the effect regions are drawn; the crisp base (dimmed
         // by the overlay outside knockouts) shows through everywhere else.
-        let fubo = &self.uniforms[next_u];
+        let fubo = &wfx.uniforms[next_u];
         write(queue, fubo, 1, 0, [0.0; 4], [0.0; 4], 0.0, 0.0, 0.0, 0.0);
-        let final_bg = mk_bg(device, &self.bgl, &self.sampler, fubo, &self.ping_views[cur]);
-        self.plan.push(PassPlan { bind_group: final_bg, target: PassTarget::Surface });
+        let final_bg = mk_bg(device, bgl, sampler, fubo, &wfx.ping_views[cur]);
+        wfx.plan.push(PassPlan { bind_group: final_bg, target: PassTarget::Surface });
     }
 
-    /// Replay the planned passes into the encoder. Intermediate passes render into full
-    /// offscreen textures; the final blit is positioned to the primitive bounds and scissored
-    /// to the clip rect (the ZoomPan content viewport).
+    /// Replay `window`'s planned passes into the encoder. Intermediate passes render into
+    /// full offscreen textures; the final blit is positioned to the primitive bounds and
+    /// scissored to the clip rect (the ZoomPan content viewport). Reads ONLY that window's
+    /// state, so it is unaffected by any other preview's `prepare` running in between.
     fn render(
         &self,
+        window: window::Id,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
     ) {
-        if self.plan.is_empty() || clip_bounds.width == 0 || clip_bounds.height == 0 {
+        // No entry yet ⇒ this window has never prepared anything to draw.
+        let Some(wfx) = self.windows.get(&window) else {
+            return;
+        };
+        if wfx.plan.is_empty() || clip_bounds.width == 0 || clip_bounds.height == 0 {
             return;
         }
-        for pass in &self.plan {
+        for pass in &wfx.plan {
             match pass.target {
                 PassTarget::Ping(i) => {
                     let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("cck-fx-offscreen"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &self.ping_views[i],
+                            view: &wfx.ping_views[i],
                             depth_slice: None,
                             resolve_target: None,
                             ops: wgpu::Operations {
@@ -739,10 +835,10 @@ impl EffectsPipeline {
                     // Position the effect quad exactly over the base image (post zoom/pan) and
                     // scissor to the clip rect — mirroring iced's own `draw`-variant viewport.
                     rp.set_viewport(
-                        self.phys_bounds.x,
-                        self.phys_bounds.y,
-                        self.phys_bounds.width,
-                        self.phys_bounds.height,
+                        wfx.phys_bounds.x,
+                        wfx.phys_bounds.y,
+                        wfx.phys_bounds.width,
+                        wfx.phys_bounds.height,
                         0.0,
                         1.0,
                     );
@@ -1006,7 +1102,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_KNOCKOUTS, UNIFORM_SIZE, WGSL};
+    use super::{MAX_KNOCKOUTS, UNIFORM_SIZE, WGSL, window_fx_survives};
+    use cosmic::iced::window;
+
+    /// The closed-preview reclaim: with a long-lived multi-document host, closing one
+    /// preview must free ITS base/accumulator/uniform state on the next prepare of any
+    /// surviving preview — nothing else ever can, since a closed window never prepares again.
+    #[test]
+    fn a_closed_previews_effect_state_is_evicted_by_another_windows_prepare() {
+        let (a, b) = (window::Id::unique(), window::Id::unique());
+        assert_ne!(a, b);
+        // B closed, A is drawing: B goes, A stays.
+        assert!(window_fx_survives(a, a, &[a]));
+        assert!(!window_fx_survives(b, a, &[a]), "a closed preview's GPU state must be freed");
+    }
+
+    /// The hazard the OPEN set exists to avoid: a preview that has opened but has not been
+    /// prepared yet has no entry of its own to defend it, and must not be wiped by another
+    /// window's prepare. Being OPEN (not DRAWN) is what protects it.
+    #[test]
+    fn an_open_but_undrawn_preview_is_never_evicted() {
+        let (a, b) = (window::Id::unique(), window::Id::unique());
+        assert!(window_fx_survives(b, a, &[a, b]), "an open preview keeps its state");
+        // The drawing window survives even a stale set that has forgotten it...
+        assert!(window_fx_survives(a, a, &[b]));
+        // ...and an EMPTY set means "unknown", never "everything is closed".
+        assert!(window_fx_survives(b, a, &[]));
+    }
 
     /// The effect WGSL only compiles on the GPU at RUNTIME, so a bad shader sails through
     /// `cargo build`/`clippy` and aborts the first time an effect is drawn (this exact test was

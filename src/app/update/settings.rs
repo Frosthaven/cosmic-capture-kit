@@ -161,12 +161,6 @@ impl App {
                 self.save_state();
                 Task::none()
             }
-            SettingsMsg::SetAllowMultiple(b) => {
-                // Applies next launch (the instance lock is taken in main()).
-                self.allow_multiple = b;
-                self.save_state();
-                Task::none()
-            }
             SettingsMsg::SetGeneralTab(entity) => {
                 // In-page General tab (DRAGON-138) — pure view state, not persisted.
                 self.settings.general_tab.activate(entity);
@@ -1086,7 +1080,7 @@ impl App {
 
     /// Reconcile the OS "launch at login" item with the current settings (DRAGON-296).
     ///
-    /// The single place both the "Keep system tray icon" (`resident`) handler and the
+    /// The single place both the "System tray icon" (`resident`) handler and the
     /// "Automatically start on login" (`autostart_on_login`) handler route through, so the
     /// desired login-item state is derived from ONE rule in ONE spot: the item is registered
     /// iff `resident && autostart_on_login` (a resident to launch, and the user opted in),

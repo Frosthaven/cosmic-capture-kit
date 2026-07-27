@@ -18,6 +18,7 @@ impl App {
                 self.sub_loading_tick(),
                 self.sub_playback_poll(),
                 self.sub_tray_poll(),
+                self.sub_preview_handoff(),
                 self.sub_recording_poll(),
                 self.sub_meter_tick(),
                 self.sub_mic_test(),
@@ -82,13 +83,16 @@ impl App {
             // Forward raw key presses; the live keymap resolves them to actions in
             // `update` (the subscription closure is `'static`, so it can't read the
             // current bindings — and rebinds must take effect immediately).
+            // The delivering surface's id rides along: it is what picks the PREVIEW
+            // document a Preview-context binding acts on when several are open
+            // (DRAGON-336 phase 2 — see `handle_key`).
             Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
                 key, modifiers, ..
-            }) => Some(Msg::WindowChrome(WindowChromeMsg::KeyPressed(modifiers, key))),
+            }) => Some(Msg::WindowChrome(WindowChromeMsg::KeyPressed(id, modifiers, key))),
             // Releases matter only for push-to-talk (release → re-mute the mic).
             Event::Keyboard(cosmic::iced::keyboard::Event::KeyReleased {
                 key, modifiers, ..
-            }) => Some(Msg::WindowChrome(WindowChromeMsg::KeyReleased(modifiers, key))),
+            }) => Some(Msg::WindowChrome(WindowChromeMsg::KeyReleased(id, modifiers, key))),
             _ => None,
         }))
     }
@@ -146,9 +150,9 @@ impl App {
     #[cfg(windows)]
     fn sub_preview_finalize(&self) -> Option<Subscription<Msg>> {
         let unconfirmed = self
-            .preview
-            .as_ref()
-            .is_some_and(|p| self.preview_shown_confirmed != Some(p.window));
+            .previews
+            .iter()
+            .any(|p| self.preview_shown_confirmed != Some(p.window));
         if unconfirmed {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(80))
@@ -210,7 +214,7 @@ impl App {
     /// runtime-dir scan); idle the rest of the time (no overlay ⇒ no tick).
     fn sub_external_recording(&self) -> Option<Subscription<Msg>> {
         let selecting = self.recording.is_none()
-            && self.preview.is_none()
+            && self.previews.is_empty()
             && self.countdown.is_none()
             && self.capturing.is_none()
             && !self.settings.only
@@ -323,17 +327,41 @@ impl App {
     /// nothing is pending, so ~60 Hz here just bounds pinch latency.
     #[cfg(target_os = "macos")]
     fn sub_preview_pinch(&self) -> Option<Subscription<Msg>> {
-        self.preview.as_ref().map(|_| {
+        // One subscription PER open preview, each with a DISTINCT hash id (the window id
+        // is folded in via `Subscription::with`, so iced can't collapse two identical
+        // 16ms timers into one) and each tick addressed to its own document.
+        if self.previews.is_empty() {
+            return None;
+        }
+        Some(Subscription::batch(self.previews.iter().map(|p| {
+            let id = p.window;
             cosmic::iced::time::every(std::time::Duration::from_millis(16))
-                .map(|_| Msg::Preview(PreviewMsg::PinchPoll))
-        })
+                .with(id)
+                .map(|(id, _)| Msg::Preview(id, PreviewMsg::PinchPoll))
+        })))
     }
 
     /// Pull decoded frames from the playback worker into the view while a recording
     /// is playing inline — polled at ~2× the source fps so frames advance smoothly.
     fn sub_playback_poll(&self) -> Option<Subscription<Msg>> {
-        let interval = self.preview.as_ref().and_then(|p| p.playback_poll())?;
-        Some(cosmic::iced::time::every(interval).map(|_| Msg::Preview(PreviewMsg::PlayerTick)))
+        // One poll PER playing preview, at ITS own source fps (DRAGON-336 phase 2). Each
+        // gets a DISTINCT hash id via `with(window_id)` — without that iced would treat
+        // two same-interval timers as ONE subscription — and each tick is addressed to the
+        // preview that owns the stream.
+        let polls: Vec<_> = self
+            .previews
+            .iter()
+            .filter_map(|p| p.playback_poll().map(|iv| (p.window, iv)))
+            .map(|(id, interval)| {
+                cosmic::iced::time::every(interval)
+                    .with(id)
+                    .map(|(id, _)| Msg::Preview(id, PreviewMsg::PlayerTick))
+            })
+            .collect();
+        if polls.is_empty() {
+            return None;
+        }
+        Some(Subscription::batch(polls))
     }
 
     /// While the recording controls live in the system tray, drain menu clicks
@@ -347,6 +375,31 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// DRAGON-336: while this process HOSTS preview handoffs, drain the inbound channel
+    /// promptly — a capture child is blocked waiting for our ack, so this interval is the
+    /// floor on how long its handoff takes (and, on a miss, how long before it gives up and
+    /// opens its own preview). 100ms is imperceptible against a capture's own save, and is
+    /// well inside `preview_ipc::ACK_TIMEOUT`. Gated on the listener existing, exactly like
+    /// `sub_tray_poll` gates on the tray: no preview open ⇒ no host ⇒ no tick.
+    #[cfg(unix)]
+    fn sub_preview_handoff(&self) -> Option<Subscription<Msg>> {
+        if self.preview_host.is_some() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(100))
+                    .map(|_| Msg::Capture(CaptureMsg::HandoffPoll)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Off unix there is no handoff transport, so nothing ever hosts — a `None` stub so the
+    /// batch call site stays platform-uniform (Windows' subscription set is unchanged).
+    #[cfg(not(unix))]
+    fn sub_preview_handoff(&self) -> Option<Subscription<Msg>> {
+        None
     }
 
     /// Live-status poll for the permission-checker window: while it is open, re-probe
@@ -404,7 +457,7 @@ impl App {
         // window goes permanently unresponsive ("froze everything", force-kill). Suppress
         // the tick under the preview. Windows-only so Linux/macOS stay byte-identical.
         #[cfg(windows)]
-        let overlay_gone = self.preview.is_some();
+        let overlay_gone = !self.previews.is_empty();
         #[cfg(not(windows))]
         let overlay_gone = false;
         if self.recording.is_none()

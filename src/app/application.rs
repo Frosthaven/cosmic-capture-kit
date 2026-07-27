@@ -136,6 +136,10 @@ impl cosmic::Application for App {
         let (precapture, frozen, frozen_slot, wallpaper_slot, cursor_slot) = acquire_scene(
             scene_active,
             launch_mode,
+            // DRAGON-336: the launch KIND gates the frozen-flats grab too — the QR/OCR
+            // scanners are the only non-freeze reader of the flats, so a `--scan` launch
+            // must grab them even with freeze off (`launch_flats_needed`).
+            startup.kind.unwrap_or(Kind::Image),
             persisted.capture_cursor,
             persisted.freeze,
             wallpaper_path(),
@@ -355,8 +359,15 @@ impl cosmic::Application for App {
                 appearance_roundness: persisted.appearance_roundness.min(2),
                 appearance_contrast_boost: persisted.appearance_contrast_boost,
                 selection_box_thickness: persisted.selection_box_thickness.clamp(1, 8),
-                preview: None,
+                previews: Vec::new(),
+                focused_preview: None,
+                capture_preview: None,
                 preview_duck: None,
+                preview_duck_refs: Default::default(),
+                // Bound lazily, at the first preview mint (`preview_surface_for`) — a
+                // capture that never opens a preview never hosts.
+                #[cfg(unix)]
+                preview_host: None,
                 trigger_display,
                 preview_output: None,
                 #[cfg(target_os = "linux")]
@@ -387,7 +398,6 @@ impl cosmic::Application for App {
                 window_transparency_multiplier: persisted.window_transparency_multiplier.clamp(0.0, 1.0),
                 window_padding: persisted.window_padding,
                 window_padding_px: NumField::new(persisted.window_padding_px),
-                allow_multiple: persisted.allow_multiple,
                 resident: persisted.resident,
                 autostart_on_login: persisted.autostart_on_login,
                 capture_hotkey: persisted.capture_hotkey.clone(),
@@ -623,7 +633,7 @@ impl cosmic::Application for App {
             return self.grab_cover_view();
         }
         if self.is_preview_window(id) {
-            return self.preview_view();
+            return self.preview_view(id);
         }
         if let Some(o) = self.outputs.iter().find(|o| o.id == id) {
             if self.recording.is_some() {
@@ -649,7 +659,7 @@ impl cosmic::Application for App {
             Msg::Settings(message) => self.update_settings(message),
             Msg::Permissions(message) => self.update_permissions(message),
             Msg::WindowChrome(message) => self.update_window_chrome(message),
-            Msg::Preview(message) => self.update_preview(message),
+            Msg::Preview(id, message) => self.update_preview(id, message),
         }
     }
 

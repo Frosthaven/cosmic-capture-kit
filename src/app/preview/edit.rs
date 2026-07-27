@@ -319,6 +319,15 @@ pub struct EditState {
     /// (round caps when > 0) read. `0.0` means [`super::annotate::DEFAULT_ANNOT_CURVE_RADIUS`]
     /// (there is no way to set a deliberate sharp `0.0` yet, so the fallback is safe).
     pub annot_curve_radius: f32,
+    /// The side (SOURCE px) the NEXT click-placed sequence badge spawns at: whatever the last
+    /// badge in THIS editor was placed or resized to. `0.0` means
+    /// [`super::annotate::DEFAULT_BADGE_SIZE`] — read it through [`Self::badge_size`].
+    ///
+    /// Deliberately per-DOCUMENT and deliberately NOT persisted: it is a within-session
+    /// convenience (place one badge, the rest match it), so it lives and dies with this
+    /// editor. Each preview — and each new capture, this being a one-shot app — starts back
+    /// at the default.
+    pub annot_badge_size: f32,
     /// The selected annotation(s) — an ordered SET since DRAGON-341 (primary last). Drives the
     /// chrome + Delete/reorder/Esc handling. Read the primary through [`Self::selected`].
     pub sel: Selection,
@@ -417,6 +426,18 @@ impl EditState {
             self.annot_stroke_w
         } else {
             super::annotate::DEFAULT_ANNOT_STROKE
+        }
+    }
+
+    /// The side (SOURCE px) a newly placed sequence badge takes — the last one placed or
+    /// resized in this editor, falling back to [`super::annotate::DEFAULT_BADGE_SIZE`]. The
+    /// caller still clamps it into the picture (see
+    /// [`super::annotate::badge_placement_rect`]).
+    pub fn badge_size(&self) -> f32 {
+        if self.annot_badge_size > 0.0 {
+            self.annot_badge_size
+        } else {
+            super::annotate::DEFAULT_BADGE_SIZE
         }
     }
 

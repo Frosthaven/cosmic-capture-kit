@@ -26,13 +26,13 @@ fn warn_pixelate_cap() {
 /// The annotation right-click context menu: z-order + delete, as a small floating panel. A
 /// Spotlight item (DRAGON-329) is a pure knockout region with no color, so it drops the color row —
 /// but it KEEPS z-order (needed to send it behind and select layers under it) + Duplicate + Delete.
-fn annot_context_menu(spotlight: bool) -> Element<'static, Msg> {
+fn annot_context_menu(pid: window::Id, spotlight: bool) -> Element<'static, Msg> {
     let item = |label: &'static str, msg: PreviewMsg| -> Element<'static, Msg> {
         crate::widgets::arrow_cursor::arrow_cursor(
             widget::button::custom(widget::text(label).size(13))
                 .width(Length::Fill)
                 .class(cosmic::theme::Button::Text)
-                .on_press(Msg::Preview(msg)),
+                .on_press(Msg::Preview(pid, msg)),
         )
     };
     // A thin full-width horizontal rule between action groups — the horizontal sibling of the
@@ -118,7 +118,7 @@ impl ImagePreview {
 
 /// Decode `path` off-thread (so a large capture doesn't stall the UI), resolving to
 /// [`PreviewMsg::ImageReady`] — or `Cancel` if the channel drops.
-pub(super) fn decode_task(path: PathBuf) -> Task<cosmic::Action<Msg>> {
+pub(super) fn decode_task(pid: window::Id, path: PathBuf) -> Task<cosmic::Action<Msg>> {
     let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let payload = match ::image::open(&path) {
@@ -134,8 +134,8 @@ pub(super) fn decode_task(path: PathBuf) -> Task<cosmic::Action<Msg>> {
         };
         let _ = tx.send(payload);
     });
-    Task::perform(rx, |res| {
-        cosmic::Action::App(Msg::Preview(match res {
+    Task::perform(rx, move |res| {
+        cosmic::Action::App(Msg::Preview(pid, match res {
             Ok((handle, original)) => PreviewMsg::ImageReady(handle, original),
             Err(_) => PreviewMsg::Cancel,
         }))
@@ -152,6 +152,9 @@ impl App {
         img: &'a ImagePreview,
         tb: Tb,
     ) -> Element<'a, Msg> {
+        // Every message this view emits is ADDRESSED to its own document (DRAGON-336
+        // phase 2), so a click in one preview can never act on another.
+        let pid = preview.window;
         // `is_loading()` guarantees `image` is Some here; fall back to the spinner just
         // in case, so this is never an empty frame.
         let Some(handle) = &img.image else {
@@ -214,8 +217,8 @@ impl App {
             preview.view.pan,
             preview.view.pan_mode,
             content_px,
-            |step, ux, uy| Msg::Preview(PreviewMsg::Zoom(step, ux, uy)),
-            |dx, dy| Msg::Preview(PreviewMsg::Pan(dx, dy)),
+            move |step, ux, uy| Msg::Preview(pid, PreviewMsg::Zoom(step, ux, uy)),
+            move |dx, dy| Msg::Preview(pid, PreviewMsg::Pan(dx, dy)),
         );
         // WRAP the ZoomPan in the annotation interaction canvas (it OWNS the ZoomPan as its
         // child): iced's `stack` doesn't reliably propagate Ignored mouse events from a top
@@ -248,9 +251,9 @@ impl App {
                 source,
                 preview.view.pan_mode,
                 accent,
-                |ev| {
+                move |ev| {
                     use crate::widgets::annotation_canvas::AnnotEvent;
-                    Msg::Preview(match ev {
+                    Msg::Preview(pid, match ev {
                         AnnotEvent::Select(o) => PreviewMsg::SelectAnnotation(o.map(AnnotId)),
                         AnnotEvent::SelectToggle(id) => {
                             PreviewMsg::ToggleAnnotationSelected(AnnotId(id))
@@ -279,9 +282,9 @@ impl App {
             .is_some_and(|it| matches!(it.kind, annotate::AnnotKind::Spotlight { .. }));
         let canvas_over: Element<'a, Msg> = match preview.edit.annot_menu {
             Some((mx, my)) => widget::popover(canvas_over)
-                .popup(annot_context_menu(spotlight_selected))
+                .popup(annot_context_menu(pid, spotlight_selected))
                 .position(widget::popover::Position::Point(cosmic::iced::Point::new(mx, my)))
-                .on_close(Msg::Preview(PreviewMsg::AnnotMenuClose))
+                .on_close(Msg::Preview(pid, PreviewMsg::AnnotMenuClose))
                 .into(),
             None => canvas_over,
         };
@@ -410,6 +413,12 @@ impl App {
                     };
                     let src = (preview.edit.frame.0 as f32, preview.edit.frame.1 as f32);
                     let fx = EffectsFx::new(
+                        // The owning window keys ALL of this shader's GPU state — iced's
+                        // pipeline storage is per-process, shared by every window's renderer.
+                        preview.window,
+                        // ...and the OPEN set lets this prepare free a CLOSED preview's
+                        // state, which nothing else can reach (DRAGON-336).
+                        self.live_preview_windows(),
                         base,
                         fx_items,
                         src,
@@ -431,7 +440,7 @@ impl App {
             .edit
             .cm_raster
             .frame()
-            .map(|cm| vec![Layer { key: LayerKey::COVERMARK, frame: cm.clone() }])
+            .map(|cm| vec![Layer { key: LayerKey::covermark(preview.window), frame: cm.clone() }])
             .unwrap_or_default();
         // The `widget::image` base (Linux/mac + the opaque windowed surface — byte-identical).
         let image_base: Element<'static, Msg> = widget::container(
@@ -444,8 +453,10 @@ impl App {
         .into();
         // The base element, plus whether the covermark is folded into it. Windows OVERLAY
         // (DRAGON-235): iced's raster-image pipeline doesn't composite on the transparent
-        // surface, so base + covermark ride ONE LayerStack (two LayerStacks on a surface fight
-        // over slot pruning); the effects shader is a distinct primitive type, stacked on top —
+        // surface, so base + covermark ride ONE LayerStack (two LayerStacks in the SAME window
+        // fight over slot pruning — the keys are window-scoped, not per-widget, so a second
+        // stack's prepare would delete this one's slots); the effects shader is a distinct
+        // primitive type (its own per-window state), stacked on top —
         // over the covermark on Windows (a z-order deviation vs Linux/mac to VERIFY, as Linux
         // builds can't exercise this cfg arm).
         #[cfg(windows)]
@@ -454,9 +465,9 @@ impl App {
             .is_window()
             && let Some(base) = super::layers::rgba_handle_frame(handle)
         {
-            let mut layers = vec![Layer { key: LayerKey::VIDEO, frame: base }];
+            let mut layers = vec![Layer { key: LayerKey::video(preview.window), frame: base }];
             layers.extend(cm_layers.iter().cloned());
-            let base_ls = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers))
+            let base_ls = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers, self.live_preview_windows()))
                 .width(Length::Fixed(dw))
                 .height(Length::Fixed(dh));
             (widget::container(Element::new(base_ls)).center_x(Length::Fill).into(), true)
@@ -472,7 +483,7 @@ impl App {
             children.push(fx);
         }
         if !cm_folded && !cm_layers.is_empty() {
-            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(cm_layers))
+            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(cm_layers, self.live_preview_windows()))
                 .width(Length::Fixed(dw))
                 .height(Length::Fixed(dh));
             children.push(widget::container(Element::new(shader)).center_x(Length::Fill).into());

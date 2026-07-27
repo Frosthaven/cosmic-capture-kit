@@ -117,8 +117,8 @@ impl App {
                 Task::none()
             }
             WindowChromeMsg::Ignore => Task::none(),
-            WindowChromeMsg::KeyPressed(modifiers, key) => self.handle_key(modifiers, key),
-            WindowChromeMsg::KeyReleased(modifiers, key) => {
+            WindowChromeMsg::KeyPressed(window, modifiers, key) => self.handle_key(window, modifiers, key),
+            WindowChromeMsg::KeyReleased(window, modifiers, key) => {
                 // DRAGON-325: some keys are delivered only on RELEASE, never on press — most
                 // notably PrintScreen (`VK_SNAPSHOT`), which Windows delivers as `WM_KEYUP`
                 // with no matching `WM_KEYDOWN`, so winit/iced emit only a `KeyReleased` for
@@ -146,7 +146,7 @@ impl App {
                 let recorder_armed =
                     recorder_armed || self.settings.capture_hotkey_rebinding.is_some();
                 if recorder_armed {
-                    return self.handle_key(modifiers, key);
+                    return self.handle_key(window, modifiers, key);
                 }
                 // Push-to-talk release: re-mute the mic when the held mic key is let go.
                 if self.ptt_held
@@ -326,7 +326,16 @@ impl App {
                 // window id no longer matches or the show is confirmed; on success they set
                 // `preview_shown_confirmed`, which stops `sub_preview_finalize`. Reading self
                 // (not a captured id) keeps it stale-proof, like `SettingsLivenessTick`.
-                match self.preview.as_ref().map(|p| (p.window, p.surface.is_window())) {
+                // With several previews open (DRAGON-336 phase 2) only the one whose show
+                // is still UNCONFIRMED needs re-driving; `finalize_preview_*` no-op for the
+                // rest anyway. Take the first unconfirmed surface — the finalize helpers match
+                // by window TITLE, so they can only ever act on one at a time.
+                let target = self
+                    .previews
+                    .iter()
+                    .find(|p| self.preview_shown_confirmed != Some(p.window))
+                    .map(|p| (p.window, p.surface.is_window()));
+                match target {
                     Some((id, true)) => self.finalize_preview_window(id, 0),
                     Some((id, false)) => {
                         // Recompute the overlay's target rect exactly as the open path did
@@ -649,7 +658,9 @@ impl App {
                 if Some(id) == self.settings.window || Some(id) == self.permissions.window {
                     window::close(id)
                 } else if self.is_preview_window(id) {
-                    self.update_preview(PreviewMsg::Cancel)
+                    // A preview's native ✕ / WM close closes THAT document (which ends the
+                    // process only if it was the last one — `close_preview`).
+                    self.update_preview(id, PreviewMsg::Cancel)
                 } else {
                     Task::none()
                 }
@@ -662,13 +673,42 @@ impl App {
                     self.close_mic_test(); // stop any live mic-test capture first
                     self.save_state();
                     self.settings.window = None;
-                    return self.finish_session();
+                    // DRAGON-336 phase 2: this is the SETTINGS pane going away, not a
+                    // preview — but the process may still be hosting preview documents, and
+                    // ending it would take them with it. So it is still a "last surface out"
+                    // decision: exit only when nothing is left. A `--settings` launch (the
+                    // only way these coexist today) opens no preview, so this is inert there
+                    // and the historical behavior is unchanged.
+                    return if self.previews.is_empty() {
+                        self.finish_session()
+                    } else {
+                        Task::none()
+                    };
                 }
                 if Some(id) == self.permissions.window {
                     // The permission-checker window closed — end this instance (it,
-                    // like `--settings`, never returns to a capture overlay).
+                    // like `--settings`, never returns to a capture overlay). Same
+                    // last-surface-out guard as the settings window above.
                     self.permissions.window = None;
-                    return self.finish_session();
+                    return if self.previews.is_empty() {
+                        self.finish_session()
+                    } else {
+                        Task::none()
+                    };
+                }
+                // A PREVIEW window/overlay finished closing. Normally its own close path
+                // (`close_preview`) already removed it, so this is a no-op; it matters when
+                // the surface went away WITHOUT routing through the editor (a compositor-side
+                // destroy), where it is the only signal that this document is gone — and, if
+                // it was the last one, that the process should end.
+                if self.is_preview_window(id) {
+                    // The surface is ALREADY gone (that is what this event reports), so
+                    // clear its liveness flag before closing the document — otherwise
+                    // `close_preview` would issue a second destroy for a dead id.
+                    if let Some(p) = self.preview_for_mut(id) {
+                        p.surface_open = false;
+                    }
+                    return self.close_preview(id);
                 }
                 Task::none()
             }

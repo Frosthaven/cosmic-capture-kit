@@ -19,6 +19,15 @@ pub enum CaptureMsg {
     HoverOutput(String),
     /// While windows are loading: advance the spinner + poll the pre-capture slot.
     LoadingTick,
+    /// DRAGON-336: ~100ms drain of the preview-HANDOFF channel while this process hosts
+    /// (`App::preview_host` bound). Each inbound request is another process's finished
+    /// capture: open it as a new preview document and ACK in the same arm, so the child
+    /// may exit. Lives in the CAPTURE domain rather than `PreviewMsg` because a handoff
+    /// poll has no preview to address — it may be what CREATES the first one, and
+    /// `Msg::Preview` now requires a `window::Id`. Never constructed off unix (no
+    /// transport, so nothing ever hosts — see `crate::preview_ipc`).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    HandoffPoll,
     /// macOS (DRAGON-148 option C): drain the DEFERRED frozen-flats grab slot into
     /// `self.frozen` + redraw against the still image. Fired by the drain poll
     /// while `frozen_pending`. Never constructed on Linux (synchronous grab).

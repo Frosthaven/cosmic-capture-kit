@@ -38,8 +38,9 @@
 //!
 //! ## Lifecycle coordination (see also [`crate::instance`])
 //!
-//! * The resident takes the shared resident single-instance lock at startup (separate
-//!   from the capture lock, so capture children can still take that) and installs the
+//! * The resident takes the shared resident single-instance lock at startup (its own
+//!   lock file; the capture children it spawns take no lock at all since DRAGON-351)
+//!   and installs the
 //!   SIGUSR1 handler FIRST THING, so a second bare launch that finds the lock held can
 //!   SIGUSR1 us → we spawn the default capture child → the second process exits.
 //! * `SetResident(true)` in the settings UI spawns this resident detached (the tray item
@@ -473,8 +474,8 @@ pub fn run(daemon_intent: bool) -> ! {
     install_sigusr1();
     install_sigterm();
 
-    // 2. Single-instance: take the resident lock (not the capture lock — that stays free
-    //    for capture children). If another resident holds it, this is a duplicate bare
+    // 2. Single-instance: take the resident lock (capture children take none —
+    //    DRAGON-351). If another resident holds it, this is a duplicate bare
     //    launch → ask the running resident to capture (its SIGUSR1 handler is up) and exit.
     //    Intent decides how hard to try (DRAGON-180): an explicit `resident` launch
     //    (autostart / manual) keeps the ~1.5s restart-handoff retry window; a bare

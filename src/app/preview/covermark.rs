@@ -115,7 +115,7 @@ impl App {
                     widget::button::custom(card)
                         .class(picker_card_class(selected))
                         .padding(6.0)
-                        .on_press(Msg::Preview(PreviewMsg::PickerPick(i))),
+                        .on_press(Msg::Preview(tb.pid, PreviewMsg::PickerPick(i))),
                 ),
             );
         }
@@ -134,10 +134,8 @@ impl App {
     /// Store the active covermark's current zoom + opacity as THIS option's remembered
     /// pref (keyed by `pref_key`), and mirror it into the global last-used values (the
     /// fallback for an option picked for the first time). No-op when no covermark is set.
-    pub(super) fn remember_covermark_pref(&mut self) {
-        let Some((key, zoom, opacity)) = self
-            .preview
-            .as_ref()
+    pub(super) fn remember_covermark_pref(&mut self, id: window::Id) {
+        let Some((key, zoom, opacity)) = self.preview_for(id)
             .and_then(|p| p.edit.covermark.as_ref())
             .map(|cm| (cm.kind.pref_key(), cm.zoom, cm.opacity))
         else {
@@ -153,9 +151,9 @@ impl App {
     /// [`layers::RasterSlot`]'s coalescing debounces a fast drag to one raster in flight + one
     /// pending re-run. Every live-adjustable edit routes through here, so the debounce is never
     /// hand-rolled per slider; a new one (dim/spotlight, DRAGON-329) adds a match arm.
-    pub(super) fn refresh_live_edit(&mut self, edit: super::edit::LiveEdit) -> Task<cosmic::Action<Msg>> {
+    pub(super) fn refresh_live_edit(&mut self, id: window::Id, edit: super::edit::LiveEdit) -> Task<cosmic::Action<Msg>> {
         match edit {
-            super::edit::LiveEdit::Covermark => self.refresh_edit_display(),
+            super::edit::LiveEdit::Covermark => self.refresh_edit_display(id),
         }
     }
 
@@ -165,8 +163,8 @@ impl App {
     /// a persistent-texture shader — so the base never re-uploads and the overlay's own
     /// texture updates in place (no atlas churn), which is what keeps edits blink-free. The
     /// bake still composites at full source resolution.
-    pub(super) fn refresh_edit_display(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn refresh_edit_display(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
         let Some(covermark) = p.edit.covermark.clone() else {
@@ -191,7 +189,7 @@ impl App {
             let _ = tx.send(frame);
         });
         Task::perform(rx, move |res| {
-            cosmic::Action::App(Msg::Preview(PreviewMsg::CovermarkRasterReady(
+            cosmic::Action::App(Msg::Preview(id, PreviewMsg::CovermarkRasterReady(
                 generation,
                 res.ok().flatten(),
             )))
@@ -203,8 +201,8 @@ impl App {
     /// zoom change so a magnified covermark sharpens toward the source resolution — without
     /// re-rastering on a zoom step that doesn't change the wanted resolution (e.g. already at
     /// the source cap, or below fit). No covermark → nothing to do.
-    pub(super) fn refresh_covermark_for_zoom(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_ref() else {
+    pub(super) fn refresh_covermark_for_zoom(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for(id) else {
             return Task::none();
         };
         if p.edit.covermark.is_none()
@@ -212,6 +210,6 @@ impl App {
         {
             return Task::none();
         }
-        self.refresh_edit_display()
+        self.refresh_edit_display(id)
     }
 }

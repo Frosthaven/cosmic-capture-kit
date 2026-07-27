@@ -8,7 +8,8 @@ points to.
 ## Module tree
 
 - `src/main.rs` — argv parsing (mode/kind/countdown/`--preview`/`--inspect`/
-  `--settings`), single-instance lock (`src/instance.rs`), launches the
+  `--settings`), the settings single-instance lock (`src/instance.rs` — a
+  CAPTURE launch takes no lock at all since DRAGON-351), launches the
   `cosmic::Application`.
 - `src/cli/` — `diagnostics.rs` (the `--test` harness) and `inspect.rs`
   (metadata dump). See [`CLI.md`](../CLI.md) for the user-facing flag list.
@@ -220,8 +221,8 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
   bare default). Detached so a child crash never touches the daemon and there's
   no SIGCHLD to reap. Each child captures and EXITS at finish — same as Linux.
 - **Lifecycle** (`src/instance.rs`) — the daemon takes its own single-instance
-  DAEMON lock (`acquire_daemon_lock`, separate from the capture lock so children
-  can still take THAT) and installs the SIGUSR1 handler first thing (no boot
+  DAEMON lock (`acquire_daemon_lock`; the one-shot capture children it spawns
+  take no lock at all) and installs the SIGUSR1 handler first thing (no boot
   race). A second bare launch finds the daemon lock held → `signal_existing_capture`
   SIGUSR1s the running daemon → daemon spawns the default capture child → second
   process exits. `SetResident(true)` (settings UI) spawns the daemon detached (menu

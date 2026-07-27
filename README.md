@@ -72,7 +72,7 @@ along with their statuses.
 | Preview editor (images): Arrows                     | ✅      |
 | Preview editor (images): Highlighter                | ✅      |
 | Preview editor (images): Text w/size                | 📅      |
-| Preview editor (images): Numbered marks             | 📅      |
+| Preview editor (images): Step markers               | ✅      |
 | Preview editor (images): Dim/spotlight              | ✅      |
 | Preview editor (images): Destructive pixelate       | ✅      |
 | Preview editor (images): Destructive blur           | ✅      |

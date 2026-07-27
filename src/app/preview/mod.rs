@@ -157,6 +157,25 @@ pub struct PreviewState {
     /// Zoom/pan of the displayed image (ctrl+scroll zoom, alt+scroll/drag pan). The whole
     /// composited image transforms together, so covermarks baked into it ride along.
     pub view: Viewport,
+    /// Whether THIS document holds a share of the process-wide "pause other apps' media"
+    /// guard (DRAGON-336 phase 2). The guard itself is refcounted on `App`
+    /// ([`DuckRefs`]); this flag is the per-document half, so a close/re-mint releases
+    /// exactly one reference and several video previews can't un-mute each other.
+    pub ducking: bool,
+    /// Whether `window` is still a LIVE surface. A few paths tear the surface down while
+    /// keeping the document loaded — the background bake and the overlay's Save As dialog
+    /// (an exclusive layer surface would render over the file chooser) — and the document
+    /// may be closed later without ever re-minting. [`App::close_preview`] reads this so it
+    /// never issues a SECOND destroy for an already-dead surface, which used to be
+    /// invisible only because the process exited immediately afterwards.
+    pub surface_open: bool,
+    /// This document was DEMOTED out of the fullscreen overlay when a second document
+    /// opened (DRAGON-336), and stays windowed for the rest of the session — even once
+    /// its siblings close and it is alone again. Silently re-entering fullscreen as
+    /// windows close would be jarring, so the pin is sticky; only the user's own
+    /// appearance toggle clears it. Read by [`overlay_taken`]; set in
+    /// [`App::demote_preview_to_window`], where the decision is documented.
+    pub demoted: bool,
 }
 
 
@@ -252,13 +271,237 @@ impl PreviewState {
 }
 
 
+/// Refcount for the "pause other apps' media" guard across MULTIPLE open previews
+/// (DRAGON-336 phase 2). The guard is a single process-wide effect, but any number of
+/// video previews may want it held, so it is engaged when the FIRST holder appears and
+/// dropped only when the LAST one releases — a plain `Option` un-muted the desktop the
+/// moment ONE of several previews stopped playing.
+///
+/// Holders are named by their preview's `window::Id`, so acquire/release are idempotent
+/// per preview (a repeated engage from the same preview is not a second reference, and a
+/// close that releases an already-released preview is a no-op).
+#[derive(Default)]
+pub(crate) struct DuckRefs {
+    holders: Vec<window::Id>,
+}
+
+impl DuckRefs {
+    /// Register `id` as a holder. Returns `true` when this is the FIRST holder — the
+    /// caller must engage the guard now.
+    pub(crate) fn acquire(&mut self, id: window::Id) -> bool {
+        if self.holders.contains(&id) {
+            return false;
+        }
+        let first = self.holders.is_empty();
+        self.holders.push(id);
+        first
+    }
+
+    /// Drop `id`'s hold. Returns `true` when that was the LAST holder — the caller must
+    /// drop the guard now (and only now).
+    pub(crate) fn release(&mut self, id: window::Id) -> bool {
+        let Some(i) = self.holders.iter().position(|h| *h == id) else {
+            return false;
+        };
+        self.holders.remove(i);
+        self.holders.is_empty()
+    }
+
+    /// Whether anyone still wants the desktop ducked.
+    pub(crate) fn held(&self) -> bool {
+        !self.holders.is_empty()
+    }
+
+    /// A holder changed surface identity (a preview re-minted its window — the appearance
+    /// toggle / cover→window swap). Move the hold WITHOUT engaging or dropping the guard;
+    /// a no-op when `old` wasn't holding.
+    pub(crate) fn rename(&mut self, old: window::Id, new: window::Id) {
+        if let Some(h) = self.holders.iter_mut().find(|h| **h == old) {
+            *h = new;
+        }
+    }
+}
+
+
+/// Position of the open preview whose surface is `id`. The one lookup rule behind
+/// [`App::preview_for`] / [`App::preview_for_mut`] / [`App::close_preview`], kept a free
+/// fn over the slice so it is unit-testable without an `App`.
+pub(super) fn index_of(previews: &[PreviewState], id: window::Id) -> Option<usize> {
+    previews.iter().position(|p| p.window == id)
+}
+
+/// The "last one out turns off the lights" decision (DRAGON-336 phase 2): closing `id`
+/// leaves NOTHING open, so the process must end. False when `id` isn't open at all AND
+/// something else still is — closing an already-gone document must not kill live ones.
+pub(super) fn closing_is_last(previews: &[PreviewState], id: window::Id) -> bool {
+    match index_of(previews, id) {
+        Some(_) => previews.len() == 1,
+        // Already removed: only the genuinely empty collection means "we're done".
+        None => previews.is_empty(),
+    }
+}
+
+/// Whether the fullscreen OVERLAY is UNAVAILABLE to the preview being minted, so it must
+/// open as a WINDOW instead.
+///
+/// THE RULE (DRAGON-336): a preview may be the fullscreen overlay only while it is the
+/// ONLY document. As soon as a SECOND document exists they are ALL windows — an overlay
+/// sitting behind floating preview windows is a strange mixed state, and two mapped
+/// `Exclusive` layer surfaces would fight over the keyboard grab besides (the DRAGON-109
+/// hazard documented at the top of `shell.rs`). So this is true whenever ANY OTHER
+/// document is open, whatever surface that one happens to be on — and the sibling still
+/// holding an overlay is DEMOTED to a window in the same pass
+/// ([`App::demote_preview_to_window`]), so the end state is either exactly one overlay or
+/// N windows, never a mix.
+///
+/// It is also true for a document DEMOTED earlier in the session
+/// ([`PreviewState::demoted`]): that one stays windowed even once it is alone again.
+///
+/// `existing` is the document being RE-minted (the appearance toggle, the cover→window
+/// swap, the Save-As re-open) — it never blocks itself, since its old surface is torn
+/// down in the same pass. `None` = a fresh document, not yet in `previews`.
+pub(super) fn overlay_taken(previews: &[PreviewState], existing: Option<window::Id>) -> bool {
+    previews.iter().any(|p| match existing {
+        // The document being re-minted: only its own sticky demotion bars it.
+        Some(e) if p.window == e => p.demoted,
+        // Any other open document bars the overlay outright.
+        _ => true,
+    })
+}
+
+/// The open documents that must come DOWN from the fullscreen overlay because a preview is
+/// being minted as a window beside them — the other half of [`overlay_taken`]'s rule, kept
+/// a free fn over the slice so the selection is unit-testable without an `App`. The
+/// demotion itself is [`App::demote_preview_to_window`].
+///
+/// A document whose surface was torn down while it stays loaded (a background bake, the
+/// overlay's Save-As dialog) is NOT selected: there is nothing on screen to demote, and
+/// re-minting a window for it would resurrect a surface that was closed on purpose. It
+/// re-opens later through the same rule, as a window.
+///
+/// `minting` is the document being minted for (never its own sibling); `None` for a fresh
+/// document, which is not yet in `previews`.
+pub(super) fn overlay_siblings(
+    previews: &[PreviewState],
+    minting: Option<window::Id>,
+) -> Vec<window::Id> {
+    previews
+        .iter()
+        .filter(|p| !p.surface.is_window() && p.surface_open && Some(p.window) != minting)
+        .map(|p| p.window)
+        .collect()
+}
+
+
 impl App {
+    /// The open preview whose surface is `id`, if any. THE lookup for every
+    /// `PreviewMsg` handler and window-keyed path — never index `self.previews`.
+    pub(in crate::app) fn preview_for(&self, id: window::Id) -> Option<&PreviewState> {
+        index_of(&self.previews, id).map(|i| &self.previews[i])
+    }
+
+    /// Mutable [`Self::preview_for`].
+    pub(in crate::app) fn preview_for_mut(&mut self, id: window::Id) -> Option<&mut PreviewState> {
+        index_of(&self.previews, id).map(|i| &mut self.previews[i])
+    }
+
+    /// The preview keyboard input belongs to when the event carries no usable window id
+    /// (the keymap dispatch). In priority order: the framework's genuinely FOCUSED window
+    /// when that is a preview, else the last preview we saw input for, else the most
+    /// recently OPENED one. The final fallback is what makes this `Some` whenever ANY
+    /// preview is open, keeping the single-preview behavior byte-identical to the old
+    /// singular-`preview` gate.
+    pub(in crate::app) fn focused_preview_id(&self) -> Option<window::Id> {
+        use cosmic::Application as _;
+        self.core()
+            .focused_window()
+            .filter(|id| self.preview_for(*id).is_some())
+            .or_else(|| self.focused_preview.filter(|id| self.preview_for(*id).is_some()))
+            .or_else(|| self.previews.last().map(|p| p.window))
+    }
+
+    /// Every OPEN preview surface, for the GPU shaders' closed-window eviction (DRAGON-336).
+    ///
+    /// iced keys a shader `Pipeline` by primitive TYPE and shares it across every window's
+    /// renderer, and exposes NO external handle to that storage — so app code cannot free a
+    /// closed preview's textures directly. Instead each `LayerStack` / `EffectsFx` carries
+    /// this set into its `prepare`, which drops the state of any window no longer in it.
+    /// It must be the OPEN set, never the drawn/focused one: a preview that has just opened
+    /// and not yet rendered is open, and that is exactly what keeps another window's prepare
+    /// from wiping it.
+    pub(in crate::app) fn live_preview_windows(&self) -> Vec<window::Id> {
+        self.previews.iter().map(|p| p.window).collect()
+    }
+
+    /// Whether the fullscreen OVERLAY is barred for the preview being minted — see
+    /// [`overlay_taken`] for the rule (a preview is the overlay only while it is the ONLY
+    /// document; a second document makes them ALL windows). [`Self::preview_surface_for`]
+    /// consults this as the single enforcement point.
+    ///
+    /// `existing` is the document being RE-minted (its old surface is torn down in the
+    /// same pass, so it never blocks itself).
+    pub(in crate::app) fn overlay_barred(&self, existing: Option<window::Id>) -> bool {
+        overlay_taken(&self.previews, existing)
+    }
+
+    /// Record which preview holds keyboard focus (an open, a focus event, or a close
+    /// that promoted another document). Ignores ids that aren't previews.
+    pub(in crate::app) fn note_preview_focus(&mut self, id: window::Id) {
+        if self.preview_for(id).is_some() {
+            self.focused_preview = Some(id);
+        }
+    }
+
+    /// THE multi-document close seam (DRAGON-336 phase 2): this ONE preview is done.
+    /// Destroys its surface, forgets its state, and — only when it was the LAST open
+    /// preview — ends the process through [`App::finish_session`] (the unchanged
+    /// one-shot lifecycle seam). With several previews open the others keep running and
+    /// focus is handed to the most recent survivor.
+    ///
+    /// Every "THIS preview is finished" path routes through here; the paths that mean
+    /// "the PROCESS is finished" (a capture error, a settings-window close, teardown)
+    /// still call `finish_session` directly.
+    pub(in crate::app) fn close_preview(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(i) = index_of(&self.previews, id) else {
+            // Already gone (a double close, or a stale async completion): if nothing is
+            // left at all this is still the last-one-out case, so honor it.
+            return if closing_is_last(&self.previews, id) {
+                self.finish_session()
+            } else {
+                Task::none()
+            };
+        };
+        // Stop this document's playback + release its share of the duck refcount BEFORE
+        // it leaves the collection (both are keyed by its id).
+        self.stop_preview_playback(id);
+        let p = self.previews.remove(i);
+        // Only destroy a surface that is still up (a bake / Save As dialog may have torn
+        // it down already while keeping the document loaded).
+        let close = if p.surface_open { p.surface.close(p.window) } else { Task::none() };
+        if self.capture_preview == Some(id) {
+            self.capture_preview = None;
+        }
+        if self.focused_preview == Some(id) {
+            self.focused_preview = None;
+        }
+        if self.previews.is_empty() {
+            // Last one out turns off the lights.
+            return Task::batch([close, self.finish_session()]);
+        }
+        // Hand focus to the most recent survivor so the keymap dispatch keeps a target.
+        self.focused_preview = self.previews.last().map(|p| p.window);
+        close
+    }
 
 
-    pub(super) fn update_preview(&mut self, message: PreviewMsg) -> Task<cosmic::Action<Msg>> {
+    pub(super) fn update_preview(
+        &mut self,
+        id: window::Id,
+        message: PreviewMsg,
+    ) -> Task<cosmic::Action<Msg>> {
         // A bake is committing the edits to disk: hold every input except its own
         // completion so the file can't be shared/deleted mid-rewrite.
-        if self.preview.as_ref().is_some_and(|p| p.edit.baking)
+        if self.preview_for(id).is_some_and(|p| p.edit.baking)
             && !matches!(message, PreviewMsg::BakeDone(_))
         {
             return Task::none();
@@ -266,7 +509,7 @@ impl App {
         match message {
             PreviewMsg::ImageReady(handle, original) => {
                 if let Some(PreviewState { kind: PreviewKind::Image(img), edit, .. }) =
-                    &mut self.preview
+                    self.preview_for_mut(id)
                 {
                     if let Some(o) = &original {
                         // Aspect for the covermark preview raster (stacked over the image).
@@ -290,7 +533,7 @@ impl App {
                 // height cap bites. Same drift-gated resize the video-meta path uses
                 // (post-open resizes are honored once the DRAGON-108 hint cleared on the
                 // first configure).
-                let refit = match self.preview.as_ref() {
+                let refit = match self.preview_for(id) {
                     Some(p) if p.surface.is_window() => {
                         let out = self.preview_output.as_ref().map(|(_, o)| *o);
                         // Windows (DRAGON-288): an external `--preview` has no capture anchor,
@@ -343,13 +586,13 @@ impl App {
                 // yet, so nothing to composite here.
                 // Keep the window focused as the spinner gives way to the image (the surface
                 // teardown behind the load could otherwise steal focus).
-                Task::batch([refit.unwrap_or_else(Task::none), self.focus_preview_window()])
+                Task::batch([refit.unwrap_or_else(Task::none), self.focus_preview_window(id)])
             }
             PreviewMsg::Covermark => {
                 // Toggle the covermark flyout. Open with the APPLIED mark highlighted (its
                 // keyboard index), falling back to the "None" card (index 0).
                 let text = self.covermark_text.clone();
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     if p.edit.flyout_kind() == Some(edit::FlyoutKind::Covermark) {
                         p.edit.close_flyout();
                     } else {
@@ -370,7 +613,7 @@ impl App {
             }
             // ── Shared toolbar-flyout keyboard nav (covermark picker + color palette) ────
             PreviewMsg::FlyoutNav(delta) => {
-                if let Some(p) = &mut self.preview
+                if let Some(p) = self.preview_for_mut(id)
                     && let Some(f) = &mut p.edit.flyout
                 {
                     f.nav(delta);
@@ -379,18 +622,18 @@ impl App {
             }
             PreviewMsg::FlyoutApply => {
                 let recents = self.annot_recent_colors.clone();
-                let flyout = self.preview.as_ref().and_then(|p| p.edit.flyout);
+                let flyout = self.preview_for(id).and_then(|p| p.edit.flyout);
                 match flyout {
                     Some(edit::FlyoutNav { kind: edit::FlyoutKind::Covermark, selected: Some(i), .. }) => {
-                        self.update_preview(PreviewMsg::PickerPick(i))
+                        self.update_preview(id, PreviewMsg::PickerPick(i))
                     }
                     Some(edit::FlyoutNav { kind: edit::FlyoutKind::Color, selected: Some(i), .. }) => {
                         match annotate::palette_entries(&recents).get(i) {
                             Some(annotate::PaletteEntry::Color(c)) => {
-                                self.update_preview(PreviewMsg::SetAnnotColor(*c))
+                                self.update_preview(id, PreviewMsg::SetAnnotColor(*c))
                             }
                             Some(annotate::PaletteEntry::Custom) => {
-                                self.update_preview(PreviewMsg::AnnotColorEditor(true))
+                                self.update_preview(id, PreviewMsg::AnnotColorEditor(true))
                             }
                             None => Task::none(),
                         }
@@ -399,7 +642,7 @@ impl App {
                 }
             }
             PreviewMsg::FlyoutClose => {
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.close_flyout();
                 }
                 Task::none()
@@ -409,7 +652,7 @@ impl App {
                 // (or the "None" card) turns it OFF; picking a different one replaces it.
                 // A covermark starts at THAT option's remembered zoom + opacity (falling
                 // back to the global last-used values the first time it's picked).
-                let (entry, active_kind) = match &self.preview {
+                let (entry, active_kind) = match self.preview_for(id) {
                     Some(p) => match &p.edit.picker {
                         Some(pk) => (
                             pk.entries.get(idx).cloned(),
@@ -433,11 +676,11 @@ impl App {
                         Some(Covermark { kind, zoom, opacity })
                     }
                 };
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.close_flyout();
                     p.edit.set_covermark(next);
                 }
-                self.refresh_edit_display()
+                self.refresh_edit_display(id)
             }
             #[cfg(target_os = "macos")]
             PreviewMsg::PinchPoll => {
@@ -448,17 +691,17 @@ impl App {
                 // matches the pinch 1:1 at `step = delta / 0.12`. No pinch → no-op.
                 crate::platform::mac::pinch::install_pinch();
                 let delta = crate::platform::mac::pinch::take_pinch();
-                if delta != 0.0 && self.preview.is_some() {
-                    return self.update_preview(PreviewMsg::Zoom(delta / 0.12, 0.0, 0.0));
+                if delta != 0.0 && self.preview_for(id).is_some() {
+                    return self.update_preview(id, PreviewMsg::Zoom(delta / 0.12, 0.0, 0.0));
                 }
                 Task::none()
             }
             PreviewMsg::Zoom(step, ux, uy) => {
                 // Zoom toward the cursor (keep the point under it fixed), then edge-snap.
-                let maxz = self.preview.as_ref().map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
-                let minz = self.preview.as_ref().map(|p| self.min_view_zoom(p)).unwrap_or(Viewport::MIN);
-                let visual = self.preview.as_ref().map(|p| self.preview_visual_scale(p)).unwrap_or(1.0);
-                if let Some(p) = &mut self.preview {
+                let maxz = self.preview_for(id).map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
+                let minz = self.preview_for(id).map(|p| self.min_view_zoom(p)).unwrap_or(Viewport::MIN);
+                let visual = self.preview_for(id).map(|p| self.preview_visual_scale(p)).unwrap_or(1.0);
+                if let Some(p) = self.preview_for_mut(id) {
                     let z0 = p.view.zoom;
                     let pan0 = p.view.pan;
                     let z1 = viewport::snap_to_hundred(
@@ -476,28 +719,28 @@ impl App {
                     p.view.zoom_preset = if (z1 - z100).abs() < 1e-3 { Some(1) } else { None };
                 }
                 // Edge-snap the pan to the (new-zoom) bounds so it can't go out of view.
-                let b = self.preview.as_ref().map(|p| self.preview_pan_bounds(p));
+                let b = self.preview_for(id).map(|p| self.preview_pan_bounds(p));
                 if let Some(((minx, maxx), (miny, maxy))) = b
-                    && let Some(p) = &mut self.preview
+                    && let Some(p) = self.preview_for_mut(id)
                 {
                     p.view.pan.0 = p.view.pan.0.clamp(minx, maxx);
                     p.view.pan.1 = p.view.pan.1.clamp(miny, maxy);
                 }
                 // Sharpen the covermark for the new zoom (no-op when unchanged / no mark).
-                self.refresh_covermark_for_zoom()
+                self.refresh_covermark_for_zoom(id)
             }
             PreviewMsg::SetViewZoom(z) => {
-                let maxz = self.preview.as_ref().map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
-                let minz = self.preview.as_ref().map(|p| self.min_view_zoom(p)).unwrap_or(Viewport::MIN);
-                let visual = self.preview.as_ref().map(|p| self.preview_visual_scale(p)).unwrap_or(1.0);
-                if let Some(p) = &mut self.preview {
+                let maxz = self.preview_for(id).map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
+                let minz = self.preview_for(id).map(|p| self.min_view_zoom(p)).unwrap_or(Viewport::MIN);
+                let visual = self.preview_for(id).map(|p| self.preview_visual_scale(p)).unwrap_or(1.0);
+                if let Some(p) = self.preview_for_mut(id) {
                     // Clamp to the 50%-display floor, then magnetically snap to exactly 100%.
                     let snapped = viewport::snap_to_hundred(z.clamp(minz, maxz), visual);
                     p.view.set_zoom(snapped);
                     let z100 = viewport::preset_zoom(Some(1.0), visual);
                     p.view.zoom_preset = if (p.view.zoom - z100).abs() < 1e-3 { Some(1) } else { None };
                 }
-                self.refresh_covermark_for_zoom()
+                self.refresh_covermark_for_zoom(id)
             }
             PreviewMsg::ZoomPreset(i) => {
                 // Presets are in VISUAL terms (100% = natural on-screen size); convert to the
@@ -505,12 +748,10 @@ impl App {
                 // targets natural size on a 2× capture (zoom = 1/visual_scale = fit at natural),
                 // and physical 1:1 lives at the "200%" preset there. "Fit to screen" (None) =
                 // fit BOTH (whole picture between the toolbars, zoom 1.0) — never overflow.
-                let visual = self
-                    .preview
-                    .as_ref()
+                let visual = self.preview_for(id)
                     .map(|p| self.preview_visual_scale(p))
                     .unwrap_or(1.0);
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.view.zoom_menu_open = false;
                     // Only real preset indices change the zoom (the combo also lists the
                     // current % as a synthetic trailing entry — selecting it is a no-op).
@@ -521,10 +762,10 @@ impl App {
                         p.view.zoom_preset = Some(i);
                     }
                 }
-                self.refresh_covermark_for_zoom()
+                self.refresh_covermark_for_zoom(id)
             }
             PreviewMsg::ToggleZoomMenu => {
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.view.zoom_menu_open = !p.view.zoom_menu_open;
                 }
                 Task::none()
@@ -532,9 +773,9 @@ impl App {
             PreviewMsg::Pan(dx, dy) => {
                 // Clamp panning to the image's overflow beyond the (scrollbar-reserved)
                 // viewport, so you can't scroll past the picture's edges.
-                let bounds = self.preview.as_ref().map(|p| self.preview_pan_bounds(p));
+                let bounds = self.preview_for(id).map(|p| self.preview_pan_bounds(p));
                 if let Some(((minx, maxx), (miny, maxy))) = bounds
-                    && let Some(p) = &mut self.preview
+                    && let Some(p) = self.preview_for_mut(id)
                 {
                     p.view.pan.0 = (p.view.pan.0 + dx).clamp(minx, maxx);
                     p.view.pan.1 = (p.view.pan.1 + dy).clamp(miny, maxy);
@@ -542,7 +783,7 @@ impl App {
                 Task::none()
             }
             PreviewMsg::SetPanMode(on) => {
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.view.pan_mode = on;
                 }
                 Task::none()
@@ -550,7 +791,7 @@ impl App {
             PreviewMsg::TogglePanMode => {
                 // The `V` hotkey: flip pan mode. The pointer/pan seg-toggle button reads
                 // the same `view.pan_mode`, so UI + hotkey stay in sync.
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.view.pan_mode = !p.view.pan_mode;
                 }
                 Task::none()
@@ -560,37 +801,37 @@ impl App {
                 // live-slider path — the covermark re-renders continuously while dragging,
                 // debounced by the RasterSlot's coalescing (one raster in flight, ticks collapse
                 // to one pending re-run), so a fast drag never thrashes the GPU.
-                if let Some(p) = &mut self.preview
+                if let Some(p) = self.preview_for_mut(id)
                     && p.edit.covermark.is_some()
                 {
                     p.edit.set_zoom(zoom);
-                    self.remember_covermark_pref();
+                    self.remember_covermark_pref(id);
                     self.save_state();
-                    return self.refresh_live_edit(edit::LiveEdit::Covermark);
+                    return self.refresh_live_edit(id, edit::LiveEdit::Covermark);
                 }
                 Task::none()
             }
             PreviewMsg::SetOpacity(opacity) => {
                 // Live slider drag: value + LIVE coalesced re-raster (see SetZoom).
-                if let Some(p) = &mut self.preview
+                if let Some(p) = self.preview_for_mut(id)
                     && let Some(cm) = &mut p.edit.covermark
                 {
                     cm.opacity = opacity;
                     p.edit.cm_raster.invalidate();
-                    self.remember_covermark_pref();
+                    self.remember_covermark_pref(id);
                     self.save_state();
-                    return self.refresh_live_edit(edit::LiveEdit::Covermark);
+                    return self.refresh_live_edit(id, edit::LiveEdit::Covermark);
                 }
                 Task::none()
             }
             // Slider RELEASE: a final settle through the same shared path (renders the last value
             // in case the trailing tick coalesced).
-            PreviewMsg::CommitCovermarkEdit => self.refresh_live_edit(edit::LiveEdit::Covermark),
+            PreviewMsg::CommitCovermarkEdit => self.refresh_live_edit(id, edit::LiveEdit::Covermark),
             PreviewMsg::SetDim(dim) => {
                 // Live slider drag: update the global dim; the GPU dim pass re-renders from the
                 // model on the next view build (no off-thread raster). Latch the pre-drag value
                 // on the FIRST tick so the whole drag coalesces into ONE undo entry on release.
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     if p.edit.dim_drag_start.is_none() {
                         p.edit.dim_drag_start = Some(p.edit.dim);
                     }
@@ -600,7 +841,7 @@ impl App {
             }
             PreviewMsg::CommitDimEdit => {
                 // Slider RELEASE: push ONE undo entry for the whole drag if the value moved.
-                if let Some(p) = &mut self.preview
+                if let Some(p) = self.preview_for_mut(id)
                     && let Some(start) = p.edit.dim_drag_start.take()
                     && (start - p.edit.dim).abs() > f32::EPSILON
                 {
@@ -612,7 +853,7 @@ impl App {
                 // The shared history walks covermark, timeline AND annotation edits; only a
                 // covermark change needs its async raster refreshed (timeline + annotation
                 // changes redraw on the next view build for free — annotations as vectors).
-                let kind = if let Some(PreviewState { kind, edit, .. }) = &mut self.preview {
+                let kind = if let Some(PreviewState { kind, edit, .. }) = self.preview_for_mut(id) {
                     let tl = match kind {
                         PreviewKind::Video(vid) => vid.timeline.as_mut(),
                         PreviewKind::Image(_) => None,
@@ -622,7 +863,7 @@ impl App {
                     None
                 };
                 match kind {
-                    Some(EditKind::Covermark) => self.refresh_edit_display(),
+                    Some(EditKind::Covermark) => self.refresh_edit_display(id),
                     // Box/arrow redraw as vectors for free (DRAGON-324); the effect layer
                     // (highlight/pixelate/blur) re-renders through the GPU shader from the
                     // restored model on the next view build (DRAGON-330). A dim change likewise
@@ -632,7 +873,7 @@ impl App {
                 }
             }
             PreviewMsg::Redo => {
-                let kind = if let Some(PreviewState { kind, edit, .. }) = &mut self.preview {
+                let kind = if let Some(PreviewState { kind, edit, .. }) = self.preview_for_mut(id) {
                     let tl = match kind {
                         PreviewKind::Video(vid) => vid.timeline.as_mut(),
                         PreviewKind::Image(_) => None,
@@ -642,7 +883,7 @@ impl App {
                     None
                 };
                 match kind {
-                    Some(EditKind::Covermark) => self.refresh_edit_display(),
+                    Some(EditKind::Covermark) => self.refresh_edit_display(id),
                     // Box/arrow redraw as vectors for free (DRAGON-324); the effect layer
                     // (highlight/pixelate/blur) re-renders through the GPU shader from the
                     // restored model on the next view build (DRAGON-330). A dim change likewise
@@ -656,19 +897,17 @@ impl App {
                 // persistent-texture shader) — NOT a full re-composite, so the base never
                 // re-uploads. `finish` drops stale generations and reports whether another
                 // refresh was requested while this one was in flight.
-                let again = self
-                    .preview
-                    .as_mut()
+                let again = self.preview_for_mut(id)
                     .map(|p| p.edit.cm_raster.finish(generation, frame))
                     .unwrap_or(false);
                 if again {
-                    return self.refresh_edit_display();
+                    return self.refresh_edit_display(id);
                 }
                 Task::none()
             }
             // ── Annotation editor (IMAGES only) ──────────────────────────────────────
             PreviewMsg::SelectTool(tool) => {
-                self.select_annot_tool(tool);
+                self.select_annot_tool(id, tool);
                 Task::none()
             }
             PreviewMsg::ToolPressed(tool) => {
@@ -676,24 +915,22 @@ impl App {
                 // second press of the same button inside the window ALSO drops a ready-made item
                 // in the middle of the picture (one undo entry, selected), on top of the ordinary
                 // arm-the-tool behavior every press has.
-                let double = self
-                    .preview
-                    .as_mut()
+                let double = self.preview_for_mut(id)
                     .is_some_and(|p| p.edit.tool_clicks.press(tool, std::time::Instant::now()));
-                self.select_annot_tool(tool);
+                self.select_annot_tool(id, tool);
                 if double {
-                    self.spawn_annotation(tool);
+                    self.spawn_annotation(id, tool);
                 }
                 Task::none()
             }
             PreviewMsg::SetAnnotColor(color) => {
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.annot_color = Some(color);
                     p.edit.close_flyout();
                 }
                 // Picking a color also recolors the SELECTED colorable item immediately (one
                 // undo entry) — same effect as the right-click "Set to current color".
-                self.recolor_selected_annotation(color);
+                self.recolor_selected_annotation(id, color);
                 // Persist so the next preview opens with this color.
                 self.annot_color = Some(color);
                 self.save_state();
@@ -702,18 +939,16 @@ impl App {
                 Task::none()
             }
             PreviewMsg::SetAnnotStrokeW(w) => {
-                self.apply_annot_stroke_w(w);
+                self.apply_annot_stroke_w(id, w);
                 Task::none()
             }
             PreviewMsg::CycleAnnotStrokeW => {
                 // The `L` hotkey: advance to the next width preset (2 → 5 → 8 → 2), applying to
                 // the selection + persisting, exactly like clicking the next segment.
-                let current = self
-                    .preview
-                    .as_ref()
+                let current = self.preview_for(id)
                     .map(|p| p.edit.stroke())
                     .unwrap_or(annotate::DEFAULT_ANNOT_STROKE);
-                self.apply_annot_stroke_w(annotate::cycle_stroke_width(current));
+                self.apply_annot_stroke_w(id, annotate::cycle_stroke_width(current));
                 Task::none()
             }
             PreviewMsg::ToggleAnnotPalette => {
@@ -721,7 +956,7 @@ impl App {
                 // (matched across ALL swatches, incl. the custom MRU); no highlight if the
                 // active color isn't present.
                 let entries = annotate::palette_entries(&self.annot_recent_colors);
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     if p.edit.flyout_kind() == Some(edit::FlyoutKind::Color) {
                         p.edit.close_flyout();
                     } else {
@@ -735,7 +970,7 @@ impl App {
                 Task::none()
             }
             PreviewMsg::AnnotColorEditor(open) => {
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     if open {
                         // Seed the wheel from the current color; close the palette flyout.
                         let bytes =
@@ -759,7 +994,7 @@ impl App {
                 Task::none()
             }
             PreviewMsg::AnnotColorPickerUpdate(u) => {
-                if let Some(p) = &mut self.preview
+                if let Some(p) = self.preview_for_mut(id)
                     && let Some(model) = &mut p.edit.annot_picker
                 {
                     // Drive the libcosmic picker; its returned Task only ever writes the hex to
@@ -776,9 +1011,7 @@ impl App {
                 // opened with — applying then pushed/selected the STALE color, which read as
                 // "nothing rotated, nothing added, nothing selected". The returned Task is
                 // droppable (only the copy button's update does real work).
-                let picked = self
-                    .preview
-                    .as_mut()
+                let picked = self.preview_for_mut(id)
                     .and_then(|p| p.edit.annot_picker.as_mut())
                     .and_then(|m| {
                         let _ = m.update::<Msg>(
@@ -794,7 +1027,7 @@ impl App {
                             255,
                         ]
                     });
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.annot_picker = None;
                     if let Some(c) = picked {
                         p.edit.annot_color = Some(c);
@@ -802,7 +1035,7 @@ impl App {
                 }
                 if let Some(c) = picked {
                     // Applying a custom wheel color also recolors the SELECTED colorable item.
-                    self.recolor_selected_annotation(c);
+                    self.recolor_selected_annotation(id, c);
                     self.annot_color = Some(c);
                     self.push_recent_color(c);
                     self.save_state();
@@ -810,65 +1043,63 @@ impl App {
                 // A recolored highlight re-renders through the GPU shader (DRAGON-330).
                 Task::none()
             }
-            PreviewMsg::SelectAnnotation(id) => {
-                if let Some(p) = &mut self.preview {
-                    match id {
-                        Some(id) => p.edit.sel.set_one(id),
+            PreviewMsg::SelectAnnotation(annot) => {
+                if let Some(p) = self.preview_for_mut(id) {
+                    match annot {
+                        Some(annot) => p.edit.sel.set_one(annot),
                         None => p.edit.sel.clear(),
                     }
                     p.edit.annot_menu = None;
                 }
                 Task::none()
             }
-            PreviewMsg::ToggleAnnotationSelected(id) => {
-                if let Some(p) = &mut self.preview {
-                    p.edit.sel.toggle(id);
+            PreviewMsg::ToggleAnnotationSelected(annot) => {
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.sel.toggle(annot);
                     p.edit.annot_menu = None;
                 }
                 Task::none()
             }
             PreviewMsg::BandSelectAnnotations(x0, y0, x1, y1, additive) => {
-                self.band_select_annotations(x0, y0, x1, y1, additive);
+                self.band_select_annotations(id, x0, y0, x1, y1, additive);
                 Task::none()
             }
             PreviewMsg::SelectAllAnnotations => {
-                self.select_all_annotations();
+                self.select_all_annotations(id);
                 Task::none()
             }
-            PreviewMsg::AnnotDrawBegin(tool, x, y) => self.annot_draw_begin(tool, x, y),
-            PreviewMsg::AnnotGrabBegin(grab, x, y) => self.annot_grab_begin(grab, x, y),
-            PreviewMsg::AnnotGestureTo(x, y) => self.annot_gesture_to(x, y),
-            PreviewMsg::AnnotGestureEnd => self.annot_gesture_end(),
-            PreviewMsg::DeleteSelected => self.annot_delete_selected(),
-            PreviewMsg::DuplicateSelected => self.duplicate_selected_annotation(),
+            PreviewMsg::AnnotDrawBegin(tool, x, y) => self.annot_draw_begin(id, tool, x, y),
+            PreviewMsg::AnnotGrabBegin(grab, x, y) => self.annot_grab_begin(id, grab, x, y),
+            PreviewMsg::AnnotGestureTo(x, y) => self.annot_gesture_to(id, x, y),
+            PreviewMsg::AnnotGestureEnd => self.annot_gesture_end(id),
+            PreviewMsg::DeleteSelected => self.annot_delete_selected(id),
+            PreviewMsg::DuplicateSelected => self.duplicate_selected_annotation(id),
             PreviewMsg::SetSelectedColor => {
                 // Recolor the selected colorable item to the CURRENT annotation color (one undo
                 // entry) — a highlight keeps its 45% tint at the new hue; pixelate/blur (no
                 // color) are skipped. Shares the recolor path with picking a color while selected.
-                let color = self
-                    .preview
-                    .as_ref()
+                let color = self.preview_for(id)
                     .and_then(|p| p.edit.annot_color)
                     .unwrap_or_else(annotate::default_annot_color);
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.annot_menu = None;
                 }
-                self.recolor_selected_annotation(color);
+                self.recolor_selected_annotation(id, color);
                 // Recoloring a highlight re-renders through the GPU shader (DRAGON-330).
                 Task::none()
             }
-            PreviewMsg::RaiseSelected => self.annot_reorder(Reorder::Up),
-            PreviewMsg::LowerSelected => self.annot_reorder(Reorder::Down),
-            PreviewMsg::SelectionToFront => self.annot_reorder(Reorder::Front),
-            PreviewMsg::SelectionToBack => self.annot_reorder(Reorder::Back),
+            PreviewMsg::RaiseSelected => self.annot_reorder(id, Reorder::Up),
+            PreviewMsg::LowerSelected => self.annot_reorder(id, Reorder::Down),
+            PreviewMsg::SelectionToFront => self.annot_reorder(id, Reorder::Front),
+            PreviewMsg::SelectionToBack => self.annot_reorder(id, Reorder::Back),
             PreviewMsg::AnnotMenuOpen(x, y) => {
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.annot_menu = Some((x, y));
                 }
                 Task::none()
             }
             PreviewMsg::AnnotMenuClose => {
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.annot_menu = None;
                 }
                 Task::none()
@@ -877,7 +1108,7 @@ impl App {
                 // Captured before borrowing `p`: whether the editor stays open after the
                 // share (the "auto close" setting is off).
                 let keep_open = !self.auto_close_preview;
-                let Some(p) = &mut self.preview else {
+                let Some(p) = self.preview_for_mut(id) else {
                     return Task::none();
                 };
                 p.edit.baking = false;
@@ -887,14 +1118,14 @@ impl App {
                 let saved_path = p.path.clone();
                 match size {
                     Some(size) => {
-                        self.stop_preview_playback();
+                        self.stop_preview_playback(id);
                         match intent {
                             // Save baked the capture IN PLACE. When keeping the editor
                             // open, the edits are now part of the file, so commit them
                             // into the base: reset the edit state and reload the baked
                             // result as the new baseline (so further edits start clean).
                             Some(ShareIntent::Save) => {
-                                if let Some(p) = &mut self.preview {
+                                if let Some(p) = self.preview_for_mut(id) {
                                     p.size = Some(size);
                                     p.edit.covermark = None;
                                     p.edit.undo_stack.clear();
@@ -929,12 +1160,14 @@ impl App {
                                     // re-probes (fresh poster, duration, timeline —
                                     // its cuts/duration may have changed).
                                     match (is_video, saved_path) {
-                                        (false, Some(path)) => image::decode_task(path),
-                                        (true, Some(path)) => video::poster_task(path),
+                                        (false, Some(path)) => image::decode_task(id, path),
+                                        (true, Some(path)) => video::poster_task(id, path),
                                         _ => Task::none(),
                                     }
                                 } else {
-                                    self.finish_session()
+                                    // THIS document is done (the process only ends with
+                                    // the last one — DRAGON-336 phase 2).
+                                    self.close_preview(id)
                                 }
                             }
                             // Copy baked to a TEMP (the saved file stays clean): the
@@ -952,12 +1185,12 @@ impl App {
                                 if keep_open {
                                     Task::none()
                                 } else {
-                                    if let Some(p) = &mut self.preview {
+                                    if let Some(p) = self.preview_for_mut(id) {
                                         p.edit.covermark = None;
                                         p.edit.undo_stack.clear();
                                         p.edit.redo_stack.clear();
                                     }
-                                    self.finish_session()
+                                    self.close_preview(id)
                                 }
                             }
                             None => Task::none(),
@@ -972,7 +1205,7 @@ impl App {
                         if let Some(path) = &saved_path {
                             crate::platform::services::notify(path, false);
                         }
-                        self.finish_session()
+                        self.close_preview(id)
                     }
                 }
             }
@@ -980,18 +1213,18 @@ impl App {
                 // The user OK'd overwriting the file: bake the edits into it in place
                 // (background, behind the processing notification), then finish. `begin_bake`
                 // uses the preview's own path, and BakeDone(Save) reveals + finishes/keeps.
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.confirm_overwrite = false;
                 }
-                if let Some(task) = self.begin_bake(ShareIntent::Save) {
+                if let Some(task) = self.begin_bake(id, ShareIntent::Save) {
                     return task;
                 }
                 // No edits after all (shouldn't happen — the dialog only opens with edits):
-                // nothing to write, just exit.
-                self.finish_session()
+                // nothing to write, just close this document.
+                self.close_preview(id)
             }
             PreviewMsg::CancelOverwrite => {
-                if let Some(p) = &mut self.preview {
+                if let Some(p) = self.preview_for_mut(id) {
                     p.edit.confirm_overwrite = false;
                 }
                 Task::none()
@@ -999,7 +1232,7 @@ impl App {
             PreviewMsg::PosterReady(poster, meta) => {
                 let mut wave = Task::none();
                 if let Some(PreviewState { kind: PreviewKind::Video(vid), edit, path, .. }) =
-                    &mut self.preview
+                    self.preview_for_mut(id)
                 {
                     vid.poster = poster;
                     vid.meta = meta;
@@ -1014,7 +1247,7 @@ impl App {
                         }
                         // Soundtrack peaks for the L/R lanes, off-thread.
                         if m.has_audio && let Some(path) = path.clone() {
-                            wave = video::waveform_task(path);
+                            wave = video::waveform_task(id, path);
                         }
                     }
                 }
@@ -1025,7 +1258,7 @@ impl App {
                 // has something real (the footprint keeps precedence when present,
                 // so a fitted recording never gets shrunk to a res-capped encode).
                 // The overlay needs nothing: its hugging viewport re-reads live.
-                let refit = match (self.preview.as_ref(), meta) {
+                let refit = match (self.preview_for(id), meta) {
                     (Some(p), Some(_)) if p.surface.is_window() => {
                         let out = self.preview_output.as_ref().map(|(_, o)| *o);
                         // Windows (DRAGON-288): an external `--preview` video has no capture
@@ -1068,37 +1301,37 @@ impl App {
                     _ => None,
                 };
                 // Keep the window focused as the spinner gives way to the poster.
-                Task::batch([wave, refit.unwrap_or_else(Task::none), self.focus_preview_window()])
+                Task::batch([wave, refit.unwrap_or_else(Task::none), self.focus_preview_window(id)])
             }
             // Playback / scrub / frame-step / timeline edits are video-only (no-ops
             // otherwise); the logic lives in `video.rs` next to the playback state.
-            PreviewMsg::Play => self.toggle_playback(),
-            PreviewMsg::PlayerTick => self.playback_tick(),
-            PreviewMsg::Seek(t) => self.seek(t),
-            PreviewMsg::FrameStep(delta) => self.frame_step(delta),
-            PreviewMsg::SeekFrameReady(handle) => self.on_seek_frame(handle),
-            PreviewMsg::TimelineSeek(t) => self.timeline_seek(t),
-            PreviewMsg::TimelineSelect(t, ctrl, shift) => self.timeline_select(t, ctrl, shift),
+            PreviewMsg::Play => self.toggle_playback(id),
+            PreviewMsg::PlayerTick => self.playback_tick(id),
+            PreviewMsg::Seek(t) => self.seek(id, t),
+            PreviewMsg::FrameStep(delta) => self.frame_step(id, delta),
+            PreviewMsg::SeekFrameReady(handle) => self.on_seek_frame(id, handle),
+            PreviewMsg::TimelineSeek(t) => self.timeline_seek(id, t),
+            PreviewMsg::TimelineSelect(t, ctrl, shift) => self.timeline_select(id, t, ctrl, shift),
             PreviewMsg::TimelineBoxSelect(a, b, additive) => {
-                self.timeline_box_select(a, b, additive)
+                self.timeline_box_select(id, a, b, additive)
             }
-            PreviewMsg::TimelineCut(t) => self.timeline_cut(t),
-            PreviewMsg::TimelineRazor(on) => self.timeline_set_razor(on),
-            PreviewMsg::TimelineDelete => self.timeline_delete_selected(),
-            PreviewMsg::TimelineMenuOpen(t, x, y) => self.timeline_menu_open(t, x, y),
-            PreviewMsg::TimelineMenuClose => self.timeline_menu_close(),
-            PreviewMsg::WaveformReady(peaks) => self.on_waveform(peaks),
+            PreviewMsg::TimelineCut(t) => self.timeline_cut(id, t),
+            PreviewMsg::TimelineRazor(on) => self.timeline_set_razor(id, on),
+            PreviewMsg::TimelineDelete => self.timeline_delete_selected(id),
+            PreviewMsg::TimelineMenuOpen(t, x, y) => self.timeline_menu_open(id, t, x, y),
+            PreviewMsg::TimelineMenuClose => self.timeline_menu_close(id),
+            PreviewMsg::WaveformReady(peaks) => self.on_waveform(id, peaks),
             PreviewMsg::Save => {
-                let external = self.preview.as_ref().is_some_and(|p| p.external);
+                let external = self.preview_for(id).is_some_and(|p| p.external);
                 // Anything to bake into the file? A covermark or deleted timeline
                 // segments bake new pixels. If so, Save always confirms the overwrite
                 // first (no cleverness about "nothing changed") — via the in-app modal,
                 // clickable over the overlay grab and in the window alike. The
                 // background bake runs on ConfirmOverwrite.
                 let would_write =
-                    self.preview.as_ref().is_some_and(|p| p.dirty());
+                    self.preview_for(id).is_some_and(|p| p.dirty());
                 if would_write {
-                    if let Some(p) = &mut self.preview {
+                    if let Some(p) = self.preview_for_mut(id) {
                         p.edit.confirm_overwrite = true;
                     }
                     return Task::none();
@@ -1106,35 +1339,35 @@ impl App {
                 // Nothing to write: a `--preview` file is the user's and untouched; a fresh
                 // capture already lives at its path. Reveal it and finish/keep.
                 if !external
-                    && let Some(path) = self.preview.as_ref().and_then(|p| p.path.as_ref())
+                    && let Some(path) = self.preview_for(id).and_then(|p| p.path.as_ref())
                 {
                     crate::platform::services::notify(path, false);
                 }
-                self.finish_or_keep_preview()
+                self.finish_or_keep_preview(id)
             }
             PreviewMsg::Copy => {
                 // Pending edits bake first so the clipboard gets the edited capture.
-                if let Some(task) = self.begin_bake(ShareIntent::Copy) {
+                if let Some(task) = self.begin_bake(id, ShareIntent::Copy) {
                     return task;
                 }
                 let is_video = matches!(
-                    self.preview.as_ref().map(|p| &p.kind),
+                    self.preview_for(id).map(|p| &p.kind),
                     Some(PreviewKind::Video(_))
                 );
-                if let Some(path) = self.preview.as_ref().and_then(|p| p.path.as_ref()) {
+                if let Some(path) = self.preview_for(id).and_then(|p| p.path.as_ref()) {
                     crate::platform::services::copy_to_clipboard(path, is_video);
                     crate::platform::services::notify(path, true);
                 }
-                self.finish_or_keep_preview()
+                self.finish_or_keep_preview(id)
             }
             PreviewMsg::Cancel => {
                 // Close without deleting — the file stays where it is. Deleting is the
                 // explicit Delete (trash) action.
-                self.stop_preview_playback();
-                self.finish_session()
+                self.stop_preview_playback(id);
+                self.close_preview(id)
             }
-            PreviewMsg::ToggleAppearance => self.toggle_preview_appearance(),
-            PreviewMsg::WindowDrag => match self.preview.as_ref() {
+            PreviewMsg::ToggleAppearance => self.toggle_preview_appearance(id),
+            PreviewMsg::WindowDrag => match self.preview_for(id) {
                 Some(p) => window::drag(p.window),
                 None => Task::none(),
             },
@@ -1147,7 +1380,7 @@ impl App {
                 #[cfg(windows)]
                 return Task::none();
                 #[cfg(not(windows))]
-                match self.preview.as_ref() {
+                match self.preview_for(id) {
                     Some(p) => window::toggle_maximize(p.window),
                     None => Task::none(),
                 }
@@ -1160,29 +1393,29 @@ impl App {
                 #[cfg(windows)]
                 return Task::none();
                 #[cfg(not(windows))]
-                match self.preview.as_ref() {
+                match self.preview_for(id) {
                     Some(p) => window::minimize(p.window, true),
                     None => Task::none(),
                 }
             }
             PreviewMsg::Delete => {
                 // Never delete a pre-existing `--preview` file (no trash button there).
-                if self.preview.as_ref().is_some_and(|p| p.external) {
+                if self.preview_for(id).is_some_and(|p| p.external) {
                     return Task::none();
                 }
                 // Explicitly delete the captured file, then close.
-                self.stop_preview_playback();
-                if let Some(path) = self.preview.as_ref().and_then(|p| p.path.as_ref()) {
+                self.stop_preview_playback(id);
+                if let Some(path) = self.preview_for(id).and_then(|p| p.path.as_ref()) {
                     let _ = std::fs::remove_file(path);
                 }
-                self.finish_session()
+                self.close_preview(id)
             }
             PreviewMsg::SaveAs => {
                 // Ask WHERE to save first — no bake up front. The bake (if any) runs in the
                 // background against the chosen destination in `SaveAsResult`, tracked by the
                 // "Processing capture" notification, so the user isn't blocked before the
                 // dialog.
-                self.save_as_dialog()
+                self.save_as_dialog(id)
             }
             PreviewMsg::SaveAsResult(opt) => {
                 let Some(dest) = opt else {
@@ -1191,22 +1424,22 @@ impl App {
                     // BACK — the capture and its edits are still loaded, and a cancelled
                     // dialog must return the user to where they were, not exit
                     // (DRAGON-157).
-                    return if self.preview.as_ref().is_some_and(|p| p.surface.is_window()) {
+                    return if self.preview_for(id).is_some_and(|p| p.surface.is_window()) {
                         Task::none()
                     } else {
-                        self.reopen_preview_surface()
+                        self.reopen_preview_surface(id)
                     };
                 };
                 // Gather everything the background worker needs, then release `self`.
-                let external = self.preview.as_ref().is_some_and(|p| p.external);
+                let external = self.preview_for(id).is_some_and(|p| p.external);
                 // Keep-open Save As is an EXPORT: the editor continues on its working
                 // document (undo/redo intact), so the working file must SURVIVE the
                 // save — copy semantics, never a move (see `SaveAsBaked`).
                 let keep_open = !self.auto_close_preview;
-                let (src, covermark, annotations, annot_curve, dim, video, is_video) = match self.preview.as_ref() {
+                let (src, covermark, annotations, annot_curve, dim, video, is_video) = match self.preview_for(id) {
                     Some(p) => {
                         let Some(src) = p.path.clone() else {
-                            return self.finish_session();
+                            return self.close_preview(id);
                         };
                         let is_video = matches!(p.kind, PreviewKind::Video(_));
                         // A video bake needs the probed metadata; without it we can only
@@ -1227,7 +1460,7 @@ impl App {
                         // Annotations + dim are IMAGES only; a video never accumulates them.
                         (src, p.edit.covermark.clone(), p.edit.annotations.clone(), p.edit.curve_radius(), p.edit.dim, video, is_video)
                     }
-                    None => return self.finish_session(),
+                    None => return self.close_preview(id),
                 };
                 // Only bake when there's something to apply AND we can (video needs meta).
                 let cuts = video.as_ref().is_some_and(|v| v.keep.is_some());
@@ -1290,7 +1523,7 @@ impl App {
                     // The reveal + write already happened on the worker; carry the dest so a
                     // keep-open session can reopen on it.
                     let done = matches!(res, Ok(true)).then(|| dest.clone());
-                    cosmic::Action::App(Msg::Preview(PreviewMsg::SaveAsBaked(done)))
+                    cosmic::Action::App(Msg::Preview(id, PreviewMsg::SaveAsBaked(done)))
                 })
             }
             PreviewMsg::SaveAsBaked(done) => {
@@ -1303,12 +1536,12 @@ impl App {
                 // working file ITSELF committed the pending edits in place, so the
                 // preview reloads that file (the committed pixels) — continuing with
                 // the old edit state would apply the edits twice.
-                if self.auto_close_preview || self.preview.is_none() {
-                    return self.finish_session();
+                if self.auto_close_preview || self.preview_for(id).is_none() {
+                    return self.close_preview(id);
                 }
                 let committed_in_place = match (
                     done.as_ref(),
-                    self.preview.as_ref().and_then(|p| p.path.as_ref()),
+                    self.preview_for(id).and_then(|p| p.path.as_ref()),
                 ) {
                     (Some(dest), Some(src)) => std::fs::canonicalize(dest)
                         .ok()
@@ -1319,19 +1552,19 @@ impl App {
                 let reload = if committed_in_place {
                     let dest = done.expect("committed_in_place implies a destination");
                     let is_video = matches!(
-                        self.preview.as_ref().map(|p| &p.kind),
+                        self.preview_for(id).map(|p| &p.kind),
                         Some(PreviewKind::Video(_))
                     );
                     let size = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-                    self.stop_preview_playback();
-                    self.reload_preview_in_place(dest, size, is_video)
+                    self.stop_preview_playback(id);
+                    self.reload_preview_in_place(id, dest, size, is_video)
                 } else {
                     Task::none()
                 };
-                let surface = if self.preview.as_ref().is_some_and(|p| p.surface.is_window()) {
+                let surface = if self.preview_for(id).is_some_and(|p| p.surface.is_window()) {
                     Task::none()
                 } else {
-                    self.reopen_preview_surface()
+                    self.reopen_preview_surface(id)
                 };
                 Task::batch([reload, surface])
             }
@@ -1389,6 +1622,9 @@ mod tests {
             kind: PreviewKind::Image(ImagePreview::loading()),
             edit,
             view: Viewport::default(),
+            ducking: false,
+            surface_open: true,
+            demoted: false,
         }
     }
 
@@ -1423,5 +1659,169 @@ mod tests {
         assert_eq!(still_at((900, 600), 1.5).sizing_media_points(), (600, 400));
         // A 1px capture at 2× must not floor to zero.
         assert_eq!(still_at((1, 1), 2.0).sizing_media_points(), (1, 1));
+    }
+
+    // ── Multi-document previews (DRAGON-336 phase 2) ────────────────────────────
+
+    /// A preview open on `surface`, carrying only what the routing/close rules read.
+    fn doc(surface: PreviewSurface) -> PreviewState {
+        PreviewState { surface, ..still_at((100, 100), 1.0) }
+    }
+
+    /// Lookup is BY SURFACE ID, not by position: each document is found at its own id
+    /// and an id nobody owns resolves to nothing (a stale async completion is a no-op,
+    /// never a hit on the wrong document).
+    #[test]
+    fn previews_are_looked_up_by_window_id() {
+        let docs = vec![doc(PreviewSurface::Window), doc(PreviewSurface::Window)];
+        assert_eq!(index_of(&docs, docs[0].window), Some(0));
+        assert_eq!(index_of(&docs, docs[1].window), Some(1));
+        assert_eq!(index_of(&docs, window::Id::unique()), None, "an unknown id matches nothing");
+        assert_eq!(index_of(&[], docs[0].window), None, "nothing is open, nothing matches");
+    }
+
+    /// The close decision: only the LAST open preview ends the process. Closing one of
+    /// several leaves the others (and the process) alive.
+    #[test]
+    fn closing_the_last_preview_ends_the_process_but_closing_one_of_many_does_not() {
+        let one = vec![doc(PreviewSurface::Window)];
+        assert!(closing_is_last(&one, one[0].window), "the only document is the last one out");
+
+        let many = vec![doc(PreviewSurface::Window), doc(PreviewSurface::Window)];
+        assert!(!closing_is_last(&many, many[0].window), "a sibling is still open");
+        assert!(!closing_is_last(&many, many[1].window));
+    }
+
+    /// A DOUBLE close (or a stale completion for an already-removed document) must not
+    /// kill live siblings — but with nothing left at all it still means "we're done", so
+    /// a re-entrant close of the final document can't strand a windowless process.
+    #[test]
+    fn closing_an_unknown_id_only_ends_the_process_when_nothing_is_open() {
+        let gone = window::Id::unique();
+        let many = vec![doc(PreviewSurface::Window)];
+        assert!(!closing_is_last(&many, gone), "an unknown id must not close live documents");
+        assert!(closing_is_last(&[], gone), "nothing open at all is still last-one-out");
+    }
+
+    /// THE LONE DOCUMENT'S APPEARANCE: a preview may be the fullscreen overlay only while
+    /// it is the ONLY one open. Opening a SECOND document bars the overlay for the newcomer
+    /// AND selects the sibling holding it for demotion — so once the pass is done NOBODY is
+    /// an overlay, rather than one overlay sitting behind a floating window.
+    #[test]
+    fn a_second_document_leaves_nobody_on_the_overlay() {
+        let none_open: Vec<PreviewState> = Vec::new();
+        assert!(!overlay_taken(&none_open, None), "nothing open: the overlay is free");
+        assert!(overlay_siblings(&none_open, None).is_empty(), "nobody to demote");
+
+        // One document holds the overlay; a fresh one is about to open beside it.
+        let mut docs = vec![doc(PreviewSurface::Overlay)];
+        let held = docs[0].window;
+        assert!(overlay_taken(&docs, None), "the newcomer must be a window");
+        assert_eq!(overlay_siblings(&docs, None), vec![held], "and the holder comes down too");
+
+        // Apply the demotion the way `demote_preview_to_window` does, then add the
+        // newcomer: the end state is N windows, with no overlay anywhere.
+        docs[0].surface = PreviewSurface::Window;
+        docs[0].demoted = true;
+        docs.push(doc(PreviewSurface::Window));
+        assert!(
+            docs.iter().all(|p| p.surface.is_window()),
+            "never a mix: with two documents open they are ALL windows"
+        );
+        assert!(overlay_siblings(&docs, None).is_empty(), "nothing left to demote");
+    }
+
+    /// A document being RE-minted never blocks itself (its old surface is torn down in the
+    /// same pass), so a LONE preview still round-trips overlay→overlay — the whole
+    /// single-document path is unchanged. It is also never its own demotion sibling.
+    #[test]
+    fn a_single_document_may_still_hold_the_overlay() {
+        let docs = vec![doc(PreviewSurface::Overlay)];
+        let me = docs[0].window;
+        assert!(!overlay_taken(&docs, Some(me)), "a lone document may re-mint as the overlay");
+        assert!(overlay_siblings(&docs, Some(me)).is_empty(), "and is never its own sibling");
+        assert!(overlay_taken(&docs, Some(window::Id::unique())), "but it blocks everyone else");
+    }
+
+    /// ONCE DEMOTED, ALWAYS WINDOWED: a document that was brought down from the overlay
+    /// keeps the sticky pin, so when its siblings close and it is alone again it does NOT
+    /// silently re-enter fullscreen.
+    #[test]
+    fn a_demoted_document_is_not_promoted_back_when_it_is_alone_again() {
+        let mut alone = doc(PreviewSurface::Window);
+        alone.demoted = true;
+        let me = alone.window;
+        let docs = vec![alone];
+        assert!(
+            overlay_taken(&docs, Some(me)),
+            "the only document open, but demoted earlier — it stays a window"
+        );
+        // A document that was never demoted is unaffected by the pin.
+        let fresh = vec![doc(PreviewSurface::Overlay)];
+        assert!(!overlay_taken(&fresh, Some(fresh[0].window)));
+    }
+
+    /// A document whose SURFACE was torn down while it stays loaded (a background bake, the
+    /// overlay's Save-As dialog) is never demoted: there is nothing on screen to bring
+    /// down, and re-minting one would resurrect a surface that was closed on purpose.
+    #[test]
+    fn a_torn_down_surface_is_not_demoted() {
+        let mut hidden = doc(PreviewSurface::Overlay);
+        hidden.surface_open = false;
+        let docs = vec![hidden, doc(PreviewSurface::Window)];
+        assert!(overlay_siblings(&docs, None).is_empty(), "a dead surface is not demoted");
+        assert!(overlay_taken(&docs, None), "but it still bars the overlay for a newcomer");
+    }
+
+    /// The audio-duck refcount: the guard is engaged for the FIRST holder and dropped
+    /// only for the LAST. This is what stops one of several video previews un-muting the
+    /// desktop under the others when it stops.
+    #[test]
+    fn duck_engages_on_the_first_holder_and_drops_on_the_last() {
+        let (a, b) = (window::Id::unique(), window::Id::unique());
+        let mut refs = DuckRefs::default();
+        assert!(!refs.held(), "nothing holds the guard to begin with");
+
+        assert!(refs.acquire(a), "the first holder engages the guard");
+        assert!(!refs.acquire(b), "a second holder must NOT re-engage it");
+        assert!(refs.held());
+
+        assert!(!refs.release(a), "releasing one of two must NOT drop the guard");
+        assert!(refs.held(), "the desktop stays muted under the surviving preview");
+        assert!(refs.release(b), "the last release drops it");
+        assert!(!refs.held());
+    }
+
+    /// Acquire/release are IDEMPOTENT per document: a repeated engage is not a second
+    /// reference (it would strand the guard forever), and releasing a non-holder is a
+    /// no-op that can never drop a guard someone else still wants.
+    #[test]
+    fn duck_refs_are_idempotent_per_document() {
+        let (a, b) = (window::Id::unique(), window::Id::unique());
+        let mut refs = DuckRefs::default();
+        assert!(refs.acquire(a));
+        assert!(!refs.acquire(a), "the same document twice is still one reference");
+        assert!(refs.release(a), "so one release is enough to drop it");
+        assert!(!refs.held());
+
+        let mut refs = DuckRefs::default();
+        refs.acquire(a);
+        assert!(!refs.release(b), "releasing a non-holder never drops the guard");
+        assert!(refs.held());
+    }
+
+    /// A document that re-mints its surface keeps its hold under the NEW id — the guard
+    /// is neither engaged nor dropped by an appearance toggle / cover→window swap.
+    #[test]
+    fn duck_hold_follows_a_document_across_a_surface_re_mint() {
+        let (old, new) = (window::Id::unique(), window::Id::unique());
+        let mut refs = DuckRefs::default();
+        refs.acquire(old);
+        refs.rename(old, new);
+        assert!(refs.held(), "the re-mint must not drop the guard");
+        assert!(!refs.release(old), "the stale id no longer holds anything");
+        assert!(refs.held());
+        assert!(refs.release(new), "the new id owns the hold");
+        assert!(!refs.held());
     }
 }

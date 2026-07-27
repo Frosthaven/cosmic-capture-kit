@@ -44,6 +44,10 @@ pub(super) fn action_tip(name: &str, action: crate::shortcuts::Action, km: &crat
 /// the `App` methods that call them) as a plain argument.
 #[derive(Clone, Copy)]
 pub(super) struct Tb {
+    /// The PREVIEW SURFACE every message these builders emit is addressed to
+    /// (DRAGON-336 phase 2). Built once in `preview_view` from the document being drawn,
+    /// so a toolbar click can never drive a different preview window.
+    pub(super) pid: window::Id,
     pub(super) scale: f32,
     /// Frosted-glass config when the preview is WINDOWED and frosting is on, else
     /// `None` (DRAGON-217). The toolbar button-group chips paint translucent so the
@@ -116,7 +120,7 @@ impl Tb {
                     .align_x(Alignment::Center),
             )
             .class(cosmic::theme::Button::Icon)
-            .on_press(Msg::Preview(msg))
+            .on_press(Msg::Preview(self.pid, msg))
             .padding(self.btn_pad()),
         );
         self.tip(button, widget::text(tip).size(12), pos)
@@ -141,6 +145,61 @@ impl Tb {
                         ..Default::default()
                     },
                     ..Default::default()
+                }
+            })))
+            .into()
+    }
+
+    /// A GROUP CONTAINER for a cluster of related annotation tools (DRAGON-340): the same
+    /// frosted, rounded, padded surface as [`Self::tool_group`] PLUS a 1px hairline border —
+    /// the border/padding treatment that used to ring each individual tool button, repurposed
+    /// to enclose a whole SET of them, so the tray reads as grouped families instead of a flat
+    /// run of icons. One border per GROUP, never per icon.
+    ///
+    /// The border token is the DROPDOWN's: `background.divider` at 1px — the exact colour the
+    /// zoom preset menu (the one dropdown on this same preview's bottom bar) outlines itself
+    /// with. It replaced the old `state_mix(MIX_OFF)` wash, which read too loud around a whole
+    /// group. The RADIUS stays the button (`xl`) token: the cluster is a capsule holding
+    /// capsule buttons, and the dropdown's panel (`s`) rounding would square its corners off
+    /// under the "round" preference.
+    ///
+    /// `chrome` decides whether that surface is PAINTED at all ([`ClusterChrome`]): a `Bare`
+    /// group keeps the identical padded footprint (so the row's spacing and alignment don't
+    /// shift) and simply draws no fill and no border.
+    ///
+    /// A one-member cluster gets exactly the same container as a five-member one (same border,
+    /// padding and corner treatment) — that is deliberate, and the reason there is no
+    /// single-member special case anywhere.
+    pub(super) fn tool_cluster(
+        self,
+        items: Vec<Element<'static, Msg>>,
+        chrome: ClusterChrome,
+    ) -> Element<'static, Msg> {
+        let glass = self.glass;
+        widget::container(widget::row(items).spacing(2.0).align_y(Alignment::Center))
+            .padding(self.grp_pad())
+            .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
+                let radius = crate::app::theme::rounding(theme).xl.into();
+                match chrome {
+                    ClusterChrome::Surface => cosmic::iced::widget::container::Style {
+                        background: Some(Background::Color(crate::app::theme::frost_color(
+                            theme.cosmic().background.component.base.into(),
+                            glass,
+                        ))),
+                        border: Border {
+                            radius,
+                            width: 1.0,
+                            // The DROPDOWN's outline token — a group outline is chrome, never
+                            // a state, so it never tracks selection.
+                            color: theme.cosmic().background.divider.into(),
+                        },
+                        ..Default::default()
+                    },
+                    // Footprint only: no fill, no border, nothing to see.
+                    ClusterChrome::Bare => cosmic::iced::widget::container::Style {
+                        border: Border { radius, ..Default::default() },
+                        ..Default::default()
+                    },
                 }
             })))
             .into()
@@ -469,11 +528,23 @@ impl Tb {
     // FLAT header button in both surfaces — `App::overlay_header_row` for the overlay,
     // `App::preview_header_controls` (the CSD titlebar) for the window.
 
-    /// A toolbar icon button styled exactly like the capture toolbar's mic/speaker
-    /// toggles: the glyph and a 1px border ring both track on/off (foreground + accent
-    /// when on, the subdued wash when off), so the outline is always present and the
-    /// footprint never shifts. `tip` is any hover element.
-    pub(super) fn bordered_button(
+    // The old per-icon `bordered_button` (a glyph inside its own 1px on/off ring) is GONE: the
+    // annotation tray dropped it in DRAGON-340 (the ring became the group's, see
+    // `Self::tool_cluster`) and its last holdout — the bottom bar's covermark toggle — followed,
+    // so the whole preview editor now speaks ONE control language. Every on/off state in this
+    // chrome is carried by icon COLOUR ([`Tb::tool_toggle`]). Don't reintroduce per-icon rings.
+
+    /// A preview-chrome TOGGLE button (DRAGON-340 restyle): a bare symbolic glyph whose COLOUR
+    /// alone carries its state — [`crate::app::theme::accent`] when ON (a tool is armed, a
+    /// covermark is applied), the plain [`crate::app::theme::foreground`] ("white" in the dark
+    /// themes, near-black in the light ones) when it isn't. No ring, no chip, no fill, in ANY
+    /// state: the border/padding that used to ring each icon now encloses a whole GROUP
+    /// ([`Self::tool_cluster`]).
+    ///
+    /// Both colours come from the theme's own ramps, so the tray tracks light/dark and the
+    /// user's accent without a hardcoded value anywhere. The footprint is identical to the
+    /// button it replaced (`icon_box` + `btn_pad`), so nothing else reflows.
+    pub(super) fn tool_toggle(
         self,
         name: &'static str,
         on: bool,
@@ -486,9 +557,9 @@ impl Tb {
             .height(Length::Fixed(self.icon_box()))
             .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |t: &cosmic::Theme| {
                 let color = if on {
-                    t.cosmic().background.component.on.into()
+                    crate::app::theme::accent(t)
                 } else {
-                    state_mix(t, MIX_OFF)
+                    crate::app::theme::foreground(t)
                 };
                 cosmic::widget::svg::Style { color: Some(color) }
             })));
@@ -500,30 +571,11 @@ impl Tb {
                     .align_x(Alignment::Center)
                     .align_y(Alignment::Center),
             )
-            .selected(on)
             .class(cosmic::theme::Button::Icon)
-            .on_press(Msg::Preview(msg))
+            .on_press(Msg::Preview(self.pid, msg))
             .padding(self.btn_pad()),
         );
-        let wrapped = widget::container(btn).class(cosmic::theme::Container::Custom(Box::new(
-            move |theme| {
-                cosmic::iced::widget::container::Style {
-                    border: Border {
-                        // The button token: the ring hugs the (framework-styled)
-                        // button inside, which rounds at the same token.
-                        radius: crate::app::theme::rounding(theme).xl.into(),
-                        width: 1.0,
-                        color: if on {
-                            crate::app::theme::accent(theme)
-                        } else {
-                            state_mix(theme, MIX_OFF)
-                        },
-                    },
-                    ..Default::default()
-                }
-            },
-        )));
-        self.tip(wrapped, tip, tip_pos)
+        self.tip(btn, tip, tip_pos)
     }
 
     /// One segment of a SEGMENTED toggle, styled exactly like the region toolbar's
@@ -564,7 +616,7 @@ impl Tb {
                 hovered: Box::new(move |_, t| style(t, true)),
                 pressed: Box::new(move |_, t| style(t, true)),
             })
-            .on_press(Msg::Preview(msg))
+            .on_press(Msg::Preview(self.pid, msg))
             .width(Length::Fixed(self.icon_box() + 2.0 * self.btn_pad()))
             .padding(self.btn_pad()),
         );
@@ -659,7 +711,9 @@ impl Tb {
 /// inherits the class's own text colour, which is what made these read accent-ish.
 /// `top_pin` stretches the control to the header's full height and pins it to the TOP (the
 /// macOS titlebar case, where its centre must land on the native traffic lights' centreline).
+#[allow(clippy::too_many_arguments)]
 fn flat_icon_button(
+    pid: window::Id,
     name: &'static str,
     tip: String,
     msg: PreviewMsg,
@@ -675,7 +729,7 @@ fn flat_icon_button(
         )));
     let btn = widget::button::custom(glyph)
         .class(cosmic::theme::Button::Icon)
-        .on_press(Msg::Preview(msg));
+        .on_press(Msg::Preview(pid, msg));
     let btn = crate::widgets::arrow_cursor::arrow_cursor(btn.padding(halo));
     let control: Element<'static, Msg> = if top_pin {
         widget::container(btn).height(Length::Fill).align_y(Alignment::Start).into()
@@ -696,6 +750,7 @@ fn flat_icon_button(
 ///   preview header already reserves `WIN_CAPTION_INSET` there; these buttons are leading.
 /// * Linux — the plain 8px halo, unchanged from the settings header's non-mac arm.
 fn titlebar_button(
+    pid: window::Id,
     name: &'static str,
     tip: String,
     msg: PreviewMsg,
@@ -705,7 +760,7 @@ fn titlebar_button(
     let (halo, top_pin) = (crate::app::settings::MAC_HEADER_GLYPH_HALO, true);
     #[cfg(not(target_os = "macos"))]
     let (halo, top_pin) = (8u16, false);
-    flat_icon_button(name, tip, msg, tint, 16, halo, top_pin)
+    flat_icon_button(pid, name, tip, msg, tint, 16, halo, top_pin)
 }
 
 impl Tb {
@@ -720,7 +775,7 @@ impl Tb {
         msg: PreviewMsg,
         tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
     ) -> Element<'static, Msg> {
-        flat_icon_button(name, tip, msg, tint, self.icon_box() as u16, self.btn_pad() as u16, false)
+        flat_icon_button(self.pid, name, tip, msg, tint, self.icon_box() as u16, self.btn_pad() as u16, false)
     }
 
     /// The undo / redo pair as FLAT header buttons: full-strength foreground ("white" in the
@@ -767,13 +822,17 @@ impl App {
         &self,
         preview: &PreviewState,
     ) -> Vec<Element<'static, Msg>> {
+        let pid = preview.window;
         let mut items = vec![titlebar_button(
+            pid,
             "view-fullscreen-symbolic",
             "Fullscreen overlay".to_string(),
             PreviewMsg::ToggleAppearance,
             crate::app::theme::accent,
         )];
-        items.extend(Tb::flat_history(&preview.edit, &self.keymap, titlebar_button));
+        items.extend(Tb::flat_history(&preview.edit, &self.keymap, move |i, t, m, c| {
+            titlebar_button(pid, i, t, m, c)
+        }));
         items
     }
 }
@@ -814,9 +873,76 @@ impl Tb {
 /// in every view — they read fine compact and free up toolbar width.
 pub(super) const SLIDER_SCALE: f32 = 0.8;
 
-/// The natural width of one [`slider_with_icon`] item (glyph + gap + slider + h-padding),
-/// used to size the overlay control area. Kept in sync with the builder below.
-pub(super) const SLIDER_ITEM_W: f32 = 2.0 * BTN_PAD + ICON_BOX * SLIDER_SCALE + 6.0 + 80.0 * SLIDER_SCALE;
+/// **How big the preview editor's slider THUMBS ("nibs") are, relative to the libcosmic
+/// default.** `1.0` is the stock 20px resting / 26px hover-and-drag thumb; `0.5` halves it.
+/// The ONE knob for every slider inside the preview editor — nudge this alone to retune them.
+///
+/// SCOPE: preview-editor sliders only. It is applied by [`preview_slider_class`], which each
+/// preview slider opts into explicitly; the SETTINGS window's sliders (`settings::row`'s
+/// shared `opacity_slider`, among others) keep the stock class and are untouched.
+///
+/// The thumb is purely VISUAL: iced's slider grabs anywhere over its whole bounds, so a
+/// smaller thumb does not shrink the hit target at all — the rail is as easy to grab as it
+/// ever was.
+pub(super) const PREVIEW_SLIDER_THUMB: f32 = 0.5;
+
+/// `style` with its thumb scaled by [`PREVIEW_SLIDER_THUMB`] and everything else — rail,
+/// colours, borders, breakpoint — left exactly as the theme resolved it.
+fn thumb_scaled(
+    mut style: cosmic::iced::widget::slider::Style,
+) -> cosmic::iced::widget::slider::Style {
+    use cosmic::iced::widget::slider::HandleShape;
+    let k = PREVIEW_SLIDER_THUMB;
+    let scale_u16 = |v: u16| ((v as f32 * k).round() as u16).max(1);
+    style.handle.shape = match style.handle.shape {
+        HandleShape::Circle { radius } => HandleShape::Circle { radius: radius * k },
+        HandleShape::Rectangle { width, height, mut border_radius } => {
+            // The corner radius rides the thumb, so a halved thumb keeps the same silhouette
+            // instead of collapsing into a disc.
+            border_radius.top_left *= k;
+            border_radius.top_right *= k;
+            border_radius.bottom_right *= k;
+            border_radius.bottom_left *= k;
+            HandleShape::Rectangle {
+                width: scale_u16(width),
+                height: scale_u16(height),
+                border_radius,
+            }
+        }
+    };
+    style.handle.border_width *= k;
+    style
+}
+
+/// The slider class every PREVIEW-EDITOR slider wears: the stock cosmic slider styling with
+/// only the thumb rescaled by [`PREVIEW_SLIDER_THUMB`].
+///
+/// It resolves through the theme's OWN `Slider::Standard` styling for each status and then
+/// adjusts the handle, so the rail colours, the high-contrast arm, the hover/drag growth and
+/// any future upstream change all still apply — this never re-implements the theme.
+pub(super) fn preview_slider_class() -> cosmic::style::iced::Slider {
+    use cosmic::iced::widget::slider::{Catalog, Status};
+    use cosmic::style::iced::Slider;
+    fn at(status: Status) -> std::rc::Rc<dyn Fn(&cosmic::Theme) -> cosmic::iced::widget::slider::Style>
+    {
+        std::rc::Rc::new(move |t: &cosmic::Theme| {
+            thumb_scaled(<cosmic::Theme as Catalog>::style(t, &Slider::Standard, status))
+        })
+    }
+    Slider::Custom {
+        active: at(Status::Active),
+        hovered: at(Status::Hovered),
+        dragging: at(Status::Dragged),
+    }
+}
+
+/// The natural width of one [`Tb::slider_with_icon`] item at chrome scale `scale` (glyph +
+/// gap + slider + h-padding), used to size the overlay control area. Kept in sync with the
+/// builder below: the padding and the glyph ride `Tb`'s scale, while the row gap and the
+/// slider's own fixed width do not.
+pub(super) fn slider_item_w(scale: f32) -> f32 {
+    scale * (2.0 * BTN_PAD + ICON_BOX * SLIDER_SCALE) + 6.0 + 80.0 * SLIDER_SCALE
+}
 
 /// The little breathing gap the overlay control area keeps between the split's two sides
 /// when the picture isn't wide enough to spread them further.
@@ -837,10 +963,13 @@ impl Tb {
         let glyph = widget::icon::icon(crate::widgets::icons::handle(icon))
             .width(Length::Fixed(self.icon_box() * SLIDER_SCALE))
             .height(Length::Fixed(self.icon_box() * SLIDER_SCALE));
-        let slider = widget::slider(range, value, move |v| Msg::Preview(to_msg(v)))
+        let pid = self.pid;
+        let slider = widget::slider(range, value, move |v| Msg::Preview(pid, to_msg(v)))
             .step(0.02f32)
             // Commit only once the drag ends (covermark stays blink-free; dim coalesces undo).
-            .on_release(Msg::Preview(commit))
+            .on_release(Msg::Preview(pid, commit))
+            // The preview editor's own (smaller) thumb — see `PREVIEW_SLIDER_THUMB`.
+            .class(preview_slider_class())
             .width(Length::Fixed(80.0 * SLIDER_SCALE));
         widget::container(
             widget::row(vec![
@@ -939,6 +1068,7 @@ impl App {
         preview: &'a PreviewState,
         tb: Tb,
     ) -> Vec<Element<'a, Msg>> {
+        let pid = preview.window;
         let e = &preview.edit;
         // Image annotation controls sit at the far left, BEFORE the covermark group: the
         // color swatch (its palette / wheel flyout floats up) then the line-width toggle.
@@ -947,13 +1077,16 @@ impl App {
             groups.push(annot_swatch_flyout(preview, &self.annot_recent_colors, &self.keymap, tb));
             groups.push(tb.stroke_width_group(e.stroke(), &self.keymap));
         }
-        // Covermark toggle (bordered like the mic/speaker toggles): on = a covermark is
-        // applied. Opens the picker dropdown floating over the preview. `Point` uses the
-        // context-menu placement: it flips ABOVE the button when there's no room below —
-        // which is always the case here, since this bar sits at the bottom.
-        let covermark_base = tb.bordered_button(
+        // Covermark toggle: on = a covermark is applied. It now wears the SAME treatment as
+        // every other control in this chrome — a bare glyph tinted accent when on, foreground
+        // when off ([`Tb::tool_toggle`]); the old per-icon ring is gone (it was the last
+        // `bordered_button` in the preview). Opens the picker dropdown floating over the
+        // preview. `Point` uses the context-menu placement: it flips ABOVE the button when
+        // there's no room below — which is always the case here, since this bar sits at the
+        // bottom.
+        let covermark_base = tb.tool_toggle(
             "insert-image-symbolic",
-            // The covermark button's ring tracks the COVERMARK specifically — NOT the
+            // The covermark button's state tracks the COVERMARK specifically — NOT the
             // general `dirty()` (which now also counts annotations, so a drawn shape must
             // not light this up). Bake gating still reads `dirty()`.
             e.covermark.is_some(),
@@ -976,7 +1109,7 @@ impl App {
                 // bottom edge lands flush with the button top (deterministic on overlay AND
                 // window; no reliance on the popover's room-below auto-flip).
                 FlyoutDir::Up(tb.flyout_panel_h(COVERMARK_PANEL_ROW_H)),
-                Msg::Preview(PreviewMsg::FlyoutClose),
+                Msg::Preview(pid, PreviewMsg::FlyoutClose),
             ),
             None => covermark_base,
         };
@@ -1065,75 +1198,187 @@ pub(super) fn flyout<'a>(
         .into()
 }
 
-/// The TOP-bar annotation DRAW tools: Arrow / Highlight / Box / Pixelate / Blur / Pencil, with
-/// the Eraser last (DRAGON-338 — it removes pen strokes rather than drawing). The color
-/// swatch + line-width groups moved to the BOTTOM bar (see [`annot_swatch_flyout`] +
-/// [`App::edit_tools`]). Add a tool = add a `bordered_button` here (plus its `Tool` variant +
-/// rasterize + bake arms + hotkey; see `annotate.rs`'s module doc), and map it to its
-/// [`crate::shortcuts::Action`] so the tooltip shows the LIVE key.
+/// How a [`Tb::tool_cluster`] paints its container — a DECLARED per-group property of the
+/// [`ANNOT_TRAY`] layout, never a special case keyed on which tools a group happens to hold.
+/// (The tray's grouping and styling have been re-cut several times; keep both declarative.)
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum ClusterChrome {
+    /// The normal frosted, dropdown-bordered surface.
+    Surface,
+    /// Footprint only — same padding and geometry, but no fill and no border. The pointer
+    /// (selection) group uses this: it is a mode, not a family of draw tools, and a chip
+    /// around it read as one more bordered box in the row.
+    Bare,
+}
+
+/// One entry in the annotation tray's DECLARED layout ([`ANNOT_TRAY`]).
+#[derive(Clone, Copy)]
+enum TrayItem {
+    /// A tool button: its glyph name, the [`Tool`] it arms, its label, and the
+    /// [`crate::shortcuts::Action`] whose LIVE binding the tooltip shows.
+    Tool(&'static str, Tool, &'static str, crate::shortcuts::Action),
+    /// The global dim ("spotlight range") slider. Not a tool — it belongs to the spotlight's
+    /// group but is always usable, whatever tool is armed (DRAGON-329).
+    DimSlider,
+}
+
+/// One GROUP of the annotation tray: its chrome treatment plus its ordered items.
+struct TrayGroup {
+    /// Whether this group's [`Tb::tool_cluster`] paints a surface + border, or only occupies
+    /// the footprint.
+    chrome: ClusterChrome,
+    items: &'static [TrayItem],
+}
+
+/// **THE annotation tray layout** (DRAGON-340): the ordered GROUPS of the top bar's draw
+/// tools, each rendered inside one [`Tb::tool_cluster`], in the order given. This list is the
+/// single source of the tray's grouping, its order AND its per-group chrome — the builder
+/// below just walks it, so regrouping or re-styling the tray means editing these rows and
+/// changing nothing else. (Both have already changed several times; keep them declarative.)
+///
+/// A ONE-member group is not special-cased anywhere: it gets exactly the container a
+/// five-member group gets, minus whatever its own [`ClusterChrome`] says.
+///
+/// Adding a tool = add a [`TrayItem::Tool`] row to the right group (plus its [`Tool`] variant +
+/// model/rasterize/bake arms + hotkey; see `annotate.rs`'s module doc).
+const ANNOT_TRAY: &[TrayGroup] = &[
+    // Selection. The POINTER creates nothing (DRAGON-341): click / Ctrl-Shift-click /
+    // rubber-band to build a selection, drag it to move it all. It is a MODE rather than a
+    // family of draw tools, so it wears no chip — only the footprint that keeps it aligned
+    // with the bordered groups after it.
+    TrayGroup { chrome: ClusterChrome::Bare, items: &[TrayItem::Tool(
+        "pointer-select-symbolic",
+        Tool::Pointer,
+        "Select",
+        crate::shortcuts::Action::PreviewAnnotPointer,
+    )] },
+    // Callouts: point at a thing, or number the steps.
+    TrayGroup { chrome: ClusterChrome::Surface, items: &[
+        TrayItem::Tool(
+            "mail-forward-symbolic",
+            Tool::Arrow,
+            "Arrow",
+            crate::shortcuts::Action::PreviewAnnotArrow,
+        ),
+        TrayItem::Tool(
+            "sequence-badge-symbolic",
+            Tool::Badge,
+            "Step Marker",
+            crate::shortcuts::Action::PreviewAnnotBadge,
+        ),
+    ] },
+    // Destructive redactions: the pixelate mosaic and the strong blur.
+    TrayGroup { chrome: ClusterChrome::Surface, items: &[
+        TrayItem::Tool(
+            "view-grid-symbolic",
+            Tool::Pixelate,
+            "Pixelate",
+            crate::shortcuts::Action::PreviewAnnotPixelate,
+        ),
+        TrayItem::Tool(
+            "image-filter-symbolic",
+            Tool::Blur,
+            "Blur",
+            crate::shortcuts::Action::PreviewAnnotBlur,
+        ),
+    ] },
+    // Emphasis: everything that draws attention to a region, ending with the spotlight and
+    // the dim range it works against.
+    TrayGroup { chrome: ClusterChrome::Surface, items: &[
+        TrayItem::Tool(
+            "format-text-highlight-symbolic",
+            Tool::Highlight,
+            "Highlight",
+            crate::shortcuts::Action::PreviewAnnotHighlight,
+        ),
+        TrayItem::Tool(
+            "checkbox-symbolic",
+            Tool::Rect,
+            "Border",
+            crate::shortcuts::Action::PreviewAnnotBox,
+        ),
+        TrayItem::Tool(
+            "box-highlight-symbolic",
+            Tool::BoxHighlight,
+            "Border Highlight",
+            crate::shortcuts::Action::PreviewAnnotBoxHighlight,
+        ),
+        TrayItem::Tool(
+            "spotlight-symbolic",
+            Tool::Spotlight,
+            "Spotlight",
+            crate::shortcuts::Action::PreviewAnnotSpotlight,
+        ),
+        TrayItem::DimSlider,
+    ] },
+    // Freehand ink and the hand-undo that removes it.
+    TrayGroup { chrome: ClusterChrome::Surface, items: &[
+        TrayItem::Tool(
+            "pencil-symbolic",
+            Tool::Pen,
+            "Pencil",
+            crate::shortcuts::Action::PreviewAnnotPen,
+        ),
+        TrayItem::Tool(
+            "eraser-symbolic",
+            Tool::Eraser,
+            "Eraser",
+            crate::shortcuts::Action::PreviewAnnotEraser,
+        ),
+    ] },
+];
+
+/// The TOP-bar annotation DRAW tools, rendered from the declared [`ANNOT_TRAY`] grouping: one
+/// bordered, padded [`Tb::tool_cluster`] per group, and inside it bare glyph buttons whose
+/// COLOUR alone shows which tool is armed ([`Tb::tool_toggle`]) — accent when selected, the
+/// theme foreground otherwise.
+///
+/// Clicking/hotkeying a tool only ever SETS it — except that DOUBLE-clicking a tray button also
+/// drops a ready-made item in the middle of the picture (DRAGON-339), which is why the tray
+/// emits `ToolPressed` (detector-aware) rather than the bare `SelectTool` the hotkeys use.
 fn annotation_tools<'a>(
     preview: &'a PreviewState,
     km: &crate::shortcuts::Keymap,
     tb: Tb,
 ) -> Element<'a, Msg> {
-    use crate::shortcuts::Action;
     let e = &preview.edit;
-    // Top toolbar → tooltips drop below. The active draw tool shows its ring; NEUTRAL
-    // (`None`) = no tool ringed. Clicking/hotkeying a tool only ever SETS it — except that
-    // DOUBLE-clicking a tray button also drops a ready-made item in the middle of the picture
-    // (DRAGON-339), which is why the tray emits `ToolPressed` (detector-aware) rather than the
-    // bare `SelectTool` the hotkeys use.
+    // Top toolbar → tooltips drop below. NEUTRAL (`None`) = no tool tinted.
     let pos = widget::tooltip::Position::Bottom;
     let active = e.tool;
-    let btn = |icon: &'static str, t: Tool, name: &str, action: Action| {
-        tb.bordered_button(
-            icon,
-            active == Some(t),
-            PreviewMsg::ToolPressed(t),
-            widget::text(action_tip(name, action, km)).size(12).into(),
-            pos,
-        )
-    };
-    // The draw-tool buttons sit bare (no capsule); the Spotlight tool + dim slider share ONE
-    // group capsule at the end — the SAME treatment as the covermark button + its opacity
-    // slider. Highlight sits just left of Box; the dim slider is ALWAYS usable, never gated on
-    // the active tool (DRAGON-329).
-    widget::row(vec![
-        // The POINTER (DRAGON-341) leads the row: a pure selection mode that creates nothing —
-        // click / Ctrl-Shift-click / rubber-band to build a selection, drag it to move it all.
-        btn("pointer-select-symbolic", Tool::Pointer, "Select", Action::PreviewAnnotPointer),
-        btn("mail-forward-symbolic", Tool::Arrow, "Arrow", Action::PreviewAnnotArrow),
-        // Destructive redactions sit right after Arrow: pixelate mosaic + strong blur.
-        btn("view-grid-symbolic", Tool::Pixelate, "Pixelate", Action::PreviewAnnotPixelate),
-        btn("image-filter-symbolic", Tool::Blur, "Blur", Action::PreviewAnnotBlur),
-        // A filled highlighter marker (distinct from Box's outline square).
-        btn("format-text-highlight-symbolic", Tool::Highlight, "Highlight", Action::PreviewAnnotHighlight),
-        btn("checkbox-symbolic", Tool::Rect, "Box Outline", Action::PreviewAnnotBox),
-        // A highlight FILL wrapped in a box OUTLINE (DRAGON-333).
-        btn("box-highlight-symbolic", Tool::BoxHighlight, "Box Highlight", Action::PreviewAnnotBoxHighlight),
-        // Spotlight + dim slider, grouped like the covermark button + opacity slider. The
-        // slider is REVERSED so it reads as image visibility: 100% = fully transparent (no dim,
-        // the default), 0% = fully opaque; stored `e.dim` is the dim amount (0 = none), so the
-        // display value + message both invert. Commits ONE undo entry on release.
-        tb.tool_group(vec![
-            btn("spotlight-symbolic", Tool::Spotlight, "Spotlight", Action::PreviewAnnotSpotlight),
-            tb.slider_with_icon(
-                "display-brightness-symbolic",
-                0.0..=1.0,
-                1.0 - e.dim,
-                |v| PreviewMsg::SetDim(1.0 - v),
-                PreviewMsg::CommitDimEdit,
-            ),
-        ]),
-        // The pencil + its eraser CLOSE the row as a pair (DRAGON-341 moved the pencil down
-        // here): freehand ink and the hand-undo that removes it belong side by side, after the
-        // shapes, with the eraser last.
-        btn("pencil-symbolic", Tool::Pen, "Pencil", Action::PreviewAnnotPen),
-        btn("eraser-symbolic", Tool::Eraser, "Eraser", Action::PreviewAnnotEraser),
-    ])
-    .spacing(tb.btn_pad())
-    .align_y(Alignment::Center)
-    .into()
+    let groups: Vec<Element<'a, Msg>> = ANNOT_TRAY
+        .iter()
+        .map(|group| {
+            let items: Vec<Element<'static, Msg>> = group
+                .items
+                .iter()
+                .map(|entry| match *entry {
+                    TrayItem::Tool(icon, tool, name, action) => tb.tool_toggle(
+                        icon,
+                        active == Some(tool),
+                        PreviewMsg::ToolPressed(tool),
+                        widget::text(action_tip(name, action, km)).size(12).into(),
+                        pos,
+                    ),
+                    // The slider is REVERSED so it reads as image VISIBILITY: 100% = fully
+                    // transparent (no dim, the default), 0% = fully opaque; stored `e.dim` is
+                    // the dim amount (0 = none), so the display value + message both invert.
+                    // Commits ONE undo entry on release.
+                    TrayItem::DimSlider => tb.slider_with_icon(
+                        "display-brightness-symbolic",
+                        0.0..=1.0,
+                        1.0 - e.dim,
+                        |v| PreviewMsg::SetDim(1.0 - v),
+                        PreviewMsg::CommitDimEdit,
+                    ),
+                })
+                .collect();
+            tb.tool_cluster(items, group.chrome)
+        })
+        .collect();
+    widget::row(groups)
+        .spacing(tb.btn_pad())
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// The BOTTOM-bar color swatch with its upward flyout (the palette grid, or — once the "+"
@@ -1156,14 +1401,14 @@ fn annot_swatch_flyout<'a>(
             swatch_seg,
             annot_palette_panel(e.flyout_selected(), recents, tb),
             FlyoutDir::Up(tb.flyout_panel_h(ANNOT_PALETTE_ROW_H)),
-            Msg::Preview(PreviewMsg::FlyoutClose),
+            Msg::Preview(tb.pid, PreviewMsg::FlyoutClose),
         )
     } else if let Some(model) = &e.annot_picker {
         flyout(
             swatch_seg,
             annot_color_picker_panel(model, tb),
             FlyoutDir::Up(tb.flyout_panel_h(ANNOT_PICKER_CONTENT_H)),
-            Msg::Preview(PreviewMsg::AnnotColorEditor(false)),
+            Msg::Preview(tb.pid, PreviewMsg::AnnotColorEditor(false)),
         )
     } else {
         swatch_seg
@@ -1217,7 +1462,7 @@ fn annot_color_swatch(
             hovered: Box::new(move |_, t| style(t, true)),
             pressed: Box::new(move |_, t| style(t, true)),
         })
-        .on_press(Msg::Preview(PreviewMsg::ToggleAnnotPalette))
+        .on_press(Msg::Preview(tb.pid, PreviewMsg::ToggleAnnotPalette))
         .width(Length::Fixed(tb.icon_box() + 2.0 * tb.btn_pad()))
         .padding(tb.btn_pad()),
     );
@@ -1246,8 +1491,8 @@ fn annot_palette_panel(sel: Option<usize>, recents: &[[u8; 4]], tb: Tb) -> Eleme
         }
         let hi = sel == Some(i);
         match entry {
-            PaletteEntry::Color(c) => items.push(annot_palette_swatch(*c, hi)),
-            PaletteEntry::Custom => items.push(annot_plus_swatch(hi)),
+            PaletteEntry::Color(c) => items.push(annot_palette_swatch(tb.pid, *c, hi)),
+            PaletteEntry::Custom => items.push(annot_plus_swatch(tb.pid, hi)),
         }
     }
     tb.tool_panel(items)
@@ -1274,7 +1519,7 @@ fn annot_palette_sep() -> Element<'static, Msg> {
 }
 
 /// The custom-color "+" opener at the end of the palette (`hi` = keyboard-highlighted).
-fn annot_plus_swatch(hi: bool) -> Element<'static, Msg> {
+fn annot_plus_swatch(pid: window::Id, hi: bool) -> Element<'static, Msg> {
     let plus = widget::text("+").size(20);
     let btn = widget::button::custom(
         widget::container(plus)
@@ -1292,7 +1537,7 @@ fn annot_plus_swatch(hi: bool) -> Element<'static, Msg> {
         pressed: Box::new(move |_f, t| plus_swatch_style(hi, t)),
         disabled: Box::new(move |t| plus_swatch_style(hi, t)),
     })
-    .on_press(Msg::Preview(PreviewMsg::AnnotColorEditor(true)));
+    .on_press(Msg::Preview(pid, PreviewMsg::AnnotColorEditor(true)));
     crate::widgets::arrow_cursor::arrow_cursor(btn)
 }
 
@@ -1326,20 +1571,28 @@ fn annot_color_picker_panel<'a>(
     // crammed left, the tabs edge-to-edge, and a huge TRANSPARENT gap whose clicks fall
     // through to the popover's dismiss backdrop. Pinning the wrapping column to a FIXED
     // width hard-caps the layout limits handed down to the widget, so the whole picker is a
-    // compact, opaque box. A non-capturing closure coerces to the `fn` pointer the builder
-    // wants.
+    // compact, opaque box.
+    //
+    // The builder wants a bare `fn` POINTER, which can't carry the addressed window id
+    // (DRAGON-336 phase 2), so build the wheel over its own `ColorPickerUpdate` message
+    // (the identity `fn`, still non-capturing) and `Element::map` the result into the
+    // addressed `Msg` — one wrapping closure instead of a captured fn pointer.
     const PICKER_W: f32 = 272.0;
-    let wheel = model
-        .builder(|u| Msg::Preview(PreviewMsg::AnnotColorPickerUpdate(u)))
-        .width(Length::Fixed(PICKER_W))
-        .height(Length::Fixed(168.0))
-        .build("Recent", "Copy to clipboard", "Copied");
+    let pid = tb.pid;
+    let wheel = Element::from(
+        model
+            .builder(std::convert::identity)
+            .width(Length::Fixed(PICKER_W))
+            .height(Length::Fixed(168.0))
+            .build("Recent", "Copy to clipboard", "Copied"),
+    )
+    .map(move |u| Msg::Preview(pid, PreviewMsg::AnnotColorPickerUpdate(u)));
     let cancel = crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::standard("Cancel")
-            .on_press(Msg::Preview(PreviewMsg::AnnotColorEditor(false))),
+            .on_press(Msg::Preview(tb.pid, PreviewMsg::AnnotColorEditor(false))),
     );
     let apply = crate::widgets::arrow_cursor::arrow_cursor(
-        widget::button::suggested("Apply").on_press(Msg::Preview(PreviewMsg::AnnotColorApply)),
+        widget::button::suggested("Apply").on_press(Msg::Preview(tb.pid, PreviewMsg::AnnotColorApply)),
     );
     let buttons = widget::row(vec![cancel, apply]).spacing(8.0);
     let col = widget::column(vec![Element::from(wheel), buttons.into()])
@@ -1349,7 +1602,7 @@ fn annot_color_picker_panel<'a>(
     tb.panel_container(col)
 }
 
-fn annot_palette_swatch(color: [u8; 4], selected: bool) -> Element<'static, Msg> {
+fn annot_palette_swatch(pid: window::Id, color: [u8; 4], selected: bool) -> Element<'static, Msg> {
     let c = cosmic::iced::Color::from_rgb(
         color[0] as f32 / 255.0,
         color[1] as f32 / 255.0,
@@ -1367,7 +1620,7 @@ fn annot_palette_swatch(color: [u8; 4], selected: bool) -> Element<'static, Msg>
             .height(Length::Fixed(28.0))
             .padding(0)
             .class(class)
-            .on_press(Msg::Preview(PreviewMsg::SetAnnotColor(color))),
+            .on_press(Msg::Preview(pid, PreviewMsg::SetAnnotColor(color))),
     )
 }
 
@@ -1430,5 +1683,160 @@ mod tests {
         // Unbound: name only.
         km.unbind(Action::PreviewSave);
         assert_eq!(action_tip("Save", Action::PreviewSave, &km), "Save");
+    }
+
+    // ── the declared annotation tray (DRAGON-340) ────────────────────────────────────
+
+    /// Every tool in the tray, flattened in render order.
+    fn tray_tools() -> Vec<Tool> {
+        ANNOT_TRAY
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .filter_map(|i| match i {
+                TrayItem::Tool(_, t, _, _) => Some(*t),
+                TrayItem::DimSlider => None,
+            })
+            .collect()
+    }
+
+    /// THE tool inventory: the tray carries every annotation tool exactly once, in the owner's
+    /// declared order. A new `Tool` variant that isn't placed in a group will fail here rather
+    /// than silently going missing from the toolbar.
+    #[test]
+    fn the_tray_carries_every_annotation_tool_exactly_once() {
+        assert_eq!(
+            tray_tools(),
+            vec![
+                Tool::Pointer,
+                Tool::Arrow,
+                Tool::Badge,
+                Tool::Pixelate,
+                Tool::Blur,
+                Tool::Highlight,
+                Tool::Rect,
+                Tool::BoxHighlight,
+                Tool::Spotlight,
+                Tool::Pen,
+                Tool::Eraser,
+            ]
+        );
+        // No duplicates (the same tool in two groups would light up twice).
+        let mut seen: Vec<&'static str> = tray_tools().iter().map(|t| t.as_str()).collect();
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "a tool appears in more than one group");
+    }
+
+    /// The declared GROUPING itself — the thing the owner reassigns. One border per group, in
+    /// this order; the dim slider rides the spotlight's group rather than standing alone.
+    #[test]
+    fn the_tray_groups_match_the_declared_layout() {
+        let shape: Vec<usize> = ANNOT_TRAY.iter().map(|g| g.items.len()).collect();
+        assert_eq!(shape, vec![1, 2, 2, 5, 2]);
+        // A ONE-member group exists and is rendered through the very same container as the
+        // others — there is no single-member branch anywhere in the builder.
+        assert!(shape.contains(&1));
+        assert!(matches!(ANNOT_TRAY[3].items[4], TrayItem::DimSlider));
+    }
+
+    /// The per-group CHROME is declared, not inferred: only the pointer (selection) group is
+    /// `Bare` — every family of draw tools keeps the bordered surface. A future re-style moves
+    /// these flags and touches no builder code.
+    #[test]
+    fn only_the_pointer_group_is_bare() {
+        for (i, g) in ANNOT_TRAY.iter().enumerate() {
+            let holds_pointer = g
+                .items
+                .iter()
+                .any(|it| matches!(it, TrayItem::Tool(_, Tool::Pointer, _, _)));
+            let want = if holds_pointer { ClusterChrome::Bare } else { ClusterChrome::Surface };
+            assert!(g.chrome == want, "group {i} chrome");
+        }
+    }
+
+    /// Every tray entry advertises a hotkey action that lives in the PREVIEW context, so its
+    /// tooltip resolves a real live binding.
+    #[test]
+    fn every_tray_tool_binds_a_preview_action() {
+        use crate::shortcuts::{Context, Keymap};
+        let km = Keymap::defaults();
+        for group in ANNOT_TRAY {
+            for entry in group.items {
+                let TrayItem::Tool(_, _, name, action) = entry else { continue };
+                assert_eq!(action.context(), Context::Preview, "{name}");
+                assert!(km.get(*action).is_some(), "{name} has no default binding");
+            }
+        }
+    }
+
+    // ── preview-editor slider thumbs ─────────────────────────────────────────────────
+
+    /// The preview's thumb scale is applied to the handle and NOTHING else — the rail and
+    /// colours stay exactly as the theme resolved them.
+    #[test]
+    fn the_preview_thumb_scale_only_touches_the_handle() {
+        use cosmic::iced::widget::slider::{Handle, HandleShape, Rail, Style};
+        let stock = Style {
+            rail: Rail {
+                backgrounds: (
+                    Background::Color(cosmic::iced::Color::WHITE),
+                    Background::Color(cosmic::iced::Color::BLACK),
+                ),
+                border: Border::default(),
+                width: 4.0,
+            },
+            handle: Handle {
+                shape: HandleShape::Rectangle { width: 20, height: 20, border_radius: 8.0.into() },
+                background: Background::Color(cosmic::iced::Color::WHITE),
+                border_width: 3.0,
+                border_color: cosmic::iced::Color::BLACK,
+            },
+            breakpoint: cosmic::iced::widget::slider::Breakpoint {
+                color: cosmic::iced::Color::WHITE,
+            },
+        };
+        let scaled = thumb_scaled(stock);
+        // Halved (the documented starting point), silhouette preserved.
+        let HandleShape::Rectangle { width, height, border_radius } = scaled.handle.shape else {
+            panic!("the cosmic thumb is a rounded rectangle");
+        };
+        assert_eq!((width, height), (10, 10));
+        assert_eq!(border_radius.top_left, 4.0);
+        assert_eq!(scaled.handle.border_width, 1.5);
+        // The rail is untouched.
+        assert_eq!(scaled.rail.width, 4.0);
+        // And the knob really is the documented fraction.
+        assert_eq!(PREVIEW_SLIDER_THUMB, 0.5);
+    }
+
+    /// A circular handle scales too, and a thumb never rounds away to nothing.
+    #[test]
+    fn a_circular_thumb_scales_and_never_vanishes() {
+        use cosmic::iced::widget::slider::HandleShape;
+        let mut s = thumb_scaled(cosmic::iced::widget::slider::Style {
+            rail: cosmic::iced::widget::slider::Rail {
+                backgrounds: (
+                    Background::Color(cosmic::iced::Color::WHITE),
+                    Background::Color(cosmic::iced::Color::WHITE),
+                ),
+                border: Border::default(),
+                width: 4.0,
+            },
+            handle: cosmic::iced::widget::slider::Handle {
+                shape: HandleShape::Circle { radius: 9.0 },
+                background: Background::Color(cosmic::iced::Color::WHITE),
+                border_width: 0.0,
+                border_color: cosmic::iced::Color::WHITE,
+            },
+            breakpoint: cosmic::iced::widget::slider::Breakpoint {
+                color: cosmic::iced::Color::WHITE,
+            },
+        });
+        assert!(matches!(s.handle.shape, HandleShape::Circle { radius } if radius == 4.5));
+        // A 1px rectangular thumb floors at 1 rather than rounding to a zero-size handle.
+        s.handle.shape = HandleShape::Rectangle { width: 1, height: 1, border_radius: 0.0.into() };
+        let s = thumb_scaled(s);
+        assert!(matches!(s.handle.shape, HandleShape::Rectangle { width: 1, height: 1, .. }));
     }
 }

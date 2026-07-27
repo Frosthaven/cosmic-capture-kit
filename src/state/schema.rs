@@ -141,10 +141,14 @@ pub struct Persisted {
     /// on — the historical always-close behaviour, now optional).
     #[serde(default = "default_true")]
     pub auto_close_preview: bool,
-    /// Whether to permit more than one overlay instance at a time (default off:
-    /// a second launch is suppressed by the single-instance lock).
-    #[serde(default)]
-    pub allow_multiple: bool,
+    // DRAGON-351: `allow_multiple` ("Allow multiple capture instances") lived here. Every
+    // launch now runs as its own instance unconditionally, so the field is REMOVED rather
+    // than kept as a deprecated read-only one — there is nothing to migrate into. Old
+    // configs still carry the key; serde ignores unknown fields (no `deny_unknown_fields`
+    // anywhere on this struct), so they keep loading with every other setting intact —
+    // pinned by `store::tests::old_allow_multiple_key_is_ignored_on_load`, the same
+    // treatment `recording_tray` (v5) and `preview_float_cosmic` (DRAGON-317) got. No
+    // `config_version` bump: nothing about the remaining fields' meaning changed.
     /// Keep the resident tray/menu-bar process running so a capture is always one click
     /// away. On macOS (DRAGON-130) that is the menu-bar daemon (the global capture hotkey
     /// is dead without it, so it defaults ON there, DRAGON-134); on Windows (DRAGON-296) it

@@ -418,6 +418,10 @@ pub(super) fn fmt_timecode(secs: f32, fps: f32) -> String {
 
 /// The timeline strip, borrowed from the preview state for one view pass.
 pub(super) struct TimelineCanvas<'a> {
+    /// The PREVIEW SURFACE every message this strip publishes is addressed to
+    /// (DRAGON-336 phase 2) — the widget lives inside exactly one preview document, so a
+    /// razor cut / scrub can never land on another open preview.
+    pub pid: window::Id,
     pub timeline: &'a Timeline,
     /// Playhead in SOURCE seconds (the arm draws at its edited mapping).
     pub position: f32,
@@ -530,7 +534,7 @@ impl cosmic::widget::canvas::Program<Msg, cosmic::Theme, cosmic::Renderer> for T
                     let x = raw.map(|p| p.x).unwrap_or_default();
                     let t = self.x_to_source(x, bounds.width);
                     return Some(
-                        Action::publish(Msg::Preview(PreviewMsg::TimelineSeek(t))).and_capture(),
+                        Action::publish(Msg::Preview(self.pid, PreviewMsg::TimelineSeek(t))).and_capture(),
                     );
                 }
                 if let Some((p0, ..)) = state.press {
@@ -555,14 +559,14 @@ impl cosmic::widget::canvas::Program<Msg, cosmic::Theme, cosmic::Renderer> for T
                     let t = self.x_to_source(p.x, bounds.width);
                     state.dragging = true;
                     return Some(
-                        Action::publish(Msg::Preview(PreviewMsg::TimelineSeek(t))).and_capture(),
+                        Action::publish(Msg::Preview(self.pid, PreviewMsg::TimelineSeek(t))).and_capture(),
                     );
                 }
                 if self.timeline.razor {
                     // Cut where the preview line shows: soft-snapped to the arm.
                     let t = self.razor_time(p.x, bounds.width);
                     return Some(
-                        Action::publish(Msg::Preview(PreviewMsg::TimelineCut(t))).and_capture(),
+                        Action::publish(Msg::Preview(self.pid, PreviewMsg::TimelineCut(t))).and_capture(),
                     );
                 }
                 // Pointer in the LANES: a pending select — resolved at release
@@ -578,7 +582,7 @@ impl cosmic::widget::canvas::Program<Msg, cosmic::Theme, cosmic::Renderer> for T
                 let p = pos?;
                 let t = self.x_to_source(p.x, bounds.width);
                 Some(
-                    Action::publish(Msg::Preview(PreviewMsg::TimelineMenuOpen(t, p.x, p.y)))
+                    Action::publish(Msg::Preview(self.pid, PreviewMsg::TimelineMenuOpen(t, p.x, p.y)))
                         .and_capture(),
                 )
             }
@@ -595,7 +599,7 @@ impl cosmic::widget::canvas::Program<Msg, cosmic::Theme, cosmic::Renderer> for T
                     let a = self.x_to_edited(p0.x.min(p1.x), bounds.width);
                     let b = self.x_to_edited(p0.x.max(p1.x), bounds.width);
                     return Some(
-                        Action::publish(Msg::Preview(PreviewMsg::TimelineBoxSelect(
+                        Action::publish(Msg::Preview(self.pid, PreviewMsg::TimelineBoxSelect(
                             a,
                             b,
                             ctrl || shift,
@@ -607,7 +611,7 @@ impl cosmic::widget::canvas::Program<Msg, cosmic::Theme, cosmic::Renderer> for T
                 // click was away from any segment (an inter-lane gap).
                 let t = lane_hit(p0).then(|| self.x_to_source(p0.x, bounds.width));
                 Some(
-                    Action::publish(Msg::Preview(PreviewMsg::TimelineSelect(t, ctrl, shift)))
+                    Action::publish(Msg::Preview(self.pid, PreviewMsg::TimelineSelect(t, ctrl, shift)))
                         .and_capture(),
                 )
             }
@@ -1117,7 +1121,7 @@ mod tests {
     #[test]
     fn razor_time_soft_snaps_onto_the_seek_arm() {
         let tl = tl(10.0);
-        let c = TimelineCanvas { timeline: &tl, position: 5.0, fps: 30.0, waveform: None };
+        let c = TimelineCanvas { pid: window::Id::unique(), timeline: &tl, position: 5.0, fps: 30.0, waveform: None };
         // 1000px wide, content inset by the ball radius each side → the arm
         // sits exactly mid-strip at x=500. Within 8px a cut snaps to the
         // playhead exactly; farther away the click keeps its own time.
@@ -1129,7 +1133,7 @@ mod tests {
     #[test]
     fn x_mapping_pins_the_content_edges_to_the_ball_inset() {
         let tl = tl(10.0);
-        let c = TimelineCanvas { timeline: &tl, position: 0.0, fps: 30.0, waveform: None };
+        let c = TimelineCanvas { pid: window::Id::unique(), timeline: &tl, position: 0.0, fps: 30.0, waveform: None };
         // The inset edges map to the exact timeline extremes (clamped past them),
         // and the arm rides between them.
         assert_eq!(c.x_to_edited(BALL_R, 1000.0), 0.0);

@@ -56,6 +56,15 @@ impl App {
                     self.text_sel.clear();
                     self.text_menu = None;
                 }
+                // DRAGON-336: the QR/OCR scanners crop their scan source out of the
+                // frozen flats, which a freeze-off non-scanner launch no longer grabs.
+                // Entering the scanner is therefore the one live toggle that must
+                // acquire them lazily (the same shape as the deferred window
+                // pre-capture below). Checked BEFORE `self.kind` moves, so it fires
+                // once per entry into the scanner, not on every scanner-kind click.
+                if k == Kind::Scanner && self.kind != Kind::Scanner {
+                    self.kick_frozen_flats();
+                }
                 self.kind = k;
                 if k == Kind::Scanner {
                     // Scanning is region work; the mode group is hidden in scanner
@@ -79,6 +88,9 @@ impl App {
                 }
                 Task::none()
             }
+            // DRAGON-336: another process handed us its finished capture — open it as a
+            // new preview document (and ack it) in the preview domain.
+            CaptureMsg::HandoffPoll => self.drain_preview_handoffs(),
             CaptureMsg::LoadingTick => {
                 // Pick up the pre-capture result the moment the thread posts it.
                 if let Some((
@@ -164,7 +176,7 @@ impl App {
                 // that produced no surface falls through to that deferred open as a fallback.
                 #[cfg(target_os = "macos")]
                 if std::mem::take(&mut self.mac_preview_preopen)
-                    && let Some(id) = self.preview.as_ref().map(|p| p.window)
+                    && let Some(id) = self.capture_preview
                 {
                     return if self.preview_windowed {
                         // DEFER the swap to `present_capture` (DRAGON-221 follow-up):
@@ -423,6 +435,53 @@ impl App {
         self.frozen_cursor = cur;
         self.cursor_pending = false;
         true
+    }
+
+    /// DRAGON-336: kick a LAZY frozen-flats grab for a launch that skipped it
+    /// (`launch_flats_needed` false — freeze off, non-scanner kind). Mirrors
+    /// [`Self::kick_window_precapture`]: spawn the same grab onto its own OS thread,
+    /// deposit into `frozen_slot`, and re-arm `frozen_pending` so the existing
+    /// `FrozenReady` drain poll lands it exactly like a launch grab.
+    ///
+    /// LIMITATION (deliberate, and why this is only wired to the SCANNER): a lazy grab
+    /// is NOT the launch instant — our capture overlay is already mapped, so the flat it
+    /// returns carries the region selector's dim wash everywhere OUTSIDE the currently
+    /// drawn selection. The selection's INTERIOR is drawn fully transparent
+    /// (`RegionSelection::draw` fills only the four surrounding bands), so the crop the
+    /// scanner actually reads is clean whenever a region is already drawn at kick time —
+    /// the common case, since the region is restored from the persisted state at launch.
+    /// A region drawn AFTER this grab, over screen area that was dimmed, scans a dimmed
+    /// source (QR still decodes; OCR degrades). That is strictly better than the
+    /// alternative (no flats at all = the scanner silently never produces a mark), but it
+    /// is the one place where a lazy flat is not equivalent to a launch flat.
+    ///
+    /// The FREEZE setting deliberately does NOT call this: a freeze toggled on mid-session
+    /// would snapshot the settings window sitting over the desktop and then show/capture
+    /// that as the "frozen screen" — corrupting, where the no-flats fallback (`freezing()`
+    /// is false on an empty map, so the capture stays live) is merely inert until the next
+    /// launch.
+    pub(in crate::app) fn kick_frozen_flats(&mut self) {
+        if !self.frozen.is_empty() {
+            // A freeze / scanner launch already grabbed them; nothing to do.
+            return;
+        }
+        crate::util::timing_mark("kick_frozen_flats: lazy frozen-flats grab (begin)");
+        let slot = self.frozen_slot.clone();
+        // Clear the EMPTY placeholder `acquire_scene` parked here for the skipped grab:
+        // if the drain poll took it after we re-armed `frozen_pending`, it would clear
+        // the flag again and stop polling before the real flats land.
+        if let Ok(mut g) = slot.lock() {
+            *g = None;
+        }
+        self.frozen_pending = true;
+        let want_cursor = self.capture_cursor;
+        std::thread::spawn(move || {
+            let flats = grab_frozen_flats(want_cursor);
+            crate::util::timing_mark("kick_frozen_flats: lazy frozen-flats grab (done)");
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(flats);
+            }
+        });
     }
 
     fn kick_window_precapture(&mut self) {

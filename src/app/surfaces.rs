@@ -4,23 +4,12 @@ impl App {
     /// Destroy every overlay surface (the dummy bottom surface stays alive as the
     /// event-loop anchor so the post-teardown capture tick still fires).
     pub(super) fn destroy_surfaces(&mut self) -> Vec<Task<cosmic::Action<Msg>>> {
-        // Release the capture single-instance lock the moment the overlays are
-        // PERMANENTLY gone (DRAGON-255+: capture committed -> preview, recording
-        // stopped -> preview, or teardown -> exit). That lock exists ONLY to stop a
-        // second trigger from opening a DUPLICATE capture overlay while one is live;
-        // once no overlay is up, this process must not keep blocking new captures.
-        // Without this, a lingering PREVIEW editor (the default post-capture path) held
-        // the lock for the whole process life, so the next daemon "Region" / global
-        // hotkey found the lock held and silently no-op'd — the "nothing happens" bug —
-        // unless "allow multiple instances" was on. `open_settings` already releases it
-        // the same way when a capture becomes a settings window; this extends the SAME
-        // rule to the preview phase, so an open preview OR settings window never blocks
-        // a fresh capture regardless of the "allow multiple instances" setting, on every
-        // platform. Idempotent + a no-op when the lock was never taken (allow-multiple
-        // on); on the exit paths the process dies right after (the mutex/flock
-        // auto-releases anyway), so this only CHANGES behavior for the keep-running
-        // preview transition — exactly the intended fix.
-        crate::instance::release_capture_lock();
+        // DRAGON-255 released the capture single-instance lock here — the moment the
+        // overlays were PERMANENTLY gone — so a lingering PREVIEW editor couldn't keep
+        // blocking the next daemon "Region" / global hotkey (the "nothing happens" bug).
+        // DRAGON-351 deleted that lock outright (every launch is now its own instance),
+        // so there is nothing left to release and the bug cannot recur by construction.
+        //
         // macOS: the AeroSpace pause exists ONLY to protect the capture overlays, so
         // resume the tiling WM the moment they're permanently gone (capture committed
         // -> preview, recording stopped, teardown) instead of at process exit — the
@@ -79,6 +68,17 @@ impl App {
         // swept by `any_other_recording`'s liveness check, this is the tidy path). Idempotent.
         crate::instance::set_recording_marker(false);
         crate::instance::set_preview_marker(false);
+        // DRAGON-336 phase 3b: stop hosting preview handoffs, marker FIRST then socket, so
+        // no child can discover us at any point during teardown. Dropping the host unlinks
+        // its socket; any handoff still sitting unacked in its channel drops with it, which
+        // closes that connection WITHOUT an `ok` — precisely the signal that sends the
+        // waiting child back to opening its own preview (nothing is ever consumed without a
+        // positive ack, see `crate::preview_ipc`). Explicit rather than left to process
+        // exit, so the socket is gone before the last preview's surface is.
+        #[cfg(unix)]
+        {
+            self.preview_host = None;
+        }
         #[cfg(target_os = "macos")]
         {
             crate::platform::mac::window::resume_tiling_wm();
@@ -584,7 +584,7 @@ impl App {
     #[cfg(target_os = "macos")]
     pub(super) fn finalize_preview_window(&mut self, id: window::Id, attempt: u8) -> Task<cosmic::Action<Msg>> {
         // Only our current windowed preview qualifies.
-        if self.preview.as_ref().is_none_or(|p| p.window != id) {
+        if self.preview_for(id).is_none() {
             return Task::none();
         }
         const MAX_ATTEMPTS: u8 = 30;
@@ -615,7 +615,7 @@ impl App {
             // preview, exactly like the Windows `frosted_windowed` gate. The chrome already
             // paints translucent from `self.glass`.
             let frosted_windowed = self.glass.is_some_and(|g| g.frosted_windows)
-                && self.preview.as_ref().is_some_and(|p| p.surface.is_window());
+                && self.preview_for(id).is_some_and(|p| p.surface.is_window());
             if frosted_windowed {
                 crate::platform::mac::window::enable_window_vibrancy(
                     super::shell::PREVIEW_WINDOW_TITLE,
@@ -666,7 +666,7 @@ impl App {
     #[cfg(target_os = "windows")]
     pub(super) fn finalize_preview_window(&mut self, id: window::Id, attempt: u8) -> Task<cosmic::Action<Msg>> {
         // Only our current windowed preview qualifies.
-        if self.preview.as_ref().is_none_or(|p| p.window != id) {
+        if self.preview_for(id).is_none() {
             return Task::none();
         }
         const MAX_ATTEMPTS: u8 = 30;
@@ -679,7 +679,7 @@ impl App {
         // Gated on the SAME frosted-windows signal Linux uses (`self.glass`, Some only on
         // Win11 22H2+ and not `CCK_NO_GLASS`-disabled), so the unified toggle turns it off too.
         let frosted_windowed = self.glass.is_some_and(|g| g.frosted_windows)
-            && self.preview.as_ref().is_some_and(|p| p.surface.is_window());
+            && self.preview_for(id).is_some_and(|p| p.surface.is_window());
         let shown =
             crate::platform::windows::window::show_centered(super::shell::PREVIEW_WINDOW_TITLE, monitor);
         if shown {
@@ -748,7 +748,7 @@ impl App {
         size: (u32, u32),
         attempt: u8,
     ) -> Task<cosmic::Action<Msg>> {
-        if self.preview.as_ref().is_none_or(|p| p.window != id) {
+        if self.preview_for(id).is_none() {
             return Task::none();
         }
         const MAX_ATTEMPTS: u8 = 30;
@@ -813,7 +813,7 @@ impl App {
         size: (u32, u32),
         attempt: u8,
     ) -> Task<cosmic::Action<Msg>> {
-        if self.preview.as_ref().is_none_or(|p| p.window != id) {
+        if self.preview_for(id).is_none() {
             return Task::none();
         }
         const MAX_ATTEMPTS: u8 = 30;

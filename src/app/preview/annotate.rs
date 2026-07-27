@@ -19,8 +19,11 @@
 //!    (scaled by `scale`). The bake reuses this at full resolution — nothing else needed
 //!    for baking overlays (destructive kinds like blur/pixelate composite FIRST — see
 //!    [`apply_annotations`]).
-//! 3. **Toolbar**: add a `tb.bordered_button` in `App::annotation_tools` (chrome.rs) and
-//!    a [`Tool`] variant.
+//! 3. **Toolbar**: add a [`Tool`] variant, then a `TrayItem::Tool` row to the group it belongs
+//!    to in `chrome.rs`'s declared `ANNOT_TRAY` layout. The tray is data-driven (DRAGON-340):
+//!    each group renders as one bordered `Tb::tool_cluster`, and the buttons inside it are
+//!    bare glyphs whose COLOUR alone shows which tool is armed (`Tb::tool_toggle`) — there is
+//!    no per-icon ring any more.
 //! 4. **Hotkey**: add an `Action` (shortcuts.rs, contiguous in the "Annotation Tools"
 //!    group) mapped to `PreviewMsg::SelectTool` in keyboard.rs.
 //! 5. **Gesture**: if it draws by drag (like Box/Arrow) it already works via
@@ -53,6 +56,40 @@
 //! separate. Because a group has no rect of its own, its selection chrome + resize ride its
 //! BOUNDING BOX ([`pen_bounds`]) and a resize maps the points affinely into the new box
 //! ([`scale_pen`]); the canvas hit-tests along the STROKES, not the (mostly empty) box.
+//!
+//! # The sequence badge — user-facing "Step Marker" (DRAGON-340)
+//! [`AnnotKind::Badge`] is the first kind with a HARD aspect constraint, the first whose
+//! appearance depends on the REST of the scene, and the only rect kind that is PLACED rather
+//! than dragged out, so it stretches three seams:
+//!
+//! * **Click to place, never drag to size.** A marker is dropped at a POINT, not swept over a
+//!   region: the press drops a finished square centred on it at
+//!   [`badge_placement_rect`]-clamped size, the drag does nothing at all (the `New` arm of
+//!   `annot_gesture_to` skips it), and the canvas therefore completes the whole gesture on a
+//!   bare click (`Tool::click_places`, shared with the pencil's tap-inks-a-dot rule). Click and
+//!   click-drag land the same badge in the same place; every OTHER draw tool still needs a real
+//!   drag, untouched.
+//! * **Remembered size.** The side comes from [`super::edit::EditState::badge_size`] — the last
+//!   badge placed or resized in THIS editor, seeded at [`DEFAULT_BADGE_SIZE`]. It is
+//!   per-document and deliberately unpersisted (a within-session convenience, not a setting);
+//!   undoing a resize does not un-remember it, since the remembered size is tool state rather
+//!   than scene state.
+//! * **Always 1:1.** Every path that can change its rect squares it: the placement
+//!   ([`badge_placement_rect`], which shrinks BOTH axes together when the picture is too
+//!   small), a resize ([`square_for_grab`], which also picks the anchor from the grab so the
+//!   handle you are NOT holding stays put), the pre-placement ([`centered_square`]) and the
+//!   image clamp ([`clamp_square`] — the ordinary `clamp_rect` would flatten a badge against an
+//!   edge). It is deliberately NOT a member of the rect-conversion family
+//!   ([`rect_family_id`]) — converting a wide box into a badge would silently reshape the
+//!   user's geometry.
+//! * **Derived numbering.** A badge stores NO number. [`badge_numbers`] hands out `1..N` over
+//!   the badges in scene order, and every renderer resolves the ordinal through it on each
+//!   draw. Deleting one renumbers the rest for free, and undo/redo restore correct numbers
+//!   because they restore the item vector the numbering is a function of. Never add a stored
+//!   index; it cannot survive either operation without bookkeeping that goes stale.
+//!
+//! Its DRAWING (disc / gap / ring / numerals / the contrast ink) is [`crate::badge`], the
+//! canvas-and-bake shared module — the same split `crate::pen_stroke` uses for the pencil.
 //!
 //! A pencil press NEVER selects (DRAGON-346): it bypasses the canvas's hit-testing entirely and
 //! always inks, even straight over an existing shape — a stroke landing while the shape under
@@ -191,6 +228,21 @@ pub enum AnnotKind {
     /// [`PIXELATE_BLOCK_MAX`]) so text of any size is obfuscated. Same geometry/interaction as a
     /// box; the sub-cell detail is unrecoverable once baked.
     Pixelate { rect: AnnotRect },
+    /// A SEQUENCE BADGE (DRAGON-340): a filled disc in [`AnnotationItem::color`], a small clear
+    /// gap, and an outer RING at `ring_w` (the current line weight) — with the badge's ORDINAL
+    /// centred on the disc in whichever ink contrasts with that colour. All the drawing figures
+    /// come from [`crate::badge::metrics`], the one module the canvas and the bake share.
+    ///
+    /// Three things make it unlike every other kind:
+    /// * it is PLACED by a click, not dragged out ([`badge_placement_rect`], at the editor's
+    ///   remembered side) — the only rect kind whose creation gesture is a point;
+    /// * `rect` is ALWAYS 1:1 — [`badge_placement_rect`] / [`square_for_grab`] force it on
+    ///   creation, on resize and on every clamp, so the badge can never be squashed into an
+    ///   oval;
+    /// * it stores NO number. The ordinal is DERIVED from the badge's position among the
+    ///   scene's badges ([`badge_numbers`]) every time anything is drawn, which is what keeps
+    ///   the set a contiguous `1..N` through deletes, undo and redo with no bookkeeping at all.
+    Badge { rect: AnnotRect, ring_w: f32 },
     /// A DESTRUCTIVE blur redaction (DRAGON-328): the region is replaced by [`BLUR_PASSES`]
     /// stacked [`BLUR_BLOCK`] box blurs ([`box_blur_stack`]) — a strong smooth (≈ Gaussian) blur.
     /// Same geometry/interaction as a box; irreversible once baked.
@@ -226,7 +278,15 @@ impl AnnotKind {
                 | AnnotKind::Highlight { .. }
                 | AnnotKind::BoxHighlight { .. }
                 | AnnotKind::Pen { .. }
+                // A badge's colour drives BOTH its disc/ring and (through the contrast rule)
+                // its numeral ink, so recolouring it is meaningful.
+                | AnnotKind::Badge { .. }
         )
+    }
+
+    /// Whether this is a SEQUENCE BADGE (DRAGON-340) — the auto-numbered, always-square kind.
+    pub fn is_badge(&self) -> bool {
+        matches!(self, AnnotKind::Badge { .. })
     }
 
     /// Whether this is a freehand PEN group (DRAGON-338) — the only kind the eraser removes.
@@ -322,6 +382,17 @@ pub const SPAWN_H: f32 = 100.0;
 /// would not fit — so a tiny capture still gets a usable, clearly-inset item.
 pub const SPAWN_MAX_FRAC: f32 = 0.8;
 
+/// ONE axis of the pre-placement size rule (DRAGON-339): the WANTED extent, capped at
+/// [`SPAWN_MAX_FRAC`] of that axis and at the room left once the item's DRAWN margin `m` is
+/// reserved on BOTH sides. Never negative. The single source both the double-click spawn
+/// ([`default_placement_rect`]) and the badge's click-to-place ([`badge_placement_rect`])
+/// size themselves through, so "too big for this picture" means the same thing in both.
+/// Pure — unit-tested.
+fn placement_extent(full: f32, want: f32, m: f32) -> f32 {
+    let room = (full - 2.0 * m).max(0.0);
+    want.min(full * SPAWN_MAX_FRAC).min(room).max(0.0)
+}
+
 /// The rect a DOUBLE-CLICKED tool spawns its item in (DRAGON-339): [`SPAWN_W`]×[`SPAWN_H`] or
 /// [`SPAWN_MAX_FRAC`] of the image per axis — whichever FITS — CENTERED in the frame, and
 /// further shrunk so the item's DRAWN extent (geometry grown by `margin`, i.e. half the stroke —
@@ -331,14 +402,45 @@ pub const SPAWN_MAX_FRAC: f32 = 0.8;
 pub fn default_placement_rect(frame: (u32, u32), margin: f32) -> AnnotRect {
     let (fw, fh) = (frame.0 as f32, frame.1 as f32);
     let m = margin.max(0.0);
-    let axis = |full: f32, want: f32| -> f32 {
-        // The inset room left once the drawn margin is reserved on BOTH sides.
-        let room = (full - 2.0 * m).max(0.0);
-        want.min(full * SPAWN_MAX_FRAC).min(room).max(0.0)
-    };
-    let w = axis(fw, SPAWN_W);
-    let h = axis(fh, SPAWN_H);
+    let w = placement_extent(fw, SPAWN_W, m);
+    let h = placement_extent(fh, SPAWN_H, m);
     AnnotRect { x: (fw - w) * 0.5, y: (fh - h) * 0.5, w, h }
+}
+
+/// The side (SOURCE px) a sequence badge is born at when nothing has been placed or resized
+/// yet — the seed of [`super::edit::EditState::badge_size`].
+///
+/// SOURCE pixels, not screen pixels: every annotation geometry in this module is source-space
+/// (see [`AnnotRect`]), as are [`DEFAULT_ANNOT_STROKE`] and [`SPAWN_W`]/[`SPAWN_H`]. That keeps
+/// a placed badge a FIXED fraction of the picture — the same in the preview at any zoom, in a
+/// re-opened preview, and in the bake, which composites at full source resolution. The
+/// trade-off is the honest one: on a 4K grab a 100px badge reads smaller on screen than on a
+/// 720p one. Sizing in screen px would invert that (consistent on screen, drifting against the
+/// image), and the badge belongs to the image.
+pub const DEFAULT_BADGE_SIZE: f32 = 100.0;
+
+/// The square a CLICK-PLACED sequence badge takes (DRAGON-340 follow-up): side `want`,
+/// CENTRED on the click, sized by the same pre-placement rule the double-click spawn uses
+/// ([`placement_extent`] per axis, then the TIGHTER axis wins so the result is still 1:1),
+/// then slid inside the picture by [`clamp_square`].
+///
+/// So a badge clicked into the corner of a big picture is exactly `want` wide and merely
+/// nudged clear of the edge, while one clicked into a picture too small to hold `want` shrinks
+/// on BOTH axes together — never flattened, which is the badge's whole invariant. A degenerate
+/// frame yields a zero square, which the caller discards like a degenerate drag.
+/// Pure — unit-tested.
+pub fn badge_placement_rect(
+    center: (f32, f32),
+    want: f32,
+    frame: (u32, u32),
+    margin: f32,
+) -> AnnotRect {
+    let (fw, fh) = (frame.0 as f32, frame.1 as f32);
+    let m = margin.max(0.0);
+    // 1:1 means ONE side: the smaller of what each axis allows.
+    let s = placement_extent(fw, want.max(0.0), m).min(placement_extent(fh, want.max(0.0), m));
+    let centred = AnnotRect { x: center.0 - s * 0.5, y: center.1 - s * 0.5, w: s, h: s };
+    clamp_square(centred, fw, fh, m)
 }
 
 /// The kind a DOUBLE-CLICKED `tool` spawns inside `rect` (DRAGON-339), or `None` for a tool that
@@ -359,11 +461,60 @@ pub fn spawn_kind(tool: Tool, rect: AnnotRect, stroke_w: f32) -> Option<AnnotKin
             b: AnnotPoint { x: rect.x + rect.w, y: rect.y + rect.h },
             stroke_w,
         },
+        // A badge is ALWAYS 1:1, so the placement rect is squared down to its shorter axis and
+        // re-centred — it must never spawn as the 200×100 oval the shared rect would give.
+        Tool::Badge => AnnotKind::Badge {
+            rect: centered_square(rect),
+            ring_w: stroke_w,
+        },
         // A freehand stroke has no meaningful default geometry; the eraser creates no item at
         // all; and the POINTER (DRAGON-341) is pure selection — it must never place anything.
         // Double-clicking any of their tray buttons just picks the tool.
         Tool::Pen | Tool::Eraser | Tool::Pointer => return None,
     })
+}
+
+/// The rect kinds that share Box GEOMETRY and interaction, as a small id — the axis
+/// [`converted_rect_kind`] converts along. `None` for anything that isn't one of them.
+///
+/// The SEQUENCE BADGE is deliberately NOT a member even though it stores a rect: it is locked
+/// 1:1, so converting a wide box into one (or a badge into a wide box) would silently reshape
+/// the user's geometry. Picking the badge tool with a box selected just arms the tool.
+fn rect_family_id(kind: &AnnotKind) -> Option<u8> {
+    Some(match kind {
+        AnnotKind::Box { .. } => 0,
+        AnnotKind::Highlight { .. } => 1,
+        AnnotKind::BoxHighlight { .. } => 2,
+        AnnotKind::Pixelate { .. } => 3,
+        AnnotKind::Blur { .. } => 4,
+        AnnotKind::Spotlight { .. } => 5,
+        AnnotKind::Arrow { .. } | AnnotKind::Pen { .. } | AnnotKind::Badge { .. } => return None,
+    })
+}
+
+/// [`rect_family_id`]'s tool side.
+fn rect_family_tool(tool: Tool) -> Option<u8> {
+    Some(match tool {
+        Tool::Rect => 0,
+        Tool::Highlight => 1,
+        Tool::BoxHighlight => 2,
+        Tool::Pixelate => 3,
+        Tool::Blur => 4,
+        Tool::Spotlight => 5,
+        Tool::Arrow | Tool::Pen | Tool::Eraser | Tool::Pointer | Tool::Badge => return None,
+    })
+}
+
+/// `rect` shrunk to the largest CENTRED 1:1 square inside it — how a pre-placed badge fits the
+/// shared (200×100) placement rect. Pure — unit-tested.
+pub fn centered_square(rect: AnnotRect) -> AnnotRect {
+    let s = rect.w.abs().min(rect.h.abs());
+    AnnotRect {
+        x: rect.x + (rect.w - s) * 0.5,
+        y: rect.y + (rect.h - s) * 0.5,
+        w: s,
+        h: s,
+    }
 }
 
 /// How long after a tool button's first press a SECOND press on the SAME tool still counts as a
@@ -459,6 +610,102 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
         }
     };
     (chan(h + 1.0 / 3.0), chan(h), chan(h - 1.0 / 3.0))
+}
+
+// ── the sequence badge: numbering + the 1:1 constraint (DRAGON-340; all pure) ──────────
+
+/// Every badge in the scene paired with its ORDINAL, in scene order: the first badge is `1`,
+/// the second `2`, and so on. Non-badge items are skipped and never consume a number.
+///
+/// The numbering is DERIVED, never stored. That is the whole design: the set is a contiguous
+/// `1..N` by construction, so deleting badge 2 makes the old 3 become 2 for free, and undo /
+/// redo restore correct numbers automatically because they restore the item VECTOR (an ordinal
+/// stored on an item could not survive either operation without bookkeeping that can go stale).
+///
+/// "Scene order" is the annotation vector's order, which is also the z-order: a badge is
+/// appended on creation, so numbering follows the order badges were PLACED. The corollary is
+/// that explicitly restacking a badge (Bring to Front / Send to Back) also renumbers it — the
+/// honest consequence of the order being the single source of truth. Pure — unit-tested.
+pub fn badge_numbers(items: &[AnnotationItem]) -> Vec<(AnnotId, u32)> {
+    items
+        .iter()
+        .filter(|it| it.kind.is_badge())
+        .enumerate()
+        .map(|(i, it)| (it.id, i as u32 + 1))
+        .collect()
+}
+
+/// `r` forced to a 1:1 SQUARE anchored at the corner the drag is NOT moving — the base of the
+/// badge's always-square rule.
+///
+/// `anchor` names the fixed corner as `(right, bottom)` flags: `(false, false)` pins the
+/// top-left (so the square grows toward +x/+y), `(true, true)` pins the bottom-right, and so
+/// on. The side is the LARGER of the two extents, so the square follows whichever axis the
+/// pointer dragged further — the behaviour a 1:1 drag reads as. Pure — unit-tested.
+pub fn square_rect(r: AnnotRect, anchor: (bool, bool)) -> AnnotRect {
+    let s = r.w.abs().max(r.h.abs());
+    let x = if anchor.0 { r.x + r.w - s } else { r.x };
+    let y = if anchor.1 { r.y + r.h - s } else { r.y };
+    AnnotRect { x, y, w: s, h: s }
+}
+
+/// A SQUARE-PRESERVING clamp into the image `[0,fw]×[0,fh]` inset by the drawn margin `m`:
+/// unlike [`clamp_rect`], which shrinks the axes independently (and would turn a badge into a
+/// rectangle against an edge), the side shrinks to the TIGHTER axis so the result is still 1:1.
+/// Pure — unit-tested.
+pub fn clamp_square(r: AnnotRect, fw: f32, fh: f32, m: f32) -> AnnotRect {
+    let s = r.w.abs().max(r.h.abs()).min((fw - 2.0 * m).max(0.0)).min((fh - 2.0 * m).max(0.0));
+    AnnotRect {
+        x: r.x.clamp(m, (fw - m - s).max(m)),
+        y: r.y.clamp(m, (fh - m - s).max(m)),
+        w: s,
+        h: s,
+    }
+}
+
+/// The square a badge takes after grab `grab` produced the (possibly non-square) rect `r`,
+/// clamped inside the image — the ONE place the "always 1:1, during AND after any resize"
+/// rule is enforced for an existing badge.
+///
+/// Which corner stays put follows the grab, so the badge grows/shrinks from the handle the
+/// user is NOT holding, exactly like a box: a NW drag pins SE, an E drag pins the west edge,
+/// and so on. Edge grabs still produce a square (that is the point) but keep the badge centred
+/// on the OTHER axis, so dragging the top edge doesn't also slide the badge sideways. A Move
+/// changes no size at all. Pure — unit-tested.
+pub fn square_for_grab(r: AnnotRect, grab: Grab, fw: f32, fh: f32, m: f32) -> AnnotRect {
+    use crate::geometry::{Corner, Edge};
+    let squared = match grab {
+        // A move never resizes: the rect is already square, just clamp it.
+        Grab::Move | Grab::ArrowA | Grab::ArrowB => r,
+        Grab::Corner(Corner::Nw) => square_rect(r, (true, true)),
+        Grab::Corner(Corner::Ne) => square_rect(r, (false, true)),
+        Grab::Corner(Corner::Sw) => square_rect(r, (true, false)),
+        Grab::Corner(Corner::Se) => square_rect(r, (false, false)),
+        // An edge drag sizes on ITS axis and recentres on the other, so the badge doesn't
+        // wander sideways while you drag its top edge.
+        Grab::Edge(e) => {
+            let (cx, cy) = (r.x + r.w * 0.5, r.y + r.h * 0.5);
+            match e {
+                Edge::N => {
+                    let s = r.h.abs();
+                    AnnotRect { x: cx - s * 0.5, y: r.y + r.h - s, w: s, h: s }
+                }
+                Edge::S => {
+                    let s = r.h.abs();
+                    AnnotRect { x: cx - s * 0.5, y: r.y, w: s, h: s }
+                }
+                Edge::W => {
+                    let s = r.w.abs();
+                    AnnotRect { x: r.x + r.w - s, y: cy - s * 0.5, w: s, h: s }
+                }
+                Edge::E => {
+                    let s = r.w.abs();
+                    AnnotRect { x: r.x, y: cy - s * 0.5, w: s, h: s }
+                }
+            }
+        }
+    };
+    clamp_square(squared, fw, fh, m)
 }
 
 // ── color palette + custom color-wheel picker ────────────────────────────────────────
@@ -908,6 +1155,9 @@ pub fn rasterize_scene(
     if w == 0 || h == 0 {
         return None;
     }
+    // Sequence-badge ordinals are DERIVED from the scene (never stored), so the bake resolves
+    // them exactly like the canvas does — one lookup table for the whole pass.
+    let badges = badge_numbers(items);
     // The rounded-corner / round-cap style both shapes share.
     let (cap, join) = if curve_radius > 0.0 {
         (sk::LineCap::Round, sk::LineJoin::Round)
@@ -943,6 +1193,14 @@ pub fn rasterize_scene(
             }
             AnnotKind::Arrow { a, b, stroke_w } => {
                 draw_arrow(&mut pixmap, (a.x, a.y), (b.x, b.y), *stroke_w, item.color, scale, cap, join);
+            }
+            // The SEQUENCE BADGE (DRAGON-340) at FULL capture resolution: the exact same
+            // `crate::badge` metrics the canvas draws, multiplied by the raster `scale`
+            // instead of by the canvas's zoom — display and bake are one drawing at two
+            // resolutions, like the pen's ribbon.
+            AnnotKind::Badge { rect, ring_w } => {
+                let n = badges.iter().find(|(id, _)| *id == item.id).map_or(1, |(_, n)| *n);
+                draw_badge(&mut pixmap, rect, *ring_w, n, item.color, scale);
             }
             // BoxHighlight: its highlight FILL composites through the effect stack (skipped
             // here); its box OUTLINE is a source-over vector, drawn EXACTLY like a fill-less
@@ -1013,6 +1271,88 @@ pub fn rasterize_scene(
         *dst = ::image::Rgba([c.red(), c.green(), c.blue(), c.alpha()]);
     }
     Some(rgba)
+}
+
+/// A circle as a tiny-skia path, built from four cubic quarter-arcs (the same kappa
+/// construction [`round_rect_path`] uses). `None` for a non-positive radius.
+fn circle_path(cx: f32, cy: f32, r: f32) -> Option<resvg::tiny_skia::Path> {
+    use resvg::tiny_skia as sk;
+    // NaN-safe: an unordered radius takes this branch and draws nothing.
+    if r.is_nan() || r <= 0.0 {
+        return None;
+    }
+    let k = r * 0.552_285;
+    let mut pb = sk::PathBuilder::new();
+    pb.move_to(cx, cy - r);
+    pb.cubic_to(cx + k, cy - r, cx + r, cy - k, cx + r, cy);
+    pb.cubic_to(cx + r, cy + k, cx + k, cy + r, cx, cy + r);
+    pb.cubic_to(cx - k, cy + r, cx - r, cy + k, cx - r, cy);
+    pb.cubic_to(cx - r, cy - k, cx - k, cy - r, cx, cy - r);
+    pb.close();
+    pb.finish()
+}
+
+/// Draw one SEQUENCE BADGE (DRAGON-340) into `pixmap` at raster `scale` (target px per SOURCE
+/// px): the filled disc, the outer ring at the current line weight, and the ordinal `number`
+/// in the contrast ink. The MIRROR of the canvas's `draw_badge` — both read
+/// [`crate::badge::metrics`] for SOURCE-px figures and apply exactly one uniform factor, so
+/// what the editor showed is what the export contains.
+fn draw_badge(
+    pixmap: &mut resvg::tiny_skia::Pixmap,
+    rect: &AnnotRect,
+    ring_w: f32,
+    number: u32,
+    color: AnnotColor,
+    scale: f32,
+) {
+    use resvg::tiny_skia as sk;
+    let ident = sk::Transform::identity();
+    let side = rect.w.abs().min(rect.h.abs());
+    let m = crate::badge::metrics(side, ring_w, crate::badge::digit_count(number));
+    if m.disc_r <= 0.0 {
+        return;
+    }
+    let (cx, cy) = ((rect.x + rect.w * 0.5) * scale, (rect.y + rect.h * 0.5) * scale);
+    let mut paint = sk::Paint { anti_alias: true, ..Default::default() };
+    paint.set_color(sk_color(color));
+    // Disc.
+    if let Some(disc) = circle_path(cx, cy, m.disc_r * scale) {
+        pixmap.fill_path(&disc, &paint, sk::FillRule::Winding, ident, None);
+    }
+    // Ring — stroked ON the model square's inscribed circle.
+    if m.ring_w > 0.0
+        && let Some(ring) = circle_path(cx, cy, m.outer_r * scale)
+    {
+        let stroke = sk::Stroke {
+            width: (m.ring_w * scale).max(0.5),
+            line_cap: sk::LineCap::Round,
+            line_join: sk::LineJoin::Round,
+            ..Default::default()
+        };
+        pixmap.stroke_path(&ring, &paint, &stroke, ident, None);
+    }
+    // The ordinal, in whichever tone contrasts with the disc.
+    let ink = crate::badge::ink_rgb8(color);
+    let mut ink_paint = sk::Paint { anti_alias: true, ..Default::default() };
+    ink_paint.set_color(sk_color([ink[0], ink[1], ink[2], color[3]]));
+    let numeral = sk::Stroke {
+        width: (m.digit_stroke * scale).max(0.5),
+        line_cap: sk::LineCap::Round,
+        line_join: sk::LineJoin::Round,
+        ..Default::default()
+    };
+    let centre = (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5);
+    for poly in crate::badge::number_polylines(number, &m, centre) {
+        let Some(first) = poly.first() else { continue };
+        let mut pb = sk::PathBuilder::new();
+        pb.move_to(first.0 * scale, first.1 * scale);
+        for q in &poly[1..] {
+            pb.line_to(q.0 * scale, q.1 * scale);
+        }
+        if let Some(path) = pb.finish() {
+            pixmap.stroke_path(&path, &ink_paint, &numeral, ident, None);
+        }
+    }
 }
 
 /// Draw one arrow into `pixmap` (source coords scaled by `scale`): a shaft to the tip plus
@@ -1178,32 +1518,17 @@ pub fn adaptive_highlight_px(
 /// when the user picks a different one of those tools. Returns the converted kind (rect
 /// preserved; the shared [`AnnotationItem::color`] is untouched by the caller; the outline
 /// `stroke_w` carries between Box/BoxHighlight and falls back to `default_stroke` when the source
-/// has none), or `None` when either side isn't a rect kind/tool (e.g. Arrow) or the kind is
-/// unchanged.
+/// has none), or `None` when either side isn't a rect kind/tool (e.g. Arrow, or the always-1:1
+/// SEQUENCE BADGE — see [`rect_family_id`]) or the kind is unchanged.
 pub(super) fn converted_rect_kind(
     cur: &AnnotKind,
     tool: Tool,
     default_stroke: f32,
 ) -> Option<AnnotKind> {
     // Rect-kind ids: 0 Box (outline), 1 Highlight, 2 Box Highlight, 3 Pixelate, 4 Blur, 5 Spotlight.
-    let from = match cur {
-        AnnotKind::Box { .. } => 0u8,
-        AnnotKind::Highlight { .. } => 1,
-        AnnotKind::BoxHighlight { .. } => 2,
-        AnnotKind::Pixelate { .. } => 3,
-        AnnotKind::Blur { .. } => 4,
-        AnnotKind::Spotlight { .. } => 5,
-        _ => return None,
-    };
-    let to = match tool {
-        Tool::Rect => 0u8,
-        Tool::Highlight => 1,
-        Tool::BoxHighlight => 2,
-        Tool::Pixelate => 3,
-        Tool::Blur => 4,
-        Tool::Spotlight => 5,
-        _ => return None,
-    };
+    // (The always-square SEQUENCE BADGE is not in the family — see [`rect_family_id`].)
+    let from = rect_family_id(cur)?;
+    let to = rect_family_tool(tool)?;
     if from == to {
         return None; // picking the current kind's own tool — no conversion, no undo entry.
     }
@@ -1524,6 +1849,8 @@ pub fn apply_one_effect_scaled(
         AnnotKind::Box { .. }
         | AnnotKind::Arrow { .. }
         | AnnotKind::Pen { .. }
+        // The SEQUENCE BADGE is an always-on-top vector like box/arrow, never an effect.
+        | AnnotKind::Badge { .. }
         | AnnotKind::Spotlight { .. } => return,
     };
     // Scale the geometry into the (possibly reduced) raster space. Blocks scale too, floored
@@ -1592,6 +1919,7 @@ pub fn apply_one_effect_scaled(
         AnnotKind::Box { .. }
         | AnnotKind::Arrow { .. }
         | AnnotKind::Pen { .. }
+        | AnnotKind::Badge { .. }
         | AnnotKind::Spotlight { .. } => {
             unreachable!("handled above")
         }
@@ -1652,6 +1980,9 @@ pub fn knockout_rects(items: &[AnnotationItem]) -> Vec<AnnotRect> {
             // region, so it never punches the dim.
             AnnotKind::Arrow { .. }
             | AnnotKind::Pen { .. }
+            // A badge MARKS a spot (like an arrow); it doesn't frame a region, so it never
+            // punches the dim either.
+            | AnnotKind::Badge { .. }
             | AnnotKind::Pixelate { .. }
             | AnnotKind::Blur { .. } => None,
         })
@@ -1724,6 +2055,9 @@ fn to_iced_color(c: AnnotColor) -> cosmic::iced::Color {
 /// [`ERASE_PREVIEW_ALPHA`] so the user sees exactly what releasing will delete. Purely a
 /// display concern — the model is untouched until the sweep commits.
 pub fn widget_items(items: &[AnnotationItem], curve_radius: f32, erasing: &[AnnotId]) -> Vec<Item> {
+    // Sequence-badge ordinals are DERIVED (never stored), so they are re-resolved on EVERY view
+    // build — a delete, an undo or a redo renumbers the tray with no extra plumbing.
+    let badges = badge_numbers(items);
     items
         .iter()
         .map(|it| {
@@ -1784,8 +2118,18 @@ pub fn widget_items(items: &[AnnotationItem], curve_radius: f32, erasing: &[Anno
                     None,
                     FxKind::BoxHighlight,
                 ),
+                // A SEQUENCE BADGE hands the canvas its square as a plain Rect (so hit-testing,
+                // chrome and resize are the ordinary ones) and rides the `badge` render flag
+                // below; `stroke_w` carries the RING weight.
+                AnnotKind::Badge { rect, ring_w } => (
+                    ItemKind::Rect { x: rect.x, y: rect.y, w: rect.w, h: rect.h },
+                    *ring_w,
+                    None,
+                    FxKind::None,
+                ),
             };
-            Item { id: it.id.0, kind, stroke_w, color: stroke_color, fill, fx, curve_radius }
+            let badge = badges.iter().find(|(id, _)| *id == it.id).map(|(_, n)| *n);
+            Item { id: it.id.0, kind, stroke_w, color: stroke_color, fill, fx, curve_radius, badge }
         })
         .collect()
 }
@@ -1799,8 +2143,8 @@ impl App {
     }
 
     /// Begin drawing a new shape of `tool` at image point `(x, y)`.
-    pub(super) fn annot_draw_begin(&mut self, tool: Tool, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn annot_draw_begin(&mut self, id: window::Id, tool: Tool, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
         let color = p.edit.annot_color.unwrap_or_else(default_annot_color);
@@ -1837,6 +2181,21 @@ impl App {
                 stroke_w,
             },
             Tool::Spotlight => AnnotKind::Spotlight { rect: AnnotRect { x, y, w: 0.0, h: 0.0 } },
+            // A badge is PLACED, not drawn (it is a numbered marker, not a region): the press
+            // drops a finished square CENTRED on it, at the size the last badge in this editor
+            // was placed or resized to. There is no drag-to-size — the `New` arm of
+            // `annot_gesture_to` leaves a badge alone, so a click and a click-drag land the
+            // same badge in the same place. Its ring rides the shared line weight.
+            Tool::Badge => AnnotKind::Badge {
+                rect: badge_placement_rect(
+                    (x, y),
+                    p.edit.badge_size(),
+                    p.edit.frame,
+                    // `kind_draw_margin` for a badge: half the ring.
+                    stroke_w.max(0.0) / 2.0,
+                ),
+                ring_w: stroke_w,
+            },
             Tool::Pixelate => AnnotKind::Pixelate { rect: AnnotRect { x, y, w: 0.0, h: 0.0 } },
             Tool::Blur => AnnotKind::Blur { rect: AnnotRect { x, y, w: 0.0, h: 0.0 } },
             // One stroke opens as a one-point polyline — already a valid DOT, so a press with
@@ -1852,6 +2211,12 @@ impl App {
             // rubber band, not a draw). Defensive.
             Tool::Eraser | Tool::Pointer => return Task::none(),
         };
+        // A placed badge REMEMBERS its side for the rest of this editor (see
+        // `EditState::annot_badge_size`) — the SETTLED one, so a badge the picture clamped
+        // down doesn't make every later click try (and fail) at the bigger size again.
+        if let AnnotKind::Badge { rect, .. } = &kind {
+            p.edit.annot_badge_size = rect.w;
+        }
         p.edit.annot_snapshot = Some(p.edit.annotations.clone());
         // The freehand pen's RAW trail (DRAGON-342): the model always holds the SMOOTHED curve,
         // so the un-smoothed samples live here for the length of the gesture and nowhere else.
@@ -1879,15 +2244,15 @@ impl App {
     /// Leaving POINTER mode DROPS every pen group from the selection (DRAGON-341): pen selection
     /// exists only under the pointer, so the state is pruned rather than the chrome hidden —
     /// otherwise a ghost member would still ride along in a group move or delete.
-    pub(super) fn select_annot_tool(&mut self, tool: Tool) {
+    pub(super) fn select_annot_tool(&mut self, id: window::Id, tool: Tool) {
         // If a box-family annotation (Box Outline / Highlight / Box Highlight) is selected
         // and the user picks a DIFFERENT one of those three tools, CONVERT the selected
         // item in place (real-time, one undo entry) rather than only arming the tool for
         // the next draw. No-op for every other selection/tool combination.
-        self.convert_selected_annotation_kind(tool);
+        self.convert_selected_annotation_kind(id, tool);
         // Only ever SETS a tool — clicking/hotkeying the active tool is a no-op (no
         // re-click-to-neutral). Persist so the next preview opens with it.
-        if let Some(p) = &mut self.preview {
+        if let Some(p) = self.preview_for_mut(id) {
             p.edit.tool = Some(tool);
             // Pen groups are selectable ONLY under the pointer, so arming anything else lets
             // them go — the visible selection and the real one never disagree.
@@ -1910,8 +2275,8 @@ impl App {
     /// Returns `false` (changing nothing) when there is no preview, the tool has no pre-placeable
     /// form ([`spawn_kind`] → `None`, e.g. a freehand tool), or the frame is too small for a
     /// non-degenerate item — the same degeneracy rule a discarded drag uses.
-    pub(super) fn spawn_annotation(&mut self, tool: Tool) -> bool {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn spawn_annotation(&mut self, id: window::Id, tool: Tool) -> bool {
+        let Some(p) = self.preview_for_mut(id) else {
             return false;
         };
         let stroke_w = p.edit.stroke();
@@ -1931,6 +2296,11 @@ impl App {
         if is_degenerate(&item) {
             return false;
         }
+        // A badge spawned this way counts as "the last one placed" too, so a later click-place
+        // matches what the double-click just dropped.
+        if let AnnotKind::Badge { rect, .. } = &item.kind {
+            p.edit.annot_badge_size = rect.w;
+        }
         let prev = p.edit.annotations.clone();
         p.edit.annotations.push(item);
         p.edit.sel.set_one(id);
@@ -1946,8 +2316,8 @@ impl App {
     /// selected, the selection isn't colorable (pixelate/blur), or the color is unchanged.
     /// Iterates the selection so it already extends to multi-select. The caller sets
     /// `annot_color` separately; the view redraws the recolored item automatically.
-    pub(super) fn recolor_selected_annotation(&mut self, color: AnnotColor) {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn recolor_selected_annotation(&mut self, id: window::Id, color: AnnotColor) {
+        let Some(p) = self.preview_for_mut(id) else {
             return;
         };
         if p.edit.sel.is_empty() {
@@ -1975,8 +2345,8 @@ impl App {
     /// [`super::edit::EditOp::Annotations`] undo snapshot — the width mirror of
     /// [`Self::recolor_selected_annotation`]. No-op (no snapshot) when nothing is selected,
     /// the selection has no stroke (highlight / pixelate / blur), or the width is unchanged.
-    pub(super) fn restroke_selected_annotation(&mut self, stroke_w: f32) {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn restroke_selected_annotation(&mut self, id: window::Id, stroke_w: f32) {
+        let Some(p) = self.preview_for_mut(id) else {
             return;
         };
         if p.edit.sel.is_empty() {
@@ -1985,7 +2355,7 @@ impl App {
         // Only a SELECTED, STROKED item (box / arrow / pen) whose width actually differs needs it.
         let needed = p.edit.annotations.iter().any(|it| {
             p.edit.sel.contains(it.id)
-                && matches!(&it.kind, AnnotKind::Box { stroke_w: w, .. } | AnnotKind::Arrow { stroke_w: w, .. } | AnnotKind::BoxHighlight { stroke_w: w, .. } | AnnotKind::Pen { stroke_w: w, .. } if *w != stroke_w)
+                && matches!(&it.kind, AnnotKind::Box { stroke_w: w, .. } | AnnotKind::Arrow { stroke_w: w, .. } | AnnotKind::BoxHighlight { stroke_w: w, .. } | AnnotKind::Pen { stroke_w: w, .. } | AnnotKind::Badge { ring_w: w, .. } if *w != stroke_w)
         });
         if !needed {
             return;
@@ -1999,7 +2369,10 @@ impl App {
                     // BoxHighlight's OUTLINE stroke re-widths like a box (DRAGON-333).
                     | AnnotKind::BoxHighlight { stroke_w: w, .. }
                     // A pen group re-widths as a whole (DRAGON-338) — 2/4/6px, same presets.
-                    | AnnotKind::Pen { stroke_w: w, .. } => {
+                    | AnnotKind::Pen { stroke_w: w, .. }
+                    // A badge's OUTER RING is the line weight, by the ticket's definition
+                    // (DRAGON-340), so it re-strokes with everything else.
+                    | AnnotKind::Badge { ring_w: w, .. } => {
                         *w = stroke_w;
                     }
                     // Effects (highlight / pixelate / blur) + spotlight carry no stroke — leave
@@ -2019,15 +2392,15 @@ impl App {
     /// that kind IN PLACE (real-time), pushing ONE [`super::edit::EditOp::Annotations`] undo
     /// snapshot. No-op (no snapshot) when nothing is selected, the selection isn't a rect kind,
     /// the tool isn't a rect kind, or the kind is unchanged — so a normal tool pick just arms it.
-    pub(super) fn convert_selected_annotation_kind(&mut self, tool: Tool) {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn convert_selected_annotation_kind(&mut self, id: window::Id, tool: Tool) {
+        let Some(p) = self.preview_for_mut(id) else {
             return;
         };
-        let Some(id) = p.edit.selected() else {
+        let Some(annot) = p.edit.selected() else {
             return;
         };
         let default_stroke = p.edit.stroke();
-        let Some(idx) = p.edit.annotations.iter().position(|it| it.id == id) else {
+        let Some(idx) = p.edit.annotations.iter().position(|it| it.id == annot) else {
             return;
         };
         let Some(new_kind) =
@@ -2046,12 +2419,12 @@ impl App {
     /// and persist — the shared body behind the width toggle group ([`PreviewMsg::SetAnnotStrokeW`])
     /// and the `L` cycle. Box/arrow redraw as vectors on the next view build, so no raster
     /// refresh is owed (effects carry no stroke).
-    pub(super) fn apply_annot_stroke_w(&mut self, w: f32) {
-        if let Some(p) = &mut self.preview {
+    pub(super) fn apply_annot_stroke_w(&mut self, id: window::Id, w: f32) {
+        if let Some(p) = self.preview_for_mut(id) {
             p.edit.annot_stroke_w = w;
         }
         // Picking a width also re-strokes the SELECTED box/arrow immediately (one undo entry).
-        self.restroke_selected_annotation(w);
+        self.restroke_selected_annotation(id, w);
         // Persist so the next preview opens with this width.
         self.annot_stroke_w = w;
         self.save_state();
@@ -2065,8 +2438,8 @@ impl App {
     /// edge. Every other grab (and any single selection) stays on the historical one-item
     /// [`AnnotGesture::Edit`] path — resize handles only ever exist on the PRIMARY item, so the
     /// whole `Grab` machinery is untouched by multi-select.
-    pub(super) fn annot_grab_begin(&mut self, grab: Grab, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn annot_grab_begin(&mut self, id: window::Id, grab: Grab, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
         if grab == Grab::Move && p.edit.sel.len() > 1 {
@@ -2084,16 +2457,16 @@ impl App {
             p.edit.gesture = Some(AnnotGesture::MoveMany { press: (x, y), originals, bounds });
             return Task::none();
         }
-        let Some(id) = p.edit.selected() else {
+        let Some(annot) = p.edit.selected() else {
             return Task::none();
         };
-        let Some(item) = p.edit.annotations.iter().find(|it| it.id == id) else {
+        let Some(item) = p.edit.annotations.iter().find(|it| it.id == annot) else {
             return Task::none();
         };
         p.edit.annot_snapshot = Some(p.edit.annotations.clone());
         p.edit.gesture = Some(AnnotGesture::Edit {
             press: (x, y),
-            id,
+            id: annot,
             grab,
             original: item.kind.clone(),
         });
@@ -2103,8 +2476,8 @@ impl App {
     /// Live drag update (image point). Updates the model geometry; box/arrow redraw as vector
     /// geometry on the view rebuild, while an effect (highlight/pixelate/blur) being drawn or
     /// resized re-rasters its display layer LIVE (coalesced) so the redaction tracks the drag.
-    pub(super) fn annot_gesture_to(&mut self, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn annot_gesture_to(&mut self, id: window::Id, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
         let Some(gesture) = p.edit.gesture.clone() else {
@@ -2136,6 +2509,13 @@ impl App {
                         AnnotKind::Arrow { b, .. } => {
                             *b = AnnotPoint { x: cur.0, y: cur.1 };
                         }
+                        // A badge is PLACED, not drawn: `annot_draw_begin` already dropped the
+                        // finished square on the press point, so the drag changes NOTHING —
+                        // click and click-drag are the same gesture. (Resizing an existing
+                        // badge is the `Edit` gesture below, which keeps it 1:1 via
+                        // `square_for_grab`.) Deliberately not a `_` arm: a new rect kind must
+                        // still choose its drag behaviour explicitly.
+                        AnnotKind::Badge { .. } => {}
                         // Freehand: APPEND to the RAW trail, but only once the pointer has
                         // travelled PEN_MIN_STEP — a slow drag must not pile up coincident
                         // vertices, and the gap between kept samples IS the speed proxy the
@@ -2198,8 +2578,8 @@ impl App {
 
     /// Commit the active gesture: discard a degenerate new shape, else push ONE undo entry
     /// (the pre-gesture snapshot); the view redraws the final scene as vectors.
-    pub(super) fn annot_gesture_end(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn annot_gesture_end(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
         let Some(gesture) = p.edit.gesture.take() else {
@@ -2244,7 +2624,21 @@ impl App {
             }
             // A one-item edit and a whole-selection move commit identically: ONE undo entry
             // holding the pre-gesture scene (DRAGON-341 — a group move is one edit, not N).
-            AnnotGesture::Edit { .. } | AnnotGesture::MoveMany { .. } => {
+            AnnotGesture::Edit { id, .. } => {
+                // Resizing a BADGE re-arms the remembered side, so the next click-placed badge
+                // matches the one you just sized. UNDOING that resize deliberately does NOT
+                // un-remember it: the remembered size is a tool preference, not scene state,
+                // and rewinding it would make undo mean two different things at once.
+                if let Some(AnnotKind::Badge { rect, .. }) =
+                    p.edit.annotations.iter().find(|it| it.id == id).map(|it| &it.kind)
+                {
+                    p.edit.annot_badge_size = rect.w;
+                }
+                if let Some(prev) = snapshot {
+                    p.edit.push_annotations(prev);
+                }
+            }
+            AnnotGesture::MoveMany { .. } => {
                 if let Some(prev) = snapshot {
                     p.edit.push_annotations(prev);
                 }
@@ -2268,8 +2662,8 @@ impl App {
     }
 
     /// Delete the WHOLE selection (DRAGON-341) — however many items — as ONE undo entry.
-    pub(super) fn annot_delete_selected(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn annot_delete_selected(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
         if p.edit.sel.is_empty() {
@@ -2293,8 +2687,8 @@ impl App {
     /// but the usual rule still applies afterwards: arming another tool prunes them
     /// ([`super::edit::EditState::drop_pen_selection`]). Returns whether anything is now
     /// selected — an empty scene changes nothing at all (no persisted state churn).
-    pub(super) fn select_all_annotations(&mut self) -> bool {
-        match self.preview.as_mut() {
+    pub(super) fn select_all_annotations(&mut self, id: window::Id) -> bool {
+        match self.preview_for_mut(id) {
             Some(p) if !p.edit.annotations.is_empty() => {
                 let ids: Vec<AnnotId> = p.edit.annotations.iter().map(|it| it.id).collect();
                 p.edit.sel.set_all(ids);
@@ -2310,15 +2704,14 @@ impl App {
     /// existing selection and adds to it; otherwise the band REPLACES it. A band that touches
     /// nothing simply clears (or leaves, when additive) the selection — never an undo entry,
     /// since selecting is not an edit.
-    pub(super) fn band_select_annotations(
-        &mut self,
+    pub(super) fn band_select_annotations(&mut self, id: window::Id,
         x0: f32,
         y0: f32,
         x1: f32,
         y1: f32,
         additive: bool,
     ) {
-        let Some(p) = self.preview.as_mut() else {
+        let Some(p) = self.preview_for_mut(id) else {
             return;
         };
         let band = AnnotRect::from_points((x0, y0), (x1, y1));
@@ -2335,14 +2728,14 @@ impl App {
     /// by an equal x/y amount (so the copy is obviously distinct and easy to grab) and clamped to
     /// stay in the image. The copy lands on TOP of the z-stack and becomes the new selection.
     /// One undo entry. No-op when nothing is selected.
-    pub(super) fn duplicate_selected_annotation(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn duplicate_selected_annotation(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
-        let Some(id) = p.edit.selected() else {
+        let Some(annot) = p.edit.selected() else {
             return Task::none();
         };
-        let Some(src) = p.edit.annotations.iter().find(|it| it.id == id).cloned() else {
+        let Some(src) = p.edit.annotations.iter().find(|it| it.id == annot).cloned() else {
             return Task::none();
         };
         let (fw, fh) = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
@@ -2365,20 +2758,20 @@ impl App {
     }
 
     /// Reorder the selected annotation in the z-stack (one undo entry when it moves).
-    pub(super) fn annot_reorder(&mut self, how: Reorder) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_mut() else {
+    pub(super) fn annot_reorder(&mut self, id: window::Id, how: Reorder) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
-        let Some(id) = p.edit.selected() else {
+        let Some(annot) = p.edit.selected() else {
             return Task::none();
         };
         p.edit.annot_menu = None;
         let prev = p.edit.annotations.clone();
         let changed = match how {
-            Reorder::Up => raise(&mut p.edit.annotations, id),
-            Reorder::Down => lower(&mut p.edit.annotations, id),
-            Reorder::Front => to_front(&mut p.edit.annotations, id),
-            Reorder::Back => to_back(&mut p.edit.annotations, id),
+            Reorder::Up => raise(&mut p.edit.annotations, annot),
+            Reorder::Down => lower(&mut p.edit.annotations, annot),
+            Reorder::Front => to_front(&mut p.edit.annotations, annot),
+            Reorder::Back => to_back(&mut p.edit.annotations, annot),
         };
         if changed {
             p.edit.push_annotations(prev);
@@ -2422,7 +2815,9 @@ fn is_degenerate(item: &AnnotationItem) -> bool {
         | AnnotKind::BoxHighlight { rect, .. }
         | AnnotKind::Spotlight { rect }
         | AnnotKind::Pixelate { rect }
-        | AnnotKind::Blur { rect } => rect.w < 2.0 || rect.h < 2.0,
+        | AnnotKind::Blur { rect }
+        // A badge is square, so either axis measures it — same stray-click bar as a box.
+        | AnnotKind::Badge { rect, .. } => rect.w < 2.0 || rect.h < 2.0,
         AnnotKind::Arrow { a, b, .. } => (a.x - b.x).hypot(a.y - b.y) < 3.0,
         // A PEN gesture is NEVER degenerate (DRAGON-342): with the pencil armed, a press is
         // always deliberate ink — a real drag is a stroke and a TAP is a dot (the commit path
@@ -2447,6 +2842,7 @@ fn kind_center(kind: &AnnotKind) -> (f32, f32) {
         | AnnotKind::BoxHighlight { rect, .. }
         | AnnotKind::Pixelate { rect }
         | AnnotKind::Blur { rect }
+        | AnnotKind::Badge { rect, .. }
         | AnnotKind::Spotlight { rect } => (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5),
         AnnotKind::Arrow { a, b, .. } => ((a.x + b.x) * 0.5, (a.y + b.y) * 0.5),
         AnnotKind::Pen { paths, .. } => {
@@ -2461,6 +2857,9 @@ fn kind_draw_margin(kind: &AnnotKind) -> f32 {
         AnnotKind::Box { stroke_w, .. } | AnnotKind::BoxHighlight { stroke_w, .. } => {
             stroke_w / 2.0
         }
+        // The badge's RING is stroked ON the square's inscribed circle, so it overhangs by
+        // half its weight exactly like a box outline does.
+        AnnotKind::Badge { ring_w, .. } => ring_w / 2.0,
         // A pen's ribbon straddles its centerline by half its WIDEST sample — a heavy
         // (pressure-swelled) stretch, not the nominal preset — so the margin rides `max_width`
         // and no inked pixel can land outside the picture.
@@ -2495,6 +2894,7 @@ fn kind_drawn_bounds(kind: &AnnotKind) -> AnnotRect {
         | AnnotKind::BoxHighlight { rect, .. }
         | AnnotKind::Spotlight { rect }
         | AnnotKind::Pixelate { rect }
+        | AnnotKind::Badge { rect, .. }
         | AnnotKind::Blur { rect } => *rect,
         AnnotKind::Arrow { a, b, .. } => AnnotRect::from_points((a.x, a.y), (b.x, b.y)),
         AnnotKind::Pen { paths, .. } => pen_bounds(paths),
@@ -2551,6 +2951,9 @@ fn translated_kind(kind: &AnnotKind, dx: f32, dy: f32) -> AnnotKind {
             AnnotKind::BoxHighlight { rect: shift(rect), stroke_w: *stroke_w }
         }
         AnnotKind::Spotlight { rect } => AnnotKind::Spotlight { rect: shift(rect) },
+        AnnotKind::Badge { rect, ring_w } => {
+            AnnotKind::Badge { rect: shift(rect), ring_w: *ring_w }
+        }
         AnnotKind::Pixelate { rect } => AnnotKind::Pixelate { rect: shift(rect) },
         AnnotKind::Blur { rect } => AnnotKind::Blur { rect: shift(rect) },
         AnnotKind::Arrow { a, b, stroke_w } => AnnotKind::Arrow {
@@ -2706,6 +3109,13 @@ fn edited_kind(
         AnnotKind::Spotlight { rect } => {
             AnnotKind::Spotlight { rect: edit_rect(rect, grab, dx, dy, fw, fh, m) }
         }
+        // The SEQUENCE BADGE takes the grab exactly like a box and is then FORCED back to 1:1
+        // ([`square_for_grab`]) — during the drag, not just on release, so it is never seen as
+        // an oval. That is the one place the always-square rule lives for an existing badge.
+        AnnotKind::Badge { rect, ring_w } => AnnotKind::Badge {
+            rect: square_for_grab(edit_rect(rect, grab, dx, dy, fw, fh, m), grab, fw, fh, m),
+            ring_w: *ring_w,
+        },
         AnnotKind::Pixelate { rect } => {
             AnnotKind::Pixelate { rect: edit_rect(rect, grab, dx, dy, fw, fh, m) }
         }
@@ -3827,6 +4237,16 @@ mod tests {
         assert_eq!(spawn_kind(Tool::Pen, r, 4.0), None);
         assert_eq!(spawn_kind(Tool::Eraser, r, 4.0), None);
         assert_eq!(spawn_kind(Tool::Pointer, r, 4.0), None, "the pointer places nothing");
+        // The badge is the one kind that does NOT take the placement rect verbatim: it squares
+        // down to the rect's shorter axis, centred (DRAGON-340). See
+        // `a_pre_placed_badge_is_a_centred_square`.
+        assert_eq!(
+            spawn_kind(Tool::Badge, r, 4.0),
+            Some(AnnotKind::Badge {
+                rect: AnnotRect { x: 60.0, y: 20.0, w: 100.0, h: 100.0 },
+                ring_w: 4.0,
+            })
+        );
     }
 
     // ── Multi-selection geometry (DRAGON-341) ────────────────────────────────────────
@@ -3849,6 +4269,7 @@ mod tests {
                 b: AnnotPoint { x: 9.0, y: 9.0 },
                 stroke_w: 4.0,
             },
+            AnnotKind::Badge { rect: r, ring_w: 4.0 },
         ] {
             assert!(kind_selects_on_create(&kind), "{kind:?} selects on create");
         }
@@ -3992,6 +4413,7 @@ mod tests {
         // drag would trip — i.e. double-click always yields a real, grabbable item.
         for tool in [
             Tool::Arrow,
+            Tool::Badge,
             Tool::Rect,
             Tool::Highlight,
             Tool::BoxHighlight,
@@ -4469,4 +4891,330 @@ mod tests {
         assert_eq!(entries[n - 3], PaletteEntry::Color(recents[0]));
         assert_eq!(entries[n - 2], PaletteEntry::Color(recents[1]));
     }
+
+    // ── the sequence badge (DRAGON-340) ──────────────────────────────────────────────
+
+    fn badge(id: u64, x: f32, y: f32, s: f32) -> AnnotationItem {
+        AnnotationItem {
+            id: AnnotId(id),
+            color: [255, 0, 0, 255],
+            kind: AnnotKind::Badge { rect: AnnotRect { x, y, w: s, h: s }, ring_w: 4.0 },
+        }
+    }
+
+    fn numbers(items: &[AnnotationItem]) -> Vec<(u64, u32)> {
+        badge_numbers(items).into_iter().map(|(id, n)| (id.0, n)).collect()
+    }
+
+    /// Placing badges numbers them 1, 2, 3… in scene order, and NON-badge items in between
+    /// never consume a number.
+    #[test]
+    fn badges_number_from_one_in_scene_order_and_skip_other_items() {
+        let scene = vec![
+            badge(1, 0.0, 0.0, 40.0),
+            boxed(2, 10.0, 10.0, 30.0, 30.0), // an ordinary box between them…
+            badge(3, 60.0, 0.0, 40.0),
+            badge(4, 120.0, 0.0, 40.0),
+        ];
+        assert_eq!(numbers(&scene), [(1, 1), (3, 2), (4, 3)]);
+        // An all-non-badge scene has no numbering at all.
+        assert!(badge_numbers(&[boxed(9, 0.0, 0.0, 5.0, 5.0)]).is_empty());
+    }
+
+    /// Deleting badge #2 renumbers the rest so the set stays a contiguous 1..N — the ticket's
+    /// "if i delete 2, then 3 becomes 2". Deleting the FIRST one shifts everything down too.
+    #[test]
+    fn deleting_a_badge_renumbers_the_rest_contiguously() {
+        let scene = vec![
+            badge(1, 0.0, 0.0, 40.0),
+            badge(2, 60.0, 0.0, 40.0),
+            badge(3, 120.0, 0.0, 40.0),
+            badge(4, 180.0, 0.0, 40.0),
+        ];
+        assert_eq!(numbers(&scene), [(1, 1), (2, 2), (3, 3), (4, 4)]);
+        // Delete the MIDDLE one (#2): 3 becomes 2, 4 becomes 3.
+        let mut without_middle = scene.clone();
+        without_middle.retain(|it| it.id != AnnotId(2));
+        assert_eq!(numbers(&without_middle), [(1, 1), (3, 2), (4, 3)]);
+        // Delete the FIRST one: everything shifts down by one.
+        let mut without_first = scene.clone();
+        without_first.retain(|it| it.id != AnnotId(1));
+        assert_eq!(numbers(&without_first), [(2, 1), (3, 2), (4, 3)]);
+        // Whatever is deleted, the set is always exactly 1..N with no gaps.
+        for drop in 1..=4u64 {
+            let mut s = scene.clone();
+            s.retain(|it| it.id != AnnotId(drop));
+            let got: Vec<u32> = numbers(&s).into_iter().map(|(_, n)| n).collect();
+            assert_eq!(got, (1..=3).collect::<Vec<_>>(), "dropping {drop} left a gap");
+        }
+    }
+
+    /// UNDO restores correct numbering for free, because the numbers are derived from the item
+    /// VECTOR that undo restores — the whole reason nothing is stored per badge. Modelled here
+    /// exactly as the shared history does it: snapshot the scene, mutate, restore the snapshot.
+    #[test]
+    fn undo_restores_badge_numbering_because_it_is_derived() {
+        let scene = vec![
+            badge(1, 0.0, 0.0, 40.0),
+            badge(2, 60.0, 0.0, 40.0),
+            badge(3, 120.0, 0.0, 40.0),
+        ];
+        let snapshot = scene.clone(); // what `push_annotations` keeps
+        let mut live = scene.clone();
+        live.retain(|it| it.id != AnnotId(2));
+        assert_eq!(numbers(&live), [(1, 1), (3, 2)]);
+        // Undo = restore the pre-edit vector.
+        let live = snapshot.clone();
+        assert_eq!(numbers(&live), [(1, 1), (2, 2), (3, 3)]);
+        // Redo = re-apply, and the numbering follows again.
+        let mut live = live;
+        live.retain(|it| it.id != AnnotId(2));
+        assert_eq!(numbers(&live), [(1, 1), (3, 2)]);
+    }
+
+    /// A pre-placed badge (double-click the tray button) is squared down to the shorter axis of
+    /// the shared 200x100 placement rect, and stays centred in it.
+    #[test]
+    fn a_pre_placed_badge_is_a_centred_square() {
+        let rect = AnnotRect { x: 100.0, y: 50.0, w: 200.0, h: 100.0 };
+        let sq = centered_square(rect);
+        assert_eq!((sq.w, sq.h), (100.0, 100.0));
+        assert_eq!((sq.x, sq.y), (150.0, 50.0));
+        // Through the real spawn path.
+        let Some(AnnotKind::Badge { rect: r, ring_w }) = spawn_kind(Tool::Badge, rect, 6.0) else {
+            panic!("the badge tool pre-places");
+        };
+        assert_eq!(r.w, r.h);
+        assert_eq!(ring_w, 6.0, "the ring takes the current line weight");
+    }
+
+    /// EVERY corner and edge grab leaves the badge 1:1 — the "always square, during and after
+    /// any resize" rule. The anchor (the handle the user is NOT holding) stays put.
+    #[rstest]
+    #[case(Grab::Corner(Corner::Nw))]
+    #[case(Grab::Corner(Corner::Ne))]
+    #[case(Grab::Corner(Corner::Sw))]
+    #[case(Grab::Corner(Corner::Se))]
+    #[case(Grab::Edge(Edge::N))]
+    #[case(Grab::Edge(Edge::S))]
+    #[case(Grab::Edge(Edge::W))]
+    #[case(Grab::Edge(Edge::E))]
+    #[case(Grab::Move)]
+    fn a_badge_stays_square_through_every_grab(#[case] grab: Grab) {
+        let start = AnnotKind::Badge {
+            rect: AnnotRect { x: 200.0, y: 200.0, w: 100.0, h: 100.0 },
+            ring_w: 4.0,
+        };
+        let frame = (1000.0, 800.0);
+        // A deliberately LOPSIDED drag: 70 across, 20 down — the aspect a free rect would take.
+        for cur in [(370.0, 320.0), (130.0, 180.0), (500.0, 210.0), (210.0, 500.0)] {
+            let out = edited_kind(&start, grab, (300.0, 300.0), cur, frame);
+            let AnnotKind::Badge { rect, .. } = out else { panic!("still a badge") };
+            assert!(
+                (rect.w - rect.h).abs() < 1e-3,
+                "{grab:?} at {cur:?} broke 1:1 ({} x {})",
+                rect.w,
+                rect.h
+            );
+            assert!(rect.w >= 0.0 && rect.h >= 0.0);
+        }
+    }
+
+    /// The corner grab anchors the OPPOSITE corner, exactly like a box does, and takes the
+    /// LARGER of the two dragged extents as the side.
+    #[test]
+    fn a_corner_grab_anchors_the_opposite_corner() {
+        use crate::geometry::Corner;
+        let r = AnnotRect { x: 100.0, y: 100.0, w: 40.0, h: 90.0 };
+        // Dragging NW: the SE corner (140, 190) is fixed, the side is the larger extent (90).
+        let out = square_for_grab(r, Grab::Corner(Corner::Nw), 1000.0, 1000.0, 0.0);
+        assert_eq!((out.w, out.h), (90.0, 90.0));
+        assert_eq!((out.x + out.w, out.y + out.h), (140.0, 190.0));
+        // Dragging SE: the NW corner is fixed.
+        let out = square_for_grab(r, Grab::Corner(Corner::Se), 1000.0, 1000.0, 0.0);
+        assert_eq!((out.x, out.y), (100.0, 100.0));
+        assert_eq!((out.w, out.h), (90.0, 90.0));
+    }
+
+    /// An EDGE grab sizes on its own axis and re-centres on the other, so dragging the top edge
+    /// doesn't also slide the badge sideways.
+    #[test]
+    fn an_edge_grab_sizes_on_its_axis_and_recentres_on_the_other() {
+        use crate::geometry::Edge;
+        let r = AnnotRect { x: 100.0, y: 100.0, w: 40.0, h: 90.0 };
+        let out = square_for_grab(r, Grab::Edge(Edge::N), 1000.0, 1000.0, 0.0);
+        assert_eq!((out.w, out.h), (90.0, 90.0));
+        assert_eq!(out.y + out.h, 190.0, "the south edge is the anchor");
+        assert!((out.x + out.w / 2.0 - 120.0).abs() < 1e-3, "the badge stayed centred in x");
+    }
+
+    /// Clamping a badge to the image keeps it SQUARE — the axis-independent `clamp_rect` would
+    /// have turned it into a rectangle against an edge.
+    #[test]
+    fn clamping_a_badge_to_the_image_keeps_it_square() {
+        // A badge taller than the (short) frame shrinks on BOTH axes, not just the tight one.
+        let r = AnnotRect { x: -50.0, y: -50.0, w: 400.0, h: 400.0 };
+        let out = clamp_square(r, 300.0, 120.0, 2.0);
+        assert_eq!(out.w, out.h);
+        assert_eq!(out.w, 116.0, "the side takes the TIGHTER axis, inset by the margin");
+        assert!(out.x >= 2.0 && out.y >= 2.0);
+        assert!(out.x + out.w <= 298.0 && out.y + out.h <= 118.0);
+        // A drag past the right edge slides back in at full size, still square.
+        let out = clamp_square(AnnotRect { x: 280.0, y: 10.0, w: 60.0, h: 60.0 }, 300.0, 200.0, 0.0);
+        assert_eq!((out.w, out.h), (60.0, 60.0));
+        assert_eq!(out.x, 240.0);
+    }
+
+    // ── click-to-place (the badge is placed, never dragged out) ──────────────────────────
+
+    /// A click in open picture places the badge CENTRED on it at exactly the wanted side.
+    #[test]
+    fn a_click_placed_badge_is_centred_on_the_click() {
+        let r = badge_placement_rect((400.0, 300.0), DEFAULT_BADGE_SIZE, (1920, 1080), 2.0);
+        assert_eq!((r.w, r.h), (DEFAULT_BADGE_SIZE, DEFAULT_BADGE_SIZE));
+        assert!((r.x + r.w / 2.0 - 400.0).abs() < 1e-3);
+        assert!((r.y + r.h / 2.0 - 300.0).abs() < 1e-3);
+    }
+
+    /// A click near an EDGE keeps the full size and slides inside the picture (the drawn
+    /// margin — half the ring — reserved), exactly like any other clamped item.
+    #[test]
+    fn a_click_placed_badge_slides_inside_the_picture() {
+        let m = 3.0;
+        let r = badge_placement_rect((5.0, 5.0), DEFAULT_BADGE_SIZE, (1920, 1080), m);
+        assert_eq!((r.w, r.h), (DEFAULT_BADGE_SIZE, DEFAULT_BADGE_SIZE), "size is not sacrificed");
+        assert_eq!((r.x, r.y), (m, m), "pushed clear of the top-left, margin reserved");
+        // ...and the same at the far corner.
+        let r = badge_placement_rect((1919.0, 1079.0), DEFAULT_BADGE_SIZE, (1920, 1080), m);
+        assert!((r.x + r.w - (1920.0 - m)).abs() < 1e-3);
+        assert!((r.y + r.h - (1080.0 - m)).abs() < 1e-3);
+    }
+
+    /// A picture too small for the wanted side shrinks the badge on BOTH axes together (the
+    /// 1:1 invariant), by the SAME rule the double-click pre-placement uses: capped at
+    /// `SPAWN_MAX_FRAC` of the tighter axis and at the room the margin leaves.
+    #[test]
+    fn a_click_placed_badge_shrinks_squarely_on_a_small_picture() {
+        let r = badge_placement_rect((30.0, 20.0), DEFAULT_BADGE_SIZE, (200, 60), 2.0);
+        assert_eq!(r.w, r.h, "still square");
+        // The short axis allows min(0.8 * 60, 60 - 4) = 48.
+        assert_eq!(r.w, 48.0);
+        assert!(r.x >= 2.0 && r.y >= 2.0);
+        assert!(r.x + r.w <= 198.0 && r.y + r.h <= 58.0);
+        // A degenerate frame yields a zero square, which the caller discards like a bad drag.
+        let z = badge_placement_rect((0.0, 0.0), DEFAULT_BADGE_SIZE, (0, 0), 2.0);
+        assert_eq!((z.w, z.h), (0.0, 0.0));
+    }
+
+    /// Click-to-place and the double-click pre-placement share ONE size rule
+    /// ([`placement_extent`]): asked for the same side on the same picture, they agree.
+    #[test]
+    fn click_placement_and_double_click_share_the_size_rule() {
+        for frame in [(1920u32, 1080u32), (300, 300), (200, 60), (90, 400)] {
+            let m = 2.0;
+            let pre = centered_square(default_placement_rect(frame, m));
+            // The pre-placement asks SPAWN_W across and SPAWN_H down, then squares to the
+            // smaller; a click asking for the SAME per-axis wants must land the same side.
+            let click_w = placement_extent(frame.0 as f32, SPAWN_W, m);
+            let click_h = placement_extent(frame.1 as f32, SPAWN_H, m);
+            assert!((pre.w - click_w.min(click_h)).abs() < 1e-3, "{frame:?}");
+        }
+    }
+
+    /// The remembered-size fallback chain: an untouched editor places at the default; once a
+    /// badge has been placed or resized, that side wins.
+    #[test]
+    fn the_badge_size_falls_back_to_the_default_until_one_is_remembered() {
+        let mut e = super::super::edit::EditState::default();
+        assert_eq!(e.annot_badge_size, 0.0, "nothing remembered on a fresh editor");
+        assert_eq!(e.badge_size(), DEFAULT_BADGE_SIZE);
+        e.annot_badge_size = 64.0;
+        assert_eq!(e.badge_size(), 64.0);
+        // A nonsense value can't make a badge vanish — it reads as "unset".
+        e.annot_badge_size = -1.0;
+        assert_eq!(e.badge_size(), DEFAULT_BADGE_SIZE);
+    }
+
+    /// The badge's DRAWN extent is its square grown by half the ring — the same overhang rule a
+    /// box outline gets, which is what keeps a badge dragged to the edge fully on the picture.
+    #[test]
+    fn a_badge_reserves_half_its_ring_as_drawn_margin() {
+        let k = AnnotKind::Badge {
+            rect: AnnotRect { x: 10.0, y: 20.0, w: 60.0, h: 60.0 },
+            ring_w: 6.0,
+        };
+        assert_eq!(kind_draw_margin(&k), 3.0);
+        let b = kind_drawn_bounds(&k);
+        assert_eq!((b.x, b.y, b.w, b.h), (7.0, 17.0, 66.0, 66.0));
+        // It marks a spot rather than framing a region, so it never punches the global dim.
+        assert!(knockout_rects(&[badge(1, 0.0, 0.0, 40.0)]).is_empty());
+    }
+
+    /// A badge is colourable (its disc/ring AND, through the contrast rule, its numeral ink),
+    /// and re-strokes with the shared line weight — the ring IS the line weight.
+    #[test]
+    fn a_badge_is_colourable_and_its_ring_is_the_line_weight() {
+        let k = AnnotKind::Badge {
+            rect: AnnotRect { x: 0.0, y: 0.0, w: 40.0, h: 40.0 },
+            ring_w: 2.0,
+        };
+        assert!(k.is_colorable());
+        assert!(k.is_badge());
+        assert!(!k.is_effect() && !k.is_pen());
+    }
+
+    /// The always-1:1 badge is NOT part of the rect-conversion family: picking the badge tool
+    /// with a box selected must not reshape the box, and vice versa.
+    #[test]
+    fn a_badge_never_converts_to_or_from_the_rect_family() {
+        let boxk = AnnotKind::Box {
+            rect: AnnotRect { x: 0.0, y: 0.0, w: 80.0, h: 20.0 },
+            stroke_w: 4.0,
+            fill: None,
+        };
+        assert_eq!(converted_rect_kind(&boxk, Tool::Badge, 4.0), None);
+        let badgek = AnnotKind::Badge {
+            rect: AnnotRect { x: 0.0, y: 0.0, w: 40.0, h: 40.0 },
+            ring_w: 4.0,
+        };
+        for tool in [Tool::Rect, Tool::Highlight, Tool::Blur, Tool::Spotlight] {
+            assert_eq!(converted_rect_kind(&badgek, tool, 4.0), None, "{tool:?}");
+        }
+    }
+
+    /// The canvas gets the badge as a plain square Rect carrying its DERIVED ordinal and the
+    /// ring weight — so hit-testing/chrome/resize are the ordinary ones and the number can
+    /// never be stale.
+    #[test]
+    fn widget_items_stamp_the_derived_ordinal_on_each_badge() {
+        let scene = vec![
+            badge(1, 0.0, 0.0, 40.0),
+            boxed(2, 0.0, 0.0, 10.0, 10.0),
+            badge(3, 60.0, 0.0, 40.0),
+        ];
+        let w = widget_items(&scene, 8.0, &[]);
+        assert_eq!(w[0].badge, Some(1));
+        assert_eq!(w[1].badge, None, "an ordinary box is not a badge");
+        assert_eq!(w[2].badge, Some(2));
+        assert_eq!(w[0].stroke_w, 4.0, "the ring weight rides `stroke_w`");
+        assert_eq!(w[0].fx, FxKind::None, "a badge is a vector, never a shader pass");
+        assert!(matches!(w[0].kind, ItemKind::Rect { w: 40.0, h: 40.0, .. }));
+    }
+
+    /// A badge draws at FULL capture resolution: the bake rasterizes real, opaque pixels inside
+    /// the badge and leaves everything outside it untouched.
+    #[test]
+    fn a_badge_bakes_at_full_resolution() {
+        let scene = vec![badge(1, 20.0, 20.0, 80.0)];
+        let img = rasterize_scene(&scene, 200, 200, 1.0, 8.0).expect("rasterized");
+        // The disc centre is opaque (the badge colour).
+        let centre = img.get_pixel(60, 60).0;
+        assert_eq!(centre[3], 255, "the disc is filled");
+        // Well outside the badge nothing was drawn.
+        assert_eq!(img.get_pixel(180, 180).0[3], 0);
+        // The ring lands on the square's inscribed circle (the leftmost point of the badge).
+        let on_ring = img.get_pixel(20, 60).0;
+        assert!(on_ring[3] > 0, "the ring is drawn on the inscribed circle");
+    }
 }
+

@@ -320,17 +320,16 @@ pub fn dialog_for_status(
 /// network race is handled by RETRIES instead (see
 /// [`DAEMON_STARTUP_CHECK_RETRIES`]): a failed first check is retried after a
 /// backoff, so a daemon that beat the network still lands the notice.
-// Consumed only by `notify_daemon_startup_if_update_available` (Linux/mac daemon) + the
-// pure tests below; Windows ships no resident daemon, so it's dead in the bin there. DRAGON-229.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+// Consumed by `notify_daemon_startup_if_update_available` on EVERY resident platform
+// (DRAGON-335: Windows joined them when DRAGON-237 landed its tray daemon) + the pure
+// tests below, so it needs no dead-code allowance anywhere.
 pub const DAEMON_STARTUP_CHECK_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Retry schedule for the daemon startup check when the fetch FAILS (network
 /// not up yet, typical right after login). Each entry is a wait before the
 /// next attempt. Up-to-date / Available results never retry; only failures do.
-// Consumed only by the Linux/mac daemon startup path + the pure tests below (no Windows
-// resident daemon), so it's dead in the Windows bin build. DRAGON-229.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+// Consumed by every resident platform's daemon startup path + the pure tests below
+// (DRAGON-335), so it needs no dead-code allowance anywhere.
 pub const DAEMON_STARTUP_CHECK_RETRIES: [std::time::Duration; 2] = [
     std::time::Duration::from_secs(15),
     std::time::Duration::from_secs(45),
@@ -344,9 +343,8 @@ pub const DAEMON_STARTUP_CHECK_RETRIES: [std::time::Duration; 2] = [
 /// every other combination (setting off, or any non-Available status) is a
 /// silent no-op. Mirrors [`dialog_for_status`]'s gate so the daemon and the
 /// settings window agree on when a notice is warranted. Pure + unit-tested.
-// Consumed only by `notify_daemon_startup_if_update_available` (Linux/mac daemon) + the pure
-// tests below; Windows ships no resident daemon, so it's dead in the bin there. DRAGON-229.
-#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+// Consumed by `notify_daemon_startup_if_update_available` on every resident platform +
+// the pure tests below (DRAGON-335), so it needs no dead-code allowance anywhere.
 pub fn should_notify_on_daemon_startup(status: &UpdateStatus, notify_updates: bool) -> bool {
     notify_updates && status.is_available()
 }
@@ -367,7 +365,13 @@ pub fn should_notify_on_daemon_startup(status: &UpdateStatus, notify_updates: bo
 /// `crate::recording_ui::spawn_capture_child("--settings")`. The spawned child
 /// inherits the environment (so its own check sees the same manifest / any
 /// `CCK_UPDATE_URL` override) and shows the dialog.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+///
+/// DRAGON-335: NOT cfg-gated. This was `macos|linux` only, written when Windows had no
+/// resident daemon — DRAGON-237 then added one and this gate was never revisited, so the
+/// Windows tray daemon silently never checked for updates. Since `resident` DEFAULTS ON
+/// for Windows (`state/schema.rs` `default_resident`), that was the typical Windows launch,
+/// and the launch-time check only ever happens when something opens a settings window.
+/// The body is fully portable, so every resident daemon now shares it. Keep it ungated.
 pub fn notify_daemon_startup_if_update_available(spawn_settings: impl FnOnce()) {
     let notify_updates = crate::state::load().notify_updates;
     if !notify_updates {
@@ -1085,6 +1089,17 @@ mod tests {
             assert!(!should_notify_on_daemon_startup(&status, true), "status {status:?} notify-on");
             assert!(!should_notify_on_daemon_startup(&status, false), "status {status:?} notify-off");
         }
+    }
+
+    /// DRAGON-335 regression guard. The startup notice was `cfg(macos|linux)` for so long
+    /// that DRAGON-237's Windows daemon shipped without ever checking for updates — the gate
+    /// was written when Windows had no resident and nobody revisited it. This takes the
+    /// function's ADDRESS (never calls it — calling would fire a real network check), so the
+    /// build FAILS on any target where the notice is compiled out. A behavioral test could
+    /// not have caught this: the bug was the absence of code on one platform.
+    #[test]
+    fn daemon_startup_notice_is_compiled_on_every_platform() {
+        let _f: fn(fn()) = notify_daemon_startup_if_update_available;
     }
 
     // The spawn side is injected as a closure, so the "spawn or not" decision can be

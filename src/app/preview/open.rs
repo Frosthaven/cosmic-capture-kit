@@ -46,8 +46,8 @@ impl App {
         let extra_h = transport_h_for(&kind, PreviewSurface::Window);
         let source_scale = self.preview_source_scale(Some(&output));
         let (id, open_task, monitor, surface) =
-            self.preview_surface_for(Some(output), monitor, dims, extra_h);
-        self.preview = Some(PreviewState {
+            self.preview_surface_for(None, Some(output), monitor, dims, extra_h);
+        self.previews.push(PreviewState {
             window: id,
             surface,
             max_hint_pending: surface.is_window(),
@@ -61,8 +61,14 @@ impl App {
             kind,
             edit: self.new_edit_state(),
             view: Viewport::default(),
+            ducking: false,
+            surface_open: true,
+            demoted: false,
         });
-        self.engage_preview_duck(with_audio);
+        // This is the in-flight capture's document; the capture flow addresses it by id.
+        self.capture_preview = Some(id);
+        self.focused_preview = Some(id);
+        self.engage_preview_duck(id, with_audio);
         open_task
     }
 
@@ -89,15 +95,49 @@ impl App {
     /// record on `PreviewState`). `output` anchors the overlay (Some = capture
     /// monitor, None = active). `extra_h` is the media kind's transport-strip
     /// reserve for a WINDOW surface — callers derive it from the kind being opened
-    /// via [`transport_h_for`] (a plain value, since the kind may not be stored in
-    /// `self.preview` yet when a spinner pre-opens).
+    /// via [`transport_h_for`] (a plain value, since the preview may not be stored in
+    /// `self.previews` yet when a spinner pre-opens).
+    ///
+    /// `existing` names the preview being RE-minted (the appearance toggle, the
+    /// cover→window swap, the Save-As re-open), whose already-loaded media supplies the
+    /// size when the caller has no hint; `None` for a fresh document.
+    ///
+    /// THE FULLSCREEN OVERLAY IS THE LONE DOCUMENT'S APPEARANCE (DRAGON-336): as soon as a
+    /// SECOND preview document exists, NONE of them is an overlay — they are all windows.
+    /// So when any other document is open this mints a WINDOW regardless of the
+    /// `preview_windowed` setting AND demotes a sibling still holding the overlay
+    /// ([`Self::demote_preview_to_window`]), leaving either exactly one overlay or N
+    /// windows, never a mix. (Beyond the mixed look, two mapped `Exclusive` layer surfaces
+    /// would fight over the keyboard grab — the DRAGON-109 note at the top of `shell.rs`.)
+    /// This is the single place the rule is enforced.
     pub(super) fn preview_surface_for(
         &mut self,
+        existing: Option<window::Id>,
         output: Option<OutputHandle>,
         capture_monitor: (u32, u32),
         media_hint: Option<(u32, u32)>,
         extra_h: f32,
     ) -> (window::Id, Task<cosmic::Action<Msg>>, (u32, u32), PreviewSurface) {
+        // DRAGON-336 phase 3b: BIND THE HANDOFF LISTENER BEFORE THE MARKER BELOW. The
+        // marker IS the discovery record — a child that finds it goes looking for the
+        // socket beside it — so binding second would open a window in which a capture
+        // child sees a host that isn't listening and needlessly opens its own preview.
+        // (That direction is merely a missed optimisation, never a lost capture: an
+        // absent socket makes the child's connect fail into its own preview. Ordering it
+        // this way simply removes the window.) Idempotent — every re-mint (the appearance
+        // toggle, the cover→window swap, a Save-As re-open) routes through here and must
+        // keep the ONE listener already bound. A bind failure is non-fatal: we just don't
+        // host, and every child behaves exactly as it did before this existed.
+        #[cfg(unix)]
+        if self.preview_host.is_none() {
+            match crate::preview_ipc::start_host() {
+                Ok(host) => {
+                    log::info!("preview handoff: hosting on {}", host.socket_path());
+                    self.preview_host = Some(host);
+                }
+                Err(e) => log::warn!("preview handoff: not hosting ({e})"),
+            }
+        }
         // DRAGON-322: a preview editor is opening — advertise it cross-process (the single
         // mint choke point every preview-open routes through) so a concurrent capture's
         // sibling sweep spares this process (self-capture keeps the existing preview open).
@@ -117,6 +157,13 @@ impl App {
         let force_neutral_overlay = self.win_preview_preopen;
         #[cfg(not(any(target_os = "macos", windows)))]
         let force_neutral_overlay = self.window_spinner_neutral;
+        // NO OVERLAY ONCE A SECOND DOCUMENT EXISTS (DRAGON-336): the fullscreen preview is
+        // only ever the LONE document's appearance, so another open document makes this one
+        // a window whatever the setting says (see [`overlay_taken`] for the rule and its
+        // reasons). Re-minting the SAME document (the appearance toggle / Save-As re-open)
+        // doesn't count: its old surface is being torn down in the same pass. Never true
+        // with a single preview open, so the single-document decision is byte-identical.
+        let overlay_taken = self.overlay_barred(existing);
         // Linux (layer-shell), macOS, and now Windows (DRAGON-233 fix 5 — a real
         // PlainWindows overlay, below) all honor `preview_windowed`. The cfg! folds to
         // `false` on all three (it only forces the WINDOW on an exotic platform with no
@@ -124,62 +171,24 @@ impl App {
         // and Windows now switches modes from the appearance toggle instead of always
         // opening a window.
         if (self.preview_windowed && !force_neutral_overlay)
+            || (overlay_taken && !force_neutral_overlay)
             || cfg!(all(
                 not(target_os = "linux"),
                 not(target_os = "macos"),
                 not(target_os = "windows")
             ))
         {
-            // Open sized to the media (aspect-matched, no letterbox), from the caller's hint
-            // (a fresh region capture knows its pixel size before the decode) or the already-
-            // loaded content (toggling to windowed). Only fall back to ~80% of the monitor
-            // width / 90% of its height when the size is genuinely unknown (a pre-opened
-            // spinner still decoding), since the compositor won't shrink an over-large
-            // window after the fact.
-            let media = media_hint
-                // Videos size to their captured footprint (the encode upscales back
-                // into it); stills to their decoded pixels — the same precedence as
-                // `preview_viewport`, so a toggle reopens at the size that's shown.
-                .or_else(|| self.preview.as_ref().map(|p| p.sizing_media()))
-                .filter(|&(w, h)| w > 0 && h > 0);
-            // The media arrives in PHYSICAL capture pixels; divide by the SOURCE
-            // display's backing scale so the window opens to the LOGICAL points the
-            // picture occupied on screen (a Retina grab isn't shown 2× too large).
-            // `1.0` on Linux (and any unknown output), so `media` is unchanged there.
-            let source_scale = self.preview_source_scale(output.as_ref());
-            let media = media.map(|px| sizing::to_points(px, source_scale));
-            // Both platforms size through the SAME `windowed_fit_size`, which caps the
-            // window at 90% of the monitor height (rule 3, DRAGON-221) so it clears the
-            // Dock / menu bar / panels neither compositor can measure client-side —
-            // macOS won't shrink an over-large window after open, and this keeps the
-            // request inside the usable area up front. Only fall back to ~80% of the
-            // monitor width / 90% of its height when the size is genuinely unknown (a
-            // pre-opened spinner still decoding), since the compositor won't shrink an
-            // over-large window later.
-            let (w, h) = match media {
-                Some(m) => windowed_fit_size(m, Some(capture_monitor), extra_h),
-                None => (
-                    (capture_monitor.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
-                    (capture_monitor.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
-                ),
-            };
-            // DRAGON-309: remember the intended open size so the macOS native finalize can
-            // re-assert it after moving the window to the trigger monitor (winit births it on
-            // the capture/active monitor, where macOS may clamp its height to a smaller screen
-            // before we relocate it). Kept off `PreviewState.monitor`, which a resize overwrites.
-            self.preview_open_size = Some((w.round().max(1.0) as u32, h.round().max(1.0) as u32));
-            // The windowed preview is only minted AFTER the grab (a window pick covers the
-            // grab with the fullscreen overlay, then swaps to this window, DRAGON-219), so it
-            // always opens visible and takes focus normally.
-            let (id, open) = super::shell::preview_window(
-                (w, h),
-                (capture_monitor.0 as f32, capture_monitor.1 as f32),
-            );
-            // Title the window (server-side decorations show it in the titlebar; on
-            // macOS the native finalize matches this exact title — hence the shared const).
-            let title =
-                self.set_window_title(super::shell::PREVIEW_WINDOW_TITLE.to_string(), id);
-            (id, Task::batch([open, title]), (w as u32, h as u32), PreviewSurface::Window)
+            // NEVER A MIXED STATE (DRAGON-336): this preview is opening as a WINDOW, so a
+            // sibling still sitting on the fullscreen overlay comes down to a window in the
+            // same pass — an overlay behind floating preview windows is the strange state
+            // this rule exists to prevent. No-op with a single document (there is no
+            // sibling), and no-op while a window pick's FOCUS-NEUTRAL cover is pre-opening
+            // (it takes the overlay branch below; the demotion happens at its cover→window
+            // swap instead, which routes back through here).
+            let demote = self.demote_overlay_previews(existing);
+            let (id, open, size) =
+                self.mint_preview_window(existing, output, capture_monitor, media_hint, extra_h);
+            (id, Task::batch([demote, open]), size, PreviewSurface::Window)
         } else {
             // macOS: a fullscreen always-on-top window covering the capture's display
             // (the pointer's display for `--preview`, which has no capture anchor) —
@@ -228,6 +237,173 @@ impl App {
         }
     }
 
+    /// Mint the preview WINDOW itself: the open-fit sizing, the surface, and its title —
+    /// everything [`Self::preview_surface_for`]'s window branch does once the
+    /// overlay-vs-window decision is made. Split out (DRAGON-336) so the DEMOTION of a
+    /// sibling out of the fullscreen overlay ([`Self::demote_preview_to_window`]) sizes and
+    /// opens through the SAME path a normally-opened window does, rather than a second
+    /// hand-rolled copy of it. Returns the window id, the open task, and the initial
+    /// content size to scale to.
+    ///
+    /// `existing` names the preview being RE-minted (its already-loaded media supplies the
+    /// size when the caller has no hint); `None` for a fresh document.
+    fn mint_preview_window(
+        &mut self,
+        existing: Option<window::Id>,
+        output: Option<OutputHandle>,
+        capture_monitor: (u32, u32),
+        media_hint: Option<(u32, u32)>,
+        extra_h: f32,
+    ) -> (window::Id, Task<cosmic::Action<Msg>>, (u32, u32)) {
+        // Open sized to the media (aspect-matched, no letterbox), from the caller's hint
+        // (a fresh region capture knows its pixel size before the decode) or the already-
+        // loaded content (toggling to windowed). Only fall back to ~80% of the monitor
+        // width / 90% of its height when the size is genuinely unknown (a pre-opened
+        // spinner still decoding), since the compositor won't shrink an over-large
+        // window after the fact.
+        let media = media_hint
+            // Videos size to their captured footprint (the encode upscales back
+            // into it); stills to their decoded pixels — the same precedence as
+            // `preview_viewport`, so a toggle reopens at the size that's shown.
+            .or_else(|| {
+                existing.and_then(|e| self.preview_for(e)).map(|p| p.sizing_media())
+            })
+            .filter(|&(w, h)| w > 0 && h > 0);
+        // The media arrives in PHYSICAL capture pixels; divide by the SOURCE
+        // display's backing scale so the window opens to the LOGICAL points the
+        // picture occupied on screen (a Retina grab isn't shown 2× too large).
+        // `1.0` on Linux (and any unknown output), so `media` is unchanged there.
+        let source_scale = self.preview_source_scale(output.as_ref());
+        let media = media.map(|px| sizing::to_points(px, source_scale));
+        // Both platforms size through the SAME `windowed_fit_size`, which caps the
+        // window at 90% of the monitor height (rule 3, DRAGON-221) so it clears the
+        // Dock / menu bar / panels neither compositor can measure client-side —
+        // macOS won't shrink an over-large window after open, and this keeps the
+        // request inside the usable area up front. Only fall back to ~80% of the
+        // monitor width / 90% of its height when the size is genuinely unknown (a
+        // pre-opened spinner still decoding), since the compositor won't shrink an
+        // over-large window later.
+        let (w, h) = match media {
+            Some(m) => windowed_fit_size(m, Some(capture_monitor), extra_h),
+            None => (
+                (capture_monitor.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
+                (capture_monitor.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
+            ),
+        };
+        // DRAGON-309: remember the intended open size so the macOS native finalize can
+        // re-assert it after moving the window to the trigger monitor (winit births it on
+        // the capture/active monitor, where macOS may clamp its height to a smaller screen
+        // before we relocate it). Kept off `PreviewState.monitor`, which a resize overwrites.
+        self.preview_open_size = Some((w.round().max(1.0) as u32, h.round().max(1.0) as u32));
+        // The windowed preview is only minted AFTER the grab (a window pick covers the
+        // grab with the fullscreen overlay, then swaps to this window, DRAGON-219), so it
+        // always opens visible and takes focus normally.
+        let (id, open) = super::shell::preview_window(
+            (w, h),
+            (capture_monitor.0 as f32, capture_monitor.1 as f32),
+        );
+        // Title the window (server-side decorations show it in the titlebar; on
+        // macOS the native finalize matches this exact title — hence the shared const).
+        let title =
+            self.set_window_title(super::shell::PREVIEW_WINDOW_TITLE.to_string(), id);
+        (id, Task::batch([open, title]), (w as u32, h as u32))
+    }
+
+    /// Bring every OTHER document still sitting on the fullscreen overlay down to a
+    /// window, because a preview is opening as a window beside it (DRAGON-336). At most
+    /// one sibling can qualify — the rule below never lets a second overlay exist — but
+    /// this sweeps them all so the invariant is enforced rather than assumed.
+    ///
+    /// `minting` is the document being minted for; it is never its own sibling.
+    fn demote_overlay_previews(&mut self, minting: Option<window::Id>) -> Task<cosmic::Action<Msg>> {
+        let tasks: Vec<_> = overlay_siblings(&self.previews, minting)
+            .into_iter()
+            .map(|id| self.demote_preview_to_window(id))
+            .collect();
+        Task::batch(tasks)
+    }
+
+    /// DEMOTE one open document out of the fullscreen overlay into a normal window,
+    /// preserving it completely: same [`PreviewState`] (pending covermark/annotation
+    /// edits, the shared undo/redo history, the zoom/pan viewport, video playback position
+    /// and timeline edits), re-pointed onto the fresh surface by [`Self::repoint_preview`]
+    /// — which also carries the focus/capture cursors and this document's audio-duck hold.
+    /// The window is minted through [`Self::mint_preview_window`], the SAME open-fit path
+    /// (`windowed_fit_size` + the transient `max_size` hint) a normally-opened window
+    /// takes, so it lands at a sane size instead of cosmic-comp's 2/3 reshape.
+    ///
+    /// ONCE DEMOTED, THE DOCUMENT STAYS WINDOWED for the rest of the session (the sticky
+    /// [`PreviewState::demoted`] pin, read by [`overlay_taken`]): it is NOT promoted back
+    /// to the overlay when its siblings close, because silently re-entering fullscreen as
+    /// windows disappear would be jarring. The user's own appearance toggle still clears
+    /// the pin — an explicit choice is not a silent one.
+    ///
+    /// The appearance SETTING is deliberately untouched: a demotion is forced by the
+    /// second document, not chosen, so it must not become the default for the next
+    /// capture (unlike [`Self::toggle_preview_appearance`], which persists its flip).
+    ///
+    /// No-op for a document that is already a window, or one whose surface was torn down
+    /// while it stays loaded (a background bake, or the overlay's Save-As dialog): there
+    /// is nothing on screen to demote, and re-minting a window for it would resurrect a
+    /// surface that was closed on purpose. Such a document re-opens through
+    /// [`Self::reopen_preview_surface`], which consults the same rule and gets a window.
+    fn demote_preview_to_window(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for(id) else {
+            return Task::none();
+        };
+        if p.surface.is_window() || !p.surface_open {
+            return Task::none();
+        }
+        let old_id = p.window;
+        let old_surface = p.surface;
+        let external = p.external;
+        let fallback_monitor = p.monitor;
+        let source_scale = p.source_scale;
+        let extra_h = transport_h_for(&p.kind, PreviewSurface::Window);
+        // `--preview` files anchor to the active output (None); in-app captures to the
+        // capture monitor — the same anchoring as `toggle_preview_appearance`'s
+        // overlay→window direction.
+        let (output, monitor) = if external {
+            (None, fallback_monitor)
+        } else {
+            match self.preview_output.clone() {
+                Some((o, m)) => (Some(o), m),
+                None => (None, fallback_monitor),
+            }
+        };
+        // Tear the overlay down via its ACTUAL recorded kind (never the setting).
+        let close = old_surface.close(old_id);
+        // `mint_preview_window` sizes through `self.preview_output_scale` — the scale of the
+        // capture being minted for, which is NOT this document's (a demotion is triggered by
+        // some OTHER document opening, and a handed-over one carries the scale of the
+        // display IT was grabbed from). Swap in this document's own scale for the mint and
+        // put the caller's back, the same dance `open_handoff_preview` does. Always 1.0 on
+        // Linux, so the sizing math there is unchanged.
+        let saved_scale = self.preview_output_scale;
+        self.preview_output_scale = source_scale;
+        // No media hint: `mint_preview_window` reads the already-loaded content's size off
+        // the document, exactly as the appearance toggle does.
+        let (new_id, open_task, new_monitor) =
+            self.mint_preview_window(Some(id), output, monitor, None, extra_h);
+        self.preview_output_scale = saved_scale;
+        self.repoint_preview(old_id, new_id, PreviewSurface::Window, new_monitor);
+        // Pin it windowed for the rest of the session (see the doc above).
+        if let Some(p) = self.preview_for_mut(new_id) {
+            p.demoted = true;
+        }
+        // The window has a different viewport than the overlay did, so a pan that was
+        // in-range before can now leave the picture's edge floating — re-clamp it to the
+        // new bounds (the same follow-up the appearance toggle does).
+        if let Some(((minx, maxx), (miny, maxy))) =
+            self.preview_for(new_id).map(|p| self.preview_pan_bounds(p))
+            && let Some(p) = self.preview_for_mut(new_id)
+        {
+            p.view.pan.0 = p.view.pan.0.clamp(minx, maxx);
+            p.view.pan.1 = p.view.pan.1.clamp(miny, maxy);
+        }
+        Task::batch([close, open_task])
+    }
+
     /// DRAGON-216/219 (windowed): swap the pre-opened fullscreen OVERLAY spinner that covered
     /// the grab for the real preview WINDOW now that the grab is done. A real toplevel takes
     /// activation (cosmic-comp's initial-map focus path is unconditional; macOS keys/activates
@@ -240,7 +416,11 @@ impl App {
     /// One-shot; the appearance setting is NOT flipped. Portable (Linux neutral layer surface
     /// / macOS shielding-level overlay).
     pub(in crate::app) fn swap_neutral_spinner_to_window(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_ref() else {
+        // The pre-open belongs to the IN-FLIGHT capture, so that document is the one to swap.
+        let Some(id) = self.capture_preview else {
+            return Task::none();
+        };
+        let Some(p) = self.preview_for(id) else {
             return Task::none();
         };
         let old_overlay = p.window;
@@ -256,17 +436,44 @@ impl App {
         // `window_spinner_neutral` was already taken (false) by the caller, so
         // `preview_surface_for` mints the WINDOW branch, not another neutral overlay.
         let (new_id, open_task, new_monitor, surface) =
-            self.preview_surface_for(output, monitor, dims, extra_h);
-        if let Some(p) = self.preview.as_mut() {
-            p.window = new_id;
-            p.surface = surface;
-            p.monitor = new_monitor;
-            p.max_hint_pending = surface.is_window();
-        }
+            self.preview_surface_for(Some(id), output, monitor, dims, extra_h);
+        self.repoint_preview(old_overlay, new_id, surface, new_monitor);
         // Keep the overlay painting its cover until the window's first configure closes it,
         // so there's never a bare desktop between the two.
         self.grab_overlay_closing = Some(old_overlay);
         open_task
+    }
+
+    /// Re-point an OPEN preview at a freshly-minted surface (the appearance toggle, the
+    /// cover→window swap, the Save-As overlay re-open). The document keeps its loaded
+    /// media and every edit; only the surface identity changes — so every id-keyed piece
+    /// of ambient state that named the OLD surface has to follow it here (the focus +
+    /// capture cursors and the audio-duck refcount). The one place that renaming
+    /// happens, so a re-mint can never strand a reference on a dead id.
+    pub(super) fn repoint_preview(
+        &mut self,
+        old_id: window::Id,
+        new_id: window::Id,
+        surface: PreviewSurface,
+        monitor: (u32, u32),
+    ) {
+        if let Some(p) = self.preview_for_mut(old_id) {
+            p.window = new_id;
+            p.surface = surface;
+            p.monitor = monitor;
+            // A freshly-minted window carries the transient max_size hint again.
+            p.max_hint_pending = surface.is_window();
+            p.surface_open = true;
+        }
+        if self.focused_preview == Some(old_id) {
+            self.focused_preview = Some(new_id);
+        }
+        if self.capture_preview == Some(old_id) {
+            self.capture_preview = Some(new_id);
+        }
+        // The document is only changing surfaces, so its duck hold moves with it — the
+        // guard is never engaged or dropped by a re-mint.
+        self.preview_duck_refs.rename(old_id, new_id);
     }
 
     /// Flip the open preview between the fullscreen overlay and a resizable window,
@@ -275,14 +482,30 @@ impl App {
     /// `PreviewState` (window, monitor, surface) at it — so the loaded content and
     /// every edit survive. The new appearance is also persisted as the default.
     /// No-op when no preview is open.
-    pub(super) fn toggle_preview_appearance(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(p) = self.preview.as_ref() else {
+    pub(super) fn toggle_preview_appearance(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for(id) else {
             return Task::none();
         };
         let old_id = p.window;
         let old_surface = p.surface;
         let external = p.external;
         let fallback_monitor = p.monitor;
+
+        // NO OVERLAY ONCE A SECOND DOCUMENT EXISTS (DRAGON-336): flipping a WINDOW toward
+        // the fullscreen overlay while another document is open could only mint another
+        // window (the rule bars the overlay) — a close/re-open flicker that changes
+        // nothing on screen. Refuse the flip instead, leaving the persisted appearance
+        // alone: the appearance isn't the user's to choose while several documents are
+        // open. Inert with a single preview open, so that toggle is byte-identical.
+        if old_surface.is_window() && self.previews.iter().any(|p| p.window != old_id) {
+            return Task::none();
+        }
+        // An explicit appearance choice clears a forced demotion's sticky pin (see
+        // [`Self::demote_preview_to_window`]) — the "stays windowed" rule is about never
+        // re-entering fullscreen SILENTLY, not about overriding the user.
+        if let Some(p) = self.preview_for_mut(id) {
+            p.demoted = false;
+        }
 
         // Persist the flip so it also becomes the default for the next capture.
         self.preview_windowed = !self.preview_windowed;
@@ -322,24 +545,17 @@ impl App {
         // preview_surface_for reads the now-flipped `preview_windowed`, so this mints the
         // OTHER kind of surface.
         let extra_h = self
-            .preview
-            .as_ref()
+            .preview_for(id)
             .map(|p| transport_h_for(&p.kind, PreviewSurface::Window))
             .unwrap_or(0.0);
         let (new_id, open_task, new_monitor, surface) =
-            self.preview_surface_for(output, monitor, None, extra_h);
-        if let Some(p) = self.preview.as_mut() {
-            p.window = new_id;
-            p.monitor = new_monitor;
-            p.surface = surface;
-            // A freshly-minted window carries the transient max_size hint again.
-            p.max_hint_pending = surface.is_window();
-        }
+            self.preview_surface_for(Some(id), output, monitor, None, extra_h);
+        self.repoint_preview(old_id, new_id, surface, new_monitor);
         // The new appearance has a different viewport, so a pan that was in-range before can
         // now leave the picture's edge floating — re-clamp it to the new bounds.
         if let Some(((minx, maxx), (miny, maxy))) =
-            self.preview.as_ref().map(|p| self.preview_pan_bounds(p))
-            && let Some(p) = self.preview.as_mut()
+            self.preview_for(new_id).map(|p| self.preview_pan_bounds(p))
+            && let Some(p) = self.preview_for_mut(new_id)
         {
             p.view.pan.0 = p.view.pan.0.clamp(minx, maxx);
             p.view.pan.1 = p.view.pan.1.clamp(miny, maxy);
@@ -351,9 +567,33 @@ impl App {
     /// loading — for as long as the overlay stays up (resumed in `stop_preview_playback`, or when
     /// we exit). Only when the user wants it and the preview has sound (`with_audio`). The pause
     /// runs in a child process, so this is just a quick spawn: no D-Bus on our threads, no UI hitch.
-    pub(super) fn engage_preview_duck(&mut self, with_audio: bool) {
-        if self.mute_others_during_preview && with_audio && self.preview_duck.is_none() {
+    ///
+    /// REFCOUNTED across preview documents (DRAGON-336 phase 2): `id` registers as a
+    /// holder and the guard is engaged only for the FIRST one, so several video previews
+    /// share one process-wide duck and the desktop stays muted until the LAST of them
+    /// releases (see [`Self::release_preview_duck`]).
+    pub(super) fn engage_preview_duck(&mut self, id: window::Id, with_audio: bool) {
+        if !(self.mute_others_during_preview && with_audio) {
+            return;
+        }
+        if let Some(p) = self.preview_for_mut(id) {
+            p.ducking = true;
+        }
+        if self.preview_duck_refs.acquire(id) && self.preview_duck.is_none() {
             self.preview_duck = Some(crate::audio::ducking::OtherAudioDuck::engage());
+        }
+    }
+
+    /// Release `id`'s hold on the "pause other apps' media" guard; the guard itself is
+    /// dropped (other players resume) only when this was the LAST holder. Idempotent.
+    pub(super) fn release_preview_duck(&mut self, id: window::Id) {
+        if let Some(p) = self.preview_for_mut(id) {
+            p.ducking = false;
+        }
+        self.preview_duck_refs.release(id);
+        if !self.preview_duck_refs.held() {
+            // The last holder let go — resume the other players.
+            self.preview_duck = None;
         }
     }
 
@@ -371,15 +611,23 @@ impl App {
         let Some((output, monitor)) = self.preview_output.clone() else {
             return Task::none();
         };
-        let (kind, task) = if is_video {
-            (PreviewKind::Video(VideoPreview::loading()), video::poster_task(path.clone()))
+        let kind = if is_video {
+            PreviewKind::Video(VideoPreview::loading())
         } else {
-            (PreviewKind::Image(ImagePreview::loading()), image::decode_task(path.clone()))
+            PreviewKind::Image(ImagePreview::loading())
         };
         let extra_h = transport_h_for(&kind, PreviewSurface::Window);
         let source_scale = self.preview_source_scale(Some(&output));
-        let (id, open_task, monitor, surface) = self.preview_surface_for(Some(output), monitor, dims, extra_h);
-        self.preview = Some(PreviewState {
+        let (id, open_task, monitor, surface) =
+            self.preview_surface_for(None, Some(output), monitor, dims, extra_h);
+        // The content prep is ADDRESSED to the surface we just minted, so its completion
+        // lands on THIS document however many previews are open (DRAGON-336 phase 2).
+        let task = if is_video {
+            video::poster_task(id, path.clone())
+        } else {
+            image::decode_task(id, path.clone())
+        };
+        self.previews.push(PreviewState {
             window: id,
             surface,
             max_hint_pending: surface.is_window(),
@@ -393,9 +641,15 @@ impl App {
             kind,
             edit: self.new_edit_state(),
             view: Viewport::default(),
+            ducking: false,
+            surface_open: true,
+            demoted: false,
         });
+        // This is the in-flight capture's document; the capture flow addresses it by id.
+        self.capture_preview = Some(id);
+        self.focused_preview = Some(id);
         // Post-capture overlay just opened — pause other media now if this recording has audio.
-        self.engage_preview_duck(is_video && (self.record_mic || self.record_system_audio));
+        self.engage_preview_duck(id, is_video && (self.record_mic || self.record_system_audio));
         Task::batch([open_task, task])
     }
 
@@ -409,10 +663,10 @@ impl App {
         size: u64,
         is_video: bool,
     ) -> Task<cosmic::Action<Msg>> {
-        let (kind, task) = if is_video {
-            (PreviewKind::Video(VideoPreview::loading()), video::poster_task(path.clone()))
+        let kind = if is_video {
+            PreviewKind::Video(VideoPreview::loading())
         } else {
-            (PreviewKind::Image(ImagePreview::loading()), image::decode_task(path.clone()))
+            PreviewKind::Image(ImagePreview::loading())
         };
         // Size the windowed preview to the file up front (the compositor won't shrink it
         // later): the picture's header dims (cheap read; video probes async, so unknown here)
@@ -429,8 +683,15 @@ impl App {
             .max_by_key(|(w, h)| *w as u64 * *h as u64)
             .unwrap_or((1920, 1080));
         let extra_h = transport_h_for(&kind, PreviewSurface::Window);
-        let (id, open_task, monitor, surface) = self.preview_surface_for(None, monitor, dims, extra_h);
-        self.preview = Some(PreviewState {
+        let (id, open_task, monitor, surface) =
+            self.preview_surface_for(None, None, monitor, dims, extra_h);
+        // Addressed to the surface just minted (see `open_preview`).
+        let task = if is_video {
+            video::poster_task(id, path.clone())
+        } else {
+            image::decode_task(id, path.clone())
+        };
+        self.previews.push(PreviewState {
             window: id,
             surface,
             max_hint_pending: surface.is_window(),
@@ -446,11 +707,222 @@ impl App {
             kind,
             edit: self.new_edit_state(),
             view: Viewport::default(),
+            ducking: false,
+            surface_open: true,
+            demoted: false,
         });
+        // A `--preview` launch has exactly this one document; the capture flow's
+        // deferred-open paths address it the same way a captured preview is addressed.
+        self.capture_preview = Some(id);
+        self.focused_preview = Some(id);
         // `--preview` is a viewer for an arbitrary file; we can't know if it has sound without
         // probing (the delay we're avoiding), so pause other media for any video as it opens.
-        self.engage_preview_duck(is_video);
+        self.engage_preview_duck(id, is_video);
         Task::batch([open_task, task])
+    }
+
+    /// DRAGON-336 phase 3b — the HOST half of the preview handoff: drain every request other
+    /// processes' capture children have posted, opening each as a NEW preview document.
+    ///
+    /// The ack is written in THIS SAME arm, only after the document is actually in
+    /// `self.previews` — that is what makes the "host is exiting" race safe: a child
+    /// concludes "accepted" only because a live host explicitly said so, and a host that
+    /// dies (or drops the request) closes the connection unacked, which the child reads as
+    /// "open your own preview". A request we cannot serve is REJECTED rather than dropped,
+    /// so the child stops waiting immediately instead of burning `ACK_TIMEOUT`.
+    #[cfg(unix)]
+    pub(in crate::app) fn drain_preview_handoffs(&mut self) -> Task<cosmic::Action<Msg>> {
+        // Take the whole batch off the channel first: opening a preview needs `&mut self`,
+        // which can't be borrowed while `self.preview_host` is.
+        let mut inbound = Vec::new();
+        if let Some(host) = &self.preview_host {
+            while let Ok(h) = host.requests.try_recv() {
+                inbound.push(h);
+            }
+        }
+        let mut tasks = Vec::new();
+        for handoff in inbound {
+            // Cloned so the borrow of `handoff` ends before it is consumed by accept/reject.
+            let req = handoff.request().clone();
+            match self.open_handoff_preview(&req) {
+                Some(task) => {
+                    log::info!("preview handoff: took ownership of {}", req.path.display());
+                    tasks.push(task);
+                    // Only NOW may the child exit — the document is in our state.
+                    handoff.accept();
+                }
+                None => {
+                    log::warn!(
+                        "preview handoff: refusing {} — the child keeps it",
+                        req.path.display()
+                    );
+                    handoff.reject(crate::preview_ipc::RejectReason::Busy);
+                }
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// Off unix nothing can host (no transport), so there is never anything to drain — a
+    /// stub keeping the `CaptureMsg::HandoffPoll` dispatch platform-uniform.
+    #[cfg(not(unix))]
+    pub(in crate::app) fn drain_preview_handoffs(&mut self) -> Task<cosmic::Action<Msg>> {
+        Task::none()
+    }
+
+    /// Open a preview document for a capture HANDED OVER by another process.
+    ///
+    /// Deliberately NOT [`Self::open_preview`]: that one claims `capture_preview` (the
+    /// IN-FLIGHT capture's document), which a handed-over file is not — this host may still
+    /// have a capture of its own running, and clobbering that pointer would misdirect its
+    /// cover→window swap and content prep. Everything else mirrors `open_preview`, fed from
+    /// the wire fields (which carry the child's own `PreviewState` values under the same
+    /// names) so the document is the one the child would have opened.
+    ///
+    /// `None` = we will not take it, and the caller must reject the handoff.
+    #[cfg(unix)]
+    fn open_handoff_preview(
+        &mut self,
+        req: &crate::preview_ipc::OpenRequest,
+    ) -> Option<Task<cosmic::Action<Msg>>> {
+        // We share the filesystem with the child, but not necessarily its view of it: refuse
+        // a path we cannot see rather than taking ownership of a document we could never
+        // load. The child then opens its own preview, where the file certainly exists.
+        if !req.path.is_file() {
+            return None;
+        }
+        let kind = if req.video {
+            PreviewKind::Video(VideoPreview::loading())
+        } else {
+            PreviewKind::Image(ImagePreview::loading())
+        };
+        // Place it where a fresh capture's preview would go when this session still knows
+        // its capture monitor, else on the largest known output, else a placeholder the
+        // first resize corrects (the `open_external_preview` fallback) — a long-lived host
+        // may have finished its own capture long ago.
+        let (output, monitor) = match self.preview_output.clone() {
+            Some((o, m)) => (Some(o), m),
+            None => (
+                None,
+                self.outputs
+                    .iter()
+                    .map(|o| o.logical_size)
+                    .max_by_key(|(w, h)| *w as u64 * *h as u64)
+                    .unwrap_or((1920, 1080)),
+            ),
+        };
+        let extra_h = transport_h_for(&kind, PreviewSurface::Window);
+        // `preview_surface_for` sizes through `self.preview_output_scale` — THIS process's
+        // capture scale. A handed-over document carries the scale of the display IT was
+        // grabbed from, so swap that in for the mint and put ours back afterwards (an
+        // in-flight capture of our own keeps its value). Both sides are always 1.0 on Linux,
+        // so the sizing math there is unchanged.
+        let saved_scale = self.preview_output_scale;
+        self.preview_output_scale = req.source_scale;
+        let (id, open_task, monitor, surface) =
+            self.preview_surface_for(None, output, monitor, req.display_dims, extra_h);
+        self.preview_output_scale = saved_scale;
+        // Addressed to the surface just minted (see `open_preview`).
+        let task = if req.video {
+            video::poster_task(id, req.path.clone())
+        } else {
+            image::decode_task(id, req.path.clone())
+        };
+        self.previews.push(PreviewState {
+            window: id,
+            surface,
+            max_hint_pending: surface.is_window(),
+            display_dims: req.display_dims,
+            path: Some(req.path.clone()),
+            size: req.size,
+            external: req.external,
+            monitor,
+            source_scale: req.source_scale,
+            loading_msg: random_loading_msg(),
+            kind,
+            edit: self.new_edit_state(),
+            view: Viewport::default(),
+            ducking: false,
+            surface_open: true,
+            demoted: false,
+        });
+        // NOT `capture_preview` (see above) — but it IS what the user just captured, so it
+        // takes the keyboard-routing focus.
+        self.focused_preview = Some(id);
+        // Same rule as a locally-opened preview: pause other players for a recording with
+        // sound (the audio toggles are persisted, so they read the same in both processes).
+        // The child's own duck died with it; re-engaging here is refcounted, so a second
+        // video document can't double-engage or un-mute the first.
+        self.engage_preview_duck(id, req.video && (self.record_mic || self.record_system_audio));
+        Some(Task::batch([open_task, task]))
+    }
+
+    /// DRAGON-336 phase 3b — the CHILD half: try to hand this finished capture to an
+    /// ALREADY-RUNNING preview host instead of keeping this whole process alive (~233 MB of
+    /// iced + wgpu + fonts) just to display it.
+    ///
+    /// `Some(task)` means the host POSITIVELY ACKNOWLEDGED ownership, so this one-shot
+    /// process is done and the task ends the session. `None` means no handoff happened and
+    /// the caller MUST open its own preview exactly as it always has.
+    ///
+    /// THE RULE IS "never lose the user's capture", so the fallback is the DEFAULT rather
+    /// than an error path: every failure mode — no host, a host mid-exit, a wedged host, a
+    /// version mismatch, an explicit refusal, a platform with no transport — arrives as
+    /// `Err` from `send_to_host` and lands on `None`. Nothing is consumed without the ack,
+    /// and the ack can only come from a host that already has the document in its state.
+    fn try_handoff_capture(
+        &mut self,
+        path: &std::path::Path,
+        size: u64,
+        is_video: bool,
+        dims: Option<(u32, u32)>,
+    ) -> Option<Task<cosmic::Action<Msg>>> {
+        // DRAGON-351: the handoff used to be gated on `instance::handoff_allowed` (the
+        // "allow multiple capture instances" setting) so that with the setting OFF a fresh
+        // capture kept COLLAPSING the existing preview instead of accumulating windows.
+        // The setting is gone and multi-document preview is the behaviour, so the attempt
+        // below is unconditional — the checks that remain are all about whether a handoff
+        // is POSSIBLE, never whether it is permitted.
+        //
+        // No transport ⇒ nobody can be hosting (Windows): skip the discovery scan entirely
+        // so that platform's capture path is byte-identical. Branching on the seam rather
+        // than a `cfg` keeps this one code path on every OS.
+        if !crate::preview_ipc::host_supported() {
+            return None;
+        }
+        // NEVER hand off while we are ourselves hosting ANOTHER process's document: we are
+        // the host in that case, and handing our own capture further down a chain would exit
+        // this process and take the documents we accepted with it. (Our own in-flight
+        // capture's preview — a pre-opened spinner — is not "another document".)
+        if self.previews.iter().any(|p| Some(p.window) != self.capture_preview) {
+            return None;
+        }
+        // Advisory fast-out for the common first-capture case: nobody is hosting, so don't
+        // build a request at all. NEVER a substitute for the acknowledged exchange below —
+        // a host can exit between these two lines, which is exactly why `send_to_host` is
+        // the only thing that may conclude "handed off".
+        crate::preview_ipc::host_pid()?;
+        let req = crate::preview_ipc::OpenRequest {
+            path: path.to_path_buf(),
+            video: is_video,
+            display_dims: dims,
+            source_scale: self.preview_source_scale(None),
+            external: false,
+            size: Some(size),
+        };
+        match crate::preview_ipc::send_to_host(&req) {
+            Ok(pid) => {
+                log::info!(
+                    "preview handoff: pid {pid} owns {} now — this process is done",
+                    path.display()
+                );
+                Some(self.finish_session())
+            }
+            Err(e) => {
+                log::info!("preview handoff: opening our own preview instead ({e})");
+                None
+            }
+        }
     }
 
     /// Update the open preview's monitor size when its surface is (re)sized — needed for
@@ -463,7 +935,7 @@ impl App {
         if w == 0 || h == 0 {
             return Task::none();
         }
-        if self.preview.as_ref().is_none_or(|p| p.window != id) {
+        if self.preview_for(id).is_none() {
             return Task::none();
         }
         // This configure is the WINDOW's FIRST map iff the transient max-size hint was still
@@ -471,8 +943,8 @@ impl App {
         // below piggybacks on (Linux-only, so gated to stay warning-clean elsewhere).
         #[cfg(target_os = "linux")]
         let first_window_configure =
-            self.preview.as_ref().is_some_and(|p| p.max_hint_pending);
-        let clear_hint = match self.preview.as_mut() {
+            self.preview_for(id).is_some_and(|p| p.max_hint_pending);
+        let clear_hint = match self.preview_for_mut(id) {
             Some(p) if p.max_hint_pending => {
                 p.max_hint_pending = false;
                 window::set_max_size(id, None)
@@ -533,14 +1005,14 @@ impl App {
         // The stored zoom is FIT-relative, so a plain resize would change the displayed size
         // while the % readout stayed put. Preserve the native scale across the resize (except
         // "Fit to screen", which re-fits to the new width) so 100% stays 100%.
-        let old_fit = self.preview.as_ref().map(|p| self.preview_fit_scale(p)).unwrap_or(1.0);
-        let old_native = self.preview.as_ref().map(|p| p.view.zoom).unwrap_or(1.0) * old_fit;
-        if let Some(p) = &mut self.preview {
+        let old_fit = self.preview_for(id).map(|p| self.preview_fit_scale(p)).unwrap_or(1.0);
+        let old_native = self.preview_for(id).map(|p| p.view.zoom).unwrap_or(1.0) * old_fit;
+        if let Some(p) = self.preview_for_mut(id) {
             p.monitor = (w, h);
         }
-        let fit_to_screen = self.preview.as_ref().is_some_and(|p| p.view.zoom_preset == Some(0));
-        let new_fit = self.preview.as_ref().map(|p| self.preview_fit_scale(p)).unwrap_or(1.0);
-        if let Some(p) = &mut self.preview {
+        let fit_to_screen = self.preview_for(id).is_some_and(|p| p.view.zoom_preset == Some(0));
+        let new_fit = self.preview_for(id).map(|p| self.preview_fit_scale(p)).unwrap_or(1.0);
+        if let Some(p) = self.preview_for_mut(id) {
             // "Fit to screen" re-fits (whole picture, zoom 1.0); any other zoom keeps its
             // native scale across the resize.
             let z = if fit_to_screen {
@@ -565,8 +1037,8 @@ impl App {
 
     /// Re-focus the preview WINDOW (windowed mode only). No-op for the overlay (a layer
     /// surface with its own exclusive keyboard grab).
-    pub(super) fn focus_preview_window(&self) -> Task<cosmic::Action<Msg>> {
-        if let Some(p) = self.preview.as_ref()
+    pub(super) fn focus_preview_window(&self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        if let Some(p) = self.preview_for(id)
             && p.surface.is_window()
         {
             return window::gain_focus(p.window);
@@ -592,11 +1064,20 @@ impl App {
         if !self.preview_after_capture {
             return self.finish_share(&path, size, is_video);
         }
+        // DRAGON-336 phase 3b: a preview is what this capture wants — so before minting one
+        // HERE, offer the finished file to an already-running preview host. On a positive
+        // ack the host owns it and this one-shot process ends right now (the whole memory
+        // saving: one preview process, several documents). On ANY other outcome we fall
+        // through and open our own preview exactly as before — see `try_handoff_capture`,
+        // where that fallback is the default rather than an error path.
+        if let Some(done) = self.try_handoff_capture(&path, size, is_video, dims) {
+            return done;
+        }
         // Pre-opened (window/freeze grab, or a stopped recording): the spinner overlay is
         // already up — record where the capture landed and kick off the content prep into
         // the existing surface (image decode, or video poster extraction).
-        if self.preview.is_some() {
-            if let Some(p) = &mut self.preview {
+        if let Some(id) = self.capture_preview {
+            if let Some(p) = self.preview_for_mut(id) {
                 p.path = Some(path.clone());
                 p.size = Some(size);
             }
@@ -607,16 +1088,19 @@ impl App {
             // Feed the composed dims into the sizing state, mint the real window at
             // its correct size, and prep the content into it.
             let swap = if std::mem::take(&mut self.windowed_swap_pending) {
-                if let (Some(d), Some(p)) = (dims, self.preview.as_mut()) {
+                if let (Some(d), Some(p)) = (dims, self.preview_for_mut(id)) {
                     p.display_dims = Some(d);
                 }
                 self.swap_neutral_spinner_to_window()
             } else {
                 Task::none()
             };
-            let prep = match self.preview.as_ref().map(|p| &p.kind) {
-                Some(PreviewKind::Image(_)) => image::decode_task(path),
-                Some(PreviewKind::Video(_)) => video::poster_task(path),
+            // The swap may have re-minted the surface, so address the content prep at the
+            // document's CURRENT id (`capture_preview` followed it through `repoint_preview`).
+            let id = self.capture_preview.unwrap_or(id);
+            let prep = match self.preview_for(id).map(|p| &p.kind) {
+                Some(PreviewKind::Image(_)) => image::decode_task(id, path),
+                Some(PreviewKind::Video(_)) => video::poster_task(id, path),
                 None => Task::none(),
             };
             return Task::batch([swap, prep]);
@@ -634,8 +1118,8 @@ impl App {
     /// The preview overlay: a spinner while loading, then the media-specific content
     /// (image or video poster) with its action bar, centred on a dimmed full-screen
     /// surface.
-    pub(in crate::app) fn preview_view(&self) -> Element<'_, Msg> {
-        let Some(preview) = &self.preview else {
+    pub(in crate::app) fn preview_view(&self, id: window::Id) -> Element<'_, Msg> {
+        let Some(preview) = self.preview_for(id) else {
             return widget::space::Space::new()
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -654,7 +1138,7 @@ impl App {
         // overlay layer-batching artifact). Normal tooltips otherwise.
         let suppress_tooltips =
             preview.edit.flyout.is_some() || preview.edit.annot_picker.is_some();
-        let tb = Tb { scale: preview.surface.btn_scale(), glass, suppress_tooltips };
+        let tb = Tb { pid: preview.window, scale: preview.surface.btn_scale(), glass, suppress_tooltips };
         let content: Element<'_, Msg> = if preview.is_loading() {
             self.preview_loading_view(preview, tb)
         } else {
@@ -673,8 +1157,8 @@ impl App {
             let header = widget::header_bar()
                 .title(super::shell::PREVIEW_WINDOW_TITLE)
                 .focused(focused)
-                .on_drag(Msg::Preview(PreviewMsg::WindowDrag))
-                .on_double_click(Msg::Preview(PreviewMsg::WindowMaximize));
+                .on_drag(Msg::Preview(id, PreviewMsg::WindowDrag))
+                .on_double_click(Msg::Preview(id, PreviewMsg::WindowMaximize));
             // DRAGON-337: the fullscreen-overlay toggle + undo / redo live in the TITLEBAR
             // (space in the toolbars was getting cramped), styled exactly like the settings
             // window's collapse / search controls. macOS: reserve the native traffic lights'
@@ -706,9 +1190,9 @@ impl App {
             );
             #[cfg(all(not(target_os = "macos"), not(windows)))]
             let header = header
-                .on_close(Msg::Preview(PreviewMsg::Cancel))
-                .on_maximize(Msg::Preview(PreviewMsg::WindowMaximize))
-                .on_minimize(Msg::Preview(PreviewMsg::WindowMinimize));
+                .on_close(Msg::Preview(id, PreviewMsg::Cancel))
+                .on_maximize(Msg::Preview(id, PreviewMsg::WindowMaximize))
+                .on_minimize(Msg::Preview(id, PreviewMsg::WindowMinimize));
             // The editor fills the space below the header; centre it so the loading spinner
             // sits in the middle (the loaded view already fills, so centring is a no-op there).
             let body = widget::container(content)
@@ -780,7 +1264,7 @@ impl App {
         };
         // A pending overwrite confirmation floats a modal dialog over everything.
         if preview.edit.confirm_overwrite {
-            return self.overwrite_dialog(base);
+            return self.overwrite_dialog(id, base);
         }
         base
     }
@@ -790,7 +1274,11 @@ impl App {
     /// that swallows (but doesn't dismiss on) clicks, with a centered Overwrite / Cancel
     /// card. Rendered in-app (stacked over the base) so it's clickable over the overlay's
     /// keyboard grab as well as in the window.
-    pub(super) fn overwrite_dialog<'a>(&self, base: Element<'a, Msg>) -> Element<'a, Msg> {
+    pub(super) fn overwrite_dialog<'a>(
+        &self,
+        id: window::Id,
+        base: Element<'a, Msg>,
+    ) -> Element<'a, Msg> {
         let backdrop: Element<'a, Msg> = widget::mouse_area(
             widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
                 .width(Length::Fill)
@@ -808,19 +1296,18 @@ impl App {
         let buttons: Element<'a, Msg> = widget::row(vec![
             crate::widgets::arrow_cursor::arrow_cursor(
                 widget::button::standard("Cancel")
-                    .on_press(Msg::Preview(PreviewMsg::CancelOverwrite)),
+                    .on_press(Msg::Preview(id, PreviewMsg::CancelOverwrite)),
             ),
             crate::widgets::arrow_cursor::arrow_cursor(
                 widget::button::destructive("Overwrite")
-                    .on_press(Msg::Preview(PreviewMsg::ConfirmOverwrite)),
+                    .on_press(Msg::Preview(id, PreviewMsg::ConfirmOverwrite)),
             ),
         ])
         .spacing(8.0)
         .into();
         // The file that's about to be overwritten (shown so the user knows exactly where).
         let path = self
-            .preview
-            .as_ref()
+            .preview_for(id)
             .and_then(|p| p.path.as_ref())
             .map(|p| p.display().to_string());
         let mut col: Vec<Element<'a, Msg>> = vec![
@@ -917,7 +1404,7 @@ impl App {
 
     /// Whether `id` is the open preview window.
     pub(in crate::app) fn is_preview_window(&self, id: window::Id) -> bool {
-        self.preview.as_ref().is_some_and(|p| p.window == id)
+        self.preview_for(id).is_some()
     }
 
     /// DRAGON-216 (Linux windowed): the transient loading cover painted by the pre-opened
@@ -929,7 +1416,11 @@ impl App {
     /// platforms `grab_overlay_closing` is never set and this is never reached).
     pub(in crate::app) fn grab_cover_view(&self) -> Element<'_, Msg> {
         let dim = self.preview_overlay_opacity;
-        let msg_idx = self.preview.as_ref().map(|p| p.loading_msg).unwrap_or(0);
+        // The cover belongs to the capture whose preview was just swapped to a window.
+        let msg_idx = self
+            .capture_preview
+            .and_then(|id| self.preview_for(id))
+            .map_or(0, |p| p.loading_msg);
         let status = widget::column(vec![
             widget::indeterminate_circular().size(56.0).into(),
             widget::text(PREVIEW_LOADING_MESSAGES[msg_idx % PREVIEW_LOADING_MESSAGES.len()])

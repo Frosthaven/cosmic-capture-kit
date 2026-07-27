@@ -108,7 +108,7 @@ impl VideoPreview {
 /// on an edge-case file, the preview must still leave its spinner (DRAGON-106) rather than
 /// wait forever — on timeout we resolve with no poster/meta (the view falls back to a film
 /// card). `PosterReady` therefore ALWAYS fires.
-pub(super) fn poster_task(path: PathBuf) -> Task<cosmic::Action<Msg>> {
+pub(super) fn poster_task(id: window::Id, path: PathBuf) -> Task<cosmic::Action<Msg>> {
     let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let (itx, irx) = std::sync::mpsc::channel();
@@ -122,38 +122,44 @@ pub(super) fn poster_task(path: PathBuf) -> Task<cosmic::Action<Msg>> {
             .unwrap_or((None, None));
         let _ = tx.send(result);
     });
-    Task::perform(rx, |res| {
+    Task::perform(rx, move |res| {
         let (poster, meta) = res.unwrap_or((None, None));
-        cosmic::Action::App(Msg::Preview(PreviewMsg::PosterReady(poster, meta)))
+        cosmic::Action::App(Msg::Preview(id, PreviewMsg::PosterReady(poster, meta)))
     })
 }
 
 /// Extract the timeline's waveform buckets off-thread → [`PreviewMsg::WaveformReady`]
 /// (an empty vector when the soundtrack won't decode — the lanes then stay flat).
-pub(super) fn waveform_task(path: PathBuf) -> Task<cosmic::Action<Msg>> {
+pub(super) fn waveform_task(id: window::Id, path: PathBuf) -> Task<cosmic::Action<Msg>> {
     let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let _ = tx.send(super::timeline::extract_waveform(&path).unwrap_or_default());
     });
-    Task::perform(rx, |res| {
-        cosmic::Action::App(Msg::Preview(PreviewMsg::WaveformReady(Arc::new(
+    Task::perform(rx, move |res| {
+        cosmic::Action::App(Msg::Preview(id, PreviewMsg::WaveformReady(Arc::new(
             res.unwrap_or_default(),
         ))))
     })
 }
 
 /// Build the single-frame scrub/step decode task → [`PreviewMsg::SeekFrameReady`].
-fn seek_frame_task(path: PathBuf, meta: VideoMeta, t: f32, accurate: bool) -> Task<cosmic::Action<Msg>> {
+fn seek_frame_task(
+    id: window::Id,
+    path: PathBuf,
+    meta: VideoMeta,
+    t: f32,
+    accurate: bool,
+) -> Task<cosmic::Action<Msg>> {
     let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
         let _ = tx.send(playback::decode_frame_at(&path, meta, t, accurate));
     });
-    Task::perform(rx, |res| {
+    Task::perform(rx, move |res| {
         let frame = res
             .ok()
             .flatten()
             .map(|f| PixelFrame::new(f.rgba, f.w, f.h));
-        cosmic::Action::App(Msg::Preview(PreviewMsg::SeekFrameReady(frame)))
+        cosmic::Action::App(Msg::Preview(id, PreviewMsg::SeekFrameReady(frame)))
     })
 }
 
@@ -188,13 +194,13 @@ fn extract_poster(path: &Path, meta: Option<VideoMeta>) -> Option<widget::image:
 /// instant) and — when there's more than one segment — "Delete segment" (the
 /// segment under the click, selected at open). Styled like the overlay's
 /// right-click text/code menus.
-fn timeline_menu(t: f32, can_delete: bool) -> Element<'static, Msg> {
+fn timeline_menu(pid: window::Id, t: f32, can_delete: bool) -> Element<'static, Msg> {
     let item = |label: &'static str, msg: PreviewMsg| {
         crate::widgets::arrow_cursor::arrow_cursor(
             widget::button::custom(widget::text(label).size(14))
                 .padding(cosmic::iced::Padding::from([6.0, 14.0]))
                 .width(Length::Fill)
-                .on_press(Msg::Preview(msg))
+                .on_press(Msg::Preview(pid, msg))
                 .class(cosmic::theme::Button::Text),
         )
     };
@@ -252,8 +258,8 @@ impl App {
     /// Play/pause toggle for a video preview. Pausing stops the stream but keeps the
     /// paused frame + playhead; playing (re)starts an `ffmpeg` stream from the playhead
     /// (or the start, if we were at the end). No-op for an image preview.
-    pub(super) fn toggle_playback(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(PreviewState { kind: PreviewKind::Video(vid), path, .. }) = &mut self.preview
+    pub(super) fn toggle_playback(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(PreviewState { kind: PreviewKind::Video(vid), path, .. }) = self.preview_for_mut(id)
         else {
             return Task::none();
         };
@@ -290,8 +296,8 @@ impl App {
     /// realtime), restart the stream at the clock — the picture jumps forward to meet
     /// the realtime audio instead of drifting ever further out of sync. No-op for an
     /// image preview.
-    pub(super) fn playback_tick(&mut self) -> Task<cosmic::Action<Msg>> {
-        let Some(PreviewState { kind: PreviewKind::Video(vid), path, .. }) = &mut self.preview
+    pub(super) fn playback_tick(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(PreviewState { kind: PreviewKind::Video(vid), path, .. }) = self.preview_for_mut(id)
         else {
             return Task::none();
         };
@@ -345,30 +351,30 @@ impl App {
 
     /// Scrub to an absolute time (seek bar): pause, move the playhead, and decode a
     /// preview frame there (fast, keyframe-approximate). No-op for an image preview.
-    pub(super) fn seek(&mut self, t: f32) -> Task<cosmic::Action<Msg>> {
-        self.request_frame(Some(t), false)
+    pub(super) fn seek(&mut self, id: window::Id, t: f32) -> Task<cosmic::Action<Msg>> {
+        self.request_frame(id, Some(t), false)
     }
 
     /// Step the playhead by `delta` frames (`,`/`.`): pause and decode that exact frame
     /// (frame-accurate). No-op for an image preview.
-    pub(super) fn frame_step(&mut self, delta: i32) -> Task<cosmic::Action<Msg>> {
-        let fps = match &self.preview {
+    pub(super) fn frame_step(&mut self, id: window::Id, delta: i32) -> Task<cosmic::Action<Msg>> {
+        let fps = match self.preview_for(id) {
             Some(PreviewState { kind: PreviewKind::Video(vid), .. }) => {
                 vid.meta.map(|m| m.fps).unwrap_or(30.0)
             }
             _ => return Task::none(),
         };
-        let pos = match &self.preview {
+        let pos = match self.preview_for(id) {
             Some(PreviewState { kind: PreviewKind::Video(vid), .. }) => vid.position,
             _ => return Task::none(),
         };
-        self.request_frame(Some(pos + (delta as f32) / fps), true)
+        self.request_frame(id, Some(pos + (delta as f32) / fps), true)
     }
 
     /// Shared scrub/step body: stop playback, move to `t` (clamped), and decode a single
     /// frame — coalescing if one is already in flight so a drag doesn't flood ffmpeg.
-    fn request_frame(&mut self, t: Option<f32>, accurate: bool) -> Task<cosmic::Action<Msg>> {
-        let Some(PreviewState { kind: PreviewKind::Video(vid), path, .. }) = &mut self.preview
+    fn request_frame(&mut self, id: window::Id, t: Option<f32>, accurate: bool) -> Task<cosmic::Action<Msg>> {
+        let Some(PreviewState { kind: PreviewKind::Video(vid), path, .. }) = self.preview_for_mut(id)
         else {
             return Task::none();
         };
@@ -385,16 +391,15 @@ impl App {
             return Task::none();
         }
         vid.seeking = true;
-        seek_frame_task(path, meta, vid.position, accurate)
+        seek_frame_task(id, path, meta, vid.position, accurate)
     }
 
     /// A scrubbed/stepped frame arrived: show it, then service any seek that was
     /// requested while this one was decoding.
-    pub(super) fn on_seek_frame(
-        &mut self,
+    pub(super) fn on_seek_frame(&mut self, id: window::Id,
         frame: Option<Arc<PixelFrame>>,
     ) -> Task<cosmic::Action<Msg>> {
-        let Some(PreviewState { kind: PreviewKind::Video(vid), path, .. }) = &mut self.preview
+        let Some(PreviewState { kind: PreviewKind::Video(vid), path, .. }) = self.preview_for_mut(id)
         else {
             return Task::none();
         };
@@ -410,33 +415,32 @@ impl App {
             return Task::none();
         };
         vid.position = t;
-        seek_frame_task(path, meta, t, accurate)
+        seek_frame_task(id, path, meta, t, accurate)
     }
 
     /// Ruler click/drag: scrub the playhead. `t` is SOURCE seconds (the widget
     /// already mapped the click through the edited timeline, so it always
     /// lands in kept content). Selection is untouched — that's a LANE click
     /// ([`Self::timeline_select`]).
-    pub(super) fn timeline_seek(&mut self, t: f32) -> Task<cosmic::Action<Msg>> {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = &mut self.preview
+    pub(super) fn timeline_seek(&mut self, id: window::Id, t: f32) -> Task<cosmic::Action<Msg>> {
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id)
             && let Some(tl) = &mut vid.timeline
         {
             tl.menu = None;
         }
-        self.seek(t)
+        self.seek(id, t)
     }
 
     /// Lane click with the pointer tool: update the selection without moving
     /// the playhead. `t` = the clicked SOURCE time when a segment was hit
     /// (`None` = away from any segment); plain replaces (or deselects on a
     /// miss), ctrl toggles, shift range-selects from the anchor.
-    pub(super) fn timeline_select(
-        &mut self,
+    pub(super) fn timeline_select(&mut self, id: window::Id,
         t: Option<f32>,
         ctrl: bool,
         shift: bool,
     ) -> Task<cosmic::Action<Msg>> {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = &mut self.preview
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id)
             && let Some(tl) = &mut vid.timeline
         {
             tl.menu = None;
@@ -455,13 +459,12 @@ impl App {
 
     /// Pointer box-select (EDITED seconds): select the segments the box
     /// swept; `additive` (ctrl/shift held) keeps the current selection.
-    pub(super) fn timeline_box_select(
-        &mut self,
+    pub(super) fn timeline_box_select(&mut self, id: window::Id,
         a: f32,
         b: f32,
         additive: bool,
     ) -> Task<cosmic::Action<Msg>> {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = &mut self.preview
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id)
             && let Some(tl) = &mut vid.timeline
         {
             tl.menu = None;
@@ -473,8 +476,8 @@ impl App {
     /// Razor (or context-menu "Cut here"): split the segment at source time `t`.
     /// Only a cut that actually took (not in a gap / too close to an edge)
     /// enters undo history.
-    pub(super) fn timeline_cut(&mut self, t: f32) -> Task<cosmic::Action<Msg>> {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), edit, .. }) = &mut self.preview
+    pub(super) fn timeline_cut(&mut self, id: window::Id, t: f32) -> Task<cosmic::Action<Msg>> {
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), edit, .. }) = self.preview_for_mut(id)
             && let Some(tl) = &mut vid.timeline
         {
             tl.menu = None;
@@ -487,8 +490,8 @@ impl App {
     }
 
     /// Arm/disarm the timeline's razor (cut) tool — the pointer/razor toggle.
-    pub(super) fn timeline_set_razor(&mut self, on: bool) -> Task<cosmic::Action<Msg>> {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = &mut self.preview
+    pub(super) fn timeline_set_razor(&mut self, id: window::Id, on: bool) -> Task<cosmic::Action<Msg>> {
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id)
             && let Some(tl) = &mut vid.timeline
         {
             tl.razor = on;
@@ -501,8 +504,8 @@ impl App {
     /// menu's "Delete segment" acts on what was clicked, and the ring shows it)
     /// and open the context menu at that point. A right-click INSIDE a
     /// multi-selection keeps it — the menu then acts on the whole group.
-    pub(super) fn timeline_menu_open(&mut self, t: f32, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = &mut self.preview
+    pub(super) fn timeline_menu_open(&mut self, id: window::Id, t: f32, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id)
             && let Some(tl) = &mut vid.timeline
         {
             let hit = tl.span_at_source(t);
@@ -515,8 +518,8 @@ impl App {
     }
 
     /// Dismiss the timeline context menu without acting.
-    pub(super) fn timeline_menu_close(&mut self) -> Task<cosmic::Action<Msg>> {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = &mut self.preview
+    pub(super) fn timeline_menu_close(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id)
             && let Some(tl) = &mut vid.timeline
         {
             tl.menu = None;
@@ -528,10 +531,10 @@ impl App {
     /// them slide left inherently. A paused playhead stranded in a new gap
     /// re-decodes at the seam so the shown frame is never deleted content (a
     /// PLAYING stream skips on its own — the tick's gap-jump).
-    pub(super) fn timeline_delete_selected(&mut self) -> Task<cosmic::Action<Msg>> {
+    pub(super) fn timeline_delete_selected(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
         let seam = {
             let Some(PreviewState { kind: PreviewKind::Video(vid), edit, .. }) =
-                &mut self.preview
+                self.preview_for_mut(id)
             else {
                 return Task::none();
             };
@@ -551,15 +554,15 @@ impl App {
             }
         };
         match seam {
-            Some(t) => self.seek(t),
+            Some(t) => self.seek(id, t),
             None => Task::none(),
         }
     }
 
     /// Store the extracted waveform buckets (empty = extraction failed / silent;
     /// the lanes then stay flat).
-    pub(super) fn on_waveform(&mut self, peaks: Arc<Vec<(f32, f32)>>) -> Task<cosmic::Action<Msg>> {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = &mut self.preview
+    pub(super) fn on_waveform(&mut self, id: window::Id, peaks: Arc<Vec<(f32, f32)>>) -> Task<cosmic::Action<Msg>> {
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id)
             && !peaks.is_empty()
         {
             vid.waveform = Some(peaks);
@@ -569,12 +572,14 @@ impl App {
 
     /// Stop any in-progress playback (kills the ffmpeg worker), e.g. before an action
     /// exits or hides the overlay. No-op for an image preview / when not playing.
-    pub(super) fn stop_preview_playback(&mut self) {
-        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = &mut self.preview {
+    pub(super) fn stop_preview_playback(&mut self, id: window::Id) {
+        if let Some(PreviewState { kind: PreviewKind::Video(vid), .. }) = self.preview_for_mut(id) {
             vid.playback = None;
         }
-        // Closing the overlay: resume any other media we paused on its behalf (no-op if none).
-        self.preview_duck = None;
+        // Closing THIS overlay: release its share of the duck. Other media resume only
+        // once the LAST preview holding it lets go (DRAGON-336 phase 2) — a plain drop
+        // here would un-mute the desktop under a second, still-playing preview.
+        self.release_preview_duck(id);
     }
 
     /// The loaded-video view: the current playback/scrub frame (else the poster, else a
@@ -585,6 +590,9 @@ impl App {
         vid: &'a VideoPreview,
         tb: Tb,
     ) -> Element<'a, Msg> {
+        // Every message this view emits is ADDRESSED to its own document (DRAGON-336
+        // phase 2), so a transport click can never drive another preview.
+        let id = preview.window;
         // The media-hugging viewport (falls back to the full box before the probe
         // lands), so the overlay's toolbars sit tight above/below the recording.
         let (avail_w, avail_h) = self.preview_viewport(preview);
@@ -598,11 +606,11 @@ impl App {
             // playback with a covermark applied both prepares wrote it and both draws
             // sampled whichever upload happened last.
             let (dw, dh) = contain_dims(frame.w, frame.h, avail_w, avail_h);
-            let mut layers = vec![Layer { key: LayerKey::VIDEO, frame: frame.clone() }];
+            let mut layers = vec![Layer { key: LayerKey::video(preview.window), frame: frame.clone() }];
             if let Some(cm) = cm_frame {
-                layers.push(Layer { key: LayerKey::COVERMARK, frame: cm.clone() });
+                layers.push(Layer { key: LayerKey::covermark(preview.window), frame: cm.clone() });
             }
-            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers))
+            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers, self.live_preview_windows()))
                 .width(Length::Fixed(dw))
                 .height(Length::Fixed(dh));
             widget::container(Element::new(shader))
@@ -644,10 +652,12 @@ impl App {
                     // set together): fall back to the plain seek slider.
                     let remaining = (meta.duration - vid.position).max(0.0);
                     let slider =
-                        widget::slider(0.0..=meta.duration, vid.position.min(meta.duration), |t| {
-                            Msg::Preview(PreviewMsg::Seek(t))
+                        widget::slider(0.0..=meta.duration, vid.position.min(meta.duration), move |t| {
+                            Msg::Preview(id, PreviewMsg::Seek(t))
                         })
-                        .step(0.05f32);
+                        .step(0.05f32)
+                        // The preview editor's own (smaller) thumb — see `PREVIEW_SLIDER_THUMB`.
+                        .class(super::chrome::preview_slider_class());
                     return widget::row(vec![
                         play,
                         slider.width(Length::Fill).into(),
@@ -661,6 +671,7 @@ impl App {
                     .into();
                 };
                 let lanes = cosmic::widget::Canvas::new(TimelineCanvas {
+                    pid: id,
                     timeline: tl,
                     position: vid.position,
                     fps: meta.fps,
@@ -674,11 +685,11 @@ impl App {
                 // dismisses.
                 let lanes: Element<'a, Msg> = match tl.menu {
                     Some((t, mx, my)) => widget::popover(Element::new(lanes))
-                        .popup(timeline_menu(t, tl.spans.len() > 1))
+                        .popup(timeline_menu(id, t, tl.spans.len() > 1))
                         .position(widget::popover::Position::Point(cosmic::iced::Point::new(
                             mx, my,
                         )))
-                        .on_close(Msg::Preview(PreviewMsg::TimelineMenuClose))
+                        .on_close(Msg::Preview(id, PreviewMsg::TimelineMenuClose))
                         .into(),
                     None => Element::new(lanes),
                 };
@@ -765,8 +776,9 @@ impl App {
     /// alpha-blended, no atlas churn). Windows OVERLAY exception (DRAGON-235): iced's
     /// raster-image pipeline does not composite on the premultiplied transparent surface, so a
     /// sized poster is drawn through the SAME LayerStack shader instead — with the covermark
-    /// folded into that one stack, so only a single LayerStack ever lives on the surface (two
-    /// would fight over slot pruning). The opaque windowed surface, Linux and macOS compile
+    /// folded into that one stack, so only a single LayerStack ever lives in this window (two
+    /// in ONE window would fight over slot pruning; slots are keyed per window, not per
+    /// widget). The opaque windowed surface, Linux and macOS compile
     /// only the portable `widget::image` paths below (byte-identical there).
     fn video_still_content(
         &self,
@@ -784,11 +796,11 @@ impl App {
         {
             let (sw, sh) = playback::scaled_dims(m.w, m.h);
             let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
-            let mut layers = vec![Layer { key: LayerKey::VIDEO, frame: pf }];
+            let mut layers = vec![Layer { key: LayerKey::video(preview.window), frame: pf }];
             if let Some(cm) = cm_frame {
-                layers.push(Layer { key: LayerKey::COVERMARK, frame: cm.clone() });
+                layers.push(Layer { key: LayerKey::covermark(preview.window), frame: cm.clone() });
             }
-            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers))
+            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers, self.live_preview_windows()))
                 .width(Length::Fixed(dw))
                 .height(Length::Fixed(dh));
             return widget::container(Element::new(shader)).center_x(Length::Fill).into();
@@ -847,7 +859,8 @@ impl App {
             let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
             // The covermark overlay draws through the persistent-texture shader (in-place
             // upload, alpha-blended over the frame) — no atlas churn, so no blink on edit.
-            let layers = LayerStack::new(vec![Layer { key: LayerKey::COVERMARK, frame: frame.clone() }]);
+            let cm = Layer { key: LayerKey::covermark(preview.window), frame: frame.clone() };
+            let layers = LayerStack::new(vec![cm], self.live_preview_windows());
             let shader = cosmic::iced::widget::shader::Shader::new(layers)
                 .width(Length::Fixed(dw))
                 .height(Length::Fixed(dh));

@@ -80,6 +80,9 @@ pub enum Action {
     PreviewSelectAll,
     /// Preview: the Arrow annotation tool (default A).
     PreviewAnnotArrow,
+    /// Preview: the Step Marker annotation tool (default Q) — DRAGON-340. (The code calls it
+    /// the "badge" everywhere; only the user-facing label was renamed.)
+    PreviewAnnotBadge,
     /// Preview: the Box (rectangle) annotation tool (default B).
     PreviewAnnotBox,
     /// Preview: the Highlight (multiply box) annotation tool (default H).
@@ -118,7 +121,7 @@ impl Action {
     /// copy / close / delete / covermark / undo / redo), then "Image Editor
     /// Shortcuts" (annotation tools / color / pan), then "Video Editor Shortcuts"
     /// (play / frame step / delete segment) — image above video.
-    pub const ALL: [Action; 34] = [
+    pub const ALL: [Action; 35] = [
         Action::SelectAllText,
         Action::DeselectText,
         Action::CopyText,
@@ -134,6 +137,7 @@ impl Action {
         Action::PreviewAnnotPointer,
         Action::PreviewSelectAll,
         Action::PreviewAnnotArrow,
+        Action::PreviewAnnotBadge,
         Action::PreviewAnnotBox,
         Action::PreviewAnnotHighlight,
         Action::PreviewAnnotBoxHighlight,
@@ -177,6 +181,7 @@ impl Action {
             Action::PreviewAnnotPointer => "Select tool",
             Action::PreviewSelectAll => "Select all annotations",
             Action::PreviewAnnotArrow => "Arrow tool",
+            Action::PreviewAnnotBadge => "Step marker tool",
             Action::PreviewAnnotBox => "Box tool",
             Action::PreviewAnnotHighlight => "Highlight tool",
             Action::PreviewAnnotBoxHighlight => "Box Highlight tool",
@@ -221,6 +226,7 @@ impl Action {
             Action::PreviewAnnotPointer => "Select, multi-select and move annotations.",
             Action::PreviewSelectAll => "Select every annotation on the image.",
             Action::PreviewAnnotArrow => "Draw an arrow.",
+            Action::PreviewAnnotBadge => "Drop a numbered step marker.",
             Action::PreviewAnnotBox => "Draw a rectangle.",
             Action::PreviewAnnotHighlight => "Draw a multiply-blended highlight box.",
             Action::PreviewAnnotBoxHighlight => "Draw a highlight box with an outline.",
@@ -262,6 +268,7 @@ impl Action {
             Action::PreviewAnnotPointer
             | Action::PreviewSelectAll
             | Action::PreviewAnnotArrow
+            | Action::PreviewAnnotBadge
             | Action::PreviewAnnotBox
             | Action::PreviewAnnotHighlight
             | Action::PreviewAnnotBoxHighlight
@@ -302,6 +309,7 @@ impl Action {
             | Action::PreviewAnnotPointer
             | Action::PreviewSelectAll
             | Action::PreviewAnnotArrow
+            | Action::PreviewAnnotBadge
             | Action::PreviewAnnotBox
             | Action::PreviewAnnotHighlight
             | Action::PreviewAnnotBoxHighlight
@@ -342,6 +350,9 @@ impl Action {
             Action::PreviewAnnotPointer => Shortcut::char('t'),
             Action::PreviewSelectAll => Shortcut::primary_char('a'),
             Action::PreviewAnnotArrow => Shortcut::char('a'),
+            // Q: the annotation-tool letters are crowded (a/b/h/g/m/u/s/n/e/t/d/l/c/v all
+            // taken), and Q sits next to them on the left hand.
+            Action::PreviewAnnotBadge => Shortcut::char('q'),
             Action::PreviewAnnotBox => Shortcut::char('b'),
             Action::PreviewAnnotHighlight => Shortcut::char('h'),
             Action::PreviewAnnotBoxHighlight => Shortcut::char('g'),

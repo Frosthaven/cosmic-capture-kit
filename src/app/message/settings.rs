@@ -70,17 +70,15 @@ pub enum SettingsMsg {
     SetWindowPaddingPx(String),
     /// Settings: toggle freeze-pixels (takes effect next launch).
     SetFreeze(bool),
-    /// Settings: toggle allowing multiple instances (takes effect next launch).
-    SetAllowMultiple(bool),
     /// Settings: toggle staying resident (the tray/menu-bar RESIDENT process). Emitted
-    /// by the "Keep system tray icon" row on macOS (menu-bar daemon), Linux (ksni
+    /// by the "System tray icon" row on macOS (menu-bar daemon), Linux (ksni
     /// tray resident, DRAGON-173), and Windows (Win32 tray daemon, DRAGON-237); a no-op on
     /// any platform without a resident, so the variant is gated to the three that construct it.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     SetResident(bool),
     /// Settings (DRAGON-296): toggle "Automatically start on login" — persist
     /// `autostart_on_login` and reconcile the OS login item (registered iff the tray is on
-    /// AND this is on). Emitted by the row directly below "Keep system tray icon", which is
+    /// AND this is on). Emitted by the row directly below "System tray icon", which is
     /// hidden while the tray is off. Gated to the three OSes with a resident (same set as
     /// `SetResident`), so Linux/other `SettingsMsg` shapes stay byte-identical elsewhere.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]

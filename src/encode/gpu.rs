@@ -22,6 +22,15 @@
 //! All the hwdevice / hwframes / filter plumbing has no safe wrapper in
 //! `ffmpeg-next`, so we use its raw `ffi`. Every raw pointer is owned by
 //! [`Encoder`] and freed in `Drop`.
+//!
+//! **libav is loaded LAZILY** (DRAGON-336). We take the bindgen *types* from
+//! `ffmpeg_next::ffi` but call none of its `extern "C"` declarations directly —
+//! every entry point goes through the [`Libav`] vtable below, `dlopen`ed on first
+//! use. With zero direct symbol references the linker's `--as-needed` drops
+//! `libavutil` / `libavcodec` / `libavfilter` from the binary's `DT_NEEDED`, so the
+//! ~120-shared-object libav closure is no longer mapped before `main()` — the tray
+//! daemon and every screenshot-only launch stop paying for an encoder they never
+//! open. Only starting a GPU zero-copy recording pulls libav in.
 
 // This is an FFI module: the `unsafe fn`s are wall-to-wall raw-pointer ffmpeg calls,
 // so the per-op `unsafe {}` blocks edition 2024 wants would be pure noise here.
@@ -30,6 +39,166 @@
 use ffmpeg_next::ffi::*;
 use std::ffi::CString;
 use std::ptr;
+use std::sync::OnceLock;
+
+// ---------------------------------------------------------------------------
+// Lazy libav linkage (DRAGON-336)
+// ---------------------------------------------------------------------------
+
+/// The three `dlopen` handles a resolve pass reads symbols out of. Deliberately
+/// never closed: once resolved the vtable holds pointers into these mappings for
+/// the rest of the process.
+struct Handles {
+    avutil: *mut libc::c_void,
+    avcodec: *mut libc::c_void,
+    avfilter: *mut libc::c_void,
+}
+
+/// Declare every libav entry point we use, once: the [`Libav`] vtable field, its
+/// `dlsym` resolve step, and a module-level shim of the SAME NAME as the C function.
+///
+/// The shim shadows the glob-imported `ffmpeg_next::ffi` declaration (explicit items
+/// beat glob imports), so every call site in this file reads exactly like a direct
+/// FFI call while actually dispatching through the vtable. When the library isn't
+/// loadable a shim returns its "miss" value instead of panicking — null for pointer
+/// returns, a negative code for `int` returns — which the existing null / `r < 0`
+/// checks already treat as a failed encoder, so a missing libav degrades into the
+/// caller's established CPU fallback.
+macro_rules! libav_syms {
+    ($( $lib:ident fn $name:ident ( $($an:ident : $at:ty),* ) -> $ret:ty = $miss:expr; )+) => {
+        /// Resolved libav entry points. Built once by [`load_libav`].
+        struct Libav {
+            $( $name: unsafe extern "C" fn($($at),*) -> $ret, )+
+        }
+
+        impl Libav {
+            /// `None` if any single symbol is missing — a partial vtable is never
+            /// published, so a shim can only ever see "all there" or "none there".
+            unsafe fn resolve(h: &Handles) -> Option<Self> {
+                Some(Libav {
+                    $( $name: std::mem::transmute::<
+                        *mut libc::c_void,
+                        unsafe extern "C" fn($($at),*) -> $ret,
+                    >(dlsym(h.$lib, concat!(stringify!($name), "\0"))?), )+
+                })
+            }
+        }
+
+        $(
+            #[inline]
+            unsafe fn $name($($an: $at),*) -> $ret {
+                match libav() {
+                    Some(l) => (l.$name)($($an),*),
+                    None => $miss,
+                }
+            }
+        )+
+    };
+}
+
+libav_syms! {
+    // libavutil
+    avutil fn av_buffer_ref(buf: *const AVBufferRef) -> *mut AVBufferRef = ptr::null_mut();
+    avutil fn av_buffer_unref(buf: *mut *mut AVBufferRef) -> () = ();
+    avutil fn av_frame_alloc() -> *mut AVFrame = ptr::null_mut();
+    avutil fn av_frame_free(frame: *mut *mut AVFrame) -> () = ();
+    avutil fn av_frame_unref(frame: *mut AVFrame) -> () = ();
+    avutil fn av_frame_get_buffer(frame: *mut AVFrame, align: libc::c_int) -> libc::c_int = MISSING;
+    avutil fn av_free(ptr: *mut libc::c_void) -> () = ();
+    avutil fn av_strerror(errnum: libc::c_int, errbuf: *mut libc::c_char, errbuf_size: usize) -> libc::c_int = MISSING;
+    avutil fn av_hwdevice_ctx_create(device_ctx: *mut *mut AVBufferRef, type_: AVHWDeviceType, device: *const libc::c_char, opts: *mut AVDictionary, flags: libc::c_int) -> libc::c_int = MISSING;
+    avutil fn av_hwframe_ctx_alloc(device_ctx: *mut AVBufferRef) -> *mut AVBufferRef = ptr::null_mut();
+    avutil fn av_hwframe_ctx_init(ref_: *mut AVBufferRef) -> libc::c_int = MISSING;
+    avutil fn av_hwframe_get_buffer(hwframe_ctx: *mut AVBufferRef, frame: *mut AVFrame, flags: libc::c_int) -> libc::c_int = MISSING;
+    avutil fn av_hwframe_map(dst: *mut AVFrame, src: *const AVFrame, flags: libc::c_int) -> libc::c_int = MISSING;
+    avutil fn av_hwframe_transfer_data(dst: *mut AVFrame, src: *const AVFrame, flags: libc::c_int) -> libc::c_int = MISSING;
+    // libavcodec
+    avcodec fn avcodec_alloc_context3(codec: *const AVCodec) -> *mut AVCodecContext = ptr::null_mut();
+    avcodec fn avcodec_find_encoder_by_name(name: *const libc::c_char) -> *const AVCodec = ptr::null();
+    avcodec fn avcodec_free_context(avctx: *mut *mut AVCodecContext) -> () = ();
+    avcodec fn avcodec_open2(avctx: *mut AVCodecContext, codec: *const AVCodec, options: *mut *mut AVDictionary) -> libc::c_int = MISSING;
+    avcodec fn avcodec_receive_packet(avctx: *mut AVCodecContext, avpkt: *mut AVPacket) -> libc::c_int = MISSING;
+    avcodec fn avcodec_send_frame(avctx: *mut AVCodecContext, frame: *const AVFrame) -> libc::c_int = MISSING;
+    avcodec fn av_packet_alloc() -> *mut AVPacket = ptr::null_mut();
+    avcodec fn av_packet_free(pkt: *mut *mut AVPacket) -> () = ();
+    avcodec fn av_packet_unref(pkt: *mut AVPacket) -> () = ();
+    // libavfilter
+    avfilter fn av_buffersink_get_frame(ctx: *mut AVFilterContext, frame: *mut AVFrame) -> libc::c_int = MISSING;
+    avfilter fn av_buffersink_get_hw_frames_ctx(ctx: *const AVFilterContext) -> *mut AVBufferRef = ptr::null_mut();
+    avfilter fn av_buffersrc_add_frame_flags(buffer_src: *mut AVFilterContext, frame: *mut AVFrame, flags: libc::c_int) -> libc::c_int = MISSING;
+    avfilter fn av_buffersrc_parameters_alloc() -> *mut AVBufferSrcParameters = ptr::null_mut();
+    avfilter fn av_buffersrc_parameters_set(ctx: *mut AVFilterContext, param: *mut AVBufferSrcParameters) -> libc::c_int = MISSING;
+    avfilter fn avfilter_get_by_name(name: *const libc::c_char) -> *const AVFilter = ptr::null();
+    avfilter fn avfilter_graph_alloc() -> *mut AVFilterGraph = ptr::null_mut();
+    avfilter fn avfilter_graph_alloc_filter(graph: *mut AVFilterGraph, filter: *const AVFilter, name: *const libc::c_char) -> *mut AVFilterContext = ptr::null_mut();
+    avfilter fn avfilter_graph_config(graphctx: *mut AVFilterGraph, log_ctx: *mut libc::c_void) -> libc::c_int = MISSING;
+    avfilter fn avfilter_graph_free(graph: *mut *mut AVFilterGraph) -> () = ();
+    avfilter fn avfilter_init_str(ctx: *mut AVFilterContext, args: *const libc::c_char) -> libc::c_int = MISSING;
+    avfilter fn avfilter_link(src: *mut AVFilterContext, srcpad: libc::c_uint, dst: *mut AVFilterContext, dstpad: libc::c_uint) -> libc::c_int = MISSING;
+}
+
+/// What an `int`-returning shim reports when libav isn't loaded: `AVERROR(ENOSYS)`,
+/// so it renders like any other ffmpeg failure and trips every `r < 0` check.
+const MISSING: libc::c_int = -libc::ENOSYS;
+
+/// Resolve one symbol, or `None` (the whole vtable then fails to build).
+unsafe fn dlsym(handle: *mut libc::c_void, name: &str) -> Option<*mut libc::c_void> {
+    // `name` is a `concat!(.., "\0")` literal, so it is already NUL-terminated.
+    let p = libc::dlsym(handle, name.as_ptr().cast::<libc::c_char>());
+    if p.is_null() {
+        log::warn!("libav: symbol {} missing; GPU encoding unavailable", name.trim_end_matches('\0'));
+        return None;
+    }
+    Some(p)
+}
+
+/// `dlopen` one libav library, pinned to the ABI major we were COMPILED against.
+///
+/// This matters: the struct layouts, field offsets and constants we use come from
+/// that major's headers via bindgen, so loading a different one would silently
+/// misread every field. We try the exact soname first, then the unversioned dev
+/// symlink, and in both cases confirm the major through the library's own
+/// `<name>_version()` before accepting it.
+unsafe fn dlopen_libav(name: &str, major: u32) -> Option<*mut libc::c_void> {
+    let ver_sym = CString::new(format!("{name}_version")).ok()?;
+    for soname in [format!("lib{name}.so.{major}"), format!("lib{name}.so")] {
+        let Ok(c_soname) = CString::new(soname.as_str()) else { continue };
+        let h = libc::dlopen(c_soname.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+        if h.is_null() {
+            continue;
+        }
+        let v = libc::dlsym(h, ver_sym.as_ptr());
+        let ok = !v.is_null() && {
+            let f = std::mem::transmute::<*mut libc::c_void, unsafe extern "C" fn() -> libc::c_uint>(v);
+            (f() >> 16) == major
+        };
+        if ok {
+            return Some(h);
+        }
+        libc::dlclose(h);
+    }
+    log::warn!("libav: no lib{name}.so.{major} on this system; GPU encoding unavailable");
+    None
+}
+
+/// Open all three libraries and resolve the vtable. `None` on any miss.
+unsafe fn load_libav() -> Option<Libav> {
+    let h = Handles {
+        avutil: dlopen_libav("avutil", LIBAVUTIL_VERSION_MAJOR as u32)?,
+        avcodec: dlopen_libav("avcodec", LIBAVCODEC_VERSION_MAJOR as u32)?,
+        avfilter: dlopen_libav("avfilter", LIBAVFILTER_VERSION_MAJOR as u32)?,
+    };
+    Libav::resolve(&h)
+}
+
+/// The process-wide vtable, resolved on first use. `None` means "libav isn't
+/// usable here" — logged once (the `OnceLock` caches the verdict, misses included).
+fn libav() -> Option<&'static Libav> {
+    static LIBAV: OnceLock<Option<Libav>> = OnceLock::new();
+    // SAFETY: dlopen/dlsym of well-known sonames; the ABI major is verified before
+    // any symbol is used, and `OnceLock` makes the load happen exactly once.
+    LIBAV.get_or_init(|| unsafe { load_libav() }).as_ref()
+}
 
 /// An in-process VAAPI H.264/HEVC encoder bound to one DRM render node, producing
 /// Annex-B packets (SPS/PPS repeated in-band, so the byte stream is self-contained
@@ -72,6 +241,12 @@ impl Encoder {
         fps: u32,
         bitrate_kbps: u32,
     ) -> Result<Self, String> {
+        // The one door into this module's ffmpeg calls: pull libav in here (the whole
+        // point of the lazy linkage) and name the failure plainly. The per-shim miss
+        // values below are belt-and-braces for the same condition.
+        if libav().is_none() {
+            return Err("libavutil/libavcodec/libavfilter not available".into());
+        }
         let even = |v: u32| (v & !1) as i32;
         let (sw, sh, dw, dh) = (even(src_w), even(src_h), even(dst_w), even(dst_h));
         if sw < 2 || sh < 2 || dw < 2 || dh < 2 {
@@ -524,7 +699,6 @@ mod tests {
     use super::*;
 
     fn vaapi_node() -> Option<String> {
-        ffmpeg_next::init().ok();
         let node = default_vaapi_node()?;
         // Driver name matters when an nvidia node is also present.
         // SAFETY: test-only, before any encoder thread starts.
@@ -551,6 +725,31 @@ mod tests {
         }
         total += enc.finish().expect("flush").len();
         Some(total)
+    }
+
+    /// The lazy `dlopen` loader must either resolve the whole vtable or decline
+    /// cleanly — never panic, either way — and cache its verdict. Needs no GPU: it
+    /// only exercises the loader plus one alloc/free pair through the vtable.
+    #[test]
+    fn libav_loads_or_cleanly_declines() {
+        let loaded = libav().is_some();
+        assert_eq!(loaded, libav().is_some(), "the load verdict must be cached, not re-probed");
+        // SAFETY: an alloc/free pair on a frame nothing else can see. When libav is
+        // absent both shims take their miss path (null / no-op) instead of calling.
+        unsafe {
+            let mut f = av_frame_alloc();
+            assert_eq!(f.is_null(), !loaded, "av_frame_alloc must allocate iff libav resolved");
+            av_frame_free(&mut f);
+            assert!(f.is_null(), "av_frame_free must null the handle");
+        }
+        if !loaded {
+            // Declining must look like an ordinary encoder failure, not a panic.
+            let Err(err) = Encoder::new("/dev/dri/renderD128", false, 320, 240, 320, 240, 30, 1000)
+            else {
+                panic!("no libav must mean no encoder")
+            };
+            assert!(err.contains("not available"), "unexpected error: {err}");
+        }
     }
 
     /// In-process VAAPI encode of synthetic NV12 frames must produce real packets.

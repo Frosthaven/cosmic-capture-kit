@@ -337,10 +337,10 @@ impl App {
         // Same idiom for the system-track ducking flag (DRAGON-128): the pump reads
         // this global when it's configured.
         crate::audio::config::set_recording_duck_system(self.duck_system_audio);
-        // Close any other instances so only this overlay records. DRAGON-322: under
-        // allow-multiple a preview / recording sibling is spared, so this recording can
-        // coexist with a concurrent capture (record a tutorial of the tool in use).
-        crate::instance::close_other_instances(self.allow_multiple);
+        // Close any other instances so only this overlay records. DRAGON-322: a preview
+        // / recording sibling is spared, so this recording can coexist with a concurrent
+        // capture (record a tutorial of the tool in use).
+        crate::instance::close_other_instances();
         // Recording starts (after any countdown) → restore focus to the window we
         // expect: the captured window when we picked one (screencopy window mode),
         // otherwise whatever was focused before we launched (origin_window — also the

@@ -25,18 +25,18 @@ impl crate::app::App {
             SectionSpec {
                 title: "Behavior",
                 items: {
+                    // DRAGON-351: the "Allow multiple capture instances" toggle used to
+                    // lead this section; the behaviour is unconditional now, so the row
+                    // is gone and the section starts empty.
                     #[cfg_attr(
-                        not(any(target_os = "macos", target_os = "linux")),
+                        not(any(
+                            target_os = "macos",
+                            target_os = "linux",
+                            target_os = "windows"
+                        )),
                         allow(unused_mut)
                     )]
-                    let mut items = vec![
-                        Item::new(
-                            "Allow multiple capture instances",
-                            "Capture yourself capturing yourself!",
-                            toggle(self.allow_multiple, |a0| Msg::Settings(SettingsMsg::SetAllowMultiple(a0))),
-                        )
-                        .reset_with(self.allow_multiple, d.allow_multiple, |a0| Msg::Settings(SettingsMsg::SetAllowMultiple(a0))),
-                    ];
+                    let mut items: Vec<Item<'_>> = Vec::new();
                     // Stay resident: keep the tray/menu-bar RESIDENT process alive so a
                     // capture is always one click away. macOS (DRAGON-130) is a menu-bar
                     // daemon with a global hotkey; Windows (DRAGON-237) is a Win32 tray
@@ -49,7 +49,7 @@ impl crate::app::App {
                     {
                         items.push(
                             Item::new(
-                                "Keep system tray icon",
+                                "System tray icon",
                                 "Cosmic Capture Kit will remain in the system tray for easily \
                                  launching capture sessions.",
                                 toggle(self.resident, |a0| Msg::Settings(SettingsMsg::SetResident(a0))),
@@ -58,7 +58,7 @@ impl crate::app::App {
                         );
                         // DRAGON-296: launch-at-login. GATED by the tray toggle — the OS only
                         // relaunches the resident if there's a resident to run, so the row is
-                        // hidden while "Keep system tray icon" is off (the login item is also
+                        // hidden while "System tray icon" is off (the login item is also
                         // force-unregistered there by `reconcile_login_item`). Sits directly
                         // below the tray row it depends on.
                         if self.resident {

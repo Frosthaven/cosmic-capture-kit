@@ -103,6 +103,13 @@ pub enum Tool {
     Pointer,
     /// Draw arrows.
     Arrow,
+    /// Place a STEP MARKER (DRAGON-340): an auto-numbered disc + ring. Geometry is a square rect
+    /// like a Box, except it is FORCED 1:1 on placement and every resize — the one annotation
+    /// that ignores free aspect — and it is PLACED by a click rather than dragged out (see
+    /// [`Tool::click_places`]). The ordinal is never stored: it is DERIVED from the badge's
+    /// position among the scene's badges (`crate::app::preview::annotate::badge_numbers`), so
+    /// deleting one renumbers the rest with no bookkeeping.
+    Badge,
     /// Draw rectangles ("Box").
     Rect,
     /// Draw a MULTIPLY-blended highlighter box — a Box variant, same geometry/interaction.
@@ -134,6 +141,7 @@ impl Tool {
         match self {
             Tool::Pointer => "pointer",
             Tool::Arrow => "arrow",
+            Tool::Badge => "badge",
             Tool::Rect => "box",
             Tool::Highlight => "highlight",
             Tool::BoxHighlight => "box-highlight",
@@ -149,6 +157,7 @@ impl Tool {
         match s {
             "pointer" => Some(Tool::Pointer),
             "arrow" => Some(Tool::Arrow),
+            "badge" => Some(Tool::Badge),
             "box" => Some(Tool::Rect),
             "highlight" => Some(Tool::Highlight),
             "box-highlight" => Some(Tool::BoxHighlight),
@@ -181,6 +190,20 @@ impl Tool {
     /// draw-over-items override) must ask this rather than `tool.is_some()`.
     pub fn draws(self) -> bool {
         !matches!(self, Tool::Eraser | Tool::Pointer)
+    }
+
+    /// Whether a plain CLICK (a press that never crosses the drag threshold) is already a
+    /// COMPLETE gesture for this tool — the canvas then runs the whole `DrawBegin` +
+    /// `GestureEnd` pair on release instead of letting the press pass through as a bare click.
+    /// Two tools place rather than drag out a region:
+    ///   * the PENCIL, whose tap is a deliberate round DOT (DRAGON-342);
+    ///   * the STEP MARKER (`Tool::Badge`), dropped at a point and sized from the last one
+    ///     placed or resized rather than from a rubber-band.
+    ///
+    /// Every other tool still needs a real drag to make a shape, so a stray click on the canvas
+    /// stays a stray click. Pure — unit-tested.
+    pub fn click_places(self) -> bool {
+        matches!(self, Tool::Pen | Tool::Badge)
     }
 }
 
@@ -325,6 +348,14 @@ pub struct Item {
     /// The shared corner curve as an ABSOLUTE radius (SOURCE px): rounds the box corners and
     /// softens the arrow caps/joins (round when > 0). Scaled to screen px at draw time.
     pub curve_radius: f32,
+    /// `Some(n)` marks a [`ItemKind::Rect`] item as a SEQUENCE BADGE (DRAGON-340) carrying
+    /// ordinal `n`: [`draw_shapes`] renders it as a disc + numeral + ring
+    /// (`crate::badge`) instead of a box outline, and `stroke_w` becomes the RING weight.
+    /// A render flag, exactly like [`Self::fx`] — the badge hit-tests, chromes and resizes as
+    /// the ordinary square rect it is, so nothing else in this widget needs to know about it.
+    /// The ordinal is derived scene-side and re-stamped on every view build, so it is never
+    /// stale; the numeral's ink colour is derived here from [`Self::color`].
+    pub badge: Option<u32>,
 }
 
 /// A pointer gesture the canvas publishes — every point is in IMAGE SOURCE pixels
@@ -1191,15 +1222,18 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                             self.emit(shell, AnnotEvent::GestureEnd);
                             shell.capture_event();
                             consumed = true;
-                        } else if matches!(pending, Pending::Draw(Tool::Pen)) {
-                            // A pencil TAP inks a DOT (DRAGON-342). Every other tool needs a
-                            // real drag to make a shape, so a no-drag press stays a click — but
-                            // with the pencil armed a press is deliberate ink, so run the whole
-                            // gesture right here: begin at the press point (a one-point stroke)
-                            // and commit it. The app side normalizes it to a dot and keeps it.
+                        } else if let Pending::Draw(t) = pending
+                            && t.click_places()
+                        {
+                            // A pencil TAP inks a DOT (DRAGON-342); a BADGE click drops a
+                            // marker. Every other tool needs a real drag to make a shape, so a
+                            // no-drag press stays a click — but for these two a press is the
+                            // whole deliberate gesture, so run it right here: begin at the
+                            // press point and commit. The app side finishes it (the pen
+                            // normalizes to a dot; the badge is already a finished square).
                             self.emit(
                                 shell,
-                                AnnotEvent::DrawBegin(Tool::Pen, state.press_img.0, state.press_img.1),
+                                AnnotEvent::DrawBegin(t, state.press_img.0, state.press_img.1),
                             );
                             self.emit(shell, AnnotEvent::GestureEnd);
                             shell.capture_event();
@@ -1440,6 +1474,13 @@ fn draw_shapes(frame: &mut canvas::Frame, map: &CanvasMap, items: &[Item]) {
         }
         let curve = (item.curve_radius * iss).max(0.0);
         let sw = (item.stroke_w * iss).max(0.5);
+        // A SEQUENCE BADGE (DRAGON-340) is a Rect item with a render flag: draw the disc +
+        // numeral + ring and skip the box outline entirely. Same geometry source, same `iss`
+        // scaling the bake applies with its raster scale — see `crate::badge`.
+        if let (Some(number), &ItemKind::Rect { x, y, w, h }) = (item.badge, &item.kind) {
+            draw_badge(frame, map, (x, y, w, h), number, item.stroke_w, item.color, iss);
+            continue;
+        }
         match &item.kind {
             &ItemKind::Rect { x, y, w, h } => {
                 let a = map.to_canvas((x, y));
@@ -1501,6 +1542,79 @@ fn draw_shapes(frame: &mut canvas::Frame, map: &CanvasMap, items: &[Item]) {
                 frame.fill(&ribbon, item.color);
             }
         }
+    }
+}
+
+/// Draw one SEQUENCE BADGE (DRAGON-340) as vector geometry: a filled disc in the annotation
+/// colour, a clear gap, an outer ring at the current line weight, and the ordinal centred on
+/// the disc in the contrast ink.
+///
+/// `rect` is the item's SOURCE-px square; its inscribed circle is the ring's centreline. All
+/// the figures come from [`crate::badge::metrics`] in SOURCE px and are multiplied by the ONE
+/// image→screen factor `iss` — the exact mirror of the bake, which multiplies the same metrics
+/// by its raster scale. The number's ink is derived from `color` at draw time, so a colour
+/// change re-picks it with no stored state.
+fn draw_badge(
+    frame: &mut canvas::Frame,
+    map: &CanvasMap,
+    rect: (f32, f32, f32, f32),
+    number: u32,
+    ring_w: f32,
+    color: Color,
+    iss: f32,
+) {
+    let (x, y, w, h) = rect;
+    // The square is forced 1:1 scene-side; a mid-drag rect can still be un-normalized, so read
+    // the side off the extent and place the centre from the two corners.
+    let side = w.abs().min(h.abs());
+    let m = crate::badge::metrics(side, ring_w, crate::badge::digit_count(number));
+    if m.disc_r <= 0.0 {
+        return;
+    }
+    let c = map.to_canvas((x + w * 0.5, y + h * 0.5));
+    let centre = Point::new(c.0, c.1);
+    // The filled disc.
+    frame.fill(&Path::circle(centre, m.disc_r * iss), color);
+    // The outer ring — stroked ON the centreline circle, so it straddles the model square's
+    // inscribed circle exactly like a box outline straddles its rect.
+    if m.ring_w > 0.0 && m.outer_r > 0.0 {
+        frame.stroke(
+            &Path::circle(centre, m.outer_r * iss),
+            Stroke {
+                style: canvas::Style::Solid(color),
+                width: (m.ring_w * iss).max(0.5),
+                line_cap: LineCap::Round,
+                line_join: LineJoin::Round,
+                ..Default::default()
+            },
+        );
+    }
+    // The ordinal, in whichever tone actually contrasts with the disc.
+    let ink = if crate::badge::prefers_dark_ink([color.r, color.g, color.b]) {
+        crate::badge::INK_DARK
+    } else {
+        crate::badge::INK_LIGHT
+    };
+    let mut ink = Color::from_rgb8(ink[0], ink[1], ink[2]);
+    ink.a = color.a;
+    let numeral = Stroke {
+        style: canvas::Style::Solid(ink),
+        width: (m.digit_stroke * iss).max(0.5),
+        line_cap: LineCap::Round,
+        line_join: LineJoin::Round,
+        ..Default::default()
+    };
+    for poly in crate::badge::number_polylines(number, &m, (x + w * 0.5, y + h * 0.5)) {
+        let Some(first) = poly.first() else { continue };
+        let path = Path::new(|p| {
+            let a = map.to_canvas(*first);
+            p.move_to(Point::new(a.0, a.1));
+            for q in &poly[1..] {
+                let b = map.to_canvas(*q);
+                p.line_to(Point::new(b.0, b.1));
+            }
+        });
+        frame.stroke(&path, numeral);
     }
 }
 
@@ -1667,6 +1781,7 @@ mod tests {
             fill: None,
             fx: FxKind::None,
             curve_radius: 8.0,
+            badge: None,
         };
         let make = |selected: Vec<u64>| {
             AnnotationCanvas::new(
@@ -1795,6 +1910,28 @@ mod tests {
         }
     }
 
+    /// Exactly TWO tools complete their gesture on a plain click — the pencil (a tap is a dot)
+    /// and the step marker (it is placed at a point, not dragged out). Every region tool still
+    /// needs a real drag, so a stray click can never leave a zero-size shape behind.
+    #[test]
+    fn only_the_placing_tools_complete_a_gesture_on_a_bare_click() {
+        assert!(Tool::Pen.click_places());
+        assert!(Tool::Badge.click_places());
+        for t in [
+            Tool::Pointer,
+            Tool::Arrow,
+            Tool::Rect,
+            Tool::Highlight,
+            Tool::BoxHighlight,
+            Tool::Spotlight,
+            Tool::Pixelate,
+            Tool::Blur,
+            Tool::Eraser,
+        ] {
+            assert!(!t.click_places(), "{t:?} must still need a drag");
+        }
+    }
+
     #[test]
     fn path_bounds_spans_every_stroke_in_the_group() {
         let paths = vec![
@@ -1824,6 +1961,7 @@ mod tests {
             fill: None,
             fx: FxKind::None,
             curve_radius: 8.0,
+            badge: None,
         };
         let make = |tool: Option<Tool>| {
             AnnotationCanvas::new(
@@ -1874,6 +2012,7 @@ mod tests {
             fill: None,
             fx: FxKind::None,
             curve_radius: 8.0,
+            badge: None,
         };
         let canvas = AnnotationCanvas::new(
             cosmic::widget::Space::new(),
@@ -1991,6 +2130,7 @@ mod tests {
             fill: None,
             fx: FxKind::None,
             curve_radius: 8.0,
+            badge: None,
         };
         let make = |tool: Option<Tool>, selection: Vec<u64>| {
             AnnotationCanvas::new(
@@ -2053,6 +2193,7 @@ mod tests {
             fill: None,
             fx: FxKind::None,
             curve_radius: 8.0,
+            badge: None,
         };
         let canvas = AnnotationCanvas::new(
             cosmic::widget::Space::new(),

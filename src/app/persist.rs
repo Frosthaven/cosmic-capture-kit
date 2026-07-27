@@ -61,7 +61,6 @@ impl App {
             annot_tool: self.annot_tool.map(|t| t.as_str().to_string()),
             annot_stroke_w: self.annot_stroke_w,
             annot_recent_colors: self.annot_recent_colors.clone(),
-            allow_multiple: self.allow_multiple,
             resident: self.resident,
             autostart_on_login: self.autostart_on_login,
             capture_hotkey: self.capture_hotkey.clone(),
@@ -156,7 +155,6 @@ impl App {
         self.window_padding_px.set_value(p.window_padding_px.min(512));
         self.settings_size = p.settings_size;
         self.freeze = p.freeze;
-        self.allow_multiple = p.allow_multiple;
         self.resident = p.resident;
         self.autostart_on_login = p.autostart_on_login;
         self.capture_hotkey = p.capture_hotkey.clone();
@@ -256,7 +254,6 @@ impl App {
                 // so it resets ONLY the visible tab's settings, not the whole page.
                 match self.settings.active_general_tab() {
                     settings::GeneralTab::Settings => {
-                        p.allow_multiple = d.allow_multiple;
                         p.resident = d.resident;
                         p.autostart_on_login = d.autostart_on_login;
                         p.copy_to_clipboard = d.copy_to_clipboard;

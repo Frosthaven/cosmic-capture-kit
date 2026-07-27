@@ -125,16 +125,22 @@ pub struct NotchedSlider<'a, Msg> {
 
 /// Wrap a `slider` so `notches` (in slider-VALUE units) are drawn aligned with its thumb.
 /// The slider must NOT be given `.breakpoints` — this replaces them.
+///
+/// `class` MUST be the SAME class the wrapped slider wears: the notch is placed off the thumb's
+/// resolved width, so a slider with a custom (e.g. rescaled) thumb must hand its class through
+/// or the tick would be aligned to a thumb that isn't there. [`notched_slider`] passes the
+/// stock class (`SliderClass::default()`) for a slider that uses the default styling.
 pub fn notched_slider<'a, Msg: 'a>(
     content: impl Into<cosmic::Element<'a, Msg>>,
     range: std::ops::RangeInclusive<f32>,
     notches: Vec<f32>,
+    class: SliderClass,
 ) -> cosmic::Element<'a, Msg> {
     cosmic::Element::new(NotchedSlider {
         content: content.into(),
         range: (*range.start(), *range.end()),
         notches,
-        class: SliderClass::default(),
+        class,
     })
 }
 

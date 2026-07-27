@@ -655,10 +655,9 @@ impl App {
                 }
                 return self.teardown();
             }
-            // This instance is becoming a settings window rather than a capture
-            // overlay, so give up the capture single-instance lock — another capture
-            // instance may now launch even with "allow multiple instances" off.
-            crate::instance::release_capture_lock();
+            // (DRAGON-351: this is where a capture-turned-settings window used to give
+            // up the capture single-instance lock so another capture could launch. The
+            // lock is gone — every launch is its own instance — so nothing to release.)
             // Refresh the Health nav icon (glyph + colour) so the expanded rail matches the
             // collapsed rail's live status the moment the window opens.
             self.update_health_nav_icon();

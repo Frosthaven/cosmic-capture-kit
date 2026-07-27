@@ -80,6 +80,10 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "format-text-highlight-symbolic" => "highlighter",
         "checkbox-symbolic" => "square", // box / rectangle tool
         "box-highlight-symbolic" => "box-highlight", // box outline + inner highlighter marker
+        // The SEQUENCE BADGE tool (DRAGON-340). The ticket names lucide `circle-star` for the
+        // tool; the badge the tool DRAWS is spelled out separately (disc + numeral + ring), so
+        // this is the tray glyph, not the rendered mark.
+        "sequence-badge-symbolic" => "circle-star",
         "pencil-symbolic" => "pencil-line", // freehand pencil tool (DRAGON-338)
         "eraser-symbolic" => "eraser", // pencil eraser (DRAGON-338)
         "sun-dim-symbolic" => "sun-dim", // dim/spotlight tool (sun with dashed rays)
@@ -134,6 +138,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "camera" => svg!("camera"),
         "video" => svg!("video"),
         "circle" => svg!("circle"),
+        "circle-star" => svg!("circle-star"),
         "play" => svg!("play"),
         "pause" => svg!("pause"),
         "square" => svg!("square"),
@@ -219,7 +224,7 @@ mod tests {
             "zoom-in-symbolic", "display-brightness-symbolic", "mail-forward-symbolic",
             "pointer-select-symbolic",
             "format-text-highlight-symbolic", "checkbox-symbolic", "box-highlight-symbolic",
-            "pencil-symbolic", "eraser-symbolic",
+            "pencil-symbolic", "eraser-symbolic", "sequence-badge-symbolic",
             "sun-dim-symbolic", "spotlight-symbolic", "view-grid-symbolic",
             "image-filter-symbolic", "edit-cut-symbolic", "minus-2", "minus-5", "minus-8",
             "video-x-generic-symbolic", "pan-down-symbolic", "folder-open-symbolic",
@@ -252,6 +257,9 @@ mod tests {
         assert_eq!(lucide_name("sun-dim-symbolic"), Some("sun-dim")); // DRAGON-329
         assert_eq!(lucide_name("pencil-symbolic"), Some("pencil-line")); // DRAGON-338
         assert_eq!(lucide_name("eraser-symbolic"), Some("eraser")); // DRAGON-338
+        // DRAGON-340: the sequence-badge TOOL wears lucide's circle-star; the badge it draws is
+        // its own vector (disc + numeral + ring), not this glyph.
+        assert_eq!(lucide_name("sequence-badge-symbolic"), Some("circle-star"));
         // DRAGON-341: the annotation pointer tool gets the FILLED cursor glyph, never the
         // capture overlay's outline one (the two controls must not look alike).
         assert_eq!(lucide_name("pointer-select-symbolic"), Some("mouse-pointer-2"));

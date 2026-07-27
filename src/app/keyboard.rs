@@ -6,70 +6,84 @@ use cosmic::Application as _;
 
 impl App {
     /// Map a keyboard [`crate::shortcuts::Action`] to the message that performs it.
-    fn action_msg(action: crate::shortcuts::Action) -> Msg {
+    ///
+    /// `preview` is the preview document a Preview-context action is ADDRESSED to (see
+    /// [`Self::focused_preview_id`]). A Preview action with no open preview has no target,
+    /// so this returns `None` — the press is simply swallowed, exactly as it was when the
+    /// old singular `preview` field was `None`.
+    fn action_msg(action: crate::shortcuts::Action, preview: Option<window::Id>) -> Option<Msg> {
         use crate::shortcuts::Action;
-        match action {
+        // Every Preview-domain arm needs the target id; bail once instead of per arm.
+        let pv = |m: PreviewMsg| preview.map(|id| Msg::Preview(id, m));
+        Some(match action {
             Action::CopyText => Msg::Detect(DetectMsg::TextCopy),
             Action::SelectAllText => Msg::Detect(DetectMsg::TextSelectAll),
             Action::DeselectText => Msg::Detect(DetectMsg::TextDeselect),
             Action::RegionCopy => Msg::Capture(CaptureMsg::CopySelection),
-            Action::PreviewSave => Msg::Preview(PreviewMsg::Save),
-            Action::PreviewSaveAs => Msg::Preview(PreviewMsg::SaveAs),
-            Action::PreviewCopy => Msg::Preview(PreviewMsg::Copy),
-            Action::PreviewPlay => Msg::Preview(PreviewMsg::Play),
-            Action::PreviewFramePrev => Msg::Preview(PreviewMsg::FrameStep(-1)),
-            Action::PreviewFrameNext => Msg::Preview(PreviewMsg::FrameStep(1)),
-            Action::PreviewDelete => Msg::Preview(PreviewMsg::Delete),
-            Action::PreviewCancel => Msg::Preview(PreviewMsg::Cancel),
-            Action::PreviewCovermark => Msg::Preview(PreviewMsg::Covermark),
-            Action::PreviewUndo => Msg::Preview(PreviewMsg::Undo),
-            Action::PreviewRedo => Msg::Preview(PreviewMsg::Redo),
-            Action::PreviewDeleteSegment => Msg::Preview(PreviewMsg::TimelineDelete),
-            Action::PreviewAnnotPointer => Msg::Preview(PreviewMsg::SelectTool(
+            Action::PreviewSave => return pv(PreviewMsg::Save),
+            Action::PreviewSaveAs => return pv(PreviewMsg::SaveAs),
+            Action::PreviewCopy => return pv(PreviewMsg::Copy),
+            Action::PreviewPlay => return pv(PreviewMsg::Play),
+            Action::PreviewFramePrev => return pv(PreviewMsg::FrameStep(-1)),
+            Action::PreviewFrameNext => return pv(PreviewMsg::FrameStep(1)),
+            Action::PreviewDelete => return pv(PreviewMsg::Delete),
+            Action::PreviewCancel => return pv(PreviewMsg::Cancel),
+            Action::PreviewCovermark => return pv(PreviewMsg::Covermark),
+            Action::PreviewUndo => return pv(PreviewMsg::Undo),
+            Action::PreviewRedo => return pv(PreviewMsg::Redo),
+            Action::PreviewDeleteSegment => return pv(PreviewMsg::TimelineDelete),
+            Action::PreviewAnnotPointer => return pv(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::Pointer,
             )),
-            Action::PreviewSelectAll => Msg::Preview(PreviewMsg::SelectAllAnnotations),
+            Action::PreviewSelectAll => return pv(PreviewMsg::SelectAllAnnotations),
             Action::PreviewAnnotArrow => {
-                Msg::Preview(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Arrow))
+                return pv(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Arrow))
+            }
+            Action::PreviewAnnotBadge => {
+                return pv(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Badge))
             }
             Action::PreviewAnnotBox => {
-                Msg::Preview(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Rect))
+                return pv(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Rect))
             }
-            Action::PreviewAnnotHighlight => Msg::Preview(PreviewMsg::SelectTool(
+            Action::PreviewAnnotHighlight => return pv(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::Highlight,
             )),
-            Action::PreviewAnnotBoxHighlight => Msg::Preview(PreviewMsg::SelectTool(
+            Action::PreviewAnnotBoxHighlight => return pv(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::BoxHighlight,
             )),
-            Action::PreviewAnnotPixelate => Msg::Preview(PreviewMsg::SelectTool(
+            Action::PreviewAnnotPixelate => return pv(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::Pixelate,
             )),
-            Action::PreviewAnnotBlur => Msg::Preview(PreviewMsg::SelectTool(
+            Action::PreviewAnnotBlur => return pv(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::Blur,
             )),
-            Action::PreviewAnnotSpotlight => Msg::Preview(PreviewMsg::SelectTool(
+            Action::PreviewAnnotSpotlight => return pv(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::Spotlight,
             )),
             Action::PreviewAnnotPen => {
-                Msg::Preview(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Pen))
+                return pv(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Pen))
             }
-            Action::PreviewAnnotEraser => Msg::Preview(PreviewMsg::SelectTool(
+            Action::PreviewAnnotEraser => return pv(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::Eraser,
             )),
-            Action::PreviewAnnotDuplicate => Msg::Preview(PreviewMsg::DuplicateSelected),
-            Action::PreviewAnnotStrokeCycle => Msg::Preview(PreviewMsg::CycleAnnotStrokeW),
-            Action::PreviewColorFlyout => Msg::Preview(PreviewMsg::ToggleAnnotPalette),
-            Action::PreviewTogglePan => Msg::Preview(PreviewMsg::TogglePanMode),
+            Action::PreviewAnnotDuplicate => return pv(PreviewMsg::DuplicateSelected),
+            Action::PreviewAnnotStrokeCycle => return pv(PreviewMsg::CycleAnnotStrokeW),
+            Action::PreviewColorFlyout => return pv(PreviewMsg::ToggleAnnotPalette),
+            Action::PreviewTogglePan => return pv(PreviewMsg::TogglePanMode),
             Action::RecordStop => Msg::Recording(RecordingMsg::StopRecording),
             Action::RecordToggleMic => Msg::Recording(RecordingMsg::ToggleMic),
             Action::RecordToggleSystemAudio => Msg::Recording(RecordingMsg::ToggleSystemAudio),
-        }
+        })
     }
 
     /// Resolve a raw key press against the live keymap: feed a rebind capture if one
     /// is in progress, otherwise dispatch the matched action.
+    /// `window` is the surface the press was delivered to (forwarded from the event
+    /// subscription), which is what picks the preview document a Preview-context binding
+    /// acts on — see the focus note at the modal branch below.
     pub(super) fn handle_key(
         &mut self,
+        window: window::Id,
         modifiers: cosmic::iced::keyboard::Modifiers,
         key: cosmic::iced::keyboard::Key,
     ) -> Task<cosmic::Action<Msg>> {
@@ -110,10 +124,20 @@ impl App {
             // A bare modifier press: keep waiting for a real key.
             return Task::none();
         }
-        // The post-capture preview is modal: only its (Preview-context) keybinds fire,
-        // and everything else is swallowed while it's up.
-        if self.preview.is_some() {
-            return self.preview_modal_key(modifiers, key);
+        // A preview editor swallows the keyboard: only its (Preview-context) keybinds
+        // fire while one is up. With SEVERAL previews open (DRAGON-336 phase 2) the old
+        // "the preview is modal" framing becomes "the FOCUSED preview owns the keyboard":
+        // the press goes to the preview the event was delivered TO when that surface is a
+        // preview, and otherwise to the last-focused one. `focused_preview_id` falls back
+        // to the most recently opened preview, so with exactly one open this resolves to
+        // that preview for every source window — byte-identical to the old gate.
+        if let Some(target) = self
+            .preview_for(window)
+            .map(|p| p.window)
+            .or_else(|| self.focused_preview_id())
+        {
+            self.note_preview_focus(target);
+            return self.preview_modal_key(target, modifiers, key);
         }
         // The mic key does double duty: in push-to-talk mode, while recording, it's
         // HOLD-to-talk — the first press un-mutes the mic (auto-repeat presses ignored;
@@ -141,8 +165,9 @@ impl App {
         // toggles are usable and reflected in the toolbar BEFORE you start, and work
         // the same with the in-frame toolbar or the system tray. Stop is a no-op when
         // idle.
-        if let Some(action) = self.keymap.action_for(Context::Recording, modifiers, &key) {
-            let msg = Self::action_msg(action);
+        if let Some(action) = self.keymap.action_for(Context::Recording, modifiers, &key)
+            && let Some(msg) = Self::action_msg(action, self.focused_preview_id())
+        {
             return self.update(msg);
         }
         // Otherwise the capture overlay. The single "Close" keybind (shared with the
@@ -165,8 +190,8 @@ impl App {
         if self.mode == Mode::Region
             && self.normalized_region().is_some()
             && let Some(action) = self.keymap.action_for(Context::Region, modifiers, &key)
+            && let Some(msg) = Self::action_msg(action, self.focused_preview_id())
         {
-            let msg = Self::action_msg(action);
             return self.update(msg);
         }
         // "Search settings" is a FIXED, non-configurable shortcut (DRAGON-158):
@@ -177,11 +202,12 @@ impl App {
         if Self::is_search_shortcut(modifiers, &key) {
             return self.update(Msg::WindowChrome(WindowChromeMsg::ConfigSearchActivate));
         }
-        match self.keymap.action_for(Context::Overlay, modifiers, &key) {
-            Some(action) => {
-                let msg = Self::action_msg(action);
-                self.update(msg)
-            }
+        match self
+            .keymap
+            .action_for(Context::Overlay, modifiers, &key)
+            .and_then(|action| Self::action_msg(action, self.focused_preview_id()))
+        {
+            Some(msg) => self.update(msg),
             None => Task::none(),
         }
     }
@@ -211,15 +237,17 @@ impl App {
     /// Key handling while the post-capture preview is open — modal, in priority
     /// order: a bake in progress holds every input; then the overwrite-confirm
     /// dialog; then the covermark picker; otherwise the preview's own keymap
-    /// context. Only called from `handle_key` once `self.preview` is known `Some`.
+    /// context. Only called from `handle_key` once `id` is known to be an OPEN preview
+    /// (the focused one); every message it produces is addressed to that document.
     fn preview_modal_key(
         &mut self,
+        id: window::Id,
         modifiers: cosmic::iced::keyboard::Modifiers,
         key: cosmic::iced::keyboard::Key,
     ) -> Task<cosmic::Action<Msg>> {
         use crate::shortcuts::Context;
         use cosmic::iced::keyboard::{key::Named, Key};
-        let Some(p) = &self.preview else {
+        let Some(p) = self.preview_for(id) else {
             return Task::none();
         };
         // While a bake is committing edits, every input is held (the pending
@@ -232,10 +260,10 @@ impl App {
         if p.edit.confirm_overwrite {
             return match &key {
                 Key::Named(Named::Enter) => {
-                    self.update(Msg::Preview(PreviewMsg::ConfirmOverwrite))
+                    self.update(Msg::Preview(id, PreviewMsg::ConfirmOverwrite))
                 }
                 Key::Named(Named::Escape) => {
-                    self.update(Msg::Preview(PreviewMsg::CancelOverwrite))
+                    self.update(Msg::Preview(id, PreviewMsg::CancelOverwrite))
                 }
                 _ => Task::none(),
             };
@@ -246,7 +274,7 @@ impl App {
         if p.edit.annot_picker.is_some()
             && let Key::Named(Named::Escape) = &key
         {
-            return self.update(Msg::Preview(PreviewMsg::AnnotColorEditor(false)));
+            return self.update(Msg::Preview(id, PreviewMsg::AnnotColorEditor(false)));
         }
         // The SHARED keyboard-navigable flyout dispatch (covermark picker OR color palette):
         // arrows move the highlight, Enter applies, Esc closes — before the keymap sees it.
@@ -263,28 +291,29 @@ impl App {
                 _ => None,
             };
             if let Some(msg) = msg {
-                return self.update(Msg::Preview(msg));
+                return self.update(Msg::Preview(id, msg));
             }
         }
         // Annotation selection: when a shape is selected, Esc deselects (before falling
         // through to Close/Cancel) and Delete/Backspace removes it (before the timeline's
         // Delete). No selection → both fall through to their normal keymap actions.
-        if self.preview.as_ref().is_some_and(|p| !p.edit.sel.is_empty()) {
+        if self.preview_for(id).is_some_and(|p| !p.edit.sel.is_empty()) {
             match &key {
                 Key::Named(Named::Escape) => {
-                    return self.update(Msg::Preview(PreviewMsg::SelectAnnotation(None)));
+                    return self.update(Msg::Preview(id, PreviewMsg::SelectAnnotation(None)));
                 }
                 Key::Named(Named::Delete) | Key::Named(Named::Backspace) => {
-                    return self.update(Msg::Preview(PreviewMsg::DeleteSelected));
+                    return self.update(Msg::Preview(id, PreviewMsg::DeleteSelected));
                 }
                 _ => {}
             }
         }
-        match self.keymap.action_for(Context::Preview, modifiers, &key) {
-            Some(action) => {
-                let msg = Self::action_msg(action);
-                self.update(msg)
-            }
+        match self
+            .keymap
+            .action_for(Context::Preview, modifiers, &key)
+            .and_then(|action| Self::action_msg(action, Some(id)))
+        {
+            Some(msg) => self.update(msg),
             None => Task::none(),
         }
     }

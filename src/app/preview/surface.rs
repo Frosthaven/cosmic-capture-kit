@@ -11,11 +11,21 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PreviewSurface { Overlay, Window }
 
+/// The preview editor's chrome scale — ONE value for BOTH surface kinds (see
+/// [`PreviewSurface::btn_scale`]).
+///
+/// It used to be per-surface: the fullscreen overlay drew its toolbars at full size (1.0)
+/// while the windowed preview tightened them to 0.82 for its smaller window. The owner
+/// preferred the tighter chrome everywhere, so the overlay was unified ONTO the windowed
+/// figure rather than the two being kept in step — there is deliberately no second constant
+/// to drift from this one.
+pub(super) const CHROME_SCALE: f32 = 0.82;
+
 /// The OVERLAY header row's height (DRAGON-337): its buttons are FLAT header-style icons —
 /// a glyph box plus its halo, with NO `tool_group` capsule — so the row is exactly one
-/// button box tall, `2 × GROUP_PAD` shorter than a capsuled toolbar bar. Unscaled, because
-/// the overlay's button scale is 1.0 (see [`PreviewSurface::btn_scale`]).
-pub(super) const OVERLAY_HEADER_H: f32 = ICON_BOX + 2.0 * BTN_PAD;
+/// button box tall, `2 × GROUP_PAD` shorter than a capsuled toolbar bar. Scaled by
+/// [`CHROME_SCALE`], like every button the row actually draws.
+pub(super) const OVERLAY_HEADER_H: f32 = CHROME_SCALE * (ICON_BOX + 2.0 * BTN_PAD);
 
 impl PreviewSurface {
     /// Whether this is the resizable WINDOW appearance, as opposed to the fullscreen
@@ -24,13 +34,11 @@ impl PreviewSurface {
         matches!(self, Self::Window)
     }
 
-    /// The toolbar-button size scale for this surface: the windowed preview's smaller
-    /// window wants tighter chrome; the fullscreen overlay uses full size.
+    /// The toolbar-button size scale for this surface: [`CHROME_SCALE`], the same in both.
+    /// The overlay used to render its chrome larger (1.0); it now matches the windowed
+    /// editor exactly, so the two surfaces differ in LAYOUT only, never in control size.
     pub fn btn_scale(self) -> f32 {
-        match self {
-            Self::Window => 0.82,
-            Self::Overlay => 1.0,
-        }
+        CHROME_SCALE
     }
 
     /// The CSD header bar's height to reserve above the content — only the WINDOW
@@ -50,13 +58,15 @@ impl PreviewSurface {
     pub(super) fn chrome_h(self) -> f32 {
         match self {
             // THREE rows in a 12px-spaced column, plus the centred group's 40px top & bottom
-            // insets: both full-scale toolbars, and above them the DRAGON-337 header row
-            // (windowed-swap / undo / redo ⟨split⟩ Close). That row's buttons are FLAT — no
-            // `tool_group` capsule — so it is one button box tall ([`OVERLAY_HEADER_H`]),
-            // NOT a full `GROUP_H_BASE`. Portable: the overlay composition is the same view
-            // on every platform (Linux layer-shell, the mac/Windows fullscreen windows), so
-            // there is no per-OS arm to add here.
-            Self::Overlay => 2.0 * (GROUP_H_BASE + 12.0) + (OVERLAY_HEADER_H + 12.0) + 80.0,
+            // insets: both toolbars (at the shared [`CHROME_SCALE`], like the window's), and
+            // above them the DRAGON-337 header row (windowed-swap / undo / redo ⟨split⟩
+            // Close). That row's buttons are FLAT — no `tool_group` capsule — so it is one
+            // button box tall ([`OVERLAY_HEADER_H`]), NOT a full `GROUP_H_BASE`. Portable:
+            // the overlay composition is the same view on every platform (Linux layer-shell,
+            // the mac/Windows fullscreen windows), so there is no per-OS arm to add here.
+            Self::Overlay => {
+                2.0 * (self.btn_scale() * GROUP_H_BASE + 12.0) + (OVERLAY_HEADER_H + 12.0) + 80.0
+            }
             // The CSD header + two edge-pinned bars: each a toolbar group at the
             // windowed button scale inside `preview_bar`'s 8px vertical padding.
             // No column spacing, no insets — the canvas fills everything between.
@@ -181,9 +191,12 @@ pub(super) fn overlay_min_content_width(preview: &PreviewState) -> f32 {
 /// composition: the media kind and whether a covermark's sliders are showing. Split out so
 /// the bar math is unit-testable without a whole `PreviewState`.
 fn overlay_min_content_width_for(video: bool, covermark: bool) -> f32 {
-    let button = ICON_BOX + 2.0 * BTN_PAD;
+    // Every button/group footprint below is at the shared chrome scale — the overlay's bars
+    // are built from the same `Tb` measurements the windowed editor's are.
+    let s = PreviewSurface::Overlay.btn_scale();
+    let button = s * (ICON_BOX + 2.0 * BTN_PAD);
     // tool_group: `grp_pad` padding + `n` buttons spaced 2px apart.
-    let group = |n: f32| 2.0 * GROUP_PAD + n * button + (n - 1.0) * 2.0;
+    let group = |n: f32| 2.0 * s * GROUP_PAD + n * button + (n - 1.0) * 2.0;
     // A bar's width: its group widths + 8px row spacing between items (groups + the split)
     // + the little split gap.
     let bar = |groups: f32, items: f32| groups + 8.0 * (items - 1.0) + SPLIT_MIN_GAP;
@@ -200,7 +213,7 @@ fn overlay_min_content_width_for(video: bool, covermark: bool) -> f32 {
     // Bottom bar: do-not-train(1) | covermark(1, +2 sliders when applied) ⟨split⟩ [images:
     // pointer/pan(2) + zoom control]. The zoom/opacity sliders live inside the covermark
     // group, so they widen the BOTTOM bar.
-    let sliders = if covermark { 2.0 * SLIDER_ITEM_W } else { 0.0 };
+    let sliders = if covermark { 2.0 * slider_item_w(s) } else { 0.0 };
     let (bottom_groups, bottom_items) = if video {
         (group(1.0) + group(1.0) + sliders, 3.0)
     } else {
@@ -228,25 +241,35 @@ mod tests {
         assert!(w.chrome_h() < PreviewSurface::Overlay.chrome_h() + w.header_px());
     }
 
-    /// DRAGON-337: the overlay reserves its two full-scale toolbars PLUS the header row —
-    /// each with one of the column's 12px gaps, inside the 40px top/bottom insets. The header
-    /// row's buttons are FLAT (no capsule), so it costs one button box, `2 × GROUP_PAD` less
-    /// than a toolbar bar would.
+    /// DRAGON-337: the overlay reserves its two toolbars PLUS the header row — each with one of
+    /// the column's 12px gaps, inside the 40px top/bottom insets. The header row's buttons are
+    /// FLAT (no capsule), so it costs one button box, `2 × GROUP_PAD` less than a toolbar bar
+    /// would. Everything here is at the shared [`CHROME_SCALE`] (the overlay no longer draws
+    /// its chrome at 1.0).
     #[test]
     fn overlay_chrome_reserves_the_flat_header_row_and_its_gap() {
         let o = PreviewSurface::Overlay;
+        let s = o.btn_scale();
         // The header row + its gap is the ONLY delta vs the historical two-bar reserve...
-        let two_bars = 2.0 * (GROUP_H_BASE + 12.0) + 80.0;
-        assert_eq!(o.chrome_h() - two_bars, OVERLAY_HEADER_H + 12.0);
-        // ...and a flat row is exactly the group padding shorter than a capsuled bar.
-        assert_eq!(GROUP_H_BASE - OVERLAY_HEADER_H, 2.0 * GROUP_PAD);
+        let two_bars = 2.0 * (s * GROUP_H_BASE + 12.0) + 80.0;
+        assert!(((o.chrome_h() - two_bars) - (OVERLAY_HEADER_H + 12.0)).abs() < 0.001);
+        // ...and a flat row is exactly the (scaled) group padding shorter than a capsuled bar.
+        assert!(((s * GROUP_H_BASE - OVERLAY_HEADER_H) - s * 2.0 * GROUP_PAD).abs() < 0.001);
+    }
+
+    /// BOTH surfaces now draw the preview editor's chrome at the SAME scale (the overlay was
+    /// unified onto the windowed figure) — there is one constant, and no second one to drift.
+    #[test]
+    fn both_surfaces_share_one_chrome_scale() {
+        assert_eq!(PreviewSurface::Overlay.btn_scale(), CHROME_SCALE);
+        assert_eq!(PreviewSurface::Window.btn_scale(), CHROME_SCALE);
     }
 
     /// The overlay control floor covers EVERY row, including the new header line — so the
     /// swap / undo / redo ⟨split⟩ Close row can never be squeezed narrower than it needs.
     #[test]
     fn overlay_min_width_covers_the_header_row() {
-        let button = ICON_BOX + 2.0 * BTN_PAD;
+        let button = PreviewSurface::Overlay.btn_scale() * (ICON_BOX + 2.0 * BTN_PAD);
         let header = 4.0 * button + 8.0 * 4.0 + SPLIT_MIN_GAP;
         for video in [false, true] {
             for covermark in [false, true] {

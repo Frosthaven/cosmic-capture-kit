@@ -1,78 +1,35 @@
 //! Single-instance locking and sibling-process management.
 //!
-//! Two independent advisory locks (via `flock`) gate how many overlapping
-//! instances of this binary may run:
-//!
-//! * The **capture lock** (`cosmic-capture-kit.lock`) prevents a second keybind
-//!   press from opening a duplicate overlay. It can be released at runtime: when
-//!   an instance becomes a settings window it gives up this lock so another
-//!   capture instance may start.
+//! ONE advisory lock (via `flock`) gates overlapping instances of this binary:
 //!
 //! * The **settings lock** (`cosmic-capture-kit-settings.lock`) ensures only one
-//!   settings pane is open across all instances, even when "allow multiple
-//!   instances" is on. It is held for the process lifetime on success.
+//!   settings pane is open across all instances. It is held for the process
+//!   lifetime on success.
+//!
+//! DRAGON-351: there used to be a second one, the **capture lock**
+//! (`cosmic-capture-kit.lock`), whose ONLY job was to stop a second keybind press from
+//! opening a duplicate overlay while one was live — i.e. it implemented "allow multiple
+//! capture instances = off". That setting is gone and multiple instances are now
+//! unconditional, so nothing was left to gate: the lock had exactly one reader (the
+//! launch step-aside in `main`) and its release path (`release_capture_lock`, called
+//! when an instance became a settings window or its overlays closed) had already
+//! degenerated to a no-op whenever the setting was on. The whole mechanism — the flock
+//! file on unix, the `Local\cosmic-capture-kit.capture` named mutex on Windows — was
+//! therefore deleted rather than left dangling. The RESIDENT lock below and the settings
+//! lock above are untouched; a leftover `cosmic-capture-kit.lock` from an older build is
+//! inert (nothing opens it) and lives in the runtime dir, which clears at logout.
 
 // DRAGON-229: rustix (POSIX flock) is unix-only; the Windows lock functions below
 // have their own (M0 fail-open) arms and never touch it. Unix selection unchanged.
 #[cfg(unix)]
 use rustix::fs::{FlockOperation, flock};
-// DRAGON-229: both the flock `File` and the `Mutex` static that holds it are unix-only;
-// Windows keeps its named-mutex handles inside `platform::windows::instance` instead.
+// DRAGON-229: the flock `File` (the settings + resident locks) and the `Mutex` static
+// that holds the resident one are unix-only; Windows keeps its named-mutex handles
+// inside `platform::windows::instance` instead.
 #[cfg(unix)]
 use std::fs::File;
 #[cfg(unix)]
 use std::sync::Mutex;
-
-/// Holds the capture single-instance lock. Unlike the settings lock it can be
-/// released at runtime: when an instance switches into the settings window it is
-/// no longer "capturing", so it gives up this lock and another capture instance
-/// may launch (even with "allow multiple instances" off).
-///
-/// DRAGON-229: unix-only — this holds the flock `File`. Windows holds its capture NAMED
-/// MUTEX handle inside `platform::windows::instance` instead (strict split).
-#[cfg(unix)]
-static CAPTURE_LOCK: Mutex<Option<File>> = Mutex::new(None);
-
-/// Path to the capture single-instance lock file.
-#[cfg(unix)]
-fn capture_lock_path() -> String {
-    format!("{}/cosmic-capture-kit.lock", crate::util::runtime_dir())
-}
-
-/// Hold a process-lifetime advisory lock so a second keybind press doesn't open
-/// a duplicate overlay. Returns false if another instance already holds it.
-///
-/// Byte-identical across platforms: the resident menu-bar DAEMON owns its OWN,
-/// separate single-instance lock ([`acquire_daemon_lock`]), so the capture lock is
-/// the plain "don't open two overlays" gate on every OS — capture children spawned
-/// by the daemon take it exactly like any one-shot capture instance would.
-#[cfg(unix)]
-pub(crate) fn acquire_lock() -> bool {
-    let file = match File::create(capture_lock_path()) {
-        Ok(f) => f,
-        Err(_) => return true, // can't create a lock file; fail open rather than block capture
-    };
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {
-            // Keep the fd open (held in CAPTURE_LOCK) => hold the lock until it's
-            // explicitly released or the process exits.
-            if let Ok(mut g) = CAPTURE_LOCK.lock() {
-                *g = Some(file);
-            }
-            true
-        }
-        Err(_) => false, // another instance already holds it
-    }
-}
-
-/// Windows (DRAGON-229): the named-mutex capture guard. Body under
-/// `platform::windows::instance` (strict split). Returns false if another capture
-/// instance already holds the mutex; fails OPEN if the mutex can't be created, matching
-/// the unix lock-file-create fail-open.
-#[cfg(windows)]
-pub(crate) fn acquire_lock() -> bool {
-    crate::platform::windows::instance::acquire_lock()
-}
 
 // ── Resident single-instance lock + pid (macOS daemon / Linux resident) ───────
 //
@@ -270,23 +227,9 @@ pub(crate) fn signal_daemon_suspend_hotkey() -> bool {
     crate::platform::windows::instance::signal_daemon_suspend_hotkey()
 }
 
-/// Release the capture single-instance lock. Called when this instance becomes a
-/// settings window, so another capture instance may now launch.
-#[cfg_attr(target_os = "macos", allow(dead_code))] // mac hands settings off to a fresh process (DRAGON-153)
-pub fn release_capture_lock() {
-    #[cfg(unix)]
-    if let Ok(mut g) = CAPTURE_LOCK.lock() {
-        *g = None; // dropping the File closes the fd and releases the flock
-    }
-    // Windows (DRAGON-229): close the capture named-mutex handle so another capture
-    // instance may create it fresh (strict split — body under platform::windows).
-    #[cfg(windows)]
-    crate::platform::windows::instance::release_capture_lock();
-}
-
 /// Acquire the *settings* single-instance lock so only one settings pane can be
-/// open across all instances, regardless of "allow multiple instances". Held for
-/// the process lifetime on success (closing settings ends the process anyway).
+/// open across all instances. Held for the process lifetime on success (closing
+/// settings ends the process anyway).
 #[cfg(unix)]
 pub fn acquire_settings_lock() -> bool {
     let dir = crate::util::runtime_dir();
@@ -340,9 +283,10 @@ pub(crate) fn settings_lock_pid() -> Option<u32> {
 
 // ── Runtime state markers (DRAGON-322) ───────────────────────────────────────
 //
-// With "allow multiple instances" ON a RECORDING session and a fresh capture — or a
-// SELF-CAPTURE of CCK's own preview-editor window — coexist as independent processes.
-// Two things then need cross-process knowledge the single-instance locks don't carry:
+// A RECORDING session and a fresh capture — or a SELF-CAPTURE of CCK's own preview-editor
+// window — coexist as independent processes (DRAGON-351: unconditionally; this used to be
+// the "allow multiple instances" setting). Two things then need cross-process knowledge
+// the settings lock doesn't carry:
 //
 //   * the sibling sweep [`close_other_instances`] must SPARE a sibling that is
 //     recording or showing a preview — those are real workspaces the user wants kept,
@@ -354,7 +298,7 @@ pub(crate) fn settings_lock_pid() -> Option<u32> {
 // Each protected instance advertises its state with a per-pid sidecar file under the
 // runtime dir (the audio-meter per-pid convention, `audio/meters.rs`): created on
 // entering the state, removed on leaving it / at exit. Per-pid so several
-// allow-multiple instances never collide. A crash can leave a STALE marker, so the
+// concurrent instances never collide. A crash can leave a STALE marker, so the
 // one consumer that reads markers for pids it hasn't already proven live
 // ([`any_other_recording`]) re-checks liveness and sweeps dead-pid files; the sweep
 // only ever queries markers for a pid it already found LIVE, so it needs no probe.
@@ -365,10 +309,64 @@ pub(crate) fn settings_lock_pid() -> Option<u32> {
 const RECORDING_MARKER: &str = "recording";
 /// Marker suffix: this pid has a preview editor open.
 const PREVIEW_MARKER: &str = "preview";
+/// Marker suffix: this pid is LISTENING for preview handoffs (DRAGON-336) — the
+/// unix-socket sibling of its [`PREVIEW_MARKER`]. Sits in the same per-pid namespace so
+/// the stale sweep below clears a SIGKILLed host's socket file for free; the transport
+/// itself lives in [`crate::preview_ipc`].
+const PREVIEW_SOCKET_MARKER: &str = "preview.sock";
 
 /// Per-pid state-marker sidecar path (`{runtime}/cosmic-capture-kit.<pid>.<suffix>`).
 fn state_marker_path(pid: u32, suffix: &str) -> String {
-    format!("{}/cosmic-capture-kit.{pid}.{suffix}", crate::util::runtime_dir())
+    state_marker_path_in(&crate::util::runtime_dir(), pid, suffix)
+}
+
+/// [`state_marker_path`] against an EXPLICIT directory, so the scan helpers can be
+/// exercised over a temp dir instead of the live runtime dir.
+fn state_marker_path_in(dir: &str, pid: u32, suffix: &str) -> String {
+    format!("{dir}/cosmic-capture-kit.{pid}.{suffix}")
+}
+
+/// Split a state-marker FILENAME back into its `(pid, suffix)`, or `None` when the name
+/// isn't one of ours. The lock/socket sidecars use a HYPHEN stem
+/// (`cosmic-capture-kit-daemon.lock`), so the dotted prefix here never matches them.
+fn parse_marker_name(name: &str) -> Option<(u32, &str)> {
+    let rest = name.strip_prefix("cosmic-capture-kit.")?;
+    let (pid_str, suffix) = rest.split_once('.')?;
+    Some((pid_str.parse::<u32>().ok()?, suffix))
+}
+
+/// Remove every state marker whose owning pid is dead — for EVERY marker kind.
+///
+/// DRAGON-336: `any_other_recording` already swept the RECORDING markers it scans, but
+/// nothing ever swept the PREVIEW ones — they are only probed by pid, for a sibling
+/// `close_other_instances` already found live, so a dead pid's marker is never visited.
+/// A preview that died without reaching `finish_session` (SIGKILL, OOM, a panic) therefore
+/// leaked its marker until the runtime dir cleared at logout, and a RECYCLED pid would then
+/// be wrongly spared from the collapse sweep. Cheap (one readdir) and best-effort
+/// throughout: a marker we fail to remove is simply retried next launch.
+pub(crate) fn sweep_stale_markers() {
+    let self_pid = std::process::id();
+    let Ok(entries) = std::fs::read_dir(crate::util::runtime_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some((pid, suffix)) = parse_marker_name(name) else {
+            continue;
+        };
+        // DRAGON-336: the preview-handoff SOCKET rides the same per-pid namespace, so a
+        // host killed with SIGKILL (which leaves its socket file behind) is cleaned up
+        // here too — otherwise a recycled pid would inherit a socket nothing listens on.
+        if suffix != RECORDING_MARKER && suffix != PREVIEW_MARKER && suffix != PREVIEW_SOCKET_MARKER
+        {
+            continue;
+        }
+        if pid == self_pid || pid_is_live(pid) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
 }
 
 /// Create (`active`) or remove this instance's RECORDING marker. Set when a recording
@@ -394,13 +392,18 @@ fn set_self_marker(suffix: &str, active: bool) {
 }
 
 /// Whether the capture overlay should SPARE a sibling instance from the collapse sweep,
-/// as a pure function of the setting + that sibling's observed state. With "allow
-/// multiple instances" ON a recording or preview sibling is a live workspace to keep;
-/// a bare selector sibling still gets collapsed. With it OFF the historical
-/// single-instance collapse applies (nothing extra is spared), so a fresh capture still
-/// replaces an existing preview exactly as before.
-pub fn should_spare_sibling(allow_multiple: bool, recording: bool, preview: bool) -> bool {
-    allow_multiple && (recording || preview)
+/// as a pure function of that sibling's observed state. A recording or preview sibling is
+/// a live workspace to keep; a BARE SELECTOR sibling still gets collapsed, which is the
+/// unrelated "only one selection overlay on screen" rule.
+///
+/// DRAGON-351: this used to be gated on the "allow multiple capture instances" setting
+/// too (`allow_multiple && (recording || preview)`); that setting is gone and the sparing
+/// is now unconditional. The predicate itself deliberately STAYS — macOS and Windows spawn
+/// a process per preview and depend on it (Windows has no preview-handoff transport at
+/// all, so its sweep is the only thing standing between a recording session and a fresh
+/// capture).
+pub fn should_spare_sibling(recording: bool, preview: bool) -> bool {
+    recording || preview
 }
 
 /// Whether the VIDEO capture kind should be offered. Disabled while another instance is
@@ -409,13 +412,13 @@ pub fn video_capture_allowed(external_recording: bool) -> bool {
     !external_recording
 }
 
-/// Whether a fresh capture launch should run as its OWN independent instance rather than
-/// stepping aside for / signalling the existing one. Purely the "allow multiple
-/// instances" setting today; a named seam so the launch decision is documented + tested
-/// in one place.
-pub fn wants_own_instance(allow_multiple: bool) -> bool {
-    allow_multiple
-}
+// DRAGON-351: `wants_own_instance(allow_multiple)` lived here — the named seam for "should
+// this launch run as its OWN process, or step aside for the running one?". Every launch now
+// wants its own instance unconditionally, so the seam has no decision left to document and
+// the `main.rs` step-aside it fed (plus the capture lock behind it, see the module doc) is
+// gone with it. Its sibling `handoff_allowed(allow_multiple)` — the DRAGON-336 preview
+// handoff gate, marked TEMPORARY from the day it was written — went the same way: a
+// finished capture now always tries the running preview host (`try_handoff_capture`).
 
 /// Whether ANOTHER live instance currently has a recording in progress (its recording
 /// marker exists and its pid is still alive). Consumed by the capture overlay to DISABLE
@@ -454,6 +457,76 @@ pub(crate) fn any_other_recording() -> bool {
     found
 }
 
+// ── Preview HOST discovery (DRAGON-336) ──────────────────────────────────────
+//
+// The multi-document preview keeps ONE process hosting several preview windows, so a
+// fresh capture child needs to FIND that host to hand its file over
+// (`crate::preview_ipc`). There is deliberately no second registry: a preview host is
+// exactly a pid whose [`PREVIEW_MARKER`] exists and is LIVE — the same marker
+// `close_other_instances` already spares. The transport socket is that pid's
+// [`PREVIEW_SOCKET_MARKER`] sibling ([`preview_socket_path`]); a marker with no socket is
+// simply a preview that isn't hosting, and the child's connect fails into its own
+// preview. Unix-only: Windows has no unix-socket transport (see `preview_ipc`).
+
+/// The preview-handoff socket path for `pid` — the sibling of that pid's preview marker.
+#[cfg(unix)]
+pub(crate) fn preview_socket_path(pid: u32) -> String {
+    state_marker_path(pid, PREVIEW_SOCKET_MARKER)
+}
+
+/// Every OTHER live preview host, in the order a child should try them: most recently
+/// opened first (its marker's mtime), ties broken by pid so the order is deterministic.
+/// Markers left by dead pids are swept as we scan, exactly like [`any_other_recording`].
+#[cfg(unix)]
+pub(crate) fn live_preview_hosts() -> Vec<u32> {
+    live_preview_hosts_in(&crate::util::runtime_dir(), std::process::id())
+}
+
+/// The pid of a live preview host, if any (excluding self) — the first candidate of
+/// [`live_preview_hosts`]. The "is anyone hosting?" question in one call.
+#[cfg(unix)]
+pub(crate) fn live_preview_host() -> Option<u32> {
+    live_preview_hosts().into_iter().next()
+}
+
+/// [`live_preview_hosts`] against an EXPLICIT runtime dir + self pid, so the scan (and
+/// its stale sweep) is testable without touching the live runtime dir.
+#[cfg(unix)]
+fn live_preview_hosts_in(dir: &str, self_pid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(u32, Option<std::time::SystemTime>)> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some((pid, suffix)) = parse_marker_name(name) else {
+            continue;
+        };
+        if suffix != PREVIEW_MARKER || pid == self_pid {
+            continue;
+        }
+        if !pid_is_live(pid) {
+            // A preview that died without reaching `finish_session`: drop its marker AND
+            // its handoff socket so no child ever tries to hand a capture to a corpse.
+            let _ = std::fs::remove_file(entry.path());
+            let _ = std::fs::remove_file(state_marker_path_in(dir, pid, PREVIEW_SOCKET_MARKER));
+            continue;
+        }
+        found.push((pid, entry.metadata().ok().and_then(|m| m.modified().ok())));
+    }
+    order_preview_hosts(found)
+}
+
+/// Order host candidates for a handoff attempt: newest marker first (the most recently
+/// opened preview host is the one the user is most likely looking at), unknown mtimes
+/// last, ties broken by ascending pid so the order never depends on readdir.
+#[cfg(unix)]
+fn order_preview_hosts(mut found: Vec<(u32, Option<std::time::SystemTime>)>) -> Vec<u32> {
+    found.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    found.into_iter().map(|(pid, _)| pid).collect()
+}
+
 /// Whether `pid` is a live process. Linux reads `/proc/<pid>`; other unix uses a
 /// signal-0 probe (`ESRCH` = gone, `EPERM` = alive but not ours); Windows delegates to
 /// the platform body. Best-effort — a false "live" only keeps the video toggle disabled
@@ -481,13 +554,14 @@ fn pid_is_live(pid: u32) -> bool {
 /// Settings windows are deliberately spared: a settings pane is its own thing (often
 /// a separate `--settings` process), and ending a capture must never close it.
 ///
-/// DRAGON-322: with `allow_multiple` on, a RECORDING or PREVIEW sibling is also spared
-/// (its per-pid state marker) so a recording session + a capture — including a
-/// self-capture of the open preview — coexist. With it off, nothing extra is spared and
-/// the historical single-instance collapse (a fresh capture replaces the old preview) is
-/// byte-identical.
+/// DRAGON-322 (unconditional since DRAGON-351): a RECORDING or PREVIEW sibling is also
+/// spared (its per-pid state marker) so a recording session + a capture — including a
+/// self-capture of the open preview — coexist. A bare selector sibling still collapses.
 #[cfg(not(windows))]
-pub fn close_other_instances(allow_multiple: bool) {
+pub fn close_other_instances() {
+    // DRAGON-336: drop dead pids' markers BEFORE reading them below, so a recycled pid
+    // can never inherit a crashed preview's marker and be wrongly spared.
+    sweep_stale_markers();
     let Ok(self_exe) = std::env::current_exe() else {
         return;
     };
@@ -512,11 +586,11 @@ pub fn close_other_instances(allow_multiple: bool) {
         if is_settings_instance(pid) {
             continue; // never close a settings window
         }
-        // DRAGON-322: keep a live recording / preview sibling under allow-multiple.
+        // DRAGON-322: keep a live recording / preview sibling.
         let recording =
             std::path::Path::new(&state_marker_path(pid, RECORDING_MARKER)).exists();
         let preview = std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists();
-        if should_spare_sibling(allow_multiple, recording, preview) {
+        if should_spare_sibling(recording, preview) {
             log::info!(
                 "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview})"
             );
@@ -540,14 +614,17 @@ pub fn close_other_instances(allow_multiple: bool) {
 /// Windows (DRAGON-229): the Toolhelp sibling-capture sweep. Body under
 /// `platform::windows::instance` (strict split) — matches siblings by full exe path,
 /// spares the settings window (its recorded pid), and force-terminates the rest (the
-/// analog of the Linux uncaught SIGTERM). Only matters with "allow multiple instances" on.
+/// analog of the Linux uncaught SIGTERM).
 ///
-/// DRAGON-322: `allow_multiple` is threaded through so the Windows body can SPARE a
-/// recording / preview sibling (its per-pid state marker) exactly like the unix body,
-/// keeping a recording session + a concurrent capture alive.
+/// DRAGON-322: the Windows body SPARES a recording / preview sibling (its per-pid state
+/// marker) exactly like the unix body, keeping a recording session + a concurrent capture
+/// alive.
 #[cfg(windows)]
-pub fn close_other_instances(allow_multiple: bool) {
-    crate::platform::windows::instance::close_other_instances(allow_multiple);
+pub fn close_other_instances() {
+    // DRAGON-336: same pre-read stale sweep as the unix body (the helper is portable
+    // std::fs), so `marker_flags` below can't see a dead pid's leftover marker.
+    sweep_stale_markers();
+    crate::platform::windows::instance::close_other_instances();
 }
 
 /// DRAGON-322: whether `pid`'s per-pid RECORDING / PREVIEW marker exists. The predicate
@@ -595,32 +672,16 @@ fn is_settings_instance(pid: u32) -> bool {
 mod tests {
     use super::*;
 
+    /// DRAGON-351: sparing is now a pure function of the SIBLING's state — the "allow
+    /// multiple capture instances" setting that used to gate it is gone. A bare selector
+    /// sibling still collapses ("one selection overlay on screen"), which is why the
+    /// predicate survives the setting's removal instead of becoming `true`.
     #[test]
-    fn wants_own_instance_follows_the_setting() {
-        // The launch decision (DRAGON-322): only "allow multiple instances" makes a
-        // fresh capture run as its own process instead of stepping aside.
-        assert!(!wants_own_instance(false));
-        assert!(wants_own_instance(true));
-    }
-
-    #[test]
-    fn spare_only_protected_siblings_under_allow_multiple() {
-        // Setting OFF: never spare — the historical single-instance collapse (a fresh
-        // capture replaces the old preview) is preserved for every sibling state.
-        for &rec in &[false, true] {
-            for &prev in &[false, true] {
-                assert!(
-                    !should_spare_sibling(false, rec, prev),
-                    "allow_multiple off must never spare (rec={rec} prev={prev})"
-                );
-            }
-        }
-        // Setting ON: spare exactly the recording / preview siblings; a bare selector
-        // sibling (neither marker) still collapses so a committed shot wins the screen.
-        assert!(!should_spare_sibling(true, false, false));
-        assert!(should_spare_sibling(true, true, false)); // recording session
-        assert!(should_spare_sibling(true, false, true)); // open preview (self-capture)
-        assert!(should_spare_sibling(true, true, true));
+    fn spare_recording_and_preview_siblings_but_never_a_bare_selector() {
+        assert!(!should_spare_sibling(false, false)); // bare selector overlay -> collapse
+        assert!(should_spare_sibling(true, false)); // recording session
+        assert!(should_spare_sibling(false, true)); // open preview (self-capture)
+        assert!(should_spare_sibling(true, true)); // recording WITH a preview open
     }
 
     #[test]
@@ -636,5 +697,103 @@ mod tests {
         assert!(rec.ends_with("cosmic-capture-kit.4242.recording"), "{rec}");
         assert!(prev.ends_with("cosmic-capture-kit.4242.preview"), "{prev}");
         assert_ne!(rec, prev);
+    }
+
+    /// DRAGON-336: the sweep's filename parser is the inverse of `state_marker_path`,
+    /// and must not claim the hyphen-stemmed lock/socket sidecars living in the same dir.
+    #[test]
+    fn marker_names_round_trip_and_ignore_lock_sidecars() {
+        for suffix in [RECORDING_MARKER, PREVIEW_MARKER] {
+            let path = state_marker_path(4242, suffix);
+            let name = path.rsplit('/').next().unwrap();
+            assert_eq!(
+                parse_marker_name(name),
+                Some((4242, suffix)),
+                "should round-trip {name}"
+            );
+        }
+        // Not markers: the lock/socket sidecars (hyphen stem, no pid) and junk.
+        for name in [
+            "cosmic-capture-kit-daemon.lock",
+            "cosmic-capture-kit-settings.lock",
+            "cosmic-capture-kit-recording.sock",
+            "cosmic-capture-kit.notapid.preview",
+            "something-else.4242.preview",
+        ] {
+            assert_eq!(parse_marker_name(name), None, "should ignore {name}");
+        }
+    }
+
+    /// DRAGON-336: the preview-handoff SOCKET is a per-pid sidecar in the same namespace,
+    /// distinct from the marker it sits beside (so a socket file can never be mistaken for
+    /// "a preview is open") and parsed by the sweep so a SIGKILLed host's socket is cleared.
+    #[cfg(unix)]
+    #[test]
+    fn preview_socket_is_a_distinct_per_pid_sidecar() {
+        let sock = preview_socket_path(4242);
+        assert!(sock.ends_with("cosmic-capture-kit.4242.preview.sock"), "{sock}");
+        assert_ne!(sock, state_marker_path(4242, PREVIEW_MARKER));
+        let name = sock.rsplit('/').next().unwrap();
+        assert_eq!(parse_marker_name(name), Some((4242, PREVIEW_SOCKET_MARKER)));
+    }
+
+    /// Host discovery is marker-driven: live preview pids only, never self, dead pids'
+    /// markers (and their sockets) swept as we scan.
+    #[cfg(unix)]
+    #[test]
+    fn preview_host_discovery_skips_self_and_dead_pids() {
+        let dir = std::env::temp_dir().join(format!("cck-host-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let live = std::process::id(); // a pid that is certainly alive
+        let dead = 0; // pid 0 is never a live process we could find
+        let selfish = 999_999_001; // stands in as "us" for this scan
+
+        for pid in [live, dead, selfish] {
+            std::fs::File::create(state_marker_path_in(&dir, pid, PREVIEW_MARKER)).unwrap();
+        }
+        std::fs::File::create(state_marker_path_in(&dir, dead, PREVIEW_SOCKET_MARKER)).unwrap();
+        // A RECORDING marker is a different state and must never look like a host.
+        std::fs::File::create(state_marker_path_in(&dir, live, RECORDING_MARKER)).unwrap();
+
+        let hosts = live_preview_hosts_in(&dir, selfish);
+        assert_eq!(hosts, vec![live], "only the live, non-self preview pid hosts");
+        assert!(
+            !std::path::Path::new(&state_marker_path_in(&dir, dead, PREVIEW_MARKER)).exists(),
+            "a dead pid's marker must be swept"
+        );
+        assert!(
+            !std::path::Path::new(&state_marker_path_in(&dir, dead, PREVIEW_SOCKET_MARKER)).exists(),
+            "a dead pid's handoff socket must be swept with it"
+        );
+        // An empty dir has no hosts (the first-capture case).
+        let empty = std::env::temp_dir().join(format!("cck-host-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(live_preview_hosts_in(&empty.to_string_lossy(), selfish).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// Candidate order is deterministic: newest marker first, unknown mtimes last, ties
+    /// by ascending pid — so a child always tries the most recently opened host first.
+    #[cfg(unix)]
+    #[test]
+    fn preview_hosts_are_ordered_newest_first() {
+        use std::time::{Duration, SystemTime};
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let t1 = t0 + Duration::from_secs(5);
+        assert_eq!(
+            order_preview_hosts(vec![(7, Some(t0)), (9, Some(t1)), (3, None)]),
+            vec![9, 7, 3]
+        );
+        // Same mtime -> ascending pid, never readdir order.
+        assert_eq!(
+            order_preview_hosts(vec![(9, Some(t0)), (3, Some(t0)), (7, Some(t0))]),
+            vec![3, 7, 9]
+        );
+        assert!(order_preview_hosts(Vec::new()).is_empty());
     }
 }

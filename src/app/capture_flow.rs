@@ -927,10 +927,25 @@ impl App {
     pub(super) fn resolve_neutral_spinner(&mut self) -> Task<cosmic::Action<Msg>> {
         // Only a live OVERLAY-appearance spinner qualifies; a window surface means the
         // defocus-sink path already opened the real preview (never routed here).
-        if self.preview.as_ref().is_none_or(|p| p.surface.is_window()) {
+        // The pre-open belongs to the IN-FLIGHT capture, so that document is the one to
+        // resolve (DRAGON-336 phase 2).
+        let Some(id) = self.capture_preview else {
+            return Task::none();
+        };
+        if self.preview_for(id).is_none_or(|p| p.surface.is_window()) {
             return Task::none();
         }
-        if self.preview_windowed {
+        // NO OVERLAY ONCE A SECOND DOCUMENT EXISTS (DRAGON-336): the pre-opened cover is
+        // minted FOCUS-NEUTRAL (`KeyboardInteractivity::None`), so it can coexist with
+        // another document's surface — but promoting it to `Exclusive` below would leave a
+        // fullscreen overlay behind that document's window (and, if that one were an
+        // overlay too, two exclusive layer surfaces fighting over the keyboard grab — the
+        // DRAGON-109 hazard). Whenever another document is open, resolve the spinner the
+        // WINDOWED way instead: `preview_surface_for` mints a window for it and demotes any
+        // sibling still on the overlay, exactly as it would for a fresh preview opened
+        // alongside one. Inert with a single preview open, so the historical path is
+        // unchanged.
+        if self.preview_windowed || self.overlay_barred(Some(id)) {
             // DEFER the swap to `present_capture` (DRAGON-221 follow-up): the composed
             // image's dims aren't known until ShotSaved (padding/shadow/wallpaper
             // margins grow it past the selection), and a post-open `window::resize` is
@@ -939,7 +954,7 @@ impl App {
             self.windowed_swap_pending = true;
             Task::none()
         } else {
-            super::shell::promote_preview_surface(self.preview.as_ref().map(|p| p.window).unwrap())
+            super::shell::promote_preview_surface(id)
         }
     }
 
@@ -1024,6 +1039,34 @@ impl App {
             .collect()
     }
 
+    /// Per-output geometry for the WINDOW composite's `frozen_geom`, i.e. the ONE place the
+    /// launch flats are read for their GEOMETRY rather than their PIXELS.
+    ///
+    /// The window composite runs POST-TEARDOWN (`destroy_surfaces` has already cleared
+    /// `self.outputs`), so it has always sourced the geometry from the launch snapshot. That
+    /// was safe only while the snapshot was unconditional: DRAGON-336's `launch_flats_needed`
+    /// now SKIPS the flats grab entirely unless freeze is on or it's a scanner launch, which
+    /// left `frozen_geom` empty on a freeze-off window capture and dropped the wallpaper
+    /// backing in `composite_over_wallpaper` (which needs an output rect to place the
+    /// wallpaper under the window). So: prefer the launch snapshot when it exists — the
+    /// launch-instant geometry, byte-identical to before — and fall back to a fresh LIVE
+    /// query (`crate::screenshot::output_descs()`, the same post-teardown-safe source
+    /// `output_rect_for_window` and the window-composite diagnostic already use) only when
+    /// it is empty.
+    fn window_composite_geom(&self) -> Vec<crate::screenshot::OutputGeom> {
+        let frozen: Vec<crate::screenshot::OutputGeom> = self
+            .frozen
+            .iter()
+            .map(|(n, f)| (n.clone(), f.logical_pos, f.logical_size))
+            .collect();
+        pick_composite_geom(frozen, || {
+            crate::screenshot::output_descs()
+                .into_iter()
+                .map(|o| (o.name, o.logical_pos, o.logical_size))
+                .collect()
+        })
+    }
+
     /// Each frozen monitor's (logical_pos, logical_size) — for trimming a frozen composite.
     fn frozen_out_rects(&self) -> Vec<((i32, i32), (i32, i32))> {
         self.frozen.values().map(|f| (f.logical_pos, f.logical_size)).collect()
@@ -1056,6 +1099,49 @@ impl App {
             .map(|f| (&*f.img, f.logical_pos, f.logical_size))
             .collect();
         crate::screenshot::stitch_region(&refs, x, y, w, h)
+    }
+
+    /// DRAGON-336: drop the launch-instant capture scene — the largest resident buffers
+    /// this process owns (one full-resolution RGBA flat PER OUTPUT, ~30 MB on a
+    /// 5120x1440 monitor, plus the per-window pixel maps and the picker wallpapers).
+    /// Nothing ever released them, so they stayed resident through the whole preview
+    /// phase even though the picture is already composed and written to disk.
+    ///
+    /// Called ONLY from [`Self::do_pixel_capture`], after that path's last read of every
+    /// buffer, which is what makes it provably safe:
+    ///
+    /// - The commit is one-shot: `do_pixel_capture` opens by `take`-ing `self.capturing`,
+    ///   so its backstop tick (and any later fire) returns before touching the scene, and
+    ///   nothing re-arms `capturing` afterwards — `begin_capture` is the only writer and
+    ///   is reachable only from the pre-commit `begin`/countdown path.
+    /// - A COUNTDOWN is entirely upstream: `enter_countdown` holds the selection in
+    ///   `pending` and can still be cancelled back to region select (`CancelCapture` /
+    ///   Escape → `restore_interactive_overlays`), all of which happens BEFORE
+    ///   `begin_capture`, let alone this. By the time we get here the overlays are torn
+    ///   down and there is no path back to a selector.
+    /// - The window commit has already CLONED what it needs (`fallback_px` out of
+    ///   `active_win_px`/`frozen_win_px`, `frozen_geom` out of `frozen`) into the
+    ///   `WindowCaptureJob` moved onto the capture worker, so the worker keeps its own
+    ///   pixels regardless of what the App drops.
+    /// - The region/monitor commit is synchronous: the composite (`frozen_captured`,
+    ///   `crop_frozen`, `frozen_out_rects`, `frozen_scale_at`) is finished and the PNG is
+    ///   on disk before this runs. Everything downstream (`present_capture`, the preview
+    ///   editor, the share/finish paths) reads the SAVED FILE, never the scene.
+    ///
+    /// `frozen_toplevels` (geometry/z-order only, no pixels) and `frozen_cursor` (a
+    /// pointer sprite) are deliberately kept: they are tiny, and `window_focus_grab` /
+    /// `window_defocus_uses_spinner` still consult the toplevel list on this same path.
+    /// NOT called on the recording path — a recording keeps the overlay alive (stop
+    /// button, meters) and its release point is a separate question (see the ticket).
+    fn release_capture_scene(&mut self) {
+        // `clear` drops the pixel buffers (the ~30 MB allocations go straight back via
+        // munmap) while keeping the tables themselves, so every reader keeps its
+        // "empty map" semantics — `freezing()` already treats an empty `frozen` as
+        // "no freeze", which is the same state a launch that skipped the grab is in.
+        self.frozen.clear();
+        self.frozen_win_px.clear();
+        self.active_win_px.clear();
+        self.wallpaper_handles.clear();
     }
 
     /// Filename stem `<timestamp>[-<descriptor>]` for a capture/recording of `sel`:
@@ -1116,10 +1202,10 @@ impl App {
         let sel = inset_region(sel);
 
         // Committing a capture collapses a multi-instance session: tear down any
-        // other overlays so only this shot proceeds. DRAGON-322: under allow-multiple a
-        // recording / preview sibling is spared, so a still capture can run alongside a
-        // recording and a self-capture keeps the existing preview open.
-        crate::instance::close_other_instances(self.allow_multiple);
+        // other overlays so only this shot proceeds. DRAGON-322: a recording / preview
+        // sibling is spared, so a still capture can run alongside a recording and a
+        // self-capture keeps the existing preview open.
+        crate::instance::close_other_instances();
 
         // Destination path (shared by both the screencopy and PipeWire paths).
         let raw_dir = if self.screenshot_dir.trim().is_empty() {
@@ -1148,6 +1234,9 @@ impl App {
                     .unwrap_or(false);
                 let _ = tx.send((path, ok));
             });
+            // DRAGON-336: the portal path grabs its frame from the held stream and never
+            // reads the launch scene at all, so it is dead the moment this branch is taken.
+            self.release_capture_scene();
             return Task::perform(
                 async move { rx.await.unwrap_or((fallback, false)) },
                 |(path, ok)| cosmic::Action::App(Msg::Capture(CaptureMsg::ShotSaved(path, ok))),
@@ -1365,12 +1454,12 @@ impl App {
                 },
                 dark: super::theme_is_dark(),
                 // The overlay (and self.outputs) is torn down before this runs, so pass the
-                // launch snapshot's per-output geometry for the composite.
-                frozen_geom: self
-                    .frozen
-                    .iter()
-                    .map(|(n, f)| (n.clone(), f.logical_pos, f.logical_size))
-                    .collect(),
+                // launch snapshot's per-output geometry for the composite — or, when this
+                // launch skipped the flats grab entirely (freeze off, not a scanner), a
+                // fresh live query. See [`App::window_composite_geom`]: without the
+                // fallback a freeze-off window capture composites with NO output geometry
+                // and loses its "Preserve wallpaper" backing.
+                frozen_geom: self.window_composite_geom(),
                 // Assigned in the worker: the off-thread focus grab (if any) OR the
                 // UI-chosen fallback. `None` here so the field exists; never the final value.
                 frozen_px: None,
@@ -1443,6 +1532,12 @@ impl App {
             } else {
                 Some((sel.width, sel.height))
             };
+            // DRAGON-336: every scene read this branch makes is already done — the job
+            // (with its CLONED `fallback_px` + `frozen_geom`) has been moved onto the
+            // worker thread above, and `window_defocus_uses_spinner` reads only
+            // `frozen_toplevels`, which the release keeps. Drop the pixels now rather
+            // than holding them through the grab + compose + the whole preview session.
+            self.release_capture_scene();
             return Task::batch([
                 Task::perform(async move { grab_rx.await.ok() }, move |_| {
                     cosmic::Action::App(Msg::Capture(CaptureMsg::WindowGrabbed(open_on_grab)))
@@ -1521,6 +1616,11 @@ impl App {
             log::warn!("failed to write screenshot to {}", path.display());
             return self.finish_session();
         }
+        // DRAGON-336: the region/monitor composite is finished and the PNG is on disk —
+        // the frozen flats, the per-window pixels and the picker wallpapers can never be
+        // read again in this process (the preview reads the saved file). Release them
+        // before the preview opens, so the long-lived preview phase doesn't sit on them.
+        self.release_capture_scene();
         // Restore focus to where we launched, then share (clipboard/explorer).
         if let Some(id) = &self.origin_window {
             crate::platform::compositor::activate(id);
@@ -2072,6 +2172,52 @@ fn output_desc_for_selection_in(
 #[cfg(not(target_os = "linux"))]
 fn output_desc_for_selection(sel: &Selection) -> Option<crate::platform::backend::OutputDesc> {
     output_desc_for_selection_in(sel, &crate::screenshot::output_descs())
+}
+
+/// The pure half of [`App::window_composite_geom`]: the launch snapshot's geometry wins
+/// whenever it has any, otherwise `live` is consulted (lazily — a live display query costs
+/// a compositor round trip, so a freeze/scanner launch must never pay it).
+///
+/// Split out so the SELECTION is testable even though `output_descs()` isn't: the bug this
+/// guards is precisely "empty snapshot silently becomes empty geometry".
+fn pick_composite_geom<F>(
+    frozen: Vec<crate::screenshot::OutputGeom>,
+    live: F,
+) -> Vec<crate::screenshot::OutputGeom>
+where
+    F: FnOnce() -> Vec<crate::screenshot::OutputGeom>,
+{
+    if frozen.is_empty() { live() } else { frozen }
+}
+
+#[cfg(test)]
+mod composite_geom_tests {
+    use super::pick_composite_geom;
+
+    fn geom(name: &str, x: i32) -> crate::screenshot::OutputGeom {
+        (name.to_string(), (x, 0), (2560, 1440))
+    }
+
+    /// A freeze / scanner launch HAS the flats: their launch-instant geometry is used and
+    /// the live query is never made (byte-identical to the pre-fix behavior).
+    #[test]
+    fn a_non_empty_launch_snapshot_wins_and_skips_the_live_query() {
+        let frozen = vec![geom("DP-1", 0), geom("DP-2", 2560)];
+        let got = pick_composite_geom(frozen.clone(), || panic!("live query must not run"));
+        assert_eq!(got, frozen);
+    }
+
+    /// DRAGON-336 regression: freeze OFF + window mode skips the flats grab, so the
+    /// snapshot is empty — the composite must then get LIVE output geometry, never an
+    /// empty vec (which drops the wallpaper backing in `composite_over_wallpaper`).
+    #[test]
+    fn an_empty_launch_snapshot_falls_back_to_live_geometry() {
+        let live = vec![geom("DP-1", 0)];
+        assert_eq!(pick_composite_geom(Vec::new(), || live.clone()), live);
+        // The fallback is only as good as its source: an empty live query stays empty
+        // (nothing to invent), which is the pre-existing no-outputs behavior.
+        assert!(pick_composite_geom(Vec::new(), Vec::new).is_empty());
+    }
 }
 
 #[cfg(test)]

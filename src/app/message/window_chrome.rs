@@ -119,7 +119,7 @@ pub enum WindowChromeMsg {
     /// the reliable re-driver when the one-shot `window::open` follow-up was never delivered
     /// because cck lost the foreground mid-countdown, leaving the preview HWND created but
     /// hidden. Parameterless (like `SettingsLivenessTick`) so it never carries a stale id;
-    /// the handler reads `self.preview`. Stops the moment `preview_shown_confirmed` matches.
+    /// the handler reads `self.previews`. Stops the moment `preview_shown_confirmed` matches.
     #[cfg(windows)]
     PreviewFinalizeTick,
     /// A window was resized (logical w, h) — used to remember the settings size.
@@ -182,10 +182,15 @@ pub enum WindowChromeMsg {
     /// A window finished closing.
     WindowClosed(window::Id),
     /// A raw key press, routed through the live keymap in `update` (so rebinds take
-    /// effect immediately, unlike the `'static` event subscription).
-    KeyPressed(Modifiers, Key),
-    /// A raw key release — only push-to-talk cares (release = mute the mic again).
-    KeyReleased(Modifiers, Key),
+    /// effect immediately, unlike the `'static` event subscription). The `window::Id` is
+    /// the surface the press was DELIVERED to — it picks the preview document a
+    /// Preview-context binding acts on when several previews are open (DRAGON-336
+    /// phase 2).
+    KeyPressed(window::Id, Modifiers, Key),
+    /// A raw key release — only push-to-talk cares (release = mute the mic again). Carries
+    /// the delivering surface for symmetry with [`Self::KeyPressed`] (a release routed into
+    /// an armed chord recorder goes through the same `handle_key`).
+    KeyReleased(window::Id, Modifiers, Key),
     /// Escape / contextual back: settings → mode → region → quit.
     Close,
     /// The toolbar ✕: always quit the tool outright.

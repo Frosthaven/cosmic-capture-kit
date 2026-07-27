@@ -236,6 +236,8 @@ impl App {
         // preset labels are now short ("Fit", "100%"…"200%"), so most of that was dead space.
         // The floor is set by the widest label ("200%") plus the dropdown chevron.
         const COMBO_W: f32 = 72.0;
+        // Addressed to this document (DRAGON-336 phase 2).
+        let pid = preview.window;
         let z = preview.view.zoom;
         let visual = self.preview_visual_scale(preview);
         let max_zoom = self.max_view_zoom(preview);
@@ -253,14 +255,18 @@ impl App {
         let max_pct = displayed_percent(max_zoom, visual) as f32;
         let cur_pct = (displayed_percent(z, visual) as f32).clamp(min_pct, max_pct);
         let vscale = visual;
+        // The preview editor's own (smaller) thumb — see `PREVIEW_SLIDER_THUMB`. The wrapper
+        // gets the SAME class so its 100% notch stays aligned with the resized thumb.
         let slider = crate::widgets::notched_slider(
             widget::slider(min_pct..=max_pct, cur_pct, move |pct| {
-                Msg::Preview(PreviewMsg::SetViewZoom(pct / (vscale * 100.0)))
+                Msg::Preview(pid, PreviewMsg::SetViewZoom(pct / (vscale * 100.0)))
             })
             .step(1.0f32)
+            .class(super::chrome::preview_slider_class())
             .width(Length::Fixed(120.0)),
             min_pct..=max_pct,
             vec![100.0],
+            super::chrome::preview_slider_class(),
         );
         // (The live percent readout that used to sit LEFT of the slider was removed — the combo
         // to the right already shows the current zoom as a preset label or "N%".)
@@ -309,7 +315,7 @@ impl App {
                 }
             }))),
         )
-        .on_press(Msg::Preview(PreviewMsg::ToggleZoomMenu));
+        .on_press(Msg::Preview(pid, PreviewMsg::ToggleZoomMenu));
         let combo: Element<'static, Msg> = if preview.view.zoom_menu_open {
             let items: Vec<Element<'static, Msg>> = ZOOM_PRESET_LABELS
                 .iter()
@@ -327,7 +333,7 @@ impl App {
                         widget::button::custom(text)
                             .width(Length::Fill)
                             .class(cosmic::theme::Button::Text)
-                            .on_press(Msg::Preview(PreviewMsg::ZoomPreset(i))),
+                            .on_press(Msg::Preview(pid, PreviewMsg::ZoomPreset(i))),
                     )
                 })
                 .collect();
@@ -349,7 +355,7 @@ impl App {
             widget::popover(button)
                 .popup(menu)
                 .position(widget::popover::Position::Point(cosmic::iced::Point::new(0.0, 0.0)))
-                .on_close(Msg::Preview(PreviewMsg::ToggleZoomMenu))
+                .on_close(Msg::Preview(pid, PreviewMsg::ToggleZoomMenu))
                 .into()
         } else {
             button.into()

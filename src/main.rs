@@ -42,6 +42,10 @@ mod geometry;
 // the crate root (next to `geometry`) because it is shared by `app::preview::annotate` and
 // `widgets::annotation_canvas` and belongs to neither.
 mod pen_stroke;
+// The sequence badge's geometry / numerals / ink rule (DRAGON-340) — the same shared-by-both-
+// renderers role `pen_stroke` plays for the pencil, and for the same reason: the live canvas
+// and the full-resolution bake must build the badge from ONE set of pure functions.
+mod badge;
 mod platform;
 mod widgets;
 mod encode;
@@ -115,6 +119,14 @@ mod daemon_linux;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 #[path = "platform/daemon_ipc.rs"]
 mod daemon_ipc;
+// Preview HANDOFF IPC (DRAGON-336, multi-document preview): a one-shot capture child
+// hands its finished file to an ALREADY RUNNING preview host (discovered through the
+// per-pid preview marker in `instance.rs`, reached over that host's per-pid unix socket)
+// instead of paying a second process's ~233 MB launch overhead. The transport + discovery
+// live here; how the App binds, drains and falls back is documented in the module doc.
+// `daemon_ipc`'s sibling, same runtime-dir/plain-words conventions.
+#[path = "platform/preview_ipc.rs"]
+mod preview_ipc;
 
 /// Install a macOS crash logger: chain a panic hook that appends the panic
 /// message + a backtrace to `~/Library/Logs/cosmic-capture-kit/panic.log`
@@ -182,6 +194,326 @@ fn install_windows_panic_hook() {
         }
         default_hook(info);
     }));
+}
+
+// DRAGON-336: a settings-only launch USED to force iced's software renderer
+// (`ICED_BACKEND=tiny-skia`), which skipped the whole GPU stack and measured
+// RSS 239.0 -> 83.3 MB / PSS 84.1 -> 56.6 MB on a dual-GPU rig. REMOVED after
+// testing — the premise was wrong. The settings window is not the small, STATIC
+// chrome the saving assumed: the microphone test is a live, continuously
+// redrawing level meter, which is the worst case for a CPU rasterizer and
+// starves the audio work it is supposed to be visualising. The window is also
+// freely resizable, and software rasterization cost scales with pixel count.
+//
+// Do not reintroduce this without re-testing the mic meter specifically. The
+// same reasoning already rules out the other two surfaces: the preview draws
+// through `cosmic::iced::widget::shader` (`app/preview/layers.rs`,
+// `widgets/annotation_fx.rs`), which tiny-skia cannot render at all and which
+// tested as too laggy regardless; and the capture overlay is fullscreen, where
+// the CPU framebuffer (~59 MB here) costs more than the GPU stack it replaces.
+// `ICED_BACKEND` is still honoured from the environment if you want to
+// experiment — nothing in-process sets it any more.
+
+/// Env vars through which the user (or a launcher script) has already expressed
+/// a GPU / Vulkan-driver choice. If ANY of them is set we keep our hands off the
+/// loader entirely — their intent outranks our memory optimization.
+#[cfg(target_os = "linux")]
+const VULKAN_SELECTION_ENV: [&str; 10] = [
+    "VK_LOADER_DRIVERS_SELECT",
+    "VK_LOADER_DRIVERS_DISABLE",
+    "VK_DRIVER_FILES",
+    "VK_ADD_DRIVER_FILES",
+    "VK_ICD_FILENAMES",
+    "MESA_VK_DEVICE_SELECT",
+    "DRI_PRIME",
+    "__NV_PRIME_RENDER_OFFLOAD",
+    "WGPU_ADAPTER_NAME",
+    "WGPU_POWER_PREF",
+];
+
+/// The first name in `names` that `is_set` reports as present. Split out from
+/// [`pin_vulkan_icd`] so the guard list is unit-testable without touching the
+/// real environment.
+#[cfg(target_os = "linux")]
+fn first_set_env<'a>(names: &[&'a str], is_set: impl Fn(&str) -> bool) -> Option<&'a str> {
+    names.iter().copied().find(|n| is_set(n))
+}
+
+/// DRAGON-336 (Linux, memory): pin the Vulkan loader to the ICD of the GPU this
+/// session actually renders on.
+///
+/// The loader initializes EVERY installed ICD just to enumerate devices. On a
+/// dual-vendor box that means Mesa's `libvulkan_radeon` + `libLLVM` (32.5 MB RSS
+/// / 8.6 MB PSS measured) stay resident purely to describe a GPU we never draw
+/// on. Naming the one driver we want in `VK_LOADER_DRIVERS_SELECT` took
+/// `--settings` from RSS 239.0 -> 204.2 MB and PSS 84.1 -> 75.7 MB.
+///
+/// This is deliberately SELF-DISABLING — every step below must positively
+/// succeed or we do nothing at all, because a wrong pin is far worse than the
+/// memory it saves:
+/// 1. nothing in [`VULKAN_SELECTION_ENV`] is already set;
+/// 2. at least two ICD manifests are installed (otherwise there is nothing to
+///    exclude, and we skip the compositor round-trip entirely);
+/// 3. the compositor positively names the device it wants clients to render on
+///    (the `zwp_linux_dmabuf_v1` default-feedback `main_device`) — no Wayland,
+///    or a compositor too old for feedback, means no pin;
+/// 4. that device resolves through sysfs to a known DRM kernel driver;
+/// 5. that driver is one we can only ever see as a DEDICATED GPU
+///    ([`dedicated_icd_families`]);
+/// 6. the resulting selection keeps at least one installed manifest and drops at
+///    least one ([`select_icds`]) — the loader must never end up with an empty
+///    driver set.
+///
+/// `VK_LOADER_DRIVERS_SELECT` is also the SAFE knob of the two: an older loader
+/// that doesn't know it simply ignores it (we just don't save the memory),
+/// whereas `VK_ICD_FILENAMES`/`VK_DRIVER_FILES` would REPLACE the search path.
+#[cfg(target_os = "linux")]
+fn pin_vulkan_icd() {
+    if let Some(var) = first_set_env(&VULKAN_SELECTION_ENV, |n| std::env::var_os(n).is_some()) {
+        log::debug!("vulkan ICD pin: skipped, {var} is already set");
+        return;
+    }
+    let installed = installed_vulkan_icds();
+    if installed.len() < 2 {
+        return; // one (or no) driver: nothing to exclude, don't even ask the compositor
+    }
+    let Some(dev) = compositor_main_device() else { return };
+    let Some(driver) = drm_driver_for_dev(dev) else { return };
+    let Some(families) = dedicated_icd_families(&driver) else { return };
+    let Some(keep) = select_icds(&installed, families) else { return };
+    log::debug!("vulkan ICD pin: session renders on {driver}; VK_LOADER_DRIVERS_SELECT={keep}");
+    // SAFETY: `set_var` is unsound only if another thread may touch the environment
+    // concurrently. This runs on the main thread inside `main`, before `app::run`
+    // builds the iced/winit runtime (and therefore before the Vulkan loader is ever
+    // touched) and before any capture/audio thread is spawned — everything above it
+    // (argument parsing, `state::load`, the instance locks) is straight-line
+    // single-threaded code, so the process is still effectively single-threaded.
+    unsafe { std::env::set_var("VK_LOADER_DRIVERS_SELECT", keep) };
+}
+
+/// Every directory the Vulkan loader scans for ICD manifests, in its own
+/// precedence order (`XDG_DATA_HOME`, then each `XDG_DATA_DIRS` entry, then
+/// `/etc`). We enumerate the same set the loader does so "is there more than one
+/// driver installed?" is answered honestly.
+#[cfg(target_os = "linux")]
+fn vulkan_icd_dirs() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut raw: Vec<PathBuf> = Vec::new();
+    if let Some(home) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    {
+        raw.push(home.join("vulkan/icd.d"));
+    }
+    let dirs = std::env::var("XDG_DATA_DIRS").unwrap_or_default();
+    let dirs = if dirs.is_empty() { "/usr/local/share:/usr/share".to_string() } else { dirs };
+    for d in dirs.split(':').filter(|s| !s.is_empty()) {
+        raw.push(PathBuf::from(d).join("vulkan/icd.d"));
+    }
+    raw.push(PathBuf::from("/etc/vulkan/icd.d"));
+    let mut out: Vec<PathBuf> = Vec::with_capacity(raw.len());
+    for d in raw {
+        if !out.contains(&d) {
+            out.push(d);
+        }
+    }
+    out
+}
+
+/// The installed ICD manifest FILE NAMES (sorted, de-duplicated). Names, not
+/// paths: `VK_LOADER_DRIVERS_SELECT` globs match the manifest's file name, and a
+/// manifest in a higher-precedence directory shadows a same-named one below it.
+#[cfg(target_os = "linux")]
+fn installed_vulkan_icds() -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for dir in vulkan_icd_dirs() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.ends_with(".json") && !names.contains(&n) {
+                names.push(n);
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// A DRM kernel driver -> the ICD manifest name PREFIXES belonging to it (one
+/// driver can ship several manifests: per-architecture `radeon_icd.x86_64.json`
+/// / `radeon_icd.i686.json`, or two Vulkan implementations for the same kernel
+/// driver).
+///
+/// ONLY drivers that can never be anything but a DEDICATED (discrete) GPU are
+/// listed, and that is the entire safety argument for the pin: `iced_wgpu` asks
+/// wgpu for `PowerPreference::HighPerformance`, which ranks `DiscreteGpu` above
+/// every other device type, so pinning a dedicated GPU cannot move our rendering
+/// onto a LESSER adapter than the one we would have picked anyway. `amdgpu`,
+/// `i915` and `xe` are deliberately ABSENT: each of them can be an integrated
+/// GPU sitting beside a discrete one, exactly the case where the compositor's
+/// main device and wgpu's preference legitimately disagree — there we no-op
+/// rather than guess. Adding a driver here means arguing that same point for it.
+#[cfg(target_os = "linux")]
+fn dedicated_icd_families(driver: &str) -> Option<&'static [&'static str]> {
+    match driver {
+        // NVIDIA proprietary: `nvidia_icd.json`.
+        "nvidia" => Some(&["nvidia_icd"]),
+        // Nouveau's Vulkan driver is Mesa NVK: `nouveau_icd.x86_64.json`.
+        "nouveau" => Some(&["nouveau_icd"]),
+        _ => None,
+    }
+}
+
+/// Build the `VK_LOADER_DRIVERS_SELECT` value: every installed manifest whose
+/// name belongs to `families`, comma-joined (the loader takes a comma-delimited
+/// list of globs matched against manifest file names).
+///
+/// `None` when the pin would be pointless or dangerous: nothing matched (we'd
+/// leave the loader with NO drivers) or everything matched (nothing to exclude).
+#[cfg(target_os = "linux")]
+fn select_icds(installed: &[String], families: &[&str]) -> Option<String> {
+    let keep: Vec<&str> = installed
+        .iter()
+        .map(String::as_str)
+        .filter(|n| families.iter().any(|f| n.starts_with(f)))
+        .collect();
+    if keep.is_empty() || keep.len() == installed.len() {
+        return None;
+    }
+    Some(keep.join(","))
+}
+
+/// Split a Linux `dev_t` into `(major, minor)` — the kernel's split encoding,
+/// transcribed from glibc's `major(3)`/`minor(3)` (both halves truncate to 32
+/// bits, which is what makes the low/high pieces line up).
+#[cfg(target_os = "linux")]
+fn major_minor(dev: u64) -> (u32, u32) {
+    let major = ((dev >> 8) & 0xfff) | (((dev >> 32) & !0xfff) & 0xffff_ffff);
+    let minor = (dev & 0xff) | (((dev >> 12) & !0xff) & 0xffff_ffff);
+    (major as u32, minor as u32)
+}
+
+/// Pull `DRIVER=<name>` out of a sysfs `uevent` file's contents.
+#[cfg(target_os = "linux")]
+fn driver_from_uevent(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("DRIVER="))
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+}
+
+/// Resolve a DRM device number to its kernel driver name. Works for either node
+/// type — the protocol explicitly leaves primary-vs-render unspecified, and both
+/// character devices hang off the same physical device in sysfs, so
+/// `/sys/dev/char/<major>:<minor>/device/uevent` answers for both.
+#[cfg(target_os = "linux")]
+fn drm_driver_for_dev(dev: u64) -> Option<String> {
+    let (major, minor) = major_minor(dev);
+    let uevent =
+        std::fs::read_to_string(format!("/sys/dev/char/{major}:{minor}/device/uevent")).ok()?;
+    driver_from_uevent(&uevent).map(str::to_owned)
+}
+
+/// Decode a Wayland `array` argument carrying a `dev_t` (native byte order).
+#[cfg(target_os = "linux")]
+fn dev_t_from_bytes(bytes: &[u8]) -> Option<u64> {
+    match bytes.len() {
+        8 => Some(u64::from_ne_bytes(bytes.try_into().ok()?)),
+        4 => Some(u64::from(u32::from_ne_bytes(bytes.try_into().ok()?))),
+        _ => None,
+    }
+}
+
+/// Ask the compositor which DRM device it wants clients to render on: the
+/// `main_device` of the default `zwp_linux_dmabuf_v1` feedback. This is the ONE
+/// authoritative, protocol-defined answer to "which GPU is this session on" —
+/// everything else (connected connectors, `boot_vga`, render-node numbering) is
+/// a guess, and on a multi-GPU box the guesses disagree with each other.
+///
+/// A short-lived private connection: bind, one default-feedback object, bounded
+/// round-trips (each returns on its own `wl_display.sync` callback), teardown.
+/// Any failure — no Wayland socket, no dmabuf global, a compositor below
+/// version 4 — returns `None`, and the caller then does nothing. `main_device`
+/// is gone from version 6 on (clients read the sampling tranche instead), so we
+/// bind the 4..=5 window that still sends it.
+#[cfg(target_os = "linux")]
+fn compositor_main_device() -> Option<u64> {
+    use wayland_client::globals::{GlobalListContents, registry_queue_init};
+    use wayland_client::protocol::wl_registry;
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+    use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_feedback_v1::{
+        self, ZwpLinuxDmabufFeedbackV1,
+    };
+    use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_dmabuf_v1::{
+        self, ZwpLinuxDmabufV1,
+    };
+
+    /// Scratch state for the one-shot probe: the device the compositor named,
+    /// plus whether the feedback batch has been fully delivered.
+    #[derive(Default)]
+    struct Probe {
+        device: Option<u64>,
+        done: bool,
+    }
+    impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for Probe {
+        fn event(
+            _: &mut Self,
+            _: &wl_registry::WlRegistry,
+            _: wl_registry::Event,
+            _: &GlobalListContents,
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ZwpLinuxDmabufV1, ()> for Probe {
+        fn event(
+            _: &mut Self,
+            _: &ZwpLinuxDmabufV1,
+            _: zwp_linux_dmabuf_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+    impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for Probe {
+        fn event(
+            state: &mut Self,
+            _: &ZwpLinuxDmabufFeedbackV1,
+            event: zwp_linux_dmabuf_feedback_v1::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            // The format-table event carries an fd; ignoring the event drops it.
+            match event {
+                zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } => {
+                    state.device = dev_t_from_bytes(&device);
+                }
+                zwp_linux_dmabuf_feedback_v1::Event::Done => state.done = true,
+                _ => {}
+            }
+        }
+    }
+
+    let conn = Connection::connect_to_env().ok()?;
+    let (globals, mut queue) = registry_queue_init::<Probe>(&conn).ok()?;
+    let qh = queue.handle();
+    let dmabuf: ZwpLinuxDmabufV1 = globals.bind(&qh, 4..=5, ()).ok()?;
+    let feedback = dmabuf.get_default_feedback(&qh, ());
+    let mut probe = Probe::default();
+    for _ in 0..3 {
+        if queue.roundtrip(&mut probe).is_err() {
+            break;
+        }
+        if probe.done || probe.device.is_some() {
+            break;
+        }
+    }
+    feedback.destroy();
+    dmabuf.destroy();
+    probe.device
 }
 
 fn main() -> cosmic::iced::Result {
@@ -447,6 +779,12 @@ fn main() -> cosmic::iced::Result {
             daemon::run(); // never returns — runs the Win32 message loop or exits
         }
     }
+    // DRAGON-336: every path from here on either returns without a GUI or ends in
+    // `app::run`, so this is the one spot that covers them all (the `--preview` arm
+    // below returns `app::run` itself). Self-disabling and Linux-only — see
+    // `pin_vulkan_icd` for the six conditions it insists on before touching anything.
+    #[cfg(target_os = "linux")]
+    pin_vulkan_icd();
     // `--preview <file>` opens the preview overlay directly for an existing image/video
     // (no capture overlay, no lock — it's a viewer). Reject unsupported types up front.
     if let Some(p) = after("--preview") {
@@ -470,9 +808,8 @@ fn main() -> cosmic::iced::Result {
         });
     }
     // `--permissions` opens the macOS permission-checker window directly (no capture
-    // overlay). Like `--settings` it takes NO capture lock. On non-macOS the flag is
-    // inert (no TCC grants / no permission window) — it falls through to a normal
-    // launch, keeping Linux byte-identical to a bare launch.
+    // overlay). On non-macOS the flag is inert (no TCC grants / no permission window) —
+    // it falls through to a normal launch, keeping Linux byte-identical to a bare launch.
     #[cfg(target_os = "macos")]
     let permissions_only = args.iter().any(|a| a == "--permissions");
     #[cfg(not(target_os = "macos"))]
@@ -480,9 +817,8 @@ fn main() -> cosmic::iced::Result {
     // `--settings` opens the settings window directly (no capture overlay).
     let settings_only = args.iter().any(|a| a == "--settings");
     if settings_only {
-        // Only one settings pane may exist (across all instances). A settings-only
-        // launch does NOT take the capture lock, so a capture instance can still
-        // run alongside it.
+        // Only one settings pane may exist (across all instances); a capture instance
+        // can still run alongside it (nothing else is locked).
         if !instance::acquire_settings_lock() {
             log::info!("settings already open; not opening another");
             // macOS (DRAGON-153) / Windows (DRAGON-246): don't vanish silently — poke the
@@ -497,19 +833,16 @@ fn main() -> cosmic::iced::Result {
             platform::compositor::activate_title(app::WINDOW_TITLE);
             return Ok(());
         }
-    } else if permissions_only {
-        // A permission-checker launch takes no capture lock either — it captures
-        // nothing. Multiple can't stack usefully, but there's no shared pane lock to
-        // contend (unlike settings), so just proceed.
-    } else if !instance::wants_own_instance(state::load().allow_multiple) && !instance::acquire_lock() {
-        // Another capture instance already holds the lock — don't open a duplicate
-        // overlay. The macOS resident "capture NOW on second launch" UX lives in the
-        // daemon now (a bare resident launch early-branches to `daemon::run`, which
-        // signals the running daemon); a capture-mode second launch is a genuine
-        // one-shot that simply steps aside here, same as on Linux.
-        log::info!("cosmic-capture-kit already running; not opening a second overlay");
-        return Ok(());
     }
+    // A CAPTURE launch takes no lock at all (DRAGON-351): every launch runs as its own
+    // instance, so there is nothing to step aside for. The step-aside that used to live
+    // here — "another capture instance holds the capture lock, don't open a duplicate
+    // overlay" — WAS the "allow multiple capture instances = off" behaviour, and it went
+    // with the setting (so did the lock itself; see `instance`'s module doc). A
+    // permission-checker launch (`--permissions`) took no lock before either, and the
+    // macOS resident "capture NOW on second launch" UX is unaffected: it lives in the
+    // daemon, which early-branches on a bare `resident` launch and owns its own lock.
+
     // Capture-mode flags: launch straight into a mode / kind / countdown. Absent
     // flags leave the fields `None`, so a bare launch is byte-identical to before.
     let has = |flag: &str| args.iter().any(|a| a == flag);
@@ -598,4 +931,99 @@ Examples:\n\
     cosmic-capture-kit --scan",
         cli::SYNC_WORKFLOW
     );
+}
+
+/// DRAGON-336: the pure islands of the Vulkan-ICD pin. Everything that decides
+/// WHETHER to pin and WHAT to pin is a plain function over data, so the whole
+/// decision is testable without a compositor, a GPU, or the real environment.
+#[cfg(all(test, target_os = "linux"))]
+mod vulkan_icd_tests {
+    use super::*;
+
+    fn icds(names: &[&str]) -> Vec<String> {
+        names.iter().copied().map(String::from).collect()
+    }
+
+    #[test]
+    fn selection_env_guard_spots_a_user_choice() {
+        assert_eq!(
+            first_set_env(&VULKAN_SELECTION_ENV, |n| n == "DRI_PRIME"),
+            Some("DRI_PRIME")
+        );
+        assert_eq!(
+            first_set_env(&VULKAN_SELECTION_ENV, |n| n == "VK_ICD_FILENAMES"),
+            Some("VK_ICD_FILENAMES")
+        );
+        assert_eq!(first_set_env(&VULKAN_SELECTION_ENV, |_| false), None);
+    }
+
+    #[test]
+    fn only_dedicated_gpu_drivers_map_to_a_family() {
+        assert_eq!(dedicated_icd_families("nvidia"), Some(&["nvidia_icd"][..]));
+        assert_eq!(dedicated_icd_families("nouveau"), Some(&["nouveau_icd"][..]));
+        // Possibly-integrated / unknown drivers must stay unmapped: the pin
+        // no-ops rather than risk moving rendering off the adapter wgpu picks.
+        for d in ["amdgpu", "i915", "xe", "radeon", "virtio_gpu", "vmwgfx", "evdi", ""] {
+            assert_eq!(dedicated_icd_families(d), None, "{d} must not map");
+        }
+    }
+
+    #[test]
+    fn select_keeps_the_family_and_drops_the_rest() {
+        // The measured dual-GPU case: amdgpu + nvidia, pin the nvidia ICD.
+        let installed = icds(&["nvidia_icd.json", "radeon_icd.json"]);
+        assert_eq!(
+            select_icds(&installed, &["nvidia_icd"]),
+            Some("nvidia_icd.json".to_string())
+        );
+    }
+
+    #[test]
+    fn select_keeps_every_manifest_of_the_same_family() {
+        let installed = icds(&["intel_icd.x86_64.json", "nvidia_icd.i686.json", "nvidia_icd.json"]);
+        assert_eq!(
+            select_icds(&installed, &["nvidia_icd"]),
+            Some("nvidia_icd.i686.json,nvidia_icd.json".to_string())
+        );
+    }
+
+    #[test]
+    fn select_refuses_when_it_would_empty_the_loader() {
+        let installed = icds(&["radeon_icd.json", "lvp_icd.x86_64.json"]);
+        assert_eq!(select_icds(&installed, &["nvidia_icd"]), None);
+        assert_eq!(select_icds(&[], &["nvidia_icd"]), None);
+    }
+
+    #[test]
+    fn select_refuses_when_nothing_would_be_excluded() {
+        let installed = icds(&["nvidia_icd.i686.json", "nvidia_icd.json"]);
+        assert_eq!(select_icds(&installed, &["nvidia_icd"]), None);
+    }
+
+    #[test]
+    fn dev_t_splits_into_major_minor() {
+        // 0xE280 is what the dmabuf feedback advertises for /dev/dri/renderD128.
+        assert_eq!(major_minor(0xE280), (226, 128));
+        assert_eq!(major_minor(0xE201), (226, 1));
+        // The high halves of the 12+20-bit split encoding.
+        assert_eq!(major_minor(0x0000_1000_0000_0000), (0x1000, 0));
+        assert_eq!(major_minor(0x0000_0000_0010_0000), (0, 0x100));
+    }
+
+    #[test]
+    fn driver_is_read_out_of_a_uevent() {
+        let uevent = "DRIVER=nvidia\nPCI_CLASS=30000\nPCI_ID=10DE:2684\n";
+        assert_eq!(driver_from_uevent(uevent), Some("nvidia"));
+        // A platform device (evdi) has no DRIVER line in this shape.
+        assert_eq!(driver_from_uevent("MODALIAS=platform:evdi\n"), None);
+        assert_eq!(driver_from_uevent("DRIVER=\n"), None);
+    }
+
+    #[test]
+    fn dev_t_array_decodes_in_native_byte_order() {
+        assert_eq!(dev_t_from_bytes(&0xE280_u64.to_ne_bytes()), Some(0xE280));
+        assert_eq!(dev_t_from_bytes(&0xE280_u32.to_ne_bytes()), Some(0xE280));
+        assert_eq!(dev_t_from_bytes(&[0, 1, 2]), None);
+        assert_eq!(dev_t_from_bytes(&[]), None);
+    }
 }

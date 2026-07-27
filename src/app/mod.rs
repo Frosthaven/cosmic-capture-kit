@@ -645,9 +645,28 @@ fn launch_precapture_runs(active: bool, mode: Mode) -> bool {
     active && mode == Mode::Window
 }
 
+/// DRAGON-336: whether the LAUNCH-time frozen-flats grab must run. The flats are ONE
+/// full-resolution RGBA snapshot PER OUTPUT held for the whole session (a 5120x1440
+/// monitor is 28.1 MB), and only TWO features can ever read them:
+///
+/// - the freeze backdrop + freeze capture (every reader is gated on [`App::freezing`],
+///   which requires the persisted `freeze` setting), and
+/// - the QR/OCR scanners, whose `MarksPoll` crops its scan source out of the flats
+///   (`crop_frozen`) precisely because the live screen carries our own dimmed overlay.
+///
+/// A launch with freeze OFF in a non-scanner kind can never read them, so it must not
+/// pay ~30 MB of resident memory for the whole session. Both consumers can be turned on
+/// mid-session: entering the scanner kicks a lazy grab (`App::kick_frozen_flats`), and
+/// see that function's doc for the one limitation a lazy grab carries. Pure so the
+/// gating is unit-testable without the App.
+fn launch_flats_needed(active: bool, want_freeze: bool, launch_kind: Kind) -> bool {
+    active && (want_freeze || launch_kind == Kind::Scanner)
+}
+
 fn acquire_scene(
     active: bool,
     launch_mode: Mode,
+    launch_kind: Kind,
     want_cursor: bool,
     want_freeze: bool,
     wallpaper: Option<std::path::PathBuf>,
@@ -691,10 +710,26 @@ fn acquire_scene(
     // selection happens over a still image and a playing video stops moving.
     // We also need this clean pre-overlay snapshot to scan codes from (the live
     // screen would have our dimmed overlay over it), so grab it for scanning too.
-    // Always grab the clean pre-overlay snapshot so freeze + the QR/OCR scanners
-    // can be toggled on/off live (they apply on the redraw after the settings
-    // panel closes); the freeze display still gates on `self.freeze`.
+    // DRAGON-336: the clean pre-overlay snapshot is grabbed only when THIS launch can
+    // actually consume it — freeze on, or a scanner launch (see `launch_flats_needed`).
+    // A plain region/window/monitor launch with freeze off held ~30 MB per output for
+    // the whole session that no reader could ever reach. The freeze display still gates
+    // on `self.freeze`; a mid-session switch INTO the scanner kicks a lazy grab
+    // (`App::kick_frozen_flats`), and turning freeze on mid-session falls back to the
+    // live capture path (`freezing()` is false on an empty map) until the next launch —
+    // the same "next launch" contract the per-window freeze pixels already carry above.
     let frozen_slot: FrozenSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let want_flats = launch_flats_needed(active, want_freeze, launch_kind);
+    // With the grab skipped nothing would ever fill the slot, so `frozen_pending` (armed
+    // from `scene_active` in `init`) would poll at 16ms forever and macOS's commit-time
+    // `await_frozen_flats` would burn its whole 750ms budget waiting on it. Park an EMPTY
+    // result so the very FIRST drain tick clears the flag and stops the poll.
+    if active
+        && !want_flats
+        && let Ok(mut g) = frozen_slot.lock()
+    {
+        *g = Some(HashMap::new());
+    }
     // macOS (DRAGON-200): the per-output picker wallpaper is resolved via SCK, which
     // serializes internally — so it must NOT run alongside the launch-critical
     // frozen-flats grab. It lands here and the UI drains it (`WallpaperReady`) a beat
@@ -719,10 +754,16 @@ fn acquire_scene(
             let wp_slot = wallpaper_slot.clone();
             crate::util::timing_mark("acquire_scene: frozen all_outputs (kick DEFERRED thread)");
             std::thread::spawn(move || {
-                let flats = grab_frozen_flats(want_cursor);
-                crate::util::timing_mark("acquire_scene: frozen all_outputs (deferred thread done)");
-                if let Ok(mut g) = slot.lock() {
-                    *g = Some(flats);
+                // DRAGON-336: skip the per-output flats when nothing this launch can read
+                // them (freeze off + not a scanner launch). The deferred per-output
+                // WALLPAPER resolve below still runs on this same thread exactly as
+                // before — the window picker needs it regardless of freeze.
+                if want_flats {
+                    let flats = grab_frozen_flats(want_cursor);
+                    crate::util::timing_mark("acquire_scene: frozen all_outputs (deferred thread done)");
+                    if let Ok(mut g) = slot.lock() {
+                        *g = Some(flats);
+                    }
                 }
                 // Only NOW (the launch-critical still is ready and drainable) resolve
                 // the per-output picker wallpaper — same thread, so its SCK grabs are
@@ -747,7 +788,9 @@ fn acquire_scene(
     // screencopy already runs off-thread for window capture. `init` returns an EMPTY map.
     #[cfg(not(target_os = "macos"))]
     let frozen: HashMap<String, FrozenOutput> = {
-        if active {
+        // DRAGON-336: `want_flats` (not bare `active`) — a freeze-off, non-scanner launch
+        // has no reader for the flats, so it neither grabs nor retains them.
+        if want_flats {
             let slot = frozen_slot.clone();
             crate::util::timing_mark("acquire_scene: frozen all_outputs (kick DEFERRED thread)");
             std::thread::spawn(move || {
@@ -1420,12 +1463,48 @@ pub struct App {
     /// toggle "Notify me when an update is available" and the dialog's "Don't remind
     /// me again" checkbox are two views of this one setting.
     notify_updates: bool,
-    /// The open post-capture preview window + the capture it's previewing (`None`
-    /// while no preview is up).
-    preview: Option<preview::PreviewState>,
-    /// While a preview with a soundtrack is open, the guard pausing OTHER apps' media
-    /// (Spotify/browsers/…). Dropped when the overlay closes → those players resume.
+    /// Every OPEN post-capture preview editor, in OPEN ORDER — one entry per previewed
+    /// document (DRAGON-336 phase 2: one process can host several preview windows and
+    /// exits when the LAST one closes; see [`App::close_preview`]). Empty while no
+    /// preview is up. Keyed by [`preview::PreviewState::window`]; look one up with
+    /// [`App::preview_for`] / [`App::preview_for_mut`] rather than indexing, and route
+    /// every `PreviewMsg` through the `Msg::Preview(window::Id, _)` wrapper so a message
+    /// can never land on the wrong document.
+    previews: Vec<preview::PreviewState>,
+    /// The preview that last took keyboard focus — the routing target for the few paths
+    /// that genuinely have no window id of their own (the keymap dispatch in
+    /// `keyboard.rs`). Maintained on open/focus/close; [`App::focused_preview_id`] is the
+    /// accessor and falls back to the most recently opened preview, so it is `Some`
+    /// whenever ANY preview is open (which keeps the single-preview behavior identical to
+    /// the pre-multi-document code).
+    focused_preview: Option<window::Id>,
+    /// The preview the IN-FLIGHT capture is feeding (its spinner pre-open, the
+    /// cover→window swap, the content prep at `present_capture`). A capture produces
+    /// exactly ONE preview, so this names it unambiguously even when other documents are
+    /// already open. `None` before the capture opens its preview and after that preview
+    /// closes.
+    capture_preview: Option<window::Id>,
+    /// While at least one preview with a soundtrack is open, the guard pausing OTHER
+    /// apps' media (Spotify/browsers/…). REFCOUNTED across previews by
+    /// [`Self::preview_duck_refs`]: engaged when the first holder appears, dropped only
+    /// when the LAST one releases → those players resume. (A plain `Option` would
+    /// un-mute the desktop as soon as ONE of several video previews stopped.)
     preview_duck: Option<crate::audio::ducking::OtherAudioDuck>,
+    /// The previews currently holding the [`Self::preview_duck`] guard (see
+    /// [`preview::DuckRefs`]).
+    preview_duck_refs: preview::DuckRefs,
+    /// The preview-HANDOFF listener (DRAGON-336 phase 3b), bound the moment this process
+    /// mints its first preview surface and dropped at [`App::finish_session`]. Its presence
+    /// is what makes this process a preview HOST: a later one-shot capture child discovers
+    /// it (via the per-pid preview marker) and hands its finished file over instead of
+    /// paying a second ~233 MB process, and `sub_preview_handoff` drains the inbound
+    /// requests. `None` before any preview exists, or when the bind failed (then nothing
+    /// discovers us and every child opens its own preview, exactly as before).
+    ///
+    /// Unix-only: Windows has no unix-socket transport, so it never hosts and its capture
+    /// path stays byte-identical (see `crate::preview_ipc`'s Platforms note).
+    #[cfg(unix)]
+    preview_host: Option<crate::preview_ipc::PreviewHost>,
     /// DRAGON-309: the TRIGGER display's NAME, snapshotted ONCE at launch (in `App::init`,
     /// before the picker overlay is shown / the cursor moves to the target / our overlay grabs
     /// focus). This is the monitor active when the capture was INITIATED, and drives where the
@@ -1555,9 +1634,6 @@ pub struct App {
     /// Margin width (logical px) when `window_padding` is on (persisted; default 8)
     /// + its settings num-input text buffer.
     window_padding_px: NumField<u32>,
-    /// Allow more than one overlay instance at once (persisted; default off).
-    /// Read at startup to decide whether to take the single-instance lock.
-    allow_multiple: bool,
     /// macOS (DRAGON-130): stay resident after a finished session instead of
     /// exiting, so a new capture session can be re-triggered (persisted; default
     /// off). Read by `finish_session` on macOS; Linux keeps the one-shot model
@@ -2081,7 +2157,15 @@ pub enum Msg {
     #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     Permissions(PermissionsMsg),
     WindowChrome(WindowChromeMsg),
-    Preview(PreviewMsg),
+    /// A preview-editor message, ADDRESSED to the preview surface it belongs to
+    /// (DRAGON-336 phase 2). The id lives on the wrapper rather than on each of
+    /// `PreviewMsg`'s ~80 variants: view code always has its `PreviewState` (hence
+    /// `p.window`) in scope, and async completions capture the owning id in their
+    /// closure at spawn time, so routing is a single structural fact instead of a
+    /// per-variant convention. `update_preview` looks the document up with
+    /// [`App::preview_for`]; an id with no live preview is a silent no-op (the
+    /// document closed while its task was in flight).
+    Preview(window::Id, PreviewMsg),
 }
 
 #[cfg(test)]
@@ -2217,6 +2301,31 @@ mod tests {
         // runs it, even if the mode happens to be Window.
         assert!(!launch_precapture_runs(false, Mode::Window));
         assert!(!launch_precapture_runs(false, Mode::Region));
+    }
+
+    // DRAGON-336: the launch-instant flats are ~30 MB PER OUTPUT held for the whole
+    // session, and only freeze + the QR/OCR scanners can read them. Grab them only when
+    // this launch can actually consume them.
+    #[test]
+    fn launch_flats_are_grabbed_only_when_freeze_or_the_scanner_can_read_them() {
+        // Freeze on: every kind needs the flats (the backdrop AND the freeze capture).
+        assert!(launch_flats_needed(true, true, Kind::Image));
+        assert!(launch_flats_needed(true, true, Kind::Video));
+        assert!(launch_flats_needed(true, true, Kind::Scanner));
+        // Freeze off, scanner launch (`--scan`): the scan source IS the flats crop.
+        assert!(launch_flats_needed(true, false, Kind::Scanner));
+        // Freeze off, plain photo/video launch: nothing can read them — skip the grab.
+        assert!(!launch_flats_needed(true, false, Kind::Image));
+        assert!(!launch_flats_needed(true, false, Kind::Video));
+    }
+
+    // A non-capture launch (settings / preview / permissions -> active=false) never
+    // grabs the flats, whatever the persisted freeze setting or kind says.
+    #[test]
+    fn launch_flats_are_never_grabbed_for_a_non_capture_launch() {
+        assert!(!launch_flats_needed(false, true, Kind::Scanner));
+        assert!(!launch_flats_needed(false, true, Kind::Image));
+        assert!(!launch_flats_needed(false, false, Kind::Scanner));
     }
 
     #[test]
