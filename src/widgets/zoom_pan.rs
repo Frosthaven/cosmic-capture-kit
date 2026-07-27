@@ -28,7 +28,8 @@ const WHEEL_PAN_STEP: f32 = 48.0;
 #[derive(Default)]
 struct State {
     mods: keyboard::Modifiers,
-    /// Last cursor position while an alt-drag pan is active (None = not dragging).
+    /// Last cursor position while a pan drag is active (alt/pan-mode left-drag or a
+    /// middle-button drag, DRAGON-347; None = not dragging).
     drag: Option<Point>,
     /// Active scrollbar drag: `(is_vertical, last_cursor)`.
     sb_drag: Option<(bool, Point)>,
@@ -421,6 +422,18 @@ impl<'a, Msg: Clone + 'a> Widget<Msg, cosmic::Theme, cosmic::Renderer> for ZoomP
                     }
                 }
             }
+            // A MIDDLE-button drag pans unconditionally (DRAGON-347): no Alt, no pan tool —
+            // the annotation layer never claims middle presses, so this works under any
+            // armed tool. Shares `st.drag` with the alt/pan-mode drag.
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
+                if let Some(p) = cursor.position()
+                    && cursor.is_over(bounds)
+                {
+                    st.drag = Some(p);
+                    shell.capture_event();
+                    return;
+                }
+            }
             Event::Mouse(mouse::Event::CursorMoved { .. }) if st.sb_drag.is_some() => {
                 if let Some(p) = cursor.position() {
                     let (vertical, last) = st.sb_drag.unwrap();
@@ -461,8 +474,11 @@ impl<'a, Msg: Clone + 'a> Widget<Msg, cosmic::Theme, cosmic::Renderer> for ZoomP
                     return;
                 }
             }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
-                if st.drag.is_some() =>
+            // Either button ends the drag — releasing left mid-middle-drag (or vice versa)
+            // harmlessly stops the pan rather than leaving a stuck grab.
+            Event::Mouse(mouse::Event::ButtonReleased(
+                mouse::Button::Left | mouse::Button::Middle,
+            )) if st.drag.is_some() =>
             {
                 st.drag = None;
                 shell.capture_event();

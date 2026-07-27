@@ -54,8 +54,14 @@
 //! BOUNDING BOX ([`pen_bounds`]) and a resize maps the points affinely into the new box
 //! ([`scale_pen`]); the canvas hit-tests along the STROKES, not the (mostly empty) box.
 //!
-//! The ERASER (`Tool::Eraser`) is not a draw tool at all — the only tool whose press never
-//! selects or moves. It opens an [`AnnotGesture::Erase`] sweep that MARKS the pen groups its
+//! A pencil press NEVER selects (DRAGON-346): it bypasses the canvas's hit-testing entirely and
+//! always inks, even straight over an existing shape — a stroke landing while the shape under
+//! the press wore selection chrome read as a manipulation that wasn't happening. Selection is
+//! the pointer's job alone.
+//!
+//! The ERASER (`Tool::Eraser`) is not a draw tool at all — like the pencil its press never
+//! selects or moves, and it is the only one that skips the drag threshold outright. It opens an
+//! [`AnnotGesture::Erase`] sweep that MARKS the pen groups its
 //! travelled SEGMENT touches ([`pen_hit_by_eraser`]) into
 //! [`super::edit::EditState::erase_marks`]; marked groups draw at [`ERASE_PREVIEW_ALPHA`]
 //! (the preview of what's going) and RELEASE deletes them all as ONE undo entry. Only pen
@@ -501,6 +507,19 @@ pub fn appearance_palette() -> [AnnotColor; PALETTE_COLOR_COUNT] {
         to(&pal.accent_green),
         to(&pal.accent_warm_grey),
     ]
+}
+
+/// How many CUSTOM colors the recents queue holds before the oldest is replaced.
+pub const RECENT_COLOR_CAP: usize = 5;
+
+/// Rotate a freshly picked CUSTOM color into the recents strip (DRAGON-348): NEWEST-FIRST —
+/// the new color lands at the FRONT of the strip, and once the strip is at cap the OLDEST
+/// (the last entry) is always the one replaced. Re-picking a color already in the strip
+/// (RGB match) moves it to the front instead of duplicating. Pure — unit-tested.
+pub fn rotate_recent_color(recents: &mut Vec<AnnotColor>, c: AnnotColor) {
+    recents.retain(|x| x[..3] != c[..3]);
+    recents.insert(0, c);
+    recents.truncate(RECENT_COLOR_CAP);
 }
 
 /// The full ordered color-flyout entry list: complement, accent, the nine palette colors,
@@ -1774,11 +1793,9 @@ pub fn widget_items(items: &[AnnotationItem], curve_radius: f32, erasing: &[Anno
 // ── app-side gesture + scene handlers ────────────────────────────────────────────────
 
 impl App {
-    /// Push a CUSTOM color onto the last-5 MRU (most-recent-first, RGB-deduped, capped at 5).
+    /// Push a CUSTOM color onto the last-5 recents queue via [`rotate_recent_color`].
     pub(super) fn push_recent_color(&mut self, c: AnnotColor) {
-        self.annot_recent_colors.retain(|x| x[..3] != c[..3]);
-        self.annot_recent_colors.insert(0, c);
-        self.annot_recent_colors.truncate(5);
+        rotate_recent_color(&mut self.annot_recent_colors, c);
     }
 
     /// Begin drawing a new shape of `tool` at image point `(x, y)`.
@@ -2270,27 +2287,22 @@ impl App {
         Task::none()
     }
 
-    /// Select EVERY annotation in the scene (DRAGON-341 — the Ctrl+A action) and engage the
-    /// POINTER tool so the resulting selection is immediately usable: the pointer is the only
-    /// mode in which pen groups are click-selectable and in which a body drag moves the whole
-    /// set, so selecting all under (say) the pencil would hand back a selection the very next
-    /// click destroys. Returns whether anything is now selected — an empty scene changes
-    /// nothing at all (no tool switch, no persisted state churn).
+    /// Select EVERY annotation in the scene (DRAGON-341 — the Ctrl+A action). The armed tool
+    /// is NEVER touched (DRAGON-344, user decision): select-all is a selection action, not a
+    /// mode switch. Pen groups join the set too — Ctrl+A is as deliberate as a pointer click —
+    /// but the usual rule still applies afterwards: arming another tool prunes them
+    /// ([`super::edit::EditState::drop_pen_selection`]). Returns whether anything is now
+    /// selected — an empty scene changes nothing at all (no persisted state churn).
     pub(super) fn select_all_annotations(&mut self) -> bool {
-        let ids: Vec<AnnotId> = match self.preview.as_ref() {
+        match self.preview.as_mut() {
             Some(p) if !p.edit.annotations.is_empty() => {
-                p.edit.annotations.iter().map(|it| it.id).collect()
+                let ids: Vec<AnnotId> = p.edit.annotations.iter().map(|it| it.id).collect();
+                p.edit.sel.set_all(ids);
+                p.edit.annot_menu = None;
+                true
             }
-            _ => return false,
-        };
-        // Engage the pointer FIRST: `select_annot_tool` can convert the current selection's kind
-        // (the box-family rule), and the pointer is never a rect tool, so this is a plain arm.
-        self.select_annot_tool(Tool::Pointer);
-        if let Some(p) = self.preview.as_mut() {
-            p.edit.sel.set_all(ids);
-            p.edit.annot_menu = None;
+            _ => false,
         }
-        true
     }
 
     /// Apply a POINTER rubber band (DRAGON-341): select every annotation the band
@@ -4422,5 +4434,39 @@ mod tests {
         assert_eq!(w[0].fx, FxKind::None, "a pen draws as a vector, never through a shader pass");
         let ItemKind::Path { paths, .. } = &w[0].kind else { panic!("pens hit-test as paths") };
         assert_eq!(paths, &vec![vec![(1.0, 2.0), (3.0, 4.0)]]);
+    }
+
+    // ── custom-color recents queue (DRAGON-348) ──────────────────────────────────────
+
+    #[test]
+    fn a_new_custom_color_leads_the_strip_and_the_oldest_is_replaced_at_cap() {
+        let col = |n: u8| [n, n, n, 255];
+        let mut recents: Vec<AnnotColor> = Vec::new();
+        // Fills newest-first: each pick lands at the FRONT of the strip.
+        for n in 1..=5 {
+            rotate_recent_color(&mut recents, col(n));
+        }
+        assert_eq!(recents, (1..=5).rev().map(col).collect::<Vec<_>>());
+        // At cap, a sixth pick replaces the OLDEST (1, the last entry) — always.
+        rotate_recent_color(&mut recents, col(6));
+        assert_eq!(recents, [col(6), col(5), col(4), col(3), col(2)]);
+        // Re-picking an existing color moves it to the front — no duplicate, nothing lost.
+        rotate_recent_color(&mut recents, col(3));
+        assert_eq!(recents, [col(3), col(6), col(5), col(4), col(2)]);
+        // The dedup is RGB-only: a same-RGB pick with different alpha replaces the entry.
+        rotate_recent_color(&mut recents, [3, 3, 3, 128]);
+        assert_eq!(recents.len(), 5);
+        assert_eq!(recents[0], [3, 3, 3, 128]);
+    }
+
+    #[test]
+    fn the_flyout_lists_recents_newest_first_before_the_custom_opener() {
+        let recents = [[10, 0, 0, 255], [0, 20, 0, 255]]; // as stored: newest at index 0
+        let entries = palette_entries(&recents);
+        let n = entries.len();
+        assert_eq!(entries[n - 1], PaletteEntry::Custom, "the '+' closes the flyout");
+        // The strip renders in stored order — newest first, oldest adjacent to the '+'.
+        assert_eq!(entries[n - 3], PaletteEntry::Color(recents[0]));
+        assert_eq!(entries[n - 2], PaletteEntry::Color(recents[1]));
     }
 }

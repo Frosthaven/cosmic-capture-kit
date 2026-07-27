@@ -2,8 +2,11 @@
 //! the preview's [`crate::widgets::ZoomPan`] that owns pointer handling for the
 //! annotation editor — click-to-select, drag-to-move, drag-handle-to-resize,
 //! drag-endpoint (arrow), draw-a-new-shape, and right-click. A press over an existing item
-//! manipulates it, EXCEPT while Ctrl is held with a draw tool armed: Ctrl flips that precedence
-//! so a new shape can be drawn on TOP of existing ones ([`force_new_draw`], DRAGON-339).
+//! manipulates it, with two exceptions that BYPASS hit-testing entirely: Ctrl held with a draw
+//! tool armed flips that precedence so a new shape can be drawn on TOP of existing ones
+//! ([`force_new_draw`], DRAGON-339), and the two whole-canvas tools — the eraser (DRAGON-338)
+//! and the PENCIL (DRAGON-346) — never select anything at all. A pencil press is ink, full
+//! stop: selection belongs to [`Tool::Pointer`].
 //!
 //! # Selection (DRAGON-341)
 //! The selection is a SET (`selection`, in selection order) rather than one id. Its LAST member
@@ -158,8 +161,10 @@ impl Tool {
         }
     }
 
-    /// Whether this tool ERASES rather than draws — the one tool whose press never selects,
-    /// moves or resizes an existing item (it always starts an erase sweep instead).
+    /// Whether this tool ERASES rather than draws — its press never selects, moves or resizes
+    /// an existing item (it always starts an erase sweep instead). Since DRAGON-346 the PENCIL
+    /// shares that "the press never selects" property (its press is always ink), so the two are
+    /// the whole-canvas tools; only the eraser's press ALSO skips the drag threshold.
     pub fn is_eraser(self) -> bool {
         matches!(self, Tool::Eraser)
     }
@@ -188,6 +193,35 @@ impl Tool {
 /// either (in pointer mode Ctrl-click is multi-select instead). Pure — unit-tested.
 pub fn force_new_draw(tool: Option<Tool>, ctrl: bool) -> Option<Tool> {
     if ctrl { tool.filter(|t| t.draws()) } else { None }
+}
+
+/// The tool a left press must draw with WITHOUT ever consulting what sits under the cursor —
+/// `None` when the press should hit-test normally (select / move / resize). Two cases bypass
+/// hit-testing, and both behave exactly like an empty-canvas press (deselect, then arm a LAZY
+/// draw):
+///   * the PENCIL, always (DRAGON-346): a pencil press is ink, full stop. Drawing over a shape
+///     used to select that shape — chrome and all — while the stroke landed, which reads as a
+///     manipulation that isn't happening. Selection belongs to [`Tool::Pointer`].
+///   * any other DRAWING tool while Ctrl is held ([`force_new_draw`], DRAGON-339), so a new
+///     shape can be laid on TOP of existing ones.
+///
+/// The eraser is not here: its press is handled earlier still (it captures immediately, with no
+/// drag threshold). Pure — unit-tested.
+pub fn draw_bypassing_items(tool: Option<Tool>, ctrl: bool) -> Option<Tool> {
+    match tool {
+        Some(Tool::Pen) => Some(Tool::Pen),
+        other => force_new_draw(other, ctrl),
+    }
+}
+
+/// Whether the armed tool owns the WHOLE canvas for CURSOR purposes: one crosshair everywhere
+/// over the content, item bodies and resize handles included. True exactly when the next press
+/// will not manipulate whatever is under the pointer — the eraser (which sweeps) or any press
+/// that bypasses hit-testing ([`draw_bypassing_items`]). The cursor must promise what the press
+/// will actually do, so this is derived from the press rule rather than restated. Pure —
+/// unit-tested.
+pub fn whole_canvas_crosshair(tool: Option<Tool>, ctrl: bool) -> bool {
+    tool.is_some_and(Tool::is_eraser) || draw_bypassing_items(tool, ctrl).is_some()
 }
 
 /// Whether a press with `tool` armed and `ctrl`/`shift` held is an ADDITIVE selection click
@@ -413,6 +447,10 @@ struct State {
     begun: bool,
     /// Latest modifiers (Alt lets an empty press fall through to the ZoomPan pan).
     mods: keyboard::Modifiers,
+    /// Whether a MIDDLE-button pan drag is live in the wrapped ZoomPan (DRAGON-347). Tracked
+    /// here (never consumed) only so `mouse_interaction` can show the grabbing cursor over
+    /// the tool cursors while the button is held.
+    mmb_pan: bool,
     /// When the pointer last entered the surface, driving the post-enter cursor re-assert (DRAGON-331;
     /// see [`crate::widgets::cursor_reassert`]). `None` after the pointer leaves.
     entered_at: Option<Instant>,
@@ -520,8 +558,10 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
     /// Whether freehand PEN groups may be picked up by a BODY click right now (DRAGON-341):
     /// only in POINTER mode. Ink is scribbled all over a picture and would otherwise swallow
     /// clicks meant for the shapes (and the drawing) beneath it, so outside the pointer tool a
-    /// pen group is inert — with the pencil armed a drag over ink DRAWS (DRAGON-338), which is
-    /// exactly what this gating leaves in charge there. Nor can a pen be selected WHILE another
+    /// pen group is inert. (With the PENCIL armed the press never reaches hit-testing at all —
+    /// it always draws, DRAGON-346 — so this gating matters for the shape tools and the neutral
+    /// state, where a click over ink must fall through to what is under it.) Nor can a pen be
+    /// selected WHILE another
     /// tool is armed: arming a non-pointer tool prunes pen ids out of the selection
     /// (`EditState::drop_pen_selection`), so this widget never receives one to chrome.
     fn pen_selectable(&self) -> bool {
@@ -832,6 +872,11 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                 renderer,
             )
         };
+        // A live middle-button pan (DRAGON-347) outranks every tool cursor — the hand is
+        // what the drag is actually doing, exactly like the alt/pan-mode grab.
+        if state.mmb_pan {
+            return mouse::Interaction::Grabbing;
+        }
         // Active annotation gesture cursors.
         match state.pending {
             Pending::Draw(_) => return mouse::Interaction::Crosshair,
@@ -858,13 +903,12 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         if self.in_scrollbar_strip(bounds, local) {
             return child();
         }
-        // The ERASER owns the whole canvas while armed (a press never selects/moves), so it
-        // shows ONE cursor everywhere over the content — no per-item grab/resize hints.
-        // Likewise Ctrl + a draw tool (DRAGON-339) draws over ANYTHING, so the crosshair holds
-        // even above an item — the cursor must promise what the press will actually do.
-        if self.tool.is_some_and(Tool::is_eraser)
-            || force_new_draw(self.tool, state.mods.control()).is_some()
-        {
+        // The eraser, the PENCIL (DRAGON-346) and Ctrl + a draw tool (DRAGON-339) each own the
+        // WHOLE canvas: their press never manipulates what is under it, so one crosshair holds
+        // everywhere over the content — above item bodies and resize handles included. Derived
+        // from the press rule itself ([`whole_canvas_crosshair`]) so the cursor can never
+        // promise something the press won't do.
+        if whole_canvas_crosshair(self.tool, state.mods.control()) {
             return mouse::Interaction::Crosshair;
         }
         // Idle hover: the selected item's handle shows its resize cursor, any item's body
@@ -873,9 +917,6 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         let map = self.map(bounds);
         match self.hit_at(&map, local) {
             Some((_, HitKind::Resize(g))) => grab_cursor(g),
-            // With the pencil armed a body drag draws rather than moves, so it keeps the draw
-            // crosshair over items too — the cursor tells the truth about what a drag will do.
-            Some((_, HitKind::Body)) if self.tool == Some(Tool::Pen) => mouse::Interaction::Crosshair,
             Some((_, HitKind::Body)) => mouse::Interaction::Grab,
             None => {
                 // Only a tool that actually DRAWS promises a crosshair over empty canvas; the
@@ -940,6 +981,19 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         let mut consumed = false;
         {
             let state = tree.state.downcast_mut::<State>();
+            // Middle-button pan tracking (DRAGON-347): mirror the ZoomPan's drag lifecycle so
+            // the cursor can promise it — press over the content arms it, release anywhere
+            // ends it. Never consumed; the event still forwards to the ZoomPan below, which
+            // owns the actual panning.
+            match event {
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
+                    state.mmb_pan = cursor.is_over(bounds);
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Middle)) => {
+                    state.mmb_pan = false;
+                }
+                _ => {}
+            }
             if let Event::Keyboard(keyboard::Event::ModifiersChanged(m)) = event {
                 state.mods = *m;
             } else if self.pan_mode || state.mods.alt() {
@@ -997,13 +1051,16 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                     shell.capture_event();
                                     consumed = true;
                                 } else if let Some(t) =
-                                    force_new_draw(self.tool, state.mods.control())
+                                    draw_bypassing_items(self.tool, state.mods.control())
                                 {
-                                    // Ctrl + a draw tool (DRAGON-339): draw a NEW item wherever the
-                                    // press lands, even over existing ones. Treated exactly like an
-                                    // empty-canvas press — deselect (so no chrome implies a
-                                    // manipulation) and arm the draw, which captures LAZILY once
-                                    // it's a genuine drag.
+                                    // The press DRAWS without looking at what is under it: the
+                                    // pencil always (DRAGON-346 — a pencil press is ink, full
+                                    // stop), or Ctrl + a draw tool (DRAGON-339 — lay a new shape
+                                    // on TOP of existing ones). Either way this is exactly the
+                                    // empty-canvas path: deselect (so no chrome implies a
+                                    // manipulation that isn't happening) and arm the draw, which
+                                    // captures LAZILY once it's a genuine drag — so a plain
+                                    // click still just deselects and the ZoomPan keeps working.
                                     self.emit(shell, AnnotEvent::Select(None));
                                     state.pending = Pending::Draw(t);
                                 } else if let Some((id, hit)) = self.hit_at(&map, local) {
@@ -1027,18 +1084,10 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                         if !(self.selection.len() > 1 && self.is_selected(id)) {
                                             self.emit(shell, AnnotEvent::Select(Some(id)));
                                         }
+                                        // (The pencil never reaches here — its press is handled
+                                        // above and always draws, DRAGON-346.)
                                         state.pending = match hit {
                                             HitKind::Resize(g) => Pending::Resize(g),
-                                            // With the PENCIL armed a drag from an item's BODY
-                                            // still DRAWS (DRAGON-338): a drawing tool you can't
-                                            // draw over is useless once the canvas has ink — and
-                                            // crossing existing strokes is exactly how they merge
-                                            // into one item. The press still SELECTS, so a plain
-                                            // click picks the item up for delete/duplicate/resize;
-                                            // moving its body needs any other tool armed.
-                                            HitKind::Body if self.tool == Some(Tool::Pen) => {
-                                                Pending::Draw(Tool::Pen)
-                                            }
                                             HitKind::Body => Pending::Move,
                                         };
                                     }
@@ -1885,6 +1934,89 @@ mod tests {
         // multi-select, so `force_new_draw` must stay out of its way entirely.
         assert_eq!(force_new_draw(Some(Tool::Pointer), true), None, "the pointer never draws");
         assert_eq!(force_new_draw(Some(Tool::Eraser), true), None, "the eraser never draws");
+    }
+
+    #[test]
+    fn a_pencil_press_always_draws_and_never_consults_what_is_under_it() {
+        // DRAGON-346: the pencil press is INK, full stop. `draw_bypassing_items` is the branch
+        // the press arm takes BEFORE `hit_at`, so a Some(_) here means the item under the cursor
+        // is never looked at — the press can only ever emit Select(None) + arm the draw, never
+        // Select(Some(id)) and never a Move/Resize grab.
+        assert_eq!(draw_bypassing_items(Some(Tool::Pen), false), Some(Tool::Pen), "plain pencil inks");
+        assert_eq!(draw_bypassing_items(Some(Tool::Pen), true), Some(Tool::Pen), "ctrl changes nothing");
+        // Every SHAPE tool keeps press-selects: it hit-tests unless Ctrl is held (DRAGON-339).
+        for t in [Tool::Rect, Tool::Arrow, Tool::Highlight, Tool::BoxHighlight, Tool::Spotlight, Tool::Pixelate, Tool::Blur] {
+            assert_eq!(draw_bypassing_items(Some(t), false), None, "{t:?} presses select as before");
+            assert_eq!(draw_bypassing_items(Some(t), true), Some(t), "{t:?} + ctrl draws over items");
+        }
+        // The pointer and the neutral state always hit-test (the pointer IS selection); the
+        // eraser never reaches this branch (handled earlier), so it must not claim one here.
+        for t in [None, Some(Tool::Pointer), Some(Tool::Eraser)] {
+            for ctrl in [false, true] {
+                assert_eq!(draw_bypassing_items(t, ctrl), None, "{t:?} ctrl={ctrl} hit-tests");
+            }
+        }
+    }
+
+    #[test]
+    fn the_cursor_promises_what_the_press_will_do() {
+        // DRAGON-346: with the pencil armed the crosshair must hold EVERYWHERE — over an item's
+        // body (which used to show the open-hand grab, promising a move that never happened) and
+        // over the selected item's resize handles too, since neither is reachable any more.
+        assert!(whole_canvas_crosshair(Some(Tool::Pen), false), "the pencil owns the whole canvas");
+        assert!(whole_canvas_crosshair(Some(Tool::Pen), true));
+        assert!(whole_canvas_crosshair(Some(Tool::Eraser), false), "so does the eraser");
+        // A shape tool shows per-item cursors until Ctrl flips it to draw-over-anything.
+        assert!(!whole_canvas_crosshair(Some(Tool::Rect), false));
+        assert!(whole_canvas_crosshair(Some(Tool::Rect), true));
+        // The pointer and the neutral state always show the per-item cursors.
+        for t in [None, Some(Tool::Pointer)] {
+            for ctrl in [false, true] {
+                assert!(!whole_canvas_crosshair(t, ctrl), "{t:?} ctrl={ctrl} keeps item cursors");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pencil_press_over_a_shape_body_still_bypasses_it() {
+        // The companion to the pure rule above, on a real canvas: a box sits under the press
+        // point and IS hit-testable (a shape tool would grab it), yet with the pencil armed the
+        // press arm never gets that far — `draw_bypassing_items` short-circuits first.
+        let cmap = map((100.0, 100.0), 1.0, (0.0, 0.0), (100.0, 100.0), (100.0, 100.0));
+        let boxed = Item {
+            id: 3,
+            kind: ItemKind::Rect { x: 20.0, y: 20.0, w: 60.0, h: 60.0 },
+            stroke_w: 8.0,
+            color: Color::WHITE,
+            fill: None,
+            fx: FxKind::None,
+            curve_radius: 8.0,
+        };
+        let make = |tool: Option<Tool>, selection: Vec<u64>| {
+            AnnotationCanvas::new(
+                cosmic::widget::Space::new(),
+                vec![boxed.clone()],
+                selection,
+                tool,
+                1.0,
+                (0.0, 0.0),
+                (100.0, 100.0),
+                (100.0, 100.0),
+                false,
+                Color::WHITE,
+                |_ev: AnnotEvent| (),
+            )
+        };
+        // The point is genuinely ON the box (a shape tool would select + move it)...
+        let with_rect = make(Some(Tool::Rect), Vec::new());
+        assert!(matches!(with_rect.hit_at(&cmap, (20.0, 50.0)), Some((3, HitKind::Body))));
+        // ...and even its resize handle is live once selected...
+        let selected = make(Some(Tool::Rect), vec![3]);
+        assert!(matches!(selected.hit_at(&cmap, (8.0, 8.0)), Some((3, HitKind::Resize(_)))));
+        // ...but with the PENCIL armed the press bypasses hit-testing entirely, so neither the
+        // body nor the handle can be reached, and the cursor says so.
+        assert_eq!(draw_bypassing_items(Some(Tool::Pen), false), Some(Tool::Pen));
+        assert!(whole_canvas_crosshair(Some(Tool::Pen), false));
     }
 
     #[test]

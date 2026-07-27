@@ -770,11 +770,22 @@ impl App {
             }
             PreviewMsg::AnnotColorApply => {
                 // Read the wheel's current color, apply + persist + push the MRU + close.
+                // The model must process `AppliedColor` FIRST (DRAGON-348): our own Apply
+                // button bypasses the picker's internal save affordance, and until that
+                // action runs `get_applied_color()` still holds the INITIAL color the picker
+                // opened with — applying then pushed/selected the STALE color, which read as
+                // "nothing rotated, nothing added, nothing selected". The returned Task is
+                // droppable (only the copy button's update does real work).
                 let picked = self
                     .preview
-                    .as_ref()
-                    .and_then(|p| p.edit.annot_picker.as_ref())
-                    .and_then(|m| m.get_applied_color())
+                    .as_mut()
+                    .and_then(|p| p.edit.annot_picker.as_mut())
+                    .and_then(|m| {
+                        let _ = m.update::<Msg>(
+                            cosmic::widget::color_picker::ColorPickerUpdate::AppliedColor,
+                        );
+                        m.get_applied_color()
+                    })
                     .map(|c| {
                         [
                             (c.r * 255.0).round() as u8,

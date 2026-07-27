@@ -16,12 +16,14 @@
 //!    EXACTLY.
 //! 2. **Pseudo-pressure → width** ([`width_profile`]) — see below.
 //! 3. **Fill geometry** ([`stroke_fill_polygons`]) — a variable-width ribbon can't be a stroked
-//!    polyline, so it is emitted as FILLED polygons: one quad per segment (offset by the local
-//!    half-width at each end) plus round discs at the caps and at joints whose turn would
-//!    otherwise leave a visible wedge. Every polygon is wound the SAME way and the whole group
-//!    fills in ONE non-zero-winding fill, so overlapping passes of a scribble union cleanly
-//!    (no cancellation holes where a stroke doubles back over itself, and no double-composited
-//!    seams when the group draws at partial alpha).
+//!    polyline, so it is emitted as FILLED polygons: one quad per segment plus round discs at
+//!    the caps and at genuinely sharp turns. Each quad is offset along the SHARED VERTEX
+//!    normals of its two endpoints ([`vertex_normals`]) — never its own segment normal, which
+//!    leaves a wedge crack at every joint (DRAGON-345) — so consecutive quads abut exactly and
+//!    the ribbon is watertight at any zoom. Every polygon is wound the SAME way and the whole
+//!    group fills in ONE non-zero-winding fill, so overlapping passes of a scribble union
+//!    cleanly (no cancellation holes where a stroke doubles back over itself or a tight turn
+//!    folds its inner edge over, and no double-composited seams at partial alpha).
 //!
 //! # The pseudo-pressure model
 //! A mouse/trackpad has no stylus pressure, so the width SIMULATES it from the gesture, using
@@ -158,6 +160,12 @@ const CURVE_REF_W: f32 = 6.0;
 /// Half-window (in samples) the pressure signals are averaged over. Width must change
 /// GRADUALLY along the ribbon — a per-sample spike would read as a lump, not as pressure.
 const PRESSURE_SMOOTH: usize = 3;
+
+/// The arc-length baseline (SOURCE px, each side) the curvature stencil spans. Immediate
+/// neighbours sit ~2px apart, where the triangle area three samples span is dominated by f32
+/// cancellation — the resulting per-sample width jitter rippled the ribbon's edge at zoom
+/// (DRAGON-345). A ~3px arm is numerically solid and measures the bend the eye calls a loop.
+const CURVE_STENCIL: f32 = 3.0;
 
 /// How heavy a TAP is, as a multiple of the preset width: a firm press that leaves a small ink
 /// pool, sized to match the body of a heavy stroke rather than a hairline.
@@ -504,9 +512,20 @@ pub fn blended_pressure(points: &[(f32, f32)], base_w: f32, speed: &[f32]) -> Ve
     let base_w = base_w.max(0.1);
     let use_speed = speed.len() == n;
     let r_ref = base_w * CURVE_REF_W;
+    // Curvature is measured across a stencil of fixed ARC LENGTH ([`CURVE_STENCIL`] source px
+    // to each side), not between immediate neighbours (DRAGON-345). Adjacent samples sit ~2px
+    // apart, and the triangle area three of them span is a difference of near-equal f32
+    // products — the cancellation noise alone made the width jitter sample-to-sample, which
+    // rippled the ribbon's edge. A longer baseline is numerically stable AND measures the
+    // curvature the eye reads as a loop rather than nib-scale wiggle.
+    let s = arc_lengths(points);
     let mut k = vec![0.0f32; n];
     for i in 1..n.saturating_sub(1) {
-        k[i] = smoothstep01(menger_curvature(points[i - 1], points[i], points[i + 1]) * r_ref);
+        let arm = CURVE_STENCIL.max(1e-3);
+        // Walk out to the requested arc length, always keeping at least one sample each side.
+        let lo = (0..i).rev().find(|&j| s[i] - s[j] >= arm).unwrap_or(i - 1);
+        let hi = (i + 1..n).find(|&j| s[j] - s[i] >= arm).unwrap_or(n - 1);
+        k[i] = smoothstep01(menger_curvature(points[lo], points[i], points[hi]) * r_ref);
     }
     if n >= 3 {
         k[0] = k[1];
@@ -590,6 +609,42 @@ fn densify(points: &[(f32, f32)], press: &[f32], max_step: f32) -> (Vec<(f32, f3
     (pts, pr)
 }
 
+/// One unit NORMAL per vertex — the perpendicular of the CENTRAL-DIFFERENCE tangent
+/// (`p[i+1] − p[i−1]`), i.e. the direction the curve is actually heading THROUGH that point
+/// rather than the direction of either segment leaving it. The ends use the one segment they
+/// have.
+///
+/// Sharing one normal between the two quads that meet at a vertex is what makes the ribbon
+/// watertight (DRAGON-345). Offsetting each segment along its OWN normal instead leaves a
+/// bowtie at every joint: the two quads overlap on the inside of the bend and leave an empty
+/// WEDGE on the outside, apex at the centerline and mouth `h·θ` wide at the edge. Each of those
+/// is a hairline crack cutting most of the way into the ink — invisible at 1:1, a fishbone of
+/// burrs once zoomed, and worst exactly where the stroke curves (θ grows with curvature). The
+/// central difference also halves the angle noise a per-segment delta picks up from densified
+/// near-coincident samples.
+///
+/// Degenerate stencils fall back: a cusp (`p[i+1] ≈ p[i−1]`) uses the outgoing segment, then
+/// the incoming one, then a fixed axis — never a zero-length normal. Pure — unit-tested.
+fn vertex_normals(pts: &[(f32, f32)]) -> Vec<(f32, f32)> {
+    let n = pts.len();
+    let unit = |v: (f32, f32)| {
+        let l = v.0.hypot(v.1);
+        (l > 1e-6).then(|| (v.0 / l, v.1 / l))
+    };
+    let delta = |a: (f32, f32), b: (f32, f32)| (b.0 - a.0, b.1 - a.1);
+    (0..n)
+        .map(|i| {
+            let lo = i.saturating_sub(1);
+            let hi = (i + 1).min(n - 1);
+            let t = unit(delta(pts[lo], pts[hi]))
+                .or_else(|| unit(delta(pts[i], pts[hi])))
+                .or_else(|| unit(delta(pts[lo], pts[i])))
+                .unwrap_or((1.0, 0.0));
+            (-t.1, t.0)
+        })
+        .collect()
+}
+
 /// A closed disc polygon (`segs`-gon) at `c`, wound to match the segment quads below — every
 /// piece of a stroke must share one winding direction for the non-zero fill to UNION them.
 fn disc(c: (f32, f32), r: f32, out: &mut Vec<Vec<(f32, f32)>>) {
@@ -613,11 +668,14 @@ fn disc(c: (f32, f32), r: f32, out: &mut Vec<Vec<(f32, f32)>>) {
 /// point to target space and `scale` is that mapping's uniform scale factor (target px per
 /// source px), which the half-widths ride.
 ///
-/// The result is one quad per segment (offset by the local half-width at each end) plus discs
-/// at both caps and at any joint whose turn would leave a visible wedge. Every polygon is
-/// closed and wound the SAME way: fill them as ONE path with the NON-ZERO rule and overlapping
-/// passes union cleanly — no cancellation holes where a scribble crosses itself, and no
-/// double-composited seams when the group draws at partial alpha. Pure — unit-tested.
+/// The result is one quad per segment plus discs at both caps and at any vertex whose turn is
+/// sharp enough to under-cover. Each quad is offset along the two SHARED VERTEX normals of its
+/// endpoints (never its own segment normal — see [`vertex_normals`]), so consecutive quads abut
+/// EXACTLY along the cross-section they share: the ribbon is watertight, with no wedge cracks
+/// between pieces (DRAGON-345). Every polygon is closed and wound the SAME way: fill them as
+/// ONE path with the NON-ZERO rule and overlapping passes union cleanly — no cancellation holes
+/// where a scribble crosses itself (or where a tight turn folds the inner edge over itself), and
+/// no double-composited seams when the group draws at partial alpha. Pure — unit-tested.
 pub fn stroke_fill_polygons(
     points: &[(f32, f32)],
     base_w: f32,
@@ -644,7 +702,9 @@ pub fn stroke_fill_polygons(
         disc(tp[0], half[0], &mut out);
         return out;
     }
-    // Unit direction per segment (skipping degenerate ones), and the quad it sweeps.
+    // ONE normal per VERTEX, shared by the two quads that meet there — the whole reason the
+    // ribbon has no cracks in it.
+    let norms = vertex_normals(&tp);
     let mut dirs: Vec<Option<(f32, f32)>> = Vec::with_capacity(tp.len() - 1);
     for i in 0..tp.len() - 1 {
         let (a, b) = (tp[i], tp[i + 1]);
@@ -656,13 +716,19 @@ pub fn stroke_fill_polygons(
         }
         let d = (dx / len, dy / len);
         dirs.push(Some(d));
-        let n = (-d.1, d.0);
+        // Both ends offset along their own VERTEX normal, so quad i's trailing edge IS quad
+        // i+1's leading edge — no gap to crack open, no bowtie to double-cover. The segment's
+        // own normal only decides which SIDE is which, so a vertex normal that ended up on the
+        // far side (a cusp) can't invert this quad's winding.
+        let sn = (-d.1, d.0);
+        let side = |n: (f32, f32)| if n.0 * sn.0 + n.1 * sn.1 >= 0.0 { n } else { (-n.0, -n.1) };
+        let (na, nb) = (side(norms[i]), side(norms[i + 1]));
         let (ha, hb) = (half[i], half[i + 1]);
         out.push(vec![
-            (a.0 + n.0 * ha, a.1 + n.1 * ha),
-            (b.0 + n.0 * hb, b.1 + n.1 * hb),
-            (b.0 - n.0 * hb, b.1 - n.1 * hb),
-            (a.0 - n.0 * ha, a.1 - n.1 * ha),
+            (a.0 + na.0 * ha, a.1 + na.1 * ha),
+            (b.0 + nb.0 * hb, b.1 + nb.1 * hb),
+            (b.0 - nb.0 * hb, b.1 - nb.1 * hb),
+            (a.0 - na.0 * ha, a.1 - na.1 * ha),
         ]);
     }
     if out.is_empty() {
@@ -674,11 +740,17 @@ pub fn stroke_fill_polygons(
     // pinch read as a nib landing and lifting rather than a chopped-off rectangle.
     disc(tp[0], half[0], &mut out);
     disc(tp[tp.len() - 1], half[tp.len() - 1], &mut out);
-    // Round JOINS only where the turn would actually show a wedge (sag ≈ h·(1 − cos(θ/2))).
-    // On a smoothed stroke most joints turn a degree or two and cost nothing to leave open;
-    // this keeps the polygon count near one per segment instead of two.
+    // Round JOINS where a turn is sharp enough that the flat cross-section falls short of the
+    // true round join (deficit ≈ h·(1 − cos(θ/2)) on the outside of the bend). With shared
+    // vertex normals this is now the ONLY defect left at a joint — a genuine under-cover, not
+    // the crack the per-segment normals used to leave — so it is rare on a smoothed stroke and
+    // the polygon count stays near one per segment.
     for i in 1..tp.len() - 1 {
-        let (Some(d0), Some(d1)) = (dirs[i - 1], dirs[i]) else { continue };
+        let (Some(d0), Some(d1)) = (dirs[i - 1], dirs[i]) else {
+            // A degenerate neighbour leaves the tangent guesswork; a round join is always safe.
+            disc(tp[i], half[i], &mut out);
+            continue;
+        };
         let cos_t = (d0.0 * d1.0 + d0.1 * d1.1).clamp(-1.0, 1.0);
         // cos(θ/2) from the half-angle identity, guarding the reversal case.
         let half_cos = ((1.0 + cos_t) * 0.5).max(0.0).sqrt();
@@ -996,6 +1068,136 @@ mod tests {
     }
 
     #[test]
+    fn a_curving_ribbon_has_no_wedge_cracks_between_its_pieces() {
+        // DRAGON-345: offsetting each segment along its OWN normal left a bowtie at every
+        // joint — overlap inside the bend, an empty WEDGE outside it, apex on the centerline.
+        // Those wedges are hairline cracks slicing most of the way into the ink: invisible at
+        // 1:1, a fishbone of burrs once zoomed, worst exactly where the stroke curves. A dense
+        // circular arc is the worst case (every joint turns), so probe INSIDE the ink right
+        // where each crack would open: on the outward normal at each vertex.
+        let (cx, cy, r) = (0.0f32, 0.0f32, 40.0);
+        let n = 90; // ~2px sampling → ~2.9° per joint
+        let span = std::f32::consts::PI; // a half turn
+        let arc: Vec<(f32, f32)> = (0..=n)
+            .map(|i| {
+                let a = span * i as f32 / n as f32;
+                (cx + r * a.cos(), cy + r * a.sin())
+            })
+            .collect();
+        let polys = stroke_fill_polygons(&arc, 6.0, &[], ident, 1.0);
+        // Well inside the ink: the ribbon's half-width never drops below 0.75×6/2 = 2.25px
+        // between the tapers, so 1.5px off the centerline is solid ink at every mid-arc vertex.
+        // On the per-segment-normal geometry these probes land in the crack.
+        let mut cracked = Vec::new();
+        for (i, p) in arc.iter().enumerate().take(arc.len() * 4 / 5).skip(arc.len() / 5) {
+            let out = ((p.0 - cx) / r, (p.1 - cy) / r); // the outward (radial) normal
+            for off in [0.8f32, 1.5, 2.0] {
+                let probe = (p.0 + out.0 * off, p.1 + out.1 * off);
+                if !covered(&polys, probe) {
+                    cracked.push((i, off));
+                }
+            }
+        }
+        assert!(cracked.is_empty(), "wedge cracks at {} probes: {:?}", cracked.len(), &cracked[..cracked.len().min(6)]);
+        // The inner side of the bend must be solid too (that is where the pieces fold over
+        // each other — the non-zero fill has to UNION them, never cancel a hole).
+        for (i, p) in arc.iter().enumerate().take(arc.len() * 4 / 5).skip(arc.len() / 5) {
+            let inw = ((cx - p.0) / r, (cy - p.1) / r);
+            let probe = (p.0 + inw.0 * 1.5, p.1 + inw.1 * 1.5);
+            assert!(covered(&polys, probe), "the inside of the bend is holed at {i}");
+        }
+        // …and nothing bulges OUT past the width ceiling: every emitted vertex stays inside the
+        // ideal offset band, so a joint can never throw a spike off the edge.
+        let ceiling = r + max_width(6.0) * 0.5 + 0.01;
+        let worst = polys
+            .iter()
+            .flatten()
+            .map(|q| (q.0 - cx).hypot(q.1 - cy))
+            .fold(0.0f32, f32::max);
+        assert!(worst <= ceiling, "a vertex bulges to {worst}, ceiling {ceiling}");
+    }
+
+    #[test]
+    fn width_does_not_jitter_sample_to_sample_on_a_smooth_curve() {
+        // DRAGON-345: a constant-curvature arc must ink at a constant width. Measuring the
+        // curvature between IMMEDIATE neighbours computes a triangle area from near-equal f32
+        // products, and out at screenshot coordinates the cancellation noise alone swung the
+        // width from sample to sample — a ripple along the ribbon's edge, obvious at zoom.
+        // The arc sits at 4K-ish coordinates on purpose: that is where f32 has least to give.
+        let (cx, cy, r) = (1500.0f32, 900.0f32, 40.0);
+        let n = 120;
+        let arc: Vec<(f32, f32)> = (0..=n)
+            .map(|i| {
+                let a = std::f32::consts::PI * i as f32 / n as f32;
+                (cx + r * a.cos(), cy + r * a.sin())
+            })
+            .collect();
+        // Profiled the way the RENDERER does it — on the densified samples, which sit under a
+        // pixel apart and are where the cancellation is worst.
+        let (dense, sp) = densify(&arc, &[], (6.0 * RESAMPLE_FRAC).max(RESAMPLE_MIN));
+        let w = width_profile(&dense, 6.0, &sp);
+        let body = &w[w.len() / 4..w.len() * 3 / 4];
+        let jitter = body.windows(2).map(|p| (p[1] - p[0]).abs()).fold(0.0f32, f32::max);
+        assert!(jitter < 0.02, "width jitters {jitter}px between neighbouring samples");
+        // Constant curvature ⇒ a constant width: the profile must not wander up and down
+        // along the arc at all (each reversal is a visible nick in the ribbon's edge).
+        let mut flips = 0;
+        let mut last = 0i32;
+        for p in body.windows(2) {
+            let d = p[1] - p[0];
+            let sg = if d > 1e-4 { 1 } else if d < -1e-4 { -1 } else { 0 };
+            if sg != 0 {
+                if last != 0 && sg != last {
+                    flips += 1;
+                }
+                last = sg;
+            }
+        }
+        assert!(flips <= 2, "the width reverses {flips} times along a constant-curvature arc");
+        // It is still a heavier-than-base stroke: the arc IS a curve, so the swell is real —
+        // this is a smoothness fix, not a flattening of the pressure look.
+        let mid = body[body.len() / 2];
+        assert!(mid > 6.0 * 1.15, "the loop swell survives: {mid}");
+        assert!(mid <= max_width(6.0) + 1e-3);
+    }
+
+    #[test]
+    fn vertex_normals_are_shared_smooth_and_never_degenerate() {
+        // The normal at a vertex is the perpendicular of the CENTRAL-DIFFERENCE tangent, so the
+        // two quads meeting there offset along the SAME direction and abut exactly.
+        let arc: Vec<(f32, f32)> = (0..=40)
+            .map(|i| {
+                let a = std::f32::consts::FRAC_PI_2 * i as f32 / 40.0;
+                (30.0 * a.cos(), 30.0 * a.sin())
+            })
+            .collect();
+        let ns = vertex_normals(&arc);
+        assert_eq!(ns.len(), arc.len());
+        assert!(ns.iter().all(|n| (n.0.hypot(n.1) - 1.0).abs() < 1e-3), "all unit length");
+        // On a circle the true normal IS radial — the central difference nails it to well
+        // under a degree (a per-segment normal is off by half the turn angle by construction).
+        for (p, n) in arc.iter().zip(&ns).skip(1).take(38) {
+            let radial = (p.0 / 30.0, p.1 / 30.0);
+            let dot = (n.0 * radial.0 + n.1 * radial.1).abs();
+            assert!(dot > 0.9999, "normal off the radial by {}°", dot.acos().to_degrees());
+        }
+        // Degeneracies: a cusp (the stencil folds back on itself), coincident points and a
+        // 2-point path all still yield a real unit normal, never a zero or a NaN.
+        for pts in [
+            vec![(0.0, 0.0), (10.0, 0.0), (0.0, 0.0)],
+            vec![(5.0, 5.0), (5.0, 5.0), (5.0, 5.0)],
+            vec![(0.0, 0.0), (3.0, 4.0)],
+        ] {
+            let ns = vertex_normals(&pts);
+            assert_eq!(ns.len(), pts.len());
+            assert!(
+                ns.iter().all(|n| n.0.is_finite() && n.1.is_finite() && n.0.hypot(n.1) > 0.9),
+                "degenerate stencil produced {ns:?}"
+            );
+        }
+    }
+
+    #[test]
     fn every_polygon_shares_one_winding_so_overlaps_union() {
         // The non-zero fill only unions a self-crossing scribble if every piece is wound the
         // same way — a reversed piece would punch a hole where the stroke crosses itself.
@@ -1038,4 +1240,3 @@ mod tests {
         }
     }
 }
-
