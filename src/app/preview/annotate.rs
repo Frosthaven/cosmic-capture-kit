@@ -13,7 +13,7 @@
 //!
 //! # Adding a new tool (the whole recipe)
 //! Two tools ship as the foundation — Box (rectangle) and Arrow. To add another
-//! (line / ellipse / text / numbered / pen / …):
+//! (line / ellipse / text / numbered / …):
 //! 1. **Model**: add a variant to [`AnnotKind`] carrying its SOURCE-pixel geometry.
 //! 2. **Rasterize**: add a match arm in [`rasterize_scene`] drawing it with tiny-skia
 //!    (scaled by `scale`). The bake reuses this at full resolution — nothing else needed
@@ -27,6 +27,55 @@
 //!    `DrawBegin`/`GestureTo` — teach [`App::annot_gesture_to`]'s `New` arm how to shape
 //!    it, and the canvas widget's hit-testing/chrome how to select it. A click-placed
 //!    tool (sticker/numbered) adds a `DrawBegin`-on-press path instead.
+//! 6. **Pre-placement** (DRAGON-339): add a match arm in [`spawn_kind`] shaping the tool into
+//!    the shared [`default_placement_rect`], so DOUBLE-CLICKING its tray button drops one
+//!    ready-made in the middle of the picture. Return `None` there for a tool with no
+//!    pre-placeable form (a freehand/stroke tool) — double-click then just picks it.
+//!    Nothing else is owed: the Ctrl-overrides-manipulation draw path
+//!    (`annotation_canvas::force_new_draw`) is tool-agnostic.
+//!
+//! # The freehand pencil + eraser (DRAGON-338), beautified (DRAGON-342)
+//! [`AnnotKind::Pen`] is the first NON-rect, non-two-point kind, and shows how far the seams
+//! stretch. A drag appends samples to the RAW trail on [`super::edit::EditState::pen_raw`]
+//! (thinned by [`PEN_MIN_STEP`]) and re-fits [`crate::pen_stroke`]'s smoothed, pseudo-pressure
+//! curve into the MODEL on every sample — so the stored points are always the beautified
+//! stroke, the ink you watch being drawn is exactly what commit keeps, and display, bake,
+//! hit-testing, the eraser and merge all read one geometry. The parallel `pressure` array is
+//! the per-point SPEED signal the width profile rides (the one thing the resample throws away);
+//! it is optional by construction — an empty entry reads as neutral. A pencil TAP is a
+//! one-point stroke that inks as a firm round DOT ([`normalize_pen_tap`]); with the pencil
+//! armed a press is always deliberate ink, so a pen gesture is never discarded as degenerate.
+//! Every reach sized off the stroke width (eraser, hit-test, merge slack, the keep-it-inside-
+//! the-picture margin) rides [`crate::pen_stroke::max_width`], since a pressure-swelled stretch
+//! draws wider than its preset. On commit,
+//! [`merge_connected_pens`] folds every same-looking pen group whose ink TOUCHES the new
+//! stroke into it — so connected scribbles are ONE selectable item and disconnected ones stay
+//! separate. Because a group has no rect of its own, its selection chrome + resize ride its
+//! BOUNDING BOX ([`pen_bounds`]) and a resize maps the points affinely into the new box
+//! ([`scale_pen`]); the canvas hit-tests along the STROKES, not the (mostly empty) box.
+//!
+//! The ERASER (`Tool::Eraser`) is not a draw tool at all — the only tool whose press never
+//! selects or moves. It opens an [`AnnotGesture::Erase`] sweep that MARKS the pen groups its
+//! travelled SEGMENT touches ([`pen_hit_by_eraser`]) into
+//! [`super::edit::EditState::erase_marks`]; marked groups draw at [`ERASE_PREVIEW_ALPHA`]
+//! (the preview of what's going) and RELEASE deletes them all as ONE undo entry. Only pen
+//! groups erase — a sweep must never silently take out a redaction it passed over.
+//!
+//! # The pointer + multi-selection (DRAGON-341)
+//! `Tool::Pointer` creates NOTHING: it is the mode in which the selection
+//! ([`super::edit::Selection`], an ordered set whose last member is the PRIMARY) is edited —
+//! Ctrl/Shift-click toggles a member, an empty-canvas drag rubber-bands ([`items_in_band`]),
+//! and dragging any selected body moves them all ([`AnnotGesture::MoveMany`], one delta clamped
+//! once on the union bounds via [`group_move_delta`], committed as ONE undo entry). It is also
+//! the ONLY tool under which pen groups are selectable AT ALL: ink never swallows clicks meant
+//! for the shapes under it ([`crate::widgets::annotation_canvas`]'s `pen_selectable`), a drawn
+//! stroke never selects itself ([`kind_selects_on_create`]), and arming any other tool prunes
+//! pen ids out of the set ([`super::edit::EditState::drop_pen_selection`]) so the visible
+//! selection and the real one can never disagree. Single-item operations (resize, duplicate,
+//! reorder, kind conversion)
+//! still act on the PRIMARY alone; whole-selection operations (move, delete, color, width) walk
+//! the set. A new tool must decide its `spawn_kind` arm and, if it creates nothing, return
+//! `None` there and answer `false` to `Tool::draws`.
 
 use super::*;
 use crate::widgets::annotation_canvas::{FxKind, Grab, Item, ItemKind, Tool};
@@ -140,6 +189,23 @@ pub enum AnnotKind {
     /// stacked [`BLUR_BLOCK`] box blurs ([`box_blur_stack`]) — a strong smooth (≈ Gaussian) blur.
     /// Same geometry/interaction as a box; irreversible once baked.
     Blur { rect: AnnotRect },
+    /// FREEHAND pen strokes (DRAGON-338): a GROUP of polylines (SOURCE px) that all read as one
+    /// drawing — every stroke that TOUCHES another one in the group (see
+    /// [`merge_connected_pens`]), so connected scribbles select/move/delete as a unit while
+    /// disconnected ones stay separate items. Stored as pure VECTOR points at the shared stroke
+    /// width, so it stays crisp at any zoom and only rasterizes at bake time. Selection chrome +
+    /// resize ride the group's bounding box; a resize scales the points affinely into the new box.
+    ///
+    /// The points are the SMOOTHED centerline (DRAGON-342) — the drag re-fits
+    /// [`crate::pen_stroke::smooth_path`] into the model on every sample, so the beautified
+    /// stroke IS what was drawn (nothing re-shapes at commit) and hit-testing / the eraser /
+    /// merge / the bake all read the one geometry the canvas draws. `pressure` is the parallel
+    /// per-point SPEED signal the pseudo-pressure width profile rides
+    /// ([`crate::pen_stroke::pressure_along`]) — the one thing the resample throws away and the
+    /// bake cannot recompute. It is OPTIONAL by construction: an empty (or wrong-length) entry
+    /// reads as neutral pressure, so a stroke built without a trail still profiles from its
+    /// curvature alone. `pressure[i]` belongs to `paths[i]`; helpers keep them in step.
+    Pen { paths: Vec<Vec<AnnotPoint>>, pressure: Vec<Vec<f32>>, stroke_w: f32 },
 }
 
 impl AnnotKind {
@@ -153,7 +219,13 @@ impl AnnotKind {
                 | AnnotKind::Arrow { .. }
                 | AnnotKind::Highlight { .. }
                 | AnnotKind::BoxHighlight { .. }
+                | AnnotKind::Pen { .. }
         )
+    }
+
+    /// Whether this is a freehand PEN group (DRAGON-338) — the only kind the eraser removes.
+    pub fn is_pen(&self) -> bool {
+        matches!(self, AnnotKind::Pen { .. })
     }
 
     /// Whether this kind is a REGION EFFECT (highlight / pixelate / blur) — the kinds that
@@ -220,6 +292,99 @@ pub enum AnnotGesture {
     /// Editing existing item `id`: `grab` is what's dragged, `original` its geometry at
     /// grab start, `press` the grab's image-px anchor.
     Edit { press: (f32, f32), id: AnnotId, grab: Grab, original: AnnotKind },
+    /// Moving a MULTI-selection as one (DRAGON-341): every selected item's geometry at grab
+    /// start, plus the union of their DRAWN bounds. The drag applies ONE delta — clamped once
+    /// against `bounds` ([`group_move_delta`]) rather than per item — so the arrangement is
+    /// rigid: nothing squeezes together when the group meets an image edge.
+    MoveMany { press: (f32, f32), originals: Vec<(AnnotId, AnnotKind)>, bounds: AnnotRect },
+    /// An ERASER sweep (DRAGON-338): `last` is the previous sampled point, so each update
+    /// tests the SEGMENT the eraser travelled (never just the sampled points — a fast drag
+    /// would otherwise jump clean over a stroke). Marks accumulate in
+    /// [`super::edit::EditState::erase_marks`]; releasing deletes them as ONE undo entry.
+    Erase { last: (f32, f32) },
+}
+
+// ── Pre-placed items: double-click a tool to spawn one (DRAGON-339) ─────────────────────
+
+/// The default spawn WIDTH (SOURCE px) of a pre-placed item — the size a double-clicked tool
+/// drops in the middle of the picture, unless 80% of the image is smaller (see
+/// [`default_placement_rect`]).
+pub const SPAWN_W: f32 = 200.0;
+/// The default spawn HEIGHT (SOURCE px) of a pre-placed item. See [`SPAWN_W`].
+pub const SPAWN_H: f32 = 100.0;
+/// The fraction of the image a pre-placed item may occupy per axis when [`SPAWN_W`]/[`SPAWN_H`]
+/// would not fit — so a tiny capture still gets a usable, clearly-inset item.
+pub const SPAWN_MAX_FRAC: f32 = 0.8;
+
+/// The rect a DOUBLE-CLICKED tool spawns its item in (DRAGON-339): [`SPAWN_W`]×[`SPAWN_H`] or
+/// [`SPAWN_MAX_FRAC`] of the image per axis — whichever FITS — CENTERED in the frame, and
+/// further shrunk so the item's DRAWN extent (geometry grown by `margin`, i.e. half the stroke —
+/// the `kind_draw_margin` overhang) still lands inside the picture. Each axis is independent, so a
+/// wide-but-short image gets a wide-but-short item. Degenerate frames yield a zero rect (the
+/// caller discards it, exactly like a degenerate drag). Pure — unit-tested.
+pub fn default_placement_rect(frame: (u32, u32), margin: f32) -> AnnotRect {
+    let (fw, fh) = (frame.0 as f32, frame.1 as f32);
+    let m = margin.max(0.0);
+    let axis = |full: f32, want: f32| -> f32 {
+        // The inset room left once the drawn margin is reserved on BOTH sides.
+        let room = (full - 2.0 * m).max(0.0);
+        want.min(full * SPAWN_MAX_FRAC).min(room).max(0.0)
+    };
+    let w = axis(fw, SPAWN_W);
+    let h = axis(fh, SPAWN_H);
+    AnnotRect { x: (fw - w) * 0.5, y: (fh - h) * 0.5, w, h }
+}
+
+/// The kind a DOUBLE-CLICKED `tool` spawns inside `rect` (DRAGON-339), or `None` for a tool that
+/// has NO pre-placeable form — a freehand/stroke tool draws only under the pointer, so
+/// double-clicking it must stay a plain tool pick. Every rect-geometry tool maps straight onto
+/// the placement rect; the arrow spans it corner-to-corner (NW → SE), so it reads as a real
+/// arrow rather than a dot. Pure — unit-tested.
+pub fn spawn_kind(tool: Tool, rect: AnnotRect, stroke_w: f32) -> Option<AnnotKind> {
+    Some(match tool {
+        Tool::Rect => AnnotKind::Box { rect, stroke_w, fill: None },
+        Tool::Highlight => AnnotKind::Highlight { rect },
+        Tool::BoxHighlight => AnnotKind::BoxHighlight { rect, stroke_w },
+        Tool::Spotlight => AnnotKind::Spotlight { rect },
+        Tool::Pixelate => AnnotKind::Pixelate { rect },
+        Tool::Blur => AnnotKind::Blur { rect },
+        Tool::Arrow => AnnotKind::Arrow {
+            a: AnnotPoint { x: rect.x, y: rect.y },
+            b: AnnotPoint { x: rect.x + rect.w, y: rect.y + rect.h },
+            stroke_w,
+        },
+        // A freehand stroke has no meaningful default geometry; the eraser creates no item at
+        // all; and the POINTER (DRAGON-341) is pure selection — it must never place anything.
+        // Double-clicking any of their tray buttons just picks the tool.
+        Tool::Pen | Tool::Eraser | Tool::Pointer => return None,
+    })
+}
+
+/// How long after a tool button's first press a SECOND press on the SAME tool still counts as a
+/// double-click (DRAGON-339). Matches the usual desktop double-click window.
+pub const TOOL_DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// The action-tray double-click detector (DRAGON-339). libcosmic buttons report presses, not
+/// click COUNTS, so the preview tracks the last tool press itself: pressing the SAME tool twice
+/// within [`TOOL_DOUBLE_CLICK`] is a double-click (which spawns a pre-placed item), anything else
+/// is a plain pick. A recognized double-click CONSUMES the record, so a third press starts a
+/// fresh pair rather than firing again. Pure state machine — unit-tested.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct ToolClicks {
+    last: Option<(Tool, std::time::Instant)>,
+}
+
+impl ToolClicks {
+    /// Record a press of `tool` at `now`, returning whether it completed a double-click.
+    pub fn press(&mut self, tool: Tool, now: std::time::Instant) -> bool {
+        let double = matches!(
+            self.last,
+            Some((prev, at)) if prev == tool && now.duration_since(at) <= TOOL_DOUBLE_CLICK
+        );
+        // A completed pair is consumed (no triple-fire); otherwise this press opens a new pair.
+        self.last = if double { None } else { Some((tool, now)) };
+        double
+    }
 }
 
 /// The straight-alpha bytes of the user's current accent color. Resolved on the main
@@ -354,6 +519,276 @@ pub fn palette_entries(recents: &[AnnotColor]) -> Vec<PaletteEntry> {
     }
     v.push(PaletteEntry::Custom);
     v
+}
+
+// ── freehand pen geometry (DRAGON-338; all pure — unit-tested) ────────────────────────
+
+/// The smallest SOURCE-px step between two recorded pen points. A pointer move closer than
+/// this to the last point is dropped, so a slow drag doesn't pile up thousands of coincident
+/// vertices (the stroke is a VECTOR — its cost is its point count, not its length).
+pub const PEN_MIN_STEP: f32 = 1.5;
+
+/// The SOURCE-px travel below which a committed pen gesture is a TAP, not a stroke
+/// (DRAGON-342): it normalizes to its single anchor point and inks as a round DOT of
+/// [`crate::pen_stroke::dot_width`]. Same 3px bar the old degeneracy rule used to DISCARD such
+/// a gesture at — now it becomes a mark instead of nothing, because with the pencil armed a
+/// press is always deliberate ink (selection lives on the pointer tool).
+pub const PEN_DOT_MAX: f32 = 3.0;
+
+/// Extra SOURCE-px slack added to the "do these two strokes touch?" test on TOP of their two
+/// stroke half-widths — the ink of two strokes drawn to meet can leave a hairline gap from
+/// pointer sampling, and a hair's gap should still read as connected.
+pub const PEN_JOIN_SLACK: f32 = 2.0;
+
+/// The eraser's SOURCE-px reach beyond a stroke's own half-width: how close the eraser path
+/// must pass to a pen stroke to mark it. Deliberately generous — erasing is a sweep, not
+/// surgery — but small enough that you can clear one scribble without catching its neighbour.
+pub const ERASER_SLACK: f32 = 6.0;
+
+/// Distance from point `p` to the segment `a`–`b`. Pure.
+fn point_seg_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f32::EPSILON {
+        return (p.0 - a.0).hypot(p.1 - a.1);
+    }
+    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0);
+    (p.0 - (a.0 + t * dx)).hypot(p.1 - (a.1 + t * dy))
+}
+
+/// The smallest distance between the segments `a1`–`a2` and `b1`–`b2` — `0` when they cross.
+/// Non-crossing segments are nearest at an ENDPOINT of one of them, so the four point-to-
+/// segment distances cover every case. Pure.
+fn seg_seg_dist(a1: (f32, f32), a2: (f32, f32), b1: (f32, f32), b2: (f32, f32)) -> f32 {
+    // Proper-intersection test by orientation signs (the crossing case, distance 0).
+    let cross = |o: (f32, f32), p: (f32, f32), q: (f32, f32)| {
+        (p.0 - o.0) * (q.1 - o.1) - (p.1 - o.1) * (q.0 - o.0)
+    };
+    let (d1, d2) = (cross(b1, b2, a1), cross(b1, b2, a2));
+    let (d3, d4) = (cross(a1, a2, b1), cross(a1, a2, b2));
+    if ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0)) {
+        return 0.0;
+    }
+    point_seg_dist(a1, b1, b2)
+        .min(point_seg_dist(a2, b1, b2))
+        .min(point_seg_dist(b1, a1, a2))
+        .min(point_seg_dist(b2, a1, a2))
+}
+
+/// The smallest distance between any segment of `paths` and the segment `a`–`b`. A single-point
+/// stroke measures as a point. `f32::INFINITY` for an empty group. Pure.
+fn pen_dist_to_segment(paths: &[Vec<AnnotPoint>], a: (f32, f32), b: (f32, f32)) -> f32 {
+    let mut best = f32::INFINITY;
+    for path in paths {
+        match path.len() {
+            0 => {}
+            1 => best = best.min(point_seg_dist((path[0].x, path[0].y), a, b)),
+            _ => {
+                for w in path.windows(2) {
+                    let d = seg_seg_dist((w[0].x, w[0].y), (w[1].x, w[1].y), a, b);
+                    best = best.min(d);
+                    if best <= 0.0 {
+                        return 0.0;
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Whether the two pen groups TOUCH: any segment of one passes within `tol` of any segment of
+/// the other (crossing counts as distance 0). `tol` is the sum of their stroke half-widths plus
+/// [`PEN_JOIN_SLACK`] — i.e. their drawn INK overlaps or all but touches. Pure — the whole
+/// definition of "connected" the merge is built on.
+pub fn pen_groups_touch(a: &[Vec<AnnotPoint>], b: &[Vec<AnnotPoint>], tol: f32) -> bool {
+    for path in a {
+        match path.len() {
+            0 => {}
+            1 => {
+                if pen_dist_to_segment(b, (path[0].x, path[0].y), (path[0].x, path[0].y)) <= tol {
+                    return true;
+                }
+            }
+            _ => {
+                for w in path.windows(2) {
+                    if pen_dist_to_segment(b, (w[0].x, w[0].y), (w[1].x, w[1].y)) <= tol {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Whether an ERASER sweep from `a` to `b` (SOURCE px) touches this pen group: any of its
+/// segments within `max_width / 2 + ERASER_SLACK` of the sweep. The reach rides
+/// [`crate::pen_stroke::max_width`], NOT the preset width — a heavy (pressure-swelled) stretch
+/// draws wider than its nominal weight, and the eraser must reach every pixel that was inked.
+/// A zero-length sweep (a plain click) is a point test, so clicking a stroke marks it. Pure —
+/// the eraser's whole hit rule.
+pub fn pen_hit_by_eraser(
+    paths: &[Vec<AnnotPoint>],
+    stroke_w: f32,
+    a: (f32, f32),
+    b: (f32, f32),
+) -> bool {
+    pen_dist_to_segment(paths, a, b) <= crate::pen_stroke::max_width(stroke_w) * 0.5 + ERASER_SLACK
+}
+
+/// A pen group's points as plain `(x, y)` tuples — the shape [`crate::pen_stroke`] and the
+/// canvas widget speak. One allocation per stroke; the pen paths are short vectors.
+pub fn pen_xy(path: &[AnnotPoint]) -> Vec<(f32, f32)> {
+    path.iter().map(|p| (p.x, p.y)).collect()
+}
+
+/// The stored per-point speed signal for stroke `i` of a pen group, or an EMPTY slice when the
+/// group carries none (or a stale/mismatched one) — which every consumer reads as neutral
+/// pressure. The single guard against the parallel arrays ever being mis-indexed.
+pub fn pen_pressure<'a>(
+    pressure: &'a [Vec<f32>],
+    paths: &[Vec<AnnotPoint>],
+    i: usize,
+) -> &'a [f32] {
+    match (pressure.get(i), paths.get(i)) {
+        (Some(p), Some(path)) if p.len() == path.len() => p,
+        _ => &[],
+    }
+}
+
+/// The SOURCE-px bounding box of a pen group (the rect its selection chrome + handles sit on).
+/// An empty group is a zero rect at the origin. Pure.
+pub fn pen_bounds(paths: &[Vec<AnnotPoint>]) -> AnnotRect {
+    let (mut lo_x, mut lo_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut hi_x, mut hi_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for p in paths.iter().flatten() {
+        lo_x = lo_x.min(p.x);
+        lo_y = lo_y.min(p.y);
+        hi_x = hi_x.max(p.x);
+        hi_y = hi_y.max(p.y);
+    }
+    if !lo_x.is_finite() || !lo_y.is_finite() {
+        return AnnotRect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 };
+    }
+    AnnotRect { x: lo_x, y: lo_y, w: hi_x - lo_x, h: hi_y - lo_y }
+}
+
+/// The total drawn LENGTH of a pen group (SOURCE px) — the "is this a real stroke or a stray
+/// click?" measure. Pure.
+pub fn pen_length(paths: &[Vec<AnnotPoint>]) -> f32 {
+    paths
+        .iter()
+        .flat_map(|p| p.windows(2))
+        .map(|w| (w[1].x - w[0].x).hypot(w[1].y - w[0].y))
+        .sum()
+}
+
+/// Map a pen group from the bounding box `from` into the box `to` — the affine a resize
+/// applies (a Move is the degenerate same-size case, a pure translation). A zero-extent axis
+/// can't scale (a perfectly straight line has no height), so it TRANSLATES on that axis
+/// instead of dividing by zero. Pure — unit-tested.
+pub fn scale_pen(paths: &[Vec<AnnotPoint>], from: AnnotRect, to: AnnotRect) -> Vec<Vec<AnnotPoint>> {
+    let sx = if from.w.abs() > 1e-4 { to.w / from.w } else { 1.0 };
+    let sy = if from.h.abs() > 1e-4 { to.h / from.h } else { 1.0 };
+    paths
+        .iter()
+        .map(|path| {
+            path.iter()
+                .map(|p| AnnotPoint {
+                    x: to.x + (p.x - from.x) * sx,
+                    y: to.y + (p.y - from.y) * sy,
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Collapse a freehand gesture that never really travelled (under [`PEN_DOT_MAX`] of ink) into
+/// the single-point DOT it is, anchored on its own first point — or on `fallback` (the raw
+/// trail's first sample) if it somehow has none. Returns whether the gesture WAS a tap (an
+/// already-single point counts, and normalizes to itself); `false`, changing nothing, for a
+/// real stroke and for every non-pen kind.
+///
+/// This is the whole "a pencil TAP inks a dot" rule (DRAGON-342). A one-point stroke renders as
+/// a firm round press ([`crate::pen_stroke::dot_width`]) and behaves like any other pen item —
+/// it merges with strokes that touch it, erases, resizes, undoes as one entry, and bakes at
+/// full resolution. The boundary is deliberately the same 3px the OLD degeneracy rule used to
+/// DISCARD such a gesture at: below it there is no stroke worth keeping, so it becomes the dot
+/// the user meant rather than nothing at all. Pure — unit-tested.
+pub fn normalize_pen_tap(kind: &mut AnnotKind, fallback: Option<AnnotPoint>) -> bool {
+    let AnnotKind::Pen { paths, pressure, .. } = kind else {
+        return false;
+    };
+    if pen_length(paths) >= PEN_DOT_MAX {
+        return false;
+    }
+    let Some(anchor) = paths.iter().flatten().next().copied().or(fallback) else {
+        return false;
+    };
+    // A dot carries no speed signal: its width is the firm-press dot width, by definition.
+    *paths = vec![vec![anchor]];
+    *pressure = vec![Vec::new()];
+    true
+}
+
+/// Fold every OTHER pen group that CONNECTS to `id` into it, transitively (absorbing one group
+/// grows the geometry, which may then reach a third), and drop the absorbed items. Returns
+/// whether anything merged.
+///
+/// Two groups connect when their ink touches ([`pen_groups_touch`]) AND they LOOK the same —
+/// identical color and stroke width. The appearance guard is deliberate: a group carries ONE
+/// color + width, so merging across a color change would silently repaint the user's earlier
+/// strokes. Same-looking strokes that touch are indistinguishable once drawn, so folding them
+/// into one selectable item changes nothing on screen — exactly the ticket's "lines that
+/// connect together become one selectable item", with disconnected (or differently-styled)
+/// strokes staying their own items. Pure over the scene vector — unit-tested.
+pub fn merge_connected_pens(items: &mut Vec<AnnotationItem>, id: AnnotId) -> bool {
+    let Some(idx) = items.iter().position(|it| it.id == id) else {
+        return false;
+    };
+    let AnnotKind::Pen { paths, pressure, stroke_w } = &items[idx].kind else {
+        return false;
+    };
+    let (mut group, mut press, mut width) = (paths.clone(), pressure.clone(), *stroke_w);
+    let color = items[idx].color;
+    let mut merged = false;
+    loop {
+        // The first OTHER same-looking pen group whose ink touches the (growing) group. The
+        // "touching" tolerance rides `max_width` (the widest a pressure-swelled stretch draws),
+        // so two strokes whose visible ink meets still merge.
+        let hit = items.iter().position(|it| {
+            if it.id == id || it.color != color {
+                return false;
+            }
+            match &it.kind {
+                AnnotKind::Pen { paths: other, stroke_w: w, .. } if (*w - width).abs() < 1e-3 => {
+                    pen_groups_touch(&group, other, crate::pen_stroke::max_width(width) + PEN_JOIN_SLACK)
+                }
+                _ => false,
+            }
+        });
+        let Some(hit) = hit else { break };
+        if let AnnotKind::Pen { paths: other, pressure: other_p, stroke_w: w } = &items[hit].kind {
+            // Both arrays grow together (padding a group that carried no signal with empty
+            // entries), so `pressure[i]` never stops belonging to `paths[i]`.
+            press.resize(group.len(), Vec::new());
+            group.extend(other.iter().cloned());
+            for i in 0..other.len() {
+                press.push(other_p.get(i).cloned().unwrap_or_default());
+            }
+            width = *w;
+        }
+        items.remove(hit);
+        merged = true;
+    }
+    if merged {
+        // The absorbing item may have shifted left as earlier items were removed.
+        if let Some(i) = items.iter().position(|it| it.id == id) {
+            items[i].kind = AnnotKind::Pen { paths: group, pressure: press, stroke_w: width };
+        }
+    }
+    merged
 }
 
 // ── z-order operations (pure; the scene's z-order IS the vector order) ────────────────
@@ -507,6 +942,40 @@ pub fn rasterize_scene(
                     ..Default::default()
                 };
                 pixmap.stroke_path(&path, &paint, &stroke, ident, None);
+            }
+            // Freehand pen (DRAGON-338 + DRAGON-342): a variable-width ribbon, so it bakes as a
+            // FILLED outline rather than a stroked polyline — the exact polygons the canvas
+            // fills live ([`crate::pen_stroke::stroke_fill_polygons`]), mapped by `scale`
+            // instead of by the canvas's zoom. Display and bake therefore differ only in
+            // resolution. Every piece of every stroke goes into ONE path filled with the
+            // NON-ZERO rule, so a scribble crossing itself unions instead of cancelling into
+            // holes (and a partially transparent color composites exactly once).
+            AnnotKind::Pen { paths, pressure, stroke_w } => {
+                let mut paint = sk::Paint { anti_alias: true, ..Default::default() };
+                paint.set_color(sk_color(item.color));
+                let mut pb = sk::PathBuilder::new();
+                for (i, path) in paths.iter().enumerate() {
+                    let pts = pen_xy(path);
+                    let press = pen_pressure(pressure, paths, i);
+                    let polys = crate::pen_stroke::stroke_fill_polygons(
+                        &pts,
+                        *stroke_w,
+                        press,
+                        |p| (p.0 * scale, p.1 * scale),
+                        scale,
+                    );
+                    for poly in polys {
+                        let Some(first) = poly.first() else { continue };
+                        pb.move_to(first.0, first.1);
+                        for q in &poly[1..] {
+                            pb.line_to(q.0, q.1);
+                        }
+                        pb.close();
+                    }
+                }
+                if let Some(ribbon) = pb.finish() {
+                    pixmap.fill_path(&ribbon, &paint, sk::FillRule::Winding, ident, None);
+                }
             }
             // The region effects (highlight, pixelate, blur) are NOT source-over overlays —
             // they composite through the true-z-order CPU stack ([`apply_one_effect`] /
@@ -1032,8 +1501,11 @@ pub fn apply_one_effect_scaled(
         // BoxHighlight contributes its highlight FILL here (the outline is a vector, drawn
         // separately by the canvas / rasterize_scene — DRAGON-333).
         | AnnotKind::BoxHighlight { rect, .. } => rect,
-        // Spotlight is NOT an effect (it composites nothing) — like box/arrow, no-op here.
-        AnnotKind::Box { .. } | AnnotKind::Arrow { .. } | AnnotKind::Spotlight { .. } => return,
+        // Spotlight is NOT an effect (it composites nothing) — like box/arrow/pen, no-op here.
+        AnnotKind::Box { .. }
+        | AnnotKind::Arrow { .. }
+        | AnnotKind::Pen { .. }
+        | AnnotKind::Spotlight { .. } => return,
     };
     // Scale the geometry into the (possibly reduced) raster space. Blocks scale too, floored
     // at 1 so a heavily-downscaled live frame still averages at least one texel per cell.
@@ -1098,7 +1570,10 @@ pub fn apply_one_effect_scaled(
                 adaptive_highlight_px(cur, cur, color, [bg[0], bg[1], bg[2]], eff)
             })
         }
-        AnnotKind::Box { .. } | AnnotKind::Arrow { .. } | AnnotKind::Spotlight { .. } => {
+        AnnotKind::Box { .. }
+        | AnnotKind::Arrow { .. }
+        | AnnotKind::Pen { .. }
+        | AnnotKind::Spotlight { .. } => {
             unreachable!("handled above")
         }
     };
@@ -1154,7 +1629,12 @@ pub fn knockout_rects(items: &[AnnotationItem]) -> Vec<AnnotRect> {
             | AnnotKind::Box { rect, .. }
             | AnnotKind::Highlight { rect }
             | AnnotKind::BoxHighlight { rect, .. } => Some(*rect),
-            AnnotKind::Arrow { .. } | AnnotKind::Pixelate { .. } | AnnotKind::Blur { .. } => None,
+            // Freehand pen is markup like an arrow — it marks a spot, it doesn't frame a
+            // region, so it never punches the dim.
+            AnnotKind::Arrow { .. }
+            | AnnotKind::Pen { .. }
+            | AnnotKind::Pixelate { .. }
+            | AnnotKind::Blur { .. } => None,
         })
         .collect()
 }
@@ -1206,6 +1686,11 @@ pub fn apply_dim(base: &mut RgbaImage, dim: f32, knockouts: &[AnnotRect], curve_
     }
 }
 
+/// How opaque a pen group marked by the in-flight eraser sweep draws (DRAGON-338): a quarter
+/// (75% transparent, user-tuned from the original half), so "these are going when you let go"
+/// reads unmistakably while the strokes stay just legible.
+pub const ERASE_PREVIEW_ALPHA: f32 = 0.25;
+
 /// Straight-alpha RGBA bytes → an iced [`Color`](cosmic::iced::Color).
 fn to_iced_color(c: AnnotColor) -> cosmic::iced::Color {
     cosmic::iced::Color::from_rgba8(c[0], c[1], c[2], c[3] as f32 / 255.0)
@@ -1215,11 +1700,22 @@ fn to_iced_color(c: AnnotColor) -> cosmic::iced::Color {
 /// shared corner curve, SOURCE px) is stamped onto each item so the canvas draws the SAME
 /// rounded corners / soft caps the bake rasterizes — the vector display and the raster bake
 /// stay visually consistent.
-pub fn widget_items(items: &[AnnotationItem], curve_radius: f32) -> Vec<Item> {
+///
+/// `erasing` holds the items the in-flight eraser sweep has MARKED (DRAGON-338): they draw at
+/// [`ERASE_PREVIEW_ALPHA`] so the user sees exactly what releasing will delete. Purely a
+/// display concern — the model is untouched until the sweep commits.
+pub fn widget_items(items: &[AnnotationItem], curve_radius: f32, erasing: &[AnnotId]) -> Vec<Item> {
     items
         .iter()
         .map(|it| {
-            let stroke_color = to_iced_color(it.color);
+            // Marked-for-erase items preview at ERASE_PREVIEW_ALPHA (never baked, never persisted).
+            let stroke_color = if erasing.contains(&it.id) {
+                let mut c = to_iced_color(it.color);
+                c.a *= ERASE_PREVIEW_ALPHA;
+                c
+            } else {
+                to_iced_color(it.color)
+            };
             // The region-effect kinds share Box GEOMETRY (a rect, no stroke → 0 chrome offset)
             // but render through shader passes, not this widget — flagged via `fx` so the
             // canvas skips drawing them while still hit-testing + chroming them.
@@ -1235,6 +1731,21 @@ pub fn widget_items(items: &[AnnotationItem], curve_radius: f32) -> Vec<Item> {
                 ),
                 AnnotKind::Arrow { a, b, stroke_w } => (
                     ItemKind::Arrow { ax: a.x, ay: a.y, bx: b.x, by: b.y },
+                    *stroke_w,
+                    None,
+                    FxKind::None,
+                ),
+                // Freehand pen: its polylines go to the canvas verbatim (SOURCE px), which
+                // draws them as pressure-profiled ribbons and hit-tests along the strokes
+                // themselves. The per-point speed signal rides along so the canvas can build
+                // the SAME width profile the bake does.
+                AnnotKind::Pen { paths, pressure, stroke_w } => (
+                    ItemKind::Path {
+                        paths: paths.iter().map(|p| pen_xy(p)).collect(),
+                        pressure: (0..paths.len())
+                            .map(|i| pen_pressure(pressure, paths, i).to_vec())
+                            .collect(),
+                    },
                     *stroke_w,
                     None,
                     FxKind::None,
@@ -1277,10 +1788,21 @@ impl App {
         };
         let color = p.edit.annot_color.unwrap_or_else(default_annot_color);
         let stroke_w = p.edit.stroke();
-        let id = p.edit.next_annot_id();
         // Clamp the start point inside the image (can't draw beyond the picture).
         let (fw, fh) = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
         let (x, y) = (x.clamp(0.0, fw), y.clamp(0.0, fh));
+        // The ERASER draws nothing (DRAGON-338): the press opens a sweep instead, snapshots the
+        // scene for the single undo entry the release will push, and marks whatever it lands on
+        // (so a plain CLICK on a stroke already marks it).
+        if tool == Tool::Eraser {
+            p.edit.sel.clear();
+            p.edit.annot_snapshot = Some(p.edit.annotations.clone());
+            p.edit.erase_marks.clear();
+            p.edit.gesture = Some(AnnotGesture::Erase { last: (x, y) });
+            mark_erased(&mut p.edit, (x, y), (x, y));
+            return Task::none();
+        }
+        let id = p.edit.next_annot_id();
         let kind = match tool {
             Tool::Arrow => AnnotKind::Arrow {
                 a: AnnotPoint { x, y },
@@ -1300,10 +1822,31 @@ impl App {
             Tool::Spotlight => AnnotKind::Spotlight { rect: AnnotRect { x, y, w: 0.0, h: 0.0 } },
             Tool::Pixelate => AnnotKind::Pixelate { rect: AnnotRect { x, y, w: 0.0, h: 0.0 } },
             Tool::Blur => AnnotKind::Blur { rect: AnnotRect { x, y, w: 0.0, h: 0.0 } },
+            // One stroke opens as a one-point polyline — already a valid DOT, so a press with
+            // no drag at all still inks (DRAGON-342). The drag appends to the RAW trail on
+            // `EditState::pen_raw` and re-fits the smoothed curve into this path every sample.
+            Tool::Pen => AnnotKind::Pen {
+                paths: vec![vec![AnnotPoint { x, y }]],
+                pressure: vec![Vec::new()],
+                stroke_w,
+            },
+            // Neither non-creating tool ever reaches here: the eraser is handled above, and the
+            // POINTER (DRAGON-341) never emits a `DrawBegin` at all (its empty-canvas drag is a
+            // rubber band, not a draw). Defensive.
+            Tool::Eraser | Tool::Pointer => return Task::none(),
         };
         p.edit.annot_snapshot = Some(p.edit.annotations.clone());
+        // The freehand pen's RAW trail (DRAGON-342): the model always holds the SMOOTHED curve,
+        // so the un-smoothed samples live here for the length of the gesture and nowhere else.
+        p.edit.pen_raw = if tool == Tool::Pen { vec![AnnotPoint { x, y }] } else { Vec::new() };
+        // A drawn shape becomes the selection so it is immediately editable — EXCEPT freehand
+        // ink, which must just land (DRAGON-341): pen selection visuals belong to pointer mode
+        // alone, and a dashed bbox snapping around every stroke you draw is pure noise.
+        let selects = kind_selects_on_create(&kind);
         p.edit.annotations.push(AnnotationItem { id, color, kind });
-        p.edit.selected = Some(id);
+        if selects {
+            p.edit.sel.set_one(id);
+        }
         p.edit.gesture = Some(AnnotGesture::New { press: (x, y), id });
         // Holistic dim rule: with a spotlight now on the canvas, make sure the frame is dimmed so
         // it reads while you draw it (own undo entry; undo removes the spotlight, then the dim).
@@ -1311,6 +1854,74 @@ impl App {
         // The GPU effects shader re-renders from the model on the next view build (DRAGON-330) —
         // no async raster to kick; a new effect item shows on the very next frame.
         Task::none()
+    }
+
+    /// Arm `tool` as the active annotation tool — the shared body behind BOTH the tray button
+    /// (`PreviewMsg::ToolPressed`) and the hotkeys (`PreviewMsg::SelectTool`).
+    ///
+    /// Leaving POINTER mode DROPS every pen group from the selection (DRAGON-341): pen selection
+    /// exists only under the pointer, so the state is pruned rather than the chrome hidden —
+    /// otherwise a ghost member would still ride along in a group move or delete.
+    pub(super) fn select_annot_tool(&mut self, tool: Tool) {
+        // If a box-family annotation (Box Outline / Highlight / Box Highlight) is selected
+        // and the user picks a DIFFERENT one of those three tools, CONVERT the selected
+        // item in place (real-time, one undo entry) rather than only arming the tool for
+        // the next draw. No-op for every other selection/tool combination.
+        self.convert_selected_annotation_kind(tool);
+        // Only ever SETS a tool — clicking/hotkeying the active tool is a no-op (no
+        // re-click-to-neutral). Persist so the next preview opens with it.
+        if let Some(p) = &mut self.preview {
+            p.edit.tool = Some(tool);
+            // Pen groups are selectable ONLY under the pointer, so arming anything else lets
+            // them go — the visible selection and the real one never disagree.
+            if !tool.is_pointer() {
+                p.edit.drop_pen_selection();
+            }
+        }
+        self.annot_tool = Some(tool);
+        self.save_state();
+    }
+
+    /// Spawn a PRE-PLACED item of `tool` in the middle of the picture (DRAGON-339) — what a
+    /// DOUBLE-CLICK on the tool's action-tray button does, so an item can be added without
+    /// dragging one out. Geometry comes from [`default_placement_rect`] (200×100 or 80% of the
+    /// image per axis, whichever fits, inset for the stroke); appearance from the SAME current
+    /// color/stroke a dragged shape would get. The new item lands on TOP of the z-stack and
+    /// becomes the selection, as ONE undo entry in the shared history (so it is undoable and
+    /// counts toward `EditState::dirty()`'s bake gate exactly like a drawn one).
+    ///
+    /// Returns `false` (changing nothing) when there is no preview, the tool has no pre-placeable
+    /// form ([`spawn_kind`] → `None`, e.g. a freehand tool), or the frame is too small for a
+    /// non-degenerate item — the same degeneracy rule a discarded drag uses.
+    pub(super) fn spawn_annotation(&mut self, tool: Tool) -> bool {
+        let Some(p) = self.preview.as_mut() else {
+            return false;
+        };
+        let stroke_w = p.edit.stroke();
+        // The margin is kind-dependent (an arrow's caps overhang more than a box's outline), so
+        // measure it on a probe of the kind itself at the nominal size.
+        let probe = AnnotRect { x: 0.0, y: 0.0, w: SPAWN_W, h: SPAWN_H };
+        let Some(margin) = spawn_kind(tool, probe, stroke_w).as_ref().map(kind_draw_margin) else {
+            return false;
+        };
+        let rect = default_placement_rect(p.edit.frame, margin);
+        let Some(kind) = spawn_kind(tool, rect, stroke_w) else {
+            return false;
+        };
+        let id = p.edit.next_annot_id();
+        let color = p.edit.annot_color.unwrap_or_else(default_annot_color);
+        let item = AnnotationItem { id, color, kind };
+        if is_degenerate(&item) {
+            return false;
+        }
+        let prev = p.edit.annotations.clone();
+        p.edit.annotations.push(item);
+        p.edit.sel.set_one(id);
+        p.edit.annot_menu = None;
+        p.edit.push_annotations(prev);
+        // Holistic dim rule: a spawned spotlight needs the frame dimmed to read (own undo entry).
+        p.edit.ensure_dim_for_spotlights();
+        true
     }
 
     /// Recolor the currently-SELECTED colorable annotation(s) to `color`, pushing ONE
@@ -1322,21 +1933,21 @@ impl App {
         let Some(p) = self.preview.as_mut() else {
             return;
         };
-        let Some(id) = p.edit.selected else {
+        if p.edit.sel.is_empty() {
             return;
-        };
+        }
         // Change is needed only if a SELECTED, COLORABLE item is actually a different color.
         let needed = p
             .edit
             .annotations
             .iter()
-            .any(|it| it.id == id && it.kind.is_colorable() && it.color != color);
+            .any(|it| p.edit.sel.contains(it.id) && it.kind.is_colorable() && it.color != color);
         if !needed {
             return;
         }
         let prev = p.edit.annotations.clone();
         for it in p.edit.annotations.iter_mut() {
-            if it.id == id && it.kind.is_colorable() {
+            if p.edit.sel.contains(it.id) && it.kind.is_colorable() {
                 it.color = color;
             }
         }
@@ -1351,25 +1962,27 @@ impl App {
         let Some(p) = self.preview.as_mut() else {
             return;
         };
-        let Some(id) = p.edit.selected else {
+        if p.edit.sel.is_empty() {
             return;
-        };
-        // Only a SELECTED, STROKED item (box / arrow) whose width actually differs needs it.
+        }
+        // Only a SELECTED, STROKED item (box / arrow / pen) whose width actually differs needs it.
         let needed = p.edit.annotations.iter().any(|it| {
-            it.id == id
-                && matches!(&it.kind, AnnotKind::Box { stroke_w: w, .. } | AnnotKind::Arrow { stroke_w: w, .. } | AnnotKind::BoxHighlight { stroke_w: w, .. } if *w != stroke_w)
+            p.edit.sel.contains(it.id)
+                && matches!(&it.kind, AnnotKind::Box { stroke_w: w, .. } | AnnotKind::Arrow { stroke_w: w, .. } | AnnotKind::BoxHighlight { stroke_w: w, .. } | AnnotKind::Pen { stroke_w: w, .. } if *w != stroke_w)
         });
         if !needed {
             return;
         }
         let prev = p.edit.annotations.clone();
         for it in p.edit.annotations.iter_mut() {
-            if it.id == id {
+            if p.edit.sel.contains(it.id) {
                 match &mut it.kind {
                     AnnotKind::Box { stroke_w: w, .. }
                     | AnnotKind::Arrow { stroke_w: w, .. }
                     // BoxHighlight's OUTLINE stroke re-widths like a box (DRAGON-333).
-                    | AnnotKind::BoxHighlight { stroke_w: w, .. } => {
+                    | AnnotKind::BoxHighlight { stroke_w: w, .. }
+                    // A pen group re-widths as a whole (DRAGON-338) — 2/4/6px, same presets.
+                    | AnnotKind::Pen { stroke_w: w, .. } => {
                         *w = stroke_w;
                     }
                     // Effects (highlight / pixelate / blur) + spotlight carry no stroke — leave
@@ -1393,7 +2006,7 @@ impl App {
         let Some(p) = self.preview.as_mut() else {
             return;
         };
-        let Some(id) = p.edit.selected else {
+        let Some(id) = p.edit.selected() else {
             return;
         };
         let default_stroke = p.edit.stroke();
@@ -1427,12 +2040,34 @@ impl App {
         self.save_state();
     }
 
-    /// Begin manipulating the selected item (`grab` from a handle / body).
+    /// Begin manipulating the selection (`grab` from a handle / body).
+    ///
+    /// A MOVE with more than one item selected (DRAGON-341) opens a group gesture
+    /// ([`AnnotGesture::MoveMany`]) that drags every selected item by ONE shared delta, clamped
+    /// once on the selection's union bounds so the arrangement never distorts against an image
+    /// edge. Every other grab (and any single selection) stays on the historical one-item
+    /// [`AnnotGesture::Edit`] path — resize handles only ever exist on the PRIMARY item, so the
+    /// whole `Grab` machinery is untouched by multi-select.
     pub(super) fn annot_grab_begin(&mut self, grab: Grab, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
         let Some(p) = self.preview.as_mut() else {
             return Task::none();
         };
-        let Some(id) = p.edit.selected else {
+        if grab == Grab::Move && p.edit.sel.len() > 1 {
+            let originals: Vec<(AnnotId, AnnotKind)> = p
+                .edit
+                .annotations
+                .iter()
+                .filter(|it| p.edit.sel.contains(it.id))
+                .map(|it| (it.id, it.kind.clone()))
+                .collect();
+            let Some(bounds) = group_drawn_bounds(originals.iter().map(|(_, k)| k)) else {
+                return Task::none();
+            };
+            p.edit.annot_snapshot = Some(p.edit.annotations.clone());
+            p.edit.gesture = Some(AnnotGesture::MoveMany { press: (x, y), originals, bounds });
+            return Task::none();
+        }
+        let Some(id) = p.edit.selected() else {
             return Task::none();
         };
         let Some(item) = p.edit.annotations.iter().find(|it| it.id == id) else {
@@ -1462,6 +2097,9 @@ impl App {
         let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
         match gesture {
             AnnotGesture::New { press, id } => {
+                // The pen's raw trail is a SIBLING field of the item vector — bound up front so
+                // the freehand arm below can read/extend it while it holds the item.
+                let raw = &mut p.edit.pen_raw;
                 if let Some(item) = p.edit.annotations.iter_mut().find(|it| it.id == id) {
                     // Clamp on the DRAWN extent so a shape drawn to the edge doesn't spill its
                     // outline/cap past it.
@@ -1481,6 +2119,35 @@ impl App {
                         AnnotKind::Arrow { b, .. } => {
                             *b = AnnotPoint { x: cur.0, y: cur.1 };
                         }
+                        // Freehand: APPEND to the RAW trail, but only once the pointer has
+                        // travelled PEN_MIN_STEP — a slow drag must not pile up coincident
+                        // vertices, and the gap between kept samples IS the speed proxy the
+                        // pseudo-pressure rides. Then RE-FIT the beautified stroke into the
+                        // model (DRAGON-342): the smoothing pipeline is causal + linear, so
+                        // this is a few microseconds and the settled ink never moves — what
+                        // you watch being drawn is exactly what commit keeps.
+                        AnnotKind::Pen { paths, pressure, stroke_w } => {
+                            let far = raw.last().is_none_or(|l| {
+                                (cur.0 - l.x).hypot(cur.1 - l.y) >= PEN_MIN_STEP
+                            });
+                            if far {
+                                raw.push(AnnotPoint { x: cur.0, y: cur.1 });
+                                let trail = pen_xy(raw);
+                                let fit = crate::pen_stroke::smooth_path(&trail, *stroke_w);
+                                let press = crate::pen_stroke::pressure_along(&trail, &fit);
+                                // The spline can bulge a hair outside its controls; keep every
+                                // stored point inside the picture like the raw samples are.
+                                let pts: Vec<AnnotPoint> = fit
+                                    .iter()
+                                    .map(|p| AnnotPoint {
+                                        x: cl(p.0, frame.0),
+                                        y: cl(p.1, frame.1),
+                                    })
+                                    .collect();
+                                *paths = vec![pts];
+                                *pressure = vec![press];
+                            }
+                        }
                     }
                 }
             }
@@ -1488,6 +2155,24 @@ impl App {
                 if let Some(item) = p.edit.annotations.iter_mut().find(|it| it.id == id) {
                     item.kind = edited_kind(&original, grab, press, (x, y), frame);
                 }
+            }
+            // A group move (DRAGON-341): ONE delta, clamped ONCE on the union bounds, applied
+            // verbatim to every member — so the selection travels as a rigid arrangement.
+            AnnotGesture::MoveMany { press, ref originals, bounds } => {
+                let (dx, dy) =
+                    group_move_delta(bounds, frame, (x - press.0, y - press.1));
+                for (id, original) in originals {
+                    if let Some(item) = p.edit.annotations.iter_mut().find(|it| it.id == *id) {
+                        item.kind = translated_kind(original, dx, dy);
+                    }
+                }
+            }
+            // The eraser MARKS along the segment it just travelled (never only the sampled
+            // point — a fast drag would jump clean over a stroke), then advances its anchor.
+            AnnotGesture::Erase { last } => {
+                let cur = (x.clamp(0.0, frame.0), y.clamp(0.0, frame.1));
+                mark_erased(&mut p.edit, last, cur);
+                p.edit.gesture = Some(AnnotGesture::Erase { last: cur });
             }
         }
         // A live drag mutates the model; the GPU effects shader re-renders from it every frame.
@@ -1504,8 +2189,17 @@ impl App {
             return Task::none();
         };
         let snapshot = p.edit.annot_snapshot.take();
+        let raw_trail = std::mem::take(&mut p.edit.pen_raw);
         match gesture {
             AnnotGesture::New { id, .. } => {
+                // A pen gesture that never really travelled is a TAP: normalize it to the
+                // single-point DOT it is (DRAGON-342), so it inks round and firm instead of as
+                // a 2px tapered smear. `is_degenerate` then KEEPS it — a deliberate press with
+                // the pencil armed is always a mark, while every other tool still discards a
+                // stray click.
+                if let Some(it) = p.edit.annotations.iter_mut().find(|it| it.id == id) {
+                    normalize_pen_tap(&mut it.kind, raw_trail.first().copied());
+                }
                 let degenerate = p
                     .edit
                     .annotations
@@ -1515,17 +2209,38 @@ impl App {
                 if degenerate {
                     // Discard: never entered history, so just drop it (no undo entry).
                     p.edit.annotations.retain(|it| it.id != id);
-                    if p.edit.selected == Some(id) {
-                        p.edit.selected = None;
-                    }
+                    p.edit.sel.retain_existing(&p.edit.annotations);
                     // A discarded in-progress effect vanishes on the next view build (GPU shader).
                     return Task::none();
+                }
+                // CONNECTIVITY (DRAGON-338): a freshly drawn stroke that touches other pen
+                // strokes of the same look folds them all into ONE selectable item, so
+                // connected scribbles move/delete together while disconnected ones stay
+                // separate. Runs BEFORE the undo push, so undo restores the un-merged scene.
+                let is_pen = p.edit.annotations.iter().any(|it| it.id == id && it.kind.is_pen());
+                if is_pen {
+                    merge_connected_pens(&mut p.edit.annotations, id);
                 }
                 if let Some(prev) = snapshot {
                     p.edit.push_annotations(prev);
                 }
             }
-            AnnotGesture::Edit { .. } => {
+            // A one-item edit and a whole-selection move commit identically: ONE undo entry
+            // holding the pre-gesture scene (DRAGON-341 — a group move is one edit, not N).
+            AnnotGesture::Edit { .. } | AnnotGesture::MoveMany { .. } => {
+                if let Some(prev) = snapshot {
+                    p.edit.push_annotations(prev);
+                }
+            }
+            // Releasing the eraser COMMITS: every marked pen group is deleted in ONE undo
+            // entry. A sweep that marked nothing leaves no trace (no entry, no redo clear).
+            AnnotGesture::Erase { .. } => {
+                let marks = std::mem::take(&mut p.edit.erase_marks);
+                if marks.is_empty() {
+                    return Task::none();
+                }
+                p.edit.annotations.retain(|it| !marks.contains(&it.id));
+                p.edit.sel.clear();
                 if let Some(prev) = snapshot {
                     p.edit.push_annotations(prev);
                 }
@@ -1535,24 +2250,73 @@ impl App {
         Task::none()
     }
 
-    /// Delete the selected annotation (one undo entry).
+    /// Delete the WHOLE selection (DRAGON-341) — however many items — as ONE undo entry.
     pub(super) fn annot_delete_selected(&mut self) -> Task<cosmic::Action<Msg>> {
         let Some(p) = self.preview.as_mut() else {
             return Task::none();
         };
-        let Some(id) = p.edit.selected else {
+        if p.edit.sel.is_empty() {
             return Task::none();
-        };
+        }
         p.edit.annot_menu = None;
         let prev = p.edit.annotations.clone();
-        p.edit.annotations.retain(|it| it.id != id);
+        p.edit.annotations.retain(|it| !p.edit.sel.contains(it.id));
         if prev.len() != p.edit.annotations.len() {
-            p.edit.selected = None;
+            p.edit.sel.clear();
             p.edit.push_annotations(prev);
             // Deleting an effect drops it from the GPU shader's item list on the next view build.
             return Task::none();
         }
         Task::none()
+    }
+
+    /// Select EVERY annotation in the scene (DRAGON-341 — the Ctrl+A action) and engage the
+    /// POINTER tool so the resulting selection is immediately usable: the pointer is the only
+    /// mode in which pen groups are click-selectable and in which a body drag moves the whole
+    /// set, so selecting all under (say) the pencil would hand back a selection the very next
+    /// click destroys. Returns whether anything is now selected — an empty scene changes
+    /// nothing at all (no tool switch, no persisted state churn).
+    pub(super) fn select_all_annotations(&mut self) -> bool {
+        let ids: Vec<AnnotId> = match self.preview.as_ref() {
+            Some(p) if !p.edit.annotations.is_empty() => {
+                p.edit.annotations.iter().map(|it| it.id).collect()
+            }
+            _ => return false,
+        };
+        // Engage the pointer FIRST: `select_annot_tool` can convert the current selection's kind
+        // (the box-family rule), and the pointer is never a rect tool, so this is a plain arm.
+        self.select_annot_tool(Tool::Pointer);
+        if let Some(p) = self.preview.as_mut() {
+            p.edit.sel.set_all(ids);
+            p.edit.annot_menu = None;
+        }
+        true
+    }
+
+    /// Apply a POINTER rubber band (DRAGON-341): select every annotation the band
+    /// `(x0, y0)`–`(x1, y1)` (image source px, either winding) TOUCHES. `additive` keeps the
+    /// existing selection and adds to it; otherwise the band REPLACES it. A band that touches
+    /// nothing simply clears (or leaves, when additive) the selection — never an undo entry,
+    /// since selecting is not an edit.
+    pub(super) fn band_select_annotations(
+        &mut self,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        additive: bool,
+    ) {
+        let Some(p) = self.preview.as_mut() else {
+            return;
+        };
+        let band = AnnotRect::from_points((x0, y0), (x1, y1));
+        let hits: Vec<AnnotId> = items_in_band(&p.edit.annotations, band);
+        if additive {
+            p.edit.sel.add_all(hits);
+        } else {
+            p.edit.sel.set_all(hits);
+        }
+        p.edit.annot_menu = None;
     }
 
     /// Duplicate the selected annotation: a clone with a new id, offset toward the frame CENTER
@@ -1563,7 +2327,7 @@ impl App {
         let Some(p) = self.preview.as_mut() else {
             return Task::none();
         };
-        let Some(id) = p.edit.selected else {
+        let Some(id) = p.edit.selected() else {
             return Task::none();
         };
         let Some(src) = p.edit.annotations.iter().find(|it| it.id == id).cloned() else {
@@ -1580,7 +2344,7 @@ impl App {
         let new_id = p.edit.next_annot_id();
         let prev = p.edit.annotations.clone();
         p.edit.annotations.push(AnnotationItem { id: new_id, color: src.color, kind: new_kind });
-        p.edit.selected = Some(new_id);
+        p.edit.sel.set_one(new_id);
         p.edit.annot_menu = None;
         p.edit.push_annotations(prev);
         // Duplicating a spotlight (e.g. after undo left the frame un-dimmed) re-ensures the dim.
@@ -1593,7 +2357,7 @@ impl App {
         let Some(p) = self.preview.as_mut() else {
             return Task::none();
         };
-        let Some(id) = p.edit.selected else {
+        let Some(id) = p.edit.selected() else {
             return Task::none();
         };
         p.edit.annot_menu = None;
@@ -1611,6 +2375,21 @@ impl App {
             return Task::none();
         }
         Task::none()
+    }
+}
+
+/// Mark every PEN group the eraser segment `a`–`b` (SOURCE px) touches for deletion, adding to
+/// (never replacing) the sweep's running mark set — a sweep only ever grows, so re-crossing a
+/// stroke can't un-mark it. Only pen groups erase: the eraser is the pencil's partner, and a
+/// sweep must never silently take out a redaction or an arrow it passed over.
+fn mark_erased(edit: &mut super::edit::EditState, a: (f32, f32), b: (f32, f32)) {
+    for it in &edit.annotations {
+        let AnnotKind::Pen { paths, stroke_w, .. } = &it.kind else {
+            continue;
+        };
+        if !edit.erase_marks.contains(&it.id) && pen_hit_by_eraser(paths, *stroke_w, a, b) {
+            edit.erase_marks.push(it.id);
+        }
     }
 }
 
@@ -1633,6 +2412,12 @@ fn is_degenerate(item: &AnnotationItem) -> bool {
         | AnnotKind::Pixelate { rect }
         | AnnotKind::Blur { rect } => rect.w < 2.0 || rect.h < 2.0,
         AnnotKind::Arrow { a, b, .. } => (a.x - b.x).hypot(a.y - b.y) < 3.0,
+        // A PEN gesture is NEVER degenerate (DRAGON-342): with the pencil armed, a press is
+        // always deliberate ink — a real drag is a stroke and a TAP is a dot (the commit path
+        // has already normalized a sub-[`PEN_DOT_MAX`] stroke to its single anchor point). The
+        // draw-vs-select ambiguity that made a pen click "probably a misclick" is gone now that
+        // selection lives on the pointer tool.
+        AnnotKind::Pen { .. } => false,
     }
 }
 
@@ -1652,12 +2437,22 @@ fn kind_center(kind: &AnnotKind) -> (f32, f32) {
         | AnnotKind::Blur { rect }
         | AnnotKind::Spotlight { rect } => (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5),
         AnnotKind::Arrow { a, b, .. } => ((a.x + b.x) * 0.5, (a.y + b.y) * 0.5),
+        AnnotKind::Pen { paths, .. } => {
+            let r = pen_bounds(paths);
+            (r.x + r.w * 0.5, r.y + r.h * 0.5)
+        }
     }
 }
 
 fn kind_draw_margin(kind: &AnnotKind) -> f32 {
     match kind {
-        AnnotKind::Box { stroke_w, .. } | AnnotKind::BoxHighlight { stroke_w, .. } => stroke_w / 2.0,
+        AnnotKind::Box { stroke_w, .. } | AnnotKind::BoxHighlight { stroke_w, .. } => {
+            stroke_w / 2.0
+        }
+        // A pen's ribbon straddles its centerline by half its WIDEST sample — a heavy
+        // (pressure-swelled) stretch, not the nominal preset — so the margin rides `max_width`
+        // and no inked pixel can land outside the picture.
+        AnnotKind::Pen { stroke_w, .. } => crate::pen_stroke::max_width(*stroke_w) / 2.0,
         AnnotKind::Arrow { stroke_w, .. } => (stroke_w + 2.0) / 2.0,
         // Stroke-less kinds draw exactly within the rect (Spotlight is an invisible knockout).
         AnnotKind::Highlight { .. }
@@ -1665,6 +2460,165 @@ fn kind_draw_margin(kind: &AnnotKind) -> f32 {
         | AnnotKind::Blur { .. }
         | AnnotKind::Spotlight { .. } => 0.0,
     }
+}
+
+// ── Multi-selection geometry (DRAGON-341) ───────────────────────────────────────────────
+
+/// Whether a freshly CREATED item of this kind becomes the selection. Every shape does — you
+/// draw a box/arrow/redaction to then nudge or resize it. Freehand PEN ink does NOT
+/// (DRAGON-341): pen selection visuals belong to pointer mode alone, so a stroke drawn with the
+/// pencil must land with no dashed bbox, no handles, and no claim on the primary slot. Pure —
+/// unit-tested.
+fn kind_selects_on_create(kind: &AnnotKind) -> bool {
+    !kind.is_pen()
+}
+
+/// A kind's DRAWN bounding rect (SOURCE px): its geometry bbox grown by [`kind_draw_margin`] —
+/// the same outer extent every clamp in this module reasons about. Pure — unit-tested.
+fn kind_drawn_bounds(kind: &AnnotKind) -> AnnotRect {
+    let m = kind_draw_margin(kind);
+    let base = match kind {
+        AnnotKind::Box { rect, .. }
+        | AnnotKind::Highlight { rect }
+        | AnnotKind::BoxHighlight { rect, .. }
+        | AnnotKind::Spotlight { rect }
+        | AnnotKind::Pixelate { rect }
+        | AnnotKind::Blur { rect } => *rect,
+        AnnotKind::Arrow { a, b, .. } => AnnotRect::from_points((a.x, a.y), (b.x, b.y)),
+        AnnotKind::Pen { paths, .. } => pen_bounds(paths),
+    };
+    AnnotRect { x: base.x - m, y: base.y - m, w: base.w + 2.0 * m, h: base.h + 2.0 * m }
+}
+
+/// The UNION of every kind's drawn bounds, or `None` for an empty selection. Pure —
+/// unit-tested.
+fn group_drawn_bounds<'a>(kinds: impl IntoIterator<Item = &'a AnnotKind>) -> Option<AnnotRect> {
+    let mut out: Option<AnnotRect> = None;
+    for k in kinds {
+        let r = kind_drawn_bounds(k);
+        out = Some(match out {
+            None => r,
+            Some(u) => {
+                let (x, y) = (u.x.min(r.x), u.y.min(r.y));
+                let (rx, by) = ((u.x + u.w).max(r.x + r.w), (u.y + u.h).max(r.y + r.h));
+                AnnotRect { x, y, w: rx - x, h: by - y }
+            }
+        });
+    }
+    out
+}
+
+/// The drag delta a GROUP move may actually apply: the raw `d` clamped per axis so the
+/// selection's union `bounds` stays inside the image `frame`. Clamping ONCE on the union (never
+/// per item) is what keeps the arrangement rigid — per-item clamping would squash items together
+/// against an edge. A union WIDER than the frame on an axis has no valid range, so that axis
+/// passes through unclamped (the group is already overflowing; fighting it would only jump it).
+/// Pure — unit-tested.
+fn group_move_delta(bounds: AnnotRect, frame: (f32, f32), d: (f32, f32)) -> (f32, f32) {
+    let axis = |lo_edge: f32, size: f32, full: f32, delta: f32| {
+        let lo = -lo_edge; // shift that puts the near edge exactly at 0
+        let hi = full - lo_edge - size; // shift that puts the far edge exactly at `full`
+        if lo > hi { delta } else { delta.clamp(lo, hi) }
+    };
+    (
+        axis(bounds.x, bounds.w, frame.0, d.0),
+        axis(bounds.y, bounds.h, frame.1, d.1),
+    )
+}
+
+/// `kind` translated by `(dx, dy)` with NO clamping — the group move clamps its shared delta up
+/// front ([`group_move_delta`]), so every item must apply it verbatim. Pure — unit-tested.
+fn translated_kind(kind: &AnnotKind, dx: f32, dy: f32) -> AnnotKind {
+    let shift = |r: &AnnotRect| AnnotRect { x: r.x + dx, y: r.y + dy, w: r.w, h: r.h };
+    match kind {
+        AnnotKind::Box { rect, stroke_w, fill } => {
+            AnnotKind::Box { rect: shift(rect), stroke_w: *stroke_w, fill: *fill }
+        }
+        AnnotKind::Highlight { rect } => AnnotKind::Highlight { rect: shift(rect) },
+        AnnotKind::BoxHighlight { rect, stroke_w } => {
+            AnnotKind::BoxHighlight { rect: shift(rect), stroke_w: *stroke_w }
+        }
+        AnnotKind::Spotlight { rect } => AnnotKind::Spotlight { rect: shift(rect) },
+        AnnotKind::Pixelate { rect } => AnnotKind::Pixelate { rect: shift(rect) },
+        AnnotKind::Blur { rect } => AnnotKind::Blur { rect: shift(rect) },
+        AnnotKind::Arrow { a, b, stroke_w } => AnnotKind::Arrow {
+            a: AnnotPoint { x: a.x + dx, y: a.y + dy },
+            b: AnnotPoint { x: b.x + dx, y: b.y + dy },
+            stroke_w: *stroke_w,
+        },
+        // A pure translation keeps the point count, so the pressure signal rides unchanged.
+        AnnotKind::Pen { paths, pressure, stroke_w } => AnnotKind::Pen {
+            paths: paths
+                .iter()
+                .map(|p| p.iter().map(|q| AnnotPoint { x: q.x + dx, y: q.y + dy }).collect())
+                .collect(),
+            pressure: pressure.clone(),
+            stroke_w: *stroke_w,
+        },
+    }
+}
+
+/// Whether two rects overlap (touching edges count).
+fn rects_overlap(a: AnnotRect, b: AnnotRect) -> bool {
+    a.x <= b.x + b.w && b.x <= a.x + a.w && a.y <= b.y + b.h && b.y <= a.y + a.h
+}
+
+/// Whether the segments `p`–`p2` and `q`–`q2` cross (proper or touching). Sign-of-cross-product
+/// straddle test, with the collinear case folded in via the zero checks.
+fn segments_cross(p: (f32, f32), p2: (f32, f32), q: (f32, f32), q2: (f32, f32)) -> bool {
+    let cross = |o: (f32, f32), a: (f32, f32), b: (f32, f32)| {
+        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
+    };
+    let on = |o: (f32, f32), a: (f32, f32), b: (f32, f32)| {
+        cross(o, a, b).abs() <= f32::EPSILON
+            && b.0 >= o.0.min(a.0)
+            && b.0 <= o.0.max(a.0)
+            && b.1 >= o.1.min(a.1)
+            && b.1 <= o.1.max(a.1)
+    };
+    let (d1, d2) = (cross(p, p2, q), cross(p, p2, q2));
+    let (d3, d4) = (cross(q, q2, p), cross(q, q2, p2));
+    if ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0)) {
+        return true;
+    }
+    on(p, p2, q) || on(p, p2, q2) || on(q, q2, p) || on(q, q2, p2)
+}
+
+/// Whether the segment `a`–`b` TOUCHES rect `r`: either endpoint inside, or it crosses an edge.
+/// Pure — unit-tested.
+fn segment_hits_rect(a: (f32, f32), b: (f32, f32), r: AnnotRect) -> bool {
+    let inside = |p: (f32, f32)| {
+        p.0 >= r.x && p.0 <= r.x + r.w && p.1 >= r.y && p.1 <= r.y + r.h
+    };
+    if inside(a) || inside(b) {
+        return true;
+    }
+    let (l, t, rr, bb) = (r.x, r.y, r.x + r.w, r.y + r.h);
+    let corners = [(l, t), (rr, t), (rr, bb), (l, bb)];
+    (0..4).any(|i| segments_cross(a, b, corners[i], corners[(i + 1) % 4]))
+}
+
+/// Every annotation the rubber `band` (SOURCE px, normalized) TOUCHES, in scene z-order
+/// (DRAGON-341). Rect-geometry kinds test their DRAWN rect against the band; an arrow tests its
+/// shaft as a segment; a pen group tests every stroke segment — so a band drawn through the
+/// empty middle of a scribble's bounding box does NOT take it, exactly like clicking. Pure —
+/// unit-tested.
+pub fn items_in_band(items: &[AnnotationItem], band: AnnotRect) -> Vec<AnnotId> {
+    items
+        .iter()
+        .filter(|it| match &it.kind {
+            AnnotKind::Arrow { a, b, .. } => segment_hits_rect((a.x, a.y), (b.x, b.y), band),
+            AnnotKind::Pen { paths, .. } => paths.iter().any(|path| match path.len() {
+                0 => false,
+                1 => segment_hits_rect((path[0].x, path[0].y), (path[0].x, path[0].y), band),
+                _ => path
+                    .windows(2)
+                    .any(|w| segment_hits_rect((w[0].x, w[0].y), (w[1].x, w[1].y), band)),
+            }),
+            other => rects_overlap(kind_drawn_bounds(other), band),
+        })
+        .map(|it| it.id)
+        .collect()
 }
 
 /// Move a rect so its WHOLE DRAWN extent (geometry grown by margin `m`) stays inside the image
@@ -1746,6 +2700,22 @@ fn edited_kind(
         AnnotKind::Blur { rect } => {
             AnnotKind::Blur { rect: edit_rect(rect, grab, dx, dy, fw, fh, m) }
         }
+        // A pen group edits through its BOUNDING BOX: the box takes the grab exactly like a
+        // rectangle (same clamping), then the strokes are mapped affinely into the result —
+        // so Move translates and a corner/edge drag scales the whole drawing.
+        AnnotKind::Pen { paths, pressure, stroke_w } => {
+            let from = pen_bounds(paths);
+            let to = edit_rect(&from, grab, dx, dy, fw, fh, m);
+            // The per-point speed signal rides along UNCHANGED: a resize maps where the ink
+            // is, not how hard it was pressed, and the point count is preserved so the
+            // parallel arrays stay in step. (The curvature half of the pressure IS recomputed
+            // from the new geometry at render, so a squashed loop re-inks coherently.)
+            AnnotKind::Pen {
+                paths: scale_pen(paths, from, to),
+                pressure: pressure.clone(),
+                stroke_w: *stroke_w,
+            }
+        }
         AnnotKind::Arrow { a, b, stroke_w } => {
             // `m` is the round-cap overhang; clamp each endpoint (and shift a Move) so the caps
             // stay inside the image, not just the endpoint positions.
@@ -1789,6 +2759,7 @@ fn shift_into(lo: f32, hi: f32, max: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::geometry::{Corner, Edge};
+    use rstest::rstest;
 
     fn boxed(id: u64, x: f32, y: f32, w: f32, h: f32) -> AnnotationItem {
         AnnotationItem {
@@ -2149,7 +3120,7 @@ mod tests {
                 kind: AnnotKind::Highlight { rect: AnnotRect { x: 0.0, y: 0.0, w: 5.0, h: 5.0 } },
             },
         ];
-        let w = widget_items(&items, 7.0);
+        let w = widget_items(&items, 7.0, &[]);
         // The shared curve radius rides onto every item.
         assert_eq!(w[0].curve_radius, 7.0);
         assert_eq!(w[1].curve_radius, 7.0);
@@ -2176,6 +3147,7 @@ mod tests {
                 },
             ],
             7.0,
+            &[],
         );
         assert_eq!(redactions[0].fx, FxKind::Pixelate);
         assert_eq!(redactions[1].fx, FxKind::Blur);
@@ -2592,7 +3564,7 @@ mod tests {
             color: [10, 20, 30, 255],
             kind: AnnotKind::BoxHighlight { rect, stroke_w: 5.0 },
         }];
-        let w = widget_items(&items, 8.0);
+        let w = widget_items(&items, 8.0, &[]);
         assert_eq!(w[0].fx, FxKind::BoxHighlight);
         assert_eq!(w[0].stroke_w, 5.0, "the outline carries the box stroke width");
         assert!(w[0].fill.is_none(), "the highlight is the fill, not a vector fill");
@@ -2665,7 +3637,7 @@ mod tests {
         assert_eq!(*got, 8.0, "new box-highlight seeds the selected 8px width");
         assert_eq!(e.annotations[0].color, color, "the shared color rides on the item");
         // The width flows through to the outline vector item.
-        let w = widget_items(&e.annotations, DEFAULT_ANNOT_CURVE_RADIUS);
+        let w = widget_items(&e.annotations, DEFAULT_ANNOT_CURVE_RADIUS, &[]);
         assert_eq!(w[0].stroke_w, 8.0);
     }
 
@@ -2783,5 +3755,672 @@ mod tests {
         apply_effects(&mut dimmed, &base, std::slice::from_ref(&px), 0.0);
         // Pixelate is not a knockout, so it stays dimmed: the mosaic of a flat 100-grey is 100.
         assert!(dimmed.get_pixel(8, 8).0[0] <= 101, "pixelate over a dimmed region stays dim");
+    }
+
+    // ── pre-placed items: double-click a tray tool (DRAGON-339) ──────────────────────
+
+    #[rstest]
+    // A roomy image: the nominal 200×100, centred.
+    #[case((1920, 1080), 0.0, (860.0, 490.0, 200.0, 100.0))]
+    // Exactly big enough for the nominal size on both axes (250×125 → 80% = 200×100).
+    #[case((250, 125), 0.0, (25.0, 12.5, 200.0, 100.0))]
+    // A SMALL image: 80% wins on both axes, still centred (10% inset each side).
+    #[case((100, 50), 0.0, (10.0, 5.0, 80.0, 40.0))]
+    // Mixed: wide but short — width takes the nominal 200, height the 80% (independent axes).
+    #[case((1000, 60), 0.0, (400.0, 6.0, 200.0, 48.0))]
+    // A tiny image where the STROKE margin binds tighter than 80%: 10 − 2·2 = 6 of room.
+    #[case((10, 10), 2.0, (2.0, 2.0, 6.0, 6.0))]
+    // Degenerate frames never produce NaN/negative geometry.
+    #[case((0, 0), 4.0, (0.0, 0.0, 0.0, 0.0))]
+    fn placement_rect_fits_and_centers(
+        #[case] frame: (u32, u32),
+        #[case] margin: f32,
+        #[case] want: (f32, f32, f32, f32),
+    ) {
+        let r = default_placement_rect(frame, margin);
+        assert_eq!((r.x, r.y, r.w, r.h), want, "frame {frame:?} margin {margin}");
+        // Invariants that must hold for EVERY frame: non-negative, inside the image, centred.
+        assert!(r.w >= 0.0 && r.h >= 0.0);
+        let (fw, fh) = (frame.0 as f32, frame.1 as f32);
+        assert!(r.x >= 0.0 && r.x + r.w <= fw + f32::EPSILON, "inside horizontally");
+        assert!(r.y >= 0.0 && r.y + r.h <= fh + f32::EPSILON, "inside vertically");
+        assert!(((r.x + r.w * 0.5) - fw * 0.5).abs() < 1e-3, "centred horizontally");
+        assert!(((r.y + r.h * 0.5) - fh * 0.5).abs() < 1e-3, "centred vertically");
+    }
+
+    #[test]
+    fn spawn_kind_maps_every_tool_onto_the_placement_rect() {
+        let r = AnnotRect { x: 10.0, y: 20.0, w: 200.0, h: 100.0 };
+        assert_eq!(spawn_kind(Tool::Rect, r, 4.0), Some(AnnotKind::Box { rect: r, stroke_w: 4.0, fill: None }));
+        assert_eq!(spawn_kind(Tool::Highlight, r, 4.0), Some(AnnotKind::Highlight { rect: r }));
+        assert_eq!(
+            spawn_kind(Tool::BoxHighlight, r, 4.0),
+            Some(AnnotKind::BoxHighlight { rect: r, stroke_w: 4.0 })
+        );
+        assert_eq!(spawn_kind(Tool::Spotlight, r, 4.0), Some(AnnotKind::Spotlight { rect: r }));
+        assert_eq!(spawn_kind(Tool::Pixelate, r, 4.0), Some(AnnotKind::Pixelate { rect: r }));
+        assert_eq!(spawn_kind(Tool::Blur, r, 4.0), Some(AnnotKind::Blur { rect: r }));
+        // The arrow spans the rect corner-to-corner, so it reads as an arrow (not a dot).
+        assert_eq!(
+            spawn_kind(Tool::Arrow, r, 4.0),
+            Some(AnnotKind::Arrow {
+                a: AnnotPoint { x: 10.0, y: 20.0 },
+                b: AnnotPoint { x: 210.0, y: 120.0 },
+                stroke_w: 4.0,
+            })
+        );
+        // The NON-creating tools spawn NOTHING — double-clicking their tray button must only
+        // pick the tool. The pencil/eraser have been that way since DRAGON-338; the POINTER
+        // joins them in DRAGON-341 (it is pure selection).
+        assert_eq!(spawn_kind(Tool::Pen, r, 4.0), None);
+        assert_eq!(spawn_kind(Tool::Eraser, r, 4.0), None);
+        assert_eq!(spawn_kind(Tool::Pointer, r, 4.0), None, "the pointer places nothing");
+    }
+
+    // ── Multi-selection geometry (DRAGON-341) ────────────────────────────────────────
+
+    #[test]
+    fn a_committed_pen_stroke_never_selects_itself_but_every_shape_does() {
+        // DRAGON-341 follow-up: drawing with the pencil must leave NO selection chrome on the
+        // ink — pen selection belongs to pointer mode alone. Every other kind keeps the
+        // historical draw-then-selected behavior (you draw a box to then nudge/resize it).
+        let r = AnnotRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        for kind in [
+            AnnotKind::Box { rect: r, stroke_w: 4.0, fill: None },
+            AnnotKind::Highlight { rect: r },
+            AnnotKind::BoxHighlight { rect: r, stroke_w: 4.0 },
+            AnnotKind::Spotlight { rect: r },
+            AnnotKind::Pixelate { rect: r },
+            AnnotKind::Blur { rect: r },
+            AnnotKind::Arrow {
+                a: AnnotPoint { x: 0.0, y: 0.0 },
+                b: AnnotPoint { x: 9.0, y: 9.0 },
+                stroke_w: 4.0,
+            },
+        ] {
+            assert!(kind_selects_on_create(&kind), "{kind:?} selects on create");
+        }
+        let pen = AnnotKind::Pen {
+            paths: vec![vec![AnnotPoint { x: 1.0, y: 1.0 }, AnnotPoint { x: 8.0, y: 8.0 }]],
+            pressure: Vec::new(),
+            stroke_w: 4.0,
+        };
+        assert!(!kind_selects_on_create(&pen), "freehand ink just lands — never selected");
+    }
+
+    #[test]
+    fn group_move_delta_clamps_once_on_the_union_so_the_arrangement_stays_rigid() {
+        // Union bounds (20,20)-(120,70) in a 200×100 frame: the group may travel −20 left,
+        // +80 right, −20 up, +30 down.
+        let b = AnnotRect { x: 20.0, y: 20.0, w: 100.0, h: 50.0 };
+        let frame = (200.0, 100.0);
+        assert_eq!(group_move_delta(b, frame, (10.0, 5.0)), (10.0, 5.0), "inside the range: verbatim");
+        assert_eq!(group_move_delta(b, frame, (-500.0, -500.0)), (-20.0, -20.0), "pinned at the near edges");
+        assert_eq!(group_move_delta(b, frame, (500.0, 500.0)), (80.0, 30.0), "pinned at the far edges");
+        // Axes clamp INDEPENDENTLY — a group pinned horizontally still slides vertically.
+        assert_eq!(group_move_delta(b, frame, (500.0, -5.0)), (80.0, -5.0));
+        // A union WIDER than the frame has no valid range on that axis, so the delta passes
+        // through rather than snapping the group somewhere it never was.
+        let wide = AnnotRect { x: -10.0, y: 20.0, w: 400.0, h: 50.0 };
+        assert_eq!(group_move_delta(wide, frame, (7.0, 500.0)), (7.0, 30.0));
+    }
+
+    #[test]
+    fn a_group_move_translates_every_kind_by_the_same_delta() {
+        // Every kind translates verbatim (the shared delta is already clamped), so the
+        // arrangement is rigid — relative offsets are preserved exactly.
+        let r = AnnotRect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 };
+        let moved = translated_kind(&AnnotKind::Box { rect: r, stroke_w: 4.0, fill: None }, 5.0, -3.0);
+        assert_eq!(
+            moved,
+            AnnotKind::Box {
+                rect: AnnotRect { x: 15.0, y: 17.0, w: 30.0, h: 40.0 },
+                stroke_w: 4.0,
+                fill: None
+            }
+        );
+        let arrow = AnnotKind::Arrow {
+            a: AnnotPoint { x: 0.0, y: 0.0 },
+            b: AnnotPoint { x: 10.0, y: 10.0 },
+            stroke_w: 2.0,
+        };
+        assert_eq!(
+            translated_kind(&arrow, -4.0, 6.0),
+            AnnotKind::Arrow {
+                a: AnnotPoint { x: -4.0, y: 6.0 },
+                b: AnnotPoint { x: 6.0, y: 16.0 },
+                stroke_w: 2.0,
+            }
+        );
+        let pen = AnnotKind::Pen {
+            paths: vec![vec![AnnotPoint { x: 1.0, y: 1.0 }, AnnotPoint { x: 3.0, y: 5.0 }]],
+            pressure: Vec::new(),
+            stroke_w: 4.0,
+        };
+        let AnnotKind::Pen { paths, .. } = translated_kind(&pen, 2.0, 2.0) else {
+            panic!("a translated pen is still a pen");
+        };
+        assert_eq!(paths[0][0], AnnotPoint { x: 3.0, y: 3.0 });
+        assert_eq!(paths[0][1], AnnotPoint { x: 5.0, y: 7.0 });
+        // A zero delta is the identity for every kind (a click that never dragged).
+        for k in [AnnotKind::Highlight { rect: r }, arrow.clone(), pen.clone()] {
+            assert_eq!(translated_kind(&k, 0.0, 0.0), k);
+        }
+    }
+
+    #[test]
+    fn group_bounds_union_covers_every_member_including_its_stroke() {
+        // A box's drawn extent includes half its stroke, so the union grows past the geometry.
+        let a = AnnotKind::Box {
+            rect: AnnotRect { x: 20.0, y: 20.0, w: 20.0, h: 20.0 },
+            stroke_w: 8.0,
+            fill: None,
+        };
+        let b = AnnotKind::Highlight { rect: AnnotRect { x: 100.0, y: 60.0, w: 10.0, h: 10.0 } };
+        let u = group_drawn_bounds([&a, &b]).expect("a non-empty selection has bounds");
+        assert_eq!((u.x, u.y), (16.0, 16.0), "the box's stroke overhang is included");
+        assert_eq!((u.x + u.w, u.y + u.h), (110.0, 70.0), "the far member sets the far edge");
+        // An EMPTY selection has no bounds at all (the group gesture refuses to open).
+        assert_eq!(group_drawn_bounds(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn band_select_takes_what_it_touches_and_nothing_it_only_encloses_emptily() {
+        let band = AnnotRect { x: 50.0, y: 50.0, w: 40.0, h: 40.0 };
+        let mk = |id: u64, kind: AnnotKind| AnnotationItem { id: AnnotId(id), color: [1, 2, 3, 4], kind };
+        let items = vec![
+            // 1: a box OVERLAPPING the band's corner.
+            mk(1, AnnotKind::Box { rect: AnnotRect { x: 80.0, y: 80.0, w: 30.0, h: 30.0 }, stroke_w: 4.0, fill: None }),
+            // 2: a box far away.
+            mk(2, AnnotKind::Box { rect: AnnotRect { x: 300.0, y: 300.0, w: 10.0, h: 10.0 }, stroke_w: 4.0, fill: None }),
+            // 3: an arrow whose SHAFT crosses the band though both ends sit outside it.
+            mk(3, AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 70.0 }, b: AnnotPoint { x: 200.0, y: 70.0 }, stroke_w: 4.0 }),
+            // 4: an "L" pen whose bbox SPANS the band but whose ink never enters it.
+            mk(4, AnnotKind::Pen {
+                paths: vec![
+                    vec![AnnotPoint { x: 10.0, y: 10.0 }, AnnotPoint { x: 200.0, y: 10.0 }],
+                    vec![AnnotPoint { x: 10.0, y: 10.0 }, AnnotPoint { x: 10.0, y: 200.0 }],
+                ],
+                pressure: Vec::new(),
+                stroke_w: 4.0,
+            }),
+            // 5: a pen stroke that DOES run through the band.
+            mk(5, AnnotKind::Pen {
+                paths: vec![vec![AnnotPoint { x: 40.0, y: 60.0 }, AnnotPoint { x: 100.0, y: 60.0 }]],
+                pressure: Vec::new(),
+                stroke_w: 4.0,
+            }),
+        ];
+        let hit = items_in_band(&items, band);
+        assert_eq!(hit, vec![AnnotId(1), AnnotId(3), AnnotId(5)], "touch = selected, in z-order");
+        // A band over nothing selects nothing (it becomes a plain deselect).
+        assert!(items_in_band(&items, AnnotRect { x: 500.0, y: 500.0, w: 5.0, h: 5.0 }).is_empty());
+        // A band ENCLOSING an item takes it too (touch includes contain).
+        let all = items_in_band(&items, AnnotRect { x: -10.0, y: -10.0, w: 1000.0, h: 1000.0 });
+        assert_eq!(all.len(), items.len(), "an all-covering band takes everything");
+    }
+
+    #[test]
+    fn segment_hits_rect_covers_crossing_containment_and_misses() {
+        let r = AnnotRect { x: 10.0, y: 10.0, w: 20.0, h: 20.0 };
+        assert!(segment_hits_rect((0.0, 20.0), (100.0, 20.0), r), "crosses straight through");
+        assert!(segment_hits_rect((15.0, 15.0), (18.0, 18.0), r), "wholly inside");
+        assert!(segment_hits_rect((0.0, 0.0), (15.0, 15.0), r), "one endpoint inside");
+        assert!(segment_hits_rect((10.0, 0.0), (10.0, 100.0), r), "runs along an edge");
+        assert!(!segment_hits_rect((0.0, 0.0), (5.0, 5.0), r), "clear of the rect");
+        assert!(!segment_hits_rect((0.0, 40.0), (100.0, 40.0), r), "passes below it");
+        // A degenerate segment (a one-point pen dab) is a point-in-rect test.
+        assert!(segment_hits_rect((20.0, 20.0), (20.0, 20.0), r));
+        assert!(!segment_hits_rect((50.0, 50.0), (50.0, 50.0), r));
+    }
+
+    #[test]
+    fn spawned_items_are_never_degenerate_on_a_normal_frame() {
+        // Every tool's spawn on an ordinary capture survives the degeneracy gate a discarded
+        // drag would trip — i.e. double-click always yields a real, grabbable item.
+        for tool in [
+            Tool::Arrow,
+            Tool::Rect,
+            Tool::Highlight,
+            Tool::BoxHighlight,
+            Tool::Spotlight,
+            Tool::Pixelate,
+            Tool::Blur,
+        ] {
+            let probe = AnnotRect { x: 0.0, y: 0.0, w: SPAWN_W, h: SPAWN_H };
+            let m = kind_draw_margin(&spawn_kind(tool, probe, DEFAULT_ANNOT_STROKE).unwrap());
+            let rect = default_placement_rect((1280, 720), m);
+            let kind = spawn_kind(tool, rect, DEFAULT_ANNOT_STROKE).unwrap();
+            let item = AnnotationItem { id: AnnotId(1), color: [255, 0, 0, 255], kind };
+            assert!(!is_degenerate(&item), "{tool:?} spawns a real item");
+        }
+    }
+
+    // ── freehand pencil + eraser (DRAGON-338) ────────────────────────────────────────
+
+    /// A pen item from a list of polylines given as raw point pairs.
+    fn pen(id: u64, color: AnnotColor, stroke_w: f32, paths: &[&[(f32, f32)]]) -> AnnotationItem {
+        AnnotationItem {
+            id: AnnotId(id),
+            color,
+            kind: AnnotKind::Pen {
+                paths: paths
+                    .iter()
+                    .map(|p| p.iter().map(|&(x, y)| AnnotPoint { x, y }).collect())
+                    .collect(),
+                // No stored speed signal: the profile reads neutral pressure and takes its
+                // character from the geometry's curvature alone (the "plain stroke" path).
+                pressure: Vec::new(),
+                stroke_w,
+            },
+        }
+    }
+
+    fn pen_paths(item: &AnnotationItem) -> &[Vec<AnnotPoint>] {
+        match &item.kind {
+            AnnotKind::Pen { paths, .. } => paths,
+            _ => panic!("expected a pen"),
+        }
+    }
+
+    #[test]
+    fn tool_double_click_needs_the_same_tool_inside_the_window() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut c = ToolClicks::default();
+        // A single press is never a double-click.
+        assert!(!c.press(Tool::Rect, t0));
+        // The same tool, promptly → double.
+        assert!(c.press(Tool::Rect, t0 + Duration::from_millis(150)));
+        // The pair is CONSUMED: an immediate third press starts over rather than re-firing.
+        assert!(!c.press(Tool::Rect, t0 + Duration::from_millis(200)));
+        assert!(c.press(Tool::Rect, t0 + Duration::from_millis(300)));
+
+        // A DIFFERENT tool never completes the pair (it opens its own).
+        let mut c = ToolClicks::default();
+        assert!(!c.press(Tool::Rect, t0));
+        assert!(!c.press(Tool::Arrow, t0 + Duration::from_millis(50)));
+        assert!(c.press(Tool::Arrow, t0 + Duration::from_millis(100)));
+
+        // Too slow → just two plain picks; the later press still opens a fresh pair.
+        let mut c = ToolClicks::default();
+        assert!(!c.press(Tool::Blur, t0));
+        assert!(!c.press(Tool::Blur, t0 + TOOL_DOUBLE_CLICK + Duration::from_millis(1)));
+        assert!(c.press(Tool::Blur, t0 + TOOL_DOUBLE_CLICK + Duration::from_millis(2)));
+    }
+
+    #[test]
+    fn seg_seg_dist_is_zero_when_crossing_and_the_gap_otherwise() {
+        // Crossing segments (an X) touch — distance 0.
+        assert_eq!(seg_seg_dist((0.0, 0.0), (10.0, 10.0), (0.0, 10.0), (10.0, 0.0)), 0.0);
+        // Parallel 3px apart: the perpendicular gap.
+        assert!((seg_seg_dist((0.0, 0.0), (10.0, 0.0), (0.0, 3.0), (10.0, 3.0)) - 3.0).abs() < 1e-4);
+        // End-to-end but offset: nearest at the endpoints.
+        assert!((seg_seg_dist((0.0, 0.0), (5.0, 0.0), (9.0, 0.0), (20.0, 0.0)) - 4.0).abs() < 1e-4);
+        // A degenerate (point) segment measures point-to-segment.
+        assert!((seg_seg_dist((5.0, 5.0), (5.0, 5.0), (0.0, 0.0), (10.0, 0.0)) - 5.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn pen_groups_touch_only_when_their_ink_meets() {
+        let a: Vec<Vec<AnnotPoint>> =
+            vec![vec![AnnotPoint { x: 0.0, y: 0.0 }, AnnotPoint { x: 20.0, y: 0.0 }]];
+        // A stroke CROSSING it touches at any tolerance.
+        let crossing: Vec<Vec<AnnotPoint>> =
+            vec![vec![AnnotPoint { x: 10.0, y: -5.0 }, AnnotPoint { x: 10.0, y: 5.0 }]];
+        assert!(pen_groups_touch(&a, &crossing, 0.0));
+        // A stroke 5px away touches at tol 6 but not at tol 4 — the tolerance IS the ink width.
+        let near: Vec<Vec<AnnotPoint>> =
+            vec![vec![AnnotPoint { x: 0.0, y: 5.0 }, AnnotPoint { x: 20.0, y: 5.0 }]];
+        assert!(pen_groups_touch(&a, &near, 6.0));
+        assert!(!pen_groups_touch(&a, &near, 4.0));
+        // A stroke far away never touches.
+        let far: Vec<Vec<AnnotPoint>> =
+            vec![vec![AnnotPoint { x: 0.0, y: 400.0 }, AnnotPoint { x: 20.0, y: 400.0 }]];
+        assert!(!pen_groups_touch(&a, &far, 20.0));
+        // Symmetric.
+        assert!(pen_groups_touch(&crossing, &a, 0.0));
+    }
+
+    #[test]
+    fn connected_strokes_merge_into_one_item_disconnected_stay_separate() {
+        // The ticket's core rule: strokes that connect become ONE selectable item; strokes
+        // that don't stay their own. The merge runs on the NEWLY drawn stroke's id.
+        let red = [255, 0, 0, 255];
+        let mut items = vec![
+            pen(1, red, 4.0, &[&[(0.0, 0.0), (20.0, 0.0)]]),          // a horizontal line
+            pen(2, red, 4.0, &[&[(0.0, 200.0), (20.0, 200.0)]]),      // far away, untouched
+            pen(3, red, 4.0, &[&[(10.0, -8.0), (10.0, 8.0)]]),        // crosses #1 → merges
+        ];
+        assert!(merge_connected_pens(&mut items, AnnotId(3)));
+        assert_eq!(items.len(), 2, "the crossing stroke absorbed the one it touches");
+        let merged = items.iter().find(|it| it.id == AnnotId(3)).expect("the drawn stroke survives");
+        assert_eq!(pen_paths(merged).len(), 2, "one item now holds BOTH polylines");
+        assert!(items.iter().any(|it| it.id == AnnotId(2)), "the disconnected stroke is untouched");
+        // Re-running is a no-op (nothing left to connect).
+        assert!(!merge_connected_pens(&mut items, AnnotId(3)));
+    }
+
+    #[test]
+    fn merging_is_transitive_through_the_growing_group() {
+        // A stroke that bridges two separate groups pulls in BOTH — and absorbing the first
+        // grows the group's reach, so a third only reachable through it merges too.
+        let c = [0, 255, 0, 255];
+        let mut items = vec![
+            pen(1, c, 4.0, &[&[(0.0, 0.0), (10.0, 0.0)]]),
+            pen(2, c, 4.0, &[&[(20.0, 0.0), (30.0, 0.0)]]),
+            // Touches #1's right end and #2's left end.
+            pen(3, c, 4.0, &[&[(10.0, 0.0), (20.0, 0.0)]]),
+        ];
+        assert!(merge_connected_pens(&mut items, AnnotId(3)));
+        assert_eq!(items.len(), 1, "all three strokes are one item");
+        assert_eq!(pen_paths(&items[0]).len(), 3);
+    }
+
+    #[test]
+    fn merging_never_repaints_differently_styled_strokes() {
+        // A group carries ONE color + width, so merging across either would silently restyle
+        // the user's earlier strokes: touching-but-different strokes stay separate items.
+        let mut items = vec![
+            pen(1, [255, 0, 0, 255], 4.0, &[&[(0.0, 0.0), (20.0, 0.0)]]),
+            pen(2, [0, 0, 255, 255], 4.0, &[&[(10.0, -8.0), (10.0, 8.0)]]), // crosses, other color
+        ];
+        assert!(!merge_connected_pens(&mut items, AnnotId(2)));
+        assert_eq!(items.len(), 2, "a different COLOR never merges");
+        let mut widths = vec![
+            pen(1, [255, 0, 0, 255], 2.0, &[&[(0.0, 0.0), (20.0, 0.0)]]),
+            pen(2, [255, 0, 0, 255], 6.0, &[&[(10.0, -8.0), (10.0, 8.0)]]),
+        ];
+        assert!(!merge_connected_pens(&mut widths, AnnotId(2)));
+        assert_eq!(widths.len(), 2, "a different WIDTH never merges");
+        // A non-pen id is simply not a merge candidate.
+        let mut mixed = vec![boxed(9, 0.0, 0.0, 10.0, 10.0)];
+        assert!(!merge_connected_pens(&mut mixed, AnnotId(9)));
+    }
+
+    #[test]
+    fn eraser_marks_the_strokes_its_sweep_crosses() {
+        let paths: Vec<Vec<AnnotPoint>> =
+            vec![vec![AnnotPoint { x: 0.0, y: 0.0 }, AnnotPoint { x: 100.0, y: 0.0 }]];
+        // A sweep straight across it hits.
+        assert!(pen_hit_by_eraser(&paths, 4.0, (50.0, -20.0), (50.0, 20.0)));
+        // A plain CLICK (zero-length sweep) ON the stroke hits — click-to-erase works.
+        assert!(pen_hit_by_eraser(&paths, 4.0, (50.0, 0.0), (50.0, 0.0)));
+        // Just outside the ink + slack does NOT (4/2 + 6 = 8px reach).
+        assert!(pen_hit_by_eraser(&paths, 4.0, (50.0, 7.5), (50.0, 7.5)));
+        assert!(!pen_hit_by_eraser(&paths, 4.0, (50.0, 40.0), (50.0, 40.0)));
+        // A FAST drag that steps clean over the stroke still hits — the SEGMENT is tested, not
+        // the sampled endpoints (both of which are far from the ink).
+        assert!(pen_hit_by_eraser(&paths, 4.0, (50.0, -60.0), (50.0, 60.0)));
+        // A sweep that misses the stroke entirely marks nothing.
+        assert!(!pen_hit_by_eraser(&paths, 4.0, (0.0, 50.0), (100.0, 50.0)));
+    }
+
+    #[test]
+    fn erase_preview_halves_the_alpha_of_marked_items_only() {
+        // The pending-deletion preview is DISPLAY-only: marked groups draw at ERASE_PREVIEW_ALPHA and
+        // the model is untouched (the sweep commits on release).
+        let items = vec![
+            pen(1, [255, 0, 0, 255], 4.0, &[&[(0.0, 0.0), (10.0, 0.0)]]),
+            pen(2, [255, 0, 0, 255], 4.0, &[&[(0.0, 20.0), (10.0, 20.0)]]),
+        ];
+        let w = widget_items(&items, 8.0, &[AnnotId(2)]);
+        assert!((w[0].color.a - 1.0).abs() < 1e-6, "unmarked stays fully opaque");
+        assert!((w[1].color.a - ERASE_PREVIEW_ALPHA).abs() < 1e-6, "marked previews at the erase alpha");
+        // Both are still real pen items in the model.
+        assert!(items.iter().all(|it| it.kind.is_pen()));
+    }
+
+    #[test]
+    fn pen_geometry_bounds_length_and_degeneracy() {
+        let paths: Vec<Vec<AnnotPoint>> = vec![
+            vec![AnnotPoint { x: 10.0, y: 5.0 }, AnnotPoint { x: 20.0, y: 5.0 }],
+            vec![AnnotPoint { x: 12.0, y: 25.0 }, AnnotPoint { x: 12.0, y: 30.0 }],
+        ];
+        let b = pen_bounds(&paths);
+        assert_eq!((b.x, b.y, b.w, b.h), (10.0, 5.0, 10.0, 25.0));
+        assert!((pen_length(&paths) - 15.0).abs() < 1e-4);
+        // An empty group is a zero rect (never a NaN/infinite one).
+        let empty = pen_bounds(&[]);
+        assert_eq!((empty.x, empty.y, empty.w, empty.h), (0.0, 0.0, 0.0, 0.0));
+        // A pen gesture is NEVER discarded (DRAGON-342): a real stroke is a stroke, a press
+        // that barely moved is a TAP, and a single point is a dot. Every other kind still
+        // discards a stray click (checked in the box/arrow degeneracy tests).
+        assert!(!is_degenerate(&pen(1, [0; 4], 4.0, &[&[(0.0, 0.0), (1.0, 0.0)]])));
+        assert!(!is_degenerate(&pen(1, [0; 4], 4.0, &[&[(0.0, 0.0), (40.0, 0.0)]])));
+        assert!(!is_degenerate(&pen(1, [0; 4], 4.0, &[&[(0.0, 0.0)]])));
+        // The pen's drawn margin is half its WIDEST (pressure-swelled) sample, so no inked
+        // pixel of a heavy stretch can land outside the picture.
+        assert_eq!(
+            kind_draw_margin(&pen(1, [0; 4], 6.0, &[&[(0.0, 0.0)]]).kind),
+            crate::pen_stroke::max_width(6.0) / 2.0
+        );
+        // Its center is the bbox midpoint.
+        assert_eq!(
+            kind_center(&pen(1, [0; 4], 4.0, &[&[(0.0, 0.0), (10.0, 20.0)]]).kind),
+            (5.0, 10.0)
+        );
+    }
+
+    #[test]
+    fn scale_pen_maps_the_group_into_the_new_bounding_box() {
+        let paths: Vec<Vec<AnnotPoint>> = vec![vec![
+            AnnotPoint { x: 0.0, y: 0.0 },
+            AnnotPoint { x: 5.0, y: 10.0 },
+            AnnotPoint { x: 10.0, y: 20.0 },
+        ]];
+        let from = pen_bounds(&paths);
+        // Pure translation (a Move): same size, shifted.
+        let moved = scale_pen(&paths, from, AnnotRect { x: 100.0, y: 50.0, w: 10.0, h: 20.0 });
+        assert_eq!(moved[0][0], AnnotPoint { x: 100.0, y: 50.0 });
+        assert_eq!(moved[0][2], AnnotPoint { x: 110.0, y: 70.0 });
+        // A 2× resize scales every point about the box origin.
+        let big = scale_pen(&paths, from, AnnotRect { x: 0.0, y: 0.0, w: 20.0, h: 40.0 });
+        assert_eq!(big[0][1], AnnotPoint { x: 10.0, y: 20.0 });
+        // A zero-extent axis (a perfectly straight horizontal stroke) translates instead of
+        // dividing by zero.
+        let flat: Vec<Vec<AnnotPoint>> =
+            vec![vec![AnnotPoint { x: 0.0, y: 7.0 }, AnnotPoint { x: 10.0, y: 7.0 }]];
+        let fb = pen_bounds(&flat);
+        let out = scale_pen(&flat, fb, AnnotRect { x: 0.0, y: 20.0, w: 10.0, h: 0.0 });
+        assert!(out[0].iter().all(|p| (p.y - 20.0).abs() < 1e-4 && p.y.is_finite()));
+    }
+
+    #[test]
+    fn pen_moves_and_resizes_through_its_bounding_box() {
+        // The grab model: Move translates the whole drawing; a corner drag scales it — both
+        // clamped inside the image like every other kind.
+        let item = pen(1, [255, 0, 0, 255], 4.0, &[&[(10.0, 10.0), (30.0, 30.0)]]);
+        let moved = edited_kind(&item.kind, Grab::Move, (0.0, 0.0), (5.0, 5.0), (200.0, 200.0));
+        let AnnotKind::Pen { paths, stroke_w, .. } = &moved else { panic!("stays a pen") };
+        assert_eq!(*stroke_w, 4.0, "a move never changes the width");
+        assert_eq!(paths[0][0], AnnotPoint { x: 15.0, y: 15.0 });
+        assert_eq!(paths[0][1], AnnotPoint { x: 35.0, y: 35.0 });
+        // Dragging the SE corner out by +20,+20 doubles the drawing's extent.
+        let grown = edited_kind(
+            &item.kind,
+            Grab::Corner(crate::geometry::Corner::Se),
+            (0.0, 0.0),
+            (20.0, 20.0),
+            (200.0, 200.0),
+        );
+        let AnnotKind::Pen { paths, .. } = &grown else { panic!("stays a pen") };
+        assert_eq!(paths[0][0], AnnotPoint { x: 10.0, y: 10.0 }, "the anchored corner holds");
+        assert_eq!(paths[0][1], AnnotPoint { x: 50.0, y: 50.0 }, "the dragged corner follows");
+    }
+
+    #[test]
+    fn pen_is_a_colorable_vector_never_an_effect_or_a_knockout() {
+        let p = pen(1, [255, 0, 0, 255], 4.0, &[&[(0.0, 0.0), (10.0, 10.0)]]);
+        assert!(p.kind.is_colorable(), "a pen takes the shared annotation color");
+        assert!(!p.kind.is_effect(), "a pen is a source-over vector, not a region effect");
+        assert!(p.kind.is_pen());
+        assert!(knockout_rects(std::slice::from_ref(&p)).is_empty(), "a pen never dims-knocks out");
+        // A pen is not part of the rect-conversion family in either direction.
+        assert_eq!(converted_rect_kind(&p.kind, Tool::Rect, 4.0), None);
+        let boxk = AnnotKind::Box {
+            rect: AnnotRect { x: 0.0, y: 0.0, w: 5.0, h: 5.0 },
+            stroke_w: 4.0,
+            fill: None,
+        };
+        assert_eq!(converted_rect_kind(&boxk, Tool::Pen, 4.0), None);
+        assert_eq!(converted_rect_kind(&boxk, Tool::Eraser, 4.0), None);
+    }
+
+    // ── pen beautification: smoothing / pseudo-pressure / the tap dot (DRAGON-342) ──────
+
+    /// One "drag" through the app's own live path: raw samples in, the model's stored
+    /// (beautified) stroke out — exactly what `annot_gesture_to` writes on every sample.
+    fn drag_fit(raw: &[(f32, f32)], stroke_w: f32) -> (Vec<AnnotPoint>, Vec<f32>) {
+        let fit = crate::pen_stroke::smooth_path(raw, stroke_w);
+        let press = crate::pen_stroke::pressure_along(raw, &fit);
+        (fit.iter().map(|p| AnnotPoint { x: p.0, y: p.1 }).collect(), press)
+    }
+
+    #[test]
+    fn a_pencil_tap_commits_a_dot_instead_of_being_discarded() {
+        // The tap rule: under PEN_DOT_MAX of travel the gesture collapses to its anchor point
+        // and is KEPT (the canvas emits DrawBegin+GestureEnd for a no-drag pencil press).
+        let mut tap = pen(1, [0; 4], 4.0, &[&[(10.0, 10.0)]]).kind;
+        assert!(normalize_pen_tap(&mut tap, None), "a lone point IS a tap");
+        let AnnotKind::Pen { paths, .. } = &tap else { panic!("stays a pen") };
+        assert_eq!(paths, &vec![vec![AnnotPoint { x: 10.0, y: 10.0 }]]);
+        // A micro-drag (a press that jittered) becomes the same dot, anchored where it began.
+        let mut jitter = pen(1, [0; 4], 4.0, &[&[(10.0, 10.0), (11.0, 10.5), (11.5, 10.0)]]).kind;
+        assert!(normalize_pen_tap(&mut jitter, None), "under 3px of ink is a tap");
+        let AnnotKind::Pen { paths, pressure, .. } = &jitter else { panic!("stays a pen") };
+        assert_eq!(paths, &vec![vec![AnnotPoint { x: 10.0, y: 10.0 }]]);
+        assert_eq!(pressure, &vec![Vec::<f32>::new()], "a dot carries no speed signal");
+        // A real stroke is left alone…
+        let mut real = pen(1, [0; 4], 4.0, &[&[(0.0, 0.0), (40.0, 0.0)]]).kind;
+        assert!(!normalize_pen_tap(&mut real, None));
+        // …and no other kind is ever touched.
+        let mut arrow = AnnotKind::Arrow {
+            a: AnnotPoint { x: 0.0, y: 0.0 },
+            b: AnnotPoint { x: 0.5, y: 0.0 },
+            stroke_w: 4.0,
+        };
+        assert!(!normalize_pen_tap(&mut arrow, None));
+        // The committed dot survives the degeneracy gate (every other kind's stray click does
+        // not) and bakes as a firm round press a touch wider than the preset.
+        let dot = pen(1, [255, 0, 0, 255], 6.0, &[&[(20.0, 20.0)]]);
+        assert!(!is_degenerate(&dot));
+        let img = rasterize_scene(&[dot], 40, 40, 1.0, DEFAULT_ANNOT_CURVE_RADIUS).expect("raster");
+        assert!(img.get_pixel(20, 20).0[3] > 0, "the dot inks at its anchor");
+        assert!(img.get_pixel(23, 20).0[3] > 0, "…and pools past the 6px preset's own radius");
+        assert!(img.get_pixel(20, 30).0[3] == 0, "but stays a dot");
+    }
+
+    #[test]
+    fn the_live_fit_is_what_commit_keeps_and_the_settled_ink_never_moves() {
+        // A jittery drag, sampled the way the pointer path does. The model holds the BEAUTIFIED
+        // curve at every step, so the commit changes nothing — and appending samples must not
+        // re-shape the ink already behind the cursor.
+        let raw: Vec<(f32, f32)> = (0..90)
+            .map(|i| {
+                let t = i as f32 * 0.06;
+                (30.0 + t * 30.0, 50.0 + (t * 1.4).sin() * 20.0 + if i % 2 == 0 { 0.4 } else { -0.4 })
+            })
+            .collect();
+        let (mid, _) = drag_fit(&raw[..60], 4.0);
+        let (end, press) = drag_fit(&raw, 4.0);
+        assert_eq!(press.len(), end.len(), "one pressure sample per stored point");
+        let settled = mid.iter().zip(&end).take_while(|(a, b)| a == b).count();
+        assert!(settled > mid.len() / 2, "most of the drawn ink had already settled");
+        // Committing re-runs nothing: the stored stroke IS the last live fit.
+        assert_eq!(drag_fit(&raw, 4.0).0, end);
+        // The stored curve is smooth (no jitter) and starts/ends exactly where the hand did.
+        assert_eq!((end[0].x, end[0].y), raw[0]);
+        assert_eq!((end[end.len() - 1].x, end[end.len() - 1].y), raw[raw.len() - 1]);
+    }
+
+    #[test]
+    fn the_speed_signal_rides_the_group_through_merge_and_resize() {
+        // The parallel pressure array must never stop belonging to its path: a resize keeps it,
+        // a merge concatenates it, and a group that carries none reads as neutral.
+        let (pts, press) = drag_fit(&[(10.0, 10.0), (12.0, 10.0), (14.0, 10.0), (40.0, 10.0)], 4.0);
+        let inked = AnnotationItem {
+            id: AnnotId(1),
+            color: [1, 2, 3, 255],
+            kind: AnnotKind::Pen { paths: vec![pts.clone()], pressure: vec![press], stroke_w: 4.0 },
+        };
+        // Resize: the points move, the per-point signal comes along unchanged and in step.
+        let grown = edited_kind(
+            &inked.kind,
+            Grab::Corner(crate::geometry::Corner::Se),
+            (0.0, 0.0),
+            (20.0, 0.0),
+            (200.0, 200.0),
+        );
+        let AnnotKind::Pen { paths, pressure, .. } = &grown else { panic!("stays a pen") };
+        assert_eq!(pressure[0].len(), paths[0].len(), "still one value per point");
+        assert!(!pen_pressure(pressure, paths, 0).is_empty(), "…so it is still READ");
+        // Merge: a touching same-look stroke that carries NO signal still lines up (its slot is
+        // an empty vector, which reads as neutral pressure — never a mis-indexed neighbour).
+        let plain = pen(2, [1, 2, 3, 255], 4.0, &[&[(40.0, 10.0), (60.0, 10.0)]]);
+        let mut items = vec![inked, plain];
+        assert!(merge_connected_pens(&mut items, AnnotId(1)));
+        assert_eq!(items.len(), 1);
+        let AnnotKind::Pen { paths, pressure, .. } = &items[0].kind else { panic!("a pen") };
+        assert_eq!(paths.len(), 2);
+        assert_eq!(pressure.len(), paths.len(), "one pressure slot per stroke");
+        assert!(!pen_pressure(pressure, paths, 0).is_empty(), "the inked stroke keeps its signal");
+        assert!(pen_pressure(pressure, paths, 1).is_empty(), "the plain one reads as neutral");
+        // A stale/short signal is ignored rather than mis-read.
+        assert!(pen_pressure(&[vec![0.5]], paths, 0).is_empty());
+    }
+
+    #[test]
+    fn the_bake_tapers_its_tips_and_covers_its_centerline() {
+        // Bake parity sanity: the rasterized ribbon covers the centerline it was traced along,
+        // and the tapered TIP is measurably thinner than the body.
+        let items = vec![pen(1, [255, 0, 0, 255], 8.0, &[&[(10.0, 40.0), (70.0, 40.0)]])];
+        let img = rasterize_scene(&items, 80, 80, 1.0, DEFAULT_ANNOT_CURVE_RADIUS).expect("raster");
+        for x in [12u32, 25, 40, 55, 68] {
+            assert!(img.get_pixel(x, 40).0[3] > 0, "the centerline is uncovered at {x}");
+        }
+        // Vertical extent at the middle vs 1px in from the start tip.
+        let thickness = |x: u32| (0..80).filter(|y| img.get_pixel(x, *y).0[3] > 0).count();
+        let mid = thickness(40);
+        let tip = thickness(11);
+        assert!(mid >= 7, "the body inks at about the 8px preset: {mid}");
+        assert!(tip < mid, "the tip is pinched: {tip} vs {mid}");
+        assert!(tip > 0, "…but never vanishes");
+        // Nothing inks outside the ribbon's width ceiling.
+        assert_eq!(img.get_pixel(40, 40 - 7).0[3], 0, "no ink past max_width/2");
+    }
+
+    #[test]
+    fn pen_rasterizes_its_strokes_for_the_bake() {
+        // The bake path: the same vector geometry the canvas draws, filled at full resolution.
+        let items = vec![pen(1, [255, 0, 0, 255], 4.0, &[&[(2.0, 20.0), (38.0, 20.0)]])];
+        let img = rasterize_scene(&items, 40, 40, 1.0, DEFAULT_ANNOT_CURVE_RADIUS).expect("raster");
+        assert!(img.get_pixel(20, 20).0[3] > 0, "the stroke is drawn where it was traced");
+        assert!(img.get_pixel(20, 2).0[3] == 0, "and nowhere else");
+        // A one-point stroke bakes as a dot rather than vanishing.
+        let dot = vec![pen(2, [255, 0, 0, 255], 6.0, &[&[(20.0, 20.0)]])];
+        let img = rasterize_scene(&dot, 40, 40, 1.0, DEFAULT_ANNOT_CURVE_RADIUS).expect("raster");
+        assert!(img.get_pixel(20, 20).0[3] > 0, "a single-point stroke is a dot");
+        // Baking composites it onto the base (a pen scene is a real edit).
+        let mut base = RgbaImage::from_pixel(40, 40, ::image::Rgba([0, 0, 0, 255]));
+        let before = base.clone();
+        apply_annotations(&mut base, &items, DEFAULT_ANNOT_CURVE_RADIUS);
+        assert_ne!(base, before, "the pen strokes bake into the picture");
+    }
+
+    #[test]
+    fn pen_carries_its_polylines_to_the_canvas_at_the_selected_width() {
+        // The width control (2/4/6px presets) is the single source of truth for a new stroke,
+        // and the polylines reach the widget verbatim in SOURCE px.
+        let mut e = super::super::edit::EditState { annot_stroke_w: 6.0, ..Default::default() };
+        assert_eq!(e.stroke(), 6.0);
+        assert!(STROKE_WIDTHS.contains(&e.stroke()), "6px is one of the three presets");
+        let id = e.next_annot_id();
+        e.annotations.push(pen(id.0, [1, 2, 3, 255], e.stroke(), &[&[(1.0, 2.0), (3.0, 4.0)]]));
+        let w = widget_items(&e.annotations, DEFAULT_ANNOT_CURVE_RADIUS, &[]);
+        assert_eq!(w[0].stroke_w, 6.0);
+        assert_eq!(w[0].fx, FxKind::None, "a pen draws as a vector, never through a shader pass");
+        let ItemKind::Path { paths, .. } = &w[0].kind else { panic!("pens hit-test as paths") };
+        assert_eq!(paths, &vec![vec![(1.0, 2.0), (3.0, 4.0)]]);
     }
 }

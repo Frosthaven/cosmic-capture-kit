@@ -11,6 +11,12 @@ use super::*;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PreviewSurface { Overlay, Window }
 
+/// The OVERLAY header row's height (DRAGON-337): its buttons are FLAT header-style icons —
+/// a glyph box plus its halo, with NO `tool_group` capsule — so the row is exactly one
+/// button box tall, `2 × GROUP_PAD` shorter than a capsuled toolbar bar. Unscaled, because
+/// the overlay's button scale is 1.0 (see [`PreviewSurface::btn_scale`]).
+pub(super) const OVERLAY_HEADER_H: f32 = ICON_BOX + 2.0 * BTN_PAD;
+
 impl PreviewSurface {
     /// Whether this is the resizable WINDOW appearance, as opposed to the fullscreen
     /// layer-shell overlay.
@@ -43,9 +49,14 @@ impl PreviewSurface {
     /// bars with no dead bands.
     pub(super) fn chrome_h(self) -> f32 {
         match self {
-            // Both toolbars at full scale in a 12px-spaced column, plus the centred
-            // group's 40px top & bottom insets.
-            Self::Overlay => 2.0 * (GROUP_H_BASE + 12.0) + 80.0,
+            // THREE rows in a 12px-spaced column, plus the centred group's 40px top & bottom
+            // insets: both full-scale toolbars, and above them the DRAGON-337 header row
+            // (windowed-swap / undo / redo ⟨split⟩ Close). That row's buttons are FLAT — no
+            // `tool_group` capsule — so it is one button box tall ([`OVERLAY_HEADER_H`]),
+            // NOT a full `GROUP_H_BASE`. Portable: the overlay composition is the same view
+            // on every platform (Linux layer-shell, the mac/Windows fullscreen windows), so
+            // there is no per-OS arm to add here.
+            Self::Overlay => 2.0 * (GROUP_H_BASE + 12.0) + (OVERLAY_HEADER_H + 12.0) + 80.0,
             // The CSD header + two edge-pinned bars: each a toolbar group at the
             // windowed button scale inside `preview_bar`'s 8px vertical padding.
             // No column spacing, no insets — the canvas fills everything between.
@@ -156,10 +167,20 @@ pub(super) fn overlay_fit_box(media: (u32, u32), avail: (f32, f32), min_w: f32) 
 }
 
 /// The minimum width (px) the overlay control area needs to show every toolbar group with
-/// a little padding between the split's two sides — the wider of the two bars. Must track
-/// the toolbar compositions (see [`App::edit_toolbar`], [`App::edit_tools`], and the action
-/// rows in `image.rs` / `video.rs`).
+/// a little padding between the split's two sides — the widest of the three bars. Must track
+/// the toolbar compositions (see [`App::overlay_header_row`], [`App::edit_toolbar`],
+/// [`App::edit_tools`], and the action rows in `image.rs` / `video.rs`).
 pub(super) fn overlay_min_content_width(preview: &PreviewState) -> f32 {
+    overlay_min_content_width_for(
+        matches!(preview.kind, PreviewKind::Video(_)),
+        preview.edit.covermark.is_some(),
+    )
+}
+
+/// [`overlay_min_content_width`]'s pure arithmetic, keyed only on what actually changes the
+/// composition: the media kind and whether a covermark's sliders are showing. Split out so
+/// the bar math is unit-testable without a whole `PreviewState`.
+fn overlay_min_content_width_for(video: bool, covermark: bool) -> f32 {
     let button = ICON_BOX + 2.0 * BTN_PAD;
     // tool_group: `grp_pad` padding + `n` buttons spaced 2px apart.
     let group = |n: f32| 2.0 * GROUP_PAD + n * button + (n - 1.0) * 2.0;
@@ -167,20 +188,20 @@ pub(super) fn overlay_min_content_width(preview: &PreviewState) -> f32 {
     // + the little split gap.
     let bar = |groups: f32, items: f32| groups + 8.0 * (items - 1.0) + SPLIT_MIN_GAP;
 
-    // Top bar: appearance(1) | undo/redo(2) ⟨split⟩ size+Delete(2) | save/save-as/copy(3) |
-    // close(1).
+    // Header row (DRAGON-337): swap | undo | redo ⟨split⟩ close — four FLAT buttons (no
+    // group capsules), so each costs a bare button box and they are all row items.
+    let header = bar(4.0 * button, 5.0);
+
+    // Top bar: ⟨split⟩ size+Delete(2) | save/save-as/copy(3). (The annotation DRAW tools
+    // lead this bar for images; like before they aren't counted — they wrap gracefully.)
     let info = group(2.0); // size label (~a button box) + Delete button
-    let top = bar(group(1.0) + group(2.0) + info + group(3.0) + group(1.0), 6.0);
+    let top = bar(info + group(3.0), 2.0);
 
     // Bottom bar: do-not-train(1) | covermark(1, +2 sliders when applied) ⟨split⟩ [images:
     // pointer/pan(2) + zoom control]. The zoom/opacity sliders live inside the covermark
     // group, so they widen the BOTTOM bar.
-    let sliders = if preview.edit.covermark.is_some() {
-        2.0 * SLIDER_ITEM_W
-    } else {
-        0.0
-    };
-    let (bottom_groups, bottom_items) = if matches!(preview.kind, PreviewKind::Video(_)) {
+    let sliders = if covermark { 2.0 * SLIDER_ITEM_W } else { 0.0 };
+    let (bottom_groups, bottom_items) = if video {
         (group(1.0) + group(1.0) + sliders, 3.0)
     } else {
         // Images: pointer/pan tools (2) + zoom control (slider + dropdown).
@@ -189,7 +210,7 @@ pub(super) fn overlay_min_content_width(preview: &PreviewState) -> f32 {
     };
     let bottom = bar(bottom_groups, bottom_items);
 
-    top.max(bottom)
+    header.max(top).max(bottom)
 }
 
 #[cfg(test)]
@@ -205,6 +226,36 @@ mod tests {
         let bar = w.btn_scale() * GROUP_H_BASE + 16.0;
         assert_eq!(w.chrome_h(), w.header_px() + 2.0 * bar);
         assert!(w.chrome_h() < PreviewSurface::Overlay.chrome_h() + w.header_px());
+    }
+
+    /// DRAGON-337: the overlay reserves its two full-scale toolbars PLUS the header row —
+    /// each with one of the column's 12px gaps, inside the 40px top/bottom insets. The header
+    /// row's buttons are FLAT (no capsule), so it costs one button box, `2 × GROUP_PAD` less
+    /// than a toolbar bar would.
+    #[test]
+    fn overlay_chrome_reserves_the_flat_header_row_and_its_gap() {
+        let o = PreviewSurface::Overlay;
+        // The header row + its gap is the ONLY delta vs the historical two-bar reserve...
+        let two_bars = 2.0 * (GROUP_H_BASE + 12.0) + 80.0;
+        assert_eq!(o.chrome_h() - two_bars, OVERLAY_HEADER_H + 12.0);
+        // ...and a flat row is exactly the group padding shorter than a capsuled bar.
+        assert_eq!(GROUP_H_BASE - OVERLAY_HEADER_H, 2.0 * GROUP_PAD);
+    }
+
+    /// The overlay control floor covers EVERY row, including the new header line — so the
+    /// swap / undo / redo ⟨split⟩ Close row can never be squeezed narrower than it needs.
+    #[test]
+    fn overlay_min_width_covers_the_header_row() {
+        let button = ICON_BOX + 2.0 * BTN_PAD;
+        let header = 4.0 * button + 8.0 * 4.0 + SPLIT_MIN_GAP;
+        for video in [false, true] {
+            for covermark in [false, true] {
+                assert!(
+                    overlay_min_content_width_for(video, covermark) >= header,
+                    "the floor must fit the header row (video={video} covermark={covermark})"
+                );
+            }
+        }
     }
 
     /// The canvas (window minus chrome) must keep the media's aspect exactly — the

@@ -668,18 +668,22 @@ impl App {
             }
             // ── Annotation editor (IMAGES only) ──────────────────────────────────────
             PreviewMsg::SelectTool(tool) => {
-                // If a box-family annotation (Box Outline / Highlight / Box Highlight) is selected
-                // and the user picks a DIFFERENT one of those three tools, CONVERT the selected
-                // item in place (real-time, one undo entry) rather than only arming the tool for
-                // the next draw. No-op for every other selection/tool combination.
-                self.convert_selected_annotation_kind(tool);
-                // Only ever SETS a tool — clicking/hotkeying the active tool is a no-op (no
-                // re-click-to-neutral). Persist so the next preview opens with it.
-                if let Some(p) = &mut self.preview {
-                    p.edit.tool = Some(tool);
+                self.select_annot_tool(tool);
+                Task::none()
+            }
+            PreviewMsg::ToolPressed(tool) => {
+                // A tray BUTTON press (DRAGON-339): ask the double-click detector first — the
+                // second press of the same button inside the window ALSO drops a ready-made item
+                // in the middle of the picture (one undo entry, selected), on top of the ordinary
+                // arm-the-tool behavior every press has.
+                let double = self
+                    .preview
+                    .as_mut()
+                    .is_some_and(|p| p.edit.tool_clicks.press(tool, std::time::Instant::now()));
+                self.select_annot_tool(tool);
+                if double {
+                    self.spawn_annotation(tool);
                 }
-                self.annot_tool = Some(tool);
-                self.save_state();
                 Task::none()
             }
             PreviewMsg::SetAnnotColor(color) => {
@@ -797,9 +801,27 @@ impl App {
             }
             PreviewMsg::SelectAnnotation(id) => {
                 if let Some(p) = &mut self.preview {
-                    p.edit.selected = id;
+                    match id {
+                        Some(id) => p.edit.sel.set_one(id),
+                        None => p.edit.sel.clear(),
+                    }
                     p.edit.annot_menu = None;
                 }
+                Task::none()
+            }
+            PreviewMsg::ToggleAnnotationSelected(id) => {
+                if let Some(p) = &mut self.preview {
+                    p.edit.sel.toggle(id);
+                    p.edit.annot_menu = None;
+                }
+                Task::none()
+            }
+            PreviewMsg::BandSelectAnnotations(x0, y0, x1, y1, additive) => {
+                self.band_select_annotations(x0, y0, x1, y1, additive);
+                Task::none()
+            }
+            PreviewMsg::SelectAllAnnotations => {
+                self.select_all_annotations();
                 Task::none()
             }
             PreviewMsg::AnnotDrawBegin(tool, x, y) => self.annot_draw_begin(tool, x, y),
@@ -870,7 +892,7 @@ impl App {
                                     // scene so the re-decoded baseline (which already shows
                                     // them) isn't double-marked.
                                     p.edit.annotations.clear();
-                                    p.edit.selected = None;
+                                    p.edit.sel.clear();
                                     p.edit.gesture = None;
                                     p.edit.annot_snapshot = None;
                                     p.edit.annot_menu = None;

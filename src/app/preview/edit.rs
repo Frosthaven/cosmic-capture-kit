@@ -7,7 +7,7 @@
 //! original (image) or stacks the covermark over the frame (video), so nothing is
 //! lost until the user commits by sharing.
 
-use super::annotate::{AnnotGesture, AnnotColor, AnnotId, AnnotationItem};
+use super::annotate::{AnnotGesture, AnnotColor, AnnotId, AnnotationItem, ToolClicks};
 use super::layers::RasterSlot;
 use super::timeline::{Span, Timeline};
 use crate::widgets::annotation_canvas::Tool;
@@ -124,6 +124,93 @@ impl FlyoutNav {
     }
 }
 
+/// The annotation SELECTION (DRAGON-341): an ordered set of ids whose LAST member is the
+/// PRIMARY — the one wearing resize handles and the one single-item operations (resize,
+/// duplicate, reorder) act on. Everything that acts on "the selection" as a whole (move,
+/// delete, recolor, re-stroke) walks [`Self::ids`] instead, as ONE undo entry.
+///
+/// Order is selection order, so the newest pick is always primary: a plain click makes its item
+/// the only (and primary) member; a Ctrl/Shift-click appends (or removes) one; a rubber band
+/// appends everything it touched. Duplicates are impossible by construction.
+#[derive(Default, Clone, Debug, PartialEq)]
+pub struct Selection {
+    ids: Vec<AnnotId>,
+}
+
+impl Selection {
+    /// The PRIMARY selected id — the most recently added. `None` when nothing is selected.
+    pub fn primary(&self) -> Option<AnnotId> {
+        self.ids.last().copied()
+    }
+
+    /// Every selected id, in selection order (primary last).
+    pub fn ids(&self) -> &[AnnotId] {
+        &self.ids
+    }
+
+    pub fn contains(&self, id: AnnotId) -> bool {
+        self.ids.contains(&id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Drop the whole selection.
+    pub fn clear(&mut self) {
+        self.ids.clear();
+    }
+
+    /// Replace the selection with exactly `id` (a plain click).
+    pub fn set_one(&mut self, id: AnnotId) {
+        self.ids.clear();
+        self.ids.push(id);
+    }
+
+    /// Replace the selection with `ids`, de-duplicated in first-seen order (Ctrl+A, a
+    /// non-additive rubber band).
+    pub fn set_all(&mut self, ids: impl IntoIterator<Item = AnnotId>) {
+        self.ids.clear();
+        self.add_all(ids);
+    }
+
+    /// Add `ids` to the selection, skipping ones already in it (an additive rubber band).
+    pub fn add_all(&mut self, ids: impl IntoIterator<Item = AnnotId>) {
+        for id in ids {
+            if !self.ids.contains(&id) {
+                self.ids.push(id);
+            }
+        }
+    }
+
+    /// Ctrl/Shift-click: remove `id` when already selected, else append it — so a freshly
+    /// added item becomes the PRIMARY and immediately shows its handles.
+    pub fn toggle(&mut self, id: AnnotId) {
+        match self.ids.iter().position(|x| *x == id) {
+            Some(i) => {
+                self.ids.remove(i);
+            }
+            None => self.ids.push(id),
+        }
+    }
+
+    /// Drop any id that is no longer in `items` — called after a mutation that can remove
+    /// items, so the selection can never point at a deleted annotation.
+    pub fn retain_existing(&mut self, items: &[AnnotationItem]) {
+        self.ids.retain(|id| items.iter().any(|it| it.id == *id));
+    }
+
+    /// Drop every id that fails `keep`, preserving the order of the rest — so the primary
+    /// simply falls back to the last SURVIVOR. Used to let pen groups go when pointer mode ends.
+    pub fn retain(&mut self, keep: impl Fn(AnnotId) -> bool) {
+        self.ids.retain(|id| keep(*id));
+    }
+}
+
 /// One undoable preview edit — the SHARED history holds both kinds in order,
 /// so Ctrl+Z walks covermark changes and timeline cuts/deletes interleaved,
 /// newest first, exactly as they were made.
@@ -218,6 +305,9 @@ pub struct EditState {
     /// `None` (the default) is NEUTRAL — existing items are still fully selectable /
     /// movable / resizable and an empty click deselects, but an empty drag draws nothing.
     pub tool: Option<Tool>,
+    /// The action tray's double-click detector (DRAGON-339): two presses of the SAME tool button
+    /// in quick succession spawn a ready-made item in the middle of the picture.
+    pub tool_clicks: ToolClicks,
     /// The current annotation color (`None` = the accent default, resolved when a shape
     /// is created so the off-thread raster never reads the theme).
     pub annot_color: Option<AnnotColor>,
@@ -229,12 +319,26 @@ pub struct EditState {
     /// (round caps when > 0) read. `0.0` means [`super::annotate::DEFAULT_ANNOT_CURVE_RADIUS`]
     /// (there is no way to set a deliberate sharp `0.0` yet, so the fallback is safe).
     pub annot_curve_radius: f32,
-    /// The selected annotation, if any (drives chrome + Delete/reorder/Esc handling).
-    pub selected: Option<AnnotId>,
+    /// The selected annotation(s) — an ordered SET since DRAGON-341 (primary last). Drives the
+    /// chrome + Delete/reorder/Esc handling. Read the primary through [`Self::selected`].
+    pub sel: Selection,
     /// The in-flight pointer gesture (draw / move / resize), if any.
     pub gesture: Option<AnnotGesture>,
     /// The pre-gesture scene snapshot, pushed as ONE undo entry on gesture-commit.
     pub annot_snapshot: Option<Vec<AnnotationItem>>,
+    /// The pen groups the IN-FLIGHT eraser sweep has marked (DRAGON-338). They draw at
+    /// [`super::annotate::ERASE_PREVIEW_ALPHA`] — the preview of what releasing deletes — and
+    /// the model itself is untouched until [`super::App::annot_gesture_end`] commits the sweep
+    /// as ONE undo entry. Always empty outside an eraser gesture.
+    pub erase_marks: Vec<AnnotId>,
+    /// The IN-FLIGHT freehand stroke's RAW pointer trail (DRAGON-342), thinned only by
+    /// [`super::annotate::PEN_MIN_STEP`]. The MODEL always holds the beautified (smoothed,
+    /// pressure-profiled) curve — that is what the canvas draws, what the bake bakes and what
+    /// every hit test reads — so the un-smoothed samples the fit is derived from live here and
+    /// nowhere else, for the length of the gesture. Also the sole source of the SPEED proxy:
+    /// the gaps between these samples are what the pseudo-pressure reads as "how hard was the
+    /// hand pressing". Always empty outside a pen draw.
+    pub pen_raw: Vec<super::annotate::AnnotPoint>,
     /// The custom-color WHEEL picker's live model. `Some` = the picker is open — it owns the
     /// interactive hue/saturation-value spectrum + hex/rgb input (libcosmic's own
     /// cross-platform color picker). `None` (the `Default`) = closed.
@@ -266,6 +370,24 @@ impl EditState {
     /// any would be silently dropped otherwise.
     pub fn dirty(&self) -> bool {
         self.covermark.is_some() || !self.annotations.is_empty() || self.dim > 0.0
+    }
+
+    /// The PRIMARY selected annotation (DRAGON-341) — what the single-item operations (resize,
+    /// duplicate, reorder, kind conversion) act on, and the only one wearing resize handles.
+    pub fn selected(&self) -> Option<AnnotId> {
+        self.sel.primary()
+    }
+
+    /// Drop every freehand PEN group from the selection (DRAGON-341) — what leaving POINTER mode
+    /// does. Pen selection exists only under the pointer, so the SET is pruned rather than the
+    /// chrome merely hidden: a hidden-but-selected stroke would still be swept up by a group
+    /// move or a Delete, which is exactly the ghost the visuals promised was gone. Non-pen
+    /// members keep their order, so the primary falls back to the last surviving shape.
+    pub fn drop_pen_selection(&mut self) {
+        let items = &self.annotations;
+        self.sel.retain(|id| {
+            !items.iter().any(|it| it.id == id && it.kind.is_pen())
+        });
     }
 
     /// The kind of toolbar flyout currently open (covermark picker / color palette), if any.
@@ -412,7 +534,7 @@ impl EditState {
             Some(EditOp::Annotations(prev)) => {
                 self.redo_stack.push(EditOp::Annotations(self.annotations.clone()));
                 self.annotations = prev;
-                self.selected = None;
+                self.sel.clear();
                 Some(EditKind::Annotations)
             }
             Some(EditOp::Dim(prev)) => {
@@ -444,7 +566,7 @@ impl EditState {
             Some(EditOp::Annotations(next)) => {
                 self.undo_stack.push(EditOp::Annotations(self.annotations.clone()));
                 self.annotations = next;
-                self.selected = None;
+                self.sel.clear();
                 Some(EditKind::Annotations)
             }
             Some(EditOp::Dim(next)) => {
@@ -1034,6 +1156,110 @@ mod tests {
         // Idempotent once dimmed — never fights a dim the user has already set.
         edit.ensure_dim_for_spotlights();
         assert_eq!(edit.dim, 0.7);
+    }
+
+    #[test]
+    fn selection_transitions_keep_the_newest_pick_primary() {
+        // DRAGON-341: the selection is an ordered SET whose LAST member is the primary — the
+        // one wearing resize handles and the target of single-item operations.
+        let (a, b, c) = (AnnotId(1), AnnotId(2), AnnotId(3));
+        let mut s = Selection::default();
+        assert!(s.is_empty() && s.primary().is_none() && s.ids().is_empty());
+        // A plain click REPLACES the selection.
+        s.set_one(a);
+        assert_eq!(s.ids(), &[a]);
+        s.set_one(b);
+        assert_eq!(s.ids(), &[b], "a plain click replaces, never adds");
+        // Ctrl/Shift-click APPENDS — and the new member becomes primary.
+        s.toggle(a);
+        assert_eq!(s.ids(), &[b, a]);
+        assert_eq!(s.primary(), Some(a), "the newly added id is primary");
+        // Toggling an existing member REMOVES it; the previous member takes over as primary.
+        s.toggle(a);
+        assert_eq!(s.ids(), &[b]);
+        assert_eq!(s.primary(), Some(b));
+        // An additive band ADDS without duplicating what is already selected.
+        s.add_all([b, c, a]);
+        assert_eq!(s.ids(), &[b, c, a], "existing members keep their place, new ones append");
+        // A non-additive band / Ctrl+A REPLACES, de-duplicated in first-seen order.
+        s.set_all([c, c, b]);
+        assert_eq!(s.ids(), &[c, b]);
+        assert!(s.contains(c) && !s.contains(a));
+        s.clear();
+        assert!(s.is_empty() && s.primary().is_none());
+    }
+
+    #[test]
+    fn selection_prunes_ids_that_left_the_scene() {
+        use crate::app::preview::annotate::{AnnotKind, AnnotRect, AnnotationItem};
+        let rect = AnnotRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        let item = |id: u64| AnnotationItem {
+            id: AnnotId(id),
+            color: [255, 0, 0, 255],
+            kind: AnnotKind::Box { rect, stroke_w: 4.0, fill: None },
+        };
+        let mut s = Selection::default();
+        s.set_all([AnnotId(1), AnnotId(2), AnnotId(3)]);
+        // Item 2 was deleted (a discarded draw / an erase sweep): it drops out, order kept.
+        s.retain_existing(&[item(1), item(3)]);
+        assert_eq!(s.ids(), &[AnnotId(1), AnnotId(3)]);
+        // Everything gone → an empty selection, never a dangling id.
+        s.retain_existing(&[]);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn leaving_pointer_mode_drops_pen_groups_from_the_selection() {
+        // DRAGON-341 follow-up: pen selection exists ONLY under the pointer, so arming any other
+        // tool prunes pen ids out of the SET (not merely hides their chrome) — a hidden-but-
+        // selected stroke would still be swept up by a group move or a Delete.
+        use crate::app::preview::annotate::{AnnotKind, AnnotPoint, AnnotRect, AnnotationItem};
+        let rect = AnnotRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 };
+        let boxed = |id: u64| AnnotationItem {
+            id: AnnotId(id),
+            color: [255, 0, 0, 255],
+            kind: AnnotKind::Box { rect, stroke_w: 4.0, fill: None },
+        };
+        let pen = |id: u64| AnnotationItem {
+            id: AnnotId(id),
+            color: [255, 0, 0, 255],
+            kind: AnnotKind::Pen {
+                paths: vec![vec![AnnotPoint { x: 1.0, y: 1.0 }, AnnotPoint { x: 5.0, y: 5.0 }]],
+                pressure: Vec::new(),
+                stroke_w: 4.0,
+            },
+        };
+        let mut e = EditState {
+            annotations: vec![boxed(1), pen(2), boxed(3), pen(4)],
+            ..Default::default()
+        };
+        // A mixed multi-selection whose PRIMARY is a pen (the last pick).
+        e.sel.set_all([AnnotId(1), AnnotId(3), AnnotId(2), AnnotId(4)]);
+        assert_eq!(e.selected(), Some(AnnotId(4)), "the pen is primary before the switch");
+        e.drop_pen_selection();
+        assert_eq!(e.sel.ids(), &[AnnotId(1), AnnotId(3)], "only the shapes survive, in order");
+        assert_eq!(e.selected(), Some(AnnotId(3)), "primary falls back to the last survivor");
+        // Idempotent, and a pen-ONLY selection empties completely (no ghost primary).
+        e.drop_pen_selection();
+        assert_eq!(e.sel.ids(), &[AnnotId(1), AnnotId(3)]);
+        e.sel.set_all([AnnotId(2), AnnotId(4)]);
+        e.drop_pen_selection();
+        assert!(e.sel.is_empty() && e.selected().is_none());
+        // A shape-only selection is untouched.
+        e.sel.set_all([AnnotId(1), AnnotId(3)]);
+        e.drop_pen_selection();
+        assert_eq!(e.sel.ids(), &[AnnotId(1), AnnotId(3)]);
+    }
+
+    #[test]
+    fn edit_state_exposes_the_primary_as_the_selected_item() {
+        let mut e = EditState::default();
+        assert_eq!(e.selected(), None);
+        e.sel.set_one(AnnotId(7));
+        assert_eq!(e.selected(), Some(AnnotId(7)));
+        e.sel.toggle(AnnotId(9));
+        assert_eq!(e.selected(), Some(AnnotId(9)), "single-item ops follow the primary");
+        assert_eq!(e.sel.len(), 2);
     }
 
     #[test]

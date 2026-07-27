@@ -6,12 +6,14 @@ pub mod arrow_cursor;
 pub mod drag_area;
 pub mod hide_when_clipped;
 pub mod icons;
+pub mod notched_slider;
 pub mod output_selection;
 pub mod region_selection;
 pub mod zoom_pan;
 
 pub use drag_area::DragArea;
 pub use hide_when_clipped::hide_when_clipped;
+pub use notched_slider::notched_slider;
 pub use output_selection::OutputSelection;
 pub use region_selection::RegionSelection;
 pub use zoom_pan::ZoomPan;

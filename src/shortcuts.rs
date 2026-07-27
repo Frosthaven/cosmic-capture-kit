@@ -72,6 +72,12 @@ pub enum Action {
     PreviewFrameNext,
     /// Preview: delete the selected timeline segment (default Delete).
     PreviewDeleteSegment,
+    /// Preview: the POINTER (pure selection) annotation tool (default T, for poinTer/selecT —
+    /// V, the usual pick, is already the pan toggle) — DRAGON-341.
+    PreviewAnnotPointer,
+    /// Preview: select every annotation in the scene, engaging pointer mode (default Ctrl+A) —
+    /// DRAGON-341.
+    PreviewSelectAll,
     /// Preview: the Arrow annotation tool (default A).
     PreviewAnnotArrow,
     /// Preview: the Box (rectangle) annotation tool (default B).
@@ -86,6 +92,10 @@ pub enum Action {
     PreviewAnnotBlur,
     /// Preview: the Spotlight (dim knockout) annotation tool (default S) — DRAGON-329.
     PreviewAnnotSpotlight,
+    /// Preview: the freehand Pencil annotation tool (default N, for peN) — DRAGON-338.
+    PreviewAnnotPen,
+    /// Preview: the Eraser (removes pen strokes; default E) — DRAGON-338.
+    PreviewAnnotEraser,
     /// Preview: duplicate the selected annotation, offset toward the frame center (default D).
     PreviewAnnotDuplicate,
     /// Preview: cycle the annotation stroke width to the next preset, wrapping (default L).
@@ -108,7 +118,7 @@ impl Action {
     /// copy / close / delete / covermark / undo / redo), then "Image Editor
     /// Shortcuts" (annotation tools / color / pan), then "Video Editor Shortcuts"
     /// (play / frame step / delete segment) — image above video.
-    pub const ALL: [Action; 30] = [
+    pub const ALL: [Action; 34] = [
         Action::SelectAllText,
         Action::DeselectText,
         Action::CopyText,
@@ -121,6 +131,8 @@ impl Action {
         Action::PreviewCovermark,
         Action::PreviewUndo,
         Action::PreviewRedo,
+        Action::PreviewAnnotPointer,
+        Action::PreviewSelectAll,
         Action::PreviewAnnotArrow,
         Action::PreviewAnnotBox,
         Action::PreviewAnnotHighlight,
@@ -128,6 +140,8 @@ impl Action {
         Action::PreviewAnnotPixelate,
         Action::PreviewAnnotBlur,
         Action::PreviewAnnotSpotlight,
+        Action::PreviewAnnotPen,
+        Action::PreviewAnnotEraser,
         Action::PreviewAnnotDuplicate,
         Action::PreviewAnnotStrokeCycle,
         Action::PreviewColorFlyout,
@@ -160,6 +174,8 @@ impl Action {
             Action::PreviewUndo => "Undo",
             Action::PreviewRedo => "Redo",
             Action::PreviewDeleteSegment => "Delete segment",
+            Action::PreviewAnnotPointer => "Select tool",
+            Action::PreviewSelectAll => "Select all annotations",
             Action::PreviewAnnotArrow => "Arrow tool",
             Action::PreviewAnnotBox => "Box tool",
             Action::PreviewAnnotHighlight => "Highlight tool",
@@ -167,6 +183,8 @@ impl Action {
             Action::PreviewAnnotPixelate => "Pixelate tool",
             Action::PreviewAnnotBlur => "Blur tool",
             Action::PreviewAnnotSpotlight => "Spotlight tool",
+            Action::PreviewAnnotPen => "Pencil tool",
+            Action::PreviewAnnotEraser => "Eraser",
             Action::PreviewAnnotDuplicate => "Duplicate annotation",
             Action::PreviewAnnotStrokeCycle => "Cycle line width",
             Action::PreviewColorFlyout => "Color",
@@ -200,6 +218,8 @@ impl Action {
             Action::PreviewFramePrev => "Step to the previous frame.",
             Action::PreviewFrameNext => "Step to the next frame.",
             Action::PreviewDeleteSegment => "Delete the selected timeline segment.",
+            Action::PreviewAnnotPointer => "Select, multi-select and move annotations.",
+            Action::PreviewSelectAll => "Select every annotation on the image.",
             Action::PreviewAnnotArrow => "Draw an arrow.",
             Action::PreviewAnnotBox => "Draw a rectangle.",
             Action::PreviewAnnotHighlight => "Draw a multiply-blended highlight box.",
@@ -207,6 +227,8 @@ impl Action {
             Action::PreviewAnnotPixelate => "Pixelate a region (destructive redaction).",
             Action::PreviewAnnotBlur => "Blur a region (destructive redaction).",
             Action::PreviewAnnotSpotlight => "Draw a spotlight that dims everything outside it.",
+            Action::PreviewAnnotPen => "Draw freehand strokes.",
+            Action::PreviewAnnotEraser => "Erase pen strokes by dragging over them.",
             Action::PreviewAnnotDuplicate => "Duplicate the selected annotation.",
             Action::PreviewAnnotStrokeCycle => "Cycle the line width.",
             Action::PreviewColorFlyout => "Open the annotation color picker.",
@@ -237,13 +259,17 @@ impl Action {
             | Action::PreviewFramePrev
             | Action::PreviewFrameNext
             | Action::PreviewDeleteSegment => "Video Editor Shortcuts",
-            Action::PreviewAnnotArrow
+            Action::PreviewAnnotPointer
+            | Action::PreviewSelectAll
+            | Action::PreviewAnnotArrow
             | Action::PreviewAnnotBox
             | Action::PreviewAnnotHighlight
             | Action::PreviewAnnotBoxHighlight
             | Action::PreviewAnnotPixelate
             | Action::PreviewAnnotBlur
             | Action::PreviewAnnotSpotlight
+            | Action::PreviewAnnotPen
+            | Action::PreviewAnnotEraser
             | Action::PreviewAnnotStrokeCycle
             | Action::PreviewAnnotDuplicate
             | Action::PreviewColorFlyout
@@ -273,6 +299,8 @@ impl Action {
             | Action::PreviewUndo
             | Action::PreviewRedo
             | Action::PreviewDeleteSegment
+            | Action::PreviewAnnotPointer
+            | Action::PreviewSelectAll
             | Action::PreviewAnnotArrow
             | Action::PreviewAnnotBox
             | Action::PreviewAnnotHighlight
@@ -280,6 +308,8 @@ impl Action {
             | Action::PreviewAnnotPixelate
             | Action::PreviewAnnotBlur
             | Action::PreviewAnnotSpotlight
+            | Action::PreviewAnnotPen
+            | Action::PreviewAnnotEraser
             | Action::PreviewAnnotStrokeCycle
             | Action::PreviewAnnotDuplicate
             | Action::PreviewColorFlyout
@@ -309,6 +339,8 @@ impl Action {
             Action::PreviewUndo => Shortcut::primary_char('z'),
             Action::PreviewRedo => Shortcut::primary_shift_char('z'),
             Action::PreviewDeleteSegment => Shortcut::named(NamedKey::Delete),
+            Action::PreviewAnnotPointer => Shortcut::char('t'),
+            Action::PreviewSelectAll => Shortcut::primary_char('a'),
             Action::PreviewAnnotArrow => Shortcut::char('a'),
             Action::PreviewAnnotBox => Shortcut::char('b'),
             Action::PreviewAnnotHighlight => Shortcut::char('h'),
@@ -316,6 +348,8 @@ impl Action {
             Action::PreviewAnnotPixelate => Shortcut::char('m'),
             Action::PreviewAnnotBlur => Shortcut::char('u'),
             Action::PreviewAnnotSpotlight => Shortcut::char('s'),
+            Action::PreviewAnnotPen => Shortcut::char('n'),
+            Action::PreviewAnnotEraser => Shortcut::char('e'),
             Action::PreviewAnnotDuplicate => Shortcut::char('d'),
             Action::PreviewAnnotStrokeCycle => Shortcut::char('l'),
             Action::PreviewColorFlyout => Shortcut::char('c'),

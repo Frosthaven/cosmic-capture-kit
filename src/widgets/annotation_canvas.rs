@@ -1,7 +1,20 @@
 //! The image-annotation interaction canvas: a transparent leaf `Widget` layered OVER
 //! the preview's [`crate::widgets::ZoomPan`] that owns pointer handling for the
 //! annotation editor — click-to-select, drag-to-move, drag-handle-to-resize,
-//! drag-endpoint (arrow), draw-a-new-shape, and right-click.
+//! drag-endpoint (arrow), draw-a-new-shape, and right-click. A press over an existing item
+//! manipulates it, EXCEPT while Ctrl is held with a draw tool armed: Ctrl flips that precedence
+//! so a new shape can be drawn on TOP of existing ones ([`force_new_draw`], DRAGON-339).
+//!
+//! # Selection (DRAGON-341)
+//! The selection is a SET (`selection`, in selection order) rather than one id. Its LAST member
+//! is the PRIMARY: the only one wearing resize handles, so every [`Grab`] still edits exactly one
+//! item and the whole resize machinery is untouched by multi-select. [`Tool::Pointer`] is the
+//! pure-selection mode that makes the set reachable — Ctrl/Shift-click toggles members
+//! ([`additive_select`]), an empty-canvas drag rubber-bands ([`Pending::Band`] →
+//! [`AnnotEvent::BoxSelect`]), and dragging any selected body emits the ordinary
+//! [`Grab::Move`], which the app applies to the WHOLE set. Pointer mode is also the only state
+//! in which freehand PEN groups are body-selectable (see `pen_selectable`): ink covers a picture
+//! and must not swallow clicks meant for what is under it.
 //!
 //! # Why a sibling overlay (not a child of ZoomPan)
 //! ZoomPan transforms its content VISUALLY in `draw` but passes RAW (untransformed)
@@ -46,6 +59,9 @@ use cosmic::widget::canvas::{self, LineCap, LineJoin, Path, Stroke};
 const HANDLE_GRAB: f32 = 16.0;
 /// Screen-px hit tolerance to the body of an arrow (its shaft).
 const ARROW_GRAB: f32 = 10.0;
+/// Screen-px hit tolerance to a pen STROKE (DRAGON-338) — tighter than the arrow's, since a
+/// scribble can wander anywhere and shouldn't swallow clicks meant for what's behind it.
+const PEN_GRAB: f32 = 6.0;
 /// Movement (screen px) before a press becomes a real drag rather than a click.
 const NEW_THRESHOLD: f32 = 4.0;
 /// Screen-px padding added around an item's OUTER drawn extent (geometry + stroke/2) for
@@ -76,6 +92,12 @@ const DASH_GAP: f32 = 4.0;
 /// NEUTRAL (no-draw) default — select/move/resize of existing items works in either state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
+    /// PURE SELECTION (DRAGON-341): draws nothing at all. A click picks the topmost item of ANY
+    /// kind, Ctrl/Shift-click toggles items into a MULTI-selection, a drag on empty canvas
+    /// rubber-bands everything it touches, and dragging a selected item's body moves the WHOLE
+    /// selection. It is also the ONLY tool under which freehand PEN groups are click-selectable
+    /// (see [`AnnotationCanvas::pen_selectable`]).
+    Pointer,
     /// Draw arrows.
     Arrow,
     /// Draw rectangles ("Box").
@@ -92,12 +114,22 @@ pub enum Tool {
     Pixelate,
     /// Draw a DESTRUCTIVE blur box — a Box variant.
     Blur,
+    /// Draw FREEHAND pen strokes (DRAGON-338): a drag traces a vector polyline at the current
+    /// stroke width. Strokes that TOUCH merge into one selectable item (see
+    /// `crate::app::preview::annotate::merge_connected_pens`).
+    Pen,
+    /// ERASE pen strokes (DRAGON-338). Not a draw tool at all: press-and-drag MARKS every pen
+    /// item the eraser passes over (dimmed to ERASE_PREVIEW_ALPHA — the pending-deletion preview) and
+    /// RELEASE deletes them all in one undo entry. Presses never select/move an item, so the
+    /// whole canvas erases while it's armed.
+    Eraser,
 }
 
 impl Tool {
     /// A stable string form for persistence.
     pub fn as_str(self) -> &'static str {
         match self {
+            Tool::Pointer => "pointer",
             Tool::Arrow => "arrow",
             Tool::Rect => "box",
             Tool::Highlight => "highlight",
@@ -105,11 +137,14 @@ impl Tool {
             Tool::Spotlight => "spotlight",
             Tool::Pixelate => "pixelate",
             Tool::Blur => "blur",
+            Tool::Pen => "pen",
+            Tool::Eraser => "eraser",
         }
     }
     /// Parse the persisted string; unknown values yield `None` (neutral).
     pub fn from_str(s: &str) -> Option<Tool> {
         match s {
+            "pointer" => Some(Tool::Pointer),
             "arrow" => Some(Tool::Arrow),
             "box" => Some(Tool::Rect),
             "highlight" => Some(Tool::Highlight),
@@ -117,9 +152,51 @@ impl Tool {
             "spotlight" => Some(Tool::Spotlight),
             "pixelate" => Some(Tool::Pixelate),
             "blur" => Some(Tool::Blur),
+            "pen" => Some(Tool::Pen),
+            "eraser" => Some(Tool::Eraser),
             _ => None,
         }
     }
+
+    /// Whether this tool ERASES rather than draws — the one tool whose press never selects,
+    /// moves or resizes an existing item (it always starts an erase sweep instead).
+    pub fn is_eraser(self) -> bool {
+        matches!(self, Tool::Eraser)
+    }
+
+    /// Whether this is the pure-SELECTION pointer (DRAGON-341) — the tool that never creates
+    /// anything and owns multi-select / rubber-band / group-move.
+    pub fn is_pointer(self) -> bool {
+        matches!(self, Tool::Pointer)
+    }
+
+    /// Whether this tool CREATES geometry on a drag. The two non-creating tools are the
+    /// [`Tool::Eraser`] (it removes) and the [`Tool::Pointer`] (it only selects) — everything
+    /// that keys off "a drag will draw something" (the crosshair cursor, the Ctrl
+    /// draw-over-items override) must ask this rather than `tool.is_some()`.
+    pub fn draws(self) -> bool {
+        !matches!(self, Tool::Eraser | Tool::Pointer)
+    }
+}
+
+/// Whether a left press must start a BRAND-NEW shape, ignoring whatever item sits under the
+/// cursor (DRAGON-339). Normally a press over an existing item selects/moves/resizes it, so
+/// there is no way to draw ON TOP of one; holding Ctrl with a draw tool armed flips that
+/// precedence — the press draws, the item below is left alone. With no tool armed (the neutral
+/// pointer) Ctrl means nothing, so manipulation stays the behavior. The non-DRAWING tools —
+/// the eraser and the DRAGON-341 pointer — have nothing to force, so Ctrl means nothing there
+/// either (in pointer mode Ctrl-click is multi-select instead). Pure — unit-tested.
+pub fn force_new_draw(tool: Option<Tool>, ctrl: bool) -> Option<Tool> {
+    if ctrl { tool.filter(|t| t.draws()) } else { None }
+}
+
+/// Whether a press with `tool` armed and `ctrl`/`shift` held is an ADDITIVE selection click
+/// (DRAGON-341): toggle the hit item into the multi-selection, or extend a rubber band, instead
+/// of replacing the selection. ONLY the pointer tool multi-selects — with a draw tool armed Ctrl
+/// still means "draw over what's under the cursor" ([`force_new_draw`]), so the two can never
+/// both claim the same press. Pure — unit-tested.
+pub fn additive_select(tool: Option<Tool>, ctrl: bool, shift: bool) -> bool {
+    tool.is_some_and(Tool::is_pointer) && (ctrl || shift)
 }
 
 /// How the canvas RENDERS an item. Box/Arrow draw as vector geometry in [`draw_shapes`]; the
@@ -174,12 +251,23 @@ enum HitKind {
 
 /// One item's GEOMETRY in image SOURCE pixels — enough for the widget to hit-test and to
 /// draw selection chrome. Appearance (color/stroke/fill) is the raster's job.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum ItemKind {
     /// A rectangle at `(x, y)` sized `w`×`h` (source px; may be un-normalized during a draw).
     Rect { x: f32, y: f32, w: f32, h: f32 },
     /// An arrow from A `(ax, ay)` to B `(bx, by)` (source px).
     Arrow { ax: f32, ay: f32, bx: f32, by: f32 },
+    /// A freehand PEN item (DRAGON-338): one or more polylines (source px) that all belong to
+    /// the SAME selectable unit — every stroke the user drew that touches another one in the
+    /// group. Selection chrome + resize handles sit on the group's bounding box; the BODY
+    /// hit-test follows the strokes themselves (a scribble's bbox is mostly empty space).
+    ///
+    /// The points are the SMOOTHED centerline and `pressure` the parallel per-point speed
+    /// signal (DRAGON-342) — together they build the pseudo-pressure width profile this widget
+    /// FILLS as a ribbon (`crate::pen_stroke::stroke_fill_polygons`), the identical geometry the
+    /// full-res bake rasterizes. `pressure[i]` belongs to `paths[i]`; an empty entry reads as
+    /// neutral pressure.
+    Path { paths: Vec<Vec<(f32, f32)>>, pressure: Vec<Vec<f32>> },
 }
 
 /// A hit-testable, DRAWABLE item: a stable id, its geometry, its stroke width (SOURCE px —
@@ -187,7 +275,7 @@ pub enum ItemKind {
 /// the appearance the canvas draws it with. The shapes are drawn as TRUE VECTOR geometry by
 /// this widget (DRAGON-324), so they stay crisp at ANY zoom instead of sampling a
 /// preview-resolution raster; the full-res bake still rasterizes the same scene on demand.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Item {
     pub id: u64,
     pub kind: ItemKind,
@@ -210,8 +298,16 @@ pub struct Item {
 /// widget-LOCAL point for placing the context-menu popover.
 #[derive(Clone, Copy, Debug)]
 pub enum AnnotEvent {
-    /// Plain click: select `Some(id)` (topmost hit) or deselect (`None`).
+    /// Plain click: select `Some(id)` (topmost hit) or deselect (`None`). REPLACES the
+    /// selection.
     Select(Option<u64>),
+    /// Ctrl/Shift-click in POINTER mode (DRAGON-341): TOGGLE `id` in the multi-selection,
+    /// keeping the rest. A newly added id becomes the PRIMARY (the one wearing resize handles).
+    SelectToggle(u64),
+    /// A pointer-mode RUBBER BAND finished (DRAGON-341): select every item the band
+    /// `(x0, y0)`–`(x1, y1)` (image source px, un-normalized) TOUCHES. `additive` (Ctrl/Shift
+    /// held at press) keeps the existing selection and adds to it.
+    BoxSelect(f32, f32, f32, f32, bool),
     /// Begin drawing a brand-new shape of `tool` from image point `(x, y)`.
     DrawBegin(Tool, f32, f32),
     /// Begin manipulating the selected item (grab kind + press image point).
@@ -296,6 +392,9 @@ enum Pending {
     Move,
     /// Pressed a handle of the selected item: a drag resizes / moves the endpoint.
     Resize(Grab),
+    /// POINTER mode, pressed empty canvas (DRAGON-341): a drag rubber-bands a selection.
+    /// `additive` (Ctrl/Shift at press) keeps whatever was already selected.
+    Band { additive: bool },
 }
 
 #[derive(Default)]
@@ -305,6 +404,9 @@ struct State {
     press_screen: (f32, f32),
     /// Press point in IMAGE source px (the gesture anchor).
     press_img: (f32, f32),
+    /// The rubber band's live far corner in widget-LOCAL screen px (DRAGON-341), meaningful
+    /// only while `pending` is [`Pending::Band`] and the press has moved.
+    band_to: (f32, f32),
     /// Whether the press has moved past the click threshold.
     moved: bool,
     /// Whether a `DrawBegin` / `GrabBegin` has been emitted for this gesture yet.
@@ -327,7 +429,10 @@ pub struct AnnotationCanvas<'a, Msg> {
     /// The wrapped ZoomPan (draws the image + shape raster, owns pan/zoom/scrollbars).
     content: cosmic::Element<'a, Msg>,
     items: Vec<Item>,
-    selected: Option<u64>,
+    /// The current MULTI-selection (DRAGON-341), in selection order — the LAST id is the
+    /// PRIMARY (the only one wearing resize handles; see [`Self::primary`]). Empty = nothing
+    /// selected. A single-item selection behaves exactly as the old `Option<u64>` did.
+    selection: Vec<u64>,
     /// The active draw tool, or `None` for neutral (no drawing on empty-canvas drag).
     tool: Option<Tool>,
     zoom: f32,
@@ -345,7 +450,7 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
     pub fn new(
         content: impl Into<cosmic::Element<'a, Msg>>,
         items: Vec<Item>,
-        selected: Option<u64>,
+        selection: Vec<u64>,
         tool: Option<Tool>,
         zoom: f32,
         pan: (f32, f32),
@@ -358,7 +463,7 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         Self {
             content: content.into(),
             items,
-            selected,
+            selection,
             tool,
             zoom,
             pan,
@@ -395,15 +500,39 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         local.0 >= cb.width || local.1 >= cb.height
     }
 
-    /// The selected item, if any.
-    fn selected_item(&self) -> Option<&Item> {
-        self.selected.and_then(|id| self.items.iter().find(|i| i.id == id))
+    /// The PRIMARY selected id — the last one added (DRAGON-341). It is the only member of a
+    /// multi-selection that wears resize handles, so the existing single-item [`Grab`] machinery
+    /// keeps working unchanged: a resize drag always edits exactly one item.
+    fn primary(&self) -> Option<u64> {
+        self.selection.last().copied()
     }
 
-    /// Hit-test in precedence order: the SELECTED item's resize HANDLES first (they exist
-    /// ONLY for the selected item, drawn HIT_PAD outside it), then ANY item's BODY top-most
-    /// first (a body press selects + moves), then empty. So an unselected item has no
-    /// grabbable handles — you select it (body-click) to reveal them.
+    /// Whether `id` is part of the current selection.
+    fn is_selected(&self, id: u64) -> bool {
+        self.selection.contains(&id)
+    }
+
+    /// The PRIMARY selected item, if any (the one the chrome hangs handles on).
+    fn selected_item(&self) -> Option<&Item> {
+        self.primary().and_then(|id| self.items.iter().find(|i| i.id == id))
+    }
+
+    /// Whether freehand PEN groups may be picked up by a BODY click right now (DRAGON-341):
+    /// only in POINTER mode. Ink is scribbled all over a picture and would otherwise swallow
+    /// clicks meant for the shapes (and the drawing) beneath it, so outside the pointer tool a
+    /// pen group is inert — with the pencil armed a drag over ink DRAWS (DRAGON-338), which is
+    /// exactly what this gating leaves in charge there. Nor can a pen be selected WHILE another
+    /// tool is armed: arming a non-pointer tool prunes pen ids out of the selection
+    /// (`EditState::drop_pen_selection`), so this widget never receives one to chrome.
+    fn pen_selectable(&self) -> bool {
+        self.tool.is_some_and(Tool::is_pointer)
+    }
+
+    /// Hit-test in precedence order: the PRIMARY selected item's resize HANDLES first (they
+    /// exist ONLY for it, drawn HIT_PAD outside it), then ANY item's BODY top-most first (a body
+    /// press selects + moves), then empty. So an unselected item has no grabbable handles — you
+    /// select it (body-click) to reveal them. In a MULTI-selection (DRAGON-341) only the primary
+    /// carries handles, so a resize still edits exactly one item.
     fn hit_at(&self, map: &CanvasMap, p: (f32, f32)) -> Option<(u64, HitKind)> {
         let g = (p.0 as i32, p.1 as i32);
         // 1. The SELECTED item's HANDLES win over everything (top precedence). Handles are
@@ -411,7 +540,15 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         //    two endpoint nodes — ONLY those resize, NOT the whole perimeter (the rest of the
         //    stroke moves, via Body in step 2).
         if let Some(sel) = self.selected_item() {
-            match sel.kind {
+            // A pen group's handles sit on its BOUNDING BOX, exactly like a rect's.
+            let sel_kind = match &sel.kind {
+                ItemKind::Path { paths, .. } => {
+                    let (x, y, w, h) = path_bounds(paths);
+                    ItemKind::Rect { x, y, w, h }
+                }
+                other => other.clone(),
+            };
+            match sel_kind {
                 ItemKind::Rect { x, y, w, h } => {
                     let r = box_chrome_rect(map, x, y, w, h, sel.stroke_w);
                     if let Some(c) = r.corner_at(g, HANDLE_GRAB) {
@@ -444,6 +581,8 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
                         return Some((sel.id, HitKind::Resize(Grab::ArrowB)));
                     }
                 }
+                // Mapped to its bounding Rect above — unreachable.
+                ItemKind::Path { .. } => {}
             }
         }
         // 2. Any item's BODY, top-most (reverse z-order) first. The SELECTED item keeps the
@@ -453,9 +592,9 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         //    instead of grabbing it. Clicking ON the visible stroke still selects. `<=` so the
         //    outer boundary counts too.
         for item in self.items.iter().rev() {
-            let selected = self.selected == Some(item.id);
-            match item.kind {
-                ItemKind::Rect { x, y, w, h } => {
+            let selected = self.is_selected(item.id);
+            match &item.kind {
+                &ItemKind::Rect { x, y, w, h } => {
                     let r = if selected {
                         box_chrome_rect(map, x, y, w, h, item.stroke_w)
                     } else {
@@ -465,7 +604,7 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
                         return Some((item.id, HitKind::Body));
                     }
                 }
-                ItemKind::Arrow { ax, ay, bx, by } => {
+                &ItemKind::Arrow { ax, ay, bx, by } => {
                     let a = map.to_canvas((ax, ay));
                     let b = map.to_canvas((bx, by));
                     // Shaft grab tolerance from the OUTER drawn stroke edge: ARROW_GRAB + stroke/2,
@@ -473,6 +612,25 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
                     let pad = if selected { HIT_PAD } else { 0.0 };
                     let tol = ARROW_GRAB + pad + item.stroke_w * map.img_to_screen_scale() * 0.5;
                     if point_near_segment(p, a, b) <= tol {
+                        return Some((item.id, HitKind::Body));
+                    }
+                }
+                // A pen group hits along its STROKES (never its mostly-empty bbox), so a click
+                // in the gap between two scribbles falls through to whatever is under it — and
+                // only in POINTER mode at all (DRAGON-341, see `pen_selectable`). The reach
+                // rides `max_width` — the widest a pressure-swelled stretch draws — so a heavy
+                // loop is grabbable everywhere it is inked.
+                ItemKind::Path { paths, .. } => {
+                    if !self.pen_selectable() {
+                        continue;
+                    }
+                    let pad = if selected { HIT_PAD } else { 0.0 };
+                    let tol = PEN_GRAB
+                        + pad
+                        + crate::pen_stroke::max_width(item.stroke_w)
+                            * map.img_to_screen_scale()
+                            * 0.5;
+                    if path_distance(map, paths, p) <= tol {
                         return Some((item.id, HitKind::Body));
                     }
                 }
@@ -539,6 +697,47 @@ fn arrow_nodes(
     let (ux, uy) = (dx / len, dy / len);
     let off = HIT_PAD + stroke_src * map.img_to_screen_scale() * 0.5;
     ((a.0 - ux * off, a.1 - uy * off), (b.0 + ux * off, b.1 + uy * off))
+}
+
+/// The SOURCE-space bounding box `(x, y, w, h)` of a pen group's polylines — the rect its
+/// selection chrome + resize handles sit on. An empty group is a zero rect at the origin.
+/// Pure — unit-tested.
+pub fn path_bounds(paths: &[Vec<(f32, f32)>]) -> (f32, f32, f32, f32) {
+    let (mut lo_x, mut lo_y) = (f32::INFINITY, f32::INFINITY);
+    let (mut hi_x, mut hi_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for p in paths.iter().flatten() {
+        lo_x = lo_x.min(p.0);
+        lo_y = lo_y.min(p.1);
+        hi_x = hi_x.max(p.0);
+        hi_y = hi_y.max(p.1);
+    }
+    if !lo_x.is_finite() || !lo_y.is_finite() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    (lo_x, lo_y, hi_x - lo_x, hi_y - lo_y)
+}
+
+/// The smallest screen-px distance from `p` (widget-local) to any segment of a pen group,
+/// mapping the SOURCE-px polylines through `map`. A single-point stroke measures to the point.
+fn path_distance(map: &CanvasMap, paths: &[Vec<(f32, f32)>], p: (f32, f32)) -> f32 {
+    let mut best = f32::INFINITY;
+    for path in paths {
+        match path.len() {
+            0 => {}
+            1 => {
+                let a = map.to_canvas(path[0]);
+                best = best.min((p.0 - a.0).hypot(p.1 - a.1));
+            }
+            _ => {
+                for w in path.windows(2) {
+                    let a = map.to_canvas(w[0]);
+                    let b = map.to_canvas(w[1]);
+                    best = best.min(point_near_segment(p, a, b));
+                }
+            }
+        }
+    }
+    best
 }
 
 /// Distance from point `p` to the segment `a`–`b` (screen px).
@@ -638,6 +837,8 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
             Pending::Draw(_) => return mouse::Interaction::Crosshair,
             Pending::Move => return mouse::Interaction::Grabbing,
             Pending::Resize(g) => return grab_cursor(g),
+            // A live rubber band reads as a marquee draw (DRAGON-341).
+            Pending::Band { .. } => return mouse::Interaction::Crosshair,
             _ => {}
         }
         // Fresh-enter re-assert dip (DRAGON-331; see `crate::widgets::cursor_reassert`): we claim the
@@ -657,15 +858,30 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         if self.in_scrollbar_strip(bounds, local) {
             return child();
         }
+        // The ERASER owns the whole canvas while armed (a press never selects/moves), so it
+        // shows ONE cursor everywhere over the content — no per-item grab/resize hints.
+        // Likewise Ctrl + a draw tool (DRAGON-339) draws over ANYTHING, so the crosshair holds
+        // even above an item — the cursor must promise what the press will actually do.
+        if self.tool.is_some_and(Tool::is_eraser)
+            || force_new_draw(self.tool, state.mods.control()).is_some()
+        {
+            return mouse::Interaction::Crosshair;
+        }
         // Idle hover: the selected item's handle shows its resize cursor, any item's body
         // the open-hand grab; empty canvas shows the draw crosshair when a draw tool is
         // active, else defer to the ZoomPan.
         let map = self.map(bounds);
         match self.hit_at(&map, local) {
             Some((_, HitKind::Resize(g))) => grab_cursor(g),
+            // With the pencil armed a body drag draws rather than moves, so it keeps the draw
+            // crosshair over items too — the cursor tells the truth about what a drag will do.
+            Some((_, HitKind::Body)) if self.tool == Some(Tool::Pen) => mouse::Interaction::Crosshair,
             Some((_, HitKind::Body)) => mouse::Interaction::Grab,
             None => {
-                if self.tool.is_some() {
+                // Only a tool that actually DRAWS promises a crosshair over empty canvas; the
+                // pointer (DRAGON-341) rubber-bands, which reads as the plain arrow until the
+                // drag starts, and the neutral state defers to the ZoomPan.
+                if self.tool.is_some_and(Tool::draws) {
                     mouse::Interaction::Crosshair
                 } else {
                     child()
@@ -739,7 +955,12 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                             if !self.in_scrollbar_strip(bounds, local)
                                 && let Some(id) = self.topmost_at(&map, local)
                             {
-                                self.emit(shell, AnnotEvent::Select(Some(id)));
+                                // Right-clicking INSIDE an existing multi-selection keeps it
+                                // whole (DRAGON-341) — the menu then acts on everything
+                                // selected; anywhere else the press selects what it hit first.
+                                if !(self.selection.len() > 1 && self.is_selected(id)) {
+                                    self.emit(shell, AnnotEvent::Select(Some(id)));
+                                }
                                 self.emit(shell, AnnotEvent::Menu(local.0, local.1));
                                 shell.capture_event();
                                 consumed = true;
@@ -757,21 +978,91 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                 state.press_img = map.to_image(local);
                                 state.moved = false;
                                 state.begun = false;
-                                if let Some((id, hit)) = self.hit_at(&map, local) {
+                                if self.tool.is_some_and(Tool::is_eraser) {
+                                    // ERASER (DRAGON-338): never selects/moves — the press ITSELF
+                                    // starts the sweep (so a plain CLICK on a stroke marks it,
+                                    // with no drag threshold to cross) and captures immediately.
+                                    self.emit(shell, AnnotEvent::Select(None));
+                                    self.emit(
+                                        shell,
+                                        AnnotEvent::DrawBegin(
+                                            Tool::Eraser,
+                                            state.press_img.0,
+                                            state.press_img.1,
+                                        ),
+                                    );
+                                    state.pending = Pending::Draw(Tool::Eraser);
+                                    state.moved = true;
+                                    state.begun = true;
+                                    shell.capture_event();
+                                    consumed = true;
+                                } else if let Some(t) =
+                                    force_new_draw(self.tool, state.mods.control())
+                                {
+                                    // Ctrl + a draw tool (DRAGON-339): draw a NEW item wherever the
+                                    // press lands, even over existing ones. Treated exactly like an
+                                    // empty-canvas press — deselect (so no chrome implies a
+                                    // manipulation) and arm the draw, which captures LAZILY once
+                                    // it's a genuine drag.
+                                    self.emit(shell, AnnotEvent::Select(None));
+                                    state.pending = Pending::Draw(t);
+                                } else if let Some((id, hit)) = self.hit_at(&map, local) {
                                     // An existing item is CANVAS-owned: capture + own it.
-                                    self.emit(shell, AnnotEvent::Select(Some(id)));
-                                    state.pending = match hit {
-                                        HitKind::Resize(g) => Pending::Resize(g),
-                                        HitKind::Body => Pending::Move,
-                                    };
+                                    if additive_select(
+                                        self.tool,
+                                        state.mods.control(),
+                                        state.mods.shift(),
+                                    ) {
+                                        // POINTER + Ctrl/Shift (DRAGON-341): TOGGLE this item in
+                                        // the multi-selection and stop there — a modifier click
+                                        // is a pure selection edit, never the start of a drag
+                                        // (dragging one you just toggled OFF would be a lie).
+                                        self.emit(shell, AnnotEvent::SelectToggle(id));
+                                        state.pending = Pending::None;
+                                    } else {
+                                        // A plain press INSIDE an existing multi-selection keeps
+                                        // it whole, so the drag moves every selected item
+                                        // together (DRAGON-341); anything else REPLACES the
+                                        // selection with the pressed item.
+                                        if !(self.selection.len() > 1 && self.is_selected(id)) {
+                                            self.emit(shell, AnnotEvent::Select(Some(id)));
+                                        }
+                                        state.pending = match hit {
+                                            HitKind::Resize(g) => Pending::Resize(g),
+                                            // With the PENCIL armed a drag from an item's BODY
+                                            // still DRAWS (DRAGON-338): a drawing tool you can't
+                                            // draw over is useless once the canvas has ink — and
+                                            // crossing existing strokes is exactly how they merge
+                                            // into one item. The press still SELECTS, so a plain
+                                            // click picks the item up for delete/duplicate/resize;
+                                            // moving its body needs any other tool armed.
+                                            HitKind::Body if self.tool == Some(Tool::Pen) => {
+                                                Pending::Draw(Tool::Pen)
+                                            }
+                                            HitKind::Body => Pending::Move,
+                                        };
+                                    }
                                     shell.capture_event();
                                     consumed = true;
                                 } else {
                                     // Empty: DESELECT (no capture — forward so the ZoomPan
                                     // can still act); a draw tool arms a draw that captures
-                                    // LAZILY once it's a genuine drag.
-                                    self.emit(shell, AnnotEvent::Select(None));
+                                    // LAZILY once it's a genuine drag. In POINTER mode
+                                    // (DRAGON-341) the same press arms a RUBBER BAND instead —
+                                    // also lazily, so a plain click still just deselects — and
+                                    // Ctrl/Shift makes it ADDITIVE (the existing selection is
+                                    // kept, so nothing is deselected up front).
+                                    let additive = additive_select(
+                                        self.tool,
+                                        state.mods.control(),
+                                        state.mods.shift(),
+                                    );
+                                    if !additive {
+                                        self.emit(shell, AnnotEvent::Select(None));
+                                    }
+                                    state.band_to = local;
                                     state.pending = match self.tool {
+                                        Some(Tool::Pointer) => Pending::Band { additive },
                                         Some(t) => Pending::Draw(t),
                                         None => Pending::None,
                                     };
@@ -817,6 +1108,10 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                         }
                                         self.emit(shell, AnnotEvent::GestureTo(img.0, img.1));
                                     }
+                                    // The rubber band publishes NOTHING while it grows — the
+                                    // drawn marquee is the whole feedback, and the selection
+                                    // lands in one `BoxSelect` on release (DRAGON-341).
+                                    Pending::Band { .. } => state.band_to = local,
                                     Pending::None => {}
                                 }
                                 shell.capture_event();
@@ -828,10 +1123,35 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                         if !matches!(state.pending, Pending::None) =>
                     {
                         let begun = state.begun;
+                        let pending = state.pending;
+                        let moved = state.moved;
+                        let band = (state.press_img, map.to_image(state.band_to));
                         state.pending = Pending::None;
                         state.moved = false;
                         state.begun = false;
-                        if begun {
+                        if let Pending::Band { additive } = pending {
+                            // A real rubber band selects everything it touched; a band that
+                            // never moved was just the deselecting click already emitted.
+                            if moved {
+                                let ((x0, y0), (x1, y1)) = band;
+                                self.emit(shell, AnnotEvent::BoxSelect(x0, y0, x1, y1, additive));
+                                shell.capture_event();
+                                consumed = true;
+                            }
+                        } else if begun {
+                            self.emit(shell, AnnotEvent::GestureEnd);
+                            shell.capture_event();
+                            consumed = true;
+                        } else if matches!(pending, Pending::Draw(Tool::Pen)) {
+                            // A pencil TAP inks a DOT (DRAGON-342). Every other tool needs a
+                            // real drag to make a shape, so a no-drag press stays a click — but
+                            // with the pencil armed a press is deliberate ink, so run the whole
+                            // gesture right here: begin at the press point (a one-point stroke)
+                            // and commit it. The app side normalizes it to a dot and keeps it.
+                            self.emit(
+                                shell,
+                                AnnotEvent::DrawBegin(Tool::Pen, state.press_img.0, state.press_img.1),
+                            );
                             self.emit(shell, AnnotEvent::GestureEnd);
                             shell.capture_event();
                             consumed = true;
@@ -911,10 +1231,19 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                 });
             });
         }
-        // 3. The annotation CHROME (selection box + handles) on top — same content clip.
-        let Some(item) = self.selected_item() else {
-            return;
+        // 3. The annotation CHROME (selection boxes + the primary's handles) and the pointer's
+        //    rubber band on top — same content clip. Every SELECTED item gets the dashed
+        //    outline (so a multi-selection is legible, DRAGON-341); only the PRIMARY carries
+        //    handles, because a resize always edits exactly one item.
+        let state = tree.state.downcast_ref::<State>();
+        let band = match state.pending {
+            Pending::Band { .. } if state.moved => Some((state.press_screen, state.band_to)),
+            _ => None,
         };
+        if band.is_none() && self.selection.is_empty() {
+            return;
+        }
+        let primary = self.primary();
         let accent = self.accent;
         renderer.with_layer(clip, |renderer| {
             let mut fill = |x: f32, y: f32, w: f32, h: f32, color: Color, radius: f32| {
@@ -936,24 +1265,65 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
             let handle = |fill: &mut dyn FnMut(f32, f32, f32, f32, Color, f32), cx: f32, cy: f32| {
                 fill(cx - s / 2.0, cy - s / 2.0, s, s, accent, s / 2.0);
             };
-            match item.kind {
-                ItemKind::Rect { x, y, w, h } => {
-                    let r = box_chrome_rect(&map, x, y, w, h, item.stroke_w);
-                    let (l, t, rr, bb) =
-                        (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
-                    dashed_rect(&mut fill, l, t, rr - l, bb - t, accent);
-                    let (mx, my) = ((l + rr) / 2.0, (t + bb) / 2.0);
-                    for (hx, hy) in [
-                        (l, t), (rr, t), (l, bb), (rr, bb),
-                        (mx, t), (mx, bb), (l, my), (rr, my),
-                    ] {
-                        handle(&mut fill, hx, hy);
+            // The pointer's live rubber band (DRAGON-341): a plain dashed marquee in the accent,
+            // drawn even when nothing is selected yet.
+            if let Some((a, b)) = band {
+                dashed_rect(
+                    &mut fill,
+                    a.0.min(b.0),
+                    a.1.min(b.1),
+                    (b.0 - a.0).abs(),
+                    (b.1 - a.1).abs(),
+                    accent,
+                );
+            }
+            for item in self.items.iter().filter(|i| self.is_selected(i.id)) {
+                let is_primary = primary == Some(item.id);
+                // A pen group chromes on its BOUNDING BOX — the same dashed rect + 8 handles a
+                // rectangle gets, so it moves/resizes with the familiar affordances.
+                let chrome_kind = match &item.kind {
+                    ItemKind::Path { paths, .. } => {
+                        let (x, y, w, h) = path_bounds(paths);
+                        ItemKind::Rect { x, y, w, h }
                     }
-                }
-                ItemKind::Arrow { ax, ay, bx, by } => {
-                    let (an, bn) = arrow_nodes(&map, ax, ay, bx, by, item.stroke_w);
-                    handle(&mut fill, an.0, an.1);
-                    handle(&mut fill, bn.0, bn.1);
+                    other => other.clone(),
+                };
+                match chrome_kind {
+                    ItemKind::Rect { x, y, w, h } => {
+                        let r = box_chrome_rect(&map, x, y, w, h, item.stroke_w);
+                        let (l, t, rr, bb) =
+                            (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+                        dashed_rect(&mut fill, l, t, rr - l, bb - t, accent);
+                        if !is_primary {
+                            continue; // secondary members of a multi-selection show no handles
+                        }
+                        let (mx, my) = ((l + rr) / 2.0, (t + bb) / 2.0);
+                        for (hx, hy) in [
+                            (l, t), (rr, t), (l, bb), (rr, bb),
+                            (mx, t), (mx, bb), (l, my), (rr, my),
+                        ] {
+                            handle(&mut fill, hx, hy);
+                        }
+                    }
+                    ItemKind::Arrow { ax, ay, bx, by } => {
+                        if is_primary {
+                            let (an, bn) = arrow_nodes(&map, ax, ay, bx, by, item.stroke_w);
+                            handle(&mut fill, an.0, an.1);
+                            handle(&mut fill, bn.0, bn.1);
+                        } else {
+                            // A secondary arrow has no endpoint nodes to show, so it wears the
+                            // same dashed box as everything else — "this is selected too".
+                            let r = box_screen_rect(&map, ax, ay, bx - ax, by - ay);
+                            let pad =
+                                (HIT_PAD + item.stroke_w * map.img_to_screen_scale() * 0.5).round()
+                                    as i32;
+                            let (l, t) = ((r.left - pad) as f32, (r.top - pad) as f32);
+                            let (rr, bb) = ((r.right + pad) as f32, (r.bottom + pad) as f32);
+                            dashed_rect(&mut fill, l, t, rr - l, bb - t, accent);
+                        }
+                    }
+                    // Mapped to its bounding Rect above — unreachable.
+                    ItemKind::Path { .. } => {}
                 }
             }
         });
@@ -1021,8 +1391,8 @@ fn draw_shapes(frame: &mut canvas::Frame, map: &CanvasMap, items: &[Item]) {
         }
         let curve = (item.curve_radius * iss).max(0.0);
         let sw = (item.stroke_w * iss).max(0.5);
-        match item.kind {
-            ItemKind::Rect { x, y, w, h } => {
+        match &item.kind {
+            &ItemKind::Rect { x, y, w, h } => {
                 let a = map.to_canvas((x, y));
                 let b = map.to_canvas((x + w, y + h));
                 let (l, t) = (a.0.min(b.0), a.1.min(b.1));
@@ -1039,13 +1409,47 @@ fn draw_shapes(frame: &mut canvas::Frame, map: &CanvasMap, items: &[Item]) {
                 }
                 frame.stroke(&path, shape_stroke(item.color, sw, curve));
             }
-            ItemKind::Arrow { ax, ay, bx, by } => {
+            &ItemKind::Arrow { ax, ay, bx, by } => {
                 let a = map.to_canvas((ax, ay));
                 let b = map.to_canvas((bx, by));
                 // Arrows render +ARROW_STROKE_BONUS source px thicker than the set width (matches
                 // the bake), so an arrow is bolder than a same-width box.
                 let asw = ((item.stroke_w + ARROW_STROKE_BONUS) * iss).max(0.5);
                 draw_arrow_vec(frame, a, b, asw, curve, iss, item.color);
+            }
+            // Freehand pen (DRAGON-338 + DRAGON-342): a pseudo-pressure RIBBON, not a
+            // fixed-width polyline — smoothed centerline, tapered tips, heavier through slow
+            // and curving stretches. `crate::pen_stroke::stroke_fill_polygons` builds the
+            // pieces (one quad per segment + round caps/joins) from the SAME stored geometry
+            // and speed signal the bake reads, mapped through this canvas's zoom instead of the
+            // bake's scale — so the two are the same drawing at two resolutions.
+            //
+            // The whole GROUP goes into ONE path filled with the default NON-ZERO rule: every
+            // piece is wound alike, so a self-crossing scribble unions instead of cancelling
+            // into holes, and a partially transparent color (an erase-marked group draws at
+            // ERASE_PREVIEW_ALPHA) composites exactly once instead of darkening at overlaps.
+            ItemKind::Path { paths, pressure } => {
+                let ribbon = Path::new(|b| {
+                    for (i, path) in paths.iter().enumerate() {
+                        let press = pressure.get(i).filter(|p| p.len() == path.len());
+                        let polys = crate::pen_stroke::stroke_fill_polygons(
+                            path,
+                            item.stroke_w,
+                            press.map_or(&[][..], |p| p.as_slice()),
+                            |p| map.to_canvas(p),
+                            iss,
+                        );
+                        for poly in polys {
+                            let Some(first) = poly.first() else { continue };
+                            b.move_to(Point::new(first.0, first.1));
+                            for q in &poly[1..] {
+                                b.line_to(Point::new(q.0, q.1));
+                            }
+                            b.close();
+                        }
+                    }
+                });
+                frame.fill(&ribbon, item.color);
             }
         }
     }
@@ -1215,7 +1619,7 @@ mod tests {
             fx: FxKind::None,
             curve_radius: 8.0,
         };
-        let make = |selected: Option<u64>| {
+        let make = |selected: Vec<u64>| {
             AnnotationCanvas::new(
                 cosmic::widget::Space::new(),
                 vec![item()],
@@ -1235,7 +1639,7 @@ mod tests {
         assert_eq!(box_drawn_rect(&cmap, 20.0, 20.0, 60.0, 60.0, 8.0).left, 16, "strict = stroke/2");
         assert_eq!(box_chrome_rect(&cmap, 20.0, 20.0, 60.0, 60.0, 8.0).left, 8, "padded = +HIT_PAD");
 
-        let unselected = make(None);
+        let unselected = make(Vec::new());
         // Clicking the visible LEFT STROKE (x=20) selects (Body) even when unselected.
         assert!(matches!(unselected.hit_at(&cmap, (20.0, 50.0)), Some((7, HitKind::Body))));
         // But the HIT_PAD band just OUTSIDE the drawn stroke (x=13, inside the old ±12 pad,
@@ -1245,7 +1649,7 @@ mod tests {
 
         // Once SELECTED, the same padded band is live again: the outer corner is a resize
         // handle, and the pad-band body is grabbable (HIT_PAD breathing room restored).
-        let selected = make(Some(7));
+        let selected = make(vec![7]);
         assert!(matches!(selected.hit_at(&cmap, (8.0, 8.0)), Some((7, HitKind::Resize(_)))), "handle at pad");
         // A padded-body point clear of the corner/edge handles (x=13 is in the ±HIT_PAD band,
         // y=30 keeps it away from the W edge-midpoint handle at (8,50)).
@@ -1266,7 +1670,7 @@ mod tests {
         AnnotationCanvas::new(
             cosmic::widget::Space::new(),
             vec![],
-            None,
+            Vec::new(),
             None,
             zoom,
             (0.0, 0.0),
@@ -1314,6 +1718,136 @@ mod tests {
     }
 
     #[test]
+    fn tool_persistence_round_trips_every_variant() {
+        // Every tool must survive a save/restore cycle (the persisted `annot_tool`), including
+        // the DRAGON-338 pencil + eraser; an unknown string stays neutral.
+        for t in [
+            Tool::Pointer,
+            Tool::Arrow,
+            Tool::Rect,
+            Tool::Highlight,
+            Tool::BoxHighlight,
+            Tool::Spotlight,
+            Tool::Pixelate,
+            Tool::Blur,
+            Tool::Pen,
+            Tool::Eraser,
+        ] {
+            assert_eq!(Tool::from_str(t.as_str()), Some(t), "{t:?} round-trips");
+        }
+        assert_eq!(Tool::from_str("not-a-tool"), None);
+        assert!(Tool::Eraser.is_eraser());
+        assert!(!Tool::Pen.is_eraser());
+        // DRAGON-341: exactly two tools create nothing — the eraser removes, the pointer selects.
+        assert!(Tool::Pointer.is_pointer() && !Tool::Arrow.is_pointer());
+        assert!(!Tool::Pointer.draws() && !Tool::Eraser.draws());
+        for t in [Tool::Arrow, Tool::Rect, Tool::Highlight, Tool::BoxHighlight, Tool::Spotlight, Tool::Pixelate, Tool::Blur, Tool::Pen] {
+            assert!(t.draws(), "{t:?} draws");
+        }
+    }
+
+    #[test]
+    fn path_bounds_spans_every_stroke_in_the_group() {
+        let paths = vec![
+            vec![(10.0, 5.0), (20.0, 5.0)],
+            vec![(12.0, 25.0), (12.0, 30.0)],
+        ];
+        assert_eq!(path_bounds(&paths), (10.0, 5.0, 10.0, 25.0));
+        // An empty group is a zero rect (never NaN/infinite chrome).
+        assert_eq!(path_bounds(&[]), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn pen_hits_along_its_strokes_not_across_its_empty_bbox() {
+        // A pen group's bbox is mostly empty space, so only the STROKES select — a click in
+        // the gap between two scribbles must fall through to whatever is under it. And since
+        // DRAGON-341 a pen group is body-selectable ONLY in POINTER mode.
+        let cmap = map((100.0, 100.0), 1.0, (0.0, 0.0), (100.0, 100.0), (100.0, 100.0));
+        let item = || Item {
+            id: 5,
+            // An "L": along the top edge, then down the left — the bbox interior stays empty.
+            kind: ItemKind::Path {
+                paths: vec![vec![(10.0, 10.0), (90.0, 10.0)], vec![(10.0, 10.0), (10.0, 90.0)]],
+                pressure: Vec::new(),
+            },
+            stroke_w: 4.0,
+            color: Color::WHITE,
+            fill: None,
+            fx: FxKind::None,
+            curve_radius: 8.0,
+        };
+        let make = |tool: Option<Tool>| {
+            AnnotationCanvas::new(
+                cosmic::widget::Space::new(),
+                vec![item()],
+                Vec::new(),
+                tool,
+                1.0,
+                (0.0, 0.0),
+                (100.0, 100.0),
+                (100.0, 100.0),
+                false,
+                Color::WHITE,
+                |_ev: AnnotEvent| (),
+            )
+        };
+        let canvas = make(Some(Tool::Pointer));
+        // On a stroke → the body (selects / moves).
+        assert!(matches!(canvas.hit_at(&cmap, (50.0, 10.0)), Some((5, HitKind::Body))), "on the top stroke");
+        assert!(matches!(canvas.hit_at(&cmap, (10.0, 50.0)), Some((5, HitKind::Body))), "on the left stroke");
+        // Deep inside the bounding box but far from any ink → no hit.
+        assert!(canvas.hit_at(&cmap, (60.0, 60.0)).is_none(), "the empty bbox interior is not the item");
+        // Outside the group entirely → no hit.
+        assert!(canvas.hit_at(&cmap, (95.0, 95.0)).is_none());
+        // path_distance measures to the nearest stroke (screen px at this 1:1 map).
+        assert!((path_distance(&cmap, &[vec![(0.0, 0.0), (100.0, 0.0)]], (50.0, 12.0)) - 12.0).abs() < 1e-3);
+        // DRAGON-341 gating: outside pointer mode the very same ink is INERT — neutral, a draw
+        // tool, the pencil itself and the eraser all fall straight through it.
+        for tool in [None, Some(Tool::Rect), Some(Tool::Pen), Some(Tool::Eraser)] {
+            let c = make(tool);
+            assert!(
+                c.hit_at(&cmap, (50.0, 10.0)).is_none(),
+                "{tool:?}: pen ink must not be click-selectable outside pointer mode"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selected_pen_gets_bounding_box_handles() {
+        // A pen group chromes + resizes on its bbox, exactly like a rectangle: once SELECTED,
+        // its outer corner is a resize handle.
+        let cmap = map((100.0, 100.0), 1.0, (0.0, 0.0), (100.0, 100.0), (100.0, 100.0));
+        let item = Item {
+            id: 7,
+            kind: ItemKind::Path { paths: vec![vec![(20.0, 20.0), (80.0, 80.0)]], pressure: Vec::new() },
+            stroke_w: 8.0,
+            color: Color::WHITE,
+            fill: None,
+            fx: FxKind::None,
+            curve_radius: 8.0,
+        };
+        let canvas = AnnotationCanvas::new(
+            cosmic::widget::Space::new(),
+            vec![item],
+            vec![7],
+            None,
+            1.0,
+            (0.0, 0.0),
+            (100.0, 100.0),
+            (100.0, 100.0),
+            false,
+            Color::WHITE,
+            |_ev: AnnotEvent| (),
+        );
+        // The bbox is (20,20)-(80,80); with stroke 8 the chrome sits at ±(8 + 4) → the NW
+        // handle is at (8,8), the same offsets a box of that geometry would use.
+        assert!(
+            matches!(canvas.hit_at(&cmap, (8.0, 8.0)), Some((7, HitKind::Resize(Grab::Corner(Corner::Nw))))),
+            "the pen's bbox corner resizes it"
+        );
+    }
+
+    #[test]
     fn arrow_head_len_is_panic_free_on_short_and_zero_arrows() {
         // DRAGON-324 regression: drawing an arrow starts with a ZERO-length shaft, and a
         // short shaft has floor (6*iss) > cap (len*0.7). The old `clamp(floor, cap)` hit
@@ -1334,5 +1868,84 @@ mod tests {
             let h = arrow_head_len(base, floor, cap);
             assert!(h.is_finite() && h >= 0.0 && h <= cap + 1e-6);
         }
+    }
+
+    #[test]
+    fn ctrl_forces_a_new_draw_only_while_a_tool_is_armed() {
+        // DRAGON-339: Ctrl flips the press precedence so a new shape can be drawn ON TOP of
+        // existing items (which normally capture the press to move/resize).
+        assert_eq!(force_new_draw(Some(Tool::Rect), true), Some(Tool::Rect), "ctrl + tool draws");
+        assert_eq!(force_new_draw(Some(Tool::Rect), false), None, "no ctrl → manipulate as before");
+        // The NEUTRAL pointer has nothing to draw, so Ctrl changes nothing there.
+        assert_eq!(force_new_draw(None, true), None, "ctrl without a tool still manipulates");
+        assert_eq!(force_new_draw(None, false), None);
+        // Whatever tool is armed is the one forced (tool-agnostic — future tools inherit it).
+        assert_eq!(force_new_draw(Some(Tool::Blur), true), Some(Tool::Blur));
+        // DRAGON-341: the NON-drawing tools have nothing to force. In pointer mode Ctrl-click is
+        // multi-select, so `force_new_draw` must stay out of its way entirely.
+        assert_eq!(force_new_draw(Some(Tool::Pointer), true), None, "the pointer never draws");
+        assert_eq!(force_new_draw(Some(Tool::Eraser), true), None, "the eraser never draws");
+    }
+
+    #[test]
+    fn additive_select_is_pointer_only_and_never_fights_ctrl_draw() {
+        // DRAGON-341 × DRAGON-339: Ctrl means "multi-select" in POINTER mode and "draw over
+        // whatever is under the cursor" with a draw tool — never both for one press.
+        assert!(additive_select(Some(Tool::Pointer), true, false), "ctrl-click adds");
+        assert!(additive_select(Some(Tool::Pointer), false, true), "shift-click adds");
+        assert!(!additive_select(Some(Tool::Pointer), false, false), "a plain click replaces");
+        for t in [Tool::Rect, Tool::Arrow, Tool::Pen, Tool::Eraser] {
+            assert!(!additive_select(Some(t), true, true), "{t:?} never multi-selects");
+        }
+        assert!(!additive_select(None, true, true), "the neutral state never multi-selects");
+        // The two Ctrl meanings are mutually exclusive for every tool.
+        for t in [None, Some(Tool::Pointer), Some(Tool::Rect), Some(Tool::Pen), Some(Tool::Eraser)] {
+            assert!(
+                !(additive_select(t, true, false) && force_new_draw(t, true).is_some()),
+                "{t:?}: ctrl must claim exactly one meaning"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_primary_of_a_multi_selection_wears_handles() {
+        // DRAGON-341: the LAST selected id is the primary — the only one with resize handles, so
+        // every Grab still edits exactly one item. The others are still BODY-hittable (they move
+        // with the group) and keep the padded selected hit region.
+        let cmap = map((200.0, 200.0), 1.0, (0.0, 0.0), (200.0, 200.0), (200.0, 200.0));
+        let boxed = |id: u64, x: f32, y: f32| Item {
+            id,
+            kind: ItemKind::Rect { x, y, w: 40.0, h: 40.0 },
+            stroke_w: 8.0,
+            color: Color::WHITE,
+            fill: None,
+            fx: FxKind::None,
+            curve_radius: 8.0,
+        };
+        let canvas = AnnotationCanvas::new(
+            cosmic::widget::Space::new(),
+            vec![boxed(1, 20.0, 20.0), boxed(2, 120.0, 20.0)],
+            vec![1, 2], // 2 is the PRIMARY (added last)
+            Some(Tool::Pointer),
+            1.0,
+            (0.0, 0.0),
+            (200.0, 200.0),
+            (200.0, 200.0),
+            false,
+            Color::WHITE,
+            |_ev: AnnotEvent| (),
+        );
+        assert_eq!(canvas.primary(), Some(2));
+        assert!(canvas.is_selected(1) && canvas.is_selected(2));
+        // The PRIMARY's NW chrome corner (120-12, 20-12) is a resize handle...
+        assert!(
+            matches!(canvas.hit_at(&cmap, (108.0, 8.0)), Some((2, HitKind::Resize(_)))),
+            "the primary resizes"
+        );
+        // ...while the secondary's matching corner is only its (padded) BODY — no handle.
+        assert!(
+            matches!(canvas.hit_at(&cmap, (8.0, 8.0)), Some((1, HitKind::Body))),
+            "a secondary member has no handles, only a grabbable body"
+        );
     }
 }

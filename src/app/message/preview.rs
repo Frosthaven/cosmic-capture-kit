@@ -159,6 +159,12 @@ pub enum PreviewMsg {
     // ── Annotation editor (DRAGON-321; IMAGES only) ──────────────────────────────────
     /// Switch the active annotation tool (Select / Arrow / Box).
     SelectTool(Tool),
+    /// An action-tray tool BUTTON was pressed (DRAGON-339). Arms the tool exactly like
+    /// [`Self::SelectTool`], but also feeds the tray's double-click detector: a second press of
+    /// the SAME button within the double-click window spawns a ready-made item in the middle of
+    /// the picture. Only the tray emits this — hotkeys stay on [`Self::SelectTool`], so
+    /// double-TAPPING a tool key never places anything.
+    ToolPressed(Tool),
     /// Set the current annotation color (applies to NEW shapes).
     SetAnnotColor([u8; 4]),
     /// Set the current annotation stroke width (SOURCE px; applies to NEW box/arrow shapes
@@ -176,8 +182,18 @@ pub enum PreviewMsg {
     /// Apply the color-wheel picker's color (Apply button): read the model's color, set
     /// `annot_color`, push the MRU, persist, and close.
     AnnotColorApply,
-    /// Select (`Some`) or deselect (`None`) an annotation.
+    /// Select (`Some`) or deselect (`None`) an annotation — REPLACES the whole selection.
     SelectAnnotation(Option<AnnotId>),
+    /// Ctrl/Shift-click in pointer mode (DRAGON-341): toggle one annotation in the
+    /// multi-selection, keeping the rest. A newly added id becomes the primary.
+    ToggleAnnotationSelected(AnnotId),
+    /// A pointer rubber band finished (DRAGON-341): select every annotation the band
+    /// `(x0, y0)`–`(x1, y1)` (image source px) touches. The `bool` is ADDITIVE (Ctrl/Shift):
+    /// keep the current selection and add to it.
+    BandSelectAnnotations(f32, f32, f32, f32, bool),
+    /// Select every annotation in the scene (DRAGON-341 — Ctrl+A), engaging pointer mode so the
+    /// selection is immediately usable.
+    SelectAllAnnotations,
     /// Begin drawing a new shape of `tool` at image point `(x, y)` (source px).
     AnnotDrawBegin(Tool, f32, f32),
     /// Begin manipulating the selected item (grab kind + press image point).
@@ -186,7 +202,7 @@ pub enum PreviewMsg {
     AnnotGestureTo(f32, f32),
     /// The active canvas gesture committed (pointer released after a real drag).
     AnnotGestureEnd,
-    /// Delete the selected annotation.
+    /// Delete the selected annotation(s) — the whole selection, as one undo entry.
     DeleteSelected,
     /// Duplicate the selected annotation, offset toward the frame center. One undo entry.
     DuplicateSelected,

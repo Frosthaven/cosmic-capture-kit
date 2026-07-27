@@ -240,19 +240,28 @@ impl App {
         let visual = self.preview_visual_scale(preview);
         let max_zoom = self.max_view_zoom(preview);
         // The slider runs in DISPLAY percent (not the raw zoom multiplier) so the 100% mark is a
-        // CONSTANT breakpoint — `.breakpoints` draws a notch there AND gravitates the thumb to
-        // exactly 100% when dragged near it (the detent cosmic-settings uses). The callback maps
-        // percent back to the fit-relative zoom.
+        // CONSTANT position on the rail, notched by a tick. The callback maps percent back to the
+        // fit-relative zoom; the magnetic detent onto exactly 100% is `snap_to_hundred`, applied
+        // when the message lands (iced's `.breakpoints` is draw-only despite its doc comment).
+        //
+        // The tick is drawn by `widgets::notched_slider`, NOT by `.breakpoints` (DRAGON-343):
+        // stock iced draws breakpoints over a different span than the thumb, so the notch sits
+        // ~3-4px off the value it marks (and shifts again when the thumb grows on hover). That
+        // bug — and the one-line upstream fix that lets us delete the wrapper — is documented in
+        // `widgets/notched_slider.rs`. Never re-add `.breakpoints` here while it stands.
         let min_pct = displayed_percent(self.min_view_zoom(preview), visual) as f32;
         let max_pct = displayed_percent(max_zoom, visual) as f32;
         let cur_pct = (displayed_percent(z, visual) as f32).clamp(min_pct, max_pct);
         let vscale = visual;
-        let slider = widget::slider(min_pct..=max_pct, cur_pct, move |pct| {
-            Msg::Preview(PreviewMsg::SetViewZoom(pct / (vscale * 100.0)))
-        })
-        .step(1.0f32)
-        .breakpoints(&[100.0])
-        .width(Length::Fixed(120.0));
+        let slider = crate::widgets::notched_slider(
+            widget::slider(min_pct..=max_pct, cur_pct, move |pct| {
+                Msg::Preview(PreviewMsg::SetViewZoom(pct / (vscale * 100.0)))
+            })
+            .step(1.0f32)
+            .width(Length::Fixed(120.0)),
+            min_pct..=max_pct,
+            vec![100.0],
+        );
         // (The live percent readout that used to sit LEFT of the slider was removed — the combo
         // to the right already shows the current zoom as a preset label or "N%".)
         // A fixed-width combo: the button shows the CURRENT zoom (a preset label, or the live
@@ -345,7 +354,7 @@ impl App {
         } else {
             button.into()
         };
-        widget::row(vec![slider.into(), combo])
+        widget::row(vec![slider, combo])
             .spacing(8.0)
             .align_y(Alignment::Center)
             .into()

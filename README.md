@@ -78,9 +78,10 @@ along with their statuses.
 | Preview editor (images): Destructive blur           | ✅      |
 | Preview editor (images): Box fill/outline           | ✅      |
 | Preview editor (images): Box highlight              | ✅      |
-| Preview editor (images): Pencil w/line widths       | 📅      |
+| Preview editor (images): Pencil w/line widths       | ✅      |
 | Preview editor (images): Sticker tool               | 📅      |
-| Preview editor (images): Eraser tool                | 📅      |
+| Preview editor (images): Eraser tool                | ✅      |
+| Preview editor (images): Select/multi-select tool   | ✅      |
 | Preview editor (videos): Simple cutting tool        | ✅      |
 | Preview editor (videos): Simple transition dropdown | ✅      |
 | Recording controls: Toggle mic                      | ✅      |

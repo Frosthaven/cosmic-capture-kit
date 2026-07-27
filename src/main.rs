@@ -37,6 +37,11 @@ mod media;
 mod wallpaper;
 mod detect;
 mod geometry;
+// Freehand pen-stroke beautification (DRAGON-342): the pure smoothing / pseudo-pressure /
+// ribbon-outline math the preview's canvas AND its full-res bake both render through. Sits at
+// the crate root (next to `geometry`) because it is shared by `app::preview::annotate` and
+// `widgets::annotation_canvas` and belongs to neither.
+mod pen_stroke;
 mod platform;
 mod widgets;
 mod encode;

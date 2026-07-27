@@ -226,13 +226,21 @@ impl App {
         // selection chrome, both clipped to the content rect. The full-res bake rasterizes
         // the same scene separately.
         let canvas_over: Element<'a, Msg> = if content_px.0 > 0.0 && preview.edit.frame.0 > 0 {
-            let items = annotate::widget_items(&preview.edit.annotations, preview.edit.curve_radius());
+            // The in-flight eraser's marked groups draw at half opacity (DRAGON-338) — the
+            // preview of what releasing the button deletes.
+            let items = annotate::widget_items(
+                &preview.edit.annotations,
+                preview.edit.curve_radius(),
+                &preview.edit.erase_marks,
+            );
             let accent = crate::app::theme::accent(&cosmic::theme::active());
             let source = (preview.edit.frame.0 as f32, preview.edit.frame.1 as f32);
             crate::widgets::annotation_canvas::AnnotationCanvas::new(
                 image,
                 items,
-                preview.edit.selected.map(|id| id.0),
+                // The whole selection, in selection order — the last id is the PRIMARY (the one
+                // wearing resize handles). DRAGON-341.
+                preview.edit.sel.ids().iter().map(|id| id.0).collect(),
                 preview.edit.tool,
                 preview.view.zoom,
                 preview.view.pan,
@@ -244,6 +252,12 @@ impl App {
                     use crate::widgets::annotation_canvas::AnnotEvent;
                     Msg::Preview(match ev {
                         AnnotEvent::Select(o) => PreviewMsg::SelectAnnotation(o.map(AnnotId)),
+                        AnnotEvent::SelectToggle(id) => {
+                            PreviewMsg::ToggleAnnotationSelected(AnnotId(id))
+                        }
+                        AnnotEvent::BoxSelect(x0, y0, x1, y1, add) => {
+                            PreviewMsg::BandSelectAnnotations(x0, y0, x1, y1, add)
+                        }
                         AnnotEvent::DrawBegin(t, x, y) => PreviewMsg::AnnotDrawBegin(t, x, y),
                         AnnotEvent::GrabBegin(g, x, y) => PreviewMsg::AnnotGrabBegin(g, x, y),
                         AnnotEvent::GestureTo(x, y) => PreviewMsg::AnnotGestureTo(x, y),
@@ -260,7 +274,7 @@ impl App {
         // Spotlight selection gets the restricted (Delete-only) menu.
         let spotlight_selected = preview
             .edit
-            .selected
+            .selected()
             .and_then(|id| preview.edit.annotations.iter().find(|it| it.id == id))
             .is_some_and(|it| matches!(it.kind, annotate::AnnotKind::Spotlight { .. }));
         let canvas_over: Element<'a, Msg> = match preview.edit.annot_menu {
@@ -284,9 +298,14 @@ impl App {
             tb.pan_tool_group(preview.view.pan_mode, &self.keymap),
         ];
         let toolbar = toolbar_row(left, Vec::new(), right);
+        // The overlay's header line (appearance / undo / redo ⟨split⟩ Close); the windowed
+        // preview carries those in its titlebar instead (DRAGON-337).
+        let header = (!preview.surface.is_window())
+            .then(|| self.overlay_header_row(preview, tb));
         compose_preview(
             preview.surface.is_window(),
             self.overlay_control_width(preview),
+            header,
             self.edit_toolbar(preview, tb),
             canvas_over,
             None,

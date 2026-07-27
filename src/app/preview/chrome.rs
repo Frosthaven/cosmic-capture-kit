@@ -314,13 +314,17 @@ impl Tb {
     }
 }
 
-/// Compose the loaded preview from its three parts. In WINDOWED mode the edit + action
-/// toolbars pin to the top / bottom of the window on full-width bars (a standard,
-/// light/dark-respecting surface colour), with the image filling the space between. In
-/// OVERLAY mode all three centre together as one floating group (the historical look).
+/// Compose the loaded preview from its parts. In WINDOWED mode the edit + action toolbars
+/// pin to the top / bottom of the window on full-width bars (a standard, light/dark-respecting
+/// surface colour), with the image filling the space between. In OVERLAY mode they centre
+/// together as one floating group (the historical look), led by `overlay_header` — the
+/// appearance / undo / redo / Close line (DRAGON-337), which the WINDOWED arm never gets
+/// (those controls live in its titlebar) and so always passes `None`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compose_preview<'a>(
     windowed: bool,
     overlay_width: f32,
+    overlay_header: Option<Element<'a, Msg>>,
     edit_toolbar: Element<'a, Msg>,
     image: Element<'a, Msg>,
     transport: Option<Element<'a, Msg>>,
@@ -328,6 +332,8 @@ pub(super) fn compose_preview<'a>(
     glass: Option<crate::app::theme::GlassConfig>,
 ) -> Element<'a, Msg> {
     if windowed {
+        // The windowed preview's titlebar owns those controls; nothing to slot in here.
+        drop(overlay_header);
         let mut col: Vec<Element<'a, Msg>> = vec![
             preview_bar(edit_toolbar, false, glass),
             widget::container(image)
@@ -353,7 +359,11 @@ pub(super) fn compose_preview<'a>(
         // edges. `overlay_width` hugs the fitted picture (never below what the
         // toolbar groups need); the outer container centres this column. The video
         // transport strip slots between the canvas and the action toolbar.
-        let mut col: Vec<Element<'a, Msg>> = vec![edit_toolbar, image];
+        // The header row (appearance / undo / redo ⟨split⟩ Close) leads the column;
+        // `PreviewSurface::chrome_h` reserves its height + one more column gap.
+        let mut col: Vec<Element<'a, Msg>> = Vec::new();
+        col.extend(overlay_header);
+        col.extend([edit_toolbar, image]);
         if let Some(t) = transport {
             col.push(transport_bar(t, false, glass));
         }
@@ -455,25 +465,9 @@ pub(super) fn preview_bar(
 }
 
 impl Tb {
-    /// The appearance-toggle group at the far top-left: one button that flips the preview
-    /// between the fullscreen overlay and a resizable window, live. The glyph advertises the
-    /// *destination* — a restore/window glyph while in the overlay (click to pop out), a
-    /// fullscreen glyph while windowed (click to go fullscreen).
-    pub(super) fn appearance_group(self, windowed: bool) -> Element<'static, Msg> {
-        let (icon, tip) = if windowed {
-            ("view-fullscreen-symbolic", "Fullscreen overlay")
-        } else {
-            ("view-restore-symbolic", "Windowed")
-        };
-        // Top toolbar → tooltip drops below. No hotkey binds the appearance toggle, so this
-        // tip carries no key — plain label.
-        self.tool_group(vec![self.tool_button(
-            icon,
-            tip.to_string(),
-            PreviewMsg::ToggleAppearance,
-            widget::tooltip::Position::Bottom,
-        )])
-    }
+    // The appearance toggle no longer has a capsuled `tool_group` form (DRAGON-337): it is a
+    // FLAT header button in both surfaces — `App::overlay_header_row` for the overlay,
+    // `App::preview_header_controls` (the CSD titlebar) for the window.
 
     /// A toolbar icon button styled exactly like the capture toolbar's mic/speaker
     /// toggles: the glyph and a 1px border ring both track on/off (foreground + accent
@@ -651,6 +645,139 @@ impl Tb {
     }
 }
 
+/// A FLAT header-style icon button (DRAGON-337): a tinted symbolic glyph in a bare
+/// `Button::Icon` with a square halo and NO group capsule behind it — the treatment the
+/// settings window's collapse / search controls use. Both the windowed preview's titlebar
+/// ([`titlebar_button`]) and the overlay preview's header row ([`overlay_header_button`])
+/// render through here, so the two can never drift apart.
+///
+/// The button ALWAYS takes `on_press`, even when it currently does nothing (a spent
+/// undo/redo stack sends its message into a no-op update): a "disabled" control must still
+/// ABSORB the click, or the press falls through to the titlebar beneath — where two quick
+/// taps on dead undo read as a titlebar double-click. Spent-ness is conveyed by `tint`
+/// alone. `tint` always names the glyph colour explicitly — a `Button::Icon` otherwise
+/// inherits the class's own text colour, which is what made these read accent-ish.
+/// `top_pin` stretches the control to the header's full height and pins it to the TOP (the
+/// macOS titlebar case, where its centre must land on the native traffic lights' centreline).
+fn flat_icon_button(
+    name: &'static str,
+    tip: String,
+    msg: PreviewMsg,
+    tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
+    glyph_px: u16,
+    halo: u16,
+    top_pin: bool,
+) -> Element<'static, Msg> {
+    let glyph = widget::icon::icon(crate::widgets::icons::handle(name))
+        .size(glyph_px)
+        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
+            move |t: &cosmic::Theme| cosmic::widget::svg::Style { color: Some(tint(t)) },
+        )));
+    let btn = widget::button::custom(glyph)
+        .class(cosmic::theme::Button::Icon)
+        .on_press(Msg::Preview(msg));
+    let btn = crate::widgets::arrow_cursor::arrow_cursor(btn.padding(halo));
+    let control: Element<'static, Msg> = if top_pin {
+        widget::container(btn).height(Length::Fill).align_y(Alignment::Start).into()
+    } else {
+        btn
+    };
+    // Below the button, clear of the top edge (the same side the top toolbar's tips drop to).
+    widget::tooltip(control, widget::text(tip).size(12), widget::tooltip::Position::Bottom).into()
+}
+
+/// A [`flat_icon_button`] sized for the WINDOWED preview's CSD titlebar — the settings
+/// header's own 16px glyph. Platform alignment mirrors that header exactly and nothing else:
+/// * macOS — the halo shrinks to [`crate::app::settings::MAC_HEADER_GLYPH_HALO`] and the button
+///   is TOP-pinned, so its centre lands on the native traffic lights' centreline; the leading
+///   traffic-light inset itself is reserved by the caller (`preview_view`), like
+///   `config_window_view` does.
+/// * Windows — nothing here: the DWM caption cluster sits at the TRAILING edge, and the
+///   preview header already reserves `WIN_CAPTION_INSET` there; these buttons are leading.
+/// * Linux — the plain 8px halo, unchanged from the settings header's non-mac arm.
+fn titlebar_button(
+    name: &'static str,
+    tip: String,
+    msg: PreviewMsg,
+    tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
+) -> Element<'static, Msg> {
+    #[cfg(target_os = "macos")]
+    let (halo, top_pin) = (crate::app::settings::MAC_HEADER_GLYPH_HALO, true);
+    #[cfg(not(target_os = "macos"))]
+    let (halo, top_pin) = (8u16, false);
+    flat_icon_button(name, tip, msg, tint, 16, halo, top_pin)
+}
+
+impl Tb {
+    /// A [`flat_icon_button`] at THIS surface's toolbar metrics — the OVERLAY header row's
+    /// buttons. Same flat look as the titlebar's, but sized to the overlay's own (scaled-up)
+    /// glyph box so the row doesn't read tiny against the chrome below it. Never top-pinned:
+    /// the row is app-drawn, with no native window buttons to line up against.
+    fn header_button(
+        self,
+        name: &'static str,
+        tip: String,
+        msg: PreviewMsg,
+        tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
+    ) -> Element<'static, Msg> {
+        flat_icon_button(name, tip, msg, tint, self.icon_box() as u16, self.btn_pad() as u16, false)
+    }
+
+    /// The undo / redo pair as FLAT header buttons: full-strength foreground ("white" in the
+    /// dark themes) while the stack has entries, the subdued wash when it's empty — the same
+    /// on/off colours [`Self::history_button`] gives the toolbar version. A spent button KEEPS
+    /// its `on_press` (undo/redo on an empty stack no-op in the update) so it still absorbs
+    /// clicks — see [`flat_icon_button`]. Shared by the overlay header row and (via
+    /// [`App::preview_header_controls`]) the titlebar, so the two stay identical.
+    fn flat_history(
+        e: &EditState,
+        km: &crate::shortcuts::Keymap,
+        build: impl Fn(&'static str, String, PreviewMsg, fn(&cosmic::Theme) -> cosmic::iced::Color) -> Element<'static, Msg>,
+    ) -> Vec<Element<'static, Msg>> {
+        let one = |icon, name, action, msg, on: bool| {
+            let tint: fn(&cosmic::Theme) -> cosmic::iced::Color =
+                if on { crate::app::theme::foreground } else { crate::app::theme::subdued };
+            build(icon, action_tip(name, action, km), msg, tint)
+        };
+        vec![
+            one(
+                "edit-undo-symbolic",
+                "Undo",
+                crate::shortcuts::Action::PreviewUndo,
+                PreviewMsg::Undo,
+                e.can_undo(),
+            ),
+            one(
+                "edit-redo-symbolic",
+                "Redo",
+                crate::shortcuts::Action::PreviewRedo,
+                PreviewMsg::Redo,
+                e.can_redo(),
+            ),
+        ]
+    }
+}
+
+impl App {
+    /// The windowed preview's TITLEBAR controls (DRAGON-337): the fullscreen-overlay toggle
+    /// (accent — it's the appearance switch, not an edit action) followed by undo / redo
+    /// (full-strength foreground when their stacks have entries, subdued + inert when empty).
+    /// Returned in leading-edge order.
+    pub(super) fn preview_header_controls(
+        &self,
+        preview: &PreviewState,
+    ) -> Vec<Element<'static, Msg>> {
+        let mut items = vec![titlebar_button(
+            "view-fullscreen-symbolic",
+            "Fullscreen overlay".to_string(),
+            PreviewMsg::ToggleAppearance,
+            crate::app::theme::accent,
+        )];
+        items.extend(Tb::flat_history(&preview.edit, &self.keymap, titlebar_button));
+        items
+    }
+}
+
 impl Tb {
     /// An undo/redo icon button that is subdued + inert when its stack is empty.
     pub(super) fn history_button(
@@ -731,53 +858,72 @@ impl Tb {
 }
 
 impl App {
-    /// The top edit bar above the preview content: the appearance toggle and undo / redo
-    /// on the left, then Save / Save As / Copy (and Close, outside windowed mode) pushed to
-    /// the right by the split. The do-not-train + covermark tools live on the BOTTOM bar
-    /// (see [`Self::edit_tools`]).
-    pub(super) fn edit_toolbar<'a>(&'a self, preview: &'a PreviewState, tb: Tb) -> Element<'a, Msg> {
-        let e = &preview.edit;
+    /// The OVERLAY preview's HEADER row (DRAGON-337) — a line above the rest of the chrome
+    /// carrying the windowed-swap toggle and undo / redo on the LEFT, with Close pushed to
+    /// the far RIGHT by the split. Every button here is FLAT (a bare tinted glyph, no
+    /// `tool_group` capsule behind it), matching the windowed preview's titlebar treatment:
+    /// the swap and Close read accent, undo / redo the foreground-vs-subdued pair.
+    ///
+    /// Only the fullscreen overlay draws this row; the windowed preview puts the same
+    /// controls in its CSD titlebar ([`App::preview_header_controls`]) and gets Close from
+    /// the native window chrome. [`PreviewSurface::chrome_h`]'s overlay arm reserves this
+    /// row's height — ONE flat button box, NOT a full toolbar group (there's no capsule
+    /// padding around it any more).
+    pub(super) fn overlay_header_row(&self, preview: &PreviewState, tb: Tb) -> Element<'static, Msg> {
         let km = &self.keymap;
-        let history = tb.tool_group(vec![
-            tb.history_button(
-                "edit-undo-symbolic",
-                action_tip("Undo", crate::shortcuts::Action::PreviewUndo, km),
-                PreviewMsg::Undo,
-                e.can_undo(),
-                widget::tooltip::Position::Bottom,
-            ),
-            tb.history_button(
-                "edit-redo-symbolic",
-                action_tip("Redo", crate::shortcuts::Action::PreviewRedo, km),
-                PreviewMsg::Redo,
-                e.can_redo(),
-                widget::tooltip::Position::Bottom,
-            ),
-        ]);
+        // The glyph advertises the DESTINATION: a restore/window glyph while in the overlay
+        // (click to pop out into a window). No hotkey binds the appearance toggle, so the
+        // tip carries no key.
+        let mut left = vec![tb.header_button(
+            "view-restore-symbolic",
+            "Windowed".to_string(),
+            PreviewMsg::ToggleAppearance,
+            crate::app::theme::accent,
+        )];
+        left.extend(Tb::flat_history(&preview.edit, km, move |n, t, m, c| {
+            tb.header_button(n, t, m, c)
+        }));
+        // Esc triggers the same `Cancel`; it never deletes (that's the Delete trash button).
+        let close = tb.header_button(
+            "window-close-symbolic",
+            action_tip("Close", crate::shortcuts::Action::PreviewCancel, km),
+            PreviewMsg::Cancel,
+            crate::app::theme::accent,
+        );
+        toolbar_row(left, Vec::new(), vec![close])
+    }
+
+    /// The top edit bar above the preview content: the annotation DRAW tools (images only)
+    /// on the left, then the size + Delete group and Save / Save As / Copy pushed to the
+    /// right by the split. The appearance toggle, undo / redo and Close moved OUT of this
+    /// bar in DRAGON-337 — to the windowed preview's titlebar
+    /// ([`App::preview_header_controls`]) and the overlay's own header row
+    /// ([`Self::overlay_header_row`]). The do-not-train + covermark tools live on the BOTTOM
+    /// bar (see [`Self::edit_tools`]).
+    pub(super) fn edit_toolbar<'a>(&'a self, preview: &'a PreviewState, tb: Tb) -> Element<'a, Msg> {
+        let km = &self.keymap;
         // Pointer / pan tools, the color swatch + line-width groups all live on the BOTTOM
         // bar (see [`Self::edit_tools`]). The DRAW tools (Arrow/Highlight/Box/Pixelate/Blur)
-        // stay on the TOP bar right after undo/redo, for IMAGES only (videos have no
-        // annotation editor).
-        let mut left = vec![tb.appearance_group(preview.surface.is_window()), history];
+        // lead the TOP bar, for IMAGES only (videos have no annotation editor).
+        let mut left: Vec<Element<'a, Msg>> = Vec::new();
         if matches!(preview.kind, PreviewKind::Image(_)) {
             left.push(annotation_tools(preview, km, tb));
         }
-        // Right: the size + Delete group, then Save / Save As / Copy, then Close.
+        // Right: the size + Delete group, then Save / Save As / Copy.
         let mut right: Vec<Element<'a, Msg>> =
             tb.info_group(preview.size, preview.external, km).into_iter().collect();
         right.push(tb.share_group(km));
-        // The Close (x) button is drawn for the OVERLAY preview (no native window
-        // chrome) and normally omitted for the WINDOWED preview (its native
-        // traffic-light close does the job). DRAGON-268 follow-up (fullscreen header
-        // vanish): in NATIVE fullscreen the windowed preview's traffic lights auto-hide,
-        // so without the app-drawn Close the user has no reachable way to leave the
-        // preview — add it back in that state. macOS-only signal (`preview_fullscreen`,
-        // set from the resize handler); off macOS the windowed preview never enters this
-        // arm, so the historical omit-when-windowed behavior is byte-identical.
+        // The Close (x) button normally lives elsewhere: the OVERLAY draws it on its header
+        // row, the WINDOWED preview gets it from the native window chrome. DRAGON-268
+        // follow-up (fullscreen header vanish): in NATIVE fullscreen the windowed preview's
+        // traffic lights auto-hide AND our CSD titlebar goes with them, so without an
+        // app-drawn Close the user has no reachable way to leave the preview — add it back
+        // to this bar in that state. macOS-only signal (`preview_fullscreen`, set from the
+        // resize handler); off macOS this arm is never reached and the bar carries no Close.
         #[cfg(target_os = "macos")]
-        let show_close = !preview.surface.is_window() || self.preview_fullscreen;
+        let show_close = preview.surface.is_window() && self.preview_fullscreen;
         #[cfg(not(target_os = "macos"))]
-        let show_close = !preview.surface.is_window();
+        let show_close = false;
         if show_close {
             right.push(tb.cancel_group(km));
         }
@@ -919,7 +1065,8 @@ pub(super) fn flyout<'a>(
         .into()
 }
 
-/// The TOP-bar annotation DRAW tools: Arrow / Highlight / Box / Pixelate / Blur. The color
+/// The TOP-bar annotation DRAW tools: Arrow / Highlight / Box / Pixelate / Blur / Pencil, with
+/// the Eraser last (DRAGON-338 — it removes pen strokes rather than drawing). The color
 /// swatch + line-width groups moved to the BOTTOM bar (see [`annot_swatch_flyout`] +
 /// [`App::edit_tools`]). Add a tool = add a `bordered_button` here (plus its `Tool` variant +
 /// rasterize + bake arms + hotkey; see `annotate.rs`'s module doc), and map it to its
@@ -932,14 +1079,17 @@ fn annotation_tools<'a>(
     use crate::shortcuts::Action;
     let e = &preview.edit;
     // Top toolbar → tooltips drop below. The active draw tool shows its ring; NEUTRAL
-    // (`None`) = no tool ringed. Clicking/hotkeying a tool only ever SETS it.
+    // (`None`) = no tool ringed. Clicking/hotkeying a tool only ever SETS it — except that
+    // DOUBLE-clicking a tray button also drops a ready-made item in the middle of the picture
+    // (DRAGON-339), which is why the tray emits `ToolPressed` (detector-aware) rather than the
+    // bare `SelectTool` the hotkeys use.
     let pos = widget::tooltip::Position::Bottom;
     let active = e.tool;
     let btn = |icon: &'static str, t: Tool, name: &str, action: Action| {
         tb.bordered_button(
             icon,
             active == Some(t),
-            PreviewMsg::SelectTool(t),
+            PreviewMsg::ToolPressed(t),
             widget::text(action_tip(name, action, km)).size(12).into(),
             pos,
         )
@@ -949,6 +1099,9 @@ fn annotation_tools<'a>(
     // slider. Highlight sits just left of Box; the dim slider is ALWAYS usable, never gated on
     // the active tool (DRAGON-329).
     widget::row(vec![
+        // The POINTER (DRAGON-341) leads the row: a pure selection mode that creates nothing —
+        // click / Ctrl-Shift-click / rubber-band to build a selection, drag it to move it all.
+        btn("pointer-select-symbolic", Tool::Pointer, "Select", Action::PreviewAnnotPointer),
         btn("mail-forward-symbolic", Tool::Arrow, "Arrow", Action::PreviewAnnotArrow),
         // Destructive redactions sit right after Arrow: pixelate mosaic + strong blur.
         btn("view-grid-symbolic", Tool::Pixelate, "Pixelate", Action::PreviewAnnotPixelate),
@@ -972,6 +1125,11 @@ fn annotation_tools<'a>(
                 PreviewMsg::CommitDimEdit,
             ),
         ]),
+        // The pencil + its eraser CLOSE the row as a pair (DRAGON-341 moved the pencil down
+        // here): freehand ink and the hand-undo that removes it belong side by side, after the
+        // shapes, with the eraser last.
+        btn("pencil-symbolic", Tool::Pen, "Pencil", Action::PreviewAnnotPen),
+        btn("eraser-symbolic", Tool::Eraser, "Eraser", Action::PreviewAnnotEraser),
     ])
     .spacing(tb.btn_pad())
     .align_y(Alignment::Center)

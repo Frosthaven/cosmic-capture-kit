@@ -918,6 +918,14 @@ pub(crate) fn subdued(theme: &Theme) -> Color {
     toward_bg(theme, 0.78)
 }
 
+/// The FULL-strength foreground on the plain background — white in the dark themes,
+/// near-black in the light ones. The un-blended end of the very ramp [`subdued`] sits on,
+/// so a control that flips between "active" and "dimmed" (the preview editor's undo / redo,
+/// DRAGON-337) stays on ONE colour ramp instead of mixing tokens.
+pub(crate) fn foreground(theme: &Theme) -> Color {
+    toward_bg(theme, 0.0)
+}
+
 /// Unified toolbar toggle-icon states: `Off` is a subtle wash, `On` renders accent
 /// (or white over a meter fill). Toggles work in every mode, so there is no
 /// disabled state — the subdued colour alone carries on/off.

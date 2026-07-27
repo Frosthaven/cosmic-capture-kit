@@ -70,6 +70,9 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "zoom-in-symbolic" => "zoom-in", // covermark zoom slider
         "display-brightness-symbolic" => "contrast", // covermark opacity slider
         "mail-forward-symbolic" => "arrow-up-right", // draw-arrow tool
+        // The annotation POINTER (selection) tool (DRAGON-341) — a filled arrow cursor,
+        // deliberately DISTINCT from the capture overlay's outline `mouse-pointer`.
+        "pointer-select-symbolic" => "mouse-pointer-2",
         // Annotation stroke-width toggle group: a horizontal line at three thicknesses.
         "minus-2" => "minus-2",
         "minus-5" => "minus-5",
@@ -77,6 +80,8 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "format-text-highlight-symbolic" => "highlighter",
         "checkbox-symbolic" => "square", // box / rectangle tool
         "box-highlight-symbolic" => "box-highlight", // box outline + inner highlighter marker
+        "pencil-symbolic" => "pencil-line", // freehand pencil tool (DRAGON-338)
+        "eraser-symbolic" => "eraser", // pencil eraser (DRAGON-338)
         "sun-dim-symbolic" => "sun-dim", // dim/spotlight tool (sun with dashed rays)
         "spotlight-symbolic" => "spotlight", // spotlight tool (fixture + beam onto a lit spot)
         "view-grid-symbolic" => "grid-3x3", // pixelate redaction (mosaic)
@@ -125,6 +130,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "monitor" => svg!("monitor"),
         "move" => svg!("move"),
         "mouse-pointer" => svg!("mouse-pointer"),
+        "mouse-pointer-2" => svg!("mouse-pointer-2"),
         "camera" => svg!("camera"),
         "video" => svg!("video"),
         "circle" => svg!("circle"),
@@ -159,6 +165,8 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "minus-8" => svg!("minus-8"),
         "highlighter" => svg!("highlighter"),
         "box-highlight" => svg!("box-highlight"),
+        "pencil-line" => svg!("pencil-line"),
+        "eraser" => svg!("eraser"),
         "sun-dim" => svg!("sun-dim"),
         "spotlight" => svg!("spotlight"),
         "grid-3x3" => svg!("grid-3x3"),
@@ -209,7 +217,9 @@ mod tests {
             "edit-copy-symbolic", "view-fullscreen-symbolic", "view-restore-symbolic",
             "edit-undo-symbolic", "edit-redo-symbolic", "insert-image-symbolic",
             "zoom-in-symbolic", "display-brightness-symbolic", "mail-forward-symbolic",
+            "pointer-select-symbolic",
             "format-text-highlight-symbolic", "checkbox-symbolic", "box-highlight-symbolic",
+            "pencil-symbolic", "eraser-symbolic",
             "sun-dim-symbolic", "spotlight-symbolic", "view-grid-symbolic",
             "image-filter-symbolic", "edit-cut-symbolic", "minus-2", "minus-5", "minus-8",
             "video-x-generic-symbolic", "pan-down-symbolic", "folder-open-symbolic",
@@ -240,6 +250,21 @@ mod tests {
         assert_eq!(lucide_name("checkbox-symbolic"), Some("square"));
         assert_eq!(lucide_name("box-highlight-symbolic"), Some("box-highlight")); // DRAGON-333
         assert_eq!(lucide_name("sun-dim-symbolic"), Some("sun-dim")); // DRAGON-329
+        assert_eq!(lucide_name("pencil-symbolic"), Some("pencil-line")); // DRAGON-338
+        assert_eq!(lucide_name("eraser-symbolic"), Some("eraser")); // DRAGON-338
+        // DRAGON-341: the annotation pointer tool gets the FILLED cursor glyph, never the
+        // capture overlay's outline one (the two controls must not look alike).
+        assert_eq!(lucide_name("pointer-select-symbolic"), Some("mouse-pointer-2"));
+        assert_eq!(lucide_name("input-mouse-symbolic"), Some("mouse-pointer"));
+    }
+
+    /// The DRAGON-338 pencil + eraser glyphs embed and are real SVGs (the tools' toolbar icons).
+    #[test]
+    fn pencil_and_eraser_icons_are_embedded() {
+        for name in ["pencil-symbolic", "eraser-symbolic"] {
+            let file = lucide_name(name).unwrap_or_else(|| panic!("`{name}` is mapped"));
+            assert!(lucide_bytes(file).starts_with(b"<svg"), "`{file}` embeds an SVG");
+        }
     }
 
     /// The DRAGON-333 box-highlight glyph embeds and is a real SVG (the tool's toolbar icon).

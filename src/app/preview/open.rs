@@ -675,6 +675,23 @@ impl App {
                 .focused(focused)
                 .on_drag(Msg::Preview(PreviewMsg::WindowDrag))
                 .on_double_click(Msg::Preview(PreviewMsg::WindowMaximize));
+            // DRAGON-337: the fullscreen-overlay toggle + undo / redo live in the TITLEBAR
+            // (space in the toolbars was getting cramped), styled exactly like the settings
+            // window's collapse / search controls. macOS: reserve the native traffic lights'
+            // leading width first — collapsed to 0 in NATIVE fullscreen, where the lights
+            // auto-hide, exactly as `config_window_view` does.
+            #[cfg(target_os = "macos")]
+            let header = header.start(widget::Space::new().width(Length::Fixed(
+                if self.preview_fullscreen {
+                    0.0
+                } else {
+                    crate::app::settings::TRAFFIC_LIGHTS_INSET
+                },
+            )));
+            let header = self
+                .preview_header_controls(preview)
+                .into_iter()
+                .fold(header, |h, control| h.start(control));
             // macOS (DRAGON-146): native traffic lights own close/min/zoom (kept +
             // centred in `finalize_preview_window`), so no CSD window buttons here;
             // native close routes through WindowCloseRequested → preview Cancel.

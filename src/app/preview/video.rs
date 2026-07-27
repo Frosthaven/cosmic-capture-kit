@@ -743,9 +743,14 @@ impl App {
                     .width(Length::Fill)
                     .into()
             });
+        // The overlay's header line (appearance / undo / redo ⟨split⟩ Close); the windowed
+        // preview carries those in its titlebar instead (DRAGON-337).
+        let header = (!preview.surface.is_window())
+            .then(|| self.overlay_header_row(preview, tb));
         compose_preview(
             preview.surface.is_window(),
             self.overlay_control_width(preview),
+            header,
             self.edit_toolbar(preview, tb),
             content,
             transport,

@@ -61,9 +61,10 @@ const FULLSCREEN_TOP_INSET: f32 = 44.0;
 pub(super) const WIN_CAPTION_INSET: f32 = 146.0;
 /// macOS: the compact header icon buttons' halo (padding around the 16px glyph)
 /// and resulting box size — half the Linux halo, per the tighter hover boxes the
-/// traffic lights sit beside. Tuned live on-device.
+/// traffic lights sit beside. Tuned live on-device. Shared with the windowed
+/// preview's titlebar controls (DRAGON-337), so both headers stay identical.
 #[cfg(target_os = "macos")]
-const MAC_HEADER_GLYPH_HALO: u16 = 4;
+pub(super) const MAC_HEADER_GLYPH_HALO: u16 = 4;
 #[cfg(target_os = "macos")]
 const MAC_HEADER_BTN: f32 = 16.0 + 2.0 * MAC_HEADER_GLYPH_HALO as f32;
 

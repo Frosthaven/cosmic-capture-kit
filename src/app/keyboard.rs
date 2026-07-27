@@ -25,6 +25,10 @@ impl App {
             Action::PreviewUndo => Msg::Preview(PreviewMsg::Undo),
             Action::PreviewRedo => Msg::Preview(PreviewMsg::Redo),
             Action::PreviewDeleteSegment => Msg::Preview(PreviewMsg::TimelineDelete),
+            Action::PreviewAnnotPointer => Msg::Preview(PreviewMsg::SelectTool(
+                crate::widgets::annotation_canvas::Tool::Pointer,
+            )),
+            Action::PreviewSelectAll => Msg::Preview(PreviewMsg::SelectAllAnnotations),
             Action::PreviewAnnotArrow => {
                 Msg::Preview(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Arrow))
             }
@@ -45,6 +49,12 @@ impl App {
             )),
             Action::PreviewAnnotSpotlight => Msg::Preview(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::Spotlight,
+            )),
+            Action::PreviewAnnotPen => {
+                Msg::Preview(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Pen))
+            }
+            Action::PreviewAnnotEraser => Msg::Preview(PreviewMsg::SelectTool(
+                crate::widgets::annotation_canvas::Tool::Eraser,
             )),
             Action::PreviewAnnotDuplicate => Msg::Preview(PreviewMsg::DuplicateSelected),
             Action::PreviewAnnotStrokeCycle => Msg::Preview(PreviewMsg::CycleAnnotStrokeW),
@@ -259,7 +269,7 @@ impl App {
         // Annotation selection: when a shape is selected, Esc deselects (before falling
         // through to Close/Cancel) and Delete/Backspace removes it (before the timeline's
         // Delete). No selection → both fall through to their normal keymap actions.
-        if self.preview.as_ref().is_some_and(|p| p.edit.selected.is_some()) {
+        if self.preview.as_ref().is_some_and(|p| !p.edit.sel.is_empty()) {
             match &key {
                 Key::Named(Named::Escape) => {
                     return self.update(Msg::Preview(PreviewMsg::SelectAnnotation(None)));
