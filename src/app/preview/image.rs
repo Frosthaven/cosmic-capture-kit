@@ -196,16 +196,43 @@ impl App {
         if !preview.surface.is_window() {
             window_keys.push(LayerKey::video(preview.window));
         }
-        let (ow, oh) = preview.frame_points();
+        // DRAGON-385: the DISPLAY frame — the crop's framing once applied, else the whole
+        // picture (a crop SESSION shows the whole picture too, so it is un-cropped here). The fit
+        // box, the ZoomPan content and the canvas mapping all key off it.
+        let (ow, oh) = preview.display_frame_points();
+        let view_crop = preview.view_crop();
         let image: Element<'a, Msg> = if ow > 0 && oh > 0 {
             let (avail_w, avail_h) = self.preview_viewport(preview);
+            // The crop window's on-screen size (whole picture's when un-cropped).
             let (dw, dh) = video::fit_dims(ow, oh, avail_w, avail_h);
             d366_avail = (avail_w, avail_h);
             d366_shown = (dw, dh);
+            // The media stack ALWAYS renders the WHOLE frame (base + effect passes + covermark
+            // unchanged); a crop just frames a sub-region of it through a CropWindow. So render at
+            // the FULL frame's on-screen size (the whole picture at the crop's scale), then clip to
+            // the crop window. Un-cropped: render_dims == (dw, dh) and there is no wrapper —
+            // byte-identical to the historical path.
+            let (render_w, render_h, crop_wrap) = match view_crop {
+                Some(c) => {
+                    // Aspect is preserved, so the width ratio is the single screen-px-per-source-px
+                    // scale for both axes.
+                    let cw = c.pixel_size().0;
+                    let s = dw / (cw.max(1) as f32); // screen px per SOURCE px
+                    let (fw, fh) = preview.edit.frame;
+                    let full = (fw as f32 * s, fh as f32 * s);
+                    (full.0, full.1, Some(((dw, dh), full, (-c.x * s, -c.y * s))))
+                }
+                None => (dw, dh, None),
+            };
             let t = std::time::Instant::now();
-            let media = self.still_media(preview, handle, dw, dh, &window_keys);
+            let media = self.still_media(preview, handle, render_w, render_h, &window_keys);
             d366_still_ms = t.elapsed().as_secs_f64() * 1000.0;
-            media
+            match crop_wrap {
+                Some((window, content, offset)) => {
+                    crate::widgets::CropWindow::new(media, window, content, offset).into()
+                }
+                None => media,
+            }
         } else {
             // No known dims (rare decode fallback): plain fit, no covermark overlay.
             widget::container(
@@ -232,8 +259,9 @@ impl App {
         // scrollbars from its REAL bounds — no dependence on an app-side viewport estimate.
         let content_px = {
             // Same natural (logical-point) fit as the drawn box above, so the pan clamp
-            // and scrollbars track the REAL displayed picture size (DRAGON-221).
-            let (iw, ih) = preview.frame_points();
+            // and scrollbars track the REAL displayed picture size (DRAGON-221) — of the
+            // DISPLAY frame (the crop window when a crop is applied, DRAGON-385).
+            let (iw, ih) = preview.display_frame_points();
             if iw > 0 && ih > 0 {
                 let (avail_w, avail_h) = self.preview_viewport(preview);
                 video::fit_dims(iw, ih, avail_w, avail_h)
@@ -241,6 +269,14 @@ impl App {
                 (0.0, 0.0)
             }
         };
+        // The DISPLAYED source dims + the view-crop offset the annotation canvas maps through
+        // (DRAGON-385): the crop's size + origin once applied, else the whole frame + `(0, 0)`.
+        // Model geometry stays FULL-source; this only shifts to the cropped on-screen content.
+        let canvas_source = {
+            let d = preview.display_frame();
+            (d.0 as f32, d.1 as f32)
+        };
+        let canvas_offset = preview.display_offset();
         let image = crate::widgets::ZoomPan::new(
             slot,
             preview.view.zoom,
@@ -258,12 +294,60 @@ impl App {
         // (DRAGON-324) — crisp at any zoom, no raster to blur — along with the (never-baked)
         // selection chrome, both clipped to the content rect. The full-res bake rasterizes
         // the same scene separately.
-        let canvas_over: Element<'a, Msg> = if content_px.0 > 0.0 && preview.edit.frame.0 > 0 {
+        let canvas_over: Element<'a, Msg> = if let Some(session) = preview
+            .edit
+            .crop_session
+            .as_ref()
+            .filter(|_| content_px.0 > 0.0 && preview.edit.frame.0 > 0)
+        {
+            // DRAGON-382/387: while a crop session is live the crop overlay OWNS the surface, but
+            // it no longer shows BARE media. It wraps a DISPLAY-ONLY annotation canvas (DRAGON-387)
+            // so the SAME composited scene the normal view builds is visible while the crop rect is
+            // repositioned over the whole picture: the committed arrows/boxes/text/badges/pen + the
+            // text-caption rasters, over the media stack (base + dim/spotlight + highlight/pixelate/
+            // blur + covermark, which already ride the wrapped ZoomPan). The crop overlay then dims
+            // outside the rect, draws the rule-of-thirds grid + handles in the accent, and maps
+            // every drag to image SOURCE px on top of that. During a session `view_crop()` is None,
+            // so `canvas_source`/`canvas_offset` are the whole frame + `(0, 0)` — the annotations
+            // map exactly as the pre-crop normal view. The display canvas forwards every pointer
+            // event to the ZoomPan (the crop overlay owns the pointer), so zoom/pan keep working.
+            let composited = self.annotation_display_canvas(
+                preview,
+                image,
+                content_px,
+                canvas_source,
+                canvas_offset,
+                &window_keys,
+            );
+            let accent = crate::app::theme::accent(&cosmic::theme::active());
+            let source = (preview.edit.frame.0 as f32, preview.edit.frame.1 as f32);
+            let r = session.rect;
+            crate::widgets::crop_canvas::CropCanvas::new(
+                composited,
+                preview.view.zoom,
+                preview.view.pan,
+                content_px,
+                source,
+                (r.x, r.y, r.w, r.h),
+                accent,
+                move |ev| {
+                    use crate::widgets::crop_canvas::CropEvent;
+                    Msg::Preview(pid, match ev {
+                        CropEvent::DragBegin(h, x, y) => PreviewMsg::CropDragBegin(h, x, y),
+                        CropEvent::DragTo(x, y, s) => PreviewMsg::CropDragTo(x, y, s),
+                        CropEvent::DragEnd => PreviewMsg::CropDragEnd,
+                    })
+                },
+            )
+            .into()
+        } else if content_px.0 > 0.0 && preview.edit.frame.0 > 0 {
             // The in-flight eraser's marked groups draw at half opacity (DRAGON-338) — the
             // preview of what releasing the button deletes.
             let items = annotate::widget_items(
                 &preview.edit.annotations,
-                preview.edit.curve_radius(),
+                // The curve radius is a POINT preset; the vector geometry is SOURCE px, so scale
+                // it to this document's backing scale (DRAGON-383). Identity on Linux/1x.
+                annotate::points_to_source_px(preview.edit.curve_radius(), preview.source_scale),
                 &preview.edit.erase_marks,
             );
             let accent = crate::app::theme::accent(&cosmic::theme::active());
@@ -329,7 +413,7 @@ impl App {
                 preview.view.zoom,
                 preview.view.pan,
                 content_px,
-                source,
+                canvas_source,
                 preview.view.pan_mode,
                 accent,
                 move |ev| {
@@ -358,6 +442,10 @@ impl App {
                     })
                 },
             )
+            // DRAGON-385: model geometry is FULL-source; when a crop frames the view the canvas
+            // maps through the crop origin (`canvas_source` is then the crop's size). `(0, 0)`
+            // un-cropped, so this is a no-op there.
+            .crop_offset(canvas_offset)
             .text_caret(text_caret)
             // The un-blinked caret drives the OS IME cursor area while editing (DRAGON-359).
             .ime_caret(ime_caret)
@@ -366,33 +454,13 @@ impl App {
             // the blink-gated caret above.
             .text_editing(editing_text, text_selection)
             // The TEXT rasters (DRAGON-373): one passive, draw-only layer per text annotation,
-            // handed to the canvas so it can draw each at its OWN place in the item order —
-            // which is what makes a rectangle brought over one caption and under another render
-            // on screen the way `rasterize_scene` has always baked it. They are elements, not
-            // widgets in the tree: the canvas never routes an event to them, so hit-testing
-            // stays entirely with the canvas's own model (see its `text_layers`).
-            .text_layers(
-                preview
-                    .edit
-                    .text_layers
-                    .iter()
-                    .map(|l| {
-                        let layer = Layer::at(
-                            LayerKey::text(preview.window, l.id.0),
-                            l.frame.clone(),
-                            // The layer covers only its own caption REGION (DRAGON-362), so it is
-                            // PLACED rather than stretched — see `layers::Layer::dest`.
-                            l.geom.dest(preview.edit.frame),
-                        );
-                        let stack = LayerStack::part(
-                            vec![layer],
-                            self.live_preview_windows(),
-                            window_keys.clone(),
-                        );
-                        (l.id.0, Element::new(cosmic::iced::widget::shader::Shader::new(stack)))
-                    })
-                    .collect(),
-            )
+            // handed to the canvas so it can draw each at its OWN place in the item order — which
+            // is what makes a rectangle brought over one caption and under another render on screen
+            // the way `rasterize_scene` bakes it. They are elements, not widgets in the tree: the
+            // canvas never routes an event to them, so hit-testing stays with its own model. Built
+            // by the shared helper so the crop-session display canvas (DRAGON-387) composes the
+            // identical layers without duplicating the assembly.
+            .text_layers(self.preview_text_layers(preview, &window_keys, canvas_offset, canvas_source))
             .into()
         } else {
             image.into()
@@ -430,7 +498,16 @@ impl App {
         // the size chip block also dropped out of the bottom-bar min-width reserve in
         // `surface.rs` while it's off.
         // right.extend(tb.size_chip(preview.size));
+        // DRAGON-382: the crop group sits immediately to the LEFT of the zoom control (user
+        // request). Idle it is a single crop icon (no group chrome, like the select tool),
+        // accent-tinted when a crop is applied; a live session replaces it with a checkmark +
+        // x pair.
         let right: Vec<Element<'a, Msg>> = vec![
+            tb.crop_group(
+                preview.edit.crop_session.is_some(),
+                preview.edit.crop.is_some(),
+                &self.keymap,
+            ),
             self.zoom_control(preview, tb),
             tb.pan_tool_group(preview.view.pan_mode, &self.keymap),
         ];
@@ -624,7 +701,9 @@ impl App {
                         fx_items,
                         src,
                         (dw, dh),
-                        preview.edit.curve_radius(),
+                        // POINT curve preset → SOURCE px, matching the source-px effect geometry
+                        // (DRAGON-383). Identity on Linux/1x.
+                        annotate::points_to_source_px(preview.edit.curve_radius(), preview.source_scale),
                         consts,
                         dim,
                         knockouts,
@@ -704,5 +783,89 @@ impl App {
             return children.pop().expect("one child");
         }
         cosmic::iced::widget::stack(children).into()
+    }
+
+    /// The TEXT annotation raster layers (DRAGON-373) for the loaded-image view, as
+    /// `(item id, draw-only element)` — one persistent-texture [`LayerStack`] per caption, placed
+    /// through the DISPLAY-frame mapping (`canvas_offset`/`canvas_source`: the crop region when a
+    /// crop is applied, else the whole frame + `(0, 0)`). Factored out so the interactive editor
+    /// canvas and the crop-session DISPLAY canvas (DRAGON-387) build the identical layers from ONE
+    /// place — the stack assembly is never duplicated. See
+    /// [`crate::widgets::annotation_canvas::AnnotationCanvas::text_layers`].
+    fn preview_text_layers<'a>(
+        &self,
+        preview: &'a PreviewState,
+        window_keys: &[LayerKey],
+        canvas_offset: (f32, f32),
+        canvas_source: (f32, f32),
+    ) -> Vec<(u64, Element<'a, Msg>)> {
+        preview
+            .edit
+            .text_layers
+            .iter()
+            .map(|l| {
+                // The layer covers only its own caption REGION (DRAGON-362), so it is PLACED rather
+                // than stretched (see `layers::Layer::dest`). Its fractions are of the DISPLAY frame
+                // (DRAGON-385): a caption inside the crop lands right, one outside is clipped away;
+                // `canvas_offset == (0, 0)` + `canvas_source == frame` un-cropped equals the old
+                // `dest(frame)`.
+                let layer = Layer::at(
+                    LayerKey::text(preview.window, l.id.0),
+                    l.frame.clone(),
+                    l.geom.dest_in(canvas_offset, canvas_source),
+                );
+                let stack = LayerStack::part(
+                    vec![layer],
+                    self.live_preview_windows(),
+                    window_keys.to_vec(),
+                );
+                (l.id.0, Element::new(cosmic::iced::widget::shader::Shader::new(stack)))
+            })
+            .collect()
+    }
+
+    /// A DISPLAY-ONLY annotation canvas (DRAGON-387) wrapping `content` (the preview's ZoomPan): it
+    /// draws the committed vector annotations + each caption's raster layer over the media, but
+    /// intercepts no pointer event and draws no selection chrome. Used by the crop SESSION, which
+    /// owns the pointer through its own overlay yet must still show the annotations composited over
+    /// the media. It shares the `items` + `text_layers` assembly with the interactive canvas in
+    /// [`Self::image_loaded_view`] (via [`Self::preview_text_layers`]), so the composited scene is
+    /// built the same way in both — no duplicated stack logic.
+    fn annotation_display_canvas<'a>(
+        &self,
+        preview: &'a PreviewState,
+        content: impl Into<Element<'a, Msg>>,
+        content_px: (f32, f32),
+        canvas_source: (f32, f32),
+        canvas_offset: (f32, f32),
+        window_keys: &[LayerKey],
+    ) -> Element<'a, Msg> {
+        let pid = preview.window;
+        let items = annotate::widget_items(
+            &preview.edit.annotations,
+            annotate::points_to_source_px(preview.edit.curve_radius(), preview.source_scale),
+            &preview.edit.erase_marks,
+        );
+        let accent = crate::app::theme::accent(&cosmic::theme::active());
+        crate::widgets::annotation_canvas::AnnotationCanvas::new(
+            content,
+            items,
+            // No selection and a neutral tool: a display-only canvas draws no chrome and never draws.
+            Vec::new(),
+            None,
+            preview.view.zoom,
+            preview.view.pan,
+            content_px,
+            canvas_source,
+            preview.view.pan_mode,
+            accent,
+            // Dead closure: `display_only(true)` forwards every event to the ZoomPan and never
+            // emits, so this can never fire. Map to an inert message purely so the type checks.
+            move |_| Msg::Preview(pid, PreviewMsg::AnnotMenuClose),
+        )
+        .display_only(true)
+        .crop_offset(canvas_offset)
+        .text_layers(self.preview_text_layers(preview, window_keys, canvas_offset, canvas_source))
+        .into()
     }
 }

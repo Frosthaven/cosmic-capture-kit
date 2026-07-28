@@ -134,15 +134,46 @@ use ::image::RgbaImage;
 /// A straight-alpha RGBA color.
 pub type AnnotColor = [u8; 4];
 
-/// The SHARED default stroke width (SOURCE px), seeded onto every new box AND arrow — the
-/// single source of truth a future width control drives (see [`super::edit::EditState::stroke`]).
+/// The SHARED default stroke width in logical POINTS (DRAGON-383), seeded onto every new box
+/// AND arrow — the single source of truth a future width control drives (see
+/// [`super::edit::EditState::stroke`]). A preset/preference is a POINT measure so a "4px" stroke
+/// spans the SAME visual size on a 1x and a 2x capture; it becomes concrete SOURCE-pixel
+/// geometry through [`points_to_source_px`] at the moment a shape is born. On Linux (and any 1x
+/// panel) points == source px, so this is unchanged there.
 pub const DEFAULT_ANNOT_STROKE: f32 = 4.0;
 
-/// The selectable stroke-width presets (SOURCE px) the toggle group offers, thin → thick
-/// (DRAGON-357 item 9: a 1px option leads and the run continues +2px past the former 6px top,
-/// to 8/10/12). `DEFAULT_ANNOT_STROKE` (4px) stays a preset. Persisted widths need no
-/// migration — they are stored as raw px and mapped through [`stroke_width_nearest_index`].
+/// The selectable stroke-width presets in logical POINTS (DRAGON-383) the toggle group offers,
+/// thin → thick (DRAGON-357 item 9: a 1px option leads and the run continues +2px past the
+/// former 6px top, to 8/10/12). `DEFAULT_ANNOT_STROKE` (4pt) stays a preset. The WORKING default
+/// ([`super::edit::EditState::annot_stroke_w`]) and the persisted preference are kept in these
+/// same POINT units, so the ladder, [`stroke_width_nearest_index`] and the chrome flyout all
+/// compare in ONE unit and the highlighted segment stays correct on a 2x document; only the
+/// value re-stroked ONTO a shape is scaled to source px. Migration: a width persisted by an
+/// older build was effectively source px — on Linux 1x that number is unchanged (px == pt); on a
+/// 2x mac it now reads as points (numerically identical, so a "8" stays "8", just reinterpreted),
+/// which self-corrects the instant a preset is picked.
 pub const STROKE_WIDTHS: [f32; 7] = [1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0];
+
+/// Convert a preset / persisted annotation dimension expressed in logical POINTS into the SOURCE
+/// pixels an annotation stores and renders in, for a document whose backing scale is `scale`
+/// (macOS Retina = 2.0). Annotation GEOMETRY lives in SOURCE px (`AnnotRect`, a shape's own
+/// `stroke_w`, a text box's `size_px`); every PRESET and PERSISTED PREFERENCE (the stroke ladder,
+/// the badge/text sizes, the curve radius) is a POINT measure so the same preset spans the same
+/// visual size across DPIs (DRAGON-383). On Linux — and any 1x panel — `scale` is always `1.0`,
+/// so this is the identity and every seeding path stays byte-identical. A non-positive scale is
+/// treated as `1.0` (defensive). Pure — unit-tested.
+pub fn points_to_source_px(points: f32, scale: f32) -> f32 {
+    points * if scale > 0.0 { scale } else { 1.0 }
+}
+
+/// The inverse of [`points_to_source_px`]: bring a SOURCE-pixel annotation dimension back to the
+/// logical POINTS the presets + persisted preferences are kept in — used when a badge RESIZE or a
+/// placed badge's settled side seeds the remembered default, so the number stored matches the
+/// preset ladder's unit and re-seeds correctly on a DIFFERENT-scale document (DRAGON-383).
+/// Identity on Linux/1x. Pure — unit-tested.
+pub fn source_px_to_points(px: f32, scale: f32) -> f32 {
+    px / if scale > 0.0 { scale } else { 1.0 }
+}
 
 /// The index into [`STROKE_WIDTHS`] whose preset is nearest `current` — which segment of the
 /// width toggle group reads as active. Argmin of the absolute difference (ties pick the
@@ -167,10 +198,12 @@ pub fn cycle_stroke_width(current: f32) -> f32 {
     STROKE_WIDTHS[(i + 1) % STROKE_WIDTHS.len()]
 }
 
-/// The SHARED default corner curve as an ABSOLUTE radius (SOURCE px), read by BOTH the box
-/// (a CONSTANT corner radius regardless of box size, reduced only when the box is too small
-/// to fit it) and the arrow (round caps/joins when > 0) — the single source of truth a
-/// future curve control drives (see [`super::edit::EditState::curve_radius`]).
+/// The SHARED default corner curve as an ABSOLUTE radius in logical POINTS (DRAGON-383), read by
+/// BOTH the box (a CONSTANT corner radius regardless of box size, reduced only when the box is
+/// too small to fit it) and the arrow (round caps/joins when > 0) — the single source of truth a
+/// future curve control drives (see [`super::edit::EditState::curve_radius`]). Like every other
+/// preset it is a POINT measure, scaled to source px through [`points_to_source_px`] at each
+/// render/bake site so the corner reads the same on a 1x and a 2x capture; identity on Linux/1x.
 pub const DEFAULT_ANNOT_CURVE_RADIUS: f32 = 8.0;
 
 /// A stable per-item identity (scene z-order is the vector order, so ids only identify).
@@ -203,6 +236,101 @@ impl AnnotRect {
     fn corners(&self) -> (f32, f32, f32, f32) {
         (self.x, self.y, self.x + self.w, self.y + self.h)
     }
+}
+
+/// The bounding-box UNION of two rects (DRAGON-389). Pure.
+fn union_rect(a: AnnotRect, b: AnnotRect) -> AnnotRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = (a.x + a.w).max(b.x + b.w);
+    let bottom = (a.y + a.h).max(b.y + b.h);
+    AnnotRect { x, y, w: right - x, h: bottom - y }
+}
+
+impl super::edit::EditState {
+    /// The rectangle (SOURCE px) annotations may be placed / moved / resized within — DRAGON-389's
+    /// single authoritative "annotatable bounds".
+    ///
+    /// It is the UNION of the source frame (origin `(0,0)`, size [`Self::frame`]) and the APPLIED
+    /// crop rect ([`Self::crop`], which may have a NEGATIVE origin and/or extend PAST the source —
+    /// the over-crop black extension, DRAGON-382/385). The union (not just the crop) keeps the
+    /// WHOLE source annotatable when a crop sits wholly inside it: out-of-crop annotations
+    /// legitimately exist and clip away, exactly as they have since DRAGON-385.
+    ///
+    /// DERIVED, never stored — recomputed per call so a crop accept / undo / redo updates it for
+    /// free. During a LIVE crop session the working rect is UNCOMMITTED, so only the committed
+    /// [`Self::crop`] counts (annotations are display-only during a session anyway, DRAGON-387).
+    pub fn annot_bounds(&self) -> AnnotRect {
+        let src = AnnotRect { x: 0.0, y: 0.0, w: self.frame.0 as f32, h: self.frame.1 as f32 };
+        match self.crop {
+            Some(c) => union_rect(src, AnnotRect { x: c.x, y: c.y, w: c.w, h: c.h }),
+            None => src,
+        }
+    }
+}
+
+// ── DRAGON-389: origin-aware (annotatable-bounds) forms of the clamp/placement kernels ────────
+//
+// The pure clamp/placement/layout kernels below ([`edited_kind`], [`reflow_text`],
+// [`badge_placement_rect`], [`spawn_placement_rect`], …) all bound against a SIZE `(fw, fh)` with
+// an implicit `(0,0)` origin. The annotatable canvas (source ∪ crop) can have a NEGATIVE origin,
+// so these thin wrappers shift the whole problem into bounds-origin space, run the proven
+// origin-0 kernel at the bounds SIZE, and shift the result back. That routes every placement /
+// move / resize through [`super::edit::EditState::annot_bounds`] without duplicating (and risking
+// drift in) the clamp math — with a `bounds` at origin `(0,0)` each is byte-identical to the
+// kernel it wraps. Pure — unit-tested (see the `dragon389_*` tests).
+
+/// [`edited_kind`] clamped against annotatable `bounds` instead of a `(0,0)`-origin frame.
+fn edited_kind_in_bounds(
+    original: &AnnotKind,
+    grab: Grab,
+    press: (f32, f32),
+    cur: (f32, f32),
+    bounds: AnnotRect,
+    scale_type: bool,
+) -> AnnotKind {
+    let (ox, oy) = (bounds.x, bounds.y);
+    // Only `dx = cur - press` reaches the kernel's clamps, so shifting the geometry is enough;
+    // press/cur ride through unchanged (their difference is origin-invariant).
+    let shifted = translated_kind(original, -ox, -oy);
+    let out = edited_kind(&shifted, grab, press, cur, (bounds.w, bounds.h), scale_type);
+    translated_kind(&out, ox, oy)
+}
+
+/// [`reflow_text`] laid out and clamped against annotatable `bounds` instead of a `(0,0)`-origin
+/// frame — so a caption's auto-wrap cap and its [`TEXT_MIN_ON_CANVAS_PX`] edge rule both track the
+/// extended canvas.
+fn reflow_text_in_bounds(
+    text: &str,
+    size_px: f32,
+    font: super::text_annot::TextFont,
+    rect: AnnotRect,
+    constrained: bool,
+    stroke_w: f32,
+    bounds: AnnotRect,
+) -> AnnotKind {
+    let (ox, oy) = (bounds.x, bounds.y);
+    let shifted = AnnotRect { x: rect.x - ox, y: rect.y - oy, ..rect };
+    let k = reflow_text(text, size_px, font, shifted, constrained, stroke_w, (bounds.w, bounds.h));
+    translated_kind(&k, ox, oy)
+}
+
+/// [`badge_placement_rect`] centred/clamped within annotatable `bounds` — so a badge can be
+/// click-placed over the crop extension.
+fn badge_placement_in_bounds(center: (f32, f32), want: f32, bounds: AnnotRect, margin: f32) -> AnnotRect {
+    let (ox, oy) = (bounds.x, bounds.y);
+    let size = (bounds.w.round().max(0.0) as u32, bounds.h.round().max(0.0) as u32);
+    let r = badge_placement_rect((center.0 - ox, center.1 - oy), want, size, margin);
+    AnnotRect { x: r.x + ox, y: r.y + oy, ..r }
+}
+
+/// [`spawn_placement_rect`] centred within annotatable `bounds` — so a double-click drop lands in
+/// the middle of the extended canvas, not the source.
+fn spawn_placement_in_bounds(tool: Tool, bounds: AnnotRect, margin: f32, badge_want: f32) -> AnnotRect {
+    let (ox, oy) = (bounds.x, bounds.y);
+    let size = (bounds.w.round().max(0.0) as u32, bounds.h.round().max(0.0) as u32);
+    let r = spawn_placement_rect(tool, size, margin, badge_want);
+    AnnotRect { x: r.x + ox, y: r.y + oy, ..r }
 }
 
 /// What an annotation draws. Add a variant here to add a tool (see the module doc).
@@ -348,6 +476,11 @@ pub const HIGHLIGHT_ALPHA: u8 = 98;
 /// is replaced by its block mean; detail finer than the chosen cell is destroyed. Grid-aligned
 /// so the display shader (NEAREST sample of the block-mean texture) and the bake share the exact
 /// same blocks.
+///
+/// DRAGON-383 audit: the pixelate cell is CONTENT-adaptive — it resolves feature spacing in
+/// source px, so a 2x capture (2x-resolution content) already produces a proportionally larger
+/// cell by construction. It is not preset/preference driven, so it stays SOURCE px and is left
+/// unscaled (mirroring [`BLUR_BLOCK`]'s audit); the points-to-source-px rule targets presets.
 pub const PIXELATE_BLOCK: u32 = 8;
 
 /// The pixelate cell-size CEILING (SOURCE px): the content-aware size never exceeds this, so the
@@ -362,6 +495,12 @@ pub const PIXELATE_BLOCK_MAX: u32 = 48;
 /// three stacked box blurs approximate a Gaussian, reading as a strong SMOOTH blur that destroys
 /// text/faces. The adaptive highlight's low-pass reuses this block at ONE pass (its own strength
 /// is unchanged).
+///
+/// DRAGON-383 audit: this stays SOURCE px, NOT converted to points. It is a redaction-strength
+/// constant (how much real image detail a blur destroys), not a user preset/preference, and
+/// there is no picker driving it — so the points-to-source-px rule (which targets presets +
+/// persisted prefs) does not apply. Fixed in source px, a 2x capture's blur destroys the same
+/// COUNT of content pixels, which is the property that matters for a redaction.
 pub const BLUR_BLOCK: u32 = 32;
 
 /// How many single-pass box blurs the standalone Blur effect stacks (≈ a Gaussian). The highlight
@@ -390,6 +529,19 @@ pub enum AnnotGesture {
     /// against `bounds` ([`group_move_delta`]) rather than per item — so the arrangement is
     /// rigid: nothing squeezes together when the group meets an image edge.
     MoveMany { press: (f32, f32), originals: Vec<(AnnotId, AnnotKind)>, bounds: AnnotRect },
+    /// Scaling a MULTI-selection as one (DRAGON-388): every selected item's geometry at grab
+    /// start, the union of their DRAWN bounds, and the group-box handle being dragged. The drag
+    /// maps every member through ONE uniform scale ([`group_scaled_kind`]) about the union's
+    /// fixed anchor corner ([`group_scale_anchor`]) — a SIMILARITY, so relative layout, overlaps
+    /// and every per-kind aspect (badges square, text aspect-locked) are preserved by
+    /// construction. The shared factor is clamped ONCE ([`clamp_group_scale`]) so no item
+    /// collapses; committed as ONE undo entry, exactly like [`Self::MoveMany`].
+    ScaleMany {
+        press: (f32, f32),
+        originals: Vec<(AnnotId, AnnotKind)>,
+        bounds: AnnotRect,
+        grab: Grab,
+    },
     /// An ERASER sweep (DRAGON-338): `last` is the previous sampled point, so each update
     /// tests the SEGMENT the eraser travelled (never just the sampled points — a fast drag
     /// would otherwise jump clean over a stroke). Marks accumulate in
@@ -899,6 +1051,43 @@ pub fn companion(theme: &cosmic::Theme) -> cosmic::iced::Color {
         c[1] as f32 / 255.0,
         c[2] as f32 / 255.0,
     )
+}
+
+/// The COMPANION of an annotation color (DRAGON-386): its [`complement`] — hue rotated 180° in
+/// HSL, saturation + lightness (and alpha) preserved. This IS the codebase's established
+/// "companion" relationship: the very complement the default annotation color
+/// ([`default_annot_color`]), the palette's lead pair ([`palette_entries`]) and the unsaved-edit
+/// tint ([`companion`]) already speak. It is what the `X` swap hotkey toggles to, mirroring
+/// Photoshop's foreground/background swap.
+///
+/// The mapping is TOTAL — every selectable color has a companion, and a GRAY (no hue to rotate)
+/// is its own companion. In exact arithmetic it is an INVOLUTION (two rotations of 180° land back
+/// on the original hue); across the u8 round-trip it is involutive up to a rounding unit, which is
+/// why the swap TOGGLE ([`companion_swap`]) also carries a remembered partner for an exact return.
+/// Pure — unit-tested.
+pub fn companion_color(c: AnnotColor) -> AnnotColor {
+    complement(c)
+}
+
+/// Resolve ONE press of the companion-swap hotkey (`X`; DRAGON-386): given the CURRENT active
+/// annotation color and the REMEMBERED swap partner (`EditState::color_swap_back`), return the
+/// `(new active color, new remembered partner)`.
+///
+/// The rule makes the toggle CLEAN despite [`companion_color`] being involutive only up to u8
+/// rounding: when the current color is exactly the companion of the remembered partner we return
+/// that partner VERBATIM (an exact "swap back"); otherwise it is a fresh swap to the companion.
+/// The new remembered partner is ALWAYS the color we just left, so a second `X` returns to the
+/// exact starting color and a third swaps forward again. A gray swaps to itself (its companion),
+/// a harmless no-op. Pure — unit-tested.
+pub fn companion_swap(
+    current: AnnotColor,
+    remembered: Option<AnnotColor>,
+) -> (AnnotColor, AnnotColor) {
+    let target = match remembered {
+        Some(back) if companion_color(back)[..3] == current[..3] => back,
+        _ => companion_color(current),
+    };
+    (target, current)
 }
 
 /// The complementary color of `rgb`: hue rotated 180° in HSL, same saturation + lightness,
@@ -2069,6 +2258,30 @@ pub fn apply_annotations(base: &mut RgbaImage, items: &[AnnotationItem], curve_r
             *d = ((s as u32 * a + *d as u32 * (255 - a)) / 255) as u8;
         }
     }
+}
+
+/// [`apply_annotations`] onto a canvas whose top-left sits at source-pixel `offset` — the vector
+/// overlay drawn into a CROPPED canvas (DRAGON-389).
+///
+/// Every item is shifted by `-offset` (via [`translated_kind`]) before rasterizing at the CROPPED
+/// canvas's own size, so a shape placed over the crop's black extension composites onto the cut
+/// canvas instead of being clipped at the old source edge. `offset == (0, 0)` is byte-identical to
+/// [`apply_annotations`] (and takes its fast path). Pixels INSIDE the crop are unchanged versus the
+/// historical "annotate the full source, then crop" order — the rasterizer's per-pixel coverage is
+/// translation-equivariant — so a crop that keeps annotations inside the source bakes identically.
+pub fn apply_annotations_at(base: &mut RgbaImage, items: &[AnnotationItem], curve_radius: f32, offset: (f32, f32)) {
+    if offset == (0.0, 0.0) {
+        return apply_annotations(base, items, curve_radius);
+    }
+    let shifted: Vec<AnnotationItem> = items
+        .iter()
+        .map(|it| AnnotationItem {
+            id: it.id,
+            color: it.color,
+            kind: translated_kind(&it.kind, -offset.0, -offset.1),
+        })
+        .collect();
+    apply_annotations(base, &shifted, curve_radius);
 }
 
 // ── region effects: multiply highlight + destructive pixelate/blur (DRAGON-326/327/328) ──
@@ -3275,6 +3488,7 @@ pub(super) fn d366_gesture_words(
             word_of(*id),
         ),
         AnnotGesture::MoveMany { .. } => ("move-many", "-"),
+        AnnotGesture::ScaleMany { .. } => ("scale-many", "-"),
         AnnotGesture::Erase { .. } => ("erase", "pen"),
     }
 }
@@ -3293,10 +3507,17 @@ impl App {
             return Task::none();
         };
         let color = p.edit.annot_color.unwrap_or_else(default_annot_color);
-        let stroke_w = p.edit.stroke();
-        // Clamp the start point inside the image (can't draw beyond the picture).
-        let (fw, fh) = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
-        let (x, y) = (x.clamp(0.0, fw), y.clamp(0.0, fh));
+        // Presets/preferences are POINTS; the concrete shape geometry is SOURCE px (DRAGON-383).
+        // Scale each seed once here, at the boundary where a preset becomes annotation geometry.
+        let scale = p.source_scale;
+        let stroke_w = points_to_source_px(p.edit.stroke(), scale);
+        // Clamp the start point inside the ANNOTATABLE canvas (source ∪ crop; DRAGON-389) — an
+        // over-crop extension is drawable too, so this is the union bounds, not the source frame.
+        let bounds = p.edit.annot_bounds();
+        let (x, y) = (
+            x.clamp(bounds.x, bounds.x + bounds.w),
+            y.clamp(bounds.y, bounds.y + bounds.h),
+        );
         // The ERASER draws nothing (DRAGON-338): the press opens a sweep instead, snapshots the
         // scene for the single undo entry the release will push, and marks whatever it lands on
         // (so a plain CLICK on a stroke already marks it).
@@ -3332,10 +3553,10 @@ impl App {
             // `annot_gesture_to` leaves a badge alone, so a click and a click-drag land the
             // same badge in the same place. Its ring rides the shared line weight.
             Tool::Badge => AnnotKind::Badge {
-                rect: badge_placement_rect(
+                rect: badge_placement_in_bounds(
                     (x, y),
-                    p.edit.badge_size(),
-                    p.edit.frame,
+                    points_to_source_px(p.edit.badge_size(), scale),
+                    bounds,
                     // `kind_draw_margin` for a badge: half the ring.
                     stroke_w.max(0.0) / 2.0,
                 ),
@@ -3354,16 +3575,16 @@ impl App {
             // TEXT (DRAGON-354): a press drops an EMPTY auto box at the point (the editor opens
             // on release). A drag re-sizes it into a fixed-width box in `annot_gesture_to`; a
             // bare click leaves it auto. Either way the box hugs the (empty) caret line for now.
-            Tool::Text => reflow_text(
+            Tool::Text => reflow_text_in_bounds(
                 "",
-                p.edit.text_size(),
+                points_to_source_px(p.edit.text_size(), scale),
                 p.edit.annot_text_font,
                 AnnotRect { x, y, w: 0.0, h: 0.0 },
                 false,
                 // DRAGON-358: a new text box captures the active line width, exactly like a box
                 // captures it as its stroke — so the width group styles text at creation too.
-                p.edit.stroke(),
-                (fw, fh),
+                stroke_w,
+                bounds,
             ),
             // Neither non-creating tool ever reaches here: the eraser is handled above, and the
             // POINTER (DRAGON-341) never emits a `DrawBegin` at all (its empty-canvas drag is a
@@ -3376,8 +3597,10 @@ impl App {
         // ends (see `remember_badge_size`), so future editors spawn markers at it too.
         let mut remembered_badge = None;
         if let AnnotKind::Badge { rect, .. } = &kind {
-            p.edit.annot_badge_size = rect.w;
-            remembered_badge = Some(rect.w);
+            // The settled side is SOURCE px; the remembered/persisted default is POINTS (DRAGON-383).
+            let side_pt = source_px_to_points(rect.w, scale);
+            p.edit.annot_badge_size = side_pt;
+            remembered_badge = Some(side_pt);
         }
         p.edit.annot_snapshot = Some(p.edit.annotations.clone());
         // The freehand pen's RAW trail (DRAGON-342): the model always holds the SMOOTHED curve,
@@ -3471,7 +3694,9 @@ impl App {
         let Some(p) = self.preview_for_mut(id) else {
             return false;
         };
-        let stroke_w = p.edit.stroke();
+        // Presets/preferences are POINTS; concrete geometry is SOURCE px (DRAGON-383).
+        let scale = p.source_scale;
+        let stroke_w = points_to_source_px(p.edit.stroke(), scale);
         // The margin is kind-dependent (an arrow's caps overhang more than a box's outline), so
         // measure it on a probe of the kind itself at the nominal size.
         let probe = AnnotRect { x: 0.0, y: 0.0, w: SPAWN_W, h: SPAWN_H };
@@ -3480,7 +3705,7 @@ impl App {
         };
         // A step marker is sized by the REMEMBERED side through the click-to-place helper;
         // every other tool takes the shared spawn box (see `spawn_placement_rect`).
-        let rect = spawn_placement_rect(tool, p.edit.frame, margin, p.edit.badge_size());
+        let rect = spawn_placement_in_bounds(tool, p.edit.annot_bounds(), margin, points_to_source_px(p.edit.badge_size(), scale));
         let Some(kind) = spawn_kind(tool, rect, stroke_w) else {
             return false;
         };
@@ -3495,8 +3720,10 @@ impl App {
         // a small picture clamps it down). Persisted after the borrow ends, as everywhere.
         let mut remembered_badge = None;
         if let AnnotKind::Badge { rect, .. } = &item.kind {
-            p.edit.annot_badge_size = rect.w;
-            remembered_badge = Some(rect.w);
+            // Settled side SOURCE px → remembered/persisted default POINTS (DRAGON-383).
+            let side_pt = source_px_to_points(rect.w, scale);
+            p.edit.annot_badge_size = side_pt;
+            remembered_badge = Some(side_pt);
         }
         let prev = p.edit.annotations.clone();
         p.edit.annotations.push(item);
@@ -3511,9 +3738,11 @@ impl App {
         true
     }
 
-    /// Remember `side` (SOURCE px) as the size the NEXT sequence badge is born at, PERSISTING it
-    /// so future editors — a new capture process, a later launch — spawn markers at it
-    /// (the mirror of [`Self::apply_annot_stroke_w`]'s persist step).
+    /// Remember `side` (logical POINTS, DRAGON-383) as the size the NEXT sequence badge is born
+    /// at, PERSISTING it so future editors — a new capture process, a later launch, a
+    /// DIFFERENT-scale display — spawn markers at the same visual size (the mirror of
+    /// [`Self::apply_annot_stroke_w`]'s persist step). The caller has already brought the settled
+    /// SOURCE-px side back to points ([`source_px_to_points`]).
     ///
     /// The caller has already written the CURRENT document's working copy
     /// (`EditState::annot_badge_size`); this is the app-wide one. Only the settled, non-degenerate
@@ -3637,7 +3866,8 @@ impl App {
         let Some(annot) = p.edit.selected() else {
             return;
         };
-        let default_stroke = p.edit.stroke();
+        // The stroke seeded onto a converted-in arrow is SOURCE px (DRAGON-383).
+        let default_stroke = points_to_source_px(p.edit.stroke(), p.source_scale);
         let Some(idx) = p.edit.annotations.iter().position(|it| it.id == annot) else {
             return;
         };
@@ -3658,11 +3888,15 @@ impl App {
     /// and the `L` cycle. Box/arrow redraw as vectors on the next view build, so no raster
     /// refresh is owed (effects carry no stroke).
     pub(super) fn apply_annot_stroke_w(&mut self, id: window::Id, w: f32) {
+        // `w` is a preset in POINTS (the flyout / the `L` cycle). The WORKING default and the
+        // persisted preference stay POINTS (they match the ladder); only the value re-stroked
+        // ONTO the selected shape is scaled to this document's SOURCE px (DRAGON-383).
+        let scale = self.preview_for(id).map(|p| p.source_scale).unwrap_or(1.0);
         if let Some(p) = self.preview_for_mut(id) {
             p.edit.annot_stroke_w = w;
         }
         // Picking a width also re-strokes the SELECTED box/arrow immediately (one undo entry).
-        self.restroke_selected_annotation(id, w);
+        self.restroke_selected_annotation(id, points_to_source_px(w, scale));
         // Persist so the next preview opens with this width.
         self.annot_stroke_w = w;
         self.save_state();
@@ -3673,13 +3907,35 @@ impl App {
     /// A MOVE with more than one item selected (DRAGON-341) opens a group gesture
     /// ([`AnnotGesture::MoveMany`]) that drags every selected item by ONE shared delta, clamped
     /// once on the selection's union bounds so the arrangement never distorts against an image
-    /// edge. Every other grab (and any single selection) stays on the historical one-item
-    /// [`AnnotGesture::Edit`] path — resize handles only ever exist on the PRIMARY item, so the
-    /// whole `Grab` machinery is untouched by multi-select.
+    /// edge. A RESIZE grab on a multi-selection opens the group SCALE gesture
+    /// ([`AnnotGesture::ScaleMany`], DRAGON-388): the handles wear the union's group box, and a
+    /// corner/edge drag scales every member in unison. A single selection stays on the historical
+    /// one-item [`AnnotGesture::Edit`] path — its resize handles ride the item itself, so the
+    /// whole `Grab` machinery is untouched there.
     pub(super) fn annot_grab_begin(&mut self, id: window::Id, grab: Grab, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
         let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
+        if p.edit.sel.len() > 1 && grab != Grab::Move {
+            // A RESIZE grab on a multi-selection is a GROUP SCALE (DRAGON-388): the handles wear
+            // the union's group box, not the primary, so any corner/edge drag scales the whole
+            // set in unison. (`Grab::Move` falls through to the group MOVE below; arrow-endpoint
+            // grabs never reach here — the group box shows no endpoint nodes.)
+            let originals: Vec<(AnnotId, AnnotKind)> = p
+                .edit
+                .annotations
+                .iter()
+                .filter(|it| p.edit.sel.contains(it.id))
+                .map(|it| (it.id, it.kind.clone()))
+                .collect();
+            let Some(bounds) = group_drawn_bounds(originals.iter().map(|(_, k)| k)) else {
+                return Task::none();
+            };
+            p.edit.annot_snapshot = Some(p.edit.annotations.clone());
+            p.edit.gesture =
+                Some(AnnotGesture::ScaleMany { press: (x, y), originals, bounds, grab });
+            return Task::none();
+        }
         if grab == Grab::Move && p.edit.sel.len() > 1 {
             let originals: Vec<(AnnotId, AnnotKind)> = p
                 .edit
@@ -3735,8 +3991,9 @@ impl App {
             let (verb, item) = d366_gesture_words(&gesture, &p.edit.annotations);
             d366.note(verb, item);
         }
-        // Clamp all gesture geometry to the image bounds (zoom-independent, in source px).
-        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        // Clamp all gesture geometry to the ANNOTATABLE canvas (source ∪ crop; DRAGON-389),
+        // zoom-independent, in source px — so a shape can be drawn / moved over the crop extension.
+        let canvas = p.edit.annot_bounds();
         // Whether this gesture touches a TEXT box (item 3) — read now, since the annotation's
         // KIND can't change during a drag, and the `match` below moves `gesture`.
         let touches_text = {
@@ -3748,7 +4005,8 @@ impl App {
             };
             match &gesture {
                 AnnotGesture::New { id, .. } | AnnotGesture::Edit { id, .. } => is_text(*id),
-                AnnotGesture::MoveMany { originals, .. } => {
+                AnnotGesture::MoveMany { originals, .. }
+                | AnnotGesture::ScaleMany { originals, .. } => {
                     originals.iter().any(|(id, _)| is_text(*id))
                 }
                 AnnotGesture::Erase { .. } => false,
@@ -3769,9 +4027,10 @@ impl App {
                     // Clamp on the DRAWN extent so a shape drawn to the edge doesn't spill its
                     // outline/cap past it.
                     let m = kind_draw_margin(&item.kind);
-                    let cl = |v: f32, hi: f32| v.clamp(m, (hi - m).max(m));
-                    let pr = (cl(press.0, frame.0), cl(press.1, frame.1));
-                    let cur = (cl(x, frame.0), cl(y, frame.1));
+                    let clx = |v: f32| v.clamp(canvas.x + m, (canvas.x + canvas.w - m).max(canvas.x + m));
+                    let cly = |v: f32| v.clamp(canvas.y + m, (canvas.y + canvas.h - m).max(canvas.y + m));
+                    let pr = (clx(press.0), cly(press.1));
+                    let cur = (clx(x), cly(y));
                     match &mut item.kind {
                         AnnotKind::Box { rect, .. }
                         | AnnotKind::Highlight { rect }
@@ -3821,8 +4080,8 @@ impl App {
                                 let pts: Vec<AnnotPoint> = fit
                                     .iter()
                                     .map(|p| AnnotPoint {
-                                        x: cl(p.0, frame.0),
-                                        y: cl(p.1, frame.1),
+                                        x: clx(p.0),
+                                        y: cly(p.1),
                                     })
                                     .collect();
                                 *paths = vec![pts];
@@ -3834,24 +4093,55 @@ impl App {
             }
             AnnotGesture::Edit { press, id, grab, original } => {
                 if let Some(item) = p.edit.annotations.iter_mut().find(|it| it.id == id) {
-                    item.kind = edited_kind(&original, grab, press, (x, y), frame, scale_type);
+                    item.kind = edited_kind_in_bounds(&original, grab, press, (x, y), canvas, scale_type);
                 }
             }
             // A group move (DRAGON-341): ONE delta, clamped ONCE on the union bounds, applied
             // verbatim to every member — so the selection travels as a rigid arrangement.
             AnnotGesture::MoveMany { press, ref originals, bounds } => {
+                // Clamp the shared delta so the selection's union stays inside the annotatable
+                // canvas — shift the union into bounds-origin space, since the canvas may have a
+                // NEGATIVE origin (DRAGON-389); the delta itself is translation-invariant.
+                let union0 = AnnotRect { x: bounds.x - canvas.x, y: bounds.y - canvas.y, ..bounds };
                 let (dx, dy) =
-                    group_move_delta(bounds, frame, (x - press.0, y - press.1));
+                    group_move_delta(union0, (canvas.w, canvas.h), (x - press.0, y - press.1));
                 for (id, original) in originals {
                     if let Some(item) = p.edit.annotations.iter_mut().find(|it| it.id == *id) {
                         item.kind = translated_kind(original, dx, dy);
                     }
                 }
             }
+            // A group SCALE (DRAGON-388): ONE uniform factor about the union's fixed anchor,
+            // clamped ONCE so no member collapses, applied to every member — so the selection
+            // scales as a rigid similarity, relative layout and overlaps intact.
+            AnnotGesture::ScaleMany { press, ref originals, bounds, grab } => {
+                let (dx, dy) = (x - press.0, y - press.1);
+                let anchor = group_scale_anchor(bounds, grab);
+                // Clamp in bounds-origin space (the annotatable canvas may have a NEGATIVE
+                // origin, DRAGON-389), mirroring `MoveMany` above: the factor itself is
+                // translation-invariant, the containment check is not.
+                let union0 = AnnotRect { x: bounds.x - canvas.x, y: bounds.y - canvas.y, ..bounds };
+                let anchor0 = (anchor.0 - canvas.x, anchor.1 - canvas.y);
+                let k = clamp_group_scale(
+                    group_scale_factor(bounds, grab, dx, dy),
+                    union0,
+                    anchor0,
+                    (canvas.w, canvas.h),
+                    originals.iter().map(|(_, k)| k),
+                );
+                for (id, original) in originals {
+                    if let Some(item) = p.edit.annotations.iter_mut().find(|it| it.id == *id) {
+                        item.kind = group_scaled_kind_in_bounds(original, anchor, k, canvas);
+                    }
+                }
+            }
             // The eraser MARKS along the segment it just travelled (never only the sampled
             // point — a fast drag would jump clean over a stroke), then advances its anchor.
             AnnotGesture::Erase { last } => {
-                let cur = (x.clamp(0.0, frame.0), y.clamp(0.0, frame.1));
+                let cur = (
+                    x.clamp(canvas.x, canvas.x + canvas.w),
+                    y.clamp(canvas.y, canvas.y + canvas.h),
+                );
                 mark_erased(&mut p.edit, last, cur);
                 p.edit.gesture = Some(AnnotGesture::Erase { last: cur });
             }
@@ -3973,6 +4263,8 @@ impl App {
         };
         let snapshot = p.edit.annot_snapshot.take();
         let raw_trail = std::mem::take(&mut p.edit.pen_raw);
+        // This document's backing scale, for the SOURCE-px→POINTS badge remember (DRAGON-383).
+        let scale = p.source_scale;
         // Set by the badge-resize arm below; persisted once the `p` borrow ends.
         let mut remembered_badge = None;
         // Set by the TEXT arm below: after the borrow ends, open the editor + render the layer.
@@ -3989,13 +4281,13 @@ impl App {
                 // Reflow it (snap the box to the caret line), stash the pre-edit scene on the
                 // editing session so the SETTLE pushes the single undo entry (an empty settle
                 // just deletes it), select it, and enter edit mode with the caret at the start.
-                let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+                let bounds = p.edit.annot_bounds();
                 if let Some(it) = p.edit.annotations.iter_mut().find(|it| it.id == id) {
                     let reflowed = if let AnnotKind::Text {
                         rect, text, size_px, font, constrained, stroke_w,
                     } = &it.kind
                     {
-                        Some(reflow_text(text, *size_px, *font, *rect, *constrained, *stroke_w, frame))
+                        Some(reflow_text_in_bounds(text, *size_px, *font, *rect, *constrained, *stroke_w, bounds))
                     } else {
                         None
                     };
@@ -4060,14 +4352,16 @@ impl App {
                 if let Some(AnnotKind::Badge { rect, .. }) =
                     p.edit.annotations.iter().find(|it| it.id == id).map(|it| &it.kind)
                 {
-                    p.edit.annot_badge_size = rect.w;
-                    remembered_badge = Some(rect.w);
+                    // Resized side SOURCE px → remembered/persisted default POINTS (DRAGON-383).
+                    let side_pt = source_px_to_points(rect.w, scale);
+                    p.edit.annot_badge_size = side_pt;
+                    remembered_badge = Some(side_pt);
                 }
                 if let Some(prev) = snapshot {
                     p.edit.push_annotations(prev);
                 }
             }
-            AnnotGesture::MoveMany { .. } => {
+            AnnotGesture::MoveMany { .. } | AnnotGesture::ScaleMany { .. } => {
                 if let Some(prev) = snapshot {
                     p.edit.push_annotations(prev);
                 }
@@ -4277,7 +4571,7 @@ impl App {
             return Task::none();
         };
         let sel = p.edit.text_edit.as_ref().and_then(|t| t.selection());
-        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let bounds = p.edit.annot_bounds();
         let Some((text, size_px, font, constrained, rect)) = p
             .edit
             .annotations
@@ -4293,7 +4587,7 @@ impl App {
             return Task::none();
         };
         // The caret-movement keys navigate the SAME layout the box geometry and renderer use.
-        let lay = text_kind_layout(&text, size_px, font, rect, constrained, frame.0);
+        let lay = text_kind_layout(&text, size_px, font, rect, constrained, bounds.w);
         // The PRIMARY command modifier (Cmd on macOS, Ctrl elsewhere) marks a shortcut combo;
         // Alt/AltGr must NOT block insertion (it composes real text on many layouts), and Shift
         // never does. So only the primary chord is treated as "a command, not text".
@@ -4322,7 +4616,7 @@ impl App {
                 Some(TextEditChord::SelectAll) => {
                     let n = ta::char_len(&text);
                     self.apply_text_edit(
-                        id, te_id, size_px, font, rect, constrained, frame, None, n, Some(0), false,
+                        id, te_id, size_px, font, rect, constrained, bounds, None, n, Some(0), false,
                     )
                 }
                 Some(TextEditChord::Copy) => {
@@ -4337,7 +4631,7 @@ impl App {
                         crate::share::copy_text(&t);
                     }
                     let (nt, nc) = ta::delete_range(&text, a, b);
-                    self.apply_text_edit(id, te_id, size_px, font, rect, constrained, frame, Some(nt), nc, None, false)
+                    self.apply_text_edit(id, te_id, size_px, font, rect, constrained, bounds, Some(nt), nc, None, false)
                 }
                 Some(TextEditChord::Paste) => {
                     let Some(pasted) = crate::share::read_text() else {
@@ -4351,7 +4645,7 @@ impl App {
                     let pasted = ta::cap_graphemes(&pasted, TEXT_PASTE_MAX_CHARS);
                     let (s, e) = sel.unwrap_or((caret, caret));
                     let (nt, nc) = ta::replace_range(&text, s, e, pasted);
-                    self.apply_text_edit(id, te_id, size_px, font, rect, constrained, frame, Some(nt), nc, None, false)
+                    self.apply_text_edit(id, te_id, size_px, font, rect, constrained, bounds, Some(nt), nc, None, false)
                 }
                 // Every other primary chord — including a non-character one — is SWALLOWED.
                 None => Task::none(),
@@ -4441,7 +4735,7 @@ impl App {
                 let mut chars = t.chars();
                 matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_whitespace())
             });
-        self.apply_text_edit(id, te_id, size_px, font, rect, constrained, frame, new_text, new_caret, new_anchor, coalesce)
+        self.apply_text_edit(id, te_id, size_px, font, rect, constrained, bounds, new_text, new_caret, new_anchor, coalesce)
     }
 
     /// Insert an OS input-method commit into the edited text box (DRAGON-359): the emoji picker
@@ -4465,7 +4759,7 @@ impl App {
             return Task::none();
         };
         let sel = p.edit.text_edit.as_ref().and_then(|t| t.selection());
-        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let bounds = p.edit.annot_bounds();
         let Some((cur, size_px, font, constrained, rect)) = p
             .edit
             .annotations
@@ -4491,7 +4785,7 @@ impl App {
         let (nt, nc) = ta::replace_range(&cur, s, e, ins);
         // An IME commit folds like paste (DRAGON-354 item 13 x DRAGON-359): its own undo step,
         // never coalesced into a typing burst.
-        self.apply_text_edit(id, te_id, size_px, font, rect, constrained, frame, Some(nt), nc, None, false)
+        self.apply_text_edit(id, te_id, size_px, font, rect, constrained, bounds, Some(nt), nc, None, false)
     }
 
     /// Commit a computed text-edit result (DRAGON-354): reflow the box when the buffer changed,
@@ -4506,7 +4800,9 @@ impl App {
         font: super::text_annot::TextFont,
         rect: AnnotRect,
         constrained: bool,
-        frame: (f32, f32),
+        // DRAGON-389: the annotatable canvas (source ∪ crop), so an edited caption reflows against
+        // the extended bounds — see [`super::edit::EditState::annot_bounds`].
+        bounds: AnnotRect,
         new_text: Option<String>,
         new_caret: usize,
         new_anchor: Option<usize>,
@@ -4551,7 +4847,7 @@ impl App {
             }
         }
         if let Some(nt) = &new_text {
-            let reflowed = reflow_text(nt, size_px, font, rect, constrained, stroke_w, frame);
+            let reflowed = reflow_text_in_bounds(nt, size_px, font, rect, constrained, stroke_w, bounds);
             if let Some(it) = p.edit.annotations.iter_mut().find(|it| it.id == te_id) {
                 it.kind = reflowed;
             }
@@ -4603,9 +4899,9 @@ impl App {
             // Exhausted: a no-op. Do NOT fall through to the global undo/redo mid-edit.
             return Task::none();
         };
-        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let bounds = p.edit.annot_bounds();
         let final_len = super::text_annot::char_len(&snap.text);
-        let reflowed = reflow_text(&snap.text, size_px, font, rect, constrained, stroke_w, frame);
+        let reflowed = reflow_text_in_bounds(&snap.text, size_px, font, rect, constrained, stroke_w, bounds);
         if let Some(it) = p.edit.annotations.iter_mut().find(|it| it.id == te_id) {
             it.kind = reflowed;
         }
@@ -4751,7 +5047,7 @@ impl App {
     fn text_caret_index_at(&self, id: window::Id, x: f32, y: f32) -> Option<(String, usize)> {
         let p = self.preview_for(id)?;
         let te_id = p.edit.text_edit.as_ref()?.id;
-        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let bounds = p.edit.annot_bounds();
         let (text, size_px, font, constrained, rect) =
             p.edit.annotations.iter().find(|it| it.id == te_id).and_then(|it| match &it.kind {
                 AnnotKind::Text { text, size_px, font, constrained, rect, .. } => {
@@ -4759,7 +5055,7 @@ impl App {
                 }
                 _ => None,
             })?;
-        let lay = text_kind_layout(&text, size_px, font, rect, constrained, frame.0);
+        let lay = text_kind_layout(&text, size_px, font, rect, constrained, bounds.w);
         let idx = super::text_annot::caret_at_point(&lay, font, size_px, x - rect.x, y - rect.y);
         Some((text, idx))
     }
@@ -4814,7 +5110,9 @@ impl App {
     /// "remember a value" are decided, keyed by WHERE the change came from
     /// ([`TextStyleSource`]). Both halves live here on purpose: a caller cannot forget to
     /// persist, and — the case that matters — cannot accidentally persist. See the block
-    /// comment above.
+    /// comment above. `size` is in logical POINTS (DRAGON-383): the working chip value and the
+    /// persisted default are both point measures, so a dropdown pick passes its preset directly
+    /// and the display-sync path brings the box's source-px size back to points first.
     fn set_text_style(
         &mut self,
         id: window::Id,
@@ -4865,10 +5163,13 @@ impl App {
         let Some(p) = self.preview_for(id) else {
             return;
         };
+        let scale = p.source_scale;
         // A live edit outranks the selection: the box being typed into is the one on screen.
         let target = p.edit.text_edit.as_ref().map(|t| t.id).or_else(|| p.edit.selected());
         if let Some((size, font)) = text_style_for_display(&p.edit.annotations, target) {
-            self.set_text_style(id, source, Some(size), Some(font));
+            // The box's `size_px` is SOURCE px; the size chips + the remembered default are
+            // POINTS (DRAGON-383), so report it in points to match the presets.
+            self.set_text_style(id, source, Some(source_px_to_points(size, scale)), Some(font));
         }
     }
 
@@ -4896,20 +5197,24 @@ impl App {
             return Task::none();
         };
         p.edit.flyout = None;
-        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        // The picked `size` is a POINT preset; the box's `size_px` geometry is SOURCE px, so
+        // scale the preset before it seeds the box (DRAGON-383). Identity on Linux/1x.
+        let scale = p.source_scale;
+        let size_px_seed = size.map(|pt| points_to_source_px(pt, scale));
+        let bounds = p.edit.annot_bounds();
         let target = p.edit.text_edit.as_ref().map(|t| t.id).or_else(|| p.edit.selected());
         if let Some(tid) = target {
             let prev = p.edit.annotations.clone();
             let reflowed = p.edit.annotations.iter().find(|it| it.id == tid).and_then(|it| {
                 match &it.kind {
-                    AnnotKind::Text { rect, text, size_px, font: f, constrained, stroke_w } => Some(reflow_text(
+                    AnnotKind::Text { rect, text, size_px, font: f, constrained, stroke_w } => Some(reflow_text_in_bounds(
                         text,
-                        size.unwrap_or(*size_px),
+                        size_px_seed.unwrap_or(*size_px),
                         font.unwrap_or(*f),
                         *rect,
                         *constrained,
                         *stroke_w,
-                        frame,
+                        bounds,
                     )),
                     _ => None,
                 }
@@ -5047,7 +5352,10 @@ impl App {
         let Some(prim_src) = sources.iter().find(|it| it.id == primary).cloned() else {
             return Task::none();
         };
-        let (fw, fh) = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        // DRAGON-389: the duplicate nudge + clamp ride the ANNOTATABLE canvas (source ∪ crop), so
+        // copies land on the extension too. Centers/unions shift into bounds-origin space (the
+        // canvas may have a NEGATIVE origin); the resulting DELTA is translation-invariant.
+        let canvas = p.edit.annot_bounds();
         let prev = p.edit.annotations.clone();
         // Build the copies. SINGLE keeps the historical per-item clamp (byte-equivalent); a GROUP
         // clamps ONE shared delta on the union and translates every copy verbatim (rigid).
@@ -5055,19 +5363,22 @@ impl App {
         let mut new_primary = primary;
         if sources.len() == 1 {
             let src = &sources[0];
-            let (dx, dy) = single_dup_offset(kind_center(&src.kind), (fw, fh));
-            // A zero-press Move applies the offset AND clamps the copy's drawn bounds inside the image.
-            let new_kind = edited_kind(&src.kind, Grab::Move, (0.0, 0.0), (dx, dy), (fw, fh), false);
+            let c = kind_center(&src.kind);
+            let (dx, dy) = single_dup_offset((c.0 - canvas.x, c.1 - canvas.y), (canvas.w, canvas.h));
+            // A zero-press Move applies the offset AND clamps the copy's drawn bounds inside the canvas.
+            let new_kind = edited_kind_in_bounds(&src.kind, Grab::Move, (0.0, 0.0), (dx, dy), canvas, false);
             let new_id = p.edit.next_annot_id();
             p.edit.annotations.push(AnnotationItem { id: new_id, color: src.color, kind: new_kind });
             new_ids.push(new_id);
             new_primary = new_id;
         } else {
             // The shared, clamped delta: computed from the PRIMARY's center like the single case,
-            // then pinned once on the union so the whole arrangement lands inside the image.
+            // then pinned once on the union so the whole arrangement lands inside the canvas.
             let union = group_drawn_bounds(sources.iter().map(|it| &it.kind))
                 .expect("a non-empty selection has drawn bounds");
-            let (dx, dy) = group_dup_offset(kind_center(&prim_src.kind), union, (fw, fh));
+            let c = kind_center(&prim_src.kind);
+            let union0 = AnnotRect { x: union.x - canvas.x, y: union.y - canvas.y, ..union };
+            let (dx, dy) = group_dup_offset((c.0 - canvas.x, c.1 - canvas.y), union0, (canvas.w, canvas.h));
             for src in &sources {
                 let new_kind = translated_kind(&src.kind, dx, dy);
                 let new_id = p.edit.next_annot_id();
@@ -5355,6 +5666,167 @@ fn translated_kind(kind: &AnnotKind, dx: f32, dy: f32) -> AnnotKind {
             pressure: pressure.clone(),
             stroke_w: *stroke_w,
         },
+    }
+}
+
+/// The floor a group scale factor (DRAGON-388) is held above so no member ever inverts or
+/// collapses to a point — the analog of [`text_scale_factor`]'s own `0.05` guard.
+const GROUP_SCALE_FLOOR: f32 = 0.05;
+
+/// The uniform scale factor a GROUP resize-handle drag implies (DRAGON-388): the drag projected
+/// onto the dragged handle's direction, normalized by the selection's union `bounds` — exactly
+/// the projection [`text_scale_factor`] uses for a text box, so a corner combines both axes and
+/// an edge uses its own. ONE scalar keeps the whole selection a SIMILARITY of itself, which is
+/// what preserves every per-kind aspect (badge squareness, text aspect-lock) and every overlap.
+/// Pure — unit-tested.
+fn group_scale_factor(bounds: AnnotRect, grab: Grab, dx: f32, dy: f32) -> f32 {
+    text_scale_factor(bounds.w, bounds.h, grab, dx, dy)
+}
+
+/// The FIXED point a group scale pivots about (DRAGON-388): the union corner OPPOSITE the dragged
+/// handle, so the handle you hold tracks the pointer while the far corner stays put. This mirrors
+/// [`anchor_scaled_text_rect`] reduced to a single point — an edge grab pins the opposite corner
+/// too, which keeps the pivot a point so a uniform scale about it stays rigid. Pure — unit-tested.
+fn group_scale_anchor(bounds: AnnotRect, grab: Grab) -> (f32, f32) {
+    use crate::geometry::{Corner, Edge};
+    let (l, t, r, b) = bounds.corners();
+    match grab {
+        Grab::Corner(Corner::Nw) => (r, b),
+        Grab::Corner(Corner::Ne) => (l, b),
+        Grab::Corner(Corner::Sw) => (r, t),
+        Grab::Corner(Corner::Se) => (l, t),
+        Grab::Edge(Edge::N) => (l, b),
+        Grab::Edge(Edge::S) => (l, t),
+        Grab::Edge(Edge::W) => (r, t),
+        Grab::Edge(Edge::E) => (l, t),
+        // A move never scales; arrow-endpoint grabs never open a group scale.
+        Grab::Move | Grab::ArrowA | Grab::ArrowB => (l, t),
+    }
+}
+
+/// Clamp a group scale factor `k` (DRAGON-388) so the gesture respects the SAME limits a
+/// single-item resize does, applied ONCE to the shared factor (never per item, which would break
+/// rigidity): no text drops below [`super::text_annot::TEXT_SCALE_MIN_PX`] or exceeds
+/// [`super::text_annot::TEXT_SCALE_MAX_PX`], nothing inverts ([`GROUP_SCALE_FLOOR`]), and the
+/// scaled union stays inside the image `frame` when GROWING — an axis whose union already
+/// overflows passes through there, mirroring [`group_move_delta`]. Pure — unit-tested.
+fn clamp_group_scale<'a>(
+    k: f32,
+    bounds: AnnotRect,
+    anchor: (f32, f32),
+    frame: (f32, f32),
+    originals: impl IntoIterator<Item = &'a AnnotKind>,
+) -> f32 {
+    let mut lo = GROUP_SCALE_FLOOR;
+    let mut hi = f32::INFINITY;
+    // A text box may not scale past its own type range; the SHARED factor takes the tightest of
+    // them so every caption stays legible and none re-flows relative to the rest.
+    for kind in originals {
+        if let AnnotKind::Text { size_px, .. } = kind
+            && *size_px > 0.0
+        {
+            lo = lo.max(super::text_annot::TEXT_SCALE_MIN_PX / *size_px);
+            hi = hi.min(super::text_annot::TEXT_SCALE_MAX_PX / *size_px);
+        }
+    }
+    // Keep the union inside the frame as it grows: each corner c maps to anchor + k·(c − anchor),
+    // required within [0, frame] per axis. A corner already OUTSIDE that band on an axis sets no
+    // ceiling there (the arrangement is overflowing; fighting it would jump it — the same
+    // pass-through `group_move_delta` takes).
+    let (fw, fh) = frame;
+    let (l, t, r, b) = bounds.corners();
+    let mut cap = |pos: f32, anc: f32, full: f32| {
+        let off = pos - anc;
+        if off > 0.0 && pos <= full {
+            hi = hi.min((full - anc) / off);
+        } else if off < 0.0 && pos >= 0.0 {
+            hi = hi.min((0.0 - anc) / off); // off < 0, so this quotient is positive
+        }
+    };
+    for (cx, cy) in [(l, t), (r, t), (l, b), (r, b)] {
+        cap(cx, anchor.0, fw);
+        cap(cy, anchor.1, fh);
+    }
+    k.clamp(lo, hi.max(lo))
+}
+
+/// Map one annotation `kind` through a UNIFORM scale by factor `k` about `anchor` (DRAGON-388) —
+/// every point p ↦ anchor + k·(p − anchor). Because the map is a SIMILARITY, each kind keeps its
+/// own resize semantics for free: rects scale position AND size together, a badge stays square, a
+/// pen group maps affinely through its bounding box ([`scale_pen`]), an arrow's endpoints move,
+/// and text scales its `size_px` (through the same [`reflow_text`] seam a single-box scale uses,
+/// so live and bake agree). Strokes stay visually consistent (their width is untouched, exactly
+/// as a single-item resize leaves `stroke_w`). Pure — unit-tested.
+/// [`group_scaled_kind`] run against annotatable `bounds` instead of a `(0,0)`-origin frame
+/// (DRAGON-389 × DRAGON-388): geometry and anchor shift into bounds-origin space, the proven
+/// kernel runs at the bounds SIZE (its only frame use is the text reflow's wrap/clamp), and the
+/// result shifts back. At a `(0,0)`-origin bounds this is byte-identical to the kernel.
+fn group_scaled_kind_in_bounds(
+    kind: &AnnotKind,
+    anchor: (f32, f32),
+    k: f32,
+    bounds: AnnotRect,
+) -> AnnotKind {
+    let shifted = translated_kind(kind, -bounds.x, -bounds.y);
+    let anchor0 = (anchor.0 - bounds.x, anchor.1 - bounds.y);
+    let out = group_scaled_kind(&shifted, anchor0, k, (bounds.w, bounds.h));
+    translated_kind(&out, bounds.x, bounds.y)
+}
+
+fn group_scaled_kind(kind: &AnnotKind, anchor: (f32, f32), k: f32, frame: (f32, f32)) -> AnnotKind {
+    let map = |x: f32, y: f32| (anchor.0 + (x - anchor.0) * k, anchor.1 + (y - anchor.1) * k);
+    let scale_rect = |r: &AnnotRect| {
+        let (nx, ny) = map(r.x, r.y);
+        AnnotRect { x: nx, y: ny, w: r.w * k, h: r.h * k }
+    };
+    match kind {
+        AnnotKind::Box { rect, stroke_w, fill } => {
+            AnnotKind::Box { rect: scale_rect(rect), stroke_w: *stroke_w, fill: *fill }
+        }
+        AnnotKind::Highlight { rect } => AnnotKind::Highlight { rect: scale_rect(rect) },
+        AnnotKind::BoxHighlight { rect, stroke_w } => {
+            AnnotKind::BoxHighlight { rect: scale_rect(rect), stroke_w: *stroke_w }
+        }
+        AnnotKind::Spotlight { rect } => AnnotKind::Spotlight { rect: scale_rect(rect) },
+        // A uniform scale keeps a square square, so the badge's always-1:1 rule holds with no
+        // special-casing; its ring weight is left as-is, like a single-item badge resize.
+        AnnotKind::Badge { rect, ring_w } => {
+            AnnotKind::Badge { rect: scale_rect(rect), ring_w: *ring_w }
+        }
+        AnnotKind::Pixelate { rect } => AnnotKind::Pixelate { rect: scale_rect(rect) },
+        AnnotKind::Blur { rect } => AnnotKind::Blur { rect: scale_rect(rect) },
+        AnnotKind::Arrow { a, b, stroke_w } => {
+            let (ax, ay) = map(a.x, a.y);
+            let (bx, by) = map(b.x, b.y);
+            AnnotKind::Arrow {
+                a: AnnotPoint { x: ax, y: ay },
+                b: AnnotPoint { x: bx, y: by },
+                stroke_w: *stroke_w,
+            }
+        }
+        // A pen group maps affinely through its bounding box, exactly like its own resize —
+        // and since `to` is `from` scaled uniformly about the anchor, every point lands on
+        // anchor + k·(p − anchor) too, so the whole selection stays one similarity.
+        AnnotKind::Pen { paths, pressure, stroke_w } => {
+            let from = pen_bounds(paths);
+            let to = scale_rect(&from);
+            AnnotKind::Pen {
+                paths: scale_pen(paths, from, to),
+                pressure: pressure.clone(),
+                stroke_w: *stroke_w,
+            }
+        }
+        // Text scales its TYPE (DRAGON-364's factor path), not its wrap frame: the size grows by
+        // `k` (clamped once by `clamp_group_scale`, so `applied == k` here for a rigid group),
+        // the box origin maps by the same `k`, and `reflow_text` re-derives the geometry through
+        // the shared layout seam. A uniform factor keeps every line break, so nothing re-flows.
+        AnnotKind::Text { rect, text, size_px, font, constrained, stroke_w } => {
+            let size = clamp_scaled_text_size(size_px * k);
+            let applied = if *size_px > 0.0 { size / *size_px } else { 1.0 };
+            let (nx, ny) = map(rect.x, rect.y);
+            let src = AnnotRect { x: nx, y: ny, w: rect.w * applied, h: rect.h * applied };
+            reflow_text(text, size, *font, src, *constrained, *stroke_w, frame)
+        }
     }
 }
 
@@ -5899,6 +6371,40 @@ mod tests {
     }
 
     #[test]
+    fn points_to_source_px_is_identity_on_linux_1x() {
+        // DRAGON-383: on Linux (and any 1x panel) scale is always 1.0, so EVERY seeding path
+        // that routes through this must stay byte-identical — the no-op safety property.
+        for pt in [1.0, 4.0, 8.0, 32.0, 75.0, DEFAULT_ANNOT_STROKE, DEFAULT_BADGE_SIZE] {
+            assert_eq!(points_to_source_px(pt, 1.0), pt);
+            assert_eq!(source_px_to_points(pt, 1.0), pt);
+        }
+        // A non-positive scale degrades to 1.0 (defensive) rather than zeroing the dimension.
+        assert_eq!(points_to_source_px(4.0, 0.0), 4.0);
+        assert_eq!(points_to_source_px(4.0, -2.0), 4.0);
+        assert_eq!(source_px_to_points(4.0, 0.0), 4.0);
+    }
+
+    #[test]
+    fn points_to_source_px_scales_on_retina_and_round_trips() {
+        // A "4pt" preset spans 8 SOURCE px on a 2x capture (so it reads the same visual size as
+        // 4px does on a 1x capture), and 3x triples it.
+        assert_eq!(points_to_source_px(4.0, 2.0), 8.0);
+        assert_eq!(points_to_source_px(12.0, 2.0), 24.0);
+        assert_eq!(points_to_source_px(32.0, 3.0), 96.0);
+        // The badge/text round trip: a resized source-px side comes back to the SAME points, so
+        // the remembered/persisted default re-seeds correctly on a different-scale document.
+        for (px, scale) in [(150.0, 2.0), (96.0, 3.0), (75.0, 1.0), (37.0, 2.0)] {
+            let pt = source_px_to_points(px, scale);
+            assert!((points_to_source_px(pt, scale) - px).abs() < 1e-4, "round trip {px}@{scale}");
+        }
+        // The ladder still matches in POINTS regardless of the document scale: a 2x document's
+        // working stroke is stored in points, so the flyout highlight is chosen off the raw
+        // preset value (8pt → index 4), never the scaled 16px.
+        assert_eq!(stroke_width_nearest_index(source_px_to_points(16.0, 2.0)), 4);
+        assert_eq!(stroke_width_nearest_index(8.0), 4);
+    }
+
+    #[test]
     fn new_shape_seeds_the_selected_stroke_width() {
         // A drawn box/arrow must take its stroke_w from the SELECTED width (EditState::stroke),
         // not the hard-coded default — the width control is the single source of truth.
@@ -5959,6 +6465,56 @@ mod tests {
         assert_eq!(complement([255, 0, 0, 200])[3], 200);
         // Double complement returns (near) the original hue.
         assert_eq!(complement(complement([255, 0, 0, 255])), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn companion_color_is_the_complement_and_total() {
+        // The companion IS the complement — the same relationship the whole palette speaks.
+        for c in [
+            [255, 0, 0, 255],
+            [17, 200, 43, 255],
+            [0, 0, 255, 200],
+            [128, 128, 128, 255], // gray → itself
+            [0, 0, 0, 255],
+        ] {
+            assert_eq!(companion_color(c), complement(c), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn companion_swap_double_press_returns_to_start_exactly() {
+        // Totality + exact double-swap-return across a spread of colors, incl. grays and alpha.
+        for start in [
+            [255, 0, 0, 255],
+            [17, 200, 43, 255],
+            [200, 90, 10, 128],
+            [3, 5, 250, 255],
+            [128, 128, 128, 255], // gray: its own companion, still a clean toggle
+            [255, 255, 255, 255],
+            [0, 0, 0, 200],
+        ] {
+            // First X: swap to the companion, remembering where we came from.
+            let (a, back) = companion_swap(start, None);
+            assert_eq!(a, companion_color(start), "{start:?} first swap");
+            // Second X: return to the EXACT starting color (memory beats rounding).
+            let (b, back2) = companion_swap(a, Some(back));
+            assert_eq!(b, start, "{start:?} double swap returns to start");
+            // Third X: swaps forward again to the companion (the toggle keeps cycling).
+            let (c, _) = companion_swap(b, Some(back2));
+            assert_eq!(c, companion_color(start), "{start:?} third swap goes forward");
+        }
+    }
+
+    #[test]
+    fn companion_swap_forgets_stale_partner_after_a_manual_pick() {
+        // Swap once, then a NON-swap color pick lands (the caller clears `color_swap_back`):
+        // the next X must operate on the NEW color, not chase the stale remembered partner.
+        let start = [255, 0, 0, 255];
+        let (_swapped, _back) = companion_swap(start, None);
+        let picked = [10, 220, 60, 255]; // an unrelated color the user chose from the flyout
+        let (t, back) = companion_swap(picked, None);
+        assert_eq!(t, companion_color(picked));
+        assert_eq!(back, picked);
     }
 
     #[test]
@@ -7375,6 +7931,183 @@ mod tests {
         let fb = pen_bounds(&flat);
         let out = scale_pen(&flat, fb, AnnotRect { x: 0.0, y: 20.0, w: 10.0, h: 0.0 });
         assert!(out[0].iter().all(|p| (p.y - 20.0).abs() < 1e-4 && p.y.is_finite()));
+    }
+
+    // ── DRAGON-388: multi-select group scale ─────────────────────────────────────────
+    fn rect_of(kind: &AnnotKind) -> AnnotRect {
+        match kind {
+            AnnotKind::Box { rect, .. }
+            | AnnotKind::Highlight { rect }
+            | AnnotKind::BoxHighlight { rect, .. }
+            | AnnotKind::Spotlight { rect }
+            | AnnotKind::Badge { rect, .. }
+            | AnnotKind::Pixelate { rect }
+            | AnnotKind::Blur { rect }
+            | AnnotKind::Text { rect, .. } => *rect,
+            AnnotKind::Pen { paths, .. } => pen_bounds(paths),
+            AnnotKind::Arrow { a, b, .. } => AnnotRect::from_points((a.x, a.y), (b.x, b.y)),
+        }
+    }
+
+    #[test]
+    fn group_scale_anchor_pins_the_corner_opposite_the_handle() {
+        use crate::geometry::{Corner, Edge};
+        // A 100×50 union at (20,30): (l,t,r,b) = (20,30,120,80).
+        let b = AnnotRect { x: 20.0, y: 30.0, w: 100.0, h: 50.0 };
+        assert_eq!(group_scale_anchor(b, Grab::Corner(Corner::Se)), (20.0, 30.0), "SE drag pins NW");
+        assert_eq!(group_scale_anchor(b, Grab::Corner(Corner::Nw)), (120.0, 80.0), "NW drag pins SE");
+        assert_eq!(group_scale_anchor(b, Grab::Corner(Corner::Ne)), (20.0, 80.0), "NE drag pins SW");
+        assert_eq!(group_scale_anchor(b, Grab::Corner(Corner::Sw)), (120.0, 30.0), "SW drag pins NE");
+        // Edge grabs pin the OPPOSITE corner, keeping the pivot a point.
+        assert_eq!(group_scale_anchor(b, Grab::Edge(Edge::S)), (20.0, 30.0));
+        assert_eq!(group_scale_anchor(b, Grab::Edge(Edge::N)), (20.0, 80.0));
+        assert_eq!(group_scale_anchor(b, Grab::Edge(Edge::E)), (20.0, 30.0));
+        assert_eq!(group_scale_anchor(b, Grab::Edge(Edge::W)), (120.0, 30.0));
+    }
+
+    #[test]
+    fn group_scale_factor_is_identity_for_a_zero_drag() {
+        use crate::geometry::Corner;
+        let b = AnnotRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        assert!((group_scale_factor(b, Grab::Corner(Corner::Se), 0.0, 0.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn group_scaled_kind_preserves_relative_layout_and_overlap() {
+        // Two OVERLAPPING boxes, scaled 2× about the shared NW anchor (0,0). Every position and
+        // size scales together, so relative offsets double and the overlap survives exactly.
+        let a = AnnotKind::Box {
+            rect: AnnotRect { x: 10.0, y: 10.0, w: 30.0, h: 30.0 },
+            stroke_w: 4.0,
+            fill: None,
+        };
+        let b = AnnotKind::Box {
+            rect: AnnotRect { x: 20.0, y: 20.0, w: 30.0, h: 30.0 },
+            stroke_w: 4.0,
+            fill: None,
+        };
+        assert!(rects_overlap(rect_of(&a), rect_of(&b)), "precondition: they overlap");
+        let (anchor, k, frame) = ((0.0, 0.0), 2.0, (1000.0, 1000.0));
+        let a2 = group_scaled_kind(&a, anchor, k, frame);
+        let b2 = group_scaled_kind(&b, anchor, k, frame);
+        assert_eq!(rect_of(&a2), AnnotRect { x: 20.0, y: 20.0, w: 60.0, h: 60.0 });
+        assert_eq!(rect_of(&b2), AnnotRect { x: 40.0, y: 40.0, w: 60.0, h: 60.0 });
+        // Relative offset between the two boxes scaled by exactly k.
+        assert_eq!(rect_of(&b2).x - rect_of(&a2).x, (20.0 - 10.0) * k);
+        assert!(rects_overlap(rect_of(&a2), rect_of(&b2)), "overlap is preserved");
+        // The stroke is left visually consistent (unchanged), like a single-item resize.
+        let AnnotKind::Box { stroke_w, .. } = a2 else { panic!("stays a box") };
+        assert_eq!(stroke_w, 4.0);
+    }
+
+    #[test]
+    fn group_scale_is_an_involution_within_tolerance() {
+        let frame = (1000.0, 1000.0);
+        let anchor = (5.0, 7.0);
+        let kinds = [
+            AnnotKind::Box {
+                rect: AnnotRect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 },
+                stroke_w: 4.0,
+                fill: Some([1, 2, 3, 4]),
+            },
+            AnnotKind::Arrow {
+                a: AnnotPoint { x: 12.0, y: 18.0 },
+                b: AnnotPoint { x: 44.0, y: 60.0 },
+                stroke_w: 6.0,
+            },
+            AnnotKind::Badge { rect: AnnotRect { x: 30.0, y: 30.0, w: 24.0, h: 24.0 }, ring_w: 3.0 },
+            pen(1, [255, 0, 0, 255], 4.0, &[&[(10.0, 10.0), (25.0, 40.0), (30.0, 12.0)]]).kind,
+        ];
+        for kind in kinds {
+            let up = group_scaled_kind(&kind, anchor, 1.7, frame);
+            let back = group_scaled_kind(&up, anchor, 1.0 / 1.7, frame);
+            let (r0, r1) = (rect_of(&kind), rect_of(&back));
+            assert!(
+                (r0.x - r1.x).abs() < 1e-3
+                    && (r0.y - r1.y).abs() < 1e-3
+                    && (r0.w - r1.w).abs() < 1e-3
+                    && (r0.h - r1.h).abs() < 1e-3,
+                "scale by k then 1/k returns the original: {r0:?} vs {r1:?}"
+            );
+        }
+        // A no-drag group scale (k = 1) is the identity map.
+        let one = AnnotKind::Box {
+            rect: AnnotRect { x: 1.0, y: 1.0, w: 2.0, h: 3.0 },
+            stroke_w: 1.0,
+            fill: None,
+        };
+        assert_eq!(group_scaled_kind(&one, anchor, 1.0, frame), one, "k=1 is a no-op");
+    }
+
+    #[test]
+    fn group_scaled_kind_keeps_a_badge_square_under_a_non_unit_factor() {
+        let badge = AnnotKind::Badge {
+            rect: AnnotRect { x: 40.0, y: 40.0, w: 20.0, h: 20.0 },
+            ring_w: 2.0,
+        };
+        let out = group_scaled_kind(&badge, (0.0, 0.0), 1.5, (1000.0, 1000.0));
+        let r = rect_of(&out);
+        assert!((r.w - r.h).abs() < 1e-4, "badge stays 1:1: {r:?}");
+        assert_eq!((r.w, r.h), (30.0, 30.0));
+        let AnnotKind::Badge { ring_w, .. } = out else { panic!("stays a badge") };
+        assert_eq!(ring_w, 2.0, "ring weight left alone, like a single badge resize");
+    }
+
+    #[test]
+    fn group_scaled_kind_scales_text_type_by_the_factor() {
+        let text = AnnotKind::Text {
+            rect: AnnotRect { x: 100.0, y: 100.0, w: 200.0, h: 60.0 },
+            text: "hi".into(),
+            size_px: 40.0,
+            font: super::super::text_annot::TextFont::Clean,
+            constrained: true,
+            stroke_w: 4.0,
+        };
+        let out = group_scaled_kind(&text, (0.0, 0.0), 2.0, (10_000.0, 10_000.0));
+        let AnnotKind::Text { size_px, .. } = out else { panic!("stays text") };
+        assert_eq!(size_px, 80.0, "type scales by the group factor");
+    }
+
+    #[test]
+    fn clamp_group_scale_floors_so_no_member_collapses_or_inverts() {
+        let bounds = AnnotRect { x: 100.0, y: 100.0, w: 50.0, h: 50.0 };
+        let anchor = (100.0, 100.0);
+        let frame = (10_000.0, 10_000.0);
+        // No text in the set: only the hard inversion floor bites for a huge shrink.
+        let empty: [AnnotKind; 0] = [];
+        let k = clamp_group_scale(-3.0, bounds, anchor, frame, empty.iter());
+        assert_eq!(k, GROUP_SCALE_FLOOR, "a collapsing/negative factor floors at the guard");
+        // A tiny text box pins the FLOOR higher so it never drops below its own min size.
+        let tiny = [AnnotKind::Text {
+            rect: AnnotRect { x: 100.0, y: 100.0, w: 20.0, h: 20.0 },
+            text: "x".into(),
+            size_px: 4.0,
+            font: super::super::text_annot::TextFont::Clean,
+            constrained: false,
+            stroke_w: 2.0,
+        }];
+        let lo = super::super::text_annot::TEXT_SCALE_MIN_PX / 4.0;
+        assert!(
+            (clamp_group_scale(0.01, bounds, anchor, frame, tiny.iter()) - lo).abs() < 1e-6,
+            "text min-size sets the floor for the shared factor"
+        );
+    }
+
+    #[test]
+    fn clamp_group_scale_keeps_the_growing_union_inside_the_frame() {
+        // Union (0,0)-(100,100), NW pinned so growth pushes SE toward the frame's far edge at 200.
+        let bounds = AnnotRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let anchor = (0.0, 0.0); // NW anchor (SE handle dragged)
+        let frame = (200.0, 200.0);
+        let empty: [AnnotKind; 0] = [];
+        // A 2× ask lands exactly at the edge (SE 100→200); anything larger is capped to 2×.
+        assert!((clamp_group_scale(2.0, bounds, anchor, frame, empty.iter()) - 2.0).abs() < 1e-4);
+        assert!((clamp_group_scale(9.0, bounds, anchor, frame, empty.iter()) - 2.0).abs() < 1e-4);
+        // A union already OVERFLOWING the frame on BOTH axes passes growth through (no valid
+        // ceiling on either), like the group MOVE — fighting it would jump the arrangement. (A
+        // uniform factor is shared, so an axis that still FITS would legitimately cap growth.)
+        let over = AnnotRect { x: -50.0, y: -50.0, w: 400.0, h: 400.0 };
+        assert!(clamp_group_scale(3.0, over, (-50.0, -50.0), frame, empty.iter()) >= 2.9);
     }
 
     #[test]
@@ -9988,5 +10721,135 @@ mod tests {
         assert_eq!(text_style_for_display(&items, None), None);
         assert_eq!(text_style_for_display(&items, Some(AnnotId(9))), None, "a box has no font");
         assert_eq!(text_style_for_display(&items, Some(AnnotId(404))), None, "a deleted id");
+    }
+
+    // ── DRAGON-389: annotatable bounds (source ∪ crop) + the over-crop bake ───────────────────
+
+    fn box_kind(x: f32, y: f32, w: f32, h: f32) -> AnnotKind {
+        AnnotKind::Box { rect: AnnotRect { x, y, w, h }, stroke_w: 4.0, fill: None }
+    }
+
+    #[test]
+    fn dragon389_union_rect_covers_both_and_handles_negative_origin() {
+        // A crop that extends LEFT/UP past the source: the union has a NEGATIVE origin and spans
+        // both rects.
+        let src = AnnotRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let crop = AnnotRect { x: -50.0, y: -30.0, w: 100.0, h: 100.0 };
+        let u = union_rect(src, crop);
+        assert_eq!((u.x, u.y), (-50.0, -30.0));
+        assert_eq!((u.x + u.w, u.y + u.h), (100.0, 100.0));
+        // A crop wholly INSIDE the source leaves the union as the whole source — out-of-crop
+        // annotations stay annotatable (DRAGON-385).
+        let inside = AnnotRect { x: 10.0, y: 10.0, w: 20.0, h: 20.0 };
+        assert_eq!(union_rect(src, inside), src);
+    }
+
+    #[test]
+    fn dragon389_annot_bounds_is_source_union_committed_crop() {
+        use super::super::crop::CropRect;
+        let mut e = super::super::edit::EditState { frame: (200, 100), ..Default::default() };
+        // No crop → the source frame.
+        assert_eq!(e.annot_bounds(), AnnotRect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 });
+        // An over-crop extending past every side → the union.
+        e.crop = Some(CropRect { x: -20.0, y: -10.0, w: 260.0, h: 140.0 });
+        let b = e.annot_bounds();
+        assert_eq!((b.x, b.y), (-20.0, -10.0));
+        assert_eq!((b.x + b.w, b.y + b.h), (240.0, 130.0));
+    }
+
+    #[test]
+    fn dragon389_move_reaches_the_over_crop_extension() {
+        // Source 100×100, crop extends 50px LEFT and UP → bounds (-50,-50,150,150).
+        let bounds = AnnotRect { x: -50.0, y: -50.0, w: 150.0, h: 150.0 };
+        let start = box_kind(0.0, 0.0, 20.0, 20.0);
+        // Drag it up-left by 40 — onto the extension.
+        let moved = edited_kind_in_bounds(&start, Grab::Move, (0.0, 0.0), (-40.0, -40.0), bounds, false);
+        let AnnotKind::Box { rect, .. } = moved else { panic!("box stays a box") };
+        assert!(rect.x < 0.0 && rect.y < 0.0, "moved onto the extension, not pinned at the source edge: {rect:?}");
+        assert!((rect.x + 40.0).abs() < 0.01 && (rect.y + 40.0).abs() < 0.01, "moved by the full delta: {rect:?}");
+        // The SAME drag against the bare source frame pins at the inset edge — the bug this fixes.
+        let pinned = edited_kind(&start, Grab::Move, (0.0, 0.0), (-40.0, -40.0), (100.0, 100.0), false);
+        let AnnotKind::Box { rect: pr, .. } = pinned else { panic!() };
+        assert!(pr.x >= 0.0, "source-frame clamp pins at the edge: {pr:?}");
+    }
+
+    #[test]
+    fn dragon389_move_reaches_extension_on_each_side() {
+        // Source 100×100, crop extends 30px on EVERY side → bounds (-30,-30,160,160).
+        let bounds = AnnotRect { x: -30.0, y: -30.0, w: 160.0, h: 160.0 };
+        let m = kind_draw_margin(&box_kind(0.0, 0.0, 10.0, 10.0)); // half-stroke overhang
+        let far = 100_000.0;
+        for (dx, dy) in [(-far, 0.0), (far, 0.0), (0.0, -far), (0.0, far)] {
+            let moved = edited_kind_in_bounds(&box_kind(40.0, 40.0, 10.0, 10.0), Grab::Move, (0.0, 0.0), (dx, dy), bounds, false);
+            let AnnotKind::Box { rect, .. } = moved else { panic!() };
+            assert!(rect.x >= bounds.x + m - 0.01 && rect.x + rect.w <= bounds.x + bounds.w - m + 0.01, "x within extended bounds: {rect:?}");
+            assert!(rect.y >= bounds.y + m - 0.01 && rect.y + rect.h <= bounds.y + bounds.h - m + 0.01, "y within extended bounds: {rect:?}");
+        }
+        // Pushing left reaches PAST the source's left edge (onto the extension).
+        let left = edited_kind_in_bounds(&box_kind(40.0, 40.0, 10.0, 10.0), Grab::Move, (0.0, 0.0), (-far, 0.0), bounds, false);
+        let AnnotKind::Box { rect, .. } = left else { panic!() };
+        assert!(rect.x < 0.0, "reached the left extension: {rect:?}");
+    }
+
+    #[test]
+    fn dragon389_wrappers_are_identity_at_zero_origin() {
+        // A bounds at origin (0,0) is byte-identical to the bare-frame kernels (uncropped parity).
+        let b = AnnotRect { x: 0.0, y: 0.0, w: 300.0, h: 200.0 };
+        let start = box_kind(10.0, 10.0, 40.0, 30.0);
+        assert_eq!(
+            edited_kind_in_bounds(&start, Grab::Corner(Corner::Se), (50.0, 40.0), (90.0, 70.0), b, false),
+            edited_kind(&start, Grab::Corner(Corner::Se), (50.0, 40.0), (90.0, 70.0), (300.0, 200.0), false),
+        );
+        assert_eq!(
+            badge_placement_in_bounds((150.0, 100.0), DEFAULT_BADGE_SIZE, b, 2.0),
+            badge_placement_rect((150.0, 100.0), DEFAULT_BADGE_SIZE, (300, 200), 2.0),
+        );
+        assert_eq!(
+            spawn_placement_in_bounds(Tool::Rect, b, 2.0, DEFAULT_BADGE_SIZE),
+            spawn_placement_rect(Tool::Rect, (300, 200), 2.0, DEFAULT_BADGE_SIZE),
+        );
+    }
+
+    #[test]
+    fn dragon389_badge_stays_square_at_the_extended_corner() {
+        // Bounds extend up-left; place a badge into the extended corner.
+        let bounds = AnnotRect { x: -80.0, y: -80.0, w: 260.0, h: 260.0 };
+        let r = badge_placement_in_bounds((-70.0, -70.0), DEFAULT_BADGE_SIZE, bounds, 2.0);
+        assert!((r.w - r.h).abs() < 0.01, "badge is 1:1 even at the extended corner: {r:?}");
+        assert!(r.x < 0.0 && r.y < 0.0, "placed over the extension: {r:?}");
+        assert!(r.x >= bounds.x + 2.0 - 0.01 && r.y >= bounds.y + 2.0 - 0.01, "clamped inside the inset bounds: {r:?}");
+    }
+
+    #[test]
+    fn dragon389_text_keeps_five_px_against_the_extended_edge() {
+        use super::super::text_annot::TextFont;
+        // Bounds extend 200px left of the source; move a caption far past the left edge.
+        let bounds = AnnotRect { x: -200.0, y: 0.0, w: 300.0, h: 200.0 };
+        let seed = reflow_text_in_bounds("Caption", 24.0, TextFont::Clean, AnnotRect { x: 0.0, y: 20.0, w: 0.0, h: 0.0 }, false, 4.0, bounds);
+        let AnnotKind::Text { rect: r0, .. } = &seed else { panic!("text kind") };
+        let keep = TEXT_MIN_ON_CANVAS_PX.min(r0.w);
+        // A pure MOVE far to the left: TEXT_MIN_ON_CANVAS_PX of the box must remain inside bounds.
+        let moved = edited_kind_in_bounds(&seed, Grab::Move, (0.0, 0.0), (-100_000.0, 0.0), bounds, false);
+        let AnnotKind::Text { rect, .. } = moved else { panic!() };
+        assert!(rect.x + rect.w >= bounds.x + keep - 0.01, "at least 5px stays against the extended left edge: {rect:?} keep={keep}");
+        assert!(rect.x < 0.0, "the box reached past the source's left edge onto the extension: {rect:?}");
+    }
+
+    #[test]
+    fn dragon389_apply_annotations_at_identity_and_shift() {
+        let items = vec![boxed(1, 10.0, 10.0, 20.0, 20.0)];
+        // offset (0,0) == apply_annotations exactly.
+        let mut a = RgbaImage::from_pixel(60, 60, ::image::Rgba([0, 0, 0, 255]));
+        let mut b = a.clone();
+        apply_annotations(&mut a, &items, DEFAULT_ANNOT_CURVE_RADIUS);
+        apply_annotations_at(&mut b, &items, DEFAULT_ANNOT_CURVE_RADIUS, (0.0, 0.0));
+        assert_eq!(a.as_raw(), b.as_raw(), "offset (0,0) is identical to apply_annotations");
+        // A +10,+10 offset draws the overlay shifted by (-10,-10): the box at source (10,10) lands
+        // at (0,0) on a canvas whose origin is (10,10).
+        let mut c = RgbaImage::from_pixel(60, 60, ::image::Rgba([0, 0, 0, 255]));
+        apply_annotations_at(&mut c, &items, DEFAULT_ANNOT_CURVE_RADIUS, (10.0, 10.0));
+        let mut d = RgbaImage::from_pixel(60, 60, ::image::Rgba([0, 0, 0, 255]));
+        apply_annotations(&mut d, &[boxed(1, 0.0, 0.0, 20.0, 20.0)], DEFAULT_ANNOT_CURVE_RADIUS);
+        assert_eq!(c.as_raw(), d.as_raw(), "offset shifts the overlay by -offset");
     }
 }

@@ -21,6 +21,7 @@ use std::path::PathBuf;
 mod annotate;
 mod chrome;
 mod covermark;
+mod crop;
 mod edit;
 mod image;
 mod layers;
@@ -391,7 +392,9 @@ impl PreviewState {
                 .and_then(known)
                 .or_else(|| known(self.edit.frame))
                 .unwrap_or((0, 0)),
-            PreviewKind::Image(_) => known(self.edit.frame)
+            // The DISPLAY frame (DRAGON-385): the crop's size once applied, else the decoded
+            // frame — so the windowed open fit and the overlay hug both size to the crop.
+            PreviewKind::Image(_) => known(self.display_frame())
                 .or_else(|| self.display_dims.and_then(known))
                 .unwrap_or((0, 0)),
         }
@@ -414,6 +417,48 @@ impl PreviewState {
     /// returns the physical dims unchanged, so the fit is byte-identical there.
     pub(super) fn frame_points(&self) -> (u32, u32) {
         sizing::to_points(self.edit.frame, self.source_scale)
+    }
+
+    /// The DISPLAY frame (DRAGON-385): the pixel dims the editor FRAMES to — the committed
+    /// crop's size once a crop is applied, else the whole decoded frame. THE seam every sizing /
+    /// fit / pan / canvas-mapping path reads, so "a crop to the bottom right shows only the
+    /// bottom right" is honoured everywhere by one accessor rather than scattered `if let
+    /// Some(crop)` branches.
+    ///
+    /// A crop is IGNORED while its session is live: the tool shows the whole image so the rect
+    /// stays repositionable (the crop overlay owns the surface). So this is the full frame
+    /// whenever `crop_session` is open, exactly reproducing the un-cropped framing for the
+    /// duration of the edit. An un-cropped document returns [`EditState::frame`] unchanged —
+    /// byte-identical to before.
+    pub(super) fn display_frame(&self) -> (u32, u32) {
+        match self.view_crop() {
+            Some(c) => c.pixel_size(),
+            None => self.edit.frame,
+        }
+    }
+
+    /// The committed crop applied to the DISPLAY right now, or `None` (DRAGON-385): the crop when
+    /// one is set AND no crop session is live (a session reveals the full image). The one place
+    /// the "session hides the applied crop" rule lives.
+    pub(super) fn view_crop(&self) -> Option<crop::CropRect> {
+        self.edit.crop.filter(|_| self.edit.crop_session.is_none())
+    }
+
+    /// The DISPLAY frame's top-left offset within the full source (SOURCE px) — the crop origin
+    /// when a crop frames the view, else `(0, 0)`. Threaded into the annotation canvas coordinate
+    /// map so full-source annotation coords place correctly against the cropped view.
+    pub(super) fn display_offset(&self) -> (f32, f32) {
+        match self.view_crop() {
+            Some(c) => (c.x, c.y),
+            None => (0.0, 0.0),
+        }
+    }
+
+    /// [`Self::display_frame`] in LOGICAL points (the physical dims divided by the source backing
+    /// scale) — the sizing input for the windowed open fit and the overlay hug, matching
+    /// [`Self::frame_points`] for an un-cropped document.
+    pub(super) fn display_frame_points(&self) -> (u32, u32) {
+        sizing::to_points(self.display_frame(), self.source_scale)
     }
 }
 
@@ -1095,6 +1140,12 @@ impl App {
                     }
                     // A dim change re-renders via the GPU dim pass for free (DRAGON-329).
                     Some(EditKind::Dim) => Task::none(),
+                    // A crop change (DRAGON-385) reframes the view to the restored crop's framing
+                    // so undo/redo shows the cropped (or whole) picture, not a stale pan/zoom.
+                    Some(EditKind::Crop) => {
+                        self.crop_reframe(id);
+                        Task::none()
+                    }
                     _ => Task::none(),
                 }
             }
@@ -1120,6 +1171,11 @@ impl App {
                     }
                     // A dim change re-renders via the GPU dim pass for free (DRAGON-329).
                     Some(EditKind::Dim) => Task::none(),
+                    // A crop change (DRAGON-385) reframes the view to the restored crop's framing.
+                    Some(EditKind::Crop) => {
+                        self.crop_reframe(id);
+                        Task::none()
+                    }
                     _ => Task::none(),
                 }
             }
@@ -1161,6 +1217,10 @@ impl App {
             PreviewMsg::SetAnnotColor(color) => {
                 if let Some(p) = self.preview_for_mut(id) {
                     p.edit.annot_color = Some(color);
+                    // A direct color pick breaks any pending companion-swap pair (DRAGON-386):
+                    // the next X operates on THIS color, not a stale remembered partner. The X
+                    // path re-arms `color_swap_back` right AFTER this handler runs.
+                    p.edit.color_swap_back = None;
                     p.edit.close_flyout();
                 }
                 // Picking a color also recolors the SELECTED colorable item immediately (one
@@ -1263,6 +1323,28 @@ impl App {
                 }
                 Task::none()
             }
+            PreviewMsg::AnnotColorCompanionSwap => {
+                // Photoshop's X: swap the ACTIVE annotation color to its companion (its
+                // complement), and swap back on the next press (DRAGON-386). Reuse the flyout's
+                // SetAnnotColor path VERBATIM so this recolors any selection + persists exactly
+                // like picking the companion swatch would; SetAnnotColor clears `color_swap_back`,
+                // so we re-arm the exact swap-back partner AFTER it runs (double-X returns to the
+                // starting color even where the complement round-trip rounds). This action never
+                // fires during a live text edit or crop session — both own the keyboard ahead of
+                // the keymap (see `preview_modal_key`).
+                let Some((target, remember)) = self.preview_for(id).map(|p| {
+                    let current =
+                        p.edit.annot_color.unwrap_or_else(annotate::default_annot_color);
+                    annotate::companion_swap(current, p.edit.color_swap_back)
+                }) else {
+                    return Task::none();
+                };
+                let task = self.update_preview(id, PreviewMsg::SetAnnotColor(target));
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.color_swap_back = Some(remember);
+                }
+                task
+            }
             PreviewMsg::AnnotColorEditor(open) => {
                 if let Some(p) = self.preview_for_mut(id) {
                     if open {
@@ -1325,6 +1407,9 @@ impl App {
                     p.edit.annot_picker = None;
                     if let Some(c) = picked {
                         p.edit.annot_color = Some(c);
+                        // A custom wheel pick also breaks a pending companion-swap pair
+                        // (DRAGON-386), like a flyout swatch pick.
+                        p.edit.color_swap_back = None;
                     }
                 }
                 if let Some(c) = picked {
@@ -1429,6 +1514,30 @@ impl App {
                 if let Some(p) = self.preview_for_mut(id) {
                     p.edit.annot_menu = None;
                 }
+                Task::none()
+            }
+            // ── Crop tool (DRAGON-382; IMAGES only) ──────────────────────────────────
+            PreviewMsg::CropEnter => {
+                // The single toolbar icon both OPENS and CONFIRMS: a press while a session is
+                // already live accepts it, so the icon toggles the tool on/off.
+                if self.preview_for(id).is_some_and(|p| p.edit.crop_session.is_some()) {
+                    self.crop_accept(id)
+                } else {
+                    self.crop_enter(id)
+                }
+            }
+            PreviewMsg::CropAccept => self.crop_accept(id),
+            PreviewMsg::CropCancel => self.crop_cancel(id),
+            PreviewMsg::CropDragBegin(handle, x, y) => {
+                self.crop_drag_begin(id, handle, x, y);
+                Task::none()
+            }
+            PreviewMsg::CropDragTo(x, y, suppress) => {
+                self.crop_drag_to(id, x, y, suppress);
+                Task::none()
+            }
+            PreviewMsg::CropDragEnd => {
+                self.crop_drag_end(id);
                 Task::none()
             }
             PreviewMsg::BakeDone(baked) => {
@@ -1754,7 +1863,7 @@ impl App {
                 // fresh capture was MOVED. DRAGON-353 made copy-not-move universal, so the
                 // distinction is gone — see the export note below.)
                 let processing_msg = random_processing_msg();
-                let (src, covermark, annotations, annot_curve, dim, video, is_video, dirty) = match self.preview_for(id) {
+                let (src, covermark, annotations, annot_curve, dim, crop, video, is_video, dirty) = match self.preview_for(id) {
                     Some(p) => {
                         let Some(src) = p.path.clone() else {
                             return self.close_preview(id);
@@ -1775,8 +1884,10 @@ impl App {
                                     .map(|t| t.spans.clone()),
                             }),
                         };
-                        // Annotations + dim are IMAGES only; a video never accumulates them.
-                        (src, p.edit.covermark.clone(), p.edit.annotations.clone(), p.edit.curve_radius(), p.edit.dim, video, is_video, p.dirty())
+                        // Annotations + dim + crop are IMAGES only; a video never accumulates them.
+                        // The curve radius is a POINT preset baked at SOURCE px (DRAGON-383);
+                        // identity on Linux/1x.
+                        (src, p.edit.covermark.clone(), p.edit.annotations.clone(), annotate::points_to_source_px(p.edit.curve_radius(), p.source_scale), p.edit.dim, p.edit.crop, video, is_video, p.dirty())
                     }
                     None => return self.close_preview(id),
                 };
@@ -1818,6 +1929,7 @@ impl App {
                                 &annotations,
                                 annot_curve,
                                 dim,
+                                crop,
                             ),
                         };
                         // Log the real io::Error here — it's about to be discarded to a bool.

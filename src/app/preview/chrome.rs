@@ -789,6 +789,54 @@ impl Tb {
         self.tip(btn, widget::text(tip).size(12), tip_pos)
     }
 
+    /// The crop tool's bottom-bar group (DRAGON-382). Idle: a single crop icon with NO group
+    /// chrome (like the select tool's `Bare` cluster), tinted accent when a crop is APPLIED so
+    /// the applied state reads at a glance. Active (a live crop session): the icon is REPLACED by
+    /// a checkmark (accent-filled, on-accent glyph) that accepts and an x (subdued) that cancels,
+    /// in one bordered capsule — so the same slot both opens and confirms the crop. Lives on the
+    /// BOTTOM bar, so tooltips rise.
+    pub(super) fn crop_group(
+        self,
+        active: bool,
+        applied: bool,
+        km: &crate::shortcuts::Keymap,
+    ) -> Element<'static, Msg> {
+        let pos = widget::tooltip::Position::Top;
+        if active {
+            // Checkmark: the shared accent-filled segment look (on-accent glyph). X: a subdued
+            // plain icon button. Enter/Escape drive the same messages (see `preview_modal_key`).
+            let accept = self.seg_toggle(
+                "emblem-ok-symbolic",
+                true,
+                PreviewMsg::CropAccept,
+                "Apply crop".to_string(),
+                true,
+                true,
+                pos,
+            );
+            let cancel = self.tool_button_tinted(
+                "window-close-symbolic",
+                "Cancel crop".to_string(),
+                PreviewMsg::CropCancel,
+                pos,
+                Some(crate::app::theme::subdued),
+            );
+            self.tool_cluster(vec![accept, cancel], ClusterChrome::Surface)
+        } else {
+            let btn = self.tool_toggle(
+                "crop-symbolic",
+                applied,
+                PreviewMsg::CropEnter,
+                // The tooltip carries the live shortcut hint (DRAGON-385: C).
+                widget::text(action_tip("Crop", crate::shortcuts::Action::PreviewCrop, km))
+                    .size(12)
+                    .into(),
+                pos,
+            );
+            self.tool_cluster(vec![btn], ClusterChrome::Bare)
+        }
+    }
+
     /// The pointer / pan (grabby-hand) tool toggle. DRAGON-357 item 10: the cursor/pan buttons
     /// wear the SAME bare white/accent glyph treatment as the top tray's tool buttons
     /// ([`Self::tool_toggle`]) — accent when active, foreground when not, no segment fill or ring
@@ -1566,9 +1614,11 @@ const ANNOT_TRAY: &[TrayGroup] = &[
             ),
         ],
     },
-    // SHAPES: the three tools that draw an emphasis shape ON the image, sharing Photoshop's
-    // own shape key `U` (DRAGON-369). This group was carved out of the old "Emphasis" group so
-    // that a tray chip and a hotkey slot are the SAME set — the spotlight below is not a shape.
+    // SHAPES: the tools that draw an emphasis shape ON the image, sharing Photoshop's own shape
+    // key `U` (DRAGON-369). Spotlight joined this slot in DRAGON-384 — it is the last member of
+    // the cycle, and its dim-range slider rides the group with it (a slider, not a tool button,
+    // so `slot_tools` skips it and the cycle stays a four-tool chain). Membership here IS the
+    // cycle: a tray chip and the hotkey slot are the SAME set.
     TrayGroup {
         chrome: ClusterChrome::Surface,
         cycle: Some(crate::shortcuts::Action::PreviewAnnotShapeCycle),
@@ -1591,20 +1641,16 @@ const ANNOT_TRAY: &[TrayGroup] = &[
                 "Border Highlight",
                 crate::shortcuts::Action::PreviewAnnotBoxHighlight,
             ),
+            TrayItem::Tool(
+                "spotlight-symbolic",
+                Tool::Spotlight,
+                "Spotlight",
+                crate::shortcuts::Action::PreviewAnnotSpotlight,
+            ),
+            // The spotlight's dim range: always usable, whatever tool is armed (DRAGON-329).
+            TrayItem::DimSlider,
         ],
     },
-    // The spotlight and the dim range it works against: a global dim with a knockout rather
-    // than a shape drawn on the image, and the only tool that owns a slider — hence its own
-    // group and its own solo key (`S`), outside the shape slot.
-    TrayGroup { chrome: ClusterChrome::Surface, cycle: None, items: &[
-        TrayItem::Tool(
-            "spotlight-symbolic",
-            Tool::Spotlight,
-            "Spotlight",
-            crate::shortcuts::Action::PreviewAnnotSpotlight,
-        ),
-        TrayItem::DimSlider,
-    ] },
     // Text captions (DRAGON-354): the lucide `type` glyph arms the text tool. Its size
     // dropdown + font toggle are injected right after this group in `annotation_tools` (they
     // are a flyout + toggle, not tray tool-buttons, so they can't live in the data-driven tray).
@@ -1686,7 +1732,7 @@ pub(super) fn next_slot_tool(members: &[Tool], armed: Option<Tool>, cursor: Opti
 /// The index of the TEXT group in [`ANNOT_TRAY`], after which the size dropdown + font toggle
 /// are injected in [`annotation_tools`] (DRAGON-354). A test pins this to the group whose sole
 /// tool is [`Tool::Text`] so a tray reorder can't silently misplace the size control.
-const TEXT_TRAY_GROUP: usize = 5;
+const TEXT_TRAY_GROUP: usize = 4;
 
 /// Which action's LIVE binding a tray button's tooltip should show (DRAGON-369): its OWN
 /// per-tool action while that is bound, otherwise its group's cycle action.
@@ -2121,7 +2167,7 @@ fn annot_swatch_flyout<'a>(
     if e.flyout_kind() == Some(super::edit::FlyoutKind::Color) {
         flyout(
             swatch_seg,
-            annot_palette_panel(e.flyout_selected(), recents, tb),
+            annot_palette_panel(e.flyout_selected(), recents, km, tb),
             FlyoutDir::Up(tb.flyout_panel_h(ANNOT_PALETTE_ROW_H)),
             Msg::Preview(tb.pid, PreviewMsg::FlyoutClose),
         )
@@ -2196,17 +2242,26 @@ fn annot_color_swatch(
     )
 }
 
-/// The palette flyout (covermark-style panel background): the ordered entry list from
-/// [`super::annotate::palette_entries`] — complement, accent | palette | last-5 custom | "+"
-/// — with a separator between each group. The keyboard-highlighted index (`sel`) shows a
-/// ring; each color swatch sets the annotation color, the "+" opens the custom hex picker.
-fn annot_palette_panel(sel: Option<usize>, recents: &[[u8; 4]], tb: Tb) -> Element<'static, Msg> {
+/// The palette flyout (covermark-style panel background): a leading SWAP affordance (DRAGON-386
+/// — the `X` companion-color swap, mirroring Photoshop's foreground/background swap), then the
+/// ordered entry list from [`super::annotate::palette_entries`] — complement, accent | palette |
+/// last-5 custom | "+" — with a separator between each group. The keyboard-highlighted index
+/// (`sel`) shows a ring; each color swatch sets the annotation color, the "+" opens the custom
+/// hex picker.
+fn annot_palette_panel(
+    sel: Option<usize>,
+    recents: &[[u8; 4]],
+    km: &crate::shortcuts::Keymap,
+    tb: Tb,
+) -> Element<'static, Msg> {
     use super::annotate::{PaletteEntry, PALETTE_COLOR_COUNT, PALETTE_LEAD};
     let entries = super::annotate::palette_entries(recents);
     // Separators AFTER the [complement, accent] group and AFTER the palette group.
     let sep_a = PALETTE_LEAD;
     let sep_b = PALETTE_LEAD + PALETTE_COLOR_COUNT;
-    let mut items: Vec<Element<'static, Msg>> = Vec::new();
+    // The swap button leads the row (with its own separator), so the color-pair toggle sits
+    // beside the accent/complement lead pair it swaps between — discoverable and out of the way.
+    let mut items: Vec<Element<'static, Msg>> = vec![annot_swap_swatch(km, tb), annot_palette_sep()];
     for (i, entry) in entries.iter().enumerate() {
         if i == sep_a || i == sep_b {
             items.push(annot_palette_sep());
@@ -2218,6 +2273,44 @@ fn annot_palette_panel(sel: Option<usize>, recents: &[[u8; 4]], tb: Tb) -> Eleme
         }
     }
     tb.tool_panel(items)
+}
+
+/// The companion-color SWAP button that leads the palette flyout (DRAGON-386): a 28px icon
+/// swatch (matching the color swatches' footprint) whose arrow-swap glyph fires
+/// [`PreviewMsg::AnnotColorCompanionSwap`] — the same toggle the `X` hotkey drives. Its tooltip
+/// names the live `X` binding via [`action_tip`]. A plain `widget::tooltip` (not [`Tb::tip`]) so
+/// it still shows while the flyout is open, since it draws on the frontmost popover.
+fn annot_swap_swatch(km: &crate::shortcuts::Keymap, tb: Tb) -> Element<'static, Msg> {
+    let glyph = widget::icon::icon(crate::widgets::icons::handle("object-flip-horizontal-symbolic"))
+        .width(Length::Fixed(18.0))
+        .height(Length::Fixed(18.0));
+    let btn = widget::button::custom(
+        widget::container(glyph)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center),
+    )
+    .width(Length::Fixed(28.0))
+    .height(Length::Fixed(28.0))
+    .padding(0)
+    .class(cosmic::theme::Button::Custom {
+        // The same resting swatch surface the "+" opener wears (never keyboard-highlighted —
+        // the swap is not part of the arrow-nav entry list), so it reads as one of the swatches.
+        active: Box::new(|_f, t| plus_swatch_style(false, t)),
+        hovered: Box::new(|_f, t| plus_swatch_style(false, t)),
+        pressed: Box::new(|_f, t| plus_swatch_style(false, t)),
+        disabled: Box::new(|t| plus_swatch_style(false, t)),
+    })
+    .on_press(Msg::Preview(tb.pid, PreviewMsg::AnnotColorCompanionSwap));
+    let btn = crate::widgets::arrow_cursor::arrow_cursor(btn);
+    widget::tooltip(
+        btn,
+        widget::text(action_tip("Swap color", crate::shortcuts::Action::PreviewColorCompanionSwap, km))
+            .size(12),
+        widget::tooltip::Position::Top,
+    )
+    .into()
 }
 
 /// A thin vertical divider between palette groups. The theme's `background.divider` is a
@@ -2561,18 +2654,19 @@ mod tests {
     }
 
     /// The declared GROUPING itself — the thing the owner reassigns. One border per group, in
-    /// this order; the dim slider rides the spotlight's group rather than standing alone.
+    /// this order; the dim slider rides the shape group (with spotlight) rather than standing alone.
     #[test]
     fn the_tray_groups_match_the_declared_layout() {
         let shape: Vec<usize> = ANNOT_TRAY.iter().map(|g| g.items.len()).collect();
-        // pointer(1), callouts(2), redact(2), SHAPES(3), spotlight+dim(2, DRAGON-369 split the
-        // old five-member "Emphasis" group in two so a chip is exactly a slot), TEXT(1,
-        // DRAGON-354), pencil+eraser(2).
-        assert_eq!(shape, vec![1, 2, 2, 3, 2, 1, 2]);
+        // pointer(1), callouts(2), redact(2), SHAPES(5 = highlight/border/border-highlight/
+        // spotlight + the dim slider, DRAGON-384 folded spotlight and its slider into the shape
+        // slot), TEXT(1, DRAGON-354), pencil+eraser(2).
+        assert_eq!(shape, vec![1, 2, 2, 5, 1, 2]);
         // A ONE-member group exists and is rendered through the very same container as the
         // others — there is no single-member branch anywhere in the builder.
         assert!(shape.contains(&1));
-        assert!(matches!(ANNOT_TRAY[4].items[1], TrayItem::DimSlider));
+        // The dim slider is the LAST item of the shape group, riding it after the four tools.
+        assert!(matches!(ANNOT_TRAY[3].items[4], TrayItem::DimSlider));
         // The size dropdown is injected right after the TEXT group, which must be the group
         // whose sole tool is Text.
         assert!(matches!(
@@ -2627,7 +2721,7 @@ mod tests {
         );
         assert_eq!(
             slot_tools(Action::PreviewAnnotShapeCycle),
-            vec![Tool::Highlight, Tool::Rect, Tool::BoxHighlight]
+            vec![Tool::Highlight, Tool::Rect, Tool::BoxHighlight, Tool::Spotlight]
         );
         // Every slot's tools appear in the SAME order the tray renders them.
         for slot in [Action::PreviewAnnotRedactCycle, Action::PreviewAnnotShapeCycle] {
@@ -2644,8 +2738,9 @@ mod tests {
         }
         // An action that names no slot has no members — a stray cycle press is a no-op.
         assert!(slot_tools(Action::PreviewSave).is_empty());
-        // Solo tools belong to no slot, so their key can never be stolen by a cycle.
-        for solo in [Tool::Pointer, Tool::Arrow, Tool::Badge, Tool::Spotlight, Tool::Text, Tool::Pen, Tool::Eraser] {
+        // Solo tools belong to no slot, so their key can never be stolen by a cycle. Spotlight is
+        // NOT among them any more — DRAGON-384 moved it into the shape slot.
+        for solo in [Tool::Pointer, Tool::Arrow, Tool::Badge, Tool::Text, Tool::Pen, Tool::Eraser] {
             assert_eq!(slot_for_tool(solo), None, "{solo:?}");
         }
     }
@@ -2655,7 +2750,8 @@ mod tests {
     /// (the cursor) rather than restarting at member one.
     #[test]
     fn a_slot_key_arms_then_advances_and_wraps() {
-        let shape = [Tool::Highlight, Tool::Rect, Tool::BoxHighlight];
+        // The real shape chain since DRAGON-384: spotlight is the last member before the wrap.
+        let shape = [Tool::Highlight, Tool::Rect, Tool::BoxHighlight, Tool::Spotlight];
         // Cold: nothing armed, no cursor → member 1.
         assert_eq!(next_slot_tool(&shape, None, None), Some(Tool::Highlight));
         // Armed → advance, and the last member wraps to the first.
@@ -2663,6 +2759,10 @@ mod tests {
         assert_eq!(next_slot_tool(&shape, Some(Tool::Rect), Some(Tool::Rect)), Some(Tool::BoxHighlight));
         assert_eq!(
             next_slot_tool(&shape, Some(Tool::BoxHighlight), Some(Tool::BoxHighlight)),
+            Some(Tool::Spotlight)
+        );
+        assert_eq!(
+            next_slot_tool(&shape, Some(Tool::Spotlight), Some(Tool::Spotlight)),
             Some(Tool::Highlight)
         );
         // Away on another tool → re-arm the CURSOR (however it was set — a tray click counts),

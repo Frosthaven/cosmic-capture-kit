@@ -3,6 +3,8 @@
 pub mod annotation_canvas;
 pub mod annotation_fx;
 pub mod arrow_cursor;
+pub mod crop_canvas;
+pub mod crop_window;
 pub mod drag_area;
 /// DRAGON-366 — TEMPORARY per-frame preview-editor diagnostics. Remove with its call sites
 /// (all tagged `DRAGON-366`) once the large-capture lag report is settled.
@@ -19,6 +21,7 @@ pub use hide_when_clipped::hide_when_clipped;
 pub use notched_slider::notched_slider;
 pub use output_selection::OutputSelection;
 pub use region_selection::RegionSelection;
+pub use crop_window::CropWindow;
 pub use zoom_pan::ZoomPan;
 
 /// Post-pointer-enter cursor RE-ASSERT (DRAGON-331). cosmic-comp DROPS a `wl_pointer.set_cursor`

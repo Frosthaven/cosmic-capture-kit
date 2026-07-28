@@ -3,6 +3,7 @@
 use crate::app::AnnotId;
 use crate::app::PixelFrame;
 use crate::widgets::annotation_canvas::{Grab, Tool};
+use crate::widgets::crop_canvas::CropHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -231,6 +232,11 @@ pub enum PreviewMsg {
     TextImeCommit(String),
     /// Open/close the color-swatch palette popover.
     ToggleAnnotPalette,
+    /// Swap the ACTIVE annotation color to its COMPANION (its complement), toggling back on a
+    /// second press (DRAGON-386; the `X` hotkey, Photoshop's foreground/background swap). Reuses
+    /// the [`Self::SetAnnotColor`] path, so it recolors any selection and persists identically to
+    /// picking the companion in the flyout. See [`crate::app::preview::annotate::companion_swap`].
+    AnnotColorCompanionSwap,
     /// Open (`true`) / close (`false`) the custom color-wheel picker, from the palette's "+".
     AnnotColorEditor(bool),
     /// A libcosmic color-picker interaction (wheel drag, hue slider, hex/rgb input): routed
@@ -280,6 +286,23 @@ pub enum PreviewMsg {
     AnnotMenuOpen(f32, f32),
     /// Dismiss the annotation context menu.
     AnnotMenuClose,
+
+    // ── Crop tool (DRAGON-382; IMAGES only) ──────────────────────────────────────────
+    /// Enter the crop tool: open a session over the current crop (or the whole frame), zoom
+    /// the media out to leave blank margin on all sides. Toggles OFF (accepts) when a session
+    /// is already open, so the single toolbar icon both opens and confirms.
+    CropEnter,
+    /// Accept the live crop: commit the session rect (Enter, or the checkmark button).
+    CropAccept,
+    /// Cancel the live crop, discarding the session (Escape, or the x button).
+    CropCancel,
+    /// A crop drag grabbed `handle` at image source point `(x, y)`.
+    CropDragBegin(CropHandle, f32, f32),
+    /// A crop drag moved to image source point `(x, y)`; the `bool` is the snap-override
+    /// modifier (Cmd/Ctrl) held.
+    CropDragTo(f32, f32, bool),
+    /// A crop drag released.
+    CropDragEnd,
 }
 
 impl PreviewMsg {
@@ -346,6 +369,11 @@ impl PreviewMsg {
                 | Self::TimelineCut(_)
                 | Self::TimelineDelete
                 | Self::TimelineMenuOpen(..)
+                // ── Crop gestures ─────────────────────────────────────────────────────
+                | Self::CropEnter
+                | Self::CropDragBegin(..)
+                | Self::CropDragTo(..)
+                | Self::CropDragEnd
         )
     }
 }

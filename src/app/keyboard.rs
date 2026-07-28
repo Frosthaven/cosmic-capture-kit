@@ -79,7 +79,12 @@ impl App {
             }
             Action::PreviewAnnotDuplicate => return pv(PreviewMsg::DuplicateSelected),
             Action::PreviewAnnotStrokeCycle => return pv(PreviewMsg::CycleAnnotStrokeW),
+            // DRAGON-385: C starts/confirms a crop session exactly like the toolbar button
+            // (`CropEnter` both opens and applies). A live session owns the keyboard, so a
+            // mid-session press never reaches here (see `preview_modal_key`) — no double-start.
+            Action::PreviewCrop => return pv(PreviewMsg::CropEnter),
             Action::PreviewColorFlyout => return pv(PreviewMsg::ToggleAnnotPalette),
+            Action::PreviewColorCompanionSwap => return pv(PreviewMsg::AnnotColorCompanionSwap),
             Action::PreviewTogglePan => return pv(PreviewMsg::TogglePanMode),
             Action::RecordStop => Msg::Recording(RecordingMsg::StopRecording),
             Action::RecordToggleMic => Msg::Recording(RecordingMsg::ToggleMic),
@@ -273,57 +278,6 @@ impl App {
         .discard()
     }
 
-    /// macOS (DRAGON-361): the key-arrival diagnostic. Logs presses delivered to a LIVE text
-    /// annotation edit, so the owner's first Mac run answers the question the rest of the
-    /// investigation now hangs on — *does ⌃⌘Space reach the application at all?*
-    ///
-    /// Why this and not a chord-only log: an intercept that only speaks when it MATCHES cannot
-    /// tell "macOS consumed the symbolic hotkey before delivery" from "the press arrived but
-    /// iced spells the key differently than the predicate expects". Both look like silence, and
-    /// they have opposite fixes (a UI affordance vs. a one-line predicate change). Logging every
-    /// qualifying press separates them: a line with `palette-chord=false` is the second case;
-    /// no line at all is the first.
-    ///
-    /// FILTERED so it cannot flood: ordinary typing — a character key with no ⌃/⌥/⌘ — is not
-    /// evidence and is skipped (Shift+letter included, since Shift alone still spells normal
-    /// typing). Everything else is logged: named keys (arrows, Escape, Backspace…) and any
-    /// press carrying a command-ish modifier. Hard-capped per process as belt-and-braces; the
-    /// last permitted line says so, so a truncated log is never mistaken for silence.
-    ///
-    /// At `warn` on purpose: `main`'s env_logger defaults to the `warn` filter, so this lands
-    /// with no `RUST_LOG` set. Temporary — delete or demote once DRAGON-361 is understood.
-    #[cfg(target_os = "macos")]
-    fn log_text_edit_key(
-        modifiers: cosmic::iced::keyboard::Modifiers,
-        key: &cosmic::iced::keyboard::Key,
-        text: Option<&str>,
-    ) {
-        use cosmic::iced::keyboard::Key;
-        use std::sync::atomic::{AtomicU32, Ordering};
-        /// How many key lines one process may emit before going quiet.
-        const CAP: u32 = 400;
-        static LOGGED: AtomicU32 = AtomicU32::new(0);
-        // Plain typing is not evidence — skip it so the interesting lines stay readable.
-        let command_mod = modifiers.control() || modifiers.alt() || modifiers.logo();
-        if matches!(key, Key::Character(_)) && !command_mod {
-            return;
-        }
-        let n = LOGGED.fetch_add(1, Ordering::Relaxed);
-        if n >= CAP {
-            return;
-        }
-        log::warn!(
-            "DRAGON-361 key #{n}: reached the live text edit — key={key:?}, ctrl={}, alt={}, \
-             shift={}, logo={}, text={text:?}, palette-chord={}{}",
-            modifiers.control(),
-            modifiers.alt(),
-            modifiers.shift(),
-            modifiers.logo(),
-            crate::shortcuts::is_character_palette_chord(modifiers, key),
-            if n + 1 == CAP { " — diagnostic cap reached, no further key lines" } else { "" },
-        );
-    }
-
     /// Key handling while the post-capture preview is open — modal, in priority
     /// order: a bake in progress holds every input; then the overwrite-confirm
     /// dialog; then the covermark picker; otherwise the preview's own keymap
@@ -347,28 +301,30 @@ impl App {
         if p.edit.baking {
             return Task::none();
         }
+        // A live CROP session (DRAGON-382) OWNS the keyboard, like a text edit: Enter accepts,
+        // Escape cancels, and every tool/action hotkey is SWALLOWED so it can't leak past the
+        // modal crop UI. Highest priority after the bake hold.
+        if p.edit.crop_session.is_some() {
+            return match &key {
+                Key::Named(Named::Enter) => self.update(Msg::Preview(id, PreviewMsg::CropAccept)),
+                Key::Named(Named::Escape) => self.update(Msg::Preview(id, PreviewMsg::CropCancel)),
+                _ => Task::none(),
+            };
+        }
         // macOS (DRAGON-361): while a text annotation is being edited, the Emoji & Symbols
         // chord (⌃⌘Space) is handled BY US — we open the Character Viewer directly rather
         // than waiting for the system to route its symbolic hotkey to an accessory-policy
-        // app that owns no menu bar. DRAGON-359 fixed the active/key/first-responder state and
-        // the picker still never appeared; the owner has since confirmed it fails in the
-        // WINDOWED preview too, which rules out the window-level theory (that surface sits at
-        // a normal level and cannot occlude an out-of-process panel), leaving key DELIVERY and
-        // the Accessory activation policy as the live suspects — both of which the mac seam's
-        // log lines separate. Scoped to a LIVE text edit, so outside one the chord is never
-        // swallowed; the
-        // `is_character_palette_chord` predicate is portable + unit-tested, only the AppKit
-        // call behind it is mac-only. Non-mac builds are byte-identical (nothing compiled).
-        //
-        // Every qualifying press is LOGGED first ([`Self::log_text_edit_key`]) — that is the
-        // single most valuable diagnostic here, because the whole question is whether the chord
-        // even ARRIVES, and silence has to be distinguishable from a predicate miss.
+        // app that owns no menu bar (see `platform::mac::window::show_character_palette` for
+        // the summon-vs-delivery story; delivery is the winit fork's out-of-band
+        // `insertText:` → `Ime::Commit` conversion, DRAGON-380). Scoped to a LIVE text edit,
+        // so outside one the chord is never swallowed; the `is_character_palette_chord`
+        // predicate is portable + unit-tested, only the AppKit call behind it is mac-only.
+        // Non-mac builds are byte-identical (nothing compiled).
         #[cfg(target_os = "macos")]
-        if p.edit.text_edit.is_some() {
-            Self::log_text_edit_key(modifiers, &key, text.as_deref());
-            if crate::shortcuts::is_character_palette_chord(modifiers, &key) {
-                return Self::show_character_palette(id);
-            }
+        if p.edit.text_edit.is_some()
+            && crate::shortcuts::is_character_palette_chord(modifiers, &key)
+        {
+            return Self::show_character_palette(id);
         }
         // A live TEXT edit (DRAGON-354) OWNS the keyboard: printable keys type into the box,
         // editing keys move the caret / delete, Escape (or NUMPAD Enter — DRAGON-364; main Enter

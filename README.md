@@ -84,6 +84,7 @@ along with their statuses.
 | Preview editor (images): Sticker tool               | 📅      |
 | Preview editor (images): Eraser tool                | ✅      |
 | Preview editor (images): Select/multi-select tool   | ✅      |
+| Preview editor (images): Crop tool                  | ✅      |
 | Preview editor (videos): Simple cutting tool        | ✅      |
 | Preview editor (videos): Simple transition dropdown | ✅      |
 | Recording controls: Toggle mic                      | ✅      |

@@ -77,15 +77,16 @@ const EMOJI: &[u8] = include_bytes!("../../../res/fonts/TwemojiMozilla-COLR.ttf"
 /// item 19). The family names match the faces' own name tables, so `Font::with_name` resolves.
 pub const UI_FONT_FACES: [(&str, &[u8]); 2] = [("Excalifont", EXCALIFONT), ("Inter", INTER)];
 
-/// The web-standard text-size scale (SOURCE px) the dropdown offers, small → large.
-/// [`DEFAULT_TEXT_SIZE`] (24px) is the mid default. The upper reach continues the scale's own
-/// doubling cadence (…48, 64, 96, 128) so the top entry lands exactly on 128px (DRAGON-354
-/// item 8).
+/// The web-standard text-size scale in logical POINTS (DRAGON-383) the dropdown offers,
+/// small → large. [`DEFAULT_TEXT_SIZE`] (32pt) is the mid default. The upper reach continues the
+/// scale's own doubling cadence (…48, 64, 96, 128) so the top entry lands exactly on 128 (DRAGON-354
+/// item 8). A preset is a POINT measure so a "32px" box reads the same on a 1x and a 2x capture;
+/// the box's stored `size_px` is the scaled SOURCE-px value. Identity on Linux/1x.
 pub const TEXT_SIZES: [f32; 10] = [12.0, 14.0, 16.0, 18.0, 24.0, 32.0, 48.0, 64.0, 96.0, 128.0];
 
-/// The default text size (SOURCE px) a fresh editor starts at — the unset-persistence fallback
-/// (DRAGON-354 item 11a: a fresh install lands on 32px + the Hand face, `TextFont`'s own
-/// `#[default]`). A preset in [`TEXT_SIZES`].
+/// The default text size in logical POINTS (DRAGON-383) a fresh editor starts at — the
+/// unset-persistence fallback (DRAGON-354 item 11a: a fresh install lands on 32 + the Hand face,
+/// `TextFont`'s own `#[default]`). A preset in [`TEXT_SIZES`].
 pub const DEFAULT_TEXT_SIZE: f32 = 32.0;
 
 /// The SMALLEST type size (SOURCE px) a handle drag can scale text down to — a sixth of the

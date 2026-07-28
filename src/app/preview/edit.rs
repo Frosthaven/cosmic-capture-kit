@@ -8,9 +8,11 @@
 //! lost until the user commits by sharing.
 
 use super::annotate::{AnnotGesture, AnnotColor, AnnotId, AnnotationItem, ToolClicks};
+use super::crop::CropRect;
 use super::layers::RasterSlot;
 use super::timeline::{Span, Timeline};
 use crate::widgets::annotation_canvas::Tool;
+use crate::widgets::crop_canvas::CropHandle;
 use ::image::RgbaImage;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -323,6 +325,9 @@ pub enum EditOp {
     /// A global dim change (DRAGON-329): the dim value (0..1) BEFORE the change. One entry per
     /// slider DRAG (coalesced via [`EditState::dim_drag_start`]), like an annotation gesture.
     Dim(f32),
+    /// A crop change (DRAGON-382): the committed crop BEFORE the change (`None` = un-cropped).
+    /// One entry per crop-session Accept.
+    Crop(Option<CropRect>),
 }
 
 /// Which display artifact an undo/redo step touched, so the caller refreshes the right
@@ -334,6 +339,31 @@ pub enum EditKind {
     Annotations,
     /// A global dim change — redraws for free through the GPU dim pass on the next view build.
     Dim,
+    /// A crop change (DRAGON-382) — applied only at bake; the main view redraws for free.
+    Crop,
+}
+
+/// The transient crop-tool SESSION (DRAGON-382): a WORKING COPY of the crop rect being edited,
+/// the viewport saved at session start (restored on Accept/Cancel), and the active drag. `Some`
+/// on [`EditState::crop_session`] is what makes the crop overlay draw and swallows the tool
+/// hotkeys (the crop UI owns the surface, like a live text edit).
+#[derive(Clone, Debug)]
+pub struct CropSession {
+    /// The live crop rect (SOURCE px) — Accept commits it, Cancel discards it.
+    pub rect: CropRect,
+    /// The viewport at session start; restored when the session ends.
+    pub saved_view: super::viewport::Viewport,
+    /// The in-flight drag, `None` between drags.
+    pub drag: Option<CropDrag>,
+}
+
+/// One in-flight crop drag: the grabbed handle plus the rect and pointer image point at press,
+/// so each motion resolves against the drag START (see [`super::crop::resolve_drag`]).
+#[derive(Clone, Copy, Debug)]
+pub struct CropDrag {
+    pub handle: CropHandle,
+    pub orig: CropRect,
+    pub press: (f32, f32),
 }
 
 /// A LIVE, debounced preview edit driven by a DRAGGING slider — the shared live-slider path
@@ -526,6 +556,15 @@ pub struct EditState {
     /// match the bake's aspect.
     pub frame: (u32, u32),
 
+    // ── Crop tool (DRAGON-382; IMAGES only) ──────────────────────────────────────────
+    /// The committed crop rectangle over the SOURCE image (`None` = un-cropped / the whole
+    /// frame). Non-destructive: applied only at bake ([`bake_image`]). A full-frame crop is
+    /// stored as `None`, so it is never dirty. See [`super::crop`].
+    pub crop: Option<CropRect>,
+    /// The transient crop-tool session, `Some` while the tool is active (its overlay draws and
+    /// the tool hotkeys are suspended). See [`CropSession`].
+    pub crop_session: Option<CropSession>,
+
     // ── Annotation editor (DRAGON-321; IMAGES only) ──────────────────────────────────
     /// The annotation scene, in SOURCE-pixel coords. Z-order IS the vector order (later
     /// = on top).
@@ -552,16 +591,26 @@ pub struct EditState {
     /// The current annotation color (`None` = the accent default, resolved when a shape
     /// is created so the off-thread raster never reads the theme).
     pub annot_color: Option<AnnotColor>,
-    /// The SHARED stroke width (SOURCE px) seeded onto every new box AND arrow — the single
-    /// source of truth a future width control drives. `0.0` means
-    /// [`super::annotate::DEFAULT_ANNOT_STROKE`].
+    /// The remembered "swap back" color for the companion-swap hotkey (`X`; DRAGON-386): the
+    /// color the active annotation color was last swapped away FROM, so a second `X` returns to
+    /// it EXACTLY ([`super::annotate::companion_color`] is involutive only up to u8 rounding).
+    /// `None` outside a swap pair; any NON-swap color pick (the flyout or the custom wheel)
+    /// clears it, so a stale partner never hijacks the next swap. See
+    /// [`super::annotate::companion_swap`].
+    pub color_swap_back: Option<AnnotColor>,
+    /// The SHARED stroke width in logical POINTS (DRAGON-383) seeded onto every new box AND
+    /// arrow — the single source of truth a future width control drives. Kept in POINTS so it
+    /// matches the preset ladder + the chrome flyout; scaled to SOURCE px at the seed site.
+    /// `0.0` means [`super::annotate::DEFAULT_ANNOT_STROKE`].
     pub annot_stroke_w: f32,
-    /// The SHARED ABSOLUTE corner radius (SOURCE px) both the box (corner radius) and arrow
-    /// (round caps when > 0) read. `0.0` means [`super::annotate::DEFAULT_ANNOT_CURVE_RADIUS`]
-    /// (there is no way to set a deliberate sharp `0.0` yet, so the fallback is safe).
+    /// The SHARED ABSOLUTE corner radius in logical POINTS (DRAGON-383) both the box (corner
+    /// radius) and arrow (round caps when > 0) read, scaled to SOURCE px at each render/bake
+    /// site. `0.0` means [`super::annotate::DEFAULT_ANNOT_CURVE_RADIUS`] (there is no way to set
+    /// a deliberate sharp `0.0` yet, so the fallback is safe).
     pub annot_curve_radius: f32,
-    /// The side (SOURCE px) the NEXT sequence badge spawns at (click-placed OR double-click
-    /// pre-placed): whatever the last badge in THIS editor was placed or resized to. `0.0`
+    /// The side in logical POINTS (DRAGON-383) the NEXT sequence badge spawns at (click-placed OR
+    /// double-click pre-placed): whatever the last badge in THIS editor was placed or resized to,
+    /// brought back to points from its settled source-px side. `0.0`
     /// means [`super::annotate::DEFAULT_BADGE_SIZE`] — read it through [`Self::badge_size`].
     ///
     /// This is the per-DOCUMENT WORKING copy of a PERSISTED preference: it is seeded at
@@ -606,8 +655,10 @@ pub struct EditState {
     pub fx_base: Option<Arc<super::layers::PixelFrame>>,
 
     // ── Text annotations (DRAGON-354; IMAGES only) ───────────────────────────────────────
-    /// The size (SOURCE px) the NEXT text box is created at — the size dropdown drives it.
-    /// `0.0` means [`super::text_annot::DEFAULT_TEXT_SIZE`]; read through [`Self::text_size`].
+    /// The size in logical POINTS (DRAGON-383) the NEXT text box is created at — the size
+    /// dropdown drives it. Kept in POINTS so the dropdown highlight + chip match the presets;
+    /// scaled to SOURCE px when it seeds a box. `0.0` means
+    /// [`super::text_annot::DEFAULT_TEXT_SIZE`]; read through [`Self::text_size`].
     pub annot_text_size: f32,
     /// The family the NEXT text box uses — the font toggle drives it. Defaults to the
     /// handwritten Excalifont.
@@ -664,7 +715,17 @@ impl EditState {
     /// re-encode?", which stays true after a save (the scene still has content). "Are there
     /// changes the file on disk doesn't have?" is [`unsaved_at`] / `PreviewState::unsaved`.
     pub fn dirty(&self) -> bool {
-        self.covermark.is_some() || !self.annotations.is_empty() || self.dim > 0.0
+        self.covermark.is_some()
+            || !self.annotations.is_empty()
+            || self.dim > 0.0
+            || self.crop.is_some()
+    }
+
+    /// Set (or clear) the committed crop, pushing the prior crop onto the shared undo stack and
+    /// clearing redo (DRAGON-382). The crop is applied only at bake, so no raster refresh is owed.
+    pub fn set_crop(&mut self, crop: Option<CropRect>) {
+        self.push_op(EditOp::Crop(self.crop));
+        self.crop = crop;
     }
 
     /// Arm a dialog-initiated action: dismiss the card, clear any stale failure notice, and
@@ -764,7 +825,10 @@ impl EditState {
         self.picker = None;
     }
 
-    /// The SHARED stroke width for new annotations (SOURCE px), falling back to the default.
+    /// The SHARED stroke width for new annotations in logical POINTS (DRAGON-383), falling back
+    /// to the default. The caller scales it to this document's SOURCE px
+    /// ([`super::annotate::points_to_source_px`]) at the moment it seeds a shape; the chrome
+    /// flyout + the cycle compare it against the (point) preset ladder directly.
     pub fn stroke(&self) -> f32 {
         if self.annot_stroke_w > 0.0 {
             self.annot_stroke_w
@@ -773,9 +837,9 @@ impl EditState {
         }
     }
 
-    /// The side (SOURCE px) a newly placed sequence badge takes — the last one placed or
-    /// resized in this editor, falling back to [`super::annotate::DEFAULT_BADGE_SIZE`]. The
-    /// caller still clamps it into the picture (see
+    /// The side (logical POINTS, DRAGON-383) a newly placed sequence badge takes — the last one
+    /// placed or resized in this editor, falling back to [`super::annotate::DEFAULT_BADGE_SIZE`].
+    /// The caller scales it to SOURCE px then clamps it into the picture (see
     /// [`super::annotate::badge_placement_rect`]).
     pub fn badge_size(&self) -> f32 {
         if self.annot_badge_size > 0.0 {
@@ -785,8 +849,9 @@ impl EditState {
         }
     }
 
-    /// The size (SOURCE px) a newly created text box takes — whatever the size dropdown last
-    /// selected, falling back to [`super::text_annot::DEFAULT_TEXT_SIZE`].
+    /// The size (logical POINTS, DRAGON-383) a newly created text box takes — whatever the size
+    /// dropdown last selected, falling back to [`super::text_annot::DEFAULT_TEXT_SIZE`]. Scaled to
+    /// SOURCE px by the caller as it seeds the box.
     pub fn text_size(&self) -> f32 {
         if self.annot_text_size > 0.0 {
             self.annot_text_size
@@ -795,8 +860,9 @@ impl EditState {
         }
     }
 
-    /// The SHARED absolute corner radius (SOURCE px) both shapes rasterize with, falling
-    /// back to the default.
+    /// The SHARED absolute corner radius in logical POINTS (DRAGON-383), falling back to the
+    /// default. Each render/bake site scales it to SOURCE px
+    /// ([`super::annotate::points_to_source_px`]) to match the source-px shape geometry.
     pub fn curve_radius(&self) -> f32 {
         if self.annot_curve_radius > 0.0 {
             self.annot_curve_radius
@@ -913,6 +979,11 @@ impl EditState {
                 self.dim = prev;
                 Some(EditKind::Dim)
             }
+            Some(EditOp::Crop(prev)) => {
+                self.redo_stack.push(EditOp::Crop(self.crop));
+                self.crop = prev;
+                Some(EditKind::Crop)
+            }
             None => None,
         }
     }
@@ -944,6 +1015,11 @@ impl EditState {
                 self.undo_stack.push(EditOp::Dim(self.dim));
                 self.dim = next;
                 Some(EditKind::Dim)
+            }
+            Some(EditOp::Crop(next)) => {
+                self.undo_stack.push(EditOp::Crop(self.crop));
+                self.crop = next;
+                Some(EditKind::Crop)
             }
             None => None,
         }
@@ -1012,12 +1088,28 @@ impl TextLayerGeom {
     /// The layer's placement within the picture canvas, as the `[x, y, w, h]` fractions
     /// [`super::layers::Layer::dest`] wants. `frame` is the source frame; a degenerate frame
     /// degrades to the whole canvas rather than a divide by zero.
+    #[cfg(test)]
     pub fn dest(&self, frame: (u32, u32)) -> super::layers::Dest {
-        let (fw, fh) = (frame.0 as f32, frame.1 as f32);
-        if !(fw > 0.0 && fh > 0.0) {
+        self.dest_in((0.0, 0.0), (frame.0 as f32, frame.1 as f32))
+    }
+
+    /// The layer's placement as fractions of the DISPLAY frame (DRAGON-385): the region shifted
+    /// by the view-crop `origin` (SOURCE px) and divided by the display `dims` (SOURCE px). With
+    /// `origin = (0, 0)` and `dims` the whole frame this is [`Self::dest`] — byte-identical for an
+    /// un-cropped document. When a crop is applied the picture canvas the text rides on is the
+    /// crop region, so the caption's fractions are measured against THAT (and a caption outside
+    /// the crop lands outside `[0, 1]`, clipped away like every other out-of-crop mark).
+    pub fn dest_in(&self, origin: (f32, f32), dims: (f32, f32)) -> super::layers::Dest {
+        let (dw, dh) = dims;
+        if !(dw > 0.0 && dh > 0.0) {
             return super::layers::DEST_FULL;
         }
-        [self.region.x / fw, self.region.y / fh, self.region.w / fw, self.region.h / fh]
+        [
+            (self.region.x - origin.0) / dw,
+            (self.region.y - origin.1) / dh,
+            self.region.w / dw,
+            self.region.h / dh,
+        ]
     }
 }
 
@@ -1307,10 +1399,11 @@ pub fn bake_image(
     annotations: &[AnnotationItem],
     curve: f32,
     dim: f32,
+    crop: Option<CropRect>,
 ) -> std::io::Result<u64> {
     let err = |e: String| std::io::Error::other(e);
     let dst_png = super::ext_of(dst).as_deref() == Some("png");
-    if cm.is_some() || !annotations.is_empty() || dim > 0.0 {
+    if cm.is_some() || !annotations.is_empty() || dim > 0.0 || crop.is_some() {
         let mut rgba = ::image::open(src).map_err(|e| err(e.to_string()))?.into_rgba8();
         // The PRISTINE full-res source, used ONLY to size the content-aware pixelate cell — the
         // SAME analysis source the GPU display uses (its retained base pixels), so display + bake
@@ -1332,7 +1425,22 @@ pub fn bake_image(
         let analysis_ref = analysis.as_ref().unwrap_or(&placeholder);
         super::annotate::apply_effects(&mut rgba, analysis_ref, annotations, curve);
         apply_covermark(&mut rgba, cm);
-        super::annotate::apply_annotations(&mut rgba, annotations, curve);
+        // DRAGON-382 + DRAGON-389: dim / effects / covermark composite over the FULL source above
+        // (they are content-anchored and cannot exist off-source). With a crop, cut the crop rect
+        // FIRST — black-filling any over-crop extension — then draw the vector overlay onto the
+        // CROPPED canvas offset by the crop origin, so an annotation the editor shows over the black
+        // extension (DRAGON-385's larger display frame) survives to the saved file instead of being
+        // clipped at the source edge. The crop origin uses the same rounding as `crop_image`'s cut,
+        // so the overlay lands pixel-aligned with the cut. With no crop this is the historical
+        // `apply_annotations` on the full source — byte-identical.
+        match crop {
+            Some(rect) => {
+                rgba = super::crop::crop_image(&rgba, rect);
+                let offset = (rect.x.round(), rect.y.round());
+                super::annotate::apply_annotations_at(&mut rgba, annotations, curve, offset);
+            }
+            None => super::annotate::apply_annotations(&mut rgba, annotations, curve),
+        }
         if dst_png {
             rgba.save_with_format(dst, ::image::ImageFormat::Png).map_err(|e| err(e.to_string()))?;
         } else {
@@ -1675,6 +1783,35 @@ mod tests {
         assert_eq!(whole.dest(frame), super::super::layers::DEST_FULL);
         // A degenerate frame degrades to the whole canvas rather than dividing by zero.
         assert_eq!(g.dest((0, 0)), super::super::layers::DEST_FULL);
+    }
+
+    /// DRAGON-385: `dest_in` measures the caption against the DISPLAY frame — the crop region when
+    /// a crop is applied — so a text box inside the crop lands right and one outside falls outside
+    /// `[0, 1]` (clipped away). With a zero origin + the whole frame it equals the un-cropped
+    /// `dest`.
+    #[test]
+    fn text_layer_geom_dest_in_is_relative_to_the_crop() {
+        use super::super::annotate::AnnotRect;
+        let g = TextLayerGeom {
+            scale: 0.5,
+            region: AnnotRect { x: 1280.0, y: 720.0, w: 640.0, h: 360.0 },
+            px: (640, 360),
+        };
+        // Un-cropped (origin 0, whole frame) is the historical placement.
+        assert_eq!(
+            g.dest_in((0.0, 0.0), (5120.0, 2880.0)),
+            [0.25, 0.25, 0.125, 0.125],
+        );
+        // A crop taken at (1280, 720) sized 1280x720: the box sits at the crop's top-left and
+        // spans half its width / height.
+        assert_eq!(g.dest_in((1280.0, 720.0), (1280.0, 720.0)), [0.0, 0.0, 0.5, 0.5]);
+        // A caption LEFT of the crop origin maps to a negative fraction (clipped away on draw).
+        let left = TextLayerGeom {
+            scale: 1.0,
+            region: AnnotRect { x: 0.0, y: 720.0, w: 100.0, h: 100.0 },
+            px: (100, 100),
+        };
+        assert!(left.dest_in((1280.0, 720.0), (1280.0, 720.0))[0] < 0.0);
     }
 
     /// DRAGON-352: `dirty()` is THE shared bake gate — Copy/Save (`begin_bake`) and
@@ -2222,5 +2359,85 @@ mod tests {
         assert!(unsaved_at(e.saved_depth, e.undo_stack.len(), true));
         e.undo(None);
         assert!(!unsaved_at(e.saved_depth, e.undo_stack.len(), true), "back at the save");
+    }
+
+    // ── DRAGON-389: the over-crop bake carries annotations onto the black extension ───────────
+
+    const CURVE: f32 = super::super::annotate::DEFAULT_ANNOT_CURVE_RADIUS;
+
+    fn filled_box(id: u64, x: f32, y: f32, w: f32, h: f32) -> AnnotationItem {
+        AnnotationItem {
+            id: AnnotId(id),
+            color: [255, 0, 0, 255],
+            kind: super::super::annotate::AnnotKind::Box {
+                rect: super::super::annotate::AnnotRect { x, y, w, h },
+                stroke_w: 3.0,
+                fill: Some([255, 0, 0, 255]),
+            },
+        }
+    }
+
+    fn is_red(p: &::image::Rgba<u8>) -> bool {
+        p.0[0] > 180 && p.0[1] < 80 && p.0[2] < 80
+    }
+
+    /// A unique temp PNG path for this process + tag, removed on drop.
+    struct TmpPng(std::path::PathBuf);
+    impl Drop for TmpPng {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn tmp_png(tag: &str) -> TmpPng {
+        TmpPng(std::env::temp_dir().join(format!("cck-dragon389-{}-{tag}.png", std::process::id())))
+    }
+
+    #[test]
+    fn dragon389_bake_carries_annotation_onto_the_extension() {
+        let src = tmp_png("survive-src");
+        let dst = tmp_png("survive-dst");
+        flat(40, 40, 128).save_with_format(&src.0, ::image::ImageFormat::Png).unwrap();
+        // A crop extending 20px LEFT of the source → a 60×40 output; output x in [0,20) is the black
+        // extension, [20,60) the source.
+        let crop = Some(CropRect { x: -20.0, y: 0.0, w: 60.0, h: 40.0 });
+        // A filled box wholly inside the extension (source x -16..-4, all < 0).
+        let items = vec![filled_box(1, -16.0, 10.0, 12.0, 12.0)];
+        bake_image(&src.0, &dst.0, None, &items, CURVE, 0.0, crop).unwrap();
+        let out = ::image::open(&dst.0).unwrap().into_rgba8();
+        assert_eq!(out.dimensions(), (60, 40), "output is the crop's pixel size");
+        // The box lands at output x 4..16 (source -16 shifted by -(-20) = +20); its interior is red.
+        assert!(is_red(out.get_pixel(9, 15)), "the extension annotation survives the bake: {:?}", out.get_pixel(9, 15));
+    }
+
+    #[test]
+    fn dragon389_bake_renders_straddling_annotation_continuously() {
+        let src = tmp_png("straddle-src");
+        let dst = tmp_png("straddle-dst");
+        flat(40, 40, 128).save_with_format(&src.0, ::image::ImageFormat::Png).unwrap();
+        let crop = Some(CropRect { x: -20.0, y: 0.0, w: 60.0, h: 40.0 });
+        // A box spanning source x -10..10 — straddling the source's left edge (source x=0 = output
+        // x=20). On the output it covers x 10..30.
+        let items = vec![filled_box(1, -10.0, 8.0, 20.0, 20.0)];
+        bake_image(&src.0, &dst.0, None, &items, CURVE, 0.0, crop).unwrap();
+        let out = ::image::open(&dst.0).unwrap().into_rgba8();
+        // Red on BOTH sides of the boundary at output x=20 — extension side (x=13) and source side
+        // (x=27) — so the shape renders continuously across the source/extension seam.
+        assert!(is_red(out.get_pixel(13, 16)), "red on the extension side: {:?}", out.get_pixel(13, 16));
+        assert!(is_red(out.get_pixel(27, 16)), "red on the source side: {:?}", out.get_pixel(27, 16));
+    }
+
+    #[test]
+    fn dragon389_uncropped_bake_matches_apply_annotations() {
+        let src = tmp_png("uncrop-src");
+        let dst = tmp_png("uncrop-dst");
+        flat(40, 40, 128).save_with_format(&src.0, ::image::ImageFormat::Png).unwrap();
+        let items = vec![filled_box(1, 8.0, 8.0, 16.0, 12.0)];
+        // The historical path: load the source, composite the annotations directly onto it.
+        let mut expected = flat(40, 40, 128);
+        super::super::annotate::apply_annotations(&mut expected, &items, CURVE);
+        bake_image(&src.0, &dst.0, None, &items, CURVE, 0.0, None).unwrap();
+        let out = ::image::open(&dst.0).unwrap().into_rgba8();
+        assert_eq!(out.dimensions(), (40, 40));
+        assert_eq!(out.as_raw(), expected.as_raw(), "an uncropped bake stays the historical apply_annotations, byte-for-byte");
     }
 }

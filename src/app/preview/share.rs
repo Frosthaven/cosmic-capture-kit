@@ -330,8 +330,12 @@ impl App {
         let covermark = p.edit.covermark.clone();
         // Annotations are IMAGES only (a video preview never accumulates them).
         let annotations = p.edit.annotations.clone();
-        let annot_curve = p.edit.curve_radius();
+        // The curve radius is a POINT preset baked into SOURCE-px geometry (DRAGON-383);
+        // identity on Linux/1x.
+        let annot_curve = super::annotate::points_to_source_px(p.edit.curve_radius(), p.source_scale);
         let dim = p.edit.dim;
+        // The committed crop (DRAGON-382; IMAGES only) — applied as the bake's final step.
+        let crop = p.edit.crop;
         let video = match &p.kind {
             PreviewKind::Image(_) => None,
             // A video bake needs the probed metadata (overlay raster size, audio
@@ -373,7 +377,7 @@ impl App {
             let result = match &video {
                 Some(v) => edit::bake_video(&src, &dst, covermark.as_ref(), v),
                 None => {
-                    edit::bake_image(&src, &dst, covermark.as_ref(), &annotations, annot_curve, dim)
+                    edit::bake_image(&src, &dst, covermark.as_ref(), &annotations, annot_curve, dim, crop)
                 }
             };
             // Log the real io::Error here — it's about to be discarded to an Option

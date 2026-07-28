@@ -128,9 +128,14 @@ pub enum Action {
     /// (DRAGON-369) — member 2 of the REDACTION slot
     /// ([`Self::PreviewAnnotRedactCycle`], `M`).
     PreviewAnnotBlur,
-    /// Preview: the Spotlight (dim knockout) annotation tool (default S) — DRAGON-329.
-    /// Deliberately OUTSIDE the shape slot (DRAGON-369): it is a global dim with a knockout,
-    /// not a shape drawn on the image, and it owns the Dim slider.
+    /// Preview: the Spotlight (dim knockout) annotation tool — DRAGON-329. UNBOUND by default
+    /// (DRAGON-384) — member 4 of the SHAPE slot ([`Self::PreviewAnnotShapeCycle`], `U`), reached
+    /// by cycling; it still owns the Dim slider, which rides the shape group. It ships with a
+    /// FIRST-CLASS per-tool escape hatch like the other slot members (bind it and the direct key
+    /// wins). A persisted keymap from before DRAGON-384 that still holds the retired `S` default
+    /// keeps working: `S` is applied as an explicit per-tool bind and, because this action is
+    /// listed BEFORE the slot cycle in [`Action::ALL`], it resolves directly to spotlight (see
+    /// [`Action::ALL`]) rather than crashing or silently swallowing the key.
     PreviewAnnotSpotlight,
     /// Preview: the freehand Pencil annotation tool (default B — Photoshop's Brush slot) —
     /// DRAGON-338.
@@ -144,16 +149,26 @@ pub enum Action {
     /// Preview: the REDACTION tool slot — Pixelate, then Blur (default M) — DRAGON-369.
     /// Arm-then-advance: see [`Action::ALL`]'s slot note.
     PreviewAnnotRedactCycle,
-    /// Preview: the SHAPE tool slot — Highlight, Border, Border Highlight (default U, which IS
-    /// Photoshop's shape-tool key) — DRAGON-369. Arm-then-advance: see [`Action::ALL`]'s slot
-    /// note.
+    /// Preview: the SHAPE tool slot — Highlight, Border, Border Highlight, Spotlight (default U,
+    /// which IS Photoshop's shape-tool key) — DRAGON-369, spotlight folded in by DRAGON-384.
+    /// Arm-then-advance: see [`Action::ALL`]'s slot note.
     PreviewAnnotShapeCycle,
     /// Preview: duplicate the selected annotation, offset toward the frame center (default D).
     PreviewAnnotDuplicate,
     /// Preview: cycle the annotation stroke width to the next preset, wrapping (default L).
     PreviewAnnotStrokeCycle,
-    /// Preview: open the annotation color flyout (default C).
+    /// Preview: the CROP tool (default C, Photoshop's Crop key) - DRAGON-385. Starts or confirms a
+    /// crop session exactly like the toolbar button ([`crate::app::message::preview::PreviewMsg`]'s
+    /// `CropEnter`, which both opens and applies). A live session OWNS the keyboard (Enter accepts,
+    /// Escape cancels; see `preview_modal_key`), so a press mid-session is swallowed rather than
+    /// double-starting the tool.
+    PreviewCrop,
+    /// Preview: open the annotation color flyout (default S, "S for swatches" - moved off C for the
+    /// crop tool in DRAGON-385, freed by DRAGON-384's spotlight consolidation).
     PreviewColorFlyout,
+    /// Preview: swap the active annotation color to its COMPANION (its complement), toggling
+    /// back on a second press (default X — Photoshop's foreground/background swap) — DRAGON-386.
+    PreviewColorCompanionSwap,
     /// Preview: toggle between selection/interact and PAN (hand) mode (default H — Photoshop's
     /// Hand tool).
     PreviewTogglePan,
@@ -174,7 +189,7 @@ impl Action {
     ///
     /// # Tool SLOTS, and why the order here is load-bearing (DRAGON-369)
     ///
-    /// Ten keys serve twelve annotation tools: five of them are reached through a per-slot
+    /// Nine keys serve twelve annotation tools: six of them are reached through a per-slot
     /// CYCLE action ([`Action::PreviewAnnotRedactCycle`] `M`,
     /// [`Action::PreviewAnnotShapeCycle`] `U`) whose behaviour is **arm-then-advance** — the
     /// slot's current member if the slot is not armed, the next member (wrapping) if it is.
@@ -188,13 +203,13 @@ impl Action {
     /// unexplainable to a user and untestable headless.
     ///
     /// **A deliberate per-tool bind always beats a slot bind.** All twelve per-tool actions
-    /// stay in this list (the five slot members simply default UNBOUND) and every one of them
+    /// stay in this list (the six slot members simply default UNBOUND) and every one of them
     /// is listed BEFORE the slot actions, so [`Keymap::action_for`]'s `.find()` resolves a
     /// per-tool binding first BY CONSTRUCTION. That is what makes
     /// [`Keymap::apply_overrides`] — which does not de-duplicate against changed defaults —
     /// a no-op for anyone who had rebound a tool, and it gives the third member of a slot a
     /// first-class escape hatch. Keep the ordering when adding tools.
-    pub const ALL: [Action; 39] = [
+    pub const ALL: [Action; 41] = [
         Action::SelectAllText,
         Action::DeselectText,
         Action::CopyText,
@@ -227,7 +242,9 @@ impl Action {
         Action::PreviewAnnotShapeCycle,
         Action::PreviewAnnotDuplicate,
         Action::PreviewAnnotStrokeCycle,
+        Action::PreviewCrop,
         Action::PreviewColorFlyout,
+        Action::PreviewColorCompanionSwap,
         Action::PreviewTogglePan,
         Action::PreviewPlay,
         Action::PreviewFramePrev,
@@ -275,7 +292,9 @@ impl Action {
             Action::PreviewAnnotShapeCycle => "Cycle shape tools",
             Action::PreviewAnnotDuplicate => "Duplicate annotation",
             Action::PreviewAnnotStrokeCycle => "Cycle line width",
+            Action::PreviewCrop => "Crop tool",
             Action::PreviewColorFlyout => "Color",
+            Action::PreviewColorCompanionSwap => "Swap color",
             Action::PreviewTogglePan => "Toggle pan mode",
             Action::RecordStop => "Stop and save recording",
             Action::RecordToggleMic => "Toggle Microphone",
@@ -324,7 +343,9 @@ impl Action {
             Action::PreviewAnnotBlur => {
                 "Blur a region (destructive redaction). Reached with Cycle redaction tools."
             }
-            Action::PreviewAnnotSpotlight => "Draw a spotlight that dims everything outside it.",
+            Action::PreviewAnnotSpotlight => {
+                "Draw a spotlight that dims everything outside it. Reached with Cycle shape tools."
+            }
             Action::PreviewAnnotPen => "Draw freehand strokes.",
             Action::PreviewAnnotText => "Add a text caption: click to type, or drag a box to wrap within.",
             Action::PreviewAnnotEraser => "Erase pen strokes by dragging over them.",
@@ -334,7 +355,11 @@ impl Action {
             }
             Action::PreviewAnnotDuplicate => "Duplicate the selected annotation.",
             Action::PreviewAnnotStrokeCycle => "Cycle the line width.",
+            Action::PreviewCrop => "Crop the image. Drag the handles, then press to apply.",
             Action::PreviewColorFlyout => "Open the annotation color picker.",
+            Action::PreviewColorCompanionSwap => {
+                "Swap the annotation color to its companion, and back again."
+            }
             Action::PreviewTogglePan => "Toggle between selection and pan (hand) mode.",
             Action::RecordStop => "",
             Action::RecordToggleMic => "",
@@ -380,7 +405,9 @@ impl Action {
             | Action::PreviewAnnotShapeCycle
             | Action::PreviewAnnotStrokeCycle
             | Action::PreviewAnnotDuplicate
+            | Action::PreviewCrop
             | Action::PreviewColorFlyout
+            | Action::PreviewColorCompanionSwap
             | Action::PreviewTogglePan => "Image Editor Shortcuts",
             Action::RecordStop
             | Action::RecordToggleMic
@@ -425,7 +452,9 @@ impl Action {
             | Action::PreviewAnnotShapeCycle
             | Action::PreviewAnnotStrokeCycle
             | Action::PreviewAnnotDuplicate
+            | Action::PreviewCrop
             | Action::PreviewColorFlyout
+            | Action::PreviewColorCompanionSwap
             | Action::PreviewTogglePan => Context::Preview,
             Action::RecordStop
             | Action::RecordToggleMic
@@ -437,9 +466,10 @@ impl Action {
     ///
     /// The annotation-tool letters are Photoshop's wherever Photoshop has an answer
     /// (DRAGON-369): `V` move/select, `T` type, `B` brush, `E` eraser, `U` shapes, `I` count,
-    /// `H` hand, `M` for the redaction family. The five tools that ship UNBOUND are the members
+    /// `H` hand, `M` for the redaction family. The six tools that ship UNBOUND are the members
     /// of the two cycling SLOTS — nothing is unreachable, and binding one of them back is the
-    /// documented escape hatch (see [`Action::ALL`]).
+    /// documented escape hatch (see [`Action::ALL`]). Spotlight joined the shape slot in
+    /// DRAGON-384, retiring its former solo `S` default.
     pub fn default_shortcut(self) -> Option<Shortcut> {
         Some(match self {
             Action::CopyText => Shortcut::primary_char('c'),
@@ -463,13 +493,13 @@ impl Action {
             Action::PreviewDeselectAll => Shortcut::primary_char('d'),
             Action::PreviewAnnotArrow => Shortcut::char('a'),
             Action::PreviewAnnotBadge => Shortcut::char('i'),
-            // The five SLOT members ship unbound — reached through their slot's cycle key.
+            // The six SLOT members ship unbound — reached through their slot's cycle key.
             Action::PreviewAnnotBox
             | Action::PreviewAnnotHighlight
             | Action::PreviewAnnotBoxHighlight
+            | Action::PreviewAnnotSpotlight
             | Action::PreviewAnnotPixelate
             | Action::PreviewAnnotBlur => return None,
-            Action::PreviewAnnotSpotlight => Shortcut::char('s'),
             Action::PreviewAnnotPen => Shortcut::char('b'),
             Action::PreviewAnnotText => Shortcut::char('t'),
             Action::PreviewAnnotEraser => Shortcut::char('e'),
@@ -477,7 +507,10 @@ impl Action {
             Action::PreviewAnnotShapeCycle => Shortcut::char('u'),
             Action::PreviewAnnotDuplicate => Shortcut::char('d'),
             Action::PreviewAnnotStrokeCycle => Shortcut::char('l'),
-            Action::PreviewColorFlyout => Shortcut::char('c'),
+            // DRAGON-385: C is the CROP tool (Photoshop parity); the color flyout moved to S.
+            Action::PreviewCrop => Shortcut::char('c'),
+            Action::PreviewColorFlyout => Shortcut::char('s'),
+            Action::PreviewColorCompanionSwap => Shortcut::char('x'),
             Action::PreviewTogglePan => Shortcut::char('h'),
             Action::RecordStop => Shortcut::named(NamedKey::Enter),
             Action::RecordToggleMic => Shortcut::char('m'),
@@ -1384,8 +1417,7 @@ mod tests {
             ("a", Action::PreviewAnnotArrow),          // solo: the highest-frequency tool
             ("i", Action::PreviewAnnotBadge),          // PS Count
             ("m", Action::PreviewAnnotRedactCycle),    // pixelate / blur
-            ("u", Action::PreviewAnnotShapeCycle),     // PS shape tools
-            ("s", Action::PreviewAnnotSpotlight),      // outside the shape slot on purpose
+            ("u", Action::PreviewAnnotShapeCycle),     // PS shape tools (spotlight joined here)
             ("t", Action::PreviewAnnotText),           // PS Type
             ("b", Action::PreviewAnnotPen),            // PS Brush
             ("e", Action::PreviewAnnotEraser),         // PS Eraser
@@ -1393,28 +1425,69 @@ mod tests {
             // Unchanged neighbours that share the row.
             ("d", Action::PreviewAnnotDuplicate),
             ("l", Action::PreviewAnnotStrokeCycle),
-            ("c", Action::PreviewColorFlyout),
+            ("c", Action::PreviewCrop),                // PS Crop (DRAGON-385)
+            ("s", Action::PreviewColorFlyout),         // "S for swatches" (moved off C, DRAGON-385)
+            ("x", Action::PreviewColorCompanionSwap), // PS foreground/background swap (DRAGON-386)
             ("w", Action::PreviewCovermark),
             ("p", Action::PreviewPlay),
         ] {
             assert_eq!(km.action_for(Context::Preview, bare, &ch(key)), Some(action), "{key}");
         }
-        // The retired letters are FREE — left unbound for future tools, not reassigned.
+        // The retired letters are FREE — left unbound for future tools, not reassigned. `s` left
+        // this list in DRAGON-385 (it now opens the color flyout); `x` left in DRAGON-386 (the
+        // companion-color swap).
         for key in ["g", "n", "q", "y", "z", "r", "o", "j", "k"] {
             assert_eq!(km.action_for(Context::Preview, bare, &ch(key)), None, "{key} must be free");
         }
-        // The five slot members ship unbound — reachable only through their cycle key…
+        // The six slot members ship unbound — reachable only through their cycle key…
         for tool in [
             Action::PreviewAnnotPixelate,
             Action::PreviewAnnotBlur,
             Action::PreviewAnnotHighlight,
             Action::PreviewAnnotBox,
             Action::PreviewAnnotBoxHighlight,
+            Action::PreviewAnnotSpotlight,
         ] {
             assert_eq!(km.get(tool), None, "{tool:?} must ship unbound");
             // …and "unbound" IS their default, so the settings row shows no stale reset.
             assert!(km.is_default(tool), "{tool:?} unbound is its default");
         }
+    }
+
+    /// DRAGON-384 migration: a keymap persisted before spotlight joined the shape slot still
+    /// carries the retired `S` default as an explicit override. It must keep selecting spotlight
+    /// — not crash, not be silently swallowed. It resolves directly because `PreviewAnnotSpotlight`
+    /// is listed BEFORE the slot cycle in [`Action::ALL`] (the same escape hatch every slot member
+    /// has), so the old `S` wins over the `U` slot and the `U` slot still cycles spotlight in too.
+    #[test]
+    fn an_old_spotlight_s_binding_still_selects_spotlight() {
+        let bare = Modifiers::empty();
+        // A fresh keymap: `S` opens the color flyout since DRAGON-385 (it moved off C); `U` is the
+        // shape slot.
+        let km = Keymap::defaults();
+        assert_eq!(
+            km.action_for(Context::Preview, bare, &ch("s")),
+            Some(Action::PreviewColorFlyout)
+        );
+        assert_eq!(
+            km.action_for(Context::Preview, bare, &ch("u")),
+            Some(Action::PreviewAnnotShapeCycle)
+        );
+        // A pre-DRAGON-384 config persisted `PreviewAnnotSpotlight -> S` (then a default, now an
+        // override). Applied literally, `S` resolves straight to spotlight: it is listed BEFORE
+        // the color flyout in [`Action::ALL`], so `action_for`'s `.find()` still returns it ahead
+        // of the flyout's own (now default) `S` binding.
+        let mut old = Keymap::defaults();
+        old.apply_overrides(&[(Action::PreviewAnnotSpotlight, Some(Shortcut::char('s')))]);
+        assert_eq!(
+            old.action_for(Context::Preview, bare, &ch("s")),
+            Some(Action::PreviewAnnotSpotlight)
+        );
+        // …and the shape slot key is untouched — spotlight is reachable BOTH ways for that user.
+        assert_eq!(
+            old.action_for(Context::Preview, bare, &ch("u")),
+            Some(Action::PreviewAnnotShapeCycle)
+        );
     }
 
     /// The migration rule, structural: every per-TOOL action precedes both slot actions in

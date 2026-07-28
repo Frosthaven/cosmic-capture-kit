@@ -124,21 +124,33 @@ pub struct Persisted {
     /// (no draw tool). DRAGON-321.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub annot_tool: Option<String>,
-    /// The last-selected annotation stroke width (SOURCE px), so a fresh preview opens with
-    /// it and new box/arrow shapes seed from it. Defaults to `DEFAULT_ANNOT_STROKE` (5px).
+    /// The last-selected annotation stroke width in logical POINTS (DRAGON-383), so a fresh
+    /// preview opens with it and new box/arrow shapes seed from it (scaled to the document's
+    /// SOURCE px at the seed site). Defaults to `DEFAULT_ANNOT_STROKE`.
+    ///
+    /// MIGRATION: an older build persisted this as raw SOURCE px. On Linux (and any 1x panel)
+    /// points == source px, so an existing value is unchanged. On a 2x mac the stored NUMBER is
+    /// reused verbatim but now MEANS points — the points interpretation wins because the value
+    /// only ever came from picking a (point) preset off the ladder in the first place, so
+    /// reinterpreting it restores the intended visual size; it also self-corrects the instant a
+    /// preset is picked. Acceptable because the pre-fix mac behavior was itself the bug.
     #[serde(default = "default_annot_stroke_w")]
     pub annot_stroke_w: f32,
-    /// The remembered SEQUENCE-BADGE ("step marker") side (SOURCE px): whatever the last badge
-    /// placed or resized in ANY preview editor settled at, so the next editor — a new capture
-    /// process, a later launch — spawns markers at it. `0.0` (and an absent key, which reads
-    /// the same) means UNSET: the caller falls back to
+    /// The remembered SEQUENCE-BADGE ("step marker") side in logical POINTS (DRAGON-383):
+    /// whatever the last badge placed or resized in ANY preview editor settled at (brought back
+    /// to points from its source-px side), so the next editor — a new capture process, a later
+    /// launch, a DIFFERENT-scale display — spawns markers at the same visual size. `0.0` (and an
+    /// absent key, which reads the same) means UNSET: the caller falls back to
     /// `app::preview::annotate::DEFAULT_BADGE_SIZE`, which is why this has no `default = …` fn
-    /// of its own (one fallback, in one place, and an old config needs no migration).
+    /// of its own. MIGRATION as for `annot_stroke_w`: a pre-fix value was source px (identity on
+    /// Linux 1x; reinterpreted as points on 2x mac, self-correcting on the next placement).
     #[serde(default)]
     pub annot_badge_size: f32,
-    /// The last-selected TEXT annotation size (SOURCE px), so a fresh preview opens the text
-    /// tool at it. `0.0` / absent = UNSET (falls back to `preview::text_annot::DEFAULT_TEXT_SIZE`),
-    /// so no `default = …` fn and an old config needs no migration. DRAGON-354.
+    /// The last-selected TEXT annotation size in logical POINTS (DRAGON-383), so a fresh preview
+    /// opens the text tool at it (scaled to SOURCE px when it seeds a box). `0.0` / absent =
+    /// UNSET (falls back to `preview::text_annot::DEFAULT_TEXT_SIZE`), so no `default = …` fn.
+    /// DRAGON-354. MIGRATION as for `annot_stroke_w` (identity on Linux 1x; reinterpreted as
+    /// points on 2x mac, self-correcting on the next dropdown pick).
     #[serde(default)]
     pub annot_text_size: f32,
     /// The last-selected TEXT font family ("hand" | "clean"). `None` / unknown = the default

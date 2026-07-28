@@ -5,7 +5,7 @@
 use super::*;
 
 /// The pan/zoom of the preview image. `zoom` 1.0 = fit (default), `pan` in screen px.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Viewport {
     pub zoom: f32,
     pub pan: (f32, f32),
@@ -17,6 +17,10 @@ pub struct Viewport {
     pub zoom_preset: Option<usize>,
     /// The zoom preset menu (combo popover) is open.
     pub zoom_menu_open: bool,
+    /// The crop tool is active (DRAGON-382): the zoom floor relaxes from [`Viewport::MIN`] to
+    /// [`Viewport::CROP_MIN`] so the user can pull the media much smaller for a roomy crop
+    /// workspace. Set on crop-session enter, cleared on exit.
+    pub crop_mode: bool,
 }
 
 impl Default for Viewport {
@@ -27,6 +31,7 @@ impl Default for Viewport {
             pan_mode: false,
             zoom_preset: Some(0),
             zoom_menu_open: false,
+            crop_mode: false,
         }
     }
 }
@@ -39,13 +44,23 @@ impl Viewport {
     /// `App::max_view_zoom`), which is what actually bounds zoom-IN.
     pub(super) const MIN: f32 = 0.5;
     pub(super) const MAX: f32 = 64.0;
+    /// The relaxed zoom floor while the crop tool is active (DRAGON-382) — a fit-relative
+    /// multiplier well below [`Self::MIN`], so the media can be pulled small for a roomy crop
+    /// workspace (much farther out than the normal 50% floor).
+    pub(super) const CROP_MIN: f32 = 0.1;
     /// The "fit" multiplier (whole picture visible) — the recentre point.
     pub(super) const FIT: f32 = 1.0;
+
+    /// The zoom floor for the current mode: the relaxed crop floor while the crop tool is
+    /// active, else the normal half-fit floor.
+    pub(super) fn zoom_floor(&self) -> f32 {
+        if self.crop_mode { Self::CROP_MIN } else { Self::MIN }
+    }
 
     /// Set the zoom multiplier directly (slider / preset), clamped. At or below fit the
     /// picture fully fits (no overflow), so recentre — drop any pan.
     pub(super) fn set_zoom(&mut self, z: f32) {
-        self.zoom = z.clamp(Self::MIN, Self::MAX);
+        self.zoom = z.clamp(self.zoom_floor(), Self::MAX);
         if self.zoom <= Self::FIT {
             self.pan = (0.0, 0.0);
         }
@@ -118,7 +133,10 @@ impl App {
     /// the USER-FACING percent and presets go through [`Self::preview_visual_scale`] instead
     /// (visual units). `1.0` when the media dims aren't known yet (still loading).
     pub(super) fn preview_fit_scale(&self, preview: &PreviewState) -> f32 {
-        let (iw, ih) = preview.edit.frame;
+        // The DISPLAY frame (DRAGON-385): a crop makes the fit / zoom / presets relative to the
+        // cropped framing (100% = the crop at natural size). Un-cropped = the decoded frame,
+        // byte-identical to before.
+        let (iw, ih) = preview.display_frame();
         if iw == 0 || ih == 0 {
             return 1.0;
         }
@@ -127,7 +145,7 @@ impl App {
         // visual at fit — the picture is shown at its natural size, not physical 1:1
         // (rule 2, DRAGON-221). `source_scale == 1.0` (Linux 1x) makes points ==
         // physical, so `dw / iw` is byte-identical to before.
-        let (pw, ph) = preview.frame_points();
+        let (pw, ph) = preview.display_frame_points();
         let (avail_w, avail_h) = self.preview_viewport(preview);
         let (dw, _) = video::fit_dims(pw.max(1), ph.max(1), avail_w, avail_h);
         (dw / iw as f32).clamp(0.0001, 1.0)
@@ -194,8 +212,9 @@ impl App {
     pub(super) fn preview_pan_bounds(&self, preview: &PreviewState) -> ((f32, f32), (f32, f32)) {
         // The displayed picture is fitted at its natural (logical-point) size (rule 2),
         // so the pan range clamps against THAT — matching the ZoomPan widget's own
-        // `content_px`, the authoritative clamp (DRAGON-221). Byte-identical at scale 1.
-        let (iw, ih) = preview.frame_points();
+        // `content_px`, the authoritative clamp (DRAGON-221). The DISPLAY frame (DRAGON-385):
+        // a crop clamps the pan to the cropped framing. Byte-identical at scale 1, un-cropped.
+        let (iw, ih) = preview.display_frame_points();
         let (vw, vh) = self.preview_viewport(preview);
         let (dw, dh) = video::fit_dims(iw.max(1), ih.max(1), vw, vh);
         let z = preview.view.zoom;
@@ -226,6 +245,11 @@ impl App {
     /// Zooming OUT bottoms out at 50% on-screen regardless of how far the fit downscaled the
     /// capture — a large grab fits at e.g. 78%, and half of THAT would read 39%, not 50%.
     pub(super) fn min_view_zoom(&self, preview: &PreviewState) -> f32 {
+        // Crop tool (DRAGON-382): relax the slider floor to the fit-relative crop minimum so the
+        // user can zoom the media much smaller for a roomy crop workspace.
+        if preview.view.crop_mode {
+            return Viewport::CROP_MIN;
+        }
         (0.5 / self.preview_visual_scale(preview)).min(Viewport::FIT)
     }
 

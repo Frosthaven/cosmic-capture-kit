@@ -76,6 +76,8 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "edit-undo-symbolic" => "undo-2",
         "edit-redo-symbolic" => "redo-2",
         // Covermark + annotation tools.
+        "crop-symbolic" => "crop", // image crop tool (DRAGON-382)
+        "object-flip-horizontal-symbolic" => "arrow-left-right", // annotation color swap (DRAGON-386)
         "insert-image-symbolic" => "flag", // covermark (flag/redact a region)
         "zoom-in-symbolic" => "zoom-in", // covermark zoom slider
         "display-brightness-symbolic" => "contrast", // covermark opacity slider
@@ -154,6 +156,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
     }
     match file {
         "crop" => svg!("crop"),
+        "arrow-left-right" => svg!("arrow-left-right"),
         "app-window" => svg!("app-window"),
         "monitor" => svg!("monitor"),
         "move" => svg!("move"),
@@ -255,7 +258,7 @@ mod tests {
             "audio-volume-high-symbolic", "notification-symbolic", "input-keyboard-symbolic",
             "view-refresh-symbolic", "document-save-symbolic", "document-save-as-symbolic",
             "edit-copy-symbolic", "view-fullscreen-symbolic", "view-restore-symbolic",
-            "edit-undo-symbolic", "edit-redo-symbolic", "insert-image-symbolic",
+            "edit-undo-symbolic", "edit-redo-symbolic", "crop-symbolic", "insert-image-symbolic",
             "zoom-in-symbolic", "display-brightness-symbolic", "mail-forward-symbolic",
             "pointer-select-symbolic",
             "format-text-highlight-symbolic", "checkbox-symbolic", "box-highlight-symbolic",

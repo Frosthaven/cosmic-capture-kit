@@ -10,8 +10,9 @@
 //!
 //! # Selection (DRAGON-341)
 //! The selection is a SET (`selection`, in selection order) rather than one id. Its LAST member
-//! is the PRIMARY: the only one wearing resize handles, so every [`Grab`] still edits exactly one
-//! item and the whole resize machinery is untouched by multi-select. [`Tool::Pointer`] is the
+//! is the PRIMARY: for a SINGLE selection it is the one wearing resize handles, so a [`Grab`]
+//! edits exactly one item. For a MULTI-selection the handles move to a GROUP box (DRAGON-388) and
+//! a resize scales every member in unison; single-select resize is untouched. [`Tool::Pointer`] is the
 //! pure-selection mode that makes the set reachable — Ctrl/Shift-click toggles members
 //! ([`additive_select`]), an empty-canvas drag rubber-bands ([`Pending::Band`] →
 //! [`AnnotEvent::BoxSelect`]), and dragging any selected body emits the ordinary
@@ -575,8 +576,14 @@ pub struct CanvasMap {
     pub pan: (f32, f32),
     /// Image on-screen display size at zoom 1 (dw, dh).
     pub disp: (f32, f32),
-    /// Image source pixel dims (fw, fh).
+    /// DISPLAYED image source pixel dims (fw, fh) — the CROP's size when a crop frames the view
+    /// (DRAGON-385), else the whole frame.
     pub source: (f32, f32),
+    /// The DISPLAY frame's top-left offset within the full source (SOURCE px), DRAGON-385: the
+    /// crop origin when a crop frames the view, else `(0, 0)`. Model coordinates stay FULL-SOURCE
+    /// (annotations never move when a crop is applied); this shifts between them and the cropped
+    /// on-screen content. `(0, 0)` = un-cropped, byte-identical to before.
+    pub offset: (f32, f32),
 }
 
 impl CanvasMap {
@@ -601,16 +608,19 @@ impl CanvasMap {
         let o = self.origin();
         let sx = if self.disp.0 > 0.0 { self.source.0 / self.disp.0 } else { 0.0 };
         let sy = if self.disp.1 > 0.0 { self.source.1 / self.disp.1 } else { 0.0 };
-        ((q.0 - o.0) * sx, (q.1 - o.1) * sy)
+        // Crop-local source px, then shift back into FULL-source coords (DRAGON-385).
+        ((q.0 - o.0) * sx + self.offset.0, (q.1 - o.1) * sy + self.offset.1)
     }
 
-    /// Image source pixel → widget-local screen point.
+    /// FULL-source image pixel → widget-local screen point.
     pub fn to_canvas(self, img: (f32, f32)) -> (f32, f32) {
         let t = self.translate();
         let o = self.origin();
         let dx = if self.source.0 > 0.0 { self.disp.0 / self.source.0 } else { 0.0 };
         let dy = if self.source.1 > 0.0 { self.disp.1 / self.source.1 } else { 0.0 };
-        let q = (o.0 + img.0 * dx, o.1 + img.1 * dy);
+        // Full-source → crop-local (DRAGON-385) before the centred fit placement.
+        let (ix, iy) = (img.0 - self.offset.0, img.1 - self.offset.1);
+        let q = (o.0 + ix * dx, o.1 + iy * dy);
         (self.zoom * q.0 + t.0, self.zoom * q.1 + t.1)
     }
 
@@ -733,6 +743,9 @@ pub struct AnnotationCanvas<'a, Msg> {
     pan: (f32, f32),
     disp: (f32, f32),
     source: (f32, f32),
+    /// The DISPLAY frame's offset within the full source (SOURCE px), DRAGON-385 — see
+    /// [`CanvasMap::offset`]. `(0, 0)` un-cropped.
+    offset: (f32, f32),
     /// The pan tool (grabby hand) is active — a press then belongs to the ZoomPan.
     pan_mode: bool,
     accent: Color,
@@ -772,6 +785,12 @@ pub struct AnnotationCanvas<'a, Msg> {
     /// [`Self::draw`] against the picture rect. Hit-testing works off the item model, so input
     /// stays entirely with this widget — an interactive sibling would swallow presses.
     text_layers: Vec<(u64, cosmic::Element<'a, Msg>)>,
+    /// DISPLAY-ONLY (DRAGON-387): draw the committed scene (vector runs + text rasters) over the
+    /// media but own NO interaction — every pointer event forwards to the wrapped ZoomPan and no
+    /// selection chrome is drawn. The crop SESSION layers its own overlay on top and owns the
+    /// pointer, so the annotations must show through non-interactively. `false` = the ordinary
+    /// interactive editor canvas, byte-identical to before.
+    display_only: bool,
     on_event: Box<dyn Fn(AnnotEvent) -> Msg>,
 }
 
@@ -799,6 +818,7 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
             pan,
             disp,
             source,
+            offset: (0.0, 0.0),
             pan_mode,
             accent,
             text_caret: None,
@@ -806,8 +826,26 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
             editing_text: None,
             text_selection: Vec::new(),
             text_layers: Vec::new(),
+            display_only: false,
             on_event: Box::new(on_event),
         }
+    }
+
+    /// Make this a DISPLAY-ONLY canvas (DRAGON-387): it draws the committed annotations over the
+    /// media but intercepts no pointer event and draws no selection chrome — used by the crop
+    /// SESSION, which owns the pointer through its own overlay yet must still show the annotations.
+    /// Builder so the constructor arg list stays fixed; an interactive canvas simply never calls it.
+    pub fn display_only(mut self, on: bool) -> Self {
+        self.display_only = on;
+        self
+    }
+
+    /// The DISPLAY frame's offset within the full source (SOURCE px), DRAGON-385: the crop origin
+    /// when a crop frames the view (`source` is then the crop's size), else `(0, 0)`. Builder so
+    /// the constructor arg list stays fixed; an un-cropped canvas simply never calls it.
+    pub fn crop_offset(mut self, offset: (f32, f32)) -> Self {
+        self.offset = offset;
+        self
     }
 
     /// Supply the TEXT annotations' raster layers as `(item id, draw-only element)` — see
@@ -874,6 +912,7 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
             pan: self.pan,
             disp: self.disp,
             source: self.source,
+            offset: self.offset,
         }
     }
 
@@ -928,11 +967,56 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         self.tool.is_some_and(Tool::is_pointer)
     }
 
+    /// The screen-px rect `(left, top, right, bottom)` an item's selection chrome sits on — the
+    /// SAME rect the draw + hit-test use per kind (DRAGON-388): a rect/pen grows by
+    /// [`box_chrome_rect`], an arrow by its span padded like the secondary-arrow chrome. Shared
+    /// so the group box (below) unions exactly what each member draws.
+    fn item_chrome_screen_rect(&self, map: &CanvasMap, item: &Item) -> (f32, f32, f32, f32) {
+        let from_global = |r: GlobalRect| (r.left as f32, r.top as f32, r.right as f32, r.bottom as f32);
+        match &item.kind {
+            ItemKind::Rect { x, y, w, h } => {
+                from_global(box_chrome_rect(map, *x, *y, *w, *h, item.stroke_w))
+            }
+            ItemKind::Path { paths, .. } => {
+                let (x, y, w, h) = path_bounds(paths);
+                from_global(box_chrome_rect(map, x, y, w, h, item.stroke_w))
+            }
+            ItemKind::Arrow { ax, ay, bx, by } => {
+                let r = box_screen_rect(map, *ax, *ay, *bx - *ax, *by - *ay);
+                let pad =
+                    (HIT_PAD + item.stroke_w * map.img_to_screen_scale() * 0.5).round() as i32;
+                (
+                    (r.left - pad) as f32,
+                    (r.top - pad) as f32,
+                    (r.right + pad) as f32,
+                    (r.bottom + pad) as f32,
+                )
+            }
+        }
+    }
+
+    /// The GROUP selection box (DRAGON-388): the union of every SELECTED item's chrome rect in
+    /// screen px `(left, top, right, bottom)`, or `None` when nothing is selected. Derived state —
+    /// recomputed each draw/hit-test as the selection or geometry changes, never stored.
+    fn group_chrome_rect(&self, map: &CanvasMap) -> Option<(f32, f32, f32, f32)> {
+        let mut acc: Option<(f32, f32, f32, f32)> = None;
+        for item in self.items.iter().filter(|i| self.is_selected(i.id)) {
+            let (l, t, r, b) = self.item_chrome_screen_rect(map, item);
+            acc = Some(match acc {
+                None => (l, t, r, b),
+                Some((al, at, ar, ab)) => (al.min(l), at.min(t), ar.max(r), ab.max(b)),
+            });
+        }
+        acc
+    }
+
     /// Hit-test in precedence order: the PRIMARY selected item's resize HANDLES first (they
     /// exist ONLY for it, drawn HIT_PAD outside it), then ANY item's BODY top-most first (a body
     /// press selects + moves), then empty. So an unselected item has no grabbable handles — you
-    /// select it (body-click) to reveal them. In a MULTI-selection (DRAGON-341) only the primary
-    /// carries handles, so a resize still edits exactly one item.
+    /// select it (body-click) to reveal them. In a MULTI-selection the handles ride the GROUP
+    /// BOX (DRAGON-388), so a resize scales the whole set in unison; single selection keeps its
+    /// handles on the item itself. Then (DRAGON-390) the group box's own border + empty interior
+    /// grab as a Body hit on the primary, so dragging the box moves the whole group.
     /// The raster layer belonging to item `id`, if it has one (DRAGON-373). A text box that is
     /// still blank has none — there is nothing to draw — so it just rides the vector run.
     fn text_layer_for(&self, id: u64) -> Option<&cosmic::Element<'a, Msg>> {
@@ -945,7 +1029,17 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         //    the 8 drawn circles (corners + edge midpoints) on the chrome rect / the arrow's
         //    two endpoint nodes — ONLY those resize, NOT the whole perimeter (the rest of the
         //    stroke moves, via Body in step 2).
-        if let Some(sel) = self.selected_item() {
+        if self.selection.len() > 1 {
+            // A MULTI-selection wears its handles on the GROUP BOX (DRAGON-388), the union of
+            // every selected item's chrome rect — NOT the primary. A hit on one opens a group
+            // SCALE (the app scales the whole set), so the id is just the primary for routing.
+            if let Some((l, t, r, b)) = self.group_chrome_rect(map)
+                && let Some(grab) = rect_handle_grab(l, t, r, b, g)
+                && let Some(pid) = self.primary()
+            {
+                return Some((pid, HitKind::Resize(grab)));
+            }
+        } else if let Some(sel) = self.selected_item() {
             // A pen group's handles sit on its BOUNDING BOX, exactly like a rect's.
             let sel_kind = match &sel.kind {
                 ItemKind::Path { paths, .. } => {
@@ -1041,6 +1135,19 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
                     }
                 }
             }
+        }
+        // 3. The GROUP BOX itself (DRAGON-390): with a multi-selection, a press on the dashed
+        //    border or the empty interior inside the union — anything the group handles (step 1)
+        //    and every annotation body (step 2) missed — grabs the WHOLE group. Routed through the
+        //    primary id as a Body hit, so the existing "a press inside a multi-selection keeps it
+        //    whole" lane arms MoveMany and the right-click lane opens the shared menu, both with
+        //    the selection left intact — no new event, no app-side change.
+        if self.selection.len() > 1
+            && let Some((l, t, r, b)) = self.group_chrome_rect(map)
+            && group_box_grab(l, t, r, b, g)
+            && let Some(pid) = self.primary()
+        {
+            return Some((pid, HitKind::Body));
         }
         None
     }
@@ -1226,6 +1333,17 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         renderer: &cosmic::Renderer,
     ) -> mouse::Interaction {
         let bounds = layout.bounds();
+        // DRAGON-387: a display-only canvas owns no cursor — defer entirely to the wrapped ZoomPan
+        // (the crop overlay above resolves the crop cursors itself).
+        if self.display_only {
+            return self.content.as_widget().mouse_interaction(
+                &tree.children[0],
+                layout,
+                cursor,
+                viewport,
+                renderer,
+            );
+        }
         let state = tree.state.downcast_ref::<State>();
         // The ZoomPan's cursor (pan grab / scrollbar / default) is the fallback for anything
         // the annotation layer doesn't own.
@@ -1330,6 +1448,22 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         shell: &mut Shell<'_, Msg>,
         viewport: &Rectangle,
     ) {
+        // DRAGON-387: a display-only canvas owns no interaction — every event goes straight to the
+        // wrapped ZoomPan (the crop overlay above owns the pointer). Returns before any modifier
+        // tracking / hit-testing / capture, so it can never claim a press.
+        if self.display_only {
+            self.content.as_widget_mut().update(
+                &mut tree.children[0],
+                event,
+                layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+            return;
+        }
         let bounds = layout.bounds();
         let map = self.map(bounds);
         let to_local = |p: Point| (p.x - bounds.x, p.y - bounds.y);
@@ -1844,8 +1978,10 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         // The picture's on-screen rectangle (GLOBAL coords) — the clip source above and the
         // placement the text layers' `dest` fractions are relative to.
         let picture = {
-            let a = map.to_canvas((0.0, 0.0));
-            let b = map.to_canvas((map.source.0, map.source.1));
+            // The DISPLAYED picture is the crop REGION (offset..offset+source) in full-source
+            // coords (DRAGON-385) — offset `(0, 0)` un-cropped, byte-identical to the old corners.
+            let a = map.to_canvas((map.offset.0, map.offset.1));
+            let b = map.to_canvas((map.offset.0 + map.source.0, map.offset.1 + map.source.1));
             Rectangle {
                 x: ox + a.0.min(b.0),
                 y: oy + a.1.min(b.1),
@@ -1890,10 +2026,15 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                 }
             }
         }
-        // 3. The annotation CHROME (selection boxes + the primary's handles) and the pointer's
-        //    rubber band on top — same content clip. Every SELECTED item gets the dashed
-        //    outline (so a multi-selection is legible, DRAGON-341); only the PRIMARY carries
-        //    handles, because a resize always edits exactly one item.
+        // A display-only canvas (DRAGON-387) stops after the committed scene: no selection chrome,
+        // no caret, no rubber band — the crop session shows the annotations, not the editing UI.
+        if self.display_only {
+            return;
+        }
+        // 3. The annotation CHROME (selection boxes + handles) and the pointer's rubber band on
+        //    top — same content clip. A single selection gets a dashed box with handles on the
+        //    item; a multi-selection (DRAGON-388) gives each member a half-opacity solid box with
+        //    NO handles and adds ONE dashed GROUP box, wearing the handles, around their union.
         let state = tree.state.downcast_ref::<State>();
         let band = match state.pending {
             Pending::Band { .. } if state.moved => Some((state.press_screen, state.band_to)),
@@ -1936,7 +2077,18 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                     accent,
                 );
             }
+            // With more than one item selected (DRAGON-388) each member wears a SOLID box at half
+            // opacity with NO handles, and a single GROUP box (below) carries the handles. Single
+            // selection keeps the historical dashed box + on-item handles, byte-identical.
+            let multi = self.selection.len() > 1;
             for item in self.items.iter().filter(|i| self.is_selected(i.id)) {
+                if multi {
+                    let (l, t, rr, bb) = self.item_chrome_screen_rect(&map, item);
+                    let mut half = accent;
+                    half.a *= 0.5;
+                    solid_rect(&mut fill, l, t, rr - l, bb - t, half);
+                    continue;
+                }
                 let is_primary = primary == Some(item.id);
                 // A pen group chromes on its BOUNDING BOX — the same dashed rect + 8 handles a
                 // rectangle gets, so it moves/resizes with the familiar affordances.
@@ -1983,6 +2135,19 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                     }
                     // Mapped to its bounding Rect above — unreachable.
                     ItemKind::Path { .. } => {}
+                }
+            }
+            // The GROUP box (DRAGON-388): a dashed accent rect wrapping the union of the members'
+            // boxes, wearing the 8 resize handles — the ONE thing a group scale drags. Derived
+            // each frame from the live selection, so it tracks any edit.
+            if multi && let Some((l, t, rr, bb)) = self.group_chrome_rect(&map) {
+                dashed_rect(&mut fill, l, t, rr - l, bb - t, accent);
+                let (mx, my) = ((l + rr) / 2.0, (t + bb) / 2.0);
+                for (hx, hy) in [
+                    (l, t), (rr, t), (l, bb), (rr, bb),
+                    (mx, t), (mx, bb), (l, my), (rr, my),
+                ] {
+                    handle(&mut fill, hx, hy);
                 }
             }
             // The text SELECTION highlight (DRAGON-354 item 12): a translucent accent wash over
@@ -2137,6 +2302,66 @@ fn grab_cursor(g: Grab) -> mouse::Interaction {
         // An arrow endpoint repositions freely — a move cursor.
         Grab::ArrowA | Grab::ArrowB => mouse::Interaction::Move,
     }
+}
+
+/// Which resize [`Grab`] a point `g` (screen px) lands on for a chrome rect whose corners are
+/// `(l, t)`..`(r, b)` (DRAGON-388): the 8 handle circles (4 corners + 4 edge midpoints), each
+/// within [`HANDLE_GRAB`]. Corners take precedence over edges (they sit at the intersections).
+/// The group box hit-tests through this; the single-item path keeps its own inline test so it
+/// stays byte-identical. Pure — unit-tested.
+fn rect_handle_grab(l: f32, t: f32, r: f32, b: f32, g: (i32, i32)) -> Option<Grab> {
+    let (gx, gy) = (g.0 as f32, g.1 as f32);
+    let near = |cx: f32, cy: f32| (gx - cx).hypot(gy - cy) <= HANDLE_GRAB;
+    let (mx, my) = ((l + r) / 2.0, (t + b) / 2.0);
+    if near(l, t) {
+        Some(Grab::Corner(Corner::Nw))
+    } else if near(r, t) {
+        Some(Grab::Corner(Corner::Ne))
+    } else if near(l, b) {
+        Some(Grab::Corner(Corner::Sw))
+    } else if near(r, b) {
+        Some(Grab::Corner(Corner::Se))
+    } else if near(mx, t) {
+        Some(Grab::Edge(Edge::N))
+    } else if near(mx, b) {
+        Some(Grab::Edge(Edge::S))
+    } else if near(l, my) {
+        Some(Grab::Edge(Edge::W))
+    } else if near(r, my) {
+        Some(Grab::Edge(Edge::E))
+    } else {
+        None
+    }
+}
+
+/// Whether `g` (widget-local px) falls on the GROUP BOX body itself (DRAGON-390): anywhere inside
+/// the union rect `(l, t, r, b)`, or within [`HIT_PAD`] of its dashed border (the same comfortable
+/// tolerance the per-item box hit-tests already breathe by). The CALLER owns precedence — this is
+/// consulted only AFTER the group handles and every annotation body have missed, so a `true` here
+/// is the group's empty interior or its border, which drags the whole selection (MoveMany) or
+/// opens its context menu. Pure — unit-tested.
+fn group_box_grab(l: f32, t: f32, r: f32, b: f32, g: (i32, i32)) -> bool {
+    let (gx, gy) = (g.0 as f32, g.1 as f32);
+    gx >= l - HIT_PAD && gx <= r + HIT_PAD && gy >= t - HIT_PAD && gy <= b + HIT_PAD
+}
+
+/// Draw a SOLID rounded rectangle outline (4 sides), 1.5px thick (DRAGON-388) — the box each
+/// member of a multi-selection wears (drawn at half opacity, no handles); the group box keeps
+/// the dashed style + handles.
+fn solid_rect(
+    fill: &mut dyn FnMut(f32, f32, f32, f32, Color, f32),
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    color: Color,
+) {
+    let thick = 1.5;
+    let rad = thick / 2.0;
+    fill(x, y, w, thick, color, rad); // top
+    fill(x, y + h - thick, w, thick, color, rad); // bottom
+    fill(x, y, thick, h, color, rad); // left
+    fill(x + w - thick, y, thick, h, color, rad); // right
 }
 
 /// Draw a dashed rounded rectangle outline (4 sides tiled with short quads), 1.5px thick.
@@ -2504,7 +2729,37 @@ mod tests {
     }
 
     fn map(bounds: (f32, f32), zoom: f32, pan: (f32, f32), disp: (f32, f32), source: (f32, f32)) -> CanvasMap {
-        CanvasMap { bounds, zoom, pan, disp, source }
+        CanvasMap { bounds, zoom, pan, disp, source, offset: (0.0, 0.0) }
+    }
+
+    /// DRAGON-385: a view-crop offset shifts between the cropped on-screen content and the
+    /// FULL-source model coords. `to_image(to_canvas(p)) == p` still round-trips, and the crop
+    /// origin lands at the content's top-left while a full-source point inside the crop maps to
+    /// its cropped-local place.
+    #[test]
+    fn crop_offset_shifts_between_full_source_and_cropped_content() {
+        // A 400x300 crop taken at source (500, 200) of a larger image, shown 1:1 (disp == source
+        // size), centred in an 800x600 canvas at fit zoom, no pan.
+        let m = CanvasMap {
+            bounds: (800.0, 600.0),
+            zoom: 1.0,
+            pan: (0.0, 0.0),
+            disp: (400.0, 300.0),
+            source: (400.0, 300.0),
+            offset: (500.0, 200.0),
+        };
+        // The crop's top-left (full-source 500,200) sits at the content box's top-left corner:
+        // centred 400x300 in 800x600 → (200, 150).
+        assert_close(m.to_canvas((500.0, 200.0)), (200.0, 150.0), 1e-3, "crop origin → content TL");
+        // A point 100px into the crop maps 100px into the content box.
+        assert_close(m.to_canvas((600.0, 250.0)), (300.0, 200.0), 1e-3, "inside the crop");
+        // Round-trip through the offset both ways.
+        for p in [(210.0f32, 160.0f32), (590.0, 440.0), (400.0, 300.0)] {
+            let back = m.to_canvas(m.to_image(p));
+            assert_close(back, p, 1e-2, "offset round-trip");
+        }
+        // to_image of the content top-left recovers the full-source crop origin.
+        assert_close(m.to_image((200.0, 150.0)), (500.0, 200.0), 1e-2, "content TL → crop origin");
     }
 
     fn assert_close(a: (f32, f32), b: (f32, f32), eps: f32, what: &str) {
@@ -2585,6 +2840,35 @@ mod tests {
         let span2 = m2.to_image((400.0, 300.0)).0 - m2.to_image((300.0, 300.0)).0;
         assert!((span1 - 100.0).abs() < 1e-3, "zoom 1: 100 screen px = 100 source px");
         assert!((span2 - 50.0).abs() < 1e-3, "zoom 2: 100 screen px = 50 source px");
+    }
+
+    #[test]
+    fn rect_handle_grab_picks_the_corner_or_edge_under_the_point() {
+        // Chrome rect (0,0)-(100,50): corners, edge midpoints, and a miss (DRAGON-388).
+        assert_eq!(rect_handle_grab(0.0, 0.0, 100.0, 50.0, (0, 0)), Some(Grab::Corner(Corner::Nw)));
+        assert_eq!(rect_handle_grab(0.0, 0.0, 100.0, 50.0, (100, 50)), Some(Grab::Corner(Corner::Se)));
+        assert_eq!(rect_handle_grab(0.0, 0.0, 100.0, 50.0, (100, 0)), Some(Grab::Corner(Corner::Ne)));
+        // Edge midpoints (50,0) top, (0,25) left.
+        assert_eq!(rect_handle_grab(0.0, 0.0, 100.0, 50.0, (50, 0)), Some(Grab::Edge(Edge::N)));
+        assert_eq!(rect_handle_grab(0.0, 0.0, 100.0, 50.0, (0, 25)), Some(Grab::Edge(Edge::W)));
+        // Dead centre is no handle.
+        assert_eq!(rect_handle_grab(0.0, 0.0, 100.0, 50.0, (50, 25)), None);
+    }
+
+    #[test]
+    fn group_box_grab_covers_the_interior_and_a_border_band() {
+        // Union (0,0)-(100,50): the dead centre and every corner/edge are ON the group body,
+        // and so is a point within HIT_PAD (8) of the border; anything past that band misses
+        // (DRAGON-390).
+        assert!(group_box_grab(0.0, 0.0, 100.0, 50.0, (50, 25)), "empty interior grabs");
+        assert!(group_box_grab(0.0, 0.0, 100.0, 50.0, (0, 0)), "corner grabs");
+        assert!(group_box_grab(0.0, 0.0, 100.0, 50.0, (100, 50)), "far corner grabs");
+        // Just outside the outline but inside the tolerance band → still the border.
+        assert!(group_box_grab(0.0, 0.0, 100.0, 50.0, (-8, 25)), "left border band");
+        assert!(group_box_grab(0.0, 0.0, 100.0, 50.0, (50, 58)), "bottom border band");
+        // Past the band on any side → a miss (marquee/deselect territory).
+        assert!(!group_box_grab(0.0, 0.0, 100.0, 50.0, (-9, 25)), "past the left band");
+        assert!(!group_box_grab(0.0, 0.0, 100.0, 50.0, (50, 59)), "past the bottom band");
     }
 
     #[test]
@@ -3108,10 +3392,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_primary_of_a_multi_selection_wears_handles() {
-        // DRAGON-341: the LAST selected id is the primary — the only one with resize handles, so
-        // every Grab still edits exactly one item. The others are still BODY-hittable (they move
-        // with the group) and keep the padded selected hit region.
+    fn a_multi_selection_wears_its_handles_on_the_group_box() {
+        // DRAGON-388 (superseding the DRAGON-341 primary-only rule): with more than one item
+        // selected the resize handles ride the GROUP box — the union of every member's chrome
+        // rect — so a corner drag scales the whole set. Members are still BODY-hittable (a body
+        // drag moves the group) and no per-item handle exists anymore.
         let cmap = map((200.0, 200.0), 1.0, (0.0, 0.0), (200.0, 200.0), (200.0, 200.0));
         let boxed = |id: u64, x: f32, y: f32| Item {
             id,
@@ -3139,16 +3424,145 @@ mod tests {
         );
         assert_eq!(canvas.primary(), Some(2));
         assert!(canvas.is_selected(1) && canvas.is_selected(2));
-        // The PRIMARY's NW chrome corner (120-12, 20-12) is a resize handle...
+        // Chrome rects (pad = HIT_PAD 8 + stroke/2 4 = 12): item 1 (8,8)-(72,72), item 2
+        // (108,8)-(172,72) → group box (8,8)-(172,72).
+        assert_eq!(canvas.group_chrome_rect(&cmap), Some((8.0, 8.0, 172.0, 72.0)));
+        // The GROUP's NW corner is a resize handle (routed via the primary id)...
         assert!(
-            matches!(canvas.hit_at(&cmap, (108.0, 8.0)), Some((2, HitKind::Resize(_)))),
-            "the primary resizes"
+            matches!(
+                canvas.hit_at(&cmap, (8.0, 8.0)),
+                Some((2, HitKind::Resize(Grab::Corner(Corner::Nw))))
+            ),
+            "the group box's corner resizes the whole selection"
         );
-        // ...while the secondary's matching corner is only its (padded) BODY — no handle.
+        // ...and so is its SE corner, which belongs to no single item's old chrome.
         assert!(
-            matches!(canvas.hit_at(&cmap, (8.0, 8.0)), Some((1, HitKind::Body))),
-            "a secondary member has no handles, only a grabbable body"
+            matches!(
+                canvas.hit_at(&cmap, (172.0, 72.0)),
+                Some((2, HitKind::Resize(Grab::Corner(Corner::Se))))
+            ),
         );
+        // The old per-item handle spot (the primary's own NW chrome corner at (108, 8)) now sits
+        // on the group box's TOP edge, between handles — it is just item 2's grabbable BODY.
+        assert!(
+            matches!(canvas.hit_at(&cmap, (110.0, 30.0)), Some((2, HitKind::Body))),
+            "a member's body still moves the group"
+        );
+    }
+
+    fn boxed_item(id: u64, x: f32, y: f32) -> Item {
+        Item {
+            id,
+            kind: ItemKind::Rect { x, y, w: 40.0, h: 40.0 },
+            stroke_w: 8.0,
+            color: Color::WHITE,
+            fill: None,
+            fx: FxKind::None,
+            curve_radius: 8.0,
+            badge: None,
+            text: false,
+        }
+    }
+
+    #[test]
+    fn the_group_box_body_grabs_the_whole_selection() {
+        // DRAGON-390: the derived group box is itself grabbable — its empty interior + border drag
+        // the whole selection, routed as a Body hit on the PRIMARY so the existing "press inside a
+        // multi-selection keeps it whole" lane arms MoveMany. Members 1 & 2 (2 primary) → group box
+        // (8,8)-(172,72), with a clear vertical gap between the two 40px rects at x 72..108.
+        let cmap = map((200.0, 200.0), 1.0, (0.0, 0.0), (200.0, 200.0), (200.0, 200.0));
+        let canvas = AnnotationCanvas::new(
+            cosmic::widget::Space::new(),
+            vec![boxed_item(1, 20.0, 20.0), boxed_item(2, 120.0, 20.0)],
+            vec![1, 2],
+            Some(Tool::Pointer),
+            1.0,
+            (0.0, 0.0),
+            (200.0, 200.0),
+            (200.0, 200.0),
+            false,
+            Color::WHITE,
+            |_ev: AnnotEvent| (),
+        );
+        // A truly EMPTY spot mid-gap (clear of both member chromes and of every handle) grabs the
+        // group as a Body hit on the primary.
+        assert!(
+            matches!(canvas.hit_at(&cmap, (90.0, 40.0)), Some((2, HitKind::Body))),
+            "the group's empty interior moves the whole selection"
+        );
+        // A group HANDLE still wins over the box body (precedence step 1 over step 3).
+        assert!(
+            matches!(
+                canvas.hit_at(&cmap, (8.0, 8.0)),
+                Some((2, HitKind::Resize(Grab::Corner(Corner::Nw))))
+            ),
+            "handles outrank the group body"
+        );
+        // Outside the union entirely → no hit (marquee/deselect territory, unchanged).
+        assert!(
+            canvas.hit_at(&cmap, (185.0, 100.0)).is_none(),
+            "past the group box is empty canvas"
+        );
+    }
+
+    #[test]
+    fn a_non_selected_item_inside_the_union_still_hits_before_the_group_body() {
+        // DRAGON-390 precedence step 2 over step 3: an UNSELECTED annotation sitting inside the
+        // union still takes the press (changing the selection exactly as before) rather than the
+        // group body swallowing it. Item 9 fills the gap between the two selected members.
+        let cmap = map((200.0, 200.0), 1.0, (0.0, 0.0), (200.0, 200.0), (200.0, 200.0));
+        let canvas = AnnotationCanvas::new(
+            cosmic::widget::Space::new(),
+            vec![boxed_item(1, 20.0, 20.0), boxed_item(2, 120.0, 20.0), boxed_item(9, 78.0, 24.0)],
+            vec![1, 2],
+            Some(Tool::Pointer),
+            1.0,
+            (0.0, 0.0),
+            (200.0, 200.0),
+            (200.0, 200.0),
+            false,
+            Color::WHITE,
+            |_ev: AnnotEvent| (),
+        );
+        // Item 9 drawn bounds (pad = stroke/2 = 4): (74,20)-(122,68); (98,44) is its centre — a
+        // handle-free spot inside the union that belongs to item 9, not the group.
+        assert!(
+            matches!(canvas.hit_at(&cmap, (98.0, 44.0)), Some((9, HitKind::Body))),
+            "a non-selected item inside the union still hits first"
+        );
+    }
+
+    #[test]
+    fn a_single_selection_has_no_grabbable_group_body() {
+        // The group-box body lane is MULTI-selection only (DRAGON-390): with one item selected the
+        // empty space around it stays empty canvas, so the marquee/deselect path is untouched.
+        let cmap = map((200.0, 200.0), 1.0, (0.0, 0.0), (200.0, 200.0), (200.0, 200.0));
+        let one = Item {
+            id: 3,
+            kind: ItemKind::Rect { x: 20.0, y: 20.0, w: 40.0, h: 40.0 },
+            stroke_w: 8.0,
+            color: Color::WHITE,
+            fill: None,
+            fx: FxKind::None,
+            curve_radius: 8.0,
+            badge: None,
+            text: false,
+        };
+        let canvas = AnnotationCanvas::new(
+            cosmic::widget::Space::new(),
+            vec![one],
+            vec![3],
+            Some(Tool::Pointer),
+            1.0,
+            (0.0, 0.0),
+            (200.0, 200.0),
+            (200.0, 200.0),
+            false,
+            Color::WHITE,
+            |_ev: AnnotEvent| (),
+        );
+        // A point well outside the single item's chrome (8,8)-(72,72) is empty canvas, not a body.
+        assert!(canvas.hit_at(&cmap, (150.0, 150.0)).is_none());
     }
 
     // ── DRAGON-364: the text element's two states (selected vs. editing) ─────────────────
