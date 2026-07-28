@@ -6,6 +6,8 @@
 
 ![Cosmic Capture Kit capturing its own settings window](res/readme/hero.png)
 
+![The preview editor annotating a captured settings window — step markers, a highlighted row, an arrow, text and freehand notes, with the annotation toolbar and zoom controls visible](res/readme/annotations.png)
+
 Cross-platform screen region, window, and monitor capture with support for glass
 windows, image, video, voice, QR, barcodes, OCR text and more. 
 

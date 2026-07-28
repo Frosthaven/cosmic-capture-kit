@@ -9,7 +9,7 @@
 //! `crate::platform::windows::update_install`).
 //!
 //! HISTORY: while the source repo was fully private the channel was a separate
-//! Pages repo (`cosmic-capture-kit-updates`), and `publish-update.yml` shipped to
+//! Pages repo (`cosmic-capture-kit-updates`), and `publish-release.yml` shipped to
 //! BOTH for a transition period. DRAGON-372 retired it: the Pages repo is gone, so
 //! that step could only fail — and because it ran before the release mirror under
 //! `set -e`, its failure took the whole publish job down with it. Installs at

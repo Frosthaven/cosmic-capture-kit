@@ -530,9 +530,10 @@ pub fn spawn_kind(tool: Tool, rect: AnnotRect, stroke_w: f32) -> Option<AnnotKin
 /// Re-lay-out a text box after any content / size / box change (DRAGON-354), the SINGLE seam
 /// creation, per-keystroke edits and a resize all reflow through — so the drawn box always hugs
 /// its text identically everywhere. Keeps the box ORIGIN; a `constrained` (dragged) box wraps
-/// within its fixed width, an auto (clicked) box grows to its widest line capped at the room to
-/// the picture's right edge; the height snaps to the wrapped line count. The origin is clamped
-/// so the box stays inside `frame`. `stroke_w` (the active line width, SOURCE px) rides along
+/// within its fixed width, an auto (clicked) box grows to its widest line capped at the
+/// PICTURE's width ([`text_auto_cap`]); the height snaps to the wrapped line count. The origin
+/// is clamped to keep the box on `frame` (DRAGON-368: 5px of it, not all of it —
+/// [`clamp_text_rect_on_canvas`]). `stroke_w` (the active line width, SOURCE px) rides along
 /// as the glyph OUTLINE weight (DRAGON-358) — it does NOT affect the layout (outline-only), so
 /// the geometry is unchanged by it. Pure.
 pub fn reflow_text(
@@ -692,36 +693,81 @@ pub fn text_edit_chord(key: &cosmic::iced::keyboard::Key, shift: bool) -> Option
 /// review decision.
 const TEXT_PASTE_MAX_CHARS: usize = 32 * 1024;
 
-/// The right-edge margin (SOURCE px) an AUTO (click-placed) text box keeps clear of the
-/// picture's right edge — the one constant behind [`text_auto_cap`].
-const TEXT_EDGE_MARGIN: f32 = 4.0;
-
-/// The wrap cap (SOURCE px) of an AUTO text box whose origin is `rect_x` and whose current
-/// width is `rect_w`, on a picture `fw` wide: the room to the picture's right edge minus
-/// [`TEXT_EDGE_MARGIN`], floored at the box's OWN width and at one glyph, and ceilinged at
-/// [`super::text_annot::AUTO_WRAP_FALLBACK`] (resvg coordinate sanity on absurd frames). Pure.
+/// The wrap cap (SOURCE px) of an AUTO (click-placed) text box whose current width is `rect_w`,
+/// set at `size_px`, on a picture `fw` wide: the PICTURE's own width, floored at the box's OWN
+/// width and at one glyph, and ceilinged at [`super::text_annot::AUTO_WRAP_FALLBACK`] (resvg
+/// coordinate sanity on absurd frames). Pure.
 ///
-/// WHY the box's own width is a floor (DRAGON-368): until this ticket a text box was clamped
-/// wholly inside the picture, which meant `fw - rect_x >= rect_w` always held and the cap could
-/// never bind on a MOVE — dragging a caption around never re-wrapped it. The owner asked that
-/// text be draggable OFF the canvas (5px of the box left on it), which breaks that invariant:
-/// without this floor, dragging a wide caption toward the right edge would shrink its wrap cap
-/// on every motion event and finally collapse it into a one-glyph-per-line column. Flooring at
-/// the box's existing width restores exactly the old guarantee — a move never re-wraps — while
-/// leaving the cap free to bind where it always did: a caption CLICKED near the right edge
-/// starts at `w = 0` and still wraps at the picture's edge, and typing keeps the width it
-/// already wrapped to. It also keeps a horizontal drag on the raster-reuse fast path
-/// ([`text_layer_xform`]), which compares the derived layout.
+/// # Why the box's POSITION is not in it (DRAGON-378)
 ///
-/// The one behaviour it does change: an auto box sitting past the picture's right edge and then
-/// scaled DOWN keeps the wide cap its old width earned, so it may un-wrap into one long line
-/// running off the canvas instead of re-wrapping at the edge. That is the same "text is allowed
-/// to leave the picture" trade, in a corner the owner is far less likely to meet than dragging.
-fn text_auto_cap(rect_x: f32, rect_w: f32, size_px: f32, fw: f32) -> f32 {
-    (fw - rect_x - TEXT_EDGE_MARGIN)
-        .max(rect_w)
-        .max(size_px)
-        .min(super::text_annot::AUTO_WRAP_FALLBACK)
+/// It used to be. The cap was `fw - rect.x - 4` — the room from the box's LEFT edge to the
+/// picture's RIGHT edge — which made an auto box's wrap width an accident of where it happened
+/// to be clicked (effectively unbounded on the left of the picture, a narrow column on the
+/// right), and left it structurally blind to the room on the box's other side. Nothing could
+/// widen it either: [`reflow_text`] keeps the box ORIGIN, so `rect.x` never moves on its own,
+/// and dragging a WEST handle — which anchors the EAST edge and grows the box leftward — laid
+/// the text out against the PRE-drag origin. Measured on a 1920px picture, a caption at x=1650
+/// dragged 600px left: the type scaled 32 → 107px as asked, but the box grew 254 → 272px and the
+/// caption fell apart into a four-line, one-word-per-line column. The identical gesture near the
+/// LEFT edge grew it 254 → 854px on ONE line, because there the cap never bound at all.
+///
+/// The obvious repair — measure the room on the side the box is actually growing toward — cannot
+/// work: the cap must be a pure function of the STORED box, and the stored origin of a scaled
+/// box is itself derived from the layout the cap produced ([`anchor_scaled_text_rect`]). Any
+/// position-dependent cap closes that circle, and it surfaces as a render deriving a different
+/// wrap from the one the reflow stored — the exact divergence [`text_kind_layout`] exists to
+/// prevent.
+///
+/// So the position term is gone — and DRAGON-368 had already made it obsolete. Once a caption
+/// may hang off the picture ([`TEXT_MIN_ON_CANVAS_PX`]), the picture's right edge is no longer a
+/// wall glyphs may not cross, so "the distance to that wall" was measuring something that no
+/// longer exists. What survives is the cap's real job — a click-placed caption must not become
+/// one unbounded line — and the picture's own width says exactly that without naming a position:
+/// an auto box is POINT text, wrapping only when a single line would outrun the whole picture. A
+/// column of a chosen width is what dragging a box out is for (`constrained`) — Photoshop's
+/// split, the one DRAGON-364 already codified.
+///
+/// Two properties fall out, both load-bearing:
+/// * a MOVE is now a pure translation ALWAYS. DRAGON-368's `rect_w` floor only stopped a
+///   RIGHTWARD move from re-wrapping (the cap shrinking under the box); a LEFTWARD move grew the
+///   cap and could silently un-wrap a caption mid-drag, off the raster-reuse fast path
+///   ([`text_layer_xform`]). With no position term there is nothing left for a move to change.
+/// * the cap is a FIXED POINT of its own layout: re-derived from the rect the reflow stored it
+///   lands in `[widest line, the cap that produced that line]`, an interval over which greedy
+///   wrap cannot move a single break — so the stored geometry, the live raster, the bake and the
+///   caret math can never disagree about the wrap.
+///
+/// The `rect_w` floor stays exactly as DRAGON-368 left it, now guarding one case instead of
+/// two: a box already WIDER than the picture (only a scale can make one) keeps its width, so
+/// neither a move nor a re-render collapses it back into the picture.
+///
+/// # The floor is the layout's own output — read this before touching it (DRAGON-379)
+///
+/// `rect_w` is not an independent quantity for an auto box: its width IS the widest laid-out
+/// line. So past the picture's width — the only regime where the floor binds — the cap is the
+/// PREVIOUS layout fed back in as this one's input, and the wrap width and the line measured
+/// against it are one number computed two ways (`Σ em_adv × s·k` versus `(Σ em_adv × s)·k`).
+///
+/// That is safe, but only conditionally, and the condition is not local to this function:
+/// * it is a genuine FIXED POINT — a re-derivation lands in `[widest line, the cap that produced
+///   it]`, where greedy wrap cannot move a break — so a caption re-flows at most once and then
+///   never again, proved by iteration in
+///   `the_auto_wrap_cap_settles_to_a_fixed_point_past_the_picture_width`;
+/// * but the two ways of computing that one number differ by a rounding step, so the fit test
+///   must not be exact. [`super::text_annot::WRAP_FIT_SLACK_REL`] is what makes it robust; before
+///   it existed, one drag through this regime alternated between one line and two 23 times in 121
+///   steps. `expanding_a_caption_past_the_media_never_alternates_between_wrapped_and_unwrapped`
+///   is the net, and it is a SWEEP for that reason: every individual step was already a fixed
+///   point, so iterating one of them could never have caught it.
+///
+/// Keeping the floor is a choice about the gesture, and it is the reason the loop is tolerated:
+/// it is the only channel through which a scale can be a SIMILARITY once a caption grows past
+/// the picture. Drop it and the cap becomes a true constant (`fw`) — the loop disappears — but
+/// scaling a caption then re-wraps it at the picture's edge and shatters long words mid-word
+/// instead of letting the caption grow off-canvas, which is precisely the "it keeps wrapping and
+/// wont expand" DRAGON-378 was raised for. Measured both ways before choosing.
+fn text_auto_cap(rect_w: f32, size_px: f32, fw: f32) -> f32 {
+    fw.max(rect_w).max(size_px).min(super::text_annot::AUTO_WRAP_FALLBACK)
 }
 
 /// THE one layout derivation for a stored [`AnnotKind::Text`]: its display lines + box
@@ -743,7 +789,7 @@ pub fn text_kind_layout(
 ) -> super::text_annot::TextLayout {
     use super::text_annot;
     let wrap_w = if constrained { Some(rect.w.max(text_annot::MIN_BOX_W)) } else { None };
-    text_annot::layout(text, font, size_px, wrap_w, text_auto_cap(rect.x, rect.w, size_px, fw))
+    text_annot::layout(text, font, size_px, wrap_w, text_auto_cap(rect.w, size_px, fw))
 }
 
 /// The rect kinds that share Box GEOMETRY and interaction, as a small id — the axis
@@ -3001,12 +3047,14 @@ impl TextXform {
 /// and moves the origins is a similarity transform of the pixels already in the raster.
 ///
 /// The LAYOUT is compared, never the wrap inputs: an auto (click-created) box derives its wrap
-/// cap from its own `rect` ([`text_auto_cap`]), so a horizontal move or a scale changes the cap
-/// even when the caption is nowhere near wide enough for it to bind. Comparing the derived
-/// layout keeps that common case on the fast path while still catching the case where the
-/// gesture genuinely DOES re-wrap the text. Deriving it is cheap — the advance tables in
-/// `text_shape` are cached per thread — and it is the same [`text_kind_layout`] seam the render
-/// and the bake use, so the comparison can never disagree with what is drawn.
+/// cap from its own width ([`text_auto_cap`]), so a scale changes the cap even when the caption
+/// is nowhere near wide enough for it to bind. (A MOVE no longer can — DRAGON-378 took the box's
+/// POSITION out of the cap, so a translated caption's layout is identical by construction rather
+/// than by comparison.) Comparing the derived layout keeps that common case on the fast path
+/// while still catching the case where the gesture genuinely DOES re-wrap the text. Deriving it
+/// is cheap — the advance tables in `text_shape` are cached per thread — and it is the same
+/// [`text_kind_layout`] seam the render and the bake use, so the comparison can never disagree
+/// with what is drawn.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct TextRenderSig {
     id: AnnotId,
@@ -5507,18 +5555,21 @@ fn edited_kind(
                 let size = clamp_scaled_text_size(
                     size_px * text_scale_factor(rect.w, rect.h, grab, dx, dy),
                 );
-                // The factor actually APPLIED, after the guard bounds have had their say. A
-                // constrained box's wrap width is scaled by exactly that, which is what makes
-                // this a true similarity of the drawing: identical line breaks, every measure ×
-                // one factor. That is not only what Photoshop does — it is what keeps a Ctrl-drag
-                // on DRAGON-368's raster-reuse fast path, and a re-wrap on every motion event of
-                // the editor's most expensive gesture is precisely what that ticket removed.
+                // The factor actually APPLIED, after the guard bounds have had their say. The
+                // box's wrap width is scaled by exactly that, which is what makes this a true
+                // similarity of the drawing: identical line breaks, every measure × one factor.
+                // That is not only what Photoshop does — it is what keeps a scale drag on
+                // DRAGON-368's raster-reuse fast path, and a re-wrap on every motion event of the
+                // editor's most expensive gesture is precisely what that ticket removed.
+                //
+                // For a CONSTRAINED box that width IS the wrap prison (DRAGON-370). For an AUTO
+                // one it reaches the layout only as the `rect_w` floor in [`text_auto_cap`], so
+                // it changes nothing until the box is already as wide as the picture — and there
+                // it is the difference between scaling up cleanly and stalling: the floor would
+                // otherwise pin the cap at the PRE-scale width, and a box that may not grow wider
+                // can only answer a bigger type with more lines (DRAGON-378).
                 let applied = if *size_px > 0.0 { size / *size_px } else { 1.0 };
-                let src = if *constrained {
-                    AnnotRect { w: rect.w * applied, ..*rect }
-                } else {
-                    *rect
-                };
+                let src = AnnotRect { w: rect.w * applied, ..*rect };
                 // Reflow at the new size FIRST (that is what decides the box extent), then
                 // re-place it against the grab's anchor. Both halves go through the shared
                 // `text_kind_layout` seam, so live and bake agree on the scaled geometry.
@@ -5678,26 +5729,34 @@ mod tests {
 
     /// WRAP PARITY (DRAGON-354 review fix): an AUTO (click-placed) box's STORED geometry and
     /// every render/caret path derive their layout through the ONE seam
-    /// ([`text_kind_layout`]), so a long caption placed near the picture's right edge wraps
-    /// identically in the box, the live raster, the bake and the caret math. The old render
-    /// paths passed the constant `AUTO_WRAP_FALLBACK` instead of the frame-derived cap — the
-    /// caption then STORED a wrapped multi-line box but RENDERED one long clipped line; this
-    /// pins the fix (the fallback layout is asserted to be genuinely different).
+    /// ([`text_kind_layout`]), so a long caption wraps identically in the box, the live raster,
+    /// the bake and the caret math. The old render paths passed the constant `AUTO_WRAP_FALLBACK`
+    /// instead of the frame-derived cap — the caption then STORED a wrapped multi-line box but
+    /// RENDERED one long clipped line; this pins the fix (the fallback layout is asserted to be
+    /// genuinely different).
+    ///
+    /// It also pins DRAGON-378's half of that seam: the cap is the PICTURE's width, so the very
+    /// same caption wraps the very same way wherever it is placed. Before, the wrap width was the
+    /// room from the box to the picture's right edge, and the identical string wrapped differently
+    /// at x=250 than at x=10 — an invisible layout choice made by where you happened to click.
     #[test]
     fn auto_box_render_layout_matches_the_stored_reflow_wrap() {
         use super::super::text_annot::{self, TextFont};
         let frame = (400.0_f32, 300.0_f32);
         let caption = "a long caption that certainly exceeds the room left of the edge";
-        // Placed at x=250 on a 400px picture: ~146px of room, far less than the caption.
-        let kind = reflow_text(
-            caption,
-            24.0,
-            TextFont::Clean,
-            AnnotRect { x: 250.0, y: 10.0, w: 0.0, h: 0.0 },
-            false,
-            4.0,
-            frame,
-        );
+        let placed = |x: f32| {
+            reflow_text(
+                caption,
+                24.0,
+                TextFont::Clean,
+                AnnotRect { x, y: 10.0, w: 0.0, h: 0.0 },
+                false,
+                4.0,
+                frame,
+            )
+        };
+        // Placed at x=250 on a 400px picture — under the old rule, ~146px of room.
+        let kind = placed(250.0);
         let AnnotKind::Text { rect, text, size_px, font, constrained, .. } = &kind else {
             panic!("reflow_text yields a Text kind");
         };
@@ -5706,16 +5765,24 @@ mod tests {
         let lay = text_kind_layout(text, *size_px, *font, *rect, *constrained, frame.0);
         assert!((lay.box_w - rect.w).abs() < 0.01, "rendered width == stored width");
         assert!((lay.box_h - rect.h).abs() < 0.01, "rendered height == stored height");
-        assert!(lay.lines.len() > 1, "a caption wider than the room must wrap");
-        // No rendered line may overrun the picture: every line fits the room to the edge.
-        let room = frame.0 - rect.x;
+        assert!(lay.lines.len() > 1, "a caption wider than the picture must wrap");
+        // No rendered line may outrun the PICTURE — the cap, and the only bound left now that
+        // glyphs are allowed past its edges (DRAGON-368).
         for line in &lay.lines {
             assert!(
-                text_annot::measure(*font, *size_px, &line.text) <= room + 0.01,
-                "line {:?} overruns the picture edge",
+                text_annot::measure(*font, *size_px, &line.text) <= frame.0 + 0.01,
+                "line {:?} outruns the picture width",
                 line.text
             );
         }
+        // DRAGON-378: the SAME caption at the other end of the picture is the same drawing,
+        // translated — same lines, same box extent.
+        let far_left = placed(10.0);
+        let AnnotKind::Text { rect: lr, .. } = &far_left else { panic!("text") };
+        assert!(
+            (lr.w - rect.w).abs() < 0.01 && (lr.h - rect.h).abs() < 0.01,
+            "where the caption was clicked changed how it wrapped: {rect:?} vs {lr:?}",
+        );
         // And the OLD behavior really was different — the constant fallback cap would not
         // have wrapped at all, which is exactly the divergence this test pins closed.
         let old = text_annot::layout(
@@ -8830,43 +8897,51 @@ mod tests {
     }
 
     /// The wrap math has to survive coordinates a clamped box could never produce (DRAGON-368):
-    /// an origin LEFT of the picture, and one so far right that the room to the edge is gone.
-    /// Neither may yield nonsense — and, the point of the `rect_w` floor in [`text_auto_cap`], a
-    /// MOVE must never re-wrap an existing caption, because that is both visually wrong and what
-    /// would knock the drag off the raster-reuse fast path.
+    /// a caption dragged clean off either edge. Neither may yield nonsense — and a MOVE must
+    /// never re-wrap an existing caption, because that is both visually wrong and what would
+    /// knock the drag off the raster-reuse fast path. DRAGON-378 is what makes that hold in BOTH
+    /// directions: the cap no longer knows where the box IS, so no translation can reach it.
     #[test]
     fn the_auto_wrap_cap_survives_off_canvas_origins_and_never_re_wraps_a_move() {
         let frame = (1200u32, 700u32);
         let fw = frame.0 as f32;
-        // Left of the picture: MORE room to the right edge, so the cap simply grows.
-        assert!(text_auto_cap(-300.0, 0.0, 32.0, fw) > text_auto_cap(0.0, 0.0, 32.0, fw));
-        // Hard against the right edge with no box width to protect it: floored at one glyph,
-        // never zero or negative (which would divide the caption into an infinite column).
-        let starved = text_auto_cap(fw - 1.0, 0.0, 32.0, fw);
-        assert!(starved >= 32.0, "a starved cap collapsed to {starved}");
-        // …and past the right edge entirely.
-        assert!(text_auto_cap(fw + 500.0, 0.0, 32.0, fw) >= 32.0);
-        // THE invariant: an existing box's own width floors the cap, so dragging it right can
-        // never make it wrap narrower than it already is.
-        assert_eq!(text_auto_cap(fw - 1.0, 800.0, 32.0, fw), 800.0);
+        // The PICTURE's width is the cap — one number, whatever the box's width or position…
+        assert_eq!(text_auto_cap(0.0, 32.0, fw), fw);
+        assert_eq!(text_auto_cap(400.0, 32.0, fw), fw);
+        // …floored at one glyph, so a picture narrower than the type can never divide the
+        // caption into a zero-width (infinite) column…
+        assert_eq!(text_auto_cap(0.0, 900.0, 10.0), 900.0);
+        // …and floored at the box's OWN width (DRAGON-368), so a box already wider than the
+        // picture — only a scale can make one — is never collapsed back into it.
+        assert_eq!(text_auto_cap(fw + 800.0, 32.0, fw), fw + 800.0);
+        // An absurd frame still lands inside resvg's coordinate sanity.
+        assert_eq!(text_auto_cap(0.0, 32.0, 1e9), super::super::text_annot::AUTO_WRAP_FALLBACK);
 
-        // End to end: a wide caption dragged hard right keeps its exact layout.
-        let before = caption(frame, 60.0, 200.0, 32.0);
-        let AnnotKind::Text { rect: r0, text: t0, .. } = before.kind.clone() else { panic!() };
-        assert!(r0.w > 400.0, "the caption must be wide enough for the cap to threaten it");
-        let after = edited_kind(&before.kind, Grab::Move, (0.0, 0.0), (5000.0, 0.0), (fw, 700.0), false);
-        let AnnotKind::Text { rect: r1, text: t1, .. } = after.clone() else { panic!() };
-        assert_eq!(t0, t1);
-        assert!((r1.w - r0.w).abs() < 1e-3, "the move re-wrapped the caption: {r0:?} → {r1:?}");
-        // …which is exactly what keeps it on the fast path.
-        assert!(
-            text_layer_xform(
-                &text_render_sigs(std::slice::from_ref(&before), frame),
-                &text_render_sigs(&[AnnotationItem { kind: after, ..before.clone() }], frame),
-            )
-            .is_some(),
-            "a drag to the right edge fell off the raster-reuse fast path",
-        );
+        // End to end, BOTH directions: a wide caption dragged clean off either edge keeps its
+        // exact layout, and stays on the raster-reuse fast path. Dragging RIGHT used to shrink
+        // the cap (the `rect_w` floor was what held it); dragging LEFT used to GROW it, and could
+        // silently un-wrap the caption mid-drag — the half DRAGON-368's floor could not cover.
+        for dx in [5000.0f32, -5000.0] {
+            let before = caption(frame, 500.0, 200.0, 32.0);
+            let AnnotKind::Text { rect: r0, text: t0, .. } = before.kind.clone() else { panic!() };
+            assert!(r0.w > 400.0, "the caption must be wide enough for the cap to threaten it");
+            let after =
+                edited_kind(&before.kind, Grab::Move, (0.0, 0.0), (dx, 0.0), (fw, 700.0), false);
+            let AnnotKind::Text { rect: r1, text: t1, .. } = after.clone() else { panic!() };
+            assert_eq!(t0, t1);
+            assert!(
+                (r1.w - r0.w).abs() < 1e-3 && (r1.h - r0.h).abs() < 1e-3,
+                "the move ({dx:+}) re-wrapped the caption: {r0:?} → {r1:?}",
+            );
+            assert!(
+                text_layer_xform(
+                    &text_render_sigs(std::slice::from_ref(&before), frame),
+                    &text_render_sigs(&[AnnotationItem { kind: after, ..before.clone() }], frame),
+                )
+                .is_some(),
+                "a drag of {dx:+} fell off the raster-reuse fast path",
+            );
+        }
     }
 
     /// BAKE PARITY for an off-canvas caption (DRAGON-368): the bake composites at the SOURCE
@@ -9391,6 +9466,283 @@ mod tests {
         );
         let AnnotKind::Text { rect: r2, .. } = &longer else { panic!("text") };
         assert!(r2.w > rect.w, "an auto box still grows to its widest line ({} -> {})", rect.w, r2.w);
+    }
+
+    // ── DRAGON-378: expanding a caption LEFTWARD works exactly like expanding it right ────
+
+    /// THE bug, as the owner met it: "if my text is close to the left edge and i expand it to the
+    /// right, it keeps expanding correctly. if my text is close to the right edge and i expand it
+    /// to the left, it keeps wrapping and wont expand correctly, even though it has a lot of room
+    /// to go on the left still."
+    ///
+    /// The two gestures are mirror images, so their results must be too. They were not: the wrap
+    /// cap was the room from the box's LEFT edge to the picture's RIGHT edge, which a leftward
+    /// expansion cannot grow ([`reflow_text`] keeps the ORIGIN, and the scale re-laid the text out
+    /// against the PRE-drag one). Measured before the fix, on this exact setup: the leftward drag
+    /// scaled the type 32 → 107px but widened the box by 18px and shattered "hello there world"
+    /// into `["hello", "there", "worl", "d"]`, while the mirrored rightward drag grew it
+    /// 254 → 854px on one line.
+    ///
+    /// Pinned for BOTH box kinds, because they reach the cap differently — a click-created (auto)
+    /// box scales its type and only touches the cap through the `rect_w` floor, a drag-created
+    /// (constrained) one reflows inside `rect.w` and is capped only by the picture clamp.
+    #[test]
+    fn an_auto_caption_expands_leftward_at_the_right_edge_exactly_as_it_expands_right() {
+        use crate::geometry::Edge;
+        let frame = (1920.0f32, 1080.0f32);
+        let lines = |k: &AnnotKind| {
+            let AnnotKind::Text { rect, text, size_px, font, constrained, .. } = k else {
+                panic!("text")
+            };
+            let lay = text_kind_layout(text, *size_px, *font, *rect, *constrained, frame.0);
+            // The stored geometry IS the derived layout — the fixed-point property the render,
+            // the bake and the caret all ride on.
+            assert!(
+                (lay.box_w - rect.w).abs() < 0.01 && (lay.box_h - rect.h).abs() < 0.01,
+                "stored box {rect:?} disagrees with the derived layout ({}, {})",
+                lay.box_w,
+                lay.box_h,
+            );
+            lay.lines.iter().map(|l| l.text.clone()).collect::<Vec<_>>()
+        };
+        for constrained in [false, true] {
+            // Near the RIGHT edge, dragged 600px LEFT by its west handle…
+            let right = text_kind(
+                constrained,
+                32.0,
+                AnnotRect { x: 1650.0, y: 400.0, w: 250.0, h: 0.0 },
+                frame,
+            );
+            let AnnotKind::Text { rect: r0, size_px: s0, .. } = &right else { panic!("text") };
+            let (r0, s0) = (*r0, *s0);
+            let grown =
+                edited_kind(&right, Grab::Edge(Edge::W), (0.0, 0.0), (-600.0, 0.0), frame, false);
+            let AnnotKind::Text { rect: r1, size_px: s1, .. } = &grown else { panic!("text") };
+            // The room on the left was there, so the box took it: the west edge travelled with
+            // the pointer and the east edge (the drag's anchor) stayed put.
+            assert!(
+                r1.x <= r0.x - 550.0,
+                "[constrained={constrained}] the box barely moved left: {r0:?} → {r1:?}",
+            );
+            assert!(
+                ((r1.x + r1.w) - (r0.x + r0.w)).abs() < 1.0,
+                "[constrained={constrained}] the anchored east edge slid: {r0:?} → {r1:?}",
+            );
+            // …and the text followed the KIND's contract on the way. An auto box scales its type,
+            // so its line breaks must survive untouched (a similarity, not a re-flow); a
+            // constrained box IS a wrap prison, so widening it re-flows — but only ever into
+            // FEWER lines, never the narrowing column the bug produced.
+            if constrained {
+                assert!(
+                    lines(&grown).len() <= lines(&right).len(),
+                    "[constrained] widening the prison added lines: {:?} → {:?}",
+                    lines(&right),
+                    lines(&grown),
+                );
+            } else {
+                assert_eq!(lines(&right), lines(&grown), "[auto] the scale re-wrapped the caption");
+            }
+
+            // Near the LEFT edge, dragged 600px RIGHT by its east handle: the mirror image.
+            let left =
+                text_kind(constrained, 32.0, AnnotRect { x: 20.0, y: 400.0, w: 250.0, h: 0.0 }, frame);
+            let mirrored =
+                edited_kind(&left, Grab::Edge(Edge::E), (0.0, 0.0), (600.0, 0.0), frame, false);
+            let AnnotKind::Text { rect: r2, size_px: s2, .. } = &mirrored else { panic!("text") };
+            assert_eq!(lines(&grown), lines(&mirrored), "[constrained={constrained}] wrap differs");
+            assert!(
+                (r1.w - r2.w).abs() < 0.01 && (r1.h - r2.h).abs() < 0.01,
+                "[constrained={constrained}] mirrored drags gave different boxes: {r1:?} vs {r2:?}",
+            );
+            assert!((s1 - s2).abs() < 0.01, "[constrained={constrained}] type sizes differ");
+            // The auto box scales its type (DRAGON-364); the constrained one never does. Both
+            // widen by 600px, which is the whole point.
+            assert_eq!(*s1 > s0, !constrained, "[constrained={constrained}] wrong resize mode");
+            assert!(
+                (r1.w - (r0.w + 600.0)).abs() < 1.0,
+                "[constrained={constrained}] the box did not take the 600px: {r0:?} → {r1:?}",
+            );
+        }
+    }
+
+    /// The other end of the same rule: an auto caption ALREADY as wide as the picture must still
+    /// scale up, growing OFF the canvas (DRAGON-368) rather than re-wrapping into more lines.
+    /// The `rect_w` floor is what would otherwise stall it — it pins the cap at the PRE-scale
+    /// width, and a box that may not grow wider can only answer a bigger type with more lines —
+    /// so the scale arm scales that floor by the factor it applied, exactly as DRAGON-370 does
+    /// for a constrained box's wrap prison. Same reason, too: it keeps the gesture a similarity,
+    /// which is what the raster-reuse proxy accepts.
+    #[test]
+    fn scaling_a_picture_wide_auto_caption_grows_it_off_canvas_instead_of_re_wrapping() {
+        use crate::geometry::Edge;
+        let frame = (1200u32, 700u32);
+        let fwh = (frame.0 as f32, frame.1 as f32);
+        // A caption sized so its single line already spans nearly the whole picture.
+        let item = caption(frame, 20.0, 200.0, 55.0);
+        let AnnotKind::Text { rect: r0, .. } = &item.kind else { panic!("text") };
+        assert!(r0.w > fwh.0 * 0.8, "the caption must start near the picture's width: {r0:?}");
+        let before = text_kind_layout_of(&item.kind, fwh.0);
+        let scaled = AnnotationItem {
+            kind: edited_kind(&item.kind, Grab::Edge(Edge::E), (0.0, 0.0), (600.0, 0.0), fwh, false),
+            ..item.clone()
+        };
+        let AnnotKind::Text { rect: r1, size_px, .. } = &scaled.kind else { panic!("text") };
+        let after = text_kind_layout_of(&scaled.kind, fwh.0);
+        assert!(*size_px > 55.0, "the type must have grown");
+        assert_eq!(before.lines, after.lines, "the scale re-wrapped a picture-wide caption");
+        assert!(r1.w > fwh.0, "the caption must have grown PAST the picture: {r1:?}");
+        // …and that is exactly what keeps it on the raster-reuse fast path.
+        assert!(
+            text_layer_xform(
+                &text_render_sigs(std::slice::from_ref(&item), frame),
+                &text_render_sigs(std::slice::from_ref(&scaled), frame),
+            )
+            .is_some(),
+            "scaling a picture-wide caption fell off the raster-reuse fast path",
+        );
+    }
+
+    /// The derived layout of a text kind, at the shared seam — test sugar.
+    fn text_kind_layout_of(kind: &AnnotKind, fw: f32) -> super::super::text_annot::TextLayout {
+        let AnnotKind::Text { rect, text, size_px, font, constrained, .. } = kind else {
+            panic!("text")
+        };
+        text_kind_layout(text, *size_px, *font, *rect, *constrained, fw)
+    }
+
+    // ── DRAGON-379: expanding a caption past the media must not flicker ──────────────────
+
+    /// THE bug: "now when i expand a text area beyond the bounds of the media, it quickly
+    /// alternates between word wrapping and just allowing text to go beyond the frame."
+    ///
+    /// Cause, measured: past the picture width the auto cap is the box's OWN width scaled by the
+    /// drag factor ([`text_auto_cap`]'s floor, fed by the scale arm), and the box's own width IS
+    /// the widest laid-out line — so the wrap width and the line being measured against it are
+    /// ONE number computed two ways (`Σ em_adv × s·k` vs `(Σ em_adv × s)·k`). They agree to a
+    /// rounding step, and a rounding step flips the decision: over this very sweep the caption
+    /// alternated between one line and two **23 times in 121 steps**. The slack in the wrap's fit
+    /// test ([`super::super::text_annot::WRAP_FIT_SLACK_REL`]) is what settles it.
+    ///
+    /// This sweep — not the fixed-point test below — is the regression net for that bug: the
+    /// derivation was already a fixed point at every INDIVIDUAL step, so iterating one step to
+    /// convergence saw nothing wrong. What flickered was the DRAG PARAMETER moving through the
+    /// tie, which only a sweep can see.
+    #[test]
+    fn expanding_a_caption_past_the_media_never_alternates_between_wrapped_and_unwrapped() {
+        use crate::geometry::Edge;
+        let frame = (1200u32, 700u32);
+        let fwh = (frame.0 as f32, frame.1 as f32);
+        let text = "The quick brown fox jumps over the lazy dog";
+        // Every gesture that can push a caption past the picture's width: an auto box grown from
+        // either side (DRAGON-378), and a paragraph box Ctrl-scaled (DRAGON-370) — the prison is
+        // scaled by the same factor there, so it rides the same comparison.
+        for (tag, grab, sign, x, constrained, ctrl) in [
+            ("auto, east handle", Grab::Edge(Edge::E), 1.0f32, 20.0f32, false, false),
+            ("auto, west handle", Grab::Edge(Edge::W), -1.0, 1000.0, false, false),
+            ("paragraph, ctrl-scaled", Grab::Edge(Edge::E), 1.0, 20.0, true, true),
+        ] {
+            let seed = reflow_text(
+                text,
+                55.0,
+                super::super::text_annot::TextFont::Clean,
+                AnnotRect { x, y: 100.0, w: 1150.0, h: 0.0 },
+                constrained,
+                2.0,
+                fwh,
+            );
+            let mut prev: Option<(usize, f32)> = None;
+            let mut widest = 0.0f32;
+            for step in 0..=120 {
+                let dx = sign * step as f32 * 10.0;
+                let k = edited_kind(&seed, grab, (0.0, 0.0), (dx, 0.0), fwh, ctrl);
+                let AnnotKind::Text { rect, text, size_px, font, constrained, .. } = &k else {
+                    panic!("text")
+                };
+                let lay = text_kind_layout(text, *size_px, *font, *rect, *constrained, fwh.0);
+                widest = widest.max(rect.w);
+                if let Some((lines, w)) = prev {
+                    // The whole gesture is ONE similarity, so the wrap must never change at all —
+                    // and certainly never change BACK, which is what the eye reads as flicker.
+                    assert_eq!(
+                        lines,
+                        lay.lines.len(),
+                        "{tag}: the wrap changed at step {step} ({lines} → {} lines)",
+                        lay.lines.len(),
+                    );
+                    // …and the box grows monotonically with the drag, never snapping narrower.
+                    assert!(
+                        rect.w >= w - 0.01,
+                        "{tag}: the box snapped narrower at step {step} ({w} → {})",
+                        rect.w,
+                    );
+                }
+                prev = Some((lay.lines.len(), rect.w));
+            }
+            assert!(
+                widest > fwh.0,
+                "{tag}: the sweep never took the caption past the picture width ({widest})",
+            );
+        }
+    }
+
+    /// The other half of the guarantee, and the one the ticket's shape demands: the auto cap
+    /// FLOORS at the box's own width, and for a click-created box that width is an OUTPUT of the
+    /// layout — so past the picture width the cap is the previous layout fed back in as an input.
+    /// That loop must reach a fixed point rather than cycle, or a caption would re-flow on every
+    /// render for as long as it is on screen.
+    ///
+    /// It settles on the FIRST re-derivation, in every regime: a plain caption, one whose
+    /// trailing spaces make its box wider than any of its lines' text (`box_w` can exceed the cap
+    /// that produced it — the one way the loop's input can grow), a caption full of runs of
+    /// spaces, and unbreakable words longer than the picture.
+    #[test]
+    fn the_auto_wrap_cap_settles_to_a_fixed_point_past_the_picture_width() {
+        use crate::geometry::Edge;
+        let frame = (1200u32, 700u32);
+        let fwh = (frame.0 as f32, frame.1 as f32);
+        for (tag, text) in [
+            ("plain", "The quick brown fox jumps over the lazy dog"),
+            ("trailing spaces", "The quick brown fox jumps over the lazy dog    "),
+            ("interior runs", "The quick brown fox    jumps    over the lazy dog   "),
+            ("unbreakable words", "Supercalifragilisticexpialidocious antidisestablishmentarianism"),
+        ] {
+            let seed = reflow_text(
+                text,
+                55.0,
+                super::super::text_annot::TextFont::Clean,
+                AnnotRect { x: 20.0, y: 100.0, w: 0.0, h: 0.0 },
+                false,
+                2.0,
+                fwh,
+            );
+            // Scaled well past the picture width, which is the only regime where the floor —
+            // and therefore the feedback — binds at all.
+            let mut kind =
+                edited_kind(&seed, Grab::Edge(Edge::E), (0.0, 0.0), (1400.0, 0.0), fwh, false);
+            let state = |k: &AnnotKind| {
+                let AnnotKind::Text { rect, text, size_px, font, constrained, .. } = k else {
+                    panic!("text")
+                };
+                let lay = text_kind_layout(text, *size_px, *font, *rect, *constrained, fwh.0);
+                (lay.lines, rect.w, rect.h)
+            };
+            let settled = state(&kind);
+            assert!(settled.1 > fwh.0, "{tag}: the caption is not past the picture width");
+            // Re-derive repeatedly, exactly as a render / a keystroke / a re-open does. Ten
+            // rounds: a two-state cycle would show up on the very first one, a longer one here.
+            for round in 1..=10 {
+                let AnnotKind::Text { rect, text, size_px, font, constrained, stroke_w } = &kind
+                else {
+                    panic!("text")
+                };
+                kind = reflow_text(text, *size_px, *font, *rect, *constrained, *stroke_w, fwh);
+                assert_eq!(
+                    state(&kind),
+                    settled,
+                    "{tag}: the layout moved on re-derivation {round} — the cap is cycling",
+                );
+            }
+        }
     }
 
     #[test]

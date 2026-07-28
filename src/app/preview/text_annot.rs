@@ -362,8 +362,8 @@ pub const MIN_BOX_W: f32 = 12.0;
 
 /// Lay out `text` at `size` in `font`. `wrap_w = Some(w)` wraps within a FIXED width `w` (the
 /// drag box); `None` auto-sizes, wrapping only when a line would exceed `auto_cap` (the click
-/// box, whose cap is the room from the click to the picture's edge). Greedy word wrap; a word
-/// longer than the width is broken mid-word so it can never overflow. Pure.
+/// box, whose cap is the PICTURE's width — see `annotate::text_auto_cap`). Greedy word wrap; a
+/// word longer than the width is broken mid-word so it can never overflow. Pure.
 pub fn layout(text: &str, font: TextFont, size: f32, wrap_w: Option<f32>, auto_cap: f32) -> TextLayout {
     let m = face(font);
     let line_h = m.line_height(size);
@@ -387,11 +387,46 @@ pub fn layout(text: &str, font: TextFont, size: f32, wrap_w: Option<f32>, auto_c
     TextLayout { lines, line_h, ascent, box_w, box_h }
 }
 
+/// How much a run may EXCEED the wrap width and still be called a fit, relative to that width
+/// (DRAGON-379). One part in 100,000 — at a 1200px picture, 0.012px.
+///
+/// # Why a fit test needs any slack at all
+///
+/// Because the wrap width is routinely the SAME MEASUREMENT it is compared against, carried
+/// through arithmetic. Both scaling paths do it deliberately: DRAGON-370 scales a paragraph box's
+/// prison by the type factor, and DRAGON-378's auto cap floors at the box's own width — which for
+/// a click-created box IS the widest laid-out line. So the predicate routinely evaluates
+/// `measure(text, s·k) <= measure(text, s)·k`, whose two sides are one number computed two ways.
+///
+/// [`super::text_shape::measure_px`] is exactly linear in the size (`Σ em_adv × size`), so the
+/// two sides agree to a rounding step — and a rounding step is enough to flip the decision.
+/// Measured on the bug: a caption scaled through a drag, cap vs measured line width
+/// `1369.843628` vs `1369.843750` — ONE f32 ulp — which wrapped the caption for that one frame
+/// and unwrapped it on the next, the "quickly alternates between word wrapping and just allowing
+/// text to go beyond the frame" the owner saw. Without slack the whole gesture rides the knife
+/// edge, so the flicker is not a corner case there but the norm.
+///
+/// The value has margin at both ends and cannot change any real wrap decision: it is ~100× the
+/// f32 round-trip error at any width, and ~10× SMALLER than the narrowest advance the smallest
+/// permitted type ([`TEXT_SCALE_MIN_PX`], 2px) can produce — so no glyph, and no space, can ever
+/// squeeze into the slack.
+pub const WRAP_FIT_SLACK_REL: f32 = 1e-5;
+
+/// The width a run must EXCEED to be wrapped: `max_w` plus [`WRAP_FIT_SLACK_REL`] of it.
+fn wrap_fit_limit(max_w: f32) -> f32 {
+    max_w + max_w.abs() * WRAP_FIT_SLACK_REL
+}
+
 /// The greedy wrap algorithm, factored on an injectable `advance` measurer so it is verified
 /// without a font. Splits on hard newlines FIRST (each paragraph wraps independently; a
 /// trailing newline yields a trailing empty line), then greedily packs words, breaking a word
-/// wider than `max_w` mid-word. Char ranges index the FULL string. Pure.
+/// wider than `max_w` mid-word. A run counts as fitting until it passes `max_w` by more than
+/// [`WRAP_FIT_SLACK_REL`] — see there for why an exact comparison flickers. Char ranges index
+/// the FULL string. Pure.
 pub fn wrap_with(measure_run: &dyn Fn(&str) -> f32, text: &str, max_w: f32) -> Vec<TextLine> {
+    // EVERY fit test below — the mid-word break here, and `place_word`'s — is against the
+    // slackened width, so the two can never disagree about what fits.
+    let max_w = wrap_fit_limit(max_w);
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     // Grapheme-boundary map (item 18b): `is_boundary[k]` is true when char index k begins a
@@ -492,6 +527,7 @@ pub fn wrap_with(measure_run: &dyn Fn(&str) -> f32, text: &str, max_w: f32) -> V
 
 /// Place the pending `word` onto the current line, wrapping to a new line first if it would
 /// not fit (and the line already has content). Shared by the space and end-of-text paths.
+/// `max_w` arrives ALREADY slackened by [`wrap_fit_limit`] — never slacken it twice.
 fn place_word(
     width: &dyn Fn(&[char]) -> f32,
     max_w: f32,
@@ -1039,6 +1075,32 @@ mod tests {
         let lines = wrap_with(&mock10, "hello world", 55.0);
         assert_eq!((lines[0].start, lines[0].end), (0, 6)); // "hello" + the consumed space
         assert_eq!((lines[1].start, lines[1].end), (6, 11)); // "world"
+    }
+
+    /// DRAGON-379: the fit test must not turn on the last rounding step, because the wrap width
+    /// is routinely the SAME measurement it is compared against, carried through a multiply — a
+    /// scaled paragraph prison (DRAGON-370) or the auto cap's own-width floor (DRAGON-378). The
+    /// slack absorbs that round trip and nothing else.
+    #[test]
+    fn the_wrap_fit_test_absorbs_a_scaled_round_trip_but_no_real_glyph() {
+        // A run over the width by less than the slack still fits…
+        let just_over = 110.0 / (1.0 + WRAP_FIT_SLACK_REL * 0.5);
+        assert_eq!(wrap_with(&mock10, "hello world", just_over).len(), 1, "a hair over must fit");
+        // …while a run over by a real amount (here a whole 10-wide glyph) still wraps.
+        assert_eq!(wrap_with(&mock10, "hello world", 100.0).len(), 2, "a glyph over must wrap");
+        // The real thing, with the real fonts: a caption laid out at `size`, then re-wrapped at
+        // `size × k` against its own width × k, must stay ONE line at every k. Without the slack
+        // this alternates as k sweeps — measured at 23 flips in 121 steps through the editor.
+        let text = "The quick brown fox jumps over the lazy dog";
+        for f in [TextFont::Clean, TextFont::Hand] {
+            let (size, base) = (55.0f32, measure(f, 55.0, text));
+            for step in 0..=120 {
+                let k = 1.0 + step as f32 * 10.0 / base;
+                let (scaled, cap) = (size * k, base * k);
+                let lines = wrap_with(&|run| measure(f, scaled, run), text, cap);
+                assert_eq!(lines.len(), 1, "{f:?}: k={k} split the caption at its own width");
+            }
+        }
     }
 
     #[test]
