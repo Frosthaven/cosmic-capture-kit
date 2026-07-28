@@ -391,8 +391,18 @@ impl App {
                 self.save_state();
                 Task::none()
             }
-            SettingsMsg::SetAutoClosePreview(b) => {
-                self.auto_close_preview = b;
+            SettingsMsg::SetPreviewSaveOnCopy(b) => {
+                self.preview_save_on_copy = b;
+                self.save_state();
+                Task::none()
+            }
+            SettingsMsg::SetPreviewCloseOnCopy(b) => {
+                self.preview_close_on_copy = b;
+                self.save_state();
+                Task::none()
+            }
+            SettingsMsg::SetPreviewCopyOnDelete(b) => {
+                self.preview_copy_on_delete = b;
                 self.save_state();
                 Task::none()
             }
@@ -523,22 +533,6 @@ impl App {
                     self.close_mic_test();
                     self.open_mic_test();
                 }
-                Task::none()
-            }
-            SettingsMsg::SetCopyToClipboard(b) => {
-                self.copy_to_clipboard = b;
-                self.save_state();
-                Task::none()
-            }
-            SettingsMsg::SetClipboardMaxMb(s) => {
-                if self.clipboard_max_mb.edit(s, 1..=1024) {
-                    self.save_state();
-                }
-                Task::none()
-            }
-            SettingsMsg::SetPreviewAfterCapture(b) => {
-                self.preview_after_capture = b;
-                self.save_state();
                 Task::none()
             }
             SettingsMsg::SetMuteOthersDuringPreview(b) => {

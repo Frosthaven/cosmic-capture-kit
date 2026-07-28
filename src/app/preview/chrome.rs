@@ -110,9 +110,29 @@ impl Tb {
         msg: PreviewMsg,
         pos: widget::tooltip::Position,
     ) -> Element<'static, Msg> {
+        self.tool_button_tinted(name, tip, msg, pos, None)
+    }
+
+    /// [`Self::tool_button`] with an optional explicit glyph COLOUR — the seam DRAGON-353's
+    /// unsaved-changes warning tint rides. `None` leaves the glyph on the `Button::Icon`
+    /// class's own colour, so an untinted call is byte-identical to the historical button.
+    pub(super) fn tool_button_tinted(
+        self,
+        name: &'static str,
+        tip: String,
+        msg: PreviewMsg,
+        pos: widget::tooltip::Position,
+        tint: Option<fn(&cosmic::Theme) -> cosmic::iced::Color>,
+    ) -> Element<'static, Msg> {
         let icon = widget::icon::icon(crate::widgets::icons::handle(name))
             .width(Length::Fixed(self.icon_box()))
             .height(Length::Fixed(self.icon_box()));
+        let icon = match tint {
+            Some(tint) => icon.class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
+                move |t: &cosmic::Theme| cosmic::widget::svg::Style { color: Some(tint(t)) },
+            ))),
+            None => icon,
+        };
         let button = crate::widgets::arrow_cursor::arrow_cursor(
             widget::button::custom(
                 widget::container(icon)
@@ -170,11 +190,11 @@ impl Tb {
     /// A one-member cluster gets exactly the same container as a five-member one (same border,
     /// padding and corner treatment) — that is deliberate, and the reason there is no
     /// single-member special case anywhere.
-    pub(super) fn tool_cluster(
+    pub(super) fn tool_cluster<'a>(
         self,
-        items: Vec<Element<'static, Msg>>,
+        items: Vec<Element<'a, Msg>>,
         chrome: ClusterChrome,
-    ) -> Element<'static, Msg> {
+    ) -> Element<'a, Msg> {
         let glass = self.glass;
         widget::container(widget::row(items).spacing(2.0).align_y(Alignment::Center))
             .padding(self.grp_pad())
@@ -243,72 +263,115 @@ impl Tb {
             .into()
     }
 
-    /// The shared Save / Save As / Copy actions group (same on image and video previews).
-    /// Save is always shown: for a fresh capture it keeps the file; for a pre-existing
-    /// `--preview` file it exits when unchanged, or overwrites (after a confirm dialog)
-    /// when the preview has edits.
-    pub(super) fn share_group(self, km: &crate::shortcuts::Keymap) -> Element<'static, Msg> {
+    /// THE shared DROPDOWN-MENU surface (DRAGON-357 items 15 + 17): an OPAQUE popover panel —
+    /// the standard component surface at full alpha (never frosted/translucent, unlike a
+    /// flyout), a 1px divider outline, PANEL (`s`) rounding, and a small inset. Every editor
+    /// dropdown menu (the text SIZE list, the text FONT list, the bottom-bar Fit/scale list)
+    /// wears this ONE look so they read as a single control family. `width` fixes the menu
+    /// width so it never resizes as its rows change.
+    pub(super) fn menu_container<'a>(
+        self,
+        content: impl Into<Element<'a, Msg>>,
+        width: f32,
+    ) -> Element<'a, Msg> {
+        widget::container(content)
+            .width(Length::Fixed(width))
+            .padding(4.0)
+            .class(cosmic::theme::Container::custom(move |theme| {
+                let c = theme.cosmic();
+                cosmic::iced::widget::container::Style {
+                    // Opaque component base — the standard menu/popover surface, NO frost.
+                    background: Some(Background::Color(c.background.component.base.into())),
+                    border: Border {
+                        radius: crate::app::theme::rounding(theme).s.into(),
+                        width: 1.0,
+                        color: c.background.divider.into(),
+                    },
+                    ..Default::default()
+                }
+            }))
+            .into()
+    }
+
+    /// THE action group (DRAGON-353): Save / Save As / Copy / Delete, in one capsule.
+    ///
+    /// Delete joined the share actions here (it used to sit beside the size chip, which
+    /// now stands alone — see [`Self::size_chip`]) so every way of DISPOSING of the capture
+    /// reads as one set. `--preview` (`external`) files drop Delete: that file is the
+    /// user's, not ours to remove.
+    ///
+    /// **The dirty tint**: while the document has unsaved edits, the three SHARING actions
+    /// wear the accent's COMPANION colour (its complement — see
+    /// [`super::annotate::companion`]) — each of them is the thing that would commit or
+    /// carry those edits, so "there is something here you haven't dealt with" belongs on
+    /// exactly those glyphs. Delete never takes the tint: it destroys rather than commits,
+    /// and inviting the eye to it while work is unsaved would be a trap.
+    pub(super) fn share_group(
+        self,
+        dirty: bool,
+        external: bool,
+        km: &crate::shortcuts::Keymap,
+    ) -> Element<'static, Msg> {
         use crate::shortcuts::Action;
         // Top toolbar → tooltips drop below.
         let pos = widget::tooltip::Position::Bottom;
-        let buttons = vec![
-            self.tool_button(
+        // One shared tint for the three sharing actions, so they can never disagree about
+        // whether the document is dirty. The accent's COMPANION (its complement), not the
+        // WARNING amber — an unsaved document is a normal working state, not an alarm.
+        let tint: Option<fn(&cosmic::Theme) -> cosmic::iced::Color> =
+            dirty.then_some(super::annotate::companion as fn(&cosmic::Theme) -> cosmic::iced::Color);
+        let mut buttons = vec![
+            self.tool_button_tinted(
                 "document-save-symbolic",
                 action_tip("Save", Action::PreviewSave, km),
                 PreviewMsg::Save,
                 pos,
+                tint,
             ),
-            self.tool_button(
+            self.tool_button_tinted(
                 "document-save-as-symbolic",
                 action_tip("Save As", Action::PreviewSaveAs, km),
                 PreviewMsg::SaveAs,
                 pos,
+                tint,
             ),
-            self.tool_button(
-                "edit-copy-symbolic",
-                action_tip("Copy", Action::PreviewCopy, km),
+            self.tool_button_tinted(
+                // DRAGON-357: the lucide clipboard-copy glyph, tooltip "Copy to clipboard" with
+                // the live hotkey appended by `action_tip`.
+                "clipboard-copy-symbolic",
+                action_tip("Copy to clipboard", Action::PreviewCopy, km),
                 PreviewMsg::Copy,
                 pos,
+                tint,
             ),
         ];
-        self.tool_group(buttons)
-    }
-
-    /// The info group pinned to the far right of the action bar: the saved file's size
-    /// followed by a Delete (trash) button, together in one group. In `--preview`
-    /// (`external`) the file is the user's, so there's no Delete — just the size. `None`
-    /// when there's nothing to show.
-    pub(super) fn info_group(
-        self,
-        size: Option<u64>,
-        external: bool,
-        km: &crate::shortcuts::Keymap,
-    ) -> Option<Element<'static, Msg>> {
-        let mut items: Vec<Element<'static, Msg>> = Vec::new();
-        if let Some(bytes) = size {
-            // Match a button's inner box (icon + its vertical padding) so the group is the same
-            // height as the action groups; the text stays vertically centred within it.
-            let label = widget::container(widget::text(friendly_size(bytes)).size(13))
-                .height(Length::Fixed(self.icon_box() + 2.0 * self.btn_pad()))
-                .padding([0.0, self.btn_pad()])
-                .align_y(Alignment::Center);
-            items.push(label.into());
-        }
         if !external {
-            // A plain (non-destructive-styled) trash button — deletes the file, Ctrl+D.
-            // Top toolbar → tooltip drops below.
-            items.push(self.tool_button(
+            // A plain (non-destructive-styled, never warning-tinted) trash button.
+            buttons.push(self.tool_button(
                 "edit-delete-symbolic",
-                action_tip("Delete", crate::shortcuts::Action::PreviewDelete, km),
+                action_tip("Delete", Action::PreviewDelete, km),
                 PreviewMsg::Delete,
-                widget::tooltip::Position::Bottom,
+                pos,
             ));
         }
-        if items.is_empty() {
-            None
-        } else {
-            Some(self.tool_group(items))
-        }
+        // DRAGON-357: the same bordered cluster the top-left tray groups wear (the per-button
+        // companion tint on Save/Save As/Copy and the untinted Delete are unchanged — only the
+        // group container gains its 1px border).
+        self.tool_cluster(buttons, ClusterChrome::Surface)
+    }
+
+    /// The saved file's SIZE, in a capsule of its own (DRAGON-353 split it out of the old
+    /// size+Delete group, so the actions read as actions and the size reads as information).
+    /// `None` before the file exists.
+    pub(super) fn size_chip(self, size: Option<u64>) -> Option<Element<'static, Msg>> {
+        let bytes = size?;
+        // Match a button's inner box (icon + its vertical padding) so the chip is the same
+        // height as the action group; the text stays vertically centred within it.
+        let label = widget::container(widget::text(friendly_size(bytes)).size(13))
+            .height(Length::Fixed(self.icon_box() + 2.0 * self.btn_pad()))
+            .padding([0.0, self.btn_pad()])
+            .align_y(Alignment::Center);
+        Some(self.tool_group(vec![label.into()]))
     }
 }
 
@@ -373,12 +436,30 @@ impl Tb {
     }
 }
 
+// THE MEDIA AREA CANNOT BE FADED in this iced — the standing finding from DRAGON-365, kept
+// because it is expensive to re-derive. A DISSOLVE (the picture's own visibility going to zero)
+// is not expressible in iced 0.14 (pinned via libcosmic): the only opacity exposed is
+// per-widget on the raster widgets (`image` / `svg`'s `.opacity()`), and the `Renderer` trait
+// carries no alpha layer (`start_layer` / `start_transformation` only), so nothing generic can
+// fade an `Element` — least of all this one, which mixes `widget::image`, the `annotation_fx`
+// pass, the covermark/text `LayerStack` and `AnnotationCanvas` geometry (custom wgpu/canvas
+// primitives widget opacity cannot reach). An opaque scrim standing in for it was built and
+// explicitly REJECTED: no animation beats a fake transparency. DRAGON-371 then removed the
+// timed close-hold the fade was meant to cover, so there is no longer even an interval to
+// animate — the editor closes outright. Do not re-add a scrim.
+
 /// Compose the loaded preview from its parts. In WINDOWED mode the edit + action toolbars
 /// pin to the top / bottom of the window on full-width bars (a standard, light/dark-respecting
 /// surface colour), with the image filling the space between. In OVERLAY mode they centre
 /// together as one floating group (the historical look), led by `overlay_header` — the
 /// appearance / undo / redo / Close line (DRAGON-337), which the WINDOWED arm never gets
 /// (those controls live in its titlebar) and so always passes `None`.
+///
+/// `toasts` (DRAGON-353) is stacked over the MEDIA element in both arms — never over the
+/// column — which is what keeps a toast inside the picture area and clear of the toolbars,
+/// the annotation tray and the video transport strip at any window size. The stack itself is
+/// UNCONDITIONAL (DRAGON-375): a toast coming or going must not change the tree SHAPE under
+/// this position, or iced discards the media subtree's state mid-gesture — see below.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compose_preview<'a>(
     windowed: bool,
@@ -389,7 +470,30 @@ pub(super) fn compose_preview<'a>(
     transport: Option<Element<'a, Msg>>,
     action_toolbar: Element<'a, Msg>,
     glass: Option<crate::app::theme::GlassConfig>,
+    toasts: Option<Element<'a, Msg>>,
 ) -> Element<'a, Msg> {
+    // The toast rides a stack over the media — and that stack is UNCONDITIONAL (DRAGON-375).
+    //
+    // WHY a placeholder instead of `match toasts`: iced reconciles state by TREE SHAPE. When the
+    // widget at a position changes TAG, `Tree::diff` throws the whole subtree away
+    // (`*self = Tree::new(..)`) and every widget under it loses its internal state. Swapping
+    // `stack([media, toast])` for a bare `media` did exactly that to the `AnnotationCanvas`,
+    // whose `State` holds the IN-FLIGHT gesture (what is being drawn, the press anchor, whether
+    // the press has moved past the click threshold). The first interaction with a fresh document
+    // shortens the opening toast to `TOAST_INTERACTION_TTL` (750 ms), so the toast expired
+    // squarely inside the user's first stroke and aborted it; every stroke afterwards was fine
+    // because by then the shape no longer changed. A toast APPEARING mid-gesture is the same
+    // mechanism in the other direction, and the unconditional stack covers both.
+    //
+    // `Space::new()` is `Shrink`×`Shrink`, i.e. zero-size but NOT `Size::is_void` — void children
+    // are silently DROPPED by `Stack::push`, which would put the child count (and so the bug)
+    // straight back. Only the FIRST child dictates the stack's sizing, so the placeholder cannot
+    // affect layout, and `Space` never captures a pointer event.
+    let image: Element<'a, Msg> = cosmic::iced::widget::stack(vec![
+        image,
+        toasts.unwrap_or_else(|| widget::Space::new().into()),
+    ])
+    .into();
     if windowed {
         // The windowed preview's titlebar owns those controls; nothing to slot in here.
         drop(overlay_header);
@@ -523,6 +627,52 @@ pub(super) fn preview_bar(
         .into()
 }
 
+/// Which background state a [`Tb::tool_toggle`] button is painting — the theme's own
+/// `icon_button` component colour for each, so the toggle keeps the stock `Button::Icon`
+/// hover/press feedback while `tool_toggle_style` overlays the active accent ring.
+#[derive(Clone, Copy)]
+enum ToggleBg {
+    Rest,
+    Hover,
+    Press,
+}
+
+/// The button [`Style`](cosmic::widget::button::Style) a [`Tb::tool_toggle`] paints (DRAGON-357
+/// item 4). It reconstructs the stock `Button::Icon` look from the theme's `icon_button`
+/// component (transparent rest fill, its hover/press tints) and, when the toggle is ON, adds a
+/// 1px ACCENT border drawn INSIDE the button bounds — so the armed control gains an accent ring
+/// with ZERO footprint change (the resting and active boxes are the same size, no reflow). The
+/// glyph colour is set separately on the SVG (accent when on); this owns only fill + border +
+/// the keyboard-focus outline. Cross-platform by construction: pure libcosmic theme tokens, no
+/// platform arm.
+fn tool_toggle_style(
+    theme: &cosmic::Theme,
+    on: bool,
+    focused: bool,
+    bg: ToggleBg,
+) -> cosmic::widget::button::Style {
+    let comp = &theme.cosmic().icon_button;
+    let fill: cosmic::iced::Color = match bg {
+        ToggleBg::Rest => comp.base.into(),
+        ToggleBg::Hover => comp.hover.into(),
+        ToggleBg::Press => comp.pressed.into(),
+    };
+    let mut style = cosmic::widget::button::Style::new();
+    style.background = Some(Background::Color(fill));
+    style.border_radius = crate::app::theme::rounding(theme).xl.into();
+    if on {
+        style.border_width = 1.0;
+        style.border_color = crate::app::theme::accent(theme);
+    }
+    // Preserve the stock icon button's keyboard-focus ring (an accent outline) so tabbing to a
+    // toggle still reads — the base `Button::Icon` drew this and a bare `Custom` would drop it.
+    if focused {
+        style.outline_width = 1.0;
+        style.outline_color = crate::app::theme::accent(theme);
+    }
+    style
+}
+
 impl Tb {
     // The appearance toggle no longer has a capsuled `tool_group` form (DRAGON-337): it is a
     // FLAT header button in both surfaces — `App::overlay_header_row` for the overlay,
@@ -533,6 +683,8 @@ impl Tb {
     // `Self::tool_cluster`) and its last holdout — the bottom bar's covermark toggle — followed,
     // so the whole preview editor now speaks ONE control language. Every on/off state in this
     // chrome is carried by icon COLOUR ([`Tb::tool_toggle`]). Don't reintroduce per-icon rings.
+
+    // (see `tool_toggle_style` below for the active-border custom class the toggle wears.)
 
     /// A preview-chrome TOGGLE button (DRAGON-340 restyle): a bare symbolic glyph whose COLOUR
     /// alone carries its state — [`crate::app::theme::accent`] when ON (a tool is armed, a
@@ -563,6 +715,13 @@ impl Tb {
                 };
                 cosmic::widget::svg::Style { color: Some(color) }
             })));
+        // DRAGON-357 item 4: the ACTIVE toggle gains a 1px accent border, drawn INSIDE the
+        // button bounds (`tool_toggle_style`) so the footprint is byte-identical in both states
+        // (no reflow on selection). The Icon button's own base/hover/pressed backgrounds are
+        // reconstructed from the theme's `icon_button` component so hover feedback is preserved;
+        // the glyph colour still rides the SVG class above (accent when on). Shared by EVERY
+        // toggle group — the top tray tools, the pointer/pan pair and the seven line-width
+        // segments — so the accent ring appears consistently on whichever is armed.
         let btn = crate::widgets::arrow_cursor::arrow_cursor(
             widget::button::custom(
                 widget::container(icon)
@@ -571,7 +730,18 @@ impl Tb {
                     .align_x(Alignment::Center)
                     .align_y(Alignment::Center),
             )
-            .class(cosmic::theme::Button::Icon)
+            .class(cosmic::theme::Button::Custom {
+                active: Box::new(move |focused, t| {
+                    tool_toggle_style(t, on, focused, ToggleBg::Rest)
+                }),
+                disabled: Box::new(move |t| tool_toggle_style(t, on, false, ToggleBg::Rest)),
+                hovered: Box::new(move |focused, t| {
+                    tool_toggle_style(t, on, focused, ToggleBg::Hover)
+                }),
+                pressed: Box::new(move |focused, t| {
+                    tool_toggle_style(t, on, focused, ToggleBg::Press)
+                }),
+            })
             .on_press(Msg::Preview(self.pid, msg))
             .padding(self.btn_pad()),
         );
@@ -581,6 +751,9 @@ impl Tb {
     /// One segment of a SEGMENTED toggle, styled exactly like the region toolbar's
     /// scanner/image/video selector: the active segment is filled accent with an on-accent
     /// glyph, the others sit on the group's divider fill; only the pair's outer corners round.
+    /// Still used by the VIDEO timeline's pointer/scissor toggle (`video.rs`); the image
+    /// editor's cursor/pan + line-width groups moved to the bare [`Self::tool_toggle`] look
+    /// (DRAGON-357 item 10).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn seg_toggle(
         self,
@@ -592,17 +765,10 @@ impl Tb {
         round_right: bool,
         tip_pos: widget::tooltip::Position,
     ) -> Element<'static, Msg> {
-        // Route through the shared Lucide resolver (DRAGON-324) — the pan/pointer glyphs
-        // (`object-move-symbolic` → `move`, `input-mouse-symbolic` → `mouse-pointer`) are
-        // bundled, so this renders identically on every platform.
-        let glyph =
-            widget::icon::icon(crate::widgets::icons::handle(icon))
-                .size(64)
-                .width(Length::Fixed(self.icon_box()))
-                .height(Length::Fixed(self.icon_box()));
-        // The shared segmented-pair style (theme.rs) — the SAME rendering as
-        // the capture toolbar's scanner/image/video pair, embossed inactive
-        // glyph included, so the two toggles can't drift apart.
+        let glyph = widget::icon::icon(crate::widgets::icons::handle(icon))
+            .size(64)
+            .width(Length::Fixed(self.icon_box()))
+            .height(Length::Fixed(self.icon_box()));
         let style = move |t: &cosmic::Theme, hovered: bool| {
             crate::app::theme::segment_style(t, active, hovered, round_left, round_right)
         };
@@ -623,42 +789,47 @@ impl Tb {
         self.tip(btn, widget::text(tip).size(12), tip_pos)
     }
 
-    /// The pointer / pan (grabby-hand) tool toggle — a segmented pair matching the region
-    /// toolbar's scanner/image/video control. Lives on the BOTTOM bar, so tooltips rise above.
+    /// The pointer / pan (grabby-hand) tool toggle. DRAGON-357 item 10: the cursor/pan buttons
+    /// wear the SAME bare white/accent glyph treatment as the top tray's tool buttons
+    /// ([`Self::tool_toggle`]) — accent when active, foreground when not, no segment fill or ring
+    /// — instead of the old segmented-capsule look. Lives on the BOTTOM bar, so tooltips rise.
     pub(super) fn pan_tool_group(
         self,
         pan_mode: bool,
         km: &crate::shortcuts::Keymap,
     ) -> Element<'static, Msg> {
         let pos = widget::tooltip::Position::Top;
-        widget::row(vec![
-            self.seg_toggle(
-                "input-mouse-symbolic",
-                !pan_mode,
-                PreviewMsg::SetPanMode(false),
-                // The pointer/pan toggle's hotkey rides BOTH segments.
-                action_tip("Pointer", crate::shortcuts::Action::PreviewTogglePan, km),
-                true,
-                false,
-                pos,
-            ),
-            self.seg_toggle(
-                "object-move-symbolic",
-                pan_mode,
-                PreviewMsg::SetPanMode(true),
-                action_tip("Pan", crate::shortcuts::Action::PreviewTogglePan, km),
-                false,
-                true,
-                pos,
-            ),
-        ])
-        .into()
+        // The pointer/pan toggle's hotkey rides BOTH glyphs.
+        let tip = |name: &str| {
+            widget::text(action_tip(name, crate::shortcuts::Action::PreviewTogglePan, km))
+                .size(12)
+                .into()
+        };
+        self.tool_cluster(
+            vec![
+                self.tool_toggle(
+                    "input-mouse-symbolic",
+                    !pan_mode,
+                    PreviewMsg::SetPanMode(false),
+                    tip("Pointer"),
+                    pos,
+                ),
+                self.tool_toggle(
+                    "object-move-symbolic",
+                    pan_mode,
+                    PreviewMsg::SetPanMode(true),
+                    tip("Pan"),
+                    pos,
+                ),
+            ],
+            ClusterChrome::Surface,
+        )
     }
 
-    /// The annotation stroke-width toggle group: three segments — Thin (2px) / Medium (5px) /
-    /// Thick (8px) — styled exactly like [`Self::pan_tool_group`]. Each glyph is a horizontal
-    /// line at the matching thickness; the segment NEAREST `current` reads as active. Lives on
-    /// the BOTTOM bar beside the color swatch, so tooltips rise above.
+    /// The annotation stroke-width toggle group: Thin (2px) / Medium (5px) / Thick (8px). Each
+    /// glyph is a horizontal line at the matching thickness; the one NEAREST `current` reads as
+    /// active. DRAGON-357 item 10: the same bare white/accent [`Self::tool_toggle`] treatment as
+    /// the pan + tray tools (no segment fill). Lives on the BOTTOM bar, so tooltips rise.
     pub(super) fn stroke_width_group(
         self,
         current: f32,
@@ -666,34 +837,38 @@ impl Tb {
     ) -> Element<'static, Msg> {
         use super::annotate::{stroke_width_nearest_index, STROKE_WIDTHS};
         let active = stroke_width_nearest_index(current);
-        // The group now lives on the BOTTOM bar (beside the color swatch), so tooltips rise.
         let pos = widget::tooltip::Position::Top;
-        // (glyph name, tooltip) per preset, thin → thick.
-        // No px in the tooltip — the rendered thickness varies by tool (e.g. arrows render
-        // thicker), and `action_tip` appends the live hotkey.
+        // (glyph name, tooltip) per preset, thin → thick — one entry per [`STROKE_WIDTHS`] (item
+        // 9: seven presets). No px in the tooltip — the rendered thickness varies by tool (e.g.
+        // arrows render thicker), and `action_tip` appends the live hotkey. The width group is
+        // driven by ONE cycle hotkey (PreviewAnnotStrokeCycle). The glyph's OWN stroke scales
+        // with the preset so all seven are visually distinguishable.
         let specs = [
-            ("minus-2", "Thin line"),
-            ("minus-5", "Medium line"),
+            ("minus-1", "Thinnest line"),
+            ("minus-2", "Thinner line"),
+            ("minus-4", "Thin line"),
+            ("minus-6", "Medium line"),
             ("minus-8", "Thick line"),
+            ("minus-10", "Thicker line"),
+            ("minus-12", "Thickest line"),
         ];
-        // The width group is driven by ONE cycle hotkey (PreviewAnnotStrokeCycle); every
-        // segment advertises it.
+        debug_assert_eq!(specs.len(), STROKE_WIDTHS.len());
         let segs: Vec<Element<'static, Msg>> = specs
             .iter()
             .enumerate()
             .map(|(i, (icon, tip))| {
-                self.seg_toggle(
+                self.tool_toggle(
                     icon,
                     i == active,
                     PreviewMsg::SetAnnotStrokeW(STROKE_WIDTHS[i]),
-                    action_tip(tip, crate::shortcuts::Action::PreviewAnnotStrokeCycle, km),
-                    i == 0,
-                    i == STROKE_WIDTHS.len() - 1,
+                    widget::text(action_tip(tip, crate::shortcuts::Action::PreviewAnnotStrokeCycle, km))
+                        .size(12)
+                        .into(),
                     pos,
                 )
             })
             .collect();
-        widget::row(segs).into()
+        widget::row(segs).spacing(2.0).align_y(Alignment::Center).into()
     }
 }
 
@@ -814,22 +989,33 @@ impl Tb {
 }
 
 impl App {
-    /// The windowed preview's TITLEBAR controls (DRAGON-337): the fullscreen-overlay toggle
-    /// (accent — it's the appearance switch, not an edit action) followed by undo / redo
-    /// (full-strength foreground when their stacks have entries, subdued + inert when empty).
-    /// Returned in leading-edge order.
+    /// The windowed preview's TITLEBAR controls (DRAGON-337): the fullscreen-overlay toggle,
+    /// then Settings (DRAGON-353) — both accent, being chrome rather than edit actions —
+    /// followed by undo / redo (full-strength foreground when their stacks have entries,
+    /// subdued + inert when empty). Returned in leading-edge order.
     pub(super) fn preview_header_controls(
         &self,
         preview: &PreviewState,
     ) -> Vec<Element<'static, Msg>> {
         let pid = preview.window;
-        let mut items = vec![titlebar_button(
-            pid,
-            "view-fullscreen-symbolic",
-            "Fullscreen overlay".to_string(),
-            PreviewMsg::ToggleAppearance,
-            crate::app::theme::accent,
-        )];
+        let mut items = vec![
+            titlebar_button(
+                pid,
+                "view-fullscreen-symbolic",
+                "Fullscreen overlay".to_string(),
+                PreviewMsg::ToggleAppearance,
+                crate::app::theme::accent,
+            ),
+            // DRAGON-353: Settings, immediately to the RIGHT of the appearance toggle — the
+            // same slot the overlay header puts it in, so the two chromes agree.
+            titlebar_button(
+                pid,
+                "emblem-system-symbolic",
+                "Settings".to_string(),
+                PreviewMsg::OpenSettings,
+                crate::app::theme::accent,
+            ),
+        ];
         items.extend(Tb::flat_history(&preview.edit, &self.keymap, move |i, t, m, c| {
             titlebar_button(pid, i, t, m, c)
         }));
@@ -960,9 +1146,38 @@ impl Tb {
         to_msg: fn(f32) -> PreviewMsg,
         commit: PreviewMsg,
     ) -> Element<'static, Msg> {
+        // DRAGON-357 item 7 (redo): the slider-adjacent glyph (covermark zoom/opacity,
+        // spotlight/dim) must read at 50% opacity so it sits as a quiet LABEL beside its rail,
+        // not a solid control.
+        //
+        // TRUE alpha is IMPOSSIBLE through the icon widget, and the earlier `c.a *= 0.6` pass was
+        // silently discarded (the glyph stayed fully opaque): libcosmic's wgpu SVG rasterizer
+        // (iced/wgpu/src/image/vector.rs, `Cache::upload`) applies the colour FILTER by
+        // overwriting ONLY the RGB channels of every non-transparent texel and LEAVING ALPHA
+        // untouched — `if rgba[3] > 0 { rgba[0] = color[0]; rgba[1] = color[1]; rgba[2] =
+        // color[2]; }` — so the alpha we hand it in `svg::Style.color` never reaches a pixel
+        // (it is part of the rasterization CACHE KEY but is applied to nothing). The mac build
+        // renders through exactly that wgpu path.
+        //
+        // Fallback (as specced): BLEND the foreground 50% toward the cluster's SURFACE colour
+        // (`background.component.base`, the fill `tool_cluster` paints behind this row), yielding
+        // an OPAQUE colour that reproduces a 50%-opacity foreground glyph on that surface. Theme
+        // tokens only (same `foreground` ramp the sibling toggle glyphs ride), no hardcoded
+        // colour, no platform arm — so it tracks light/dark and the user's accent.
         let glyph = widget::icon::icon(crate::widgets::icons::handle(icon))
             .width(Length::Fixed(self.icon_box() * SLIDER_SCALE))
-            .height(Length::Fixed(self.icon_box() * SLIDER_SCALE));
+            .height(Length::Fixed(self.icon_box() * SLIDER_SCALE))
+            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|t: &cosmic::Theme| {
+                let fg = crate::app::theme::foreground(t);
+                let bg: cosmic::iced::Color = t.cosmic().background.component.base.into();
+                let mix = |a: f32, b: f32| a + (b - a) * 0.5;
+                let c = cosmic::iced::Color::from_rgb(
+                    mix(fg.r, bg.r),
+                    mix(fg.g, bg.g),
+                    mix(fg.b, bg.b),
+                );
+                cosmic::widget::svg::Style { color: Some(c) }
+            })));
         let pid = self.pid;
         let slider = widget::slider(range, value, move |v| Msg::Preview(pid, to_msg(v)))
             .step(0.02f32)
@@ -988,8 +1203,8 @@ impl Tb {
 
 impl App {
     /// The OVERLAY preview's HEADER row (DRAGON-337) — a line above the rest of the chrome
-    /// carrying the windowed-swap toggle and undo / redo on the LEFT, with Close pushed to
-    /// the far RIGHT by the split. Every button here is FLAT (a bare tinted glyph, no
+    /// carrying the windowed-swap toggle, Settings (DRAGON-353) and undo / redo on the LEFT,
+    /// with Close pushed to the far RIGHT by the split. Every button here is FLAT (a bare tinted glyph, no
     /// `tool_group` capsule behind it), matching the windowed preview's titlebar treatment:
     /// the swap and Close read accent, undo / redo the foreground-vs-subdued pair.
     ///
@@ -1003,12 +1218,23 @@ impl App {
         // The glyph advertises the DESTINATION: a restore/window glyph while in the overlay
         // (click to pop out into a window). No hotkey binds the appearance toggle, so the
         // tip carries no key.
-        let mut left = vec![tb.header_button(
-            "view-restore-symbolic",
-            "Windowed".to_string(),
-            PreviewMsg::ToggleAppearance,
-            crate::app::theme::accent,
-        )];
+        let mut left = vec![
+            tb.header_button(
+                "view-restore-symbolic",
+                "Windowed".to_string(),
+                PreviewMsg::ToggleAppearance,
+                crate::app::theme::accent,
+            ),
+            // DRAGON-353: Settings sits immediately right of the appearance toggle here too.
+            // Clicking it DEMOTES this overlay to a window first (an exclusive layer surface
+            // would cover the settings window) — see `App::open_settings_from_preview`.
+            tb.header_button(
+                "emblem-system-symbolic",
+                "Settings".to_string(),
+                PreviewMsg::OpenSettings,
+                crate::app::theme::accent,
+            ),
+        ];
         left.extend(Tb::flat_history(&preview.edit, km, move |n, t, m, c| {
             tb.header_button(n, t, m, c)
         }));
@@ -1019,7 +1245,21 @@ impl App {
             PreviewMsg::Cancel,
             crate::app::theme::accent,
         );
-        toolbar_row(left, Vec::new(), vec![close])
+        // DRAGON-357: on the macOS OVERLAY, Close sits to the LEFT of the Windowed toggle
+        // (mac close-on-left convention) — scoped to this per-platform arm so every other OS
+        // keeps Close on the right, byte-identical. The windowed preview gets Close from the
+        // native window chrome, so this only affects the overlay row.
+        #[cfg(target_os = "macos")]
+        {
+            let mut row = Vec::with_capacity(left.len() + 1);
+            row.push(close);
+            row.extend(left);
+            toolbar_row(row, Vec::new(), Vec::new())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            toolbar_row(left, Vec::new(), vec![close])
+        }
     }
 
     /// The top edit bar above the preview content: the annotation DRAW tools (images only)
@@ -1038,10 +1278,16 @@ impl App {
         if matches!(preview.kind, PreviewKind::Image(_)) {
             left.push(annotation_tools(preview, km, tb));
         }
-        // Right: the size + Delete group, then Save / Save As / Copy.
-        let mut right: Vec<Element<'a, Msg>> =
-            tb.info_group(preview.size, preview.external, km).into_iter().collect();
-        right.push(tb.share_group(km));
+        // Right: the Save / Save As / Copy / Delete action group — the sharing actions tinted
+        // with the accent's companion while there are unsaved edits (Delete stays untinted).
+        // (DRAGON-357 item 8: for IMAGES the filesize block moved to the BOTTOM bar, before the
+        // scaling slider — see `image.rs`. VIDEOS have no bottom zoom cluster, so their filesize
+        // stays here on the top bar.)
+        let mut right: Vec<Element<'a, Msg>> = Vec::new();
+        if matches!(preview.kind, PreviewKind::Video(_)) {
+            right.extend(tb.size_chip(preview.size));
+        }
+        right.push(tb.share_group(preview.unsaved(), preview.external, km));
         // The Close (x) button normally lives elsewhere: the OVERLAY draws it on its header
         // row, the WINDOWED preview gets it from the native window chrome. DRAGON-268
         // follow-up (fullscreen header vanish): in NATIVE fullscreen the windowed preview's
@@ -1074,8 +1320,16 @@ impl App {
         // color swatch (its palette / wheel flyout floats up) then the line-width toggle.
         let mut groups: Vec<Element<'a, Msg>> = Vec::new();
         if matches!(preview.kind, PreviewKind::Image(_)) {
-            groups.push(annot_swatch_flyout(preview, &self.annot_recent_colors, &self.keymap, tb));
-            groups.push(tb.stroke_width_group(e.stroke(), &self.keymap));
+            // DRAGON-357: the color swatch + the three line-width segments share ONE bordered
+            // cluster (the same container the top-left tray groups use), instead of two
+            // borderless controls.
+            groups.push(tb.tool_cluster(
+                vec![
+                    annot_swatch_flyout(preview, &self.annot_recent_colors, &self.keymap, tb),
+                    tb.stroke_width_group(e.stroke(), &self.keymap),
+                ],
+                ClusterChrome::Surface,
+            ));
         }
         // Covermark toggle: on = a covermark is applied. It now wears the SAME treatment as
         // every other control in this chrome — a bare glyph tinted accent when on, foreground
@@ -1132,7 +1386,9 @@ impl App {
                 PreviewMsg::CommitCovermarkEdit,
             ));
         }
-        groups.push(tb.tool_group(covermark_items));
+        // DRAGON-357: the covermark toggle (plus its zoom/opacity sliders when applied) rides a
+        // bordered cluster like every other bottom-bar group, not its own borderless surface.
+        groups.push(tb.tool_cluster(covermark_items, ClusterChrome::Surface));
         groups
     }
 }
@@ -1150,6 +1406,11 @@ pub(super) enum FlyoutDir {
     /// room-below auto-flip (which fails on the fullscreen overlay, where there is always
     /// room below the bottom bar). Requires a FIXED-height panel so the offset is exact.
     Up(f32),
+    /// Anchor on the TOP toolbar → expand DOWNWARD (DRAGON-357 item 14). Uses the popover's own
+    /// `Position::Bottom` (the popup's top at the anchor button's bottom, centered under it), so
+    /// the top-bar dropdowns (text SIZE + text FONT) open DOWN into the canvas — no reliance on a
+    /// hand-guessed anchor height.
+    Down,
 }
 
 /// The ONE shared toolbar-flyout mechanism used by both the covermark picker and the color
@@ -1171,8 +1432,13 @@ pub(super) fn flyout<'a>(
     dir: FlyoutDir,
     on_close: Msg,
 ) -> Element<'a, Msg> {
-    let point = match dir {
-        FlyoutDir::Up(panel_h) => cosmic::iced::Point::new(0.0, -panel_h),
+    // Up offsets by a KNOWN panel height (`Point`, left-aligned); Down uses the popover's own
+    // `Bottom` (anchor-height-aware, no guessing).
+    let position = match dir {
+        FlyoutDir::Up(panel_h) => {
+            widget::popover::Position::Point(cosmic::iced::Point::new(0.0, -panel_h))
+        }
+        FlyoutDir::Down => widget::popover::Position::Bottom,
     };
     // The popover dismisses (non-modal) on ANY press that isn't over the ANCHOR button —
     // including presses on the panel's own padding / inter-widget gaps, which no inner widget
@@ -1193,7 +1459,7 @@ pub(super) fn flyout<'a>(
     let panel = widget::mouse_area(panel).interaction(cosmic::iced::core::mouse::Interaction::Idle);
     widget::popover(base)
         .popup(panel)
-        .position(widget::popover::Position::Point(point))
+        .position(position)
         .on_close(on_close)
         .into()
 }
@@ -1222,11 +1488,22 @@ enum TrayItem {
     DimSlider,
 }
 
-/// One GROUP of the annotation tray: its chrome treatment plus its ordered items.
+/// One GROUP of the annotation tray: its chrome treatment, its optional one-key tool SLOT,
+/// plus its ordered items.
 struct TrayGroup {
     /// Whether this group's [`Tb::tool_cluster`] paints a surface + border, or only occupies
     /// the footprint.
     chrome: ClusterChrome,
+    /// The group's CYCLE action, when its tools share ONE hotkey (DRAGON-369) — pressing it
+    /// arms the group's current member, pressing it again advances to the next, wrapping.
+    /// `None` = every tool in the group owns its own key (or has none).
+    ///
+    /// Declaring the slot HERE is what makes the tray the single source of truth for the
+    /// cycle: membership is the group's tools and the cycle ORDER is their declared order, so
+    /// the keyboard order and the visible left-to-right button order are the same fact. Read
+    /// it through [`slot_tools`] / [`slot_for_tool`]; the per-slot cursor is runtime preview
+    /// state ([`super::edit::EditState::slot_cursor`]).
+    cycle: Option<crate::shortcuts::Action>,
     items: &'static [TrayItem],
 }
 
@@ -1246,14 +1523,16 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // rubber-band to build a selection, drag it to move it all. It is a MODE rather than a
     // family of draw tools, so it wears no chip — only the footprint that keeps it aligned
     // with the bordered groups after it.
-    TrayGroup { chrome: ClusterChrome::Bare, items: &[TrayItem::Tool(
+    TrayGroup { chrome: ClusterChrome::Bare, cycle: None, items: &[TrayItem::Tool(
         "pointer-select-symbolic",
         Tool::Pointer,
         "Select",
         crate::shortcuts::Action::PreviewAnnotPointer,
     )] },
-    // Callouts: point at a thing, or number the steps.
-    TrayGroup { chrome: ClusterChrome::Surface, items: &[
+    // Callouts: point at a thing, or number the steps. NO cycle key — the arrow is the
+    // highest-frequency tool in a screenshot annotator and must never cost two presses, and
+    // the step marker takes Photoshop's Count key.
+    TrayGroup { chrome: ClusterChrome::Surface, cycle: None, items: &[
         TrayItem::Tool(
             "mail-forward-symbolic",
             Tool::Arrow,
@@ -1267,42 +1546,57 @@ const ANNOT_TRAY: &[TrayGroup] = &[
             crate::shortcuts::Action::PreviewAnnotBadge,
         ),
     ] },
-    // Destructive redactions: the pixelate mosaic and the strong blur.
-    TrayGroup { chrome: ClusterChrome::Surface, items: &[
-        TrayItem::Tool(
-            "view-grid-symbolic",
-            Tool::Pixelate,
-            "Pixelate",
-            crate::shortcuts::Action::PreviewAnnotPixelate,
-        ),
-        TrayItem::Tool(
-            "image-filter-symbolic",
-            Tool::Blur,
-            "Blur",
-            crate::shortcuts::Action::PreviewAnnotBlur,
-        ),
-    ] },
-    // Emphasis: everything that draws attention to a region, ending with the spotlight and
-    // the dim range it works against.
-    TrayGroup { chrome: ClusterChrome::Surface, items: &[
-        TrayItem::Tool(
-            "format-text-highlight-symbolic",
-            Tool::Highlight,
-            "Highlight",
-            crate::shortcuts::Action::PreviewAnnotHighlight,
-        ),
-        TrayItem::Tool(
-            "checkbox-symbolic",
-            Tool::Rect,
-            "Border",
-            crate::shortcuts::Action::PreviewAnnotBox,
-        ),
-        TrayItem::Tool(
-            "box-highlight-symbolic",
-            Tool::BoxHighlight,
-            "Border Highlight",
-            crate::shortcuts::Action::PreviewAnnotBoxHighlight,
-        ),
+    // Destructive redactions: the pixelate mosaic and the strong blur. ONE family (both are
+    // drag-a-rect destructive redactions), so ONE cycle key — `M` (DRAGON-369).
+    TrayGroup {
+        chrome: ClusterChrome::Surface,
+        cycle: Some(crate::shortcuts::Action::PreviewAnnotRedactCycle),
+        items: &[
+            TrayItem::Tool(
+                "view-grid-symbolic",
+                Tool::Pixelate,
+                "Pixelate",
+                crate::shortcuts::Action::PreviewAnnotPixelate,
+            ),
+            TrayItem::Tool(
+                "image-filter-symbolic",
+                Tool::Blur,
+                "Blur",
+                crate::shortcuts::Action::PreviewAnnotBlur,
+            ),
+        ],
+    },
+    // SHAPES: the three tools that draw an emphasis shape ON the image, sharing Photoshop's
+    // own shape key `U` (DRAGON-369). This group was carved out of the old "Emphasis" group so
+    // that a tray chip and a hotkey slot are the SAME set — the spotlight below is not a shape.
+    TrayGroup {
+        chrome: ClusterChrome::Surface,
+        cycle: Some(crate::shortcuts::Action::PreviewAnnotShapeCycle),
+        items: &[
+            TrayItem::Tool(
+                "format-text-highlight-symbolic",
+                Tool::Highlight,
+                "Highlight",
+                crate::shortcuts::Action::PreviewAnnotHighlight,
+            ),
+            TrayItem::Tool(
+                "checkbox-symbolic",
+                Tool::Rect,
+                "Border",
+                crate::shortcuts::Action::PreviewAnnotBox,
+            ),
+            TrayItem::Tool(
+                "box-highlight-symbolic",
+                Tool::BoxHighlight,
+                "Border Highlight",
+                crate::shortcuts::Action::PreviewAnnotBoxHighlight,
+            ),
+        ],
+    },
+    // The spotlight and the dim range it works against: a global dim with a knockout rather
+    // than a shape drawn on the image, and the only tool that owns a slider — hence its own
+    // group and its own solo key (`S`), outside the shape slot.
+    TrayGroup { chrome: ClusterChrome::Surface, cycle: None, items: &[
         TrayItem::Tool(
             "spotlight-symbolic",
             Tool::Spotlight,
@@ -1311,8 +1605,20 @@ const ANNOT_TRAY: &[TrayGroup] = &[
         ),
         TrayItem::DimSlider,
     ] },
-    // Freehand ink and the hand-undo that removes it.
-    TrayGroup { chrome: ClusterChrome::Surface, items: &[
+    // Text captions (DRAGON-354): the lucide `type` glyph arms the text tool. Its size
+    // dropdown + font toggle are injected right after this group in `annotation_tools` (they
+    // are a flyout + toggle, not tray tool-buttons, so they can't live in the data-driven tray).
+    TrayGroup { chrome: ClusterChrome::Surface, cycle: None, items: &[
+        TrayItem::Tool(
+            "text-tool-symbolic",
+            Tool::Text,
+            "Text",
+            crate::shortcuts::Action::PreviewAnnotText,
+        ),
+    ] },
+    // Freehand ink and the hand-undo that removes it. NO cycle key: inking and erasing are
+    // the pair you alternate between fastest, so they keep a key each (`B` / `E`).
+    TrayGroup { chrome: ClusterChrome::Surface, cycle: None, items: &[
         TrayItem::Tool(
             "pencil-symbolic",
             Tool::Pen,
@@ -1327,6 +1633,78 @@ const ANNOT_TRAY: &[TrayGroup] = &[
         ),
     ] },
 ];
+
+/// The ordered TOOLS of the slot whose cycle action is `cycle` — the cycle's membership AND
+/// its order, read straight off [`ANNOT_TRAY`] (DRAGON-369) so there is no second declaration
+/// to drift. Empty for an action that names no slot, which makes a stray cycle message a
+/// harmless no-op.
+pub(super) fn slot_tools(cycle: crate::shortcuts::Action) -> Vec<Tool> {
+    ANNOT_TRAY
+        .iter()
+        .filter(|g| g.cycle == Some(cycle))
+        .flat_map(|g| g.items.iter())
+        .filter_map(|i| match i {
+            TrayItem::Tool(_, t, _, _) => Some(*t),
+            TrayItem::DimSlider => None,
+        })
+        .collect()
+}
+
+/// The cycle action of the slot `tool` belongs to, if any — how arming a tool by ANY route
+/// (tray click included) moves that slot's cursor, so keyboard and mouse can never disagree.
+pub(super) fn slot_for_tool(tool: Tool) -> Option<crate::shortcuts::Action> {
+    ANNOT_TRAY
+        .iter()
+        .find(|g| {
+            g.cycle.is_some()
+                && g.items
+                    .iter()
+                    .any(|i| matches!(i, TrayItem::Tool(_, t, _, _) if *t == tool))
+        })
+        .and_then(|g| g.cycle)
+}
+
+/// The member a slot's cycle key arms next — **arm-then-advance** (DRAGON-369):
+///
+/// * the slot is NOT armed → arm its CURRENT member (`cursor`, i.e. whichever member was last
+///   armed however it was armed — a tray click counts), falling back to the first;
+/// * the slot IS armed → ADVANCE from the armed member to the next, wrapping.
+///
+/// There is deliberately **no timeout**: Photoshop has none, and a timeout would make one
+/// keystroke mean two things depending on typing speed. Repeat work is the normal case, so the
+/// two-press cost of a switch is paid once per switch-away, never per use.
+pub(super) fn next_slot_tool(members: &[Tool], armed: Option<Tool>, cursor: Option<Tool>) -> Option<Tool> {
+    let pos = armed.and_then(|t| members.iter().position(|m| *m == t));
+    match pos {
+        Some(i) => members.get((i + 1) % members.len()).copied(),
+        None => cursor
+            .filter(|c| members.contains(c))
+            .or_else(|| members.first().copied()),
+    }
+}
+
+/// The index of the TEXT group in [`ANNOT_TRAY`], after which the size dropdown + font toggle
+/// are injected in [`annotation_tools`] (DRAGON-354). A test pins this to the group whose sole
+/// tool is [`Tool::Text`] so a tray reorder can't silently misplace the size control.
+const TEXT_TRAY_GROUP: usize = 5;
+
+/// Which action's LIVE binding a tray button's tooltip should show (DRAGON-369): its OWN
+/// per-tool action while that is bound, otherwise its group's cycle action.
+///
+/// The order mirrors how a press actually resolves ([`crate::shortcuts::Keymap::action_for`]
+/// walks the per-tool actions before the slot actions), so the tip can never advertise a key
+/// that a deliberate per-tool bind has taken over — and a slot member, which ships unbound,
+/// still shows the key that reaches it instead of no key at all.
+fn tip_action(
+    own: crate::shortcuts::Action,
+    cycle: Option<crate::shortcuts::Action>,
+    km: &crate::shortcuts::Keymap,
+) -> crate::shortcuts::Action {
+    match cycle {
+        Some(slot) if km.get(own).is_none() => slot,
+        _ => own,
+    }
+}
 
 /// The TOP-bar annotation DRAW tools, rendered from the declared [`ANNOT_TRAY`] grouping: one
 /// bordered, padded [`Tb::tool_cluster`] per group, and inside it bare glyph buttons whose
@@ -1347,8 +1725,9 @@ fn annotation_tools<'a>(
     let active = e.tool;
     let groups: Vec<Element<'a, Msg>> = ANNOT_TRAY
         .iter()
-        .map(|group| {
-            let items: Vec<Element<'static, Msg>> = group
+        .enumerate()
+        .map(|(gi, group)| {
+            let mut items: Vec<Element<'static, Msg>> = group
                 .items
                 .iter()
                 .map(|entry| match *entry {
@@ -1356,7 +1735,9 @@ fn annotation_tools<'a>(
                         icon,
                         active == Some(tool),
                         PreviewMsg::ToolPressed(tool),
-                        widget::text(action_tip(name, action, km)).size(12).into(),
+                        widget::text(action_tip(name, tip_action(action, group.cycle, km), km))
+                            .size(12)
+                            .into(),
                         pos,
                     ),
                     // The slider is REVERSED so it reads as image VISIBILITY: 100% = fully
@@ -1372,6 +1753,11 @@ fn annotation_tools<'a>(
                     ),
                 })
                 .collect();
+            // DRAGON-357 item 7: the text SIZE + FONT dropdowns live INSIDE the text tool's
+            // cluster (one bordered group: icon + size dropdown + style dropdown), not beside it.
+            if gi == TEXT_TRAY_GROUP {
+                items.extend(text_style_controls(preview, tb));
+            }
             tb.tool_cluster(items, group.chrome)
         })
         .collect();
@@ -1379,6 +1765,342 @@ fn annotation_tools<'a>(
         .spacing(tb.btn_pad())
         .align_y(Alignment::Center)
         .into()
+}
+
+/// The fixed menu width (px) of the text SIZE + FONT dropdowns — wide enough for "128px" (item
+/// 8) / the font labels plus the row padding.
+const TEXT_DROPDOWN_MENU_W: f32 = 96.0;
+
+/// The fixed CLOSED-control width (px) of the text SIZE dropdown chip, sized for the widest
+/// "128px" label (item 8) plus the chevron so the control never resizes as the selection changes
+/// (DRAGON-357 item 3). The font chip's width is MEASURED from its own faces (see
+/// [`text_font_ctrl_w`]); the Fit chip keeps its own `COMBO_W`.
+const TEXT_SIZE_CTRL_W: f32 = 62.0;
+
+/// The fixed CLOSED-control width (px) of the text FONT dropdown chip: the WIDER of "Hand"
+/// (Excalifont) / "Clean" (Inter), each measured in the face it actually renders with (item 3's
+/// requirement, met by construction with the embedded metrics — identical on every platform),
+/// plus the chevron + padding. Derived, so a font swap can't silently under-size the chip.
+fn text_font_ctrl_w() -> f32 {
+    let label_w = text_annot::measure(text_annot::TextFont::Hand, TEXT_CHIP_LABEL_SIZE, text_annot::TextFont::Hand.label())
+        .max(text_annot::measure(text_annot::TextFont::Clean, TEXT_CHIP_LABEL_SIZE, text_annot::TextFont::Clean.label()));
+    // + chevron (10) + row spacing (3) + button h-padding (2 * 6), with a couple px of slack.
+    label_w + 10.0 + 3.0 + 12.0 + 4.0
+}
+
+/// The label text size (px) of a CLOSED dropdown chip, and of a dropdown MENU row. Named because
+/// a face-previewing label must measure its metrics at the SAME size it renders at
+/// ([`cap_centered_label`]); an inline literal could drift from the `.size(..)` beside it.
+const TEXT_CHIP_LABEL_SIZE: f32 = 12.0;
+const TEXT_MENU_LABEL_SIZE: f32 = 13.0;
+
+// ── Cap-band label centring (DRAGON-363) ─────────────────────────────────────────────────────
+//
+// A label that PREVIEWS a text face in its own face is placed vertically by cosmic-text's LINE-BOX
+// rule: inside a line box of height `LH` the baseline lands at `LH/2 + (ascent - descent)/2`
+// (`cosmic_text::Buffer`'s `centering_offset + max_ascent`), i.e. the box is centred on the face's
+// ascent/descent band. Two faces sharing one row therefore put their visible glyphs at DIFFERENT
+// heights whenever their vertical metrics differ — the DRAGON-363 report: "Hand" (Excalifont)
+// rides high while "Clean" (Inter) and the neighbouring "32px" chip look centred.
+//
+// WHY those two look right: Inter's metrics satisfy `ascent - |descent| == capHeight` EXACTLY
+// (2728 - 680 == 2048 design units), so for Inter the line-box rule already coincides with
+// centring the CAP BAND — and every UI-font label here is Inter too (it is the COSMIC interface
+// font). Excalifont does not: 886 - 374 = 512 against a 600-unit cap height, so its cap band sits
+// 0.088em high — the gap above its capitals is ~1.06px smaller than the gap below at the 12px
+// chip. Half of that difference (0.044em ≈ 0.53px) is the correction below.
+//
+// The RULE applied here is therefore CAP-BAND centring: put the band from the baseline to the
+// face's cap height in the middle of the row. One rule for every face — no per-face constant, no
+// lookup table, no `if font == Hand`; a third face added to the picker is corrected by the same
+// arithmetic on its own metrics, and a face that already satisfies Inter's identity is left
+// untouched by construction (shift 0.0).
+//
+// Why NOT ink-box (visual glyph extent) centring: it is STRING-dependent, and the very control the
+// report names as correctly aligned disproves it — "32px" carries a 'p' descender, so its ink-box
+// centre sits 0.098em BELOW where Inter's baseline rule puts it; ink centring would visibly move a
+// control that is already right, and would make two menu rows with different ascenders/descenders
+// ("Hand" vs a future "Jump") sit on different baselines.
+
+/// The vertical metrics ONE face contributes to [`cap_center_shift_em`], in FONT UNITS plus the
+/// face's em. `ttf-parser`'s `ascender`/`descender` walk the SAME FreeType ladder as the `skrifa`
+/// metrics `cosmic-text` lays out with (OS/2 typographic metrics when the `USE_TYPO_METRICS` flag
+/// is set, else `hhea`, else the OS/2 fallbacks), so these are the numbers that actually placed
+/// the glyphs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FaceVMetrics {
+    /// Design units per em (`head.unitsPerEm`).
+    upem: f32,
+    /// Baseline → top of the alignment box, font units (positive up).
+    ascent: f32,
+    /// Baseline → bottom of the alignment box, font units, as a POSITIVE magnitude.
+    descent: f32,
+    /// Baseline → top of a capital, font units. `None` when the face declares no cap height and
+    /// has no 'H' outline to stand in — then NO correction is applied and the label keeps the
+    /// historical line-box placement.
+    cap: Option<f32>,
+}
+
+/// Read [`FaceVMetrics`] off a parsed face. The cap ladder is OS/2 `sCapHeight` → the 'H' outline's
+/// top (the same band, measured, for faces whose OS/2 table predates v2) → give up.
+fn face_v_metrics(face: &ttf_parser::Face<'_>) -> FaceVMetrics {
+    let cap = face
+        .capital_height()
+        .map(|v| v as f32)
+        .or_else(|| {
+            face.glyph_index('H')
+                .and_then(|g| face.glyph_bounding_box(g))
+                .map(|bb| bb.y_max as f32)
+        })
+        .filter(|c| *c > 0.0);
+    FaceVMetrics {
+        upem: face.units_per_em() as f32,
+        ascent: face.ascender() as f32,
+        // `descender` is negative (below the baseline); we carry the magnitude.
+        descent: -(face.descender() as f32),
+        cap,
+    }
+}
+
+/// How far DOWN (in em) a label in this face must move so its CAP BAND — not its line box — is
+/// centred in the row. Pure, and the whole of the rule: cosmic-text puts the baseline
+/// `(ascent - descent)/2` below the row centre, cap-band centring wants it `cap/2` below, and the
+/// shift is the difference. `0.0` for a face that already agrees (Inter) or declares no cap.
+fn cap_center_shift_em(m: FaceVMetrics) -> f32 {
+    let (Some(cap), true) = (m.cap, m.upem > 0.0) else { return 0.0 };
+    (cap - (m.ascent - m.descent)) / (2.0 * m.upem)
+}
+
+/// The line box + padding that realise a cap-centring shift WITHOUT changing the element's outer
+/// height: the line box is shortened by twice the shift's magnitude and the padding puts it back
+/// asymmetrically, so `pad_top + line_h + pad_bottom` is always the label's natural line-box
+/// height. That is what lets the chip and the menu rows keep their exact historical size while the
+/// glyphs inside move — and it makes a zero shift byte-identical to the historical layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CapCenteredBox {
+    line_h: f32,
+    pad_top: f32,
+    pad_bottom: f32,
+}
+
+fn cap_centered_box(size: f32, shift_em: f32) -> CapCenteredBox {
+    use cosmic::iced::advanced::text::LineHeight;
+    // iced's OWN default line box for this text size (so the corrected label keeps exactly the
+    // height an uncorrected one has, whatever that default is).
+    let box_h = LineHeight::default().to_absolute(cosmic::iced::Pixels(size)).0;
+    // A correction may never eat the line box: clamp to a quarter of it. No sane face comes close
+    // — Excalifont, the largest correction among the embedded faces, wants 0.53px of 4.2px at the
+    // 12px chip.
+    let shift = (shift_em * size).clamp(-box_h / 4.0, box_h / 4.0);
+    CapCenteredBox {
+        line_h: box_h - 2.0 * shift.abs(),
+        pad_top: shift.abs() + shift,
+        pad_bottom: shift.abs() - shift,
+    }
+}
+
+/// The cap-centring shift (em) for `font`'s face, parsed ONCE per process from the SAME embedded
+/// bytes the UI font system was registered with ([`text_annot::UI_FONT_FACES`], keyed by family
+/// name — so a face added there and to `TextFont` is picked up with no change here). An
+/// unparseable or unlisted family yields `0.0`: the historical placement, never a panic.
+fn face_shift_em(font: text_annot::TextFont) -> f32 {
+    static SHIFTS: std::sync::OnceLock<Vec<(&'static str, f32)>> = std::sync::OnceLock::new();
+    let table = SHIFTS.get_or_init(|| {
+        text_annot::UI_FONT_FACES
+            .iter()
+            .map(|(family, bytes)| {
+                let shift = ttf_parser::Face::parse(bytes, 0)
+                    .map(|f| cap_center_shift_em(face_v_metrics(&f)))
+                    .unwrap_or(0.0);
+                (*family, shift)
+            })
+            .collect()
+    });
+    table
+        .iter()
+        .find(|(family, _)| *family == font.family())
+        .map_or(0.0, |(_, shift)| *shift)
+}
+
+/// Wrap a `label` rendered in `font`'s OWN face (already sized/classed by the caller, at `size`)
+/// so it is CAP-BAND centred in its row instead of line-box centred — the DRAGON-363 fix, applied
+/// identically to the closed chip and to the dropdown's menu rows.
+fn cap_centered_label<'a>(
+    font: text_annot::TextFont,
+    size: f32,
+    label: widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
+) -> Element<'a, Msg> {
+    use cosmic::iced::advanced::text::LineHeight;
+    let b = cap_centered_box(size, face_shift_em(font));
+    widget::container(label.line_height(LineHeight::Absolute(cosmic::iced::Pixels(b.line_h))))
+        .padding([b.pad_top, 0.0, b.pad_bottom, 0.0])
+        .into()
+}
+
+/// The shared CLOSED dropdown-control chip (DRAGON-357 items 2/3/15/16): a `Button::Text` chip
+/// showing `label` (already fonted/sized by the caller) left-aligned with a size-10
+/// `pan-down-symbolic` chevron pinned to the right, at a FIXED `width` so the control never
+/// resizes as its selection changes (item 3). `Button::Text` supplies the SAME hover
+/// trim/background as every editor dropdown — so the px, Hand/Clean and Fit chips read as ONE
+/// control family in both light and dark themes (item 2 + the hover addendum, since the hover
+/// styling lives in this ONE shared class, not per call site). `toggle` opens/closes its menu.
+pub(super) fn dropdown_chip<'a>(
+    pid: window::Id,
+    label: Element<'a, Msg>,
+    width: f32,
+    toggle: PreviewMsg,
+) -> Element<'a, Msg> {
+    crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::custom(
+            widget::row(vec![
+                widget::container(label).width(Length::Fill).into(),
+                widget::icon::icon(crate::widgets::icons::handle("pan-down-symbolic"))
+                    .size(10)
+                    .into(),
+            ])
+            .spacing(3.0)
+            .align_y(Alignment::Center),
+        )
+        .class(cosmic::theme::Button::Text)
+        .padding([2.0, 6.0])
+        .width(Length::Fixed(width))
+        .on_press(Msg::Preview(pid, toggle)),
+    )
+}
+
+/// The iced UI font that PREVIEWS a [`text_annot::TextFont`] in its own face (DRAGON-354 item
+/// 19): "Hand" in Excalifont, "Clean" in Inter. The faces are registered with the UI font
+/// system at startup (`App::init`, reusing the same embedded bytes as the rasterizer); if that
+/// registration ever fails the label just falls back to the default UI font.
+fn font_preview_face(font: text_annot::TextFont) -> cosmic::iced::Font {
+    cosmic::iced::Font::with_name(font.family())
+}
+
+/// The text SIZE dropdown + FONT dropdown (DRAGON-354 / DRAGON-357), returned as the two
+/// controls that sit INSIDE the text tool's bordered cluster (item 7). Both open DOWNWARD
+/// (item 14) with an OPAQUE menu (item 15), and both apply to NEW text and the edited/selected
+/// box. The size button shows the current px; the font button shows the current family's label
+/// rendered in that family's own face (item 19).
+fn text_style_controls(preview: &PreviewState, tb: Tb) -> Vec<Element<'static, Msg>> {
+    let e = &preview.edit;
+    let pid = tb.pid;
+    let size = e.text_size();
+    let font = e.annot_text_font;
+    // ── SIZE dropdown ("24px ⌄") ──────────────────────────────────────────────────────────
+    let size_btn: Element<'static, Msg> = dropdown_chip(
+        pid,
+        widget::text(format!("{}px", size.round() as i32)).size(12).into(),
+        TEXT_SIZE_CTRL_W,
+        PreviewMsg::ToggleTextSizeFlyout,
+    );
+    let size_ctrl: Element<'static, Msg> =
+        if e.flyout_kind() == Some(super::edit::FlyoutKind::TextSize) {
+            flyout(
+                size_btn,
+                text_size_panel(pid, size, e.flyout_selected(), tb),
+                FlyoutDir::Down,
+                Msg::Preview(pid, PreviewMsg::FlyoutClose),
+            )
+        } else {
+            size_btn
+        };
+    // ── FONT dropdown ("Hand ⌄" / "Clean ⌄", label in its own face) (item 16) ──────────────
+    // The label is CAP-BAND centred (DRAGON-363), not line-box centred, so every face's glyphs
+    // sit at the same height in the chip as the UI-font "24px" chip beside it.
+    let font_btn: Element<'static, Msg> = dropdown_chip(
+        pid,
+        cap_centered_label(
+            font,
+            TEXT_CHIP_LABEL_SIZE,
+            widget::text(font.label()).size(TEXT_CHIP_LABEL_SIZE).font(font_preview_face(font)),
+        ),
+        text_font_ctrl_w(),
+        PreviewMsg::ToggleTextFontFlyout,
+    );
+    let font_ctrl: Element<'static, Msg> =
+        if e.flyout_kind() == Some(super::edit::FlyoutKind::TextFont) {
+            flyout(
+                font_btn,
+                text_font_panel(pid, font, e.flyout_selected(), tb),
+                FlyoutDir::Down,
+                Msg::Preview(pid, PreviewMsg::FlyoutClose),
+            )
+        } else {
+            font_btn
+        };
+    vec![size_ctrl, font_ctrl]
+}
+
+/// The text-size dropdown MENU (DRAGON-354): one row per [`text_annot::TEXT_SIZES`] entry, the
+/// current/highlighted one in accent. Opaque menu surface (item 15); keyboard-navigable through
+/// the shared flyout state (arrows move `selected`, Enter applies).
+fn text_size_panel(
+    pid: window::Id,
+    current: f32,
+    selected: Option<usize>,
+    tb: Tb,
+) -> Element<'static, Msg> {
+    let rows: Vec<Element<'static, Msg>> = text_annot::TEXT_SIZES
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let hot = selected == Some(i) || (selected.is_none() && (s - current).abs() < 0.5);
+            let label = if hot {
+                widget::text(format!("{}px", s.round() as i32)).size(13).class(
+                    cosmic::theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+                        color: Some(crate::app::theme::accent(t)),
+                        ..Default::default()
+                    }),
+                )
+            } else {
+                widget::text(format!("{}px", s.round() as i32)).size(13)
+            };
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(label)
+                    .width(Length::Fill)
+                    .class(cosmic::theme::Button::Text)
+                    .on_press(Msg::Preview(pid, PreviewMsg::SetTextSize(s))),
+            )
+        })
+        .collect();
+    tb.menu_container(widget::column(rows).spacing(2.0), TEXT_DROPDOWN_MENU_W)
+}
+
+/// The text-font dropdown MENU (DRAGON-357 item 16): "Hand" (Excalifont) and "Clean" (Inter),
+/// each label previewing its own face (item 19), the active one in accent. Opaque menu surface;
+/// keyboard-navigable through the shared flyout state.
+fn text_font_panel(
+    pid: window::Id,
+    current: text_annot::TextFont,
+    selected: Option<usize>,
+    tb: Tb,
+) -> Element<'static, Msg> {
+    let rows: Vec<Element<'static, Msg>> = [text_annot::TextFont::Hand, text_annot::TextFont::Clean]
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let hot = selected == Some(i) || (selected.is_none() && f == current);
+            let mut label = widget::text(f.label()).size(TEXT_MENU_LABEL_SIZE).font(font_preview_face(f));
+            if hot {
+                label = label.class(cosmic::theme::Text::Custom(|t| {
+                    cosmic::iced::widget::text::Style {
+                        color: Some(crate::app::theme::accent(t)),
+                        ..Default::default()
+                    }
+                }));
+            }
+            // Same cap-band centring as the closed chip (DRAGON-363): the rows preview two faces
+            // side by side, so line-box centring would stagger them against each other.
+            let label = cap_centered_label(f, TEXT_MENU_LABEL_SIZE, label);
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(label)
+                    .width(Length::Fill)
+                    .class(cosmic::theme::Button::Text)
+                    .on_press(Msg::Preview(pid, PreviewMsg::SetTextFont(f))),
+            )
+        })
+        .collect();
+    tb.menu_container(widget::column(rows).spacing(2.0), TEXT_DROPDOWN_MENU_W)
 }
 
 /// The BOTTOM-bar color swatch with its upward flyout (the palette grid, or — once the "+"
@@ -1646,6 +2368,115 @@ fn annot_palette_style(
 mod tests {
     use super::*;
 
+    // ── DRAGON-375: a toast must never change the composed tree's SHAPE ────────────────
+
+    /// A distinctive stand-in for the MEDIA element: a stateful widget (a button carries its
+    /// own `tree::State`), so it can be located by tag in the composed tree and nothing else
+    /// in these fixtures shares it.
+    fn media_marker() -> Element<'static, Msg> {
+        widget::button::custom(widget::text("media")).into()
+    }
+
+    /// Where the media element sits in a composed tree: the index path to it, its own child
+    /// count, and its PARENT's child count — i.e. everything iced's reconciler uses to decide
+    /// whether the retained state at that position still belongs to the same widget.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Site {
+        path: Vec<usize>,
+        children: usize,
+        siblings: usize,
+    }
+
+    /// Locate the first node tagged `tag`. `None` when the tag isn't in the tree at all.
+    fn marker_site(
+        el: &Element<'_, Msg>,
+        tag: cosmic::iced::core::widget::tree::Tag,
+    ) -> Option<Site> {
+        fn walk(
+            node: &cosmic::iced::core::widget::Tree,
+            tag: cosmic::iced::core::widget::tree::Tag,
+            path: &mut Vec<usize>,
+            siblings: usize,
+        ) -> Option<Site> {
+            if node.tag == tag {
+                return Some(Site { path: path.clone(), children: node.children.len(), siblings });
+            }
+            for (i, child) in node.children.iter().enumerate() {
+                path.push(i);
+                if let Some(found) = walk(child, tag, path, node.children.len()) {
+                    return Some(found);
+                }
+                path.pop();
+            }
+            None
+        }
+        let tree = cosmic::iced::core::widget::Tree::new(el.as_widget());
+        walk(&tree, tag, &mut Vec::new(), 1)
+    }
+
+    /// Compose one preview with and without a toast and return where the media landed in each.
+    fn media_sites(windowed: bool) -> (Site, Site) {
+        let tag = cosmic::iced::core::widget::Tree::new(media_marker().as_widget()).tag;
+        let compose = |toasts: Option<Element<'static, Msg>>| {
+            let header = (!windowed).then(|| widget::Space::new().into());
+            compose_preview(
+                windowed,
+                600.0,
+                header,
+                widget::Space::new().into(),
+                media_marker(),
+                None,
+                widget::Space::new().into(),
+                None,
+                toasts,
+            )
+        };
+        let with = marker_site(&compose(Some(widget::text("toast").into())), tag)
+            .expect("the media element is in the composed tree");
+        let without =
+            marker_site(&compose(None), tag).expect("the media element is in the composed tree");
+        (with, without)
+    }
+
+    /// The regression this exists for: iced reconciles state by tree shape, so if the media
+    /// element moves (or its parent changes tag) when a toast comes or goes, every widget under
+    /// it — including the `AnnotationCanvas` holding the IN-FLIGHT gesture — is rebuilt from
+    /// scratch and the stroke the user is drawing is thrown away. The opening toast expires
+    /// 750 ms after the first interaction, i.e. inside the first stroke.
+    #[test]
+    fn a_toast_coming_or_going_never_moves_the_media_element() {
+        for windowed in [false, true] {
+            let (with, without) = media_sites(windowed);
+            assert_eq!(
+                with, without,
+                "windowed={windowed}: the media element must sit at the same path (and keep the \
+                 same children) whether or not a toast is showing"
+            );
+        }
+    }
+
+    /// …and the placeholder must actually SURVIVE into the stack. `Stack::push` silently drops
+    /// any child whose size hint `is_void` (a `Fixed(0.0)` axis), which would restore the very
+    /// child-count change this fix removes — so assert the toast SLOT is occupied (two children
+    /// beside the media) with no toast, rather than trusting the placeholder's sizing.
+    #[test]
+    fn the_toast_slot_is_occupied_even_with_no_toast() {
+        for windowed in [false, true] {
+            let (with, without) = media_sites(windowed);
+            assert_eq!(with.siblings, 2, "windowed={windowed}: media + toast");
+            assert_eq!(
+                without.siblings, 2,
+                "windowed={windowed}: the empty toast slot must not be dropped from the stack"
+            );
+            // The media is child 0 of the stack in both arms; the toast/placeholder is child 1.
+            assert_eq!(
+                with.path.last(),
+                Some(&0),
+                "windowed={windowed}: the media stays the stack's BASE layer"
+            );
+        }
+    }
+
     #[test]
     fn friendly_size_stays_in_bytes_below_1024() {
         assert_eq!(friendly_size(0), "0 B");
@@ -1716,6 +2547,7 @@ mod tests {
                 Tool::Rect,
                 Tool::BoxHighlight,
                 Tool::Spotlight,
+                Tool::Text,
                 Tool::Pen,
                 Tool::Eraser,
             ]
@@ -1733,11 +2565,20 @@ mod tests {
     #[test]
     fn the_tray_groups_match_the_declared_layout() {
         let shape: Vec<usize> = ANNOT_TRAY.iter().map(|g| g.items.len()).collect();
-        assert_eq!(shape, vec![1, 2, 2, 5, 2]);
+        // pointer(1), callouts(2), redact(2), SHAPES(3), spotlight+dim(2, DRAGON-369 split the
+        // old five-member "Emphasis" group in two so a chip is exactly a slot), TEXT(1,
+        // DRAGON-354), pencil+eraser(2).
+        assert_eq!(shape, vec![1, 2, 2, 3, 2, 1, 2]);
         // A ONE-member group exists and is rendered through the very same container as the
         // others — there is no single-member branch anywhere in the builder.
         assert!(shape.contains(&1));
-        assert!(matches!(ANNOT_TRAY[3].items[4], TrayItem::DimSlider));
+        assert!(matches!(ANNOT_TRAY[4].items[1], TrayItem::DimSlider));
+        // The size dropdown is injected right after the TEXT group, which must be the group
+        // whose sole tool is Text.
+        assert!(matches!(
+            ANNOT_TRAY[TEXT_TRAY_GROUP].items,
+            [TrayItem::Tool(_, Tool::Text, _, _)]
+        ));
     }
 
     /// The per-group CHROME is declared, not inferred: only the pointer (selection) group is
@@ -1755,8 +2596,9 @@ mod tests {
         }
     }
 
-    /// Every tray entry advertises a hotkey action that lives in the PREVIEW context, so its
-    /// tooltip resolves a real live binding.
+    /// Every tray entry advertises a hotkey action that lives in the PREVIEW context, and every
+    /// tool is REACHABLE from the keyboard out of the box — directly, or through its group's
+    /// cycle key (DRAGON-369). The tooltip shows whichever one actually reaches it.
     #[test]
     fn every_tray_tool_binds_a_preview_action() {
         use crate::shortcuts::{Context, Keymap};
@@ -1765,9 +2607,95 @@ mod tests {
             for entry in group.items {
                 let TrayItem::Tool(_, _, name, action) = entry else { continue };
                 assert_eq!(action.context(), Context::Preview, "{name}");
-                assert!(km.get(*action).is_some(), "{name} has no default binding");
+                let tip = tip_action(*action, group.cycle, &km);
+                assert_eq!(tip.context(), Context::Preview, "{name} tip");
+                assert!(km.get(tip).is_some(), "{name} is unreachable from the keyboard");
             }
         }
+    }
+
+    // ── one-key tool SLOTS (DRAGON-369) ──────────────────────────────────────────────
+
+    /// The slots are read off the tray itself: membership IS the group's tools and the cycle
+    /// order IS their declared left-to-right order — learn the tray, you have learned the cycle.
+    #[test]
+    fn the_slots_are_the_declared_tray_groups() {
+        use crate::shortcuts::Action;
+        assert_eq!(
+            slot_tools(Action::PreviewAnnotRedactCycle),
+            vec![Tool::Pixelate, Tool::Blur]
+        );
+        assert_eq!(
+            slot_tools(Action::PreviewAnnotShapeCycle),
+            vec![Tool::Highlight, Tool::Rect, Tool::BoxHighlight]
+        );
+        // Every slot's tools appear in the SAME order the tray renders them.
+        for slot in [Action::PreviewAnnotRedactCycle, Action::PreviewAnnotShapeCycle] {
+            let members = slot_tools(slot);
+            let idx: Vec<usize> = members
+                .iter()
+                .map(|m| tray_tools().iter().position(|t| t == m).expect("in the tray"))
+                .collect();
+            assert!(idx.windows(2).all(|w| w[0] < w[1]), "{slot:?} cycles against tray order");
+            // …and each member maps back to its own slot.
+            for m in &members {
+                assert_eq!(slot_for_tool(*m), Some(slot));
+            }
+        }
+        // An action that names no slot has no members — a stray cycle press is a no-op.
+        assert!(slot_tools(Action::PreviewSave).is_empty());
+        // Solo tools belong to no slot, so their key can never be stolen by a cycle.
+        for solo in [Tool::Pointer, Tool::Arrow, Tool::Badge, Tool::Spotlight, Tool::Text, Tool::Pen, Tool::Eraser] {
+            assert_eq!(slot_for_tool(solo), None, "{solo:?}");
+        }
+    }
+
+    /// Arm-then-advance, the whole behaviour: a cold press arms the first member, a repeat
+    /// advances and wraps, leaving the slot and coming back re-arms the member you left on
+    /// (the cursor) rather than restarting at member one.
+    #[test]
+    fn a_slot_key_arms_then_advances_and_wraps() {
+        let shape = [Tool::Highlight, Tool::Rect, Tool::BoxHighlight];
+        // Cold: nothing armed, no cursor → member 1.
+        assert_eq!(next_slot_tool(&shape, None, None), Some(Tool::Highlight));
+        // Armed → advance, and the last member wraps to the first.
+        assert_eq!(next_slot_tool(&shape, Some(Tool::Highlight), Some(Tool::Highlight)), Some(Tool::Rect));
+        assert_eq!(next_slot_tool(&shape, Some(Tool::Rect), Some(Tool::Rect)), Some(Tool::BoxHighlight));
+        assert_eq!(
+            next_slot_tool(&shape, Some(Tool::BoxHighlight), Some(Tool::BoxHighlight)),
+            Some(Tool::Highlight)
+        );
+        // Away on another tool → re-arm the CURSOR (however it was set — a tray click counts),
+        // so repeat work costs one press.
+        assert_eq!(next_slot_tool(&shape, Some(Tool::Arrow), Some(Tool::Rect)), Some(Tool::Rect));
+        // A cursor from another slot (or a stale one) never wins over the slot's own order.
+        assert_eq!(next_slot_tool(&shape, None, Some(Tool::Blur)), Some(Tool::Highlight));
+        // An empty slot arms nothing at all.
+        assert_eq!(next_slot_tool(&[], Some(Tool::Rect), None), None);
+    }
+
+    /// The tooltip resolves the key that ACTUALLY reaches the tool, in the same order a press
+    /// does: a per-tool bind wins, and a slot member (unbound by default) shows its cycle key.
+    #[test]
+    fn a_slot_members_tip_falls_back_to_the_cycle_key() {
+        use crate::shortcuts::{Action, Keymap, Shortcut, ShortcutKey};
+        let mut km = Keymap::defaults();
+        let slot = Some(Action::PreviewAnnotShapeCycle);
+        assert_eq!(
+            tip_action(Action::PreviewAnnotBoxHighlight, slot, &km),
+            Action::PreviewAnnotShapeCycle
+        );
+        // The escape hatch: bind the tool directly and the tip follows the direct key.
+        km.set(
+            Action::PreviewAnnotBoxHighlight,
+            Shortcut { ctrl: false, alt: false, shift: false, logo: false, key: ShortcutKey::Char("g".into()) },
+        );
+        assert_eq!(
+            tip_action(Action::PreviewAnnotBoxHighlight, slot, &km),
+            Action::PreviewAnnotBoxHighlight
+        );
+        // A tool in a group with no slot always shows its own action.
+        assert_eq!(tip_action(Action::PreviewAnnotArrow, None, &km), Action::PreviewAnnotArrow);
     }
 
     // ── preview-editor slider thumbs ─────────────────────────────────────────────────
@@ -1838,5 +2766,170 @@ mod tests {
         s.handle.shape = HandleShape::Rectangle { width: 1, height: 1, border_radius: 0.0.into() };
         let s = thumb_scaled(s);
         assert!(matches!(s.handle.shape, HandleShape::Rectangle { width: 1, height: 1, .. }));
+    }
+
+    // ── Cap-band label centring (DRAGON-363) ────────────────────────────────────────────────
+    //
+    // The rendered result is headless-unverifiable, so the rule is pinned as pure arithmetic over
+    // the EMBEDDED faces' real metrics, against a MODEL of cosmic-text's own placement.
+
+    /// Metrics of the face registered under `family`, read from the same embedded bytes the UI
+    /// font system gets.
+    fn embedded_metrics(family: &str) -> FaceVMetrics {
+        let (_, bytes) = text_annot::UI_FONT_FACES
+            .iter()
+            .find(|(name, _)| *name == family)
+            .unwrap_or_else(|| panic!("{family} is registered as a UI font face"));
+        let face = ttf_parser::Face::parse(bytes, 0).expect("embedded face parses");
+        face_v_metrics(&face)
+    }
+
+    /// cosmic-text's OWN placement rule, as the test's model: inside a line box of height
+    /// `line_h` the baseline lands at `line_h/2 + (ascent - descent)/2` (`cosmic_text::Buffer`'s
+    /// `centering_offset + max_ascent`). Returns the baseline measured from the top of the WHOLE
+    /// padded element.
+    fn modelled_baseline(m: FaceVMetrics, size: f32, b: CapCenteredBox) -> f32 {
+        b.pad_top + b.line_h / 2.0 + (m.ascent - m.descent) * size / (2.0 * m.upem)
+    }
+
+    /// The gap between the element's vertical centre and the centre of the face's CAP BAND
+    /// (baseline → cap height) once the correction is applied. Zero = the rule is satisfied.
+    fn cap_band_offset(m: FaceVMetrics, size: f32, b: CapCenteredBox) -> f32 {
+        let outer_h = b.pad_top + b.line_h + b.pad_bottom;
+        let baseline = modelled_baseline(m, size, b);
+        let cap_center = baseline - m.cap.unwrap() * size / (2.0 * m.upem);
+        cap_center - outer_h / 2.0
+    }
+
+    /// The reason "Clean" (and every UI-font label in the toolbar, the interface font being Inter)
+    /// already reads centred: Inter's metrics satisfy `ascent - |descent| == capHeight` exactly, so
+    /// the line-box rule IS cap-band centring for it. The correction must therefore be exactly
+    /// zero — and a zero correction must reproduce the historical layout byte for byte.
+    #[test]
+    fn inter_is_already_cap_centred_so_clean_never_moves() {
+        let m = embedded_metrics("Inter");
+        assert_eq!(m.ascent - m.descent, m.cap.unwrap(), "Inter's alignment box IS its cap band");
+        assert_eq!(cap_center_shift_em(m), 0.0);
+        for size in [12.0_f32, 13.0, 24.0] {
+            let b = cap_centered_box(size, cap_center_shift_em(m));
+            assert_eq!((b.pad_top, b.pad_bottom), (0.0, 0.0), "no padding is introduced");
+            let natural = cosmic::iced::advanced::text::LineHeight::default()
+                .to_absolute(cosmic::iced::Pixels(size))
+                .0;
+            assert_eq!(b.line_h, natural, "the line box is the untouched default at {size}px");
+        }
+    }
+
+    /// Excalifont is the face the report is about: its alignment box is SHORTER than its cap band
+    /// (886 - 374 = 512 units against a 600-unit cap height), so line-box centring rides its
+    /// capitals high by half that difference. The correction is that half, pushing DOWN.
+    #[test]
+    fn excalifont_rides_high_by_exactly_half_its_metric_gap() {
+        let m = embedded_metrics("Excalifont");
+        let gap = (m.cap.unwrap() - (m.ascent - m.descent)) / m.upem;
+        assert!(gap > 0.0, "the cap band overshoots the alignment box");
+        let shift = cap_center_shift_em(m);
+        assert!((shift - gap / 2.0).abs() < 1e-6, "the shift is half the gap");
+        assert!((shift - 0.044).abs() < 5e-4, "0.044em — ~0.53px at the 12px chip, got {shift}");
+        // And it moves the label DOWN (the report: the label sits too high).
+        let b = cap_centered_box(12.0, shift);
+        assert!(b.pad_top > 0.0 && b.pad_bottom == 0.0);
+    }
+
+    /// THE rule, applied to every embedded face at both label sizes the picker uses (the closed
+    /// chip's 12px and the menu rows' 13px): the cap band ends up centred, and the element keeps
+    /// the exact height an uncorrected label has — so neither the chip nor a menu row changes
+    /// size. A face added to `UI_FONT_FACES` is covered here with no new code.
+    #[test]
+    fn every_embedded_face_centres_its_cap_band_without_changing_height() {
+        for (family, bytes) in text_annot::UI_FONT_FACES {
+            let face = ttf_parser::Face::parse(bytes, 0).expect("embedded face parses");
+            let m = face_v_metrics(&face);
+            assert!(m.cap.is_some(), "{family} declares a cap height");
+            for size in [TEXT_CHIP_LABEL_SIZE, TEXT_MENU_LABEL_SIZE, 24.0] {
+                let b = cap_centered_box(size, cap_center_shift_em(m));
+                let natural = cosmic::iced::advanced::text::LineHeight::default()
+                    .to_absolute(cosmic::iced::Pixels(size))
+                    .0;
+                assert!(
+                    (b.pad_top + b.line_h + b.pad_bottom - natural).abs() < 1e-4,
+                    "{family} at {size}px keeps the natural {natural}px element height"
+                );
+                assert!(b.line_h > 0.0 && b.pad_top >= 0.0 && b.pad_bottom >= 0.0);
+                assert!(
+                    cap_band_offset(m, size, b).abs() < 1e-4,
+                    "{family} at {size}px centres its cap band, off by {}",
+                    cap_band_offset(m, size, b)
+                );
+            }
+        }
+    }
+
+    /// The picker's two faces land at the SAME height as each other — which is all the user can
+    /// see. Measured as the distance from the row centre to each face's cap-band centre.
+    #[test]
+    fn the_two_picker_faces_agree_after_the_correction() {
+        for size in [TEXT_CHIP_LABEL_SIZE, TEXT_MENU_LABEL_SIZE] {
+            let mut offsets = Vec::new();
+            for font in [text_annot::TextFont::Hand, text_annot::TextFont::Clean] {
+                let m = embedded_metrics(font.family());
+                let b = cap_centered_box(size, face_shift_em(font));
+                offsets.push(cap_band_offset(m, size, b));
+            }
+            assert!(
+                (offsets[0] - offsets[1]).abs() < 1e-4,
+                "the faces disagree by {} at {size}px",
+                offsets[0] - offsets[1]
+            );
+        }
+        // The un-corrected placement is what the report saw: the faces disagreed by a real amount.
+        let (hand, clean) = (embedded_metrics("Excalifont"), embedded_metrics("Inter"));
+        let uncorrected = |m: FaceVMetrics| {
+            let b = cap_centered_box(TEXT_CHIP_LABEL_SIZE, 0.0);
+            cap_band_offset(m, TEXT_CHIP_LABEL_SIZE, b)
+        };
+        assert!(
+            (uncorrected(hand) - uncorrected(clean)).abs() > 0.5,
+            "the historical placement staggered the faces by more than half a pixel"
+        );
+    }
+
+    /// The rule is arithmetic on whatever metrics a face declares — it never needs to know WHICH
+    /// face it is. A synthetic face whose alignment box OVERSHOOTS its cap band (the common case
+    /// for `hhea`-metric faces) is pushed the other way, and an absurd face is clamped so the line
+    /// box can never vanish.
+    #[test]
+    fn the_rule_generalises_to_any_face() {
+        let tall = FaceVMetrics { upem: 1000.0, ascent: 1000.0, descent: 300.0, cap: Some(700.0) };
+        let shift = cap_center_shift_em(tall);
+        assert_eq!(shift, 0.0, "700 == 1000 - 300: already cap-centred");
+        let leggy = FaceVMetrics { upem: 1000.0, ascent: 1100.0, descent: 400.0, cap: Some(650.0) };
+        let b = cap_centered_box(12.0, cap_center_shift_em(leggy));
+        assert!(cap_center_shift_em(leggy) < 0.0, "this face renders LOW, so it moves up");
+        assert!(b.pad_bottom > 0.0 && b.pad_top == 0.0);
+        assert!(cap_band_offset(leggy, 12.0, b).abs() < 1e-4);
+        // Absurd metrics: clamped, and the line box survives.
+        let absurd = FaceVMetrics { upem: 1000.0, ascent: 5000.0, descent: 0.0, cap: Some(500.0) };
+        let b = cap_centered_box(12.0, cap_center_shift_em(absurd));
+        assert!(b.line_h > 0.0 && b.pad_top >= 0.0 && b.pad_bottom >= 0.0);
+        // A face that declares nothing usable keeps the historical placement.
+        let blind = FaceVMetrics { upem: 1000.0, ascent: 900.0, descent: 200.0, cap: None };
+        assert_eq!(cap_center_shift_em(blind), 0.0);
+        assert_eq!(cap_centered_box(12.0, 0.0).pad_top, 0.0);
+    }
+
+    /// An unregistered family (or one whose bytes never parsed) is a no-op, not a panic — the
+    /// label just keeps the historical placement.
+    #[test]
+    fn a_known_face_resolves_and_the_lookup_is_total() {
+        assert_eq!(face_shift_em(text_annot::TextFont::Clean), 0.0);
+        assert!(face_shift_em(text_annot::TextFont::Hand) > 0.0);
+        for font in [text_annot::TextFont::Hand, text_annot::TextFont::Clean] {
+            assert!(
+                text_annot::UI_FONT_FACES.iter().any(|(f, _)| *f == font.family()),
+                "{} must be registered for its preview label to render in its own face",
+                font.family()
+            );
+        }
     }
 }

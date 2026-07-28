@@ -589,6 +589,7 @@ impl App {
         preview: &'a PreviewState,
         vid: &'a VideoPreview,
         tb: Tb,
+        toasts: Option<Element<'a, Msg>>,
     ) -> Element<'a, Msg> {
         // Every message this view emits is ADDRESSED to its own document (DRAGON-336
         // phase 2), so a transport click can never drive another preview.
@@ -606,9 +607,9 @@ impl App {
             // playback with a covermark applied both prepares wrote it and both draws
             // sampled whichever upload happened last.
             let (dw, dh) = contain_dims(frame.w, frame.h, avail_w, avail_h);
-            let mut layers = vec![Layer { key: LayerKey::video(preview.window), frame: frame.clone() }];
+            let mut layers = vec![Layer::full(LayerKey::video(preview.window), frame.clone())];
             if let Some(cm) = cm_frame {
-                layers.push(Layer { key: LayerKey::covermark(preview.window), frame: cm.clone() });
+                layers.push(Layer::full(LayerKey::covermark(preview.window), cm.clone()));
             }
             let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers, self.live_preview_windows()))
                 .width(Length::Fixed(dw))
@@ -683,16 +684,21 @@ impl App {
                 // "Delete segment" for the segment under the click (which the
                 // open selected). Anchored at the click point; an outside click
                 // dismisses.
-                let lanes: Element<'a, Msg> = match tl.menu {
-                    Some((t, mx, my)) => widget::popover(Element::new(lanes))
+                // The popover WRAPPER is unconditional (DRAGON-375): only the POPUP comes and
+                // goes. `Popover::children` keeps its content at index 0 either way, so the
+                // timeline canvas's widget state — which holds an in-flight scrub/razor drag —
+                // survives the menu opening and closing. Wrapping conditionally changed the TAG
+                // at this position, and iced answers that by rebuilding the whole subtree.
+                let mut lanes_over = widget::popover(Element::new(lanes));
+                if let Some((t, mx, my)) = tl.menu {
+                    lanes_over = lanes_over
                         .popup(timeline_menu(id, t, tl.spans.len() > 1))
                         .position(widget::popover::Position::Point(cosmic::iced::Point::new(
                             mx, my,
                         )))
-                        .on_close(Msg::Preview(id, PreviewMsg::TimelineMenuClose))
-                        .into(),
-                    None => Element::new(lanes),
-                };
+                        .on_close(Msg::Preview(id, PreviewMsg::TimelineMenuClose));
+                }
+                let lanes: Element<'a, Msg> = lanes_over.into();
                 // The now-playing time (EDITED position / duration, in the
                 // editor's one fixed-width HH:MM:SS:FF timecode format — same
                 // as the ruler labels); it sits right of the play button. The
@@ -767,6 +773,7 @@ impl App {
             transport,
             toolbar,
             tb.glass,
+            toasts,
         )
     }
 
@@ -796,9 +803,9 @@ impl App {
         {
             let (sw, sh) = playback::scaled_dims(m.w, m.h);
             let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
-            let mut layers = vec![Layer { key: LayerKey::video(preview.window), frame: pf }];
+            let mut layers = vec![Layer::full(LayerKey::video(preview.window), pf)];
             if let Some(cm) = cm_frame {
-                layers.push(Layer { key: LayerKey::covermark(preview.window), frame: cm.clone() });
+                layers.push(Layer::full(LayerKey::covermark(preview.window), cm.clone()));
             }
             let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers, self.live_preview_windows()))
                 .width(Length::Fixed(dw))
@@ -859,7 +866,7 @@ impl App {
             let (dw, dh) = contain_dims(sw, sh, avail_w, avail_h);
             // The covermark overlay draws through the persistent-texture shader (in-place
             // upload, alpha-blended over the frame) — no atlas churn, so no blink on edit.
-            let cm = Layer { key: LayerKey::covermark(preview.window), frame: frame.clone() };
+            let cm = Layer::full(LayerKey::covermark(preview.window), frame.clone());
             let layers = LayerStack::new(vec![cm], self.live_preview_windows());
             let shader = cosmic::iced::widget::shader::Shader::new(layers)
                 .width(Length::Fixed(dw))

@@ -6,16 +6,55 @@
 use super::*;
 
 
+/// One ACTION button on the unsaved-changes dialog: the action's own toolbar glyph beside
+/// its name, as a standard button. `tint` colours the glyph when the action deserves a
+/// warning (Delete); `None` leaves it on the button's own text colour.
+fn dialog_action(
+    icon: &'static str,
+    label: &'static str,
+    msg: PreviewMsg,
+    id: window::Id,
+    tint: Option<fn(&cosmic::Theme) -> cosmic::iced::Color>,
+) -> Element<'static, Msg> {
+    let glyph = widget::icon::icon(crate::widgets::icons::handle(icon))
+        .width(Length::Fixed(16.0))
+        .height(Length::Fixed(16.0));
+    let glyph = match tint {
+        Some(tint) => glyph.class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
+            move |t: &cosmic::Theme| cosmic::widget::svg::Style { color: Some(tint(t)) },
+        ))),
+        None => glyph,
+    };
+    let content = widget::row(vec![glyph.into(), widget::text(label).size(13).into()])
+        .spacing(6.0)
+        .align_y(Alignment::Center);
+    crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::custom(content)
+            .class(cosmic::theme::Button::Standard)
+            .padding([6.0, 12.0])
+            .on_press(Msg::Preview(id, msg)),
+    )
+}
+
 impl App {
     /// A fresh [`EditState`] seeded with the PERSISTED annotation defaults (the last-used
-    /// stroke color + tool), so every new preview opens the way the user left the
-    /// annotation controls (DRAGON-321). `None` color → the accent-complement default;
-    /// `None` tool → neutral.
+    /// stroke color + tool + step-marker size), so every new preview opens the way the user
+    /// left the annotation controls (DRAGON-321). `None` color → the accent-complement
+    /// default; `None` tool → neutral; `0.0` badge size → the built-in default.
+    ///
+    /// This is THE document-open seam for the remembered badge side: each document takes its
+    /// own WORKING COPY here, and a placement/resize writes back to the persisted one
+    /// (`App::remember_badge_size`). Two documents open at once may therefore briefly disagree
+    /// — deliberately: last write wins on disk, and the next document opened takes it up. No
+    /// cross-document sync.
     pub(super) fn new_edit_state(&self) -> EditState {
         EditState {
             annot_color: self.annot_color,
             tool: self.annot_tool,
             annot_stroke_w: self.annot_stroke_w,
+            annot_badge_size: self.annot_badge_size,
+            annot_text_size: self.annot_text_size,
+            annot_text_font: self.annot_text_font,
             ..EditState::default()
         }
     }
@@ -31,9 +70,6 @@ impl App {
         kind: PreviewKind,
         dims: Option<(u32, u32)>,
     ) -> Task<cosmic::Action<Msg>> {
-        if !self.preview_after_capture {
-            return Task::none();
-        }
         let Some((output, monitor)) = self.preview_output.clone() else {
             return Task::none();
         };
@@ -63,7 +99,12 @@ impl App {
             view: Viewport::default(),
             ducking: false,
             surface_open: true,
+            toasts: Toasts::default(),
+            save_in_place: false,
+            copied_on_open: false,
             demoted: false,
+            saved_path: None,
+            written: Vec::new(),
         });
         // This is the in-flight capture's document; the capture flow addresses it by id.
         self.capture_preview = Some(id);
@@ -347,7 +388,7 @@ impl App {
     /// is nothing on screen to demote, and re-minting a window for it would resurrect a
     /// surface that was closed on purpose. Such a document re-opens through
     /// [`Self::reopen_preview_surface`], which consults the same rule and gets a window.
-    fn demote_preview_to_window(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+    pub(super) fn demote_preview_to_window(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
         let Some(p) = self.preview_for(id) else {
             return Task::none();
         };
@@ -563,6 +604,64 @@ impl App {
         Task::batch([close, open_task])
     }
 
+    /// Open the SETTINGS pane from the preview editor's chrome (DRAGON-353).
+    ///
+    /// # Why this is NOT `App::open_settings`
+    ///
+    /// The capture overlay's gear CONVERTS its own process into the settings pane (Linux)
+    /// or hands off and tears the session down (macOS) — both end the capture. A preview
+    /// editor is a multi-document HOST (DRAGON-336): converting or ending it would destroy
+    /// every open document, including siblings handed to it by other processes. So the
+    /// pane is always a SEPARATE detached child here, and this process keeps its documents.
+    ///
+    /// # Open vs. refocus
+    ///
+    /// Only one settings pane may exist across all instances, so the decision is:
+    ///
+    /// * this process already HAS a pane → focus it and do nothing else. Unreachable in
+    ///   practice (a `--settings` launch never opens a preview, and the gear that converts
+    ///   a capture into a pane runs before any preview exists), but cheap and honest to
+    ///   handle rather than assume;
+    /// * a pane is open ELSEWHERE ([`crate::instance::settings_pane_is_open`], a probe that
+    ///   does not retain the lock) → spawn the `--focus-settings` helper, exactly as the
+    ///   capture gear does, so the activation outlives the spawn;
+    /// * otherwise → spawn a `--settings` child.
+    ///
+    /// The probe is TOCTOU-racy by nature and deliberately tolerated: if a pane appears in
+    /// the gap, our `--settings` child finds the lock taken and (macOS/Windows) pokes the
+    /// holder or (Linux) returns quietly — the same outcome the other branch aimed for.
+    ///
+    /// # The fullscreen overlay must come down first
+    ///
+    /// An `Exclusive` layer surface owns the keyboard and covers the display, so a settings
+    /// window would open behind it and be unreachable. A document on the overlay is
+    /// therefore DEMOTED to a window first, through the very same
+    /// [`Self::demote_preview_to_window`] the second-document rule uses — which means it
+    /// takes the sticky `demoted` pin too. That is the behaviour we want: the conversion is
+    /// FORCED (by needing the screen), not chosen, so it must neither flip the persisted
+    /// appearance nor let the document silently jump back to fullscreen while settings is
+    /// up. The user's own appearance toggle still clears the pin, as always.
+    ///
+    /// The demotion task is batched FIRST so the exclusive surface is on its way out before
+    /// the child is spawned.
+    pub(super) fn open_settings_from_preview(
+        &mut self,
+        id: window::Id,
+    ) -> Task<cosmic::Action<Msg>> {
+        // Same-process pane (see above): just focus it, and leave the surfaces alone.
+        if let Some(settings) = self.settings.window {
+            return window::gain_focus(settings);
+        }
+        let demote = self.demote_preview_to_window(id);
+        let flag = if crate::instance::settings_pane_is_open() {
+            "--focus-settings"
+        } else {
+            "--settings"
+        };
+        crate::recording_ui::spawn_capture_child(flag);
+        demote
+    }
+
     /// Pause OTHER apps' media the instant a preview overlay opens — not when its asset finishes
     /// loading — for as long as the overlay stays up (resumed in `stop_preview_playback`, or when
     /// we exit). Only when the user wants it and the preview has sound (`with_audio`). The pause
@@ -643,13 +742,22 @@ impl App {
             view: Viewport::default(),
             ducking: false,
             surface_open: true,
+            toasts: Toasts::default(),
+            save_in_place: false,
+            copied_on_open: false,
             demoted: false,
+            saved_path: None,
+            written: Vec::new(),
         });
         // This is the in-flight capture's document; the capture flow addresses it by id.
         self.capture_preview = Some(id);
         self.focused_preview = Some(id);
         // Post-capture overlay just opened — pause other media now if this recording has audio.
         self.engage_preview_duck(id, is_video && (self.record_mic || self.record_system_audio));
+        // DRAGON-353: the editor copies the capture to the clipboard as it opens (the old
+        // "Automatically copy to clipboard" setting, now unconditional). The path is
+        // already known on this path, so it happens right here.
+        self.auto_copy_preview_on_open(id);
         Task::batch([open_task, task])
     }
 
@@ -709,7 +817,12 @@ impl App {
             view: Viewport::default(),
             ducking: false,
             surface_open: true,
+            toasts: Toasts::default(),
+            save_in_place: false,
+            copied_on_open: false,
             demoted: false,
+            saved_path: None,
+            written: Vec::new(),
         });
         // A `--preview` launch has exactly this one document; the capture flow's
         // deferred-open paths address it the same way a captured preview is addressed.
@@ -844,7 +957,12 @@ impl App {
             view: Viewport::default(),
             ducking: false,
             surface_open: true,
+            toasts: Toasts::default(),
+            save_in_place: false,
+            copied_on_open: false,
             demoted: false,
+            saved_path: None,
+            written: Vec::new(),
         });
         // NOT `capture_preview` (see above) — but it IS what the user just captured, so it
         // takes the keyboard-routing focus.
@@ -854,6 +972,9 @@ impl App {
         // The child's own duck died with it; re-engaging here is refcounted, so a second
         // video document can't double-engage or un-mute the first.
         self.engage_preview_duck(id, req.video && (self.record_mic || self.record_system_audio));
+        // A handed-over capture is still a capture the user just took: copy it on open,
+        // exactly as a locally-opened one is (DRAGON-353).
+        self.auto_copy_preview_on_open(id);
         Some(Task::batch([open_task, task]))
     }
 
@@ -1061,9 +1182,9 @@ impl App {
         if std::mem::take(&mut self.copy_selection_pending) {
             return self.finish_share_forced_copy(&path, size, is_video);
         }
-        if !self.preview_after_capture {
-            return self.finish_share(&path, size, is_video);
-        }
+        // DRAGON-353: the editor is the capture's destination unconditionally (the "Open in
+        // preview editor" setting is gone); the preview-less `finish_share` fallback below
+        // now fires ONLY when no editor can be opened at all (no known output).
         // DRAGON-336 phase 3b: a preview is what this capture wants — so before minting one
         // HERE, offer the finished file to an already-running preview host. On a positive
         // ack the host owns it and this one-shot process ends right now (the whole memory
@@ -1081,6 +1202,10 @@ impl App {
                 p.path = Some(path.clone());
                 p.size = Some(size);
             }
+            // A PRE-OPENED spinner had no path when it opened, so the open-time automatic
+            // clipboard copy (DRAGON-353) waits for this moment — the file has just landed.
+            // Idempotent, so the swap below can't double-copy.
+            self.auto_copy_preview_on_open(id);
             // DRAGON-221 follow-up: a WINDOWED window-pick deferred its cover→window
             // swap to THIS moment, when the COMPOSED dims are finally known (the
             // selection dims under-size the window — padding/shadow/wallpaper margins
@@ -1139,12 +1264,21 @@ impl App {
         let suppress_tooltips =
             preview.edit.flyout.is_some() || preview.edit.annot_picker.is_some();
         let tb = Tb { pid: preview.window, scale: preview.surface.btn_scale(), glass, suppress_tooltips };
+        // The document's toasts (DRAGON-353), built once and handed to whichever content
+        // branch draws. They anchor to the MEDIA area, so the builders own the placement
+        // rather than this function stacking them over the whole surface (which would cover
+        // the chrome too).
+        //
+        // (No closing FADE rides along here any more — see the removal note above
+        // `compose_preview` in `chrome.rs`: a dissolve is not expressible in this iced, and a
+        // scrim standing in for one was rejected.)
+        let toasts = toast::toast_layer(&preview.toasts, glass);
         let content: Element<'_, Msg> = if preview.is_loading() {
-            self.preview_loading_view(preview, tb)
+            self.preview_loading_view(preview, tb, toasts)
         } else {
             match &preview.kind {
-                PreviewKind::Image(img) => self.image_loaded_view(preview, img, tb),
-                PreviewKind::Video(vid) => self.video_loaded_view(preview, vid, tb),
+                PreviewKind::Image(img) => self.image_loaded_view(preview, img, tb, toasts),
+                PreviewKind::Video(vid) => self.video_loaded_view(preview, vid, tb, toasts),
             }
         };
 
@@ -1262,23 +1396,93 @@ impl App {
                 }))
                 .into()
         };
-        // A pending overwrite confirmation floats a modal dialog over everything.
-        if preview.edit.confirm_overwrite {
-            return self.overwrite_dialog(id, base);
+        // ── The editor's own overlays, bottom to top (DRAGON-353) ────────────────────
+        // Identical in BOTH appearances: they stack over `base`, which is already the
+        // whole composed editor for whichever surface this document lives on, so the
+        // fullscreen overlay and the CSD window get the same behaviour from one builder.
+        let mut layers: Vec<Element<'_, Msg>> = vec![base];
+        // A bake / export is committing edits — dim the editor behind the spinner (which
+        // also reads as "your input is being held", which it is).
+        if preview.edit.baking {
+            layers.push(self.processing_overlay(preview));
         }
-        base
+        // (The toast layer is NOT stacked here — it anchors inside the media area, so the
+        // content builders above own it. See `toast::toast_layer`.)
+        // The modal unsaved-changes card is topmost: it must be reachable over the
+        // overlay's exclusive keyboard grab as well as in a window.
+        if preview.edit.confirm_close {
+            layers.extend(self.unsaved_dialog(id, preview));
+        }
+        if layers.len() == 1 {
+            // Nothing stacked — hand back the bare editor so the common case adds no
+            // wrapper at all (the stack widget is not free, and this is every frame).
+            return layers.remove(0);
+        }
+        cosmic::iced::widget::stack(layers).into()
     }
 
-    /// The overwrite-confirmation modal shown when Save is pressed on an edited capture
-    /// (a fresh capture's auto-saved file or a `--preview` original): a dimming backdrop
-    /// that swallows (but doesn't dismiss on) clicks, with a centered Overwrite / Cancel
-    /// card. Rendered in-app (stacked over the base) so it's clickable over the overlay's
-    /// keyboard grab as well as in the window.
-    pub(super) fn overwrite_dialog<'a>(
-        &self,
+    /// The PROCESSING overlay (DRAGON-353): a dimming scrim over the editor carrying the
+    /// same spinner the load state uses, plus one of [`PREVIEW_PROCESSING_MESSAGES`].
+    ///
+    /// This replaced the desktop "Processing capture" notification, which only existed
+    /// because the editor used to VANISH for the duration of a bake. It stays up now, so
+    /// the progress belongs in it. The spinner is INDETERMINATE on purpose: the work is an
+    /// `ffmpeg`/encode run behind a blocking call on a worker thread with no progress
+    /// channel back, so a progress BAR could only lie. (Wiring one would mean parsing
+    /// ffmpeg's `-progress` stream for videos and instrumenting the image bake — a real
+    /// feature, not a view change.)
+    ///
+    /// It swallows stray presses so a click during the bake can't reach the chrome
+    /// underneath; the update loop already holds every input behind `edit.baking`, and
+    /// this makes that visible rather than mysterious.
+    fn processing_overlay(&self, preview: &PreviewState) -> Element<'_, Msg> {
+        let msg = PREVIEW_PROCESSING_MESSAGES
+            [preview.edit.processing_msg % PREVIEW_PROCESSING_MESSAGES.len()];
+        let status = widget::column(vec![
+            widget::indeterminate_circular().size(56.0).into(),
+            widget::text(msg).size(16).into(),
+        ])
+        .spacing(20.0)
+        .align_x(Alignment::Center);
+        widget::mouse_area(
+            widget::container(status)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .class(cosmic::theme::Container::custom(|_t| {
+                    cosmic::iced::widget::container::Style {
+                        background: Some(Background::Color(crate::app::theme::SCRIM)),
+                        ..Default::default()
+                    }
+                })),
+        )
+        .on_press(Msg::WindowChrome(WindowChromeMsg::Ignore))
+        .interaction(cosmic::iced::mouse::Interaction::Idle)
+        .into()
+    }
+
+    /// The UNSAVED-CHANGES modal (DRAGON-353): raised when a close is attempted with edits
+    /// that have never been baked into a file. Returns the backdrop + the centred card, to
+    /// be stacked over the editor by [`Self::preview_view`].
+    ///
+    /// The action buttons ACT — they are the editor's own Save / Save As / Copy / Delete,
+    /// and each closes the document once it lands (`share_then_close`). A dialog that only
+    /// dismissed you back into the editor to press the same buttons would be a speed bump,
+    /// not an answer to "what do you want to do with these edits". "Keep editing" is the
+    /// dismiss; "Close without saving" abandons the pending edits (the FILE is untouched —
+    /// nothing on disk is lost, only the un-baked overlay).
+    ///
+    /// Rendered in-app rather than as a real dialog window so it is clickable over the
+    /// fullscreen overlay's exclusive keyboard grab as well as inside the CSD window. The
+    /// layout is deliberately SHORT — a title, one line, and two button rows — because the
+    /// overlay-mode card must fit inside `PREVIEW_MIN_H` (545px) with the editor's chrome
+    /// already claiming `PreviewSurface::chrome_h`.
+    fn unsaved_dialog<'a>(
+        &'a self,
         id: window::Id,
-        base: Element<'a, Msg>,
-    ) -> Element<'a, Msg> {
+        preview: &'a PreviewState,
+    ) -> Vec<Element<'a, Msg>> {
         let backdrop: Element<'a, Msg> = widget::mouse_area(
             widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
                 .width(Length::Fill)
@@ -1290,74 +1494,109 @@ impl App {
                     }
                 })),
         )
-        .on_press(Msg::WindowChrome(WindowChromeMsg::Ignore)) // swallow; never dismiss on a stray click
+        // Swallow; never dismiss on a stray click — a mis-click must not decide the fate
+        // of unsaved work.
+        .on_press(Msg::WindowChrome(WindowChromeMsg::Ignore))
         .interaction(cosmic::iced::mouse::Interaction::Idle)
         .into();
-        let buttons: Element<'a, Msg> = widget::row(vec![
+
+        // The SAME lineup as the action bar (minus the size chip): every way out of the
+        // document is offered here, so the dialog never sends you back to hunt for one.
+        // Delete is present because it IS one of the four actions, and it is tinted
+        // DANGER so it can't be mistaken for a save.
+        let mut actions: Vec<Element<'a, Msg>> = vec![
+            dialog_action("document-save-symbolic", "Save", PreviewMsg::SaveAndClose, id, None),
+            dialog_action(
+                "document-save-as-symbolic",
+                "Save As",
+                PreviewMsg::SaveAsAndClose,
+                id,
+                None,
+            ),
+            dialog_action("edit-copy-symbolic", "Copy", PreviewMsg::CopyAndClose, id, None),
+        ];
+        // Never offer to delete a `--preview` file: it isn't ours (same rule as the bar).
+        if !preview.external {
+            actions.push(dialog_action(
+                "edit-delete-symbolic",
+                "Delete",
+                PreviewMsg::DeleteAndClose,
+                id,
+                Some(crate::app::theme::danger),
+            ));
+        }
+
+        // A FAILED attempt turns this card into the failure report (DRAGON-353 follow-up):
+        // same four actions (so the top row IS the retry), but the wording says what went
+        // wrong and the way out is renamed to what it now means — leaving KNOWING the save
+        // did not happen. One extra confirmation of an informed intent, not a new route:
+        // it still fires `DiscardAndClose`.
+        let failure = preview.edit.close_error.as_deref();
+        let (title, body, leave) = match failure {
+            Some(reason) => ("Couldn't finish that", reason, "Exit anyway"),
+            None => (
+                "Unsaved changes",
+                "Your edits haven't been written to a file yet. Save them, put them on the \
+                 clipboard, or keep working.",
+                "Close without saving",
+            ),
+        };
+
+        let choices: Element<'a, Msg> = widget::row(vec![
             crate::widgets::arrow_cursor::arrow_cursor(
-                widget::button::standard("Cancel")
-                    .on_press(Msg::Preview(id, PreviewMsg::CancelOverwrite)),
+                widget::button::suggested("Continue editing")
+                    .on_press(Msg::Preview(id, PreviewMsg::KeepEditing)),
             ),
             crate::widgets::arrow_cursor::arrow_cursor(
-                widget::button::destructive("Overwrite")
-                    .on_press(Msg::Preview(id, PreviewMsg::ConfirmOverwrite)),
+                widget::button::destructive(leave)
+                    .on_press(Msg::Preview(id, PreviewMsg::DiscardAndClose)),
             ),
         ])
         .spacing(8.0)
         .into();
-        // The file that's about to be overwritten (shown so the user knows exactly where).
-        let path = self
-            .preview_for(id)
-            .and_then(|p| p.path.as_ref())
-            .map(|p| p.display().to_string());
-        let mut col: Vec<Element<'a, Msg>> = vec![
-            widget::text::title4("Overwrite original file?").into(),
-            widget::text("Your edits will be written into the file on disk. This can't be undone.")
-                .size(13)
-                .into(),
+
+        // The reason is drawn in the theme's DANGER colour so a failure can never be
+        // mistaken for the ordinary "you have unsaved work" prompt.
+        let body_text = widget::text(body.to_string()).size(13);
+        let body_el: Element<'a, Msg> = if failure.is_some() {
+            body_text
+                .class(cosmic::theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+                    color: Some(crate::app::theme::danger(t)),
+                    ..Default::default()
+                }))
+                .into()
+        } else {
+            body_text.into()
+        };
+
+        let col: Vec<Element<'a, Msg>> = vec![
+            widget::text::title4(title).into(),
+            body_el,
+            widget::row(actions).spacing(8.0).into(),
+            choices,
         ];
-        if let Some(path) = path {
-            col.push(
-                widget::container(widget::text(path).size(12).font(cosmic::font::mono()))
-                    .padding([6.0, 10.0])
-                    .width(Length::Fill)
-                    .class(cosmic::theme::Container::custom(|theme| {
-                        let c = theme.cosmic();
-                        cosmic::iced::widget::container::Style {
-                            background: Some(Background::Color(c.background.component.base.into())),
-                            border: Border {
-                                radius: crate::app::theme::rounding(theme).s.into(),
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        }
-                    }))
-                    .into(),
-            );
-        }
-        col.push(buttons);
         let card = widget::container(widget::column(col).spacing(16.0))
-        .padding(24.0)
-        .max_width(420.0)
-        .class(cosmic::theme::Container::custom(|theme| {
-            let c = theme.cosmic();
-            cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background.base.into())),
-                border: Border {
-                    radius: crate::app::theme::rounding(theme).m.into(),
-                    width: 1.0,
-                    color: c.background.divider.into(),
-                },
-                ..Default::default()
-            }
-        }));
+            .padding(24.0)
+            .max_width(460.0)
+            .class(cosmic::theme::Container::custom(|theme| {
+                let c = theme.cosmic();
+                cosmic::iced::widget::container::Style {
+                    background: Some(Background::Color(c.background.base.into())),
+                    border: Border {
+                        radius: crate::app::theme::rounding(theme).m.into(),
+                        width: 1.0,
+                        color: c.background.divider.into(),
+                    },
+                    ..Default::default()
+                }
+            }));
         let centered: Element<'a, Msg> = widget::container(card)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .width(Length::Fill)
             .height(Length::Fill)
             .into();
-        cosmic::iced::widget::stack(vec![base, backdrop, centered]).into()
+        vec![backdrop, centered]
     }
 
     /// Loading state: a centred spinner + a playful status line (picked from the kind's
@@ -1377,7 +1616,12 @@ impl App {
     /// interactive. On macOS/Windows the surface is itself an opaque, full-display winit window
     /// (never a click-through layer), so it already eats all pointer events; the swallow is the
     /// portable belt-and-suspenders that matches `overwrite_dialog`.
-    pub(super) fn preview_loading_view(&self, preview: &PreviewState, tb: Tb) -> Element<'_, Msg> {
+    pub(super) fn preview_loading_view<'a>(
+        &'a self,
+        preview: &'a PreviewState,
+        tb: Tb,
+        toasts: Option<Element<'a, Msg>>,
+    ) -> Element<'a, Msg> {
         let msgs: &[&str] = match &preview.kind {
             PreviewKind::Image(_) => &PREVIEW_LOADING_MESSAGES,
             PreviewKind::Video(_) => &video::PREVIEW_VIDEO_LOADING_MESSAGES,
@@ -1396,10 +1640,17 @@ impl App {
         // Swallow any press that lands off the cancel affordance so it can't reach a window
         // being rearranged behind the overlay. `Interaction::Idle` keeps the normal cursor over
         // the dead area (the X provides its own pointer feedback).
-        widget::mouse_area(content)
+        let swallowed: Element<'a, Msg> = widget::mouse_area(content)
             .on_press(Msg::WindowChrome(WindowChromeMsg::Ignore))
             .interaction(cosmic::iced::mouse::Interaction::Idle)
-            .into()
+            .into();
+        // The open-time automatic clipboard copy toasts BEFORE the decode lands, so the
+        // loading state has to be able to show one too (DRAGON-353). Nothing here is
+        // chrome, so the top-right anchor is unobstructed.
+        match toasts {
+            Some(t) => cosmic::iced::widget::stack(vec![swallowed, t]).into(),
+            None => swallowed,
+        }
     }
 
     /// Whether `id` is the open preview window.

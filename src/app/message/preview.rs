@@ -35,8 +35,16 @@ pub enum PreviewMsg {
     /// app alive until it lands, then closes (auto-close on) or reopens the editor on the
     /// just-saved file (auto-close off).
     SaveAsBaked(Option<PathBuf>),
-    /// Copy the capture to the clipboard, then finish.
+    /// Copy the capture to the clipboard. DRAGON-353: this NEVER closes the editor —
+    /// pending edits bake to a throwaway temp so the saved file stays clean, and a toast
+    /// reports the outcome.
     Copy,
+    /// Open the SETTINGS pane from the preview editor's chrome. A fullscreen-overlay
+    /// document converts itself to a window first (an exclusive layer surface would sit
+    /// over the settings window); the pane itself is a detached `--settings` child, or a
+    /// `--focus-settings` poke when one is already open — this multi-document HOST must
+    /// never convert ITSELF into the settings pane the way the capture overlay's gear does.
+    OpenSettings,
     /// Toggle inline playback of a recording (play / pause).
     Play,
     /// Poll the playback worker for the next decoded frame (while playing).
@@ -148,10 +156,25 @@ pub enum PreviewMsg {
     CovermarkRasterReady(u64, Option<Arc<PixelFrame>>),
     /// A bake (export re-encode) finished: the new file size, or `None` on failure.
     BakeDone(Option<u64>),
-    /// Confirm overwriting the original `--preview` file with the edited version.
-    ConfirmOverwrite,
-    /// Dismiss the overwrite confirmation dialog, staying in the preview.
-    CancelOverwrite,
+    // ── Unsaved-changes close guard (DRAGON-353) ─────────────────────────────────────
+    /// Dismiss the unsaved-changes dialog and stay in the editor ("Keep editing").
+    KeepEditing,
+    /// Close the document, abandoning the pending edits ("Close without saving"). The
+    /// FILE is untouched — only the un-baked edits are lost.
+    DiscardAndClose,
+    /// The unsaved-changes dialog's action buttons: do the share, THEN close the document.
+    /// Each arms `EditState::close_after_share` and delegates to the plain action, so the
+    /// share flow itself never learns about closing.
+    SaveAndClose,
+    SaveAsAndClose,
+    CopyAndClose,
+    /// The dialog's Delete button. Delete closes the document by itself, so the "and then
+    /// close" here buys nothing functionally — it exists so all FOUR dialog buttons take
+    /// the identical route (`share_then_close` → the plain toolbar message), which is what
+    /// dismisses the dialog before the action's own feedback appears.
+    DeleteAndClose,
+    /// Sweep this document's expired toasts (the `sub_preview_toasts` tick).
+    ToastTick,
     /// A recording's poster frame + probed metadata finished (`None` poster = none could
     /// be made; `None` meta = ffprobe failed, so playback/scrub stay disabled).
     PosterReady(Option<cosmic::widget::image::Handle>, Option<VideoMeta>),
@@ -165,6 +188,11 @@ pub enum PreviewMsg {
     /// the picture. Only the tray emits this — hotkeys stay on [`Self::SelectTool`], so
     /// double-TAPPING a tool key never places anything.
     ToolPressed(Tool),
+    /// A tool SLOT's cycle key was pressed (DRAGON-369), carried as the slot's own cycle
+    /// [`crate::shortcuts::Action`] — the slot's identity everywhere. Arms the slot's current
+    /// member, or advances to the next when the slot is already armed (see
+    /// `preview::chrome::next_slot_tool`). An action that names no slot is a no-op.
+    CycleToolSlot(crate::shortcuts::Action),
     /// Set the current annotation color (applies to NEW shapes).
     SetAnnotColor([u8; 4]),
     /// Set the current annotation stroke width (SOURCE px; applies to NEW box/arrow shapes
@@ -172,6 +200,35 @@ pub enum PreviewMsg {
     SetAnnotStrokeW(f32),
     /// Cycle the annotation stroke width to the next preset (2 → 5 → 8 → 2), the `L` hotkey.
     CycleAnnotStrokeW,
+    /// Open/close the TEXT-size dropdown flyout (DRAGON-354).
+    ToggleTextSizeFlyout,
+    /// Open/close the text FONT dropdown (DRAGON-357 item 16): Hand / Clean.
+    ToggleTextFontFlyout,
+    /// Set the text size (SOURCE px) for NEW text boxes, and re-size the SELECTED text box —
+    /// picked from the size dropdown.
+    SetTextSize(f32),
+    /// Switch the text FONT family for NEW text boxes, and re-font the SELECTED text box
+    /// (handwritten Excalifont vs clean Inter).
+    SetTextFont(crate::app::preview::text_annot::TextFont),
+    /// Re-open the in-canvas editor on the existing TEXT annotation `id` (DRAGON-354): a press
+    /// on a text box with the Text tool armed, or a double-click on one.
+    EditText(AnnotId),
+    /// A caret-blink tick while a text box is being edited: toggle the caret's visible phase.
+    TextCaretBlink,
+    /// A pointer PRESS inside the actively-edited text box (DRAGON-354 item 12): place the caret
+    /// at image point `(x, y)`. `extend` (Shift held) keeps the current anchor and extends the
+    /// selection; `word` (a double-click) selects the whole word under the point; `all` (a
+    /// triple-click) selects the whole box, the same target as Cmd/Ctrl+A.
+    TextClickAt { x: f32, y: f32, extend: bool, word: bool, all: bool },
+    /// A drag inside the actively-edited text box (DRAGON-354 item 12): extend the selection to
+    /// image point `(x, y)` (the caret end moves, the press anchor stays).
+    TextDragTo(f32, f32),
+    /// The OS input method committed a string while a text box was being edited (DRAGON-359):
+    /// insert it at the caret, replacing any selection. This is how the emoji picker
+    /// (Ctrl+Cmd+Space / fn-E on macOS, the Windows emoji panel) and CJK composition deliver
+    /// their result — the canvas widget publishes `InputMethod::Enabled` so the OS knows a text
+    /// field is focused, then routes the `Ime::Commit` here.
+    TextImeCommit(String),
     /// Open/close the color-swatch palette popover.
     ToggleAnnotPalette,
     /// Open (`true`) / close (`false`) the custom color-wheel picker, from the palette's "+".
@@ -198,8 +255,10 @@ pub enum PreviewMsg {
     AnnotDrawBegin(Tool, f32, f32),
     /// Begin manipulating the selected item (grab kind + press image point).
     AnnotGrabBegin(Grab, f32, f32),
-    /// Live drag update to image point `(x, y)`.
-    AnnotGestureTo(f32, f32),
+    /// Live drag update to image point `(x, y)`. `scale_type` is the DRAGON-370 modifier
+    /// (Ctrl held during a RESIZE = scale the type instead of reflowing the box), sampled fresh
+    /// on every motion event — see `crate::widgets::annotation_canvas::AnnotEvent::GestureTo`.
+    AnnotGestureTo(f32, f32, bool),
     /// The active canvas gesture committed (pointer released after a real drag).
     AnnotGestureEnd,
     /// Delete the selected annotation(s) — the whole selection, as one undo entry.
@@ -221,4 +280,124 @@ pub enum PreviewMsg {
     AnnotMenuOpen(f32, f32),
     /// Dismiss the annotation context menu.
     AnnotMenuClose,
+}
+
+impl PreviewMsg {
+    /// Whether this message means the user has got HANDS-ON with the document — the
+    /// signal that shortens any live toast on it to
+    /// [`crate::app::preview::toast::TOAST_INTERACTION_TTL`] (DRAGON-353 follow-up).
+    ///
+    /// The classifier lives beside the enum on purpose: a new variant is classified where
+    /// it is declared, not in a match buried in the update loop that nobody remembers to
+    /// extend.
+    ///
+    /// # What qualifies
+    ///
+    /// Direct manipulation of the picture or its timeline: arming a tool (the pointer/pan
+    /// toggle included — picking a tool IS the start of working), any canvas press, drag or
+    /// selection, and every timeline gesture (scrub, razor, select, delete, right-click).
+    ///
+    /// # What deliberately does NOT
+    ///
+    /// * **Hover / pointer motion** — reading a toast requires the pointer to be
+    ///   somewhere; moving it is not a decision.
+    /// * **The action bar and header buttons** (Save, Copy, Delete, appearance, window
+    ///   chrome). These are what PRODUCE toasts; letting them shorten would mean an action
+    ///   racing its own confirmation. Ordering makes this belt-and-braces — the shortening
+    ///   is applied BEFORE the handler runs, so a toast a handler posts always gets the
+    ///   full TTL — but they are excluded on merit as well.
+    /// * **Wheel zoom / zoom presets / the pinch poll** — a zoom is looking, not editing,
+    ///   and a wheel event is easy to send by accident while reading.
+    /// * **The covermark / dim / stroke sliders** — toolbar controls, not the canvas.
+    /// * **Playback transport** (Play, frame-step) and every async completion tick.
+    ///
+    /// `Pan` is the one grey area and it QUALIFIES: it is direct manipulation of the
+    /// picture. That also catches alt+scroll panning, which the message cannot distinguish
+    /// from an alt+drag — panning with the wheel is still moving the picture, so the
+    /// inability to tell them apart costs nothing.
+    pub fn is_document_interaction(&self) -> bool {
+        matches!(
+            self,
+            // ── Tool arming ──────────────────────────────────────────────────────────
+            Self::SelectTool(_)
+                | Self::ToolPressed(_)
+                | Self::CycleToolSlot(_)
+                | Self::SetPanMode(_)
+                | Self::TogglePanMode
+                | Self::TimelineRazor(_)
+                // ── Canvas press / drag / selection ──────────────────────────────────
+                | Self::AnnotDrawBegin(..)
+                | Self::AnnotGrabBegin(..)
+                | Self::AnnotGestureTo(..)
+                | Self::AnnotGestureEnd
+                | Self::SelectAnnotation(_)
+                | Self::ToggleAnnotationSelected(_)
+                | Self::BandSelectAnnotations(..)
+                | Self::AnnotMenuOpen(..)
+                | Self::TextClickAt { .. }
+                | Self::TextDragTo(..)
+                | Self::TextImeCommit(..)
+                | Self::Pan(..)
+                // ── Video timeline / scrubbing ───────────────────────────────────────
+                | Self::Seek(_)
+                | Self::TimelineSeek(_)
+                | Self::TimelineSelect(..)
+                | Self::TimelineBoxSelect(..)
+                | Self::TimelineCut(_)
+                | Self::TimelineDelete
+                | Self::TimelineMenuOpen(..)
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::widgets::annotation_canvas::Tool;
+
+    /// The interaction classifier: hands-on gestures shorten a document's toasts, the
+    /// controls that PRODUCE toasts (and mere looking) do not.
+    #[test]
+    fn hands_on_messages_are_interactions_and_toast_producers_are_not() {
+        for m in [
+            PreviewMsg::SelectTool(Tool::Pointer),
+            PreviewMsg::ToolPressed(Tool::Rect),
+            PreviewMsg::CycleToolSlot(crate::shortcuts::Action::PreviewAnnotShapeCycle),
+            PreviewMsg::TogglePanMode,
+            PreviewMsg::AnnotDrawBegin(Tool::Arrow, 1.0, 2.0),
+            PreviewMsg::AnnotGestureEnd,
+            PreviewMsg::SelectAnnotation(None),
+            PreviewMsg::Pan(3.0, 4.0),
+            PreviewMsg::Seek(1.5),
+            PreviewMsg::TimelineCut(2.0),
+            PreviewMsg::TimelineDelete,
+            PreviewMsg::TimelineRazor(true),
+        ] {
+            assert!(m.is_document_interaction(), "{m:?} must count as interaction");
+        }
+        for m in [
+            // The actions that create toasts must never shorten the toast they create.
+            PreviewMsg::Save,
+            PreviewMsg::SaveAs,
+            PreviewMsg::Copy,
+            PreviewMsg::Delete,
+            PreviewMsg::SaveAndClose,
+            PreviewMsg::CopyAndClose,
+            PreviewMsg::DeleteAndClose,
+            // Looking, not editing.
+            PreviewMsg::Zoom(1.0, 0.0, 0.0),
+            PreviewMsg::ZoomPreset(1),
+            PreviewMsg::SetViewZoom(2.0),
+            // Transport + async ticks.
+            PreviewMsg::Play,
+            PreviewMsg::PlayerTick,
+            PreviewMsg::FrameStep(1),
+            PreviewMsg::ToastTick,
+            // Toolbar sliders.
+            PreviewMsg::SetOpacity(0.5),
+            PreviewMsg::SetDim(0.3),
+        ] {
+            assert!(!m.is_document_interaction(), "{m:?} must NOT count as interaction");
+        }
+    }
 }

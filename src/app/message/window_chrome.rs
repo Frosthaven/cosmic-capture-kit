@@ -3,7 +3,7 @@
 use crate::app::ResetScope;
 #[cfg(target_os = "linux")]
 use cosmic::iced::core::event::wayland::OutputEvent;
-use cosmic::iced::keyboard::{Key, Modifiers};
+use cosmic::iced::keyboard::{Key, Location, Modifiers};
 use cosmic::iced::window;
 use cosmic::widget;
 #[cfg(target_os = "linux")]
@@ -186,7 +186,17 @@ pub enum WindowChromeMsg {
     /// the surface the press was DELIVERED to — it picks the preview document a
     /// Preview-context binding acts on when several previews are open (DRAGON-336
     /// phase 2).
-    KeyPressed(window::Id, Modifiers, Key),
+    /// The last field is the TEXT the key press produced (iced's `text`), if any — the
+    /// composed, shift/dead-key/IME-resolved string the live text-annotation editor inserts
+    /// (DRAGON-354). The raw `key` alone is unreliable for shifted characters on macOS (its
+    /// base key can arrive Unidentified), so text input rides this field, not the key name.
+    ///
+    /// [`Location`] (DRAGON-364) is the key's PHYSICAL group — `Numpad` for a keypad key,
+    /// `Left`/`Right` for a paired modifier, `Standard` otherwise. It rides along because the
+    /// LOGICAL key cannot tell numpad Enter from main Enter: both backends map `KP_Enter` to
+    /// `Key::Named(Named::Enter)` and record the difference ONLY here (see
+    /// [`crate::app::preview::annotate::text_edit_exits`]).
+    KeyPressed(window::Id, Modifiers, Key, Location, Option<String>),
     /// A raw key release — only push-to-talk cares (release = mute the mic again). Carries
     /// the delivering surface for symmetry with [`Self::KeyPressed`] (a release routed into
     /// an armed chord recorder goes through the same `handle_key`).

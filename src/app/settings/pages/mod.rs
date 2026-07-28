@@ -4,6 +4,7 @@ pub(super) mod capture;
 pub(super) mod general;
 pub(super) mod health;
 pub(super) mod keyboard;
+pub(super) mod preview_editor;
 pub(super) mod recordings;
 pub(super) mod scanner;
 pub(super) mod screenshots;

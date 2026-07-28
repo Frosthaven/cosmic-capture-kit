@@ -9,10 +9,13 @@
 //! `crate::platform::windows::update_install`).
 //!
 //! HISTORY: while the source repo was fully private the channel was a separate
-//! Pages repo (`cosmic-capture-kit-updates`). Installs at <= 0.12.0 still poll
-//! that URL, so the legacy Pages push (`publish-update.yml`) stays alive until
-//! the installed base has crossed onto a release that carries this file — then
-//! the Pages repo retires (see RELEASING.md).
+//! Pages repo (`cosmic-capture-kit-updates`), and `publish-update.yml` shipped to
+//! BOTH for a transition period. DRAGON-372 retired it: the Pages repo is gone, so
+//! that step could only fail — and because it ran before the release mirror under
+//! `set -e`, its failure took the whole publish job down with it. Installs at
+//! <= 0.12.0 polled the old URL and can no longer self-update; they must be
+//! replaced by hand. Every release from 0.13.0 on carries this file and polls
+//! [`DEFAULT_MANIFEST_URL`].
 //!
 //! Everything here is dependency-light on purpose:
 //!   * fetch is a `curl` shell-out (present on macOS and virtually every Linux),

@@ -4,6 +4,9 @@ pub mod annotation_canvas;
 pub mod annotation_fx;
 pub mod arrow_cursor;
 pub mod drag_area;
+/// DRAGON-366 — TEMPORARY per-frame preview-editor diagnostics. Remove with its call sites
+/// (all tagged `DRAGON-366`) once the large-capture lag report is settled.
+pub mod dragon366;
 pub mod hide_when_clipped;
 pub mod icons;
 pub mod notched_slider;

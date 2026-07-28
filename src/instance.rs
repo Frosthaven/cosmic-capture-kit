@@ -260,6 +260,54 @@ pub fn acquire_settings_lock() -> bool {
     }
 }
 
+/// Whether a settings pane is CURRENTLY open somewhere, probed WITHOUT retaining the lock
+/// (DRAGON-353 — the preview editor's settings button needs the answer, not the lock).
+///
+/// A `flock` is released when its fd closes, so a non-blocking exclusive attempt on a
+/// freshly-opened descriptor that is then DROPPED tells us whether someone else holds it
+/// and leaves the world exactly as it found it. Crucially it opens WITHOUT truncating —
+/// truncating would erase the holder's recorded pid, which `settings_lock_pid` consumers
+/// need (the same trap [`acquire_settings_lock`] documents above).
+///
+/// Inherently a TOCTOU answer: a pane can open or close between this call and whatever the
+/// caller does next. That is acceptable at the only call site — the worst case is a
+/// `--settings` child that finds the lock taken and (per platform) either pokes the holder
+/// or returns quietly, i.e. exactly what the other branch would have done.
+#[cfg(unix)]
+pub fn settings_pane_is_open() -> bool {
+    let dir = crate::util::runtime_dir();
+    let Ok(file) = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(format!("{dir}/cosmic-capture-kit-settings.lock"))
+    else {
+        // Can't even create the lock file; `acquire_settings_lock` fails OPEN in the same
+        // situation, so match it and assume nothing is holding the pane.
+        return false;
+    };
+    // Taking the lock here would mean HOLDING it (a `flock` is not released by an explicit
+    // unlock we then race on), so probe and immediately drop the fd — the kernel releases
+    // whatever we took as the descriptor closes.
+    let held = flock(&file, FlockOperation::NonBlockingLockExclusive).is_err();
+    drop(file);
+    held
+}
+
+/// Windows: always `false` — deliberately, not as a stub.
+///
+/// The Windows settings guard is a NAMED MUTEX with no non-retaining probe, and it does not
+/// need one: a blocked `--settings` launch there does not vanish (as it historically did on
+/// Linux) — it writes the focus POKE the live holder polls (`main.rs`'s settings_only
+/// branch → `compositor::activate_title`). So the caller's open-vs-refocus decision is moot
+/// on Windows: spawning `--settings` unconditionally produces the right behaviour either
+/// way, which is what answering `false` here arranges.
+#[cfg(windows)]
+pub fn settings_pane_is_open() -> bool {
+    false
+}
+
 /// Windows (DRAGON-229): the named-mutex settings guard. Body under
 /// `platform::windows::instance` (strict split); on success it also records the holder
 /// pid so the sibling sweep can spare THIS settings window. Returns false if a settings
@@ -748,7 +796,14 @@ mod tests {
         let dir = dir.to_string_lossy().into_owned();
 
         let live = std::process::id(); // a pid that is certainly alive
-        let dead = 0; // pid 0 is never a live process we could find
+        // A spawned-and-reaped child is a pid that is certainly dead. (Pid 0 is NOT a
+        // usable stand-in: kill(0, 0) probes the caller's own process group and reports
+        // it alive on macOS.)
+        let dead = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
         let selfish = 999_999_001; // stands in as "us" for this scan
 
         for pid in [live, dead, selfish] {

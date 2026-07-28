@@ -15,7 +15,10 @@ mod notify;
 mod open;
 mod wifi;
 
-pub use clipboard::{copy_text, copy_to_clipboard, run_copy, run_copy_text};
-pub use notify::{notify, run_notify, with_processing_notification};
+pub use clipboard::{
+    AUTO_COPY_MAX_BYTES, auto_copy_limit_label, copy_text, copy_to_clipboard, read_text,
+    run_copy, run_copy_text,
+};
+pub use notify::{notify, run_notify};
 pub use open::{open_uri, run_open_uri, run_reveal, save_and_open};
 pub use wifi::join_wifi;

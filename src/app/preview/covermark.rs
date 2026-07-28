@@ -164,6 +164,11 @@ impl App {
     /// texture updates in place (no atlas churn), which is what keeps edits blink-free. The
     /// bake still composites at full source resolution.
     pub(super) fn refresh_edit_display(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        // The visual scale needs the App (viewport geometry), so resolve it under an IMMUTABLE
+        // borrow before taking the mutable one below.
+        let Some(vscale) = self.preview_for(id).map(|p| self.preview_visual_scale(p)) else {
+            return Task::none();
+        };
         let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
@@ -176,9 +181,12 @@ impl App {
             // once that raster lands (see the `CovermarkRasterReady` handler below).
             return Task::none();
         };
-        // Size the raster to the CURRENT zoom (capped at the source frame) so a magnified
-        // covermark stays crisp (DRAGON-324); remember it so a no-op zoom skips a re-raster.
-        let (pw, ph) = p.edit.covermark_raster_size(p.view.zoom);
+        // Size the raster to the covermark layer's ON-SCREEN device-pixel footprint at the
+        // current zoom (capped at the source frame) so it is exactly as crisp as the base
+        // pixels beside it (DRAGON-324, corrected in DRAGON-362 — the old fixed 1024 baseline
+        // left a big capture's mark upsampled at fit zoom); remember it so a no-op zoom skips
+        // a re-raster.
+        let (pw, ph) = p.edit.covermark_raster_size(p.view.zoom, vscale);
         p.edit.cm_raster_px = (pw, ph);
         let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
         std::thread::spawn(move || {
@@ -206,7 +214,8 @@ impl App {
             return Task::none();
         };
         if p.edit.covermark.is_none()
-            || p.edit.covermark_raster_size(p.view.zoom) == p.edit.cm_raster_px
+            || p.edit.covermark_raster_size(p.view.zoom, self.preview_visual_scale(p))
+                == p.edit.cm_raster_px
         {
             return Task::none();
         }

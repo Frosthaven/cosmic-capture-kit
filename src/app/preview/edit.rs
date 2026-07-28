@@ -79,8 +79,101 @@ pub struct Covermark {
 /// What share action to run once a bake finishes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ShareIntent {
+    /// Commit the edits to the document's save target (DRAGON-353: the `-edited` sibling,
+    /// or the explicitly-chosen path — see [`super::naming::save_target`]).
     Save,
+    /// Bake to a THROWAWAY temp and put that on the clipboard, leaving the saved file
+    /// untouched (so copying never persists edits).
     Copy,
+    /// SAVE to the document's save target, put the SAVED file on the clipboard, then close
+    /// the document — save-on-copy AND close-on-copy both on (DRAGON-355; the old combined
+    /// "save & close on copy"). One bake, not two: the clipboard gets the same bytes that
+    /// landed on disk.
+    SaveCopyClose,
+    /// SAVE to the document's save target and put the SAVED file on the clipboard, but do NOT
+    /// close — save-on-copy on, close-on-copy off (DRAGON-355). Like [`Save`](Self::Save)
+    /// followed by a copy of what it wrote; the editor stays open.
+    SaveCopy,
+    /// COPY the (baked) capture and then close the document, WITHOUT saving — close-on-copy
+    /// on, save-on-copy off (DRAGON-355). Bakes to a THROWAWAY temp like [`Copy`](Self::Copy)
+    /// so the saved file is left alone; the close is held (so the copy toast reads) and, over
+    /// UNSAVED edits, asks first rather than dropping them silently.
+    CopyClose,
+    /// Copy, then DELETE the document's file and close it — the "Copy to clipboard on
+    /// delete" setting's path. Always copies from a STAGED temp (see
+    /// `App::stage_clipboard_copy`) so unlinking the original can never strand the
+    /// clipboard worker.
+    CopyThenDelete,
+    /// Delete the document's file and close it, with no clipboard step — Delete with
+    /// "Automatically copy to clipboard on delete" turned off. Never baked: the user is discarding the
+    /// file, so committing edits into it first would be absurd.
+    Delete,
+}
+
+impl ShareIntent {
+    /// Whether this intent's bake targets a throwaway TEMP rather than the document's own
+    /// save path. The copy-only flavours do: the point of copying is to leave the saved
+    /// file alone. [`Self::SaveCopyClose`] does NOT — it is a real save whose result is
+    /// then copied.
+    pub fn bakes_to_temp(self) -> bool {
+        // A copy that does NOT save leaves the saved file alone by baking to a temp.
+        matches!(self, Self::Copy | Self::CopyThenDelete | Self::CopyClose)
+    }
+
+    /// Whether this intent WRITES the document's save target.
+    pub fn saves(self) -> bool {
+        matches!(self, Self::Save | Self::SaveCopyClose | Self::SaveCopy)
+    }
+
+    /// Whether this intent puts something on the clipboard.
+    pub fn copies(self) -> bool {
+        matches!(
+            self,
+            Self::Copy | Self::SaveCopyClose | Self::CopyThenDelete | Self::SaveCopy | Self::CopyClose
+        )
+    }
+
+    /// Whether this intent DELETES the document's file.
+    pub fn deletes(self) -> bool {
+        matches!(self, Self::CopyThenDelete | Self::Delete)
+    }
+
+    /// Whether this intent owes a BAKE before it can run, given the document's `dirty`
+    /// (any pending scene: covermark / annotations / deleted timeline content) and `unsaved`
+    /// (the history has moved past the last save) state. The pure decision behind
+    /// [`super::super::App::begin_bake`]'s single-flight kickoff:
+    ///
+    /// * A COPY-to-temp flavour (plain [`Copy`](Self::Copy), [`CopyClose`](Self::CopyClose),
+    ///   or [`CopyThenDelete`], all
+    ///   [`bakes_to_temp`](Self::bakes_to_temp)) bakes whenever the document is `dirty` — the
+    ///   throwaway temp does not exist yet, so ANY scene content needs rendering onto it.
+    ///   This is what makes copy-on-delete put the EDITED picture on the clipboard rather
+    ///   than the untouched base (DRAGON-352).
+    /// * A SAVING flavour bakes only when `dirty && unsaved`: standing on its own save point
+    ///   would re-encode identical pixels for nothing (the clean-save no-op).
+    /// * A plain [`Delete`](Self::Delete) NEVER bakes — nobody reads the output and the
+    ///   source is about to be unlinked, so it would be pure waste.
+    pub fn owes_bake(self, dirty: bool, unsaved: bool) -> bool {
+        if self.bakes_to_temp() {
+            dirty
+        } else if self.saves() {
+            dirty && unsaved
+        } else {
+            false
+        }
+    }
+
+    /// Whether the document CLOSES once this intent completes. DRAGON-353 removed every
+    /// unconditional auto-close — a plain Save / Save As / Copy leaves you in the editor —
+    /// so only the SETTINGS-driven flavours close: the close-on-copy ones because the user
+    /// asked for it, delete because there is no file left to edit. [`SaveCopy`](Self::SaveCopy)
+    /// (save-on-copy WITHOUT close-on-copy, DRAGON-355) deliberately does NOT close.
+    pub fn closes_document(self) -> bool {
+        matches!(
+            self,
+            Self::SaveCopyClose | Self::CopyClose | Self::CopyThenDelete | Self::Delete
+        )
+    }
 }
 
 /// The covermark picker's entries while open (a dropdown under the covermark button). The
@@ -101,6 +194,10 @@ pub enum FlyoutKind {
     Covermark,
     /// The annotation color palette (top bar).
     Color,
+    /// The TEXT-size dropdown (top bar, DRAGON-354).
+    TextSize,
+    /// The TEXT-font dropdown (top bar, DRAGON-357 item 16): Hand / Clean.
+    TextFont,
 }
 
 /// The shared open/nav state of a toolbar flyout: which one is open, the highlighted entry
@@ -260,6 +357,109 @@ pub enum LiveEdit {
     Covermark,
 }
 
+/// The in-flight text-annotation editing session (DRAGON-354): which item is open, the caret
+/// position (CHAR index into the item's text), the pre-edit scene for the ONE undo entry the
+/// settle pushes, whether the box was just created (so an empty settle DISCARDS it), and the
+/// caret blink phase. Held on [`EditState::text_edit`]; `Some` is what routes keystrokes to
+/// the editor and suspends the tool hotkeys.
+#[derive(Clone, Debug)]
+pub struct TextEdit {
+    pub id: AnnotId,
+    /// Caret position as a CHAR index into the item's text (0..=char_len).
+    pub caret: usize,
+    /// The OTHER end of an active text selection (a CHAR index), or `None` for a bare caret
+    /// (DRAGON-354 item 12). The selected range is `[min(anchor, caret), max(anchor, caret))`;
+    /// a drag from a press point, or Shift+arrows, extends it. Typing / Backspace / paste act
+    /// on the whole range when it is non-empty.
+    pub anchor: Option<usize>,
+    /// The scene BEFORE this edit began — pushed as one `EditOp::Annotations` on a changed
+    /// settle (and never pushed when nothing changed / the box is discarded).
+    pub snapshot: Vec<AnnotationItem>,
+    /// The box was created by THIS session (a fresh click/drag): an empty settle removes it
+    /// with no undo entry, exactly like a degenerate shape.
+    pub is_new: bool,
+    /// Whether the caret is on this blink tick (toggled by the blink subscription).
+    pub blink_on: bool,
+    /// The IN-SESSION text undo/redo history (DRAGON-354 item 13): Cmd/Ctrl+Z steps back through
+    /// this session's typing/paste/cut/replace, Shift+Cmd/Ctrl+Z forward, WITHOUT touching the
+    /// shared `EditOp` stack. The session still settles into exactly ONE `EditOp::Annotations`
+    /// entry (see `settle_text_edit`), so the GLOBAL history stays one-entry-per-text-edit; this
+    /// stack is scoped to the open session and is dropped when it settles. Exhausting it makes a
+    /// further Cmd+Z a NO-OP (never a settle-and-pop of the global history mid-edit).
+    pub history: TextEditHistory,
+}
+
+/// One reversible state of a text-edit session (DRAGON-354 item 13): the box's whole buffer plus
+/// the caret and selection anchor at that moment. Small by construction (the buffer is capped at
+/// the 32KB paste limit), so snapshotting per input event is cheap.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct TextSnapshot {
+    pub text: String,
+    pub caret: usize,
+    pub anchor: Option<usize>,
+}
+
+/// The per-session text undo/redo stacks (DRAGON-354 item 13) — a small state machine, kept PURE
+/// (no window/annotation coupling) so its push/undo/redo/coalesce/clear-on-input behaviour is
+/// unit-testable. Consecutive single-character typing COALESCES into one step (a burst); a
+/// word-break (space/newline), a caret move, or any non-typing edit ends the burst so the next
+/// char starts a fresh step.
+#[derive(Clone, Debug, Default)]
+pub struct TextEditHistory {
+    undo: Vec<TextSnapshot>,
+    redo: Vec<TextSnapshot>,
+    /// A single-character typing burst is in progress: further coalescing typing extends the
+    /// current step instead of pushing a new one.
+    typing_burst: bool,
+}
+
+impl TextEditHistory {
+    /// Record the PRE-edit `snapshot` before a mutation. `coalesce` = this mutation is
+    /// single-character typing that should merge with an ongoing burst. Any recorded input clears
+    /// the redo stack (standard redo-dies-on-new-input semantics).
+    pub fn record(&mut self, snapshot: TextSnapshot, coalesce: bool) {
+        if !(coalesce && self.typing_burst) {
+            self.undo.push(snapshot);
+        }
+        self.redo.clear();
+        self.typing_burst = coalesce;
+    }
+
+    /// End any ongoing typing burst (a caret move / non-typing op) so the next typing character
+    /// begins a fresh undo step.
+    pub fn break_burst(&mut self) {
+        self.typing_burst = false;
+    }
+
+    /// Undo: given the session's `current` state, pop the prior snapshot (pushing `current` onto
+    /// the redo stack) — or `None` when the session stack is exhausted (a NO-OP; the global
+    /// history is never touched mid-edit).
+    pub fn undo(&mut self, current: TextSnapshot) -> Option<TextSnapshot> {
+        let prev = self.undo.pop()?;
+        self.redo.push(current);
+        self.typing_burst = false;
+        Some(prev)
+    }
+
+    /// Redo: given the session's `current` state, pop the next snapshot (pushing `current` back
+    /// onto the undo stack) — or `None` when there is nothing to redo.
+    pub fn redo(&mut self, current: TextSnapshot) -> Option<TextSnapshot> {
+        let next = self.redo.pop()?;
+        self.undo.push(current);
+        self.typing_burst = false;
+        Some(next)
+    }
+}
+
+impl TextEdit {
+    /// The active selection as a CHAR range `[start, end)`, or `None` for a bare caret (no
+    /// anchor, or the anchor collapsed onto the caret). Order-normalized.
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let a = self.anchor?;
+        (a != self.caret).then(|| (a.min(self.caret), a.max(self.caret)))
+    }
+}
+
 /// The preview's edit state — shared by image and video previews.
 #[derive(Default)]
 pub struct EditState {
@@ -282,8 +482,37 @@ pub struct EditState {
     /// The file the in-flight bake writes (the capture itself for Save/SaveAs; a
     /// throwaway temp for Copy, so copying never persists edits to the saved file).
     pub pending_output: Option<PathBuf>,
-    /// Save was pressed on a `--preview` file with edits: confirm before overwriting.
-    pub confirm_overwrite: bool,
+    /// The document was asked to CLOSE with unsaved edits (DRAGON-353): show the modal
+    /// "you have unsaved changes" card instead of closing. Cleared by every button on it.
+    /// Replaces the old `confirm_overwrite` flag — Save no longer overwrites ANY original
+    /// (it writes the `-edited` sibling), so there is nothing left to confirm there.
+    pub confirm_close: bool,
+    /// Close this document as soon as the in-flight share action completes (DRAGON-353).
+    /// Set by the unsaved-changes dialog's Save / Save As / Copy / Delete buttons, which
+    /// ACT and THEN close — the share itself never closes anything. It doubles as the
+    /// "this action came from the dialog" signal: only a dialog press ever sets it, so a
+    /// failure can tell whether it owes the user a dialog (see [`Self::close_error`]).
+    pub close_after_share: bool,
+    /// Why the last dialog-initiated action FAILED (DRAGON-353 follow-up), when one did.
+    ///
+    /// `Some` re-raises the unsaved-changes dialog carrying the real reason — the
+    /// `io::Error`, the encoder's complaint, the unlink that didn't — instead of letting a
+    /// toast expire over a window that looks like nothing happened. From there the user has
+    /// three honest ways forward, all already on the card: retry the action, **Exit anyway**
+    /// (the same discard route as "Close without saving", now an informed choice), or
+    /// **Continue editing**. Cleared by every button on the dialog and by the start of the
+    /// next attempt, so a retry is never wedged by a stale notice.
+    pub close_error: Option<String>,
+    /// Index into [`super::PREVIEW_PROCESSING_MESSAGES`] for the in-editor processing
+    /// overlay, picked when a bake/export starts (DRAGON-353 replaced the desktop
+    /// "Processing capture" notification with the editor's own spinner).
+    pub processing_msg: usize,
+    /// The surface was destroyed (a `WindowClosed` event) while the bake was in flight
+    /// (DRAGON-352): closing the document right then would `finish_session` and exit
+    /// with the bake thread mid-write, so the close is DEFERRED — `BakeDone` reads this
+    /// and completes it (forcing the close even in keep-open mode, since the surface is
+    /// already gone and the document would otherwise linger surfaceless).
+    pub close_after_bake: bool,
     /// Cached covermark-overlay raster (raw RGBA), stacked over the base image/video via a
     /// persistent-texture shader so re-rasters don't churn iced's atlas (no blink). Built
     /// off-thread, coalesced/staleness-tracked by the slot itself. Shared by image + video
@@ -308,6 +537,18 @@ pub struct EditState {
     /// The action tray's double-click detector (DRAGON-339): two presses of the SAME tool button
     /// in quick succession spawn a ready-made item in the middle of the picture.
     pub tool_clicks: ToolClicks,
+    /// The per-slot tool-cycle CURSOR (DRAGON-369): for each cycling tray slot (keyed by its
+    /// cycle [`crate::shortcuts::Action`]) the member that was last armed — by its cycle key,
+    /// by a direct tray click, or by a per-tool hotkey alike, since every route funnels through
+    /// `App::select_annot_tool`. That is what makes the keyboard and the mouse agree: clicking
+    /// Border in the tray makes the next `U` advance to Border Highlight, exactly like picking
+    /// from a Photoshop flyout.
+    ///
+    /// RUNTIME state, reset per document on purpose — the one-shot process model makes
+    /// cross-session memory near-meaningless, and it would make a fresh capture behave unlike
+    /// the last one. (The ARMED TOOL itself is persisted, `App::annot_tool`; that is a separate,
+    /// pre-existing preference.)
+    pub slot_cursor: std::collections::HashMap<crate::shortcuts::Action, Tool>,
     /// The current annotation color (`None` = the accent default, resolved when a shape
     /// is created so the off-thread raster never reads the theme).
     pub annot_color: Option<AnnotColor>,
@@ -319,14 +560,16 @@ pub struct EditState {
     /// (round caps when > 0) read. `0.0` means [`super::annotate::DEFAULT_ANNOT_CURVE_RADIUS`]
     /// (there is no way to set a deliberate sharp `0.0` yet, so the fallback is safe).
     pub annot_curve_radius: f32,
-    /// The side (SOURCE px) the NEXT click-placed sequence badge spawns at: whatever the last
-    /// badge in THIS editor was placed or resized to. `0.0` means
-    /// [`super::annotate::DEFAULT_BADGE_SIZE`] — read it through [`Self::badge_size`].
+    /// The side (SOURCE px) the NEXT sequence badge spawns at (click-placed OR double-click
+    /// pre-placed): whatever the last badge in THIS editor was placed or resized to. `0.0`
+    /// means [`super::annotate::DEFAULT_BADGE_SIZE`] — read it through [`Self::badge_size`].
     ///
-    /// Deliberately per-DOCUMENT and deliberately NOT persisted: it is a within-session
-    /// convenience (place one badge, the rest match it), so it lives and dies with this
-    /// editor. Each preview — and each new capture, this being a one-shot app — starts back
-    /// at the default.
+    /// This is the per-DOCUMENT WORKING copy of a PERSISTED preference: it is seeded at
+    /// document open from `App::annot_badge_size` (`preview::open::new_edit_state`), and every
+    /// placement/resize writes back through `App::remember_badge_size`, so the size survives
+    /// new editors, new capture processes and app restarts. With two documents open in the
+    /// multi-doc host the two working copies may briefly disagree — deliberately: last write
+    /// wins on disk, and the next document opened picks that up. No cross-document sync.
     pub annot_badge_size: f32,
     /// The selected annotation(s) — an ordered SET since DRAGON-341 (primary last). Drives the
     /// chrome + Delete/reorder/Esc handling. Read the primary through [`Self::selected`].
@@ -362,6 +605,28 @@ pub struct EditState {
     /// fell back to a path handle (no retained pixels) — effects then appear only on export.
     pub fx_base: Option<Arc<super::layers::PixelFrame>>,
 
+    // ── Text annotations (DRAGON-354; IMAGES only) ───────────────────────────────────────
+    /// The size (SOURCE px) the NEXT text box is created at — the size dropdown drives it.
+    /// `0.0` means [`super::text_annot::DEFAULT_TEXT_SIZE`]; read through [`Self::text_size`].
+    pub annot_text_size: f32,
+    /// The family the NEXT text box uses — the font toggle drives it. Defaults to the
+    /// handwritten Excalifont.
+    pub annot_text_font: super::text_annot::TextFont,
+    /// The IN-FLIGHT text-editing session (blinking caret + live buffer), if any. `Some` gates
+    /// keyboard routing (printable keys type into the box; shortcuts are suspended) and the
+    /// caret blink subscription. See [`TextEdit`].
+    pub text_edit: Option<TextEdit>,
+    /// The live TEXT raster layers — ONE PER text annotation (DRAGON-354; split per item by
+    /// DRAGON-373), in SCENE order, each a persistent-texture layer keyed by its annotation
+    /// ([`super::layers::LayerKey::text`]) so per-keystroke re-renders never churn iced's atlas.
+    /// Rendered synchronously by [`super::App::refresh_text_display`]; empty when there is no
+    /// text (a blank box has no layer either — there is nothing to draw).
+    ///
+    /// Per ITEM rather than one composite because the live view has to interleave text with the
+    /// vector kinds in true z-order, and one raster can only sit at one depth — see
+    /// [`super::layers::LayerSlot::text`].
+    pub text_layers: Vec<TextItemLayer>,
+
     // ── Global dim / spotlight (DRAGON-329; IMAGES only) ─────────────────────────────────
     /// The global dim amount (0..1): `0` = no dim (byte-identical to no dim), higher = darker.
     /// Punched out to full brightness inside the knockout rects (spotlight / box / highlight /
@@ -371,14 +636,93 @@ pub struct EditState {
     /// The dim value at the START of the active slider drag, `Some` while dragging — so a whole
     /// drag coalesces into ONE undo entry (pushed on release; the mirror of `annot_snapshot`).
     pub dim_drag_start: Option<f32>,
+
+    /// The undo DEPTH (`undo_stack.len()`) at which this document was last SAVED — the
+    /// history position the file on disk corresponds to. `None` = never saved, or the
+    /// save point was stranded on an abandoned redo branch (see [`Self::push_op`]).
+    ///
+    /// # Why a depth and not a bool (DRAGON-353 follow-up)
+    ///
+    /// A save no longer clears the history — the editor is non-destructive, so the scene
+    /// and its whole undo stack SURVIVE a save and Ctrl+Z still walks back through
+    /// everything. That makes a bare `saved: bool` a liar the moment the user undoes past
+    /// the save point: the file on disk stops matching the scene, but the flag still says
+    /// clean and the document would close silently on work that is once again unsaved.
+    ///
+    /// The depth is the honest form. `undo_stack.len()` IS the position along a linear
+    /// history (undo moves it down, redo moves it back up), so "clean" is exactly "we are
+    /// standing where we saved" — see [`unsaved_at`].
+    pub saved_depth: Option<usize>,
 }
 
 impl EditState {
     /// Whether an edit needs a bake before sharing: a covermark, a non-empty annotation scene
     /// (any spotlight is an item, so this counts it), OR a non-zero global dim (DRAGON-329) —
     /// any would be silently dropped otherwise.
+    ///
+    /// This is the BAKE gate, not the unsaved-work gate — it answers "does an export have to
+    /// re-encode?", which stays true after a save (the scene still has content). "Are there
+    /// changes the file on disk doesn't have?" is [`unsaved_at`] / `PreviewState::unsaved`.
     pub fn dirty(&self) -> bool {
         self.covermark.is_some() || !self.annotations.is_empty() || self.dim > 0.0
+    }
+
+    /// Arm a dialog-initiated action: dismiss the card, clear any stale failure notice, and
+    /// remember that this action owes the user a close. The dialog's four buttons all go
+    /// through here (via `App::share_then_close`) before dispatching the plain TOOLBAR
+    /// message, which is what keeps the two entry points on one implementation.
+    pub fn begin_close_action(&mut self) {
+        self.confirm_close = false;
+        self.close_error = None;
+        self.close_after_share = true;
+    }
+
+    /// A dialog-initiated action FAILED: disarm the close, re-raise the dialog and give it
+    /// `reason`. Returns whether it actually was dialog-initiated — a toolbar action's
+    /// failure raises nothing (its toast already said so and the editor simply stays up).
+    ///
+    /// Nothing about the document's WORK is touched: the scene, the history and the save
+    /// point are exactly as they were, so retrying, exiting anyway and continuing to edit
+    /// are all live from here. Disarming the close is what stops a failure from attaching
+    /// itself to an unrelated later completion.
+    pub fn note_action_failure(&mut self, reason: impl Into<String>) -> bool {
+        if !std::mem::take(&mut self.close_after_share) {
+            return false;
+        }
+        self.close_after_bake = false;
+        self.confirm_close = true;
+        self.close_error = Some(reason.into());
+        true
+    }
+
+    /// The dialog's "Continue editing" / "Exit anyway" / "Close without saving" all land
+    /// here first: the card and its failure notice go, whatever happens next.
+    pub fn dismiss_close_dialog(&mut self) {
+        self.confirm_close = false;
+        self.close_error = None;
+    }
+
+    /// Record where the file on disk now sits in the history — called after every save that
+    /// actually WROTE something (a dirty Save, a Save As export). From here the document is
+    /// clean until the user moves off this position.
+    pub fn mark_saved(&mut self) {
+        self.saved_depth = Some(self.undo_stack.len());
+    }
+
+    /// Push one op onto the shared history: clear redo (a new edit abandons the redone
+    /// branch) and, if the SAVE POINT lived on that abandoned branch, forget it.
+    ///
+    /// The second half is what stops the depth from lying. Save at depth 3, undo to 2, then
+    /// draw something new: the stack is back at depth 3, but it is a DIFFERENT depth 3 —
+    /// the state the file holds is no longer reachable by any amount of redo. Dropping the
+    /// marker makes the document permanently unsaved-relative-to-disk until it is saved
+    /// again, which is the truth.
+    fn push_op(&mut self, op: EditOp) {
+        if self.saved_depth.is_some_and(|d| d > self.undo_stack.len()) {
+            self.saved_depth = None;
+        }
+        self.undo_stack.push(op);
+        self.redo_stack.clear();
     }
 
     /// The PRIMARY selected annotation (DRAGON-341) — what the single-item operations (resize,
@@ -441,6 +785,16 @@ impl EditState {
         }
     }
 
+    /// The size (SOURCE px) a newly created text box takes — whatever the size dropdown last
+    /// selected, falling back to [`super::text_annot::DEFAULT_TEXT_SIZE`].
+    pub fn text_size(&self) -> f32 {
+        if self.annot_text_size > 0.0 {
+            self.annot_text_size
+        } else {
+            super::text_annot::DEFAULT_TEXT_SIZE
+        }
+    }
+
     /// The SHARED absolute corner radius (SOURCE px) both shapes rasterize with, falling
     /// back to the default.
     pub fn curve_radius(&self) -> f32 {
@@ -460,15 +814,13 @@ impl EditState {
     /// Record an annotation mutation in the shared history: push the PRE-EDIT scene and
     /// clear redo, mirroring [`Self::push_timeline`].
     pub fn push_annotations(&mut self, prev: Vec<AnnotationItem>) {
-        self.undo_stack.push(EditOp::Annotations(prev));
-        self.redo_stack.clear();
+        self.push_op(EditOp::Annotations(prev));
     }
 
     /// Record a global-dim change (DRAGON-329) in the shared history: push the PRE-DRAG value
     /// and clear redo, mirroring [`Self::push_annotations`]. `prev` is the dim BEFORE the drag.
     pub fn push_dim(&mut self, prev: f32) {
-        self.undo_stack.push(EditOp::Dim(prev));
-        self.redo_stack.clear();
+        self.push_op(EditOp::Dim(prev));
     }
 
     /// Holistic spotlight/dim rule (DRAGON-329): a spotlight knocks a hole in the dim, so with no
@@ -504,8 +856,7 @@ impl EditState {
     /// Set (or clear) the active covermark, pushing the prior state onto the undo
     /// stack and clearing redo. The display recomposite is the caller's job (async).
     pub fn set_covermark(&mut self, cm: Option<Covermark>) {
-        self.undo_stack.push(EditOp::Covermark(self.covermark.clone()));
-        self.redo_stack.clear();
+        self.push_op(EditOp::Covermark(self.covermark.clone()));
         self.covermark = cm;
         self.cm_raster.invalidate();
     }
@@ -514,8 +865,7 @@ impl EditState {
     /// push the PRE-EDIT spans and clear redo, mirroring `set_covermark`. Called
     /// after the mutation succeeded (refused cuts/deletes never enter history).
     pub fn push_timeline(&mut self, prev: Vec<Span>) {
-        self.undo_stack.push(EditOp::Timeline(prev));
-        self.redo_stack.clear();
+        self.push_op(EditOp::Timeline(prev));
     }
 
     /// Live-adjust the active covermark's zoom (no undo entry — it's a continuous
@@ -599,31 +949,161 @@ impl EditState {
         }
     }
 
-    /// The display-preview raster size for the current frame (a ≤1024 box at the
-    /// capture's aspect) — the baseline covermark raster resolution at fit zoom.
-    pub fn preview_raster_size(&self) -> (u32, u32) {
-        let (fw, fh) = match self.frame {
+    /// This document's frame, defaulted for a not-yet-loaded (0-sized) capture.
+    fn raster_frame(&self) -> (u32, u32) {
+        match self.frame {
             (0, _) | (_, 0) => (1280u32, 800u32),
             f => f,
-        };
-        let scale = (1024.0 / fw as f32).min(1024.0 / fh as f32).min(1.0);
-        (((fw as f32 * scale) as u32).max(1), ((fh as f32 * scale) as u32).max(1))
+        }
     }
 
-    /// The covermark display raster resolution at the current `view_zoom` (DRAGON-324): the
-    /// ≤1024 baseline at fit zoom, growing PROPORTIONALLY as you zoom in — capped at the full
-    /// source frame (beyond which there is no detail to gain, and it matches the bake exactly).
-    /// So a magnified covermark re-rasters sharper instead of sampling a soft preview texture.
-    pub fn covermark_raster_size(&self, view_zoom: f32) -> (u32, u32) {
-        let (fw, fh) = match self.frame {
-            (0, _) | (_, 0) => (1280u32, 800u32),
-            f => f,
-        };
-        let (pw, ph) = self.preview_raster_size();
-        let z = view_zoom.max(1.0);
-        let w = ((pw as f32 * z).round() as u32).clamp(pw, fw);
-        let h = ((ph as f32 * z).round() as u32).clamp(ph, fh);
-        (w, h)
+    /// The covermark display raster resolution at the current `view_zoom` — the layer's own
+    /// ON-SCREEN device-pixel footprint (DRAGON-362), see [`layer_raster_dims`]. The covermark
+    /// layer spans the whole frame, so its raster is the whole frame at that scale.
+    pub fn covermark_raster_size(&self, view_zoom: f32, visual_scale: f32) -> (u32, u32) {
+        layer_raster_dims(self.raster_frame(), layer_raster_scale(view_zoom, visual_scale))
+    }
+}
+
+/// ONE text annotation's live raster layer (DRAGON-373): the pixels, where they go, and the
+/// signature of what they hold.
+#[derive(Clone)]
+pub struct TextItemLayer {
+    /// The annotation drawn here — its identity for the texture slot AND its place in the
+    /// scene's z-order (the layers list mirrors the item order).
+    pub id: super::annotate::AnnotId,
+    /// The rendered glyphs. A layer only exists when there is ink, so this is never a blank box.
+    pub frame: Arc<super::layers::PixelFrame>,
+    /// WHERE and at what resolution [`Self::frame`] was rendered.
+    pub geom: TextLayerGeom,
+    /// The RASTER-INPUT signature of the drawing in [`Self::frame`] (DRAGON-376): everything
+    /// [`super::text_annot::render_into`] actually reads — the derived layout, the origin, the
+    /// face, the size, the outline weight and the colour.
+    ///
+    /// It lets [`super::App::refresh_text_display`] answer "would re-rendering this box produce a
+    /// different bitmap?" WITHOUT re-rendering it. Editor CHROME — the caret index, the selection
+    /// anchor, the blink phase — lives on [`EditState::text_edit`] and is drawn as canvas
+    /// vectors, so it reaches nothing here: a drag-select used to re-run the whole SVG-build →
+    /// usvg-parse → resvg → demultiply pipeline once per pointer event to produce a byte-identical
+    /// raster (~29 ms/event at 512 px type, against a 125 Hz pointer — the reported lock-up).
+    ///
+    /// It describes the RASTER, not the scene: the DRAGON-368 gesture proxy deliberately re-places
+    /// an existing raster without re-rendering, and leaving this signature at what was actually
+    /// drawn is what makes the commit re-render fire exactly once at the end of the gesture.
+    pub(super) sig: super::annotate::TextRenderSig,
+}
+
+/// The live TEXT layer's geometry (DRAGON-362): the picture REGION it covers, the raster
+/// scale it was rendered at, and the resulting pixel dimensions. The text layer is a
+/// sub-rect of the canvas — see [`super::annotate::text_layer_region`] — so the view needs
+/// its placement, and a zoom step needs its scale to decide whether a re-render would
+/// actually change anything.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextLayerGeom {
+    /// The raster scale (raster px per source px) — see [`layer_raster_scale`].
+    pub scale: f32,
+    /// The picture region the raster covers, in SOURCE px.
+    pub region: super::annotate::AnnotRect,
+    /// The raster's pixel dimensions.
+    pub px: (u32, u32),
+}
+
+impl TextLayerGeom {
+    /// The layer's placement within the picture canvas, as the `[x, y, w, h]` fractions
+    /// [`super::layers::Layer::dest`] wants. `frame` is the source frame; a degenerate frame
+    /// degrades to the whole canvas rather than a divide by zero.
+    pub fn dest(&self, frame: (u32, u32)) -> super::layers::Dest {
+        let (fw, fh) = (frame.0 as f32, frame.1 as f32);
+        if !(fw > 0.0 && fh > 0.0) {
+            return super::layers::DEST_FULL;
+        }
+        [self.region.x / fw, self.region.y / fh, self.region.w / fw, self.region.h / fh]
+    }
+}
+
+/// The largest texture dimension a live layer raster may reach. `wgpu::Limits::default()`
+/// (what iced/libcosmic request) puts `max_texture_dimension_2d` at 8192, so a raster past
+/// this could not be uploaded at all — a capture wider than 8192 px (a multi-monitor "all
+/// displays" grab is easily 10240) would otherwise blow up now that the raster tracks the
+/// SOURCE frame rather than a fixed 1024 box. Layers beyond it degrade to a soft (resampled)
+/// overlay instead of failing; the BAKE is unaffected — it composites on the CPU at full
+/// source resolution regardless.
+pub const MAX_LAYER_DIM: u32 = 8192;
+
+/// The granularity the layer raster scale is snapped UP to (1/16 of the source resolution).
+///
+/// WHY quantize: the wanted scale now moves CONTINUOUSLY with the zoom slider, and a raster
+/// whose dimensions changed on every zoom step would (a) re-render on every tick and (b) force
+/// the layer's persistent GPU texture to be RE-CREATED each time (`LayerStackPipeline::upsert`
+/// only updates in place while the dimensions hold), which is exactly the churn `layers.rs`
+/// exists to avoid. Snapping UP — never down — means the raster is always at least the layer's
+/// on-screen size, so quantization can never reintroduce softness; it only spends up to one
+/// step's worth of extra pixels.
+pub const RASTER_QUANTUM: f32 = 1.0 / 16.0;
+
+/// The fraction of the SOURCE frame's pixels a full-frame live layer occupies ON SCREEN, which
+/// is the resolution its raster must be rendered at to be pixel-crisp beside the base image
+/// (DRAGON-362).
+///
+/// The base image is drawn from the untouched source pixels and DOWNSAMPLED into the viewport;
+/// a layer rastered smaller than its on-screen footprint is UPSAMPLED into the same area, and
+/// that mismatch is what read as "fuzzy text next to crisp pixels" on a large (5120×2880)
+/// capture — the old contract pinned every layer to a 1024 box at fit zoom, so a 5K capture
+/// shown ~2300 px wide sampled a 1024-wide raster.
+///
+/// `visual_scale` is [`super::App::preview_visual_scale`] = `fit_scale × source_scale`: the
+/// fraction of the picture's NATURAL on-screen size shown at fit, times the source display's
+/// backing scale. Their product is exactly `device pixels per source pixel` at fit — the
+/// `source_scale` factor is what carries HiDPI, since the preview surface renders `source_scale`
+/// device pixels per logical point. So `view_zoom × visual_scale` is the on-screen device-pixel
+/// footprint as a fraction of the source frame.
+///
+/// Capped at `1.0`: there is no detail beyond the source pixels, and stopping there is what
+/// keeps the live layer and the bake (which composites at exactly the source frame) agreeing.
+/// Floored just above zero so a degenerate scale can never produce an empty raster. Pure.
+pub fn layer_raster_scale(view_zoom: f32, visual_scale: f32) -> f32 {
+    let want = view_zoom.max(0.0) * visual_scale.max(0.0);
+    if !want.is_finite() || want <= 0.0 {
+        return 1.0; // unknown geometry → full source resolution, never a soft guess
+    }
+    // Snap UP to the next quantum (see [`RASTER_QUANTUM`]) and cap at the source resolution.
+    ((want / RASTER_QUANTUM).ceil() * RASTER_QUANTUM).min(1.0)
+}
+
+/// A layer raster's pixel dimensions: `frame × scale`, never zero, capped at the source frame
+/// and at [`MAX_LAYER_DIM`]. The [`MAX_LAYER_DIM`] cap is applied to BOTH axes by the same
+/// factor so the raster keeps the region's aspect (an anisotropic clamp would visibly stretch
+/// the layer). Pure.
+pub fn layer_raster_dims(frame: (u32, u32), scale: f32) -> (u32, u32) {
+    let (fw, fh) = (frame.0.max(1), frame.1.max(1));
+    let s = scale.clamp(0.0, 1.0);
+    let mut w = ((fw as f32 * s).ceil() as u32).clamp(1, fw);
+    let mut h = ((fh as f32 * s).ceil() as u32).clamp(1, fh);
+    if w > MAX_LAYER_DIM || h > MAX_LAYER_DIM {
+        let k = MAX_LAYER_DIM as f32 / w.max(h) as f32;
+        w = ((w as f32 * k).floor() as u32).max(1);
+        h = ((h as f32 * k).floor() as u32).max(1);
+    }
+    (w, h)
+}
+
+/// THE unsaved-work predicate (DRAGON-353 follow-up), as pure arithmetic over the history
+/// position — so the rule can be tested without a document.
+///
+/// * `saved_depth` — [`EditState::saved_depth`]: where the file on disk sits in the
+///   history, or `None` for "never saved / the save point was abandoned".
+/// * `depth` — the CURRENT `undo_stack.len()`.
+/// * `scene_dirty` — whether the scene has content at all (`PreviewState::dirty`, which
+///   ORs in deleted timeline segments).
+///
+/// Saved ⇒ unsaved exactly when we have moved off the save point, in EITHER direction:
+/// undoing past it leaves the file holding more than the scene, redoing past it leaves the
+/// scene holding more than the file. Never saved ⇒ fall back to "is there anything to
+/// lose", which is the pre-existing behaviour for a document that has never written a file.
+pub fn unsaved_at(saved_depth: Option<usize>, depth: usize, scene_dirty: bool) -> bool {
+    match saved_depth {
+        Some(d) => depth != d,
+        None => scene_dirty,
     }
 }
 
@@ -992,6 +1472,61 @@ pub fn bake_video(src: &Path, dst: &Path, cm: Option<&Covermark>, video: &VideoB
 mod tests {
     use super::*;
 
+    fn snap(text: &str, caret: usize) -> TextSnapshot {
+        TextSnapshot { text: text.to_string(), caret, anchor: None }
+    }
+
+    /// DRAGON-354 item 13: the in-session text history — record/undo/redo, typing coalesce, and
+    /// redo-dies-on-new-input, all pure.
+    #[test]
+    fn text_edit_history_records_undo_redo_and_coalesces() {
+        let mut h = TextEditHistory::default();
+        // A burst of single-char typing "" → "a" → "ab" → "abc" coalesces into ONE step: only the
+        // first (pre-burst empty) snapshot is recorded.
+        h.record(snap("", 0), true);
+        h.record(snap("a", 1), true);
+        h.record(snap("ab", 2), true);
+        // One undo from "abc" restores the whole burst's pre-state ("").
+        assert_eq!(h.undo(snap("abc", 3)), Some(snap("", 0)));
+        // Redo returns to "abc".
+        assert_eq!(h.redo(snap("", 0)), Some(snap("abc", 3)));
+        // Exhausted undo/redo are no-ops.
+        assert_eq!(h.undo(snap("abc", 3)), Some(snap("", 0)));
+        assert_eq!(h.undo(snap("", 0)), None);
+
+        // A word-break (coalesce=false) starts a NEW step, so two words = two undo steps.
+        let mut h = TextEditHistory::default();
+        h.record(snap("", 0), true); // 'h'
+        h.record(snap("h", 1), true); // 'i' (coalesced)
+        h.record(snap("hi", 2), false); // ' ' breaks the burst → its own step
+        h.record(snap("hi ", 3), true); // 'y'
+        h.record(snap("hi y", 4), true); // 'o' (coalesced)
+        assert_eq!(h.undo(snap("hi yo", 5)), Some(snap("hi ", 3)), "undo the second word");
+        assert_eq!(h.undo(snap("hi ", 3)), Some(snap("hi", 2)), "undo the space step");
+        assert_eq!(h.undo(snap("hi", 2)), Some(snap("", 0)), "undo the first word");
+        assert_eq!(h.undo(snap("", 0)), None);
+    }
+
+    /// New input after an undo CLEARS the redo stack (standard semantics), and `break_burst`
+    /// forces the next typing char to start a fresh step.
+    #[test]
+    fn text_edit_history_new_input_clears_redo_and_break_ends_burst() {
+        let mut h = TextEditHistory::default();
+        h.record(snap("", 0), false); // step for "x"
+        assert_eq!(h.undo(snap("x", 1)), Some(snap("", 0)));
+        // A fresh edit after the undo: redo must be gone.
+        h.record(snap("", 0), false);
+        assert_eq!(h.redo(snap("y", 1)), None, "redo cleared by new input");
+
+        // break_burst ends coalescing so two same-kind typing chars become two steps.
+        let mut h = TextEditHistory::default();
+        h.record(snap("", 0), true);
+        h.break_burst();
+        h.record(snap("a", 1), true);
+        assert_eq!(h.undo(snap("ab", 2)), Some(snap("a", 1)), "second char is its own step");
+        assert_eq!(h.undo(snap("a", 1)), Some(snap("", 0)));
+    }
+
     #[test]
     fn flyout_nav_wraps_and_starts_from_no_highlight() {
         let mut f = FlyoutNav { kind: FlyoutKind::Color, selected: None, len: 4 };
@@ -1011,24 +1546,166 @@ mod tests {
         assert_eq!(h.selected, None);
     }
 
+    /// DRAGON-362 — the REPLACEMENT for the old `covermark_raster_size_scales_with_zoom_
+    /// capped_at_frame`. That test pinned the OLD contract: a fixed ≤1024 box at fit zoom,
+    /// grown by `max(zoom, 1)`. The contract is now "raster at the layer's ON-SCREEN
+    /// device-pixel footprint" (`view_zoom × visual_scale` of the source frame), which is what
+    /// stops a big capture's overlay being upsampled beside a downsampled base image. The
+    /// surviving properties — grows with zoom, never past the source frame, never zero — are
+    /// re-asserted here against the new formula.
     #[test]
-    fn covermark_raster_size_scales_with_zoom_capped_at_frame() {
-        // DRAGON-324: the covermark display raster grows with the view zoom (crisp when
-        // magnified) but never past the source frame.
+    fn covermark_raster_size_tracks_the_on_screen_footprint_capped_at_frame() {
         let mut e = EditState { frame: (4000, 2000), ..Default::default() };
-        let base = e.preview_raster_size();
-        assert_eq!(base, (1024, 512), "≤1024 box preserving aspect");
-        // At or below fit zoom, the baseline resolution.
-        assert_eq!(e.covermark_raster_size(1.0), base);
-        assert_eq!(e.covermark_raster_size(0.5), base, "zoom-out never shrinks below baseline");
-        // Zooming in grows proportionally...
-        assert_eq!(e.covermark_raster_size(2.0), (2048, 1024));
-        // ...capped at the full source frame at high zoom.
-        assert_eq!(e.covermark_raster_size(100.0), (4000, 2000));
+        // A 4000-wide capture fitted to ~2000 px of screen (visual_scale 0.5): at fit zoom the
+        // covermark is rastered at the 2000 px it actually occupies — under the OLD contract
+        // this was 1024, i.e. upsampled ~2× on screen.
+        assert_eq!(e.covermark_raster_size(1.0, 0.5), (2000, 1000));
+        // Zooming in grows it proportionally...
+        assert_eq!(e.covermark_raster_size(1.5, 0.5), (3000, 1500));
+        // ...capped at the full source frame (no detail beyond it; matches the bake).
+        assert_eq!(e.covermark_raster_size(100.0, 0.5), (4000, 2000));
+        // Zooming OUT now genuinely shrinks the raster (it is genuinely smaller on screen) —
+        // the old baseline floor is gone, and that is a pure win for the per-edit cost.
+        assert_eq!(e.covermark_raster_size(0.5, 0.5), (1000, 500));
         // A zero/unknown frame falls back to a sane default (never a 0-size raster).
         e.frame = (0, 0);
-        let (w, h) = e.covermark_raster_size(3.0);
+        let (w, h) = e.covermark_raster_size(3.0, 0.5);
         assert!(w > 0 && h > 0);
+    }
+
+    /// The scale is the on-screen footprint fraction, snapped UP to a [`RASTER_QUANTUM`] step
+    /// and capped at the source resolution.
+    #[test]
+    fn layer_raster_scale_snaps_up_and_caps_at_source() {
+        // Exactly on a quantum boundary stays put.
+        assert!((layer_raster_scale(1.0, 0.5) - 0.5).abs() < 1e-6);
+        // Between boundaries rounds UP — never down, so the raster is never smaller than the
+        // layer's on-screen size (which is what would make it soft).
+        let s = layer_raster_scale(1.0, 0.4512);
+        assert!(s >= 0.4512, "snapped {s} must not fall below the wanted 0.4512");
+        assert!((s - 0.5).abs() < 1e-6, "0.4512 snaps up to the 8/16 step, got {s}");
+        // Zoom multiplies the footprint...
+        assert!((layer_raster_scale(2.0, 0.25) - 0.5).abs() < 1e-6);
+        // ...and the cap is the source resolution, never beyond.
+        assert!((layer_raster_scale(64.0, 0.5) - 1.0).abs() < 1e-6);
+        assert!((layer_raster_scale(1.0, 4.0) - 1.0).abs() < 1e-6);
+        // Degenerate geometry (unknown scale) → full source resolution, never a soft guess.
+        assert!((layer_raster_scale(1.0, 0.0) - 1.0).abs() < 1e-6);
+        assert!((layer_raster_scale(0.0, 0.5) - 1.0).abs() < 1e-6);
+        assert!((layer_raster_scale(f32::NAN, 0.5) - 1.0).abs() < 1e-6);
+    }
+
+    /// Quantization is what keeps a zoom DRAG from re-rendering (and re-creating the layer's
+    /// GPU texture) on every tick: neighbouring zooms inside one step resolve to the SAME
+    /// raster, so `refresh_*_for_zoom`'s "wanted == current" check short-circuits.
+    #[test]
+    fn layer_raster_scale_is_stable_within_a_quantum() {
+        let e = EditState { frame: (5120, 2880), ..Default::default() };
+        let a = e.covermark_raster_size(1.00, 0.4512);
+        let b = e.covermark_raster_size(1.02, 0.4512);
+        let c = e.covermark_raster_size(1.05, 0.4512);
+        assert_eq!(a, b, "a nudge inside one quantum must not resize the raster");
+        assert_eq!(a, c);
+        // A step big enough to cross a quantum boundary DOES grow it.
+        assert!(e.covermark_raster_size(1.30, 0.4512).0 > a.0);
+    }
+
+    /// The 5K case from the bug report, end to end: a 5120×2880 capture shown ~2311 px wide
+    /// (visual_scale ≈ 0.4514) rasters its layers at ~the on-screen size, NOT the old 1024 box.
+    #[test]
+    fn five_k_capture_at_fit_zoom_rasters_at_screen_size_not_1024() {
+        let e = EditState { frame: (5120, 2880), ..Default::default() };
+        let (w, h) = e.covermark_raster_size(1.0, 2311.0 / 5120.0);
+        assert!(w >= 2311, "raster {w} must cover the 2311 px it occupies on screen");
+        assert!(w < 5120, "and must not needlessly reach full source resolution: {w}");
+        assert_eq!((w, h), (2560, 1440), "the 8/16 quantum above 0.4514");
+        // The OLD contract's answer, for the record — 2.26× short of the screen size.
+        assert!(w > 1024 * 2);
+    }
+
+    /// [`MAX_LAYER_DIM`] bounds the raster for captures larger than a GPU texture: an
+    /// "all displays" grab is easily wider than 8192 px, and the frame cap alone would ask for
+    /// a texture the device cannot allocate. The clamp is ISOTROPIC — the aspect is preserved.
+    #[test]
+    fn layer_raster_dims_clamp_to_the_texture_limit_without_stretching() {
+        // A 3-monitor 10240×2880 grab at full source scale.
+        let (w, h) = layer_raster_dims((10240, 2880), 1.0);
+        assert!(w <= MAX_LAYER_DIM && h <= MAX_LAYER_DIM, "{w}x{h} exceeds the texture limit");
+        assert_eq!(w, MAX_LAYER_DIM);
+        let want = 10240.0 / 2880.0;
+        assert!((w as f32 / h as f32 - want).abs() < 1e-2, "aspect drift: {w}x{h}");
+        // Below the limit nothing is clamped.
+        assert_eq!(layer_raster_dims((5120, 2880), 1.0), (5120, 2880));
+        // A TALL over-limit frame clamps on the other axis, same isotropy.
+        let (w, h) = layer_raster_dims((2880, 10240), 1.0);
+        assert_eq!(h, MAX_LAYER_DIM);
+        assert!((w as f32 / h as f32 - 2880.0 / 10240.0).abs() < 1e-2);
+    }
+
+    /// Dimensions never collapse to zero, whatever the scale.
+    #[test]
+    fn layer_raster_dims_never_zero() {
+        for frame in [(1u32, 1u32), (5120, 2880), (0, 0)] {
+            for scale in [0.0f32, 1e-6, 0.5, 1.0, 2.0] {
+                let (w, h) = layer_raster_dims(frame, scale);
+                assert!(w >= 1 && h >= 1, "{frame:?} @ {scale} → {w}x{h}");
+            }
+        }
+    }
+
+    /// A placed layer's `dest` is its region expressed as fractions of the picture — the
+    /// contract `layers.rs`'s vertex shader consumes. A full-picture region round-trips to
+    /// `DEST_FULL`, which is byte-identical to the pre-DRAGON-362 full-canvas quad.
+    #[test]
+    fn text_layer_geom_dest_is_the_region_as_canvas_fractions() {
+        use super::super::annotate::AnnotRect;
+        let frame = (5120u32, 2880u32);
+        let g = TextLayerGeom {
+            scale: 0.5,
+            region: AnnotRect { x: 1280.0, y: 720.0, w: 2560.0, h: 720.0 },
+            px: (1280, 360),
+        };
+        assert_eq!(g.dest(frame), [0.25, 0.25, 0.5, 0.25]);
+        // The whole picture → the whole canvas (the historical quad).
+        let whole = TextLayerGeom {
+            scale: 1.0,
+            region: AnnotRect { x: 0.0, y: 0.0, w: 5120.0, h: 2880.0 },
+            px: frame,
+        };
+        assert_eq!(whole.dest(frame), super::super::layers::DEST_FULL);
+        // A degenerate frame degrades to the whole canvas rather than dividing by zero.
+        assert_eq!(g.dest((0, 0)), super::super::layers::DEST_FULL);
+    }
+
+    /// DRAGON-352: `dirty()` is THE shared bake gate — Copy/Save (`begin_bake`) and
+    /// Save As all read it through `PreviewState::dirty()` (which ORs in DELETED
+    /// timeline content for videos). Every result-changing edit kind must trip it
+    /// alone, and a pristine state must not (no needless re-encode).
+    #[test]
+    fn dirty_trips_on_every_result_changing_edit() {
+        use super::super::annotate::{AnnotKind, AnnotRect};
+
+        assert!(!EditState::default().dirty(), "pristine state must not bake");
+        let cm = EditState {
+            covermark: Some(Covermark { kind: CovermarkKind::Confidential, zoom: 0.0, opacity: 1.0 }),
+            ..Default::default()
+        };
+        assert!(cm.dirty(), "a covermark alone must bake");
+        let annot = EditState {
+            annotations: vec![AnnotationItem {
+                id: AnnotId(1),
+                color: [255, 0, 0, 255],
+                kind: AnnotKind::Box {
+                    rect: AnnotRect { x: 1.0, y: 1.0, w: 10.0, h: 10.0 },
+                    stroke_w: 2.0,
+                    fill: None,
+                },
+            }],
+            ..Default::default()
+        };
+        assert!(annot.dirty(), "any annotation alone must bake");
+        let dim = EditState { dim: 0.25, ..Default::default() };
+        assert!(dim.dirty(), "a non-zero global dim alone must bake");
     }
 
     fn flat(w: u32, h: u32, v: u8) -> RgbaImage {
@@ -1180,6 +1857,86 @@ mod tests {
     }
 
     #[test]
+    fn text_outline_width_restyle_joins_the_shared_undo_history() {
+        // DRAGON-358: re-styling a text box's line width is ONE `EditOp::Annotations` snapshot on
+        // the shared history (the width mirror of the color-restyle flow) — undo restores the
+        // prior outline weight, redo re-applies it, exactly like a recolor. This pins the
+        // push-snapshot-then-mutate shape `restroke_selected_annotation` uses for text.
+        use crate::app::preview::annotate::{AnnotId, AnnotKind, AnnotRect, AnnotationItem};
+        let rect = AnnotRect { x: 0.0, y: 0.0, w: 40.0, h: 20.0 };
+        let text = |w: f32| AnnotKind::Text {
+            rect,
+            text: "hi".to_string(),
+            size_px: 24.0,
+            font: crate::app::preview::text_annot::TextFont::Clean,
+            constrained: false,
+            stroke_w: w,
+        };
+        let mut edit = EditState::default();
+        edit.annotations.push(AnnotationItem { id: AnnotId(1), color: [255, 0, 0, 255], kind: text(2.0) });
+        // Restyle to a wider pencil: snapshot the pre-edit scene, then mutate — one undo entry.
+        let prev = edit.annotations.clone();
+        if let AnnotKind::Text { stroke_w, .. } = &mut edit.annotations[0].kind {
+            *stroke_w = 6.0;
+        }
+        edit.push_annotations(prev);
+        let width = |e: &EditState| match &e.annotations[0].kind {
+            AnnotKind::Text { stroke_w, .. } => *stroke_w,
+            _ => unreachable!(),
+        };
+        assert_eq!(width(&edit), 6.0, "the wider outline is applied");
+        assert!(edit.can_undo());
+        edit.undo(None);
+        assert_eq!(width(&edit), 2.0, "undo restores the prior outline weight");
+        edit.redo(None);
+        assert_eq!(width(&edit), 6.0, "redo re-applies it");
+    }
+
+    #[test]
+    fn mid_edit_width_restyle_folds_into_the_settle_snapshot() {
+        // DRAGON-358 review fix: a width click DURING an active text-edit session must NOT push
+        // its own undo entry — the settle owns the single snapshot (the pre-edit scene), exactly
+        // like the size/font restyles (`apply_text_style`'s gate) and the recolor. This models
+        // the gated flow: mutate with no push while `text_edit` is live, then settle-push the
+        // session snapshot once — exactly ONE undo entry, restoring the full pre-edit scene.
+        use crate::app::preview::annotate::{AnnotId, AnnotKind, AnnotRect, AnnotationItem};
+        let rect = AnnotRect { x: 0.0, y: 0.0, w: 40.0, h: 20.0 };
+        let text = |s: &str, w: f32| AnnotKind::Text {
+            rect,
+            text: s.to_string(),
+            size_px: 24.0,
+            font: crate::app::preview::text_annot::TextFont::Clean,
+            constrained: false,
+            stroke_w: w,
+        };
+        let mut edit = EditState::default();
+        edit.annotations.push(AnnotationItem { id: AnnotId(1), color: [255, 0, 0, 255], kind: text("hi", 2.0) });
+        // The edit session opens on the box: the settle snapshot IS the pre-edit scene.
+        let snapshot = edit.annotations.clone();
+        edit.text_edit = Some(TextEdit {
+            id: AnnotId(1),
+            caret: 2,
+            anchor: None,
+            snapshot: snapshot.clone(),
+            is_new: false,
+            blink_on: true,
+            history: Default::default(),
+        });
+        // Mid-edit: type a character AND click a width — both mutate, NEITHER pushes (the
+        // restyle gate on `text_edit.is_none()`).
+        edit.annotations[0].kind = text("hi!", 6.0);
+        assert!(!edit.can_undo(), "nothing pushed while the session is live");
+        // The settle: the scene changed, so ONE entry holding the pre-edit scene is pushed.
+        let te = edit.text_edit.take().expect("session live");
+        assert_ne!(te.snapshot, edit.annotations, "the settle sees a changed scene");
+        edit.push_annotations(te.snapshot);
+        // Exactly one undo step restores BOTH the text and the outline weight together.
+        edit.undo(None);
+        assert_eq!(edit.annotations, snapshot, "one undo restores the full pre-edit scene");
+        assert!(!edit.can_undo(), "and it was the ONLY entry");
+    }
+
+    #[test]
     fn selection_transitions_keep_the_newest_pick_primary() {
         // DRAGON-341: the selection is an ordered SET whose LAST member is the primary — the
         // one wearing resize handles and the target of single-item operations.
@@ -1309,5 +2066,161 @@ mod tests {
              [vc][1:v]overlay=(W-w)/2:(H-h)/2[v]"
         );
         assert!(!g.contains("[a]"), "no audio chain for a silent recording");
+    }
+
+    // ── The save point (DRAGON-353 follow-up) ─────────────────────────────────────────
+
+    /// A NEVER-saved document falls back to "is there anything in the scene", which is the
+    /// behaviour that predates the save point.
+    #[test]
+    fn an_unsaved_document_is_dirty_exactly_when_the_scene_has_content() {
+        assert!(!unsaved_at(None, 0, false));
+        assert!(unsaved_at(None, 3, true));
+        // The DEPTH is irrelevant while there is no save point: a user who drew and then
+        // undid everything back to empty has nothing to lose.
+        assert!(!unsaved_at(None, 7, false));
+    }
+
+    /// THE cycle the owner asked about: save → undo → redo → save. The history SURVIVES
+    /// the save, so "clean" has to mean "standing where we saved", not "we saved once".
+    #[test]
+    fn dirty_tracks_the_save_point_across_undo_and_redo() {
+        // Saved at depth 2 with a scene on screen.
+        assert!(!unsaved_at(Some(2), 2, true), "standing on the save point is clean");
+        // Undo past it: the file holds MORE than the scene does — dirty again.
+        assert!(unsaved_at(Some(2), 1, true));
+        assert!(unsaved_at(Some(2), 0, false), "even undone to an empty scene");
+        // Redo back onto it: clean again, no re-save needed.
+        assert!(!unsaved_at(Some(2), 2, true));
+        // Redo/edit PAST it: the scene holds more than the file — dirty.
+        assert!(unsaved_at(Some(2), 3, true));
+    }
+
+    /// The real state machine on an `EditState`: edit → save → edit → undo → redo, with
+    /// the history intact throughout (a save must never clear it).
+    #[test]
+    fn a_save_keeps_the_history_and_marks_the_position() {
+        let mut e = EditState::default();
+        e.push_dim(0.0);
+        e.dim = 0.5;
+        assert_eq!(e.undo_stack.len(), 1);
+        assert!(e.saved_depth.is_none());
+
+        e.mark_saved();
+        assert_eq!(e.saved_depth, Some(1));
+        assert!(e.can_undo(), "the save must NOT clear the history");
+        assert!(!unsaved_at(e.saved_depth, e.undo_stack.len(), e.dirty()));
+
+        // Undo past the save: the history still works, and the document is dirty again.
+        e.undo(None);
+        assert_eq!(e.undo_stack.len(), 0);
+        assert!(e.can_redo());
+        assert!(unsaved_at(e.saved_depth, e.undo_stack.len(), e.dirty()));
+
+        // Redo back onto the save point: clean again.
+        e.redo(None);
+        assert_eq!(e.undo_stack.len(), 1);
+        assert!(!unsaved_at(e.saved_depth, e.undo_stack.len(), e.dirty()));
+    }
+
+    /// BRANCH INVALIDATION: undo past the save point, then make a NEW edit. The stack
+    /// returns to the same DEPTH, but the state the file holds is no longer reachable by
+    /// any amount of redo — so the marker is dropped and the document stays dirty until it
+    /// is saved again. Without this the depth would silently claim "clean" for a scene the
+    /// file has never seen.
+    #[test]
+    fn a_new_edit_on_an_abandoned_branch_forgets_the_save_point() {
+        let mut e = EditState::default();
+        e.push_dim(0.0);
+        e.dim = 0.5;
+        e.mark_saved();
+        assert_eq!(e.saved_depth, Some(1));
+
+        e.undo(None); // back to depth 0, redo available
+        e.push_annotations(Vec::new()); // a NEW edit: redo is abandoned...
+        assert!(!e.can_redo());
+        assert_eq!(e.undo_stack.len(), 1, "same depth as the save point");
+        assert_eq!(e.saved_depth, None, "...and the save point went with it");
+        assert!(unsaved_at(e.saved_depth, e.undo_stack.len(), true));
+    }
+
+    // ── The dirty-close dialog's failure state machine (DRAGON-353 follow-up) ────────
+
+    /// action → FAILURE → retry → success. A failed dialog action re-raises the card with
+    /// the reason and DISARMS the close; the retry arms it again from a clean slate; the
+    /// success clears everything. At no point does the failure leave a flag set that would
+    /// silently swallow or auto-close a later action.
+    #[test]
+    fn a_failed_dialog_action_reraises_the_dialog_and_a_retry_starts_clean() {
+        let mut e = EditState::default();
+
+        // The dialog's button: card down, close armed.
+        e.begin_close_action();
+        assert!(e.close_after_share && !e.confirm_close && e.close_error.is_none());
+
+        // ...the action fails.
+        assert!(e.note_action_failure("Disk full"));
+        assert!(e.confirm_close, "the card comes back");
+        assert_eq!(e.close_error.as_deref(), Some("Disk full"));
+        assert!(!e.close_after_share, "the close is DISARMED — we are not leaving");
+        assert!(!e.close_after_bake);
+
+        // A SECOND failure report with nothing armed changes nothing (a toolbar action's
+        // failure never raises this dialog, and a duplicate completion can't either).
+        let mut stale = EditState::default();
+        assert!(!stale.note_action_failure("ignored"));
+        assert!(!stale.confirm_close && stale.close_error.is_none());
+
+        // Retry: the stale reason goes and the close is armed afresh — nothing wedged.
+        e.begin_close_action();
+        assert!(e.close_after_share && !e.confirm_close && e.close_error.is_none());
+    }
+
+    /// "Exit anyway" and "Continue editing" both clear the card and its notice; they differ
+    /// only in what the CALLER does next (close vs. stay), which is why they share one
+    /// dismissal and one discard route.
+    #[test]
+    fn dismissing_the_dialog_clears_the_failure_either_way() {
+        for _ in 0..2 {
+            let mut e = EditState::default();
+            e.begin_close_action();
+            e.note_action_failure("Permission denied");
+            e.dismiss_close_dialog();
+            assert!(!e.confirm_close && e.close_error.is_none() && !e.close_after_share);
+        }
+    }
+
+    /// A failure NEVER touches the work: the scene, the history and the save point are
+    /// exactly as they were, so "Continue editing" really does continue.
+    #[test]
+    fn a_failure_leaves_the_document_untouched() {
+        let mut e = EditState::default();
+        e.push_dim(0.0);
+        e.dim = 0.4;
+        e.mark_saved();
+        e.push_dim(0.4);
+        e.dim = 0.9;
+        let (depth, saved, dim) = (e.undo_stack.len(), e.saved_depth, e.dim);
+
+        e.begin_close_action();
+        e.note_action_failure("Nope");
+        assert_eq!(e.undo_stack.len(), depth, "history intact");
+        assert_eq!(e.saved_depth, saved, "save point intact");
+        assert_eq!(e.dim, dim, "scene intact");
+        assert!(unsaved_at(e.saved_depth, e.undo_stack.len(), e.dirty()), "still dirty");
+    }
+
+    /// An edit made while standing ON or AFTER the save point does NOT invalidate it — the
+    /// save is still reachable by undoing back to it.
+    #[test]
+    fn an_edit_forward_of_the_save_point_keeps_it() {
+        let mut e = EditState::default();
+        e.push_dim(0.0);
+        e.mark_saved();
+        e.push_dim(0.5); // depth 2, the save point at 1 is still behind us
+        assert_eq!(e.saved_depth, Some(1));
+        assert!(unsaved_at(e.saved_depth, e.undo_stack.len(), true));
+        e.undo(None);
+        assert!(!unsaved_at(e.saved_depth, e.undo_stack.len(), true), "back at the save");
     }
 }

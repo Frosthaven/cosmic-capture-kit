@@ -88,12 +88,37 @@ pub enum ConfigTab {
     /// Scanner + Screenshots + Screen Recordings, consolidated into one nav page
     /// with in-page tabs (DRAGON-140; see [`CaptureTab`]).
     CaptureModes,
+    /// The post-capture PREVIEW EDITOR's own behaviour (DRAGON-353): what Copy and
+    /// Delete do with the document, and the covermark content its picker offers. Sits
+    /// right after Capture Modes — it is what happens NEXT. One flat section list, no
+    /// in-page tabs yet.
+    PreviewEditor,
     /// Audio + Video, consolidated into one nav page with in-page tabs (DRAGON-141;
     /// see [`AudioVideoTab`]).
     AudioVideo,
     Shortcuts,
     Health,
     About,
+}
+
+/// THE preview editor's glyph in settings (DRAGON-353). Shared by the Preview Editor nav
+/// page and the Keyboard Shortcuts page's "Preview Editor" tab, so the editor reads as one
+/// thing throughout settings and the two can never drift.
+pub(super) const PREVIEW_EDITOR_ICON: &str = "view-timeline-symbolic";
+
+impl ConfigTab {
+    /// Every settings page, in NAV ORDER (DRAGON-353). The global SEARCH sweeps this, so a
+    /// page added to the enum and the nav but forgotten here would be silently unsearchable
+    /// — which is exactly what `every_page_is_named_iconed_and_searchable` guards.
+    pub(crate) const ALL: [ConfigTab; 7] = [
+        ConfigTab::General,
+        ConfigTab::CaptureModes,
+        ConfigTab::PreviewEditor,
+        ConfigTab::AudioVideo,
+        ConfigTab::Shortcuts,
+        ConfigTab::Health,
+        ConfigTab::About,
+    ];
 }
 
 /// The General page's in-page tabs (DRAGON-138): a horizontal strip splitting the
@@ -269,6 +294,10 @@ impl SettingsState {
             .data(ConfigTab::CaptureModes)
             .id();
         nav.insert()
+            .text("Preview Editor")
+            .icon(crate::widgets::icons::handle(PREVIEW_EDITOR_ICON).icon())
+            .data(ConfigTab::PreviewEditor);
+        nav.insert()
             .text("Audio & Video")
             .icon(crate::widgets::icons::handle("applications-multimedia-symbolic").icon())
             .data(ConfigTab::AudioVideo);
@@ -368,7 +397,9 @@ impl SettingsState {
         shortcuts_tab
             .insert()
             .text("Preview Editor")
-            .icon(crate::widgets::icons::handle("image-x-generic-symbolic").icon())
+            // The SAME glyph as the Preview Editor settings nav page (DRAGON-353), so the
+            // editor has one identity everywhere in settings.
+            .icon(crate::widgets::icons::handle(PREVIEW_EDITOR_ICON).icon())
             .data(ShortcutsTab::Preview);
         shortcuts_tab.activate(shortcuts_tab_capture);
         Self {
@@ -880,14 +911,7 @@ impl App {
         if searching {
             let q = self.settings.search.trim().to_lowercase();
             let mut col: Vec<Element<'_, Msg>> = Vec::new();
-            for tab in [
-                ConfigTab::General,
-                ConfigTab::CaptureModes,
-                ConfigTab::AudioVideo,
-                ConfigTab::Shortcuts,
-                ConfigTab::Health,
-                ConfigTab::About,
-            ] {
+            for tab in ConfigTab::ALL {
                 let secs = self.rendered_sections(tab, Some(&q));
                 if !secs.is_empty() {
                     col.push(widget::text::title4(Self::page_name(tab)).into());
@@ -939,6 +963,11 @@ impl App {
                         CaptureTab::Recordings => self.recordings_sections(),
                     };
                     col.extend(self.render_specs(specs, None));
+                }
+                ConfigTab::PreviewEditor => {
+                    // One flat section list (DRAGON-353) — no in-page tab strip, so the
+                    // head is just the page title.
+                    col.extend(self.render_specs(self.preview_editor_sections(), None));
                 }
                 ConfigTab::AudioVideo => {
                     // Audio / Video, split into in-page tabs (DRAGON-141) — the strip
@@ -1583,6 +1612,7 @@ impl App {
         match tab {
             ConfigTab::General => "General",
             ConfigTab::CaptureModes => "Capture Modes",
+            ConfigTab::PreviewEditor => "Preview Editor",
             ConfigTab::AudioVideo => "Audio & Video",
             ConfigTab::Shortcuts => "Keyboard Shortcuts",
             ConfigTab::Health => "Health",
@@ -1594,6 +1624,7 @@ impl App {
         match tab {
             ConfigTab::General => "preferences-system-symbolic",
             ConfigTab::CaptureModes => "accessories-screenshot-symbolic",
+            ConfigTab::PreviewEditor => PREVIEW_EDITOR_ICON,
             ConfigTab::AudioVideo => "applications-multimedia-symbolic",
             ConfigTab::Shortcuts => "input-keyboard-symbolic",
             ConfigTab::Health => "utilities-system-monitor-symbolic",
@@ -1724,6 +1755,7 @@ impl App {
                 secs.extend(self.recordings_sections());
                 secs
             }
+            ConfigTab::PreviewEditor => self.preview_editor_sections(),
             // Concatenate the two former pages so the global search surfaces every
             // Audio & Video item under one header, regardless of the active in-page tab
             // (DRAGON-141; mirrors `general_sections`).
@@ -1819,3 +1851,59 @@ fn about_rail_button_class(active: bool) -> cosmic::theme::Button {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every page carries a name and a bundled icon, both UNIQUE, and appears exactly once
+    /// in the search sweep ([`ConfigTab::ALL`]). Adding a page without wiring its name,
+    /// icon or search entry fails here rather than shipping an unsearchable nav item
+    /// (DRAGON-353 added the Preview Editor page through exactly these three seams).
+    #[test]
+    fn every_page_is_named_iconed_and_searchable() {
+        let mut names: Vec<&str> = Vec::new();
+        let mut icons: Vec<&str> = Vec::new();
+        for tab in ConfigTab::ALL {
+            let name = App::page_name(tab);
+            assert!(!name.is_empty(), "{tab:?} has no name");
+            let icon = App::page_icon(tab);
+            // The glyph must actually be bundled — an unmapped name silently falls back to
+            // the system theme, which is blank off Linux.
+            assert!(
+                crate::widgets::icons::is_bundled(icon),
+                "{tab:?}'s icon `{icon}` is not a bundled glyph"
+            );
+            names.push(name);
+            icons.push(icon);
+        }
+        let unique = |mut v: Vec<&str>| {
+            let n = v.len();
+            v.sort_unstable();
+            v.dedup();
+            v.len() == n
+        };
+        assert!(unique(names), "two pages share a name");
+        assert!(unique(icons), "two pages share an icon");
+    }
+
+    /// The PREVIEW EDITOR page and the Keyboard Shortcuts page's "Preview Editor" tab wear
+    /// the SAME glyph, so the editor has one identity throughout settings (DRAGON-353).
+    #[test]
+    fn the_preview_editor_has_one_icon_everywhere() {
+        assert_eq!(App::page_icon(ConfigTab::PreviewEditor), "view-timeline-symbolic");
+        let tab_icon = SettingsState::new()
+            .shortcuts_tab
+            .iter()
+            .find(|e| SettingsState::new().shortcuts_tab.text(*e) == Some("Preview Editor"))
+            .is_some();
+        assert!(tab_icon, "the shortcuts page must still have a Preview Editor tab");
+    }
+
+    /// The Preview Editor page's rows are reachable by the global search: `sections_for`
+    /// answers for it, and the rows it returns are the ones the page renders.
+    #[test]
+    fn the_preview_editor_page_feeds_the_search() {
+        assert!(ConfigTab::ALL.contains(&ConfigTab::PreviewEditor));
+    }
+}

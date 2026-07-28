@@ -230,6 +230,25 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
         // the environment concurrently with this write.
         unsafe { std::env::set_var("ICED_PRESENT_MODE", mode) };
     }
+    // DRAGON-354: register the two embedded annotation faces (Excalifont / Inter) with the
+    // GLOBAL cosmic-text font system SYNCHRONOUSLY, here — BEFORE `cosmic::app::run` below
+    // creates the renderer/compositor. This is the ONE reliable seam. The prior attempt loaded
+    // them with the async `cosmic::iced::font::load` Task dispatched from `App::init`, but that
+    // races the compositor's LAZY creation: iced_winit only creates the compositor on the FIRST
+    // `WindowCreated`, and its `LoadFont` action handler is a silent no-op while the compositor
+    // is still `None` — so an init-time font-load is dropped and never retried, and the family
+    // names never enter the shared db (the dropdown labels fell back to the UI font forever).
+    // Loading straight into the process-global `font_system()` mirrors libcosmic's own
+    // `preload_fonts` (its OpenSans/Noto faces) and guarantees "Excalifont"/"Inter" resolve for
+    // `Font::with_name` before any text is shaped, in every window/surface.
+    {
+        use std::borrow::Cow;
+        if let Ok(mut fs) = cosmic::iced::advanced::graphics::text::font_system().write() {
+            for (_family, bytes) in preview::text_annot::UI_FONT_FACES {
+                fs.load_font(Cow::Borrowed(bytes));
+            }
+        }
+    }
     let settings = cosmic::app::Settings::default()
         .no_main_window(true)
         .exit_on_close(false);
@@ -1422,17 +1441,26 @@ pub struct App {
     /// Live keyboard-shortcut bindings (`Action -> Shortcut`) — the single source of
     /// truth for key handling and the Keyboard Shortcuts settings page.
     keymap: crate::shortcuts::Keymap,
-    /// Show the post-capture preview window instead of immediately saving/copying.
-    preview_after_capture: bool,
     /// Set by the "Copy selection" region quick-action (primary+C in region-draw mode):
-    /// the in-flight capture must force-copy to the clipboard and finish WITHOUT the
-    /// preview, regardless of the persisted `preview_after_capture` / `copy_to_clipboard`
-    /// settings. Consumed once by the capture-completion share path.
+    /// the in-flight capture must force-copy to the clipboard and finish WITHOUT ever
+    /// opening the preview editor. Consumed once by the capture-completion share path.
+    /// (DRAGON-353: the editor otherwise ALWAYS opens — the `preview_after_capture`
+    /// setting is gone — so this flag is the one remaining deliberate bypass.)
     copy_selection_pending: bool,
     /// Preview editor appearance: `true` = resizable window, `false` = overlay (setting).
     preview_windowed: bool,
-    /// Auto-close the preview editor after a Save / Save As / Copy (setting; default on).
-    auto_close_preview: bool,
+    /// Preview editor (DRAGON-355): a manual Copy saves the document first (setting; default
+    /// on), through the normal save-target rule. Split from the old "save & close on copy" —
+    /// independent of `preview_close_on_copy`. The open-time automatic copy never triggers it.
+    preview_save_on_copy: bool,
+    /// Preview editor (DRAGON-355): a manual Copy closes the document once the clipboard has
+    /// it (setting; default on), held briefly so the copy toast can be read and aborted if
+    /// the copy fails. Split from the old "save & close on copy"; independent of
+    /// `preview_save_on_copy`. With save off, a close over unsaved edits asks first.
+    preview_close_on_copy: bool,
+    /// Preview editor (DRAGON-353): Delete copies to the clipboard first (setting;
+    /// default on), so the pixels outlive the file.
+    preview_copy_on_delete: bool,
     /// Mute other apps' audio while a video preview with sound is playing (restored on close).
     mute_others_during_preview: bool,
     /// Duck the recorded system audio while the mic hears speech (DRAGON-128; persisted).
@@ -1793,10 +1821,11 @@ pub struct App {
     external_recording: bool,
     /// Where screenshots are saved (persisted; `~` expanded).
     screenshot_dir: String,
-    /// Copy a capture to the clipboard when it's at or under the size limit
-    /// (persisted; default on) + the limit in MB + its live text-field buffer.
-    copy_to_clipboard: bool,
-    clipboard_max_mb: NumField<u32>,
+    // DRAGON-353: `clipboard_max_mb` (the "Clipboard size limit" NumField) lived here.
+    // The automatic copy is still bounded, but by the fixed
+    // `crate::share::AUTO_COPY_MAX_BYTES` rather than a setting — the editor toasts a
+    // named error when it declines a copy for size, so there is nothing left for a knob
+    // to pre-empt.
     /// Record microphone / system audio with videos (persisted; default off). Only
     /// toggleable in video mode.
     record_mic: bool,
@@ -1968,6 +1997,18 @@ pub struct App {
     /// Persisted last-selected annotation stroke width (SOURCE px), 5px default. Seeds
     /// `EditState::annot_stroke_w` on every preview open and new box/arrow shapes.
     annot_stroke_w: f32,
+    /// Persisted remembered sequence-badge ("step marker") side (SOURCE px) — the last one
+    /// placed or resized in ANY editor. `0.0` = unset (fall back to
+    /// `preview::annotate::DEFAULT_BADGE_SIZE`). Seeds `EditState::annot_badge_size` on every
+    /// preview open, and every placement/resize writes back through
+    /// `App::remember_badge_size`, so the size survives new capture processes and restarts.
+    annot_badge_size: f32,
+    /// Persisted last-selected TEXT size (SOURCE px) and FONT family (DRAGON-354), so a fresh
+    /// preview opens the text tool at them. `0.0` size = unset (fall back to
+    /// `preview::text_annot::DEFAULT_TEXT_SIZE`). Seed `EditState::annot_text_size` /
+    /// `annot_text_font` on every preview open.
+    annot_text_size: f32,
+    annot_text_font: crate::app::preview::text_annot::TextFont,
     /// Persisted last-5 CUSTOM annotation colors (most-recent-first), shown as MRU swatches
     /// in the color flyout (DRAGON-321).
     annot_recent_colors: Vec<[u8; 4]>,

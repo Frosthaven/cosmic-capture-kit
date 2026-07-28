@@ -67,7 +67,7 @@ fn load_raw() -> Option<Persisted> {
 
 /// Current config schema version. Bump when a stored index changes meaning and
 /// add a guarded step in `migrate`.
-pub const CONFIG_VERSION: u32 = 7;
+pub const CONFIG_VERSION: u32 = 8;
 
 /// One-time migrations for configs saved by older versions, keyed on
 /// `config_version`. Idempotent — running it on an already-current config is a
@@ -164,6 +164,18 @@ fn migrate(p: &mut Persisted) {
             // (widths 3/1, shadow on, single-window = Active).
             _ => {}
         }
+    }
+    if p.config_version < 8 {
+        // v8 (DRAGON-355): the single "Automatically save & close on copy" toggle split into
+        // independent save-on-copy and close-on-copy. BOTH new settings inherit the old
+        // combined value, so on->on/on and off->off/off — the prior behaviour is unchanged
+        // until the user parts the two. The old key is a read-only `skip_serializing` field
+        // (see the schema) purely so its value is still readable here; this is the same
+        // deprecated-field + migrate pattern the v3 capture booleans used. New/absent keys
+        // deserialize to their `default_true`, so a config that predated even the combined
+        // key still lands on on/on.
+        p.preview_save_on_copy = p.preview_save_close_on_copy;
+        p.preview_close_on_copy = p.preview_save_close_on_copy;
     }
     // Version-independent safety net: an empty id (hand-edited config) falls back
     // to the platform default rather than persisting as unset.
@@ -277,11 +289,16 @@ record_fps = 60\n";
         assert_eq!(d.text_confidence, 20.0);
         assert_eq!(d.region_overlay_opacity, 0.66);
         assert_eq!(d.record_fps, 30);
-        assert!(d.copy_to_clipboard);
+        // DRAGON-353's preview-editor convenience toggles default ON (the settings-copy
+        // house style for "Automatically …" rows). DRAGON-355 split save-&-close into two,
+        // both still ON by default.
+        assert!(d.preview_save_on_copy);
+        assert!(d.preview_close_on_copy);
+        assert!(d.preview_copy_on_delete);
         assert_eq!(d.record_res_preset, 5); // 2K
         assert_eq!(d.nvenc_preset, "p4");
         assert_eq!(d.x264_preset, "fast");
-        assert_eq!(d.config_version, 7);
+        assert_eq!(d.config_version, 8);
         // DRAGON-174: the new toolbar-hiding setting defaults OFF (do not hide).
         assert!(!d.hide_toolbar_fullscreen);
         // Residency defaults on where the global hotkey needs the daemon (macOS AND Windows,
@@ -453,6 +470,25 @@ record_fps = 60\n";
         assert!(!old.win_login_item_seeded, "an old config without the key loads false");
     }
 
+    // The remembered STEP-MARKER side is persisted (it used to be session-only): a set value
+    // must survive a save so a later launch spawns markers at it, and an old config that
+    // predates the key must load as UNSET (0.0) — which the reader turns into
+    // `DEFAULT_BADGE_SIZE`, never into a zero-sized marker.
+    #[test]
+    fn annot_badge_size_persists_and_reads_unset_from_an_old_config() {
+        assert_eq!(defaults().annot_badge_size, 0.0, "fresh install remembers nothing");
+        let mut p = defaults();
+        p.annot_badge_size = 132.0;
+        let s = toml::to_string(&p).expect("serialize");
+        let q: Persisted = toml::from_str(&s).expect("parse back");
+        assert_eq!(q.annot_badge_size, 132.0, "a remembered side survives a save round trip");
+        // An old config (no key at all) parses cleanly and reads as unset — no migration owed.
+        let old: Persisted =
+            toml::from_str("annot_stroke_w = 8.0\n").expect("an old config must still parse");
+        assert_eq!(old.annot_stroke_w, 8.0, "its other annotation settings survive");
+        assert_eq!(old.annot_badge_size, 0.0, "absent key = unset (falls back to the default)");
+    }
+
     #[test]
     fn migrate_v3_maps_pipewire_booleans_to_backend_ids() {
         // An old (v2) config's method booleans become backend ids exactly once.
@@ -607,6 +643,37 @@ record_fps = 60\n";
     }
 
     #[test]
+    fn migrate_v8_splits_save_close_on_copy_into_two_and_never_writes_the_old_key() {
+        // DRAGON-355: a pre-v8 config carries the combined `preview_save_close_on_copy`;
+        // both new independent settings inherit its value on the one-time migration, and the
+        // old key is never written back.
+        for old in [true, false] {
+            let s = format!("preview_save_close_on_copy = {old}\nconfig_version = 7\n");
+            let mut p: super::Persisted = toml::from_str(&s).expect("parse");
+            migrate(&mut p);
+            assert_eq!(p.config_version, CONFIG_VERSION);
+            assert_eq!(p.preview_save_on_copy, old, "save-on-copy inherits the combined value");
+            assert_eq!(p.preview_close_on_copy, old, "close-on-copy inherits the combined value");
+        }
+        // A config that predated even the combined key (absent) still lands on on/on — the
+        // deprecated field's `default_true` feeds both.
+        let mut absent: super::Persisted =
+            toml::from_str("config_version = 7\n").expect("parse");
+        migrate(&mut absent);
+        assert!(absent.preview_save_on_copy && absent.preview_close_on_copy);
+        // The retired key must not reappear on disk.
+        let written = toml::to_string(&defaults()).expect("serialize");
+        assert!(!written.contains("preview_save_close_on_copy"), "got: {written}");
+        // A v8+ config is left ALONE — the split step never re-runs and clobbers a parted
+        // choice (save off, close on).
+        let mut current = defaults();
+        current.preview_save_on_copy = false;
+        current.preview_close_on_copy = true;
+        migrate(&mut current);
+        assert!(!current.preview_save_on_copy && current.preview_close_on_copy);
+    }
+
+    #[test]
     fn window_border_style_is_never_written() {
         // v7 retired the field: it must not appear on disk (its presence is what marks
         // a pre-v7 config for the one-time migration).
@@ -684,5 +751,60 @@ record_fps = 60\n";
         // And the key is never WRITTEN again: a fresh save carries no trace of it.
         let s = toml::to_string(&defaults()).expect("serialize");
         assert!(!s.contains("allow_multiple"), "got: {s}");
+    }
+
+    #[test]
+    fn old_preview_workflow_keys_are_ignored_on_load() {
+        // DRAGON-353 retired four preview-workflow settings — `auto_close_preview`
+        // ("Automatically close the preview editor on save or copy"), `copy_to_clipboard`
+        // ("Automatically copy to clipboard"), `preview_after_capture` ("Open in preview
+        // editor") and `clipboard_max_mb` ("Clipboard size limit"). The first three
+        // behaviours are unconditional now; the fourth is the fixed
+        // `share::AUTO_COPY_MAX_MB` (the editor toasts a named error when it declines an
+        // automatic copy for size, so the knob only pre-empted a readable failure). EVERY
+        // existing config carries all four keys (each was always serialized), so serde must
+        // silently DROP them: an unknown key must never fail the parse, because `load()`
+        // answers a failed parse with `defaults()`, which would wipe every other setting.
+        // Same treatment as the retired `allow_multiple` / `recording_tray` /
+        // `preview_float_cosmic` keys, and both on-disk formats are covered: TOML (current)
+        // and legacy RON.
+        const RETIRED: [(&str, &str); 4] = [
+            ("auto_close_preview", "true"),
+            ("copy_to_clipboard", "true"),
+            ("preview_after_capture", "true"),
+            ("clipboard_max_mb", "42"),
+        ];
+        for (key, sample) in RETIRED {
+            for value in ["false", sample] {
+                let toml_on_disk =
+                    format!("record_dir = \"~/Videos\"\n{key} = {value}\nrecord_fps = 60\n");
+                let p: super::Persisted = toml::from_str(&toml_on_disk)
+                    .unwrap_or_else(|e| panic!("a retired {key} = {value} must not fail: {e}"));
+                assert_eq!(p.record_dir, "~/Videos", "settings BEFORE {key} survive");
+                assert_eq!(p.record_fps, 60, "settings AFTER {key} survive");
+            }
+            let ron_on_disk =
+                format!("(record_dir: \"~/Videos\", {key}: {sample}, record_fps: 60)");
+            let q: super::Persisted = ron::from_str(&ron_on_disk)
+                .unwrap_or_else(|e| panic!("a legacy RON {key} must not fail: {e}"));
+            assert_eq!(q.record_dir, "~/Videos");
+            assert_eq!(q.record_fps, 60);
+        }
+
+        // A config carrying ALL FOUR at once (what every real upgrade looks like) still
+        // loads with every remaining setting intact.
+        let all = "record_dir = \"~/Videos\"\nauto_close_preview = false\n\
+                   copy_to_clipboard = false\npreview_after_capture = false\n\
+                   clipboard_max_mb = 42\nrecord_fps = 60\n";
+        let p: super::Persisted =
+            toml::from_str(all).expect("a config with every retired key must still load");
+        assert_eq!(p.record_dir, "~/Videos");
+        assert_eq!(p.record_fps, 60, "the surviving settings still read");
+
+        // And none of them is ever WRITTEN again.
+        let s = toml::to_string(&defaults()).expect("serialize");
+        for (key, _) in RETIRED {
+            assert!(!s.contains(key), "{key} must not be written; got: {s}");
+        }
     }
 }

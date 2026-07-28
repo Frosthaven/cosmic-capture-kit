@@ -27,19 +27,33 @@
 //! `window::Id` is a process-unique counter (`Copy + Eq + Hash`), so it is used directly —
 //! no hashing, no collisions.
 //!
-//! The remaining per-SURFACE invariant: at most ONE `LayerStack` may be mounted in a given
-//! window's view, because the prune below treats a primitive's key set as the whole truth
-//! FOR THE WINDOWS IT DREW. Two `LayerStack`s in one window would still take turns deleting
-//! each other's slots (which is why the Windows overlay folds base + covermark into a single
-//! stack — see `image.rs`/`video.rs`). Different windows are now independent.
+//! A window MAY mount several `LayerStack`s (DRAGON-373 — the text annotations are one layer per
+//! item, drawn by the `AnnotationCanvas` so they can interleave with the vector kinds in true
+//! z-order), on ONE condition: every stack of that window must carry the same window-wide key set
+//! in [`LayerStack::part`]. The prune below reclaims what a window stopped drawing, and it reads
+//! that set rather than the individual primitive's layers — without it, each stack's prepare
+//! would delete the others' slots and every layer would flicker. [`LayerStack::new`] is the
+//! single-stack form (the window's layers ARE its whole intent). Different windows are
+//! independent either way.
 //!
 //! Adding a new editable layer:
 //! 1. Add a new [`LayerSlot`] const — the stable WITHIN-window identity of its texture slot.
 //! 2. Produce its pixels off-thread as an `Arc<PixelFrame>`, tracked by a [`RasterSlot`]
 //!    (coalesces overlapping refresh requests, drops stale results).
-//! 3. Push a `Layer { key: LayerKey::new(preview.window, SLOT), frame }` into the `Vec`
+//! 3. Push a `Layer::full(LayerKey::new(preview.window, SLOT), frame)` into the `Vec`
 //!    passed to `LayerStack::new` in the view — draw order follows the `Vec`'s order, NOT
-//!    key order.
+//!    key order. If the layer's content occupies only PART of the picture, use
+//!    `Layer::at(key, frame, dest)` and raster only that region — see [`Layer::dest`].
+//!
+//! # Sizing a layer's raster (DRAGON-362)
+//! Two rules, both cost-critical on a large (5K+) capture:
+//! * Raster at the layer's ON-SCREEN device-pixel size, via `edit::layer_raster_scale`
+//!   (`view_zoom × preview_visual_scale`), capped at the source frame and at
+//!   `edit::MAX_LAYER_DIM`. Smaller than that and the layer is UPSAMPLED into a canvas whose
+//!   base image was DOWNSAMPLED — the "fuzzy overlay beside crisp pixels" defect.
+//! * Raster only the region the content covers ([`Layer::dest`]). Both the CPU render and the
+//!   GPU upload are `O(raster area)`, and layers that re-render per keystroke (text) must not
+//!   pay for the whole capture.
 
 use cosmic::iced::widget::shader::{self, Viewport};
 use cosmic::iced::wgpu;
@@ -98,8 +112,34 @@ impl LayerSlot {
     pub const VIDEO: LayerSlot = LayerSlot(0);
     /// The covermark overlay raster. (The region effects — highlight / pixelate / blur — are
     /// NOT a raster layer: they render in real time through the `annotation_fx` GPU shader,
-    /// DRAGON-330; box/arrow stay vector geometry drawn by the `AnnotationCanvas`.)
+    /// DRAGON-330; box/arrow stay vector geometry drawn by the `AnnotationCanvas`, which since
+    /// DRAGON-373 also draws the per-item TEXT layers so they interleave with those vectors.)
     pub const COVERMARK: LayerSlot = LayerSlot(1);
+    /// Where the per-text-item slots start (DRAGON-373). Well clear of the fixed slots above,
+    /// and of any that get added beside them.
+    const TEXT_BASE: u32 = 0x8000_0000;
+
+    /// The raster of ONE text annotation (DRAGON-354, split per item by DRAGON-373): its glyphs
+    /// drawn by the shared embedded-font renderer. A raster layer (not a canvas vector) so the
+    /// glyphs are pixel-identical to the bake and a per-keystroke re-render never churns iced's
+    /// atlas.
+    ///
+    /// # Why one slot PER ITEM rather than one for all text
+    /// The live view has to interleave text with the vector kinds in true z-order — a rectangle
+    /// brought over one caption and under another is an ordinary thing to draw, and the bake has
+    /// always rendered it that way (`rasterize_scene` walks every kind in ONE in-order loop). A
+    /// single composited text raster can only ever sit at ONE depth, so it cannot express that
+    /// however it is stacked. Per item, the canvas simply draws each raster at its own place in
+    /// the item order and interleaving falls out. It is also cheaper for captions that are far
+    /// apart: the old shared layer had to span their UNION, which on a large capture is most of
+    /// the picture, while each item's raster tracks only its own ink.
+    ///
+    /// `id` is the annotation's id — a per-document monotonic counter (`EditState::next_annot_id`)
+    /// that starts at 1, so the low 32 bits identify it uniquely in any real scene, and slots are
+    /// window-scoped ([`LayerKey`]) so two documents can never collide at all.
+    pub fn text(id: u64) -> LayerSlot {
+        LayerSlot(Self::TEXT_BASE.wrapping_add(id as u32))
+    }
 }
 
 /// A layer's stable IDENTITY — maps to one persistent GPU texture slot that updates in
@@ -131,17 +171,53 @@ impl LayerKey {
         Self::new(window, LayerSlot::COVERMARK)
     }
 
+    /// This window's raster for the text annotation `id` (DRAGON-354/373).
+    pub fn text(window: window::Id, id: u64) -> Self {
+        Self::new(window, LayerSlot::text(id))
+    }
+
     /// The window this slot belongs to — what makes the prune window-scoped.
     pub fn window(self) -> window::Id {
         self.window
     }
 }
 
-/// One layer to draw: a stable identity plus the pixels currently on it.
+/// Where in the widget's bounds a layer's texture is drawn, as `[x, y, w, h]` FRACTIONS of
+/// those bounds (y down from the top). [`DEST_FULL`] — the whole canvas — is what every layer
+/// did before DRAGON-362.
+pub type Dest = [f32; 4];
+
+/// The whole widget: the placement every full-frame layer (video, covermark) uses.
+pub const DEST_FULL: Dest = [0.0, 0.0, 1.0, 1.0];
+
+/// One layer to draw: a stable identity, the pixels currently on it, and WHERE in the canvas
+/// they go ([`Layer::dest`]).
 #[derive(Clone, Debug)]
 pub struct Layer {
     pub key: LayerKey,
     pub frame: Arc<PixelFrame>,
+    /// The sub-rect of the widget's bounds this layer covers, in `[x, y, w, h]` fractions
+    /// (see [`Dest`]). [`DEST_FULL`] for a layer whose raster spans the whole picture.
+    ///
+    /// WHY a layer may cover only PART of the canvas (DRAGON-362): a full-frame raster costs
+    /// `O(frame area)` to render AND to upload, and the text layer re-renders on every
+    /// keystroke — at 5120×2880 that is ~59 MB and ~82 ms per event, which is what made the
+    /// editor unusable on a large capture. A layer whose content occupies a small region
+    /// (a caption) rasters just that region and places it here instead, so its cost tracks
+    /// the CONTENT's area rather than the capture's.
+    pub dest: Dest,
+}
+
+impl Layer {
+    /// A layer whose raster spans the whole picture (video frames, the covermark).
+    pub fn full(key: LayerKey, frame: Arc<PixelFrame>) -> Self {
+        Self { key, frame, dest: DEST_FULL }
+    }
+
+    /// A layer whose raster covers only `dest` (fractions of the canvas) — see [`Layer::dest`].
+    pub fn at(key: LayerKey, frame: Arc<PixelFrame>, dest: Dest) -> Self {
+        Self { key, frame, dest }
+    }
 }
 
 /// The `shader::Program` placed in the view, holding the layers to draw (in order) plus
@@ -149,13 +225,26 @@ pub struct Layer {
 pub struct LayerStack {
     layers: Vec<Layer>,
     live: Vec<window::Id>,
+    /// See [`LayerStackPrimitive::window_keys`]. Equal to `layers`' keys for a window that
+    /// mounts exactly one stack.
+    window_keys: Vec<LayerKey>,
 }
 
 impl LayerStack {
-    /// `live` must be EVERY open preview window (`App::live_preview_windows`), not just the
-    /// one drawing — it is what lets this primitive free a CLOSED preview's textures.
+    /// The whole of a window's layer stack: `layers` is everything that window draws this
+    /// frame. `live` must be EVERY open preview window (`App::live_preview_windows`), not just
+    /// the one drawing — it is what lets this primitive free a CLOSED preview's textures.
     pub fn new(layers: Vec<Layer>, live: Vec<window::Id>) -> Self {
-        Self { layers, live }
+        let window_keys = layers.iter().map(|l| l.key).collect();
+        Self { layers, live, window_keys }
+    }
+
+    /// PART of a window's layer stack (DRAGON-373): this primitive draws `layers`, while
+    /// `window_keys` is every key the owning window draws THIS FRAME across all of its
+    /// primitives. See [`LayerStackPrimitive::window_keys`] for why that is needed the moment a
+    /// window mounts more than one stack.
+    pub fn part(layers: Vec<Layer>, live: Vec<window::Id>, window_keys: Vec<LayerKey>) -> Self {
+        Self { layers, live, window_keys }
     }
 }
 
@@ -165,7 +254,11 @@ impl<Message> shader::Program<Message> for LayerStack {
 
     fn draw(&self, _state: &(), _cursor: mouse::Cursor, _bounds: Rectangle) -> LayerStackPrimitive {
         // Arc clones are cheap — this runs every view build.
-        LayerStackPrimitive { layers: self.layers.clone(), live: self.live.clone() }
+        LayerStackPrimitive {
+            layers: self.layers.clone(),
+            live: self.live.clone(),
+            window_keys: self.window_keys.clone(),
+        }
     }
 }
 
@@ -185,6 +278,19 @@ pub struct LayerStackPrimitive {
     /// safety property: a preview that has just opened and has not yet been prepared is
     /// still open, so it is in here, so another window's prepare cannot wipe it.
     live: Vec<window::Id>,
+    /// Every layer key the OWNING WINDOW draws this frame — across ALL of its primitives, not
+    /// just this one (DRAGON-373).
+    ///
+    /// The within-window reclaim (rule 2 of [`slot_survives`]) frees whatever the window stopped
+    /// drawing, and it needs the window's whole intent to do that. While a window mounted exactly
+    /// one `LayerStack` its own layers WERE that intent, which is why this used to be implicit.
+    /// Since the text annotations became one layer per item drawn by the `AnnotationCanvas` (so
+    /// they can interleave with the vector kinds in true z-order), a window submits several
+    /// stacks per frame — and with the implicit rule each one's prepare would delete the others'
+    /// slots, so every layer would be re-created every frame and each would VANISH on the frames
+    /// it lost. Carrying the same window-wide key set in every primitive makes the reclaim agree
+    /// with itself however many stacks a window mounts.
+    window_keys: Vec<LayerKey>,
 }
 
 impl shader::Primitive for LayerStackPrimitive {
@@ -198,19 +304,31 @@ impl shader::Primitive for LayerStackPrimitive {
         _bounds: &Rectangle,
         _viewport: &Viewport,
     ) {
+        // DRAGON-366 (TEMPORARY): time the prepare and record, per layer, whether this frame
+        // actually re-uploaded its raster — a layer re-uploading every frame is paying its
+        // full raster cost per frame. Remove with `crate::widgets::dragon366`.
+        let d366_start = std::time::Instant::now();
+        let mut d366_uploads: Vec<(u32, u32, u32, bool)> = Vec::with_capacity(self.layers.len());
         for layer in &self.layers {
-            pipeline.upsert(device, queue, layer.key, &layer.frame);
+            let before = pipeline.slots.get(&layer.key).map(|s| s.seq);
+            pipeline.upsert(device, queue, layer.key, &layer.frame, layer.dest);
+            let uploaded = before != Some(layer.frame.seq);
+            d366_uploads.push((layer.key.slot.0, layer.frame.w, layer.frame.h, uploaded));
         }
+        crate::widgets::dragon366::layers_prepared(
+            d366_start.elapsed().as_secs_f64() * 1000.0,
+            &d366_uploads,
+        );
         // Two reclaims in one pass over the process-wide slot map:
-        //  * WITHIN a window this primitive drew, anything it stopped pushing (e.g. the
-        //    covermark was cleared) is freed — at most one LayerStack exists per window, so
-        //    its key set IS the whole picture for that window.
+        //  * WITHIN a window this primitive drew, anything the WINDOW stopped drawing (e.g. the
+        //    covermark was cleared, or a text box was deleted) is freed — `window_keys` is that
+        //    window's whole intent for this frame, so several stacks in one window agree.
         //  * For any window that is no longer an OPEN preview, everything is freed — the
         //    closed-preview leak, which no prepare OF THAT WINDOW can ever fix because that
         //    window is never drawn again.
         // Anything else — another LIVE window's slots — is untouchable here.
-        let present: HashSet<LayerKey> = self.layers.iter().map(|l| l.key).collect();
-        let drawn: HashSet<window::Id> = present.iter().map(|k| k.window()).collect();
+        let present: HashSet<LayerKey> = self.window_keys.iter().copied().collect();
+        let drawn: HashSet<window::Id> = self.layers.iter().map(|l| l.key.window()).collect();
         let live: HashSet<window::Id> = self.live.iter().copied().collect();
         pipeline.slots.retain(|k, _| slot_survives(*k, &present, &drawn, &live));
     }
@@ -221,22 +339,26 @@ impl shader::Primitive for LayerStackPrimitive {
 }
 
 /// The prune predicate, split out as pure logic so it can be unit-tested without a GPU:
-/// does the existing texture slot `key` survive a prepare whose layer keys are `present`
-/// (belonging to the windows `drawn`), given that `live` are the preview windows currently
+/// does the existing texture slot `key` survive a prepare that drew layers for the windows
+/// `drawn`, whose owning windows intend to draw `present` this frame
+/// ([`LayerStackPrimitive::window_keys`]), given that `live` are the preview windows currently
 /// OPEN?
 ///
 /// Two independent reasons to free a slot, and nothing else may:
 /// 1. **Its window is closed** — not in `live`. This is the reclaim for a preview that went
 ///    away while others stayed open; no prepare of that window will ever run again.
-/// 2. **Its window WAS drawn by this primitive and the slot wasn't in it** — the
-///    within-window reclaim (a cleared covermark), unchanged from before.
+/// 2. **Its window WAS drawn by this primitive and the WINDOW isn't drawing that slot** — the
+///    within-window reclaim (a cleared covermark, a deleted text box). `present` is the
+///    window's whole frame, not this primitive's share of it, so a window that mounts several
+///    stacks reclaims the same set from every one of them (DRAGON-373).
 ///
 /// The safety property that makes (1) sound is that `live` is the set of OPEN previews, not
 /// of drawn ones: a preview that has just opened and has not yet been prepared is open, so
 /// it is in `live`, so another window's prepare leaves it alone. As a belt for a caller that
 /// somehow has no live set at all, an EMPTY `live` disables (1) entirely rather than wiping
 /// the process's slots — an unknown set must never be read as "everything is closed".
-/// An empty primitive (`present` empty ⇒ `drawn` empty) likewise prunes nothing under (2).
+/// A primitive that drew NOTHING (`drawn` empty) likewise prunes nothing under (2), whatever
+/// `present` says — a window only reclaims on a frame it actually rendered.
 fn slot_survives(
     key: LayerKey,
     present: &HashSet<LayerKey>,
@@ -253,11 +375,20 @@ fn slot_survives(
     !drawing || present.contains(&key)
 }
 
-/// One layer's persistent GPU texture + the bind group wrapping it.
+/// One layer's persistent GPU texture + the bind group wrapping it, plus the small uniform
+/// carrying its [`Layer::dest`] placement.
 struct TextureSlot {
     texture: wgpu::Texture,
+    /// The 16-byte placement uniform (`vec4<f32>` = `[x, y, w, h]` fractions of the widget).
+    /// Lives alongside the texture in the SAME bind group, so it is created once with the
+    /// slot and only re-WRITTEN (never reallocated) when the placement moves.
+    dest_buf: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     dims: (u32, u32),
+    /// The placement currently in `dest_buf`, so a redraw with an unchanged rect skips the
+    /// write — the same "only touch the GPU when something actually changed" rule the `seq`
+    /// check applies to the pixels.
+    dest: Dest,
     seq: u64,
 }
 
@@ -308,6 +439,18 @@ impl shader::Pipeline for LayerStackPipeline {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // The per-slot placement rect (DRAGON-362), read by the VERTEX stage to put
+                // the quad somewhere other than the whole canvas.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -378,7 +521,15 @@ impl LayerStackPipeline {
     /// Upsert `key`'s slot: (re)create its texture when missing or its dimensions
     /// changed (forcing a re-upload below), then upload `frame`'s pixels — but skip the
     /// upload when the frame hasn't changed since last time (its `seq` already matches).
-    fn upsert(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: LayerKey, frame: &PixelFrame) {
+    /// `dest` is the layer's placement; it is only written when it actually moved.
+    fn upsert(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: LayerKey,
+        frame: &PixelFrame,
+        dest: Dest,
+    ) {
         let (w, h) = (frame.w, frame.h);
         if w == 0 || h == 0 {
             return;
@@ -399,6 +550,12 @@ impl LayerStackPipeline {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let dest_buf = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("cck-video-dest"),
+                size: std::mem::size_of::<Dest>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("cck-video-bg"),
                 layout: &self.bind_group_layout,
@@ -411,11 +568,35 @@ impl LayerStackPipeline {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: dest_buf.as_entire_binding(),
+                    },
                 ],
             });
-            self.slots.insert(key, TextureSlot { texture, bind_group, dims: (w, h), seq: 0 });
+            // A sentinel placement that can never equal a real one, so the write below always
+            // runs for a fresh slot (the buffer's contents are undefined until it does).
+            self.slots.insert(
+                key,
+                TextureSlot {
+                    texture,
+                    dest_buf,
+                    bind_group,
+                    dims: (w, h),
+                    dest: [f32::NAN; 4],
+                    seq: 0,
+                },
+            );
         }
         let slot = self.slots.get_mut(&key).expect("just inserted above when missing");
+        if slot.dest != dest {
+            let mut bytes = [0u8; std::mem::size_of::<Dest>()];
+            for (i, v) in dest.iter().enumerate() {
+                bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+            }
+            queue.write_buffer(&slot.dest_buf, 0, &bytes);
+            slot.dest = dest;
+        }
         if slot.seq != frame.seq {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -454,8 +635,13 @@ impl LayerStackPipeline {
     }
 }
 
-/// Fullscreen-quad vertex shader (the render pass is scissored to the widget's bounds) +
-/// a texture-sampling fragment shader.
+/// Placed-quad vertex shader + a texture-sampling fragment shader.
+///
+/// iced sets the render pass's VIEWPORT to the widget's physical bounds (and the scissor to
+/// its visible clip) before calling `Primitive::draw`, so clip space `-1..1` IS the widget
+/// rectangle — no bounds transform belongs here. The quad is then placed WITHIN that
+/// rectangle by the per-slot `dest` uniform (`[x, y, w, h]` fractions, y down from the top);
+/// `DEST_FULL` = `(0, 0, 1, 1)` reproduces the historical full-widget quad exactly.
 const WGSL: &str = r#"
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -464,20 +650,23 @@ struct VsOut {
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var<uniform> dest: vec4<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
-    var positions = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(-1.0, 1.0),
-        vec2<f32>(-1.0, 1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0)
-    );
-    var uvs = array<vec2<f32>, 6>(
+    // The unit quad in TOP-DOWN texture space; the same six corners as the uv table below,
+    // so corner k's uv is exactly its position in the destination rect.
+    var corners = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0)
     );
+    let c = corners[idx];
+    // Unit quad -> destination rect (widget fractions, y down) -> clip space (y up).
+    let fx = dest.x + c.x * dest.z;
+    let fy = dest.y + c.y * dest.w;
     var out: VsOut;
-    out.pos = vec4<f32>(positions[idx], 0.0, 1.0);
-    out.uv = uvs[idx];
+    out.pos = vec4<f32>(fx * 2.0 - 1.0, 1.0 - fy * 2.0, 0.0, 1.0);
+    out.uv = c;
     return out;
 }
 
@@ -573,12 +762,24 @@ mod tests {
         PixelFrame::new(vec![0, 0, 0, 0], 1, 1)
     }
 
-    /// The slot prune, exercised exactly as `prepare` runs it: `held` are the slots the
-    /// process-wide pipeline currently holds, `layers` the keys of the primitive being
-    /// prepared, `open` the preview windows still open. Returns the surviving slots.
+    /// The slot prune, exercised exactly as `prepare` runs it for a window that mounts ONE
+    /// stack: `held` are the slots the process-wide pipeline currently holds, `layers` the keys
+    /// of the primitive being prepared (which are then also its window's whole intent), `open`
+    /// the preview windows still open. Returns the surviving slots.
     fn prune(held: &[LayerKey], layers: &[LayerKey], open: &[window::Id]) -> Vec<LayerKey> {
-        let present: HashSet<LayerKey> = layers.iter().copied().collect();
-        let drawn: HashSet<window::Id> = present.iter().map(|k| k.window()).collect();
+        prune_part(held, layers, layers, open)
+    }
+
+    /// The prune for ONE primitive of a window that mounts SEVERAL stacks (DRAGON-373):
+    /// `layers` is this primitive's share, `window_keys` the whole window's frame.
+    fn prune_part(
+        held: &[LayerKey],
+        layers: &[LayerKey],
+        window_keys: &[LayerKey],
+        open: &[window::Id],
+    ) -> Vec<LayerKey> {
+        let present: HashSet<LayerKey> = window_keys.iter().copied().collect();
+        let drawn: HashSet<window::Id> = layers.iter().map(|k| k.window()).collect();
         let live: HashSet<window::Id> = open.iter().copied().collect();
         held.iter().copied().filter(|k| slot_survives(*k, &present, &drawn, &live)).collect()
     }
@@ -657,6 +858,33 @@ mod tests {
         );
         // Belt: an EMPTY live set means "unknown", never "everything closed".
         assert_eq!(prune(&held, &[LayerKey::video(a)], &[]), held.to_vec());
+    }
+
+    /// DRAGON-373: a window that mounts SEVERAL stacks in one frame (the covermark stack plus a
+    /// text layer per annotation, so text can interleave with the vector kinds) must reclaim the
+    /// same set from every one of them. Each primitive carries the window's whole frame, so no
+    /// stack's prepare can delete another's slots — the failure this replaced was every layer
+    /// being destroyed and re-created each frame, and vanishing on the frames it lost.
+    #[test]
+    fn several_stacks_in_one_window_never_delete_each_others_slots() {
+        let w = window::Id::unique();
+        let (cm, t1, t2) = (LayerKey::covermark(w), LayerKey::text(w, 1), LayerKey::text(w, 2));
+        let held = [cm, t1, t2];
+        let frame = [cm, t1, t2];
+        // The covermark stack's prepare, then each text layer's: all three survive every one.
+        for part in [&[cm][..], &[t1][..], &[t2][..]] {
+            assert_eq!(
+                prune_part(&held, part, &frame, &[w]),
+                held.to_vec(),
+                "the stack drawing {part:?} deleted another stack's slots"
+            );
+        }
+        // …and the within-window reclaim still works on the WINDOW's intent: delete text box 2
+        // and its slot goes, on the very next prepare of any of the window's stacks.
+        let frame = [cm, t1];
+        for part in [&[cm][..], &[t1][..]] {
+            assert_eq!(prune_part(&held, part, &frame, &[w]), vec![cm, t1]);
+        }
     }
 
     /// Single-window behaviour is unchanged (the pre-scoping semantics): everything the

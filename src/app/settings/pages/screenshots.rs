@@ -190,27 +190,10 @@ impl crate::app::App {
                 items: win_items,
             });
         }
-        // Covermarks: the custom-text covermark's content (used by the preview
-        // overlay's "Custom text" choice), plus a hint for where to drop more SVGs.
-        secs.push(SectionSpec {
-            title: "Covermarks",
-            items: vec![
-                Item::new(
-                    "Custom overlayed text",
-                    format!("Covermark SVG loaded from:\n{}", covermark_dir_display()),
-                    crate::widgets::hide_when_clipped(
-                        widget::text_input("CONFIGURE TEXT IN SETTINGS", &self.covermark_text)
-                            .on_input(|a0| Msg::Settings(SettingsMsg::SetCovermarkText(a0)))
-                            .width(Length::Fixed(280.0)),
-                    ),
-                )
-                .reset_with(
-                    self.covermark_text.clone(),
-                    d.covermark_text.clone(),
-                    |a0| Msg::Settings(SettingsMsg::SetCovermarkText(a0)),
-                ),
-            ],
-        });
+        // DRAGON-353: the "Covermarks" section lived here. It configures the PREVIEW
+        // EDITOR's covermark picker rather than anything about taking a screenshot, so it
+        // moved verbatim to the Preview Editor page (`pages/preview_editor.rs`) — same
+        // field, message and reset. The Screenshots tab keeps its other sections.
         secs
     }
 
@@ -305,19 +288,6 @@ fn border_width_slider<'a>(value: u32, msg: fn(u32) -> Msg) -> Element<'a, Msg> 
     .spacing(8.0)
     .align_y(Alignment::Center)
     .into()
-}
-
-/// The covermark folder path for display, abbreviating `$HOME` to `~`.
-fn covermark_dir_display() -> String {
-    let Some(dir) = crate::app::preview::covermark_dir() else {
-        return "~/.config/cosmic-capture-kit/covermarks".into();
-    };
-    if let Some(home) = dirs::home_dir()
-        && let Ok(rest) = dir.strip_prefix(&home)
-    {
-        return format!("~/{}", rest.display());
-    }
-    dir.display().to_string()
 }
 
 #[cfg(test)]

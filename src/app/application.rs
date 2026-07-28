@@ -346,11 +346,12 @@ impl cosmic::Application for App {
                 settings,
                 permissions,
                 keymap,
-                preview_after_capture: persisted.preview_after_capture,
                 copy_selection_pending: false,
                 // `--preview` (windowed unless `--overlay`) overrides the persisted setting.
                 preview_windowed: startup.preview_windowed.unwrap_or(persisted.preview_windowed),
-                auto_close_preview: persisted.auto_close_preview,
+                preview_save_on_copy: persisted.preview_save_on_copy,
+                preview_close_on_copy: persisted.preview_close_on_copy,
+                preview_copy_on_delete: persisted.preview_copy_on_delete,
                 mute_others_during_preview: persisted.mute_others_during_preview,
                 duck_system_audio: persisted.duck_system_audio,
                 appearance_use_system: persisted.appearance_use_system,
@@ -465,8 +466,6 @@ impl cosmic::Application for App {
                 ptt_held: false,
                 hotkeys: None,
                 screenshot_dir: persisted.screenshot_dir,
-                copy_to_clipboard: persisted.copy_to_clipboard,
-                clipboard_max_mb: NumField::new(persisted.clipboard_max_mb.max(1)),
                 record_mic: persisted.record_mic,
                 record_system_audio: persisted.record_system_audio,
                 covermark_text: persisted.covermark_text,
@@ -483,6 +482,13 @@ impl cosmic::Application for App {
                     .as_deref()
                     .and_then(crate::widgets::annotation_canvas::Tool::from_str),
                 annot_stroke_w: persisted.annot_stroke_w,
+                annot_badge_size: persisted.annot_badge_size,
+                annot_text_size: persisted.annot_text_size,
+                annot_text_font: persisted
+                    .annot_text_font
+                    .as_deref()
+                    .and_then(crate::app::preview::text_annot::TextFont::from_str)
+                    .unwrap_or_default(),
                 annot_recent_colors: persisted.annot_recent_colors,
                 mic_level: 0.0,
                 sys_level: 0.0,
@@ -605,6 +611,12 @@ impl cosmic::Application for App {
                 tasks.push(Task::done(cosmic::Action::App(Msg::WindowChrome(
                     super::WindowChromeMsg::SeedOutputs,
                 ))));
+                // The two embedded annotation faces (Excalifont / Inter) are registered with the
+                // GLOBAL cosmic-text font system SYNCHRONOUSLY in `super::run`, before the
+                // compositor exists — NOT here. An async `iced::font::load` Task dispatched from
+                // `init` races the compositor's lazy creation and is silently dropped (see the
+                // long note in `run`), which is why the font-preview dropdown labels (DRAGON-354
+                // item 19) never resolved. Nothing to do at this seam.
                 // No per-session idle icon anymore (DRAGON-182): the app's own status
                 // icon exists ONLY while a recording is live (`begin_recording_tray`);
                 // a resident, when enabled, owns the one always-present tray icon.

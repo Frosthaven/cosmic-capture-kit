@@ -71,7 +71,7 @@ along with their statuses.
 | Preview editor (images): Color selector             | ✅      |
 | Preview editor (images): Arrows                     | ✅      |
 | Preview editor (images): Highlighter                | ✅      |
-| Preview editor (images): Text w/size                | 📅      |
+| Preview editor (images): Text w/size                | ✅      |
 | Preview editor (images): Step markers               | ✅      |
 | Preview editor (images): Dim/spotlight              | ✅      |
 | Preview editor (images): Destructive pixelate       | ✅      |
@@ -176,7 +176,7 @@ settings window and the preview editor by using the information below.
 
 ```
 ~/.config/aerospace/aerospace.toml
-``
+```
 
 ```toml
 [[on-window-detected]]

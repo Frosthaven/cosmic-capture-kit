@@ -706,19 +706,23 @@ impl App {
         }
     }
 
-    /// Finish a capture: it's already saved. Copy it to the clipboard when that's
-    /// enabled and it's within the size limit, then post a notification — "Copied
+    /// Finish a capture WITHOUT the preview editor: it's already saved. Copy it to the
+    /// clipboard when it's within the size limit, then post a notification — "Copied
     /// to clipboard" when we did, otherwise "Saved" with the location. Clicking the
     /// notification reveals the file. The clipboard + notifier run as detached
     /// helper processes, so we just exit.
+    ///
+    /// DRAGON-353: the copy is UNCONDITIONAL (bar the size limit) — the "Automatically
+    /// copy to clipboard" setting is gone, and the editor's own open-time auto-copy is
+    /// this path's mirror for the (normal) case where an editor does open. This path
+    /// survives only for captures that CANNOT open one (no known output).
     pub(super) fn finish_share(
         &mut self,
         path: &std::path::Path,
         size: u64,
         is_video: bool,
     ) -> Task<cosmic::Action<Msg>> {
-        let within_limit = size <= self.clipboard_max_mb.value as u64 * 1_048_576;
-        let copied = self.copy_to_clipboard && within_limit;
+        let copied = size <= crate::platform::services::AUTO_COPY_MAX_BYTES;
         if copied {
             crate::platform::services::copy_to_clipboard(path, is_video);
         }
@@ -738,7 +742,7 @@ impl App {
         size: u64,
         is_video: bool,
     ) -> Task<cosmic::Action<Msg>> {
-        let within_limit = size <= self.clipboard_max_mb.value as u64 * 1_048_576;
+        let within_limit = size <= crate::platform::services::AUTO_COPY_MAX_BYTES;
         if within_limit {
             crate::platform::services::copy_to_clipboard(path, is_video);
         } else {
@@ -867,7 +871,6 @@ impl App {
         window_pick_neutral_spinner_decision(
             immediate,
             sel.window_id.is_some(),
-            self.preview_after_capture,
             self.window_defocus_uses_spinner(sel),
         )
     }
@@ -890,7 +893,7 @@ impl App {
     /// appearances now (immediate window pick with the post-capture preview on).
     #[cfg(target_os = "macos")]
     fn window_pick_preopens_window(&self, sel: &Selection, immediate: bool) -> bool {
-        window_pick_preopen_decision(immediate, sel.window_id.is_some(), self.preview_after_capture)
+        window_pick_preopen_decision(immediate, sel.window_id.is_some())
     }
 
     /// DRAGON-305 (Windows): a WINDOWED single-window capture pre-opens its fullscreen loading
@@ -905,7 +908,6 @@ impl App {
         windows_window_pick_preopens(
             immediate,
             sel.window_id.is_some(),
-            self.preview_after_capture,
             self.preview_windowed,
         )
     }
@@ -1976,10 +1978,12 @@ pub(super) enum WindowFocusIntent {
 fn window_pick_neutral_spinner_decision(
     immediate: bool,
     is_window_pick: bool,
-    preview_enabled: bool,
     is_defocus_sink: bool,
 ) -> bool {
-    immediate && is_window_pick && preview_enabled && !is_defocus_sink
+    // DRAGON-353: the `preview_enabled` term is gone with the "Open in preview editor"
+    // setting — the editor always opens, so a window pick always has a spinner to cover
+    // the grab with.
+    immediate && is_window_pick && !is_defocus_sink
 }
 
 /// DRAGON-216: the pure decision behind [`App::window_pick_preopens_window`] (macOS). A
@@ -1992,12 +1996,10 @@ fn window_pick_neutral_spinner_decision(
 /// (tested on every platform); the macOS and Windows callers consult it (DRAGON-305), so it is
 /// dead code only on Linux + exotic targets.
 #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
-fn window_pick_preopen_decision(
-    immediate: bool,
-    is_window_pick: bool,
-    preview_enabled: bool,
-) -> bool {
-    immediate && is_window_pick && preview_enabled
+fn window_pick_preopen_decision(immediate: bool, is_window_pick: bool) -> bool {
+    // DRAGON-353: the `preview_enabled` term is gone with the "Open in preview editor"
+    // setting — the editor always opens.
+    immediate && is_window_pick
 }
 
 /// DRAGON-305: the pure decision behind the Windows [`App::window_pick_preopens_window`] arm. A
@@ -2006,13 +2008,8 @@ fn window_pick_preopen_decision(
 /// shows the fullscreen blocker after the grab, so it needs no pre-open. Otherwise it is exactly
 /// [`window_pick_preopen_decision`] (immediate window pick with preview enabled). Windows-only.
 #[cfg(windows)]
-fn windows_window_pick_preopens(
-    immediate: bool,
-    is_window_pick: bool,
-    preview_enabled: bool,
-    windowed: bool,
-) -> bool {
-    windowed && window_pick_preopen_decision(immediate, is_window_pick, preview_enabled)
+fn windows_window_pick_preopens(immediate: bool, is_window_pick: bool, windowed: bool) -> bool {
+    windowed && window_pick_preopen_decision(immediate, is_window_pick)
 }
 
 /// The [`WindowFocusIntent`] for a single-window capture given the persisted
@@ -2510,10 +2507,10 @@ mod output_desc_for_selection_tests {
 mod neutral_spinner_tests {
     use super::window_pick_neutral_spinner_decision as decide;
 
-    // The happy path: immediate window pick, preview on, not the defocus sink.
+    // The happy path: immediate window pick, not the defocus sink.
     #[test]
     fn window_pick_pre_opens_neutral() {
-        assert!(decide(true, true, true, false));
+        assert!(decide(true, true, false));
     }
 
     // WINDOWED mode also pre-opens the neutral overlay now (DRAGON-216 follow-up): the
@@ -2523,23 +2520,23 @@ mod neutral_spinner_tests {
     #[test]
     fn both_appearances_pre_open_neutral() {
         // Same inputs regardless of preview_windowed — the decision no longer takes it.
-        assert!(decide(true, true, true, false));
+        assert!(decide(true, true, false));
     }
 
     // The single-toplevel defocus sink deliberately pre-opens Exclusive to BE the focus
     // sink, so it must NOT be routed through the neutral path.
     #[test]
     fn defocus_sink_is_not_neutral() {
-        assert!(!decide(true, true, true, true));
+        assert!(!decide(true, true, true));
     }
 
     // A delayed shot (not immediate) never pre-opens; nor does a non-window pick
-    // (region/monitor), nor a run with the post-capture preview disabled.
+    // (region/monitor). DRAGON-353: there is no longer a "preview off" miss — the editor
+    // always opens.
     #[test]
     fn other_misses_defer() {
-        assert!(!decide(false, true, true, false)); // delayed
-        assert!(!decide(true, false, true, false)); // region/monitor
-        assert!(!decide(true, true, false, false)); // preview off
+        assert!(!decide(false, true, false)); // delayed
+        assert!(!decide(true, false, false)); // region/monitor
     }
 }
 
@@ -2552,15 +2549,14 @@ mod mac_preopen_tests {
     // (DRAGON-216: the fullscreen overlay preview covers the grab too, not just windowed).
     #[test]
     fn window_pick_pre_opens_both_appearances() {
-        assert!(decide(true, true, true));
+        assert!(decide(true, true));
     }
 
-    // Delayed / non-window / preview-off all defer.
+    // Delayed / non-window both defer (DRAGON-353: "preview off" no longer exists).
     #[test]
     fn other_misses_defer() {
-        assert!(!decide(false, true, true)); // delayed
-        assert!(!decide(true, false, true)); // region/monitor
-        assert!(!decide(true, true, false)); // preview off
+        assert!(!decide(false, true)); // delayed
+        assert!(!decide(true, false)); // region/monitor
     }
 }
 
@@ -2572,22 +2568,21 @@ mod windows_preopen_tests {
     // blocker cover.
     #[test]
     fn windowed_window_pick_pre_opens() {
-        assert!(decide(true, true, true, true));
+        assert!(decide(true, true, true));
     }
 
     // Overlay-preview mode (windowed = false) does NOT pre-open — it already shows the fullscreen
     // blocker after the grab.
     #[test]
     fn overlay_mode_defers() {
-        assert!(!decide(true, true, true, false));
+        assert!(!decide(true, true, false));
     }
 
-    // The base misses (delayed / non-window / preview-off) still defer even in windowed mode.
+    // The base misses (delayed / non-window) still defer even in windowed mode.
     #[test]
     fn base_misses_defer_even_when_windowed() {
-        assert!(!decide(false, true, true, true)); // delayed
-        assert!(!decide(true, false, true, true)); // region/monitor
-        assert!(!decide(true, true, false, true)); // preview off
+        assert!(!decide(false, true, true)); // delayed
+        assert!(!decide(true, false, true)); // region/monitor
     }
 }
 

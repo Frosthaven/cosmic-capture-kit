@@ -151,6 +151,7 @@ impl App {
         preview: &'a PreviewState,
         img: &'a ImagePreview,
         tb: Tb,
+        toasts: Option<Element<'a, Msg>>,
     ) -> Element<'a, Msg> {
         // Every message this view emits is ADDRESSED to its own document (DRAGON-336
         // phase 2), so a click in one preview can never act on another.
@@ -158,7 +159,7 @@ impl App {
         // `is_loading()` guarantees `image` is Some here; fall back to the spinner just
         // in case, so this is never an empty frame.
         let Some(handle) = &img.image else {
-            return self.preview_loading_view(preview, tb);
+            return self.preview_loading_view(preview, tb, toasts);
         };
         // The base image stays a STABLE handle; the covermark is a separate raster stacked
         // over it, drawn through the persistent-texture shader (same as the video path). The
@@ -171,11 +172,40 @@ impl App {
         // image HANDLE stays the hi-res physical pixels, downsampled into this box, so
         // it's sharp on hidpi. `source_scale == 1.0` (Linux 1x) makes points == physical
         // — byte-identical to the old `edit.frame` fit.
+        // DRAGON-366 (TEMPORARY): the view build's own wall clock. See
+        // `crate::widgets::dragon366` — remove with the probe call at the end of this fn.
+        let d366_view_start = std::time::Instant::now();
+        let mut d366_still_ms = 0.0f64;
+        let mut d366_shown = (0.0f32, 0.0f32);
+        let mut d366_avail = (0.0f32, 0.0f32);
+        // Every persistent-texture layer key this window draws this frame (DRAGON-373): the
+        // covermark's, the Windows-overlay base's, and one per text annotation. EVERY LayerStack
+        // this window mounts must carry the same set, or their prepares take turns freeing each
+        // other's textures — see `layers.rs`. The Windows base key is included whenever that arm
+        // could fold (over-approximating is safe; under-approximating frees a live texture).
+        let mut window_keys: Vec<LayerKey> = preview
+            .edit
+            .text_layers
+            .iter()
+            .map(|l| LayerKey::text(preview.window, l.id.0))
+            .collect();
+        if preview.edit.cm_raster.frame().is_some() {
+            window_keys.push(LayerKey::covermark(preview.window));
+        }
+        #[cfg(windows)]
+        if !preview.surface.is_window() {
+            window_keys.push(LayerKey::video(preview.window));
+        }
         let (ow, oh) = preview.frame_points();
         let image: Element<'a, Msg> = if ow > 0 && oh > 0 {
             let (avail_w, avail_h) = self.preview_viewport(preview);
             let (dw, dh) = video::fit_dims(ow, oh, avail_w, avail_h);
-            self.still_media(preview, handle, dw, dh)
+            d366_avail = (avail_w, avail_h);
+            d366_shown = (dw, dh);
+            let t = std::time::Instant::now();
+            let media = self.still_media(preview, handle, dw, dh, &window_keys);
+            d366_still_ms = t.elapsed().as_secs_f64() * 1000.0;
+            media
         } else {
             // No known dims (rare decode fallback): plain fit, no covermark overlay.
             widget::container(
@@ -238,6 +268,57 @@ impl App {
             );
             let accent = crate::app::theme::accent(&cosmic::theme::active());
             let source = (preview.edit.frame.0 as f32, preview.edit.frame.1 as f32);
+            // The blinking text caret (DRAGON-354): box-relative geometry (source px) of the
+            // edited box, passed only on a blink-ON tick so `None` reads as "no caret this
+            // frame". Computed from the SAME layout the renderer uses, so it lands between the
+            // right glyphs at any zoom.
+            // The UN-blinked caret geometry (DRAGON-359): computed once from the SAME layout the
+            // renderer uses, so it lands between the right glyphs at any zoom. It drives the OS
+            // IME cursor area every frame (the emoji picker / composition candidate window
+            // anchors here); the DRAWN caret below is this same geometry, but gated by the blink.
+            let ime_caret = preview.edit.text_edit.as_ref().and_then(|te| {
+                preview.edit.annotations.iter().find(|it| it.id == te.id).and_then(|it| {
+                    match &it.kind {
+                        annotate::AnnotKind::Text { rect, text, size_px, font, constrained, .. } => {
+                            let lay = annotate::text_kind_layout(
+                                text, *size_px, *font, *rect, *constrained, source.0,
+                            );
+                            Some(text_annot::caret_geometry(&lay, *font, *size_px, te.caret))
+                        }
+                        _ => None,
+                    }
+                })
+            });
+            // The blinking text caret (DRAGON-354): passed only on a blink-ON tick so `None`
+            // reads as "no caret this frame".
+            let text_caret = preview
+                .edit
+                .text_edit
+                .as_ref()
+                .filter(|te| te.blink_on)
+                .and(ime_caret);
+            // The edited box id + its selection-highlight rects (DRAGON-354 item 12): derived
+            // from the SAME layout, so the wash lands under exactly the selected glyphs.
+            let editing_text = preview.edit.text_edit.as_ref().map(|te| te.id.0);
+            let text_selection: Vec<(f32, f32, f32, f32)> = preview
+                .edit
+                .text_edit
+                .as_ref()
+                .and_then(|te| te.selection().map(|(s, e)| (te.id, s, e)))
+                .and_then(|(tid, s, e)| {
+                    preview.edit.annotations.iter().find(|it| it.id == tid).and_then(|it| {
+                        match &it.kind {
+                            annotate::AnnotKind::Text { rect, text, size_px, font, constrained, .. } => {
+                                let lay = annotate::text_kind_layout(
+                                    text, *size_px, *font, *rect, *constrained, source.0,
+                                );
+                                Some(text_annot::selection_rects(&lay, *font, *size_px, s, e))
+                            }
+                            _ => None,
+                        }
+                    })
+                })
+                .unwrap_or_default();
             crate::widgets::annotation_canvas::AnnotationCanvas::new(
                 image,
                 items,
@@ -263,11 +344,54 @@ impl App {
                         }
                         AnnotEvent::DrawBegin(t, x, y) => PreviewMsg::AnnotDrawBegin(t, x, y),
                         AnnotEvent::GrabBegin(g, x, y) => PreviewMsg::AnnotGrabBegin(g, x, y),
-                        AnnotEvent::GestureTo(x, y) => PreviewMsg::AnnotGestureTo(x, y),
+                        AnnotEvent::GestureTo(x, y, scale_type) => {
+                            PreviewMsg::AnnotGestureTo(x, y, scale_type)
+                        }
                         AnnotEvent::GestureEnd => PreviewMsg::AnnotGestureEnd,
+                        AnnotEvent::EditText(aid) => PreviewMsg::EditText(AnnotId(aid)),
+                        AnnotEvent::TextClick { x, y, extend, word, all } => {
+                            PreviewMsg::TextClickAt { x, y, extend, word, all }
+                        }
+                        AnnotEvent::TextDragTo(x, y) => PreviewMsg::TextDragTo(x, y),
+                        AnnotEvent::ImeCommit(s) => PreviewMsg::TextImeCommit(s),
                         AnnotEvent::Menu(x, y) => PreviewMsg::AnnotMenuOpen(x, y),
                     })
                 },
+            )
+            .text_caret(text_caret)
+            // The un-blinked caret drives the OS IME cursor area while editing (DRAGON-359).
+            .ime_caret(ime_caret)
+            // The id being edited + its text-selection rects (DRAGON-356 in-box shift guard +
+            // DRAGON-354 item 12 drag-select). `editing_text` is set for the WHOLE edit, unlike
+            // the blink-gated caret above.
+            .text_editing(editing_text, text_selection)
+            // The TEXT rasters (DRAGON-373): one passive, draw-only layer per text annotation,
+            // handed to the canvas so it can draw each at its OWN place in the item order —
+            // which is what makes a rectangle brought over one caption and under another render
+            // on screen the way `rasterize_scene` has always baked it. They are elements, not
+            // widgets in the tree: the canvas never routes an event to them, so hit-testing
+            // stays entirely with the canvas's own model (see its `text_layers`).
+            .text_layers(
+                preview
+                    .edit
+                    .text_layers
+                    .iter()
+                    .map(|l| {
+                        let layer = Layer::at(
+                            LayerKey::text(preview.window, l.id.0),
+                            l.frame.clone(),
+                            // The layer covers only its own caption REGION (DRAGON-362), so it is
+                            // PLACED rather than stretched — see `layers::Layer::dest`.
+                            l.geom.dest(preview.edit.frame),
+                        );
+                        let stack = LayerStack::part(
+                            vec![layer],
+                            self.live_preview_windows(),
+                            window_keys.clone(),
+                        );
+                        (l.id.0, Element::new(cosmic::iced::widget::shader::Shader::new(stack)))
+                    })
+                    .collect(),
             )
             .into()
         } else {
@@ -280,14 +404,20 @@ impl App {
             .selected()
             .and_then(|id| preview.edit.annotations.iter().find(|it| it.id == id))
             .is_some_and(|it| matches!(it.kind, annotate::AnnotKind::Spotlight { .. }));
-        let canvas_over: Element<'a, Msg> = match preview.edit.annot_menu {
-            Some((mx, my)) => widget::popover(canvas_over)
+        // The popover WRAPPER is unconditional (DRAGON-375's class): only the POPUP comes and
+        // goes. `Popover::children` puts its content at index 0 whether or not a popup is
+        // attached, so the `AnnotationCanvas` subtree — which holds the in-flight gesture in its
+        // widget state — keeps its identity when the menu opens or closes. Wrapping conditionally
+        // changed the tag at this position, and iced answers a tag change by rebuilding the whole
+        // subtree, so dismissing the menu with a press-drag threw the gesture away as it started.
+        let mut menu_over = widget::popover(canvas_over);
+        if let Some((mx, my)) = preview.edit.annot_menu {
+            menu_over = menu_over
                 .popup(annot_context_menu(pid, spotlight_selected))
                 .position(widget::popover::Position::Point(cosmic::iced::Point::new(mx, my)))
-                .on_close(Msg::Preview(pid, PreviewMsg::AnnotMenuClose))
-                .into(),
-            None => canvas_over,
-        };
+                .on_close(Msg::Preview(pid, PreviewMsg::AnnotMenuClose));
+        }
+        let canvas_over: Element<'a, Msg> = menu_over.into();
         // Left: do-not-train + covermark tools. Right: the size + Delete group. (Save / Save
         // As / Copy, appearance, and Close live on the top bar.) Center reserved for the zoom
         // scale.
@@ -295,7 +425,11 @@ impl App {
         // is covariant in its lifetime), so this is a plain re-binding.
         let left: Vec<Element<'a, Msg>> = self.edit_tools(preview, tb);
         // Right: the zoom scale (Fit/%/presets), then the pointer/pan tools at the far right.
-        // (Size + Delete moved to the top bar.)
+        // Filesize chip DISABLED pending a decision on whether it belongs on the bottom bar.
+        // Left commented (not deleted) so it can be restored intact (prepend the extend below);
+        // the size chip block also dropped out of the bottom-bar min-width reserve in
+        // `surface.rs` while it's off.
+        // right.extend(tb.size_chip(preview.size));
         let right: Vec<Element<'a, Msg>> = vec![
             self.zoom_control(preview, tb),
             tb.pan_tool_group(preview.view.pan_mode, &self.keymap),
@@ -305,7 +439,7 @@ impl App {
         // preview carries those in its titlebar instead (DRAGON-337).
         let header = (!preview.surface.is_window())
             .then(|| self.overlay_header_row(preview, tb));
-        compose_preview(
+        let composed = compose_preview(
             preview.surface.is_window(),
             self.overlay_control_width(preview),
             header,
@@ -314,17 +448,83 @@ impl App {
             None,
             toolbar,
             tb.glass,
-        )
+            toasts,
+        );
+        // DRAGON-366 (TEMPORARY): one line per new interaction plus a sampled stream within it,
+        // carrying the redraw cadence, our own CPU cost, the scene shape, and WHAT THE USER WAS
+        // DOING — the split the ticket hangs on. Remove this call, `d366_interaction`, and the
+        // timers above with the diagnostic.
+        let (d366_verb, d366_item) = self.d366_interaction(preview);
+        let mut d366_fx = (0usize, 0usize, 0usize);
+        for it in &preview.edit.annotations {
+            match it.kind {
+                annotate::AnnotKind::Blur { .. } => d366_fx.0 += 1,
+                annotate::AnnotKind::Pixelate { .. } => d366_fx.1 += 1,
+                annotate::AnnotKind::Highlight { .. }
+                | annotate::AnnotKind::BoxHighlight { .. } => d366_fx.2 += 1,
+                _ => {}
+            }
+        }
+        crate::widgets::dragon366::view_built(crate::widgets::dragon366::FrameFacts {
+            verb: d366_verb,
+            item: d366_item,
+            build_ms: d366_view_start.elapsed().as_secs_f64() * 1000.0,
+            still_ms: d366_still_ms,
+            source: preview.edit.frame,
+            shown: d366_shown,
+            avail: d366_avail,
+            zoom: preview.view.zoom,
+            overlay: !preview.surface.is_window(),
+            annots: preview.edit.annotations.len(),
+            fx_blur: d366_fx.0,
+            fx_pixelate: d366_fx.1,
+            fx_highlight: d366_fx.2,
+            dim: preview.edit.dim,
+            covermark: preview.edit.cm_raster.frame().is_some(),
+            text_layer: !preview.edit.text_layers.is_empty(),
+        });
+        composed
+    }
+
+    /// DRAGON-366 (TEMPORARY): name the interaction currently on screen, as
+    /// `(verb, item-kind)`, from state the view can already see. This is what makes the
+    /// diagnostic self-interpreting — comparing `idle` against `drag/text` against
+    /// `create/blur` on the SAME capture is what separates a per-frame cost that is paid
+    /// regardless (the base image) from one driven by a specific interaction.
+    ///
+    /// An in-flight pointer gesture wins over text editing, because during a drag of a text box
+    /// both are live and the DRAG is what is being measured.
+    fn d366_interaction(&self, preview: &PreviewState) -> (&'static str, &'static str) {
+        match &preview.edit.gesture {
+            // Rubber-band drawing / moving / resizing / erasing — named by the SHARED helper, so
+            // the view channel and the update channel label one drag identically.
+            Some(g) => annotate::d366_gesture_words(g, &preview.edit.annotations),
+            // No pointer gesture: typing into a text box, or genuinely idle. The idle frames
+            // between the owner's actions are the ONLY no-effect baseline this ticket gets.
+            None => match &preview.edit.text_edit {
+                Some(_) => ("type", "text"),
+                None => ("idle", "-"),
+            },
+        }
     }
 
     /// The base still plus the effect + covermark overlays for the loaded-image view, fitted to
     /// `dw`×`dh`. Stack order (bottom→top) mirrors the bake: base, then the REGION EFFECTS
     /// (highlight / pixelate / blur) rendered in true z-order by the real-time GPU shader
     /// ([`crate::widgets::annotation_fx`], DRAGON-330 — no CPU raster, updates every frame as
-    /// the user drags), then the covermark (its own persistent-texture `LayerStack`). Box/arrow
-    /// stay vector geometry drawn by the `AnnotationCanvas` over this surface. All three ride
-    /// the ZoomPan transform (in its content) so they zoom/pan locked to the picture and clip to
-    /// the media viewport. Portable path: a STABLE `widget::image` base. Windows OVERLAY
+    /// the user drags), then the covermark (its own persistent-texture `LayerStack`). All three
+    /// ride the ZoomPan transform (in its content) so they zoom/pan locked to the picture and
+    /// clip to the media viewport. Everything ABOVE the covermark in the bake — box / arrow /
+    /// pen / badge as vector geometry AND the text boxes as per-item rasters — is drawn by the
+    /// `AnnotationCanvas` over this surface, in ONE in-order pass (DRAGON-373), which is what
+    /// makes the live stack the same composite as `bake_image`'s: dim → effects → covermark →
+    /// the annotation scene in item order.
+    ///
+    /// `window_keys` is every layer key this WINDOW draws this frame, across the canvas's text
+    /// layers as well as the stacks built here — the multi-stack prune contract in `layers.rs`.
+    /// It may over-approximate (a key that ends up not drawn merely keeps a slot alive until the
+    /// preview closes); it must never under-approximate, or a live layer's texture is freed.
+    /// Portable path: a STABLE `widget::image` base. Windows OVERLAY
     /// exception (DRAGON-235): iced's raster-image pipeline does not composite on the
     /// premultiplied transparent surface, so the base (and covermark) fold into ONE `LayerStack`
     /// drawn through the shader; the effects shader stacks on top of it (over the covermark on
@@ -337,6 +537,7 @@ impl App {
         handle: &widget::image::Handle,
         dw: f32,
         dh: f32,
+        window_keys: &[LayerKey],
     ) -> Element<'static, Msg> {
         use crate::widgets::annotation_fx::{EffectsFx, FxConst, FxEffect, FxItem};
         // The region-effect items, in scene z-order (SOURCE-pixel geometry). Box/arrow are
@@ -435,12 +636,15 @@ impl App {
                 }
                 _ => None,
             };
-        // The covermark overlay (its own LayerStack — a persistent texture updated in place).
+        // The covermark's raster overlay, stacked over the base/effects — a persistent texture
+        // updated in place. The TEXT layers are NO LONGER here (DRAGON-373): they are drawn by
+        // the `AnnotationCanvas`, interleaved with the vector kinds in true z-order, because a
+        // layer stacked at a fixed depth can never be UNDER a rectangle drawn after it.
         let cm_layers: Vec<Layer> = preview
             .edit
             .cm_raster
             .frame()
-            .map(|cm| vec![Layer { key: LayerKey::covermark(preview.window), frame: cm.clone() }])
+            .map(|cm| vec![Layer::full(LayerKey::covermark(preview.window), cm.clone())])
             .unwrap_or_default();
         // The `widget::image` base (Linux/mac + the opaque windowed surface — byte-identical).
         let image_base: Element<'static, Msg> = widget::container(
@@ -453,23 +657,27 @@ impl App {
         .into();
         // The base element, plus whether the covermark is folded into it. Windows OVERLAY
         // (DRAGON-235): iced's raster-image pipeline doesn't composite on the transparent
-        // surface, so base + covermark ride ONE LayerStack (two LayerStacks in the SAME window
-        // fight over slot pruning — the keys are window-scoped, not per-widget, so a second
-        // stack's prepare would delete this one's slots); the effects shader is a distinct
+        // surface, so base + covermark ride ONE LayerStack; the effects shader is a distinct
         // primitive type (its own per-window state), stacked on top —
         // over the covermark on Windows (a z-order deviation vs Linux/mac to VERIFY, as Linux
-        // builds can't exercise this cfg arm).
+        // builds can't exercise this cfg arm). Note the text layers are NOT folded in here on
+        // either platform: they are canvas-drawn (DRAGON-373), which keeps this arm's z-order
+        // exactly as it was — text has always ridden above base, effects and covermark alike.
         #[cfg(windows)]
         let (base_element, cm_folded): (Element<'static, Msg>, bool) = if !preview
             .surface
             .is_window()
             && let Some(base) = super::layers::rgba_handle_frame(handle)
         {
-            let mut layers = vec![Layer { key: LayerKey::video(preview.window), frame: base }];
+            let mut layers = vec![Layer::full(LayerKey::video(preview.window), base)];
             layers.extend(cm_layers.iter().cloned());
-            let base_ls = cosmic::iced::widget::shader::Shader::new(LayerStack::new(layers, self.live_preview_windows()))
-                .width(Length::Fixed(dw))
-                .height(Length::Fixed(dh));
+            let base_ls = cosmic::iced::widget::shader::Shader::new(LayerStack::part(
+                layers,
+                self.live_preview_windows(),
+                window_keys.to_vec(),
+            ))
+            .width(Length::Fixed(dw))
+            .height(Length::Fixed(dh));
             (widget::container(Element::new(base_ls)).center_x(Length::Fill).into(), true)
         } else {
             (image_base, false)
@@ -483,9 +691,13 @@ impl App {
             children.push(fx);
         }
         if !cm_folded && !cm_layers.is_empty() {
-            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::new(cm_layers, self.live_preview_windows()))
-                .width(Length::Fixed(dw))
-                .height(Length::Fixed(dh));
+            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::part(
+                cm_layers,
+                self.live_preview_windows(),
+                window_keys.to_vec(),
+            ))
+            .width(Length::Fixed(dw))
+            .height(Length::Fixed(dh));
             children.push(widget::container(Element::new(shader)).center_x(Length::Fill).into());
         }
         if children.len() == 1 {

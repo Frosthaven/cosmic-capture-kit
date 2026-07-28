@@ -269,11 +269,20 @@ pub(super) fn preview_overlay_window(
     (id, open)
 }
 
-/// The windowed preview's floor size — small enough to sit on a compact monitor, large
-/// enough that every top/bottom toolbar control stays laid out without clipping. Shared by
-/// the window `min_size` and the fit-to-media sizing so they agree.
-pub(super) const PREVIEW_MIN_W: f32 = 795.0;
-pub(super) const PREVIEW_MIN_H: f32 = 545.0;
+/// The windowed preview's floor size (LOGICAL points) — large enough that every top/bottom
+/// toolbar control (the merged text cluster, the moved filesize block, the padded scaling
+/// slider) stays laid out without clipping. Shared by the window `min_size` and the
+/// fit-to-media sizing so they agree.
+///
+/// **This is THE one knob** (DRAGON-357 item 11): the value is the user's measured preferred
+/// minimum for the live preview editor (914 x 732 logical points, measured 2026-07-27), which
+/// comfortably exceeds the content-derived toolbar floor (`overlay_min_content_width_for`, the
+/// widest bar's arithmetic) — so it is the "whichever is larger" of the two. On a display too
+/// small to hold it, [`preview_window`] clamps the actual `min_size` down to the output so the
+/// floor never exceeds the usable area; the open-fit math (`sizing::spawn_window_size`) already
+/// clamps to the monitor too.
+pub(super) const PREVIEW_MIN_W: f32 = 914.0;
+pub(super) const PREVIEW_MIN_H: f32 = 732.0;
 
 /// The post-capture preview as a normal RESIZABLE WINDOW (the "Windowed" appearance)
 /// instead of the fullscreen overlay — so it can be moved / resized / min / maximized.
@@ -314,8 +323,13 @@ pub(super) fn preview_window(
             output.1.max(size.1),
         )),
         // Floor sized so the top/bottom toolbars (incl. the covermark sliders + zoom scale)
-        // never clamp and clip over each other — see DRAGON-106.
-        min_size: Some(cosmic::iced::Size::new(PREVIEW_MIN_W, PREVIEW_MIN_H)),
+        // never clamp and clip over each other — see DRAGON-106. Clamped to the output so the
+        // floor never EXCEEDS a small display's usable area (DRAGON-357 item 11): on a monitor
+        // narrower/shorter than the preferred floor, the min shrinks to the output instead.
+        min_size: Some(cosmic::iced::Size::new(
+            PREVIEW_MIN_W.min(output.0.max(1.0)),
+            PREVIEW_MIN_H.min(output.1.max(1.0)),
+        )),
         resizable: true,
         resize_border: 8,
         // CLIENT-side decorations (like the settings window): we draw our own header bar

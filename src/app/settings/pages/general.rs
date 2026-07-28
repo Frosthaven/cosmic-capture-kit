@@ -1,7 +1,7 @@
 //! General settings page section builder.
 
 use super::super::*;
-use super::super::row::{num_input, opacity_slider, reset_button, toggle, Item, SectionSpec};
+use super::super::row::{opacity_slider, reset_button, toggle, Item, SectionSpec};
 
 impl crate::app::App {
     /// Every General-page section (both in-page tabs concatenated). The single
@@ -17,8 +17,8 @@ impl crate::app::App {
     }
 
     /// The "Settings" in-page tab (DRAGON-138): everything on the General page
-    /// except the appearance (overlay-opacity) group — Behavior, Capture Preview,
-    /// After a Capture.
+    /// except the appearance (overlay-opacity) group — Behavior and Capture Preview.
+    /// (DRAGON-353 emptied and removed the third, "After a Capture".)
     pub(in crate::app::settings) fn general_settings_sections(&self) -> Vec<SectionSpec<'_>> {
         let d = crate::state::defaults();
         vec![
@@ -81,92 +81,20 @@ impl crate::app::App {
                     items
                 },
             },
-            SectionSpec {
-                title: "Capture Preview",
-                items: {
-                    let mut items = vec![
-                        Item::new(
-                            "Preview editor appearance mode",
-                            "",
-                            crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                                &PREVIEW_APPEARANCES,
-                                Some(usize::from(self.preview_windowed)),
-                                |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                            )),
-                        )
-                        .reset_with(
-                            usize::from(self.preview_windowed),
-                            usize::from(d.preview_windowed),
-                            |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                        ),
-                    ];
-                    items.push(
-                        Item::new(
-                            "Automatically close the preview editor on save or copy",
-                            "",
-                            toggle(self.auto_close_preview, |a0| Msg::Settings(SettingsMsg::SetAutoClosePreview(a0))),
-                        )
-                        .reset_with(
-                            self.auto_close_preview,
-                            d.auto_close_preview,
-                            |a0| Msg::Settings(SettingsMsg::SetAutoClosePreview(a0)),
-                        ),
-                    );
-                    items
-                },
-            },
-            SectionSpec {
-                title: "After a Capture",
-                items: {
-                    let mut items = vec![
-                        Item::new(
-                            "Automatically copy to clipboard",
-                            "",
-                            toggle(self.copy_to_clipboard, |a0| Msg::Settings(SettingsMsg::SetCopyToClipboard(a0))),
-                        )
-                        .reset_with(
-                            self.copy_to_clipboard,
-                            d.copy_to_clipboard,
-                            |a0| Msg::Settings(SettingsMsg::SetCopyToClipboard(a0)),
-                        ),
-                    ];
-                    // Only relevant when copy-to-clipboard is on. Sits with the
-                    // copy toggle, above the preview-editor option.
-                    if self.copy_to_clipboard {
-                        items.push(
-                            Item::new(
-                                "Clipboard size limit",
-                                "Anything under this size will get copied to the clipboard. \
-                                 Great for sharing!",
-                                num_input(
-                                    "10",
-                                    &self.clipboard_max_mb.text,
-                                    Some(|a0| Msg::Settings(SettingsMsg::SetClipboardMaxMb(a0))),
-                                ),
-                            )
-                            .suffix("MB")
-                            .reset_with(
-                                self.clipboard_max_mb.text.clone(),
-                                d.clipboard_max_mb.to_string(),
-                                |a0| Msg::Settings(SettingsMsg::SetClipboardMaxMb(a0)),
-                            ),
-                        );
-                    }
-                    items.push(
-                        Item::new(
-                            "Open in preview editor",
-                            "Enables extra post-editing of images and video content.",
-                            toggle(self.preview_after_capture, |a0| Msg::Settings(SettingsMsg::SetPreviewAfterCapture(a0))),
-                        )
-                        .reset_with(
-                            self.preview_after_capture,
-                            d.preview_after_capture,
-                            |a0| Msg::Settings(SettingsMsg::SetPreviewAfterCapture(a0)),
-                        ),
-                    );
-                    items
-                },
-            },
+            // DRAGON-353: the "Capture Preview" section lived here, holding "Automatically
+            // close the preview editor on save or copy" and "Preview editor appearance
+            // mode". The auto-close setting is gone entirely (no share action closes the
+            // editor any more — see the schema note), and the appearance dropdown moved to
+            // the Preview Editor page's "General" group as "Editor appearance", where the
+            // nav already says which editor is meant. That emptied the section, so it is
+            // gone rather than lingering as a heading.
+            //
+            // DRAGON-353: the "After a Capture" section lived here too, holding
+            // "Automatically copy to clipboard", the clipboard size limit, and "Open in
+            // preview editor". Both toggles became unconditional behaviour (a capture opens
+            // the editor, which copies it to the clipboard as it opens), and the size limit
+            // is now the fixed `share::AUTO_COPY_MAX_MB` rather than a setting at all.
+            // Nothing was left there either.
         ]
     }
 
@@ -407,10 +335,6 @@ impl crate::app::App {
 
 /// Swatch edge length (logical px) for the accent palette + custom entry.
 const SWATCH: f32 = 40.0;
-
-/// The "Preview editor appearance mode" dropdown options (index 0 = overlay, 1 = windowed
-/// — matches `preview_windowed` as a bool).
-const PREVIEW_APPEARANCES: [&str; 2] = ["Overlay", "Windowed"];
 
 /// A palette `Srgba` (0..1 components) as an opaque iced `Color` — built by
 /// component so it never depends on a `From<Srgba>` impl.

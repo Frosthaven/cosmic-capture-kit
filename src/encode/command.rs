@@ -235,7 +235,12 @@ fn build_media_clock_command(
     for a in &plan.pre {
         cmd.arg(a);
     }
-    let in_fmt = if plan.nv12 { "nv12" } else { "rgba" };
+    // The rawvideo input pixel format: NV12 on the hardware-feed path, otherwise the
+    // plan's RGBA-feed byte order (`"rgba"` for every Linux/Windows worker and the mac
+    // default; the macOS SCK worker sets `"bgra"` so it feeds ScreenCaptureKit's native
+    // BGRA buffers WITHOUT a per-pixel swizzle — DRAGON-316). The default keeps every
+    // historical Linux/Windows command line byte-identical.
+    let in_fmt = if plan.nv12 { "nv12" } else { plan.input_pix_fmt };
     // Index-stamped video input (DRAGON-125): frame k's PTS = k/fps, assigned by
     // `-r fps` on the input instead of wallclock arrival — the pump's
     // `due_video_ticks` already paces frame delivery to exactly one slot per 1/fps
@@ -418,6 +423,7 @@ mod tests {
             vf: None,
             color_tags: false,
             nv12: false,
+            input_pix_fmt: "rgba",
             quality_rc: true,
         }
     }
@@ -473,6 +479,50 @@ mod tests {
         );
         assert!(args.iter().any(|a| a == "/tmp/mic.pcm"), "{args:?}");
         assert!(args.iter().any(|a| a == "/tmp/sys.pcm"), "{args:?}");
+    }
+
+    /// The rawvideo input pixel format defaults to `rgba` (locking the byte-identical
+    /// Linux/Windows command line), and honours a plan that overrides `input_pix_fmt`
+    /// to `bgra` (the macOS SCK worker's swizzle-free feed, DRAGON-316) WITHOUT changing
+    /// any other argument. The `-pix_fmt` value sits on the rawvideo INPUT (before the
+    /// video `-i -`).
+    #[test]
+    fn media_clock_command_input_pix_fmt_defaults_rgba_and_honours_bgra() {
+        // Default plan: `-pix_fmt rgba` on the rawvideo input.
+        let rgba_args = media_clock_args(&test_plan());
+        let pf = rgba_args.iter().position(|a| a == "-pix_fmt").expect("has -pix_fmt");
+        assert_eq!(rgba_args[pf + 1], "rgba", "default input pix_fmt is rgba: {rgba_args:?}");
+        // The `-pix_fmt` sits BEFORE the video `-i -` (an input option).
+        let video_i = rgba_args.iter().position(|a| a == "-i").expect("has -i");
+        assert!(pf < video_i, "-pix_fmt must precede the video -i: {rgba_args:?}");
+
+        // A plan overriding input_pix_fmt to bgra flips ONLY the -pix_fmt value; every
+        // other argument stays byte-identical to the rgba plan.
+        let mut bgra_plan = test_plan();
+        bgra_plan.input_pix_fmt = "bgra";
+        let bgra_args = media_clock_args(&bgra_plan);
+        assert_eq!(bgra_args[pf + 1], "bgra", "bgra plan feeds -pix_fmt bgra: {bgra_args:?}");
+        // Prove nothing else moved: the two arg vectors differ ONLY at the pix_fmt value.
+        assert_eq!(rgba_args.len(), bgra_args.len());
+        for (i, (a, b)) in rgba_args.iter().zip(bgra_args.iter()).enumerate() {
+            if i == pf + 1 {
+                continue;
+            }
+            assert_eq!(a, b, "arg {i} differs beyond the pix_fmt value: {a} vs {b}");
+        }
+    }
+
+    /// An NV12 (hardware-feed) plan ignores `input_pix_fmt` entirely — the feed is `nv12`
+    /// regardless of the RGBA-path byte order, so a stray override can never mislabel the
+    /// NV12 stream.
+    #[test]
+    fn media_clock_command_nv12_plan_ignores_input_pix_fmt() {
+        let mut plan = test_plan();
+        plan.nv12 = true;
+        plan.input_pix_fmt = "bgra"; // must be ignored on the nv12 path
+        let args = media_clock_args(&plan);
+        let pf = args.iter().position(|a| a == "-pix_fmt").expect("has -pix_fmt");
+        assert_eq!(args[pf + 1], "nv12", "nv12 feed ignores input_pix_fmt: {args:?}");
     }
 
     #[cfg(feature = "zero-copy")]

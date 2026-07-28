@@ -25,7 +25,10 @@
 //!    bare glyphs whose COLOUR alone shows which tool is armed (`Tb::tool_toggle`) — there is
 //!    no per-icon ring any more.
 //! 4. **Hotkey**: add an `Action` (shortcuts.rs, contiguous in the "Annotation Tools"
-//!    group) mapped to `PreviewMsg::SelectTool` in keyboard.rs.
+//!    group, and BEFORE the slot actions — see `Action::ALL`) mapped to
+//!    `PreviewMsg::SelectTool` in keyboard.rs. If the tool joins a family that already
+//!    shares one key, give it no default bind and just drop it into that tray group: the
+//!    group's `cycle` action picks it up, in the order you declared it (DRAGON-369).
 //! 5. **Gesture**: if it draws by drag (like Box/Arrow) it already works via
 //!    `DrawBegin`/`GestureTo` — teach [`App::annot_gesture_to`]'s `New` arm how to shape
 //!    it, and the canvas widget's hit-testing/chrome how to select it. A click-placed
@@ -69,11 +72,15 @@
 //!   bare click (`Tool::click_places`, shared with the pencil's tap-inks-a-dot rule). Click and
 //!   click-drag land the same badge in the same place; every OTHER draw tool still needs a real
 //!   drag, untouched.
-//! * **Remembered size.** The side comes from [`super::edit::EditState::badge_size`] — the last
-//!   badge placed or resized in THIS editor, seeded at [`DEFAULT_BADGE_SIZE`]. It is
-//!   per-document and deliberately unpersisted (a within-session convenience, not a setting);
-//!   undoing a resize does not un-remember it, since the remembered size is tool state rather
-//!   than scene state.
+//! * **Remembered size, PERSISTED.** The side comes from [`super::edit::EditState::badge_size`]
+//!   — the last badge placed or resized, falling back to [`DEFAULT_BADGE_SIZE`] only when
+//!   nothing has ever been remembered. Every placement and resize writes it back through
+//!   [`App::remember_badge_size`] to the persisted `App::annot_badge_size`, so FUTURE editors
+//!   (a new capture process, a later launch) spawn markers at it; the `EditState` field is the
+//!   per-document working copy, seeded at document open. BOTH spawn paths — click-to-place and
+//!   the double-click pre-placement ([`spawn_placement_rect`]) — size through the SAME
+//!   [`badge_placement_rect`], so they can never drift apart. Undoing a resize does not
+//!   un-remember it, since the remembered size is tool state rather than scene state.
 //! * **Always 1:1.** Every path that can change its rect squares it: the placement
 //!   ([`badge_placement_rect`], which shrinks BOTH axes together when the picture is too
 //!   small), a resize ([`square_for_grab`], which also picks the anchor from the grab so the
@@ -131,9 +138,11 @@ pub type AnnotColor = [u8; 4];
 /// single source of truth a future width control drives (see [`super::edit::EditState::stroke`]).
 pub const DEFAULT_ANNOT_STROKE: f32 = 4.0;
 
-/// The three selectable stroke-width presets (SOURCE px) the toggle group offers, thin →
-/// thick. `DEFAULT_ANNOT_STROKE` (4px) is the middle option (default-selected).
-pub const STROKE_WIDTHS: [f32; 3] = [2.0, 4.0, 6.0];
+/// The selectable stroke-width presets (SOURCE px) the toggle group offers, thin → thick
+/// (DRAGON-357 item 9: a 1px option leads and the run continues +2px past the former 6px top,
+/// to 8/10/12). `DEFAULT_ANNOT_STROKE` (4px) stays a preset. Persisted widths need no
+/// migration — they are stored as raw px and mapped through [`stroke_width_nearest_index`].
+pub const STROKE_WIDTHS: [f32; 7] = [1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0];
 
 /// The index into [`STROKE_WIDTHS`] whose preset is nearest `current` — which segment of the
 /// width toggle group reads as active. Argmin of the absolute difference (ties pick the
@@ -151,8 +160,8 @@ pub fn stroke_width_nearest_index(current: f32) -> usize {
     best
 }
 
-/// The next stroke-width preset after `current`, wrapping (2 → 5 → 8 → 2 …) — the `L` hotkey's
-/// cycle. Keyed off the nearest preset to `current`. Pure — unit-tested.
+/// The next stroke-width preset after `current`, wrapping (1 → 2 → 4 → 6 → 8 → 10 → 12 → 1 …) —
+/// the `L` hotkey's cycle. Keyed off the nearest preset to `current`. Pure — unit-tested.
 pub fn cycle_stroke_width(current: f32) -> f32 {
     let i = stroke_width_nearest_index(current);
     STROKE_WIDTHS[(i + 1) % STROKE_WIDTHS.len()]
@@ -264,6 +273,22 @@ pub enum AnnotKind {
     /// reads as neutral pressure, so a stroke built without a trail still profiles from its
     /// curvature alone. `pressure[i]` belongs to `paths[i]`; helpers keep them in step.
     Pen { paths: Vec<Vec<AnnotPoint>>, pressure: Vec<Vec<f32>>, stroke_w: f32 },
+    /// A TEXT annotation (DRAGON-354): wrapped text in an EMBEDDED font, laid out and
+    /// rasterized by [`super::text_annot`] (the ONE renderer both the live layer and the bake
+    /// call, so they agree pixel-for-pixel). `rect` is the drawn box in SOURCE px, recomputed
+    /// from the layout on every edit; `size_px` is the SOURCE-pixel font size (zooms with the
+    /// picture like the stroke width); `font` picks the handwritten vs clean family; and
+    /// `constrained` is `true` for a DRAG box (text wraps within the fixed `rect.w`) and
+    /// `false` for a CLICK box (the box auto-sizes to the widest line). The stroke
+    /// [`AnnotationItem::color`] is the ink. `stroke_w` is the active LINE WIDTH (SOURCE px)
+    /// captured at creation (DRAGON-358): it maps through
+    /// [`super::text_annot::text_stroke_width`] to an OUTLINE weight painted under the fill, so
+    /// the width group thickens text the way it thickens a box/arrow stroke — and it re-styles
+    /// on a selected box exactly like the color does. Outline-only, so the shared layout
+    /// ([`text_kind_layout`]) is untouched and live/bake parity holds. Selection chrome +
+    /// move/resize ride `rect` exactly like a [`Self::Box`]; the glyphs never draw on the vector
+    /// canvas (the raster layer owns them).
+    Text { rect: AnnotRect, text: String, size_px: f32, font: super::text_annot::TextFont, constrained: bool, stroke_w: f32 },
 }
 
 impl AnnotKind {
@@ -281,6 +306,8 @@ impl AnnotKind {
                 // A badge's colour drives BOTH its disc/ring and (through the contrast rule)
                 // its numeral ink, so recolouring it is meaningful.
                 | AnnotKind::Badge { .. }
+                // Text ink IS its colour (DRAGON-354).
+                | AnnotKind::Text { .. }
         )
     }
 
@@ -407,17 +434,18 @@ pub fn default_placement_rect(frame: (u32, u32), margin: f32) -> AnnotRect {
     AnnotRect { x: (fw - w) * 0.5, y: (fh - h) * 0.5, w, h }
 }
 
-/// The side (SOURCE px) a sequence badge is born at when nothing has been placed or resized
-/// yet — the seed of [`super::edit::EditState::badge_size`].
+/// The side (SOURCE px) a sequence badge is born at when NOTHING has been remembered yet —
+/// the fallback behind [`super::edit::EditState::badge_size`], reached only on a fresh install
+/// (or after a config reset), since the remembered side is persisted.
 ///
 /// SOURCE pixels, not screen pixels: every annotation geometry in this module is source-space
 /// (see [`AnnotRect`]), as are [`DEFAULT_ANNOT_STROKE`] and [`SPAWN_W`]/[`SPAWN_H`]. That keeps
 /// a placed badge a FIXED fraction of the picture — the same in the preview at any zoom, in a
 /// re-opened preview, and in the bake, which composites at full source resolution. The
-/// trade-off is the honest one: on a 4K grab a 100px badge reads smaller on screen than on a
+/// trade-off is the honest one: on a 4K grab a 75px badge reads smaller on screen than on a
 /// 720p one. Sizing in screen px would invert that (consistent on screen, drifting against the
 /// image), and the badge belongs to the image.
-pub const DEFAULT_BADGE_SIZE: f32 = 100.0;
+pub const DEFAULT_BADGE_SIZE: f32 = 75.0;
 
 /// The square a CLICK-PLACED sequence badge takes (DRAGON-340 follow-up): side `want`,
 /// CENTRED on the click, sized by the same pre-placement rule the double-click spawn uses
@@ -441,6 +469,31 @@ pub fn badge_placement_rect(
     let s = placement_extent(fw, want.max(0.0), m).min(placement_extent(fh, want.max(0.0), m));
     let centred = AnnotRect { x: center.0 - s * 0.5, y: center.1 - s * 0.5, w: s, h: s };
     clamp_square(centred, fw, fh, m)
+}
+
+/// The rect a DOUBLE-CLICKED `tool` pre-places its item in — the geometry half of
+/// [`App::spawn_annotation`], split out so it is pure and unit-tested.
+///
+/// Every ordinary tool takes the shared [`default_placement_rect`] (the 200×100 spawn box).
+/// The SEQUENCE BADGE does NOT: a step marker has a REMEMBERED size, and dropping one from the
+/// tray must produce exactly the marker a click would — so it goes through
+/// [`badge_placement_rect`] at `badge_want` (the editor's [`super::edit::EditState::badge_size`])
+/// and is merely CENTRED in the picture instead of dropped on the pointer. That is the whole
+/// difference between the two spawn routes; the SIZE rule and the clamp are shared, so the two
+/// can never drift (they used to: the badge inherited the spawn box's shorter axis, ignoring
+/// the remembered side entirely).
+pub fn spawn_placement_rect(
+    tool: Tool,
+    frame: (u32, u32),
+    margin: f32,
+    badge_want: f32,
+) -> AnnotRect {
+    if tool == Tool::Badge {
+        let (fw, fh) = (frame.0 as f32, frame.1 as f32);
+        badge_placement_rect((fw * 0.5, fh * 0.5), badge_want, frame, margin)
+    } else {
+        default_placement_rect(frame, margin)
+    }
 }
 
 /// The kind a DOUBLE-CLICKED `tool` spawns inside `rect` (DRAGON-339), or `None` for a tool that
@@ -468,10 +521,229 @@ pub fn spawn_kind(tool: Tool, rect: AnnotRect, stroke_w: f32) -> Option<AnnotKin
             ring_w: stroke_w,
         },
         // A freehand stroke has no meaningful default geometry; the eraser creates no item at
-        // all; and the POINTER (DRAGON-341) is pure selection — it must never place anything.
-        // Double-clicking any of their tray buttons just picks the tool.
-        Tool::Pen | Tool::Eraser | Tool::Pointer => return None,
+        // all; the POINTER (DRAGON-341) is pure selection; and TEXT (DRAGON-354) is typed into,
+        // not pre-placed — double-clicking any of their tray buttons just picks the tool.
+        Tool::Pen | Tool::Eraser | Tool::Pointer | Tool::Text => return None,
     })
+}
+
+/// Re-lay-out a text box after any content / size / box change (DRAGON-354), the SINGLE seam
+/// creation, per-keystroke edits and a resize all reflow through — so the drawn box always hugs
+/// its text identically everywhere. Keeps the box ORIGIN; a `constrained` (dragged) box wraps
+/// within its fixed width, an auto (clicked) box grows to its widest line capped at the room to
+/// the picture's right edge; the height snaps to the wrapped line count. The origin is clamped
+/// so the box stays inside `frame`. `stroke_w` (the active line width, SOURCE px) rides along
+/// as the glyph OUTLINE weight (DRAGON-358) — it does NOT affect the layout (outline-only), so
+/// the geometry is unchanged by it. Pure.
+pub fn reflow_text(
+    text: &str,
+    size_px: f32,
+    font: super::text_annot::TextFont,
+    rect: AnnotRect,
+    constrained: bool,
+    stroke_w: f32,
+    frame: (f32, f32),
+) -> AnnotKind {
+    let (fw, fh) = frame;
+    let lay = text_kind_layout(text, size_px, font, rect, constrained, fw);
+    let (w, h) = (lay.box_w, lay.box_h);
+    // DRAGON-368: held to [`TEXT_MIN_ON_CANVAS_PX`] of the box on the picture rather than wholly
+    // inside it. This is THE seam a text box's position is normalized at — creation, typing,
+    // moving and scaling all pass through here — so putting the rule here is what keeps the
+    // gestures from disagreeing about where a caption is allowed to be. The visible consequence
+    // beyond dragging: typing at the picture's edge now grows the box OFF the picture instead of
+    // sliding the caption inboard under the caret, which is the same trade the owner asked for
+    // ("aligning text to an edge currently forces it to be clipped or blocked") applied to the
+    // one other gesture that can grow a box.
+    let placed = clamp_text_rect_on_canvas(AnnotRect { x: rect.x, y: rect.y, w, h }, fw, fh);
+    AnnotKind::Text {
+        rect: placed,
+        text: text.to_string(),
+        size_px,
+        font,
+        constrained,
+        stroke_w,
+    }
+}
+
+/// Resolve a caret MOVE (DRAGON-354 item 12) into `(new_text=None, caret, anchor)`:
+/// * Shift held → EXTEND the selection: keep the anchor (seed it at the old caret if there was
+///   none) and move the caret to `moved`.
+/// * No shift, a selection exists:
+///   * an ARROW (`travel = false`) COLLAPSES to the edge in the movement direction
+///     (`to_start_side` = left/up → start, right/down → end); the caret doesn't travel further.
+///   * HOME/END (`travel = true`) clear the selection AND travel to the computed line
+///     boundary — collapsing to the selection edge instead is the classic Home-with-selection
+///     bug (the caret would stop mid-line).
+/// * No shift, no selection → just move to `moved`.
+///
+/// Pure — unit-tested.
+fn caret_move(
+    old_caret: usize,
+    moved: usize,
+    anchor: Option<usize>,
+    sel: Option<(usize, usize)>,
+    shift: bool,
+    to_start_side: bool,
+    travel: bool,
+) -> (Option<String>, usize, Option<usize>) {
+    if shift {
+        (None, moved, Some(anchor.unwrap_or(old_caret)))
+    } else if let Some((a, b)) = sel {
+        if travel {
+            (None, moved, None)
+        } else {
+            (None, if to_start_side { a } else { b }, None)
+        }
+    } else {
+        (None, moved, None)
+    }
+}
+
+/// Whether a press ENDS the live text-edit session (DRAGON-364) — Escape, as always, or
+/// **numpad** Enter.
+///
+/// Why `location` and not the key alone: iced's LOGICAL key cannot tell the two Enters apart.
+/// BOTH backends this app runs on map the keypad key to the same `Key::Named(Named::Enter)` as
+/// the main one — the Wayland layer-shell path through `keysym_to_key(KP_Enter) -> Named::Enter`,
+/// the winit path through winit's own logical mapping — and record the keypad ONLY in the
+/// event's [`Location`] (`KP_Enter -> Location::Numpad`, set by `keysym_location` and by
+/// winit's `KeyLocation::Numpad`). That field is plumbed from the event subscription for exactly
+/// this predicate; `physical_key` would work equally well but is a per-layout code where
+/// `Location` is already the normalized "which group of keys" answer both backends compute.
+///
+/// MAIN Enter is deliberately NOT an exit: the box is multi-line and Enter inserts a newline
+/// (`text_edit_key`'s `Named::Enter` arm), so exiting on it would make a paragraph unwritable.
+/// Modifiers are not consulted — the exit is the key itself, however it is qualified.
+///
+/// Pure — unit-tested.
+pub fn text_edit_exits(
+    key: &cosmic::iced::keyboard::Key,
+    location: cosmic::iced::keyboard::Location,
+) -> bool {
+    use cosmic::iced::keyboard::{key::Named, Key, Location};
+    match key {
+        Key::Named(Named::Escape) => true,
+        Key::Named(Named::Enter) => location == Location::Numpad,
+        _ => false,
+    }
+}
+
+/// What a PRIMARY-modifier press means to a LIVE text-annotation edit (DRAGON-354 item 13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextEditChord {
+    /// Cmd/Ctrl+Z — step this session's text history back.
+    Undo,
+    /// Shift+Cmd/Ctrl+Z, or Cmd/Ctrl+Y — step it forward.
+    Redo,
+    /// Cmd/Ctrl+A — select the whole box.
+    SelectAll,
+    /// Cmd/Ctrl+C — copy the selected text.
+    Copy,
+    /// Cmd/Ctrl+X — cut the selected text.
+    Cut,
+    /// Cmd/Ctrl+V — paste at the caret.
+    Paste,
+}
+
+/// Classify a press that arrived with the PRIMARY command modifier (Cmd on macOS, Ctrl
+/// elsewhere) held while a text box is being edited. `None` = the chord is **swallowed**.
+///
+/// # Why this is a named, tested predicate and not an inline match (DRAGON-369)
+///
+/// A live text edit OWNS the keyboard: `keyboard.rs`'s `preview_modal_key` hands every press to
+/// [`super::App::text_edit_key`] BEFORE the Preview keymap is consulted, so this list is the
+/// complete inventory of primary chords that do anything at all while you are typing —
+/// everything else is silently dropped and NEVER reaches an editor binding.
+///
+/// That is a SAFETY property, not an implementation detail, because the Preview context binds
+/// two chords whose stray arrival mid-typing would be destructive: `Ctrl+D`
+/// ([`crate::shortcuts::Action::PreviewDeselectAll`]) and `Ctrl+Shift+X`
+/// ([`crate::shortcuts::Action::PreviewDelete`] — a hard `remove_file` on the capture). Neither
+/// `d` nor a bare `x`-with-Shift-as-a-different-meaning is claimed here, so:
+/// * `Ctrl+D` while typing does NOTHING (swallowed) — it cannot deselect out from under an
+///   active edit;
+/// * `Ctrl+Shift+X` while typing cuts the TEXT SELECTION (the [`TextEditChord::Cut`] arm — the
+///   arms are modifier-insensitive apart from Shift+Z, so it behaves exactly like `Ctrl+X`) and
+///   can never delete the capture file.
+///
+/// Pure — unit-tested, including both of those.
+pub fn text_edit_chord(key: &cosmic::iced::keyboard::Key, shift: bool) -> Option<TextEditChord> {
+    let cosmic::iced::keyboard::Key::Character(s) = key else {
+        // A non-character primary chord (a bare modifier, an F-key, an arrow): swallowed.
+        return None;
+    };
+    Some(match s.to_ascii_lowercase().as_str() {
+        "z" if shift => TextEditChord::Redo,
+        "z" => TextEditChord::Undo,
+        "y" => TextEditChord::Redo,
+        "a" => TextEditChord::SelectAll,
+        "c" => TextEditChord::Copy,
+        "x" => TextEditChord::Cut,
+        "v" => TextEditChord::Paste,
+        _ => return None,
+    })
+}
+
+/// The most CHARS one paste may insert into a text annotation (32K). A caption is at most a
+/// paragraph; an accidental multi-MB clipboard (a log file, a document) would otherwise drive
+/// the per-edit reflow + resvg re-raster into a multi-second stall. The excess is silently
+/// truncated at a grapheme boundary ([`super::text_annot::cap_graphemes`]) — no toast, by
+/// review decision.
+const TEXT_PASTE_MAX_CHARS: usize = 32 * 1024;
+
+/// The right-edge margin (SOURCE px) an AUTO (click-placed) text box keeps clear of the
+/// picture's right edge — the one constant behind [`text_auto_cap`].
+const TEXT_EDGE_MARGIN: f32 = 4.0;
+
+/// The wrap cap (SOURCE px) of an AUTO text box whose origin is `rect_x` and whose current
+/// width is `rect_w`, on a picture `fw` wide: the room to the picture's right edge minus
+/// [`TEXT_EDGE_MARGIN`], floored at the box's OWN width and at one glyph, and ceilinged at
+/// [`super::text_annot::AUTO_WRAP_FALLBACK`] (resvg coordinate sanity on absurd frames). Pure.
+///
+/// WHY the box's own width is a floor (DRAGON-368): until this ticket a text box was clamped
+/// wholly inside the picture, which meant `fw - rect_x >= rect_w` always held and the cap could
+/// never bind on a MOVE — dragging a caption around never re-wrapped it. The owner asked that
+/// text be draggable OFF the canvas (5px of the box left on it), which breaks that invariant:
+/// without this floor, dragging a wide caption toward the right edge would shrink its wrap cap
+/// on every motion event and finally collapse it into a one-glyph-per-line column. Flooring at
+/// the box's existing width restores exactly the old guarantee — a move never re-wraps — while
+/// leaving the cap free to bind where it always did: a caption CLICKED near the right edge
+/// starts at `w = 0` and still wraps at the picture's edge, and typing keeps the width it
+/// already wrapped to. It also keeps a horizontal drag on the raster-reuse fast path
+/// ([`text_layer_xform`]), which compares the derived layout.
+///
+/// The one behaviour it does change: an auto box sitting past the picture's right edge and then
+/// scaled DOWN keeps the wide cap its old width earned, so it may un-wrap into one long line
+/// running off the canvas instead of re-wrapping at the edge. That is the same "text is allowed
+/// to leave the picture" trade, in a corner the owner is far less likely to meet than dragging.
+fn text_auto_cap(rect_x: f32, rect_w: f32, size_px: f32, fw: f32) -> f32 {
+    (fw - rect_x - TEXT_EDGE_MARGIN)
+        .max(rect_w)
+        .max(size_px)
+        .min(super::text_annot::AUTO_WRAP_FALLBACK)
+}
+
+/// THE one layout derivation for a stored [`AnnotKind::Text`]: its display lines + box
+/// metrics as a pure function of the stored fields and the picture width. EVERY consumer —
+/// [`reflow_text`] (the stored geometry), [`render_text_layer`] (the live raster),
+/// [`rasterize_scene`]'s Text arm (the bake), the caret geometry in `image.rs`, and the
+/// caret-movement keys in [`App::text_edit_key`] — derives its layout HERE, so the wrap can
+/// never diverge between the box geometry and what is actually drawn. (It used to: the render
+/// paths passed the constant `AUTO_WRAP_FALLBACK` where the reflow used the frame-derived
+/// cap, so a long caption near the right edge stored a wrapped box but rendered one clipped
+/// line.) Pure — the parity is unit-tested.
+pub fn text_kind_layout(
+    text: &str,
+    size_px: f32,
+    font: super::text_annot::TextFont,
+    rect: AnnotRect,
+    constrained: bool,
+    fw: f32,
+) -> super::text_annot::TextLayout {
+    use super::text_annot;
+    let wrap_w = if constrained { Some(rect.w.max(text_annot::MIN_BOX_W)) } else { None };
+    text_annot::layout(text, font, size_px, wrap_w, text_auto_cap(rect.x, rect.w, size_px, fw))
 }
 
 /// The rect kinds that share Box GEOMETRY and interaction, as a small id — the axis
@@ -488,7 +760,12 @@ fn rect_family_id(kind: &AnnotKind) -> Option<u8> {
         AnnotKind::Pixelate { .. } => 3,
         AnnotKind::Blur { .. } => 4,
         AnnotKind::Spotlight { .. } => 5,
-        AnnotKind::Arrow { .. } | AnnotKind::Pen { .. } | AnnotKind::Badge { .. } => return None,
+        // Text is NOT a rect-conversion member (DRAGON-354): converting a box into text (or vice
+        // versa) would throw away the string / reshape the layout — arming the tool just arms it.
+        AnnotKind::Arrow { .. }
+        | AnnotKind::Pen { .. }
+        | AnnotKind::Badge { .. }
+        | AnnotKind::Text { .. } => return None,
     })
 }
 
@@ -501,7 +778,9 @@ fn rect_family_tool(tool: Tool) -> Option<u8> {
         Tool::Pixelate => 3,
         Tool::Blur => 4,
         Tool::Spotlight => 5,
-        Tool::Arrow | Tool::Pen | Tool::Eraser | Tool::Pointer | Tool::Badge => return None,
+        Tool::Arrow | Tool::Pen | Tool::Eraser | Tool::Pointer | Tool::Badge | Tool::Text => {
+            return None;
+        }
     })
 }
 
@@ -557,6 +836,23 @@ pub fn accent_color_bytes() -> AnnotColor {
 /// current accent at runtime, so it tracks theme changes.
 pub fn default_annot_color() -> AnnotColor {
     complement(accent_color_bytes())
+}
+
+/// The accent's COMPANION colour as an iced [`Color`] — the accent's [`complement`] (hue
+/// rotated 180°), read from `theme` so it tracks a live appearance override. The SAME
+/// companion the default annotation colour uses ([`default_annot_color`]); the preview's
+/// sharing actions (Save / Save As / Copy) tint with it while the document has unsaved
+/// edits, so the "there is uncommitted work here" cue reads as the accent's partner rather
+/// than an alarm colour.
+pub fn companion(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    let a = crate::app::theme::accent(theme);
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let c = complement([byte(a.r), byte(a.g), byte(a.b), 255]);
+    cosmic::iced::Color::from_rgb(
+        c[0] as f32 / 255.0,
+        c[1] as f32 / 255.0,
+        c[2] as f32 / 255.0,
+    )
 }
 
 /// The complementary color of `rgb`: hue rotated 180° in HSL, same saturation + lightness,
@@ -706,6 +1002,214 @@ pub fn square_for_grab(r: AnnotRect, grab: Grab, fw: f32, fh: f32, m: f32) -> An
         }
     };
     clamp_square(squared, fw, fh, m)
+}
+
+// ── text box resize: the two modes (DRAGON-364) ──────────────────────────────────────
+
+/// The minimum of a text box's own `rect` (SOURCE px) that must remain ON the picture
+/// (DRAGON-368) — the whole of what stops a caption being dragged out of existence.
+///
+/// WHY the box may leave the canvas at all: the owner asked for it, because a caption's ink
+/// simply cannot be aligned FLUSH to an edge while the box is clamped wholly inside — the layout
+/// box carries side bearings and line leading the ink does not fill, so "as far left as it goes"
+/// still leaves a visible gap. Letting the box overhang lets the INK meet the edge.
+///
+/// WHY it is measured on `rect` and NOT on the padded region ([`text_padded_bounds`]): the
+/// padding is slack for ink that might escape the box, up to `size_px * TEXT_INK_OVERHANG_EM`
+/// plus the outline — 134 px per side at 512px type. Clamping on that is precisely what made
+/// edge alignment impossible. `rect` is also the rect the canvas hit-tests, so "5 px of box left
+/// on the picture" is the same 5 px you can still grab to drag it back: recoverability falls out
+/// of the number instead of needing a second rule of its own.
+///
+/// SOURCE px, so it does not change meaning with zoom — at fit zoom on a 5K capture 5 source px
+/// is a bit over 2 device px, which is small but reliably grabbable, and it is a floor on how far
+/// out you can push rather than a target.
+pub const TEXT_MIN_ON_CANVAS_PX: f32 = 5.0;
+
+/// A text box's rect held to [`TEXT_MIN_ON_CANVAS_PX`] of itself on the picture (DRAGON-368) —
+/// the MOVE clamp for text, in place of the "wholly inside the frame" [`clamp_rect`] every other
+/// kind takes.
+///
+/// Per axis the rule is simply that the overlap of the box with the picture stays at least
+/// `min(TEXT_MIN_ON_CANVAS_PX, extent)` — the `min` so a box narrower than the threshold (a
+/// single hairline glyph) is held by its whole width rather than being unclampable. A degenerate
+/// frame leaves the rect alone rather than inventing a position. Pure — unit-tested.
+fn clamp_text_rect_on_canvas(r: AnnotRect, fw: f32, fh: f32) -> AnnotRect {
+    let axis = |v: f32, extent: f32, full: f32| {
+        // A degenerate (or NaN) frame leaves the rect alone rather than inventing a position;
+        // spelled as a positive comparison so a NaN `full` falls through here too.
+        if !(full.is_finite() && full > 0.0) || !v.is_finite() {
+            return v;
+        }
+        let keep = TEXT_MIN_ON_CANVAS_PX.min(extent.max(0.0));
+        v.clamp(keep - extent.max(0.0), full - keep)
+    };
+    AnnotRect { x: axis(r.x, r.w, fw), y: axis(r.y, r.h, fh), w: r.w, h: r.h }
+}
+
+/// The SIZE (SOURCE px) a handle drag SCALES an auto text box to: the drag's own factor, held
+/// inside the guard bounds [`super::text_annot::TEXT_SCALE_MIN_PX`]..=
+/// [`super::text_annot::TEXT_SCALE_MAX_PX`] and otherwise untouched.
+///
+/// DRAGON-367 made the size reach past the dropdown's span (a drag goes 64 → 96 → 128 → 192 and
+/// on up, or below 12) and land on discrete LADDER rungs so a resize read as deliberate steps.
+/// DRAGON-368 removed the stepping on the owner's instruction ("we need to remove snapping from
+/// the sizer") — the type now tracks the pointer continuously, exactly as the box does. Only the
+/// ladder's two ENDS survive, as guards: "no limit" cannot mean "no guard", since `size_px` feeds
+/// the text layer's padded region and a runaway (or NaN) size has no rasterizable region at all.
+///
+/// The BOX scales with the type, and that is not a compromise: a normal (click-created) box has
+/// no independent geometry — `reflow_text` derives its extent from the text at `size_px`, which
+/// is the whole reason DRAGON-364 scales the type here instead of stretching the frame.
+///
+/// The chip reports the real number, and the dropdown highlights nothing while the size is
+/// off-preset ([`super::text_annot::text_size_preset_index`]) — which is now the usual case, not
+/// the exception — so an off-preset size is never misreported as a preset and is never silently
+/// snapped back into the listed range.
+fn clamp_scaled_text_size(px: f32) -> f32 {
+    super::text_annot::text_scale_clamp(px)
+}
+
+/// The UNIFORM scale factor a resize grab implies for an AUTO ("normal") text box — the
+/// DRAGON-364 rule that a click-created box grows its GLYPHS rather than its wrap frame.
+///
+/// A normal box has no independent geometry: `reflow_text` derives its `w`/`h` from the text at
+/// `size_px`, so there is nothing to stretch — the only thing a handle CAN change is the type
+/// size, and scaling that uniformly is what makes the resize aspect-ratio-locked by
+/// construction (both axes come from one number, so the box can never be squashed).
+///
+/// The factor is the drag PROJECTED onto the direction the handle actually pulls, normalized by
+/// the box's own extent:
+///   * a CORNER projects onto that corner's outward diagonal, so both axes contribute and a
+///     purely horizontal or purely vertical drag still resizes (a per-axis `max`/`min` would
+///     dead-zone one of them, and the geometric mean would halve the response);
+///   * an EDGE uses its own axis alone — dragging the bottom edge down grows, up shrinks.
+///
+/// Both are continuous through 1.0 and monotone in the drag, so the text tracks the pointer
+/// without a jump when the drag direction crosses an axis.
+///
+/// `w`/`h` are the box's PRE-drag extent; a degenerate axis falls back to the other so a
+/// one-line box with a hairline height can still be scaled. Clamped to a small positive floor —
+/// the caller's [`clamp_scaled_text_size`] owns the real range; this only guarantees the factor
+/// never goes zero or negative (which would invert the type). Pure — unit-tested.
+pub fn text_scale_factor(w: f32, h: f32, grab: Grab, dx: f32, dy: f32) -> f32 {
+    use crate::geometry::{Corner, Edge};
+    // Guard degenerate extents: fall back to the other axis, then to 1px, so no division by ~0.
+    let w = if w.abs() > 0.5 { w.abs() } else if h.abs() > 0.5 { h.abs() } else { 1.0 };
+    let h = if h.abs() > 0.5 { h.abs() } else { w };
+    // The outward direction of the dragged handle, in box units.
+    let (sx, sy) = match grab {
+        Grab::Corner(Corner::Nw) => (-1.0, -1.0),
+        Grab::Corner(Corner::Ne) => (1.0, -1.0),
+        Grab::Corner(Corner::Sw) => (-1.0, 1.0),
+        Grab::Corner(Corner::Se) => (1.0, 1.0),
+        Grab::Edge(Edge::N) => (0.0, -1.0),
+        Grab::Edge(Edge::S) => (0.0, 1.0),
+        Grab::Edge(Edge::W) => (-1.0, 0.0),
+        Grab::Edge(Edge::E) => (1.0, 0.0),
+        // A move never resizes; arrow grabs never apply to a box.
+        Grab::Move | Grab::ArrowA | Grab::ArrowB => return 1.0,
+    };
+    // Project the drag onto that direction and divide by the extent ALONG it: for a corner that
+    // is the squared diagonal (w² + h²), for an edge simply its own axis.
+    let (ox, oy) = (sx * w, sy * h);
+    let denom = ox * ox + oy * oy;
+    if denom <= f32::EPSILON {
+        return 1.0;
+    }
+    (1.0 + (dx * ox + dy * oy) / denom).max(0.05)
+}
+
+/// Re-place a rescaled AUTO text box so the grab's ANCHOR — the corner/edge OPPOSITE the handle
+/// being dragged — stays put (DRAGON-364), then clamp the result inside `frame`.
+///
+/// Scaling changes the box's derived `w`/`h`, so without this the box would grow from its
+/// top-left and the handle you are holding would slide out from under the pointer. Mirrors
+/// [`edit_rect`]'s anchoring exactly: an NW drag pins SE, an E drag pins the west edge, and an
+/// edge drag leaves the other axis's origin alone (unlike the badge's recentring — a caption
+/// that slid sideways while you dragged its bottom edge would read as a move, not a resize).
+/// Pure — unit-tested.
+pub fn anchor_scaled_text_rect(
+    orig: AnnotRect,
+    new_w: f32,
+    new_h: f32,
+    grab: Grab,
+    frame: (f32, f32),
+) -> AnnotRect {
+    use crate::geometry::{Corner, Edge};
+    let (l, t, r, b) = orig.corners();
+    // `(x, y)` of the new box, chosen so the anchor edge/corner is preserved.
+    let (x, y) = match grab {
+        Grab::Corner(Corner::Nw) => (r - new_w, b - new_h),
+        Grab::Corner(Corner::Ne) => (l, b - new_h),
+        Grab::Corner(Corner::Sw) => (r - new_w, t),
+        Grab::Corner(Corner::Se) => (l, t),
+        Grab::Edge(Edge::N) => (l, b - new_h),
+        Grab::Edge(Edge::S) => (l, t),
+        Grab::Edge(Edge::W) => (r - new_w, t),
+        Grab::Edge(Edge::E) => (l, t),
+        Grab::Move | Grab::ArrowA | Grab::ArrowB => (orig.x, orig.y),
+    };
+    let (fw, fh) = frame;
+    // DRAGON-368: held to [`TEXT_MIN_ON_CANVAS_PX`] on the picture rather than wholly inside it,
+    // the same rule a text MOVE takes. Applied here too so scaling a caption you have deliberately
+    // aligned to an edge grows it past that edge instead of shoving it back inboard — the two
+    // gestures would otherwise disagree about where a text box is allowed to be.
+    clamp_text_rect_on_canvas(AnnotRect { x, y, w: new_w, h: new_h }, fw, fh)
+}
+
+// ── text style: display vs. remembered default (DRAGON-364) ──────────────────────────
+
+/// WHERE a text size/font change came from — the axis that decides whether it is a user
+/// PREFERENCE (persisted as the default new boxes are born with) or merely a REPORT about the
+/// element under the cursor (the dropdown chips following the selection).
+///
+/// This exists as a named type rather than a bare `bool` so every call site has to say which
+/// kind of change it is making, and the rule lives in exactly one place
+/// ([`Self::writes_default`]) instead of being restated — the two must never quietly collapse
+/// into "any style change persists", which would let merely clicking an old 96px caption re-set
+/// the default for every future capture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextStyleSource {
+    /// The user picked a value in the font/size dropdown menu — the only genuine statement of
+    /// preference, and the only source that writes the persisted default.
+    DropdownPick,
+    /// The dropdowns are REPORTING the selected / newly-edited element's own style
+    /// (DRAGON-364 task 3). A report, not a choice.
+    SelectionSync,
+    /// A handle drag scaled a NORMAL box, changing its font size (DRAGON-364 task 4). The user
+    /// dragged geometry; they did not pick a size, so the default must not move — confirmed by
+    /// the repo owner. The chip still follows the drag, so the number stays honest.
+    HandleScale,
+}
+
+impl TextStyleSource {
+    /// Whether a style change from this source updates the PERSISTED default for future text
+    /// boxes. Only an explicit dropdown pick does. Pure — unit-tested in both directions.
+    pub fn writes_default(self) -> bool {
+        match self {
+            TextStyleSource::DropdownPick => true,
+            TextStyleSource::SelectionSync | TextStyleSource::HandleScale => false,
+        }
+    }
+}
+
+/// The `(size_px, font)` the dropdowns should DISPLAY for `target` within `annotations`
+/// (DRAGON-364 task 3) — `None` when there is no target, it has vanished, or it is not a text
+/// item, in which case the chips keep showing what a new box would take.
+///
+/// The caller resolves `target` as "the box being edited, else the PRIMARY selection", and the
+/// primary is the LAST-selected item — which is precisely the ticket's "in the case of multiple
+/// you can match the last one selected". Pure — unit-tested.
+pub fn text_style_for_display(
+    annotations: &[AnnotationItem],
+    target: Option<AnnotId>,
+) -> Option<(f32, super::text_annot::TextFont)> {
+    let tid = target?;
+    annotations.iter().find(|it| it.id == tid).and_then(|it| match &it.kind {
+        AnnotKind::Text { size_px, font, .. } => Some((*size_px, *font)),
+        _ => None,
+    })
 }
 
 // ── color palette + custom color-wheel picker ────────────────────────────────────────
@@ -1144,6 +1648,13 @@ fn round_rect_path(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<resvg::tiny
 /// downscaled target). Now used ONLY by the bake ([`apply_annotations`]); the live preview
 /// draws vectors. `curve` (the shared curviness, 0..1) softens BOTH the box corners
 /// and the arrow caps/joins. Returns `None` for an empty target.
+/// How much room (RASTER px) the bake gives an OFF-CANVAS caption around the output before
+/// cropping back to it (DRAGON-368) — see the Text arm of [`rasterize_scene`]. The artifact it
+/// exists to move out of frame lands on the pixmap's own boundary line, so one px would do; eight
+/// costs `(w + h) * 8 * 4` bytes once per bake and leaves room for a shallow curve that smears
+/// across more than a single scanline.
+const TEXT_BAKE_BLEED: u32 = 8;
+
 pub fn rasterize_scene(
     items: &[AnnotationItem],
     w: u32,
@@ -1253,6 +1764,76 @@ pub fn rasterize_scene(
                 if let Some(ribbon) = pb.finish() {
                     pixmap.fill_path(&ribbon, &paint, sk::FillRule::Winding, ident, None);
                 }
+            }
+            // TEXT (DRAGON-354): the SAME embedded-font renderer the live layer calls, so bake
+            // and preview are one drawing at two resolutions — and the SAME layout derivation
+            // as the stored geometry ([`text_kind_layout`]; `w / scale` recovers the SOURCE
+            // frame width this raster covers), so the wrap can never differ either.
+            AnnotKind::Text { rect, text, size_px, font, constrained, stroke_w } => {
+                let lay = text_kind_layout(
+                    text,
+                    *size_px,
+                    *font,
+                    *rect,
+                    *constrained,
+                    w as f32 / scale.max(f32::EPSILON),
+                );
+                let origin = (rect.x * scale, rect.y * scale);
+                // DRAGON-368 — text may now hang OFF the canvas, and a glyph whose outline
+                // crosses the output's edge cannot be drawn straight into the output pixmap:
+                // tiny_skia's path clipper closes the clipped outline along the pixmap boundary,
+                // which deposits phantom coverage on the boundary ROW/COLUMN. Measured on a
+                // caption dragged past the top edge: alpha up to 121/255 in picture row 0 at
+                // every place a glyph crossed it, i.e. a faint dotted line along the edge of the
+                // exported image, where the live layer (cut by a hard GPU scissor) shows nothing.
+                //
+                // So a caption that escapes the output is drawn into a BLED pixmap first and
+                // blitted back — the clipper's artifact then lands in the bleed and is cropped
+                // away, and an axis-aligned pixmap blit has no rasterizer to misbehave. Text that
+                // sits wholly inside takes the original call unchanged, so every historical bake
+                // stays byte-identical.
+                let escapes = text_padded_bounds(std::slice::from_ref(item)).is_some_and(
+                    |(x0, y0, x1, y1)| {
+                        x0 * scale < 0.0
+                            || y0 * scale < 0.0
+                            || x1 * scale > w as f32
+                            || y1 * scale > h as f32
+                    },
+                );
+                if escapes {
+                    let bleed = TEXT_BAKE_BLEED;
+                    if let Some(mut bled) = sk::Pixmap::new(w + 2 * bleed, h + 2 * bleed) {
+                        super::text_annot::render_into(
+                            &mut bled,
+                            &lay,
+                            *font,
+                            *size_px,
+                            item.color,
+                            *stroke_w,
+                            (origin.0 + bleed as f32, origin.1 + bleed as f32),
+                            scale,
+                        );
+                        pixmap.as_mut().draw_pixmap(
+                            -(bleed as i32),
+                            -(bleed as i32),
+                            bled.as_ref(),
+                            &sk::PixmapPaint::default(),
+                            ident,
+                            None,
+                        );
+                        continue;
+                    }
+                }
+                super::text_annot::render_into(
+                    &mut pixmap,
+                    &lay,
+                    *font,
+                    *size_px,
+                    item.color,
+                    *stroke_w,
+                    origin,
+                    scale,
+                );
             }
             // The region effects (highlight, pixelate, blur) are NOT source-over overlays —
             // they composite through the true-z-order CPU stack ([`apply_one_effect`] /
@@ -1851,6 +2432,8 @@ pub fn apply_one_effect_scaled(
         | AnnotKind::Pen { .. }
         // The SEQUENCE BADGE is an always-on-top vector like box/arrow, never an effect.
         | AnnotKind::Badge { .. }
+        // TEXT (DRAGON-354) draws through its own raster layer, never the effect stack.
+        | AnnotKind::Text { .. }
         | AnnotKind::Spotlight { .. } => return,
     };
     // Scale the geometry into the (possibly reduced) raster space. Blocks scale too, floored
@@ -1920,6 +2503,7 @@ pub fn apply_one_effect_scaled(
         | AnnotKind::Arrow { .. }
         | AnnotKind::Pen { .. }
         | AnnotKind::Badge { .. }
+        | AnnotKind::Text { .. }
         | AnnotKind::Spotlight { .. } => {
             unreachable!("handled above")
         }
@@ -1983,6 +2567,8 @@ pub fn knockout_rects(items: &[AnnotationItem]) -> Vec<AnnotRect> {
             // A badge MARKS a spot (like an arrow); it doesn't frame a region, so it never
             // punches the dim either.
             | AnnotKind::Badge { .. }
+            // TEXT is a caption, not a region marker — it never punches the dim (DRAGON-354).
+            | AnnotKind::Text { .. }
             | AnnotKind::Pixelate { .. }
             | AnnotKind::Blur { .. } => None,
         })
@@ -2127,11 +2713,522 @@ pub fn widget_items(items: &[AnnotationItem], curve_radius: f32, erasing: &[Anno
                     None,
                     FxKind::None,
                 ),
+                // TEXT (DRAGON-354): hands the canvas its box as a plain Rect so hit-testing,
+                // chrome and resize are the ordinary ones, and rides the `text` flag below so
+                // the canvas draws NO outline (the glyphs come from the raster layer).
+                AnnotKind::Text { rect, .. } => (
+                    ItemKind::Rect { x: rect.x, y: rect.y, w: rect.w, h: rect.h },
+                    0.0,
+                    None,
+                    FxKind::None,
+                ),
             };
             let badge = badges.iter().find(|(id, _)| *id == it.id).map(|(_, n)| *n);
-            Item { id: it.id.0, kind, stroke_w, color: stroke_color, fill, fx, curve_radius, badge }
+            let text = matches!(it.kind, AnnotKind::Text { .. });
+            Item { id: it.id.0, kind, stroke_w, color: stroke_color, fill, fx, curve_radius, badge, text }
         })
         .collect()
+}
+
+/// The grid (SOURCE px) the text layer's REGION is snapped outward to (DRAGON-362). Typing a
+/// character usually grows the caption by less than this, so the region — and therefore the
+/// raster's pixel dimensions — hold still across a burst of keystrokes. That matters because
+/// `LayerStackPipeline::upsert` only updates a layer's texture IN PLACE while its dimensions
+/// are unchanged; a region that moved every keystroke would re-create the texture every
+/// keystroke, which is exactly the churn `layers.rs` exists to avoid.
+const TEXT_REGION_GRID: f32 = 64.0;
+
+/// How far a glyph's INK may escape its layout box, as a fraction of the type size — the slack
+/// [`text_padded_bounds`] adds on every side, on top of the outline weight.
+///
+/// WHY this number (DRAGON-368): it used to be a flat half-em, chosen as "obviously enough". A
+/// half-em on all four sides is a large fraction of a big caption's region, and the region's
+/// AREA is what a re-render costs, so the guess was being paid for on every event. Measured
+/// instead — rendering Latin, accented, emoji and punctuation-heavy samples in both embedded
+/// faces, at a hairline and at the heaviest pencil, and comparing the real ink bounds against
+/// the stored box — the worst overhang is 0.172 em (Excalifont, accented capitals, heaviest
+/// outline; that figure already includes the outline's own half-width). `text_padded_bounds`
+/// adds the FULL stroke width separately, so 0.25 em here leaves better than a 2× margin on the
+/// worst case measured while cutting the padded area of a large caption by about a fifth.
+///
+/// The one case no padding covers is a CJK run: our advance ladder under-measures glyphs that
+/// fall through to a system face, so the stored box can be ~5 em narrower than the ink. That is
+/// a measurement bug (the `text_shape` ladder), not a padding one — a half-em never covered it
+/// either — and it is out of DRAGON-368's scope. Guarded by a unit test that renders real
+/// samples and asserts the ink stays inside the padded bound.
+pub const TEXT_INK_OVERHANG_EM: f32 = 0.25;
+
+/// The PADDED ink bounds of every non-empty text box (SOURCE px, `(x0, y0, x1, y1)`) — the
+/// union [`text_layer_region`] then snaps outward. Split out because the DRAGON-367 reuse fast
+/// path needs the un-snapped bound on its own: it is what decides whether an existing raster
+/// already covers ALL of the ink (see [`placed_text_region`]).
+///
+/// `None` when nothing would be drawn (no text items, or every one of them blank).
+fn text_padded_bounds(items: &[AnnotationItem]) -> Option<(f32, f32, f32, f32)> {
+    let mut acc: Option<(f32, f32, f32, f32)> = None; // (x0, y0, x1, y1)
+    for item in items {
+        let AnnotKind::Text { rect, text, size_px, stroke_w, .. } = &item.kind else {
+            continue;
+        };
+        if text.trim().is_empty() {
+            continue;
+        }
+        // The outline (half of it lies OUTSIDE the glyph edge) plus the measured ink overhang
+        // for side bearings, accents and descenders — the box is a layout measure, not a
+        // guaranteed ink bound, and clipping a caption's tail would be a visible defect.
+        let pad = size_px * TEXT_INK_OVERHANG_EM
+            + super::text_annot::text_stroke_width(*stroke_w, *size_px);
+        let (x0, y0) = (rect.x - pad, rect.y - pad);
+        let (x1, y1) = (rect.x + rect.w + pad, rect.y + rect.h + pad);
+        acc = Some(match acc {
+            None => (x0, y0, x1, y1),
+            Some((ax0, ay0, ax1, ay1)) => (ax0.min(x0), ay0.min(y0), ax1.max(x1), ay1.max(y1)),
+        });
+    }
+    acc
+}
+
+/// The region of the picture (SOURCE px) the live text layer must cover: the union of every
+/// non-empty text box, padded for the glyph OUTLINE and its measured ink overhang
+/// ([`TEXT_INK_OVERHANG_EM`]) and snapped outward to [`TEXT_REGION_GRID`]. `None` when there is
+/// no text to draw.
+///
+/// WHY the layer is a REGION and not the whole picture (DRAGON-362): rendering the text layer
+/// costs `O(raster area)` — measured at ~5.6 ms per megapixel, essentially all of it the
+/// pixmap allocation and the premultiply→straight-alpha pass, with the glyph drawing itself a
+/// rounding error — and the GPU upload is another 4 bytes per pixel. A full-frame layer on a
+/// 5120×2880 capture therefore cost ~82 ms and ~59 MB on EVERY keystroke, drag tick and
+/// selection change. Sizing the raster to the caption instead makes that cost track the text,
+/// not the capture.
+///
+/// WHY it is NO LONGER clipped to the picture (DRAGON-368) — this is the whole drag fix. Clipping
+/// meant a raster near an edge did not contain all of its own ink, and the reuse fast path has to
+/// refuse such a raster (moving it inward would reveal the tail that was never drawn). Measured
+/// on a 5120×2880 capture at fit zoom, that refusal was not an edge case: a caption at 256px took
+/// the fast path on 6.7% of a drag's motion events and one at 512px or 768px on **zero** of them,
+/// so every event paid a 29–32 ms re-render. That is exactly the "drag still lags at 512px" the
+/// owner reported after DRAGON-367. An unclipped region contains its ink BY CONSTRUCTION, so the
+/// fast path holds everywhere — including with the box dragged off the canvas, which DRAGON-368
+/// also allows ([`clamp_text_rect_on_canvas`]).
+///
+/// Nothing draws outside the picture as a result: the layer is a `shader::Shader` sized exactly
+/// `dw × dh` (the on-screen picture), and iced scissors every shader primitive to its own widget
+/// bounds before calling `Primitive::draw` (`iced_wgpu`'s `lib.rs`: `set_viewport(bounds)` +
+/// `set_scissor_rect(bounds ∩ physical_bounds)`), so the part of the quad past the picture is
+/// discarded by the GPU. That is why this needs no extra clip uniform, and why the region may
+/// carry negative coordinates. Pure — unit-tested.
+pub fn text_layer_region(items: &[AnnotationItem], frame: (u32, u32)) -> Option<AnnotRect> {
+    if frame.0 == 0 || frame.1 == 0 {
+        return None;
+    }
+    let (x0, y0, x1, y1) = text_padded_bounds(items)?;
+    // Snap outward to the grid. NOT clipped to the picture — see the doc above.
+    let g = TEXT_REGION_GRID;
+    let x0 = (x0 / g).floor() * g;
+    let y0 = (y0 / g).floor() * g;
+    let x1 = (x1 / g).ceil() * g;
+    let y1 = (y1 / g).ceil() * g;
+    let (w, h) = (x1 - x0, y1 - y0);
+    if !(w > 0.0 && h > 0.0) || !(x0.is_finite() && y0.is_finite()) {
+        return None;
+    }
+    Some(AnnotRect { x: x0, y: y0, w, h })
+}
+
+/// Rasterize ONLY the TEXT items (DRAGON-354) into a `pw`×`ph` straight-alpha RGBA covering
+/// `region` of the picture (SOURCE px, from [`text_layer_region`]) — the live text LAYER,
+/// stacked over the base/effects/covermark at that region's place in the canvas. The other
+/// annotation kinds draw as canvas vectors (box/arrow/pen/badge) or fx-shader passes
+/// (highlight/pixelate/blur), never here. Returns `None` when nothing is drawn (no text, or
+/// every box empty). Shares [`super::text_annot::render_into`] with the bake, so the live
+/// layer and the exported pixels are the identical drawing at two resolutions — the region is
+/// a pure TRANSLATION of the drawing, so live/bake parity is untouched. The premultiply to
+/// straight-alpha mirrors [`rasterize_scene`]'s tail.
+fn render_text_layer(
+    items: &[AnnotationItem],
+    frame: (u32, u32),
+    region: AnnotRect,
+    pw: u32,
+    ph: u32,
+) -> Option<RgbaImage> {
+    use resvg::tiny_skia as sk;
+    if pw == 0 || ph == 0 || frame.0 == 0 || region.w <= 0.0 {
+        return None;
+    }
+    // Raster px per SOURCE px, taken from the region the texture actually maps onto — so the
+    // glyphs land exactly where the placed quad says they do, whatever rounding the pixel
+    // dimensions took.
+    let scale = pw as f32 / region.w;
+    let mut pixmap = sk::Pixmap::new(pw, ph)?;
+    let mut drew = false;
+    for item in items {
+        if let AnnotKind::Text { rect, text, size_px, font, constrained, stroke_w } = &item.kind {
+            if text.trim().is_empty() {
+                continue;
+            }
+            // The SAME layout derivation as the stored geometry (`text_kind_layout`), so the
+            // live glyphs always wrap exactly where the box says they do.
+            let lay =
+                text_kind_layout(text, *size_px, *font, *rect, *constrained, frame.0 as f32);
+            super::text_annot::render_into(
+                &mut pixmap,
+                &lay,
+                *font,
+                *size_px,
+                item.color,
+                *stroke_w,
+                ((rect.x - region.x) * scale, (rect.y - region.y) * scale),
+                scale,
+            );
+            drew = true;
+        }
+    }
+    if !drew {
+        return None;
+    }
+    let mut rgba = RgbaImage::new(pw, ph);
+    for (dst, src) in rgba.pixels_mut().zip(pixmap.pixels()) {
+        let c = src.demultiply();
+        *dst = ::image::Rgba([c.red(), c.green(), c.blue(), c.alpha()]);
+    }
+    Some(rgba)
+}
+
+// ── DRAGON-367/368: re-placing the text raster instead of re-rendering it ────────────
+//
+// `render_text_layer` is the single most expensive thing the preview's UPDATE path can do:
+// every call builds an SVG document, parses it through `usvg::Tree::from_data` (XML + font
+// resolution + text shaping) and replays it through resvg into a freshly allocated pixmap,
+// then walks that pixmap once more to demultiply. Its cost is `O(region area)` — measured at
+// ~5.6 ms per megapixel — and the region grows with BOTH the caption's extent and its padding,
+// so it climbs steeply with the type size: on a 5120×2880 capture at fit zoom one event costs
+// 3.3 ms at 64px type, 13.7 ms at 256px, 29.2 ms at 512px and 32.2 ms at 768px. A pointer
+// delivers events far faster than that, so past ~256px the update path simply cannot keep up
+// and the events queue: the caption freezes, then teleports.
+//
+// Neither a MOVE nor a RESIZE needs any of it, because the layer is PLACED rather than stretched
+// (DRAGON-362 gave `Layer` a `dest` rect) and both gestures leave the DRAWING alone — the glyphs,
+// the wrap, the face, the outline and the colour are identical; only the similarity transform
+// mapping that drawing onto the picture changes. So the fast path re-uses the raster verbatim
+// and moves/scales the region it is placed at: one 16-byte uniform write on the GPU instead of a
+// full re-raster, and the layer's persistent texture is never even touched
+// (`LayerStackPipeline::upsert` re-uploads on a `seq` change; the `Arc<PixelFrame>` is the same
+// one, so there is no upload and no churn — the `layers.rs` flicker-free contract).
+//
+// This is the LIVE-TRANSFORM PROXY every raster editor uses, and it is worth naming the prior
+// art because it also fixes what the proxy is allowed to look like. Photoshop's Free Transform
+// and Figma both transform the EXISTING pixels during the gesture and re-render at full quality
+// once, on commit. The browser compositors do the same thing under `will-change: transform`:
+// Chrome's own guidance is that content WITHOUT that hint "is re-rastered when its transform
+// scale changes", and that the hint "effectively means 'please apply the transformation quickly'
+// without taking the additional time for rasterization" — with a crisp re-raster arriving on the
+// frame after the hint is dropped (developer.chrome.com, "Re-rastering composited layers on scale
+// change"). A gesture is exactly that window. So:
+//
+//   * DURING a gesture the raster is re-used and may be SOFT — a caption scaled up is being
+//     magnified from the resolution it was rendered at;
+//   * the moment the gesture COMMITS (`annot_gesture_end` → `refresh_text_display`) it is
+//     re-rendered exactly, at the new size and the display's own device resolution.
+//
+// The one asymmetry we impose on the browser model is [`TEXT_PROXY_MIN_SCALE`]: shrinking is
+// re-rendered once it passes an octave, because a linear-filtered minification with no mip chain
+// starts to shimmer, and a smaller raster is CHEAP to re-render. Magnification has no such
+// escape hatch and is the expensive direction, so it rides the proxy all the way to commit.
+//
+// The two functions below are the whole decision, kept pure so both halves are unit-tested:
+// [`text_layer_xform`] answers "is the new scene the old scene, rigidly scaled and moved?" and
+// [`placed_text_region`] answers "may this raster be re-used at the transformed place?".
+
+/// How far two per-item offsets may disagree (SOURCE px) and still count as ONE rigid
+/// translation. Not zero because the deltas are recovered by subtraction from f32 coordinates
+/// that each took their own clamp; a thousandth of a source pixel is far below anything the
+/// raster can express (the raster is at most ~2 device px per source px) yet comfortably above
+/// f32 subtraction noise at 5K coordinates.
+const TEXT_SLIDE_EPS: f32 = 1e-3;
+
+/// How far two derived layout metrics may disagree from the common scale factor, RELATIVE, and
+/// still count as one uniform scale (DRAGON-368). The metrics are all `em_fraction × size_px`
+/// products recomputed at the new size, so they agree to f32 rounding on a genuine scale; a
+/// tenth of a percent is orders of magnitude above that noise and far below any re-wrap, which
+/// changes a line's measured width by whole glyphs.
+const TEXT_SCALE_EPS: f32 = 1e-3;
+
+/// The smallest accumulated shrink a text raster may be re-used at before it is re-rendered
+/// instead (DRAGON-368) — one octave.
+///
+/// Magnification is left unbounded on purpose (see the module note above): it is the expensive
+/// direction to re-render, and a soft caption mid-gesture is the accepted behaviour of every
+/// editor that does this. Minification is the opposite on both counts — the layer's sampler is
+/// `FilterMode::Linear` with NO mip chain, so past about 2× reduction a stroked glyph starts to
+/// drop scanlines and shimmer as it moves, and the re-render that fixes it is `O(area)` on the
+/// SMALLER region, i.e. cheap. So a shrink past an octave pays for a fresh raster and starts the
+/// next octave from there.
+const TEXT_PROXY_MIN_SCALE: f32 = 0.5;
+
+/// The similarity transform carrying the drawing the live text raster holds onto the scene as it
+/// now stands: `p ↦ scale · p + (dx, dy)`, in SOURCE px (DRAGON-368).
+///
+/// `scale == 1.0` is DRAGON-367's pure translation — the common case, and still the only thing a
+/// MOVE can produce.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct TextXform {
+    /// Uniform scale factor (raster's drawing → current drawing).
+    pub scale: f32,
+    pub dx: f32,
+    pub dy: f32,
+}
+
+impl TextXform {
+    /// Map a picture rect through the transform. The region the raster is placed at is exactly
+    /// its old region mapped this way: the raster holds drawing `D` over region `R`, the scene
+    /// now holds `T(D)`, and `T` is a similarity — so `T(D)` sits over `T(R)` and the placed
+    /// quad is right by construction, whatever resampling the GPU does inside it.
+    fn apply(self, r: AnnotRect) -> AnnotRect {
+        AnnotRect {
+            x: r.x * self.scale + self.dx,
+            y: r.y * self.scale + self.dy,
+            w: r.w * self.scale,
+            h: r.h * self.scale,
+        }
+    }
+}
+
+/// Everything the live text raster is a function of for ONE text item, MINUS the similarity
+/// transform placing it: the derived layout (the glyphs and the wrap they fell into), the face,
+/// the size, the outline weight and the colour — precisely the arguments
+/// [`super::text_annot::render_into`] draws from. Two snapshots that agree on all of it up to
+/// ONE common scale draw the SAME ink at two magnifications, so a scene change that only scales
+/// and moves the origins is a similarity transform of the pixels already in the raster.
+///
+/// The LAYOUT is compared, never the wrap inputs: an auto (click-created) box derives its wrap
+/// cap from its own `rect` ([`text_auto_cap`]), so a horizontal move or a scale changes the cap
+/// even when the caption is nowhere near wide enough for it to bind. Comparing the derived
+/// layout keeps that common case on the fast path while still catching the case where the
+/// gesture genuinely DOES re-wrap the text. Deriving it is cheap — the advance tables in
+/// `text_shape` are cached per thread — and it is the same [`text_kind_layout`] seam the render
+/// and the bake use, so the comparison can never disagree with what is drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct TextRenderSig {
+    id: AnnotId,
+    /// The box origin (SOURCE px) — mapped by the similarity, never compared directly.
+    origin: (f32, f32),
+    color: AnnotColor,
+    font: super::text_annot::TextFont,
+    size_px: f32,
+    stroke_w: f32,
+    layout: super::text_annot::TextLayout,
+}
+
+/// The render signature of ONE item — `None` when it isn't a text item at all.
+pub(super) fn text_render_sig(item: &AnnotationItem, frame: (u32, u32)) -> Option<TextRenderSig> {
+    let AnnotKind::Text { rect, text, size_px, font, constrained, stroke_w } = &item.kind else {
+        return None;
+    };
+    Some(TextRenderSig {
+        id: item.id,
+        origin: (rect.x, rect.y),
+        color: item.color,
+        font: *font,
+        size_px: *size_px,
+        stroke_w: *stroke_w,
+        layout: text_kind_layout(text, *size_px, *font, *rect, *constrained, frame.0 as f32),
+    })
+}
+
+/// Snapshot the render signature of every TEXT item, in scene order.
+pub(super) fn text_render_sigs(items: &[AnnotationItem], frame: (u32, u32)) -> Vec<TextRenderSig> {
+    items.iter().filter_map(|item| text_render_sig(item, frame)).collect()
+}
+
+/// Whether `a` is `b × s` to within [`TEXT_SCALE_EPS`], RELATIVE — the comparison every scaled
+/// layout metric takes. Zero-vs-zero agrees (an empty line's width is zero at every size).
+fn scales_by(a: f32, b: f32, s: f32) -> bool {
+    let want = b * s;
+    (a - want).abs() <= TEXT_SCALE_EPS * want.abs().max(1.0)
+}
+
+/// `Some(xform)` when `after` is `before` SCALED AND MOVED AS ONE: the same text items, in the
+/// same order, whose derived layouts differ by one common factor and whose origins differ by the
+/// matching offset, and which agree in everything else that reaches the raster. `None` the moment
+/// anything else moved — a re-wrap, a recoloured or restyled box, an item added or removed, or
+/// members that scaled/slid by different amounts (which is not a similarity of the layer at all,
+/// since the layer holds them together in one texture).
+///
+/// An empty scene yields `None`: there is no raster to re-use, and the caller must fall through
+/// to the normal path so the layer is cleared.
+pub(super) fn text_layer_xform(
+    before: &[TextRenderSig],
+    after: &[TextRenderSig],
+) -> Option<TextXform> {
+    if before.is_empty() || before.len() != after.len() {
+        return None;
+    }
+    // The scale comes from the type size, which is the ONE input every metric is proportional
+    // to. A pure move leaves it at exactly 1.0, so DRAGON-367's translation is this with s == 1.
+    let s = if after[0].size_px == before[0].size_px {
+        1.0
+    } else {
+        after[0].size_px / before[0].size_px
+    };
+    if !(s.is_finite() && s > 0.0) {
+        return None;
+    }
+    // …and the offset from the first item's origin, once the scale is taken out.
+    let (dx, dy) = (
+        after[0].origin.0 - s * before[0].origin.0,
+        after[0].origin.1 - s * before[0].origin.1,
+    );
+    if !dx.is_finite() || !dy.is_finite() {
+        return None;
+    }
+    let xf = TextXform { scale: s, dx, dy };
+    for (b, a) in before.iter().zip(after) {
+        if b.id != a.id || b.color != a.color || b.font != a.font {
+            return None;
+        }
+        // The pencil width is a SOURCE-px setting the user chose, not a scaled quantity — but
+        // the outline it paints is `em_frac(pencil) × size_px`, so it scales with the type
+        // automatically. An unchanged pencil is therefore exactly what a similarity needs.
+        if b.stroke_w != a.stroke_w || !scales_by(a.size_px, b.size_px, s) {
+            return None;
+        }
+        // Same glyphs, same wrap: the ink is one drawing at two magnifications.
+        if b.layout.lines != a.layout.lines {
+            return None;
+        }
+        // …and every derived metric scaled by the same factor. Cheap belt over the line
+        // comparison: it catches a face whose metrics are not linear in the size.
+        if !scales_by(a.layout.line_h, b.layout.line_h, s)
+            || !scales_by(a.layout.ascent, b.layout.ascent, s)
+            || !scales_by(a.layout.box_w, b.layout.box_w, s)
+            || !scales_by(a.layout.box_h, b.layout.box_h, s)
+        {
+            return None;
+        }
+        // Every member must ride the SAME transform — the layer holds them in one texture, so
+        // members that separated are not a similarity of it.
+        let (wx, wy) = (s * b.origin.0 + dx, s * b.origin.1 + dy);
+        // The tolerance grows with the coordinate: at 5K source coordinates the products above
+        // carry more than a thousandth of a pixel of f32 rounding on their own.
+        let eps = TEXT_SLIDE_EPS * wx.abs().max(wy.abs()).max(1.0);
+        if (a.origin.0 - wx).abs() > eps || (a.origin.1 - wy).abs() > eps {
+            return None;
+        }
+    }
+    Some(xf)
+}
+
+/// Where an existing text raster may be RE-PLACED after the scene moved by `xform` — `None` when
+/// it may not be, and the caller must re-render instead.
+///
+/// `region` is where the raster currently sits and `padded` the post-gesture padded ink bounds
+/// ([`text_padded_bounds`]). Two refusals, and both are about EXACTNESS or quality, not caution:
+///
+/// * **the placed region must still cover all of the ink.** A raster only ever held the ink that
+///   fell inside its own region; any ink outside it was never drawn, and re-placing the raster
+///   so that missing area becomes visible would show a blank tail. Since DRAGON-368 stopped
+///   clipping the region to the picture ([`text_layer_region`]) a freshly rendered raster always
+///   contains its whole padded bound, so this holds by construction on every ordinary gesture —
+///   it is the guard that a scene change which slipped past [`text_layer_xform`] cannot silently
+///   truncate the caption.
+/// * **it must not be shrunk past [`TEXT_PROXY_MIN_SCALE`].** See that constant: minification
+///   through a mip-less linear sampler shimmers, and re-rendering smaller is cheap.
+///
+/// Note there is deliberately NO "stays inside the picture" condition (there was until
+/// DRAGON-368, and it is what made the fast path unreachable for a large caption — see
+/// [`text_layer_region`]). The GPU scissors the layer to the picture, and text is now allowed to
+/// hang off the canvas anyway.
+pub(super) fn placed_text_region(
+    region: AnnotRect,
+    xform: TextXform,
+    padded: (f32, f32, f32, f32),
+) -> Option<AnnotRect> {
+    if !(xform.scale.is_finite() && xform.scale >= TEXT_PROXY_MIN_SCALE)
+        || !xform.dx.is_finite()
+        || !xform.dy.is_finite()
+    {
+        return None;
+    }
+    let placed = xform.apply(region);
+    if !(placed.w > 0.0 && placed.h > 0.0) {
+        return None;
+    }
+    let (x0, y0, x1, y1) = padded;
+    // A hair of slack: `padded` is recomputed from the moved scene while `placed` is the old
+    // region carried through the transform, so at 5K coordinates the two disagree in the last
+    // f32 place. Refusing on that would drop the fast path for no visible reason.
+    let slack = TEXT_SLIDE_EPS * placed.w.max(placed.h).max(1.0);
+    if x0 < placed.x - slack
+        || y0 < placed.y - slack
+        || x1 > placed.x + placed.w + slack
+        || y1 > placed.y + placed.h + slack
+    {
+        return None;
+    }
+    Some(placed)
+}
+
+/// Whether ONE text box's raster already on screen IS what re-rendering it right now would
+/// produce (DRAGON-376) — i.e. whether [`App::refresh_text_display`] may re-use it verbatim,
+/// texture and all, instead of drawing it again.
+///
+/// `held` is the (raster scale, signature) of the layer currently displayed for that box, or
+/// `None` when it has none (a new box, a blank one that just gained ink, or a render that
+/// produced no pixels — a fresh attempt must always be allowed, or a transient failure would
+/// stick forever). `want`/`scale` are the signature and resolution a render would use now.
+///
+/// The signature is the WHOLE raster input ([`text_render_sig`] — the derived layout, origin,
+/// face, size, outline weight and colour, which is exactly what
+/// [`super::text_annot::render_into`] draws from), so an equal signature at an equal scale means
+/// a byte-identical bitmap. Editor chrome — caret index, selection anchor, blink phase — is not
+/// in it because it never reaches the renderer: the canvas draws the caret and the selection wash
+/// as vectors over the layer. Pure — unit-tested.
+fn text_raster_is_current(
+    held: Option<(f32, &TextRenderSig)>,
+    want: &TextRenderSig,
+    scale: f32,
+) -> bool {
+    held == Some((scale, want))
+}
+
+/// DRAGON-366 (TEMPORARY): name an in-flight gesture as `(verb, item-kind)` for the diagnostic
+/// channels. Shared by the VIEW probe (`image.rs`'s `d366_interaction`) and the UPDATE probe in
+/// [`App::annot_gesture_to`], so both label the same drag with the same words. Remove with
+/// `crate::widgets::dragon366`.
+pub(super) fn d366_gesture_words(
+    gesture: &AnnotGesture,
+    items: &[AnnotationItem],
+) -> (&'static str, &'static str) {
+    fn kind_word(k: &AnnotKind) -> &'static str {
+        match k {
+            AnnotKind::Box { .. } => "box",
+            AnnotKind::Arrow { .. } => "arrow",
+            AnnotKind::Highlight { .. } => "highlight",
+            AnnotKind::BoxHighlight { .. } => "box-highlight",
+            AnnotKind::Spotlight { .. } => "spotlight",
+            AnnotKind::Pixelate { .. } => "pixelate",
+            AnnotKind::Badge { .. } => "badge",
+            AnnotKind::Blur { .. } => "blur",
+            AnnotKind::Pen { .. } => "pen",
+            AnnotKind::Text { .. } => "text",
+        }
+    }
+    let word_of = |id: AnnotId| -> &'static str {
+        items.iter().find(|it| it.id == id).map(|it| kind_word(&it.kind)).unwrap_or("?")
+    };
+    match gesture {
+        AnnotGesture::New { id, .. } => ("create", word_of(*id)),
+        AnnotGesture::Edit { id, grab, .. } => (
+            if matches!(grab, crate::widgets::annotation_canvas::Grab::Move) {
+                "drag"
+            } else {
+                "resize"
+            },
+            word_of(*id),
+        ),
+        AnnotGesture::MoveMany { .. } => ("move-many", "-"),
+        AnnotGesture::Erase { .. } => ("erase", "pen"),
+    }
 }
 
 // ── app-side gesture + scene handlers ────────────────────────────────────────────────
@@ -2206,16 +3303,33 @@ impl App {
                 pressure: vec![Vec::new()],
                 stroke_w,
             },
+            // TEXT (DRAGON-354): a press drops an EMPTY auto box at the point (the editor opens
+            // on release). A drag re-sizes it into a fixed-width box in `annot_gesture_to`; a
+            // bare click leaves it auto. Either way the box hugs the (empty) caret line for now.
+            Tool::Text => reflow_text(
+                "",
+                p.edit.text_size(),
+                p.edit.annot_text_font,
+                AnnotRect { x, y, w: 0.0, h: 0.0 },
+                false,
+                // DRAGON-358: a new text box captures the active line width, exactly like a box
+                // captures it as its stroke — so the width group styles text at creation too.
+                p.edit.stroke(),
+                (fw, fh),
+            ),
             // Neither non-creating tool ever reaches here: the eraser is handled above, and the
             // POINTER (DRAGON-341) never emits a `DrawBegin` at all (its empty-canvas drag is a
             // rubber band, not a draw). Defensive.
             Tool::Eraser | Tool::Pointer => return Task::none(),
         };
-        // A placed badge REMEMBERS its side for the rest of this editor (see
-        // `EditState::annot_badge_size`) — the SETTLED one, so a badge the picture clamped
-        // down doesn't make every later click try (and fail) at the bigger size again.
+        // A placed badge REMEMBERS its side — the SETTLED one, so a badge the picture clamped
+        // down doesn't make every later click try (and fail) at the bigger size again. The
+        // document's working copy takes it now; the PERSISTED one is written after the borrow
+        // ends (see `remember_badge_size`), so future editors spawn markers at it too.
+        let mut remembered_badge = None;
         if let AnnotKind::Badge { rect, .. } = &kind {
             p.edit.annot_badge_size = rect.w;
+            remembered_badge = Some(rect.w);
         }
         p.edit.annot_snapshot = Some(p.edit.annotations.clone());
         // The freehand pen's RAW trail (DRAGON-342): the model always holds the SMOOTHED curve,
@@ -2233,6 +3347,9 @@ impl App {
         // Holistic dim rule: with a spotlight now on the canvas, make sure the frame is dimmed so
         // it reads while you draw it (own undo entry; undo removes the spotlight, then the dim).
         p.edit.ensure_dim_for_spotlights();
+        if let Some(side) = remembered_badge {
+            self.remember_badge_size(side);
+        }
         // The GPU effects shader re-renders from the model on the next view build (DRAGON-330) —
         // no async raster to kick; a new effect item shows on the very next frame.
         Task::none()
@@ -2245,6 +3362,9 @@ impl App {
     /// exists only under the pointer, so the state is pruned rather than the chrome hidden —
     /// otherwise a ghost member would still ride along in a group move or delete.
     pub(super) fn select_annot_tool(&mut self, id: window::Id, tool: Tool) {
+        // Arming ANY tool settles an in-flight text edit first (DRAGON-354): the box you were
+        // typing into commits (or, if empty, vanishes) before the new mode takes over.
+        let _ = self.settle_text_edit(id);
         // If a box-family annotation (Box Outline / Highlight / Box Highlight) is selected
         // and the user picks a DIFFERENT one of those three tools, CONVERT the selected
         // item in place (real-time, one undo entry) rather than only arming the tool for
@@ -2254,6 +3374,12 @@ impl App {
         // re-click-to-neutral). Persist so the next preview opens with it.
         if let Some(p) = self.preview_for_mut(id) {
             p.edit.tool = Some(tool);
+            // DRAGON-369: arming a member MOVES its slot's cycle cursor, whatever the route —
+            // hotkey, cycle key or tray click. This one line is why the keyboard and the mouse
+            // can never disagree about "the slot's current member".
+            if let Some(slot) = super::chrome::slot_for_tool(tool) {
+                p.edit.slot_cursor.insert(slot, tool);
+            }
             // Pen groups are selectable ONLY under the pointer, so arming anything else lets
             // them go — the visible selection and the real one never disagree.
             if !tool.is_pointer() {
@@ -2264,13 +3390,31 @@ impl App {
         self.save_state();
     }
 
+    /// Press a tool SLOT's cycle key (DRAGON-369): arm the slot's current member, or advance to
+    /// the next when the slot is already armed. Membership, order and the arm-then-advance rule
+    /// all live in `chrome` beside the tray that declares them; this only resolves the target
+    /// and arms it through the ordinary [`Self::select_annot_tool`] path, so a cycle press is
+    /// indistinguishable from clicking that tray button (undo, persistence, text-edit settling
+    /// and the cursor update all included). A slot with no members is a no-op.
+    pub(super) fn cycle_tool_slot(&mut self, id: window::Id, slot: crate::shortcuts::Action) {
+        let members = super::chrome::slot_tools(slot);
+        let (armed, cursor) = match self.preview_for(id) {
+            Some(p) => (p.edit.tool, p.edit.slot_cursor.get(&slot).copied()),
+            None => return,
+        };
+        if let Some(tool) = super::chrome::next_slot_tool(&members, armed, cursor) {
+            self.select_annot_tool(id, tool);
+        }
+    }
+
     /// Spawn a PRE-PLACED item of `tool` in the middle of the picture (DRAGON-339) — what a
     /// DOUBLE-CLICK on the tool's action-tray button does, so an item can be added without
-    /// dragging one out. Geometry comes from [`default_placement_rect`] (200×100 or 80% of the
-    /// image per axis, whichever fits, inset for the stroke); appearance from the SAME current
-    /// color/stroke a dragged shape would get. The new item lands on TOP of the z-stack and
-    /// becomes the selection, as ONE undo entry in the shared history (so it is undoable and
-    /// counts toward `EditState::dirty()`'s bake gate exactly like a drawn one).
+    /// dragging one out. Geometry comes from [`spawn_placement_rect`] (the 200×100 spawn box or
+    /// 80% of the image per axis, whichever fits, inset for the stroke — but the REMEMBERED
+    /// side for a step marker, sized by the very helper click-to-place uses); appearance from
+    /// the SAME current color/stroke a dragged shape would get. The new item lands on TOP of
+    /// the z-stack and becomes the selection, as ONE undo entry in the shared history (so it is
+    /// undoable and counts toward `EditState::dirty()`'s bake gate exactly like a drawn one).
     ///
     /// Returns `false` (changing nothing) when there is no preview, the tool has no pre-placeable
     /// form ([`spawn_kind`] → `None`, e.g. a freehand tool), or the frame is too small for a
@@ -2286,7 +3430,9 @@ impl App {
         let Some(margin) = spawn_kind(tool, probe, stroke_w).as_ref().map(kind_draw_margin) else {
             return false;
         };
-        let rect = default_placement_rect(p.edit.frame, margin);
+        // A step marker is sized by the REMEMBERED side through the click-to-place helper;
+        // every other tool takes the shared spawn box (see `spawn_placement_rect`).
+        let rect = spawn_placement_rect(tool, p.edit.frame, margin, p.edit.badge_size());
         let Some(kind) = spawn_kind(tool, rect, stroke_w) else {
             return false;
         };
@@ -2297,9 +3443,12 @@ impl App {
             return false;
         }
         // A badge spawned this way counts as "the last one placed" too, so a later click-place
-        // matches what the double-click just dropped.
+        // matches what the double-click just dropped (it can differ from the remembered side:
+        // a small picture clamps it down). Persisted after the borrow ends, as everywhere.
+        let mut remembered_badge = None;
         if let AnnotKind::Badge { rect, .. } = &item.kind {
             p.edit.annot_badge_size = rect.w;
+            remembered_badge = Some(rect.w);
         }
         let prev = p.edit.annotations.clone();
         p.edit.annotations.push(item);
@@ -2308,14 +3457,36 @@ impl App {
         p.edit.push_annotations(prev);
         // Holistic dim rule: a spawned spotlight needs the frame dimmed to read (own undo entry).
         p.edit.ensure_dim_for_spotlights();
+        if let Some(side) = remembered_badge {
+            self.remember_badge_size(side);
+        }
         true
     }
 
+    /// Remember `side` (SOURCE px) as the size the NEXT sequence badge is born at, PERSISTING it
+    /// so future editors — a new capture process, a later launch — spawn markers at it
+    /// (the mirror of [`Self::apply_annot_stroke_w`]'s persist step).
+    ///
+    /// The caller has already written the CURRENT document's working copy
+    /// (`EditState::annot_badge_size`); this is the app-wide one. Only the settled, non-degenerate
+    /// side is taken, and an unchanged size writes nothing — placing ten identical markers must
+    /// not mean ten config writes. With two documents open the working copies may briefly
+    /// disagree; last write wins on disk, by design (no cross-document sync).
+    pub(super) fn remember_badge_size(&mut self, side: f32) {
+        if side <= 0.0 || self.annot_badge_size == side {
+            return;
+        }
+        self.annot_badge_size = side;
+        self.save_state();
+    }
+
     /// Recolor the currently-SELECTED colorable annotation(s) to `color`, pushing ONE
-    /// [`super::edit::EditOp::Annotations`] undo snapshot. No-op (no snapshot) when nothing is
-    /// selected, the selection isn't colorable (pixelate/blur), or the color is unchanged.
-    /// Iterates the selection so it already extends to multi-select. The caller sets
-    /// `annot_color` separately; the view redraws the recolored item automatically.
+    /// [`super::edit::EditOp::Annotations`] undo snapshot — unless a text-edit session is
+    /// active, whose settle owns the single snapshot (the change folds into it). No-op (no
+    /// snapshot) when nothing is selected, the selection isn't colorable (pixelate/blur), or
+    /// the color is unchanged. Iterates the selection so it already extends to multi-select.
+    /// The caller sets `annot_color` separately; the view redraws the recolored item
+    /// automatically.
     pub(super) fn recolor_selected_annotation(&mut self, id: window::Id, color: AnnotColor) {
         let Some(p) = self.preview_for_mut(id) else {
             return;
@@ -2338,13 +3509,20 @@ impl App {
                 it.color = color;
             }
         }
-        p.edit.push_annotations(prev);
+        // Same mid-edit gate as the width restyle (and [`Self::apply_text_style`]): during an
+        // active text-edit session the SETTLE owns the single undo snapshot, so a recolor folds
+        // into it instead of pushing an out-of-order entry of its own.
+        if p.edit.text_edit.is_none() {
+            p.edit.push_annotations(prev);
+        }
     }
 
     /// Re-stroke the currently-SELECTED box/arrow to `stroke_w` (SOURCE px), pushing ONE
     /// [`super::edit::EditOp::Annotations`] undo snapshot — the width mirror of
-    /// [`Self::recolor_selected_annotation`]. No-op (no snapshot) when nothing is selected,
-    /// the selection has no stroke (highlight / pixelate / blur), or the width is unchanged.
+    /// [`Self::recolor_selected_annotation`], with the same mid-edit fold: during an active
+    /// text-edit session the settle owns the single snapshot. No-op (no snapshot) when nothing
+    /// is selected, the selection has no stroke (highlight / pixelate / blur), or the width is
+    /// unchanged.
     pub(super) fn restroke_selected_annotation(&mut self, id: window::Id, stroke_w: f32) {
         let Some(p) = self.preview_for_mut(id) else {
             return;
@@ -2352,10 +3530,11 @@ impl App {
         if p.edit.sel.is_empty() {
             return;
         }
-        // Only a SELECTED, STROKED item (box / arrow / pen) whose width actually differs needs it.
+        // Only a SELECTED, STROKED item (box / arrow / pen / badge / text) whose width actually
+        // differs needs it. Text carries its width as the glyph OUTLINE weight (DRAGON-358).
         let needed = p.edit.annotations.iter().any(|it| {
             p.edit.sel.contains(it.id)
-                && matches!(&it.kind, AnnotKind::Box { stroke_w: w, .. } | AnnotKind::Arrow { stroke_w: w, .. } | AnnotKind::BoxHighlight { stroke_w: w, .. } | AnnotKind::Pen { stroke_w: w, .. } | AnnotKind::Badge { ring_w: w, .. } if *w != stroke_w)
+                && matches!(&it.kind, AnnotKind::Box { stroke_w: w, .. } | AnnotKind::Arrow { stroke_w: w, .. } | AnnotKind::BoxHighlight { stroke_w: w, .. } | AnnotKind::Pen { stroke_w: w, .. } | AnnotKind::Badge { ring_w: w, .. } | AnnotKind::Text { stroke_w: w, .. } if *w != stroke_w)
         });
         if !needed {
             return;
@@ -2372,7 +3551,12 @@ impl App {
                     | AnnotKind::Pen { stroke_w: w, .. }
                     // A badge's OUTER RING is the line weight, by the ticket's definition
                     // (DRAGON-340), so it re-strokes with everything else.
-                    | AnnotKind::Badge { ring_w: w, .. } => {
+                    | AnnotKind::Badge { ring_w: w, .. }
+                    // Text re-widths its glyph OUTLINE (DRAGON-358) — the width group mirrors the
+                    // color flow, so picking a width restyles a selected text box (one undo entry).
+                    // No reflow needed: the outline is metrics-neutral, so the box geometry is
+                    // unchanged and the raster refresh alone shows the new weight.
+                    | AnnotKind::Text { stroke_w: w, .. } => {
                         *w = stroke_w;
                     }
                     // Effects (highlight / pixelate / blur) + spotlight carry no stroke — leave
@@ -2384,7 +3568,13 @@ impl App {
                 }
             }
         }
-        p.edit.push_annotations(prev);
+        // A restyle on a merely-SELECTED item is its own undo entry; during an active text-edit
+        // session the SETTLE owns the single snapshot (the pre-edit scene already covers this
+        // change), so pushing here would add an out-of-order duplicate — same gate as
+        // [`Self::apply_text_style`].
+        if p.edit.text_edit.is_none() {
+            p.edit.push_annotations(prev);
+        }
     }
 
     /// When a rect annotation (Box Outline / Highlight / Box Highlight / Pixelate / Blur) is
@@ -2476,15 +3666,52 @@ impl App {
     /// Live drag update (image point). Updates the model geometry; box/arrow redraw as vector
     /// geometry on the view rebuild, while an effect (highlight/pixelate/blur) being drawn or
     /// resized re-rasters its display layer LIVE (coalesced) so the redaction tracks the drag.
-    pub(super) fn annot_gesture_to(&mut self, id: window::Id, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
+    pub(super) fn annot_gesture_to(
+        &mut self,
+        id: window::Id,
+        x: f32,
+        y: f32,
+        scale_type: bool,
+    ) -> Task<cosmic::Action<Msg>> {
+        // DRAGON-366 (TEMPORARY): time the whole UPDATE-path handling of this motion event. The
+        // original instrumentation only measured the VIEW path, which is precisely why the text
+        // drag's cost was invisible. Remove with `crate::widgets::dragon366`.
+        let mut d366 = crate::widgets::dragon366::GestureTimer::start();
         let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
         let Some(gesture) = p.edit.gesture.clone() else {
             return Task::none();
         };
+        {
+            let (verb, item) = d366_gesture_words(&gesture, &p.edit.annotations);
+            d366.note(verb, item);
+        }
         // Clamp all gesture geometry to the image bounds (zoom-independent, in source px).
         let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        // Whether this gesture touches a TEXT box (item 3) — read now, since the annotation's
+        // KIND can't change during a drag, and the `match` below moves `gesture`.
+        let touches_text = {
+            let is_text = |id: AnnotId| {
+                p.edit
+                    .annotations
+                    .iter()
+                    .any(|it| it.id == id && matches!(it.kind, AnnotKind::Text { .. }))
+            };
+            match &gesture {
+                AnnotGesture::New { id, .. } | AnnotGesture::Edit { id, .. } => is_text(*id),
+                AnnotGesture::MoveMany { originals, .. } => {
+                    originals.iter().any(|(id, _)| is_text(*id))
+                }
+                AnnotGesture::Erase { .. } => false,
+            }
+        };
+        // DRAGON-367/368: the text raster's render signature BEFORE this event, so the tail can
+        // ask whether the event only moved/scaled the drawing (which needs no re-render — see
+        // [`text_layer_xform`]). Only paid on gestures that touch text; deriving it is a
+        // cached-metrics layout pass, orders of magnitude below the resvg render it avoids.
+        let text_before =
+            touches_text.then(|| text_render_sigs(&p.edit.annotations, p.edit.frame));
         match gesture {
             AnnotGesture::New { press, id } => {
                 // The pen's raw trail is a SIBLING field of the item vector — bound up front so
@@ -2516,6 +3743,15 @@ impl App {
                         // `square_for_grab`.) Deliberately not a `_` arm: a new rect kind must
                         // still choose its drag behaviour explicitly.
                         AnnotKind::Badge { .. } => {}
+                        // TEXT (DRAGON-354): a real drag turns the auto box into a FIXED-width
+                        // (constrained) box the text will wrap within — the box you see dragged
+                        // out is the wrap frame. The height snaps to the content at
+                        // `annot_gesture_end` (empty for now). A bare click never reaches here,
+                        // so it stays an auto box.
+                        AnnotKind::Text { rect, constrained, .. } => {
+                            *rect = AnnotRect::from_points(pr, cur);
+                            *constrained = true;
+                        }
                         // Freehand: APPEND to the RAW trail, but only once the pointer has
                         // travelled PEN_MIN_STEP — a slow drag must not pile up coincident
                         // vertices, and the gap between kept samples IS the speed proxy the
@@ -2550,7 +3786,7 @@ impl App {
             }
             AnnotGesture::Edit { press, id, grab, original } => {
                 if let Some(item) = p.edit.annotations.iter_mut().find(|it| it.id == id) {
-                    item.kind = edited_kind(&original, grab, press, (x, y), frame);
+                    item.kind = edited_kind(&original, grab, press, (x, y), frame, scale_type);
                 }
             }
             // A group move (DRAGON-341): ONE delta, clamped ONCE on the union bounds, applied
@@ -2572,8 +3808,110 @@ impl App {
                 p.edit.gesture = Some(AnnotGesture::Erase { last: cur });
             }
         }
+        // A drag that RESHAPED a TEXT box must re-wrap AND re-raster LIVE (DRAGON-354 item 3),
+        // not only on release: `edited_kind` already reflowed the model above (the shared
+        // `text_kind_layout` seam), so all that remains is refreshing the raster layer from it.
+        // Vector shapes + effects still redraw for free on the view rebuild, so only text needs
+        // this. (`touches_text` was read BEFORE the match, since the KIND can't change
+        // mid-gesture.)
+        //
+        // DRAGON-367/368 — but neither a MOVE nor a RESIZE reshapes the DRAWING. The glyphs, the
+        // wrap, the face, the outline and the colour are identical; only the similarity transform
+        // placing them changed, and the layer is PLACED by a `dest` rect (DRAGON-362) rather than
+        // stretched. So the raster is re-used verbatim and only the region it is placed at moves
+        // and scales: a 16-byte uniform write instead of an SVG parse + resvg render costing
+        // 29 ms at 512px type. That is what turned a big caption's gesture into an event-queue
+        // backlog (the pointer's events piled up behind the render, then burst) — and it is why
+        // the geometry can now be applied on EVERY motion event, with nothing left to throttle.
+        if touches_text {
+            // SCALING a normal box changes its `size_px` (DRAGON-364 task 4), so the size chip
+            // follows the drag live. DISPLAY only — dragging a handle is not the user picking a
+            // size, so the persisted default is untouched (see the display-vs-remember comment).
+            self.sync_text_style_to_selection(id, TextStyleSource::HandleScale);
+            if let Some(xf) = self.proxy_text_layer(id, text_before.as_deref()) {
+                d366.proxied(xf.scale);
+                return Task::none();
+            }
+            let t = std::time::Instant::now();
+            let task = self.refresh_text_display(id);
+            d366.rastered(t.elapsed().as_secs_f64() * 1000.0, self.d366_text_region(id));
+            return task;
+        }
         // A live drag mutates the model; the GPU effects shader re-renders from it every frame.
         Task::none()
+    }
+
+    /// DRAGON-367/368 — the LIVE-TRANSFORM PROXY: when this motion event only moved and/or
+    /// uniformly scaled the text, re-place the existing raster instead of re-rendering it.
+    /// `Some(xform)` when it did, and the caller must NOT re-render.
+    ///
+    /// `before` is the pre-event render signature ([`text_render_sigs`]); `None` means the
+    /// gesture never touched text, which is not a proxy. Everything the decision needs is pure
+    /// and unit-tested in [`text_layer_xform`] + [`placed_text_region`]; this is only the state
+    /// plumbing around them. The transform is composed INCREMENTALLY (each event maps the region
+    /// the previous one left), which is exact for a similarity — and every gesture ends in a
+    /// fresh exact render, so nothing accumulates across gestures.
+    ///
+    /// Note the raster's `Arc` is untouched, so the layer's GPU texture is not re-uploaded
+    /// either — `LayerStackPipeline::upsert` keys uploads off the frame's `seq`, and only the
+    /// `dest` uniform actually changes. That is the `layers.rs` flicker-free contract holding by
+    /// construction rather than by luck, and it is what lets a resize run at pointer rate.
+    ///
+    /// `TextLayerGeom::scale`/`px` deliberately keep describing the RASTER (what it was rendered
+    /// at, and how big it is), not the placement — only `region` moves here. That is what
+    /// `refresh_text_for_zoom` compares against, and what the commit re-render replaces.
+    fn proxy_text_layer(
+        &mut self,
+        id: window::Id,
+        before: Option<&[TextRenderSig]>,
+    ) -> Option<TextXform> {
+        let before = before?;
+        let p = self.preview_for_mut(id)?;
+        // No raster on screen yet (a caption that is still empty, or a layer never rendered) —
+        // there is nothing to re-place, so the normal path must run and create one.
+        if p.edit.text_layers.is_empty() {
+            return None;
+        }
+        let after = text_render_sigs(&p.edit.annotations, p.edit.frame);
+        // The layers are now PER BOX (DRAGON-373), so the decision is per box too: each one's
+        // raster may be re-placed if that box alone moved/scaled rigidly. A box the gesture did
+        // not touch yields the identity and simply stays put, which is what lets a drag of ONE
+        // caption keep the fast path in a scene that holds several — the shared layer had to
+        // refuse that outright, because members separating is not a similarity of one texture.
+        let mut placed: Vec<(AnnotId, AnnotRect)> = Vec::with_capacity(p.edit.text_layers.len());
+        let mut moved = TextXform { scale: 1.0, dx: 0.0, dy: 0.0 };
+        for layer in &p.edit.text_layers {
+            let b = before.iter().find(|s| s.id == layer.id)?;
+            let a = after.iter().find(|s| s.id == layer.id)?;
+            let xform = text_layer_xform(std::slice::from_ref(b), std::slice::from_ref(a))?;
+            let item = p.edit.annotations.iter().find(|it| it.id == layer.id)?;
+            let padded = text_padded_bounds(std::slice::from_ref(item))?;
+            placed.push((layer.id, placed_text_region(layer.geom.region, xform, padded)?));
+            if xform != (TextXform { scale: 1.0, dx: 0.0, dy: 0.0 }) {
+                moved = xform;
+            }
+        }
+        for (aid, region) in placed {
+            if let Some(layer) = p.edit.text_layers.iter_mut().find(|l| l.id == aid) {
+                layer.geom.region = region;
+            }
+        }
+        Some(moved)
+    }
+
+    /// DRAGON-366 (TEMPORARY): the BIGGEST text layer's raster dimensions, for the update-path
+    /// diagnostic line — this is the quantity the owner's "big text lags, small text doesn't"
+    /// report predicts a re-render's cost from. Remove with `crate::widgets::dragon366`.
+    fn d366_text_region(&self, id: window::Id) -> (u32, u32) {
+        self.preview_for(id)
+            .and_then(|p| {
+                p.edit
+                    .text_layers
+                    .iter()
+                    .map(|l| l.geom.px)
+                    .max_by_key(|(w, h)| (*w as u64) * (*h as u64))
+            })
+            .unwrap_or((0, 0))
     }
 
     /// Commit the active gesture: discard a degenerate new shape, else push ONE undo entry
@@ -2587,7 +3925,48 @@ impl App {
         };
         let snapshot = p.edit.annot_snapshot.take();
         let raw_trail = std::mem::take(&mut p.edit.pen_raw);
+        // Set by the badge-resize arm below; persisted once the `p` borrow ends.
+        let mut remembered_badge = None;
+        // Set by the TEXT arm below: after the borrow ends, open the editor + render the layer.
+        let mut entered_text = false;
         match gesture {
+            AnnotGesture::New { id, .. }
+                if p
+                    .edit
+                    .annotations
+                    .iter()
+                    .any(|it| it.id == id && matches!(it.kind, AnnotKind::Text { .. })) =>
+            {
+                // TEXT (DRAGON-354): a new box is NEVER discarded here — it OPENS the editor.
+                // Reflow it (snap the box to the caret line), stash the pre-edit scene on the
+                // editing session so the SETTLE pushes the single undo entry (an empty settle
+                // just deletes it), select it, and enter edit mode with the caret at the start.
+                let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+                if let Some(it) = p.edit.annotations.iter_mut().find(|it| it.id == id) {
+                    let reflowed = if let AnnotKind::Text {
+                        rect, text, size_px, font, constrained, stroke_w,
+                    } = &it.kind
+                    {
+                        Some(reflow_text(text, *size_px, *font, *rect, *constrained, *stroke_w, frame))
+                    } else {
+                        None
+                    };
+                    if let Some(k) = reflowed {
+                        it.kind = k;
+                    }
+                }
+                p.edit.sel.set_one(id);
+                p.edit.text_edit = Some(super::edit::TextEdit {
+                    id,
+                    caret: 0,
+                    anchor: None,
+                    snapshot: snapshot.unwrap_or_default(),
+                    is_new: true,
+                    blink_on: true,
+                    history: Default::default(),
+                });
+                entered_text = true;
+            }
             AnnotGesture::New { id, .. } => {
                 // A pen gesture that never really travelled is a TAP: normalize it to the
                 // single-point DOT it is (DRAGON-342), so it inks round and firm instead of as
@@ -2625,14 +4004,16 @@ impl App {
             // A one-item edit and a whole-selection move commit identically: ONE undo entry
             // holding the pre-gesture scene (DRAGON-341 — a group move is one edit, not N).
             AnnotGesture::Edit { id, .. } => {
-                // Resizing a BADGE re-arms the remembered side, so the next click-placed badge
-                // matches the one you just sized. UNDOING that resize deliberately does NOT
-                // un-remember it: the remembered size is a tool preference, not scene state,
-                // and rewinding it would make undo mean two different things at once.
+                // Resizing a BADGE re-arms the remembered side, so the next badge — placed by
+                // click OR pre-placed by double-click, here or in a LATER editor — matches the
+                // one you just sized. UNDOING that resize deliberately does NOT un-remember it:
+                // the remembered size is a tool preference, not scene state, and rewinding it
+                // would make undo mean two different things at once.
                 if let Some(AnnotKind::Badge { rect, .. }) =
                     p.edit.annotations.iter().find(|it| it.id == id).map(|it| &it.kind)
                 {
                     p.edit.annot_badge_size = rect.w;
+                    remembered_badge = Some(rect.w);
                 }
                 if let Some(prev) = snapshot {
                     p.edit.push_annotations(prev);
@@ -2657,8 +4038,846 @@ impl App {
                 }
             }
         }
-        // The committed geometry renders through the GPU effects shader on the next view build.
+        if let Some(side) = remembered_badge {
+            self.remember_badge_size(side);
+        }
+        // A freshly opened text box needs its raster layer rendered (and the blink primed on
+        // the next subscription tick). The `p` borrow has ended, so the App-level refresh runs.
+        if entered_text {
+            let refresh = self.refresh_text_display(id);
+            #[cfg(target_os = "macos")]
+            let refresh = Task::batch([self.focus_preview_for_text_edit(id), refresh]);
+            return refresh;
+        }
+        // Any committed gesture may have MOVED / RESIZED / ERASED a text box, so re-render the
+        // text layer (a cheap no-op when the scene holds no text). Vector shapes + effects
+        // redraw on the next view build for free.
+        self.refresh_text_display(id)
+    }
+
+    /// Re-render the live TEXT raster layers (DRAGON-354) SYNCHRONOUSLY into `edit.text_layers` —
+    /// ONE per text annotation (DRAGON-373), each covering just that box's REGION
+    /// ([`text_layer_region`]) at the layer's ON-SCREEN
+    /// device-pixel resolution ([`super::edit::layer_raster_scale`], capped at the source frame
+    /// — the same policy the covermark uses). It runs inline on every keystroke, on zoom, and
+    /// after any edit that adds/moves/removes text, so both of those are load-bearing
+    /// (DRAGON-362): the resolution is what keeps the glyphs as crisp as the base pixels beside
+    /// them, and the region is what keeps the per-keystroke cost proportional to the caption
+    /// rather than to the capture. No layers when there is no text (nor for a blank box — it
+    /// draws nothing). The edited box reads its LIVE buffer (the item's own text is mutated in
+    /// place while editing), so the layer always shows what is being typed.
+    ///
+    /// # A re-render that would change nothing never happens (DRAGON-376)
+    ///
+    /// This is the most expensive thing the preview's update path can do, and most of its ~16
+    /// call sites reach it on edits that CANNOT change a glyph: a drag-select or a caret click
+    /// (chrome, drawn as canvas vectors — [`super::edit::TextEdit`] state reaches no renderer
+    /// input at all), re-opening the editor on a box that is already on screen, recolouring or
+    /// restroking a selection that holds no text. Drag-select was the sharp end: one full
+    /// SVG-build → `usvg` parse → resvg replay → demultiply pass per POINTER EVENT, producing a
+    /// byte-identical bitmap, ~29 ms each at 512 px type against a 125 Hz pointer — the event
+    /// queue fell ~4× behind realtime and the editor locked up.
+    ///
+    /// So the gate is here rather than in the callers: each box's RASTER INPUTS are signed
+    /// ([`text_render_sig`] — precisely what [`super::text_annot::render_into`] reads) and
+    /// compared against the signature of the drawing already on screen, together with the raster
+    /// scale ([`text_raster_is_current`]). Nothing changed ⇒ nothing is rendered, and the layer's
+    /// `Arc` is re-used so its persistent texture is not even re-uploaded. That makes a wasted
+    /// re-render impossible by construction, for the 17th call site as much as for these, instead
+    /// of by per-call-site review — the same trick as [`text_layer_xform`]'s layout comparison,
+    /// applied per layer rather than to one gesture. Per BOX (DRAGON-373), so typing into one
+    /// caption never re-renders the others.
+    pub(super) fn refresh_text_display(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        // The visual scale needs the App (viewport geometry), so resolve it under an IMMUTABLE
+        // borrow before taking the mutable one below.
+        let Some(vscale) = self.preview_for(id).map(|p| self.preview_visual_scale(p)) else {
+            return Task::none();
+        };
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        let scale = super::edit::layer_raster_scale(p.view.zoom, vscale);
+        let frame = p.edit.frame;
+        // The layers that are on screen right now. Each is re-used verbatim — pixels, texture and
+        // all — unless THAT box's raster inputs or the raster scale actually moved, so a scene of
+        // three captions re-renders only the one being typed into, and a chrome-only event
+        // (drag-select, caret click, a recolour that hit no text) re-renders nothing at all.
+        let held = std::mem::take(&mut p.edit.text_layers);
+        let mut next: Vec<super::edit::TextItemLayer> = Vec::with_capacity(held.len());
+        for item in &p.edit.annotations {
+            let Some(sig) = text_render_sig(item, frame) else {
+                continue; // not a text item
+            };
+            // A blank box draws nothing, so it owns no layer (and no texture slot).
+            let Some(region) = text_layer_region(std::slice::from_ref(item), frame) else {
+                continue;
+            };
+            let prev = held.iter().find(|l| l.id == item.id);
+            if text_raster_is_current(prev.map(|l| (l.geom.scale, &l.sig)), &sig, scale) {
+                next.push(prev.expect("matched a held layer").clone());
+                continue;
+            }
+            // The region's own pixel dimensions at that scale (never zero, never past the source
+            // resolution or the texture limit).
+            let (pw, ph) = super::edit::layer_raster_dims(
+                (region.w.ceil().max(1.0) as u32, region.h.ceil().max(1.0) as u32),
+                scale,
+            );
+            let Some(img) = render_text_layer(std::slice::from_ref(item), frame, region, pw, ph)
+            else {
+                continue;
+            };
+            let (w, h) = img.dimensions();
+            next.push(super::edit::TextItemLayer {
+                id: item.id,
+                frame: crate::app::PixelFrame::new(img.into_raw(), w, h),
+                geom: super::edit::TextLayerGeom { scale, region, px: (pw, ph) },
+                // Sign what was actually drawn, so the next call can tell "this box moved on"
+                // from "only the editor's chrome did" (DRAGON-376).
+                sig,
+            });
+        }
+        p.edit.text_layers = next;
         Task::none()
+    }
+
+    /// Re-render the text layer for a NEW zoom when the wanted resolution actually changed
+    /// (mirrors [`Self::refresh_covermark_for_zoom`]) — so a magnified caption sharpens toward
+    /// the source resolution without a re-render on every idle zoom step. The comparison is on
+    /// the quantized raster SCALE (the region is content-derived and zoom-independent), so a
+    /// zoom nudge inside one [`super::edit::RASTER_QUANTUM`] step costs nothing.
+    pub(super) fn refresh_text_for_zoom(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for(id) else {
+            return Task::none();
+        };
+        let has_text = p
+            .edit
+            .annotations
+            .iter()
+            .any(|it| matches!(it.kind, AnnotKind::Text { .. }));
+        let want = super::edit::layer_raster_scale(p.view.zoom, self.preview_visual_scale(p));
+        // Every layer already at the wanted resolution ⇒ nothing to sharpen. (An empty list with
+        // text present means the boxes are all blank, which likewise has nothing to render.)
+        if !has_text || p.edit.text_layers.iter().all(|l| l.geom.scale == want) {
+            return Task::none();
+        }
+        self.refresh_text_display(id)
+    }
+
+    /// Settle the in-flight text edit (DRAGON-354): an EMPTY box is discarded (with an undo
+    /// entry ONLY if it existed before this session), a non-empty CHANGED box pushes ONE undo
+    /// entry (its pre-edit scene), and the session ends. No-op when nothing is being edited.
+    pub(super) fn settle_text_edit(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        let Some(te) = p.edit.text_edit.take() else {
+            return Task::none();
+        };
+        let empty = p
+            .edit
+            .annotations
+            .iter()
+            .find(|it| it.id == te.id)
+            .map(|it| matches!(&it.kind, AnnotKind::Text { text, .. } if text.trim().is_empty()))
+            .unwrap_or(true);
+        if empty {
+            // Drop the empty box. Emptying a PRE-EXISTING box is a real change (push the undo
+            // entry); discarding a just-created one leaves no trace.
+            p.edit.annotations.retain(|it| it.id != te.id);
+            p.edit.sel.retain_existing(&p.edit.annotations);
+            if !te.is_new {
+                p.edit.push_annotations(te.snapshot);
+            }
+        } else if te.snapshot != p.edit.annotations {
+            // A changed box: one undo entry holding the pre-edit scene.
+            p.edit.push_annotations(te.snapshot);
+        }
+        self.refresh_text_display(id)
+    }
+
+    /// Route ONE key into the active text editor (DRAGON-354): printable input rides iced's
+    /// PRODUCED text (so shifted / dead-key / precomposed characters insert correctly),
+    /// Backspace/Delete remove (a whole grapheme, or the selection), the arrows + Home/End move
+    /// the caret (Shift extends a selection), Cmd/Ctrl+C/X/V do clipboard, Escape or NUMPAD
+    /// Enter settles ([`text_edit_exits`], DRAGON-364). A non-clipboard primary-modifier chord
+    /// is SWALLOWED. Called from `keyboard.rs` before the keymap sees the press.
+    pub(crate) fn text_edit_key(
+        &mut self,
+        id: window::Id,
+        modifiers: cosmic::iced::keyboard::Modifiers,
+        key: cosmic::iced::keyboard::Key,
+        location: cosmic::iced::keyboard::Location,
+        typed: Option<String>,
+    ) -> Task<cosmic::Action<Msg>> {
+        use cosmic::iced::keyboard::{key::Named, Key};
+        use super::text_annot as ta;
+        // Escape / numpad Enter END the session. Checked BEFORE the modifier lanes so a stray
+        // Shift or AltGr can't turn the exit key into a swallowed chord.
+        if text_edit_exits(&key, location) {
+            return self.settle_text_edit(id);
+        }
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        let Some((te_id, caret, anchor)) = p
+            .edit
+            .text_edit
+            .as_ref()
+            .map(|t| (t.id, t.caret, t.anchor))
+        else {
+            return Task::none();
+        };
+        let sel = p.edit.text_edit.as_ref().and_then(|t| t.selection());
+        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let Some((text, size_px, font, constrained, rect)) = p
+            .edit
+            .annotations
+            .iter()
+            .find(|it| it.id == te_id)
+            .and_then(|it| match &it.kind {
+                AnnotKind::Text { text, size_px, font, constrained, rect, .. } => {
+                    Some((text.clone(), *size_px, *font, *constrained, *rect))
+                }
+                _ => None,
+            })
+        else {
+            return Task::none();
+        };
+        // The caret-movement keys navigate the SAME layout the box geometry and renderer use.
+        let lay = text_kind_layout(&text, size_px, font, rect, constrained, frame.0);
+        // The PRIMARY command modifier (Cmd on macOS, Ctrl elsewhere) marks a shortcut combo;
+        // Alt/AltGr must NOT block insertion (it composes real text on many layouts), and Shift
+        // never does. So only the primary chord is treated as "a command, not text".
+        #[cfg(target_os = "macos")]
+        let primary = modifiers.logo();
+        #[cfg(not(target_os = "macos"))]
+        let primary = modifiers.control();
+
+        // ── Clipboard combos (DRAGON-354 item 13): Cmd/Ctrl+A/C/X/V act on the TEXT while
+        // editing (never the image-copy flow); other primary chords are swallowed. The
+        // classification is the pure, unit-tested [`text_edit_chord`] — see its doc for why
+        // that matters (DRAGON-369). ─────────────────────────────────────────────────────────
+        if primary {
+            let selected_text = |sel: Option<(usize, usize)>| -> Option<String> {
+                let (a, b) = sel?;
+                Some(text.chars().skip(a).take(b - a).collect())
+            };
+            return match text_edit_chord(&key, modifiers.shift()) {
+                // In-session text undo/redo (DRAGON-354 item 13): Cmd/Ctrl+Z undoes this
+                // session's edits, Shift+Cmd/Ctrl+Z (and Cmd/Ctrl+Y) redoes — WITHOUT touching
+                // the shared EditOp stack. Exhausted = a no-op, never a settle-and-pop of the
+                // global history mid-edit.
+                Some(TextEditChord::Undo) => self.text_edit_history_step(id, false),
+                Some(TextEditChord::Redo) => self.text_edit_history_step(id, true),
+                // Select all: anchor at 0, caret at the end (a pure selection change).
+                Some(TextEditChord::SelectAll) => {
+                    let n = ta::char_len(&text);
+                    self.apply_text_edit(
+                        id, te_id, size_px, font, rect, constrained, frame, None, n, Some(0), false,
+                    )
+                }
+                Some(TextEditChord::Copy) => {
+                    if let Some(t) = selected_text(sel) {
+                        crate::share::copy_text(&t);
+                    }
+                    Task::none()
+                }
+                Some(TextEditChord::Cut) => {
+                    let Some((a, b)) = sel else { return Task::none() };
+                    if let Some(t) = selected_text(sel) {
+                        crate::share::copy_text(&t);
+                    }
+                    let (nt, nc) = ta::delete_range(&text, a, b);
+                    self.apply_text_edit(id, te_id, size_px, font, rect, constrained, frame, Some(nt), nc, None, false)
+                }
+                Some(TextEditChord::Paste) => {
+                    let Some(pasted) = crate::share::read_text() else {
+                        return Task::none();
+                    };
+                    // Normalize CRLF/CR so pasted newlines wrap like typed Enter, then CAP
+                    // the insertion (a multi-MB clipboard would drive the per-keystroke
+                    // reflow + resvg raster into a stall). Truncated at a grapheme
+                    // boundary; silent by design (no toast).
+                    let pasted = pasted.replace("\r\n", "\n").replace('\r', "\n");
+                    let pasted = ta::cap_graphemes(&pasted, TEXT_PASTE_MAX_CHARS);
+                    let (s, e) = sel.unwrap_or((caret, caret));
+                    let (nt, nc) = ta::replace_range(&text, s, e, pasted);
+                    self.apply_text_edit(id, te_id, size_px, font, rect, constrained, frame, Some(nt), nc, None, false)
+                }
+                // Every other primary chord — including a non-character one — is SWALLOWED.
+                None => Task::none(),
+            };
+        }
+
+        let shift = modifiers.shift();
+        // `(new_text, new_caret, new_anchor)`: `new_text=None` is a pure caret/selection move.
+        let (new_text, new_caret, new_anchor): (Option<String>, usize, Option<usize>) = match &key {
+            Key::Named(Named::Backspace) => {
+                if let Some((a, b)) = sel {
+                    let (t, c) = ta::delete_range(&text, a, b);
+                    (Some(t), c, None)
+                } else {
+                    let (t, c) = ta::backspace(&text, caret);
+                    (Some(t), c, None)
+                }
+            }
+            Key::Named(Named::Delete) => {
+                if let Some((a, b)) = sel {
+                    let (t, c) = ta::delete_range(&text, a, b);
+                    (Some(t), c, None)
+                } else {
+                    let (t, c) = ta::delete_forward(&text, caret);
+                    (Some(t), c, None)
+                }
+            }
+            // MAIN Enter inserts a newline — the box is multi-line. The NUMPAD one never reaches
+            // here: it settled the session above ([`text_edit_exits`], DRAGON-364).
+            Key::Named(Named::Enter) => {
+                let (s, e) = sel.unwrap_or((caret, caret));
+                let (t, c) = ta::replace_range(&text, s, e, "\n");
+                (Some(t), c, None)
+            }
+            // Space arrives as a Character(" ") on iced, so it rides the Character/text arm below.
+            Key::Named(Named::ArrowLeft) => {
+                let c = ta::move_left(&text, caret);
+                caret_move(caret, c, anchor, sel, shift, true, false)
+            }
+            Key::Named(Named::ArrowRight) => {
+                let c = ta::move_right(&text, caret);
+                caret_move(caret, c, anchor, sel, shift, false, false)
+            }
+            Key::Named(Named::ArrowUp) => {
+                let c = ta::move_up(&lay, font, size_px, caret);
+                caret_move(caret, c, anchor, sel, shift, true, false)
+            }
+            Key::Named(Named::ArrowDown) => {
+                let c = ta::move_down(&lay, font, size_px, caret);
+                caret_move(caret, c, anchor, sel, shift, false, false)
+            }
+            // Home/End TRAVEL to the line boundary even with a selection (travel = true).
+            Key::Named(Named::Home) => {
+                let c = ta::line_home(&lay, caret);
+                caret_move(caret, c, anchor, sel, shift, true, true)
+            }
+            Key::Named(Named::End) => {
+                let c = ta::line_end(&lay, caret);
+                caret_move(caret, c, anchor, sel, shift, false, true)
+            }
+            // Printable input rides iced's PRODUCED text (DRAGON-354 items 1 + 18a): the shifted /
+            // dead-key-composed / precomposed string, not the raw key name (whose base char is
+            // unreliable for shifted characters on macOS). Insert only real text; a Character key
+            // that produced none (a bare compose press) inserts nothing.
+            // Space arrives as Character(" ") on iced, so the Character arm covers it too.
+            Key::Character(_) => {
+                // `primary` is already false here (a primary chord returned above); the shared
+                // pure decision still filters bare compose presses / control text.
+                let Some(ins) = ta::insertable_text(false, typed.as_deref()) else {
+                    return Task::none();
+                };
+                let (s, e) = sel.unwrap_or((caret, caret));
+                let (t, c) = ta::replace_range(&text, s, e, ins);
+                (Some(t), c, None)
+            }
+            // Everything else (bare modifiers, F-keys, Tab): swallowed, no change — the tool
+            // hotkeys stay suspended while a box is being edited.
+            _ => return Task::none(),
+        };
+        // DRAGON-354 item 13: a single, non-whitespace typed character COALESCES into the current
+        // undo burst; a word-break space, a multi-char (IME) commit, deletion, Enter, etc. each
+        // start their own step (`coalesce = false`). A pure caret move (`new_text == None`) ends
+        // the burst inside `apply_text_edit`.
+        let coalesce = new_text.is_some()
+            && matches!(&key, Key::Character(_))
+            && typed.as_deref().is_some_and(|t| {
+                let mut chars = t.chars();
+                matches!((chars.next(), chars.next()), (Some(c), None) if !c.is_whitespace())
+            });
+        self.apply_text_edit(id, te_id, size_px, font, rect, constrained, frame, new_text, new_caret, new_anchor, coalesce)
+    }
+
+    /// Insert an OS input-method commit into the edited text box (DRAGON-359): the emoji picker
+    /// or a CJK composition delivers its result as one string, which lands at the caret and
+    /// replaces any active selection. Same insertion path as typing a character (through
+    /// [`Self::apply_text_edit`]) — capped like a paste so a pathological commit can't stall the
+    /// per-keystroke reflow. A no-op unless a text box is actually being edited.
+    pub(crate) fn text_edit_ime_commit(
+        &mut self,
+        id: window::Id,
+        text: String,
+    ) -> Task<cosmic::Action<Msg>> {
+        use super::text_annot as ta;
+        if text.is_empty() {
+            return Task::none();
+        }
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        let Some((te_id, caret)) = p.edit.text_edit.as_ref().map(|t| (t.id, t.caret)) else {
+            return Task::none();
+        };
+        let sel = p.edit.text_edit.as_ref().and_then(|t| t.selection());
+        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let Some((cur, size_px, font, constrained, rect)) = p
+            .edit
+            .annotations
+            .iter()
+            .find(|it| it.id == te_id)
+            .and_then(|it| match &it.kind {
+                // `stroke_w` (DRAGON-358) is not needed here: `apply_text_edit` reads the live
+                // outline weight itself when it reflows.
+                AnnotKind::Text { text, size_px, font, constrained, rect, .. } => {
+                    Some((text.clone(), *size_px, *font, *constrained, *rect))
+                }
+                _ => None,
+            })
+        else {
+            return Task::none();
+        };
+        // Normalize newlines like paste (an IME could deliver them), then CAP the insertion at a
+        // grapheme boundary so an outsized commit can't drive the reflow + resvg raster into a
+        // stall.
+        let ins = text.replace("\r\n", "\n").replace('\r', "\n");
+        let ins = ta::cap_graphemes(&ins, TEXT_PASTE_MAX_CHARS);
+        let (s, e) = sel.unwrap_or((caret, caret));
+        let (nt, nc) = ta::replace_range(&cur, s, e, ins);
+        // An IME commit folds like paste (DRAGON-354 item 13 x DRAGON-359): its own undo step,
+        // never coalesced into a typing burst.
+        self.apply_text_edit(id, te_id, size_px, font, rect, constrained, frame, Some(nt), nc, None, false)
+    }
+
+    /// Commit a computed text-edit result (DRAGON-354): reflow the box when the buffer changed,
+    /// clamp + store the caret/selection, prime the blink, and re-render the live layer. Shared
+    /// by every branch of [`Self::text_edit_key`] (typing, deletion, clipboard, caret moves).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_text_edit(
+        &mut self,
+        id: window::Id,
+        te_id: AnnotId,
+        size_px: f32,
+        font: super::text_annot::TextFont,
+        rect: AnnotRect,
+        constrained: bool,
+        frame: (f32, f32),
+        new_text: Option<String>,
+        new_caret: usize,
+        new_anchor: Option<usize>,
+        // DRAGON-354 item 13: this mutation is single-character typing that should COALESCE into
+        // the current in-session undo burst. `false` for every non-typing edit (deletion, paste,
+        // cut, Enter, word-break space) and for pure caret/selection moves (which end the burst).
+        coalesce: bool,
+    ) -> Task<cosmic::Action<Msg>> {
+        use super::text_annot as ta;
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        // Preserve the box's OUTLINE weight across the edit (DRAGON-358): the width is not one
+        // of this helper's style params (it re-styles independently), so read the live value.
+        let (cur_text, stroke_w) = p
+            .edit
+            .annotations
+            .iter()
+            .find(|it| it.id == te_id)
+            .and_then(|it| match &it.kind {
+                AnnotKind::Text { text, stroke_w, .. } => Some((text.clone(), *stroke_w)),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let final_len = new_text.as_deref().map_or_else(|| ta::char_len(&cur_text), ta::char_len);
+        // The caret/selection BEFORE this edit — the state an in-session undo restores to.
+        let (old_caret, old_anchor) =
+            p.edit.text_edit.as_ref().map(|t| (t.caret, t.anchor)).unwrap_or((0, None));
+        // DRAGON-354 item 13: snapshot the PRE-edit state onto the session history for a real
+        // buffer change; a pure caret/selection move only ENDS any typing burst (it is not itself
+        // undoable — matching every text editor). This history is settled away into the single
+        // global `EditOp` when the session ends.
+        if let Some(te) = p.edit.text_edit.as_mut() {
+            match &new_text {
+                Some(nt) if *nt != cur_text => {
+                    te.history.record(
+                        super::edit::TextSnapshot { text: cur_text.clone(), caret: old_caret, anchor: old_anchor },
+                        coalesce,
+                    );
+                }
+                _ => te.history.break_burst(),
+            }
+        }
+        if let Some(nt) = &new_text {
+            let reflowed = reflow_text(nt, size_px, font, rect, constrained, stroke_w, frame);
+            if let Some(it) = p.edit.annotations.iter_mut().find(|it| it.id == te_id) {
+                it.kind = reflowed;
+            }
+        }
+        if let Some(te) = p.edit.text_edit.as_mut() {
+            te.caret = new_caret.min(final_len);
+            te.anchor = new_anchor.map(|a| a.min(final_len));
+            te.blink_on = true;
+        }
+        self.refresh_text_display(id)
+    }
+
+    /// Apply an in-session undo/redo (DRAGON-354 item 13): pop the session history (or redo)
+    /// stack, restore that buffer + caret + selection into the open text box, and re-render.
+    /// A NO-OP when the stack is exhausted — the shared `EditOp` history is NEVER touched
+    /// mid-edit (it settles to one entry when the session ends). `redo` picks the direction.
+    fn text_edit_history_step(&mut self, id: window::Id, redo: bool) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        let Some((te_id, cur_caret, cur_anchor)) =
+            p.edit.text_edit.as_ref().map(|t| (t.id, t.caret, t.anchor))
+        else {
+            return Task::none();
+        };
+        // `stroke_w` (DRAGON-358) rides the restore too: the outline weight is a style, not part
+        // of the text history, so the box keeps its LIVE width across an in-session undo/redo.
+        let Some((cur_text, size_px, font, constrained, rect, stroke_w)) = p
+            .edit
+            .annotations
+            .iter()
+            .find(|it| it.id == te_id)
+            .and_then(|it| match &it.kind {
+                AnnotKind::Text { text, size_px, font, constrained, rect, stroke_w } => {
+                    Some((text.clone(), *size_px, *font, *constrained, *rect, *stroke_w))
+                }
+                _ => None,
+            })
+        else {
+            return Task::none();
+        };
+        let current =
+            super::edit::TextSnapshot { text: cur_text, caret: cur_caret, anchor: cur_anchor };
+        let Some(te) = p.edit.text_edit.as_mut() else {
+            return Task::none();
+        };
+        let restored = if redo { te.history.redo(current) } else { te.history.undo(current) };
+        let Some(snap) = restored else {
+            // Exhausted: a no-op. Do NOT fall through to the global undo/redo mid-edit.
+            return Task::none();
+        };
+        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let final_len = super::text_annot::char_len(&snap.text);
+        let reflowed = reflow_text(&snap.text, size_px, font, rect, constrained, stroke_w, frame);
+        if let Some(it) = p.edit.annotations.iter_mut().find(|it| it.id == te_id) {
+            it.kind = reflowed;
+        }
+        if let Some(te) = p.edit.text_edit.as_mut() {
+            te.caret = snap.caret.min(final_len);
+            te.anchor = snap.anchor.map(|a| a.min(final_len));
+            te.blink_on = true;
+        }
+        self.refresh_text_display(id)
+    }
+
+    /// Re-open the editor on an existing text box (DRAGON-354) — the double-click / Text-tool
+    /// press path. Settles any current edit first, then selects the box and drops the caret at
+    /// its end.
+    /// macOS (DRAGON-359): when a text edit BEGINS, make our accessory app active + the preview
+    /// surface key + the WinitView first responder, so the system emoji & symbols picker
+    /// (Ctrl+Cmd+Space) routes to our text box (see
+    /// [`crate::platform::mac::window::focus_view_for_text_edit`] for the AppKit reasoning).
+    /// Targeted by window IDENTITY through `window::run_with_handle(id, ..)` — DRAGON-336 allows
+    /// several simultaneous windowed previews all sharing one title, so a title scan could key
+    /// the WRONG document (focus theft, emoji into the wrong box); the handle route reaches
+    /// exactly THIS `window::Id`'s native view (the raw handle's `ns_view` IS the WinitView in
+    /// our winit fork, the vibrancy nesting included). Scoped to begin-edit only, so capture-time
+    /// overlay behavior is unchanged. `Task::none()` when no preview is open.
+    #[cfg(target_os = "macos")]
+    pub(super) fn focus_preview_for_text_edit(&self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        if self.preview_for(id).is_none() {
+            return Task::none();
+        }
+        window::run_with_handle(id, |handle| {
+            use window::raw_window_handle::RawWindowHandle;
+            if let RawWindowHandle::AppKit(h) = handle.as_raw() {
+                // SAFETY: the callback runs synchronously on the winit event loop (the main
+                // thread) while the handle borrow of the live window is held — exactly the fn's
+                // documented contract.
+                unsafe { crate::platform::mac::window::focus_view_for_text_edit(h.ns_view) };
+            }
+        })
+        .discard()
+    }
+
+    pub(super) fn edit_existing_text(&mut self, id: window::Id, annot: AnnotId) -> Task<cosmic::Action<Msg>> {
+        let _ = self.settle_text_edit(id);
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        let Some(text) = p.edit.annotations.iter().find(|it| it.id == annot).and_then(|it| {
+            match &it.kind {
+                AnnotKind::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            }
+        }) else {
+            return Task::none();
+        };
+        p.edit.sel.set_one(annot);
+        p.edit.annot_menu = None;
+        // Entering edit mode reflects it in the UI: arm the Text tool (DRAGON-354 item 4) so the
+        // tray highlights Text and the pointer becomes the I-beam over the box. Since DRAGON-364
+        // the armed Text tool no longer swallows presses on existing boxes, so leaving it armed
+        // still allows dragging/resizing this box once the edit settles.
+        p.edit.tool = Some(Tool::Text);
+        p.edit.text_edit = Some(super::edit::TextEdit {
+            id: annot,
+            caret: super::text_annot::char_len(&text),
+            anchor: None,
+            snapshot: p.edit.annotations.clone(),
+            is_new: false,
+            blink_on: true,
+            history: Default::default(),
+        });
+        // The dropdowns follow the box you just opened (DRAGON-364 task 3) — display only.
+        self.sync_text_style_to_selection(id, TextStyleSource::SelectionSync);
+        let refresh = self.refresh_text_display(id);
+        #[cfg(target_os = "macos")]
+        let refresh = Task::batch([self.focus_preview_for_text_edit(id), refresh]);
+        refresh
+    }
+
+    /// A pointer PRESS inside the actively-edited text box (DRAGON-354 item 12): place the caret
+    /// at image point `(x, y)`. `word` (double-click) selects the word; `extend` (Shift) extends
+    /// from the current caret; a plain press seeds the anchor so a subsequent drag selects.
+    pub(super) fn text_click_at(
+        &mut self,
+        id: window::Id,
+        x: f32,
+        y: f32,
+        extend: bool,
+        word: bool,
+        all: bool,
+    ) -> Task<cosmic::Action<Msg>> {
+        let Some((text, idx)) = self.text_caret_index_at(id, x, y) else {
+            return Task::none();
+        };
+        if let Some(p) = self.preview_for_mut(id)
+            && let Some(te) = p.edit.text_edit.as_mut()
+        {
+            if all {
+                // Triple-click (DRAGON-354 item 12): select the WHOLE box — the same target as
+                // Cmd/Ctrl+A (anchor at 0, caret at the end). A pure selection change.
+                te.anchor = Some(0);
+                te.caret = super::text_annot::char_len(&text);
+            } else if word {
+                let (ws, we) = super::text_annot::word_range_at(&text, idx);
+                te.anchor = Some(ws);
+                te.caret = we;
+            } else if extend {
+                if te.anchor.is_none() {
+                    te.anchor = Some(te.caret);
+                }
+                te.caret = idx;
+            } else {
+                // Seed the anchor at the press so a drag selects; collapsed (anchor == caret)
+                // reads as no selection until the caret moves.
+                te.anchor = Some(idx);
+                te.caret = idx;
+            }
+            te.blink_on = true;
+        }
+        self.refresh_text_display(id)
+    }
+
+    /// A drag inside the actively-edited text box (DRAGON-354 item 12): extend the selection to
+    /// image point `(x, y)` — the caret end moves, the press anchor stays.
+    pub(super) fn text_drag_to(&mut self, id: window::Id, x: f32, y: f32) -> Task<cosmic::Action<Msg>> {
+        let Some((_text, idx)) = self.text_caret_index_at(id, x, y) else {
+            return Task::none();
+        };
+        if let Some(p) = self.preview_for_mut(id)
+            && let Some(te) = p.edit.text_edit.as_mut()
+        {
+            if te.anchor.is_none() {
+                te.anchor = Some(te.caret);
+            }
+            te.caret = idx;
+            te.blink_on = true;
+        }
+        self.refresh_text_display(id)
+    }
+
+    /// Map image point `(x, y)` to the caret CHAR index in the currently-edited text box, plus a
+    /// clone of its text — via the SAME layout the renderer uses. `None` when nothing is being
+    /// edited. Shared by the press / drag caret placement.
+    fn text_caret_index_at(&self, id: window::Id, x: f32, y: f32) -> Option<(String, usize)> {
+        let p = self.preview_for(id)?;
+        let te_id = p.edit.text_edit.as_ref()?.id;
+        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let (text, size_px, font, constrained, rect) =
+            p.edit.annotations.iter().find(|it| it.id == te_id).and_then(|it| match &it.kind {
+                AnnotKind::Text { text, size_px, font, constrained, rect, .. } => {
+                    Some((text.clone(), *size_px, *font, *constrained, *rect))
+                }
+                _ => None,
+            })?;
+        let lay = text_kind_layout(&text, size_px, font, rect, constrained, frame.0);
+        let idx = super::text_annot::caret_at_point(&lay, font, size_px, x - rect.x, y - rect.y);
+        Some((text, idx))
+    }
+
+    /// The caret-blink tick (DRAGON-354): flip the caret's visible phase while editing.
+    pub(super) fn text_caret_blink(&mut self, id: window::Id) {
+        if let Some(p) = self.preview_for_mut(id)
+            && let Some(te) = p.edit.text_edit.as_mut()
+        {
+            te.blink_on = !te.blink_on;
+        }
+    }
+
+    /// Set the text SIZE (SOURCE px) for new boxes and re-size the edited/selected one — the
+    /// size dropdown. Re-flows through the same seam every text change uses; when NOT editing
+    /// (a plain selection), it is one undo entry.
+    pub(super) fn set_text_size(&mut self, id: window::Id, size: f32) -> Task<cosmic::Action<Msg>> {
+        self.apply_text_style(id, Some(size), None)
+    }
+
+    /// Switch the text FONT for new boxes and re-font the edited/selected one — the font toggle.
+    pub(super) fn set_text_font(
+        &mut self,
+        id: window::Id,
+        font: super::text_annot::TextFont,
+    ) -> Task<cosmic::Action<Msg>> {
+        self.apply_text_style(id, None, Some(font))
+    }
+
+    // ── DISPLAY a style vs. REMEMBER a style (DRAGON-364) ────────────────────────────────
+    //
+    // These two are deliberately SEPARATE operations, and the split is the whole point of the
+    // ticket's parenthetical. Text style reaches the user through two different pieces of state:
+    //
+    //   * `EditState::annot_text_size` / `annot_text_font` — the CURRENT document's working
+    //     style. It is what the dropdown chips DISPLAY and what a new box in this document is
+    //     born with. Per-document, never persisted, thrown away when the preview closes.
+    //   * `App::annot_text_size` / `annot_text_font` — the REMEMBERED default, persisted through
+    //     `state/schema.rs` and re-seeded into every future `EditState` on open.
+    //
+    // Selecting a text box, entering its editor, or SCALING a normal box (DRAGON-364 task 4) all
+    // change what the dropdowns should SHOW — they are reports about the element under the
+    // cursor, not statements of preference. Only an explicit pick in the dropdown menu is the
+    // user saying "this is my size/font from now on", and only that may write the persisted
+    // default. Collapsing these two would make merely clicking an old 96px caption silently
+    // re-set the default for every future capture.
+    //
+    // So: [`Self::show_text_style`] never persists, [`Self::remember_text_style`] always does,
+    // and the ONE caller that does both is the dropdown handler [`Self::apply_text_style`].
+
+    /// Apply `size`/`font` to the text dropdowns — the ONE seam where "display a value" and
+    /// "remember a value" are decided, keyed by WHERE the change came from
+    /// ([`TextStyleSource`]). Both halves live here on purpose: a caller cannot forget to
+    /// persist, and — the case that matters — cannot accidentally persist. See the block
+    /// comment above.
+    fn set_text_style(
+        &mut self,
+        id: window::Id,
+        source: TextStyleSource,
+        size: Option<f32>,
+        font: Option<super::text_annot::TextFont>,
+    ) {
+        // ALWAYS: what the chips show (and what the next new box in this document takes).
+        if let Some(p) = self.preview_for_mut(id) {
+            if let Some(s) = size {
+                p.edit.annot_text_size = s;
+            }
+            if let Some(f) = font {
+                p.edit.annot_text_font = f;
+            }
+        }
+        // ONLY for an explicit pick: the persisted default for every FUTURE document.
+        if !source.writes_default() {
+            return;
+        }
+        if let Some(s) = size {
+            self.annot_text_size = s;
+        }
+        if let Some(f) = font {
+            self.annot_text_font = f;
+        }
+        self.save_state();
+    }
+
+    /// Point the font/size dropdowns at the PRIMARY selected (or actively edited) text box, so
+    /// the chips always report the element you are working on (DRAGON-364 task 3). With a
+    /// multi-selection the primary IS the last-selected item ([`super::edit::EditState::selected`]),
+    /// which is exactly the "match the last one selected" rule.
+    ///
+    /// DISPLAY-only by construction — every caller passes a `source` whose
+    /// [`TextStyleSource::writes_default`] is false, so the persisted default can never move
+    /// through here. A non-text (or empty) selection leaves the chips alone: they keep showing
+    /// what a new box would take, which is still true.
+    pub(super) fn sync_text_style_to_selection(
+        &mut self,
+        id: window::Id,
+        source: TextStyleSource,
+    ) {
+        debug_assert!(
+            !source.writes_default(),
+            "syncing the chips to an existing element is a REPORT, never a preference write",
+        );
+        let Some(p) = self.preview_for(id) else {
+            return;
+        };
+        // A live edit outranks the selection: the box being typed into is the one on screen.
+        let target = p.edit.text_edit.as_ref().map(|t| t.id).or_else(|| p.edit.selected());
+        if let Some((size, font)) = text_style_for_display(&p.edit.annotations, target) {
+            self.set_text_style(id, source, Some(size), Some(font));
+        }
+    }
+
+    /// Shared body behind the size dropdown + font toggle — the ONE path that is a genuine user
+    /// PREFERENCE statement, so it both displays the new style and REMEMBERS it (see the
+    /// display-vs-remember block comment above). Then re-flows the box currently being edited
+    /// (or, if none, the selected text box) with the new size/font. A change made outside an
+    /// edit session is its own undo entry; during an edit the settle pushes the one entry.
+    /// Closes the size flyout.
+    fn apply_text_style(
+        &mut self,
+        id: window::Id,
+        size: Option<f32>,
+        font: Option<super::text_annot::TextFont>,
+    ) -> Task<cosmic::Action<Msg>> {
+        // The armed tool is DELIBERATELY left alone here (DRAGON-354 item 11c, per the user's
+        // correction): changing a text dropdown only updates the setting and restyles the
+        // selected/edited text box — it never switches the active tool to Text.
+        if self.preview_for(id).is_none() {
+            return Task::none();
+        }
+        // The ONE `DropdownPick`: displays AND persists.
+        self.set_text_style(id, TextStyleSource::DropdownPick, size, font);
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        p.edit.flyout = None;
+        let frame = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
+        let target = p.edit.text_edit.as_ref().map(|t| t.id).or_else(|| p.edit.selected());
+        if let Some(tid) = target {
+            let prev = p.edit.annotations.clone();
+            let reflowed = p.edit.annotations.iter().find(|it| it.id == tid).and_then(|it| {
+                match &it.kind {
+                    AnnotKind::Text { rect, text, size_px, font: f, constrained, stroke_w } => Some(reflow_text(
+                        text,
+                        size.unwrap_or(*size_px),
+                        font.unwrap_or(*f),
+                        *rect,
+                        *constrained,
+                        *stroke_w,
+                        frame,
+                    )),
+                    _ => None,
+                }
+            });
+            if let Some(k) = reflowed {
+                if let Some(it) = p.edit.annotations.iter_mut().find(|it| it.id == tid) {
+                    it.kind = k;
+                }
+                // A style change on a merely-SELECTED box is its own undo entry; while editing,
+                // the settle owns the entry.
+                if p.edit.text_edit.is_none() {
+                    p.edit.push_annotations(prev);
+                }
+            }
+        }
+        self.refresh_text_display(id)
     }
 
     /// Delete the WHOLE selection (DRAGON-341) — however many items — as ONE undo entry.
@@ -2674,9 +4893,19 @@ impl App {
         p.edit.annotations.retain(|it| !p.edit.sel.contains(it.id));
         if prev.len() != p.edit.annotations.len() {
             p.edit.sel.clear();
+            // Deleting the text box currently being EDITED ends its session (DRAGON-354): the
+            // one undo entry below already restores the box, and a live `text_edit` pointing at
+            // a gone id would keep swallowing the keyboard (mirrors the Undo/Redo arms). No
+            // settle — settling would push a second, conflicting entry for a removed item.
+            if p.edit.text_edit.as_ref().is_some_and(|te| {
+                !p.edit.annotations.iter().any(|it| it.id == te.id)
+            }) {
+                p.edit.text_edit = None;
+            }
             p.edit.push_annotations(prev);
-            // Deleting an effect drops it from the GPU shader's item list on the next view build.
-            return Task::none();
+            // Deleting a text box drops it from the raster layer (DRAGON-354); effects/vectors
+            // redraw on the next view build.
+            return self.refresh_text_display(id);
         }
         Task::none()
     }
@@ -2688,7 +4917,7 @@ impl App {
     /// ([`super::edit::EditState::drop_pen_selection`]). Returns whether anything is now
     /// selected — an empty scene changes nothing at all (no persisted state churn).
     pub(super) fn select_all_annotations(&mut self, id: window::Id) -> bool {
-        match self.preview_for_mut(id) {
+        let selected = match self.preview_for_mut(id) {
             Some(p) if !p.edit.annotations.is_empty() => {
                 let ids: Vec<AnnotId> = p.edit.annotations.iter().map(|it| it.id).collect();
                 p.edit.sel.set_all(ids);
@@ -2696,7 +4925,12 @@ impl App {
                 true
             }
             _ => false,
+        };
+        if selected {
+            // The dropdowns follow the new primary (DRAGON-364 task 3) — display only.
+            self.sync_text_style_to_selection(id, TextStyleSource::SelectionSync);
         }
+        selected
     }
 
     /// Apply a POINTER rubber band (DRAGON-341): select every annotation the band
@@ -2722,39 +4956,89 @@ impl App {
             p.edit.sel.set_all(hits);
         }
         p.edit.annot_menu = None;
+        // The dropdowns follow the new primary (DRAGON-364 task 3) — display only.
+        self.sync_text_style_to_selection(id, TextStyleSource::SelectionSync);
     }
 
-    /// Duplicate the selected annotation: a clone with a new id, offset toward the frame CENTER
-    /// by an equal x/y amount (so the copy is obviously distinct and easy to grab) and clamped to
-    /// stay in the image. The copy lands on TOP of the z-stack and becomes the new selection.
-    /// One undo entry. No-op when nothing is selected.
+    /// Duplicate the WHOLE selection (DRAGON-356): every selected item is cloned with a new id,
+    /// the copies land on TOP of the z-stack (keeping their z-order among themselves), and the
+    /// selection swaps to the copies (primary = the copy of the old primary). ONE undo entry.
+    /// No-op when nothing is selected.
+    ///
+    /// The offset is the historical single-item nudge (toward the frame CENTER, from the
+    /// PRIMARY's center, scaled a little to the image size), applied as ONE shared delta to every
+    /// copy so the arrangement is duplicated RIGIDLY — the relative positions of the members are
+    /// preserved exactly. A single-item selection stays byte-equivalent to the pre-DRAGON-356
+    /// behavior: the historical [`edited_kind`] Move path (which clamps the lone copy's own drawn
+    /// bounds, reflows a text box, etc.). A GROUP clamps the shared delta ONCE against the union
+    /// of every member's drawn bounds ([`group_dup_offset`]) and translates every copy verbatim
+    /// ([`translated_kind`]) — the same clamp-the-shared-delta discipline as a group MOVE, so the
+    /// group can never distort against an image edge.
     pub(super) fn duplicate_selected_annotation(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        // A live text edit SETTLES first (DRAGON-354): duplicating moves the selection to the
+        // copies, and a session left open on an original would keep the keyboard while the
+        // chrome (primary-keyed caret) pointed elsewhere. Settle commits (or discards an
+        // empty box) as its own undo entry, then the duplicate proceeds normally. (The hotkey
+        // can't fire mid-edit — keys are swallowed — but the context menu can.)
+        let _ = self.settle_text_edit(id);
         let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
-        let Some(annot) = p.edit.selected() else {
+        let Some(primary) = p.edit.sel.primary() else {
             return Task::none();
         };
-        let Some(src) = p.edit.annotations.iter().find(|it| it.id == annot).cloned() else {
+        // The selected sources in SCENE order (so the copies keep the members' relative z-order),
+        // remembering which source is the primary.
+        let sources: Vec<AnnotationItem> = p
+            .edit
+            .annotations
+            .iter()
+            .filter(|it| p.edit.sel.contains(it.id))
+            .cloned()
+            .collect();
+        let Some(prim_src) = sources.iter().find(|it| it.id == primary).cloned() else {
             return Task::none();
         };
         let (fw, fh) = (p.edit.frame.0 as f32, p.edit.frame.1 as f32);
-        // Offset toward the frame center, equal on both axes, scaled a little to the image size.
-        let off = (fw.min(fh) * 0.04).clamp(16.0, 64.0);
-        let (cx, cy) = kind_center(&src.kind);
-        let dx = if fw * 0.5 >= cx { off } else { -off };
-        let dy = if fh * 0.5 >= cy { off } else { -off };
-        // A zero-press Move applies the offset AND clamps the copy's drawn bounds inside the image.
-        let new_kind = edited_kind(&src.kind, Grab::Move, (0.0, 0.0), (dx, dy), (fw, fh));
-        let new_id = p.edit.next_annot_id();
         let prev = p.edit.annotations.clone();
-        p.edit.annotations.push(AnnotationItem { id: new_id, color: src.color, kind: new_kind });
-        p.edit.sel.set_one(new_id);
+        // Build the copies. SINGLE keeps the historical per-item clamp (byte-equivalent); a GROUP
+        // clamps ONE shared delta on the union and translates every copy verbatim (rigid).
+        let mut new_ids: Vec<AnnotId> = Vec::with_capacity(sources.len());
+        let mut new_primary = primary;
+        if sources.len() == 1 {
+            let src = &sources[0];
+            let (dx, dy) = single_dup_offset(kind_center(&src.kind), (fw, fh));
+            // A zero-press Move applies the offset AND clamps the copy's drawn bounds inside the image.
+            let new_kind = edited_kind(&src.kind, Grab::Move, (0.0, 0.0), (dx, dy), (fw, fh), false);
+            let new_id = p.edit.next_annot_id();
+            p.edit.annotations.push(AnnotationItem { id: new_id, color: src.color, kind: new_kind });
+            new_ids.push(new_id);
+            new_primary = new_id;
+        } else {
+            // The shared, clamped delta: computed from the PRIMARY's center like the single case,
+            // then pinned once on the union so the whole arrangement lands inside the image.
+            let union = group_drawn_bounds(sources.iter().map(|it| &it.kind))
+                .expect("a non-empty selection has drawn bounds");
+            let (dx, dy) = group_dup_offset(kind_center(&prim_src.kind), union, (fw, fh));
+            for src in &sources {
+                let new_kind = translated_kind(&src.kind, dx, dy);
+                let new_id = p.edit.next_annot_id();
+                p.edit.annotations.push(AnnotationItem { id: new_id, color: src.color, kind: new_kind });
+                new_ids.push(new_id);
+                if src.id == primary {
+                    new_primary = new_id;
+                }
+            }
+        }
+        // The selection swaps to the copies, with the copy of the old primary LAST so it becomes
+        // the new primary (the one wearing resize handles) — mirroring the single-item rule.
+        p.edit.sel.set_all(dup_selection_order(&new_ids, new_primary));
         p.edit.annot_menu = None;
         p.edit.push_annotations(prev);
         // Duplicating a spotlight (e.g. after undo left the frame un-dimmed) re-ensures the dim.
         p.edit.ensure_dim_for_spotlights();
-        Task::none()
+        // Duplicating a text box adds a text item to the raster layer (DRAGON-354).
+        self.refresh_text_display(id)
     }
 
     /// Reorder the selected annotation in the z-stack (one undo entry when it moves).
@@ -2776,8 +5060,9 @@ impl App {
         if changed {
             p.edit.push_annotations(prev);
             // Reordering across effect TYPES changes the true-z-order composite — the GPU shader
-            // walks the reordered item list on the next view build.
-            return Task::none();
+            // walks the reordered item list on the next view build; the text layer re-composites
+            // in the new scene order too (DRAGON-354).
+            return self.refresh_text_display(id);
         }
         Task::none()
     }
@@ -2818,6 +5103,10 @@ fn is_degenerate(item: &AnnotationItem) -> bool {
         | AnnotKind::Blur { rect }
         // A badge is square, so either axis measures it — same stray-click bar as a box.
         | AnnotKind::Badge { rect, .. } => rect.w < 2.0 || rect.h < 2.0,
+        // A TEXT box is NEVER degenerate at creation (DRAGON-354): an empty box is valid — the
+        // editor opens on it. Emptiness is resolved at SETTLE (an empty settled box is deleted
+        // with no undo entry), never here.
+        AnnotKind::Text { .. } => false,
         AnnotKind::Arrow { a, b, .. } => (a.x - b.x).hypot(a.y - b.y) < 3.0,
         // A PEN gesture is NEVER degenerate (DRAGON-342): with the pencil armed, a press is
         // always deliberate ink — a real drag is a stroke and a TAP is a dot (the commit path
@@ -2843,6 +5132,7 @@ fn kind_center(kind: &AnnotKind) -> (f32, f32) {
         | AnnotKind::Pixelate { rect }
         | AnnotKind::Blur { rect }
         | AnnotKind::Badge { rect, .. }
+        | AnnotKind::Text { rect, .. }
         | AnnotKind::Spotlight { rect } => (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5),
         AnnotKind::Arrow { a, b, .. } => ((a.x + b.x) * 0.5, (a.y + b.y) * 0.5),
         AnnotKind::Pen { paths, .. } => {
@@ -2866,9 +5156,11 @@ fn kind_draw_margin(kind: &AnnotKind) -> f32 {
         AnnotKind::Pen { stroke_w, .. } => crate::pen_stroke::max_width(*stroke_w) / 2.0,
         AnnotKind::Arrow { stroke_w, .. } => (stroke_w + 2.0) / 2.0,
         // Stroke-less kinds draw exactly within the rect (Spotlight is an invisible knockout).
+        // Text's glyphs are laid out inside the box, so it likewise overhangs by nothing.
         AnnotKind::Highlight { .. }
         | AnnotKind::Pixelate { .. }
         | AnnotKind::Blur { .. }
+        | AnnotKind::Text { .. }
         | AnnotKind::Spotlight { .. } => 0.0,
     }
 }
@@ -2895,6 +5187,7 @@ fn kind_drawn_bounds(kind: &AnnotKind) -> AnnotRect {
         | AnnotKind::Spotlight { rect }
         | AnnotKind::Pixelate { rect }
         | AnnotKind::Badge { rect, .. }
+        | AnnotKind::Text { rect, .. }
         | AnnotKind::Blur { rect } => *rect,
         AnnotKind::Arrow { a, b, .. } => AnnotRect::from_points((a.x, a.y), (b.x, b.y)),
         AnnotKind::Pen { paths, .. } => pen_bounds(paths),
@@ -2938,6 +5231,39 @@ fn group_move_delta(bounds: AnnotRect, frame: (f32, f32), d: (f32, f32)) -> (f32
     )
 }
 
+/// The RAW duplication nudge for an item whose center is `center` in a `frame`-sized image: an
+/// equal x/y offset toward the frame CENTER (so the copy is obviously distinct and easy to grab),
+/// scaled a little to the image size. This is the historical single-item rule (DRAGON-356 lifted
+/// it out of `duplicate_selected_annotation` unchanged); the caller clamps it — the single case
+/// through [`edited_kind`]'s own clamp, a group through [`group_dup_offset`]. Pure — unit-tested.
+fn single_dup_offset(center: (f32, f32), frame: (f32, f32)) -> (f32, f32) {
+    let (fw, fh) = frame;
+    let off = (fw.min(fh) * 0.04).clamp(16.0, 64.0);
+    let dx = if fw * 0.5 >= center.0 { off } else { -off };
+    let dy = if fh * 0.5 >= center.1 { off } else { -off };
+    (dx, dy)
+}
+
+/// The GROUP duplication delta (DRAGON-356): the same raw nudge as a single item
+/// ([`single_dup_offset`], computed from the PRIMARY's `primary_center`), clamped ONCE against the
+/// selection's `union` drawn bounds so the whole arrangement lands inside the image without
+/// distorting — the identical clamp-the-shared-delta discipline as a group MOVE
+/// ([`group_move_delta`]). Applied VERBATIM to every copy, it preserves the members' relative
+/// positions exactly. Pure — unit-tested.
+fn group_dup_offset(primary_center: (f32, f32), union: AnnotRect, frame: (f32, f32)) -> (f32, f32) {
+    group_move_delta(union, frame, single_dup_offset(primary_center, frame))
+}
+
+/// The new SELECTION order after a duplicate (DRAGON-356): every `copies` id (in scene order),
+/// with the copy of the old primary — `primary_copy` — moved to LAST so it becomes the new
+/// primary (the only member wearing resize handles), mirroring the single-item rule. Pure —
+/// unit-tested.
+fn dup_selection_order(copies: &[AnnotId], primary_copy: AnnotId) -> Vec<AnnotId> {
+    let mut out: Vec<AnnotId> = copies.iter().copied().filter(|c| *c != primary_copy).collect();
+    out.push(primary_copy);
+    out
+}
+
 /// `kind` translated by `(dx, dy)` with NO clamping — the group move clamps its shared delta up
 /// front ([`group_move_delta`]), so every item must apply it verbatim. Pure — unit-tested.
 fn translated_kind(kind: &AnnotKind, dx: f32, dy: f32) -> AnnotKind {
@@ -2956,6 +5282,17 @@ fn translated_kind(kind: &AnnotKind, dx: f32, dy: f32) -> AnnotKind {
         }
         AnnotKind::Pixelate { rect } => AnnotKind::Pixelate { rect: shift(rect) },
         AnnotKind::Blur { rect } => AnnotKind::Blur { rect: shift(rect) },
+        // Text moves as a value (DRAGON-354): only the box origin shifts; the string, size,
+        // font and wrap mode ride along — so a duplicate/group-offset is a plain clone + shift
+        // (no hidden shared state, DRAGON-356).
+        AnnotKind::Text { rect, text, size_px, font, constrained, stroke_w } => AnnotKind::Text {
+            rect: shift(rect),
+            text: text.clone(),
+            size_px: *size_px,
+            font: *font,
+            constrained: *constrained,
+            stroke_w: *stroke_w,
+        },
         AnnotKind::Arrow { a, b, stroke_w } => AnnotKind::Arrow {
             a: AnnotPoint { x: a.x + dx, y: a.y + dy },
             b: AnnotPoint { x: b.x + dx, y: b.y + dy },
@@ -3081,12 +5418,18 @@ fn edit_rect(rect: &AnnotRect, grab: Grab, dx: f32, dy: f32, fw: f32, fh: f32, m
 /// Apply an edit grab to `original` geometry, dragging from `press` to `cur` (image px),
 /// clamped to the image `frame`. RELATIVE (delta-based): the dragged corner/edge/endpoint
 /// moves by `(cur - press)`, so an OFFSET handle drags with NO jump. Pure — unit-tested.
+///
+/// `scale_type` is the DRAGON-370 override, and ONLY a text box reads it: Ctrl held during a
+/// handle drag scales a CONSTRAINED (drag-created, "paragraph") box's type instead of reflowing
+/// it, which is Photoshop's paragraph-vs-point-text modifier. The canvas samples it per motion
+/// EVENT rather than latching it at press, so the user can change their mind mid-drag.
 fn edited_kind(
     original: &AnnotKind,
     grab: Grab,
     press: (f32, f32),
     cur: (f32, f32),
     frame: (f32, f32),
+    scale_type: bool,
 ) -> AnnotKind {
     let (dx, dy) = (cur.0 - press.0, cur.1 - press.1);
     let (fw, fh) = frame;
@@ -3121,6 +5464,79 @@ fn edited_kind(
         }
         AnnotKind::Blur { rect } => {
             AnnotKind::Blur { rect: edit_rect(rect, grab, dx, dy, fw, fh, m) }
+        }
+        // A TEXT box has TWO resize modes, keyed by how it was CREATED (DRAGON-364). The
+        // `constrained` flag already records that: a DRAG lays out a fixed-width "prison" the
+        // text wraps inside, a CLICK an auto box that hugs its own content.
+        //
+        //   * CONSTRAINED (dragged): the handle resizes the BOX. The wrap width follows it and
+        //     the text re-flows inside; `size_px` never changes. (DRAGON-354's behaviour.)
+        //   * NORMAL (clicked): the box has no independent geometry to stretch — its extent is
+        //     DERIVED from the text — so the handle scales the TYPE instead, aspect-locked by
+        //     construction ([`text_scale_factor`]), and the box is re-anchored so the handle
+        //     opposite the one being dragged stays put ([`anchor_scaled_text_rect`]). It stays
+        //     normal, so typing more text still auto-grows it at the new size.
+        //
+        // That split IS Photoshop's paragraph-text vs point-text distinction, one to one — and
+        // DRAGON-370 completes it with Photoshop's OVERRIDE: `scale_type` (Ctrl held) makes a
+        // CONSTRAINED box take the scale arm too, wrap width and all. It is meaningless on a
+        // normal box, which already scales; the reverse override (Ctrl to set a wrap width on a
+        // point box) is deliberately absent, exactly as in Photoshop.
+        //
+        // A pure MOVE never changes either mode or the size — it only translates.
+        AnnotKind::Text { rect, text, size_px, font, constrained, stroke_w } => {
+            if matches!(grab, Grab::Move) {
+                // DRAGON-368: a text MOVE may leave the canvas, keeping only
+                // [`TEXT_MIN_ON_CANVAS_PX`] of the box on it — see that constant for why the
+                // threshold is on the box and not on the padded region. Every other kind (and a
+                // CONSTRAINED box's resize handles, below) still clamps wholly inside: a shape's
+                // ink IS its geometry, so an off-canvas box/arrow/redaction would just be a
+                // partly-invisible shape, whereas a caption's whole point is where its glyphs
+                // sit relative to the picture. (The clamp itself lives in `reflow_text`, the one
+                // seam every text placement passes through.)
+                let moved = AnnotRect { x: rect.x + dx, y: rect.y + dy, ..*rect };
+                reflow_text(text, *size_px, *font, moved, *constrained, *stroke_w, (fw, fh))
+            } else if *constrained && !scale_type {
+                let r = edit_rect(rect, grab, dx, dy, fw, fh, m);
+                reflow_text(text, *size_px, *font, r, *constrained, *stroke_w, (fw, fh))
+            } else {
+                // The SCALE mode: a normal box always, and a CONSTRAINED one while the
+                // DRAGON-370 override is held. The box keeps whatever kind it was — the modifier
+                // changes what the handle DOES, not what the text IS, so a paragraph box scaled
+                // this way is still a paragraph box the next (unmodified) drag will reflow.
+                let size = clamp_scaled_text_size(
+                    size_px * text_scale_factor(rect.w, rect.h, grab, dx, dy),
+                );
+                // The factor actually APPLIED, after the guard bounds have had their say. A
+                // constrained box's wrap width is scaled by exactly that, which is what makes
+                // this a true similarity of the drawing: identical line breaks, every measure ×
+                // one factor. That is not only what Photoshop does — it is what keeps a Ctrl-drag
+                // on DRAGON-368's raster-reuse fast path, and a re-wrap on every motion event of
+                // the editor's most expensive gesture is precisely what that ticket removed.
+                let applied = if *size_px > 0.0 { size / *size_px } else { 1.0 };
+                let src = if *constrained {
+                    AnnotRect { w: rect.w * applied, ..*rect }
+                } else {
+                    *rect
+                };
+                // Reflow at the new size FIRST (that is what decides the box extent), then
+                // re-place it against the grab's anchor. Both halves go through the shared
+                // `text_kind_layout` seam, so live and bake agree on the scaled geometry.
+                let grown = reflow_text(text, size, *font, src, *constrained, *stroke_w, (fw, fh));
+                match grown {
+                    AnnotKind::Text { rect: gr, .. } => AnnotKind::Text {
+                        rect: anchor_scaled_text_rect(*rect, gr.w, gr.h, grab, (fw, fh)),
+                        text: text.to_string(),
+                        size_px: size,
+                        font: *font,
+                        constrained: *constrained,
+                        stroke_w: *stroke_w,
+                    },
+                    // `reflow_text` always returns a Text kind; keep the original if it ever
+                    // doesn't rather than inventing geometry.
+                    other => other,
+                }
+            }
         }
         // A pen group edits through its BOUNDING BOX: the box takes the grab exactly like a
         // rectangle (same clamping), then the strokes are mapped affinely into the result —
@@ -3183,12 +5599,133 @@ mod tests {
     use crate::geometry::{Corner, Edge};
     use rstest::rstest;
 
+    #[test]
+    fn caret_move_extends_collapses_and_plain_moves() {
+        // DRAGON-354 item 12. Shift extends: keep/seed the anchor, move the caret.
+        let (t, c, a) = caret_move(5, 3, None, None, true, true, false);
+        assert_eq!((t, c, a), (None, 3, Some(5)), "shift seeds anchor at old caret");
+        let (_t, c, a) = caret_move(5, 3, Some(9), Some((5, 9)), true, true, false);
+        assert_eq!((c, a), (3, Some(9)), "shift keeps the existing anchor");
+        // No shift + a selection: an ARROW collapses to the movement-side edge, no travel.
+        let (_t, c, a) = caret_move(7, 6, Some(9), Some((7, 9)), false, true, false);
+        assert_eq!((c, a), (7, None), "left/up collapses to selection start");
+        let (_t, c, a) = caret_move(7, 8, Some(4), Some((4, 7)), false, false, false);
+        assert_eq!((c, a), (7, None), "right/down collapses to selection end");
+        // No shift, no selection: a plain move.
+        let (_t, c, a) = caret_move(5, 4, None, None, false, true, false);
+        assert_eq!((c, a), (4, None));
+        // HOME/END (travel = true) with a selection: clear it AND travel to the line boundary
+        // (index 0 / 12 here), never stop at the selection edge — the reviewed bug.
+        let (_t, c, a) = caret_move(7, 0, Some(9), Some((7, 9)), false, true, true);
+        assert_eq!((c, a), (0, None), "Home travels to the line start, selection cleared");
+        let (_t, c, a) = caret_move(7, 12, Some(4), Some((4, 7)), false, false, true);
+        assert_eq!((c, a), (12, None), "End travels to the line end, selection cleared");
+        // Shift+Home still extends (travel only changes the no-shift collapse).
+        let (_t, c, a) = caret_move(7, 0, Some(9), Some((7, 9)), true, true, true);
+        assert_eq!((c, a), (0, Some(9)));
+    }
+
     fn boxed(id: u64, x: f32, y: f32, w: f32, h: f32) -> AnnotationItem {
         AnnotationItem {
             id: AnnotId(id),
             color: [255, 0, 0, 255],
             kind: AnnotKind::Box { rect: AnnotRect { x, y, w, h }, stroke_w: 4.0, fill: None },
         }
+    }
+
+    /// OUTLINE PARITY (DRAGON-358): the active line width thickens text through the ONE renderer
+    /// (`text_annot::render_into`) both the live layer (`render_text_layer`) and the bake
+    /// (`rasterize_scene`) call, so a stroked caption is pixel-identical on both — and a wider
+    /// pencil demonstrably paints MORE ink than a hairline on BOTH paths (the width reaches the
+    /// raster, not just the model). Mirrors the wrap-parity test's live-vs-bake pattern.
+    #[test]
+    fn text_outline_width_is_honored_identically_live_and_baked() {
+        use super::super::text_annot::TextFont;
+        let (w, h) = (200u32, 60u32);
+        let frame = (w as f32, h as f32);
+        // A hairline (no outline) vs a heavy pencil, same caption / size / origin.
+        let item = |pencil_w: f32| AnnotationItem {
+            id: AnnotId(1),
+            color: [0, 0, 0, 255],
+            kind: reflow_text(
+                "Weighty",
+                24.0,
+                TextFont::Clean,
+                AnnotRect { x: 4.0, y: 4.0, w: 0.0, h: 0.0 },
+                false,
+                pencil_w,
+                frame,
+            ),
+        };
+        let ink = |img: &RgbaImage| img.pixels().filter(|p| p.0[3] > 0).count();
+        // The bake (rasterize_scene) and the live layer (render_text_layer) draw the SAME stroked
+        // text at scale 1.0 → byte-identical rasters (the parity contract).
+        // DRAGON-362: the live layer now rasters a REGION; comparing against the bake means
+        // asking for the WHOLE frame as the region, at scale 1 — which is exactly the bake's
+        // canvas, so the parity contract is unchanged.
+        let whole = AnnotRect { x: 0.0, y: 0.0, w: frame.0, h: frame.1 };
+        let bold = vec![item(6.0)];
+        let live = render_text_layer(&bold, (w, h), whole, w, h).expect("live raster");
+        let bake = rasterize_scene(&bold, w, h, 1.0, DEFAULT_ANNOT_CURVE_RADIUS).expect("bake raster");
+        assert_eq!(live.as_raw(), bake.as_raw(), "live and bake agree pixel-for-pixel");
+        // And the width is genuinely honored: a wider pencil inks MORE than a hairline, on BOTH.
+        let hair = vec![item(1.0)];
+        let live_hair = render_text_layer(&hair, (w, h), whole, w, h).expect("live hairline");
+        let bake_hair = rasterize_scene(&hair, w, h, 1.0, DEFAULT_ANNOT_CURVE_RADIUS).expect("bake hairline");
+        assert!(ink(&live) > ink(&live_hair), "the wider pencil thickens the live text");
+        assert!(ink(&bake) > ink(&bake_hair), "and thickens the baked text too");
+    }
+
+    /// WRAP PARITY (DRAGON-354 review fix): an AUTO (click-placed) box's STORED geometry and
+    /// every render/caret path derive their layout through the ONE seam
+    /// ([`text_kind_layout`]), so a long caption placed near the picture's right edge wraps
+    /// identically in the box, the live raster, the bake and the caret math. The old render
+    /// paths passed the constant `AUTO_WRAP_FALLBACK` instead of the frame-derived cap — the
+    /// caption then STORED a wrapped multi-line box but RENDERED one long clipped line; this
+    /// pins the fix (the fallback layout is asserted to be genuinely different).
+    #[test]
+    fn auto_box_render_layout_matches_the_stored_reflow_wrap() {
+        use super::super::text_annot::{self, TextFont};
+        let frame = (400.0_f32, 300.0_f32);
+        let caption = "a long caption that certainly exceeds the room left of the edge";
+        // Placed at x=250 on a 400px picture: ~146px of room, far less than the caption.
+        let kind = reflow_text(
+            caption,
+            24.0,
+            TextFont::Clean,
+            AnnotRect { x: 250.0, y: 10.0, w: 0.0, h: 0.0 },
+            false,
+            4.0,
+            frame,
+        );
+        let AnnotKind::Text { rect, text, size_px, font, constrained, .. } = &kind else {
+            panic!("reflow_text yields a Text kind");
+        };
+        assert!(!constrained, "a click-placed box stays auto");
+        // The layout every render/caret path derives is EXACTLY the stored box's geometry.
+        let lay = text_kind_layout(text, *size_px, *font, *rect, *constrained, frame.0);
+        assert!((lay.box_w - rect.w).abs() < 0.01, "rendered width == stored width");
+        assert!((lay.box_h - rect.h).abs() < 0.01, "rendered height == stored height");
+        assert!(lay.lines.len() > 1, "a caption wider than the room must wrap");
+        // No rendered line may overrun the picture: every line fits the room to the edge.
+        let room = frame.0 - rect.x;
+        for line in &lay.lines {
+            assert!(
+                text_annot::measure(*font, *size_px, &line.text) <= room + 0.01,
+                "line {:?} overruns the picture edge",
+                line.text
+            );
+        }
+        // And the OLD behavior really was different — the constant fallback cap would not
+        // have wrapped at all, which is exactly the divergence this test pins closed.
+        let old = text_annot::layout(
+            text,
+            *font,
+            *size_px,
+            None,
+            text_annot::AUTO_WRAP_FALLBACK,
+        );
+        assert_eq!(old.lines.len(), 1, "the constant cap would render one clipped line");
     }
 
     #[test]
@@ -3262,28 +5799,36 @@ mod tests {
     }
 
     #[test]
-    fn stroke_width_cycle_wraps_2_4_6() {
-        // The `L` hotkey advances thin → medium → thick → thin.
+    fn stroke_width_cycle_wraps_the_seven_presets() {
+        // DRAGON-357 item 9: the `L` hotkey advances 1 → 2 → 4 → 6 → 8 → 10 → 12 → 1.
+        assert_eq!(cycle_stroke_width(1.0), 2.0);
         assert_eq!(cycle_stroke_width(2.0), 4.0);
         assert_eq!(cycle_stroke_width(4.0), 6.0);
-        assert_eq!(cycle_stroke_width(6.0), 2.0);
-        // The default (4px) cycles to thick, then wraps back around.
+        assert_eq!(cycle_stroke_width(6.0), 8.0);
+        assert_eq!(cycle_stroke_width(8.0), 10.0);
+        assert_eq!(cycle_stroke_width(10.0), 12.0);
+        assert_eq!(cycle_stroke_width(12.0), 1.0); // wraps
+        // The default (4px) cycles to 6px.
         assert_eq!(cycle_stroke_width(DEFAULT_ANNOT_STROKE), 6.0);
         // A near-but-inexact width snaps to its nearest preset first, then advances.
         assert_eq!(cycle_stroke_width(3.9), 6.0); // nearest 4 → 6
-        assert_eq!(cycle_stroke_width(1.0), 4.0); // nearest 2 → 4
-        assert_eq!(cycle_stroke_width(100.0), 2.0); // nearest 6 → wraps to 2
+        assert_eq!(cycle_stroke_width(100.0), 1.0); // nearest 12 → wraps to 1
     }
 
     #[test]
     fn stroke_width_nearest_index_picks_closest_preset() {
-        assert_eq!(stroke_width_nearest_index(2.0), 0);
-        assert_eq!(stroke_width_nearest_index(4.0), 1);
-        assert_eq!(stroke_width_nearest_index(6.0), 2);
+        assert_eq!(stroke_width_nearest_index(1.0), 0);
+        assert_eq!(stroke_width_nearest_index(2.0), 1);
+        assert_eq!(stroke_width_nearest_index(4.0), 2);
+        assert_eq!(stroke_width_nearest_index(6.0), 3);
+        assert_eq!(stroke_width_nearest_index(8.0), 4);
+        assert_eq!(stroke_width_nearest_index(10.0), 5);
+        assert_eq!(stroke_width_nearest_index(12.0), 6);
         // Off-preset values map to the closest segment (so exactly one reads active).
-        assert_eq!(stroke_width_nearest_index(2.9), 0); // |2.9-2|<|2.9-4|
-        assert_eq!(stroke_width_nearest_index(5.0), 1); // tie 4 vs 6 → lower index
-        assert_eq!(stroke_width_nearest_index(0.0), 0); // 0 (unset) → 2px, nearest
+        assert_eq!(stroke_width_nearest_index(2.9), 1); // |2.9-2|<|2.9-4|
+        assert_eq!(stroke_width_nearest_index(5.0), 2); // tie 4 vs 6 → lower index
+        assert_eq!(stroke_width_nearest_index(0.0), 0); // 0 (unset) → 1px, nearest
+        assert_eq!(stroke_width_nearest_index(100.0), 6); // huge → thickest
     }
 
     #[test]
@@ -3360,7 +5905,7 @@ mod tests {
     #[test]
     fn edited_move_translates_a_box() {
         let orig = AnnotKind::Box { rect: AnnotRect { x: 10.0, y: 20.0, w: 30.0, h: 40.0 }, stroke_w: 4.0, fill: None };
-        let k = edited_kind(&orig, Grab::Move, (0.0, 0.0), (5.0, -7.0), (10000.0, 10000.0));
+        let k = edited_kind(&orig, Grab::Move, (0.0, 0.0), (5.0, -7.0), (10000.0, 10000.0), false);
         let AnnotKind::Box { rect, .. } = k else { panic!() };
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (15.0, 13.0, 30.0, 40.0));
     }
@@ -3369,7 +5914,7 @@ mod tests {
     fn edited_corner_resizes_from_the_opposite_corner() {
         let orig = AnnotKind::Box { rect: AnnotRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, stroke_w: 4.0, fill: None };
         // Drag the SE corner to (150, 130): the NW corner (0,0) stays put.
-        let k = edited_kind(&orig, Grab::Corner(Corner::Se), (100.0, 100.0), (150.0, 130.0), (10000.0, 10000.0));
+        let k = edited_kind(&orig, Grab::Corner(Corner::Se), (100.0, 100.0), (150.0, 130.0), (10000.0, 10000.0), false);
         let AnnotKind::Box { rect, .. } = k else { panic!() };
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (0.0, 0.0, 150.0, 130.0));
     }
@@ -3382,7 +5927,7 @@ mod tests {
         // exactly 10px with no snap.
         let orig = AnnotKind::Box { rect: AnnotRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, stroke_w: 4.0, fill: None };
         // Press 4px past the SE corner (the outward handle), drag +10,+10.
-        let k = edited_kind(&orig, Grab::Corner(Corner::Se), (104.0, 104.0), (114.0, 114.0), (10000.0, 10000.0));
+        let k = edited_kind(&orig, Grab::Corner(Corner::Se), (104.0, 104.0), (114.0, 114.0), (10000.0, 10000.0), false);
         let AnnotKind::Box { rect, .. } = k else { panic!() };
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (0.0, 0.0, 110.0, 110.0), "no 4px jump");
     }
@@ -3390,7 +5935,7 @@ mod tests {
     #[test]
     fn edited_edge_moves_only_that_side() {
         let orig = AnnotKind::Box { rect: AnnotRect { x: 0.0, y: 0.0, w: 100.0, h: 100.0 }, stroke_w: 4.0, fill: None };
-        let k = edited_kind(&orig, Grab::Edge(Edge::E), (100.0, 50.0), (140.0, 50.0), (10000.0, 10000.0));
+        let k = edited_kind(&orig, Grab::Edge(Edge::E), (100.0, 50.0), (140.0, 50.0), (10000.0, 10000.0), false);
         let AnnotKind::Box { rect, .. } = k else { panic!() };
         assert_eq!((rect.x, rect.y, rect.w, rect.h), (0.0, 0.0, 140.0, 100.0));
     }
@@ -3399,11 +5944,11 @@ mod tests {
     fn edited_arrow_endpoints_and_move() {
         let orig = AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 100.0, y: 0.0 }, stroke_w: 6.0 };
         // Drag endpoint B to (120, 30): A unchanged.
-        let k = edited_kind(&orig, Grab::ArrowB, (100.0, 0.0), (120.0, 30.0), (10000.0, 10000.0));
+        let k = edited_kind(&orig, Grab::ArrowB, (100.0, 0.0), (120.0, 30.0), (10000.0, 10000.0), false);
         let AnnotKind::Arrow { a, b, .. } = k else { panic!() };
         assert_eq!((a.x, a.y, b.x, b.y), (0.0, 0.0, 120.0, 30.0));
         // Move translates both.
-        let k = edited_kind(&orig, Grab::Move, (0.0, 0.0), (10.0, 5.0), (10000.0, 10000.0));
+        let k = edited_kind(&orig, Grab::Move, (0.0, 0.0), (10.0, 5.0), (10000.0, 10000.0), false);
         let AnnotKind::Arrow { a, b, .. } = k else { panic!() };
         assert_eq!((a.x, a.y, b.x, b.y), (10.0, 5.0, 110.0, 5.0));
     }
@@ -3490,7 +6035,7 @@ mod tests {
         // MOVE far past the edges: the WHOLE box + its stroke/2 margin (stroke 4 → 2) pins inside,
         // so the geometry stops 2px short of the raw edge (x ≤ 158, y ≤ 58).
         let AnnotKind::Box { rect, .. } =
-            edited_kind(&orig, Grab::Move, (0.0, 0.0), (500.0, 500.0), frame)
+            edited_kind(&orig, Grab::Move, (0.0, 0.0), (500.0, 500.0), frame, false)
         else {
             panic!()
         };
@@ -3503,6 +6048,7 @@ mod tests {
             (190.0, 90.0),
             (500.0, 500.0),
             frame,
+            false,
         ) else {
             panic!()
         };
@@ -3515,7 +6061,7 @@ mod tests {
         // A Highlight edits via the SAME clamped rect path.
         let hl = AnnotKind::Highlight { rect: AnnotRect { x: 150.0, y: 50.0, w: 40.0, h: 40.0 } };
         let AnnotKind::Highlight { rect } =
-            edited_kind(&hl, Grab::Move, (0.0, 0.0), (500.0, 500.0), frame)
+            edited_kind(&hl, Grab::Move, (0.0, 0.0), (500.0, 500.0), frame, false)
         else {
             panic!()
         };
@@ -4341,6 +6887,110 @@ mod tests {
         }
     }
 
+    // ── Duplicate (DRAGON-356) ───────────────────────────────────────────────────────
+
+    #[test]
+    fn single_dup_offset_nudges_toward_the_frame_center_scaled_to_the_image() {
+        // The historical single-item rule (lifted verbatim into `single_dup_offset`): an equal
+        // x/y offset TOWARD the frame center, `frame.min * 0.04` clamped to [16, 64].
+        // A 1000×1000 image → 40px; an item in the top-left nudges DOWN-RIGHT (+,+).
+        assert_eq!(single_dup_offset((100.0, 100.0), (1000.0, 1000.0)), (40.0, 40.0));
+        // An item past the center on both axes nudges back UP-LEFT (−,−).
+        assert_eq!(single_dup_offset((900.0, 900.0), (1000.0, 1000.0)), (-40.0, -40.0));
+        // Mixed: right of center but above it → (−x, +y).
+        assert_eq!(single_dup_offset((900.0, 100.0), (1000.0, 1000.0)), (-40.0, 40.0));
+        // The magnitude clamps: a tiny image floors at 16, a huge one caps at 64.
+        assert_eq!(single_dup_offset((10.0, 10.0), (100.0, 100.0)), (16.0, 16.0));
+        assert_eq!(single_dup_offset((10.0, 10.0), (5000.0, 5000.0)), (64.0, 64.0));
+        // On the exact center line the `>=` tie resolves to the POSITIVE direction, matching the
+        // pre-DRAGON-356 `if fw*0.5 >= cx` branch byte-for-byte.
+        assert_eq!(single_dup_offset((500.0, 500.0), (1000.0, 1000.0)), (40.0, 40.0));
+    }
+
+    #[test]
+    fn group_dup_offset_clamps_the_shared_delta_on_the_union() {
+        // The primary sits top-left so the raw nudge is (+16, +16) in this 200×200 image
+        // (200*0.04 = 8, floored to 16). A union already near the far edge can only travel part
+        // of the way before it would push the arrangement out of the picture.
+        let frame = (200.0, 200.0);
+        // Union with room to move: the full (+16,+16) applies.
+        let roomy = AnnotRect { x: 20.0, y: 20.0, w: 40.0, h: 40.0 };
+        assert_eq!(group_dup_offset((30.0, 30.0), roomy, frame), (16.0, 16.0));
+        // Union hard against the far edge (right edge at x=195): only +5 of the +16 fits, so the
+        // shared delta is pinned — the WHOLE group stops at the edge, never distorts past it.
+        let tight = AnnotRect { x: 100.0, y: 20.0, w: 95.0, h: 40.0 };
+        assert_eq!(group_dup_offset((30.0, 30.0), tight, frame), (5.0, 16.0));
+    }
+
+    #[test]
+    fn a_group_duplicate_preserves_member_relative_positions_exactly() {
+        // Three members; the shared clamped delta is applied verbatim to every copy, so the
+        // vectors BETWEEN members are identical before and after — the arrangement is rigid.
+        let a = AnnotKind::Box { rect: AnnotRect { x: 20.0, y: 20.0, w: 30.0, h: 30.0 }, stroke_w: 4.0, fill: None };
+        let b = AnnotKind::Highlight { rect: AnnotRect { x: 90.0, y: 60.0, w: 20.0, h: 20.0 } };
+        let c = AnnotKind::Arrow { a: AnnotPoint { x: 40.0, y: 100.0 }, b: AnnotPoint { x: 70.0, y: 130.0 }, stroke_w: 2.0 };
+        let members = [&a, &b, &c];
+        let union = group_drawn_bounds(members).expect("non-empty");
+        // Primary = `a` (top-left), image large enough that the nudge applies unclamped.
+        let (dx, dy) = group_dup_offset(kind_center(&a), union, (1000.0, 1000.0));
+        assert_eq!((dx, dy), (40.0, 40.0), "roomy image: the raw nudge applies verbatim");
+        let copies: Vec<AnnotKind> = members.iter().map(|k| translated_kind(k, dx, dy)).collect();
+        // The relative vector between each pair of member CENTERS is unchanged by the shared move.
+        let rel = |x: &AnnotKind, y: &AnnotKind| {
+            let (cx0, cy0) = kind_center(x);
+            let (cx1, cy1) = kind_center(y);
+            (cx1 - cx0, cy1 - cy0)
+        };
+        assert_eq!(rel(&a, &b), rel(&copies[0], &copies[1]), "A→B vector preserved");
+        assert_eq!(rel(&a, &c), rel(&copies[0], &copies[2]), "A→C vector preserved");
+        assert_eq!(rel(&b, &c), rel(&copies[1], &copies[2]), "B→C vector preserved");
+        // And every copy is offset by EXACTLY the shared delta from its source.
+        for (src, cp) in members.iter().zip(&copies) {
+            let (sx, sy) = kind_center(src);
+            let (dx2, dy2) = kind_center(cp);
+            assert_eq!((dx2 - sx, dy2 - sy), (dx, dy), "each copy moves by the shared delta");
+        }
+    }
+
+    #[test]
+    fn single_dup_offset_matches_the_historical_edited_kind_move() {
+        // Single-item equivalence: `single_dup_offset` + `edited_kind(Move, false)` reproduces the
+        // pre-DRAGON-356 duplicate EXACTLY — the offset formula and the per-item clamp are both
+        // the original code, just relocated.
+        let src = AnnotKind::Box { rect: AnnotRect { x: 100.0, y: 100.0, w: 50.0, h: 50.0 }, stroke_w: 4.0, fill: None };
+        let frame: (f32, f32) = (1000.0, 1000.0);
+        // The OLD inline computation, verbatim.
+        let off = (frame.0.min(frame.1) * 0.04).clamp(16.0, 64.0);
+        let (cx, cy) = kind_center(&src);
+        let old_dx = if frame.0 * 0.5 >= cx { off } else { -off };
+        let old_dy = if frame.1 * 0.5 >= cy { off } else { -off };
+        let old_copy = edited_kind(&src, Grab::Move, (0.0, 0.0), (old_dx, old_dy), frame, false);
+        // The NEW path.
+        let (dx, dy) = single_dup_offset(kind_center(&src), frame);
+        let new_copy = edited_kind(&src, Grab::Move, (0.0, 0.0), (dx, dy), frame, false);
+        assert_eq!((dx, dy), (old_dx, old_dy));
+        assert_eq!(new_copy, old_copy);
+    }
+
+    #[test]
+    fn dup_selection_order_puts_the_primary_copy_last() {
+        // The copies land in scene order; the copy of the old primary must be LAST so it becomes
+        // the new primary (handle-wearing), whatever position the primary held among them.
+        let ids: Vec<AnnotId> = [10, 11, 12, 13].into_iter().map(AnnotId).collect();
+        // Primary copy in the middle → moved to the end, the rest keep their order.
+        assert_eq!(
+            dup_selection_order(&ids, AnnotId(12)),
+            vec![AnnotId(10), AnnotId(11), AnnotId(13), AnnotId(12)],
+        );
+        // Already last → unchanged.
+        assert_eq!(
+            dup_selection_order(&ids, AnnotId(13)),
+            vec![AnnotId(10), AnnotId(11), AnnotId(12), AnnotId(13)],
+        );
+        // A single copy → itself, and it is the primary.
+        assert_eq!(dup_selection_order(&[AnnotId(7)], AnnotId(7)), vec![AnnotId(7)]);
+    }
+
     #[test]
     fn group_bounds_union_covers_every_member_including_its_stroke() {
         // A box's drawn extent includes half its stroke, so the union grows past the geometry.
@@ -4665,7 +7315,7 @@ mod tests {
         // The grab model: Move translates the whole drawing; a corner drag scales it — both
         // clamped inside the image like every other kind.
         let item = pen(1, [255, 0, 0, 255], 4.0, &[&[(10.0, 10.0), (30.0, 30.0)]]);
-        let moved = edited_kind(&item.kind, Grab::Move, (0.0, 0.0), (5.0, 5.0), (200.0, 200.0));
+        let moved = edited_kind(&item.kind, Grab::Move, (0.0, 0.0), (5.0, 5.0), (200.0, 200.0), false);
         let AnnotKind::Pen { paths, stroke_w, .. } = &moved else { panic!("stays a pen") };
         assert_eq!(*stroke_w, 4.0, "a move never changes the width");
         assert_eq!(paths[0][0], AnnotPoint { x: 15.0, y: 15.0 });
@@ -4677,6 +7327,7 @@ mod tests {
             (0.0, 0.0),
             (20.0, 20.0),
             (200.0, 200.0),
+            false,
         );
         let AnnotKind::Pen { paths, .. } = &grown else { panic!("stays a pen") };
         assert_eq!(paths[0][0], AnnotPoint { x: 10.0, y: 10.0 }, "the anchored corner holds");
@@ -4785,6 +7436,7 @@ mod tests {
             (0.0, 0.0),
             (20.0, 0.0),
             (200.0, 200.0),
+            false,
         );
         let AnnotKind::Pen { paths, pressure, .. } = &grown else { panic!("stays a pen") };
         assert_eq!(pressure[0].len(), paths[0].len(), "still one value per point");
@@ -5008,7 +7660,7 @@ mod tests {
         let frame = (1000.0, 800.0);
         // A deliberately LOPSIDED drag: 70 across, 20 down — the aspect a free rect would take.
         for cur in [(370.0, 320.0), (130.0, 180.0), (500.0, 210.0), (210.0, 500.0)] {
-            let out = edited_kind(&start, grab, (300.0, 300.0), cur, frame);
+            let out = edited_kind(&start, grab, (300.0, 300.0), cur, frame, false);
             let AnnotKind::Badge { rect, .. } = out else { panic!("still a badge") };
             assert!(
                 (rect.w - rect.h).abs() < 1e-3,
@@ -5106,8 +7758,11 @@ mod tests {
         assert_eq!((z.w, z.h), (0.0, 0.0));
     }
 
-    /// Click-to-place and the double-click pre-placement share ONE size rule
-    /// ([`placement_extent`]): asked for the same side on the same picture, they agree.
+    /// Click-to-place and the double-click pre-placement share ONE size rule: the ordinary
+    /// tools ride [`placement_extent`] per axis, and a BADGE double-click goes through the very
+    /// helper a click uses ([`badge_placement_rect`]) at the REMEMBERED side — it must never
+    /// fall back to the generic 200×100 spawn box, which used to hand it a fixed 100px square
+    /// no matter what size the user had settled on.
     #[test]
     fn click_placement_and_double_click_share_the_size_rule() {
         for frame in [(1920u32, 1080u32), (300, 300), (200, 60), (90, 400)] {
@@ -5118,16 +7773,53 @@ mod tests {
             let click_w = placement_extent(frame.0 as f32, SPAWN_W, m);
             let click_h = placement_extent(frame.1 as f32, SPAWN_H, m);
             assert!((pre.w - click_w.min(click_h)).abs() < 1e-3, "{frame:?}");
+            // A badge double-click IS a click-place, centred: same helper, same clamp, same
+            // wanted side — for the default AND for any remembered one.
+            let (fw, fh) = (frame.0 as f32, frame.1 as f32);
+            for want in [DEFAULT_BADGE_SIZE, 40.0, 160.0] {
+                let dbl = spawn_placement_rect(Tool::Badge, frame, m, want);
+                assert_eq!(
+                    dbl,
+                    badge_placement_rect((fw * 0.5, fh * 0.5), want, frame, m),
+                    "{frame:?} @ {want}"
+                );
+                // `spawn_kind`'s squaring leaves it alone (it is already 1:1), so what the
+                // double-click actually drops is exactly that rect.
+                assert_eq!(centered_square(dbl), dbl, "{frame:?} @ {want}");
+                assert_eq!(dbl.w, dbl.h, "{frame:?} @ {want}");
+            }
+            // ...and on a picture big enough to hold them, the remembered side is what lands —
+            // 40 and 160 must NOT both come out as the spawn box's shorter axis.
+            if frame == (1920, 1080) {
+                assert_eq!(spawn_placement_rect(Tool::Badge, frame, m, 40.0).w, 40.0);
+                assert_eq!(spawn_placement_rect(Tool::Badge, frame, m, 160.0).w, 160.0);
+                assert_eq!(
+                    spawn_placement_rect(Tool::Badge, frame, m, DEFAULT_BADGE_SIZE).w,
+                    DEFAULT_BADGE_SIZE
+                );
+            }
+            // Every OTHER tool still takes the shared spawn box, untouched by the badge rule.
+            for tool in [Tool::Rect, Tool::Arrow, Tool::Blur] {
+                assert_eq!(
+                    spawn_placement_rect(tool, frame, m, 40.0),
+                    default_placement_rect(frame, m),
+                    "{tool:?} on {frame:?}"
+                );
+            }
         }
     }
 
-    /// The remembered-size fallback chain: an untouched editor places at the default; once a
-    /// badge has been placed or resized, that side wins.
+    /// The remembered-size fallback chain: an editor with nothing remembered (fresh install —
+    /// the persisted seed is `0.0`) places at the default; once a badge has been placed or
+    /// resized (or a persisted side seeded the document), that side wins.
     #[test]
     fn the_badge_size_falls_back_to_the_default_until_one_is_remembered() {
         let mut e = super::super::edit::EditState::default();
         assert_eq!(e.annot_badge_size, 0.0, "nothing remembered on a fresh editor");
         assert_eq!(e.badge_size(), DEFAULT_BADGE_SIZE);
+        assert_eq!(DEFAULT_BADGE_SIZE, 75.0, "the shipped default side");
+        // The seed a preview open copies out of the PERSISTED setting behaves the same way as
+        // one placed in this editor — it is the same field.
         e.annot_badge_size = 64.0;
         assert_eq!(e.badge_size(), 64.0);
         // A nonsense value can't make a badge vanish — it reads as "unset".
@@ -5216,5 +7908,1733 @@ mod tests {
         let on_ring = img.get_pixel(20, 60).0;
         assert!(on_ring[3] > 0, "the ring is drawn on the inscribed circle");
     }
-}
 
+    /// A caption on a big capture, for the region/cost tests below.
+    fn caption(frame: (u32, u32), x: f32, y: f32, size: f32) -> AnnotationItem {
+        AnnotationItem {
+            id: AnnotId(1),
+            color: [255, 255, 255, 255],
+            kind: reflow_text(
+                "The quick brown fox jumps over the lazy dog",
+                size,
+                super::super::text_annot::TextFont::Clean,
+                AnnotRect { x, y, w: 0.0, h: 0.0 },
+                false,
+                2.0,
+                (frame.0 as f32, frame.1 as f32),
+            ),
+        }
+    }
+
+    /// DRAGON-362: the live text layer covers the CAPTION, not the capture — the whole reason
+    /// a 5K editor stopped being usable was that every keystroke rendered (and uploaded) a
+    /// full-frame raster. The region must contain the text box with room for the outline, and
+    /// be a small fraction of a large frame.
+    #[test]
+    fn text_layer_region_hugs_the_caption_on_a_large_frame() {
+        let frame = (5120u32, 2880u32);
+        let item = caption(frame, 200.0, 300.0, 64.0);
+        let r = text_layer_region(std::slice::from_ref(&item), frame).expect("a region");
+        let AnnotKind::Text { rect, .. } = &item.kind else { panic!("text") };
+        // Contains the box, with padding on every side (glyph overhang + outline).
+        assert!(r.x <= rect.x && r.y <= rect.y, "region {r:?} clips the box origin {rect:?}");
+        assert!(r.x + r.w >= rect.x + rect.w, "region {r:?} clips the box width");
+        assert!(r.y + r.h >= rect.y + rect.h, "region {r:?} clips the box height");
+        // And it is a small slice of the picture — this ratio IS the per-keystroke speedup.
+        let frac = (r.w * r.h) / (frame.0 as f32 * frame.1 as f32);
+        assert!(frac < 0.05, "region covers {:.1}% of the frame", frac * 100.0);
+    }
+
+    /// The region is snapped to [`TEXT_REGION_GRID`] so a burst of keystrokes keeps the SAME
+    /// raster dimensions — which is what lets the layer's GPU texture update in place instead
+    /// of being re-created (the `layers.rs` flicker-free contract).
+    #[test]
+    fn text_layer_region_is_grid_stable_across_small_edits() {
+        let frame = (5120u32, 2880u32);
+        let short = AnnotationItem {
+            kind: reflow_text(
+                "Hello",
+                64.0,
+                super::super::text_annot::TextFont::Clean,
+                AnnotRect { x: 200.0, y: 300.0, w: 0.0, h: 0.0 },
+                false,
+                2.0,
+                (frame.0 as f32, frame.1 as f32),
+            ),
+            ..caption(frame, 200.0, 300.0, 64.0)
+        };
+        let longer = AnnotationItem {
+            kind: reflow_text(
+                "Hell",
+                64.0,
+                super::super::text_annot::TextFont::Clean,
+                AnnotRect { x: 200.0, y: 300.0, w: 0.0, h: 0.0 },
+                false,
+                2.0,
+                (frame.0 as f32, frame.1 as f32),
+            ),
+            ..caption(frame, 200.0, 300.0, 64.0)
+        };
+        let a = text_layer_region(std::slice::from_ref(&short), frame).expect("region");
+        let b = text_layer_region(std::slice::from_ref(&longer), frame).expect("region");
+        assert_eq!((a.x, a.y), (b.x, b.y), "the origin holds still while typing");
+        // Both snapped to the grid.
+        for r in [a, b] {
+            for v in [r.x, r.y, r.w, r.h] {
+                assert!(
+                    (v % TEXT_REGION_GRID).abs() < 1e-3 || v == 0.0,
+                    "{v} is not on the {TEXT_REGION_GRID}px grid"
+                );
+            }
+        }
+    }
+
+    /// Several captions spread across the picture union into one region; no text at all (or
+    /// only empty boxes) yields no layer.
+    #[test]
+    fn text_layer_region_unions_and_handles_the_empty_cases() {
+        let frame = (5120u32, 2880u32);
+        let a = caption(frame, 200.0, 300.0, 64.0);
+        let mut b = caption(frame, 3000.0, 2000.0, 64.0);
+        b.id = AnnotId(2);
+        let r = text_layer_region(&[a.clone(), b], frame).expect("a region");
+        assert!(r.x <= 200.0 && r.y <= 300.0);
+        assert!(r.x + r.w >= 3000.0 && r.y + r.h >= 2000.0);
+        // NOT clipped to the picture any more (DRAGON-368) — it contains the padded ink instead,
+        // which is what lets the raster be re-placed rather than re-rendered. See
+        // [`text_layer_region`] for why nothing draws outside the picture as a result.
+        let (x0, y0, x1, y1) = text_padded_bounds(&[a.clone(), AnnotationItem {
+            id: AnnotId(2),
+            ..caption(frame, 3000.0, 2000.0, 64.0)
+        }])
+        .expect("padded bounds");
+        assert!(r.x <= x0 && r.y <= y0 && r.x + r.w >= x1 && r.y + r.h >= y1);
+        // No text / whitespace-only text / a degenerate frame → no layer at all.
+        assert!(text_layer_region(&[], frame).is_none());
+        assert!(text_layer_region(&[boxed(9, 0.0, 0.0, 10.0, 10.0)], frame).is_none());
+        let blank = AnnotationItem {
+            kind: reflow_text(
+                "   ",
+                64.0,
+                super::super::text_annot::TextFont::Clean,
+                AnnotRect { x: 10.0, y: 10.0, w: 0.0, h: 0.0 },
+                false,
+                2.0,
+                (frame.0 as f32, frame.1 as f32),
+            ),
+            ..a.clone()
+        };
+        assert!(text_layer_region(&[blank], frame).is_none());
+        assert!(text_layer_region(&[a], (0, 0)).is_none());
+    }
+
+    /// The region is a pure TRANSLATION of the drawing: glyphs rendered into a region raster
+    /// land at the same picture position as in a full-frame raster (live/bake parity — the
+    /// bake still composites the whole frame, so the two must agree on WHERE the ink is).
+    #[test]
+    fn region_raster_places_glyphs_at_the_same_picture_position_as_a_full_frame_raster() {
+        let frame = (1024u32, 512u32);
+        let item = caption(frame, 200.0, 180.0, 32.0);
+        let region = text_layer_region(std::slice::from_ref(&item), frame).expect("region");
+        // Full-frame reference: the region is the whole picture, rastered 1:1.
+        let full = AnnotRect { x: 0.0, y: 0.0, w: frame.0 as f32, h: frame.1 as f32 };
+        let a = render_text_layer(std::slice::from_ref(&item), frame, full, frame.0, frame.1)
+            .expect("full raster");
+        // The sub-region raster at the SAME 1:1 scale.
+        let (rw, rh) = (region.w as u32, region.h as u32);
+        let b = render_text_layer(std::slice::from_ref(&item), frame, region, rw, rh)
+            .expect("region raster");
+        assert_eq!(b.dimensions(), (rw, rh));
+        // Every pixel of the region raster equals the full raster's pixel at the same picture
+        // coordinate — the region only moves the canvas, never the ink.
+        let (ox, oy) = (region.x as u32, region.y as u32);
+        let mut ink = 0u32;
+        for y in 0..rh {
+            for x in 0..rw {
+                let want = a.get_pixel(ox + x, oy + y).0;
+                let got = b.get_pixel(x, y).0;
+                // Tolerance of one antialiasing step: the two rasters are the same drawing at
+                // the same scale but with different pixmap ORIGINS, and resvg's edge coverage
+                // can round a boundary pixel's alpha by 1/255. Ink placement is exact; only the
+                // faintest edge sample may differ.
+                for ch in 0..4 {
+                    assert!(
+                        want[ch].abs_diff(got[ch]) <= 2,
+                        "mismatch at region ({x},{y}) = picture ({},{}): {want:?} vs {got:?}",
+                        ox + x,
+                        oy + y,
+                    );
+                }
+                ink += u32::from(got[3] > 0);
+            }
+        }
+        assert!(ink > 100, "the region raster drew almost nothing ({ink} px) — vacuous test");
+        // And the full raster has NO ink outside the region (so nothing was lost by cropping).
+        for y in 0..frame.1 {
+            for x in 0..frame.0 {
+                let inside = x >= ox && x < ox + rw && y >= oy && y < oy + rh;
+                if !inside {
+                    assert_eq!(a.get_pixel(x, y).0[3], 0, "ink at ({x},{y}) is outside the region");
+                }
+            }
+        }
+    }
+
+    /// The measured cost driver (DRAGON-362): rendering the text layer is `O(raster area)` —
+    /// the glyph pass is a rounding error next to the pixmap allocation and the
+    /// premultiply→straight-alpha conversion. This pins the CONSEQUENCE rather than a wall
+    /// time (which would be a flaky assertion): the raster the editor actually builds for a
+    /// caption on a 5K capture is orders of magnitude smaller than the frame it used to build.
+    #[test]
+    fn text_layer_raster_area_is_bounded_by_the_caption_not_the_capture() {
+        let frame = (5120u32, 2880u32);
+        let item = caption(frame, 200.0, 300.0, 64.0);
+        let region = text_layer_region(std::slice::from_ref(&item), frame).expect("region");
+        // Fit zoom on a 2560-wide screen: visual_scale ≈ 0.45.
+        let scale = super::super::edit::layer_raster_scale(1.0, 2311.0 / 5120.0);
+        let (pw, ph) = super::super::edit::layer_raster_dims(
+            (region.w as u32, region.h as u32),
+            scale,
+        );
+        let px = pw as u64 * ph as u64;
+        let old_full_frame_px = 5120u64 * 2880;
+        assert!(
+            px * 50 < old_full_frame_px,
+            "raster {pw}x{ph} = {px}px is not decisively smaller than the old {old_full_frame_px}px"
+        );
+        // ...and still at least the caption's on-screen size, so it is not soft either.
+        assert!(pw as f32 >= region.w * scale - 1.0);
+    }
+
+    // ── DRAGON-367/368: a move OR a resize must not re-raster ────────────────────────────
+
+    /// The mechanism behind the owner's "scale the text up and it lags, scale it down and it is
+    /// fine": the text layer's region grows with the caption's own extent AND its padding, so the
+    /// raster's AREA grows super-linearly with the type size. A re-render per motion event is
+    /// therefore cheap for a small caption and expensive for a large one — which is exactly the
+    /// asymmetry reported, and exactly why the fix has to be to skip the render, not to shrink it.
+    #[test]
+    fn the_text_raster_area_grows_super_linearly_with_the_type_size() {
+        let frame = (5120u32, 2880u32);
+        let area = |size: f32| {
+            let item = caption(frame, 200.0, 300.0, size);
+            let r = text_layer_region(std::slice::from_ref(&item), frame).expect("region");
+            (r.w * r.h) as f64
+        };
+        let (small, large) = (area(16.0), area(64.0));
+        assert!(
+            large > small * 4.0,
+            "a 4x type size only grew the raster {:.1}x — the reported asymmetry has no mechanism",
+            large / small,
+        );
+    }
+
+    /// DRAGON-368: the padded region genuinely CONTAINS the ink it claims to. The half-em slack
+    /// was replaced by the measured [`TEXT_INK_OVERHANG_EM`], so this is the guard that the
+    /// smaller number is still honest — it renders real samples (accents that overshoot the
+    /// ascent, descenders, emoji, punctuation) in BOTH faces at a hairline and at the heaviest
+    /// pencil, and asserts no inked pixel escapes the padded bound.
+    ///
+    /// A CJK run is deliberately absent: our advance ladder under-measures glyphs that fall
+    /// through to a system face, so its stored box can be ~5 em narrower than its ink. That is a
+    /// `text_shape` measurement bug, not a padding one (a half-em never covered it either) and it
+    /// is out of DRAGON-368's scope — but it is why this test names what it covers.
+    #[test]
+    fn the_padded_region_actually_contains_the_ink() {
+        use super::super::text_annot::TextFont;
+        let frame = (2000u32, 700u32);
+        let samples = [
+            "The quick brown fox jumps over the lazy dog",
+            "ÀÉÎÕÜ ĝĵŷ ÅÆØ Ïÿ Ǻ ẞ ﬁﬂ",
+            "gjpqy_,;| WAV// {}[]()",
+            "1234567890 @#$%^&*",
+            "hi 😀🎉 there",
+        ];
+        for font in [TextFont::Hand, TextFont::Clean] {
+            for pencil in [1.0f32, 6.0, 12.0] {
+                for text in samples {
+                    let item = AnnotationItem {
+                        id: AnnotId(1),
+                        color: [255, 255, 255, 255],
+                        kind: reflow_text(
+                            text,
+                            64.0,
+                            font,
+                            AnnotRect { x: 300.0, y: 300.0, w: 0.0, h: 0.0 },
+                            false,
+                            pencil,
+                            (frame.0 as f32, frame.1 as f32),
+                        ),
+                    };
+                    let items = std::slice::from_ref(&item);
+                    let (x0, y0, x1, y1) = text_padded_bounds(items).expect("padded bounds");
+                    // Render into the WHOLE frame so ink outside the padded bound is visible
+                    // rather than being cropped away by the region itself.
+                    let whole =
+                        AnnotRect { x: 0.0, y: 0.0, w: frame.0 as f32, h: frame.1 as f32 };
+                    let img = render_text_layer(items, frame, whole, frame.0, frame.1)
+                        .expect("a raster");
+                    let mut ink = 0u32;
+                    for (x, y, px) in img.enumerate_pixels() {
+                        if px.0[3] == 0 {
+                            continue;
+                        }
+                        ink += 1;
+                        let (fx, fy) = (x as f32, y as f32);
+                        assert!(
+                            fx + 1.0 > x0 && fx < x1 && fy + 1.0 > y0 && fy < y1,
+                            "{font:?}/pencil {pencil}: ink at ({x},{y}) escapes the padded bound \
+                             ({x0:.1},{y0:.1})-({x1:.1},{y1:.1}) for {text:?}",
+                        );
+                    }
+                    assert!(ink > 100, "{text:?} drew almost nothing ({ink} px) — vacuous");
+                }
+            }
+        }
+    }
+
+    /// DRAGON-368: the region is NO LONGER clipped to the picture, which is what makes the reuse
+    /// fast path reachable at all for a large caption (a clipped raster does not contain its own
+    /// ink, so it can never be re-placed) — and what lets a caption be dragged off the canvas.
+    /// Nothing draws outside the picture as a result: the GPU scissors the layer to the shader
+    /// widget, which IS the picture. See [`text_layer_region`].
+    #[test]
+    fn the_region_may_hang_off_the_picture_and_always_contains_its_ink() {
+        let frame = (1024u32, 512u32);
+        // A caption pushed hard against the top-left, and one against the bottom-right.
+        for (x, y) in [(-40.0f32, -30.0f32), (900.0, 470.0)] {
+            let item = caption(frame, x, y, 48.0);
+            let items = std::slice::from_ref(&item);
+            let r = text_layer_region(items, frame).expect("a region");
+            let (x0, y0, x1, y1) = text_padded_bounds(items).expect("padded bounds");
+            // THE invariant the fast path rests on: the region contains the whole padded ink,
+            // whatever the picture's edges do.
+            assert!(
+                r.x <= x0 && r.y <= y0 && r.x + r.w >= x1 && r.y + r.h >= y1,
+                "region {r:?} does not contain the padded ink ({x0},{y0})-({x1},{y1})",
+            );
+        }
+        // …and it really does leave the picture rather than being silently clamped.
+        let out = caption(frame, -40.0, -30.0, 48.0);
+        let r = text_layer_region(std::slice::from_ref(&out), frame).expect("a region");
+        assert!(r.x < 0.0 && r.y < 0.0, "region {r:?} was clamped back onto the picture");
+    }
+
+    /// The predicate the fast path rests on: MOVING a caption changes nothing the raster is a
+    /// function of, so it reports the offset (at scale 1) and the pixels are re-used.
+    #[test]
+    fn a_pure_move_is_recognised_as_a_rigid_translation() {
+        let frame = (5120u32, 2880u32);
+        let before = vec![caption(frame, 200.0, 300.0, 64.0)];
+        let moved = vec![AnnotationItem {
+            kind: translated_kind(&before[0].kind, 137.0, -42.0),
+            ..before[0].clone()
+        }];
+        let d = text_layer_xform(
+            &text_render_sigs(&before, frame),
+            &text_render_sigs(&moved, frame),
+        );
+        assert_eq!(d, Some(TextXform { scale: 1.0, dx: 137.0, dy: -42.0 }));
+        // A zero move (pointer jitter inside one source pixel) is still a translation — it must
+        // not fall back to a re-render either.
+        assert_eq!(
+            text_layer_xform(
+                &text_render_sigs(&before, frame),
+                &text_render_sigs(&before, frame)
+            ),
+            Some(TextXform { scale: 1.0, dx: 0.0, dy: 0.0 }),
+        );
+    }
+
+    /// DRAGON-368's own predicate: a continuous handle SCALE is a similarity of the same drawing,
+    /// so it too re-uses the raster. This is the test the whole ticket turns on — without it,
+    /// removing the size ladder would have made every resize event re-render.
+    #[test]
+    fn a_uniform_scale_is_recognised_and_reports_its_factor() {
+        use crate::geometry::Corner;
+        let frame = (5120u32, 2880u32);
+        let before = vec![caption(frame, 400.0, 500.0, 64.0)];
+        // The real gesture, not a hand-built scene: pull the SE corner outward.
+        let after: Vec<AnnotationItem> = before
+            .iter()
+            .map(|it| AnnotationItem {
+                kind: edited_kind(
+                    &it.kind,
+                    Grab::Corner(Corner::Se),
+                    (0.0, 0.0),
+                    (60.0, 60.0),
+                    (frame.0 as f32, frame.1 as f32),
+                    false,
+                ),
+                ..it.clone()
+            })
+            .collect();
+        let AnnotKind::Text { size_px: was, .. } = &before[0].kind else { panic!("text") };
+        let AnnotKind::Text { size_px: now, .. } = &after[0].kind else { panic!("text") };
+        assert!(now > was, "the drag must have grown the type for this test to mean anything");
+        assert_ne!(now, was, "…and it must not have snapped back to the old size");
+        let xf = text_layer_xform(
+            &text_render_sigs(&before, frame),
+            &text_render_sigs(&after, frame),
+        )
+        .expect("a scale is a similarity of the same drawing");
+        assert!(
+            (xf.scale - now / was).abs() < 1e-4,
+            "reported scale {} is not the type-size ratio {}",
+            xf.scale,
+            now / was,
+        );
+        // An SE drag pins the NW corner. The transform scales about the picture's ORIGIN, not
+        // about the anchor, so its offset is NOT zero — what must hold is that the anchor point
+        // maps to itself, which is the geometric statement of "the corner you are not holding
+        // stayed put".
+        let AnnotKind::Text { rect, .. } = &before[0].kind else { panic!("text") };
+        let anchor = xf.apply(AnnotRect { x: rect.x, y: rect.y, w: 0.0, h: 0.0 });
+        assert!(
+            (anchor.x - rect.x).abs() < 1e-2 && (anchor.y - rect.y).abs() < 1e-2,
+            "an SE scale moved the pinned NW corner: {rect:?} → ({}, {})",
+            anchor.x,
+            anchor.y,
+        );
+    }
+
+    /// …and the other half of the contract: anything that changes the DRAWING is refused, so a
+    /// re-wrap, a restyle or an edit still re-renders. This is the test that stops the fast path
+    /// from quietly freezing the caption's appearance.
+    #[test]
+    fn anything_that_changes_the_drawing_refuses_the_fast_path() {
+        let frame = (5120u32, 2880u32);
+        let fw = (frame.0 as f32, frame.1 as f32);
+        let base = vec![caption(frame, 200.0, 300.0, 64.0)];
+        let sigs = |items: &[AnnotationItem]| text_render_sigs(items, frame);
+        let AnnotKind::Text { text, rect, font, stroke_w, .. } = base[0].kind.clone() else {
+            panic!("text")
+        };
+        let with = |kind: AnnotKind| vec![AnnotationItem { kind, ..base[0].clone() }];
+
+        // A CONSTRAINED box resized: the same glyphs re-wrapped inside a narrower frame. The
+        // drawing genuinely changed, so no similarity can express it.
+        let narrow = AnnotRect { w: 240.0, ..rect };
+        let wrapped = with(reflow_text(&text, 64.0, font, narrow, true, stroke_w, fw));
+        assert_eq!(text_layer_xform(&sigs(&base), &sigs(&wrapped)), None, "a re-wrap re-renders");
+
+        // Edited text, a different face, a different outline weight, a different colour.
+        let typed = with(reflow_text("Something else entirely", 64.0, font, rect, false, stroke_w, fw));
+        assert_eq!(text_layer_xform(&sigs(&base), &sigs(&typed)), None, "an edit re-renders");
+        let other_face = with(reflow_text(
+            &text,
+            64.0,
+            super::super::text_annot::TextFont::Hand,
+            rect,
+            false,
+            stroke_w,
+            fw,
+        ));
+        assert_eq!(text_layer_xform(&sigs(&base), &sigs(&other_face)), None, "a face re-renders");
+        let outlined = with(reflow_text(&text, 64.0, font, rect, false, 12.0, fw));
+        assert_eq!(text_layer_xform(&sigs(&base), &sigs(&outlined)), None, "an outline re-renders");
+        let recoloured =
+            vec![AnnotationItem { color: [255, 0, 0, 255], ..base[0].clone() }];
+        assert_eq!(text_layer_xform(&sigs(&base), &sigs(&recoloured)), None, "a colour re-renders");
+
+        // An item added or removed, and an empty scene, all fall through to the normal path.
+        let mut two = base.clone();
+        two.push(AnnotationItem { id: AnnotId(2), ..caption(frame, 900.0, 900.0, 64.0) });
+        assert_eq!(text_layer_xform(&sigs(&base), &sigs(&two)), None, "a new caption re-renders");
+        assert_eq!(text_layer_xform(&sigs(&two), &sigs(&base)), None, "a deletion re-renders");
+        assert_eq!(text_layer_xform(&[], &sigs(&base)), None, "an empty before has no raster");
+    }
+
+    // ── DRAGON-373: one raster PER text box ──────────────────────────────────────────────
+
+    /// Splitting the layer per box is what lets the canvas draw each caption at its own depth,
+    /// and it is CHEAPER too — measured, not assumed. Two captions in opposite corners of a 5K
+    /// capture shared one raster spanning their UNION, which is most of the picture; per box each
+    /// raster tracks only its own ink.
+    #[test]
+    fn per_box_rasters_are_far_smaller_than_the_union_they_replaced() {
+        let frame = (5120u32, 2880u32);
+        let both = vec![
+            caption(frame, 200.0, 200.0, 96.0),
+            AnnotationItem { id: AnnotId(2), ..caption(frame, 2600.0, 2400.0, 96.0) },
+        ];
+        let area = |r: AnnotRect| r.w * r.h;
+        let union = area(text_layer_region(&both, frame).expect("two captions have a region"));
+        let per_box: f32 = both
+            .iter()
+            .map(|it| area(text_layer_region(std::slice::from_ref(it), frame).expect("ink")))
+            .sum();
+        assert!(
+            per_box * 4.0 < union,
+            "per-box rasters ({per_box} px²) should be a small fraction of the shared union \
+             ({union} px²)"
+        );
+    }
+
+    /// …and they must draw the SAME PICTURE. Two per-box rasters composited at their own regions
+    /// have to land pixel-for-pixel where the one shared raster put them — that is what keeps the
+    /// live view identical to `rasterize_scene`'s single in-order pass, which is the parity this
+    /// whole ticket is about restoring. (The regions are snapped to the same 64 px grid, so the
+    /// glyphs fall on the same sub-pixel phase in either raster and the comparison is exact.)
+    #[test]
+    fn per_box_rasters_composite_to_the_same_picture_as_one_shared_raster() {
+        let frame = (2560u32, 1440u32);
+        let items = vec![
+            caption(frame, 200.0, 200.0, 48.0),
+            AnnotationItem { id: AnnotId(2), ..caption(frame, 300.0, 900.0, 48.0) },
+        ];
+        // `region` may hang off the picture (DRAGON-368), so composite into a canvas that is
+        // offset enough to hold every region whole; both paths use the same one.
+        let pad = 256i32;
+        let (cw, ch) = (frame.0 + 2 * pad as u32, frame.1 + 2 * pad as u32);
+        let over = |dst: &mut RgbaImage, src: &RgbaImage, at: (i32, i32)| {
+            for (sx, sy, px) in src.enumerate_pixels() {
+                let (x, y) = (at.0 + sx as i32 + pad, at.1 + sy as i32 + pad);
+                if x < 0 || y < 0 || x >= cw as i32 || y >= ch as i32 {
+                    continue;
+                }
+                let a = px.0[3] as u32;
+                if a == 0 {
+                    continue;
+                }
+                let d = dst.get_pixel_mut(x as u32, y as u32);
+                for (i, s) in px.0.iter().take(3).enumerate() {
+                    d.0[i] = ((*s as u32 * a + d.0[i] as u32 * (255 - a)) / 255) as u8;
+                }
+                d.0[3] = (a + d.0[3] as u32 * (255 - a) / 255).min(255) as u8;
+            }
+        };
+        let render = |slice: &[AnnotationItem]| {
+            let r = text_layer_region(slice, frame).expect("ink");
+            let (pw, ph) = (r.w as u32, r.h as u32);
+            (render_text_layer(slice, frame, r, pw, ph).expect("draws"), (r.x as i32, r.y as i32))
+        };
+
+        let mut shared_canvas = RgbaImage::new(cw, ch);
+        let (shared, at) = render(&items);
+        over(&mut shared_canvas, &shared, at);
+
+        let mut split_canvas = RgbaImage::new(cw, ch);
+        for item in &items {
+            let (raster, at) = render(std::slice::from_ref(item));
+            over(&mut split_canvas, &raster, at);
+        }
+        assert_eq!(
+            shared_canvas.as_raw(),
+            split_canvas.as_raw(),
+            "per-box rasters must composite to the same picture as the shared one"
+        );
+    }
+
+    // ── DRAGON-376: a re-render that would change nothing must not happen ────────────────
+
+    /// The claim the whole fix rests on, checked against real PIXELS rather than inferred from a
+    /// signature: the editor's caret/selection/blink state cannot reach the raster, so a
+    /// drag-select re-render produces a byte-identical bitmap. Here the "drag" is a live
+    /// [`super::edit::TextEdit`] whose caret and anchor sweep across the caption exactly as
+    /// `text_drag_to` moves them — the item list, which is all the renderer sees, never changes.
+    #[test]
+    fn a_drag_select_cannot_change_a_single_pixel_of_the_raster() {
+        let frame = (2560u32, 1440u32);
+        let items = vec![caption(frame, 200.0, 300.0, 96.0)];
+        let region = text_layer_region(&items, frame).expect("a caption has a region");
+        let (pw, ph) =
+            (region.w.ceil().max(1.0) as u32, region.h.ceil().max(1.0) as u32);
+        let first = render_text_layer(&items, frame, region, pw, ph).expect("the caption draws");
+
+        let AnnotKind::Text { text, .. } = &items[0].kind else { panic!("text") };
+        let len = super::super::text_annot::char_len(text);
+        let mut te = super::edit::TextEdit {
+            id: AnnotId(1),
+            caret: 0,
+            anchor: None,
+            snapshot: items.clone(),
+            is_new: false,
+            blink_on: true,
+            history: Default::default(),
+        };
+        // 20 motion events of a drag-select, i.e. what used to cost a full re-raster each.
+        for step in 0..20usize {
+            if te.anchor.is_none() {
+                te.anchor = Some(te.caret);
+            }
+            te.caret = (step * len / 20).min(len);
+            te.blink_on = !te.blink_on;
+            let again =
+                render_text_layer(&items, frame, region, pw, ph).expect("the caption draws");
+            assert_eq!(
+                first.as_raw(),
+                again.as_raw(),
+                "caret {} produced different pixels — the raster DOES depend on edit state",
+                te.caret
+            );
+        }
+        // …and the same thing said in the currency of the gate: the raster-input signature is
+        // untouched by any of it, so `refresh_text_display` short-circuits every one of those
+        // events. `region`/`px` follow from the signature, so the scale is the only other input.
+        let sig = text_render_sig(&items[0], frame).expect("a text item signs");
+        assert!(
+            text_raster_is_current(Some((0.5, &sig)), &sig, 0.5),
+            "a chrome-only change must not re-render"
+        );
+    }
+
+    /// The gate's other half: everything that DOES reach the renderer re-renders, and so does a
+    /// zoom that changes the raster resolution. This is what stops the guard from freezing the
+    /// caption's appearance — the same contract `anything_that_changes_the_drawing_refuses_the_
+    /// fast_path` holds the DRAGON-368 proxy to.
+    #[test]
+    fn anything_that_reaches_the_renderer_still_re_renders() {
+        let frame = (2560u32, 1440u32);
+        let fw = (frame.0 as f32, frame.1 as f32);
+        let base = [caption(frame, 200.0, 300.0, 64.0)];
+        let sig = |item: &AnnotationItem| text_render_sig(item, frame).expect("a text item signs");
+        let held = sig(&base[0]);
+        let AnnotKind::Text { text, rect, font, stroke_w, .. } = base[0].kind.clone() else {
+            panic!("text")
+        };
+        let with = |kind: AnnotKind| AnnotationItem { kind, ..base[0].clone() };
+        let stale =
+            |item: &AnnotationItem| !text_raster_is_current(Some((0.5, &held)), &sig(item), 0.5);
+
+        assert!(stale(&with(reflow_text("Typed something", 64.0, font, rect, false, stroke_w, fw))));
+        assert!(stale(&with(reflow_text(&text, 96.0, font, rect, false, stroke_w, fw))), "size");
+        assert!(
+            stale(&with(reflow_text(
+                &text,
+                64.0,
+                super::super::text_annot::TextFont::Hand,
+                rect,
+                false,
+                stroke_w,
+                fw
+            ))),
+            "face"
+        );
+        assert!(stale(&with(reflow_text(&text, 64.0, font, rect, false, 12.0, fw))), "outline");
+        assert!(stale(&with(translated_kind(&base[0].kind, 40.0, 0.0))), "a move");
+        assert!(
+            stale(&AnnotationItem { color: [255, 0, 0, 255], ..base[0].clone() }),
+            "a recolour"
+        );
+        // A zoom step that moves the raster resolution re-renders even with an identical scene.
+        assert!(
+            !text_raster_is_current(Some((0.5, &held)), &held, 0.75),
+            "a new raster scale must re-render"
+        );
+        // No raster yet (a new box, one that just gained ink, or a render that made no pixels).
+        assert!(!text_raster_is_current(None, &held, 0.5), "no raster to re-use");
+    }
+
+    /// A GROUP gesture only re-uses the raster when the members travel TOGETHER: the layer holds
+    /// them in one texture, so members moving (or scaling) by different amounts is not a
+    /// similarity of it.
+    #[test]
+    fn a_group_move_must_be_rigid_for_the_whole_layer() {
+        let frame = (5120u32, 2880u32);
+        let a = caption(frame, 200.0, 300.0, 48.0);
+        let b = AnnotationItem { id: AnnotId(2), ..caption(frame, 1500.0, 900.0, 48.0) };
+        let before = vec![a.clone(), b.clone()];
+        let rigid = vec![
+            AnnotationItem { kind: translated_kind(&a.kind, 60.0, 10.0), ..a.clone() },
+            AnnotationItem { kind: translated_kind(&b.kind, 60.0, 10.0), ..b.clone() },
+        ];
+        assert_eq!(
+            text_layer_xform(&text_render_sigs(&before, frame), &text_render_sigs(&rigid, frame)),
+            Some(TextXform { scale: 1.0, dx: 60.0, dy: 10.0 }),
+        );
+        let skewed = vec![
+            AnnotationItem { kind: translated_kind(&a.kind, 60.0, 10.0), ..a.clone() },
+            AnnotationItem { kind: translated_kind(&b.kind, 60.0, 40.0), ..b },
+        ];
+        assert_eq!(
+            text_layer_xform(&text_render_sigs(&before, frame), &text_render_sigs(&skewed, frame)),
+            None,
+            "members that separated are not one rigid translation",
+        );
+        // One member scaled while the other only moved is likewise not one similarity.
+        let one_scaled = vec![
+            AnnotationItem { kind: translated_kind(&a.kind, 60.0, 10.0), ..a.clone() },
+            AnnotationItem { id: AnnotId(2), ..caption(frame, 1560.0, 910.0, 96.0) },
+        ];
+        assert_eq!(
+            text_layer_xform(
+                &text_render_sigs(&before, frame),
+                &text_render_sigs(&one_scaled, frame)
+            ),
+            None,
+            "one member rescaled is not a similarity of the whole layer",
+        );
+    }
+
+    /// Where the transformed raster may be RE-PLACED. The coverage refusal is correctness — a
+    /// raster that never held the whole padded ink would reveal a missing tail — and the shrink
+    /// refusal is quality (see [`TEXT_PROXY_MIN_SCALE`]). There is deliberately NO
+    /// inside-the-picture condition: that is what DRAGON-368 removed.
+    #[test]
+    fn a_raster_is_re_placed_while_it_covers_the_ink_and_is_not_over_shrunk() {
+        let region = AnnotRect { x: 128.0, y: 128.0, w: 256.0, h: 128.0 };
+        let mv = |dx, dy| TextXform { scale: 1.0, dx, dy };
+        // The ink sits comfortably inside the raster: a modest slide is exact.
+        assert_eq!(
+            placed_text_region(region, mv(64.0, 32.0), (224.0, 192.0, 364.0, 232.0)),
+            Some(AnnotRect { x: 192.0, y: 160.0, w: 256.0, h: 128.0 }),
+        );
+        // A zero move is a legal (and exact) placement.
+        let padded = (160.0, 160.0, 300.0, 200.0);
+        assert_eq!(placed_text_region(region, mv(0.0, 0.0), padded), Some(region));
+        // A SCALE maps the region the same way the drawing was mapped.
+        let grown = placed_text_region(
+            region,
+            TextXform { scale: 2.0, dx: 0.0, dy: 0.0 },
+            (320.0, 320.0, 600.0, 400.0),
+        )
+        .expect("a scale-up is placeable");
+        assert_eq!(grown, AnnotRect { x: 256.0, y: 256.0, w: 512.0, h: 256.0 });
+        // Ink that pokes outside the placed region means the raster never held all of it.
+        assert_eq!(
+            placed_text_region(region, mv(0.0, 0.0), (100.0, 160.0, 300.0, 200.0)),
+            None,
+            "ink left of the raster was never drawn into it",
+        );
+        assert_eq!(
+            placed_text_region(region, mv(0.0, 0.0), (160.0, 160.0, 300.0, 400.0)),
+            None,
+            "ink below the raster was never drawn into it",
+        );
+        // DRAGON-368: leaving the PICTURE is explicitly fine — the GPU scissors the layer, and
+        // text is allowed to hang off the canvas. These used to be refusals.
+        assert!(placed_text_region(region, mv(-200.0, 0.0), (-72.0, 160.0, 68.0, 200.0)).is_some());
+        assert!(placed_text_region(region, mv(0.0, 400.0), (160.0, 560.0, 300.0, 600.0)).is_some());
+        // A shrink past an octave re-renders instead (quality, see TEXT_PROXY_MIN_SCALE); one
+        // exactly AT the octave is still re-used.
+        let half = TextXform { scale: TEXT_PROXY_MIN_SCALE, dx: 0.0, dy: 0.0 };
+        assert!(placed_text_region(region, half, (80.0, 80.0, 150.0, 100.0)).is_some());
+        let quarter = TextXform { scale: 0.25, dx: 0.0, dy: 0.0 };
+        assert_eq!(placed_text_region(region, quarter, (40.0, 40.0, 75.0, 50.0)), None);
+        // Degenerate inputs never produce a placement.
+        assert_eq!(placed_text_region(region, mv(f32::NAN, 0.0), padded), None);
+        assert_eq!(
+            placed_text_region(region, TextXform { scale: f32::NAN, dx: 0.0, dy: 0.0 }, padded),
+            None,
+        );
+    }
+
+    /// The end-to-end property the fix exists for: a caption dragged across the picture yields
+    /// the SAME pixels whether the raster is re-rendered at the new place or simply re-placed
+    /// there. If this ever fails, the fast path is showing something the slow path would not.
+    #[test]
+    fn re_placing_the_raster_draws_what_re_rendering_would_have_drawn() {
+        let frame = (1024u32, 512u32);
+        let before = vec![caption(frame, 180.0, 160.0, 24.0)];
+        let region = text_layer_region(&before, frame).expect("region");
+        let (pw, ph) = (region.w as u32, region.h as u32);
+        let raster = render_text_layer(&before, frame, region, pw, ph).expect("raster");
+
+        let (dx, dy) = (96.0f32, 64.0f32);
+        let after = vec![AnnotationItem {
+            kind: translated_kind(&before[0].kind, dx, dy),
+            ..before[0].clone()
+        }];
+        // The fast path must accept this move and say where the raster goes...
+        let xf = text_layer_xform(
+            &text_render_sigs(&before, frame),
+            &text_render_sigs(&after, frame),
+        )
+        .expect("a move is a similarity");
+        assert_eq!(xf, TextXform { scale: 1.0, dx, dy });
+        let padded = text_padded_bounds(&after).expect("bounds");
+        let slid = placed_text_region(region, xf, padded).expect("a placement");
+        // ...and rendering the moved caption into that very region must reproduce the raster.
+        let fresh = render_text_layer(&after, frame, slid, pw, ph).expect("raster");
+        assert_eq!(fresh.dimensions(), raster.dimensions());
+        let mut ink = 0u32;
+        for (a, b) in raster.pixels().zip(fresh.pixels()) {
+            for ch in 0..4 {
+                assert_eq!(a.0[ch], b.0[ch], "the re-placed raster differs from a re-render");
+            }
+            ink += u32::from(a.0[3] > 0);
+        }
+        assert!(ink > 100, "the caption drew almost nothing ({ink} px) — vacuous test");
+    }
+
+    /// DRAGON-368 — the proxy's SCALED counterpart of the test above, and the honest statement
+    /// of what a proxy is: re-placing the raster under a uniform scale puts the ink in the same
+    /// PLACE a re-render would, only at the resolution it was rendered at.
+    ///
+    /// So this compares GEOMETRY, not pixels: the ink's bounding box in picture coordinates,
+    /// which is what "the caption is where you dragged it" means. Sharpness is deliberately not
+    /// asserted — that is the trade the proxy makes, and `annot_gesture_end` is what settles it.
+    #[test]
+    fn a_scaled_proxy_puts_the_ink_where_a_re_render_would() {
+        use crate::geometry::Corner;
+        let frame = (1400u32, 900u32);
+        let fw = (frame.0 as f32, frame.1 as f32);
+        let before = vec![caption(frame, 120.0, 200.0, 32.0)];
+        let region = text_layer_region(&before, frame).expect("region");
+        let after: Vec<AnnotationItem> = before
+            .iter()
+            .map(|it| AnnotationItem {
+                kind: edited_kind(&it.kind, Grab::Corner(Corner::Se), (0.0, 0.0), (40.0, 40.0), fw, false),
+                ..it.clone()
+            })
+            .collect();
+        let xf = text_layer_xform(
+            &text_render_sigs(&before, frame),
+            &text_render_sigs(&after, frame),
+        )
+        .expect("a similarity");
+        assert!(xf.scale > 1.0, "the drag must have grown the type");
+        let padded = text_padded_bounds(&after).expect("bounds");
+        let placed = placed_text_region(region, xf, padded).expect("a placement");
+
+        // Where the ink sits in the OLD raster, mapped through the proxy's own placement...
+        let (pw, ph) = (region.w as u32, region.h as u32);
+        let old = render_text_layer(&before, frame, region, pw, ph).expect("raster");
+        let ink_box = |img: &RgbaImage| {
+            let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
+            for (x, y, p) in img.enumerate_pixels() {
+                if p.0[3] > 0 {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+            assert!(x1 > 0, "nothing drawn — vacuous test");
+            (x0 as f32, y0 as f32, x1 as f32, y1 as f32)
+        };
+        let (ox0, oy0, ox1, oy1) = ink_box(&old);
+        // The old raster is 1:1 with SOURCE px here, so raster px k IS picture px region.x + k;
+        // the proxy stretches that whole rect onto `placed`.
+        let map = |v: f32, from_lo: f32, from_len: f32, to_lo: f32, to_len: f32| {
+            to_lo + (v + from_lo - from_lo) / from_len * to_len
+        };
+        let proxied = (
+            map(ox0, 0.0, region.w, placed.x, placed.w),
+            map(oy0, 0.0, region.h, placed.y, placed.h),
+            map(ox1, 0.0, region.w, placed.x, placed.w),
+            map(oy1, 0.0, region.h, placed.y, placed.h),
+        );
+        // ...must match where a genuine re-render puts it, to within a couple of source px of
+        // antialiasing + the region's 64px grid rounding riding the scale.
+        let fresh_region = text_layer_region(&after, frame).expect("region");
+        let (fw2, fh2) = (fresh_region.w as u32, fresh_region.h as u32);
+        let fresh = render_text_layer(&after, frame, fresh_region, fw2, fh2).expect("raster");
+        let (fx0, fy0, fx1, fy1) = ink_box(&fresh);
+        let truth = (
+            fresh_region.x + fx0,
+            fresh_region.y + fy0,
+            fresh_region.x + fx1,
+            fresh_region.y + fy1,
+        );
+        let tol = 3.0 + xf.scale * 2.0;
+        for (got, want, name) in [
+            (proxied.0, truth.0, "left"),
+            (proxied.1, truth.1, "top"),
+            (proxied.2, truth.2, "right"),
+            (proxied.3, truth.3, "bottom"),
+        ] {
+            assert!(
+                (got - want).abs() <= tol,
+                "the proxy puts the ink's {name} edge at {got:.1}, a re-render at {want:.1}",
+            );
+        }
+    }
+
+    // ── DRAGON-368: text may be dragged OFF the canvas ───────────────────────────────────
+
+    /// The clamp itself: a text box keeps at least [`TEXT_MIN_ON_CANVAS_PX`] of ITSELF on the
+    /// picture, per axis, and is otherwise free — which is what lets a caption's ink be aligned
+    /// flush to (or past) an edge. The same number is what stays grabbable, since the canvas
+    /// hit-tests this rect.
+    #[test]
+    fn a_text_box_may_leave_the_canvas_but_never_entirely() {
+        let (fw, fh) = (1000.0f32, 800.0f32);
+        let r = |x: f32, y: f32| AnnotRect { x, y, w: 300.0, h: 120.0 };
+        // Well inside: untouched.
+        let inside = clamp_text_rect_on_canvas(r(100.0, 100.0), fw, fh);
+        assert_eq!((inside.x, inside.y), (100.0, 100.0));
+        // Pushed off each edge: stopped exactly at the 5px overlap, not at the picture's edge.
+        let left = clamp_text_rect_on_canvas(r(-9999.0, 100.0), fw, fh);
+        assert_eq!(left.x, TEXT_MIN_ON_CANVAS_PX - 300.0, "5px of box must remain on the right");
+        let right = clamp_text_rect_on_canvas(r(9999.0, 100.0), fw, fh);
+        assert_eq!(right.x, fw - TEXT_MIN_ON_CANVAS_PX);
+        let up = clamp_text_rect_on_canvas(r(100.0, -9999.0), fw, fh);
+        assert_eq!(up.y, TEXT_MIN_ON_CANVAS_PX - 120.0);
+        let down = clamp_text_rect_on_canvas(r(100.0, 9999.0), fw, fh);
+        assert_eq!(down.y, fh - TEXT_MIN_ON_CANVAS_PX);
+        // The overlap really is ≥ 5px on every one of those.
+        for c in [left, right, up, down] {
+            let ox = (c.x + c.w).min(fw) - c.x.max(0.0);
+            let oy = (c.y + c.h).min(fh) - c.y.max(0.0);
+            assert!(ox >= TEXT_MIN_ON_CANVAS_PX - 1e-3, "only {ox}px of box left horizontally");
+            assert!(oy >= TEXT_MIN_ON_CANVAS_PX - 1e-3, "only {oy}px of box left vertically");
+        }
+        // A box NARROWER than the threshold is held by its whole width rather than being
+        // unclampable (the `min` in the rule).
+        let hair = clamp_text_rect_on_canvas(
+            AnnotRect { x: 9999.0, y: 9999.0, w: 2.0, h: 1.0 },
+            fw,
+            fh,
+        );
+        assert_eq!((hair.x, hair.y), (fw - 2.0, fh - 1.0));
+        // A degenerate frame leaves the rect alone rather than inventing a position.
+        assert_eq!(clamp_text_rect_on_canvas(r(50.0, 60.0), 0.0, 0.0), r(50.0, 60.0));
+    }
+
+    /// The rule reaching the actual gesture — and the boundary of it: TEXT moves off canvas,
+    /// every other kind still clamps wholly inside (a shape's ink IS its geometry, so a
+    /// half-off box would just be a broken box), and a text box's RESIZE handles keep their
+    /// old inside-the-picture clamp while its SCALE follows the move rule.
+    #[test]
+    fn only_text_drags_off_the_canvas() {
+        let frame = (1000.0f32, 800.0f32);
+        let far = 5000.0f32;
+        // TEXT: a Move ends up hanging off the right edge, with 5px still on.
+        let text = text_kind(false, 32.0, AnnotRect { x: 400.0, y: 300.0, w: 0.0, h: 0.0 }, frame);
+        let moved = edited_kind(&text, Grab::Move, (0.0, 0.0), (far, far), frame, false);
+        let AnnotKind::Text { rect, .. } = &moved else { panic!("text") };
+        assert!(rect.x + rect.w > frame.0, "the caption did not leave the canvas at all");
+        assert!(
+            (rect.x - (frame.0 - TEXT_MIN_ON_CANVAS_PX)).abs() < 1e-3,
+            "a moved caption stopped somewhere other than the 5px rule: {rect:?}",
+        );
+        // A BOX with the same drag is still held wholly inside.
+        let bx = AnnotKind::Box {
+            rect: AnnotRect { x: 400.0, y: 300.0, w: 100.0, h: 80.0 },
+            stroke_w: 4.0,
+            fill: None,
+        };
+        let AnnotKind::Box { rect: br, .. } =
+            edited_kind(&bx, Grab::Move, (0.0, 0.0), (far, far), frame, false)
+        else {
+            panic!("box")
+        };
+        assert!(br.x + br.w <= frame.0 + 1e-3 && br.y + br.h <= frame.1 + 1e-3);
+        // A CONSTRAINED text box's resize handle keeps the old clamp: it is dragging the WRAP
+        // FRAME, not placing the ink, so nothing is gained by letting it leave.
+        let boxed_text =
+            text_kind(true, 32.0, AnnotRect { x: 400.0, y: 300.0, w: 200.0, h: 90.0 }, frame);
+        let AnnotKind::Text { rect: cr, .. } = edited_kind(
+            &boxed_text,
+            Grab::Corner(crate::geometry::Corner::Se),
+            (0.0, 0.0),
+            (far, far),
+            frame,
+            false,
+        ) else {
+            panic!("text")
+        };
+        assert!(cr.x + cr.w <= frame.0 + 1e-3, "a constrained resize left the picture: {cr:?}");
+    }
+
+    /// The wrap math has to survive coordinates a clamped box could never produce (DRAGON-368):
+    /// an origin LEFT of the picture, and one so far right that the room to the edge is gone.
+    /// Neither may yield nonsense — and, the point of the `rect_w` floor in [`text_auto_cap`], a
+    /// MOVE must never re-wrap an existing caption, because that is both visually wrong and what
+    /// would knock the drag off the raster-reuse fast path.
+    #[test]
+    fn the_auto_wrap_cap_survives_off_canvas_origins_and_never_re_wraps_a_move() {
+        let frame = (1200u32, 700u32);
+        let fw = frame.0 as f32;
+        // Left of the picture: MORE room to the right edge, so the cap simply grows.
+        assert!(text_auto_cap(-300.0, 0.0, 32.0, fw) > text_auto_cap(0.0, 0.0, 32.0, fw));
+        // Hard against the right edge with no box width to protect it: floored at one glyph,
+        // never zero or negative (which would divide the caption into an infinite column).
+        let starved = text_auto_cap(fw - 1.0, 0.0, 32.0, fw);
+        assert!(starved >= 32.0, "a starved cap collapsed to {starved}");
+        // …and past the right edge entirely.
+        assert!(text_auto_cap(fw + 500.0, 0.0, 32.0, fw) >= 32.0);
+        // THE invariant: an existing box's own width floors the cap, so dragging it right can
+        // never make it wrap narrower than it already is.
+        assert_eq!(text_auto_cap(fw - 1.0, 800.0, 32.0, fw), 800.0);
+
+        // End to end: a wide caption dragged hard right keeps its exact layout.
+        let before = caption(frame, 60.0, 200.0, 32.0);
+        let AnnotKind::Text { rect: r0, text: t0, .. } = before.kind.clone() else { panic!() };
+        assert!(r0.w > 400.0, "the caption must be wide enough for the cap to threaten it");
+        let after = edited_kind(&before.kind, Grab::Move, (0.0, 0.0), (5000.0, 0.0), (fw, 700.0), false);
+        let AnnotKind::Text { rect: r1, text: t1, .. } = after.clone() else { panic!() };
+        assert_eq!(t0, t1);
+        assert!((r1.w - r0.w).abs() < 1e-3, "the move re-wrapped the caption: {r0:?} → {r1:?}");
+        // …which is exactly what keeps it on the fast path.
+        assert!(
+            text_layer_xform(
+                &text_render_sigs(std::slice::from_ref(&before), frame),
+                &text_render_sigs(&[AnnotationItem { kind: after, ..before.clone() }], frame),
+            )
+            .is_some(),
+            "a drag to the right edge fell off the raster-reuse fast path",
+        );
+    }
+
+    /// BAKE PARITY for an off-canvas caption (DRAGON-368): the bake composites at the SOURCE
+    /// frame, so ink outside the picture is clipped by the output pixmap — which must be exactly
+    /// the pixels the live layer shows, since the GPU scissors the layer to the same picture.
+    /// This pins that `render_into` with an origin outside the pixmap CLIPS rather than
+    /// misbehaving, and that the surviving pixels agree with the live raster.
+    #[test]
+    fn an_off_canvas_caption_bakes_the_same_pixels_the_live_layer_shows() {
+        let frame = (600u32, 300u32);
+        // Hanging off the left AND the top, with only a corner of the box on the picture.
+        let item = caption(frame, -120.0, -40.0, 40.0);
+        let items = std::slice::from_ref(&item);
+        let bake = rasterize_scene(items, frame.0, frame.1, 1.0, DEFAULT_ANNOT_CURVE_RADIUS)
+            .expect("the bake must not fail on an off-canvas caption");
+        assert_eq!(bake.dimensions(), frame, "the bake is always the source frame");
+        let region = text_layer_region(items, frame).expect("region");
+        assert!(region.x < 0.0 && region.y < 0.0, "the region must genuinely hang off");
+        let (rw, rh) = (region.w as u32, region.h as u32);
+        let live = render_text_layer(items, frame, region, rw, rh).expect("live raster");
+        // Every PICTURE pixel: what the bake drew is what the live layer holds at that same
+        // picture coordinate (the layer is 1:1 with source px here). Ink that fell outside the
+        // picture is simply absent from the bake — clipped, not wrapped or shifted.
+        //
+        // This is byte-for-byte, and it is what pins the BLED bake pixmap (see the Text arm of
+        // [`rasterize_scene`]). Rendering an off-canvas caption straight into the output made
+        // tiny_skia's path clipper deposit phantom coverage on the boundary line — measured at
+        // alpha up to 121/255 across picture ROW 0, a faint dotted line along the edge of the
+        // exported image that the GPU-scissored live layer never showed. With the bleed the two
+        // agree to within one antialiasing step — the same tolerance
+        // `region_raster_places_glyphs_at_the_same_picture_position_as_a_full_frame_raster`
+        // takes, and for the same reason: two pixmaps with different ORIGINS can round a
+        // boundary sample's coverage by a hair. Ink PLACEMENT is exact.
+        let (ox, oy) = (region.x, region.y);
+        let mut ink = 0u32;
+        for y in 0..frame.1 {
+            for x in 0..frame.0 {
+                let want = bake.get_pixel(x, y).0;
+                let (lx, ly) = (x as f32 - ox, y as f32 - oy);
+                let got = if lx >= 0.0 && ly >= 0.0 && (lx as u32) < rw && (ly as u32) < rh {
+                    live.get_pixel(lx as u32, ly as u32).0
+                } else {
+                    [0, 0, 0, 0]
+                };
+                // ALPHA is the comparison: these are straight-alpha pixels, so a FULLY
+                // transparent sample's RGB is whatever the renderer happened to leave behind and
+                // carries no information. Colour is compared only where there is ink to colour.
+                assert!(
+                    want[3].abs_diff(got[3]) <= 2,
+                    "picture ({x},{y}): bake {want:?} vs live {got:?} — the coverage differs",
+                );
+                if want[3] > 32 && got[3] > 32 {
+                    assert_eq!(
+                        want[..3],
+                        got[..3],
+                        "picture ({x},{y}): bake and live disagree on the glyph COLOUR",
+                    );
+                }
+                ink += u32::from(want[3] > 0);
+            }
+        }
+        assert!(ink > 100, "the off-canvas caption drew almost nothing ({ink} px) — vacuous test");
+        // And it really is only PART of the caption: a fully on-canvas copy inks strictly more.
+        let inboard = vec![caption(frame, 10.0, 10.0, 40.0)];
+        let full = rasterize_scene(&inboard, frame.0, frame.1, 1.0, DEFAULT_ANNOT_CURVE_RADIUS)
+            .expect("bake");
+        let count = |img: &RgbaImage| img.pixels().filter(|p| p.0[3] > 0).count();
+        assert!(count(&full) > count(&bake), "nothing was actually clipped — vacuous test");
+    }
+
+    /// DRAGON-368 — what one MOTION EVENT costs the update path, at several type sizes, for BOTH
+    /// gestures. This is the pairing the ticket turns on: the RE-RENDER column is what an event
+    /// used to pay (and it climbs steeply with the type size, which is the owner's "512px lags"),
+    /// the PROXY column is what it pays now, and the HIT columns say how often the proxy is
+    /// actually reached over a realistic gesture — the number that was 0% at 512px before this
+    /// ticket, which is why DRAGON-367 alone did not fix the drag. `#[ignore]`d: it is a
+    /// benchmark, not an assertion.
+    #[test]
+    #[ignore]
+    fn bench_text_gesture_paths() {
+        use crate::geometry::Corner;
+        use std::time::Instant;
+        let frame = (5120u32, 2880u32);
+        // Fit zoom on the owner's 2560-wide screen: the picture is shown ~2311 px wide.
+        let vscale = 2311.0 / 5120.0;
+        let fwh = (frame.0 as f32, frame.1 as f32);
+        println!(
+            "{:>6}  {:>13}  {:>13}  {:>9}  {:>9}  {:>8}  {:>10}",
+            "type", "region(src)", "raster(px)", "render", "proxy", "drag hit", "resize hit"
+        );
+        for size in [64.0f32, 128.0, 256.0, 512.0, 768.0] {
+            let start = vec![caption(frame, 900.0, 700.0, size)];
+            let Some(region) = text_layer_region(&start, frame) else { continue };
+            let scale = super::super::edit::layer_raster_scale(1.0, vscale);
+            let (pw, ph) = super::super::edit::layer_raster_dims(
+                (region.w.ceil().max(1.0) as u32, region.h.ceil().max(1.0) as u32),
+                scale,
+            );
+            // One re-render: the cost every event pays whenever the proxy is refused.
+            let _ = render_text_layer(&start, frame, region, pw, ph);
+            let n = 10;
+            let t = Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(render_text_layer(&start, frame, region, pw, ph));
+            }
+            let render_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+            // The proxy decision itself — the whole of what an event now costs the update path.
+            let moved = vec![AnnotationItem {
+                kind: translated_kind(&start[0].kind, 3.0, 2.0),
+                ..start[0].clone()
+            }];
+            let n = 2000;
+            let t = Instant::now();
+            for _ in 0..n {
+                let b = text_render_sigs(&start, frame);
+                let a = text_render_sigs(&moved, frame);
+                let xf = text_layer_xform(&b, &a).expect("a move");
+                let p = text_padded_bounds(&moved).expect("bounds");
+                std::hint::black_box(placed_text_region(region, xf, p));
+            }
+            let proxy_ms = t.elapsed().as_secs_f64() * 1000.0 / n as f64;
+
+            // A realistic gesture, replayed event by event: each step asks the proxy for a
+            // placement and, when refused, pays a re-render (which also re-bases the region).
+            let sweep = |steps: u32, step_kind: &dyn Fn(&[AnnotationItem], u32) -> Vec<AnnotationItem>| {
+                let (mut items, mut geom) = (start.clone(), region);
+                let (mut hits, mut evts) = (0u32, 0u32);
+                for k in 1..=steps {
+                    let next = step_kind(&items, k);
+                    evts += 1;
+                    let placed = text_layer_xform(
+                        &text_render_sigs(&items, frame),
+                        &text_render_sigs(&next, frame),
+                    )
+                    .and_then(|xf| {
+                        text_padded_bounds(&next).and_then(|p| placed_text_region(geom, xf, p))
+                    });
+                    match placed {
+                        Some(r) => {
+                            hits += 1;
+                            geom = r;
+                        }
+                        None => geom = text_layer_region(&next, frame).unwrap_or(geom),
+                    }
+                    items = next;
+                }
+                100.0 * hits as f64 / evts as f64
+            };
+            // The caption walked right + down across the picture in 8px steps.
+            let drag_hit = sweep(240, &|items, k| {
+                let (dx, dy) = if k % 2 == 0 { (8.0, 3.0) } else { (8.0, -1.0) };
+                items
+                    .iter()
+                    .map(|it| AnnotationItem {
+                        kind: translated_kind(&it.kind, dx, dy),
+                        ..it.clone()
+                    })
+                    .collect()
+            });
+            // The SE corner pulled outward in 6px steps — with the ladder gone, a fresh
+            // `size_px` on every single event.
+            let resize_hit = sweep(120, &|_, k| {
+                let drag = k as f32 * 6.0;
+                start
+                    .iter()
+                    .map(|it| AnnotationItem {
+                        kind: edited_kind(
+                            &it.kind,
+                            Grab::Corner(Corner::Se),
+                            (0.0, 0.0),
+                            (drag, drag),
+                            fwh,
+                            false,
+                        ),
+                        ..it.clone()
+                    })
+                    .collect()
+            });
+            println!(
+                "{size:>6.0}  {:>6.0}x{:<6.0}  {pw:>6}x{ph:<6}  {render_ms:>7.2}ms  \
+                 {proxy_ms:>7.4}ms  {drag_hit:>7.1}%  {resize_hit:>9.1}%",
+                region.w, region.h,
+            );
+        }
+    }
+
+    /// TEMP instrumentation (DRAGON-362) — the wall-clock numbers quoted in the ticket.
+    /// `#[ignore]`d: it is a benchmark, not an assertion.
+    #[test]
+    #[ignore]
+    fn bench_render_text_layer() {
+        let frame = (5120u32, 2880u32);
+        let item = caption(frame, 200.0, 300.0, 64.0);
+        let full = AnnotRect { x: 0.0, y: 0.0, w: frame.0 as f32, h: frame.1 as f32 };
+        let region = text_layer_region(std::slice::from_ref(&item), frame).expect("region");
+        let cases: [(&str, AnnotRect, u32, u32); 5] = [
+            ("OLD full-frame @ the 1024 box", full, 1024, 576),
+            ("OLD full-frame @ screen size", full, 2560, 1440),
+            ("OLD full-frame @ source", full, 5120, 2880),
+            ("NEW region @ screen size", region, (region.w * 0.5) as u32, (region.h * 0.5) as u32),
+            ("NEW region @ source", region, region.w as u32, region.h as u32),
+        ];
+        // Q: does the per-motion cost scale with the SOURCE FRAME independently of the output
+        // pixmap? (The layout + SVG are built in frame coordinates.) Answer: no — with the
+        // output pinned, a 1080p and a 5K frame cost the same. The cost is OUTPUT AREA only.
+        for f in [(1920u32, 1080u32), (5120, 2880)] {
+            let it = caption(f, 200.0, 300.0, 64.0);
+            let rect = AnnotRect { x: 0.0, y: 0.0, w: f.0 as f32, h: f.1 as f32 };
+            let _ = render_text_layer(std::slice::from_ref(&it), f, rect, 1024, 576);
+            const N: u32 = 20;
+            let t0 = std::time::Instant::now();
+            for _ in 0..N {
+                assert!(render_text_layer(std::slice::from_ref(&it), f, rect, 1024, 576).is_some());
+            }
+            eprintln!("BENCH frame {:?} @ fixed 1024x576 output = {:8.3?}/render", f, t0.elapsed() / N);
+        }
+        for (label, rect, pw, ph) in cases {
+            let _ = render_text_layer(std::slice::from_ref(&item), frame, rect, pw, ph);
+            const N: u32 = 20;
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                assert!(render_text_layer(std::slice::from_ref(&item), frame, rect, pw, ph).is_some());
+            }
+            eprintln!(
+                "BENCH {label:32} {pw:5}x{ph:<5} = {:8.3?}/render, {:5.1} MB upload",
+                t.elapsed() / N,
+                (pw as f64 * ph as f64 * 4.0) / 1e6,
+            );
+        }
+    }
+
+    // ── DRAGON-364: numpad Enter exits, the two text-box resize modes, dropdown sync ──────
+
+    #[test]
+    fn only_the_numpad_enter_exits_a_live_text_edit() {
+        use cosmic::iced::keyboard::{key::Named, Key, Location};
+        // The whole point of plumbing `Location`: the two Enters are the SAME logical key, so
+        // the location is the only thing that can separate them.
+        let enter = Key::Named(Named::Enter);
+        assert!(text_edit_exits(&enter, Location::Numpad), "numpad Enter settles the edit");
+        assert!(
+            !text_edit_exits(&enter, Location::Standard),
+            "MAIN Enter must keep inserting a newline — the box is multi-line",
+        );
+        // Escape stays an exit from every location (it has no keypad twin, but be explicit).
+        for loc in [Location::Standard, Location::Left, Location::Right, Location::Numpad] {
+            assert!(text_edit_exits(&Key::Named(Named::Escape), loc), "Escape always settles");
+        }
+        // Nothing else exits — including keys that DO have a numpad twin, so the predicate is
+        // keyed on the key AND the location, never on "any numpad press".
+        for k in [
+            Key::Named(Named::Tab),
+            Key::Named(Named::Backspace),
+            Key::Named(Named::Delete),
+            Key::Named(Named::ArrowDown),
+            Key::Named(Named::Home),
+            Key::Character("5".into()),
+            Key::Character(" ".into()),
+        ] {
+            for loc in [Location::Standard, Location::Numpad] {
+                assert!(!text_edit_exits(&k, loc), "{k:?} at {loc:?} must not end the session");
+            }
+        }
+    }
+
+    // ── DRAGON-369: what a live text edit does with the DESTRUCTIVE preview chords ────────
+
+    /// **The safety pin.** A live text edit swallows every PRIMARY chord it does not claim, and
+    /// the claimed set is exactly Z / Y / A / C / X / V. `keyboard.rs`'s `preview_modal_key`
+    /// routes into the text editor BEFORE the Preview keymap is consulted, so this inventory is
+    /// the whole answer to "what happens if the user hits an editor chord mid-typing".
+    ///
+    /// The two that matter, both bound in the Preview context by DRAGON-369:
+    /// * `Ctrl+D` (deselect all annotations) — NOT claimed, so it does nothing at all while
+    ///   typing and can never deselect out from under an active edit;
+    /// * `Ctrl+Shift+X` (delete the capture file, irreversibly) — lands on the text CUT arm, so
+    ///   the worst it can do is cut the text selection. The capture is untouchable while a box
+    ///   is being edited.
+    #[test]
+    fn a_live_text_edit_swallows_the_destructive_preview_chords() {
+        use cosmic::iced::keyboard::{key::Named, Key};
+        // Ctrl+D: the deselect chord is not claimed, with or without Shift → swallowed.
+        assert_eq!(text_edit_chord(&Key::Character("d".into()), false), None);
+        assert_eq!(text_edit_chord(&Key::Character("d".into()), true), None);
+        // Ctrl+Shift+X: the DELETE-the-capture chord means CUT-the-text here — never the file.
+        assert_eq!(
+            text_edit_chord(&Key::Character("x".into()), true),
+            Some(TextEditChord::Cut),
+        );
+        assert_eq!(
+            text_edit_chord(&Key::Character("X".into()), true),
+            Some(TextEditChord::Cut),
+        );
+        // The rest of the claimed set, unchanged (DRAGON-354 item 13) — Shift only ever
+        // switches undo to redo.
+        for (k, shift, want) in [
+            ("z", false, TextEditChord::Undo),
+            ("z", true, TextEditChord::Redo),
+            ("y", false, TextEditChord::Redo),
+            ("a", false, TextEditChord::SelectAll),
+            ("c", false, TextEditChord::Copy),
+            ("x", false, TextEditChord::Cut),
+            ("v", false, TextEditChord::Paste),
+        ] {
+            assert_eq!(text_edit_chord(&Key::Character(k.into()), shift), Some(want), "{k}");
+        }
+        // Every OTHER preview hotkey letter is swallowed too, so no tool arms itself mid-word.
+        for k in ["b", "e", "h", "i", "l", "m", "p", "s", "t", "u", "w", "g", "n", "q"] {
+            assert_eq!(text_edit_chord(&Key::Character(k.into()), false), None, "{k}");
+            assert_eq!(text_edit_chord(&Key::Character(k.into()), true), None, "{k}+shift");
+        }
+        // A non-character primary chord (Delete, Escape, an F-key) is swallowed as well.
+        for k in [Named::Delete, Named::Backspace, Named::Escape, Named::F5, Named::Enter] {
+            assert_eq!(text_edit_chord(&Key::Named(k), false), None, "{k:?}");
+        }
+    }
+
+    /// A CLICK-created ("normal", auto) caption and a DRAG-created ("constrained") one, both
+    /// laid out through the shared reflow seam so the geometry is the real thing.
+    fn text_kind(constrained: bool, size: f32, rect: AnnotRect, frame: (f32, f32)) -> AnnotKind {
+        reflow_text(
+            "hello there world",
+            size,
+            super::super::text_annot::TextFont::Clean,
+            rect,
+            constrained,
+            2.0,
+            frame,
+        )
+    }
+
+    #[test]
+    fn resizing_a_constrained_box_rewraps_it_and_never_scales_the_glyphs() {
+        let frame = (1000.0, 800.0);
+        let orig = text_kind(true, 32.0, AnnotRect { x: 100.0, y: 100.0, w: 300.0, h: 0.0 }, frame);
+        let AnnotKind::Text { rect: r0, size_px: s0, .. } = &orig else { panic!("text") };
+        let (r0, s0) = (*r0, *s0);
+        // Drag the EAST edge inward: the prison narrows, the text re-wraps inside it, and the
+        // type size is untouched — that is the constrained contract.
+        let out = edited_kind(
+            &orig,
+            Grab::Edge(crate::geometry::Edge::E),
+            (0.0, 0.0),
+            (-120.0, 0.0),
+            frame,
+            false,
+        );
+        let AnnotKind::Text { rect, size_px, constrained, .. } = &out else { panic!("text") };
+        assert!(*constrained, "a dragged box stays a wrap prison");
+        assert_eq!(*size_px, s0, "the glyphs must NOT scale — only the box changed");
+        assert!(rect.w < r0.w, "the wrap width followed the handle ({} -> {})", r0.w, rect.w);
+        // Narrower wrap ⇒ more lines ⇒ a taller box: the height snaps to the wrapped content.
+        assert!(rect.h >= r0.h, "re-wrapping into a narrower prison grows the height");
+    }
+
+    // ── DRAGON-370: Ctrl overrides a paragraph box's handle into a type scaler ───────────
+
+    /// The override itself. DRAGON-364's constrained/normal split IS Photoshop's
+    /// paragraph/point-text distinction; the piece that was missing is Photoshop's modifier —
+    /// Ctrl on a PARAGRAPH box's handle scales the type instead of reflowing the box. The box
+    /// keeps its kind, so the very next unmodified drag reflows again.
+    #[test]
+    fn ctrl_makes_a_constrained_box_scale_its_type_instead_of_reflowing() {
+        use crate::geometry::Corner;
+        let frame = (2000.0, 1600.0);
+        let orig = text_kind(true, 32.0, AnnotRect { x: 200.0, y: 200.0, w: 400.0, h: 0.0 }, frame);
+        let AnnotKind::Text { rect: r0, size_px: s0, .. } = &orig else { panic!("text") };
+        let (r0, s0) = (*r0, *s0);
+        let drag = |scale_type: bool| {
+            edited_kind(&orig, Grab::Corner(Corner::Se), (0.0, 0.0), (120.0, 120.0), frame, scale_type)
+        };
+        // WITHOUT the modifier: DRAGON-364's contract, untouched.
+        let AnnotKind::Text { size_px: plain, constrained: c0, .. } = drag(false) else {
+            panic!("text")
+        };
+        assert_eq!(plain, s0, "an unmodified paragraph drag must never scale the glyphs");
+        assert!(c0, "…and it stays a paragraph box");
+        // WITH it: the type scales, and the box is still a paragraph box.
+        let out = drag(true);
+        let AnnotKind::Text { rect, size_px, constrained, .. } = &out else { panic!("text") };
+        assert!(*size_px > s0, "ctrl-drag must scale the type ({s0} -> {size_px})");
+        assert!(*constrained, "the modifier changes what the HANDLE does, not what the text IS");
+        // The wrap width scaled by the same factor — that is what keeps the line breaks and
+        // makes the change a similarity rather than a re-wrap.
+        let applied = size_px / s0;
+        assert!(
+            (rect.w / r0.w - applied).abs() < 0.05,
+            "the wrap width ({} -> {}) did not follow the type ({applied:.3}x)",
+            r0.w,
+            rect.w,
+        );
+        // A NORMAL box is unaffected by the modifier: it already scales, and Photoshop offers no
+        // reverse override (point text has no wrap width to set).
+        let normal = text_kind(false, 24.0, AnnotRect { x: 200.0, y: 300.0, w: 0.0, h: 0.0 }, frame);
+        let with = edited_kind(&normal, Grab::Corner(Corner::Se), (0.0, 0.0), (60.0, 60.0), frame, true);
+        let without =
+            edited_kind(&normal, Grab::Corner(Corner::Se), (0.0, 0.0), (60.0, 60.0), frame, false);
+        assert_eq!(with, without, "ctrl must mean nothing on a point box");
+    }
+
+    /// The half that makes it usable, and the reason it had to wait for DRAGON-368: a Ctrl-drag
+    /// scales the wrap width by the SAME factor as the type, so the line breaks hold and the
+    /// whole change is a similarity — which is exactly what the raster-reuse proxy accepts. A
+    /// re-wrap on every motion event of the editor's most expensive gesture is what this avoids.
+    #[test]
+    fn a_ctrl_scale_stays_a_similarity_so_the_raster_is_re_used() {
+        use crate::geometry::Corner;
+        let frame = (4000u32, 3000u32);
+        let fwh = (frame.0 as f32, frame.1 as f32);
+        let para = AnnotationItem {
+            id: AnnotId(1),
+            color: [255, 255, 255, 255],
+            kind: reflow_text(
+                "The quick brown fox jumps over the lazy dog and keeps going for a while",
+                96.0,
+                super::super::text_annot::TextFont::Clean,
+                AnnotRect { x: 300.0, y: 400.0, w: 1200.0, h: 0.0 },
+                true,
+                2.0,
+                fwh,
+            ),
+        };
+        let AnnotKind::Text { text, .. } = &para.kind else { panic!("text") };
+        assert!(text.len() > 40, "the caption must be long enough to actually wrap");
+        let start = vec![para];
+        let (mut items, mut geom) = (start.clone(), text_layer_region(&start, frame).expect("r"));
+        for step in 1..=40 {
+            let next: Vec<AnnotationItem> = start
+                .iter()
+                .map(|it| AnnotationItem {
+                    kind: edited_kind(
+                        &it.kind,
+                        Grab::Corner(Corner::Se),
+                        (0.0, 0.0),
+                        (step as f32 * 8.0, step as f32 * 8.0),
+                        fwh,
+                        true,
+                    ),
+                    ..it.clone()
+                })
+                .collect();
+            let xf = text_layer_xform(
+                &text_render_sigs(&items, frame),
+                &text_render_sigs(&next, frame),
+            )
+            .unwrap_or_else(|| panic!("ctrl-scale step {step} was not recognised as a similarity"));
+            assert!(xf.scale > 1.0, "step {step} did not grow the type");
+            let padded = text_padded_bounds(&next).expect("bounds");
+            geom = placed_text_region(geom, xf, padded)
+                .unwrap_or_else(|| panic!("ctrl-scale step {step} could not re-place the raster"));
+            items = next;
+        }
+        assert!(geom.w > 0.0 && geom.h > 0.0);
+    }
+
+    #[test]
+    fn resizing_a_normal_box_scales_the_type_aspect_locked_and_stays_normal() {
+        let frame = (2000.0, 1600.0);
+        let orig = text_kind(false, 24.0, AnnotRect { x: 200.0, y: 300.0, w: 0.0, h: 0.0 }, frame);
+        let AnnotKind::Text { rect: r0, size_px: s0, .. } = &orig else { panic!("text") };
+        let (r0, s0) = (*r0, *s0);
+        // Drag the SE corner outward along the box diagonal: the TYPE grows.
+        let out = edited_kind(
+            &orig,
+            Grab::Corner(crate::geometry::Corner::Se),
+            (0.0, 0.0),
+            (r0.w * 0.5, r0.h * 0.5),
+            frame,
+            false,
+        );
+        let AnnotKind::Text { rect, size_px, constrained, text, .. } = &out else { panic!("text") };
+        assert!(!*constrained, "a click-created box stays NORMAL — a scale is not a wrap change");
+        assert!(*size_px > s0, "the font size grew ({s0} -> {size_px})");
+        assert_eq!(text, "hello there world", "a resize never edits the string");
+        // Aspect-ratio LOCKED: the box extent comes from one uniformly scaled number, so its
+        // proportions survive the drag (a stretch would move this ratio).
+        let (a0, a1) = (r0.w / r0.h, rect.w / rect.h);
+        assert!((a0 - a1).abs() / a0 < 0.02, "aspect held: {a0} vs {a1}");
+        // …and the box tracks the size, not the pointer delta.
+        assert!((rect.w / r0.w - size_px / s0).abs() < 0.05, "extent scales with the type size");
+        // Dragging the same corner INWARD shrinks it — the factor is continuous through 1.0.
+        let smaller = edited_kind(
+            &orig,
+            Grab::Corner(crate::geometry::Corner::Se),
+            (0.0, 0.0),
+            (-r0.w * 0.25, -r0.h * 0.25),
+            frame,
+            false,
+        );
+        let AnnotKind::Text { size_px: s2, .. } = &smaller else { panic!("text") };
+        assert!(*s2 < s0, "dragging inward shrinks the type ({s0} -> {s2})");
+    }
+
+    #[test]
+    fn a_scaled_normal_box_still_auto_grows_when_more_text_is_typed() {
+        // The interaction the ticket asks about: scaling must not secretly constrain the box,
+        // or the caption would start wrapping at its scaled width instead of growing.
+        let frame = (2000.0, 1600.0);
+        let orig = text_kind(false, 24.0, AnnotRect { x: 100.0, y: 100.0, w: 0.0, h: 0.0 }, frame);
+        let scaled = edited_kind(
+            &orig,
+            Grab::Corner(crate::geometry::Corner::Se),
+            (0.0, 0.0),
+            (200.0, 200.0),
+            frame,
+            false,
+        );
+        let AnnotKind::Text { rect, size_px, constrained, font, stroke_w, .. } = &scaled else {
+            panic!("text")
+        };
+        assert!(!*constrained);
+        // Re-flow the SAME box with a longer string, exactly as a keystroke does.
+        let longer = reflow_text(
+            "hello there world and then some considerably more words",
+            *size_px,
+            *font,
+            *rect,
+            *constrained,
+            *stroke_w,
+            frame,
+        );
+        let AnnotKind::Text { rect: r2, .. } = &longer else { panic!("text") };
+        assert!(r2.w > rect.w, "an auto box still grows to its widest line ({} -> {})", rect.w, r2.w);
+    }
+
+    #[test]
+    fn a_move_changes_neither_text_box_mode_nor_its_size() {
+        let frame = (1000.0, 800.0);
+        for constrained in [false, true] {
+            let orig =
+                text_kind(constrained, 32.0, AnnotRect { x: 100.0, y: 100.0, w: 250.0, h: 0.0 }, frame);
+            let AnnotKind::Text { rect: r0, size_px: s0, .. } = &orig else { panic!("text") };
+            let (r0, s0) = (*r0, *s0);
+            let out = edited_kind(&orig, Grab::Move, (0.0, 0.0), (40.0, 30.0), frame, false);
+            let AnnotKind::Text { rect, size_px, constrained: c, .. } = &out else { panic!("text") };
+            assert_eq!(*c, constrained, "a move never flips the wrap mode");
+            assert_eq!(*size_px, s0, "a move never scales the type");
+            assert!((rect.x - (r0.x + 40.0)).abs() < 0.01 && (rect.y - (r0.y + 30.0)).abs() < 0.01);
+            assert!((rect.w - r0.w).abs() < 0.01 && (rect.h - r0.h).abs() < 0.01, "extent held");
+        }
+    }
+
+    #[test]
+    fn the_text_scale_factor_is_directional_continuous_and_never_inverts() {
+        use crate::geometry::{Corner, Edge};
+        let (w, h) = (200.0f32, 100.0f32);
+        // No drag ⇒ no scale, for every grab.
+        for g in [
+            Grab::Corner(Corner::Nw),
+            Grab::Corner(Corner::Se),
+            Grab::Edge(Edge::N),
+            Grab::Edge(Edge::E),
+        ] {
+            assert!((text_scale_factor(w, h, g, 0.0, 0.0) - 1.0).abs() < 1e-6, "{g:?} idle");
+        }
+        // A Move (and the arrow grabs) never scale at all.
+        for g in [Grab::Move, Grab::ArrowA, Grab::ArrowB] {
+            assert_eq!(text_scale_factor(w, h, g, 99.0, 99.0), 1.0);
+        }
+        // Each corner grows when dragged OUTWARD and shrinks when dragged inward.
+        for (g, out) in [
+            (Grab::Corner(Corner::Se), (1.0f32, 1.0f32)),
+            (Grab::Corner(Corner::Nw), (-1.0, -1.0)),
+            (Grab::Corner(Corner::Ne), (1.0, -1.0)),
+            (Grab::Corner(Corner::Sw), (-1.0, 1.0)),
+        ] {
+            let grow = text_scale_factor(w, h, g, out.0 * 20.0, out.1 * 20.0);
+            let shrink = text_scale_factor(w, h, g, out.0 * -20.0, out.1 * -20.0);
+            assert!(grow > 1.0, "{g:?} outward grows (got {grow})");
+            assert!(shrink < 1.0, "{g:?} inward shrinks (got {shrink})");
+        }
+        // A corner responds to a PURELY horizontal drag as well as a purely vertical one —
+        // the diagonal projection is exactly what avoids a per-axis dead zone.
+        assert!(text_scale_factor(w, h, Grab::Corner(Corner::Se), 30.0, 0.0) > 1.0);
+        assert!(text_scale_factor(w, h, Grab::Corner(Corner::Se), 0.0, 30.0) > 1.0);
+        // Edges act on their OWN axis only.
+        assert!(text_scale_factor(w, h, Grab::Edge(Edge::E), 40.0, 0.0) > 1.0);
+        assert_eq!(text_scale_factor(w, h, Grab::Edge(Edge::E), 0.0, 40.0), 1.0);
+        assert!(text_scale_factor(w, h, Grab::Edge(Edge::S), 0.0, 40.0) > 1.0);
+        assert!(text_scale_factor(w, h, Grab::Edge(Edge::N), 0.0, 40.0) < 1.0);
+        // A huge inward drag can never flip the type negative (or to zero).
+        let f = text_scale_factor(w, h, Grab::Corner(Corner::Se), -100000.0, -100000.0);
+        assert!(f > 0.0 && f.is_finite(), "factor stays positive, got {f}");
+        // A degenerate extent falls back instead of dividing by ~0.
+        assert!(text_scale_factor(0.0, 0.0, Grab::Corner(Corner::Se), 5.0, 5.0).is_finite());
+    }
+
+    #[test]
+    fn a_scaled_normal_box_is_anchored_at_the_handle_you_are_not_holding() {
+        use crate::geometry::{Corner, Edge};
+        let frame = (1000.0, 1000.0);
+        let orig = AnnotRect { x: 100.0, y: 200.0, w: 200.0, h: 100.0 };
+        let (l, t, r, b) = (100.0, 200.0, 300.0, 300.0);
+        // Growing from each corner pins the OPPOSITE one.
+        let se = anchor_scaled_text_rect(orig, 300.0, 150.0, Grab::Corner(Corner::Se), frame);
+        assert_eq!((se.x, se.y), (l, t), "an SE drag pins NW");
+        let nw = anchor_scaled_text_rect(orig, 300.0, 150.0, Grab::Corner(Corner::Nw), frame);
+        assert!((nw.x + nw.w - r).abs() < 1e-4 && (nw.y + nw.h - b).abs() < 1e-4, "NW pins SE");
+        let ne = anchor_scaled_text_rect(orig, 300.0, 150.0, Grab::Corner(Corner::Ne), frame);
+        assert!((ne.x - l).abs() < 1e-4 && (ne.y + ne.h - b).abs() < 1e-4, "NE pins SW");
+        let sw = anchor_scaled_text_rect(orig, 300.0, 150.0, Grab::Corner(Corner::Sw), frame);
+        assert!((sw.x + sw.w - r).abs() < 1e-4 && (sw.y - t).abs() < 1e-4, "SW pins NE");
+        // An edge pins the opposite edge and leaves the OTHER axis' origin alone (no drift).
+        let n = anchor_scaled_text_rect(orig, 300.0, 150.0, Grab::Edge(Edge::N), frame);
+        assert!((n.x - l).abs() < 1e-4, "an N drag must not slide the box sideways");
+        assert!((n.y + n.h - b).abs() < 1e-4, "…and pins the south edge");
+        let e = anchor_scaled_text_rect(orig, 300.0, 150.0, Grab::Edge(Edge::E), frame);
+        assert_eq!((e.x, e.y), (l, t), "an E drag pins the west edge and the top");
+        // The result is always clamped inside the picture.
+        let huge = anchor_scaled_text_rect(orig, 4000.0, 4000.0, Grab::Corner(Corner::Se), frame);
+        assert!(huge.x >= 0.0 && huge.y >= 0.0, "a scaled box never leaves the frame");
+    }
+
+    /// DRAGON-368 REPLACES DRAGON-367's `a_scale_steps_past_both_ends_…`, which pinned the size
+    /// LADDER. The owner's rules, in order: DRAGON-367 — "we shouldn't limit how much we can
+    /// scale, it should exceed beyond the min/max of the options in dropdown"; DRAGON-368 — "we
+    /// need to remove snapping from the sizer". So a drag reaches past both ends of the listed
+    /// presets, lands on ANY size in between, and only the guard bounds hold.
+    #[test]
+    fn a_scale_slides_continuously_past_both_ends_and_stops_only_at_the_guard_bounds() {
+        use super::super::text_annot::{TEXT_SCALE_MAX_PX, TEXT_SCALE_MIN_PX, TEXT_SIZES};
+        use crate::geometry::Corner;
+        let frame = (4000.0, 4000.0);
+        let scaled = |px: f32, drag: f32| {
+            let orig = text_kind(false, px, AnnotRect { x: 10.0, y: 10.0, w: 0.0, h: 0.0 }, frame);
+            let out = edited_kind(&orig, Grab::Corner(Corner::Se), (0.0, 0.0), (drag, drag), frame, false);
+            let AnnotKind::Text { size_px, .. } = out else { panic!("text") };
+            size_px
+        };
+        // Past BOTH ends of the listed range — the behaviour DRAGON-364 forbade.
+        let (lo, hi) = (TEXT_SIZES[0], TEXT_SIZES[TEXT_SIZES.len() - 1]);
+        assert!(scaled(hi, 100_000.0) > hi, "a drag must reach above the largest preset");
+        assert!(scaled(lo, -100_000.0) < lo, "a drag must reach below the smallest preset");
+        // …but never past the guard bounds, however violent the drag.
+        for (px, drag) in [(12.0f32, -1.0e9f32), (128.0, 1.0e9), (32.0, 0.0)] {
+            let got = scaled(px, drag);
+            assert!(
+                (TEXT_SCALE_MIN_PX..=TEXT_SCALE_MAX_PX).contains(&got),
+                "a scaled size escaped the guard bounds: {got}",
+            );
+        }
+        // NO SNAPPING: the size moves with EVERY step of the drag, and lands off-preset. A
+        // ladder would have produced long runs of one value and only ever listed sizes.
+        let mut seen = Vec::new();
+        for step in 0..40 {
+            let got = scaled(32.0, step as f32 * 2.0);
+            if let Some(prev) = seen.last() {
+                assert!(got > *prev, "the size stalled between {prev} and {got} — that is a snap");
+            }
+            seen.push(got);
+        }
+        assert!(
+            seen.iter().any(|s| super::super::text_annot::text_size_preset_index(*s).is_none()),
+            "a continuous drag must be able to sit between the dropdown's presets",
+        );
+    }
+
+    /// The DRAGON-364 × DRAGON-368 interaction that replaces DRAGON-367's
+    /// `a_resize_within_one_ladder_rung_…`. Snapping used to make most resize events a no-op,
+    /// which was an accidental performance win; with it gone, EVERY event changes the drawing's
+    /// size and the raster must follow. This pins that the live-transform proxy is what carries
+    /// it — the whole reason removing the snap did not reintroduce the stall.
+    #[test]
+    fn every_continuous_resize_event_moves_the_size_and_still_re_uses_the_raster() {
+        use crate::geometry::Corner;
+        let frame = (4000u32, 4000u32);
+        let fwh = (frame.0 as f32, frame.1 as f32);
+        let start = vec![caption(frame, 200.0, 200.0, 96.0)];
+        let at = |drag: f32| -> Vec<AnnotationItem> {
+            start
+                .iter()
+                .map(|it| AnnotationItem {
+                    kind: edited_kind(
+                        &it.kind,
+                        Grab::Corner(Corner::Se),
+                        (0.0, 0.0),
+                        (drag, drag),
+                        fwh,
+                        false,
+                    ),
+                    ..it.clone()
+                })
+                .collect()
+        };
+        // Two adjacent motion events genuinely differ now — no rung to hide behind.
+        let (a, b) = (at(1.0), at(2.0));
+        let AnnotKind::Text { size_px: sa, .. } = &a[0].kind else { panic!("text") };
+        let AnnotKind::Text { size_px: sb, .. } = &b[0].kind else { panic!("text") };
+        assert_ne!(sa, sb, "with the ladder gone, every event must move the size");
+        // …and the proxy takes every one of them: replay a whole resize and require a placement
+        // at each step. Before DRAGON-368 this was a re-render per event.
+        let (mut items, mut geom) = (start.clone(), text_layer_region(&start, frame).expect("r"));
+        for step in 1..=60 {
+            let next = at(step as f32 * 4.0);
+            let xf = text_layer_xform(
+                &text_render_sigs(&items, frame),
+                &text_render_sigs(&next, frame),
+            )
+            .unwrap_or_else(|| panic!("resize step {step} was not recognised as a similarity"));
+            let padded = text_padded_bounds(&next).expect("bounds");
+            geom = placed_text_region(geom, xf, padded)
+                .unwrap_or_else(|| panic!("resize step {step} could not re-place the raster"));
+            items = next;
+        }
+        assert!(geom.w > 0.0 && geom.h > 0.0);
+    }
+
+    #[test]
+    fn only_an_explicit_dropdown_pick_writes_the_remembered_text_default() {
+        // The DRAGON-364 rule, in the one place it lives. Selecting an element, or dragging a
+        // handle that scales it, are REPORTS about that element — the chips follow, the
+        // persisted default for future captures does not move. Only picking in the menu does.
+        assert!(
+            TextStyleSource::DropdownPick.writes_default(),
+            "picking a size/font IS the user stating a preference",
+        );
+        assert!(
+            !TextStyleSource::SelectionSync.writes_default(),
+            "clicking an existing 96px caption must not re-set the default for every capture",
+        );
+        assert!(
+            !TextStyleSource::HandleScale.writes_default(),
+            "dragging a handle scales the element; it is not picking a size",
+        );
+    }
+
+    #[test]
+    fn the_dropdowns_report_the_last_selected_text_element() {
+        use super::super::text_annot::TextFont;
+        let frame = (1000.0, 1000.0);
+        let mk = |id: u64, size: f32, font: TextFont| AnnotationItem {
+            id: AnnotId(id),
+            color: [255, 255, 255, 255],
+            kind: reflow_text(
+                "caption",
+                size,
+                font,
+                AnnotRect { x: 10.0, y: 10.0, w: 0.0, h: 0.0 },
+                false,
+                2.0,
+                frame,
+            ),
+        };
+        let shape = AnnotationItem {
+            id: AnnotId(9),
+            color: [255, 0, 0, 255],
+            kind: AnnotKind::Box {
+                rect: AnnotRect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 },
+                stroke_w: 4.0,
+                fill: None,
+            },
+        };
+        let items = vec![mk(1, 16.0, TextFont::Clean), mk(2, 96.0, TextFont::Hand), shape];
+        // The PRIMARY (= last-selected) item is what the caller passes, so "match the last one
+        // selected" falls straight out.
+        assert_eq!(
+            text_style_for_display(&items, Some(AnnotId(2))),
+            Some((96.0, TextFont::Hand)),
+        );
+        assert_eq!(
+            text_style_for_display(&items, Some(AnnotId(1))),
+            Some((16.0, TextFont::Clean)),
+        );
+        // Nothing selected, a NON-text primary, or a stale id: the chips keep showing what a
+        // new box would take rather than inventing a value.
+        assert_eq!(text_style_for_display(&items, None), None);
+        assert_eq!(text_style_for_display(&items, Some(AnnotId(9))), None, "a box has no font");
+        assert_eq!(text_style_for_display(&items, Some(AnnotId(404))), None, "a deleted id");
+    }
+}

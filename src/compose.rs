@@ -29,16 +29,21 @@ pub(crate) fn round_corners(img: &mut RgbaImage, radius: u32) {
         (0, h - r, rf, (h - r) as f32),
         (w - r, h - r, (w - r) as f32, (h - r) as f32),
     ];
+    // Direct alpha-byte access instead of per-pixel `get_pixel_mut` (DRAGON-316): a pure
+    // access-pattern change (same index arithmetic `(y*w + x)*4 + 3`), output-identical.
+    let ww = w as usize;
+    let buf: &mut [u8] = &mut *img;
     for (ox, oy, ccx, ccy) in corners {
         for y in oy..oy + r {
+            let row = y as usize * ww;
             for x in ox..ox + r {
                 let dx = x as f32 + 0.5 - ccx;
                 let dy = y as f32 + 0.5 - ccy;
                 let dist = (dx * dx + dy * dy).sqrt();
                 // 1 inside the radius, 0 outside, 1px anti-aliased edge.
                 let cov = (rf - dist + 0.5).clamp(0.0, 1.0);
-                let p = img.get_pixel_mut(x, y);
-                p[3] = (p[3] as f32 * cov).round() as u8;
+                let a = (row + x as usize) * 4 + 3;
+                buf[a] = (buf[a] as f32 * cov).round() as u8;
             }
         }
     }
@@ -100,18 +105,23 @@ fn opacify_body_keep_corners(img: &mut RgbaImage) {
     let orig_alpha: Vec<u8> = img.pixels().map(|p| p[3]).collect();
     let body_f = body as f32;
     flatten_opaque(img);
-    let mut restore = |ox: u32, oy: u32| {
+    // Direct alpha-byte access instead of per-pixel `get_pixel_mut` (DRAGON-316): a pure
+    // access-pattern change (same index arithmetic `(y*w + x)*4 + 3`), output-identical.
+    let ww = w as usize;
+    let buf: &mut [u8] = &mut *img;
+    let restore = |buf: &mut [u8], ox: u32, oy: u32| {
         for y in oy..(oy + r).min(h) {
+            let row = y as usize * ww;
             for x in ox..(ox + r).min(w) {
-                let a = orig_alpha[(y * w + x) as usize] as f32;
-                img.get_pixel_mut(x, y)[3] = ((a / body_f) * 255.0).round().min(255.0) as u8;
+                let a = orig_alpha[row + x as usize] as f32;
+                buf[(row + x as usize) * 4 + 3] = ((a / body_f) * 255.0).round().min(255.0) as u8;
             }
         }
     };
-    restore(0, 0);
-    restore(w.saturating_sub(r), 0);
-    restore(0, h.saturating_sub(r));
-    restore(w.saturating_sub(r), h.saturating_sub(r));
+    restore(buf, 0, 0);
+    restore(buf, w.saturating_sub(r), 0);
+    restore(buf, 0, h.saturating_sub(r));
+    restore(buf, w.saturating_sub(r), h.saturating_sub(r));
 }
 
 /// Post-process a captured window whose corners are ALREADY native (delivered
@@ -250,12 +260,16 @@ pub fn add_border_native_corners(win: RgbaImage, border: u32, color: [u8; 4]) ->
     let (w, h) = (win.width(), win.height());
     let b = border as i32;
     let (cw, ch) = (w + 2 * border, h + 2 * border);
-    // Window opaque coverage (alpha as f32 0..1), indexed in window space.
+    // Window opaque coverage (alpha as f32 0..1), indexed in window space. Direct
+    // alpha-byte access instead of per-pixel `get_pixel` (DRAGON-316): a pure
+    // access-pattern change (same index `(y*w + x)*4 + 3`), output-identical.
+    let wbuf: &[u8] = &win;
+    let ww = w as usize;
     let cov = |x: i32, y: i32| -> f32 {
         if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
             0.0
         } else {
-            win.get_pixel(x as u32, y as u32)[3] as f32 / 255.0
+            wbuf[(y as usize * ww + x as usize) * 4 + 3] as f32 / 255.0
         }
     };
     // Precompute a circular offset kernel (dx, dy) with dx*dx+dy*dy <= border*border,
@@ -270,7 +284,12 @@ pub fn add_border_native_corners(win: RgbaImage, border: u32, color: [u8; 4]) ->
         }
     }
     let mut canvas = RgbaImage::new(cw, ch);
+    // Direct pixel-byte writes instead of per-pixel `get_pixel_mut` (DRAGON-316): a pure
+    // access-pattern change (same index `(cy*cw + cx)*4`), output-identical.
+    let cwsz = cw as usize;
+    let cbuf: &mut [u8] = &mut canvas;
     for cy in 0..ch as i32 {
+        let crow = cy as usize * cwsz;
         for cx in 0..cw as i32 {
             // Canvas -> window space (the window sits at offset (border, border)).
             let (wx, wy) = (cx - b, cy - b);
@@ -292,11 +311,11 @@ pub fn add_border_native_corners(win: RgbaImage, border: u32, color: [u8; 4]) ->
             // its own translucency over the wallpaper). Clamp at 0.
             let ring = (grown - self_cov).max(0.0);
             if ring > 0.0 {
-                let p = canvas.get_pixel_mut(cx as u32, cy as u32);
-                p[0] = color[0];
-                p[1] = color[1];
-                p[2] = color[2];
-                p[3] = (color[3] as f32 * ring).round() as u8;
+                let idx = (crow + cx as usize) * 4;
+                cbuf[idx] = color[0];
+                cbuf[idx + 1] = color[1];
+                cbuf[idx + 2] = color[2];
+                cbuf[idx + 3] = (color[3] as f32 * ring).round() as u8;
             }
         }
     }
@@ -368,8 +387,15 @@ pub fn trim_transparent_gutter(img: &RgbaImage, corner_radius: u32) -> (RgbaImag
     if w == 0 || h == 0 {
         return (img.clone(), (0, 0, w, h));
     }
-    let col_transparent = |x: u32| (0..h).all(|y| img.get_pixel(x, y)[3] == 0);
-    let row_transparent = |y: u32| (0..w).all(|x| img.get_pixel(x, y)[3] == 0);
+    // Direct alpha-byte reads instead of per-pixel `get_pixel` (DRAGON-316): a pure
+    // access-pattern change (same index `(y*w + x)*4 + 3`), output-identical.
+    let buf: &[u8] = img;
+    let ww = w as usize;
+    let col_transparent = |x: u32| (0..h).all(|y| buf[(y as usize * ww + x as usize) * 4 + 3] == 0);
+    let row_transparent = |y: u32| {
+        let row = y as usize * ww;
+        (0..w).all(|x| buf[(row + x as usize) * 4 + 3] == 0)
+    };
 
     // Count fully-transparent runs at each edge, scanning inward. Cap each run so the
     // opposite edge always survives (never trim the whole axis away).
@@ -575,6 +601,69 @@ mod native_border_tests {
         assert_eq!(out.as_raw(), win.as_raw(), "transparency ON returns the window untouched");
     }
 
+}
+
+/// DRAGON-316 equivalence tests: the direct-buffer rewrites of `round_corners` (and,
+/// through `finish_window_native_corners`, `opacify_body_keep_corners`) must stay
+/// PIXEL-identical to the original `get_pixel`/`get_pixel_mut` implementations. This
+/// module pins `round_corners` against an inline REFERENCE copy of the pre-rewrite
+/// algorithm, so any accidental index/arithmetic drift fails loudly. Pure image math,
+/// runs on every platform.
+#[cfg(test)]
+mod round_equiv_tests {
+    use super::*;
+
+    /// The pre-DRAGON-316 `round_corners` verbatim (per-pixel `get_pixel_mut`), used only
+    /// as the equivalence oracle for the direct-buffer rewrite.
+    fn round_corners_ref(img: &mut RgbaImage, radius: u32) {
+        let (w, h) = (img.width(), img.height());
+        let r = radius.min(w / 2).min(h / 2);
+        if r == 0 {
+            return;
+        }
+        let rf = r as f32;
+        let corners = [
+            (0u32, 0u32, rf, rf),
+            (w - r, 0, (w - r) as f32, rf),
+            (0, h - r, rf, (h - r) as f32),
+            (w - r, h - r, (w - r) as f32, (h - r) as f32),
+        ];
+        for (ox, oy, ccx, ccy) in corners {
+            for y in oy..oy + r {
+                for x in ox..ox + r {
+                    let dx = x as f32 + 0.5 - ccx;
+                    let dy = y as f32 + 0.5 - ccy;
+                    let dist = (dx * dx + dy * dy).sqrt();
+                    let cov = (rf - dist + 0.5).clamp(0.0, 1.0);
+                    let p = img.get_pixel_mut(x, y);
+                    p[3] = (p[3] as f32 * cov).round() as u8;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round_corners_matches_reference_across_sizes() {
+        // A spread of shapes/radii (incl. r==0 no-op, tiny, wide, and radius-clamped).
+        for (w, h, r) in [
+            (20u32, 20u32, 6u32),
+            (31, 17, 8),
+            (4, 4, 2),
+            (50, 10, 3),
+            (10, 10, 0),
+            (13, 40, 100), // radius clamps to min(w/2, h/2)
+        ] {
+            // A non-uniform starting alpha so the multiply is actually exercised (not just
+            // 255*cov): stripe the alpha by column.
+            let mut a = RgbaImage::from_fn(w, h, |x, _| {
+                image::Rgba([120, 30, 200, (60 + (x % 4) * 40).min(255) as u8])
+            });
+            let mut b = a.clone();
+            round_corners(&mut a, r);
+            round_corners_ref(&mut b, r);
+            assert_eq!(a.as_raw(), b.as_raw(), "round_corners differs at {w}x{h} r={r}");
+        }
+    }
 }
 
 /// DRAGON-190 trim tests — NOT macOS-gated: `trim_transparent_gutter` is platform-

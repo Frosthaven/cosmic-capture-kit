@@ -117,7 +117,9 @@ impl App {
                 Task::none()
             }
             WindowChromeMsg::Ignore => Task::none(),
-            WindowChromeMsg::KeyPressed(window, modifiers, key) => self.handle_key(window, modifiers, key),
+            WindowChromeMsg::KeyPressed(window, modifiers, key, location, text) => {
+                self.handle_key(window, modifiers, key, location, text)
+            }
             WindowChromeMsg::KeyReleased(window, modifiers, key) => {
                 // DRAGON-325: some keys are delivered only on RELEASE, never on press — most
                 // notably PrintScreen (`VK_SNAPSHOT`), which Windows delivers as `WM_KEYUP`
@@ -146,7 +148,17 @@ impl App {
                 let recorder_armed =
                     recorder_armed || self.settings.capture_hotkey_rebinding.is_some();
                 if recorder_armed {
-                    return self.handle_key(window, modifiers, key);
+                    // A routed RELEASE only ever feeds a chord recorder, which reads the logical
+                    // key alone — so the physical group is irrelevant here and `Standard` is the
+                    // honest stand-in (this path never reaches the text editor, whose numpad
+                    // predicate is the sole `Location` consumer).
+                    return self.handle_key(
+                        window,
+                        modifiers,
+                        key,
+                        cosmic::iced::keyboard::Location::Standard,
+                        None,
+                    );
                 }
                 // Push-to-talk release: re-mute the mic when the held mic key is let go.
                 if self.ptt_held
@@ -707,6 +719,15 @@ impl App {
                     // `close_preview` would issue a second destroy for a dead id.
                     if let Some(p) = self.preview_for_mut(id) {
                         p.surface_open = false;
+                        // A bake is committing the edits to disk (DRAGON-352): its own
+                        // background teardown reports Closed HERE, outside the
+                        // `update_preview` baking guard — closing the document now would
+                        // `finish_session` and exit with the bake thread mid-write.
+                        // Defer: `BakeDone` reads the flag and completes the close.
+                        if p.edit.baking {
+                            p.edit.close_after_bake = true;
+                            return Task::none();
+                        }
                     }
                     return self.close_preview(id);
                 }

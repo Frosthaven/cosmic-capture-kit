@@ -43,7 +43,14 @@ pub enum Action {
     CopyText,
     /// Select all recognized text in the region (default Ctrl+A).
     SelectAllText,
-    /// Clear the text selection (default Ctrl+Shift+A).
+    /// Clear the RECOGNIZED-text selection in the scanner overlay (default Ctrl+D).
+    ///
+    /// DESELECT IS `Ctrl+D` IN EVERY CONTEXT (DRAGON-369) — the rule, not a coincidence:
+    /// select-all was already one key everywhere ([`Self::SelectAllText`] /
+    /// [`Self::PreviewSelectAll`], both Ctrl+A), resolved by what is on screen, and deselect
+    /// simply was not following it. `Ctrl+D` is also Photoshop's Deselect. A future action that
+    /// DESELECTS something must join this key in its own context; [`Keymap::set`] de-duplicates
+    /// only WITHIN a context, so that is a no-conflict addition by construction.
     DeselectText,
     /// Region select: copy the drawn selection to the clipboard and finish
     /// (default Ctrl+C on Linux, Cmd+C on macOS).
@@ -56,7 +63,19 @@ pub enum Action {
     PreviewCopy,
     /// Preview: close without deleting (default Esc).
     PreviewCancel,
-    /// Preview: delete the file and close (default Ctrl+D).
+    /// Preview: delete the file and close (default Ctrl+Shift+X).
+    ///
+    /// WHY that chord (DRAGON-369, a deliberate pick — do not "tidy" it): this action is
+    /// `std::fs::remove_file` on the capture (both variants since DRAGON-353) — a hard unlink,
+    /// no trash, fully irreversible. It used to be `Ctrl+D`, which Photoshop spells Deselect,
+    /// so it was the one muscle-memory mismatch in the app that DESTROYS work. Of the
+    /// candidates, `Ctrl+X` was rejected as a two-key chord for an irreversible delete sitting
+    /// next to Ctrl+C/Ctrl+S (and it is the natural home of a future annotation Cut), and
+    /// `Shift+Delete` — the exact OS "delete permanently" convention — was rejected because it
+    /// is ONE modifier away from [`Self::PreviewDeleteSegment`] (plain Delete) on the very same
+    /// screen. `Ctrl+Shift+X` collides with no universal meaning and no other destructive
+    /// binding, and its awkwardness is a FEATURE. No Photoshop parity is forfeited: Photoshop
+    /// never touches your source file, so there is nothing to be faithful to here.
     PreviewDelete,
     /// Preview: open/close the covermark picker (default W).
     PreviewCovermark,
@@ -72,40 +91,71 @@ pub enum Action {
     PreviewFrameNext,
     /// Preview: delete the selected timeline segment (default Delete).
     PreviewDeleteSegment,
-    /// Preview: the POINTER (pure selection) annotation tool (default T, for poinTer/selecT —
-    /// V, the usual pick, is already the pan toggle) — DRAGON-341.
+    /// Preview: the POINTER (pure selection) annotation tool (default V — Photoshop's Move
+    /// tool) — DRAGON-341.
     PreviewAnnotPointer,
     /// Preview: select every annotation in the scene, engaging pointer mode (default Ctrl+A) —
     /// DRAGON-341.
     PreviewSelectAll,
-    /// Preview: the Arrow annotation tool (default A).
+    /// Preview: clear the annotation selection (default Ctrl+D) — DRAGON-369. The matched pair
+    /// to [`Self::PreviewSelectAll`], and Photoshop's Deselect; see [`Self::DeselectText`] for
+    /// the everywhere-we-deselect rule.
+    PreviewDeselectAll,
+    /// Preview: the Arrow annotation tool (default A). SOLO on purpose — the highest-frequency
+    /// tool in a screenshot annotator must never cost two presses (DRAGON-369).
     PreviewAnnotArrow,
-    /// Preview: the Step Marker annotation tool (default Q) — DRAGON-340. (The code calls it
-    /// the "badge" everywhere; only the user-facing label was renamed.)
+    /// Preview: the Step Marker annotation tool (default I — Photoshop's Count tool, in the
+    /// eyedropper group) — DRAGON-340. (The code calls it the "badge" everywhere; only the
+    /// user-facing label was renamed.)
     PreviewAnnotBadge,
-    /// Preview: the Box (rectangle) annotation tool (default B).
+    /// Preview: the Box (rectangle) annotation tool. UNBOUND by default (DRAGON-369) — it is
+    /// member 2 of the SHAPE slot, reached with [`Self::PreviewAnnotShapeCycle`] (`U`).
     PreviewAnnotBox,
-    /// Preview: the Highlight (multiply box) annotation tool (default H).
+    /// Preview: the Highlight (multiply box) annotation tool. UNBOUND by default (DRAGON-369) —
+    /// member 1 of the SHAPE slot ([`Self::PreviewAnnotShapeCycle`], `U`).
     PreviewAnnotHighlight,
-    /// Preview: the Box-Highlight (highlight fill + box outline) annotation tool (default G).
+    /// Preview: the Box-Highlight (highlight fill + box outline) annotation tool. UNBOUND by
+    /// default (DRAGON-369) — member 3 of the SHAPE slot
+    /// ([`Self::PreviewAnnotShapeCycle`], `U`), the slowest row to reach, so this action is
+    /// also its first-class escape hatch: bind it and the direct key wins (see
+    /// [`Action::ALL`]).
     PreviewAnnotBoxHighlight,
-    /// Preview: the Pixelate (destructive redaction) annotation tool (default M).
+    /// Preview: the Pixelate (destructive redaction) annotation tool. UNBOUND by default
+    /// (DRAGON-369) — member 1 of the REDACTION slot
+    /// ([`Self::PreviewAnnotRedactCycle`], `M`).
     PreviewAnnotPixelate,
-    /// Preview: the Blur (destructive redaction) annotation tool (default U, for "blUr").
+    /// Preview: the Blur (destructive redaction) annotation tool. UNBOUND by default
+    /// (DRAGON-369) — member 2 of the REDACTION slot
+    /// ([`Self::PreviewAnnotRedactCycle`], `M`).
     PreviewAnnotBlur,
     /// Preview: the Spotlight (dim knockout) annotation tool (default S) — DRAGON-329.
+    /// Deliberately OUTSIDE the shape slot (DRAGON-369): it is a global dim with a knockout,
+    /// not a shape drawn on the image, and it owns the Dim slider.
     PreviewAnnotSpotlight,
-    /// Preview: the freehand Pencil annotation tool (default N, for peN) — DRAGON-338.
+    /// Preview: the freehand Pencil annotation tool (default B — Photoshop's Brush slot) —
+    /// DRAGON-338.
     PreviewAnnotPen,
-    /// Preview: the Eraser (removes pen strokes; default E) — DRAGON-338.
+    /// Preview: the Text annotation tool (default T — Photoshop's Type tool) — DRAGON-354.
+    PreviewAnnotText,
+    /// Preview: the Eraser (removes pen strokes; default E) — DRAGON-338. Deliberately NOT
+    /// folded into the Pencil's slot (DRAGON-369): inking and erasing are the pair you
+    /// alternate between fastest.
     PreviewAnnotEraser,
+    /// Preview: the REDACTION tool slot — Pixelate, then Blur (default M) — DRAGON-369.
+    /// Arm-then-advance: see [`Action::ALL`]'s slot note.
+    PreviewAnnotRedactCycle,
+    /// Preview: the SHAPE tool slot — Highlight, Border, Border Highlight (default U, which IS
+    /// Photoshop's shape-tool key) — DRAGON-369. Arm-then-advance: see [`Action::ALL`]'s slot
+    /// note.
+    PreviewAnnotShapeCycle,
     /// Preview: duplicate the selected annotation, offset toward the frame center (default D).
     PreviewAnnotDuplicate,
     /// Preview: cycle the annotation stroke width to the next preset, wrapping (default L).
     PreviewAnnotStrokeCycle,
     /// Preview: open the annotation color flyout (default C).
     PreviewColorFlyout,
-    /// Preview: toggle between selection/interact and PAN (hand) mode (default V).
+    /// Preview: toggle between selection/interact and PAN (hand) mode (default H — Photoshop's
+    /// Hand tool).
     PreviewTogglePan,
     /// Recording: stop + save the in-progress recording (default Enter).
     RecordStop,
@@ -116,12 +166,35 @@ pub enum Action {
 }
 
 impl Action {
-    /// Every action, in display + match order. Preview actions are grouped so the
+    /// Every action, in display + MATCH order. Preview actions are grouped so the
     /// settings page's contiguous-group builder yields "Action Shortcuts" (save /
     /// copy / close / delete / covermark / undo / redo), then "Image Editor
     /// Shortcuts" (annotation tools / color / pan), then "Video Editor Shortcuts"
     /// (play / frame step / delete segment) — image above video.
-    pub const ALL: [Action; 35] = [
+    ///
+    /// # Tool SLOTS, and why the order here is load-bearing (DRAGON-369)
+    ///
+    /// Ten keys serve twelve annotation tools: five of them are reached through a per-slot
+    /// CYCLE action ([`Action::PreviewAnnotRedactCycle`] `M`,
+    /// [`Action::PreviewAnnotShapeCycle`] `U`) whose behaviour is **arm-then-advance** — the
+    /// slot's current member if the slot is not armed, the next member (wrapping) if it is.
+    /// A cycle action is one ordinary `Action` bound to one ordinary [`Shortcut`], exactly like
+    /// [`Action::PreviewAnnotStrokeCycle`]; there is no keymap concept behind it. Membership
+    /// and cycle ORDER come from `preview::chrome`'s declared `ANNOT_TRAY` (the tray is the
+    /// single source of truth for both), and the per-slot cursor is runtime preview state.
+    ///
+    /// **There is no timeout, and there must never be one** — Photoshop has none, and a
+    /// timeout would make one keystroke mean two different things depending on typing speed:
+    /// unexplainable to a user and untestable headless.
+    ///
+    /// **A deliberate per-tool bind always beats a slot bind.** All twelve per-tool actions
+    /// stay in this list (the five slot members simply default UNBOUND) and every one of them
+    /// is listed BEFORE the slot actions, so [`Keymap::action_for`]'s `.find()` resolves a
+    /// per-tool binding first BY CONSTRUCTION. That is what makes
+    /// [`Keymap::apply_overrides`] — which does not de-duplicate against changed defaults —
+    /// a no-op for anyone who had rebound a tool, and it gives the third member of a slot a
+    /// first-class escape hatch. Keep the ordering when adding tools.
+    pub const ALL: [Action; 39] = [
         Action::SelectAllText,
         Action::DeselectText,
         Action::CopyText,
@@ -136,6 +209,8 @@ impl Action {
         Action::PreviewRedo,
         Action::PreviewAnnotPointer,
         Action::PreviewSelectAll,
+        Action::PreviewDeselectAll,
+        // The twelve PER-TOOL actions come first — see the slot note above.
         Action::PreviewAnnotArrow,
         Action::PreviewAnnotBadge,
         Action::PreviewAnnotBox,
@@ -145,7 +220,11 @@ impl Action {
         Action::PreviewAnnotBlur,
         Action::PreviewAnnotSpotlight,
         Action::PreviewAnnotPen,
+        Action::PreviewAnnotText,
         Action::PreviewAnnotEraser,
+        // …then the SLOT cycles, so a per-tool bind always resolves first.
+        Action::PreviewAnnotRedactCycle,
+        Action::PreviewAnnotShapeCycle,
         Action::PreviewAnnotDuplicate,
         Action::PreviewAnnotStrokeCycle,
         Action::PreviewColorFlyout,
@@ -180,6 +259,7 @@ impl Action {
             Action::PreviewDeleteSegment => "Delete segment",
             Action::PreviewAnnotPointer => "Select tool",
             Action::PreviewSelectAll => "Select all annotations",
+            Action::PreviewDeselectAll => "Deselect all annotations",
             Action::PreviewAnnotArrow => "Arrow tool",
             Action::PreviewAnnotBadge => "Step marker tool",
             Action::PreviewAnnotBox => "Box tool",
@@ -189,7 +269,10 @@ impl Action {
             Action::PreviewAnnotBlur => "Blur tool",
             Action::PreviewAnnotSpotlight => "Spotlight tool",
             Action::PreviewAnnotPen => "Pencil tool",
+            Action::PreviewAnnotText => "Text tool",
             Action::PreviewAnnotEraser => "Eraser",
+            Action::PreviewAnnotRedactCycle => "Cycle redaction tools",
+            Action::PreviewAnnotShapeCycle => "Cycle shape tools",
             Action::PreviewAnnotDuplicate => "Duplicate annotation",
             Action::PreviewAnnotStrokeCycle => "Cycle line width",
             Action::PreviewColorFlyout => "Color",
@@ -225,16 +308,30 @@ impl Action {
             Action::PreviewDeleteSegment => "Delete the selected timeline segment.",
             Action::PreviewAnnotPointer => "Select, multi-select and move annotations.",
             Action::PreviewSelectAll => "Select every annotation on the image.",
+            Action::PreviewDeselectAll => "Clear the annotation selection.",
             Action::PreviewAnnotArrow => "Draw an arrow.",
             Action::PreviewAnnotBadge => "Drop a numbered step marker.",
-            Action::PreviewAnnotBox => "Draw a rectangle.",
-            Action::PreviewAnnotHighlight => "Draw a multiply-blended highlight box.",
-            Action::PreviewAnnotBoxHighlight => "Draw a highlight box with an outline.",
-            Action::PreviewAnnotPixelate => "Pixelate a region (destructive redaction).",
-            Action::PreviewAnnotBlur => "Blur a region (destructive redaction).",
+            Action::PreviewAnnotBox => "Draw a rectangle. Reached with Cycle shape tools.",
+            Action::PreviewAnnotHighlight => {
+                "Draw a multiply-blended highlight box. Reached with Cycle shape tools."
+            }
+            Action::PreviewAnnotBoxHighlight => {
+                "Draw a highlight box with an outline. Reached with Cycle shape tools."
+            }
+            Action::PreviewAnnotPixelate => {
+                "Pixelate a region (destructive redaction). Reached with Cycle redaction tools."
+            }
+            Action::PreviewAnnotBlur => {
+                "Blur a region (destructive redaction). Reached with Cycle redaction tools."
+            }
             Action::PreviewAnnotSpotlight => "Draw a spotlight that dims everything outside it.",
             Action::PreviewAnnotPen => "Draw freehand strokes.",
+            Action::PreviewAnnotText => "Add a text caption: click to type, or drag a box to wrap within.",
             Action::PreviewAnnotEraser => "Erase pen strokes by dragging over them.",
+            Action::PreviewAnnotRedactCycle => "Pixelate and blur. Press again to switch.",
+            Action::PreviewAnnotShapeCycle => {
+                "Highlight, border, and border highlight. Press again to switch."
+            }
             Action::PreviewAnnotDuplicate => "Duplicate the selected annotation.",
             Action::PreviewAnnotStrokeCycle => "Cycle the line width.",
             Action::PreviewColorFlyout => "Open the annotation color picker.",
@@ -267,6 +364,7 @@ impl Action {
             | Action::PreviewDeleteSegment => "Video Editor Shortcuts",
             Action::PreviewAnnotPointer
             | Action::PreviewSelectAll
+            | Action::PreviewDeselectAll
             | Action::PreviewAnnotArrow
             | Action::PreviewAnnotBadge
             | Action::PreviewAnnotBox
@@ -276,7 +374,10 @@ impl Action {
             | Action::PreviewAnnotBlur
             | Action::PreviewAnnotSpotlight
             | Action::PreviewAnnotPen
+            | Action::PreviewAnnotText
             | Action::PreviewAnnotEraser
+            | Action::PreviewAnnotRedactCycle
+            | Action::PreviewAnnotShapeCycle
             | Action::PreviewAnnotStrokeCycle
             | Action::PreviewAnnotDuplicate
             | Action::PreviewColorFlyout
@@ -308,6 +409,7 @@ impl Action {
             | Action::PreviewDeleteSegment
             | Action::PreviewAnnotPointer
             | Action::PreviewSelectAll
+            | Action::PreviewDeselectAll
             | Action::PreviewAnnotArrow
             | Action::PreviewAnnotBadge
             | Action::PreviewAnnotBox
@@ -317,7 +419,10 @@ impl Action {
             | Action::PreviewAnnotBlur
             | Action::PreviewAnnotSpotlight
             | Action::PreviewAnnotPen
+            | Action::PreviewAnnotText
             | Action::PreviewAnnotEraser
+            | Action::PreviewAnnotRedactCycle
+            | Action::PreviewAnnotShapeCycle
             | Action::PreviewAnnotStrokeCycle
             | Action::PreviewAnnotDuplicate
             | Action::PreviewColorFlyout
@@ -328,12 +433,18 @@ impl Action {
         }
     }
 
-    /// The factory-default binding.
-    pub fn default_shortcut(self) -> Shortcut {
-        match self {
+    /// The factory-default binding — `None` for an action that ships UNBOUND.
+    ///
+    /// The annotation-tool letters are Photoshop's wherever Photoshop has an answer
+    /// (DRAGON-369): `V` move/select, `T` type, `B` brush, `E` eraser, `U` shapes, `I` count,
+    /// `H` hand, `M` for the redaction family. The five tools that ship UNBOUND are the members
+    /// of the two cycling SLOTS — nothing is unreachable, and binding one of them back is the
+    /// documented escape hatch (see [`Action::ALL`]).
+    pub fn default_shortcut(self) -> Option<Shortcut> {
+        Some(match self {
             Action::CopyText => Shortcut::primary_char('c'),
             Action::SelectAllText => Shortcut::primary_char('a'),
-            Action::DeselectText => Shortcut::primary_shift_char('a'),
+            Action::DeselectText => Shortcut::primary_char('d'),
             Action::RegionCopy => Shortcut::primary_char('c'),
             Action::PreviewSave => Shortcut::primary_char('s'),
             Action::PreviewSaveAs => Shortcut::primary_shift_char('s'),
@@ -341,34 +452,37 @@ impl Action {
             Action::PreviewPlay => Shortcut::char('p'),
             Action::PreviewFramePrev => Shortcut::char(','),
             Action::PreviewFrameNext => Shortcut::char('.'),
-            Action::PreviewDelete => Shortcut::primary_char('d'),
+            Action::PreviewDelete => Shortcut::primary_shift_char('x'),
             Action::PreviewCancel => Shortcut::named(NamedKey::Escape),
             Action::PreviewCovermark => Shortcut::char('w'),
             Action::PreviewUndo => Shortcut::primary_char('z'),
             Action::PreviewRedo => Shortcut::primary_shift_char('z'),
             Action::PreviewDeleteSegment => Shortcut::named(NamedKey::Delete),
-            Action::PreviewAnnotPointer => Shortcut::char('t'),
+            Action::PreviewAnnotPointer => Shortcut::char('v'),
             Action::PreviewSelectAll => Shortcut::primary_char('a'),
+            Action::PreviewDeselectAll => Shortcut::primary_char('d'),
             Action::PreviewAnnotArrow => Shortcut::char('a'),
-            // Q: the annotation-tool letters are crowded (a/b/h/g/m/u/s/n/e/t/d/l/c/v all
-            // taken), and Q sits next to them on the left hand.
-            Action::PreviewAnnotBadge => Shortcut::char('q'),
-            Action::PreviewAnnotBox => Shortcut::char('b'),
-            Action::PreviewAnnotHighlight => Shortcut::char('h'),
-            Action::PreviewAnnotBoxHighlight => Shortcut::char('g'),
-            Action::PreviewAnnotPixelate => Shortcut::char('m'),
-            Action::PreviewAnnotBlur => Shortcut::char('u'),
+            Action::PreviewAnnotBadge => Shortcut::char('i'),
+            // The five SLOT members ship unbound — reached through their slot's cycle key.
+            Action::PreviewAnnotBox
+            | Action::PreviewAnnotHighlight
+            | Action::PreviewAnnotBoxHighlight
+            | Action::PreviewAnnotPixelate
+            | Action::PreviewAnnotBlur => return None,
             Action::PreviewAnnotSpotlight => Shortcut::char('s'),
-            Action::PreviewAnnotPen => Shortcut::char('n'),
+            Action::PreviewAnnotPen => Shortcut::char('b'),
+            Action::PreviewAnnotText => Shortcut::char('t'),
             Action::PreviewAnnotEraser => Shortcut::char('e'),
+            Action::PreviewAnnotRedactCycle => Shortcut::char('m'),
+            Action::PreviewAnnotShapeCycle => Shortcut::char('u'),
             Action::PreviewAnnotDuplicate => Shortcut::char('d'),
             Action::PreviewAnnotStrokeCycle => Shortcut::char('l'),
             Action::PreviewColorFlyout => Shortcut::char('c'),
-            Action::PreviewTogglePan => Shortcut::char('v'),
+            Action::PreviewTogglePan => Shortcut::char('h'),
             Action::RecordStop => Shortcut::named(NamedKey::Enter),
             Action::RecordToggleMic => Shortcut::char('m'),
             Action::RecordToggleSystemAudio => Shortcut::char('s'),
-        }
+        })
     }
 }
 
@@ -946,6 +1060,43 @@ impl Shortcut {
     }
 }
 
+/// Whether a keypress is the macOS **Emoji & Symbols** chord — ⌃⌘Space, confirmed with the
+/// owner as the trigger actually being pressed (DRAGON-361).
+///
+/// Deliberately NOT part of the editable keymap: it is a SYSTEM chord we merely recognize so
+/// the mac seam can open the palette itself (`App::preview_modal_key` → the AppKit
+/// `orderFrontCharacterPalette:` call), bypassing hotkey routing that never reaches an
+/// accessory-policy app. The check is exact — Control + Command and NOTHING else — so adding
+/// Shift or Option falls through to the normal text-edit handling instead of being swallowed.
+///
+/// The space bar has NO `Key::Named` spelling in iced's UI-Events key model (`Named` carries
+/// no `Space` variant — space is a CHARACTER key), so the match is on the character. Both
+/// spellings a Control-modified space can arrive as are accepted: the plain `" "` AppKit
+/// reports through `charactersIgnoringModifiers`, and the ASCII NUL `"\0"` that Ctrl+Space
+/// produces in the raw `characters` string — missing either would silently reinstate the bug,
+/// and neither can be confused with another key while ⌃⌘ are the exact modifiers held.
+///
+/// The OTHER system trigger — the 🌐 Globe/Fn key, the Ventura+ default — is deliberately NOT
+/// matched, because it is UNREACHABLE by construction and no predicate could help: on macOS
+/// that key never arrives as a key event at all. It surfaces only through `flagsChanged:`,
+/// where winit's `key_to_modifier` returns `None` for `NamedKey::Fn` and the event is dropped
+/// before any `KeyEvent` is built; Apple's own documentation, quoted verbatim in winit's macOS
+/// backend, says the Function key is handled "at a lower level and your app never sees" it. If
+/// a Mac is ever configured to use Globe instead, the answer has to be a UI affordance
+/// (toolbar / menu item) calling the same seam — never a hotkey hook.
+///
+/// Portable + pure ON PURPOSE (compiled everywhere, called only from the macOS arm) so the
+/// decision logic is unit-testable on Linux, where the AppKit call it guards cannot be built.
+/// Off macOS the only caller is that unit test, so the non-test build honestly declares it
+/// dead there rather than hiding behind a blanket allow.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn is_character_palette_chord(modifiers: Modifiers, key: &Key) -> bool {
+    if !(modifiers.control() && modifiers.logo() && !modifiers.alt() && !modifiers.shift()) {
+        return false;
+    }
+    matches!(key, Key::Character(c) if c.as_str() == " " || c.as_str() == "\0")
+}
+
 /// macOS (DRAGON-294): render a daemon "Start Capture" hotkey SPEC string (the form
 /// `Shortcut::daemon_spec` produces / the daemon parses — e.g. `"Cmd+Shift+2"`,
 /// `"Ctrl+Alt+K"`, `"PrintScreen"`) into the native macOS modifier SYMBOLS: Control ⌃,
@@ -1071,7 +1222,7 @@ impl Keymap {
         Keymap {
             binds: Action::ALL
                 .into_iter()
-                .map(|a| (a, Some(a.default_shortcut())))
+                .map(|a| (a, a.default_shortcut()))
                 .collect(),
         }
     }
@@ -1080,13 +1231,14 @@ impl Keymap {
     pub fn get(&self, action: Action) -> Option<Shortcut> {
         match self.binds.get(&action) {
             Some(binding) => binding.clone(),
-            None => Some(action.default_shortcut()),
+            None => action.default_shortcut(),
         }
     }
 
-    /// Whether an action is at its default binding.
+    /// Whether an action is at its default binding (an action that ships UNBOUND is at its
+    /// default while it stays unbound).
     pub fn is_default(&self, action: Action) -> bool {
-        self.get(action) == Some(action.default_shortcut())
+        self.get(action) == action.default_shortcut()
     }
 
     /// The action in `context` currently bound to `shortcut`, if any.
@@ -1146,6 +1298,13 @@ mod tests {
     use super::*;
     use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
 
+    /// An action's default binding, for the many tests that assert on a chord known to be
+    /// bound out of the box (DRAGON-369 made the default an `Option` — five slot-member tools
+    /// now ship unbound).
+    fn def(a: Action) -> Shortcut {
+        a.default_shortcut().unwrap_or_else(|| panic!("{a:?} ships unbound"))
+    }
+
     fn ch(s: &str) -> Key {
         Key::Character(s.into())
     }
@@ -1158,9 +1317,29 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     const PRIMARY: Modifiers = Modifiers::CTRL;
 
+    /// DRAGON-361: the Emoji & Symbols chord is ⌃⌘Space EXACTLY — both spellings a
+    /// Control-modified space arrives as count, and any extra modifier (or a different key)
+    /// must fall through so the text editor still sees it.
+    #[test]
+    fn character_palette_chord_is_ctrl_cmd_space_exactly() {
+        let both = Modifiers::CTRL | Modifiers::LOGO;
+        assert!(is_character_palette_chord(both, &ch(" ")));
+        assert!(is_character_palette_chord(both, &ch("\0"))); // Ctrl+Space's raw NUL
+        // Missing one half of the chord.
+        assert!(!is_character_palette_chord(Modifiers::CTRL, &ch(" ")));
+        assert!(!is_character_palette_chord(Modifiers::LOGO, &ch(" ")));
+        assert!(!is_character_palette_chord(Modifiers::empty(), &ch(" ")));
+        // An EXTRA modifier is a different chord — never swallowed.
+        assert!(!is_character_palette_chord(both | Modifiers::SHIFT, &ch(" ")));
+        assert!(!is_character_palette_chord(both | Modifiers::ALT, &ch(" ")));
+        // Right modifiers, wrong key.
+        assert!(!is_character_palette_chord(both, &ch("a")));
+        assert!(!is_character_palette_chord(both, &Key::Named(Named::Enter)));
+    }
+
     #[test]
     fn matches_is_modifier_exact_and_case_insensitive() {
-        let copy = Action::CopyText.default_shortcut(); // primary+C
+        let copy = def(Action::CopyText); // primary+C
         assert!(copy.matches(PRIMARY, &ch("c")));
         assert!(copy.matches(PRIMARY, &ch("C"))); // case-insensitive
         assert!(!copy.matches(PRIMARY | Modifiers::SHIFT, &ch("c"))); // extra modifier
@@ -1168,19 +1347,140 @@ mod tests {
         assert!(!copy.matches(PRIMARY, &ch("x"))); // wrong key
     }
 
+    /// Select-all is primary+A and DESELECT IS primary+D — in EVERY context that has one
+    /// (DRAGON-369). One key, one meaning, resolved by what is on screen; the old
+    /// primary+Shift+A deselect is retired and left UNBOUND rather than reassigned. This test
+    /// is the stated invariant: a future deselect-shaped action must join it here.
     #[test]
-    fn select_vs_deselect_disambiguate_by_shift() {
+    fn deselect_is_primary_d_in_every_context() {
         let km = Keymap::defaults();
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("a")), Some(Action::SelectAllText));
+        for (ctx, select, deselect) in [
+            (Context::Overlay, Action::SelectAllText, Action::DeselectText),
+            (Context::Preview, Action::PreviewSelectAll, Action::PreviewDeselectAll),
+        ] {
+            assert_eq!(km.action_for(ctx, PRIMARY, &ch("a")), Some(select), "{ctx:?} select-all");
+            assert_eq!(km.action_for(ctx, PRIMARY, &ch("d")), Some(deselect), "{ctx:?} deselect");
+            // The chord it replaced is freed, not reassigned.
+            assert_eq!(km.action_for(ctx, PRIMARY | Modifiers::SHIFT, &ch("a")), None, "{ctx:?}");
+        }
+        // Every action whose NAME says it deselects is on the key — the general rule, checked
+        // by enumeration so a new one cannot quietly pick something else.
+        for action in Action::ALL.into_iter().filter(|a| format!("{a:?}").contains("Deselect")) {
+            let sc = km.get(action).unwrap_or_else(|| panic!("{action:?} must be bound"));
+            assert!(sc.matches(PRIMARY, &ch("d")), "{action:?} must deselect on primary+D");
+        }
+    }
+
+    // ── DRAGON-369: the Photoshop-parity preview keymap ──────────────────────────────
+
+    /// THE tool map: ten keys, twelve tools, every letter a real Photoshop key or an
+    /// uncontested mnemonic. Asserted as a table so a future re-map is a visible diff.
+    #[test]
+    fn the_preview_tool_keys_are_the_photoshop_map() {
+        let km = Keymap::defaults();
+        let bare = Modifiers::empty();
+        for (key, action) in [
+            ("v", Action::PreviewAnnotPointer),        // PS Move
+            ("a", Action::PreviewAnnotArrow),          // solo: the highest-frequency tool
+            ("i", Action::PreviewAnnotBadge),          // PS Count
+            ("m", Action::PreviewAnnotRedactCycle),    // pixelate / blur
+            ("u", Action::PreviewAnnotShapeCycle),     // PS shape tools
+            ("s", Action::PreviewAnnotSpotlight),      // outside the shape slot on purpose
+            ("t", Action::PreviewAnnotText),           // PS Type
+            ("b", Action::PreviewAnnotPen),            // PS Brush
+            ("e", Action::PreviewAnnotEraser),         // PS Eraser
+            ("h", Action::PreviewTogglePan),           // PS Hand
+            // Unchanged neighbours that share the row.
+            ("d", Action::PreviewAnnotDuplicate),
+            ("l", Action::PreviewAnnotStrokeCycle),
+            ("c", Action::PreviewColorFlyout),
+            ("w", Action::PreviewCovermark),
+            ("p", Action::PreviewPlay),
+        ] {
+            assert_eq!(km.action_for(Context::Preview, bare, &ch(key)), Some(action), "{key}");
+        }
+        // The retired letters are FREE — left unbound for future tools, not reassigned.
+        for key in ["g", "n", "q", "y", "z", "r", "o", "j", "k"] {
+            assert_eq!(km.action_for(Context::Preview, bare, &ch(key)), None, "{key} must be free");
+        }
+        // The five slot members ship unbound — reachable only through their cycle key…
+        for tool in [
+            Action::PreviewAnnotPixelate,
+            Action::PreviewAnnotBlur,
+            Action::PreviewAnnotHighlight,
+            Action::PreviewAnnotBox,
+            Action::PreviewAnnotBoxHighlight,
+        ] {
+            assert_eq!(km.get(tool), None, "{tool:?} must ship unbound");
+            // …and "unbound" IS their default, so the settings row shows no stale reset.
+            assert!(km.is_default(tool), "{tool:?} unbound is its default");
+        }
+    }
+
+    /// The migration rule, structural: every per-TOOL action precedes both slot actions in
+    /// [`Action::ALL`], so `action_for`'s `.find()` resolves a deliberate per-tool binding
+    /// first BY CONSTRUCTION — which is also what makes `apply_overrides` (no de-duplication
+    /// against changed defaults) a no-op for anyone who had rebound a tool.
+    #[test]
+    fn a_per_tool_bind_beats_its_slot_bind() {
+        let pos = |a: Action| Action::ALL.iter().position(|x| *x == a).expect("in ALL");
+        let slots = [Action::PreviewAnnotRedactCycle, Action::PreviewAnnotShapeCycle];
+        // The twelve per-TOOL actions (one per tray tool) — the list `chrome`'s tray mirrors.
+        let tools = [
+            Action::PreviewAnnotPointer,
+            Action::PreviewAnnotArrow,
+            Action::PreviewAnnotBadge,
+            Action::PreviewAnnotPixelate,
+            Action::PreviewAnnotBlur,
+            Action::PreviewAnnotHighlight,
+            Action::PreviewAnnotBox,
+            Action::PreviewAnnotBoxHighlight,
+            Action::PreviewAnnotSpotlight,
+            Action::PreviewAnnotText,
+            Action::PreviewAnnotPen,
+            Action::PreviewAnnotEraser,
+        ];
+        for tool in tools {
+            for slot in slots {
+                assert!(pos(tool) < pos(slot), "{tool:?} must precede {slot:?} in ALL");
+            }
+        }
+        // An old config that had rebound a tool ONTO a slot key still wins there, with no
+        // de-duplication pass: the ordering alone decides.
+        let mut km = Keymap::defaults();
+        km.apply_overrides(&[(Action::PreviewAnnotBoxHighlight, Some(Shortcut::char('u')))]);
         assert_eq!(
-            km.action_for(Context::Overlay, PRIMARY | Modifiers::SHIFT, &ch("a")),
-            Some(Action::DeselectText)
+            km.action_for(Context::Preview, Modifiers::empty(), &ch("u")),
+            Some(Action::PreviewAnnotBoxHighlight)
+        );
+        // The slot action is untouched (still bound) — nothing was stolen behind the user's back.
+        assert_eq!(km.get(Action::PreviewAnnotShapeCycle), Some(Shortcut::char('u')));
+    }
+
+    /// The destructive binding moved OFF Ctrl+D (Photoshop's Deselect) to Ctrl+Shift+X, and
+    /// neither of the two chords it vacated was reassigned opportunistically — Ctrl+X stays
+    /// reserved for a future annotation Cut.
+    #[test]
+    fn delete_is_the_awkward_chord_and_the_freed_ones_stay_free() {
+        let km = Keymap::defaults();
+        let shift = PRIMARY | Modifiers::SHIFT;
+        assert_eq!(
+            km.action_for(Context::Preview, shift, &ch("x")),
+            Some(Action::PreviewDelete)
+        );
+        assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("x")), None);
+        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("x")), None);
+        // Plain Delete still belongs to the timeline, one modifier away from nothing
+        // destructive (which is why Shift+Delete was rejected for the file delete).
+        assert_eq!(
+            km.action_for(Context::Preview, Modifiers::empty(), &Key::Named(Named::Delete)),
+            Some(Action::PreviewDeleteSegment)
         );
     }
 
     #[test]
     fn named_key_matches_and_has_no_modifiers() {
-        let close = Action::PreviewCancel.default_shortcut(); // Esc
+        let close = def(Action::PreviewCancel); // Esc
         assert!(close.matches(Modifiers::empty(), &Key::Named(Named::Escape)));
         assert!(!close.matches(Modifiers::CTRL, &Key::Named(Named::Escape)));
     }
@@ -1190,16 +1490,16 @@ mod tests {
         assert!(Shortcut::from_event(PRIMARY, &Key::Named(Named::Control)).is_none());
         assert_eq!(
             Shortcut::from_event(PRIMARY, &ch("c")),
-            Some(Action::CopyText.default_shortcut())
+            Some(def(Action::CopyText))
         );
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn label_formats_modifiers() {
-        assert_eq!(Action::CopyText.default_shortcut().label(), "Ctrl+C");
-        assert_eq!(Action::DeselectText.default_shortcut().label(), "Ctrl+Shift+A");
-        assert_eq!(Action::PreviewCancel.default_shortcut().label(), "Esc");
+        assert_eq!(def(Action::CopyText).label(), "Ctrl+C");
+        assert_eq!(def(Action::DeselectText).label(), "Ctrl+D");
+        assert_eq!(def(Action::PreviewCancel).label(), "Esc");
     }
 
     /// Linux/Windows defaults use Ctrl (the primary command modifier), never logo,
@@ -1218,7 +1518,7 @@ mod tests {
             Action::PreviewUndo,
             Action::PreviewRedo,
         ] {
-            let sc = action.default_shortcut();
+            let sc = def(action);
             assert!(sc.ctrl, "{action:?} should default to Ctrl off macOS");
             assert!(!sc.logo, "{action:?} should not default to logo off macOS");
         }
@@ -1240,19 +1540,19 @@ mod tests {
             Action::PreviewUndo,
             Action::PreviewRedo,
         ] {
-            let sc = action.default_shortcut();
+            let sc = def(action);
             assert!(sc.logo, "{action:?} should default to Cmd (logo) on macOS");
             assert!(!sc.ctrl, "{action:?} should not default to Ctrl on macOS");
         }
         // The shifted chords keep Shift alongside Cmd.
-        assert!(Action::PreviewSaveAs.default_shortcut().shift);
-        assert!(Action::PreviewRedo.default_shortcut().shift);
+        assert!(def(Action::PreviewSaveAs).shift);
+        assert!(def(Action::PreviewRedo).shift);
         // Bare-key defaults stay unmodified on macOS too.
-        let play = Action::PreviewPlay.default_shortcut();
+        let play = def(Action::PreviewPlay);
         assert!(!play.ctrl && !play.logo && !play.alt && !play.shift);
         // macOS labels render the ⌘ glyph.
-        assert_eq!(Action::CopyText.default_shortcut().label(), "⌘C");
-        assert_eq!(Action::PreviewSaveAs.default_shortcut().label(), "⇧⌘S");
+        assert_eq!(def(Action::CopyText).label(), "⌘C");
+        assert_eq!(def(Action::PreviewSaveAs).label(), "⇧⌘S");
     }
 
     /// A persisted override (e.g. a Linux config carried to a Mac) is applied
@@ -1268,14 +1568,14 @@ mod tests {
         let fs = km.get(Action::SelectAllText).unwrap();
         assert!(fs.ctrl && !fs.logo, "override keeps its literal Ctrl, not the platform primary");
         // An action with no override still gets the platform default.
-        assert_eq!(km.get(Action::CopyText), Some(Action::CopyText.default_shortcut()));
+        assert_eq!(km.get(Action::CopyText), Some(def(Action::CopyText)));
     }
 
     #[test]
     fn set_steals_on_conflict() {
         let mut km = Keymap::defaults();
         // Rebind "copy" to primary+A, which "select all" already holds.
-        km.set(Action::CopyText, Action::SelectAllText.default_shortcut());
+        km.set(Action::CopyText, def(Action::SelectAllText));
         assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("a")), Some(Action::CopyText));
         // Select-all loses primary+A (now unbound); Copy's old primary+C is no longer matched.
         assert_eq!(km.get(Action::SelectAllText), None);
@@ -1317,7 +1617,7 @@ mod tests {
     /// cfg branches so a future modifier tweak can't silently diverge them.
     #[test]
     fn region_copy_default_is_primary_c() {
-        let sc = Action::RegionCopy.default_shortcut();
+        let sc = def(Action::RegionCopy);
         assert!(matches!(&sc.key, ShortcutKey::Char(c) if c == "c"));
         assert!(!sc.alt && !sc.shift);
         assert!(sc.matches(PRIMARY, &ch("c")));
@@ -1343,7 +1643,7 @@ mod tests {
         km.set(Action::RegionCopy, Shortcut::ctrl_char('y'));
         // RegionCopy moved; CopyText's primary+C in the Overlay context is untouched.
         assert_eq!(km.action_for(Context::Region, Modifiers::CTRL, &ch("y")), Some(Action::RegionCopy));
-        assert_eq!(km.get(Action::CopyText), Some(Action::CopyText.default_shortcut()));
+        assert_eq!(km.get(Action::CopyText), Some(def(Action::CopyText)));
         assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("c")), Some(Action::CopyText));
     }
 

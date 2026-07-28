@@ -34,6 +34,14 @@
 //! clipped to ZoomPan's content rect (no bleed past the flush scrollbars) and never baked;
 //! the full-resolution bake rasterizes the same scene independently.
 //!
+//! # Text rides along, in z-order (DRAGON-373)
+//! Text annotations are RASTERS (their glyphs must be pixel-identical to the bake), and they are
+//! handed to this widget as draw-only layers — one per box — rather than stacked under it, so
+//! [`draw_passes`] can interleave them with the vector runs in ITEM order. Anything drawn under
+//! this widget necessarily sits under EVERY vector, which is why bringing a caption to the front
+//! used to do nothing on screen while the export honoured it. Those layers never receive an
+//! event: hit-testing works off the item model, so input stays entirely here.
+//!
 //! # Pass-through
 //! The widget captures pointer events ONLY when it is actually acting (a drawing tool is
 //! down, or a Select gesture grabbed an item/handle). Idle hovers, wheel scroll, and
@@ -50,6 +58,7 @@ use crate::geometry::{Corner, Edge, GlobalRect};
 use cosmic::iced::core::renderer::Quad;
 use cosmic::iced::core::time::Instant;
 use cosmic::iced::core::widget::{tree, Tree};
+use cosmic::iced::core::input_method::{self, InputMethod, Purpose};
 use cosmic::iced::core::{
     Border, Clipboard, Color, Event, Layout, Length, Point, Rectangle, Shadow, Shell, Size,
     Vector, keyboard, mouse,
@@ -128,6 +137,13 @@ pub enum Tool {
     /// stroke width. Strokes that TOUCH merge into one selectable item (see
     /// `crate::app::preview::annotate::merge_connected_pens`).
     Pen,
+    /// Place a TEXT annotation (DRAGON-354): a CLICK drops an auto-sizing box at the point and
+    /// opens the in-canvas editor (blinking caret); a DRAG lays out a fixed-width box the text
+    /// wraps within. Both enter edit mode on release. A press that lands on an existing text box
+    /// re-opens IT instead of creating a new one, and (under the pointer) a double-click on a
+    /// text box re-opens editing too. Geometry is a Box-like rect; the glyphs render through the
+    /// shared embedded-font rasterizer (`crate::app::preview::text_annot`), not this widget.
+    Text,
     /// ERASE pen strokes (DRAGON-338). Not a draw tool at all: press-and-drag MARKS every pen
     /// item the eraser passes over (dimmed to ERASE_PREVIEW_ALPHA — the pending-deletion preview) and
     /// RELEASE deletes them all in one undo entry. Presses never select/move an item, so the
@@ -149,6 +165,7 @@ impl Tool {
             Tool::Pixelate => "pixelate",
             Tool::Blur => "blur",
             Tool::Pen => "pen",
+            Tool::Text => "text",
             Tool::Eraser => "eraser",
         }
     }
@@ -165,6 +182,7 @@ impl Tool {
             "pixelate" => Some(Tool::Pixelate),
             "blur" => Some(Tool::Blur),
             "pen" => Some(Tool::Pen),
+            "text" => Some(Tool::Text),
             "eraser" => Some(Tool::Eraser),
             _ => None,
         }
@@ -199,11 +217,20 @@ impl Tool {
     ///   * the PENCIL, whose tap is a deliberate round DOT (DRAGON-342);
     ///   * the STEP MARKER (`Tool::Badge`), dropped at a point and sized from the last one
     ///     placed or resized rather than from a rubber-band.
+    ///   * the TEXT tool (`Tool::Text`, DRAGON-354): a bare click drops an auto-sizing text box
+    ///     at the point and opens the editor. (A real drag instead lays out a fixed-width box —
+    ///     `Tool::Text` also `draws()`.)
     ///
     /// Every other tool still needs a real drag to make a shape, so a stray click on the canvas
     /// stays a stray click. Pure — unit-tested.
     pub fn click_places(self) -> bool {
-        matches!(self, Tool::Pen | Tool::Badge)
+        matches!(self, Tool::Pen | Tool::Badge | Tool::Text)
+    }
+
+    /// Whether this tool creates TEXT — the one tool whose press re-opens an existing text box
+    /// under the cursor (rather than always drawing a brand-new item). Pure.
+    pub fn is_text(self) -> bool {
+        matches!(self, Tool::Text)
     }
 }
 
@@ -229,12 +256,49 @@ pub fn force_new_draw(tool: Option<Tool>, ctrl: bool) -> Option<Tool> {
 ///     shape can be laid on TOP of existing ones.
 ///
 /// The eraser is not here: its press is handled earlier still (it captures immediately, with no
-/// drag threshold). Pure — unit-tested.
-pub fn draw_bypassing_items(tool: Option<Tool>, ctrl: bool) -> Option<Tool> {
+/// drag threshold).
+///
+/// `over_handle` is [`HitKind::Resize`] — a press on the selected item's resize handle, which no
+/// MODIFIER may claim ([`handle_press_beats_modifiers`], DRAGON-370). The PENCIL is deliberately
+/// checked first and is not gated by it: DRAGON-346's rule is that a pencil press is ink, full
+/// stop, and that is unconditional, not a modifier. Pure — unit-tested.
+pub fn draw_bypassing_items(tool: Option<Tool>, ctrl: bool, over_handle: bool) -> Option<Tool> {
     match tool {
         Some(Tool::Pen) => Some(Tool::Pen),
+        _ if handle_press_beats_modifiers(over_handle) => None,
         other => force_new_draw(other, ctrl),
     }
+}
+
+/// THE resize-handle rule (DRAGON-370): a press that lands on a selected item's RESIZE HANDLE
+/// starts a resize, and NO MODIFIER GATE may claim it. Every modifier path in the press ladder
+/// consults this, so there is exactly one statement of it.
+///
+/// WHY a handle is special. A handle only exists on an item that is ALREADY selected, and it is a
+/// few px across sitting on top of that item. So each thing a modifier would otherwise claim
+/// there is either a no-op or a near-impossible aim:
+///
+/// * Ctrl/Shift + pointer would TOGGLE the item into the multi-selection ([`additive_select`]) —
+///   but it is selected already, which is the only reason the handle is on screen at all.
+/// * Shift + any other tool would do the same ([`shift_selects_with_tool`]).
+/// * Ctrl + a draw tool would start a new shape on top ([`draw_bypassing_items`]) — landing that
+///   exactly on a handle rather than anywhere else on the item is not something anyone aims for.
+///
+/// What it BUYS is the DRAGON-370 override: Ctrl held during a text box's handle drag scales the
+/// TYPE instead of reflowing the box (Photoshop's paragraph-vs-point modifier). Without it the
+/// modifier could only be pressed AFTER the drag was already in flight, which is a trap — you
+/// hold Ctrl, press, and nothing happens.
+///
+/// Two things it deliberately does NOT touch, both because they are unconditional behaviours
+/// rather than modifier meanings, and the repo states each as a rule of its own:
+///
+/// * the PENCIL still inks over a handle (DRAGON-346, "a pencil press is ink, full stop");
+/// * the ERASER still sweeps over one (it captures before this whole ladder).
+///
+/// And it is about the HANDLE, not the item: a modifier press on the item's BODY still
+/// selects/toggles exactly as it did, so nothing a user could do is gone — only moved a few px.
+pub fn handle_press_beats_modifiers(over_handle: bool) -> bool {
+    over_handle
 }
 
 /// Whether the armed tool owns the WHOLE canvas for CURSOR purposes: one crosshair everywhere
@@ -243,17 +307,98 @@ pub fn draw_bypassing_items(tool: Option<Tool>, ctrl: bool) -> Option<Tool> {
 /// that bypasses hit-testing ([`draw_bypassing_items`]). The cursor must promise what the press
 /// will actually do, so this is derived from the press rule rather than restated. Pure —
 /// unit-tested.
-pub fn whole_canvas_crosshair(tool: Option<Tool>, ctrl: bool) -> bool {
-    tool.is_some_and(Tool::is_eraser) || draw_bypassing_items(tool, ctrl).is_some()
+pub fn whole_canvas_crosshair(tool: Option<Tool>, ctrl: bool, over_handle: bool) -> bool {
+    // The ERASER and the PENCIL are not gated on the handle — both genuinely act over one (see
+    // [`handle_press_beats_modifiers`]), so promising a crosshair there is still the truth.
+    // Everything else defers to [`draw_bypassing_items`], which now refuses a handle, so Ctrl +
+    // a SHAPE tool over a handle shows the resize cursor — which is what that press will do
+    // (DRAGON-370).
+    tool.is_some_and(Tool::is_eraser) || draw_bypassing_items(tool, ctrl, over_handle).is_some()
 }
 
 /// Whether a press with `tool` armed and `ctrl`/`shift` held is an ADDITIVE selection click
 /// (DRAGON-341): toggle the hit item into the multi-selection, or extend a rubber band, instead
 /// of replacing the selection. ONLY the pointer tool multi-selects — with a draw tool armed Ctrl
 /// still means "draw over what's under the cursor" ([`force_new_draw`]), so the two can never
-/// both claim the same press. Pure — unit-tested.
-pub fn additive_select(tool: Option<Tool>, ctrl: bool, shift: bool) -> bool {
-    tool.is_some_and(Tool::is_pointer) && (ctrl || shift)
+/// both claim the same press.
+///
+/// `over_handle` is [`HitKind::Resize`], which is never additive ([`handle_press_beats_modifiers`],
+/// DRAGON-370) — the item is already selected, so the toggle was a no-op anyway. Pure —
+/// unit-tested.
+pub fn additive_select(tool: Option<Tool>, ctrl: bool, shift: bool, over_handle: bool) -> bool {
+    !handle_press_beats_modifiers(over_handle)
+        && tool.is_some_and(Tool::is_pointer)
+        && (ctrl || shift)
+}
+
+/// Whether a SHIFT-press claims the press for SELECTION while a NON-pointer tool is armed
+/// (DRAGON-356): shift is the universal selection modifier, so with the pencil / text / a shape /
+/// the eraser (or the neutral state) armed a shift-press toggles the hit item into the
+/// multi-selection instead of running the tool. The POINTER tool is EXCLUDED here because it owns
+/// its own ctrl/shift path ([`additive_select`], the additive rubber band + toggle) — the two
+/// never both claim the same press. Only shift qualifies: Ctrl with a draw tool still means "draw
+/// over what's under the cursor" ([`force_new_draw`]).
+///
+/// `over_handle` is [`HitKind::Resize`], excluded for the same reason [`additive_select`] excludes
+/// it (DRAGON-370): a handle only exists on an already-selected item. Gating BOTH is what makes
+/// the rule statable as one sentence — a press on a handle resizes, full stop — instead of
+/// leaving shift meaning one thing over a handle with the pointer armed and another with the text
+/// tool armed. Pure — unit-tested.
+pub fn shift_selects_with_tool(tool: Option<Tool>, shift: bool, over_handle: bool) -> bool {
+    !handle_press_beats_modifiers(over_handle) && shift && !tool.is_some_and(Tool::is_pointer)
+}
+
+/// Whether a press belongs to the TEXT EDITOR (DRAGON-354 item 12 × DRAGON-356) — returns the
+/// edited box's id when the press BODY-hits the box that is currently being edited, else `None`.
+/// This decision runs BEFORE [`shift_selects_with_tool`], so an in-box press (shift or not) is
+/// caret placement / drag-select / shift-extend of the TEXT selection, never an annotation
+/// select/toggle. A press that misses the body (a different item, empty canvas, or the edited
+/// box's own resize handle) returns `None` and falls through to the normal gates. Pure —
+/// unit-tested.
+fn text_edit_press_target(
+    editing_text: Option<u64>,
+    hit_id: Option<u64>,
+    hit_is_body: bool,
+) -> Option<u64> {
+    editing_text.filter(|&eid| hit_is_body && hit_id == Some(eid))
+}
+
+/// Whether a plain left press with `tool` armed drops a BRAND-NEW text box WITHOUT consulting
+/// what is under the cursor (DRAGON-354 × DRAGON-364).
+///
+/// The DRAGON-364 change lives here. The text tool used to claim EVERY press over an existing
+/// text box and re-open its editor immediately, which left a settled box un-draggable and
+/// un-resizable: entering an edit arms the Text tool (`App::edit_existing_text`) and settling
+/// does not disarm it, so the very next click re-entered editing instead of grabbing a handle.
+/// Now the text tool only claims presses that are NOT over a text box; a press that IS falls
+/// through to the shared item lane, where it selects + arms move/resize exactly like the
+/// pointer tool and a DOUBLE-click re-opens the editor ([`text_body_reopens_editor`]).
+///
+/// A press over a NON-text item (a rect, an arrow) still places a new box — unchanged, and the
+/// reason this asks about text items specifically rather than "any hit". Ctrl is not consulted:
+/// Ctrl + a draw tool is [`draw_bypassing_items`]'s job, checked after this, so Ctrl-pressing an
+/// existing text box still lays a new one on top (DRAGON-339). Pure — unit-tested.
+pub fn text_press_places_new(tool: Option<Tool>, over_text_item: bool) -> bool {
+    tool.is_some_and(Tool::is_text) && !over_text_item
+}
+
+/// Whether a plain left press on an EXISTING item re-opens a text editor rather than arming a
+/// move/resize (DRAGON-354 × DRAGON-364): a text item's BODY, double-clicked.
+///
+/// Requiring the BODY is what keeps the two states usable together — a second click on a
+/// resize HANDLE is a resize, never an accidental edit. Pure — unit-tested.
+pub fn text_body_reopens_editor(is_text_item: bool, hit_is_body: bool, second_click: bool) -> bool {
+    is_text_item && hit_is_body && second_click
+}
+
+/// Whether the TEXT tool's I-beam holds at a hover (DRAGON-354 × DRAGON-364).
+///
+/// Derived from the press rule so the cursor can never promise what the press won't do: the
+/// I-beam means "this press starts text entry", which after DRAGON-364 is everywhere EXCEPT over
+/// an existing text box (where the press selects / moves / resizes). The one exception is the box
+/// currently being EDITED, whose body press really does place the caret. Pure — unit-tested.
+pub fn text_tool_ibeam(tool: Option<Tool>, over_text_item: bool, over_edited_body: bool) -> bool {
+    tool.is_some_and(Tool::is_text) && (!over_text_item || over_edited_body)
 }
 
 /// How the canvas RENDERS an item. Box/Arrow draw as vector geometry in [`draw_shapes`]; the
@@ -356,12 +501,20 @@ pub struct Item {
     /// The ordinal is derived scene-side and re-stamped on every view build, so it is never
     /// stale; the numeral's ink colour is derived here from [`Self::color`].
     pub badge: Option<u32>,
+    /// Marks a [`ItemKind::Rect`] item as a TEXT box (DRAGON-354): its glyphs are drawn by the
+    /// shared embedded-font raster layer, so [`draw_shapes`] draws NO outline for it — but it
+    /// hit-tests, chromes and resizes as the ordinary rect it is (exactly like [`Self::badge`]).
+    /// A double-click on a text box re-opens its editor.
+    pub text: bool,
 }
 
 /// A pointer gesture the canvas publishes — every point is in IMAGE SOURCE pixels
 /// (already mapped through [`CanvasMap`]), except [`Self::Menu`] which carries a
 /// widget-LOCAL point for placing the context-menu popover.
-#[derive(Clone, Copy, Debug)]
+///
+/// Not `Copy`: [`Self::ImeCommit`] carries the OS-composed string (DRAGON-359). Every
+/// variant is still constructed inline and consumed once, so `Clone` is enough.
+#[derive(Clone, Debug)]
 pub enum AnnotEvent {
     /// Plain click: select `Some(id)` (topmost hit) or deselect (`None`). REPLACES the
     /// selection.
@@ -377,10 +530,33 @@ pub enum AnnotEvent {
     DrawBegin(Tool, f32, f32),
     /// Begin manipulating the selected item (grab kind + press image point).
     GrabBegin(Grab, f32, f32),
-    /// Drag update to image point `(x, y)`.
-    GestureTo(f32, f32),
+    /// Drag update to image point `(x, y)`. `scale_type` is the DRAGON-370 override, sampled
+    /// FRESH on every motion event rather than latched at press: Ctrl held during a RESIZE means
+    /// "scale the type" — Photoshop's paragraph-vs-point-text modifier. Only a text box acts on
+    /// it (`edited_kind`); for every other kind, and for a move or a draw, it is `false` and
+    /// carries no meaning. Sampling per event is deliberately better than Photoshop: the user can
+    /// change their mind mid-drag and watch the box flip between reflowing and scaling.
+    GestureTo(f32, f32, bool),
     /// The active gesture committed (pointer released after a real drag).
     GestureEnd,
+    /// Re-open the in-canvas editor on the existing TEXT item `id` (DRAGON-354): emitted by a
+    /// press on a text box with the Text tool armed, or a double-click on one under the pointer.
+    EditText(u64),
+    /// A PRESS inside the actively-edited text box (DRAGON-354 item 12): place the caret at
+    /// image point `(x, y)`. `extend` = Shift held (extend the selection from the caret);
+    /// `word` = a double-click (select the word under the point); `all` = a TRIPLE-click (select
+    /// the whole box, the same target as Cmd/Ctrl+A). `word` and `all` are mutually exclusive.
+    TextClick { x: f32, y: f32, extend: bool, word: bool, all: bool },
+    /// A drag inside the actively-edited text box (item 12): extend the text selection to image
+    /// point `(x, y)`.
+    TextDragTo(f32, f32),
+    /// The OS input method committed a string while a text box was being edited (DRAGON-359):
+    /// insert it at the caret (replacing any selection). This is how the macOS/Windows emoji
+    /// picker and CJK composition deliver their result — the OS calls `insertText:`, winit
+    /// turns it into an `Ime::Commit`, and iced routes it here as an
+    /// [`input_method::Event::Commit`]. The in-flight (uncommitted) composition rides the
+    /// over-the-spot preedit overlay instead and never reaches the app.
+    ImeCommit(String),
     /// Right-click context menu, anchored at widget-LOCAL `(x, y)`.
     Menu(f32, f32),
 }
@@ -460,6 +636,9 @@ enum Pending {
     /// POINTER mode, pressed empty canvas (DRAGON-341): a drag rubber-bands a selection.
     /// `additive` (Ctrl/Shift at press) keeps whatever was already selected.
     Band { additive: bool },
+    /// Pressed INSIDE the actively-edited text box (DRAGON-354 item 12): a drag extends the
+    /// text selection (caret placement already emitted on press).
+    TextSelect,
 }
 
 #[derive(Default)]
@@ -485,6 +664,52 @@ struct State {
     /// When the pointer last entered the surface, driving the post-enter cursor re-assert (DRAGON-331;
     /// see [`crate::widgets::cursor_reassert`]). `None` after the pointer leaves.
     entered_at: Option<Instant>,
+    /// The last left-press that landed on an item (time + id + running consecutive-click count),
+    /// for the text-box click LADDER (DRAGON-354 item 12: double = word, triple = select all) and
+    /// the double-click-to-reopen. Cleared after a re-open fires or on any non-matching press.
+    last_click: Option<(Instant, u64, u8)>,
+    /// The IN-FLIGHT OS input-method composition (DRAGON-359), i.e. the uncommitted preedit an
+    /// IME shows while composing (CJK, dead keys). Set from `Ime::Preedit`, cleared on
+    /// `Ime::Commit`/`Ime::Disabled`. Republished into the `InputMethod::Enabled` strategy each
+    /// redraw so iced_winit paints it as an over-the-spot overlay at the cursor area — the
+    /// widget's own raster never has to splice it in. `None` when nothing is being composed.
+    preedit: Option<input_method::Preedit>,
+}
+
+/// The window within which two presses on the SAME item count as a double-click (re-open a
+/// text box for editing). Matches the tray's own double-click window for consistency.
+const TEXT_DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// What a text-edit press resolves to on the click ladder (DRAGON-354 item 12): a single click
+/// places the caret, a double selects the word under it, a triple (or more) selects the whole
+/// box. Deliberately capped at "select all" — no line/paragraph step for a 4th click.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextClickKind {
+    Caret,
+    Word,
+    All,
+}
+
+/// The running consecutive-click COUNT for a text-edit press (item 12): `same_within_window` is
+/// whether the previous press was on the SAME box within [`TEXT_DOUBLE_CLICK`], `prev_count` its
+/// running count. A same-and-in-time press advances the ladder; anything else restarts at 1.
+/// Saturates so a very fast repeated click can't wrap. Pure — unit-tested.
+fn text_click_count(same_within_window: bool, prev_count: u8) -> u8 {
+    if same_within_window {
+        prev_count.saturating_add(1)
+    } else {
+        1
+    }
+}
+
+/// Map a consecutive-click count to its [`TextClickKind`]: 1 → caret, 2 → word, ≥3 → select all.
+/// Pure — unit-tested.
+fn text_click_kind(count: u8) -> TextClickKind {
+    match count {
+        0 | 1 => TextClickKind::Caret,
+        2 => TextClickKind::Word,
+        _ => TextClickKind::All,
+    }
 }
 
 
@@ -511,6 +736,42 @@ pub struct AnnotationCanvas<'a, Msg> {
     /// The pan tool (grabby hand) is active — a press then belongs to the ZoomPan.
     pan_mode: bool,
     accent: Color,
+    /// While a text box is being EDITED (DRAGON-354): the blinking caret geometry in image
+    /// SOURCE px `(x, y_top, height)`, box-relative to the primary selection's rect. `None`
+    /// when not editing OR on a blink-off tick (the app gates the blink by passing `None`), so
+    /// the widget just draws it when present.
+    text_caret: Option<(f32, f32, f32)>,
+    /// The UN-blinked caret geometry (image SOURCE px `(x, y_top, height)`, box-relative to the
+    /// primary selection's rect) while a text box is being edited (DRAGON-359). Unlike
+    /// [`text_caret`] this is never gated by the blink, so it can drive the OS IME cursor area
+    /// (`set_ime_cursor_area`) every frame — the emoji picker / composition candidate window
+    /// anchors here. `None` when not editing.
+    ime_caret: Option<(f32, f32, f32)>,
+    /// The id of the text box currently being EDITED, if any (DRAGON-356 + DRAGON-354 item 12).
+    /// Set for the WHOLE edit (never gated by the blink, unlike [`text_caret`]), so a press can
+    /// tell an in-box click — which belongs to the TEXT EDITOR (caret placement / drag-select) —
+    /// from a click on a DIFFERENT item (a multi-select / shift-toggle). `None` when no box is
+    /// being edited.
+    editing_text: Option<u64>,
+    /// The selection-highlight rectangles of the edited box (image SOURCE px `(x0, y_top, x1,
+    /// height)`, box-relative to that box's rect) — painted as a translucent accent wash behind
+    /// the glyphs (DRAGON-354 item 12). Empty when there is no text selection.
+    text_selection: Vec<(f32, f32, f32, f32)>,
+    /// The TEXT annotations' raster layers (DRAGON-373), as `(item id, a DRAW-ONLY element)`.
+    ///
+    /// # Why the canvas draws them
+    /// Text is a raster (the glyphs must be pixel-identical to the bake, and re-rendering them
+    /// per keystroke must not churn iced's atlas — see `preview/layers.rs`), while box / arrow /
+    /// pen / badge are vector geometry drawn HERE, over everything this widget's child drew. A
+    /// raster stacked under this widget therefore sat under EVERY vector whatever its depth, so
+    /// bringing a caption to the front did nothing on screen even though the export honoured it
+    /// (`rasterize_scene` walks all kinds in ONE in-order loop). Drawing the rasters here, at
+    /// their own place in [`Self::items`], is what makes the two agree.
+    ///
+    /// They are DRAW-ONLY: never in the widget tree, never handed an event, laid out by
+    /// [`Self::draw`] against the picture rect. Hit-testing works off the item model, so input
+    /// stays entirely with this widget — an interactive sibling would swallow presses.
+    text_layers: Vec<(u64, cosmic::Element<'a, Msg>)>,
     on_event: Box<dyn Fn(AnnotEvent) -> Msg>,
 }
 
@@ -540,8 +801,70 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
             source,
             pan_mode,
             accent,
+            text_caret: None,
+            ime_caret: None,
+            editing_text: None,
+            text_selection: Vec::new(),
+            text_layers: Vec::new(),
             on_event: Box::new(on_event),
         }
+    }
+
+    /// Supply the TEXT annotations' raster layers as `(item id, draw-only element)` — see
+    /// [`Self::text_layers`]. Builder so the constructor arg list stays fixed.
+    pub fn text_layers(mut self, layers: Vec<(u64, cosmic::Element<'a, Msg>)>) -> Self {
+        self.text_layers = layers;
+        self
+    }
+
+    /// The id of the box being edited + its selection-highlight rects (DRAGON-354 item 12).
+    /// Builder so the constructor arg list stays fixed.
+    pub fn text_editing(
+        mut self,
+        editing: Option<u64>,
+        selection: Vec<(f32, f32, f32, f32)>,
+    ) -> Self {
+        self.editing_text = editing;
+        self.text_selection = selection;
+        self
+    }
+
+    /// Supply the blinking caret geometry (image SOURCE px `(x, y_top, height)`, box-relative
+    /// to the primary selection's rect) while a text box is being edited — `None` on a
+    /// blink-off tick or when not editing. Builder so the constructor arg list stays fixed.
+    pub fn text_caret(mut self, caret: Option<(f32, f32, f32)>) -> Self {
+        self.text_caret = caret;
+        self
+    }
+
+    /// Supply the UN-blinked caret geometry (image SOURCE px `(x, y_top, height)`, box-relative
+    /// to the primary selection's rect) while a text box is being edited (DRAGON-359). Same
+    /// geometry as [`text_caret`] but never gated by the blink, so it can position the OS IME
+    /// cursor area every frame. `None` when not editing. Builder so the arg list stays fixed.
+    pub fn ime_caret(mut self, caret: Option<(f32, f32, f32)>) -> Self {
+        self.ime_caret = caret;
+        self
+    }
+
+    /// The caret rectangle in GLOBAL (window-logical) coordinates for the OS IME cursor area
+    /// (DRAGON-359). Mirrors the caret DRAW: box-relative source px → canvas-local via
+    /// [`CanvasMap`], offset by the widget's bounds origin so it is window-relative like every
+    /// iced layout bound (what `set_ime_cursor_area` expects). `None` until the app supplies an
+    /// un-blinked caret for the primary text box.
+    fn ime_cursor_rect(&self, bounds: Rectangle, map: CanvasMap) -> Option<Rectangle> {
+        let (cx, cy, ch) = self.ime_caret?;
+        let primary = self.primary();
+        let &ItemKind::Rect { x, y, .. } = self
+            .items
+            .iter()
+            .find(|i| Some(i.id) == primary && i.text)
+            .map(|i| &i.kind)?
+        else {
+            return None;
+        };
+        let top = map.to_canvas((x + cx, y + cy));
+        let bot = map.to_canvas((x + cx, y + cy + ch));
+        Some(ime_cursor_rect_from(top, bot, (bounds.x, bounds.y)))
     }
 
     fn map(&self, bounds: Rectangle) -> CanvasMap {
@@ -586,6 +909,12 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         self.primary().and_then(|id| self.items.iter().find(|i| i.id == id))
     }
 
+    /// Whether `id` is a TEXT box (DRAGON-354) — the kind a press/double-click re-opens for
+    /// editing.
+    fn is_text_item(&self, id: u64) -> bool {
+        self.items.iter().any(|i| i.id == id && i.text)
+    }
+
     /// Whether freehand PEN groups may be picked up by a BODY click right now (DRAGON-341):
     /// only in POINTER mode. Ink is scribbled all over a picture and would otherwise swallow
     /// clicks meant for the shapes (and the drawing) beneath it, so outside the pointer tool a
@@ -604,6 +933,12 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
     /// press selects + moves), then empty. So an unselected item has no grabbable handles — you
     /// select it (body-click) to reveal them. In a MULTI-selection (DRAGON-341) only the primary
     /// carries handles, so a resize still edits exactly one item.
+    /// The raster layer belonging to item `id`, if it has one (DRAGON-373). A text box that is
+    /// still blank has none — there is nothing to draw — so it just rides the vector run.
+    fn text_layer_for(&self, id: u64) -> Option<&cosmic::Element<'a, Msg>> {
+        self.text_layers.iter().find(|(lid, _)| *lid == id).map(|(_, el)| el)
+    }
+
     fn hit_at(&self, map: &CanvasMap, p: (f32, f32)) -> Option<(u64, HitKind)> {
         let g = (p.0 as i32, p.1 as i32);
         // 1. The SELECTED item's HANDLES win over everything (top precedence). Handles are
@@ -915,6 +1250,8 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
             Pending::Resize(g) => return grab_cursor(g),
             // A live rubber band reads as a marquee draw (DRAGON-341).
             Pending::Band { .. } => return mouse::Interaction::Crosshair,
+            // Drag-selecting text (item 12) keeps the I-beam.
+            Pending::TextSelect => return mouse::Interaction::Text,
             _ => {}
         }
         // Fresh-enter re-assert dip (DRAGON-331; see `crate::widgets::cursor_reassert`): we claim the
@@ -934,19 +1271,39 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         if self.in_scrollbar_strip(bounds, local) {
             return child();
         }
+        let map = self.map(bounds);
+        let hit = self.hit_at(&map, local);
+        let over_handle = matches!(hit, Some((_, HitKind::Resize(_))));
         // The eraser, the PENCIL (DRAGON-346) and Ctrl + a draw tool (DRAGON-339) each own the
         // WHOLE canvas: their press never manipulates what is under it, so one crosshair holds
-        // everywhere over the content — above item bodies and resize handles included. Derived
-        // from the press rule itself ([`whole_canvas_crosshair`]) so the cursor can never
-        // promise something the press won't do.
-        if whole_canvas_crosshair(self.tool, state.mods.control()) {
+        // everywhere over the content — above item bodies and, EXCEPT for the eraser, up to but
+        // not including a selected item's resize handle (DRAGON-370: that press resizes). Derived
+        // from the press rule itself ([`whole_canvas_crosshair`]) so the cursor can never promise
+        // something the press won't do — which is why the hit test now runs first.
+        if whole_canvas_crosshair(self.tool, state.mods.control(), over_handle) {
             return mouse::Interaction::Crosshair;
+        }
+        // The TEXT tool (DRAGON-354) shows an I-beam wherever a press starts TEXT ENTRY, which
+        // since DRAGON-364 is everywhere EXCEPT over an existing text box — those presses now
+        // select / move / resize, so they wear the ordinary manipulation cursors from the match
+        // below. The box actually being EDITED keeps the I-beam over its body: that press really
+        // does place the caret. Derived through [`text_tool_ibeam`] from the press rule itself.
+        if text_tool_ibeam(
+            self.tool,
+            hit.map(|(id, _)| id).is_some_and(|id| self.is_text_item(id)),
+            text_edit_press_target(
+                self.editing_text,
+                hit.map(|(id, _)| id),
+                matches!(hit, Some((_, HitKind::Body))),
+            )
+            .is_some(),
+        ) {
+            return mouse::Interaction::Text;
         }
         // Idle hover: the selected item's handle shows its resize cursor, any item's body
         // the open-hand grab; empty canvas shows the draw crosshair when a draw tool is
         // active, else defer to the ZoomPan.
-        let map = self.map(bounds);
-        match self.hit_at(&map, local) {
+        match hit {
             Some((_, HitKind::Resize(g))) => grab_cursor(g),
             Some((_, HitKind::Body)) => mouse::Interaction::Grab,
             None => {
@@ -1010,6 +1367,67 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         // this reliably as siblings — hence the wrap). Modifiers are both tracked AND
         // forwarded (the ZoomPan tracks Alt too).
         let mut consumed = false;
+        // ── OS input-method bridge (DRAGON-359) ───────────────────────────────────────────
+        // A custom canvas editor never told the OS a text field was focused, so the emoji
+        // picker (Ctrl+Cmd+Space / fn-E on macOS) and CJK composition had nothing to target.
+        // While a text box is being edited we PUBLISH an `InputMethod::Enabled` strategy every
+        // redraw — iced_winit reads it there and calls `set_ime_allowed(true)` +
+        // `set_ime_cursor_area(caret)` — and turn the OS commit/preedit events (winit `Ime::*`,
+        // routed here as `Event::InputMethod`) into an insertion / an over-the-spot overlay.
+        // The insertion piggybacks the same `on_event` channel as every pointer gesture; the
+        // in-flight preedit lives in this widget's `State` so no app/model change is needed.
+        if self.editing_text.is_some() {
+            match event {
+                Event::Window(cosmic::iced::core::window::Event::RedrawRequested(_)) => {
+                    // Mirror `text_input`: the strategy is only harvested on the redraw pass
+                    // (`user_interface::State::Updated { input_method, .. }`), so publish here.
+                    if let Some(cursor) = self.ime_cursor_rect(bounds, map) {
+                        let state = tree.state.downcast_ref::<State>();
+                        shell.request_input_method(&InputMethod::Enabled {
+                            cursor,
+                            purpose: Purpose::Normal,
+                            preedit: state.preedit.as_ref().map(input_method::Preedit::as_ref),
+                        });
+                    }
+                }
+                Event::InputMethod(ime) => {
+                    let state = tree.state.downcast_mut::<State>();
+                    match ime {
+                        input_method::Event::Opened => {
+                            state.preedit = Some(input_method::Preedit::new());
+                        }
+                        input_method::Event::Closed => {
+                            state.preedit = None;
+                        }
+                        input_method::Event::Preedit(content, selection) => {
+                            state.preedit = Some(input_method::Preedit {
+                                content: content.clone(),
+                                selection: selection.clone(),
+                                text_size: None,
+                            });
+                        }
+                        input_method::Event::Commit(text) => {
+                            state.preedit = None;
+                            self.emit(shell, AnnotEvent::ImeCommit(text.clone()));
+                        }
+                    }
+                    // A composing/committing IME event is fully handled here; keep it off the
+                    // wrapped ZoomPan and force a redraw so the strategy + overlay refresh.
+                    shell.request_redraw();
+                    shell.capture_event();
+                    consumed = true;
+                }
+                _ => {}
+            }
+        } else {
+            // The edit session ended (settle/Escape) — possibly MID-composition, where no
+            // Ime::Closed has arrived yet. Drop any stale preedit so the next session's first
+            // publish can't flash the old composition overlay.
+            let state = tree.state.downcast_mut::<State>();
+            if state.preedit.is_some() {
+                state.preedit = None;
+            }
+        }
         {
             let state = tree.state.downcast_mut::<State>();
             // Middle-button pan tracking (DRAGON-347): mirror the ZoomPan's drag lifecycle so
@@ -1063,7 +1481,93 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                 state.press_img = map.to_image(local);
                                 state.moved = false;
                                 state.begun = false;
-                                if self.tool.is_some_and(Tool::is_eraser) {
+                                // ── Press decision matrix while a text box is being EDITED
+                                // (DRAGON-354 item 12 × DRAGON-356 reconciliation) ──────────
+                                // A press whose BODY hit is the actively-edited box belongs to
+                                // the TEXT EDITOR, and takes PRIORITY over DRAGON-356's shift
+                                // gate below: it places the caret (Shift EXTENDS the text
+                                // selection, a double-click selects the word) and arms a
+                                // drag-select. A shift-press inside the edited box therefore
+                                // extends the TEXT selection — it does NOT toggle the box in the
+                                // annotation multi-selection. Presses that DON'T body-hit the
+                                // edited box fall through: a shift-press on a DIFFERENT item (or
+                                // the edited box's own resize handle) goes to DRAGON-356's gate;
+                                // everything else to the tool gates. (Resizing a text box still
+                                // needs the pointer tool, as before — the Text tool's own press
+                                // path re-opens the editor rather than resizing.)
+                                let hit = self.hit_at(&map, local);
+                                // DRAGON-370: no MODIFIER gate may claim a press on a selected
+                                // item's RESIZE HANDLE — see [`handle_press_beats_modifiers`].
+                                // Every modifier gate below consults it, which is what lets Ctrl
+                                // be held BEFORE the press to arm the text scale override.
+                                let over_handle = matches!(hit, Some((_, HitKind::Resize(_))));
+                                let edit_body_hit = text_edit_press_target(
+                                    self.editing_text,
+                                    hit.map(|(id, _)| id),
+                                    matches!(hit, Some((_, HitKind::Body))),
+                                );
+                                if let Some(eid) = edit_body_hit {
+                                    let now = Instant::now();
+                                    // The click ladder (item 12): a same-box press within the
+                                    // window advances the count — 1 caret / 2 word / 3+ select all.
+                                    let same = state.last_click.is_some_and(|(t, lid, _)| {
+                                        lid == eid && now.duration_since(t) <= TEXT_DOUBLE_CLICK
+                                    });
+                                    let prev_count = state.last_click.map_or(0, |(_, _, c)| c);
+                                    let count = text_click_count(same, prev_count);
+                                    state.last_click = Some((now, eid, count));
+                                    let (word, all) = match text_click_kind(count) {
+                                        TextClickKind::Caret => (false, false),
+                                        TextClickKind::Word => (true, false),
+                                        TextClickKind::All => (false, true),
+                                    };
+                                    self.emit(
+                                        shell,
+                                        AnnotEvent::TextClick {
+                                            x: state.press_img.0,
+                                            y: state.press_img.1,
+                                            extend: state.mods.shift(),
+                                            word,
+                                            all,
+                                        },
+                                    );
+                                    state.pending = Pending::TextSelect;
+                                    shell.capture_event();
+                                    consumed = true;
+                                } else if shift_selects_with_tool(
+                                    self.tool,
+                                    state.mods.shift(),
+                                    over_handle,
+                                ) {
+                                    // SHIFT-SELECT FROM ANY TOOL (DRAGON-356): shift is the
+                                    // universal selection modifier, so while a NON-pointer tool
+                                    // (pencil, text, a shape, the eraser) is armed a shift-press
+                                    // claims the press for SELECTION instead of running the tool.
+                                    // The decision matrix (an in-box text edit takes priority):
+                                    //   * hit the box being EDITED  → no-op: the press belongs to
+                                    //     the text editor (caret/selection); captured so the tool
+                                    //     can't also act on it.
+                                    //   * hit any OTHER item         → TOGGLE it into the
+                                    //     multi-selection (the app settles a live edit of a
+                                    //     different box first, like a click-away). No stroke, no
+                                    //     new text box — the modifier claims the press.
+                                    //   * hit EMPTY canvas           → no-op: no draw, no band (a
+                                    //     miss must never surprise with a stroke); the event
+                                    //     forwards so the ZoomPan can still pan/scroll.
+                                    // Pen groups stay pointer-only (`pen_selectable`), so shift
+                                    // over ink with a non-pointer tool reads as empty. The armed
+                                    // tool is NEVER switched. The pointer tool keeps its own
+                                    // ctrl/shift path (`additive_select`, additive band + toggle)
+                                    // untouched below.
+                                    state.pending = Pending::None;
+                                    if let Some(hit_id) = self.topmost_at(&map, local) {
+                                        if self.editing_text != Some(hit_id) {
+                                            self.emit(shell, AnnotEvent::SelectToggle(hit_id));
+                                        }
+                                        shell.capture_event();
+                                        consumed = true;
+                                    }
+                                } else if self.tool.is_some_and(Tool::is_eraser) {
                                     // ERASER (DRAGON-338): never selects/moves — the press ITSELF
                                     // starts the sweep (so a plain CLICK on a stroke marks it,
                                     // with no drag threshold to cross) and captures immediately.
@@ -1081,8 +1585,23 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                     state.begun = true;
                                     shell.capture_event();
                                     consumed = true;
+                                } else if text_press_places_new(
+                                    self.tool,
+                                    hit.map(|(id, _)| id).is_some_and(|id| self.is_text_item(id)),
+                                ) {
+                                    // TEXT tool (DRAGON-354), press NOT over an existing text box:
+                                    // start a brand-new one WITHOUT hit-testing (a bare click
+                                    // drops an auto box, a drag lays out a fixed-width one) — the
+                                    // same lazy-draw path the pencil uses, so a click that never
+                                    // drags still settles through the click-place branch on
+                                    // release. A press that IS over a text box deliberately falls
+                                    // THROUGH to the shared item lane below (DRAGON-364), where it
+                                    // selects + arms move/resize and a double-click re-opens the
+                                    // editor — the two-state model.
+                                    self.emit(shell, AnnotEvent::Select(None));
+                                    state.pending = Pending::Draw(Tool::Text);
                                 } else if let Some(t) =
-                                    draw_bypassing_items(self.tool, state.mods.control())
+                                    draw_bypassing_items(self.tool, state.mods.control(), over_handle)
                                 {
                                     // The press DRAWS without looking at what is under it: the
                                     // pencil always (DRAGON-346 — a pencil press is ink, full
@@ -1094,12 +1613,16 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                     // click still just deselects and the ZoomPan keeps working.
                                     self.emit(shell, AnnotEvent::Select(None));
                                     state.pending = Pending::Draw(t);
-                                } else if let Some((id, hit)) = self.hit_at(&map, local) {
-                                    // An existing item is CANVAS-owned: capture + own it.
+                                } else if let Some((id, hit)) = hit {
+                                    // An existing item is CANVAS-owned: capture + own it. Since
+                                    // DRAGON-364 the TEXT tool reaches here too (over a text box),
+                                    // so this ONE lane now serves both tools: single click =
+                                    // selected-not-editing (drag + resize), double click = edit.
                                     if additive_select(
                                         self.tool,
                                         state.mods.control(),
                                         state.mods.shift(),
+                                        over_handle,
                                     ) {
                                         // POINTER + Ctrl/Shift (DRAGON-341): TOGGLE this item in
                                         // the multi-selection and stop there — a modifier click
@@ -1117,10 +1640,28 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                         }
                                         // (The pencil never reaches here — its press is handled
                                         // above and always draws, DRAGON-346.)
-                                        state.pending = match hit {
-                                            HitKind::Resize(g) => Pending::Resize(g),
-                                            HitKind::Body => Pending::Move,
-                                        };
+                                        // DOUBLE-CLICK a text box body → re-open its editor
+                                        // (DRAGON-354); otherwise arm the normal move/resize.
+                                        let now = Instant::now();
+                                        let dbl = text_body_reopens_editor(
+                                            self.is_text_item(id),
+                                            matches!(hit, HitKind::Body),
+                                            state.last_click.is_some_and(|(t, lid, _)| {
+                                                lid == id
+                                                    && now.duration_since(t) <= TEXT_DOUBLE_CLICK
+                                            }),
+                                        );
+                                        state.last_click = Some((now, id, 1));
+                                        if dbl {
+                                            self.emit(shell, AnnotEvent::EditText(id));
+                                            state.last_click = None;
+                                            state.pending = Pending::None;
+                                        } else {
+                                            state.pending = match hit {
+                                                HitKind::Resize(g) => Pending::Resize(g),
+                                                HitKind::Body => Pending::Move,
+                                            };
+                                        }
                                     }
                                     shell.capture_event();
                                     consumed = true;
@@ -1132,10 +1673,12 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                     // also lazily, so a plain click still just deselects — and
                                     // Ctrl/Shift makes it ADDITIVE (the existing selection is
                                     // kept, so nothing is deselected up front).
+                                    // Empty canvas — there is no hit at all, so no handle.
                                     let additive = additive_select(
                                         self.tool,
                                         state.mods.control(),
                                         state.mods.shift(),
+                                        false,
                                     );
                                     if !additive {
                                         self.emit(shell, AnnotEvent::Select(None));
@@ -1172,26 +1715,37 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                             self.emit(shell, AnnotEvent::DrawBegin(tool, state.press_img.0, state.press_img.1));
                                             state.begun = true;
                                         }
-                                        self.emit(shell, AnnotEvent::GestureTo(img.0, img.1));
+                                        self.emit(shell, AnnotEvent::GestureTo(img.0, img.1, false));
                                     }
                                     Pending::Move => {
                                         if !state.begun {
                                             self.emit(shell, AnnotEvent::GrabBegin(Grab::Move, state.press_img.0, state.press_img.1));
                                             state.begun = true;
                                         }
-                                        self.emit(shell, AnnotEvent::GestureTo(img.0, img.1));
+                                        self.emit(shell, AnnotEvent::GestureTo(img.0, img.1, false));
                                     }
                                     Pending::Resize(g) => {
                                         if !state.begun {
                                             self.emit(shell, AnnotEvent::GrabBegin(g, state.press_img.0, state.press_img.1));
                                             state.begun = true;
                                         }
-                                        self.emit(shell, AnnotEvent::GestureTo(img.0, img.1));
+                                        // DRAGON-370: the ONE place the override is read, and it
+                                        // is read NOW rather than remembered from the press — see
+                                        // `AnnotEvent::GestureTo`.
+                                        self.emit(
+                                            shell,
+                                            AnnotEvent::GestureTo(img.0, img.1, state.mods.control()),
+                                        );
                                     }
                                     // The rubber band publishes NOTHING while it grows — the
                                     // drawn marquee is the whole feedback, and the selection
                                     // lands in one `BoxSelect` on release (DRAGON-341).
                                     Pending::Band { .. } => state.band_to = local,
+                                    // Drag-select inside the edited text box (item 12): extend
+                                    // the text selection to the current point every motion.
+                                    Pending::TextSelect => {
+                                        self.emit(shell, AnnotEvent::TextDragTo(img.0, img.1));
+                                    }
                                     Pending::None => {}
                                 }
                                 shell.capture_event();
@@ -1287,32 +1841,54 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         // (its pixmap is image-sized), not bleed into the letterbox. `clip` (the full content
         // rect) still bounds it away from the scrollbars; the chrome/handles keep `clip` so they
         // can float outside the picture.
-        let shape_clip = {
+        // The picture's on-screen rectangle (GLOBAL coords) — the clip source above and the
+        // placement the text layers' `dest` fractions are relative to.
+        let picture = {
             let a = map.to_canvas((0.0, 0.0));
             let b = map.to_canvas((map.source.0, map.source.1));
-            let img = Rectangle {
+            Rectangle {
                 x: ox + a.0.min(b.0),
                 y: oy + a.1.min(b.1),
                 width: (b.0 - a.0).abs(),
                 height: (b.1 - a.1).abs(),
-            };
-            img.intersection(&clip)
-                .unwrap_or(Rectangle { x: 0.0, y: 0.0, width: 0.0, height: 0.0 })
+            }
         };
-        // 2. The committed shapes as TRUE VECTOR geometry (crisp at any zoom), CLIPPED to the
-        //    IMAGE rect. A canvas `Frame` builds the geometry in widget-LOCAL coords; the
-        //    `with_translation` maps it to global, and iced scissors the geometry to the
-        //    surrounding `with_layer` clip. Vector redraw each frame = no atlas churn = no
-        //    flicker (the whole reason the raster display layer was retired).
-        if !self.items.is_empty() {
-            renderer.with_layer(shape_clip, |renderer| {
-                let mut frame = canvas::Frame::new(renderer, Size::new(bounds.width, bounds.height));
-                draw_shapes(&mut frame, &map, &self.items);
-                let geometry = frame.into_geometry();
-                renderer.with_translation(Vector::new(ox, oy), |renderer| {
-                    renderer.draw_geometry(geometry);
-                });
-            });
+        let shape_clip = picture
+            .intersection(&clip)
+            .unwrap_or(Rectangle { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
+        // 2. The committed scene IN ITEM ORDER, CLIPPED to the IMAGE rect: runs of vector
+        //    geometry (crisp at any zoom) with each TEXT item's raster layer drawn at its own
+        //    place between them (DRAGON-373). A canvas `Frame` builds the geometry in
+        //    widget-LOCAL coords; the `with_translation` maps it to global, and iced scissors the
+        //    geometry to the surrounding `with_layer` clip. Vector redraw each frame = no atlas
+        //    churn = no flicker (the whole reason the raster display layer was retired).
+        //
+        //    WHY each run gets its own `with_layer`: within ONE iced layer the primitive TYPES
+        //    draw in a fixed order (quads, then geometry, then shader primitives, then images,
+        //    then text) — submission order does NOT decide it. A layer BOUNDARY does, and iced's
+        //    layer merge only fuses neighbours whose type ranges already agree, so the order
+        //    written here is the order drawn. That is what lets a rectangle sit over one caption
+        //    and under another, exactly as `rasterize_scene` bakes it.
+        for pass in draw_passes(&self.items, |id| self.text_layer_for(id).is_some()) {
+            match pass {
+                DrawPass::Shapes(from, to) => {
+                    let run = &self.items[from..to];
+                    renderer.with_layer(shape_clip, |renderer| {
+                        let mut frame =
+                            canvas::Frame::new(renderer, Size::new(bounds.width, bounds.height));
+                        draw_shapes(&mut frame, &map, run);
+                        let geometry = frame.into_geometry();
+                        renderer.with_translation(Vector::new(ox, oy), |renderer| {
+                            renderer.draw_geometry(geometry);
+                        });
+                    });
+                }
+                DrawPass::TextLayer(i) => {
+                    if let Some(layer) = self.text_layer_for(self.items[i].id) {
+                        draw_placed(layer, renderer, theme, style, picture, shape_clip, viewport);
+                    }
+                }
+            }
         }
         // 3. The annotation CHROME (selection boxes + the primary's handles) and the pointer's
         //    rubber band on top — same content clip. Every SELECTED item gets the dashed
@@ -1409,7 +1985,144 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                     ItemKind::Path { .. } => {}
                 }
             }
+            // The text SELECTION highlight (DRAGON-354 item 12): a translucent accent wash over
+            // the selected glyphs, box-relative to the primary text item's rect (source px →
+            // canvas). Drawn BEFORE the caret so the caret stays crisp on top.
+            if !self.text_selection.is_empty()
+                && let Some(&ItemKind::Rect { x, y, .. }) = self
+                    .items
+                    .iter()
+                    .find(|i| Some(i.id) == primary && i.text)
+                    .map(|i| &i.kind)
+            {
+                let mut wash = accent;
+                wash.a = 0.30;
+                for (x0, yt, x1, h) in self.text_selection.iter().copied() {
+                    let tl = map.to_canvas((x + x0, y + yt));
+                    let br = map.to_canvas((x + x1, y + yt + h));
+                    fill(
+                        tl.0.min(br.0),
+                        tl.1.min(br.1),
+                        (br.0 - tl.0).abs(),
+                        (br.1 - tl.1).abs(),
+                        wash,
+                        0.0,
+                    );
+                }
+            }
+            // The blinking text caret (DRAGON-354): a thin accent bar, box-relative to the
+            // primary text item's rect (source px → canvas). Present only on a blink-on tick
+            // while editing (the app gates the blink by passing `None`).
+            if let Some((cx, cy, ch)) = self.text_caret
+                && let Some(&ItemKind::Rect { x, y, .. }) = self
+                    .items
+                    .iter()
+                    .find(|i| Some(i.id) == primary && i.text)
+                    .map(|i| &i.kind)
+            {
+                let top = map.to_canvas((x + cx, y + cy));
+                let bot = map.to_canvas((x + cx, y + cy + ch));
+                let h = (bot.1 - top.1).abs().max(2.0);
+                fill(top.0, top.1.min(bot.1), 1.5, h, accent, 0.0);
+            }
         });
+    }
+}
+
+/// One pass of the committed scene's draw (DRAGON-373), in ITEM order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DrawPass {
+    /// The half-open item range `from..to`, drawn as ONE batch of vector geometry.
+    Shapes(usize, usize),
+    /// The text annotation at this index, drawn as its own raster layer.
+    TextLayer(usize),
+}
+
+/// Split the scene into draw passes: maximal runs of vector items, with each text item that
+/// OWNS a raster layer (`has_layer`) standing alone between them.
+///
+/// This is the z-order fix in one function. The vector kinds are drawn by this widget and the
+/// text kinds are rasters; drawing all of one and then all of the other — which is what a raster
+/// layer stacked under the canvas amounts to — pins every text box either above or below every
+/// vector, so bringing a caption to the front had no effect on screen even though the export
+/// honoured it (`rasterize_scene` walks every kind in ONE in-order loop). Splitting at each text
+/// item and drawing the passes in order reproduces that loop exactly, so live and bake agree at
+/// any depth, in any arrangement.
+///
+/// A text box with no layer (still blank — nothing to draw) stays inside the surrounding vector
+/// run: `draw_shapes` skips it anyway, and not splitting there keeps a scene with no text on
+/// exactly ONE pass, as it was before. Pure — unit-tested.
+fn draw_passes(items: &[Item], has_layer: impl Fn(u64) -> bool) -> Vec<DrawPass> {
+    let mut passes = Vec::new();
+    let mut run_start = 0usize;
+    for (i, item) in items.iter().enumerate() {
+        if !has_layer(item.id) {
+            continue;
+        }
+        if i > run_start {
+            passes.push(DrawPass::Shapes(run_start, i));
+        }
+        passes.push(DrawPass::TextLayer(i));
+        run_start = i + 1;
+    }
+    if items.len() > run_start {
+        passes.push(DrawPass::Shapes(run_start, items.len()));
+    }
+    passes
+}
+
+/// Draw one DRAW-ONLY element (a text annotation's raster layer, DRAGON-373) over `place` —
+/// the picture's on-screen rectangle — clipped to `clip`.
+///
+/// The element is not in the widget tree (see [`AnnotationCanvas::text_layers`]): it is laid out
+/// here, against the picture rather than by a parent, and handed a throwaway state tree. That is
+/// sound precisely because it is draw-only — a `LayerStack` shader program is stateless
+/// (`State = ()`), it is never sent an event, and its GPU textures live in iced's per-process
+/// pipeline storage keyed by `LayerKey`, not in the widget tree. Placing it here is also what
+/// makes the placement right: the fractions in `Layer::dest` are fractions of the PICTURE, and
+/// `place` is that picture under the current zoom/pan (the same [`CanvasMap`] the vectors use),
+/// so the raster and the geometry can never drift apart.
+fn draw_placed<Msg>(
+    element: &cosmic::Element<'_, Msg>,
+    renderer: &mut cosmic::Renderer,
+    theme: &cosmic::Theme,
+    style: &cosmic::iced::core::renderer::Style,
+    place: Rectangle,
+    clip: Rectangle,
+    viewport: &Rectangle,
+) {
+    use cosmic::iced::core::Renderer as _;
+    use cosmic::iced::core::layout;
+    if place.width <= 0.0 || place.height <= 0.0 || clip.width <= 0.0 || clip.height <= 0.0 {
+        return;
+    }
+    let node = layout::Node::new(Size::new(place.width, place.height))
+        .move_to(Point::new(place.x, place.y));
+    let layout = Layout::new(&node);
+    let tree = Tree::new(element.as_widget());
+    renderer.with_layer(clip, |renderer| {
+        element.as_widget().draw(
+            &tree,
+            renderer,
+            theme,
+            style,
+            layout,
+            mouse::Cursor::Unavailable,
+            viewport,
+        );
+    });
+}
+
+/// Assemble the OS IME cursor rectangle in WINDOW-GLOBAL coords (DRAGON-359) from the caret's
+/// top/bottom canvas-LOCAL endpoints and the widget's bounds origin. Pure so the offset +
+/// normalization (top = the smaller y; a non-negative height floored to 2px so a degenerate
+/// caret still gives the OS a real anchor) is unit-testable away from the widget tree.
+fn ime_cursor_rect_from(top: (f32, f32), bot: (f32, f32), origin: (f32, f32)) -> Rectangle {
+    Rectangle {
+        x: origin.0 + top.0,
+        y: origin.1 + top.1.min(bot.1),
+        width: 2.0,
+        height: (bot.1 - top.1).abs().max(2.0),
     }
 }
 
@@ -1479,6 +2192,12 @@ fn draw_shapes(frame: &mut canvas::Frame, map: &CanvasMap, items: &[Item]) {
         // scaling the bake applies with its raster scale — see `crate::badge`.
         if let (Some(number), &ItemKind::Rect { x, y, w, h }) = (item.badge, &item.kind) {
             draw_badge(frame, map, (x, y, w, h), number, item.stroke_w, item.color, iss);
+            continue;
+        }
+        // A TEXT box (DRAGON-354) renders its glyphs through the shared embedded-font raster
+        // layer, so this widget draws NO outline for it (only its selection/edit chrome, drawn
+        // separately). Same skip as the shader-drawn effect kinds above.
+        if item.text {
             continue;
         }
         match &item.kind {
@@ -1691,7 +2410,98 @@ impl<'a, Msg: Clone + 'static> From<AnnotationCanvas<'a, Msg>> for cosmic::Eleme
 
 #[cfg(test)]
 mod tests {
+    // ── DRAGON-373: text draws at its own depth, not above (or below) every vector ──────
+
+    /// A scene of `n` items where those in `text` are TEXT boxes, in item (z) order.
+    fn z_scene(n: u64, text: &[u64]) -> Vec<super::Item> {
+        (0..n)
+            .map(|id| super::Item {
+                id,
+                kind: super::ItemKind::Rect { x: 0.0, y: 0.0, w: 10.0, h: 10.0 },
+                stroke_w: 1.0,
+                color: super::Color::WHITE,
+                fill: None,
+                fx: super::FxKind::None,
+                curve_radius: 0.0,
+                badge: None,
+                text: text.contains(&id),
+            })
+            .collect()
+    }
+
+    /// The reported bug, as a draw order: a rectangle between two captions must be drawn AFTER
+    /// the one it covers and BEFORE the one that covers it. A single text layer (however it is
+    /// stacked) cannot express that — it draws all text at one depth — which is why the layers
+    /// are per box and the canvas splits its geometry around each one.
+    #[test]
+    fn a_vector_between_two_captions_draws_between_them() {
+        use super::DrawPass::*;
+        // text(0), rect(1), text(2), rect(3), rect(4)
+        let items = z_scene(5, &[0, 2]);
+        let passes = super::draw_passes(&items, |id| id == 0 || id == 2);
+        assert_eq!(passes, vec![TextLayer(0), Shapes(1, 2), TextLayer(2), Shapes(3, 5)]);
+    }
+
+    /// The general invariant that makes live and bake agree: the passes visit EVERY item exactly
+    /// once, in item order — the same single in-order walk `rasterize_scene` bakes with. So any
+    /// arrangement of any depth is drawn the way it exports, not just the reported one.
+    #[test]
+    fn the_passes_cover_every_item_exactly_once_in_scene_order() {
+        for text in [
+            vec![],
+            vec![0],
+            vec![3],
+            vec![0, 1, 2, 3],
+            vec![1, 2],
+            vec![0, 3],
+        ] {
+            let items = z_scene(4, &text);
+            let passes = super::draw_passes(&items, |id| text.contains(&id));
+            let visited: Vec<usize> = passes
+                .iter()
+                .flat_map(|p| match *p {
+                    super::DrawPass::Shapes(a, b) => (a..b).collect::<Vec<_>>(),
+                    super::DrawPass::TextLayer(i) => vec![i],
+                })
+                .collect();
+            assert_eq!(visited, (0..items.len()).collect::<Vec<_>>(), "text at {text:?}");
+        }
+    }
+
+    /// A scene with no text (or with a blank box, which owns no raster) keeps the historical
+    /// SINGLE geometry pass — the default path stays exactly what it was.
+    #[test]
+    fn a_scene_without_text_layers_is_one_pass() {
+        let items = z_scene(4, &[2]);
+        // The text box at index 2 is still blank, so it has no layer: one run covers everything
+        // (`draw_shapes` skips text items itself).
+        assert_eq!(super::draw_passes(&items, |_| false), vec![super::DrawPass::Shapes(0, 4)]);
+        assert!(super::draw_passes(&[], |_| false).is_empty(), "an empty scene draws nothing");
+    }
+
     use super::*;
+
+    /// DRAGON-354 item 12: the text-edit click ladder. A same-box, in-window press advances the
+    /// count (caret → word → select-all, capped); anything else restarts at a single caret click.
+    #[test]
+    fn text_click_ladder_caret_word_all() {
+        // A fresh press (nothing before, or out of window / different box) is a single caret click.
+        assert_eq!(text_click_count(false, 0), 1);
+        assert_eq!(text_click_kind(text_click_count(false, 0)), TextClickKind::Caret);
+        // Second same-box in-window press → word.
+        let c2 = text_click_count(true, 1);
+        assert_eq!(c2, 2);
+        assert_eq!(text_click_kind(c2), TextClickKind::Word);
+        // Third → select all, and it STAYS select-all for a fourth (no line/paragraph step).
+        let c3 = text_click_count(true, c2);
+        assert_eq!(text_click_kind(c3), TextClickKind::All);
+        let c4 = text_click_count(true, c3);
+        assert_eq!(text_click_kind(c4), TextClickKind::All);
+        // A gap (different box or too slow) restarts the ladder at a single caret click.
+        assert_eq!(text_click_kind(text_click_count(false, c4)), TextClickKind::Caret);
+        // The count saturates rather than wrapping on a very long same-box burst.
+        assert_eq!(text_click_count(true, u8::MAX), u8::MAX);
+    }
 
     fn map(bounds: (f32, f32), zoom: f32, pan: (f32, f32), disp: (f32, f32), source: (f32, f32)) -> CanvasMap {
         CanvasMap { bounds, zoom, pan, disp, source }
@@ -1699,6 +2509,27 @@ mod tests {
 
     fn assert_close(a: (f32, f32), b: (f32, f32), eps: f32, what: &str) {
         assert!((a.0 - b.0).abs() < eps && (a.1 - b.1).abs() < eps, "{what}: {a:?} vs {b:?}");
+    }
+
+    /// DRAGON-359: the OS IME cursor rect offsets caret-local coords by the widget bounds
+    /// origin (so it is window-global like `set_ime_cursor_area` expects), takes the SMALLER y
+    /// as the top, and floors the height to a real anchor even for a degenerate caret.
+    #[test]
+    fn ime_cursor_rect_offsets_and_normalizes() {
+        // Normal caret: top above bottom, bounds origin added.
+        let r = ime_cursor_rect_from((10.0, 20.0), (10.0, 44.0), (100.0, 200.0));
+        assert_eq!((r.x, r.y), (110.0, 220.0));
+        assert!((r.height - 24.0).abs() < 1e-3, "height {}", r.height);
+        assert!((r.width - 2.0).abs() < 1e-3);
+
+        // Inverted endpoints (top y > bottom y): the min is still the rect top.
+        let r = ime_cursor_rect_from((5.0, 60.0), (5.0, 30.0), (0.0, 0.0));
+        assert_eq!(r.y, 30.0);
+        assert!((r.height - 30.0).abs() < 1e-3);
+
+        // Degenerate (zero-height) caret still yields the 2px floor so the OS gets an anchor.
+        let r = ime_cursor_rect_from((0.0, 8.0), (0.0, 8.0), (0.0, 0.0));
+        assert!((r.height - 2.0).abs() < 1e-3, "floored height {}", r.height);
     }
 
     /// Round-trip: to_canvas(to_image(p)) == p, across zoom/pan/non-square fits.
@@ -1782,6 +2613,7 @@ mod tests {
             fx: FxKind::None,
             curve_radius: 8.0,
             badge: None,
+            text: false,
         };
         let make = |selected: Vec<u64>| {
             AnnotationCanvas::new(
@@ -1962,6 +2794,7 @@ mod tests {
             fx: FxKind::None,
             curve_radius: 8.0,
             badge: None,
+            text: false,
         };
         let make = |tool: Option<Tool>| {
             AnnotationCanvas::new(
@@ -2013,6 +2846,7 @@ mod tests {
             fx: FxKind::None,
             curve_radius: 8.0,
             badge: None,
+            text: false,
         };
         let canvas = AnnotationCanvas::new(
             cosmic::widget::Space::new(),
@@ -2081,20 +2915,37 @@ mod tests {
         // the press arm takes BEFORE `hit_at`, so a Some(_) here means the item under the cursor
         // is never looked at — the press can only ever emit Select(None) + arm the draw, never
         // Select(Some(id)) and never a Move/Resize grab.
-        assert_eq!(draw_bypassing_items(Some(Tool::Pen), false), Some(Tool::Pen), "plain pencil inks");
-        assert_eq!(draw_bypassing_items(Some(Tool::Pen), true), Some(Tool::Pen), "ctrl changes nothing");
+        assert_eq!(draw_bypassing_items(Some(Tool::Pen), false, false), Some(Tool::Pen), "plain pencil inks");
+        assert_eq!(draw_bypassing_items(Some(Tool::Pen), true, false), Some(Tool::Pen), "ctrl changes nothing");
         // Every SHAPE tool keeps press-selects: it hit-tests unless Ctrl is held (DRAGON-339).
         for t in [Tool::Rect, Tool::Arrow, Tool::Highlight, Tool::BoxHighlight, Tool::Spotlight, Tool::Pixelate, Tool::Blur] {
-            assert_eq!(draw_bypassing_items(Some(t), false), None, "{t:?} presses select as before");
-            assert_eq!(draw_bypassing_items(Some(t), true), Some(t), "{t:?} + ctrl draws over items");
+            assert_eq!(draw_bypassing_items(Some(t), false, false), None, "{t:?} presses select as before");
+            assert_eq!(draw_bypassing_items(Some(t), true, false), Some(t), "{t:?} + ctrl draws over items");
         }
         // The pointer and the neutral state always hit-test (the pointer IS selection); the
         // eraser never reaches this branch (handled earlier), so it must not claim one here.
         for t in [None, Some(Tool::Pointer), Some(Tool::Eraser)] {
             for ctrl in [false, true] {
-                assert_eq!(draw_bypassing_items(t, ctrl), None, "{t:?} ctrl={ctrl} hit-tests");
+                assert_eq!(draw_bypassing_items(t, ctrl, false), None, "{t:?} ctrl={ctrl} hit-tests");
             }
         }
+        // DRAGON-370: over a selected item's RESIZE HANDLE the Ctrl override stops claiming the
+        // press, so it can arm the text scale modifier instead. The PENCIL is untouched — its
+        // bypass is unconditional (DRAGON-346), not a modifier meaning.
+        for t in [None, Some(Tool::Pointer), Some(Tool::Rect), Some(Tool::Text)] {
+            for ctrl in [false, true] {
+                assert_eq!(
+                    draw_bypassing_items(t, ctrl, true),
+                    None,
+                    "{t:?} ctrl={ctrl}: a handle press must resize",
+                );
+            }
+        }
+        assert_eq!(
+            draw_bypassing_items(Some(Tool::Pen), false, true),
+            Some(Tool::Pen),
+            "the pencil still inks over a handle — DRAGON-346 is unconditional",
+        );
     }
 
     #[test]
@@ -2102,18 +2953,34 @@ mod tests {
         // DRAGON-346: with the pencil armed the crosshair must hold EVERYWHERE — over an item's
         // body (which used to show the open-hand grab, promising a move that never happened) and
         // over the selected item's resize handles too, since neither is reachable any more.
-        assert!(whole_canvas_crosshair(Some(Tool::Pen), false), "the pencil owns the whole canvas");
-        assert!(whole_canvas_crosshair(Some(Tool::Pen), true));
-        assert!(whole_canvas_crosshair(Some(Tool::Eraser), false), "so does the eraser");
+        assert!(whole_canvas_crosshair(Some(Tool::Pen), false, false), "the pencil owns the whole canvas");
+        assert!(whole_canvas_crosshair(Some(Tool::Pen), true, false));
+        assert!(whole_canvas_crosshair(Some(Tool::Eraser), false, false), "so does the eraser");
         // A shape tool shows per-item cursors until Ctrl flips it to draw-over-anything.
-        assert!(!whole_canvas_crosshair(Some(Tool::Rect), false));
-        assert!(whole_canvas_crosshair(Some(Tool::Rect), true));
+        assert!(!whole_canvas_crosshair(Some(Tool::Rect), false, false));
+        assert!(whole_canvas_crosshair(Some(Tool::Rect), true, false));
         // The pointer and the neutral state always show the per-item cursors.
         for t in [None, Some(Tool::Pointer)] {
             for ctrl in [false, true] {
-                assert!(!whole_canvas_crosshair(t, ctrl), "{t:?} ctrl={ctrl} keeps item cursors");
+                assert!(!whole_canvas_crosshair(t, ctrl, false), "{t:?} ctrl={ctrl} keeps item cursors");
             }
         }
+        // DRAGON-370 — the invariant, restated where the handle rule now bites: Ctrl + a SHAPE
+        // tool over a RESIZE HANDLE will resize, so the crosshair must stop being promised there.
+        // This is the whole reason `whole_canvas_crosshair` is derived from the press rule rather
+        // than written out twice.
+        for t in [Some(Tool::Rect), Some(Tool::Text), Some(Tool::Pointer), None] {
+            for ctrl in [false, true] {
+                assert!(
+                    !whole_canvas_crosshair(t, ctrl, true),
+                    "{t:?} ctrl={ctrl}: promised a crosshair over a handle the press will resize",
+                );
+            }
+        }
+        // The PENCIL and the ERASER genuinely still act over a handle (their bypass is
+        // unconditional, not a modifier), so their crosshair stays the truth there.
+        assert!(whole_canvas_crosshair(Some(Tool::Pen), false, true), "the pencil still inks");
+        assert!(whole_canvas_crosshair(Some(Tool::Eraser), false, true), "the eraser still sweeps");
     }
 
     #[test]
@@ -2131,6 +2998,7 @@ mod tests {
             fx: FxKind::None,
             curve_radius: 8.0,
             badge: None,
+            text: false,
         };
         let make = |tool: Option<Tool>, selection: Vec<u64>| {
             AnnotationCanvas::new(
@@ -2155,28 +3023,88 @@ mod tests {
         assert!(matches!(selected.hit_at(&cmap, (8.0, 8.0)), Some((3, HitKind::Resize(_)))));
         // ...but with the PENCIL armed the press bypasses hit-testing entirely, so neither the
         // body nor the handle can be reached, and the cursor says so.
-        assert_eq!(draw_bypassing_items(Some(Tool::Pen), false), Some(Tool::Pen));
-        assert!(whole_canvas_crosshair(Some(Tool::Pen), false));
+        assert_eq!(draw_bypassing_items(Some(Tool::Pen), false, false), Some(Tool::Pen));
+        assert!(whole_canvas_crosshair(Some(Tool::Pen), false, false));
+        // ...and DRAGON-370 does not carve the pencil out: its bypass is unconditional, so it
+        // still inks over the handle too. Only the CTRL override defers there.
+        assert_eq!(draw_bypassing_items(Some(Tool::Pen), false, true), Some(Tool::Pen));
+        assert!(whole_canvas_crosshair(Some(Tool::Pen), false, true));
+        assert_eq!(draw_bypassing_items(Some(Tool::Rect), true, true), None, "ctrl defers");
     }
 
     #[test]
     fn additive_select_is_pointer_only_and_never_fights_ctrl_draw() {
         // DRAGON-341 × DRAGON-339: Ctrl means "multi-select" in POINTER mode and "draw over
         // whatever is under the cursor" with a draw tool — never both for one press.
-        assert!(additive_select(Some(Tool::Pointer), true, false), "ctrl-click adds");
-        assert!(additive_select(Some(Tool::Pointer), false, true), "shift-click adds");
-        assert!(!additive_select(Some(Tool::Pointer), false, false), "a plain click replaces");
+        assert!(additive_select(Some(Tool::Pointer), true, false, false), "ctrl-click adds");
+        assert!(additive_select(Some(Tool::Pointer), false, true, false), "shift-click adds");
+        assert!(!additive_select(Some(Tool::Pointer), false, false, false), "a plain click replaces");
         for t in [Tool::Rect, Tool::Arrow, Tool::Pen, Tool::Eraser] {
-            assert!(!additive_select(Some(t), true, true), "{t:?} never multi-selects");
+            assert!(!additive_select(Some(t), true, true, false), "{t:?} never multi-selects");
         }
-        assert!(!additive_select(None, true, true), "the neutral state never multi-selects");
+        assert!(!additive_select(None, true, true, false), "the neutral state never multi-selects");
         // The two Ctrl meanings are mutually exclusive for every tool.
         for t in [None, Some(Tool::Pointer), Some(Tool::Rect), Some(Tool::Pen), Some(Tool::Eraser)] {
             assert!(
-                !(additive_select(t, true, false) && force_new_draw(t, true).is_some()),
+                !(additive_select(t, true, false, false) && force_new_draw(t, true).is_some()),
                 "{t:?}: ctrl must claim exactly one meaning"
             );
         }
+        // DRAGON-370 adds a THIRD Ctrl meaning — "scale the type" during a text box's handle
+        // drag — and the rule that keeps all three from colliding is positional, not modal: over
+        // a RESIZE HANDLE the press resizes and no modifier gate fires at all. So Ctrl still
+        // claims exactly one meaning per press, now per (tool, what is under the cursor).
+        for t in [None, Some(Tool::Pointer), Some(Tool::Rect), Some(Tool::Text)] {
+            for shift in [false, true] {
+                assert!(
+                    !additive_select(t, true, shift, true),
+                    "{t:?}: a handle press must resize, not toggle the selection",
+                );
+            }
+            assert!(
+                !(additive_select(t, true, false, true)
+                    || draw_bypassing_items(t, true, true).is_some()
+                    || shift_selects_with_tool(t, true, true)),
+                "{t:?}: no MODIFIER gate may claim a handle press",
+            );
+        }
+        // …and the handle exclusion is exactly that — positional. The item's BODY is untouched,
+        // so nothing the user could previously do with a modifier is gone, only moved a few px.
+        assert!(additive_select(Some(Tool::Pointer), true, false, false));
+        assert!(shift_selects_with_tool(Some(Tool::Text), true, false));
+    }
+
+    #[test]
+    fn shift_selects_from_any_non_pointer_tool_never_the_pointer() {
+        // DRAGON-356: shift is the universal selection modifier — with any NON-pointer tool (or
+        // the neutral state) armed a shift-press claims the press for selection.
+        for t in [None, Some(Tool::Rect), Some(Tool::Arrow), Some(Tool::Pen), Some(Tool::Text), Some(Tool::Eraser)] {
+            assert!(shift_selects_with_tool(t, true, false), "{t:?}: shift claims the press");
+            assert!(!shift_selects_with_tool(t, false, false), "{t:?}: no shift, the tool acts");
+            // DRAGON-370: never over a resize handle, whatever the tool.
+            assert!(!shift_selects_with_tool(t, true, true), "{t:?}: a handle press resizes");
+        }
+        // The POINTER tool is excluded — it owns its own ctrl/shift path (`additive_select`), so
+        // the two paths never both fire for one press.
+        assert!(!shift_selects_with_tool(Some(Tool::Pointer), true, false), "pointer keeps its own path");
+        // Shift-select rides the SHIFT modifier; the Ctrl-draw override rides CTRL — so a shape
+        // tool with Ctrl (only) still draws over what is under the cursor, never selects.
+        assert!(!shift_selects_with_tool(Some(Tool::Rect), false, false));
+        assert_eq!(force_new_draw(Some(Tool::Rect), true), Some(Tool::Rect));
+    }
+
+    #[test]
+    fn text_edit_press_target_claims_only_an_in_box_body_press() {
+        // DRAGON-354 item 12 × DRAGON-356: a BODY press on the edited box (id 7) belongs to the
+        // text editor and takes priority over the shift gate — regardless of shift.
+        assert_eq!(text_edit_press_target(Some(7), Some(7), true), Some(7));
+        // A press on the edited box's RESIZE HANDLE (not body) falls through (→ None).
+        assert_eq!(text_edit_press_target(Some(7), Some(7), false), None);
+        // A body press on a DIFFERENT item falls through to the shift/tool gates.
+        assert_eq!(text_edit_press_target(Some(7), Some(3), true), None);
+        // Empty canvas, or nothing being edited, never targets the editor.
+        assert_eq!(text_edit_press_target(Some(7), None, true), None);
+        assert_eq!(text_edit_press_target(None, Some(7), true), None);
     }
 
     #[test]
@@ -2194,6 +3122,7 @@ mod tests {
             fx: FxKind::None,
             curve_radius: 8.0,
             badge: None,
+            text: false,
         };
         let canvas = AnnotationCanvas::new(
             cosmic::widget::Space::new(),
@@ -2220,5 +3149,96 @@ mod tests {
             matches!(canvas.hit_at(&cmap, (8.0, 8.0)), Some((1, HitKind::Body))),
             "a secondary member has no handles, only a grabbable body"
         );
+    }
+
+    // ── DRAGON-364: the text element's two states (selected vs. editing) ─────────────────
+
+    #[test]
+    fn the_text_tool_only_claims_presses_that_are_not_over_a_text_box() {
+        // BEFORE DRAGON-364 the text tool claimed EVERY press over a text box and re-opened its
+        // editor, which is why a settled box could not be dragged or resized: entering an edit
+        // arms the Text tool and settling does not disarm it, so the next click re-entered
+        // editing. Now a press over a text box falls through to the shared item lane.
+        assert!(
+            !text_press_places_new(Some(Tool::Text), true),
+            "a press over an existing text box must NOT place a new one — it manipulates",
+        );
+        assert!(
+            text_press_places_new(Some(Tool::Text), false),
+            "empty canvas (or a non-text item) still places a new box",
+        );
+        // No other tool ever places text, whatever is under the cursor.
+        for t in [
+            None,
+            Some(Tool::Pointer),
+            Some(Tool::Rect),
+            Some(Tool::Arrow),
+            Some(Tool::Pen),
+            Some(Tool::Badge),
+            Some(Tool::Eraser),
+            Some(Tool::Highlight),
+        ] {
+            for over in [false, true] {
+                assert!(!text_press_places_new(t, over), "{t:?} never places text");
+            }
+        }
+    }
+
+    #[test]
+    fn a_text_box_edits_on_the_second_body_click_and_resizes_on_a_handle() {
+        // The two-state model: single click = selected-not-editing (drag + resize), double
+        // click on the BODY = immediate editing.
+        assert!(text_body_reopens_editor(true, true, true), "double-click a text body → edit");
+        assert!(!text_body_reopens_editor(true, true, false), "a FIRST click only selects it");
+        assert!(
+            !text_body_reopens_editor(true, false, true),
+            "a second click on a resize HANDLE is a resize, never an accidental edit",
+        );
+        // Only text items have an editor to re-open, so a double-clicked box/arrow keeps its
+        // ordinary move/resize — which is also what keeps DRAGON-339 placement untouched for
+        // every other tool.
+        assert!(!text_body_reopens_editor(false, true, true), "a non-text item has no editor");
+    }
+
+    #[test]
+    fn the_text_tool_cursor_promises_exactly_what_its_press_will_do() {
+        // The I-beam means "this press starts text entry". After DRAGON-364 that is everywhere
+        // EXCEPT over an existing text box, whose press now selects/moves/resizes — so the
+        // cursor rule is derived from the press rule and the two can never disagree.
+        assert!(text_tool_ibeam(Some(Tool::Text), false, false), "empty canvas: text entry");
+        assert!(
+            !text_tool_ibeam(Some(Tool::Text), true, false),
+            "over a settled text box the press manipulates, so no I-beam",
+        );
+        assert!(
+            text_tool_ibeam(Some(Tool::Text), true, true),
+            "the box being EDITED keeps the I-beam — that press really does place the caret",
+        );
+        // Every other tool keeps its own cursor.
+        for t in [None, Some(Tool::Pointer), Some(Tool::Rect), Some(Tool::Pen)] {
+            assert!(!text_tool_ibeam(t, false, false), "{t:?} is not the text tool");
+        }
+        // The press rule and the cursor rule agree wherever the text tool is armed and no edit
+        // is live: an I-beam iff the press places a new box.
+        for over in [false, true] {
+            assert_eq!(
+                text_tool_ibeam(Some(Tool::Text), over, false),
+                text_press_places_new(Some(Tool::Text), over),
+                "cursor and press must agree (over_text_item = {over})",
+            );
+        }
+    }
+
+    #[test]
+    fn double_click_to_place_survives_for_the_tools_that_have_it() {
+        // DRAGON-339/342/354: a click PLACES for the pen, the badge and text — a text press on
+        // empty canvas still drops a box, so double-clicking empty canvas keeps placing.
+        assert!(Tool::Text.click_places());
+        assert!(Tool::Pen.click_places());
+        assert!(Tool::Badge.click_places());
+        // And Ctrl + a draw tool still lays a NEW shape over an existing item (checked AFTER
+        // the text lane, so Ctrl-pressing a text box still draws rather than manipulating).
+        assert_eq!(draw_bypassing_items(Some(Tool::Text), true, false), Some(Tool::Text));
+        assert_eq!(draw_bypassing_items(Some(Tool::Text), false, false), None);
     }
 }

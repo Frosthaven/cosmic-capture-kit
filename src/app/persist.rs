@@ -60,6 +60,9 @@ impl App {
             annot_color: self.annot_color,
             annot_tool: self.annot_tool.map(|t| t.as_str().to_string()),
             annot_stroke_w: self.annot_stroke_w,
+            annot_badge_size: self.annot_badge_size,
+            annot_text_size: self.annot_text_size,
+            annot_text_font: Some(self.annot_text_font.as_str().to_string()),
             annot_recent_colors: self.annot_recent_colors.clone(),
             resident: self.resident,
             autostart_on_login: self.autostart_on_login,
@@ -86,8 +89,6 @@ impl App {
             record_dir: self.record_dir.clone(),
             record_hardware: true, // deprecated (removed toggle); kept for back-compat read
             screenshot_dir: self.screenshot_dir.clone(),
-            copy_to_clipboard: self.copy_to_clipboard,
-            clipboard_max_mb: self.clipboard_max_mb.value,
             record_mic: self.record_mic,
             hide_toolbar_fullscreen: self.hide_toolbar_fullscreen,
             push_to_talk: self.push_to_talk,
@@ -120,9 +121,14 @@ impl App {
             auto_gain: self.auto_gain,
             advanced_vad: self.advanced_vad,
             shortcuts: self.keymap.overrides(),
-            preview_after_capture: self.preview_after_capture,
             preview_windowed: self.preview_windowed,
-            auto_close_preview: self.auto_close_preview,
+            // DRAGON-355: the combined key is deprecated (read-only, skip_serializing) — it is
+            // NEVER written, so its snapshot value is inert; only the migrate hook reads it,
+            // and only off a freshly-parsed old config. Snapshot the two independent settings.
+            preview_save_close_on_copy: true,
+            preview_save_on_copy: self.preview_save_on_copy,
+            preview_close_on_copy: self.preview_close_on_copy,
+            preview_copy_on_delete: self.preview_copy_on_delete,
             mute_others_during_preview: self.mute_others_during_preview,
             duck_system_audio: self.duck_system_audio,
             appearance_use_system: self.appearance_use_system,
@@ -190,8 +196,6 @@ impl App {
         self.scan_text = p.scan_text;
         self.text_confidence = p.text_confidence.clamp(0.0, 60.0);
         self.screenshot_dir = p.screenshot_dir;
-        self.copy_to_clipboard = p.copy_to_clipboard;
-        self.clipboard_max_mb.set_value(p.clipboard_max_mb.max(1));
         self.record_mic = p.record_mic;
         self.record_system_audio = p.record_system_audio;
         self.record_backend = p.record_backend;
@@ -208,9 +212,10 @@ impl App {
         let mut keymap = crate::shortcuts::Keymap::defaults();
         keymap.apply_overrides(&p.shortcuts);
         self.keymap = keymap;
-        self.preview_after_capture = p.preview_after_capture;
         self.preview_windowed = p.preview_windowed;
-        self.auto_close_preview = p.auto_close_preview;
+        self.preview_save_on_copy = p.preview_save_on_copy;
+        self.preview_close_on_copy = p.preview_close_on_copy;
+        self.preview_copy_on_delete = p.preview_copy_on_delete;
         self.mute_others_during_preview = p.mute_others_during_preview;
         self.duck_system_audio = p.duck_system_audio;
         self.appearance_use_system = p.appearance_use_system;
@@ -225,6 +230,13 @@ impl App {
             .as_deref()
             .and_then(crate::widgets::annotation_canvas::Tool::from_str);
         self.annot_stroke_w = p.annot_stroke_w;
+        self.annot_badge_size = p.annot_badge_size.max(0.0);
+        self.annot_text_size = p.annot_text_size.max(0.0);
+        self.annot_text_font = p
+            .annot_text_font
+            .as_deref()
+            .and_then(crate::app::preview::text_annot::TextFont::from_str)
+            .unwrap_or_default();
         self.annot_recent_colors = p.annot_recent_colors;
         self.notify_updates = p.notify_updates;
     }
@@ -256,9 +268,6 @@ impl App {
                     settings::GeneralTab::Settings => {
                         p.resident = d.resident;
                         p.autostart_on_login = d.autostart_on_login;
-                        p.copy_to_clipboard = d.copy_to_clipboard;
-                        p.clipboard_max_mb = d.clipboard_max_mb;
-                        p.preview_after_capture = d.preview_after_capture;
                     }
                     settings::GeneralTab::Appearance => {
                         p.region_overlay_opacity = d.region_overlay_opacity;
@@ -272,6 +281,16 @@ impl App {
                         p.selection_box_thickness = d.selection_box_thickness;
                     }
                 }
+            }
+            ConfigTab::PreviewEditor => {
+                // DRAGON-353: one flat page, so "Reset to defaults" resets all of it —
+                // including the editor appearance and the covermark text, which both moved
+                // here with their rows.
+                p.preview_windowed = d.preview_windowed;
+                p.preview_save_on_copy = d.preview_save_on_copy;
+                p.preview_close_on_copy = d.preview_close_on_copy;
+                p.preview_copy_on_delete = d.preview_copy_on_delete;
+                p.covermark_text = d.covermark_text.clone();
             }
             ConfigTab::CaptureModes => {
                 // The Capture Modes page is split into in-page tabs (DRAGON-140), and

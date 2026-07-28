@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 description = "Cross-platform screen region, window, and monitor capture with support for glass windows, image, video, voice, QR, barcodes, OCR text and more."
 license = "GPL-3.0-only"
@@ -77,6 +77,25 @@ earshot = "1.1.0"
 # Rasterizing covermark SVGs onto captures (preview editing). The same version
 # libcosmic's renderer already resolves, so it adds no extra build.
 resvg = "0.45"
+# Glyph advance-width metrics for the text-annotation greedy word-wrap (DRAGON-354):
+# the wrap decisions are OURS (each line is pre-broken and handed to resvg as its own
+# <text>), so we measure with the SAME ttf-parser resvg 0.45 already resolves — no
+# extra build, and one shared font-metrics source for wrap + render.
+ttf-parser = "0.25"
+# The SHAPER (DRAGON-360). resvg/usvg 0.45 shapes every <text> run through rustybuzz, so a
+# multi-codepoint grapheme cluster (a ZWJ family, a skin-tone modifier, a regional-indicator
+# flag) becomes ONE ligature glyph with ONE advance — while summing per-codepoint ttf-parser
+# advances counts every member. Measuring through the SAME shaper is what keeps the caret,
+# selection rects and wrap aligned with the raster. PINNED to the version usvg 0.45.1 already
+# resolves (0.20.x): a second rustybuzz in the tree would be both bloat AND a correctness
+# hazard, since the whole point is to shape identically to the renderer. usvg does not
+# re-export it, hence the direct entry. It re-exports the same ttf-parser 0.25 pinned above.
+rustybuzz = "0.20"
+# Grapheme segmentation for the text-annotation editor (DRAGON-354): caret movement,
+# backspace/delete and selection boundaries snap to whole GRAPHEME clusters (emoji ZWJ
+# sequences, skin tones, flags, combining accents) so an edit never splits a user-visible
+# character. Tiny pure-Rust crate; already in the tree transitively — pinned direct here.
+unicode-segmentation = "1"
 
 # ── Unix-only dependencies (POSIX fd/lock/signal primitives) ──────────────────
 # rustix backs the FIFO/fd plumbing (record::owned/pump, audio meters), the flock
@@ -209,6 +228,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     # NSURL (NSPasteboardWriting). Pulls objc2-foundation NSArray/NSString/NSData,
     # all already default-enabled, so no new packages land in the lock.
     "NSPasteboard",
+    # DRAGON-352: the still-image clipboard copy vends CONCRETE image bytes (PNG +
+    # TIFF as eager NSData) so the pasteboard survives our one-shot exit — a promised
+    # NSImage would die with the process. NSBitmapImageRep decodes the baked file and
+    # re-encodes canonical PNG/TIFF. Additive AppKit headers (objc2-foundation deps
+    # already default-enabled), so no new packages land in the lock.
+    "NSBitmapImageRep",
     # DRAGON-130 phase 4 (resident menu-bar): the always-present NSStatusItem shown
     # while resident mode is on — its NSStatusBarButton carries the app glyph, and
     # its NSMenu (New Capture / Settings / Quit) targets a small objc2 handler that

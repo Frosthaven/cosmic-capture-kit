@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-capture-kit"
-version = "0.20.0"
+version = "0.21.0"
 dependencies = [
  "arboard",
  "ashpd 0.12.3",
@@ -1154,11 +1154,14 @@ dependencies = [
  "ron 0.8.1",
  "rstest",
  "rustix 1.1.4",
+ "rustybuzz",
  "rxing",
  "serde",
  "sonora",
  "tokio",
  "toml 0.8.23",
+ "ttf-parser",
+ "unicode-segmentation",
  "wayland-client",
  "wayland-protocols",
  "windows 0.62.2",

@@ -9,67 +9,16 @@ use super::reexec::{NOTIFY_COPIED, NOTIFY_SAVED, spawn_self};
 /// Post the capture notification — "Copied to clipboard" when `copied`, else
 /// "Saved" — whose click reveals the file. Detached.
 pub fn notify(path: &Path, copied: bool) {
-    spawn_self(if copied { NOTIFY_COPIED } else { NOTIFY_SAVED }, path);
+    let _ = spawn_self(if copied { NOTIFY_COPIED } else { NOTIFY_SAVED }, path);
 }
 
-/// macOS/Windows: no sticky/replaceable notification (that's
-/// UNUserNotificationCenter, which needs a signed .app bundle — DRAGON-130
-/// packaging). The processing notification is best-effort even on Linux, so here
-/// we just run the work; on macOS we additionally fire a one-shot `osascript`
-/// banner at the start (it can't be updated or closed, only posted).
-#[cfg(not(target_os = "linux"))]
-pub fn with_processing_notification<T>(work: impl FnOnce() -> T) -> T {
-    #[cfg(target_os = "macos")]
-    crate::platform::mac::notify::display_notification(
-        "Processing capture",
-        "Processing edited capture...",
-    );
-    work()
-}
-
-/// Run `work` with a persistent "Processing capture…" notification up for its
-/// duration — posted before, closed after (best effort; the work runs regardless
-/// of D-Bus availability). Blocking: call from a worker thread, never the UI.
-#[cfg(target_os = "linux")]
-pub fn with_processing_notification<T>(work: impl FnOnce() -> T) -> T {
-    let posted = zbus::blocking::Connection::session().ok().and_then(|conn| {
-        let hints: std::collections::HashMap<&str, zbus::zvariant::Value> =
-            std::collections::HashMap::new();
-        let id = conn
-            .call_method(
-                Some("org.freedesktop.Notifications"),
-                "/org/freedesktop/Notifications",
-                Some("org.freedesktop.Notifications"),
-                "Notify",
-                &(
-                    "Cosmic Capture Kit",
-                    0u32,
-                    notification_icon(),
-                    "Processing capture",
-                    "Processing edited capture...",
-                    Vec::<&str>::new(),
-                    hints,
-                    0i32, // sticks until we close it
-                ),
-            )
-            .ok()?
-            .body()
-            .deserialize::<u32>()
-            .ok()?;
-        Some((conn, id))
-    });
-    let out = work();
-    if let Some((conn, id)) = posted {
-        let _ = conn.call_method(
-            Some("org.freedesktop.Notifications"),
-            "/org/freedesktop/Notifications",
-            Some("org.freedesktop.Notifications"),
-            "CloseNotification",
-            &(id,),
-        );
-    }
-    out
-}
+// DRAGON-353: `with_processing_notification` lived here — it wrapped the preview editor's
+// bake/export in a sticky desktop "Processing capture" notification, because the editor
+// TORE ITS SURFACE DOWN for the duration and there was nowhere else to show progress. The
+// editor now stays up and draws its own spinner over the picture
+// (`PREVIEW_PROCESSING_MESSAGES`), so the notification had no callers left and is gone
+// rather than kept as an unused helper. Its macOS one-shot `osascript` banner rode the
+// same function; the mac `display_notification` body it called survives for `run_notify`.
 
 /// The notification icon: the installed app icon when present (packaging puts
 /// it in hicolor), else a stock camera glyph so dev runs aren't iconless.

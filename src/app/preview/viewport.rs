@@ -236,6 +236,13 @@ impl App {
         // preset labels are now short ("Fit", "100%"…"200%"), so most of that was dead space.
         // The floor is set by the widest label ("200%") plus the dropdown chevron.
         const COMBO_W: f32 = 72.0;
+        // The zoom-preset menu's on-screen height (px) for the UPWARD flyout offset (item 2
+        // CAUTION: bottom-bar dropdowns open up). Five `menu_container` rows — each a size-13
+        // text button (~27px with cosmic's 5px button padding) — plus the 2px inter-row gaps and
+        // the container's 4px inset top+bottom. A small over-estimate only lifts the menu a hair
+        // clear of the chip; it never overlaps.
+        const ZOOM_MENU_PANEL_H: f32 =
+            ZOOM_PRESET_LABELS.len() as f32 * 27.0 + (ZOOM_PRESET_LABELS.len() as f32 - 1.0) * 2.0 + 2.0 * 4.0;
         // Addressed to this document (DRAGON-336 phase 2).
         let pid = preview.window;
         let z = preview.view.zoom;
@@ -277,58 +284,32 @@ impl App {
             Some(i) => ZOOM_PRESET_LABELS[i].to_string(),
             None => format!("{}%", displayed_percent(z, visual)),
         };
-        // The clickable chip matches the timer dropdown's chip: a bordered container at the
-        // toolbar-button height with the 1px trim ring. The ring is the ACCENT trim whenever
-        // we're zoomed off the default (a % level or an in-between slider/scroll zoom), and
-        // subdued at Fit / 100% — same "armed vs resting" cue as the timer chip.
-        let armed = !matches!(preview.view.zoom_preset, Some(0) | Some(1));
-        let button = widget::mouse_area(
-            widget::container(
-                widget::row(vec![
-                    widget::text(label).size(14).width(Length::Fill).into(),
-                    crate::widgets::icons::handle("pan-down-symbolic").icon().size(14).into(),
-                ])
-                .align_y(Alignment::Center),
-            )
-            .width(Length::Fixed(COMBO_W))
-            .height(Length::Fixed(tb.icon_box() + 2.0 * tb.btn_pad()))
-            // Tighter than a button's `btn_pad`: the narrowed combo needs the room for its
-            // label + chevron.
-            .padding([0.0, tb.btn_pad() * 0.5])
-            .align_y(Alignment::Center)
-            .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
-                let c = theme.cosmic();
-                cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(c.background.component.base.into())),
-                    text_color: Some(c.background.component.on.into()),
-                    border: Border {
-                        // Button token — the combo reads as a bordered button.
-                        radius: crate::app::theme::rounding(theme).xl.into(),
-                        width: 1.0,
-                        color: if armed {
-                            crate::app::theme::accent(theme)
-                        } else {
-                            state_mix(theme, MIX_OFF)
-                        },
-                    },
-                    ..Default::default()
-                }
-            }))),
-        )
-        .on_press(Msg::Preview(pid, PreviewMsg::ToggleZoomMenu));
+        // DRAGON-357 item 2: the Fit/scale chip is the EXACT same closed control the text SIZE /
+        // FONT dropdowns wear ([`chrome::dropdown_chip`]) — a `Button::Text` chip (size-12 label,
+        // size-10 pan-down chevron, [2,6] padding, fixed `COMBO_W`) so the trim colour, font
+        // size, chevron glyph AND hover trim all match across the editor (the hover styling lives
+        // in the shared `Button::Text` class, so the Fit control can't miss it). It still INHERITS
+        // the enclosing bordered cluster's fill.
+        let button =
+            super::chrome::dropdown_chip(pid, widget::text(label).size(12).into(), COMBO_W, PreviewMsg::ToggleZoomMenu);
         let combo: Element<'static, Msg> = if preview.view.zoom_menu_open {
+            let cur = preview.view.zoom_preset;
             let items: Vec<Element<'static, Msg>> = ZOOM_PRESET_LABELS
                 .iter()
                 .enumerate()
                 .map(|(i, lbl)| {
-                    let _ = i;
-                    // All preset options render on the theme foreground (white).
-                    let text = widget::text(*lbl).size(14).class(cosmic::theme::Text::Custom(
-                        |t| cosmic::iced::widget::text::Style {
-                            color: Some(t.cosmic().background.component.on.into()),
-                            ..Default::default()
-                        },
-                    ));
+                    // Match the text menus: the CURRENT preset row reads accent, the rest default.
+                    let hot = cur == Some(i);
+                    let text = if hot {
+                        widget::text(*lbl).size(13).class(cosmic::theme::Text::Custom(|t| {
+                            cosmic::iced::widget::text::Style {
+                                color: Some(crate::app::theme::accent(t)),
+                                ..Default::default()
+                            }
+                        }))
+                    } else {
+                        widget::text(*lbl).size(13)
+                    };
                     crate::widgets::arrow_cursor::arrow_cursor(
                         widget::button::custom(text)
                             .width(Length::Fill)
@@ -337,33 +318,38 @@ impl App {
                     )
                 })
                 .collect();
-            let menu = widget::container(widget::column(items).spacing(2.0))
-                .width(Length::Fixed(COMBO_W))
-                .padding(4.0)
-                .class(cosmic::theme::Container::custom(|theme| {
-                    let c = theme.cosmic();
-                    cosmic::iced::widget::container::Style {
-                        background: Some(Background::Color(c.background.component.base.into())),
-                        border: Border {
-                            radius: crate::app::theme::rounding(theme).s.into(),
-                            width: 1.0,
-                            color: c.background.divider.into(),
-                        },
-                        ..Default::default()
-                    }
-                }));
-            widget::popover(button)
-                .popup(menu)
-                .position(widget::popover::Position::Point(cosmic::iced::Point::new(0.0, 0.0)))
-                .on_close(Msg::Preview(pid, PreviewMsg::ToggleZoomMenu))
-                .into()
+            // DRAGON-357 item 17: the Fit/scale menu wears the SAME opaque dropdown surface as the
+            // text SIZE / FONT menus. Item 2 CAUTION: it opens UPWARD (bottom bar), via the shared
+            // `flyout` helper's `Up` direction — deterministic in both the overlay and the window,
+            // unlike the raw popover's room-below auto-flip.
+            let menu = tb.menu_container(widget::column(items).spacing(2.0), COMBO_W);
+            super::chrome::flyout(
+                button,
+                menu,
+                super::chrome::FlyoutDir::Up(ZOOM_MENU_PANEL_H),
+                Msg::Preview(pid, PreviewMsg::ToggleZoomMenu),
+            )
         } else {
-            button.into()
+            button
         };
-        widget::row(vec![slider, combo])
-            .spacing(8.0)
-            .align_y(Alignment::Center)
-            .into()
+        // DRAGON-357: the slider + dropdown share ONE bordered cluster, like the other bottom-bar
+        // groups (the dropdown chip above no longer draws its own chrome). Item 9: the slider
+        // gets inner-LEFT padding so its rail doesn't hug the group's left edge.
+        let slider = widget::container(slider).padding([0.0, 0.0, 0.0, 8.0]);
+        // The slider + dropdown are both SHORTER than a toolbar button box, so left to their own
+        // natural height this cluster collapsed below the pointer/pan group beside it (the
+        // dropdown-chip rebuild dropped the tall combo that used to anchor the height). Pin the
+        // row to the button-box height (`icon_box + 2*btn_pad`, the SAME height `slider_with_icon`
+        // and every `tool_toggle` resolve to) and centre its contents, so the zoom cluster matches
+        // its sibling group's height with its items vertically centred.
+        let row = widget::container(
+            widget::row(vec![slider.into(), combo])
+                .spacing(8.0)
+                .align_y(Alignment::Center),
+        )
+        .height(Length::Fixed(tb.icon_box() + 2.0 * tb.btn_pad()))
+        .align_y(Alignment::Center);
+        tb.tool_cluster(vec![row.into()], super::chrome::ClusterChrome::Surface)
     }
 
     /// The explicit width (px) for the fullscreen-overlay control column — the

@@ -121,10 +121,14 @@ impl crate::app::App {
             ])
                 .spacing(4.0)
                 .align_y(Alignment::Center);
-            let item = Item::new(action.label(), action.description(), control).reset_to(
-                Msg::Settings(SettingsMsg::SetShortcut(action, action.default_shortcut())),
-                !self.keymap.is_default(action),
-            );
+            // Reset restores the FACTORY binding — or clears it, for an action that ships
+            // unbound (DRAGON-369: the slot-member tools, reached through their cycle key).
+            let reset = match action.default_shortcut() {
+                Some(sc) => Msg::Settings(SettingsMsg::SetShortcut(action, sc)),
+                None => Msg::Settings(SettingsMsg::UnbindShortcut(action)),
+            };
+            let item = Item::new(action.label(), action.description(), control)
+                .reset_to(reset, !self.keymap.is_default(action));
             match secs.last_mut() {
                 Some(sec) if sec.title == action.group() => sec.items.push(item),
                 _ => secs.push(SectionSpec {

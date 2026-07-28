@@ -36,6 +36,9 @@ impl App {
                 crate::widgets::annotation_canvas::Tool::Pointer,
             )),
             Action::PreviewSelectAll => return pv(PreviewMsg::SelectAllAnnotations),
+            // Deselect-all (DRAGON-369) REPLACES the whole selection with nothing — the same
+            // message the canvas's empty-click and Esc use, so there is one deselect path.
+            Action::PreviewDeselectAll => return pv(PreviewMsg::SelectAnnotation(None)),
             Action::PreviewAnnotArrow => {
                 return pv(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Arrow))
             }
@@ -63,9 +66,17 @@ impl App {
             Action::PreviewAnnotPen => {
                 return pv(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Pen))
             }
+            Action::PreviewAnnotText => {
+                return pv(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Text))
+            }
             Action::PreviewAnnotEraser => return pv(PreviewMsg::SelectTool(
                 crate::widgets::annotation_canvas::Tool::Eraser,
             )),
+            // The one-key tool SLOTS (DRAGON-369): the action IS the slot's identity, so both
+            // arms carry it through unchanged and `cycle_tool_slot` reads the tray for the rest.
+            Action::PreviewAnnotRedactCycle | Action::PreviewAnnotShapeCycle => {
+                return pv(PreviewMsg::CycleToolSlot(action))
+            }
             Action::PreviewAnnotDuplicate => return pv(PreviewMsg::DuplicateSelected),
             Action::PreviewAnnotStrokeCycle => return pv(PreviewMsg::CycleAnnotStrokeW),
             Action::PreviewColorFlyout => return pv(PreviewMsg::ToggleAnnotPalette),
@@ -81,11 +92,18 @@ impl App {
     /// `window` is the surface the press was delivered to (forwarded from the event
     /// subscription), which is what picks the preview document a Preview-context binding
     /// acts on — see the focus note at the modal branch below.
+    ///
+    /// `location` (DRAGON-364) is the press's PHYSICAL key group, forwarded untouched to the
+    /// live text-annotation editor — the one place that needs to tell numpad Enter from main
+    /// Enter, which the logical `key` alone cannot. Nothing else consults it: the keymap binds
+    /// LOGICAL keys, so every lane below is byte-identical to before.
     pub(super) fn handle_key(
         &mut self,
         window: window::Id,
         modifiers: cosmic::iced::keyboard::Modifiers,
         key: cosmic::iced::keyboard::Key,
+        location: cosmic::iced::keyboard::Location,
+        text: Option<String>,
     ) -> Task<cosmic::Action<Msg>> {
         use crate::shortcuts::Context;
         use cosmic::iced::keyboard::{key::Named, Key};
@@ -137,7 +155,7 @@ impl App {
             .or_else(|| self.focused_preview_id())
         {
             self.note_preview_focus(target);
-            return self.preview_modal_key(target, modifiers, key);
+            return self.preview_modal_key(target, modifiers, key, location, text);
         }
         // The mic key does double duty: in push-to-talk mode, while recording, it's
         // HOLD-to-talk — the first press un-mutes the mic (auto-repeat presses ignored;
@@ -234,6 +252,78 @@ impl App {
         }
     }
 
+    /// macOS (DRAGON-361): open the Emoji & Symbols palette against preview `id`'s own native
+    /// view. Routed by window IDENTITY through `window::run_with_handle(id, ..)` — the same
+    /// route `focus_preview_for_text_edit` uses and for the same reason (DRAGON-336 allows
+    /// several simultaneous previews, so a title scan could target the WRONG document) — whose
+    /// callback runs on the winit event loop with that exact window's raw handle; the AppKit
+    /// handle's `ns_view` IS the WinitView in our winit fork, i.e. the `NSTextInputClient` the
+    /// palette must insert into. The AppKit work (and the diagnostics) live in the mac seam.
+    #[cfg(target_os = "macos")]
+    fn show_character_palette(id: window::Id) -> Task<cosmic::Action<Msg>> {
+        window::run_with_handle(id, |handle| {
+            use window::raw_window_handle::RawWindowHandle;
+            if let RawWindowHandle::AppKit(h) = handle.as_raw() {
+                // SAFETY: the callback runs synchronously on the winit event loop (the main
+                // thread) while the handle borrow of the live window is held — exactly the
+                // seam's documented contract.
+                unsafe { crate::platform::mac::window::show_character_palette(h.ns_view) };
+            }
+        })
+        .discard()
+    }
+
+    /// macOS (DRAGON-361): the key-arrival diagnostic. Logs presses delivered to a LIVE text
+    /// annotation edit, so the owner's first Mac run answers the question the rest of the
+    /// investigation now hangs on — *does ⌃⌘Space reach the application at all?*
+    ///
+    /// Why this and not a chord-only log: an intercept that only speaks when it MATCHES cannot
+    /// tell "macOS consumed the symbolic hotkey before delivery" from "the press arrived but
+    /// iced spells the key differently than the predicate expects". Both look like silence, and
+    /// they have opposite fixes (a UI affordance vs. a one-line predicate change). Logging every
+    /// qualifying press separates them: a line with `palette-chord=false` is the second case;
+    /// no line at all is the first.
+    ///
+    /// FILTERED so it cannot flood: ordinary typing — a character key with no ⌃/⌥/⌘ — is not
+    /// evidence and is skipped (Shift+letter included, since Shift alone still spells normal
+    /// typing). Everything else is logged: named keys (arrows, Escape, Backspace…) and any
+    /// press carrying a command-ish modifier. Hard-capped per process as belt-and-braces; the
+    /// last permitted line says so, so a truncated log is never mistaken for silence.
+    ///
+    /// At `warn` on purpose: `main`'s env_logger defaults to the `warn` filter, so this lands
+    /// with no `RUST_LOG` set. Temporary — delete or demote once DRAGON-361 is understood.
+    #[cfg(target_os = "macos")]
+    fn log_text_edit_key(
+        modifiers: cosmic::iced::keyboard::Modifiers,
+        key: &cosmic::iced::keyboard::Key,
+        text: Option<&str>,
+    ) {
+        use cosmic::iced::keyboard::Key;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        /// How many key lines one process may emit before going quiet.
+        const CAP: u32 = 400;
+        static LOGGED: AtomicU32 = AtomicU32::new(0);
+        // Plain typing is not evidence — skip it so the interesting lines stay readable.
+        let command_mod = modifiers.control() || modifiers.alt() || modifiers.logo();
+        if matches!(key, Key::Character(_)) && !command_mod {
+            return;
+        }
+        let n = LOGGED.fetch_add(1, Ordering::Relaxed);
+        if n >= CAP {
+            return;
+        }
+        log::warn!(
+            "DRAGON-361 key #{n}: reached the live text edit — key={key:?}, ctrl={}, alt={}, \
+             shift={}, logo={}, text={text:?}, palette-chord={}{}",
+            modifiers.control(),
+            modifiers.alt(),
+            modifiers.shift(),
+            modifiers.logo(),
+            crate::shortcuts::is_character_palette_chord(modifiers, key),
+            if n + 1 == CAP { " — diagnostic cap reached, no further key lines" } else { "" },
+        );
+    }
+
     /// Key handling while the post-capture preview is open — modal, in priority
     /// order: a bake in progress holds every input; then the overwrite-confirm
     /// dialog; then the covermark picker; otherwise the preview's own keymap
@@ -244,6 +334,8 @@ impl App {
         id: window::Id,
         modifiers: cosmic::iced::keyboard::Modifiers,
         key: cosmic::iced::keyboard::Key,
+        location: cosmic::iced::keyboard::Location,
+        text: Option<String>,
     ) -> Task<cosmic::Action<Msg>> {
         use crate::shortcuts::Context;
         use cosmic::iced::keyboard::{key::Named, Key};
@@ -255,15 +347,48 @@ impl App {
         if p.edit.baking {
             return Task::none();
         }
-        // The overwrite-confirmation dialog is modal: Enter overwrites, Esc
-        // cancels, everything else is swallowed.
-        if p.edit.confirm_overwrite {
+        // macOS (DRAGON-361): while a text annotation is being edited, the Emoji & Symbols
+        // chord (⌃⌘Space) is handled BY US — we open the Character Viewer directly rather
+        // than waiting for the system to route its symbolic hotkey to an accessory-policy
+        // app that owns no menu bar. DRAGON-359 fixed the active/key/first-responder state and
+        // the picker still never appeared; the owner has since confirmed it fails in the
+        // WINDOWED preview too, which rules out the window-level theory (that surface sits at
+        // a normal level and cannot occlude an out-of-process panel), leaving key DELIVERY and
+        // the Accessory activation policy as the live suspects — both of which the mac seam's
+        // log lines separate. Scoped to a LIVE text edit, so outside one the chord is never
+        // swallowed; the
+        // `is_character_palette_chord` predicate is portable + unit-tested, only the AppKit
+        // call behind it is mac-only. Non-mac builds are byte-identical (nothing compiled).
+        //
+        // Every qualifying press is LOGGED first ([`Self::log_text_edit_key`]) — that is the
+        // single most valuable diagnostic here, because the whole question is whether the chord
+        // even ARRIVES, and silence has to be distinguishable from a predicate miss.
+        #[cfg(target_os = "macos")]
+        if p.edit.text_edit.is_some() {
+            Self::log_text_edit_key(modifiers, &key, text.as_deref());
+            if crate::shortcuts::is_character_palette_chord(modifiers, &key) {
+                return Self::show_character_palette(id);
+            }
+        }
+        // A live TEXT edit (DRAGON-354) OWNS the keyboard: printable keys type into the box,
+        // editing keys move the caret / delete, Escape (or NUMPAD Enter — DRAGON-364; main Enter
+        // still inserts a newline) settles — and every tool/action hotkey
+        // is SUSPENDED (swallowed) so typing "b" adds a letter, not a box. Highest priority
+        // after the bake hold, before the confirm-close and keymap dispatch below.
+        if p.edit.text_edit.is_some() {
+            return self.text_edit_key(id, modifiers, key, location, text);
+        }
+        // The unsaved-changes dialog (DRAGON-353) is modal: Enter takes the SAFE default
+        // (save, then close), Esc keeps editing, everything else is swallowed. Esc
+        // deliberately does NOT close the document — Esc is the very key that raised this
+        // dialog, so treating it as "discard" would make a double-tap lose the edits.
+        if p.edit.confirm_close {
             return match &key {
                 Key::Named(Named::Enter) => {
-                    self.update(Msg::Preview(id, PreviewMsg::ConfirmOverwrite))
+                    self.update(Msg::Preview(id, PreviewMsg::SaveAndClose))
                 }
                 Key::Named(Named::Escape) => {
-                    self.update(Msg::Preview(id, PreviewMsg::CancelOverwrite))
+                    self.update(Msg::Preview(id, PreviewMsg::KeepEditing))
                 }
                 _ => Task::none(),
             };

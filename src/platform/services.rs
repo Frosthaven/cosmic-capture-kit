@@ -17,4 +17,7 @@
 //! `run_*` worker halves stay internal — they execute in a re-exec'd child, an
 //! implementation detail of this platform, wired in `main.rs`).
 
-pub use crate::share::{copy_text, copy_to_clipboard, join_wifi, notify, open_uri, save_and_open};
+pub use crate::share::{
+    AUTO_COPY_MAX_BYTES, auto_copy_limit_label, copy_text, copy_to_clipboard, join_wifi, notify,
+    open_uri, save_and_open,
+};

@@ -21,6 +21,14 @@ pub struct EncodePlan {
     /// and the driver tags the stream itself).
     pub(crate) color_tags: bool,
     pub(crate) nv12: bool,
+    /// The rawvideo input pixel format for the RGBA-feed (`nv12 == false`) path — the
+    /// byte order the worker delivers, passed to ffmpeg's `-pix_fmt`. Defaults to
+    /// `"rgba"` (every Linux/Windows worker, and the mac software/VideoToolbox default);
+    /// the macOS SCK worker overrides it to `"bgra"` so it can hand ScreenCaptureKit's
+    /// native BGRA buffers to ffmpeg WITHOUT a per-pixel swizzle (DRAGON-316). Ignored
+    /// when `nv12` is true (the feed is NV12 then). Keeping the default `"rgba"` keeps
+    /// every historical command line byte-identical.
+    pub(crate) input_pix_fmt: &'static str,
     /// Quality-based rate control (CQ/CRF set in `codec`): the bitrate setting is then
     /// a peak CAP, not a target — small files for static content, good quality, no
     /// chroma crush. `false` = classic bitrate target (VAAPI).
@@ -273,6 +281,7 @@ fn software_plan(x264_preset: &str, codec_choice: &str, w: u32, h: u32) -> Encod
         vf: None,
         color_tags: false,
         nv12: false,
+        input_pix_fmt: "rgba",
         quality_rc: true,
     }
 }
@@ -337,6 +346,7 @@ fn nvenc_plan(w: u32, h: u32, nvenc_preset: &str, codec_choice: &str) -> Option<
         vf: None,
         color_tags: true,
         nv12: true,
+        input_pix_fmt: "rgba",
         quality_rc: true,
     })
 }
@@ -391,6 +401,7 @@ fn vaapi_plan(w: u32, h: u32, compression_level: i32, codec_choice: &str) -> Opt
         vf: Some("format=nv12,hwupload".to_string()),
         color_tags: false,
         nv12: true,
+        input_pix_fmt: "rgba",
         // QVBR (when probed above) makes the bitrate a ceiling; without it, a target.
         // Both want spawn_ffmpeg's `-b:v`, so quality_rc is false in both cases.
         quality_rc: false,
@@ -433,6 +444,7 @@ fn videotoolbox_plan_with(encoders: &str, w: u32, h: u32, codec_choice: &str) ->
         vf: None,
         color_tags: false,
         nv12: false,
+        input_pix_fmt: "rgba",
         quality_rc: false,
     })
 }
@@ -574,6 +586,7 @@ fn amf_plan(w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
         vf: None,
         color_tags: false,
         nv12: true,
+        input_pix_fmt: "rgba",
         quality_rc: false,
     })
 }
@@ -607,6 +620,7 @@ fn qsv_plan(w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
         vf: None,
         color_tags: false,
         nv12: true,
+        input_pix_fmt: "rgba",
         quality_rc: false,
     })
 }
@@ -640,6 +654,7 @@ mod tests {
             vf: None,
             color_tags: false,
             nv12: false,
+            input_pix_fmt: "rgba",
             quality_rc: false,
         }
     }

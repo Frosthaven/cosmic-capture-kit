@@ -26,6 +26,16 @@ pub fn handle(name: &str) -> Handle {
     }
 }
 
+/// Whether `name` resolves to a BUNDLED Lucide glyph rather than falling through to the
+/// system/embedded theme (which renders blank off Linux for most names). The one public
+/// probe over [`lucide_name`], so callers can assert a glyph really ships without exposing
+/// the mapping itself. Test-only: production code just calls [`handle`], which already
+/// falls back gracefully — this exists so a TEST can insist there is nothing to fall back to.
+#[cfg(test)]
+pub(crate) fn is_bundled(name: &str) -> bool {
+    lucide_name(name).is_some()
+}
+
 /// Map an app icon name (freedesktop-style / legacy) to the bundled Lucide glyph that best
 /// fits the control's MEANING. `None` = unmapped (the caller falls back to `from_name`). The
 /// single source of the mapping decision — unit-tested; every returned file is embedded by
@@ -73,10 +83,15 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         // The annotation POINTER (selection) tool (DRAGON-341) — a filled arrow cursor,
         // deliberately DISTINCT from the capture overlay's outline `mouse-pointer`.
         "pointer-select-symbolic" => "mouse-pointer-2",
-        // Annotation stroke-width toggle group: a horizontal line at three thicknesses.
+        // Annotation stroke-width toggle group (DRAGON-357 item 9): a horizontal line drawn at
+        // SEVEN thicknesses, the glyph's stroke scaling with the px preset it selects.
+        "minus-1" => "minus-1",
         "minus-2" => "minus-2",
-        "minus-5" => "minus-5",
+        "minus-4" => "minus-4",
+        "minus-6" => "minus-6",
         "minus-8" => "minus-8",
+        "minus-10" => "minus-10",
+        "minus-12" => "minus-12",
         "format-text-highlight-symbolic" => "highlighter",
         "checkbox-symbolic" => "square", // box / rectangle tool
         "box-highlight-symbolic" => "box-highlight", // box outline + inner highlighter marker
@@ -85,12 +100,21 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         // this is the tray glyph, not the rendered mark.
         "sequence-badge-symbolic" => "circle-star",
         "pencil-symbolic" => "pencil-line", // freehand pencil tool (DRAGON-338)
+        "text-tool-symbolic" => "type", // text annotation tool (DRAGON-354 items 6 + 5)
+        "clipboard-copy-symbolic" => "clipboard-copy", // Copy-to-clipboard button (DRAGON-357)
+        "clipboard-check-symbolic" => "clipboard-check", // "Copied" toast (DRAGON-357)
+        "clipboard-x-symbolic" => "clipboard-x", // clipboard-error toast (DRAGON-357)
+        "save-check-symbolic" => "save-check", // "Saved" success toast (DRAGON-357)
+        "save-off-symbolic" => "save-off", // save-error toast (DRAGON-357)
         "eraser-symbolic" => "eraser", // pencil eraser (DRAGON-338)
         "sun-dim-symbolic" => "sun-dim", // dim/spotlight tool (sun with dashed rays)
         "spotlight-symbolic" => "spotlight", // spotlight tool (fixture + beam onto a lit spot)
         "view-grid-symbolic" => "grid-3x3", // pixelate redaction (mosaic)
         "image-filter-symbolic" => "droplet", // blur redaction
         "edit-cut-symbolic" => "scissors", // razor
+        // The PREVIEW EDITOR's identity glyph (DRAGON-353): the settings nav page and the
+        // Keyboard Shortcuts page's "Preview Editor" tab both wear it, so the two agree.
+        "view-timeline-symbolic" => "timeline",
         "video-x-generic-symbolic" => "film", // video placeholder
         "pan-down-symbolic" => "chevron-down",
         // Settings + misc.
@@ -165,18 +189,29 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "zoom-in" => svg!("zoom-in"),
         "contrast" => svg!("contrast"),
         "arrow-up-right" => svg!("arrow-up-right"),
+        "minus-1" => svg!("minus-1"),
         "minus-2" => svg!("minus-2"),
-        "minus-5" => svg!("minus-5"),
+        "minus-4" => svg!("minus-4"),
+        "minus-6" => svg!("minus-6"),
         "minus-8" => svg!("minus-8"),
+        "minus-10" => svg!("minus-10"),
+        "minus-12" => svg!("minus-12"),
         "highlighter" => svg!("highlighter"),
         "box-highlight" => svg!("box-highlight"),
         "pencil-line" => svg!("pencil-line"),
+        "type" => svg!("type"),
+        "clipboard-copy" => svg!("clipboard-copy"),
+        "clipboard-check" => svg!("clipboard-check"),
+        "clipboard-x" => svg!("clipboard-x"),
+        "save-check" => svg!("save-check"),
+        "save-off" => svg!("save-off"),
         "eraser" => svg!("eraser"),
         "sun-dim" => svg!("sun-dim"),
         "spotlight" => svg!("spotlight"),
         "grid-3x3" => svg!("grid-3x3"),
         "droplet" => svg!("droplet"),
         "scissors" => svg!("scissors"),
+        "timeline" => svg!("timeline"),
         "film" => svg!("film"),
         "chevron-down" => svg!("chevron-down"),
         "folder-open" => svg!("folder-open"),
@@ -224,9 +259,13 @@ mod tests {
             "zoom-in-symbolic", "display-brightness-symbolic", "mail-forward-symbolic",
             "pointer-select-symbolic",
             "format-text-highlight-symbolic", "checkbox-symbolic", "box-highlight-symbolic",
-            "pencil-symbolic", "eraser-symbolic", "sequence-badge-symbolic",
+            "pencil-symbolic", "text-tool-symbolic", "eraser-symbolic",
+            "clipboard-copy-symbolic", "clipboard-check-symbolic", "clipboard-x-symbolic",
+            "save-check-symbolic", "save-off-symbolic",
+            "sequence-badge-symbolic",
             "sun-dim-symbolic", "spotlight-symbolic", "view-grid-symbolic",
-            "image-filter-symbolic", "edit-cut-symbolic", "minus-2", "minus-5", "minus-8",
+            "image-filter-symbolic", "edit-cut-symbolic", "view-timeline-symbolic",
+            "minus-1", "minus-2", "minus-4", "minus-6", "minus-8", "minus-10", "minus-12",
             "video-x-generic-symbolic", "pan-down-symbolic", "folder-open-symbolic",
             "list-add-symbolic", "system-search-symbolic", "navbar-open-symbolic",
             "navbar-closed-symbolic", "accessories-screenshot-symbolic",
@@ -264,6 +303,8 @@ mod tests {
         // capture overlay's outline one (the two controls must not look alike).
         assert_eq!(lucide_name("pointer-select-symbolic"), Some("mouse-pointer-2"));
         assert_eq!(lucide_name("input-mouse-symbolic"), Some("mouse-pointer"));
+        // DRAGON-354 item 5: the text tool wears lucide's `type` glyph (was `case-sensitive`).
+        assert_eq!(lucide_name("text-tool-symbolic"), Some("type"));
     }
 
     /// The DRAGON-338 pencil + eraser glyphs embed and are real SVGs (the tools' toolbar icons).

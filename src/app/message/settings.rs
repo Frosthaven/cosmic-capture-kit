@@ -156,13 +156,16 @@ pub enum SettingsMsg {
     SetShortcutsTab(cosmic::widget::segmented_button::Entity),
     /// Settings: preview editor appearance (windowed vs overlay).
     SetPreviewWindowed(bool),
-    /// Settings: auto-close the preview editor after a save/copy.
-    SetAutoClosePreview(bool),
+    /// Settings: a manual Copy in the preview editor saves the document first (DRAGON-355).
+    SetPreviewSaveOnCopy(bool),
+    /// Settings: a manual Copy in the preview editor closes the document afterwards
+    /// (DRAGON-355; independent of save-on-copy).
+    SetPreviewCloseOnCopy(bool),
+    /// Settings: a Delete in the preview editor copies to the clipboard first.
+    SetPreviewCopyOnDelete(bool),
     /// Settings: open the folder picker for a save directory, then apply it.
     PickDir(DirTarget),
     DirPicked(DirTarget, Option<std::path::PathBuf>),
-    /// Settings: toggle copy-to-clipboard.
-    SetCopyToClipboard(bool),
     /// Settings: toggle real-time noise reduction on the captured mic.
     SetNoiseReduction(bool),
     /// Settings: pick the microphone input device (0 = System / automatic).
@@ -188,10 +191,6 @@ pub enum SettingsMsg {
     CloseMicTest,
     /// Repaint tick for the live mic-test waveform (snapshots fresh samples).
     MicTestTick,
-    /// Settings: clipboard size-limit field (MB).
-    SetClipboardMaxMb(String),
-    /// Settings: toggle the post-capture preview window.
-    SetPreviewAfterCapture(bool),
     /// Settings: toggle muting other apps' audio while a video preview plays.
     SetMuteOthersDuringPreview(bool),
     /// Settings: toggle ducking the recorded system audio under mic speech.

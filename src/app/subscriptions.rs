@@ -17,6 +17,8 @@ impl App {
                 self.sub_pixel_capture(),
                 self.sub_loading_tick(),
                 self.sub_playback_poll(),
+                self.sub_preview_toasts(),
+                self.sub_text_caret_blink(),
                 self.sub_tray_poll(),
                 self.sub_preview_handoff(),
                 self.sub_recording_poll(),
@@ -86,9 +88,20 @@ impl App {
             // The delivering surface's id rides along: it is what picks the PREVIEW
             // document a Preview-context binding acts on when several are open
             // (DRAGON-336 phase 2 — see `handle_key`).
+            // `location` (DRAGON-364) is the key's PHYSICAL group and is the ONLY thing that
+            // separates numpad Enter from main Enter: both the winit path and the Wayland
+            // layer-shell path map `KP_Enter` to the same logical `Key::Named(Named::Enter)`
+            // and record the keypad only here. Forwarded verbatim; the live text-annotation
+            // editor is its one consumer today.
             Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
-                key, modifiers, ..
-            }) => Some(Msg::WindowChrome(WindowChromeMsg::KeyPressed(id, modifiers, key))),
+                key, modifiers, location, text, ..
+            }) => Some(Msg::WindowChrome(WindowChromeMsg::KeyPressed(
+                id,
+                modifiers,
+                key,
+                location,
+                text.map(|t| t.to_string()),
+            ))),
             // Releases matter only for push-to-talk (release → re-mute the mic).
             Event::Keyboard(cosmic::iced::keyboard::Event::KeyReleased {
                 key, modifiers, ..
@@ -339,6 +352,65 @@ impl App {
                 .with(id)
                 .map(|(id, _)| Msg::Preview(id, PreviewMsg::PinchPoll))
         })))
+    }
+
+    /// Expire each document's in-editor toasts (DRAGON-353).
+    ///
+    /// One tick PER document that actually HAS toasts, each with a DISTINCT hash id (via
+    /// `with(window_id)`, without which iced collapses same-interval timers into one) and
+    /// each addressed to its own document — the same shape `sub_playback_poll` uses. The
+    /// whole subscription disappears once every queue drains, so an idle editor ticks
+    /// nothing at all.
+    ///
+    /// The interval is a fraction of `TOAST_TTL`: a toast may linger up to one tick past
+    /// its expiry, which at 250ms against a 4s life is imperceptible and costs far less
+    /// than a per-toast timer would. It is also a fraction of the interaction TTL (750ms —
+    /// DRAGON-353 follow-up), so a toast the user shortened by getting hands-on still goes
+    /// promptly rather than waiting on a coarse sweep.
+    fn sub_preview_toasts(&self) -> Option<Subscription<Msg>> {
+        let ticks: Vec<_> = self
+            .previews
+            .iter()
+            .filter(|p| !p.toasts.is_empty())
+            .map(|p| {
+                let id = p.window;
+                cosmic::iced::time::every(std::time::Duration::from_millis(250))
+                    .with(id)
+                    .map(|(id, _)| Msg::Preview(id, PreviewMsg::ToastTick))
+            })
+            .collect();
+        if ticks.is_empty() {
+            return None;
+        }
+        Some(Subscription::batch(ticks))
+    }
+
+    // DRAGON-371: `sub_preview_close_hold` lived here — a 50ms per-document tick that drove
+    // the 1s hold a close-after-copy/delete used to sit through so its success toast could be
+    // read. The hold is gone (the share closes the moment its work succeeds), so the tick,
+    // its `PendingClose` condition and its `CloseHoldElapsed` message went with it. Nothing
+    // times a close now; if a timed close ever returns it needs a subscription of its own,
+    // not a revival of this one.
+
+    /// Blink the text-annotation caret (DRAGON-354): while a preview has a live text edit, tick
+    /// every ~530ms so the caret flashes at the familiar rate. Same per-document shape as the
+    /// toast tick; it vanishes the moment nothing is being edited.
+    fn sub_text_caret_blink(&self) -> Option<Subscription<Msg>> {
+        let ticks: Vec<_> = self
+            .previews
+            .iter()
+            .filter(|p| p.edit.text_edit.is_some())
+            .map(|p| {
+                let id = p.window;
+                cosmic::iced::time::every(std::time::Duration::from_millis(530))
+                    .with(id)
+                    .map(|(id, _)| Msg::Preview(id, PreviewMsg::TextCaretBlink))
+            })
+            .collect();
+        if ticks.is_empty() {
+            return None;
+        }
+        Some(Subscription::batch(ticks))
     }
 
     /// Pull decoded frames from the playback worker into the view while a recording

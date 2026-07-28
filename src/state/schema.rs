@@ -128,6 +128,23 @@ pub struct Persisted {
     /// it and new box/arrow shapes seed from it. Defaults to `DEFAULT_ANNOT_STROKE` (5px).
     #[serde(default = "default_annot_stroke_w")]
     pub annot_stroke_w: f32,
+    /// The remembered SEQUENCE-BADGE ("step marker") side (SOURCE px): whatever the last badge
+    /// placed or resized in ANY preview editor settled at, so the next editor — a new capture
+    /// process, a later launch — spawns markers at it. `0.0` (and an absent key, which reads
+    /// the same) means UNSET: the caller falls back to
+    /// `app::preview::annotate::DEFAULT_BADGE_SIZE`, which is why this has no `default = …` fn
+    /// of its own (one fallback, in one place, and an old config needs no migration).
+    #[serde(default)]
+    pub annot_badge_size: f32,
+    /// The last-selected TEXT annotation size (SOURCE px), so a fresh preview opens the text
+    /// tool at it. `0.0` / absent = UNSET (falls back to `preview::text_annot::DEFAULT_TEXT_SIZE`),
+    /// so no `default = …` fn and an old config needs no migration. DRAGON-354.
+    #[serde(default)]
+    pub annot_text_size: f32,
+    /// The last-selected TEXT font family ("hand" | "clean"). `None` / unknown = the default
+    /// (handwritten). DRAGON-354.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annot_text_font: Option<String>,
     /// The last 5 CUSTOM annotation colors chosen (most-recent-first, RGBA), shown as MRU
     /// swatches in the color flyout. DRAGON-321.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -137,10 +154,41 @@ pub struct Persisted {
     /// users keep whatever they saved; only a fresh install picks up the windowed default.
     #[serde(default = "default_true")]
     pub preview_windowed: bool,
-    /// Automatically close the preview editor after a Save / Save As / Copy (default
-    /// on — the historical always-close behaviour, now optional).
+    /// DEPRECATED (DRAGON-355): the combined "Automatically save & close on copy" toggle,
+    /// split into `preview_save_on_copy` + `preview_close_on_copy`. Kept as a read-only
+    /// field ONLY so `migrate` (config_version < 8) can seed BOTH new settings from its old
+    /// value on the first load of an old config — serde would otherwise drop the unknown key
+    /// and the user's choice with it. `skip_serializing`, so it is never written again; the
+    /// `default_true` matches the old default, so a pre-v8 config that predated even this key
+    /// still fans out to on/on (the historical behaviour). Never read outside `migrate`.
+    #[serde(default = "default_true", skip_serializing)]
+    pub preview_save_close_on_copy: bool,
+    /// Preview editor: a manual **Copy** first SAVES the document (through the normal
+    /// save-target rule — the `-edited` sibling, or an explicitly-chosen path). Default on.
+    /// Settings → Preview Editor → Image Editor. INDEPENDENT of `preview_close_on_copy`
+    /// since DRAGON-355 (the two were one "save & close on copy" toggle before).
+    ///
+    /// Only the user's Copy ACTION is affected; the automatic copy the editor performs as
+    /// it OPENS never saves or closes (that would shut the editor the instant it appeared).
     #[serde(default = "default_true")]
-    pub auto_close_preview: bool,
+    pub preview_save_on_copy: bool,
+    /// Preview editor: a manual **Copy** CLOSES the document once the clipboard has it (held
+    /// briefly so the copy toast can be read, the same hold as copy-on-delete, and aborted if
+    /// the copy fails). Default on. Settings → Preview Editor → Image Editor. INDEPENDENT of
+    /// `preview_save_on_copy` since DRAGON-355. With save OFF and close ON, a close over
+    /// UNSAVED edits raises the unsaved-changes dialog instead of dropping them silently.
+    #[serde(default = "default_true")]
+    pub preview_close_on_copy: bool,
+    /// Preview editor: **Delete** first copies the media to the clipboard, so the pixels
+    /// survive the file. Default on. Settings → Preview Editor → Image Editor.
+    #[serde(default = "default_true")]
+    pub preview_copy_on_delete: bool,
+    // DRAGON-353: `auto_close_preview` ("Automatically close the preview editor on save or
+    // copy") lived here. NO share action closes the editor any more — Save / Save As / Copy
+    // all keep the document open — so the setting had no behaviour left to name and a
+    // setting that does nothing is dishonest UI. REMOVED (not kept as a deprecated
+    // read-only field: there is nothing to migrate into). Same treatment as `allow_multiple`
+    // below; pinned by `store::tests::old_preview_workflow_keys_are_ignored_on_load`.
     // DRAGON-351: `allow_multiple` ("Allow multiple capture instances") lived here. Every
     // launch now runs as its own instance unconditionally, so the field is REMOVED rather
     // than kept as a deprecated read-only one — there is nothing to migrate into. Old
@@ -305,12 +353,14 @@ pub struct Persisted {
     /// `~/Capture`.
     #[serde(default = "default_screenshot_dir")]
     pub screenshot_dir: String,
-    /// Copy the capture to the clipboard (when it's at or under the size limit).
-    #[serde(default = "default_true")]
-    pub copy_to_clipboard: bool,
-    /// Max size (MB) to copy to the clipboard.
-    #[serde(default = "default_clipboard_max_mb")]
-    pub clipboard_max_mb: u32,
+    // DRAGON-353: `copy_to_clipboard` ("Automatically copy to clipboard") and
+    // `clipboard_max_mb` ("Clipboard size limit") both lived here. The preview editor now
+    // copies the capture the moment it opens (and the immediate, preview-less share path
+    // copies too), so the behaviour is unconditional and the toggle is REMOVED; the size
+    // limit is REMOVED as a setting too and lives on as the fixed
+    // `share::AUTO_COPY_MAX_MB` — the editor toasts a named error when it declines a copy
+    // for size, so the knob existed only to pre-empt a failure the user can now read. See
+    // that constant's doc for why the limit itself survives.
     /// Record microphone audio with videos (default off).
     #[serde(default)]
     pub record_mic: bool,
@@ -411,10 +461,11 @@ pub struct Persisted {
     /// from these on load.
     #[serde(default, with = "shortcut_overrides", skip_serializing_if = "Vec::is_empty")]
     pub shortcuts: Vec<(crate::shortcuts::Action, Option<crate::shortcuts::Shortcut>)>,
-    /// Show the post-capture preview window (review + Save/Copy/Save As/Cancel) instead
-    /// of immediately saving and copying. Default on.
-    #[serde(default = "default_true")]
-    pub preview_after_capture: bool,
+    // DRAGON-353: `preview_after_capture` ("Open in preview editor") lived here. The editor
+    // is now the capture's destination unconditionally — it copies to the clipboard on open
+    // and owns every save/share action — so the toggle is REMOVED. The preview-less
+    // save+copy+notify path still exists for the cases where no editor CAN open (no known
+    // output) and for the region "Copy selection" quick-action, which is a deliberate bypass.
     /// Pause other media players (via MPRIS) while a video preview with sound is playing,
     /// resuming them when it closes. Default on.
     #[serde(default = "default_true")]
@@ -476,10 +527,6 @@ fn default_input_sensitivity() -> f32 {
 
 fn default_screenshot_dir() -> String {
     "~/Capture".to_string()
-}
-
-fn default_clipboard_max_mb() -> u32 {
-    1024
 }
 
 fn default_covermark_text() -> String {

@@ -201,25 +201,39 @@ fn overlay_min_content_width_for(video: bool, covermark: bool) -> f32 {
     // + the little split gap.
     let bar = |groups: f32, items: f32| groups + 8.0 * (items - 1.0) + SPLIT_MIN_GAP;
 
-    // Header row (DRAGON-337): swap | undo | redo ⟨split⟩ close — four FLAT buttons (no
-    // group capsules), so each costs a bare button box and they are all row items.
-    let header = bar(4.0 * button, 5.0);
+    // Header row (DRAGON-337 + DRAGON-353's Settings button): swap | settings | undo | redo
+    // ⟨split⟩ close — five FLAT buttons (no group capsules), so each costs a bare button box
+    // and they are all row items.
+    let header = bar(5.0 * button, 6.0);
 
-    // Top bar: ⟨split⟩ size+Delete(2) | save/save-as/copy(3). (The annotation DRAW tools
-    // lead this bar for images; like before they aren't counted — they wrap gracefully.)
-    let info = group(2.0); // size label (~a button box) + Delete button
-    let top = bar(info + group(3.0), 2.0);
+    // Top bar (DRAGON-353 / DRAGON-357 item 8): ⟨split⟩ [size chip, VIDEOS only] |
+    // save/save-as/copy/delete(4). Reserved at the VIDEO shape (chip + 4) — the wider case,
+    // safe for images too. (The annotation DRAW tools lead this bar for images; like before
+    // they aren't counted — they wrap gracefully. That leading row now also carries the
+    // DRAGON-354 Text tool cluster with its size + font dropdowns; being part of the same
+    // wrapping draw-tools row, they need no min-width reserve of their own.) `--preview` drops
+    // Delete, so four is the wider case and the one to reserve for.
+    let size_chip = group(1.0); // the size label, ~a button box wide
+    let top = bar(size_chip + group(4.0), 2.0);
 
-    // Bottom bar: do-not-train(1) | covermark(1, +2 sliders when applied) ⟨split⟩ [images:
-    // pointer/pan(2) + zoom control]. The zoom/opacity sliders live inside the covermark
-    // group, so they widen the BOTTOM bar.
+    // Bottom bar (DRAGON-357 regrouping, re-derived at the item-11 review): for a video it
+    // stays do-not-train(1) | covermark(1, +2 sliders when applied). For an image it is FOUR
+    // bordered clusters — [swatch + 7 line-width segments (item 9)], [covermark (+ its
+    // zoom/opacity sliders when applied)] ⟨split⟩ [the 8px-inner-padded zoom slider + the 72px
+    // preset dropdown (COMBO_W in viewport.rs)], and [the pointer/pan pair]. The size chip that
+    // briefly lived here (item 8) is DISABLED (commented out in `image.rs`), so it no longer
+    // costs a `group(1.0)` nor a row item here — the floor gains that much slack.
     let sliders = if covermark { 2.0 * slider_item_w(s) } else { 0.0 };
     let (bottom_groups, bottom_items) = if video {
         (group(1.0) + group(1.0) + sliders, 3.0)
     } else {
-        // Images: pointer/pan tools (2) + zoom control (slider + dropdown).
-        let zoom_ctrl = 120.0 + 150.0 + 8.0;
-        (group(1.0) + group(1.0) + sliders + group(2.0) + zoom_ctrl, 5.0)
+        // The zoom cluster: group padding + 8px inner-left slider pad + the 120px slider +
+        // 8px row spacing + the 72px combo.
+        let zoom_ctrl = 2.0 * s * GROUP_PAD + 8.0 + 120.0 + 8.0 + 72.0;
+        (
+            group(8.0) + group(1.0) + sliders + zoom_ctrl + group(2.0),
+            4.0,
+        )
     };
     let bottom = bar(bottom_groups, bottom_items);
 
@@ -270,12 +284,31 @@ mod tests {
     #[test]
     fn overlay_min_width_covers_the_header_row() {
         let button = PreviewSurface::Overlay.btn_scale() * (ICON_BOX + 2.0 * BTN_PAD);
-        let header = 4.0 * button + 8.0 * 4.0 + SPLIT_MIN_GAP;
+        // Five flat buttons since DRAGON-353 added Settings beside the appearance toggle.
+        let header = 5.0 * button + 8.0 * 5.0 + SPLIT_MIN_GAP;
         for video in [false, true] {
             for covermark in [false, true] {
                 assert!(
                     overlay_min_content_width_for(video, covermark) >= header,
                     "the floor must fit the header row (video={video} covermark={covermark})"
+                );
+            }
+        }
+    }
+
+    /// DRAGON-357 item 11: the user-measured windowed floor (`PREVIEW_MIN_W` = 914) DOMINATES
+    /// the content-derived toolbar floor in every composition (worst case — image + covermark
+    /// sliders — re-derived at ~890px after the item 9 line-width regrouping to seven segments).
+    /// If a future cluster grows the content floor past the constant, this fails: at that point
+    /// switch the windowed floor to `max(PREVIEW_MIN_W, content)` instead of silently clipping.
+    #[test]
+    fn windowed_floor_dominates_the_content_derived_bar_widths() {
+        for video in [false, true] {
+            for covermark in [false, true] {
+                let content = overlay_min_content_width_for(video, covermark);
+                assert!(
+                    content <= super::super::shell::PREVIEW_MIN_W,
+                    "content floor {content} exceeds PREVIEW_MIN_W (video={video} covermark={covermark}) — bump the floor to max(constant, content)"
                 );
             }
         }
