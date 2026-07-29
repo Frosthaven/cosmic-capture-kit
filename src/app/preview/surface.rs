@@ -15,10 +15,40 @@ pub enum PreviewSurface { Overlay, Window }
 /// [`PreviewSurface::btn_scale`]).
 ///
 /// It used to be per-surface: the fullscreen overlay drew its toolbars at full size (1.0)
-/// while the windowed preview tightened them to 0.82 for its smaller window. The owner
-/// preferred the tighter chrome everywhere, so the overlay was unified ONTO the windowed
-/// figure rather than the two being kept in step — there is deliberately no second constant
-/// to drift from this one.
+/// while the windowed preview tightened them for its smaller window. The owner preferred the
+/// tighter chrome everywhere, so the overlay was unified ONTO the windowed figure rather than
+/// the two being kept in step — there is deliberately no second constant to drift from this one.
+///
+/// **It briefly also decided how sharply the toolbar GLYPHS render** — it does not any more, and
+/// the history matters because it is easy to reach for this constant again for the wrong reason.
+///
+/// It was raised 0.82 → 0.91 (DRAGON-392) to buy the accept checkmark a solid spine: the glyph
+/// box was `ICON_BOX × this`, and a FRACTIONAL box made iced rasterize at one size and draw at
+/// another, resampling the texture and softening every edge. DRAGON-399 found and fixed that at
+/// the source — [`crate::widgets::icons::box_px`] snaps every icon box to a whole pixel — so the
+/// bigger chrome was paying for a bug, and the scale returned to 0.82. **Do not raise it for
+/// glyph sharpness again**; if a glyph looks soft, check its box is integral first.
+///
+/// With the snap in place the numbers are, on a 1× display (`box = round(22 × scale)`, and the
+/// raster now equals the draw, so nothing is resampled at ANY scale):
+///
+/// | scale | raw box | snapped | stroke | solid px in the accept check |
+/// |-------|---------|---------|--------|------------------------------|
+/// | 0.82  | 18.04   | 18      | 1.50px | 4                            |
+/// | 0.91  | 20.02   | 20      | 1.67px | 0                            |
+/// | 1.09  | 23.98   | 24      | 2.00px | 16                           |
+///
+/// Note the middle row: sharpness is NOT monotonic in size — it depends on how the glyph's
+/// coordinates land on the pixel grid — so 0.82 measures BETTER than the 0.91 it was raised to,
+/// once the resample is gone. Tuning this for glyph crispness is guesswork; tune it for how big
+/// the chrome should be, which is what it is for.
+///
+/// Everything scale-derived (`btn_pad`, `grp_pad`, the flyout padding, [`OVERLAY_HEADER_H`],
+/// `slider_item_w`, the bar-height reservations, the group footprints) follows automatically —
+/// nothing is tuned to a particular value of it. What does NOT follow are the deliberately
+/// scale-independent, text-bearing widths (the Fit combo's `COMBO_W`, the slider rail, the text
+/// size/font chips, the label point sizes): those hold still while the buttons around them
+/// change size.
 pub(super) const CHROME_SCALE: f32 = 0.82;
 
 /// The OVERLAY header row's height (DRAGON-337): its buttons are FLAT header-style icons —
@@ -206,34 +236,32 @@ fn overlay_min_content_width_for(video: bool, covermark: bool) -> f32 {
     // and they are all row items.
     let header = bar(5.0 * button, 6.0);
 
-    // Top bar (DRAGON-353 / DRAGON-357 item 8): ⟨split⟩ [size chip, VIDEOS only] |
-    // save/save-as/copy/delete(4). Reserved at the VIDEO shape (chip + 4) — the wider case,
-    // safe for images too. (The annotation DRAW tools lead this bar for images; like before
-    // they aren't counted — they wrap gracefully. That leading row now also carries the
-    // DRAGON-354 Text tool cluster with its size + font dropdowns; being part of the same
-    // wrapping draw-tools row, they need no min-width reserve of their own.) `--preview` drops
-    // Delete, so four is the wider case and the one to reserve for.
-    let size_chip = group(1.0); // the size label, ~a button box wide
-    let top = bar(size_chip + group(4.0), 2.0);
+    // Top bar (DRAGON-392): ⟨split⟩ save/save-as/copy/delete(4). The filesize chip that used to
+    // sit here for VIDEOS moved to their bottom bar, and the images' info block leads the LEFT
+    // side with the annotation tray — like the tray itself it isn't counted, because that whole
+    // leading row wraps gracefully. `--preview` drops Delete, so four is the wider case and the
+    // one to reserve for.
+    let top = bar(group(4.0), 2.0);
 
-    // Bottom bar (DRAGON-357 regrouping, re-derived at the item-11 review): for a video it
-    // stays do-not-train(1) | covermark(1, +2 sliders when applied). For an image it is FOUR
-    // bordered clusters — [swatch + 7 line-width segments (item 9)], [covermark (+ its
-    // zoom/opacity sliders when applied)] ⟨split⟩ [the 8px-inner-padded zoom slider + the 72px
-    // preset dropdown (COMBO_W in viewport.rs)], and [the pointer/pan pair]. The size chip that
-    // briefly lived here (item 8) is DISABLED (commented out in `image.rs`), so it no longer
-    // costs a `group(1.0)` nor a row item here — the floor gains that much slack.
+    // Bottom bar (DRAGON-392 re-derivation). VIDEO: [covermark (+ its zoom/opacity sliders when
+    // applied)] ⟨split⟩ [the document-info block]. IMAGE: [swatch + 7 line-width segments],
+    // [covermark (+ sliders)] ⟨split⟩ [the document-info block], [the zoom slider + preset
+    // dropdown]. The crop button and the pointer/pan pair are no longer here at all — crop moved
+    // into the top tray's Select/Hand/Crop group and the pan pair became the Hand tool inside it.
     let sliders = if covermark { 2.0 * slider_item_w(s) } else { 0.0 };
+    // The info block: group padding + the button-box side padding its container adds + the
+    // widest line it can hold. That line is a resolution ("3840 × 2160" — 11 glyphs at the
+    // 13px menu-label size, ~7px each in Inter), never the filesize, which is far shorter.
+    let info_chip = 2.0 * s * GROUP_PAD + 2.0 * s * BTN_PAD + 88.0;
     let (bottom_groups, bottom_items) = if video {
-        (group(1.0) + group(1.0) + sliders, 3.0)
+        (group(1.0) + sliders + info_chip, 3.0)
     } else {
-        // The zoom cluster: group padding + 8px inner-left slider pad + the 120px slider +
-        // 8px row spacing + the 72px combo.
-        let zoom_ctrl = 2.0 * s * GROUP_PAD + 8.0 + 120.0 + 8.0 + 72.0;
-        (
-            group(8.0) + group(1.0) + sliders + zoom_ctrl + group(2.0),
-            4.0,
-        )
+        // The zoom cluster: group padding + the 8px inner-left slider pad + the ZOOM rail
+        // (`ZOOM_SLIDER_W` — its own width since the owner widened it a third; the icon-led
+        // sliders above still ride `slider_item_w`'s shared one) + 8px row spacing + the 72px
+        // combo (COMBO_W in viewport.rs).
+        let zoom_ctrl = 2.0 * s * GROUP_PAD + 8.0 + super::chrome::ZOOM_SLIDER_W + 8.0 + 72.0;
+        (group(8.0) + group(1.0) + sliders + info_chip + zoom_ctrl, 5.0)
     };
     let bottom = bar(bottom_groups, bottom_items);
 
@@ -296,7 +324,8 @@ mod tests {
         }
     }
 
-    /// DRAGON-357 item 11: the user-measured windowed floor (`PREVIEW_MIN_W` = 914) DOMINATES
+    /// DRAGON-357 item 11: the user-measured windowed floor (`PREVIEW_MIN_W`, 924 since
+    /// DRAGON-392) DOMINATES
     /// the content-derived toolbar floor in every composition (worst case — image + covermark
     /// sliders — re-derived at ~890px after the item 9 line-width regrouping to seven segments).
     /// If a future cluster grows the content floor past the constant, this fails: at that point

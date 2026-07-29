@@ -882,11 +882,24 @@ impl App {
         // `toggle_maximize`). A trailing `WIN_CAPTION_INSET` spacer reserves the cluster's
         // width so the header title/content never slides under the buttons. The native
         // buttons are installed post-show in the `ConfigWindowFloat` handler.
+        // DRAGON-403: only where DWM actually PAINTS those native buttons — Win11 (build
+        // 22000+). On Windows 10 they hit-test but never render ("clickable but invisible"),
+        // so fall back to the CSD buttons this window used before DRAGON-284; their messages
+        // already route to the native `toggle_maximize` / `minimize` helpers (DRAGON-258), and
+        // `install_native_caption_buttons` skips the whole DWM recipe under the same gate, so
+        // nothing swallows their clicks. The Win11 branch is the byte-identical builder chain.
         #[cfg(windows)]
-        let header = header
-            .start(toggle_nav)
-            .start(search)
-            .end(widget::Space::new().width(Length::Fixed(WIN_CAPTION_INSET)));
+        let header = {
+            let header = header.start(toggle_nav).start(search);
+            if crate::platform::windows::caption::native_caption_buttons_supported() {
+                header.end(widget::Space::new().width(Length::Fixed(WIN_CAPTION_INSET)))
+            } else {
+                header
+                    .on_close(Msg::WindowChrome(WindowChromeMsg::CloseConfigWindow))
+                    .on_maximize(Msg::WindowChrome(WindowChromeMsg::ConfigWindowMaximize))
+                    .on_minimize(Msg::WindowChrome(WindowChromeMsg::ConfigWindowMinimize))
+            }
+        };
         #[cfg(all(not(target_os = "macos"), not(windows)))]
         let header = header
             .start(toggle_nav)

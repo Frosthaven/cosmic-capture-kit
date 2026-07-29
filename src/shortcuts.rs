@@ -169,9 +169,12 @@ pub enum Action {
     /// Preview: swap the active annotation color to its COMPANION (its complement), toggling
     /// back on a second press (default X — Photoshop's foreground/background swap) — DRAGON-386.
     PreviewColorCompanionSwap,
-    /// Preview: toggle between selection/interact and PAN (hand) mode (default H — Photoshop's
-    /// Hand tool).
-    PreviewTogglePan,
+    /// Preview: arm the HAND tool (default H — Photoshop's Hand key). DRAGON-392 turned panning
+    /// from a MODE toggle into a real armed tool, so this arms it exactly like every other
+    /// per-tool action; the key is unchanged. The old `PreviewTogglePan` spelling is accepted on
+    /// load (`serde(alias)`) so a user who rebound the pan key keeps their binding.
+    #[serde(alias = "PreviewTogglePan")]
+    PreviewAnnotHand,
     /// Recording: stop + save the in-progress recording (default Enter).
     RecordStop,
     /// Recording: toggle the microphone channel (default M).
@@ -223,6 +226,9 @@ impl Action {
         Action::PreviewUndo,
         Action::PreviewRedo,
         Action::PreviewAnnotPointer,
+        // The HAND (DRAGON-392) rides with the pointer: both are selection-family tools that
+        // draw nothing, and like every per-tool action it is listed BEFORE the slot cycles.
+        Action::PreviewAnnotHand,
         Action::PreviewSelectAll,
         Action::PreviewDeselectAll,
         // The twelve PER-TOOL actions come first — see the slot note above.
@@ -245,7 +251,6 @@ impl Action {
         Action::PreviewCrop,
         Action::PreviewColorFlyout,
         Action::PreviewColorCompanionSwap,
-        Action::PreviewTogglePan,
         Action::PreviewPlay,
         Action::PreviewFramePrev,
         Action::PreviewFrameNext,
@@ -295,7 +300,7 @@ impl Action {
             Action::PreviewCrop => "Crop tool",
             Action::PreviewColorFlyout => "Color",
             Action::PreviewColorCompanionSwap => "Swap color",
-            Action::PreviewTogglePan => "Toggle pan mode",
+            Action::PreviewAnnotHand => "Hand tool",
             Action::RecordStop => "Stop and save recording",
             Action::RecordToggleMic => "Toggle Microphone",
             Action::RecordToggleSystemAudio => "Toggle system audio",
@@ -360,7 +365,7 @@ impl Action {
             Action::PreviewColorCompanionSwap => {
                 "Swap the annotation color to its companion, and back again."
             }
-            Action::PreviewTogglePan => "Toggle between selection and pan (hand) mode.",
+            Action::PreviewAnnotHand => "Pan the picture by dragging it.",
             Action::RecordStop => "",
             Action::RecordToggleMic => "",
             Action::RecordToggleSystemAudio => "",
@@ -408,7 +413,7 @@ impl Action {
             | Action::PreviewCrop
             | Action::PreviewColorFlyout
             | Action::PreviewColorCompanionSwap
-            | Action::PreviewTogglePan => "Image Editor Shortcuts",
+            | Action::PreviewAnnotHand => "Image Editor Shortcuts",
             Action::RecordStop
             | Action::RecordToggleMic
             | Action::RecordToggleSystemAudio => "Recording",
@@ -455,7 +460,7 @@ impl Action {
             | Action::PreviewCrop
             | Action::PreviewColorFlyout
             | Action::PreviewColorCompanionSwap
-            | Action::PreviewTogglePan => Context::Preview,
+            | Action::PreviewAnnotHand => Context::Preview,
             Action::RecordStop
             | Action::RecordToggleMic
             | Action::RecordToggleSystemAudio => Context::Recording,
@@ -511,7 +516,9 @@ impl Action {
             Action::PreviewCrop => Shortcut::char('c'),
             Action::PreviewColorFlyout => Shortcut::char('s'),
             Action::PreviewColorCompanionSwap => Shortcut::char('x'),
-            Action::PreviewTogglePan => Shortcut::char('h'),
+            // DRAGON-392: H arms the HAND TOOL (it toggled a pan MODE before) — same key, and
+            // still Photoshop's Hand.
+            Action::PreviewAnnotHand => Shortcut::char('h'),
             Action::RecordStop => Shortcut::named(NamedKey::Enter),
             Action::RecordToggleMic => Shortcut::char('m'),
             Action::RecordToggleSystemAudio => Shortcut::char('s'),
@@ -1421,7 +1428,7 @@ mod tests {
             ("t", Action::PreviewAnnotText),           // PS Type
             ("b", Action::PreviewAnnotPen),            // PS Brush
             ("e", Action::PreviewAnnotEraser),         // PS Eraser
-            ("h", Action::PreviewTogglePan),           // PS Hand
+            ("h", Action::PreviewAnnotHand),           // PS Hand (DRAGON-392: a real tool)
             // Unchanged neighbours that share the row.
             ("d", Action::PreviewAnnotDuplicate),
             ("l", Action::PreviewAnnotStrokeCycle),

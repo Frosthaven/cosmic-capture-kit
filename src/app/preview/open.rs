@@ -16,9 +16,7 @@ fn dialog_action(
     id: window::Id,
     tint: Option<fn(&cosmic::Theme) -> cosmic::iced::Color>,
 ) -> Element<'static, Msg> {
-    let glyph = widget::icon::icon(crate::widgets::icons::handle(icon))
-        .width(Length::Fixed(16.0))
-        .height(Length::Fixed(16.0));
+    let glyph = crate::widgets::icons::sized(icon, 16.0);
     let glyph = match tint {
         Some(tint) => glyph.class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
             move |t: &cosmic::Theme| cosmic::widget::svg::Style { color: Some(tint(t)) },
@@ -1133,6 +1131,12 @@ impl App {
         }
         let fit_to_screen = self.preview_for(id).is_some_and(|p| p.view.zoom_preset == Some(0));
         let new_fit = self.preview_for(id).map(|p| self.preview_fit_scale(p)).unwrap_or(1.0);
+        // DRAGON-401: preserving the NATIVE scale raises the fit-relative zoom whenever the
+        // window shrinks, so this path writes a zoom too. It is size-preserving by
+        // construction (the media's physical extent is what is being held constant), but it
+        // reaches `set_zoom` — which knows only the backstop — so it takes the device ceiling
+        // like every other writer rather than relying on that argument staying true.
+        let maxz = self.preview_for(id).map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
         if let Some(p) = self.preview_for_mut(id) {
             // "Fit to screen" re-fits (whole picture, zoom 1.0); any other zoom keeps its
             // native scale across the resize.
@@ -1141,7 +1145,7 @@ impl App {
             } else {
                 old_native / new_fit.max(0.0001)
             };
-            p.view.set_zoom(z);
+            p.view.set_zoom(z.min(maxz));
         }
         // DRAGON-216 (Linux windowed swap): this configure is the swapped-in window's FIRST
         // map (it's now `p.window`), so the neutral overlay that covered the grab has served
@@ -1318,10 +1322,24 @@ impl App {
             // CSD buttons and reserve the trailing `WIN_CAPTION_INSET` spacer so the header
             // content clears the cluster. Native ✕ → WindowCloseRequested → preview Cancel;
             // the header double-click → the same native `toggle_maximize` as the max button.
+            // DRAGON-403: only where DWM actually PAINTS those native buttons — Win11 (build
+            // 22000+). On Windows 10 they hit-test but never render, so fall back to the CSD
+            // buttons this window used before DRAGON-284 (their messages already route to the
+            // native `toggle_maximize` / `minimize` helpers, DRAGON-258); the DWM recipe is
+            // skipped under the same gate so nothing swallows their clicks. The Win11 branch
+            // is the byte-identical builder chain.
             #[cfg(windows)]
-            let header = header.end(
-                widget::Space::new().width(Length::Fixed(crate::app::settings::WIN_CAPTION_INSET)),
-            );
+            let header = if crate::platform::windows::caption::native_caption_buttons_supported() {
+                header.end(
+                    widget::Space::new()
+                        .width(Length::Fixed(crate::app::settings::WIN_CAPTION_INSET)),
+                )
+            } else {
+                header
+                    .on_close(Msg::Preview(id, PreviewMsg::Cancel))
+                    .on_maximize(Msg::Preview(id, PreviewMsg::WindowMaximize))
+                    .on_minimize(Msg::Preview(id, PreviewMsg::WindowMinimize))
+            };
             #[cfg(all(not(target_os = "macos"), not(windows)))]
             let header = header
                 .on_close(Msg::Preview(id, PreviewMsg::Cancel))
@@ -1647,10 +1665,35 @@ impl App {
         // The open-time automatic clipboard copy toasts BEFORE the decode lands, so the
         // loading state has to be able to show one too (DRAGON-353). Nothing here is
         // chrome, so the top-right anchor is unobstructed.
-        match toasts {
-            Some(t) => cosmic::iced::widget::stack(vec![swallowed, t]).into(),
-            None => swallowed,
-        }
+        //
+        // DRAGON-393: anchor it to the whole loading REGION, not to the spinner. The spinner
+        // column is `Shrink` and centred, so stacking the toast straight over it put the toast
+        // in the middle of the window — and the moment the decode landed it jumped to the
+        // top-right of the media area. That is the centre-to-right flit the owner reported: it
+        // happens BEFORE `compose_preview` ever runs, so re-anchoring the loaded view alone
+        // would not have fixed it. Filling the region here makes the FIRST placement the final
+        // one horizontally. The stack is unconditional for the same reason it is in
+        // `compose_preview` (DRAGON-375's class): a toast coming or going must not change the
+        // tree shape under this position. `Space::new()` is zero-size but not `is_void`, so
+        // `Stack::push` keeps the slot.
+        //
+        // WIDTH: a WINDOW's region is the whole body. The OVERLAY's is the hugged control width
+        // — the very width the loaded editor's column will take ([`App::overlay_control_width`])
+        // — and both are centred by the same outer container, so once the media dims are known
+        // (a fresh capture knows its footprint at open) the toast's top-right corner is already
+        // the corner it will keep. Height stays `Fill` in both: the loading state has no
+        // toolbars, so a toast does start higher than it will sit once they appear.
+        let width = if preview.surface.is_window() {
+            Length::Fill
+        } else {
+            Length::Fixed(self.overlay_control_width(preview))
+        };
+        let region = super::chrome::toast_region(swallowed, width, Length::Fill);
+        cosmic::iced::widget::stack(vec![
+            region,
+            toasts.unwrap_or_else(|| widget::Space::new().into()),
+        ])
+        .into()
     }
 
     /// Whether `id` is the open preview window.

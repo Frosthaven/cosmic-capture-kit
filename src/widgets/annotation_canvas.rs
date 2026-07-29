@@ -111,6 +111,13 @@ pub enum Tool {
     /// selection. It is also the ONLY tool under which freehand PEN groups are click-selectable
     /// (see [`AnnotationCanvas::pen_selectable`]).
     Pointer,
+    /// The HAND (DRAGON-392): draws nothing and manipulates nothing — while it is armed a plain
+    /// left-drag PANS the picture, exactly as Alt-drag does under every other tool. It replaced
+    /// the old pointer/pan MODE toggle: panning is now a tool you arm like any other (`H`,
+    /// Photoshop's Hand key), so the editor has ONE selection model instead of a tool plus a
+    /// parallel mode flag. The canvas forwards every pointer event to its `ZoomPan` child while
+    /// it is armed — see the `pan_mode` field, which the app now feeds from this tool.
+    Hand,
     /// Draw arrows.
     Arrow,
     /// Place a STEP MARKER (DRAGON-340): an auto-numbered disc + ring. Geometry is a square rect
@@ -157,6 +164,7 @@ impl Tool {
     pub fn as_str(self) -> &'static str {
         match self {
             Tool::Pointer => "pointer",
+            Tool::Hand => "hand",
             Tool::Arrow => "arrow",
             Tool::Badge => "badge",
             Tool::Rect => "box",
@@ -174,6 +182,7 @@ impl Tool {
     pub fn from_str(s: &str) -> Option<Tool> {
         match s {
             "pointer" => Some(Tool::Pointer),
+            "hand" => Some(Tool::Hand),
             "arrow" => Some(Tool::Arrow),
             "badge" => Some(Tool::Badge),
             "box" => Some(Tool::Rect),
@@ -203,12 +212,20 @@ impl Tool {
         matches!(self, Tool::Pointer)
     }
 
-    /// Whether this tool CREATES geometry on a drag. The two non-creating tools are the
-    /// [`Tool::Eraser`] (it removes) and the [`Tool::Pointer`] (it only selects) — everything
-    /// that keys off "a drag will draw something" (the crosshair cursor, the Ctrl
-    /// draw-over-items override) must ask this rather than `tool.is_some()`.
+    /// Whether this is the HAND (DRAGON-392) — the tool whose press PANS the picture instead of
+    /// reaching the annotation model at all. The app reads it to drive the canvas's / `ZoomPan`'s
+    /// `pan_mode`, so "the hand is armed" and "a plain drag pans" are one fact.
+    pub fn is_hand(self) -> bool {
+        matches!(self, Tool::Hand)
+    }
+
+    /// Whether this tool CREATES geometry on a drag. The three non-creating tools are the
+    /// [`Tool::Eraser`] (it removes), the [`Tool::Pointer`] (it only selects) and the
+    /// [`Tool::Hand`] (it pans) — everything that keys off "a drag will draw something" (the
+    /// crosshair cursor, the Ctrl draw-over-items override) must ask this rather than
+    /// `tool.is_some()`.
     pub fn draws(self) -> bool {
-        !matches!(self, Tool::Eraser | Tool::Pointer)
+        !matches!(self, Tool::Eraser | Tool::Pointer | Tool::Hand)
     }
 
     /// Whether a plain CLICK (a press that never crosses the drag threshold) is already a
@@ -300,6 +317,34 @@ pub fn draw_bypassing_items(tool: Option<Tool>, ctrl: bool, over_handle: bool) -
 /// selects/toggles exactly as it did, so nothing a user could do is gone — only moved a few px.
 pub fn handle_press_beats_modifiers(over_handle: bool) -> bool {
     over_handle
+}
+
+/// The band hit-test [`AnnotationCanvas::band_hits`] holds: `(x0, y0, x1, y1)` in image SOURCE
+/// px → the ids that band would take. Named because the boxed closure spells out awkwardly at
+/// every use.
+type BandHits<'a> = Box<dyn Fn(f32, f32, f32, f32) -> Vec<u64> + 'a>;
+
+/// **What a live rubber band WOULD select** (DRAGON-397): the ids that release would leave
+/// selected, given what is `existing`ly selected, the `hits` the band currently covers, and
+/// whether the band is `additive` (Ctrl/Shift at press — [`additive_select`]).
+///
+/// This mirrors the app's commit exactly: a plain band REPLACES (`Selection::set_all`), an
+/// additive one KEEPS what was selected and appends the new ids, skipping duplicates
+/// (`Selection::add_all`) — so a Ctrl-band sweeping an ALREADY-selected item previews it as
+/// staying selected, which is what will happen, rather than as a fresh hit. Order matches the
+/// commit's too (existing first, then hits in scene order), so the previewed set and the
+/// committed one are the same list.
+///
+/// Deliberately NOT a toggle: only a Ctrl/Shift CLICK toggles ([`AnnotEvent::SelectToggle`]); a
+/// band adds. Pure — unit-tested.
+pub fn band_preview_ids(existing: &[u64], hits: &[u64], additive: bool) -> Vec<u64> {
+    let mut out: Vec<u64> = if additive { existing.to_vec() } else { Vec::new() };
+    for id in hits {
+        if !out.contains(id) {
+            out.push(*id);
+        }
+    }
+    out
 }
 
 /// Whether the armed tool owns the WHOLE canvas for CURSOR purposes: one crosshair everywhere
@@ -661,6 +706,14 @@ struct State {
     /// The rubber band's live far corner in widget-LOCAL screen px (DRAGON-341), meaningful
     /// only while `pending` is [`Pending::Band`] and the press has moved.
     band_to: (f32, f32),
+    /// The ids the live band WOULD select if released now (DRAGON-397) — the result of
+    /// [`band_preview_ids`] over the injected [`AnnotationCanvas::band_hits`], recomputed on each
+    /// motion of a moved band and cleared when the gesture ends.
+    ///
+    /// **Chrome only.** The committed selection still changes exactly once, on release, through
+    /// the single `BoxSelect` event: nothing here reaches the app, so the group box, the toolbar's
+    /// enabled state and undo are untouched while the band grows.
+    band_preview: Vec<u64>,
     /// Whether the press has moved past the click threshold.
     moved: bool,
     /// Whether a `DrawBegin` / `GrabBegin` has been emitted for this gesture yet.
@@ -746,7 +799,9 @@ pub struct AnnotationCanvas<'a, Msg> {
     /// The DISPLAY frame's offset within the full source (SOURCE px), DRAGON-385 — see
     /// [`CanvasMap::offset`]. `(0, 0)` un-cropped.
     offset: (f32, f32),
-    /// The pan tool (grabby hand) is active — a press then belongs to the ZoomPan.
+    /// The HAND tool ([`Tool::Hand`]) is armed — a press then belongs to the ZoomPan. Fed by the
+    /// app from the armed tool since DRAGON-392 (it was a separate pan MODE flag before), so this
+    /// widget's behaviour is unchanged: one bool, one meaning — "a plain drag pans".
     pan_mode: bool,
     accent: Color,
     /// While a text box is being EDITED (DRAGON-354): the blinking caret geometry in image
@@ -770,7 +825,17 @@ pub struct AnnotationCanvas<'a, Msg> {
     /// height)`, box-relative to that box's rect) — painted as a translucent accent wash behind
     /// the glyphs (DRAGON-354 item 12). Empty when there is no text selection.
     text_selection: Vec<(f32, f32, f32, f32)>,
-    /// The TEXT annotations' raster layers (DRAGON-373), as `(item id, a DRAW-ONLY element)`.
+    /// The TEXT annotations' raster layers (DRAGON-373), as `(item id, a DRAW-ONLY element, the
+    /// caption's SOURCE-px region `(x, y, w, h)`)`.
+    ///
+    /// The REGION is the placement (DRAGON-396): each layer is laid out at its own rect, mapped
+    /// through the same [`CanvasMap`] the vector geometry uses, and its raster fills that rect.
+    /// Previously the layer was stretched across the whole picture with `dest` fractions locating
+    /// the caption inside it — equivalent on screen (pinned by
+    /// `text_region_placement_matches_the_picture_fraction_form`), but it bounded every caption BY
+    /// the picture: a shader primitive is clipped to its own widget rect, so a caption outside the
+    /// image could not be drawn at all, whatever the clip said. Placing each at its own rect is
+    /// what lets the crop session show them (see [`Self::marks_outside_image`]).
     ///
     /// # Why the canvas draws them
     /// Text is a raster (the glyphs must be pixel-identical to the bake, and re-rendering them
@@ -784,13 +849,32 @@ pub struct AnnotationCanvas<'a, Msg> {
     /// They are DRAW-ONLY: never in the widget tree, never handed an event, laid out by
     /// [`Self::draw`] against the picture rect. Hit-testing works off the item model, so input
     /// stays entirely with this widget — an interactive sibling would swallow presses.
-    text_layers: Vec<(u64, cosmic::Element<'a, Msg>)>,
+    text_layers: Vec<TextLayerMount<'a, Msg>>,
     /// DISPLAY-ONLY (DRAGON-387): draw the committed scene (vector runs + text rasters) over the
     /// media but own NO interaction — every pointer event forwards to the wrapped ZoomPan and no
     /// selection chrome is drawn. The crop SESSION layers its own overlay on top and owns the
     /// pointer, so the annotations must show through non-interactively. `false` = the ordinary
     /// interactive editor canvas, byte-identical to before.
     display_only: bool,
+    /// Draw the committed scene BEYOND the picture rectangle (DRAGON-396) — out to the whole
+    /// content area rather than cut at the image edge.
+    ///
+    /// The crop SESSION sets this: the user is deciding what the crop should include, so a mark
+    /// lying outside the current image (in an over-crop's extension, or outside a tightened crop)
+    /// has to be visible and identifiable to be judged — "so that we can easily recrop later".
+    /// `false` — every other canvas — cuts at the picture, which is where the BAKE cuts.
+    marks_outside_image: bool,
+    /// Resolve which items a rubber BAND touches, for the LIVE sweep preview (DRAGON-397):
+    /// `(x0, y0, x1, y1)` in image SOURCE px (un-normalized, exactly the corners
+    /// [`AnnotEvent::BoxSelect`] carries) → the ids that band would take, in scene order.
+    ///
+    /// It is INJECTED rather than implemented here on purpose: the release path already owns
+    /// that rule (`preview::annotate::items_in_band` — arrows test their shaft, pen groups test
+    /// every stroke, everything else its drawn bounds), and a preview computed from a second
+    /// implementation would eventually lie about what release will do. The app hands in a
+    /// closure over the SAME function, so there is exactly one rule. `None` (a display-only
+    /// canvas, or any caller that doesn't want it) simply draws no preview.
+    band_hits: Option<BandHits<'a>>,
     on_event: Box<dyn Fn(AnnotEvent) -> Msg>,
 }
 
@@ -827,6 +911,8 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
             text_selection: Vec::new(),
             text_layers: Vec::new(),
             display_only: false,
+            marks_outside_image: false,
+            band_hits: None,
             on_event: Box::new(on_event),
         }
     }
@@ -840,6 +926,24 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         self
     }
 
+    /// Draw the committed scene beyond the picture rectangle (DRAGON-396) — see
+    /// [`Self::marks_outside_image`]. Builder; every canvas but the crop session's leaves it off.
+    pub fn marks_outside_image(mut self, on: bool) -> Self {
+        self.marks_outside_image = on;
+        self
+    }
+
+    /// Supply the band hit-test the LIVE sweep preview reads (DRAGON-397) — see
+    /// [`Self::band_hits`]. Builder so the constructor arg list stays fixed; a canvas that never
+    /// calls it behaves exactly as before (the marquee alone, everything lighting up on release).
+    pub fn band_hits(
+        mut self,
+        hits: impl Fn(f32, f32, f32, f32) -> Vec<u64> + 'a,
+    ) -> Self {
+        self.band_hits = Some(Box::new(hits));
+        self
+    }
+
     /// The DISPLAY frame's offset within the full source (SOURCE px), DRAGON-385: the crop origin
     /// when a crop frames the view (`source` is then the crop's size), else `(0, 0)`. Builder so
     /// the constructor arg list stays fixed; an un-cropped canvas simply never calls it.
@@ -848,9 +952,9 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
         self
     }
 
-    /// Supply the TEXT annotations' raster layers as `(item id, draw-only element)` — see
-    /// [`Self::text_layers`]. Builder so the constructor arg list stays fixed.
-    pub fn text_layers(mut self, layers: Vec<(u64, cosmic::Element<'a, Msg>)>) -> Self {
+    /// Supply the TEXT annotations' raster layers as `(item id, draw-only element, SOURCE-px
+    /// region)` — see [`Self::text_layers`]. Builder so the constructor arg list stays fixed.
+    pub fn text_layers(mut self, layers: Vec<TextLayerMount<'a, Msg>>) -> Self {
         self.text_layers = layers;
         self
     }
@@ -1017,10 +1121,12 @@ impl<'a, Msg> AnnotationCanvas<'a, Msg> {
     /// BOX (DRAGON-388), so a resize scales the whole set in unison; single selection keeps its
     /// handles on the item itself. Then (DRAGON-390) the group box's own border + empty interior
     /// grab as a Body hit on the primary, so dragging the box moves the whole group.
-    /// The raster layer belonging to item `id`, if it has one (DRAGON-373). A text box that is
-    /// still blank has none — there is nothing to draw — so it just rides the vector run.
-    fn text_layer_for(&self, id: u64) -> Option<&cosmic::Element<'a, Msg>> {
-        self.text_layers.iter().find(|(lid, _)| *lid == id).map(|(_, el)| el)
+    /// The raster layer belonging to item `id` — the element and its SOURCE-px region — if it has
+    /// one (DRAGON-373). A text box that is still blank has none — there is nothing to draw — so it
+    /// just rides the vector run.
+    #[allow(clippy::type_complexity)]
+    fn text_layer_for(&self, id: u64) -> Option<(&cosmic::Element<'a, Msg>, (f32, f32, f32, f32))> {
+        self.text_layers.iter().find(|(lid, ..)| *lid == id).map(|(_, el, region)| (el, *region))
     }
 
     fn hit_at(&self, map: &CanvasMap, p: (f32, f32)) -> Option<(u64, HitKind)> {
@@ -1872,9 +1978,28 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                                         );
                                     }
                                     // The rubber band publishes NOTHING while it grows — the
-                                    // drawn marquee is the whole feedback, and the selection
-                                    // lands in one `BoxSelect` on release (DRAGON-341).
-                                    Pending::Band { .. } => state.band_to = local,
+                                    // selection still lands in ONE `BoxSelect` on release
+                                    // (DRAGON-341). What it DOES do is re-resolve which items it
+                                    // is covering (DRAGON-397) so `draw` can put the selection
+                                    // box on them live; that stays inside this widget's own
+                                    // state, so no message, no app update, no re-raster rides on
+                                    // a motion event (DRAGON-376's lesson).
+                                    Pending::Band { additive } => {
+                                        state.band_to = local;
+                                        state.band_preview = match &self.band_hits {
+                                            Some(hits) => band_preview_ids(
+                                                &self.selection,
+                                                &hits(
+                                                    state.press_img.0,
+                                                    state.press_img.1,
+                                                    img.0,
+                                                    img.1,
+                                                ),
+                                                additive,
+                                            ),
+                                            None => Vec::new(),
+                                        };
+                                    }
                                     // Drag-select inside the edited text box (item 12): extend
                                     // the text selection to the current point every motion.
                                     Pending::TextSelect => {
@@ -1897,6 +2022,9 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                         state.pending = Pending::None;
                         state.moved = false;
                         state.begun = false;
+                        // The live sweep preview belongs to the gesture: the committed selection
+                        // takes over the instant `BoxSelect` lands (DRAGON-397).
+                        state.band_preview.clear();
                         if let Pending::Band { additive } = pending {
                             // A real rubber band selects everything it touched; a band that
                             // never moved was just the deselecting click already emitted.
@@ -1977,21 +2105,25 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
         // can float outside the picture.
         // The picture's on-screen rectangle (GLOBAL coords) — the clip source above and the
         // placement the text layers' `dest` fractions are relative to.
-        let picture = {
-            // The DISPLAYED picture is the crop REGION (offset..offset+source) in full-source
-            // coords (DRAGON-385) — offset `(0, 0)` un-cropped, byte-identical to the old corners.
-            let a = map.to_canvas((map.offset.0, map.offset.1));
-            let b = map.to_canvas((map.offset.0 + map.source.0, map.offset.1 + map.source.1));
-            Rectangle {
-                x: ox + a.0.min(b.0),
-                y: oy + a.1.min(b.1),
-                width: (b.0 - a.0).abs(),
-                height: (b.1 - a.1).abs(),
-            }
+        // The DISPLAYED picture is the crop REGION (offset..offset+source) in full-source
+        // coords (DRAGON-385) — offset `(0, 0)` un-cropped, byte-identical to the old corners.
+        let picture = region_on_screen(
+            &map,
+            (ox, oy),
+            (map.offset.0, map.offset.1, map.source.0, map.source.1),
+        );
+        // DRAGON-396: a crop SESSION lifts that cut. The user is choosing what the crop should
+        // contain, so a mark lying outside the current image must be visible to be judged — it is
+        // drawn out to the whole content rect instead (still bounded away from the scrollbars, and
+        // the crop overlay's own scrim above dims whatever falls outside the crop rect, so the two
+        // states stay distinguishable WITHOUT rendering the marks any differently).
+        let shape_clip = if self.marks_outside_image {
+            clip
+        } else {
+            picture
+                .intersection(&clip)
+                .unwrap_or(Rectangle { x: 0.0, y: 0.0, width: 0.0, height: 0.0 })
         };
-        let shape_clip = picture
-            .intersection(&clip)
-            .unwrap_or(Rectangle { x: 0.0, y: 0.0, width: 0.0, height: 0.0 });
         // 2. The committed scene IN ITEM ORDER, CLIPPED to the IMAGE rect: runs of vector
         //    geometry (crisp at any zoom) with each TEXT item's raster layer drawn at its own
         //    place between them (DRAGON-373). A canvas `Frame` builds the geometry in
@@ -2020,8 +2152,19 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                     });
                 }
                 DrawPass::TextLayer(i) => {
-                    if let Some(layer) = self.text_layer_for(self.items[i].id) {
-                        draw_placed(layer, renderer, theme, style, picture, shape_clip, viewport);
+                    if let Some((layer, region)) = self.text_layer_for(self.items[i].id) {
+                        // Ordinarily the layer is stretched across the PICTURE and its `dest`
+                        // fractions locate the caption inside it. In a crop session it is placed at
+                        // ITS OWN region instead, through the same map as the vectors (DRAGON-396):
+                        // a shader is clipped to its own widget rect, so a picture-wide layer could
+                        // never draw a caption that sits outside the image. The two forms put it in
+                        // the same place — see the placement-equivalence test.
+                        let place = if self.marks_outside_image {
+                            region_on_screen(&map, (ox, oy), region)
+                        } else {
+                            picture
+                        };
+                        draw_placed(layer, renderer, theme, style, place, shape_clip, viewport);
                     }
                 }
             }
@@ -2040,6 +2183,8 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
             Pending::Band { .. } if state.moved => Some((state.press_screen, state.band_to)),
             _ => None,
         };
+        // (A live band always draws — its marquee, and since DRAGON-397 the swept items' boxes —
+        // so the `band.is_none()` guard already covers the preview.)
         if band.is_none() && self.selection.is_empty() {
             return;
         }
@@ -2076,6 +2221,28 @@ impl<'a, Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer>
                     (b.1 - a.1).abs(),
                     accent,
                 );
+            }
+            // The LIVE sweep preview (DRAGON-397): every item the band is currently covering wears
+            // the same half-opacity solid box a selected member does, so the user watches items
+            // take the selection box as the band reaches them and drop it as it retreats. Items
+            // ALREADY selected are skipped — the committed chrome below draws them (a plain band
+            // deselected everything at press, so in practice this is only the additive case).
+            //
+            // It is CHROME ONLY: `self.selection` is untouched until `BoxSelect` lands on release,
+            // so the group box, the handles and everything the app derives from the selection stay
+            // put while the band grows. The set is resolved on motion (see `update`), never here —
+            // `draw` does no hit-testing.
+            if band.is_some() && !state.band_preview.is_empty() {
+                let mut half = accent;
+                half.a *= 0.5;
+                for item in self
+                    .items
+                    .iter()
+                    .filter(|i| state.band_preview.contains(&i.id) && !self.is_selected(i.id))
+                {
+                    let (l, t, rr, bb) = self.item_chrome_screen_rect(&map, item);
+                    solid_rect(&mut fill, l, t, rr - l, bb - t, half);
+                }
             }
             // With more than one item selected (DRAGON-388) each member wears a SOLID box at half
             // opacity with NO handles, and a single GROUP box (below) carries the handles. Single
@@ -2236,8 +2403,29 @@ fn draw_passes(items: &[Item], has_layer: impl Fn(u64) -> bool) -> Vec<DrawPass>
     passes
 }
 
+/// A picture REGION (full-source px `(x, y, w, h)`) as its GLOBAL on-screen rectangle: mapped
+/// through `map` — the same transform the vector geometry rides — and shifted by the widget's
+/// bounds origin. THE placement kernel for the picture rect itself and for each text caption's
+/// raster (DRAGON-396), so a caption can never drift from the shapes around it. Pure.
+/// One TEXT annotation's draw-only raster layer as the canvas receives it: the item id, the
+/// element, and the caption's SOURCE-px region `(x, y, w, h)`. See
+/// [`AnnotationCanvas::text_layers`].
+pub type TextLayerMount<'a, Msg> = (u64, cosmic::Element<'a, Msg>, (f32, f32, f32, f32));
+
+pub(crate) fn region_on_screen(map: &CanvasMap, origin: (f32, f32), region: (f32, f32, f32, f32)) -> Rectangle {
+    let (x, y, w, h) = region;
+    let a = map.to_canvas((x, y));
+    let b = map.to_canvas((x + w, y + h));
+    Rectangle {
+        x: origin.0 + a.0.min(b.0),
+        y: origin.1 + a.1.min(b.1),
+        width: (b.0 - a.0).abs(),
+        height: (b.1 - a.1).abs(),
+    }
+}
+
 /// Draw one DRAW-ONLY element (a text annotation's raster layer, DRAGON-373) over `place` —
-/// the picture's on-screen rectangle — clipped to `clip`.
+/// the region's on-screen rectangle — clipped to `clip`.
 ///
 /// The element is not in the widget tree (see [`AnnotationCanvas::text_layers`]): it is laid out
 /// here, against the picture rather than by a parent, and handed a throwaway state tree. That is
@@ -3314,6 +3502,40 @@ mod tests {
         assert_eq!(draw_bypassing_items(Some(Tool::Pen), false, true), Some(Tool::Pen));
         assert!(whole_canvas_crosshair(Some(Tool::Pen), false, true));
         assert_eq!(draw_bypassing_items(Some(Tool::Rect), true, true), None, "ctrl defers");
+    }
+
+    // ── DRAGON-397: the live band preview ────────────────────────────────────────────
+
+    /// The preview is the RESULT of the modifier, not the raw intersection: a plain band
+    /// replaces, so what is currently selected has no say in what the boxes show.
+    #[test]
+    fn a_plain_band_previews_exactly_what_it_covers() {
+        assert_eq!(band_preview_ids(&[7, 8], &[1, 2], false), vec![1, 2]);
+        // Sweeping off everything previews an EMPTY selection — the boxes drop as the band
+        // retreats, which is the behaviour the ticket is about.
+        assert_eq!(band_preview_ids(&[7, 8], &[], false), Vec::<u64>::new());
+    }
+
+    /// An ADDITIVE band (Ctrl/Shift at press) keeps the existing selection and appends —
+    /// and an already-selected item swept by it previews as STAYING selected, exactly once
+    /// and in its original position, which is what release will commit (`Selection::add_all`).
+    /// It must never read as a toggle: only a Ctrl/Shift CLICK removes.
+    #[test]
+    fn an_additive_band_keeps_the_selection_and_never_toggles() {
+        assert_eq!(band_preview_ids(&[7, 8], &[1, 2], true), vec![7, 8, 1, 2]);
+        // The already-selected item is covered by the band: still selected, not dropped, and
+        // not duplicated.
+        assert_eq!(band_preview_ids(&[7, 8], &[8, 1], true), vec![7, 8, 1]);
+        // Covering nothing leaves the selection alone.
+        assert_eq!(band_preview_ids(&[7, 8], &[], true), vec![7, 8]);
+    }
+
+    /// The hits themselves are de-duplicated too, so a preview list can never carry an id
+    /// twice (which would double-draw its half-opacity box and read as a darker one).
+    #[test]
+    fn the_preview_set_is_deduplicated() {
+        assert_eq!(band_preview_ids(&[], &[3, 3, 4], false), vec![3, 4]);
+        assert_eq!(band_preview_ids(&[3], &[3, 3, 4], true), vec![3, 4]);
     }
 
     #[test]

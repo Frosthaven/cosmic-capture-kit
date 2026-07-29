@@ -183,9 +183,7 @@ pub(super) fn toggle<'a>(on: bool, msg: fn(bool) -> Msg) -> Element<'a, Msg> {
 pub(super) fn folder_btn<'a>(target: DirTarget) -> Element<'a, Msg> {
     crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::custom(
-            widget::icon::icon(crate::widgets::icons::handle("folder-open-symbolic"))
-                .width(Length::Fixed(20.0))
-                .height(Length::Fixed(20.0)),
+            crate::widgets::icons::sized("folder-open-symbolic", 20.0),
         )
         .class(standard_button_class())
         .on_press(Msg::Settings(SettingsMsg::PickDir(target)))

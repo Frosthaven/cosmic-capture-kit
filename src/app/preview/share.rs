@@ -88,9 +88,9 @@ impl App {
     /// recording) from a detached child, so unlinking the original right after spawning it
     /// is a race at best and a dead URI at worst. Staging first removes the question —
     /// the same trick the edited-copy bake already uses.
-    fn stage_clipboard_copy(src: &std::path::Path) -> Option<PathBuf> {
-        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
-        let temp = PathBuf::from(crate::util::runtime_dir()).join(format!("cck-copy.{ext}"));
+    fn stage_clipboard_copy(src: &std::path::Path, is_video: bool) -> Option<PathBuf> {
+        let temp = PathBuf::from(crate::util::runtime_dir())
+            .join(clipboard_temp_name(src, is_video, false));
         match std::fs::copy(src, &temp) {
             Ok(_) => Some(temp),
             Err(e) => {
@@ -278,6 +278,66 @@ impl App {
         p.saved_path.clone().or_else(|| p.path.clone())
     }
 
+    /// Whether this document's media can be BAKED at all right now (DRAGON-398).
+    ///
+    /// An IMAGE always can — its pixels are already decoded in the editor. A VIDEO cannot
+    /// until its ffprobe metadata has landed: [`edit::VideoBake`] needs the pixel size (for
+    /// the covermark raster) and the audio-presence flag (for the cut filtergraph), and a
+    /// probe that timed out or failed (DRAGON-106) leaves `meta` at `None` forever. A
+    /// document with no file at all is likewise unbakeable.
+    ///
+    /// Split out because "the bake silently did not happen" used to be indistinguishable
+    /// from "there was nothing to bake": both made [`Self::begin_bake`] return `None`, and
+    /// the share then completed against the UNEDITED file wearing a success toast — a Save
+    /// that reported "Already saved as …" without saving the edits, and a Copy that put the
+    /// untouched recording on the clipboard. See [`bake_blocked`] for the rule this feeds.
+    fn preview_media_bakeable(&self, id: window::Id) -> bool {
+        let Some(p) = self.preview_for(id) else { return false };
+        if p.path.is_none() {
+            return false;
+        }
+        match &p.kind {
+            PreviewKind::Image(_) => true,
+            PreviewKind::Video(vid) => vid.meta.is_some(),
+        }
+    }
+
+    /// Report — and REFUSE — a share whose bake cannot run (DRAGON-398). Returns `true` when
+    /// the caller must abandon the action.
+    ///
+    /// `owed` is whether this action would have to bake (the intent's [`ShareIntent::owes_bake`],
+    /// or a plain `dirty()` for Save As, which always writes a fresh file). When something is
+    /// owed and [`Self::preview_media_bakeable`] says it cannot be produced, the whole action
+    /// stops here: nothing is written, nothing is copied, nothing is deleted and nothing closes.
+    /// The document keeps its edits and the editor stays up with the reason — the same shape as
+    /// every other failure in this file (`copy_failure_aborts`, `delete_owned_files`'s `Err`), so
+    /// retry / save / exit-anyway all stay reachable.
+    fn refuse_unbakeable(&mut self, id: window::Id, owed: bool) -> bool {
+        if !bake_blocked(owed, self.preview_media_bakeable(id)) {
+            return false;
+        }
+        log::warn!("preview: refusing a share that owes a bake the media can't produce");
+        // The wording names the media honestly: the real (and video-only) cause is a probe
+        // that never landed, but the degenerate no-file case can reach here for either kind.
+        let video = self.preview_for(id).is_some_and(|p| matches!(p.kind, PreviewKind::Video(_)));
+        let (toast, reason) = if video {
+            (
+                "Couldn't read this recording, so the edits can't be applied",
+                "This recording couldn't be read, so the edits couldn't be applied and nothing \
+                 was written, copied or deleted.",
+            )
+        } else {
+            (
+                "Couldn't read this capture, so the edits can't be applied",
+                "This capture couldn't be read, so the edits couldn't be applied and nothing \
+                 was written, copied or deleted.",
+            )
+        };
+        self.preview_toast_icon(id, ToastKind::Error, toast, "save-off-symbolic");
+        self.fail_close_action(id, reason);
+        true
+    }
+
     /// THE share entry point (DRAGON-353): run `intent` against `id`, baking first when
     /// there are edits to commit. Every action bar button, hotkey and unsaved-changes
     /// dialog button routes through here, so the bake-vs-no-bake fork exists once.
@@ -286,12 +346,32 @@ impl App {
         id: window::Id,
         intent: ShareIntent,
     ) -> Task<cosmic::Action<Msg>> {
+        // DRAGON-398: a share that OWES a bake it cannot produce must not quietly complete
+        // against the unedited file. Refuse it loudly instead (the editor stays up).
+        let owed = self
+            .preview_for(id)
+            .map(|p| intent.owes_bake(p.dirty(), p.unsaved()))
+            .unwrap_or(false);
+        if self.refuse_unbakeable(id, owed) {
+            return Task::none();
+        }
         match self.begin_bake(id, intent) {
             // A bake is in flight; `BakeDone` calls `finish_share_intent` with its output.
             Some(task) => task,
             // Nothing to commit — complete the intent right now against the file as it is.
             None => self.finish_share_intent(id, intent, None),
         }
+    }
+
+    /// The Save As guard (DRAGON-398): `true` when the destination picker must NOT open,
+    /// because the edits this export would have to render cannot be produced. Refusing
+    /// BEFORE the dialog is deliberate — making the user choose a destination for a save
+    /// that is going to drop their edits is worse than refusing up front.
+    pub(super) fn refuse_unbakeable_save_as(&mut self, id: window::Id) -> bool {
+        // Save As always writes a NEW file, so it owes a bake whenever the scene is dirty
+        // (there is no "standing on our own save point" no-op to fall back to).
+        let owed = self.preview_for(id).is_some_and(|p| p.dirty());
+        self.refuse_unbakeable(id, owed)
     }
 
     /// Kick off a bake before running `intent`, or `None` when none is needed (no pending
@@ -336,11 +416,13 @@ impl App {
         let dim = p.edit.dim;
         // The committed crop (DRAGON-382; IMAGES only) — applied as the bake's final step.
         let crop = p.edit.crop;
+        let is_video = matches!(p.kind, PreviewKind::Video(_));
         let video = match &p.kind {
             PreviewKind::Image(_) => None,
             // A video bake needs the probed metadata (overlay raster size, audio
-            // presence for the cut graph); without it (ffprobe failed) there's
-            // nothing sane to do, so share unedited.
+            // presence for the cut graph). `run_share` already REFUSED the action when it
+            // is missing (DRAGON-398), so this `?` is now unreachable defence rather than
+            // the silent share-unedited fallback it used to be.
             PreviewKind::Video(vid) => {
                 let m = vid.meta?;
                 Some(edit::VideoBake {
@@ -361,8 +443,8 @@ impl App {
         // Copy flavours target a throwaway temp (leave the saved file clean); saving
         // flavours write the document's save target.
         let dst = if intent.bakes_to_temp() {
-            let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
-            PathBuf::from(crate::util::runtime_dir()).join(format!("cck-copy.{ext}"))
+            PathBuf::from(crate::util::runtime_dir())
+                .join(clipboard_temp_name(&src, is_video, true))
         } else {
             save_target.clone().unwrap_or_else(|| src.clone())
         };
@@ -480,9 +562,10 @@ impl App {
                 // anywhere); a DELETE-flavoured one must serve a STAGED temp, because the
                 // clipboard worker is handed a path and the original is about to be
                 // unlinked out from under it.
-                (None, i) if i.deletes() => {
-                    path.as_deref().and_then(Self::stage_clipboard_copy).or_else(|| path.clone())
-                }
+                (None, i) if i.deletes() => path
+                    .as_deref()
+                    .and_then(|p| Self::stage_clipboard_copy(p, is_video))
+                    .or_else(|| path.clone()),
                 (None, _) => path.clone(),
             };
             let copy_ok = match source {
@@ -674,6 +757,61 @@ pub(super) fn close_guards_unsaved(intent: ShareIntent, from_dialog: bool) -> bo
     !from_dialog && !intent.saves() && !intent.deletes()
 }
 
+/// DRAGON-398: must a share be REFUSED because the bake it owes cannot be produced?
+///
+/// Yes exactly when something is owed and the media cannot render it. The only real
+/// instance is a VIDEO whose ffprobe metadata never landed (a probe timeout / failure —
+/// DRAGON-106 — leaves `VideoPreview::meta` at `None`, and [`edit::VideoBake`] cannot be
+/// built without it), plus the degenerate document that has no file at all.
+///
+/// # Why this needs to be its own rule
+///
+/// It closes a hole the image path never had, because an image's pixels are always
+/// available. Before this, an unbakeable video made `begin_bake` return `None` — the SAME
+/// answer as "there is nothing to bake" — and the share completed against the untouched
+/// file wearing a SUCCESS toast: a Save that said "Already saved as …" while the cut was
+/// dropped, and a Copy that put the unedited recording on the clipboard. That is precisely
+/// the "a Copy that silently no-ops" the ticket rules out; the refusal says so instead.
+///
+/// It is deliberately gated on `owed` rather than on dirtiness: an UNCUT, un-covermarked
+/// recording owes no bake, so a missing probe must not stop it being saved, copied or
+/// deleted. Those paths never touch ffmpeg at all.
+pub(super) fn bake_blocked(owed: bool, media_bakeable: bool) -> bool {
+    owed && !media_bakeable
+}
+
+/// The runtime-dir FILENAME a clipboard copy is served from (DRAGON-398).
+///
+/// * **Images** keep the fixed `cck-copy.<ext>` — byte-identical to before. Every platform
+///   hands the clipboard IMAGE BYTES (Linux reads the file in the selection worker; macOS
+///   writes `NSData`; Windows CF_DIBV5), so the name is never user-visible and a fixed one
+///   keeps the runtime dir bounded no matter how many copies a session makes.
+/// * **Videos** take the document's OWN name, because there the name IS user-visible:
+///   every platform puts a recording on the clipboard as a FILE REFERENCE (Linux a
+///   `text/uri-list` URI, macOS an `NSURL`, Windows CF_HDROP), so pasting into a file
+///   manager or a chat client writes a file called whatever this returns. `cck-copy.mp4`
+///   was a poor thing to hand someone; `Recording 2026-edited.mp4` is the file they think
+///   they copied. `edited` marks the BAKED variant (a cut / covermarked export) so it can
+///   never collide with the staged copy of the untouched original.
+///
+/// Always a single path component (`file_name`, never a directory), so the caller's
+/// `runtime_dir().join(..)` can't be walked out of.
+pub(super) fn clipboard_temp_name(src: &std::path::Path, is_video: bool, edited: bool) -> String {
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    if !is_video {
+        return format!("cck-copy.{ext}");
+    }
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if stem.is_empty() {
+        return format!("cck-copy.{ext}");
+    }
+    if edited {
+        format!("{stem}{}.{ext}", naming::EDITED_SUFFIX)
+    } else {
+        format!("{stem}.{ext}")
+    }
+}
+
 /// The failure reason handed to [`App::fail_close_action`] when a copy step aborts — spells
 /// out that the destructive half did NOT run, so the dialog's re-raised card is truthful.
 fn copy_failure_reason(deletes: bool) -> &'static str {
@@ -726,6 +864,69 @@ mod tests {
         // From the dialog, nothing re-guards (the card already asked) — including CopyClose.
         for i in [CopyClose, SaveCopyClose, Copy, Delete] {
             assert!(!close_guards_unsaved(i, true), "{i:?} from the dialog must not re-ask");
+        }
+    }
+
+    /// DRAGON-398: a share that OWES a bake the media cannot produce is refused; one that owes
+    /// nothing is never gated on it.
+    ///
+    /// The second half is the important one for video. An UNCUT, un-covermarked recording owes
+    /// no bake, so a failed ffprobe must not stop it being saved, copied or deleted — those
+    /// paths never invoke ffmpeg at all, which is the same reason they stay byte-identical.
+    #[test]
+    fn a_bake_that_cannot_run_blocks_only_the_actions_that_need_it() {
+        // Owed + unbakeable (a recording whose probe never landed) => refuse.
+        assert!(bake_blocked(true, false));
+        // Owed + bakeable => proceed, which is every normal edited share.
+        assert!(!bake_blocked(true, true));
+        // Nothing owed => never blocked, bakeable or not. The uncut-video case.
+        assert!(!bake_blocked(false, false));
+        assert!(!bake_blocked(false, true));
+    }
+
+    /// DRAGON-398: the refusal is reachable for exactly the intents that can owe a bake, and
+    /// never for a plain Delete (which never bakes — `owes_bake` is false for it whatever the
+    /// document's state, so a corrupt recording can still be thrown away).
+    #[test]
+    fn a_plain_delete_is_never_refused_for_an_unbakeable_recording() {
+        use ShareIntent::*;
+        // Worst case: dirty AND unsaved AND unbakeable.
+        for i in [Copy, CopyClose, CopyThenDelete, Save, SaveCopy, SaveCopyClose] {
+            assert!(bake_blocked(i.owes_bake(true, true), false), "{i:?} owes a bake");
+        }
+        assert!(
+            !bake_blocked(Delete.owes_bake(true, true), false),
+            "a plain Delete never bakes, so an unreadable recording is still deletable"
+        );
+    }
+
+    /// DRAGON-398 clipboard naming. Images keep the fixed `cck-copy.<ext>` (their bytes go on
+    /// the clipboard, so the name is never seen and a fixed one bounds the runtime dir);
+    /// VIDEOS carry the document's own name, because every platform puts a recording on the
+    /// clipboard as a FILE REFERENCE and that name is what a paste writes to disk.
+    #[test]
+    fn a_copied_recording_pastes_under_its_own_name_and_a_still_does_not() {
+        use std::path::Path;
+        // Images: unchanged in both flavours.
+        for edited in [true, false] {
+            assert_eq!(clipboard_temp_name(Path::new("/shots/a.png"), false, edited), "cck-copy.png");
+            assert_eq!(clipboard_temp_name(Path::new("/shots/a.JPG"), false, edited), "cck-copy.JPG");
+        }
+        // Videos: the BAKED variant is marked `-edited` (matching what a Save would have
+        // written beside the original); the staged copy of the untouched file is not, so the
+        // two can never collide in the runtime dir.
+        let rec = Path::new("/rec/Recording 2026.mp4");
+        assert_eq!(clipboard_temp_name(rec, true, true), "Recording 2026-edited.mp4");
+        assert_eq!(clipboard_temp_name(rec, true, false), "Recording 2026.mp4");
+        // The extension rides along whatever it is.
+        assert_eq!(clipboard_temp_name(Path::new("/rec/t.mkv"), true, true), "t-edited.mkv");
+        assert_eq!(clipboard_temp_name(Path::new("/rec/t.webm"), true, false), "t.webm");
+        // A path with no file name at all falls back rather than producing an empty name.
+        assert_eq!(clipboard_temp_name(Path::new("/"), true, true), "cck-copy.png");
+        // Always ONE path component: a `join` onto the runtime dir can't be walked out of.
+        for (p, v) in [("/rec/a/b.mp4", true), ("/shots/a/b.png", false)] {
+            let name = clipboard_temp_name(Path::new(p), v, true);
+            assert_eq!(Path::new(&name).components().count(), 1, "{name}");
         }
     }
 

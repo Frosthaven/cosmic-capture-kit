@@ -9,9 +9,10 @@ use super::*;
 pub struct Viewport {
     pub zoom: f32,
     pub pan: (f32, f32),
-    /// Pan tool active: a plain left-drag pans (the grabby-hand mode) instead of the normal
-    /// pointer. Alt+drag pans in either mode.
-    pub pan_mode: bool,
+    // DRAGON-392: the pan MODE flag is gone. Panning is the HAND TOOL
+    // (`annotation_canvas::Tool::Hand`, `EditState::pan_active`), so "a plain drag pans" is
+    // derived from the armed tool rather than tracked beside it. Alt+drag still pans under
+    // every tool.
     /// The zoom-scale dropdown selection: `Some(i)` = a preset is exactly applied, `None` =
     /// an in-between zoom (slider drag / scroll). Drives the combo's current label.
     pub zoom_preset: Option<usize>,
@@ -28,7 +29,6 @@ impl Default for Viewport {
         Self {
             zoom: 1.0,
             pan: (0.0, 0.0),
-            pan_mode: false,
             zoom_preset: Some(0),
             zoom_menu_open: false,
             crop_mode: false,
@@ -40,10 +40,16 @@ impl Viewport {
     /// The zoom range, as a multiple of the FIT size. The floor is HALF the fit (0.5) — the
     /// user can zoom OUT to half the whole-picture-fit size (DRAGON: preview-editor polish).
     /// Below fit the picture is smaller than the viewport, so it just recentres (no pan). The
-    /// ceiling is a hard cap; the effective max is the 200%-visual limit (see
-    /// `App::max_view_zoom`), which is what actually bounds zoom-IN.
+    /// ceiling is a hard cap; the effective max is the VISUAL limit (see `App::max_view_zoom`),
+    /// which is what actually bounds zoom-IN.
+    ///
+    /// `MAX` is a backstop and must stay clear of that limit, which is `MAX_VISUAL /
+    /// visual_scale` — so the smaller the fit, the higher it reaches. At 500% (DRAGON-400) a
+    /// capture fitted at 8% of natural size wants `5.0 / 0.078 ≈ 64`, i.e. the OLD `64.0` cap
+    /// would have started binding on a wide multi-monitor grab in a small window and silently
+    /// capped the zoom below the advertised 500%. Raised with headroom to spare.
     pub(super) const MIN: f32 = 0.5;
-    pub(super) const MAX: f32 = 64.0;
+    pub(super) const MAX: f32 = 320.0;
     /// The relaxed zoom floor while the crop tool is active (DRAGON-382) — a fit-relative
     /// multiplier well below [`Self::MIN`], so the media can be pulled small for a roomy crop
     /// workspace (much farther out than the normal 50% floor).
@@ -73,13 +79,18 @@ impl Viewport {
 /// saw when capturing), NOT physical 1:1. On a 2× Retina capture, `100%` = natural size
 /// (physical 1:1 would read `200%`); on Linux / 1× panels a visual fraction equals a native
 /// fraction, so these are byte-identical to the pre-visual-units behaviour.
-pub(super) const ZOOM_PRESET_LABELS: [&str; 5] =
-    ["Fit", "100%", "125%", "150%", "200%"];
+/// The 200%-and-below stops are UNCHANGED by the 500% raise (DRAGON-400): 125% and 150% are the
+/// fine-tuning steps people actually use, and dropping them to spread five stops evenly across
+/// the wider range would have taken away precision exactly where the work happens. The new range
+/// gets ROUND HUNDREDS instead — at 300%+ you are inspecting pixels, not choosing a working
+/// scale, so coarse stops cost nothing and the list stays scannable.
+pub(super) const ZOOM_PRESET_LABELS: [&str; 8] =
+    ["Fit", "100%", "125%", "150%", "200%", "300%", "400%", "500%"];
 
 /// The presets as VISUAL fractions (`1.0` = natural on-screen size). Converted to the
 /// viewport's fit-relative multiplier via `visual_scale` (see [`App::preview_visual_scale`]).
-pub(super) const ZOOM_PRESET_VISUAL: [Option<f32>; 5] =
-    [None, Some(1.0), Some(1.25), Some(1.5), Some(2.0)];
+pub(super) const ZOOM_PRESET_VISUAL: [Option<f32>; 8] =
+    [None, Some(1.0), Some(1.25), Some(1.5), Some(2.0), Some(3.0), Some(4.0), Some(MAX_VISUAL)];
 
 /// Compose the user-facing VISUAL scale from the internal `fit_scale` (physical-pixel
 /// fraction at fit) and the capture's `source_scale` (backing scale; `1.0` on Linux/1×).
@@ -108,11 +119,70 @@ pub(super) fn displayed_percent(zoom: f32, visual_scale: f32) -> i32 {
     (zoom * visual_scale * 100.0).round() as i32
 }
 
-/// Snap a slider/scroll zoom to EXACTLY 100% on-screen (natural size) when it lands within a
-/// couple display-percent of it — a magnetic detent so the user can hit 100% precisely.
+/// **The zoom ceiling in VISUAL units** — 500% of the picture's natural on-screen size
+/// (DRAGON-400, raised from 200%). Read by [`App::max_view_zoom`] and by the top preset, so the
+/// rail's end and the list's last row can never disagree about where the range stops.
+pub(super) const MAX_VISUAL: f32 = 5.0;
+
+/// Whether preset `i` can actually be APPLIED at the current ceiling (DRAGON-401).
+///
+/// A preset above `max_zoom` would clamp to the ceiling and land the user somewhere other than
+/// the row they clicked, while the menu went on advertising it — so those rows are dropped
+/// from the list instead. On any capture the GPU bound does not bite (the common case, and
+/// every capture at all before DRAGON-400 raised the ceiling) every preset survives and the
+/// menu is unchanged.
+///
+/// "Fit" (`None`) is always reachable — it is the fit multiplier itself — and `max_zoom` is
+/// floored at fit, so the list can never empty out. A hair of tolerance keeps a preset that
+/// sits exactly ON the ceiling (float rounding either way) in the list rather than blinking
+/// out of it.
+pub(super) fn reachable_preset(i: usize, visual_scale: f32, max_zoom: f32) -> bool {
+    match ZOOM_PRESET_VISUAL.get(i).copied() {
+        Some(frac) => preset_zoom(frac, visual_scale) <= max_zoom * 1.001,
+        // Out of range: not a real preset, so nothing to offer.
+        None => false,
+    }
+}
+
+/// The 100% detent's capture zone for the SCROLL wheel, in displayed percent. Scroll steps are
+/// multiplicative and fine (12% per notch), so a value-space tolerance is the natural one and
+/// this is the historic figure, unchanged.
+pub(super) const SNAP_SCROLL_PCT: f32 = 2.5;
+
+/// The 100% detent's capture zone for the SLIDER, in RAIL PIXELS either side of the tick.
+///
+/// The slider's detent is specified in PIXELS, not percent, because the rail maps the whole
+/// zoom range linearly onto ~64pt: how much percent a pixel is worth depends entirely on the
+/// range, so a fixed percent tolerance is a moving target. At the old 200% ceiling a pixel was
+/// worth ~2.3% and the historic ±2.5% detent was about a pixel wide; at 500% a pixel is worth
+/// ~7% and that same ±2.5% would be **sub-pixel — literally unhittable by dragging**, silently
+/// retiring a detent the owner asked to keep. Specifying the zone in rail space keeps it the
+/// same SIZE UNDER THE POINTER at any range, which is the property that actually matters.
+///
+/// 1.5px gives a 3px-wide capture zone: a little more forgiving than the historic ~2px, which is
+/// deliberate — the old one was tight enough to miss.
+pub(super) const SNAP_RAIL_PX: f32 = 1.5;
+
+/// The detent tolerance (displayed percent) for a rail `rail_px` long spanning
+/// `min_pct..=max_pct` — [`SNAP_RAIL_PX`] converted into the value space the snap works in.
+/// Floored at [`SNAP_SCROLL_PCT`] so a degenerate rail (zero length, or a range so narrow the
+/// pixels are worth almost nothing) can never produce a detent tighter than the historic one.
+pub(super) fn rail_snap_pct(min_pct: f32, max_pct: f32, rail_px: f32) -> f32 {
+    if rail_px <= 0.0 {
+        return SNAP_SCROLL_PCT;
+    }
+    ((max_pct - min_pct).max(0.0) / rail_px * SNAP_RAIL_PX).max(SNAP_SCROLL_PCT)
+}
+
+/// Snap a slider/scroll zoom to EXACTLY 100% on-screen (natural size) when it lands within
+/// `tol_pct` displayed percent of it — a magnetic detent so the user can hit 100% precisely.
 /// Returns the input unchanged when it isn't near 100%.
-pub(super) fn snap_to_hundred(zoom: f32, visual_scale: f32) -> f32 {
-    if (zoom * visual_scale * 100.0 - 100.0).abs() <= 2.5 {
+///
+/// The tolerance is the CALLER's because the two callers snap in different spaces: the scroll
+/// wheel in value space ([`SNAP_SCROLL_PCT`]), the slider in rail space ([`rail_snap_pct`]).
+/// One rule, two geometries — rather than one tolerance that is right for neither.
+pub(super) fn snap_to_hundred(zoom: f32, visual_scale: f32, tol_pct: f32) -> f32 {
+    if (zoom * visual_scale * 100.0 - 100.0).abs() <= tol_pct {
         preset_zoom(Some(1.0), visual_scale) // the zoom whose displayed% == 100
     } else {
         zoom
@@ -129,10 +199,35 @@ impl App {
     }
 
     /// The fraction of native (PHYSICAL-pixel) size the picture is displayed at when FIT
-    /// (ScaleDown) into the content area. The internal building block for pan/zoom geometry;
-    /// the USER-FACING percent and presets go through [`Self::preview_visual_scale`] instead
-    /// (visual units). `1.0` when the media dims aren't known yet (still loading).
+    /// (ScaleDown) into the content area — capped at `1.0`, so fit never reads over 100%. The
+    /// internal building block for pan/zoom geometry; the USER-FACING percent and presets go
+    /// through [`Self::preview_visual_scale`] instead (visual units). `1.0` when the media
+    /// dims aren't known yet (still loading).
     pub(super) fn preview_fit_scale(&self, preview: &PreviewState) -> f32 {
+        // Expressed through the unclamped form so the two can never drift apart. The `1.0`
+        // ceiling is the readout's rule ("fit never reads over 100%"), not a geometric fact —
+        // see [`Self::preview_points_per_source_px`] for why the device bound must NOT take it.
+        self.preview_points_per_source_px(preview).min(1.0)
+    }
+
+    /// Screen POINTS per SOURCE pixel at zoom 1 — the scale `preview/image.rs` lays the media
+    /// stack out at, and the geometric building block [`Self::preview_fit_scale`] adds its
+    /// readout ceiling to.
+    ///
+    /// Un-cropped this is `dw / frame_w` (the fit); with a crop applied it is `dw / crop_w` —
+    /// the WHOLE frame rendered at the crop's scale, since the media stack always renders the
+    /// whole frame and the crop only frames a sub-region of it (DRAGON-385/391).
+    ///
+    /// **Why the device bound (DRAGON-401) reads this rather than `preview_fit_scale`**: the
+    /// clamped form can only ever REPORT LESS, and under-reporting the media stack's size is
+    /// precisely what hands the GPU an oversized viewport. Today the two agree everywhere —
+    /// `fit_dims` caps its scale at `1.0`, so the crop case cannot blow a small region up past
+    /// natural size and the ceiling never binds. Should display ever start upscaling (a
+    /// fill-the-viewport crop, say), the clamped form would silently under-report and this
+    /// crash would come straight back; taking the unclamped one here means it cannot.
+    ///
+    /// `1.0` when the media dims aren't known yet (still loading).
+    pub(super) fn preview_points_per_source_px(&self, preview: &PreviewState) -> f32 {
         // The DISPLAY frame (DRAGON-385): a crop makes the fit / zoom / presets relative to the
         // cropped framing (100% = the crop at natural size). Un-cropped = the decoded frame,
         // byte-identical to before.
@@ -148,7 +243,29 @@ impl App {
         let (pw, ph) = preview.display_frame_points();
         let (avail_w, avail_h) = self.preview_viewport(preview);
         let (dw, _) = video::fit_dims(pw.max(1), ph.max(1), avail_w, avail_h);
-        (dw / iw as f32).clamp(0.0001, 1.0)
+        (dw / iw as f32).max(0.0001)
+    }
+
+    /// The zoom ceiling this DEVICE imposes (DRAGON-401): past it, the media stack's viewport
+    /// exceeds `max_texture_dimension_2d` and wgpu kills the process mid-frame. See
+    /// [`crate::widgets::gpu::max_zoom_for_device`] for the arithmetic, and that module for
+    /// why the limit and the render scale are observed rather than assumed — and for why the
+    /// budget is the limit less three pixels rather than the limit itself (the effects shader
+    /// snaps its viewport out to the pixel grid, so a ceiling landing exactly ON the limit
+    /// overflowed it by one).
+    ///
+    /// Floored at fit: showing the whole picture must always be possible, and it always CAN
+    /// be. `fit_dims` never upscales, so at zoom 1 the media is at most its own source size
+    /// and the whole capture would have to exceed the device limit for the floor to be
+    /// reached — in which case nothing could be shown at all and no zoom ceiling would help.
+    pub(super) fn gpu_max_zoom(&self, preview: &PreviewState) -> f32 {
+        crate::widgets::gpu::max_zoom_for_device(
+            preview.edit.frame,
+            self.preview_points_per_source_px(preview),
+            crate::widgets::gpu::render_scale(),
+            crate::widgets::gpu::max_texture_dim(),
+        )
+        .max(Viewport::FIT)
     }
 
     /// The fraction of the picture's TRUE ON-SCREEN (visual) size it is displayed at when
@@ -231,13 +348,26 @@ impl App {
         )
     }
 
-    /// The maximum view zoom (fit-relative) — the 200%-VISUAL cap: displayed visual
-    /// fraction = zoom × visual_scale, so zoom for 200% visual = 2.0 / visual_scale. Never
-    /// below fit. On a 2× capture, 200% visual is exactly physical 1:1 (`source_scale = 2`,
-    /// so `visual_scale ≈ 1.0` at fit and the ceiling ≈ 2.0), keeping the actual-pixels view
-    /// reachable. On Linux (`source_scale = 1.0`) this is `2.0 / fit` — byte-identical.
+    /// The maximum view zoom (fit-relative) — the [`MAX_VISUAL`] cap, 500% since DRAGON-400:
+    /// displayed visual fraction = zoom × visual_scale, so the zoom for 500% visual is
+    /// `5.0 / visual_scale`. Never below fit.
+    ///
+    /// The old 200% ceiling was chosen so a 2× capture could always reach physical 1:1 — at
+    /// `source_scale = 2`, `visual_scale ≈ 1.0` at fit, so 200% visual IS 1:1. **That property
+    /// still holds**: 500% simply extends past it, and actual-pixels remains reachable (now as a
+    /// point inside the range rather than at its end). What the raise adds is inspection room
+    /// above 1:1 — reading small text, checking an annotation's edge — which is what the owner
+    /// asked for.
+    ///
+    /// **DRAGON-401**: the [`MAX_VISUAL`] ceiling is then cut down to whatever this DEVICE can
+    /// actually draw ([`Self::gpu_max_zoom`]). On a large capture the GPU bound is the binding
+    /// one, so 500% is simply not reachable there — and because the slider's rail, its readout
+    /// and the preset list are all built from THIS function, the UI stops advertising a zoom it
+    /// cannot deliver rather than pretending and stopping short.
     pub(super) fn max_view_zoom(&self, preview: &PreviewState) -> f32 {
-        (2.0 / self.preview_visual_scale(preview)).max(Viewport::FIT)
+        (MAX_VISUAL / self.preview_visual_scale(preview))
+            .min(self.gpu_max_zoom(preview))
+            .max(Viewport::FIT)
     }
 
     /// The zoom FLOOR: the multiplier whose DISPLAYED percent is 50% (`0.5 / visual_scale`),
@@ -257,16 +387,28 @@ impl App {
     /// (Fit / 1:1 / % levels). Shown for images (which pan/zoom via [`ZoomPan`]).
     pub(super) fn zoom_control(&self, preview: &PreviewState, tb: Tb) -> Element<'static, Msg> {
         // Slashed from the former 150px (which was sized for the long "Fit to screen"): the
-        // preset labels are now short ("Fit", "100%"…"200%"), so most of that was dead space.
-        // The floor is set by the widest label ("200%") plus the dropdown chevron.
+        // preset labels are now short ("Fit", "100%"…"500%"), so most of that was dead space.
+        // The floor is set by the widest label plus the dropdown chevron. DRAGON-400 checked the
+        // worst case the readout can produce — a three-digit NON-preset percent from a slider or
+        // scroll zoom, e.g. "437%": four glyphs at size 12 (~27pt) + the 10pt chevron + 3pt
+        // spacing + 12pt padding ≈ 52pt, comfortably inside this. It never needs to grow for the
+        // wider range, because "500%" is the same four glyphs "200%" was.
         const COMBO_W: f32 = 72.0;
         // The zoom-preset menu's on-screen height (px) for the UPWARD flyout offset (item 2
-        // CAUTION: bottom-bar dropdowns open up). Five `menu_container` rows — each a size-13
-        // text button (~27px with cosmic's 5px button padding) — plus the 2px inter-row gaps and
-        // the container's 4px inset top+bottom. A small over-estimate only lifts the menu a hair
-        // clear of the chip; it never overlaps.
-        const ZOOM_MENU_PANEL_H: f32 =
-            ZOOM_PRESET_LABELS.len() as f32 * 27.0 + (ZOOM_PRESET_LABELS.len() as f32 - 1.0) * 2.0 + 2.0 * 4.0;
+        // CAUTION: bottom-bar dropdowns open up). One `menu_container` row per preset — each a
+        // size-13 text button (~27px with cosmic's 5px button padding) — plus the 2px inter-row
+        // gaps and the container's 4px inset top+bottom. Derived from the label COUNT, so the
+        // DRAGON-400 stops grew it automatically: 8 rows ≈ 238pt (was ≈151pt at five). It still
+        // lands on screen — the smallest content area this control can appear in is the 732pt
+        // minimum window less its chrome, ≈597pt, so the popup clears the bar with room to spare.
+        // A small over-estimate only lifts the menu a hair clear of the chip; it never overlaps.
+        // DRAGON-401 made it a fn of the ROW COUNT rather than of the label count: a device
+        // ceiling can drop the top presets from the list, and a height still sized for all
+        // eight would float the shortened menu a couple of rows above the chip.
+        fn zoom_menu_panel_h(rows: usize) -> f32 {
+            let n = rows.max(1) as f32;
+            n * 27.0 + (n - 1.0) * 2.0 + 2.0 * 4.0
+        }
         // Addressed to this document (DRAGON-336 phase 2).
         let pid = preview.window;
         let z = preview.view.zoom;
@@ -288,13 +430,20 @@ impl App {
         let vscale = visual;
         // The preview editor's own (smaller) thumb — see `PREVIEW_SLIDER_THUMB`. The wrapper
         // gets the SAME class so its 100% notch stays aligned with the resized thumb.
+        // The rail is `ZOOM_SLIDER_W` — the shared toolbar-slider width widened by a third
+        // (owner's request). It came FROM that shared width in DRAGON-392 and diverged from it
+        // here; see the constant for why the zoom rail alone earns the extra pixels. The tick is
+        // drawn by `notched_slider` from the slider's own bounds, so it stays on the 100 position
+        // at any width, and the magnetic detent is measured in RAIL PIXELS (`rail_snap_pct`), so
+        // a longer rail makes it FINER in percent while keeping it the same size under the
+        // pointer — the resize can only improve it.
         let slider = crate::widgets::notched_slider(
             widget::slider(min_pct..=max_pct, cur_pct, move |pct| {
                 Msg::Preview(pid, PreviewMsg::SetViewZoom(pct / (vscale * 100.0)))
             })
             .step(1.0f32)
             .class(super::chrome::preview_slider_class())
-            .width(Length::Fixed(120.0)),
+            .width(Length::Fixed(super::chrome::ZOOM_SLIDER_W)),
             min_pct..=max_pct,
             vec![100.0],
             super::chrome::preview_slider_class(),
@@ -315,12 +464,20 @@ impl App {
         // in the shared `Button::Text` class, so the Fit control can't miss it). It still INHERITS
         // the enclosing bordered cluster's fill.
         let button =
-            super::chrome::dropdown_chip(pid, widget::text(label).size(12).into(), COMBO_W, PreviewMsg::ToggleZoomMenu);
+            // Always enabled: this is the BOTTOM bar, which a crop session does not gate.
+            super::chrome::dropdown_chip(
+                pid,
+                widget::text(label).size(12).into(),
+                COMBO_W,
+                PreviewMsg::ToggleZoomMenu,
+                true,
+            );
         let combo: Element<'static, Msg> = if preview.view.zoom_menu_open {
             let cur = preview.view.zoom_preset;
             let items: Vec<Element<'static, Msg>> = ZOOM_PRESET_LABELS
                 .iter()
                 .enumerate()
+                .filter(|(i, _)| reachable_preset(*i, visual, max_zoom))
                 .map(|(i, lbl)| {
                     // Match the text menus: the CURRENT preset row reads accent, the rest default.
                     let hot = cur == Some(i);
@@ -342,6 +499,7 @@ impl App {
                     )
                 })
                 .collect();
+            let panel_h = zoom_menu_panel_h(items.len());
             // DRAGON-357 item 17: the Fit/scale menu wears the SAME opaque dropdown surface as the
             // text SIZE / FONT menus. Item 2 CAUTION: it opens UPWARD (bottom bar), via the shared
             // `flyout` helper's `Up` direction — deterministic in both the overlay and the window,
@@ -350,7 +508,7 @@ impl App {
             super::chrome::flyout(
                 button,
                 menu,
-                super::chrome::FlyoutDir::Up(ZOOM_MENU_PANEL_H),
+                super::chrome::FlyoutDir::Up(panel_h),
                 Msg::Preview(pid, PreviewMsg::ToggleZoomMenu),
             )
         } else {
@@ -359,9 +517,10 @@ impl App {
         // DRAGON-357: the slider + dropdown share ONE bordered cluster, like the other bottom-bar
         // groups (the dropdown chip above no longer draws its own chrome). Item 9: the slider
         // gets inner-LEFT padding so its rail doesn't hug the group's left edge.
-        let slider = widget::container(slider).padding([0.0, 0.0, 0.0, 8.0]);
+        let slider =
+            widget::container(slider).padding([0.0, 0.0, 0.0, super::chrome::CLUSTER_INNER_PAD]);
         // The slider + dropdown are both SHORTER than a toolbar button box, so left to their own
-        // natural height this cluster collapsed below the pointer/pan group beside it (the
+        // natural height this cluster collapsed below the tool group beside it (the
         // dropdown-chip rebuild dropped the tall combo that used to anchor the height). Pin the
         // row to the button-box height (`icon_box + 2*btn_pad`, the SAME height `slider_with_icon`
         // and every `tool_toggle` resolve to) and centre its contents, so the zoom cluster matches
@@ -373,7 +532,7 @@ impl App {
         )
         .height(Length::Fixed(tb.icon_box() + 2.0 * tb.btn_pad()))
         .align_y(Alignment::Center);
-        tb.tool_cluster(vec![row.into()], super::chrome::ClusterChrome::Surface)
+        tb.tool_cluster(vec![row.into()])
     }
 
     /// The explicit width (px) for the fullscreen-overlay control column — the
@@ -421,8 +580,10 @@ mod tests {
     #[test]
     fn set_zoom_above_fit_clamps_to_the_ceiling_and_keeps_pan() {
         let mut v = Viewport { pan: (3.0, 4.0), ..Viewport::default() };
-        v.set_zoom(1000.0);
-        assert_eq!(v.zoom, 64.0);
+        v.set_zoom(10_000.0);
+        // The BACKSTOP, not the user-facing ceiling — that is `App::max_view_zoom`, which
+        // always binds first. Raised with the 500% range (DRAGON-400) so it stays clear of it.
+        assert_eq!(v.zoom, Viewport::MAX);
         assert_eq!(v.pan, (3.0, 4.0), "zooming in past fit must not disturb an existing pan");
     }
 
@@ -469,12 +630,127 @@ mod tests {
         // A large grab fitted at 78% on-screen (visual_scale 0.78).
         let vs = visual_scale(0.78, 1.0);
         let z100 = preset_zoom(Some(1.0), vs); // the zoom whose displayed% == 100
+        let tol = SNAP_SCROLL_PCT;
         // Within a couple percent of 100 snaps to exactly 100.
-        assert_eq!(displayed_percent(snap_to_hundred(z100 * 1.02, vs), vs), 100);
-        assert_eq!(displayed_percent(snap_to_hundred(z100 * 0.98, vs), vs), 100);
+        assert_eq!(displayed_percent(snap_to_hundred(z100 * 1.02, vs, tol), vs), 100);
+        assert_eq!(displayed_percent(snap_to_hundred(z100 * 0.98, vs, tol), vs), 100);
         // Far from 100 (a 50%-ish zoom) is left untouched.
         let far = 0.5 / vs;
-        assert!((snap_to_hundred(far, vs) - far).abs() < 1e-6);
+        assert!((snap_to_hundred(far, vs, tol) - far).abs() < 1e-6);
+    }
+
+    /// **The acceptance test for DRAGON-400: dragging must still land exactly on 100%.**
+    ///
+    /// Simulated the way the control actually works — the rail maps `min..=max` displayed
+    /// percent linearly onto the 64pt rail, the slider quantises to whole percent, and the
+    /// message runs through the snap. Every pixel within the detent's reach must produce
+    /// EXACTLY 100, at the old 200% ceiling AND the new 500% one.
+    ///
+    /// This is what the old fixed ±2.5% tolerance would have failed: at 500% a pixel is worth
+    /// ~7%, so no drag position other than a bullseye would have landed inside it.
+    #[test]
+    fn the_hundred_percent_detent_stays_hittable_by_dragging_at_any_ceiling() {
+        // The REAL rail, not a copy: a widened rail must re-run this, not silently pass.
+        let rail = chrome::ZOOM_SLIDER_W;
+        for (label, max_visual) in [("old 200% ceiling", 2.0_f32), ("new 500% ceiling", MAX_VISUAL)] {
+            // A large grab fitted at 78% on-screen — the realistic case, where fit != 100%.
+            let vs = visual_scale(0.78, 1.0);
+            let min_pct = displayed_percent((0.5 / vs).min(Viewport::FIT), vs) as f32;
+            let max_pct = displayed_percent(max_visual / vs, vs) as f32;
+            let tol = rail_snap_pct(min_pct, max_pct, rail);
+            // Where 100% sits along the rail, in pixels.
+            let px_of = |pct: f32| (pct - min_pct) / (max_pct - min_pct) * rail;
+            let hundred_px = px_of(100.0);
+            // Drag to the nearest whole pixel either side of the tick — the best a pointer can
+            // realistically do — and demand an exact 100 out of it.
+            let mut hits = 0;
+            for dx in [-1.0_f32, 0.0, 1.0] {
+                let px = (hundred_px + dx).clamp(0.0, rail);
+                // The slider reports the value under the pointer, quantised by `.step(1.0)`.
+                let pct = (min_pct + px / rail * (max_pct - min_pct)).round();
+                let zoom = pct / (vs * 100.0);
+                let snapped = snap_to_hundred(zoom, vs, tol);
+                assert_eq!(
+                    displayed_percent(snapped, vs),
+                    100,
+                    "{label}: dragging to {dx:+} px from the 100% tick landed off 100"
+                );
+                hits += 1;
+            }
+            assert_eq!(hits, 3);
+            // …and the detent is still a DETENT, not a dead zone swallowing the neighbourhood:
+            // a drag a quarter of the way along the rail is well outside it and must come
+            // through UNCHANGED.
+            let far_pct = (min_pct + 0.25 * (max_pct - min_pct)).round();
+            assert!(
+                (far_pct - 100.0).abs() > tol,
+                "{label}: the fixture is inside the detent, so it proves nothing"
+            );
+            let far = far_pct / (vs * 100.0);
+            assert!(
+                (snap_to_hundred(far, vs, tol) - far).abs() < f32::EPSILON,
+                "{label}: the detent reached a quarter of the way down the rail"
+            );
+        }
+    }
+
+    /// The rail detent is specified in PIXELS, so it must stay ~the same width under the pointer
+    /// as the range grows — that is the whole reason it is not a percent.
+    #[test]
+    fn the_rail_detent_keeps_its_pixel_width_as_the_range_grows() {
+        let rail = 64.0_f32;
+        for (min_pct, max_pct) in [(50.0_f32, 200.0_f32), (50.0, 500.0), (78.0, 641.0)] {
+            let tol = rail_snap_pct(min_pct, max_pct, rail);
+            let px_per_pct = rail / (max_pct - min_pct);
+            let half_width_px = tol * px_per_pct;
+            assert!(
+                (half_width_px - SNAP_RAIL_PX).abs() < 0.01,
+                "range {min_pct}..{max_pct}: detent is {half_width_px}px either side, not \
+                 {SNAP_RAIL_PX}"
+            );
+        }
+        // A degenerate rail can never produce a detent TIGHTER than the historic value.
+        assert_eq!(rail_snap_pct(100.0, 100.0, 64.0), SNAP_SCROLL_PCT);
+        assert_eq!(rail_snap_pct(50.0, 500.0, 0.0), SNAP_SCROLL_PCT);
+    }
+
+    /// The ceiling reaches the advertised 500% of natural size, and the hard `MAX` backstop
+    /// stays clear of it even for a very small fit (a wide multi-monitor grab in a small window),
+    /// where the old 64.0 would have started clamping below the advertised range.
+    #[test]
+    fn the_ceiling_reaches_five_hundred_percent_without_the_backstop_binding() {
+        for fit in [1.0_f32, 0.5, 0.25, 0.117, 0.078] {
+            let vs = visual_scale(fit, 1.0);
+            let ceiling = (MAX_VISUAL / vs).max(Viewport::FIT);
+            assert_eq!(displayed_percent(ceiling, vs), 500, "fit {fit}: ceiling is not 500%");
+            assert!(
+                ceiling <= Viewport::MAX,
+                "fit {fit}: the ceiling {ceiling} exceeds the MAX backstop {}",
+                Viewport::MAX
+            );
+        }
+    }
+
+    /// The preset table and its labels stay in step, the list ends at the ceiling, and the
+    /// pre-500% stops are untouched (existing muscle memory keeps working).
+    #[test]
+    fn the_presets_span_the_range_and_keep_their_old_stops() {
+        assert_eq!(ZOOM_PRESET_LABELS.len(), ZOOM_PRESET_VISUAL.len());
+        assert_eq!(&ZOOM_PRESET_LABELS[..5], &["Fit", "100%", "125%", "150%", "200%"]);
+        assert_eq!(ZOOM_PRESET_VISUAL[0], None, "the first stop is Fit");
+        assert_eq!(
+            *ZOOM_PRESET_VISUAL.last().unwrap(),
+            Some(MAX_VISUAL),
+            "the last preset must be the rail's own ceiling"
+        );
+        // Strictly increasing after Fit, and every label matches its fraction.
+        let mut prev = 0.0;
+        for (i, frac) in ZOOM_PRESET_VISUAL.iter().enumerate().skip(1) {
+            let f = frac.expect("only Fit is None");
+            assert!(f > prev, "preset {i} is not above the one before it");
+            prev = f;
+            assert_eq!(ZOOM_PRESET_LABELS[i], format!("{}%", (f * 100.0).round() as i32));
+        }
     }
 
     /// The reset / "100%" preset targets natural on-screen size: `preset_zoom(Some(1.0), s)
@@ -508,5 +784,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// DRAGON-401: when the device ceiling does NOT bite, every preset is still offered — the
+    /// menu on an ordinary capture is byte-identical to before.
+    #[test]
+    fn every_preset_is_offered_when_the_ceiling_does_not_bite() {
+        let vs = visual_scale(0.787, 1.0);
+        let max = MAX_VISUAL / vs; // the 500% ceiling itself — nothing below it
+        for (i, lbl) in ZOOM_PRESET_LABELS.iter().enumerate() {
+            assert!(reachable_preset(i, vs, max), "preset {i} ({lbl}) dropped");
+        }
+    }
+
+    /// The owner's capture (2640x1448 fitted at 0.787) against this GPU's 8192 limit: the real
+    /// ceiling is ~394% fit-relative = ~310% displayed, so 400% and 500% cannot be reached and
+    /// must not be listed — the menu stops advertising a row that would land somewhere else.
+    #[test]
+    fn presets_above_the_device_ceiling_are_dropped() {
+        let vs = visual_scale(2078.0 / 2640.0, 1.0);
+        let max = crate::widgets::gpu::max_zoom_for_device((2640, 1448), 2078.0 / 2640.0, 1.0, 8192);
+        let offered: Vec<&str> = ZOOM_PRESET_LABELS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| reachable_preset(*i, vs, max))
+            .map(|(_, l)| *l)
+            .collect();
+        assert_eq!(offered, ["Fit", "100%", "125%", "150%", "200%", "300%"]);
+    }
+
+    /// However hard the ceiling bites, "Fit" survives — the list can never empty out, because
+    /// `max_view_zoom` floors at fit and "Fit" IS that multiplier.
+    #[test]
+    fn fit_is_always_offered() {
+        for vs in [0.05f32, 0.5, 1.0, 4.0] {
+            assert!(reachable_preset(0, vs, Viewport::FIT), "visual_scale {vs}");
+        }
+    }
+
+    /// A preset sitting exactly ON the ceiling stays listed (float rounding must not make a row
+    /// blink in and out as the window is resized by a pixel).
+    #[test]
+    fn a_preset_exactly_at_the_ceiling_stays_listed() {
+        let vs = visual_scale(0.5, 1.0);
+        let at_200 = preset_zoom(Some(2.0), vs);
+        assert!(reachable_preset(4, vs, at_200), "200% is preset index 4");
+        // A hair below it and the row goes.
+        assert!(!reachable_preset(4, vs, at_200 * 0.99));
     }
 }

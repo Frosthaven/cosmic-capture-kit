@@ -40,6 +40,10 @@
 //!    Nothing else is owed: the Ctrl-overrides-manipulation draw path
 //!    (`annotation_canvas::force_new_draw`) is tool-agnostic.
 //!
+//! A tool that DRAWS NOTHING skips 1, 2, 5 and 6 entirely and only does 3 + 4 — it declares
+//! itself in `Tool::draws()` and gets `None`/`return` arms in the model matches. The
+//! [`Tool::Pointer`] (pure selection) and the [`Tool::Hand`] (pan, DRAGON-392) are the two.
+//!
 //! # The freehand pencil + eraser (DRAGON-338), beautified (DRAGON-342)
 //! [`AnnotKind::Pen`] is the first NON-rect, non-two-point kind, and shows how far the seams
 //! stretch. A drag appends samples to the RAW trail on [`super::edit::EditState::pen_raw`]
@@ -673,9 +677,10 @@ pub fn spawn_kind(tool: Tool, rect: AnnotRect, stroke_w: f32) -> Option<AnnotKin
             ring_w: stroke_w,
         },
         // A freehand stroke has no meaningful default geometry; the eraser creates no item at
-        // all; the POINTER (DRAGON-341) is pure selection; and TEXT (DRAGON-354) is typed into,
-        // not pre-placed — double-clicking any of their tray buttons just picks the tool.
-        Tool::Pen | Tool::Eraser | Tool::Pointer | Tool::Text => return None,
+        // all; the POINTER (DRAGON-341) is pure selection and the HAND (DRAGON-392) only pans;
+        // and TEXT (DRAGON-354) is typed into, not pre-placed — double-clicking any of their
+        // tray buttons just picks the tool.
+        Tool::Pen | Tool::Eraser | Tool::Pointer | Tool::Hand | Tool::Text => return None,
     })
 }
 
@@ -976,9 +981,13 @@ fn rect_family_tool(tool: Tool) -> Option<u8> {
         Tool::Pixelate => 3,
         Tool::Blur => 4,
         Tool::Spotlight => 5,
-        Tool::Arrow | Tool::Pen | Tool::Eraser | Tool::Pointer | Tool::Badge | Tool::Text => {
-            return None;
-        }
+        Tool::Arrow
+        | Tool::Pen
+        | Tool::Eraser
+        | Tool::Pointer
+        | Tool::Hand
+        | Tool::Badge
+        | Tool::Text => return None,
     })
 }
 
@@ -3586,10 +3595,11 @@ impl App {
                 stroke_w,
                 bounds,
             ),
-            // Neither non-creating tool ever reaches here: the eraser is handled above, and the
-            // POINTER (DRAGON-341) never emits a `DrawBegin` at all (its empty-canvas drag is a
-            // rubber band, not a draw). Defensive.
-            Tool::Eraser | Tool::Pointer => return Task::none(),
+            // No non-creating tool ever reaches here: the eraser is handled above, the POINTER
+            // (DRAGON-341) never emits a `DrawBegin` at all (its empty-canvas drag is a rubber
+            // band, not a draw), and the HAND (DRAGON-392) hands every press to the ZoomPan.
+            // Defensive.
+            Tool::Eraser | Tool::Pointer | Tool::Hand => return Task::none(),
         };
         // A placed badge REMEMBERS its side — the SETTLED one, so a badge the picture clamped
         // down doesn't make every later click try (and fail) at the bigger size again. The
@@ -3633,31 +3643,50 @@ impl App {
     /// exists only under the pointer, so the state is pruned rather than the chrome hidden —
     /// otherwise a ghost member would still ride along in a group move or delete.
     pub(super) fn select_annot_tool(&mut self, id: window::Id, tool: Tool) {
+        self.set_annot_tool(id, Some(tool));
+    }
+
+    /// [`Self::select_annot_tool`]'s body, over an OPTIONAL tool — the ONE funnel every change to
+    /// the armed tool goes through, arming and DISARMING alike (DRAGON-392 correction: entering a
+    /// crop session disarms the tray, and leaving it re-arms whatever was held). Routing the
+    /// disarm through here rather than writing `edit.tool` directly is what keeps the text-edit
+    /// settle, the pen-selection drop and the DRAGON-369 slot cursor behaving exactly as they do
+    /// for an ordinary tool change.
+    ///
+    /// `None` is the NEUTRAL state: nothing armed, no conversion, and (like every non-pointer
+    /// tool) no pen selection kept.
+    pub(super) fn set_annot_tool(&mut self, id: window::Id, tool: Option<Tool>) {
         // Arming ANY tool settles an in-flight text edit first (DRAGON-354): the box you were
-        // typing into commits (or, if empty, vanishes) before the new mode takes over.
+        // typing into commits (or, if empty, vanishes) before the new mode takes over. Disarming
+        // settles it too — which is also what stops a crop session ever coexisting with a live
+        // text edit, an ambiguity Enter would otherwise have to resolve.
         let _ = self.settle_text_edit(id);
         // If a box-family annotation (Box Outline / Highlight / Box Highlight) is selected
         // and the user picks a DIFFERENT one of those three tools, CONVERT the selected
         // item in place (real-time, one undo entry) rather than only arming the tool for
-        // the next draw. No-op for every other selection/tool combination.
-        self.convert_selected_annotation_kind(id, tool);
-        // Only ever SETS a tool — clicking/hotkeying the active tool is a no-op (no
+        // the next draw. No-op for every other selection/tool combination — and for a disarm,
+        // which picks nothing to convert TO.
+        if let Some(tool) = tool {
+            self.convert_selected_annotation_kind(id, tool);
+        }
+        // Only ever SETS the tool — clicking/hotkeying the active tool is a no-op (no
         // re-click-to-neutral). Persist so the next preview opens with it.
         if let Some(p) = self.preview_for_mut(id) {
-            p.edit.tool = Some(tool);
+            p.edit.tool = tool;
             // DRAGON-369: arming a member MOVES its slot's cycle cursor, whatever the route —
             // hotkey, cycle key or tray click. This one line is why the keyboard and the mouse
-            // can never disagree about "the slot's current member".
-            if let Some(slot) = super::chrome::slot_for_tool(tool) {
-                p.edit.slot_cursor.insert(slot, tool);
+            // can never disagree about "the slot's current member". A DISARM leaves every cursor
+            // where it was, so a crop round-trip can't change what the next M/U press arms.
+            if let Some(slot) = tool.and_then(super::chrome::slot_for_tool) {
+                p.edit.slot_cursor.insert(slot, tool.expect("slot implies a tool"));
             }
             // Pen groups are selectable ONLY under the pointer, so arming anything else lets
             // them go — the visible selection and the real one never disagree.
-            if !tool.is_pointer() {
+            if !tool.is_some_and(Tool::is_pointer) {
                 p.edit.drop_pen_selection();
             }
         }
-        self.annot_tool = Some(tool);
+        self.annot_tool = tool;
         self.save_state();
     }
 
@@ -4484,7 +4513,7 @@ impl App {
     }
 
     /// Re-render the text layer for a NEW zoom when the wanted resolution actually changed
-    /// (mirrors [`Self::refresh_covermark_for_zoom`]) — so a magnified caption sharpens toward
+    /// (mirrors [`Self::refresh_covermark_for_view`]) — so a magnified caption sharpens toward
     /// the source resolution without a re-render on every idle zoom step. The comparison is on
     /// the quantized raster SCALE (the region is content-derived and zoom-independent), so a
     /// zoom nudge inside one [`super::edit::RASTER_QUANTUM`] step costs nothing.
@@ -5301,8 +5330,7 @@ impl App {
         let Some(p) = self.preview_for_mut(id) else {
             return;
         };
-        let band = AnnotRect::from_points((x0, y0), (x1, y1));
-        let hits: Vec<AnnotId> = items_in_band(&p.edit.annotations, band);
+        let hits: Vec<AnnotId> = band_hit_ids(&p.edit.annotations, x0, y0, x1, y1);
         if additive {
             p.edit.sel.add_all(hits);
         } else {
@@ -5868,6 +5896,25 @@ fn segment_hits_rect(a: (f32, f32), b: (f32, f32), r: AnnotRect) -> bool {
     let (l, t, rr, bb) = (r.x, r.y, r.x + r.w, r.y + r.h);
     let corners = [(l, t), (rr, t), (rr, bb), (l, bb)];
     (0..4).any(|i| segments_cross(a, b, corners[i], corners[(i + 1) % 4]))
+}
+
+/// **THE band rule's entry point**: the ids a rubber band whose corners are `(x0, y0)`–`(x1, y1)`
+/// (image SOURCE px, UN-normalized — exactly as the canvas reports them) would take, in scene
+/// z-order. Normalizes the corners, then applies [`items_in_band`].
+///
+/// Both users go through here: the RELEASE commit ([`App::band_select_annotations`]) and
+/// DRAGON-397's LIVE sweep preview, which the canvas calls per motion event through an injected
+/// closure. One entry point means the boxes that light up under the band and the selection that
+/// lands on release cannot drift apart — including the normalization, which a second caller
+/// would otherwise have to remember.
+pub fn band_hit_ids(
+    items: &[AnnotationItem],
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) -> Vec<AnnotId> {
+    items_in_band(items, AnnotRect::from_points((x0, y0), (x1, y1)))
 }
 
 /// Every annotation the rubber `band` (SOURCE px, normalized) TOUCHES, in scene z-order

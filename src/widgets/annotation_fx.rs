@@ -245,6 +245,9 @@ impl shader::Primitive for EffectsPrimitive {
         bounds: &Rectangle,
         viewport: &Viewport,
     ) {
+        // DRAGON-401: this primitive's viewport is scaled by the view zoom exactly as the
+        // layer stack's is, so it reports the same device facts (see `widgets::gpu`).
+        crate::widgets::gpu::observe(device, viewport);
         // DRAGON-366 (TEMPORARY): time the whole prepare from OUTSIDE, so every exit inside
         // (the dim-only fast path as well as the full effect plan) is covered by one probe.
         // Remove with `crate::widgets::dragon366`.
@@ -595,11 +598,14 @@ impl EffectsPipeline {
         // A raw `bounds * sf` can land a fractional pixel short on the right/bottom, leaving a ~1px
         // undimmed seam there (the base rasterizes to whole pixels, our float viewport didn't reach
         // them). floor/ceil guarantees coverage; the clip scissor still bounds it to the content view.
-        let px = (bounds.x * sf).floor();
-        let py = (bounds.y * sf).floor();
-        let pr = ((bounds.x + bounds.width) * sf).ceil();
-        let pb = ((bounds.y + bounds.height) * sf).ceil();
-        wfx.phys_bounds = Rectangle { x: px, y: py, width: pr - px, height: pb - py };
+        //
+        // DRAGON-401 (fix 2): the snap is `gpu::snap_axis` — the SAME function the zoom ceiling
+        // budgets against — because this expansion is what makes the viewport this pass issues
+        // larger than `bounds * sf`, and landing the zoom exactly on the device limit therefore
+        // overflowed it by one pixel and killed the process. One arithmetic, one owner.
+        let (px, pw) = crate::widgets::gpu::snap_axis(bounds.x, bounds.width, sf);
+        let (py, ph) = crate::widgets::gpu::snap_axis(bounds.y, bounds.height, sf);
+        wfx.phys_bounds = Rectangle { x: px, y: py, width: pw, height: ph };
 
         wfx.ensure_base(device, queue, &prim.base, tex_format);
         wfx.ensure_ping(device, tex_w, tex_h);

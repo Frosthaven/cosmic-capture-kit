@@ -551,6 +551,17 @@ fn main() -> cosmic::iced::Result {
     }
     #[cfg(not(windows))]
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // DRAGON-406: start the Windows chrome/transparency diagnostics session. Placed here, in
+    // `main` BEFORE every subcommand return and before the daemon branch, so that EVERY way of
+    // starting this program produces the report: a Start Menu / shortcut launch, a hotkey or
+    // CLI capture, the resident daemon, and each capture child the daemon spawns (they are
+    // this same exe and run this same line). A child inheriting a console it does not have is
+    // exactly how a log comes back empty, so it writes to a file under %LOCALAPPDATA% that all
+    // of them append to. DRAGON-408 removed the Windows-10 gate — it now records on every
+    // Windows run, with no trigger — and everything it does is best-effort, so it cannot fail
+    // startup. Removed by DRAGON-407.
+    #[cfg(windows)]
+    platform::windows::diag::init();
     #[cfg(target_os = "macos")]
     install_macos_panic_hook();
     #[cfg(windows)]
@@ -776,6 +787,11 @@ fn main() -> cosmic::iced::Result {
             )
         });
         if bare && state::load().resident {
+            // DRAGON-406: re-tag this process's diagnostics lines as the DAEMON before its
+            // message loop takes over, so the shared file distinguishes the long-lived tray
+            // process from the one-shot capture children it spawns (that distinction is the
+            // whole point of covering all three launch paths). Inert on Windows 11.
+            platform::windows::diag::mark_daemon();
             daemon::run(); // never returns — runs the Win32 message loop or exits
         }
     }

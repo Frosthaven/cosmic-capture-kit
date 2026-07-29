@@ -11,9 +11,9 @@
 //! with several documents open (DRAGON-336) a toast belongs to the one whose button was
 //! pressed, and it must render in that document's surface whether that is the fullscreen
 //! overlay or a CSD window. The rendering seam ([`toast_layer`]) is surface-agnostic for
-//! exactly that reason — it is stacked over the MEDIA element (by `compose_preview`, or by
-//! the loading spinner while the media is still arriving), so the two appearances get
-//! identical placement from one builder and neither can overlap the chrome.
+//! exactly that reason — it is stacked over the media REGION (`chrome::toast_region`, from
+//! `compose_preview` or from the loading view while the media is still arriving), so the two
+//! appearances get identical placement from one builder and neither can overlap the chrome.
 //!
 //! Expiry is driven by a tick subscription (`sub_preview_toasts`) rather than by a timer
 //! per toast: [`Toasts::expire`] is a pure sweep the tick calls, and it reports whether
@@ -231,14 +231,18 @@ const TOAST_OPACITY: f32 = 0.85;
 /// instead of quietly resetting its timer somewhere in the middle. Each card expires on
 /// its own clock and the ones below slide up to fill the gap.
 ///
-/// **Anchoring**: the returned layer is stacked over the media element itself (by
-/// `compose_preview` for a loaded document, and over the spinner while one is still
-/// loading) — never over the whole surface. That is what guarantees it can't overlap the
-/// toolbars, the annotation tray or the video transport strip in EITHER appearance: in a
-/// WINDOW the media element is the Fill container between the two bars; in the fullscreen
-/// OVERLAY it is the hugged picture inside the centred column. Both give the same
-/// top-right-of-the-picture placement from one builder, at any window size, with no
-/// per-surface arithmetic to keep in sync.
+/// **Anchoring**: the returned layer is stacked over the media REGION — the space BETWEEN the
+/// toolbars ([`super::chrome::toast_region`], from `compose_preview` for a loaded document and
+/// from the loading view while one is still arriving) — never over the whole surface. That is
+/// what guarantees it can't overlap the toolbars, the annotation tray or the video transport
+/// strip in EITHER appearance: in a WINDOW the region is the Fill box between the two bars; in
+/// the fullscreen OVERLAY it is the hugged column's width by the media row's height. Both give
+/// the same top-right placement from one builder, at any window size, with no per-surface
+/// arithmetic to keep in sync.
+///
+/// It anchors to the region rather than to the media ELEMENT (DRAGON-393): the element is only
+/// as big as the fitted picture, so a small capture gave a small centred anchor and the toast
+/// visibly flitted from the window's middle to the right as the media settled.
 ///
 /// Deliberately inert: no `mouse_area`, no button, nothing that captures a press — so a
 /// toast can never eat a click meant for the picture or the chrome beneath it. It expires
@@ -293,9 +297,7 @@ fn card(
     let kind = toast.kind;
     // A per-toast icon overrides the severity default (DRAGON-357).
     let icon_name = toast.icon.unwrap_or_else(|| kind.icon());
-    let glyph = widget::icon::icon(crate::widgets::icons::handle(icon_name))
-        .width(Length::Fixed(16.0))
-        .height(Length::Fixed(16.0))
+    let glyph = crate::widgets::icons::sized(icon_name, 16.0)
         .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
             move |t: &cosmic::Theme| cosmic::widget::svg::Style { color: Some(kind.color(t)) },
         )));

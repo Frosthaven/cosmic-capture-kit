@@ -465,7 +465,7 @@ pub(crate) fn accent_text(theme: &Theme) -> Color {
 // ── Shared segmented-pair styling ────────────────────────────────────────────
 
 /// The ONE segmented-toggle segment style — the capture toolbar's
-/// scanner/image/video kind pair AND the preview's pointer/pan and
+/// scanner/image/video kind pair AND the preview's
 /// pointer/razor pairs all render through here, so they can never drift
 /// apart again. Active = accent fill (dimmed on hover) with the on-accent
 /// glyph; inactive = the group's divider fill with the group background's own
@@ -495,7 +495,7 @@ pub(crate) fn segment_style(
         // An OPAQUE resting fill (a low blend toward the foreground) rather than the
         // theme's translucent `component.divider`: the divider's alpha let the frosted
         // preview toolbars show through, washing the inactive segment out to near-invisible
-        // (the image editor's pointer/pan toggle on the glass bar especially). An opaque
+        // (the image editor's toggles on the glass bar especially). An opaque
         // fill reads clearly on every backing while staying clearly below the accent-filled
         // active state. Shared by both preview toggles + the capture mode selector, so all
         // three stay consistent. Bumped 0.12 -> 0.2 so unselected items read stronger against
@@ -755,25 +755,63 @@ pub(crate) fn glass_config() -> Option<GlassConfig> {
 #[cfg(windows)]
 const MICA_SURFACE_ALPHA: f32 = 0.0;
 
-/// The Windows frosted-windows config (DRAGON-267) — the Mica-backdrop equivalent of the
+/// The frosted-surface opacity the chrome paints at over the WINDOWS 10 **blur-behind**
+/// material (DRAGON-405) — deliberately NOT [`MICA_SURFACE_ALPHA`]'s 0.0.
+///
+/// This constant IS the feature's safety property. Mica can afford a fully transparent chrome
+/// because DWM guarantees the material behind it; Win10's blur comes from an UNDOCUMENTED
+/// accent policy that may silently do nothing on some build, and a 0.0 surface over no
+/// material is a see-through window (or, if per-pixel alpha never reaches DWM, a solid black
+/// one). At 0.85 — the restrained pre-DRAGON-275 value — every failure mode is boring:
+/// * policy applied → a subtle blur reads through a mostly-solid surface;
+/// * policy silently ignored → an 85%-opaque theme surface, barely distinguishable from today;
+/// * per-pixel alpha not honored at all → a plain opaque window, exactly today's look.
+///
+/// Tune HERE (not in the native arm): the accent policy is applied with a zero gradient
+/// colour, so all of the Win10 glass tint comes from this one number.
+#[cfg(windows)]
+const WIN10_SURFACE_ALPHA: f32 = 0.85;
+
+/// The Windows frosted-windows config (DRAGON-267) — the native-material equivalent of the
 /// Linux COSMIC frosted-glass read. On Win11 22H2+ (where DWM's `DWMWA_SYSTEMBACKDROP_TYPE`
 /// Mica material is supported) this returns `Some` with `frosted_windows` ON, so the SHARED
 /// translucent-chrome painting (`frost_color`, the settings/preview chrome closures) and
-/// [`glass_windows_enabled`] behave exactly like Linux's frosted glass; the native DWM
-/// material itself is applied post-show by `platform::windows::window::apply_mica`. Below
-/// 22H2 (Mica unsupported) it is `None` — a graceful no-op keeping today's opaque look.
+/// [`glass_windows_enabled`] behave exactly like Linux's frosted glass; the native
+/// material itself is applied post-show by
+/// `platform::windows::window::apply_window_glass`. On Windows 10 the same `Some` comes
+/// back with [`WIN10_SURFACE_ALPHA`] and the blur-behind material behind it (DRAGON-405);
+/// on a Win11 build below 22H2 (neither material) it is `None` — a graceful no-op keeping
+/// today's opaque look.
 /// Honors the SAME `CCK_NO_GLASS=1` kill-switch as the Linux reader so the frosted-windows
 /// toggle is unified across platforms. `strength_ordinal` is unused off Linux (only the
 /// COSMIC capture-glass reproduction consumes it), so a `0` placeholder.
+/// DRAGON-405: below the Mica floor this no longer falls straight through to `None`. Windows
+/// 10 gets its own material — the blur-behind accent policy — with its own, deliberately
+/// CONSERVATIVE surface alpha ([`WIN10_SURFACE_ALPHA`], see there for the failure modes). The
+/// materials are mutually exclusive by build (`mica_supported` ≥ 22621 vs
+/// `blur_behind_supported` `[10240, 22000)`), and Mica is asked FIRST so every Windows 11
+/// build keeps exactly what it returns today: Some(0.0) at 22H2+, and `None` in the
+/// 22000..22620 band, which has neither material.
 #[cfg(windows)]
 fn windows_glass_config() -> Option<GlassConfig> {
     if std::env::var_os("CCK_NO_GLASS").is_some_and(|v| v == "1") {
         return None;
     }
-    if !crate::platform::windows::window::mica_supported() {
-        return None;
+    if crate::platform::windows::window::mica_supported() {
+        return Some(GlassConfig {
+            strength_ordinal: 0,
+            alpha: MICA_SURFACE_ALPHA,
+            frosted_windows: true,
+        });
     }
-    Some(GlassConfig { strength_ordinal: 0, alpha: MICA_SURFACE_ALPHA, frosted_windows: true })
+    if crate::platform::windows::window::blur_behind_supported() {
+        return Some(GlassConfig {
+            strength_ordinal: 0,
+            alpha: WIN10_SURFACE_ALPHA,
+            frosted_windows: true,
+        });
+    }
+    None
 }
 
 

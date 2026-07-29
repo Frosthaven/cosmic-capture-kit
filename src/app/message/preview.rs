@@ -129,11 +129,11 @@ pub enum PreviewMsg {
     ToggleZoomMenu,
     /// Pan the displayed image by a screen-px delta (alt+scroll / alt+drag).
     Pan(f32, f32),
-    /// Switch the preview pointer tool: `false` = normal pointer, `true` = pan (grabby hand).
-    SetPanMode(bool),
-    /// Toggle between selection/interact and PAN mode (the `V` hotkey) — flips
-    /// `view.pan_mode`, kept in sync with the pointer/pan seg-toggle button.
-    TogglePanMode,
+    // DRAGON-392: there is no pan MODE any more. Panning is the HAND TOOL
+    // (`annotation_canvas::Tool::Hand`), armed through the ordinary `SelectTool` /
+    // `ToolPressed` path like every other tool — so the toolbar, the `H` key and the canvas all
+    // read ONE fact (`edit.tool`) instead of a tool plus a parallel mode flag. Do not
+    // reintroduce a mode message here.
     /// Set the active covermark's zoom (0 = default cover fit). Live from the slider —
     /// updates the value only; the (blink-free) re-raster happens on `CommitCovermarkEdit`.
     SetZoom(f32),
@@ -316,7 +316,7 @@ impl PreviewMsg {
     ///
     /// # What qualifies
     ///
-    /// Direct manipulation of the picture or its timeline: arming a tool (the pointer/pan
+    /// Direct manipulation of the picture or its timeline: arming a tool (the select/hand
     /// toggle included — picking a tool IS the start of working), any canvas press, drag or
     /// selection, and every timeline gesture (scrub, razor, select, delete, right-click).
     ///
@@ -345,8 +345,6 @@ impl PreviewMsg {
             Self::SelectTool(_)
                 | Self::ToolPressed(_)
                 | Self::CycleToolSlot(_)
-                | Self::SetPanMode(_)
-                | Self::TogglePanMode
                 | Self::TimelineRazor(_)
                 // ── Canvas press / drag / selection ──────────────────────────────────
                 | Self::AnnotDrawBegin(..)
@@ -391,7 +389,8 @@ mod tests {
             PreviewMsg::SelectTool(Tool::Pointer),
             PreviewMsg::ToolPressed(Tool::Rect),
             PreviewMsg::CycleToolSlot(crate::shortcuts::Action::PreviewAnnotShapeCycle),
-            PreviewMsg::TogglePanMode,
+            // DRAGON-392: arming the hand IS a tool arming, no special message.
+            PreviewMsg::SelectTool(Tool::Hand),
             PreviewMsg::AnnotDrawBegin(Tool::Arrow, 1.0, 2.0),
             PreviewMsg::AnnotGestureEnd,
             PreviewMsg::SelectAnnotation(None),

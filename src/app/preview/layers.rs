@@ -302,8 +302,12 @@ impl shader::Primitive for LayerStackPrimitive {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         _bounds: &Rectangle,
-        _viewport: &Viewport,
+        viewport: &Viewport,
     ) {
+        // DRAGON-401: record what THIS device accepts for `set_viewport` (and the scale factor
+        // iced multiplies our bounds by), which is what bounds the preview's zoom. The app
+        // never holds a `wgpu::Device`; `prepare` is the only place both facts are in hand.
+        crate::widgets::gpu::observe(device, viewport);
         // DRAGON-366 (TEMPORARY): time the prepare and record, per layer, whether this frame
         // actually re-uploaded its raster — a layer re-uploading every frame is paying its
         // full raster cost per frame. Remove with `crate::widgets::dragon366`.

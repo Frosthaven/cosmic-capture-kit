@@ -166,7 +166,8 @@ pub struct ZoomPan<'a, Msg> {
     content: cosmic::Element<'a, Msg>,
     zoom: f32,
     pan: (f32, f32),
-    /// Pan tool active: a plain left-drag pans (grabby hand), no Alt needed.
+    /// The HAND tool is armed: a plain left-drag pans (grabby hand), no Alt needed. Driven by
+    /// `Tool::Hand` since DRAGON-392 (a separate pan MODE flag before) — same bool, same rule.
     pan_mode: bool,
     /// The fitted picture's pixel size at zoom 1.0 (dw, dh). With the widget's ACTUAL bounds
     /// this drives BOTH the pan clamp and the scrollbar geometry, so the thumb tracks the real

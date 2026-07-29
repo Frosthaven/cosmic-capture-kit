@@ -275,13 +275,20 @@ pub(super) fn preview_overlay_window(
 /// fit-to-media sizing so they agree.
 ///
 /// **This is THE one knob** (DRAGON-357 item 11): the value is the user's measured preferred
-/// minimum for the live preview editor (914 x 732 logical points, measured 2026-07-27), which
-/// comfortably exceeds the content-derived toolbar floor (`overlay_min_content_width_for`, the
-/// widest bar's arithmetic) — so it is the "whichever is larger" of the two. On a display too
-/// small to hold it, [`preview_window`] clamps the actual `min_size` down to the output so the
-/// floor never exceeds the usable area; the open-fit math (`sizing::spawn_window_size`) already
-/// clamps to the monitor too.
-pub(super) const PREVIEW_MIN_W: f32 = 914.0;
+/// minimum for the live preview editor, which comfortably exceeds the content-derived toolbar
+/// floor (`overlay_min_content_width_for`, the widest bar's arithmetic) — so it is the
+/// "whichever is larger" of the two. On a display too small to hold it, [`preview_window`]
+/// clamps the actual `min_size` down to the output so the floor never exceeds the usable area;
+/// the open-fit math (`sizing::spawn_window_size`) already clamps to the monitor too.
+///
+/// The WIDTH is `924` (DRAGON-392: the owner's +10 on the 914 measured 2026-07-27, for the
+/// bottom bar's new document-info block). It is a COMFORT bump, not a requirement: the widest
+/// bar's own arithmetic asks for ~834pt with the info block counted, so the constraint had ~80pt
+/// of slack before this and has ~90pt now. One constant serves both the toplevel `min_size` hint
+/// and the internal layout floor (`preview_viewport`'s `min_w`), so they cannot clamp at
+/// different widths. The OPEN-fit path is untouched — it reads this floor but keeps its own
+/// DRAGON-108 max-size-hint dance.
+pub(super) const PREVIEW_MIN_W: f32 = 924.0;
 pub(super) const PREVIEW_MIN_H: f32 = 732.0;
 
 /// The post-capture preview as a normal RESIZABLE WINDOW (the "Windowed" appearance)

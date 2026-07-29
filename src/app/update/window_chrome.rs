@@ -116,6 +116,14 @@ impl App {
                 crate::platform::services::open_uri(&url);
                 Task::none()
             }
+            // DRAGON-406: the About page's "Open logs folder" button. Windows-only, so the
+            // variant and this arm are both `cfg(windows)` and Linux/macOS are byte-identical.
+            // The row that sends it only exists on a Windows 10 run. DRAGON-407.
+            #[cfg(windows)]
+            WindowChromeMsg::OpenDiagnosticsFolder => {
+                crate::platform::windows::diag::open_logs_folder();
+                Task::none()
+            }
             WindowChromeMsg::Ignore => Task::none(),
             WindowChromeMsg::KeyPressed(window, modifiers, key, location, text) => {
                 self.handle_key(window, modifiers, key, location, text)
@@ -273,12 +281,14 @@ impl App {
                     crate::platform::windows::caption::install_native_caption_buttons(
                         settings::WINDOW_TITLE,
                     );
-                    // Mica backdrop (DRAGON-267): apply the DWM Mica material — gated on the SAME
-                    // frosted-windows signal Linux uses (`self.glass` is `Some(frosted_windows)` only
-                    // on Win11 22H2+ and not `CCK_NO_GLASS`-disabled), so the unified toggle turns it
-                    // off too. A no-op otherwise. The chrome already paints translucent from `self.glass`.
+                    // Frosted-windows material (DRAGON-267 Mica; DRAGON-405 Win10 blur-behind):
+                    // gated on the SAME frosted-windows signal Linux uses (`self.glass` is
+                    // `Some(frosted_windows)` only where a material exists — Win11 22H2+ or Win10 —
+                    // and not `CCK_NO_GLASS`-disabled), so the unified toggle turns it off too. A
+                    // no-op otherwise; the native side picks WHICH material from the same build read.
+                    // The chrome already paints translucent from `self.glass`.
                     if self.glass.is_some_and(|g| g.frosted_windows) {
-                        crate::platform::windows::window::apply_mica(settings::WINDOW_TITLE);
+                        crate::platform::windows::window::apply_window_glass(settings::WINDOW_TITLE);
                     }
                     // DRAGON-299/313: the sub-min re-assert in `ConfigWindowResized` remains a
                     // defensive net against any post-show winit soft-size; schedule the SETTLE that

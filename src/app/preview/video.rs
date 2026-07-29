@@ -633,7 +633,17 @@ impl App {
         // `Vec<Element<'static, _>>` is a subtype of `Vec<Element<'a, _>>` (Element
         // is covariant in its lifetime), so this is a plain re-binding.
         let left: Vec<Element<'a, Msg>> = self.edit_tools(preview, tb);
-        let toolbar = toolbar_row(left, Vec::new(), Vec::new());
+        // DRAGON-392: the document-info block (resolution over filesize) moved OFF the top bar —
+        // where the bare filesize chip used to sit beside the share actions — to the right of
+        // THIS bar. Same builder AND the same slot as the image editor's (immediately left of the
+        // scale group, which a video has none of, so here it is simply the right-hand item), so
+        // the two can only differ in what surrounds them. `display_frame()` is the probed encode
+        // resolution for a recording.
+        let right: Vec<Element<'a, Msg>> = tb
+            .info_chip(Some(preview.display_frame()), preview.size)
+            .into_iter()
+            .collect();
+        let toolbar = toolbar_row(left, Vec::new(), right);
 
         // The transport strip — a tool row (play on the left; the seek time,
         // the pointer/razor toggle, and segment delete on the right) stacked

@@ -228,6 +228,12 @@ pub mod linux_autostart;
 #[cfg(target_os = "windows")]
 #[path = "windows/autostart.rs"]
 pub mod windows_autostart;
+// DRAGON-406: the PURE half of the Windows 10 diagnostics log (formatting, redaction,
+// rotation policy). Compiled on EVERY platform on purpose — it contains no Win32, and
+// living in the shared tree is what lets the Linux gate unit-test the redaction rules that
+// keep a customer's filenames out of the file. The Win32 half is
+// `platform/windows/diag.rs` (closed split). Removed wholesale by DRAGON-407.
+pub mod win_diag;
 
 /// Opt OUR-app window titled `title` OUT of automatic tiling by the user's tiling window
 /// manager — AeroSpace on macOS, komorebi on Windows — where possible. This is the single
@@ -346,5 +352,309 @@ pub fn window_current_display(title: &str) -> Option<String> {
     #[cfg(target_os = "windows")]
     {
         crate::platform::windows::window::window_current_display(title)
+    }
+}
+
+// ── Windows OS-build gates (DRAGON-403) ───────────────────────────────────────
+// PURE build-number predicates, deliberately kept in the SHARED tree (not under
+// `platform/windows/`) so `cargo test` proves them on ANY host — the Windows arms they
+// gate can only be compiled on Windows, and DRAGON-403 is a Windows-10-only bug nobody
+// on this project can run. The version READ (`platform::windows::window::os_build`,
+// `RtlGetVersion` with a registry fallback) stays Windows-native; only the
+// "build number in → is this feature permitted" decision lives here, where it is testable.
+
+/// The first Windows build that is **Windows 11** (21H2 = build 22000). Everything below
+/// it is Windows 10 or older, where the Win11 DWM window model our chrome assumes does
+/// not exist. Distinct from the Mica floor (`platform::windows::window::MICA_MIN_BUILD`
+/// = 22621, Win11 22H2): Mica is a strictly LATER, narrower gate.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WIN11_MIN_BUILD: u32 = 22000;
+
+/// Pure: may this OS `build` be asked to paint the **native DWM caption buttons** over our
+/// frameless settings / preview toplevels (the DRAGON-284 recipe —
+/// `DwmExtendFrameIntoClientArea` top margin + a `DwmDefWindowProc`-first subclass)?
+///
+/// Win11 (22000+) only. On Windows 10 the buttons hit-test (DwmDefWindowProc computes the
+/// cluster from window metrics regardless of build) but are never SEEN — DRAGON-403's
+/// "clickable but invisible" report. Two mechanisms can produce that, and this gate covers
+/// BOTH because it stops depending on DWM to paint the buttons at all:
+///
+/// 1. **The client covers them.** DWM composites the caption cluster in the extended-frame
+///    layer BEHIND the window's own content, so it is only visible where that content is
+///    transparent. Our chrome paints transparent ONLY when `app::theme::glass_config` says
+///    frosted (Windows arm: Mica, i.e. build ≥ 22621); below that `frost_color` leaves the
+///    window base fully OPAQUE — so on Windows 10 the header paints over the strip.
+/// 2. **Win10's DWM does not composite a caption cluster there at all** for a window whose
+///    caption region is CLIENT (our `WM_NCCALCSIZE` leaves the top flush).
+///
+/// Below the gate the toplevels keep their own CSD min/max/close instead (the pre-DRAGON-284
+/// Windows path, still wired: those messages route to the native `toggle_maximize` /
+/// `minimize` helpers). Win11 is unaffected — it takes the exact path it ships today.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_build_paints_native_caption_buttons(build: u32) -> bool {
+    build >= WIN11_MIN_BUILD
+}
+
+// DRAGON-408 DELETED the second DRAGON-403 gate that lived here,
+// `win_build_layered_keeps_per_pixel_alpha` — "below Win11, withhold `WS_EX_LAYERED` from the
+// capture overlays, because a layered top-level driven by `SetLayeredWindowAttributes`
+// composites at a CONSTANT alpha and flattens the swapchain's per-pixel alpha to solid black".
+//
+// Its premise is DISPROVEN from both directions:
+//
+// * Windows 11 renders the overlay CORRECTLY while carrying the exact configuration the gate
+//   blamed — `WS_EX_LAYERED` set and `SetLayeredWindowAttributes(key=0, alpha=255, LWA_ALPHA)`
+//   called. If LWA_ALPHA destroyed per-pixel alpha, Win11 would be black too.
+// * The gate WORKED and changed nothing. A real Windows 10 run with the DRAGON-406 diagnostics
+//   read back `layered_tier=false ex_actual=0x00000199 slwa=not-called` — the bit withheld
+//   exactly as designed, the OS agreeing — and the overlay was still 40/40 pure black.
+//
+// The real constraint sits a level BELOW the window style, and it is not OS-keyed: wgpu's DX12
+// backend hardcodes `composite_alpha_modes = [Opaque]` for every HWND-target surface
+// (`wgpu-hal/src/dx12/adapter.rs`, a plain match on the surface target with no OS check),
+// because DXGI does not offer premultiplied alpha on `CreateSwapChainForHwnd`. Windows 11 gets
+// that same `[Opaque]` swapchain and is translucent anyway — so its translucency rides on
+// undefined behaviour that some GPU/driver/DWM composition paths honour and others do not
+// (the WARP software adapter does not, which is why a Win11 VM is black too). The supported
+// fix is a DirectComposition swapchain; see `place_overlay`'s doc for why the app cannot
+// currently ask for one.
+//
+// So the gate could never have helped, and it COST DRAGON-280's protection against a
+// fullscreen hardware-overlay video flipping the capture overlay away on Windows 10. The
+// overlay is layered again on every Windows build, exactly as DRAGON-280 shipped it.
+//
+// The CAPTION half of DRAGON-403 (`win_build_paints_native_caption_buttons`, above) is
+// untouched: that one is confirmed working on Windows 10 and stays.
+
+/// The first Windows 10 build (RTM 1507 = 10240) — the floor for the undocumented
+/// `SetWindowCompositionAttribute` accent policy, which arrived with Windows 10 and does not
+/// exist on 8.1 or earlier.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WIN10_MIN_BUILD: u32 = 10240;
+
+/// Pure: does this OS `build` take the **blur-behind** accent policy as its frosted-windows
+/// material (DRAGON-405)? Windows 10 ONLY — `[10240, 22000)`.
+///
+/// This is the Win10 analog of Win11's Mica: `ACCENT_ENABLE_BLURBEHIND` via the undocumented
+/// `SetWindowCompositionAttribute`. Deliberately NOT acrylic
+/// (`ACCENT_ENABLE_ACRYLICBLURBEHIND`), which carries a documented, never-fixed drag/resize
+/// input lag on Windows 10 1903+ (the OS is EOL, so it will not be fixed); blur-behind is the
+/// standard workaround and is the performant one.
+///
+/// The window is CLOSED at both ends on purpose:
+/// * below 10240 the accent policy does not exist (8.1 and older);
+/// * at/above [`WIN11_MIN_BUILD`] every Windows 11 build keeps EXACTLY today's behavior —
+///   Mica at ≥ 22621 (`platform::windows::window::mica_supported`) and, for the 22000..22620
+///   band (Win11 21H2, which has no Mica), the same "no glass, fully opaque" look it has now.
+///   Win11 must not gain a new material from this change.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_build_has_blur_behind_glass(build: u32) -> bool {
+    win_build_is_windows_10(build)
+}
+
+/// Pure: is this OS `build` **Windows 10** — the closed band `[10240, 22000)`?
+///
+/// Extracted (DRAGON-406) from [`win_build_has_blur_behind_glass`], which had carried the
+/// band inline since DRAGON-405 and now delegates here. It is ONE definition of "this is
+/// Windows 10" on purpose: the DRAGON-406 diagnostics log is gated on the same predicate as
+/// the blur-behind material, so the instrument can never disagree with the thing it is
+/// instrumenting about which builds it applies to.
+///
+/// DRAGON-407 KEEP: removing the diagnostics must NOT remove this — `win_build_has_blur_behind_glass`
+/// (a shipped Win10 feature) is defined in terms of it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_build_is_windows_10(build: u32) -> bool {
+    (WIN10_MIN_BUILD..WIN11_MIN_BUILD).contains(&build)
+}
+
+/// The env var that flips the Windows 10 overlay between the two candidate window shapes
+/// (DRAGON-408). Temporary — see [`win_overlay_is_layered`].
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WIN10_LAYERED_ENV: &str = "CCK_WIN10_LAYERED";
+
+/// Pure: should the capture overlay carry `WS_EX_LAYERED` on this OS `build`, given the
+/// raw value of [`WIN10_LAYERED_ENV`]?
+///
+/// **This exists to settle an argument with one measurement, not to be a setting.** The
+/// Windows 10 overlay renders solid black where it should be translucent. The surviving
+/// hypothesis is that Windows 10's DWM honours `SetLayeredWindowAttributes(LWA_ALPHA, 255)`
+/// literally — constant alpha, per-pixel alpha discarded — while Windows 11's ignores it in
+/// favour of the swapchain's own alpha. Every piece of REAL evidence fits that:
+///
+/// * real Windows 10 hardware — overlay opaque, with the bit set;
+/// * real Windows 11 hardware — overlay correct, with the same bit and the same call.
+///
+/// DRAGON-403 tested it by withholding the bit below [`WIN11_MIN_BUILD`], and DRAGON-408
+/// reverted that on a measurement showing the withholding made no difference. **That
+/// measurement is void**: it was taken on the WARP software adapter (`device_type=Cpu`),
+/// which renders this overlay black on *any* Windows version and any window style, so it
+/// could not have shown a difference either way. The hypothesis was never actually tested.
+///
+/// Nobody on the team has Windows 10 hardware, so the only route is a customer running both
+/// shapes and reporting which one is translucent. Hence a runtime flip rather than a build:
+/// one binary, two runs, no guessing.
+///
+/// Contract:
+/// * **Windows 11 and newer is untouched, whatever the env says.** The bit is always set
+///   there. It works today and must stay byte-identical.
+/// * Windows 10 defaults to LAYERED — today's behaviour, so a customer who never sets the
+///   variable sees no change.
+/// * Only the exact value `"0"` withholds it, and only on Windows 10. Anything else
+///   (unset, `"1"`, empty, junk) means layered, because a typo must not silently give up
+///   DRAGON-280's protection against a fullscreen hardware-overlay video flipping the
+///   overlay away.
+///
+/// Delete this the moment the answer is known — it is an experiment, and an experiment left
+/// in the tree becomes a configuration surface nobody can remove later.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_overlay_is_layered(build: u32, env: Option<&str>) -> bool {
+    if !win_build_is_windows_10(build) {
+        return true;
+    }
+    env != Some("0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_caption_buttons_are_windows_11_only() {
+        // Win11 21H2 (the first 22000 build) and everything after it: the DRAGON-284
+        // native DWM caption buttons stay exactly as they ship today.
+        assert!(win_build_paints_native_caption_buttons(22000)); // 21H2
+        assert!(win_build_paints_native_caption_buttons(22621)); // 22H2 (the Mica floor)
+        assert!(win_build_paints_native_caption_buttons(22631)); // 23H2
+        assert!(win_build_paints_native_caption_buttons(26100)); // 24H2
+        assert!(win_build_paints_native_caption_buttons(u32::MAX)); // future builds
+        // Windows 10 (any servicing level) and older: CSD buttons instead (DRAGON-403).
+        assert!(!win_build_paints_native_caption_buttons(19045)); // 22H2, the last Win10
+        assert!(!win_build_paints_native_caption_buttons(19041)); // 2004
+        assert!(!win_build_paints_native_caption_buttons(10240)); // Win10 RTM
+        assert!(!win_build_paints_native_caption_buttons(9600)); // Win8.1
+        // A build number that could not be read at all reads as 0 → treated as Win10,
+        // i.e. the SAFE side: we draw our own buttons rather than trust DWM to.
+        assert!(!win_build_paints_native_caption_buttons(0));
+    }
+
+    // DRAGON-408 deleted `layered_per_pixel_alpha_is_windows_11_only` along with the gate it
+    // pinned. `WS_EX_LAYERED` is unconditional on every Windows build again (DRAGON-280's
+    // shape), so there is no build-keyed decision left to test — see the note above
+    // `WIN10_MIN_BUILD` for why the gate's premise was wrong.
+
+    #[test]
+    fn win11_is_always_layered_whatever_the_env_says() {
+        // DRAGON-408: Windows 11 works today. The experiment must not be able to reach it,
+        // including by a customer who sets the variable globally and then runs on Win11.
+        for build in [WIN11_MIN_BUILD, 22621, 26100, u32::MAX] {
+            for env in [None, Some("0"), Some("1"), Some("")] {
+                assert!(
+                    win_overlay_is_layered(build, env),
+                    "build {build} env {env:?} must stay layered"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn win10_defaults_to_layered_and_only_an_exact_zero_withholds() {
+        // Default = today's shipped behaviour, so an untouched install changes nothing.
+        assert!(win_overlay_is_layered(19045, None));
+        assert!(win_overlay_is_layered(19045, Some("1")));
+        // The experiment.
+        assert!(!win_overlay_is_layered(19045, Some("0")));
+        // Anything ambiguous keeps the bit: a typo must not silently drop DRAGON-280's
+        // MPO protection, which is the failure a customer would never think to report.
+        for junk in ["", " ", "0 ", "00", "false", "no", "O"] {
+            assert!(
+                win_overlay_is_layered(19045, Some(junk)),
+                "{junk:?} must not be read as off"
+            );
+        }
+    }
+
+    #[test]
+    fn the_layered_experiment_covers_exactly_the_windows_10_band() {
+        // Same band as every other Win10 predicate — one definition of "this is Windows 10",
+        // so the experiment cannot drift from the thing it is experimenting on.
+        for build in [WIN10_MIN_BUILD, 19041, 19045, WIN11_MIN_BUILD - 1] {
+            assert!(!win_overlay_is_layered(build, Some("0")), "build {build} is in-band");
+        }
+        for build in [0, 7600, WIN10_MIN_BUILD - 1, WIN11_MIN_BUILD] {
+            assert!(win_overlay_is_layered(build, Some("0")), "build {build} is out of band");
+        }
+    }
+
+    // DRAGON-406: the diagnostics log and the blur-behind material must key off the SAME
+    // notion of "this is Windows 10", so they can never drift into disagreeing about which
+    // builds they apply to. `win_build_has_blur_behind_glass` delegates to
+    // `win_build_is_windows_10`; this pins that they stay one band, band-for-band.
+    #[test]
+    fn windows_10_band_is_one_definition() {
+        for build in [0, 9600, 10240, 19041, 19045, 21999, 22000, 22621, 26100, u32::MAX] {
+            assert_eq!(
+                win_build_is_windows_10(build),
+                win_build_has_blur_behind_glass(build),
+                "build {build} must classify identically for both"
+            );
+        }
+        // And the band itself is the closed [10240, 22000) DRAGON-405 established.
+        assert!(!win_build_is_windows_10(10239));
+        assert!(win_build_is_windows_10(10240));
+        assert!(win_build_is_windows_10(21999));
+        assert!(!win_build_is_windows_10(22000));
+        // An unreadable build reads as "not Windows 10" -> diagnostics stay off, which is
+        // the safe side: a Win11 user must never be able to tell the feature exists.
+        assert!(!win_build_is_windows_10(0));
+    }
+
+    #[test]
+    fn blur_behind_glass_is_windows_10_only() {
+        // Windows 10, RTM through the last servicing build: the blur-behind accent policy is
+        // the frosted-windows material (DRAGON-405).
+        assert!(win_build_has_blur_behind_glass(10240)); // 1507 RTM
+        assert!(win_build_has_blur_behind_glass(19041)); // 2004
+        assert!(win_build_has_blur_behind_glass(19045)); // 22H2, the last Win10
+        assert!(win_build_has_blur_behind_glass(21996)); // just under the Win11 floor
+        // Windows 11, EVERY build: unchanged. 22000..22620 keeps its current no-glass look
+        // (Mica starts at 22H2), 22621+ keeps Mica — neither may pick up blur-behind.
+        assert!(!win_build_has_blur_behind_glass(22000)); // 21H2 — no glass, as today
+        assert!(!win_build_has_blur_behind_glass(22621)); // 22H2 — Mica, as today
+        assert!(!win_build_has_blur_behind_glass(26100)); // 24H2 — Mica, as today
+        // Windows 8.1 and older have no accent policy at all; an unreadable build reads as 0.
+        assert!(!win_build_has_blur_behind_glass(9600)); // 8.1
+        assert!(!win_build_has_blur_behind_glass(0));
+    }
+
+    #[test]
+    fn exactly_one_windows_glass_material_per_build() {
+        // The two materials must never both claim a build (they would fight over the same
+        // window) and Win10 must never be left materialless. `mica_supported` (≥ 22621) lives
+        // in the Windows plugin, so it is modelled here by its floor.
+        let mica = |b: u32| b >= 22621;
+        for build in [0, 9600, 10240, 19041, 19045, 21999, 22000, 22620, 22621, 26100, u32::MAX] {
+            assert!(
+                !(mica(build) && win_build_has_blur_behind_glass(build)),
+                "build {build} claimed by both materials"
+            );
+        }
+        // Every real Windows 10 build gets exactly the blur-behind material.
+        for build in [10240_u32, 14393, 17763, 19041, 19045] {
+            assert!(win_build_has_blur_behind_glass(build));
+            assert!(!mica(build));
+        }
+    }
+
+    #[test]
+    fn every_mica_build_also_clears_the_win11_gates() {
+        // The Windows gates are ordered: the Mica floor (22H2 = 22621, checked in
+        // `platform::windows::window`) sits ABOVE the Win11 floor, so everything that gets
+        // Mica also gets the native caption buttons — never the reverse (22000..22621 is
+        // Win11 without Mica: buttons yes, Mica no). DRAGON-408: the layered-alpha gate that
+        // used to be asserted alongside is gone; the overlay is layered on every build.
+        for build in [22621_u32, 22631, 26100] {
+            assert!(win_build_paints_native_caption_buttons(build));
+        }
+        assert!(win_build_paints_native_caption_buttons(22000));
     }
 }

@@ -441,7 +441,9 @@ impl PreviewState {
     /// one is set AND no crop session is live (a session reveals the full image). The one place
     /// the "session hides the applied crop" rule lives.
     pub(super) fn view_crop(&self) -> Option<crop::CropRect> {
-        self.edit.crop.filter(|_| self.edit.crop_session.is_none())
+        // ONE definition (DRAGON-391): the model side reads the same rule for the covermark's
+        // canvas, so "what is framed" can never diverge between the two.
+        self.edit.view_crop()
     }
 
     /// The DISPLAY frame's top-left offset within the full source (SOURCE px) — the crop origin
@@ -968,9 +970,12 @@ impl App {
                 if let Some(p) = self.preview_for_mut(id) {
                     let z0 = p.view.zoom;
                     let pan0 = p.view.pan;
+                    // Scroll snaps in VALUE space: its steps are multiplicative and fine, so
+                    // there is no rail geometry to measure against (DRAGON-400).
                     let z1 = viewport::snap_to_hundred(
                         (z0 * (1.0 + 0.12 * step)).clamp(minz, maxz),
                         visual,
+                        viewport::SNAP_SCROLL_PCT,
                     );
                     let ratio = z1 / z0;
                     p.view.zoom = z1;
@@ -991,20 +996,29 @@ impl App {
                     p.view.pan.1 = p.view.pan.1.clamp(miny, maxy);
                 }
                 // Sharpen the covermark for the new zoom (no-op when unchanged / no mark).
-                Task::batch([self.refresh_covermark_for_zoom(id), self.refresh_text_for_zoom(id)])
+                Task::batch([self.refresh_covermark_for_view(id), self.refresh_text_for_zoom(id)])
             }
             PreviewMsg::SetViewZoom(z) => {
                 let maxz = self.preview_for(id).map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
                 let minz = self.preview_for(id).map(|p| self.min_view_zoom(p)).unwrap_or(Viewport::MIN);
                 let visual = self.preview_for(id).map(|p| self.preview_visual_scale(p)).unwrap_or(1.0);
+                // The slider snaps in RAIL space (DRAGON-400): the detent is a fixed number of
+                // rail PIXELS wide, so raising the ceiling to 500% cannot shrink it below what a
+                // drag can land on. Same rail geometry the control is built from — the range in
+                // displayed percent, over the shared toolbar rail width.
+                let tol = viewport::rail_snap_pct(
+                    viewport::displayed_percent(minz, visual) as f32,
+                    viewport::displayed_percent(maxz, visual) as f32,
+                    chrome::ZOOM_SLIDER_W,
+                );
                 if let Some(p) = self.preview_for_mut(id) {
                     // Clamp to the 50%-display floor, then magnetically snap to exactly 100%.
-                    let snapped = viewport::snap_to_hundred(z.clamp(minz, maxz), visual);
+                    let snapped = viewport::snap_to_hundred(z.clamp(minz, maxz), visual, tol);
                     p.view.set_zoom(snapped);
                     let z100 = viewport::preset_zoom(Some(1.0), visual);
                     p.view.zoom_preset = if (p.view.zoom - z100).abs() < 1e-3 { Some(1) } else { None };
                 }
-                Task::batch([self.refresh_covermark_for_zoom(id), self.refresh_text_for_zoom(id)])
+                Task::batch([self.refresh_covermark_for_view(id), self.refresh_text_for_zoom(id)])
             }
             PreviewMsg::ZoomPreset(i) => {
                 // Presets are in VISUAL terms (100% = natural on-screen size); convert to the
@@ -1015,6 +1029,13 @@ impl App {
                 let visual = self.preview_for(id)
                     .map(|p| self.preview_visual_scale(p))
                     .unwrap_or(1.0);
+                // DRAGON-401: `Viewport::set_zoom` only knows the BACKSTOP (`Viewport::MAX`),
+                // so a preset was the one zoom path that could step past the device's viewport
+                // limit and take the process down. Clamp it to the same ceiling the slider and
+                // the wheel already respect. (The menu below no longer OFFERS an unreachable
+                // preset, so this normally clamps nothing — it is what makes that a display
+                // detail rather than the only thing standing between a click and a panic.)
+                let maxz = self.preview_for(id).map(|p| self.max_view_zoom(p)).unwrap_or(Viewport::MAX);
                 if let Some(p) = self.preview_for_mut(id) {
                     p.view.zoom_menu_open = false;
                     // Only real preset indices change the zoom (the combo also lists the
@@ -1022,11 +1043,11 @@ impl App {
                     if let Some(visual_frac) = ZOOM_PRESET_VISUAL.get(i).copied() {
                         // visual fraction (1.0 = 100% = natural size): displayed =
                         // zoom*visual_scale → zoom = frac/visual_scale.
-                        p.view.set_zoom(viewport::preset_zoom(visual_frac, visual));
+                        p.view.set_zoom(viewport::preset_zoom(visual_frac, visual).min(maxz));
                         p.view.zoom_preset = Some(i);
                     }
                 }
-                Task::batch([self.refresh_covermark_for_zoom(id), self.refresh_text_for_zoom(id)])
+                Task::batch([self.refresh_covermark_for_view(id), self.refresh_text_for_zoom(id)])
             }
             PreviewMsg::ToggleZoomMenu => {
                 if let Some(p) = self.preview_for_mut(id) {
@@ -1043,20 +1064,6 @@ impl App {
                 {
                     p.view.pan.0 = (p.view.pan.0 + dx).clamp(minx, maxx);
                     p.view.pan.1 = (p.view.pan.1 + dy).clamp(miny, maxy);
-                }
-                Task::none()
-            }
-            PreviewMsg::SetPanMode(on) => {
-                if let Some(p) = self.preview_for_mut(id) {
-                    p.view.pan_mode = on;
-                }
-                Task::none()
-            }
-            PreviewMsg::TogglePanMode => {
-                // The `V` hotkey: flip pan mode. The pointer/pan seg-toggle button reads
-                // the same `view.pan_mode`, so UI + hotkey stay in sync.
-                if let Some(p) = self.preview_for_mut(id) {
-                    p.view.pan_mode = !p.view.pan_mode;
                 }
                 Task::none()
             }
@@ -1141,10 +1148,11 @@ impl App {
                     // A dim change re-renders via the GPU dim pass for free (DRAGON-329).
                     Some(EditKind::Dim) => Task::none(),
                     // A crop change (DRAGON-385) reframes the view to the restored crop's framing
-                    // so undo/redo shows the cropped (or whole) picture, not a stale pan/zoom.
+                    // so undo/redo shows the cropped (or whole) picture, not a stale pan/zoom —
+                    // and moves the covermark's canvas with it (DRAGON-391).
                     Some(EditKind::Crop) => {
                         self.crop_reframe(id);
-                        Task::none()
+                        self.refresh_covermark_for_view(id)
                     }
                     _ => Task::none(),
                 }
@@ -1171,10 +1179,11 @@ impl App {
                     }
                     // A dim change re-renders via the GPU dim pass for free (DRAGON-329).
                     Some(EditKind::Dim) => Task::none(),
-                    // A crop change (DRAGON-385) reframes the view to the restored crop's framing.
+                    // A crop change (DRAGON-385) reframes the view to the restored crop's framing —
+                    // and moves the covermark's canvas with it (DRAGON-391).
                     Some(EditKind::Crop) => {
                         self.crop_reframe(id);
-                        Task::none()
+                        self.refresh_covermark_for_view(id)
                     }
                     _ => Task::none(),
                 }
@@ -1839,6 +1848,13 @@ impl App {
                 self.run_share(id, delete_intent(self.preview_copy_on_delete))
             }
             PreviewMsg::SaveAs => {
+                // DRAGON-398: refuse BEFORE the picker when the edits this export would have
+                // to render cannot be produced (a recording whose probe never landed). Making
+                // the user choose a destination for a save that is going to silently drop
+                // their cut is worse than saying so up front.
+                if self.refuse_unbakeable_save_as(id) {
+                    return Task::none();
+                }
                 // Ask WHERE to save first — no bake up front. The bake (if any) runs in the
                 // background against the chosen destination in `SaveAsResult`, behind the
                 // editor's own processing overlay, so the user isn't blocked before the
@@ -1892,6 +1908,9 @@ impl App {
                     None => return self.close_preview(id),
                 };
                 // Only bake when there's something to apply AND we can (video needs meta).
+                // The `video.is_some()` term is now unreachable defence: `PreviewMsg::SaveAs`
+                // REFUSES a dirty document whose media can't bake before the picker even
+                // opens (DRAGON-398), so a dirty video arriving here always has its meta.
                 // `dirty()` is THE shared gate (the one Save/Copy's `begin_bake` reads):
                 // covermark / annotations / dim / DELETED timeline content — razor cuts
                 // alone never re-encode (DRAGON-352 unification; two parallel predicates
@@ -2511,6 +2530,98 @@ mod tests {
             assert!(!i.owes_bake(true, false), "{i:?} on its own save point is a no-op");
             assert!(!i.owes_bake(false, true), "{i:?} with no edits is a no-op");
         }
+    }
+
+    /// A VIDEO preview carrying `timeline` and nothing else — enough for the share gates.
+    fn video_with(timeline: Option<timeline::Timeline>) -> PreviewState {
+        let mut vid = video::VideoPreview::loading();
+        vid.timeline = timeline;
+        PreviewState {
+            path: Some(PathBuf::from("/rec/take.mp4")),
+            kind: PreviewKind::Video(vid),
+            ..still_at((1920, 1080), 1.0)
+        }
+    }
+
+    /// DRAGON-398 — the intent matrix reaching the VIDEO kind. `owes_bake` is media-agnostic;
+    /// what differs for a recording is where its `dirty` comes from, so this pins the whole
+    /// chain from timeline state through `PreviewState::dirty()` into each intent's decision.
+    ///
+    /// **The invariant that matters**: an uncut recording — including one the user razored to
+    /// pieces without deleting any of them — is NOT dirty, so NO intent owes it a bake and its
+    /// ffmpeg invocations never change (see `edit::video_bake_args`'s uncut test for the other
+    /// end of that chain). A recording only starts re-encoding once content is actually gone.
+    #[test]
+    fn a_video_owes_a_bake_only_once_content_is_deleted() {
+        use ShareIntent::*;
+        // No timeline at all (the probe never landed) — nothing to bake.
+        assert!(!video_with(None).dirty());
+
+        // A whole, uncut recording.
+        let whole = timeline::Timeline::new(10.0);
+        let p = video_with(Some(whole.clone()));
+        assert!(!p.dirty(), "an untouched recording is clean");
+
+        // RAZOR CUTS ALONE: three segments, none deleted. The concatenation is byte-for-byte
+        // the original, so this must stay clean — cutting is not editing until something goes.
+        let mut razored = whole.clone();
+        assert!(razored.cut_at_source(3.0));
+        assert!(razored.cut_at_source(7.0));
+        assert_eq!(razored.spans.len(), 3, "the razor split the timeline");
+        let p = video_with(Some(razored.clone()));
+        assert!(!p.dirty(), "razor cuts alone must never re-encode");
+        for i in [Save, Copy, SaveCopy, SaveCopyClose, CopyClose, CopyThenDelete, Delete] {
+            assert!(!i.owes_bake(p.dirty(), p.unsaved()), "{i:?} must not bake an uncut recording");
+        }
+
+        // DELETE one segment: now the output differs from the source, so it is dirty and the
+        // baking flavours owe a re-encode (Delete still never bakes — the file is being binned).
+        let mut cut = razored;
+        assert!(cut.delete(1));
+        let p = video_with(Some(cut));
+        assert!(p.dirty(), "deleted content must bake");
+        assert!(p.unsaved(), "and it has never been saved");
+        for i in [Save, Copy, SaveCopy, SaveCopyClose, CopyClose, CopyThenDelete] {
+            assert!(i.owes_bake(p.dirty(), p.unsaved()), "{i:?} must bake the cut");
+        }
+        assert!(!Delete.owes_bake(p.dirty(), p.unsaved()), "a plain Delete never bakes");
+    }
+
+    /// DRAGON-398 — a recording's Save writes the `-edited` sibling exactly like an image's,
+    /// because `preview_save_target`'s rule is `naming::save_target` for both. The ORIGINAL
+    /// recording survives its first edit; the second save writes back to the file it adopted.
+    #[test]
+    fn a_recordings_first_save_writes_the_edited_sibling() {
+        let none = |_: &std::path::Path| false;
+        let rec = std::path::Path::new("/rec/take.mp4");
+        assert_eq!(
+            naming::save_target(rec, false, &none),
+            PathBuf::from("/rec/take-edited.mp4"),
+            "the untouched recording must survive the first save"
+        );
+        // Once adopted (`save_in_place`), further saves land on it rather than compounding.
+        let adopted = std::path::Path::new("/rec/take-edited.mp4");
+        assert_eq!(naming::save_target(adopted, true, &none), PathBuf::from(adopted));
+    }
+
+    /// DRAGON-398 — Delete removes BOTH variants of a recording. `delete_paths` is tracked,
+    /// not derived, so the `-edited` file a Save minted goes with the original and nothing is
+    /// orphaned; a `-edited` file from an EARLIER session is never swept up.
+    #[test]
+    fn deleting_a_recording_removes_the_original_and_its_edited_variant() {
+        let mut p = video_with(Some(timeline::Timeline::new(10.0)));
+        assert_eq!(p.delete_paths(), vec![PathBuf::from("/rec/take.mp4")]);
+        // A Save minted (and adopted) the `-edited` sibling: both are now this document's.
+        p.note_written(std::path::Path::new("/rec/take-edited.mp4"));
+        assert_eq!(
+            p.delete_paths(),
+            vec![PathBuf::from("/rec/take.mp4"), PathBuf::from("/rec/take-edited.mp4")]
+        );
+        // A Save As destination elsewhere joins the set too.
+        p.note_written(std::path::Path::new("/home/me/final.mp4"));
+        assert!(p.delete_paths().contains(&PathBuf::from("/home/me/final.mp4")));
+        // An `-edited` file this document never wrote is NOT in the set.
+        assert!(!p.delete_paths().contains(&PathBuf::from("/rec/take-edited-2.mp4")));
     }
 
     /// The unsaved-changes gate: a dirty close asks first, a clean one just goes — and a

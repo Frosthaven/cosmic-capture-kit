@@ -144,10 +144,19 @@ mod tests {
             edited_target(Path::new("/shots/clip.JPG"), &none),
             PathBuf::from("/shots/clip-edited.JPG")
         );
-        assert_eq!(
-            edited_target(Path::new("/rec/take.mp4"), &none),
-            PathBuf::from("/rec/take-edited.mp4")
-        );
+        // RECORDINGS derive identically (DRAGON-398: the video editor's Save writes the same
+        // `-edited` sibling as an image's, from this same rule — there is no second naming
+        // implementation for video). Every container the recorder can produce:
+        for (src, want) in [
+            ("/rec/take.mp4", "/rec/take-edited.mp4"),
+            ("/rec/take.mkv", "/rec/take-edited.mkv"),
+            ("/rec/take.webm", "/rec/take-edited.webm"),
+            ("/rec/take.mov", "/rec/take-edited.mov"),
+            // A recorder's default name is spaced and dotted; both survive.
+            ("/rec/Recording 2026-07-29 at 10.30.mp4", "/rec/Recording 2026-07-29 at 10.30-edited.mp4"),
+        ] {
+            assert_eq!(edited_target(Path::new(src), &none), PathBuf::from(want), "{src}");
+        }
         // Only the LAST extension is an extension, so a dotted stem keeps its dots.
         assert_eq!(
             edited_target(Path::new("/shots/a.b.png"), &none),
@@ -227,22 +236,30 @@ mod tests {
     /// `-edited` file and every later save writes to whatever path is current, so exactly
     /// TWO files exist at the end (the untouched original and the edit), plus whatever
     /// Save As put where the user asked.
+    ///
+    /// Run for BOTH media kinds (DRAGON-398): a cut recording follows exactly the same
+    /// life cycle as an annotated screenshot, because the video editor's Save routes through
+    /// this same rule rather than a parallel one.
     #[test]
     fn repeated_save_cycles_settle_on_one_file() {
         let none = taken(&[]);
-        // 1. Fresh capture, first dirty save.
-        let capture = Path::new("/shots/2026.png");
-        let first = save_target(capture, false, &none);
-        assert_eq!(first, PathBuf::from("/shots/2026-edited.png"));
-        // 2. The document adopts it (save_in_place = true) — the next save is in place...
-        assert_eq!(save_target(&first, true, &none), first);
-        // ...and would be even if the flag were somehow lost, because the stem carries the
-        // marker. Belt and braces: the suffix can never compound.
-        assert_eq!(save_target(&first, false, &none), first);
-        // 3. Save As elsewhere; that destination is explicit, so it stays exact.
-        let elsewhere = Path::new("/home/me/final.png");
-        assert_eq!(save_target(elsewhere, true, &none), PathBuf::from("/home/me/final.png"));
-        // The ORIGINAL capture is never a target after step 1.
-        assert_ne!(first, capture);
+        for (capture, first_edit, elsewhere) in [
+            ("/shots/2026.png", "/shots/2026-edited.png", "/home/me/final.png"),
+            ("/rec/2026.mp4", "/rec/2026-edited.mp4", "/home/me/final.mp4"),
+        ] {
+            // 1. Fresh capture, first dirty save.
+            let capture = Path::new(capture);
+            let first = save_target(capture, false, &none);
+            assert_eq!(first, PathBuf::from(first_edit));
+            // 2. The document adopts it (save_in_place = true) — the next save is in place...
+            assert_eq!(save_target(&first, true, &none), first);
+            // ...and would be even if the flag were somehow lost, because the stem carries the
+            // marker. Belt and braces: the suffix can never compound.
+            assert_eq!(save_target(&first, false, &none), first);
+            // 3. Save As elsewhere; that destination is explicit, so it stays exact.
+            assert_eq!(save_target(Path::new(elsewhere), true, &none), PathBuf::from(elsewhere));
+            // The ORIGINAL capture is never a target after step 1.
+            assert_ne!(first, capture.to_path_buf());
+        }
     }
 }

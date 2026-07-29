@@ -85,7 +85,11 @@ impl App {
             Action::PreviewCrop => return pv(PreviewMsg::CropEnter),
             Action::PreviewColorFlyout => return pv(PreviewMsg::ToggleAnnotPalette),
             Action::PreviewColorCompanionSwap => return pv(PreviewMsg::AnnotColorCompanionSwap),
-            Action::PreviewTogglePan => return pv(PreviewMsg::TogglePanMode),
+            // DRAGON-392: H arms the HAND TOOL through the ordinary tool path (it flipped a pan
+            // MODE before), so the toolbar button and the key can't disagree about what is armed.
+            Action::PreviewAnnotHand => {
+                return pv(PreviewMsg::SelectTool(crate::widgets::annotation_canvas::Tool::Hand))
+            }
             Action::RecordStop => Msg::Recording(RecordingMsg::StopRecording),
             Action::RecordToggleMic => Msg::Recording(RecordingMsg::ToggleMic),
             Action::RecordToggleSystemAudio => Msg::Recording(RecordingMsg::ToggleSystemAudio),

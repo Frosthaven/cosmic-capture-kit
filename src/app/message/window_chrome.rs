@@ -74,6 +74,16 @@ pub enum WindowChromeMsg {
     /// Open a dynamically-sourced URL (a markdown release-note link, DRAGON-177,
     /// whose target is only known at runtime — the `&'static` form can't carry it).
     OpenUrlOwned(String),
+    /// DRAGON-406: open the Windows 10 diagnostics log folder in Explorer (the About
+    /// page's button). The row that emits this only exists on a Windows 10 run — the
+    /// point is that a non-technical customer can reach the file to mail it, without
+    /// being told to navigate to `%LOCALAPPDATA%` by hand. Removed by DRAGON-407.
+    /// A dedicated variant rather than `OpenUrlOwned` so the path never round-trips
+    /// through `cmd /C start`, whose quoting mangles a username with a space in it.
+    /// `cfg(windows)` so Linux and macOS are byte-identical (a message-domain variant
+    /// plus its `update_*` arm is an accepted per-platform cfg site).
+    #[cfg(windows)]
+    OpenDiagnosticsFolder,
     /// Swallow an input event without doing anything (e.g. a click on a modal
     /// backdrop that must block the window behind it but not dismiss the modal).
     Ignore,

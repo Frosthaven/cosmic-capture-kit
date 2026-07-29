@@ -207,11 +207,25 @@ impl App {
             let (dw, dh) = video::fit_dims(ow, oh, avail_w, avail_h);
             d366_avail = (avail_w, avail_h);
             d366_shown = (dw, dh);
-            // The media stack ALWAYS renders the WHOLE frame (base + effect passes + covermark
-            // unchanged); a crop just frames a sub-region of it through a CropWindow. So render at
-            // the FULL frame's on-screen size (the whole picture at the crop's scale), then clip to
-            // the crop window. Un-cropped: render_dims == (dw, dh) and there is no wrapper —
-            // byte-identical to the historical path.
+            // The media stack ALWAYS renders the WHOLE frame (base + effect passes); a crop just
+            // frames a sub-region of it through a CropWindow. So render at the FULL frame's
+            // on-screen size (the whole picture at the crop's scale), then clip to the crop window.
+            // Un-cropped: render_dims == (dw, dh) and there is no wrapper — byte-identical to the
+            // historical path.
+            //
+            // The COVERMARK is the exception (DRAGON-391): it spans THE IMAGE, and once a crop is
+            // applied the image is the CROP RECT — not the source frame. A layer inside the media
+            // stack is laid out at the source's size, so it can only ever cover the source (that is
+            // what left an over-crop's extension bare). With a crop applied it therefore mounts as
+            // a sibling filling the CropWindow — the one element that spans exactly the display
+            // frame — so it covers the whole cropped image, extension included, and is scissored at
+            // its edges so nothing paints beyond. Un-cropped the media stack IS the image, so the
+            // covermark stays exactly where it always rode.
+            //
+            // ...and inside a crop SESSION it is not drawn at all (DRAGON-402,
+            // `EditState::covermark_visible`). Only the media-stack mount can be reached there —
+            // `view_crop()` is `None` for the duration, so `crop_wrap` is `None` and the sibling
+            // below cannot arise — which is why suppressing it here is the whole change.
             let (render_w, render_h, crop_wrap) = match view_crop {
                 Some(c) => {
                     // Aspect is preserved, so the width ratio is the single screen-px-per-source-px
@@ -225,11 +239,26 @@ impl App {
                 None => (dw, dh, None),
             };
             let t = std::time::Instant::now();
-            let media = self.still_media(preview, handle, render_w, render_h, &window_keys);
+            // `false` withholds the covermark from the media stack — because it is mounted over the
+            // crop window below instead (DRAGON-391), or because a crop session is live and it is
+            // not drawn at all (DRAGON-402).
+            let media = self.still_media(
+                preview,
+                handle,
+                render_w,
+                render_h,
+                &window_keys,
+                view_crop.is_none() && preview.edit.covermark_visible(),
+            );
             d366_still_ms = t.elapsed().as_secs_f64() * 1000.0;
             match crop_wrap {
                 Some((window, content, offset)) => {
-                    crate::widgets::CropWindow::new(media, window, content, offset).into()
+                    let framed: Element<'a, Msg> =
+                        crate::widgets::CropWindow::new(media, window, content, offset).into();
+                    match self.covermark_stack(preview, &window_keys, window.0, window.1) {
+                        Some(cm) => cosmic::iced::widget::stack(vec![framed, cm]).into(),
+                        None => framed,
+                    }
                 }
                 None => media,
             }
@@ -281,7 +310,7 @@ impl App {
             slot,
             preview.view.zoom,
             preview.view.pan,
-            preview.view.pan_mode,
+            preview.edit.pan_active(),
             content_px,
             move |step, ux, uy| Msg::Preview(pid, PreviewMsg::Zoom(step, ux, uy)),
             move |dx, dy| Msg::Preview(pid, PreviewMsg::Pan(dx, dy)),
@@ -414,7 +443,7 @@ impl App {
                 preview.view.pan,
                 content_px,
                 canvas_source,
-                preview.view.pan_mode,
+                preview.edit.pan_active(),
                 accent,
                 move |ev| {
                     use crate::widgets::annotation_canvas::AnnotEvent;
@@ -446,6 +475,18 @@ impl App {
             // maps through the crop origin (`canvas_source` is then the crop's size). `(0, 0)`
             // un-cropped, so this is a no-op there.
             .crop_offset(canvas_offset)
+            // DRAGON-397: the LIVE rubber-band preview reads the SAME rule the release path
+            // commits with — `items_in_band`, handed in as a closure over this document's
+            // annotations — so the boxes that light up as the band sweeps can never disagree with
+            // what release actually selects (arrows by their shaft, pen groups by their strokes,
+            // everything else by its drawn bounds). The canvas keeps the result in its own widget
+            // state and only draws it: no message per motion event, so nothing here re-rasters.
+            .band_hits(|x0, y0, x1, y1| {
+                annotate::band_hit_ids(&preview.edit.annotations, x0, y0, x1, y1)
+                    .into_iter()
+                    .map(|id| id.0)
+                    .collect()
+            })
             .text_caret(text_caret)
             // The un-blinked caret drives the OS IME cursor area while editing (DRAGON-359).
             .ime_caret(ime_caret)
@@ -460,7 +501,7 @@ impl App {
             // canvas never routes an event to them, so hit-testing stays with its own model. Built
             // by the shared helper so the crop-session display canvas (DRAGON-387) composes the
             // identical layers without duplicating the assembly.
-            .text_layers(self.preview_text_layers(preview, &window_keys, canvas_offset, canvas_source))
+            .text_layers(self.preview_text_layers(preview, &window_keys, canvas_offset, canvas_source, false))
             .into()
         } else {
             image.into()
@@ -492,25 +533,14 @@ impl App {
         // `Vec<Element<'static, _>>` is a subtype of `Vec<Element<'a, _>>` (Element
         // is covariant in its lifetime), so this is a plain re-binding.
         let left: Vec<Element<'a, Msg>> = self.edit_tools(preview, tb);
-        // Right: the zoom scale (Fit/%/presets), then the pointer/pan tools at the far right.
-        // Filesize chip DISABLED pending a decision on whether it belongs on the bottom bar.
-        // Left commented (not deleted) so it can be restored intact (prepend the extend below);
-        // the size chip block also dropped out of the bottom-bar min-width reserve in
-        // `surface.rs` while it's off.
-        // right.extend(tb.size_chip(preview.size));
-        // DRAGON-382: the crop group sits immediately to the LEFT of the zoom control (user
-        // request). Idle it is a single crop icon (no group chrome, like the select tool),
-        // accent-tinted when a crop is applied; a live session replaces it with a checkmark +
-        // x pair.
-        let right: Vec<Element<'a, Msg>> = vec![
-            tb.crop_group(
-                preview.edit.crop_session.is_some(),
-                preview.edit.crop.is_some(),
-                &self.keymap,
-            ),
-            self.zoom_control(preview, tb),
-            tb.pan_tool_group(preview.view.pan_mode, &self.keymap),
-        ];
+        // Right: the document-info block (resolution over filesize), then the zoom scale
+        // (Fit/%/presets). DRAGON-392: the crop control moved UP into the tray's Select/Hand/Crop
+        // group and the pointer/pan pair went with the pan mode it toggled (panning is the Hand
+        // TOOL now), so the info block sits immediately LEFT of the scale group — the same
+        // builder and the same slot the VIDEO editor uses on its own bottom bar.
+        let mut right: Vec<Element<'a, Msg>> = Vec::new();
+        right.extend(tb.info_chip(Some(preview.display_frame()), preview.size));
+        right.push(self.zoom_control(preview, tb));
         let toolbar = toolbar_row(left, Vec::new(), right);
         // The overlay's header line (appearance / undo / redo ⟨split⟩ Close); the windowed
         // preview carries those in its titlebar instead (DRAGON-337).
@@ -556,7 +586,9 @@ impl App {
             fx_blur: d366_fx.0,
             fx_pixelate: d366_fx.1,
             fx_highlight: d366_fx.2,
-            dim: preview.edit.dim,
+            // The dim this frame actually DREW (`view_dim`), which is what a scene-shape
+            // diagnostic is for — a crop session renders undimmed (DRAGON-410).
+            dim: preview.edit.view_dim(),
             covermark: preview.edit.cm_raster.frame().is_some(),
             text_layer: !preview.edit.text_layers.is_empty(),
         });
@@ -597,6 +629,11 @@ impl App {
     /// makes the live stack the same composite as `bake_image`'s: dim → effects → covermark →
     /// the annotation scene in item order.
     ///
+    /// `covermark` says whether the covermark layer belongs in this stack (DRAGON-391): `true` for
+    /// the ordinary un-cropped mount, `false` when a crop frames the view, which moves it out to a
+    /// sibling filling the crop window (see the caller) — this stack is laid out at the SOURCE's
+    /// size, and once cropped the image the mark must cover is the crop rect instead.
+    ///
     /// `window_keys` is every layer key this WINDOW draws this frame, across the canvas's text
     /// layers as well as the stacks built here — the multi-stack prune contract in `layers.rs`.
     /// It may over-approximate (a key that ends up not drawn merely keeps a slot alive until the
@@ -615,6 +652,7 @@ impl App {
         dw: f32,
         dh: f32,
         window_keys: &[LayerKey],
+        covermark: bool,
     ) -> Element<'static, Msg> {
         use crate::widgets::annotation_fx::{EffectsFx, FxConst, FxEffect, FxItem};
         // The region-effect items, in scene z-order (SOURCE-pixel geometry). Box/arrow are
@@ -663,7 +701,9 @@ impl App {
             .collect();
         // The global dim (DRAGON-329) + its knockout rects (SOURCE px): the union of spotlight /
         // box / highlight / box-highlight rects, capped at the shader's uniform-array size.
-        let dim = preview.edit.dim;
+        // `view_dim`, not the model's `dim`: a live crop session renders the picture undimmed
+        // (DRAGON-410) without touching the document. Byte-identical outside a session.
+        let dim = preview.edit.view_dim();
         let mut knockouts: Vec<[f32; 4]> = annotate::knockout_rects(&preview.edit.annotations)
             .into_iter()
             .map(|r| [r.x, r.y, r.w, r.h])
@@ -719,10 +759,14 @@ impl App {
         // updated in place. The TEXT layers are NO LONGER here (DRAGON-373): they are drawn by
         // the `AnnotationCanvas`, interleaved with the vector kinds in true z-order, because a
         // layer stacked at a fixed depth can never be UNDER a rectangle drawn after it.
+        // `covermark` is false when a crop frames the view — the mark then rides OVER the crop
+        // window instead (DRAGON-391), since the image it spans is the crop rect, not this stack's
+        // source — or when a crop SESSION is live, where it is not drawn at all (DRAGON-402;
+        // `covermark_layer` enforces that second rule for every mount).
         let cm_layers: Vec<Layer> = preview
             .edit
-            .cm_raster
-            .frame()
+            .covermark_layer()
+            .filter(|_| covermark)
             .map(|cm| vec![Layer::full(LayerKey::covermark(preview.window), cm.clone())])
             .unwrap_or_default();
         // The `widget::image` base (Linux/mac + the opaque windowed surface — byte-identical).
@@ -742,6 +786,9 @@ impl App {
         // builds can't exercise this cfg arm). Note the text layers are NOT folded in here on
         // either platform: they are canvas-drawn (DRAGON-373), which keeps this arm's z-order
         // exactly as it was — text has always ridden above base, effects and covermark alike.
+        // DRAGON-391: with a crop applied `cm_layers` is empty here on EVERY platform (the
+        // covermark rides over the crop window instead), so this arm then folds the base alone —
+        // the covermark still draws, through its own `LayerStack` one level up.
         #[cfg(windows)]
         let (base_element, cm_folded): (Element<'static, Msg>, bool) = if !preview
             .surface
@@ -769,15 +816,11 @@ impl App {
         if let Some(fx) = fx_element {
             children.push(fx);
         }
-        if !cm_folded && !cm_layers.is_empty() {
-            let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::part(
-                cm_layers,
-                self.live_preview_windows(),
-                window_keys.to_vec(),
-            ))
-            .width(Length::Fixed(dw))
-            .height(Length::Fixed(dh));
-            children.push(widget::container(Element::new(shader)).center_x(Length::Fill).into());
+        if !cm_folded
+            && !cm_layers.is_empty()
+            && let Some(cm) = self.covermark_stack(preview, window_keys, dw, dh)
+        {
+            children.push(cm);
         }
         if children.len() == 1 {
             return children.pop().expect("one child");
@@ -785,41 +828,89 @@ impl App {
         cosmic::iced::widget::stack(children).into()
     }
 
+    /// The covermark's own persistent-texture `LayerStack` element, filling `w`×`h` — `None` when
+    /// no covermark raster exists.
+    ///
+    /// ONE builder for both mounts (DRAGON-391): inside the media stack when un-cropped, and
+    /// filling the crop window when a crop is applied. Both are the element that spans THE IMAGE
+    /// the mark covers, so the layer is `full` in either case — the raster was rendered for exactly
+    /// that canvas (see `EditState::raster_frame`), which is what keeps live and bake identical.
+    /// Reads through `covermark_layer`, so neither mount can draw inside a crop session
+    /// (DRAGON-402) — the crop-window mount cannot arise there anyway, but the rule lives at the
+    /// read rather than depending on that.
+    fn covermark_stack(
+        &self,
+        preview: &PreviewState,
+        window_keys: &[LayerKey],
+        w: f32,
+        h: f32,
+    ) -> Option<Element<'static, Msg>> {
+        let cm = preview.edit.covermark_layer()?;
+        let shader = cosmic::iced::widget::shader::Shader::new(LayerStack::part(
+            vec![Layer::full(LayerKey::covermark(preview.window), cm.clone())],
+            self.live_preview_windows(),
+            window_keys.to_vec(),
+        ))
+        .width(Length::Fixed(w))
+        .height(Length::Fixed(h));
+        Some(widget::container(Element::new(shader)).center_x(Length::Fill).into())
+    }
+
     /// The TEXT annotation raster layers (DRAGON-373) for the loaded-image view, as
-    /// `(item id, draw-only element)` — one persistent-texture [`LayerStack`] per caption, placed
-    /// through the DISPLAY-frame mapping (`canvas_offset`/`canvas_source`: the crop region when a
-    /// crop is applied, else the whole frame + `(0, 0)`). Factored out so the interactive editor
-    /// canvas and the crop-session DISPLAY canvas (DRAGON-387) build the identical layers from ONE
-    /// place — the stack assembly is never duplicated. See
+    /// `(item id, draw-only element, the caption's SOURCE-px region)` — one persistent-texture
+    /// [`LayerStack`] per caption. Factored out so the interactive editor canvas and the
+    /// crop-session DISPLAY canvas (DRAGON-387) build the identical layers from ONE place — the
+    /// stack assembly is never duplicated. See
     /// [`crate::widgets::annotation_canvas::AnnotationCanvas::text_layers`].
+    ///
+    /// Two PLACEMENT conventions, picked by `per_region` — they put the caption in the same place
+    /// on screen (pinned by `annotation_canvas`'s
+    /// `text_region_placement_matches_the_picture_fraction_form`), but they bound it differently:
+    ///
+    /// * `false` — the historical form (DRAGON-362/385): the layer is stretched across the whole
+    ///   PICTURE with [`super::edit::TextLayerGeom::dest_in`] fractions locating the caption inside
+    ///   it. A shader is clipped to its own widget rect, so this also bounds every caption BY the
+    ///   picture — right for the editor, where the bake cuts at exactly that edge.
+    /// * `true` — DRAGON-396, the crop SESSION: the layer fills a rect of its OWN, which the canvas
+    ///   maps from the returned region. That is what lets a caption outside the image be drawn at
+    ///   all, so the user can see what a wider crop would take back in.
+    ///
+    /// The region rides along either way; only the session reads it.
     fn preview_text_layers<'a>(
         &self,
         preview: &'a PreviewState,
         window_keys: &[LayerKey],
         canvas_offset: (f32, f32),
         canvas_source: (f32, f32),
-    ) -> Vec<(u64, Element<'a, Msg>)> {
+        per_region: bool,
+    ) -> Vec<crate::widgets::annotation_canvas::TextLayerMount<'a, Msg>> {
         preview
             .edit
             .text_layers
             .iter()
             .map(|l| {
+                let key = LayerKey::text(preview.window, l.id.0);
                 // The layer covers only its own caption REGION (DRAGON-362), so it is PLACED rather
                 // than stretched (see `layers::Layer::dest`). Its fractions are of the DISPLAY frame
                 // (DRAGON-385): a caption inside the crop lands right, one outside is clipped away;
                 // `canvas_offset == (0, 0)` + `canvas_source == frame` un-cropped equals the old
-                // `dest(frame)`.
-                let layer = Layer::at(
-                    LayerKey::text(preview.window, l.id.0),
-                    l.frame.clone(),
-                    l.geom.dest_in(canvas_offset, canvas_source),
-                );
+                // `dest(frame)`. Per-region, the canvas does that placement instead (see above).
+                let layer = if per_region {
+                    Layer::full(key, l.frame.clone())
+                } else {
+                    Layer::at(key, l.frame.clone(), l.geom.dest_in(canvas_offset, canvas_source))
+                };
                 let stack = LayerStack::part(
                     vec![layer],
                     self.live_preview_windows(),
                     window_keys.to_vec(),
                 );
-                (l.id.0, Element::new(cosmic::iced::widget::shader::Shader::new(stack)))
+                let r = l.geom.region;
+                (
+                    l.id.0,
+                    Element::new(cosmic::iced::widget::shader::Shader::new(stack)),
+                    (r.x, r.y, r.w, r.h),
+                )
             })
             .collect()
     }
@@ -857,15 +948,22 @@ impl App {
             preview.view.pan,
             content_px,
             canvas_source,
-            preview.view.pan_mode,
+            preview.edit.pan_active(),
             accent,
             // Dead closure: `display_only(true)` forwards every event to the ZoomPan and never
             // emits, so this can never fire. Map to an inert message purely so the type checks.
             move |_| Msg::Preview(pid, PreviewMsg::AnnotMenuClose),
         )
         .display_only(true)
+        // DRAGON-396: this canvas IS the crop session's, and there the marks must show OUTSIDE the
+        // current image — the user is deciding what to crop back in ("so that we can easily recrop
+        // later"). The crop overlay's own scrim, drawn above, is what distinguishes in-crop from
+        // out-of-crop; the marks themselves render at full strength either side of that line.
+        .marks_outside_image(true)
         .crop_offset(canvas_offset)
-        .text_layers(self.preview_text_layers(preview, window_keys, canvas_offset, canvas_source))
+        // `true`: the session places each caption at its own rect, so one lying outside the image
+        // is drawn instead of being bounded by the picture (DRAGON-396).
+        .text_layers(self.preview_text_layers(preview, window_keys, canvas_offset, canvas_source, true))
         .into()
     }
 }

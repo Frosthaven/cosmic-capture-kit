@@ -25,10 +25,7 @@ fn render_chip(
     spacing: f32,
 ) -> Element<'static, Msg> {
     let white_icon = |name: &'static str, size: f32| -> Element<'static, Msg> {
-        widget::icon::icon(crate::widgets::icons::handle(name))
-            .size(64)
-            .width(Length::Fixed(size))
-            .height(Length::Fixed(size))
+        crate::widgets::icons::sized(name, size)
             .class(cosmic::theme::Svg::Custom(Rc::new(|_t| cosmic::widget::svg::Style {
                 color: Some(cosmic::iced::Color::WHITE),
             })))
@@ -107,10 +104,7 @@ impl App {
         // button stretched to fill its (stacked) group keeps the glyph at its true
         // size and centered instead of stretching it.
         let mode_icon = |name: &'static str, active: bool| {
-            let icon = widget::icon::icon(crate::widgets::icons::handle(name))
-                .size(64)
-                .width(Length::Fixed(ICON_BOX))
-                .height(Length::Fixed(ICON_BOX))
+            let icon = crate::widgets::icons::sized(name, ICON_BOX)
                 .class(if active {
                     cosmic::theme::Svg::Custom(Rc::new(|t| cosmic::widget::svg::Style {
                         color: Some(crate::app::theme::accent(t)),
@@ -140,6 +134,38 @@ impl App {
             } else {
                 Some(Msg::Capture(CaptureMsg::SetMode(m)))
             };
+            // DRAGON-392 correction — the ACTIVE REGION selector is an "accept region" button, so
+            // it wears the SAME look as the preview editor's accept-crop button: the shared
+            // accent-filled segment style with the solid on-accent glyph
+            // (`theme::segment_style`, the one source both go through — never a second copy of
+            // the accent values). Both confirm a rect the user actively dragged out.
+            //
+            // Scoped to REGION and only while it is the ACTIVE mode. Window and Monitor keep the
+            // plain selector look: there is no user-authored geometry to accept there — picking
+            // the target IS the action (the active Window selector is a literal no-op) — so
+            // dressing them as an accept would promise a confirmation step that doesn't exist.
+            let accept_region = active && m == Mode::Region;
+            if accept_region {
+                let seg_style = move |t: &cosmic::Theme, hovered: bool| {
+                    // A standalone button, so BOTH outer corners round.
+                    crate::app::theme::segment_style(t, true, hovered, true, true)
+                };
+                // The DEFAULT icon class: the button's own per-state `icon_color` (on-accent,
+                // from the style above) colours the glyph, exactly as the kind pair does. An
+                // `Svg::Custom` accent class here would paint accent-on-accent — invisible.
+                return crate::widgets::arrow_cursor::arrow_cursor(
+                    widget::button::custom(mode_icon(name, false))
+                        .class(cosmic::theme::Button::Custom {
+                            active: Box::new(move |_, t| seg_style(t, false)),
+                            disabled: Box::new(move |t| seg_style(t, false)),
+                            hovered: Box::new(move |_, t| seg_style(t, true)),
+                            pressed: Box::new(move |_, t| seg_style(t, true)),
+                        })
+                        .on_press_maybe(msg)
+                        .width(btn_width)
+                        .padding(BTN_PAD),
+                );
+            }
             // Natural padding keeps the icon at its proper size (forcing the height
             // scaled/clipped it); the width is fixed horizontally and fills when
             // stacked so the buttons share the group evenly.
@@ -160,12 +186,9 @@ impl App {
             // Default icon class: the button's per-state `icon_color` (below) colours
             // it, so the glyph can react to hover — an Svg::Custom class can't see
             // hover state.
-            let icon = widget::icon::icon(crate::widgets::icons::handle(name))
-                .size(64)
-                .width(Length::Fixed(ICON_BOX))
-                .height(Length::Fixed(ICON_BOX));
+            let icon = crate::widgets::icons::sized(name, ICON_BOX);
             // The shared segmented-pair style (theme.rs) — one source for this
-            // pair and the preview's pointer/pan + pointer/razor toggles.
+            // pair and the preview's pointer/razor toggle.
             let seg_style = move |t: &cosmic::Theme, hovered: bool| {
                 crate::app::theme::segment_style(t, active, hovered, round_left, round_right)
             };
@@ -573,9 +596,7 @@ impl App {
                           level: Option<f32>|
          -> Element<'static, Msg> {
             let metering = level.is_some();
-            let icon = widget::icon::icon(crate::widgets::icons::handle(name))
-                .width(Length::Fixed(ICON_BOX))
-                .height(Length::Fixed(ICON_BOX))
+            let icon = crate::widgets::icons::sized(name, ICON_BOX)
                 .class(cosmic::theme::Svg::Custom(Rc::new(move |t: &cosmic::Theme| {
                     let color = if metering || on {
                         // On: the default icon foreground (same as the gear/close

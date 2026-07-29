@@ -204,16 +204,30 @@ impl App {
         })
     }
 
-    /// Re-raster the covermark at the CURRENT view zoom when a mark is applied AND the zoom
-    /// now wants a DIFFERENT resolution than the last raster (DRAGON-324). Called after every
-    /// zoom change so a magnified covermark sharpens toward the source resolution — without
-    /// re-rastering on a zoom step that doesn't change the wanted resolution (e.g. already at
-    /// the source cap, or below fit). No covermark → nothing to do.
-    pub(super) fn refresh_covermark_for_zoom(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+    /// Re-raster the covermark for the CURRENT view when a mark is applied AND the view now wants
+    /// a DIFFERENT raster than the last one (DRAGON-324). Called after every zoom change so a
+    /// magnified covermark sharpens toward the source resolution — without re-rastering on a zoom
+    /// step that doesn't change the wanted resolution (e.g. already at the source cap, or below
+    /// fit) — and after every CROP change, including opening and closing a crop SESSION
+    /// (DRAGON-391), because the covermark's canvas IS the image: accepting a crop makes it the
+    /// crop rect, a session reveals the whole frame again, so the mark must be re-rendered at the
+    /// new canvas's size and aspect or it would be stretched onto it. The wanted-size compare is a
+    /// complete staleness test: the raster's content depends on nothing else about the canvas (a
+    /// cover-fit is centred, so only the size can change it). No covermark → nothing to do.
+    ///
+    /// DRAGON-402 — and NOTHING while a crop session is live, because the layer is not drawn there
+    /// ([`super::edit::EditState::covermark_visible`]). That is not just an optimisation: every
+    /// raster this produced during a session was for the session's canvas (the whole frame), and
+    /// the session's own zooming kept producing more. Leaving the slot untouched for the duration
+    /// means BOTH exits find exactly the raster they left — so cancel and an unchanged accept
+    /// restore the mark with no work and no flicker, and only a real crop change re-rasters. See
+    /// the commit for the mis-render that came of doing it the other way.
+    pub(super) fn refresh_covermark_for_view(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
         let Some(p) = self.preview_for(id) else {
             return Task::none();
         };
-        if p.edit.covermark.is_none()
+        if p.edit.crop_session.is_some()
+            || p.edit.covermark.is_none()
             || p.edit.covermark_raster_size(p.view.zoom, self.preview_visual_scale(p))
                 == p.edit.cm_raster_px
         {

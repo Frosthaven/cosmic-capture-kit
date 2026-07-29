@@ -26,6 +26,49 @@ pub fn handle(name: &str) -> Handle {
     }
 }
 
+/// **THE icon-size seam (DRAGON-399): snap a glyph's logical box to a WHOLE pixel.**
+///
+/// iced rasterizes an SVG at `ceil(display_scale × bounds)` device px and then draws that
+/// texture into the bounds it was given. When the bounds are FRACTIONAL the two disagree and the
+/// texture is RESAMPLED to fit — a bilinear pass that softens every edge the rasterizer had
+/// computed exactly. A whole-pixel box makes raster size == draw size, so the rasterizer's own
+/// analytic coverage reaches the screen untouched.
+///
+/// The bug this fixes, measured: the preview toolbar's glyph box was `ICON_BOX 22 × CHROME_SCALE
+/// 0.91 = 20.02` logical, rasterizing at 21px and drawn into 20.02 — a ~5% downscale. That is
+/// what put the visible step in the accept checkmark's ascending arm. Reproduced outside the app:
+/// a clean 61px `rsvg-convert` render downscaled to 60 lands on the app's exact glyph bounding
+/// box (44×32) INCLUDING the step, while the un-resampled 61px render is clean at 45×33.
+///
+/// It also explains why six successive ASSET variants failed to help (miter join, stroke-to-path,
+/// `check-line`, the crop glyph, two-path round caps, filling the viewBox): the resample happens
+/// AFTER rasterization, so nothing expressible in the SVG could reach it. Do not go back to the
+/// assets for a soft glyph before checking its box is integral.
+///
+/// **The rounding is deliberately independent of any particular scale VALUE.** It is not "0.91
+/// happens to need it": every future [`crate::app::preview::surface::CHROME_SCALE`] stays sharp,
+/// not only the ones where `22 × scale` lands on an integer by luck. Keep it that way — a
+/// `if scale == …` shortcut here would silently blur the UI the next time the owner tunes the
+/// chrome.
+pub fn box_px(logical: f32) -> f32 {
+    // `max(1.0)`: a rounded-to-zero box would make the glyph vanish rather than merely blur.
+    logical.round().max(1.0)
+}
+
+/// Resolve `name` and size it to a whole-pixel box in ONE call — the path every sized glyph
+/// should take, so a control added later cannot forget [`box_px`] the way scattered
+/// `.round()` call sites would be forgotten. Chain `.class(..)` on the result as usual.
+///
+/// Some call sites legitimately do NOT come through here: cosmic's `Icon::size(u16)` takes a
+/// whole number BY TYPE (it can't be fractional), and the About page's app icon is built from
+/// raw bytes rather than a named handle. Both are noted where they sit.
+pub fn sized(name: &str, box_px_logical: f32) -> icon::Icon {
+    let px = box_px(box_px_logical);
+    icon::icon(handle(name))
+        .width(cosmic::iced::Length::Fixed(px))
+        .height(cosmic::iced::Length::Fixed(px))
+}
+
 /// Whether `name` resolves to a BUNDLED Lucide glyph rather than falling through to the
 /// system/embedded theme (which renders blank off Linux for most names). The one public
 /// probe over [`lucide_name`], so callers can assert a glyph really ships without exposing
@@ -47,6 +90,9 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "screenshot-window-symbolic" => "app-window",
         "screenshot-screen-symbolic" => "monitor",
         "object-move-symbolic" => "move", // pan / grab tool
+        // The preview editor's HAND tool (DRAGON-392) — lucide `hand`, the open palm. Distinct
+        // from `move` (the capture overlay's four-way drag handle) and from `hand-coins`.
+        "hand-symbolic" => "hand",
         "input-mouse-symbolic" => "mouse-pointer", // pointer tool
         "camera-photo-symbolic" => "camera",
         "camera-video-symbolic" => "video",
@@ -55,6 +101,25 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "media-playback-pause-symbolic" => "pause",
         "media-playback-stop-symbolic" => "square", // stop
         "emblem-ok-symbolic" => "check", // confirm / finish
+        // The CROP session's ACCEPT mark (DRAGON-392). It is lucide `check`'s exact geometry and
+        // the set's exact stroke weight — the ONE thing it changes is that the tick is TWO
+        // SEPARATE PATHS (`M20 6 9 17` + `M9 17 4 12`) instead of one joined polyline.
+        // **Do not "restore" it to the upstream single path**, and do not fold it back into
+        // `check`: the split is the whole point here, and `check` is shared with the countdown
+        // chip, the settings rows and the success toast, which must not shift.
+        //
+        // WHY, measured at the ~19 device px this actually renders at: with ONE joined path the
+        // vertex is a stroke JOIN, and a round join's disc (radius stroke/2, well under a pixel
+        // here) cannot fill the outer wedge — the tip antialiases into a visible chip. Two paths
+        // make that vertex two overlapping round CAPS instead, which cannot under-resolve at any
+        // size. Tip-pixel coverage, joined -> two-path: 102 -> 161 and 134 -> 198 (of 255).
+        // (`stroke-linejoin="miter"` was an earlier fix and is measurably worse than the split;
+        // outlining the stroke does NOT work at all — it bakes the round join's arcs and
+        // rasterizes pixel-identically to the chipped original.)
+        //
+        // What it does NOT buy: the two 45° arms are the same diagonal at the same size, so they
+        // stay stair-stepped. Only more pixels help that — no asset change will.
+        "crop-accept-symbolic" => "check-split",
         "edit-delete-symbolic" => "trash-2",
         "window-close-symbolic" => "x",
         "emblem-system-symbolic" => "settings", // gear
@@ -160,6 +225,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "app-window" => svg!("app-window"),
         "monitor" => svg!("monitor"),
         "move" => svg!("move"),
+        "hand" => svg!("hand"),
         "mouse-pointer" => svg!("mouse-pointer"),
         "mouse-pointer-2" => svg!("mouse-pointer-2"),
         "camera" => svg!("camera"),
@@ -170,6 +236,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "pause" => svg!("pause"),
         "square" => svg!("square"),
         "check" => svg!("check"),
+        "check-split" => svg!("check-split"),
         "trash-2" => svg!("trash-2"),
         "x" => svg!("x"),
         "settings" => svg!("settings"),
@@ -258,7 +325,8 @@ mod tests {
             "audio-volume-high-symbolic", "notification-symbolic", "input-keyboard-symbolic",
             "view-refresh-symbolic", "document-save-symbolic", "document-save-as-symbolic",
             "edit-copy-symbolic", "view-fullscreen-symbolic", "view-restore-symbolic",
-            "edit-undo-symbolic", "edit-redo-symbolic", "crop-symbolic", "insert-image-symbolic",
+            "edit-undo-symbolic", "edit-redo-symbolic", "crop-symbolic", "crop-accept-symbolic",
+            "insert-image-symbolic",
             "zoom-in-symbolic", "display-brightness-symbolic", "mail-forward-symbolic",
             "pointer-select-symbolic",
             "format-text-highlight-symbolic", "checkbox-symbolic", "box-highlight-symbolic",
@@ -283,6 +351,107 @@ mod tests {
             let file = lucide_name(n).unwrap_or_else(|| panic!("`{n}` is unmapped"));
             assert!(!lucide_bytes(file).is_empty(), "`{file}` embeds no bytes");
             assert!(lucide_bytes(file).starts_with(b"<svg"), "`{file}` is not an SVG");
+        }
+    }
+
+    /// **One stroke weight across the toolbar set** (DRAGON-392): the bundled glyphs stroke at 2
+    /// — lucide's own default — so no icon reads heavier or thinner than the ones beside it. The
+    /// owner's rule, after a `+1px` pass on the crop / accept / cancel trio was tried and
+    /// withdrawn: "there shouldn't be out-of-sync variants".
+    ///
+    /// This is the guard that turns that from a preference into something the suite enforces — a
+    /// new bold variant fails HERE rather than shipping and being spotted by eye.
+    ///
+    /// ONE exemption remains, and it is permanent:
+    ///
+    /// * `minus-N` — the annotation line-width PREVIEW swatches. The varying stroke IS the
+    ///   content: each one shows the thickness it selects, so a single weight would make the
+    ///   whole control meaningless.
+    ///
+    /// **`move` and `type` used to be exempt too, and no longer are** (DRAGON-399). They had
+    /// been thickened to stroke 3 on the grounds that they "render poorly on HiDPI" — which was
+    /// TRUE, but the cause was the fractional-icon-box resample ([`box_px`]), not the glyphs.
+    /// Measured at the device size a 2× display produced (`22 × 0.82 × 2 = 36.08`, rastered at
+    /// 37 and squeezed into 36.08): the resample cost `move` **140 of its 384 solid pixels** and
+    /// `type` **116 of 254**, turning them into partial coverage — and it cost the untouched
+    /// `crop` glyph 92 the same way, which is what shows the defect was universal rather than
+    /// something about those two. With the box snapped, the compensation is double-counting, so
+    /// they are back at the set weight and byte-identical to upstream lucide.
+    ///
+    /// Do not reinstate them from folklore. A new exemption needs a reason of the `minus-N` kind
+    /// — one where the weight is the CONTENT — recorded beside it. Weight parity is the default.
+    #[test]
+    fn bundled_glyphs_share_one_stroke_weight_unless_deliberately_thickened() {
+        /// The set's weight: lucide's default, and what every toolbar glyph wears.
+        const SET_WEIGHT: &str = "2";
+        // See the doc above for why each of these is exempt.
+        let exempt = |stem: &str| stem.starts_with("minus-");
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("res/icons/lucide");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("the bundled icon directory") {
+            let path = entry.expect("a directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("svg") {
+                continue;
+            }
+            let stem = path.file_stem().and_then(|s| s.to_str()).expect("a file stem").to_string();
+            let svg = std::fs::read_to_string(&path).expect("a readable SVG");
+            // EVERY occurrence, not just the first: a future multi-path glyph could carry a
+            // per-path weight, and that is exactly the drift this is here to catch.
+            let widths: Vec<&str> = svg
+                .match_indices("stroke-width=\"")
+                .map(|(i, m)| {
+                    let rest = &svg[i + m.len()..];
+                    &rest[..rest.find('"').expect("a closed stroke-width attribute")]
+                })
+                .collect();
+            assert!(!widths.is_empty(), "`{stem}` declares no stroke-width");
+            if exempt(&stem) {
+                continue;
+            }
+            for w in widths {
+                assert_eq!(
+                    w, SET_WEIGHT,
+                    "`{stem}` strokes at {w}, not the set's {SET_WEIGHT} — an out-of-sync \
+                     variant. If the deviation is deliberate (a rendering compensation, or the \
+                     stroke IS the content), exempt it in this test WITH the reason."
+                );
+            }
+            checked += 1;
+        }
+        // A directory that failed to read, or a rename that emptied it, must not pass silently.
+        assert!(checked > 60, "only {checked} glyphs checked — the bundled set should be larger");
+    }
+
+    /// **Every icon box is a WHOLE logical pixel** (DRAGON-399) — across a spread of chrome
+    /// scales, not just today's. A fractional box makes iced raster at one size and draw at
+    /// another, and the bilinear resample that follows softens every glyph edge; that defect
+    /// survived six asset rewrites before it was found, so it is worth failing loudly for.
+    ///
+    /// The spread deliberately includes values that are hostile to `ICON_BOX 22` — 0.91 (the
+    /// shipping one, `20.02` raw), 0.82 (`18.04`), and thirds/sevenths that land nowhere near an
+    /// integer. If a future scale is chosen for how the chrome LOOKS, this keeps the glyphs sharp
+    /// without anyone having to remember why.
+    #[test]
+    fn every_icon_box_snaps_to_a_whole_pixel() {
+        let whole = |v: f32| (v.fract() == 0.0, v);
+        // The seam itself, over raw fractional inputs.
+        for raw in [18.04_f32, 20.02, 16.4, 0.2, 21.5, 22.0, 33.333, 47.999] {
+            let (ok, v) = whole(box_px(raw));
+            assert!(ok, "box_px({raw}) = {v}, not a whole pixel");
+            assert!(v >= 1.0, "box_px({raw}) = {v} would make the glyph vanish");
+        }
+        // …and through the app's own derivation, at scales chosen to be awkward for ICON_BOX.
+        for scale in [0.82_f32, 0.91, 1.0, 1.09, 0.5, 1.0 / 3.0, 2.0 / 7.0, 1.618] {
+            let base = crate::app::ICON_BOX * scale;
+            let (ok, v) = whole(box_px(base));
+            assert!(ok, "chrome scale {scale}: glyph box {base} snapped to {v}, not whole");
+            // The slider glyph derives ANOTHER box from that one — integral today only because
+            // 20 x 0.8 = 16, so it must go through the seam too rather than ride on luck. (The
+            // 0.8 is `preview::chrome::SLIDER_SCALE`, private to that module; mirrored here as a
+            // literal because this test is about the SEAM, not about that constant's value.)
+            let (ok, sv) = whole(box_px(v * 0.8));
+            assert!(ok, "chrome scale {scale}: slider glyph box {sv} is not whole");
         }
     }
 

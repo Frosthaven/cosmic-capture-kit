@@ -434,6 +434,23 @@ record_fps = 60\n";
         assert_eq!(q.shortcuts[0].0, crate::shortcuts::Action::CopyText);
     }
 
+    // DRAGON-392 RENAMED an action (`PreviewTogglePan` → `PreviewAnnotHand`, when panning became
+    // a real tool). A rename is NOT a removal: a user who had rebound the pan key must keep that
+    // binding, so the old spelling is carried by `#[serde(alias)]` and must still LOAD — in both
+    // on-disk shapes. (Contrast the test above: an action that genuinely no longer exists drops.)
+    #[test]
+    fn the_renamed_pan_action_still_loads_under_its_old_name() {
+        let on_disk = "[[shortcuts]]\naction = \"PreviewTogglePan\"\n";
+        let p: Persisted = toml::from_str(on_disk).expect("the alias must parse");
+        assert_eq!(p.shortcuts.len(), 1, "the override survives the rename");
+        assert_eq!(p.shortcuts[0].0, crate::shortcuts::Action::PreviewAnnotHand);
+
+        let legacy = "(shortcuts: [(PreviewTogglePan, None)])";
+        let q: Persisted = ron::from_str(legacy).expect("the alias must parse from RON too");
+        assert_eq!(q.shortcuts.len(), 1);
+        assert_eq!(q.shortcuts[0].0, crate::shortcuts::Action::PreviewAnnotHand);
+    }
+
     // None-valued options must serialize by OMISSION (TOML has no literal None) and
     // deserialize back to None from an absent key.
     #[test]

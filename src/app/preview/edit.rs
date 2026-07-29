@@ -353,6 +353,15 @@ pub struct CropSession {
     pub rect: CropRect,
     /// The viewport at session start; restored when the session ends.
     pub saved_view: super::viewport::Viewport,
+    /// The ARMED TOOL at session start, restored when the session ends (DRAGON-392 correction).
+    /// The session disarms the tray — nothing may look armed while the crop owns the canvas — and
+    /// hands the tool back on BOTH exits, accept and cancel alike: which tool you were holding has
+    /// nothing to do with the crop's outcome. `None` (the neutral state) round-trips as `None`,
+    /// which is why this is the whole `Option` rather than "a tool if there was one".
+    ///
+    /// SESSION state, like [`Self::saved_view`] beside it: it lives and dies with the session and
+    /// never reaches the settings store.
+    pub saved_tool: Option<Tool>,
     /// The in-flight drag, `None` between drags.
     pub drag: Option<CropDrag>,
 }
@@ -707,6 +716,14 @@ pub struct EditState {
 }
 
 impl EditState {
+    /// Whether a plain left-drag PANS the picture — i.e. the HAND tool is armed (DRAGON-392).
+    /// THE seam that replaced the old `Viewport::pan_mode` flag: the canvas and the `ZoomPan`
+    /// still take one bool, but it is now DERIVED from the armed tool, so the toolbar, the `H`
+    /// key and the pointer behaviour can never disagree.
+    pub fn pan_active(&self) -> bool {
+        self.tool.is_some_and(Tool::is_hand)
+    }
+
     /// Whether an edit needs a bake before sharing: a covermark, a non-empty annotation scene
     /// (any spotlight is an item, so this counts it), OR a non-zero global dim (DRAGON-329) —
     /// any would be silently dropped otherwise.
@@ -1025,8 +1042,79 @@ impl EditState {
         }
     }
 
-    /// This document's frame, defaulted for a not-yet-loaded (0-sized) capture.
+    /// The crop APPLIED to the display right now, or `None` — the crop when one is set AND no crop
+    /// session is live (a session reveals the whole image so the rect stays repositionable).
+    ///
+    /// THE rule, in one place: [`super::PreviewState::view_crop`] delegates here, so the model side
+    /// (the covermark canvas below) and the view side can never disagree about what is framed.
+    pub fn view_crop(&self) -> Option<CropRect> {
+        self.crop.filter(|_| self.crop_session.is_none())
+    }
+
+    /// Whether the covermark LAYER is drawn right now (DRAGON-402): everywhere except inside a
+    /// live crop session.
+    ///
+    /// The covermark is a treatment of the FINAL FRAMING — DRAGON-391 made its canvas the crop
+    /// rect, and the mark is re-rastered for the new canvas the moment a crop is accepted. So
+    /// whatever a session could show was never predictive: it is a mark for the OLD framing,
+    /// drawn over a view that is deliberately showing something else (the whole image, reframed
+    /// and zoomed out for the crop workspace), and guaranteed to be replaced on accept. Hiding it
+    /// is more honest than rendering it — and it is what the owner asked for, the mark having
+    /// visibly mis-rendered in that state (see the commit for the mechanism).
+    ///
+    /// Strictly a DISPLAY rule: [`Self::covermark`] is never touched, so a session — cancelled or
+    /// accepted — leaves the document exactly as it found it, and the bake (which a session can
+    /// never reach) is unaffected.
+    pub fn covermark_visible(&self) -> bool {
+        self.crop_session.is_none()
+    }
+
+    /// The global dim actually RENDERED right now (DRAGON-410): the user's [`Self::dim`]
+    /// everywhere except inside a live crop session, which forces it CLEAR (0 = maximum
+    /// brightness, fully transparent).
+    ///
+    /// WHY: you cannot judge a crop through a dimmed image. The session's whole job is showing
+    /// the picture being framed, so it shows it undimmed — the same call as hiding the covermark
+    /// (see [`Self::covermark_visible`]), and it retires DRAGON-392's carve-out that kept the dim
+    /// SLIDER live mid-crop on the reasoning that dim is a viewing aid (it is; the aid just points
+    /// the wrong way here, so the session takes the decision instead of offering it).
+    ///
+    /// **An OVERRIDE, not an edit — and that is the whole design.** The model's `dim` is never
+    /// written, so there is nothing to save and nothing to restore: no history entry can be
+    /// pushed, [`Self::dirty()`] cannot move, and the bake (`bake_image`, which reads `dim`
+    /// directly and which a session can never reach anyway) is untouched. Both exits — accept and
+    /// cancel alike — restore the user's dim EXACTLY, by the arithmetic of the session ending, not
+    /// by a saved copy that some third exit path could forget to put back. Contrast
+    /// [`CropSession::saved_view`] / [`CropSession::saved_tool`], which have to be stashed because
+    /// the session genuinely mutates them.
+    pub fn view_dim(&self) -> f32 {
+        if self.crop_session.is_some() { 0.0 } else { self.dim }
+    }
+
+    /// The covermark raster to DRAW, if any — THE one read every mount goes through, so
+    /// [`Self::covermark_visible`] cannot be honoured at one mount and forgotten at another.
+    ///
+    /// Deliberately NOT what decides the layer KEY the view registers: the raster survives a
+    /// session untouched in its slot, so keeping the key listed keeps the GPU texture alive and
+    /// makes the restore on exit a redraw rather than a re-upload (over-approximating the key set
+    /// is explicitly safe — see `layers.rs`; under-approximating is what frees a live texture).
+    pub fn covermark_layer(&self) -> Option<&Arc<super::layers::PixelFrame>> {
+        self.cm_raster.frame().filter(|_| self.covermark_visible())
+    }
+
+    /// The covermark raster's CANVAS in whole SOURCE px — THE IMAGE the mark covers, defaulted for
+    /// a not-yet-loaded (0-sized) capture.
+    ///
+    /// DRAGON-391: once a crop is accepted **the image IS the crop rectangle** (DRAGON-385's
+    /// display frame), so that is what the covermark spans — including the black extension an
+    /// over-crop adds, and nothing beyond it. NOT the source frame (which left the extension bare),
+    /// and NOT the source ∪ crop union (which would pattern past the image the user cropped to).
+    /// Un-cropped — and during a crop SESSION, which reveals the whole image — this is the source
+    /// frame, exactly what it always was; videos never crop, so they are untouched.
     fn raster_frame(&self) -> (u32, u32) {
+        if let Some(c) = self.view_crop() {
+            return c.pixel_size();
+        }
         match self.frame {
             (0, _) | (_, 0) => (1280u32, 800u32),
             f => f,
@@ -1035,7 +1123,10 @@ impl EditState {
 
     /// The covermark display raster resolution at the current `view_zoom` — the layer's own
     /// ON-SCREEN device-pixel footprint (DRAGON-362), see [`layer_raster_dims`]. The covermark
-    /// layer spans the whole frame, so its raster is the whole frame at that scale.
+    /// layer spans the whole image, so its raster is [`Self::raster_frame`] — the crop rect once a
+    /// crop is applied (DRAGON-391) — at that scale. `visual_scale` is device px per SOURCE px and
+    /// is measured against the same display frame, so the product is the canvas's true on-screen
+    /// footprint either way.
     pub fn covermark_raster_size(&self, view_zoom: f32, visual_scale: f32) -> (u32, u32) {
         layer_raster_dims(self.raster_frame(), layer_raster_scale(view_zoom, visual_scale))
     }
@@ -1389,7 +1480,9 @@ pub fn apply_covermark(base: &mut RgbaImage, cm: Option<&Covermark>) {
 ///    [`super::annotate::apply_dim`] — a no-op when `dim == 0`;
 /// 1. the region EFFECTS (highlight / pixelate / blur) composite in true scene z-order via
 ///    [`super::annotate::apply_effects`], each reading the content accumulated below it;
-/// 2. the covermark (privacy mark) as a source-over overlay;
+/// 2. the covermark (privacy mark) as a source-over overlay, spanning THE IMAGE — the crop
+///    rectangle once a crop is applied, so it covers an over-crop's black extension and nothing
+///    past it (DRAGON-391);
 /// 3. the box/arrow annotation scene ON TOP (the active markup, above the privacy mark) —
 ///    all at full source resolution, position-aware.
 pub fn bake_image(
@@ -1424,18 +1517,23 @@ pub fn bake_image(
         let placeholder = ::image::RgbaImage::new(1, 1);
         let analysis_ref = analysis.as_ref().unwrap_or(&placeholder);
         super::annotate::apply_effects(&mut rgba, analysis_ref, annotations, curve);
+        // DRAGON-382 + DRAGON-389 + DRAGON-391: dim / effects composite over the FULL source above
+        // (they are content-anchored and cannot exist off-source). Everything BELOW this line works
+        // on THE IMAGE — which, once a crop is applied, IS the crop rectangle: cut it FIRST
+        // (black-filling any over-crop extension), then lay the covermark and the vector overlay
+        // onto that canvas. So both cover the whole framed image, extension included, and neither
+        // reaches past it — what the editor shows over the black extension (DRAGON-385's display
+        // frame) survives to the saved file instead of being clipped at the old source edge. The
+        // annotations draw offset by the crop origin, rounded exactly as `crop_image` cuts, so they
+        // land pixel-aligned with it; the covermark simply spans the cut canvas. Z-order is
+        // unchanged (covermark under the annotation scene), and with no crop this is the historical
+        // `apply_covermark` + `apply_annotations` on the full source — byte-identical.
+        if let Some(rect) = crop {
+            rgba = super::crop::crop_image(&rgba, rect);
+        }
         apply_covermark(&mut rgba, cm);
-        // DRAGON-382 + DRAGON-389: dim / effects / covermark composite over the FULL source above
-        // (they are content-anchored and cannot exist off-source). With a crop, cut the crop rect
-        // FIRST — black-filling any over-crop extension — then draw the vector overlay onto the
-        // CROPPED canvas offset by the crop origin, so an annotation the editor shows over the black
-        // extension (DRAGON-385's larger display frame) survives to the saved file instead of being
-        // clipped at the source edge. The crop origin uses the same rounding as `crop_image`'s cut,
-        // so the overlay lands pixel-aligned with the cut. With no crop this is the historical
-        // `apply_annotations` on the full source — byte-identical.
         match crop {
             Some(rect) => {
-                rgba = super::crop::crop_image(&rgba, rect);
                 let offset = (rect.x.round(), rect.y.round());
                 super::annotate::apply_annotations_at(&mut rgba, annotations, curve, offset);
             }
@@ -1507,6 +1605,66 @@ fn cut_filtergraph(keep: &[Span], has_audio: bool, overlay: bool) -> String {
     graph
 }
 
+/// The x264 re-encode flags every RE-ENCODING video bake path uses (the cut export and
+/// the covermark overlay). Named once so the two can never drift.
+const VIDEO_REENCODE: [&str; 8] =
+    ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"];
+
+/// THE video bake's ffmpeg argument plan, as a pure function (DRAGON-398).
+///
+/// Everything between the INPUTS (`-i src`, plus `-i overlay.png` when `overlay`) and the
+/// OUTPUT path. Split out of [`bake_video`] so the invariant CLAUDE.md is explicit about —
+/// **an UNCUT timeline must keep its historical ffmpeg invocations byte-identical** — is
+/// pinned by unit tests instead of resting on a reading of the code. The three shapes are:
+///
+/// * **cut** (`keep` = a non-empty span list, i.e. content was DELETED): the
+///   [`cut_filtergraph`] trim/concat export. Both streams re-encode — arbitrary trim
+///   points cannot stream-copy.
+/// * **covermark only** (uncut, `overlay`): the historical single-`overlay` filtergraph,
+///   video re-encoded, audio STREAM-COPIED.
+/// * **neither** (defensive): `-map 0 -c copy` — every stream copied, nothing re-encoded.
+///
+/// `keep` is deliberately taken as `Option<&[Span]>` with an EMPTY list treated as uncut:
+/// `VideoBake::keep` is already `None` for a razor-only timeline (the caller filters on
+/// `Timeline::edited`), and an empty list reaching here must not produce a `concat=n=0`.
+pub(super) fn video_bake_args(
+    keep: Option<&[Span]>,
+    has_audio: bool,
+    overlay: bool,
+    ext: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut push = |xs: &[&str]| args.extend(xs.iter().map(|s| s.to_string()));
+    match keep.filter(|k| !k.is_empty()) {
+        Some(keep) => {
+            // Timeline export: keep only the spans, hard-cut seams. Both streams
+            // re-encode — trim points are arbitrary, so stream-copy can't hold them.
+            let graph = cut_filtergraph(keep, has_audio, overlay);
+            push(&["-filter_complex", &graph]);
+            push(&["-map", "[v]"]);
+            if has_audio {
+                push(&["-map", "[a]"]);
+            }
+            push(&VIDEO_REENCODE);
+            if has_audio {
+                push(&["-c:a", "aac", "-b:a", "192k"]);
+            }
+        }
+        None if overlay => {
+            push(&["-filter_complex", "[0:v][1:v]overlay=(W-w)/2:(H-h)/2[v]"]);
+            push(&["-map", "[v]", "-map", "0:a?"]);
+            push(&VIDEO_REENCODE);
+            push(&["-c:a", "copy"]);
+        }
+        // No edit to bake (defensive): copy every stream, no re-encode.
+        None => push(&["-map", "0", "-c", "copy"]),
+    }
+    if ext == "mp4" || ext == "m4v" || ext == "mov" {
+        push(&["-movflags", "+faststart"]);
+    }
+    args
+}
+
 /// Bake the pending edits onto a video, reading `src` and writing `dst`. Deleted
 /// timeline segments export through a `trim`+`concat` filtergraph (video re-encoded,
 /// audio re-encoded once); a covermark overlays the (joined) video; with neither,
@@ -1533,32 +1691,15 @@ pub fn bake_video(src: &Path, dst: &Path, cm: Option<&Covermark>, video: &VideoB
     }
     let ext = super::ext_of(dst).unwrap_or_else(|| "mp4".into());
     let tmp = dir.join(format!("cck-bake.{ext}"));
-    let reencode: [&str; 8] =
-        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"];
-    if let Some(keep) = video.keep.as_deref().filter(|k| !k.is_empty()) {
-        // Timeline export: keep only the spans, hard-cut seams. Both streams
-        // re-encode — trim points are arbitrary, so stream-copy can't hold them.
-        let graph = cut_filtergraph(keep, video.has_audio, overlay_png.is_some());
-        cmd.args(["-filter_complex", &graph]).args(["-map", "[v]"]);
-        if video.has_audio {
-            cmd.args(["-map", "[a]"]);
-        }
-        cmd.args(reencode);
-        if video.has_audio {
-            cmd.args(["-c:a", "aac", "-b:a", "192k"]);
-        }
-    } else if overlay_png.is_some() {
-        cmd.args(["-filter_complex", "[0:v][1:v]overlay=(W-w)/2:(H-h)/2[v]"])
-            .args(["-map", "[v]", "-map", "0:a?"])
-            .args(reencode)
-            .args(["-c:a", "copy"]);
-    } else {
-        // No edit to bake (defensive): copy every stream, no re-encode.
-        cmd.args(["-map", "0", "-c", "copy"]);
-    }
-    if ext == "mp4" || ext == "m4v" || ext == "mov" {
-        cmd.args(["-movflags", "+faststart"]);
-    }
+    // The whole argument plan (cut / covermark-only / stream-copy, plus faststart) is
+    // [`video_bake_args`] — pure, so the "an uncut timeline never re-encodes" invariant is
+    // unit-tested rather than assumed.
+    cmd.args(video_bake_args(
+        video.keep.as_deref(),
+        video.has_audio,
+        overlay_png.is_some(),
+        &ext,
+    ));
     cmd.arg(&tmp);
     let out = cmd.output()?;
     if let Some(p) = &overlay_png {
@@ -1679,6 +1820,26 @@ mod tests {
         e.frame = (0, 0);
         let (w, h) = e.covermark_raster_size(3.0, 0.5);
         assert!(w > 0 && h > 0);
+    }
+
+    /// DRAGON-391 — the SAME DRAGON-362 contract, measured against the covermark's canvas (the
+    /// image) rather than the source frame: a crop makes the image the crop rect, so the raster
+    /// tracks THAT footprint. The properties are untouched — it still scales with the on-screen
+    /// device pixels and still caps at 1:1 with the canvas's own pixels; only WHAT it spans
+    /// followed the crop, which is what lets the mark cover the extension without overshooting it.
+    #[test]
+    fn dragon391_covermark_raster_size_tracks_the_cropped_image() {
+        let mut e = EditState { frame: (4000, 2000), ..Default::default() };
+        // An over-crop 1000 px LEFT of the source, 2000×2500 (taller than the source — the black
+        // extension): at half the on-screen footprint the raster is half the CROP, not the frame.
+        e.crop = Some(CropRect { x: -1000.0, y: 0.0, w: 2000.0, h: 2500.0 });
+        assert_eq!(e.covermark_raster_size(1.0, 0.5), (1000, 1250));
+        // The cap is 1:1 with the crop — no detail beyond it, matching the bake, which rasterizes
+        // exactly the cut canvas's pixels.
+        assert_eq!(e.covermark_raster_size(100.0, 0.5), (2000, 2500));
+        // A crop SMALLER than the frame shrinks the raster with it (it is genuinely smaller now).
+        e.crop = Some(CropRect { x: 0.0, y: 0.0, w: 800.0, h: 400.0 });
+        assert_eq!(e.covermark_raster_size(1.0, 1.0), (800, 400));
     }
 
     /// The scale is the on-screen footprint fraction, snapped UP to a [`RASTER_QUANTUM`] step
@@ -1812,6 +1973,228 @@ mod tests {
             px: (100, 100),
         };
         assert!(left.dest_in((1280.0, 720.0), (1280.0, 720.0))[0] < 0.0);
+    }
+
+    /// DRAGON-396: the two caption PLACEMENTS must agree on screen — the historical form (stretch
+    /// the layer across the picture, locate the caption by these `dest_in` fractions) and the crop
+    /// session's (place the layer at the caption's own region through the annotation canvas's
+    /// `CanvasMap`, which is what lets a caption OUTSIDE the image be drawn at all: a shader is
+    /// clipped to its own widget rect, so a picture-wide layer can never leave the picture).
+    ///
+    /// Switching forms must move a caption's BOUND, never the caption. Checked un-cropped AND
+    /// against a crop with a NEGATIVE origin (the over-crop case), since the crop shift reaches the
+    /// two forms by different routes: `dest_in`'s origin argument vs the map's own.
+    #[test]
+    fn dragon396_region_placement_matches_the_picture_fraction_form() {
+        use crate::widgets::annotation_canvas::{CanvasMap, region_on_screen};
+        use super::super::annotate::AnnotRect;
+        for (offset, source) in
+            [((0.0f32, 0.0f32), (800.0f32, 600.0f32)), ((-120.0, -40.0), (500.0, 400.0))]
+        {
+            let map = CanvasMap {
+                bounds: (1000.0, 700.0),
+                zoom: 0.5,
+                pan: (30.0, -12.0),
+                disp: (640.0, 480.0),
+                source,
+                offset,
+            };
+            let origin = (17.0, 23.0);
+            let picture = region_on_screen(&map, origin, (offset.0, offset.1, source.0, source.1));
+            // A caption inside the image, and one wholly OUTSIDE it (left of a negative-origin
+            // crop) — the case this ticket exists for.
+            for region in [
+                AnnotRect { x: offset.0 + 40.0, y: offset.1 + 30.0, w: 160.0, h: 90.0 },
+                AnnotRect { x: offset.0 - 220.0, y: offset.1 - 60.0, w: 120.0, h: 50.0 },
+            ] {
+                // Form A (crop session): the region mapped to its own on-screen rect.
+                let a = region_on_screen(&map, origin, (region.x, region.y, region.w, region.h));
+                // Form B (editor): the picture rect with the quad placed inside it by the `dest`
+                // fractions — the arithmetic `layers.rs`'s vertex shader performs.
+                let geom = TextLayerGeom { scale: 1.0, region, px: (1, 1) };
+                let d = geom.dest_in(offset, source);
+                let b = (
+                    picture.x + d[0] * picture.width,
+                    picture.y + d[1] * picture.height,
+                    d[2] * picture.width,
+                    d[3] * picture.height,
+                );
+                for (lhs, rhs, what) in [
+                    (a.x, b.0, "x"),
+                    (a.y, b.1, "y"),
+                    (a.width, b.2, "width"),
+                    (a.height, b.3, "height"),
+                ] {
+                    assert!(
+                        (lhs - rhs).abs() < 0.01,
+                        "{what}: region form {lhs} vs picture-fraction form {rhs} \
+                         (offset {offset:?}, region {region:?})",
+                    );
+                }
+            }
+        }
+    }
+
+    /// DRAGON-391: the covermark's canvas is THE IMAGE — the crop rect once a crop is applied, the
+    /// source frame otherwise — and a live crop SESSION reveals the whole image again, so the
+    /// canvas reverts to the source for the duration.
+    #[test]
+    fn dragon391_covermark_canvas_is_the_crop_rect_once_applied() {
+        let frame = (4000u32, 2000u32);
+        // Un-cropped: the source frame, exactly as always.
+        let plain = EditState { frame, ..Default::default() };
+        assert_eq!(plain.covermark_raster_size(100.0, 1.0), (4000, 2000));
+        // An over-crop 1000 px LEFT of the source: the image is now the 2000×2500 crop — INCLUDING
+        // the black extension it adds, and nothing beyond it (NOT the 5000×2500 source ∪ crop
+        // union, which would pattern past the image the user cropped to).
+        let cropped = EditState {
+            frame,
+            crop: Some(CropRect { x: -1000.0, y: 0.0, w: 2000.0, h: 2500.0 }),
+            ..Default::default()
+        };
+        assert_eq!(cropped.covermark_raster_size(100.0, 1.0), (2000, 2500));
+        // A crop wholly INSIDE the source is the same rule — the image is the crop.
+        let inner = EditState {
+            frame,
+            crop: Some(CropRect { x: 100.0, y: 100.0, w: 1000.0, h: 500.0 }),
+            ..Default::default()
+        };
+        assert_eq!(inner.covermark_raster_size(100.0, 1.0), (1000, 500));
+        // ...and the DRAGON-362 footprint scaling still applies on top of that canvas.
+        assert_eq!(inner.covermark_raster_size(1.0, 0.5), (500, 250));
+        // While a crop SESSION is live the whole image is revealed, so the canvas is the source
+        // frame again — the mark covers what the user can actually see while repositioning.
+        let rect = CropRect { x: -1000.0, y: 0.0, w: 2000.0, h: 2500.0 };
+        let session = EditState {
+            frame,
+            crop: Some(rect),
+            crop_session: Some(CropSession {
+                rect,
+                saved_view: Default::default(),
+                saved_tool: None,
+                drag: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(session.covermark_raster_size(100.0, 1.0), (4000, 2000));
+    }
+
+    /// DRAGON-402: the covermark LAYER is hidden for the duration of a crop session, and the
+    /// document is untouched by it — so both exits restore the mark exactly, and cancel especially
+    /// leaves everything as it was found.
+    #[test]
+    fn dragon402_a_crop_session_hides_the_covermark_layer_without_touching_the_document() {
+        let mark = Covermark { kind: CovermarkKind::Confidential, zoom: 0.35, opacity: 0.6 };
+        let mut e = EditState { frame: (4000, 2000), ..Default::default() };
+        e.set_covermark(Some(mark.clone()));
+        let before = e.covermark.clone();
+        let depth = e.undo_stack.len();
+        assert!(e.covermark_visible(), "no session → the mark draws, exactly as before");
+
+        // Enter a session (over-cropping past the source, the case that reframes hardest).
+        let rect = CropRect { x: -500.0, y: -200.0, w: 3000.0, h: 2400.0 };
+        e.crop_session =
+            Some(CropSession { rect, saved_view: Default::default(), saved_tool: None, drag: None });
+        assert!(!e.covermark_visible(), "a live crop session hides the layer");
+        // HIDE, not clear: the model is untouched, so nothing about the document changed — no
+        // history entry, and the mark (with its zoom/opacity) is exactly as applied.
+        assert_eq!(e.covermark, before, "the session must not touch the covermark model");
+        assert_eq!(e.undo_stack.len(), depth, "hiding a layer is not an edit");
+        assert!(e.dirty(), "and the document is still dirty for the mark it still carries");
+
+        // Cancel: the session simply ends, and the mark is visible again, unchanged.
+        e.crop_session = None;
+        assert!(e.covermark_visible());
+        assert_eq!(e.covermark, before, "cancel leaves the document as it was found");
+    }
+
+    /// DRAGON-410: a crop session forces the global dim CLEAR (maximum brightness, fully
+    /// transparent) for its whole duration — you cannot judge a crop through a dimmed image — and
+    /// the user's value comes back EXACTLY on both exits.
+    ///
+    /// The round-trip is proven on the ACCEPT path and the CANCEL path separately, because the
+    /// ticket asks for both; they are the same two lines here precisely because the dim is a view
+    /// OVERRIDE (nothing is stashed, so no exit can forget to put it back) rather than a
+    /// save-and-restore like `saved_view` / `saved_tool`. The rest of the test is the other half
+    /// of the requirement: the session must not enter the undo history, must not move `dirty()`,
+    /// and must not change what a bake would read.
+    #[test]
+    fn dragon410_a_crop_session_forces_the_dim_clear_and_restores_it_on_both_exits() {
+        let session = |rect: CropRect| CropSession {
+            rect,
+            saved_view: Default::default(),
+            saved_tool: None,
+            drag: None,
+        };
+        let rect = CropRect { x: 10.0, y: 10.0, w: 800.0, h: 600.0 };
+
+        let mut e = EditState { frame: (1000, 800), ..Default::default() };
+        // A user-set dim, applied the ordinary way (one history entry, as the slider commits).
+        e.push_dim(e.dim);
+        e.dim = 0.62;
+        let depth = e.undo_stack.len();
+        assert_eq!(e.view_dim(), 0.62, "no session → the view renders the user's dim");
+        assert!(e.dirty(), "a non-zero dim is a real edit and still bakes");
+
+        // ── ACCEPT path ──────────────────────────────────────────────────────────────────
+        e.crop_session = Some(session(rect));
+        assert_eq!(e.view_dim(), 0.0, "a live session renders at maximum brightness");
+        // A VIEW override: the model, the history and the bake gate are all untouched, so
+        // nothing about the document changed and nothing can leak into a save.
+        assert_eq!(e.dim, 0.62, "the session must not touch the dim model");
+        assert_eq!(e.undo_stack.len(), depth, "forcing the view clear is not an edit");
+        assert!(e.redo_stack.is_empty(), "…and cannot have cleared a redo stack");
+        assert!(e.dirty(), "the document is still dirty for the dim it still carries");
+        // Accept commits the crop and ends the session; the dim comes back exactly.
+        e.set_crop(Some(rect));
+        e.crop_session = None;
+        assert_eq!(e.view_dim(), 0.62, "accept returns the post-crop view to the user's dim");
+        assert_eq!(e.dim, 0.62);
+
+        // ── CANCEL path ──────────────────────────────────────────────────────────────────
+        let after_accept = (e.dim, e.undo_stack.len());
+        e.crop_session = Some(session(rect));
+        assert_eq!(e.view_dim(), 0.0);
+        // Cancel discards the session and touches nothing else at all.
+        e.crop_session = None;
+        assert_eq!(e.view_dim(), 0.62, "cancel restores the user's dim exactly");
+        assert_eq!((e.dim, e.undo_stack.len()), after_accept, "cancel changed nothing");
+
+        // A ZERO dim round-trips as zero — the override is not a floor of its own.
+        let mut plain = EditState { frame: (100, 80), ..Default::default() };
+        assert_eq!(plain.view_dim(), 0.0);
+        plain.crop_session = Some(session(CropRect { x: 0.0, y: 0.0, w: 50.0, h: 40.0 }));
+        assert_eq!(plain.view_dim(), 0.0);
+        plain.crop_session = None;
+        assert_eq!(plain.view_dim(), 0.0);
+    }
+
+    /// The layer READ is where the rule lives (DRAGON-402), so no mount can honour it and another
+    /// forget: with a session live there is no raster to draw, even though the slot still holds one
+    /// — which is what makes the restore on exit a redraw rather than a re-render.
+    #[test]
+    fn dragon402_the_layer_read_is_empty_during_a_session_though_the_slot_is_not() {
+        let mut e = EditState { frame: (100, 80), ..Default::default() };
+        e.set_covermark(Some(Covermark {
+            kind: CovermarkKind::Confidential,
+            zoom: 0.0,
+            opacity: 1.0,
+        }));
+        // A raster in the slot, as a live document would have.
+        let frame = super::super::layers::PixelFrame::new(vec![0u8; 4 * 4 * 4], 4, 4);
+        let generation = e.cm_raster.begin().expect("a fresh slot is not refreshing");
+        e.cm_raster.finish(generation, Some(frame));
+        assert!(e.cm_raster.frame().is_some(), "the slot holds a raster");
+        assert!(e.covermark_layer().is_some(), "…and it draws with no session");
+
+        let rect = CropRect { x: 0.0, y: 0.0, w: 50.0, h: 40.0 };
+        e.crop_session =
+            Some(CropSession { rect, saved_view: Default::default(), saved_tool: None, drag: None });
+        assert!(e.covermark_layer().is_none(), "a session yields nothing to draw");
+        assert!(e.cm_raster.frame().is_some(), "…but the slot KEEPS it, ready for the exit");
+
+        e.crop_session = None;
+        assert!(e.covermark_layer().is_some(), "the same raster draws again on exit");
     }
 
     /// DRAGON-352: `dirty()` is THE shared bake gate — Copy/Save (`begin_bake`) and
@@ -2104,6 +2487,36 @@ mod tests {
         assert!(s.is_empty() && s.primary().is_none());
     }
 
+    /// DRAGON-397's live band PREVIEW must show what release will COMMIT. The preview is
+    /// computed in the canvas widget ([`crate::widgets::annotation_canvas::band_preview_ids`]),
+    /// the commit here (`set_all` / `add_all`) — two places, so this pins them to the same
+    /// answer for both modifier states, including the ordering (which decides the primary) and
+    /// the already-selected-item case the ticket calls out.
+    #[test]
+    fn the_band_preview_matches_what_the_commit_would_select() {
+        use crate::widgets::annotation_canvas::band_preview_ids;
+        let cases: [(&[u64], &[u64]); 4] =
+            [(&[], &[1, 2]), (&[7, 8], &[1, 2]), (&[7, 8], &[8, 1]), (&[7, 8], &[])];
+        for (existing, hits) in cases {
+            for additive in [false, true] {
+                let mut sel = Selection::default();
+                sel.set_all(existing.iter().copied().map(AnnotId));
+                let ids = hits.iter().copied().map(AnnotId);
+                if additive {
+                    sel.add_all(ids);
+                } else {
+                    sel.set_all(ids);
+                }
+                let committed: Vec<u64> = sel.ids().iter().map(|i| i.0).collect();
+                assert_eq!(
+                    committed,
+                    band_preview_ids(existing, hits, additive),
+                    "existing={existing:?} hits={hits:?} additive={additive}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn selection_prunes_ids_that_left_the_scene() {
         use crate::app::preview::annotate::{AnnotKind, AnnotRect, AnnotationItem};
@@ -2203,6 +2616,115 @@ mod tests {
              [vc][1:v]overlay=(W-w)/2:(H-h)/2[v]"
         );
         assert!(!g.contains("[a]"), "no audio chain for a silent recording");
+    }
+
+    // ── The video bake's ffmpeg plan (DRAGON-398) ────────────────────────────────────
+
+    /// **THE uncut invariant, pinned.** CLAUDE.md: "An UNCUT timeline must keep its
+    /// historical ffmpeg invocations byte-identical (stream-copy / overlay-only paths)."
+    /// A recording with no edits must never start re-encoding because the save workflow
+    /// changed, so the exact argument lists are asserted here rather than inferred.
+    ///
+    /// Note what is ABSENT from both uncut shapes: no `-filter_complex` at all in the
+    /// stream-copy case, and no `trim`/`concat` in the covermark case.
+    #[test]
+    fn an_uncut_timeline_keeps_its_historical_ffmpeg_invocation() {
+        // 1. No cut, no covermark: EVERY stream copied. Nothing is re-encoded, so a plain
+        //    Save As / Copy of an untouched recording costs one file copy's worth of ffmpeg.
+        assert_eq!(
+            video_bake_args(None, true, false, "mp4"),
+            ["-map", "0", "-c", "copy", "-movflags", "+faststart"]
+        );
+        // The audio flag is irrelevant to a stream copy (`-map 0` takes whatever is there).
+        assert_eq!(
+            video_bake_args(None, false, false, "mp4"),
+            video_bake_args(None, true, false, "mp4")
+        );
+        // 2. A covermark WITHOUT a cut: the historical overlay-only graph — video re-encoded,
+        //    audio STREAM-COPIED (`-c:a copy`), and no trim/concat anywhere.
+        let overlay_only = video_bake_args(None, true, true, "mp4");
+        assert_eq!(
+            overlay_only,
+            [
+                "-filter_complex",
+                "[0:v][1:v]overlay=(W-w)/2:(H-h)/2[v]",
+                "-map",
+                "[v]",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "18",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+            ]
+        );
+        assert!(!overlay_only.iter().any(|a| a.contains("trim") || a.contains("concat")));
+        // 3. A razor-only timeline reaches here as `keep: None` (the caller filters on
+        //    `Timeline::edited`), and an EMPTY span list is treated the same way — neither
+        //    may produce a `concat=n=0` or drag the file through a re-encode.
+        for keep in [None, Some(&[][..])] {
+            assert_eq!(
+                video_bake_args(keep, true, false, "mp4"),
+                ["-map", "0", "-c", "copy", "-movflags", "+faststart"],
+                "an uncut timeline must stream-copy"
+            );
+        }
+    }
+
+    /// A CUT timeline is the one shape that re-encodes both streams — arbitrary trim points
+    /// cannot stream-copy. The graph itself is `cut_filtergraph`'s (tested above); this pins
+    /// the maps and codecs around it, and that the audio maps/encoder appear only when there
+    /// IS a soundtrack (mapping `[a]` on a silent recording would fail the whole export).
+    #[test]
+    fn a_cut_timeline_re_encodes_both_streams() {
+        let keep = [Span { start: 0.0, end: 1.0 }, Span { start: 2.0, end: 3.0 }];
+        let with_audio = video_bake_args(Some(&keep), true, false, "mp4");
+        assert_eq!(with_audio[0], "-filter_complex");
+        assert_eq!(with_audio[1], cut_filtergraph(&keep, true, false));
+        assert_eq!(
+            &with_audio[2..],
+            [
+                "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast", "-crf",
+                "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags",
+                "+faststart",
+            ]
+        );
+        // Silent recording: no `[a]` map and no audio encoder.
+        let silent = video_bake_args(Some(&keep), false, false, "mp4");
+        assert!(!silent.iter().any(|a| a == "[a]" || a == "aac" || a == "-b:a"));
+        assert!(silent.iter().any(|a| a == "libx264"), "video still re-encodes");
+        // A cut WITH a covermark folds the overlay into the same graph (one ffmpeg run, not
+        // two), so the argument shape is the cut one.
+        let both = video_bake_args(Some(&keep), true, true, "mp4");
+        assert_eq!(both[1], cut_filtergraph(&keep, true, true));
+        assert_eq!(&both[2..], &with_audio[2..]);
+    }
+
+    /// `+faststart` is an MP4-family container flag, so it rides exactly the extensions that
+    /// understand it — every bake shape, and no others (ffmpeg errors on an unknown movflag).
+    #[test]
+    fn faststart_follows_the_container_not_the_edit() {
+        let keep = [Span { start: 0.0, end: 1.0 }];
+        for shape in [None, Some(&keep[..])] {
+            for overlay in [true, false] {
+                for ext in ["mp4", "m4v", "mov"] {
+                    let a = video_bake_args(shape, true, overlay, ext);
+                    assert_eq!(&a[a.len() - 2..], ["-movflags", "+faststart"], "{ext}");
+                }
+                for ext in ["mkv", "webm", "avi", "MP4"] {
+                    let a = video_bake_args(shape, true, overlay, ext);
+                    assert!(!a.iter().any(|x| x == "-movflags"), "{ext} takes no movflags");
+                }
+            }
+        }
     }
 
     // ── The save point (DRAGON-353 follow-up) ─────────────────────────────────────────
@@ -2424,6 +2946,111 @@ mod tests {
         // (x=27) — so the shape renders continuously across the source/extension seam.
         assert!(is_red(out.get_pixel(13, 16)), "red on the extension side: {:?}", out.get_pixel(13, 16));
         assert!(is_red(out.get_pixel(27, 16)), "red on the source side: {:?}", out.get_pixel(27, 16));
+    }
+
+    // ── DRAGON-391: the over-crop bake patterns the COVERMARK onto the black extension ────────
+
+    /// A deterministic two-colour covermark: the left half of a square viewBox is RED, the right
+    /// half BLUE — no text, so it rasterizes identically on every box (no font dependency), and the
+    /// colour boundary makes the pattern's placement and scale directly observable.
+    struct TmpSvg(std::path::PathBuf);
+    impl Drop for TmpSvg {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn half_and_half_mark(tag: &str) -> (TmpSvg, Covermark) {
+        let path =
+            std::env::temp_dir().join(format!("cck-dragon391-{}-{tag}.svg", std::process::id()));
+        std::fs::write(
+            &path,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+<rect x="0" y="0" width="50" height="100" fill="#ff0000"/>
+<rect x="50" y="0" width="50" height="100" fill="#0000ff"/>
+</svg>"##,
+        )
+        .unwrap();
+        let cm = Covermark { kind: CovermarkKind::File(path.clone()), zoom: 0.0, opacity: 1.0 };
+        (TmpSvg(path), cm)
+    }
+
+    fn is_blue(p: &::image::Rgba<u8>) -> bool {
+        p.0[2] > 180 && p.0[0] < 80 && p.0[1] < 80
+    }
+
+    #[test]
+    fn dragon391_bake_covers_the_whole_cropped_image_extension_included() {
+        let src = tmp_png("cm-extend-src");
+        let dst = tmp_png("cm-extend-dst");
+        let (_svg, cm) = half_and_half_mark("extend");
+        flat(40, 40, 128).save_with_format(&src.0, ::image::ImageFormat::Png).unwrap();
+        // A crop extending 20 px LEFT of the source → a 60×40 image; output x in [0,20) is the
+        // black extension, [20,60) the source. The image IS that 60×40 rect, so the square mark
+        // cover-fits IT (scale 0.6): red half over output x 0..30, blue over 30..60.
+        let crop = Some(CropRect { x: -20.0, y: 0.0, w: 60.0, h: 40.0 });
+        bake_image(&src.0, &dst.0, Some(&cm), &[], CURVE, 0.0, crop).unwrap();
+        let out = ::image::open(&dst.0).unwrap().into_rgba8();
+        assert_eq!(out.dimensions(), (60, 40), "output is the crop's pixel size");
+        // Ink on BOTH sides of the source's left edge (output x = 20) — the mark covers the black
+        // extension continuously with the source, instead of stopping at the old image edge.
+        assert!(is_red(out.get_pixel(10, 20)), "the extension side: {:?}", out.get_pixel(10, 20));
+        assert!(is_red(out.get_pixel(25, 20)), "the source side: {:?}", out.get_pixel(25, 20));
+        assert!(is_blue(out.get_pixel(45, 20)), "the mark's blue half: {:?}", out.get_pixel(45, 20));
+        // EVERY pixel of the image carries the mark — no bare corner anywhere in the extension.
+        for (x, y) in [(0u32, 0u32), (0, 39), (59, 0), (59, 39), (19, 20), (20, 20)] {
+            let p = out.get_pixel(x, y);
+            assert!(is_red(p) || is_blue(p), "bare pixel at ({x},{y}): {p:?}");
+        }
+    }
+
+    /// The canvas is the CROP RECT — not the source, and not the source ∪ crop union. The union is
+    /// strictly larger whenever the crop does not contain the source, and fitting the mark to it
+    /// would pattern past the image the user cropped to.
+    #[test]
+    fn dragon391_bake_patterns_over_the_crop_not_the_union() {
+        let src = tmp_png("cm-canvas-src");
+        let dst = tmp_png("cm-canvas-dst");
+        let (_svg, cm) = half_and_half_mark("canvas");
+        flat(40, 40, 128).save_with_format(&src.0, ::image::ImageFormat::Png).unwrap();
+        // A 40×40 crop 20 px LEFT of the source covers source x -20..20; the union (-20..40) would
+        // be 60 wide. Fitted to the CROP (scale 0.4) the mark's red/blue boundary lands at output
+        // x 20; fitted to the UNION (scale 0.6) it would land at x 30 and x 25 would still be red.
+        let crop = Some(CropRect { x: -20.0, y: 0.0, w: 40.0, h: 40.0 });
+        bake_image(&src.0, &dst.0, Some(&cm), &[], CURVE, 0.0, crop).unwrap();
+        let out = ::image::open(&dst.0).unwrap().into_rgba8();
+        assert_eq!(out.dimensions(), (40, 40));
+        assert!(is_red(out.get_pixel(10, 20)), "extension side: {:?}", out.get_pixel(10, 20));
+        assert!(
+            is_blue(out.get_pixel(25, 20)),
+            "the mark must be fitted to the CROP, not the source ∪ crop union: {:?}",
+            out.get_pixel(25, 20),
+        );
+    }
+
+    /// The same rule with no over-crop at all: after an inner crop the image is that crop, so the
+    /// mark re-fits to it. This DELIBERATELY replaces the pre-DRAGON-391 behaviour (a fragment of a
+    /// source-fitted mark, whatever happened to fall inside the crop) — "the image is the crop" is
+    /// one rule with no special case, and it is what makes live and bake agree.
+    #[test]
+    fn dragon391_inner_crop_bake_refits_the_mark_to_the_crop() {
+        let src = tmp_png("cm-inner-src");
+        let dst = tmp_png("cm-inner-dst");
+        let (_svg, cm) = half_and_half_mark("inner");
+        flat(40, 40, 128).save_with_format(&src.0, ::image::ImageFormat::Png).unwrap();
+        // A 20×24 crop inside the source: the mark cover-fits THAT, so its red/blue boundary sits
+        // at the output's own midpoint (x = 10), wherever in the source the crop was taken.
+        let rect = CropRect { x: 8.0, y: 6.0, w: 20.0, h: 24.0 };
+        bake_image(&src.0, &dst.0, Some(&cm), &[], CURVE, 0.0, Some(rect)).unwrap();
+        let out = ::image::open(&dst.0).unwrap().into_rgba8();
+        assert_eq!(out.dimensions(), (20, 24));
+        assert!(is_red(out.get_pixel(5, 12)), "left half: {:?}", out.get_pixel(5, 12));
+        assert!(is_blue(out.get_pixel(15, 12)), "right half: {:?}", out.get_pixel(15, 12));
+        // The equivalent uncropped bake is untouched: the mark fits the 40×40 source, boundary at
+        // x = 20 — so nothing about the un-cropped path moved.
+        let plain = tmp_png("cm-inner-plain");
+        bake_image(&src.0, &plain.0, Some(&cm), &[], CURVE, 0.0, None).unwrap();
+        let full = ::image::open(&plain.0).unwrap().into_rgba8();
+        assert!(is_red(full.get_pixel(10, 20)) && is_blue(full.get_pixel(30, 20)));
     }
 
     #[test]

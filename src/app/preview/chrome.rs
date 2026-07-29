@@ -25,6 +25,11 @@ const ANNOT_PALETTE_ROW_H: f32 = 28.0;
 /// [`COVERMARK_PANEL_ROW_H`] for the upward-floating picker on the bottom bar.
 const ANNOT_PICKER_CONTENT_H: f32 = 214.0;
 
+/// The LABEL on a live crop session's accept button (DRAGON-410). Named because two places read
+/// it: [`Tb::crop_items`], which draws it, and the test that proves the labelled pair still fits
+/// the narrowest preview the editor will open at.
+pub(super) const CROP_ACCEPT_LABEL: &str = "Accept Crop";
+
 /// Format a tool tooltip as `"Name  (KEY)"`, reading the LIVE binding for `action` from the
 /// keymap (the SAME lookup the settings shortcuts page uses: [`crate::shortcuts::Keymap::get`]
 /// → [`crate::shortcuts::Shortcut::label`]). Falls back to just `"Name"` when the action is
@@ -37,9 +42,28 @@ pub(super) fn action_tip(name: &str, action: crate::shortcuts::Action, km: &crat
     }
 }
 
-/// Toolbar-builder scale context — an explicit value replacing a former `thread_local`:
-/// 1.0 for the fullscreen overlay, 0.82 for the windowed preview (its smaller window
-/// wants tighter chrome; see [`PreviewSurface::btn_scale`]). Built once at the top of
+/// A tooltip for a control whose key is **not** in the keymap — same `"Name  (KEY)"` shape as
+/// [`action_tip`], with the key spelled literally.
+///
+/// Used by exactly two controls: the crop session's ACCEPT (Enter) and REJECT (Esc). Those are
+/// not [`crate::shortcuts::Action`]s and deliberately so — a live crop session is MODAL and takes
+/// the keyboard whole in `keyboard.rs`'s `preview_modal_key`, matching `Named::Enter` /
+/// `Named::Escape` directly and swallowing everything else, exactly as a live text edit does.
+/// There is nothing in the keymap to read, and nothing a user could rebind, so the literal is
+/// honest rather than a shortcut around the live-binding rule. Keep the FORM here so the two
+/// tooltips still match the rest of the tray's.
+///
+/// (Verified rather than assumed, DRAGON-392: Enter really does accept and Esc really does
+/// cancel; the crop branch runs BEFORE the keymap dispatch, so Esc cancels the SESSION and never
+/// closes the editor; and a session can no longer coexist with a live text edit — entering one
+/// settles it — so Enter has one meaning.)
+pub(super) fn fixed_key_tip(name: &str, key: &str) -> String {
+    format!("{name}  ({key})")
+}
+
+/// Toolbar-builder scale context — an explicit value replacing a former `thread_local`.
+/// ONE [`super::surface::CHROME_SCALE`] for both surface kinds (it was per-surface once; see
+/// [`PreviewSurface::btn_scale`]). Built once at the top of
 /// `preview_view` and threaded down through every scale-dependent builder below (and
 /// the `App` methods that call them) as a plain argument.
 #[derive(Clone, Copy)]
@@ -77,9 +101,16 @@ impl Tb {
         }
     }
 
-    /// The scaled toolbar-button glyph box.
+    /// The scaled toolbar-button glyph box, SNAPPED to a whole logical pixel.
+    ///
+    /// The rounding is the DRAGON-399 fix and is load-bearing, not tidiness: iced rasterizes an
+    /// SVG at `ceil(display_scale × bounds)` and draws it into the bounds given, so a fractional
+    /// box (`ICON_BOX 22 × CHROME_SCALE 0.91 = 20.02`) rasters at 21px, is drawn into 20.02, and
+    /// gets bilinearly RESAMPLED — which is what put the visible step in the accept checkmark's
+    /// arm and defeated six successive asset fixes. See [`crate::widgets::icons::box_px`] for the
+    /// measurement and for why this must never become scale-value-specific.
     pub(super) fn icon_box(self) -> f32 {
-        ICON_BOX * self.scale
+        crate::widgets::icons::box_px(ICON_BOX * self.scale)
     }
     /// The scaled per-button inner padding.
     pub(super) fn btn_pad(self) -> f32 {
@@ -124,9 +155,7 @@ impl Tb {
         pos: widget::tooltip::Position,
         tint: Option<fn(&cosmic::Theme) -> cosmic::iced::Color>,
     ) -> Element<'static, Msg> {
-        let icon = widget::icon::icon(crate::widgets::icons::handle(name))
-            .width(Length::Fixed(self.icon_box()))
-            .height(Length::Fixed(self.icon_box()));
+        let icon = crate::widgets::icons::sized(name, self.icon_box());
         let icon = match tint {
             Some(tint) => icon.class(cosmic::theme::Svg::Custom(std::rc::Rc::new(
                 move |t: &cosmic::Theme| cosmic::widget::svg::Style { color: Some(tint(t)) },
@@ -183,43 +212,38 @@ impl Tb {
     /// capsule buttons, and the dropdown's panel (`s`) rounding would square its corners off
     /// under the "round" preference.
     ///
-    /// `chrome` decides whether that surface is PAINTED at all ([`ClusterChrome`]): a `Bare`
-    /// group keeps the identical padded footprint (so the row's spacing and alignment don't
-    /// shift) and simply draws no fill and no border.
-    ///
     /// A one-member cluster gets exactly the same container as a five-member one (same border,
     /// padding and corner treatment) — that is deliberate, and the reason there is no
     /// single-member special case anywhere.
+    ///
+    /// EVERY cluster paints this one surface. There used to be a declared per-group `chrome`
+    /// axis (`ClusterChrome::Bare`: the identical padded footprint with no fill and no border)
+    /// for the lone Select button, which read as one more bordered box when it stood by itself;
+    /// DRAGON-392 made Select part of a real three-peer group (Select / Hand / Crop), leaving no
+    /// bare group anywhere. If a group ever needs the footprint-only look again, the axis comes
+    /// back HERE and as a field on [`TrayGroup`] — never as a special case in view code.
     pub(super) fn tool_cluster<'a>(
         self,
         items: Vec<Element<'a, Msg>>,
-        chrome: ClusterChrome,
     ) -> Element<'a, Msg> {
         let glass = self.glass;
         widget::container(widget::row(items).spacing(2.0).align_y(Alignment::Center))
             .padding(self.grp_pad())
             .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
-                let radius = crate::app::theme::rounding(theme).xl.into();
-                match chrome {
-                    ClusterChrome::Surface => cosmic::iced::widget::container::Style {
-                        background: Some(Background::Color(crate::app::theme::frost_color(
-                            theme.cosmic().background.component.base.into(),
-                            glass,
-                        ))),
-                        border: Border {
-                            radius,
-                            width: 1.0,
-                            // The DROPDOWN's outline token — a group outline is chrome, never
-                            // a state, so it never tracks selection.
-                            color: theme.cosmic().background.divider.into(),
-                        },
-                        ..Default::default()
+                cosmic::iced::widget::container::Style {
+                    background: Some(Background::Color(crate::app::theme::frost_color(
+                        theme.cosmic().background.component.base.into(),
+                        glass,
+                    ))),
+                    border: Border {
+                        radius: crate::app::theme::rounding(theme).xl.into(),
+                        width: 1.0,
+                        // The DROPDOWN's outline token — a group outline is chrome, never
+                        // a state, so it never tracks selection. Shared with the disabled
+                        // tone through [`cluster_border`].
+                        color: cluster_border(theme),
                     },
-                    // Footprint only: no fill, no border, nothing to see.
-                    ClusterChrome::Bare => cosmic::iced::widget::container::Style {
-                        border: Border { radius, ..Default::default() },
-                        ..Default::default()
-                    },
+                    ..Default::default()
                 }
             })))
             .into()
@@ -296,7 +320,7 @@ impl Tb {
     /// THE action group (DRAGON-353): Save / Save As / Copy / Delete, in one capsule.
     ///
     /// Delete joined the share actions here (it used to sit beside the size chip, which
-    /// now stands alone — see [`Self::size_chip`]) so every way of DISPOSING of the capture
+    /// now stands alone — see [`Self::info_chip`]) so every way of DISPOSING of the capture
     /// reads as one set. `--preview` (`external`) files drop Delete: that file is the
     /// user's, not ours to remove.
     ///
@@ -357,21 +381,67 @@ impl Tb {
         // DRAGON-357: the same bordered cluster the top-left tray groups wear (the per-button
         // companion tint on Save/Save As/Copy and the untinted Delete are unchanged — only the
         // group container gains its 1px border).
-        self.tool_cluster(buttons, ClusterChrome::Surface)
+        self.tool_cluster(buttons)
     }
 
-    /// The saved file's SIZE, in a capsule of its own (DRAGON-353 split it out of the old
-    /// size+Delete group, so the actions read as actions and the size reads as information).
-    /// `None` before the file exists.
-    pub(super) fn size_chip(self, size: Option<u64>) -> Option<Element<'static, Msg>> {
-        let bytes = size?;
-        // Match a button's inner box (icon + its vertical padding) so the chip is the same
-        // height as the action group; the text stays vertically centred within it.
-        let label = widget::container(widget::text(friendly_size(bytes)).size(13))
-            .height(Length::Fixed(self.icon_box() + 2.0 * self.btn_pad()))
-            .padding([0.0, self.btn_pad()])
-            .align_y(Alignment::Center);
-        Some(self.tool_group(vec![label.into()]))
+    /// **THE document-info block** (DRAGON-392): the media's RESOLUTION over the saved file's
+    /// SIZE, two quiet lines of BARE TEXT on the bottom bar — no group fill, no border (the owner
+    /// removed the chip: it is information, not a control, and a chip made it read as one). Built
+    /// ONCE for both media kinds, and both place it immediately LEFT of the scale/zoom group (a
+    /// video has no zoom group, so there it is simply the right-hand item).
+    ///
+    /// `res` is the DISPLAY frame (`PreviewState::display_frame`), so a CROPPED still reports the
+    /// framing that would be exported, not the original grab. `None` for either half simply drops
+    /// that line (the size is unknown until the file exists, the resolution until the decode /
+    /// probe lands); with neither there is nothing to show at all.
+    ///
+    /// Sizing/typography, all deliberate:
+    /// * both lines wear [`TEXT_MENU_LABEL_SIZE`] — the SAME size as the text tool's px list
+    ///   (the owner's reference point), read from that constant rather than a copied literal;
+    /// * both are quiet via [`quiet_on_bar`], measured against the BAR (`primary.base`) now that
+    ///   there is no chip between the text and it. Plain `theme::subdued` is still not the right
+    ///   token here — it is blended toward `background.base`, which the bar is not;
+    /// * horizontal padding is [`TOOLBAR_ROW_GAP`], the row's own inter-item gap, rather than the
+    ///   cluster's inner inset it used while it had a border: bare text needs a gap of its own to
+    ///   clear its neighbours' borders (see that constant);
+    /// * the block is PINNED to the standard button-box height, so it can never make the bar
+    ///   taller than the groups beside it — the toolbar height is reserved arithmetically
+    ///   (`PreviewSurface::chrome_h`) and a bar that outgrew its reserve would push the media out
+    ///   of its fitted box. (2 × 13 × 1.15 ≈ 30px inside the 31px box; the digits and "×" carry
+    ///   no descenders, so nothing is clipped.)
+    pub(super) fn info_chip(
+        self,
+        res: Option<(u32, u32)>,
+        size: Option<u64>,
+    ) -> Option<Element<'static, Msg>> {
+        let quiet = |s: String| {
+            widget::text(s)
+                .size(TEXT_MENU_LABEL_SIZE)
+                .line_height(cosmic::iced::widget::text::LineHeight::Relative(1.15))
+                .class(cosmic::theme::Text::Custom(|t: &cosmic::Theme| {
+                    cosmic::iced::widget::text::Style {
+                        color: Some(quiet_on_bar(t)),
+                        ..Default::default()
+                    }
+                }))
+        };
+        let mut lines: Vec<Element<'static, Msg>> = Vec::new();
+        if let Some((w, h)) = res.filter(|(w, h)| *w > 0 && *h > 0) {
+            lines.push(quiet(format!("{w} × {h}")).into());
+        }
+        if let Some(bytes) = size {
+            lines.push(quiet(friendly_size(bytes)).into());
+        }
+        if lines.is_empty() {
+            return None;
+        }
+        let block = widget::container(
+            widget::column(lines).spacing(0.0).align_x(Alignment::Start),
+        )
+        .height(Length::Fixed(self.icon_box() + 2.0 * self.btn_pad()))
+        .padding([0.0, TOOLBAR_ROW_GAP])
+        .align_y(Alignment::Center);
+        Some(block.into())
     }
 }
 
@@ -397,7 +467,7 @@ pub(super) fn toolbar_row<'a>(
     }
     items.extend(right);
     widget::row(items)
-        .spacing(8.0)
+        .spacing(TOOLBAR_ROW_GAP)
         .width(Length::Fill)
         .align_y(Alignment::Center)
         .into()
@@ -455,11 +525,16 @@ impl Tb {
 /// appearance / undo / redo / Close line (DRAGON-337), which the WINDOWED arm never gets
 /// (those controls live in its titlebar) and so always passes `None`.
 ///
-/// `toasts` (DRAGON-353) is stacked over the MEDIA element in both arms — never over the
-/// column — which is what keeps a toast inside the picture area and clear of the toolbars,
-/// the annotation tray and the video transport strip at any window size. The stack itself is
-/// UNCONDITIONAL (DRAGON-375): a toast coming or going must not change the tree SHAPE under
-/// this position, or iced discards the media subtree's state mid-gesture — see below.
+/// `toasts` (DRAGON-353) is stacked over the media VIEWPORT in both arms — the whole region
+/// BETWEEN the toolbars — and never over the column, which is what keeps a toast clear of the
+/// toolbars, the annotation tray and the video transport strip at any window size. It used to
+/// anchor to the media ELEMENT (its fitted pixels), which held that same guarantee but made the
+/// anchor as small as the picture: a small capture put the toast near the window's CENTRE and
+/// then flitted it right as the media settled into its fitted box (DRAGON-393). Anchoring to
+/// the REGION is the fix — same clearance, a position that no longer depends on the media's
+/// size. The stack itself is UNCONDITIONAL (DRAGON-375): a toast coming or going must not
+/// change the tree SHAPE under this position, or iced discards the media subtree's state
+/// mid-gesture — see below.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compose_preview<'a>(
     windowed: bool,
@@ -489,23 +564,29 @@ pub(super) fn compose_preview<'a>(
     // are silently DROPPED by `Stack::push`, which would put the child count (and so the bug)
     // straight back. Only the FIRST child dictates the stack's sizing, so the placeholder cannot
     // affect layout, and `Space` never captures a pointer event.
+    //
+    // The stack's BASE layer is the media REGION, not the bare media element (DRAGON-393): the
+    // fill/centre container that used to sit OUTSIDE the stack is now its first child
+    // ([`toast_region`]), so the stack — which takes its size from that first child alone —
+    // spans the whole space between the toolbars. The media still centres inside it exactly as
+    // before (the same container, only moved), and the toast layer (`Fill`×`Fill`, top-right
+    // aligned) now measures against the region instead of the picture. WINDOWED the region fills
+    // both axes; in the OVERLAY it is the hugged column's width by the media row's own height —
+    // the same box the toolbars span.
+    let region = if windowed {
+        toast_region(image, Length::Fill, Length::Fill)
+    } else {
+        toast_region(image, Length::Fill, Length::Shrink)
+    };
     let image: Element<'a, Msg> = cosmic::iced::widget::stack(vec![
-        image,
+        region,
         toasts.unwrap_or_else(|| widget::Space::new().into()),
     ])
     .into();
     if windowed {
         // The windowed preview's titlebar owns those controls; nothing to slot in here.
         drop(overlay_header);
-        let mut col: Vec<Element<'a, Msg>> = vec![
-            preview_bar(edit_toolbar, false, glass),
-            widget::container(image)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .into(),
-        ];
+        let mut col: Vec<Element<'a, Msg>> = vec![preview_bar(edit_toolbar, false, glass), image];
         // The video transport strip sits between the canvas and the action bar.
         if let Some(t) = transport {
             col.push(transport_bar(t, true, glass));
@@ -537,6 +618,28 @@ pub(super) fn compose_preview<'a>(
             .align_x(Alignment::Center)
             .into()
     }
+}
+
+/// **THE toast anchor** (DRAGON-393): wrap `content` (the media, or the loading spinner) in the
+/// REGION a toast is placed against, centring it inside. The returned element takes `width` /
+/// `height` from its ARGUMENTS, never from what it wraps — that is the whole point. The toast
+/// layer is `Fill`×`Fill` top-right aligned, and a `stack` sizes itself from its FIRST child, so
+/// whatever this reports is exactly the box the toast corners on.
+///
+/// Before this existed the stack's base layer was the media element itself, whose size is the
+/// picture's FITTED pixels: a small capture gave a small, centred anchor, so a toast opened near
+/// the middle of the window and flitted to the right as the media settled. Wrapping keeps every
+/// property that made "over the media" the original choice — the region is still strictly the
+/// space BETWEEN the toolbars, so a toast can never sit over the toolbars, the annotation tray or
+/// the video transport strip — while making the position independent of the media's size.
+pub(super) fn toast_region<'a>(
+    content: Element<'a, Msg>,
+    width: Length,
+    height: Length,
+) -> Element<'a, Msg> {
+    // `center_x`/`center_y` set the axis length AND its alignment, so this is the same container
+    // the windowed arm always wrapped its media in.
+    widget::container(content).center_x(width).center_y(height).into()
 }
 
 /// The transport strip's wrapper: the play/seek row on a QUIETER surface than the
@@ -704,14 +807,34 @@ impl Tb {
         tip: Element<'static, Msg>,
         tip_pos: widget::tooltip::Position,
     ) -> Element<'static, Msg> {
-        let icon = widget::icon::icon(crate::widgets::icons::handle(name))
-            .width(Length::Fixed(self.icon_box()))
-            .height(Length::Fixed(self.icon_box()))
+        self.tool_toggle_gated(name, on, true, msg, tip, tip_pos)
+    }
+
+    /// [`Self::tool_toggle`] with an ENABLED gate (DRAGON-392 correction): a disabled toggle keeps
+    /// the identical footprint but draws its glyph in [`disabled_label_tone`] — the group's own
+    /// BORDER colour, the faintest line this chrome draws — and carries NO `on_press`, so it
+    /// reads and behaves as unavailable. A crop SESSION gates the tray this way; an ordinary call
+    /// passes `true` and is byte-identical to the historical button.
+    ///
+    /// (`history_button`'s disabled undo/redo keep `theme::subdued` instead: those sit FLAT on
+    /// the header bar with no cluster behind them, so the page-background token is the right one
+    /// there. Same principle — measure against the surface you are actually drawn on.)
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn tool_toggle_gated(
+        self,
+        name: &'static str,
+        on: bool,
+        enabled: bool,
+        msg: PreviewMsg,
+        tip: Element<'static, Msg>,
+        tip_pos: widget::tooltip::Position,
+    ) -> Element<'static, Msg> {
+        let icon = crate::widgets::icons::sized(name, self.icon_box())
             .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |t: &cosmic::Theme| {
-                let color = if on {
-                    crate::app::theme::accent(t)
-                } else {
-                    crate::app::theme::foreground(t)
+                let color = match (enabled, on) {
+                    (false, _) => disabled_label_tone(t),
+                    (true, true) => crate::app::theme::accent(t),
+                    (true, false) => crate::app::theme::foreground(t),
                 };
                 cosmic::widget::svg::Style { color: Some(color) }
             })));
@@ -720,8 +843,8 @@ impl Tb {
         // (no reflow on selection). The Icon button's own base/hover/pressed backgrounds are
         // reconstructed from the theme's `icon_button` component so hover feedback is preserved;
         // the glyph colour still rides the SVG class above (accent when on). Shared by EVERY
-        // toggle group — the top tray tools, the pointer/pan pair and the seven line-width
-        // segments — so the accent ring appears consistently on whichever is armed.
+        // toggle group — the top tray tools (Select / Hand / Crop included) and the seven
+        // line-width segments — so the accent ring appears consistently on whichever is armed.
         let btn = crate::widgets::arrow_cursor::arrow_cursor(
             widget::button::custom(
                 widget::container(icon)
@@ -742,7 +865,9 @@ impl Tb {
                     tool_toggle_style(t, on, focused, ToggleBg::Press)
                 }),
             })
-            .on_press(Msg::Preview(self.pid, msg))
+            // Disabled = NO `on_press` at all (the `history_button` pattern): the press can't
+            // fire and the button reports itself as inert, hover feedback included.
+            .on_press_maybe(enabled.then_some(Msg::Preview(self.pid, msg)))
             .padding(self.btn_pad()),
         );
         self.tip(btn, tip, tip_pos)
@@ -765,10 +890,19 @@ impl Tb {
         round_right: bool,
         tip_pos: widget::tooltip::Position,
     ) -> Element<'static, Msg> {
-        let glyph = widget::icon::icon(crate::widgets::icons::handle(icon))
-            .size(64)
-            .width(Length::Fixed(self.icon_box()))
-            .height(Length::Fixed(self.icon_box()));
+        // DRAGON-392 correction — WHY the colour is set here explicitly. Every OTHER button in
+        // this chrome ([`Self::tool_toggle`]) hands its glyph an explicit `Svg::Custom` colour;
+        // this one used to leave the class at its default, so the bundled lucide SVG rendered
+        // with its own `currentColor` instead of the segment's. On the accent-filled ACTIVE
+        // segment that reads as a dark knockout — the owner's "the icons seem like they are
+        // cutouts". `segment_style` already declares the intent ("Uniform icon color across the
+        // whole group: ... `on_accent`"); this makes the glyph actually obey it, so the checkmark
+        // is a SOLID on-accent mark in the middle of the fill. (The video timeline's
+        // pointer/scissor pair goes through here too and had the same defect.)
+        let glyph = crate::widgets::icons::sized(icon, self.icon_box())
+            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|t: &cosmic::Theme| {
+                cosmic::widget::svg::Style { color: Some(crate::app::theme::on_accent(t)) }
+            })));
         let style = move |t: &cosmic::Theme, hovered: bool| {
             crate::app::theme::segment_style(t, active, hovered, round_left, round_right)
         };
@@ -789,89 +923,83 @@ impl Tb {
         self.tip(btn, widget::text(tip).size(12), tip_pos)
     }
 
-    /// The crop tool's bottom-bar group (DRAGON-382). Idle: a single crop icon with NO group
-    /// chrome (like the select tool's `Bare` cluster), tinted accent when a crop is APPLIED so
-    /// the applied state reads at a glance. Active (a live crop session): the icon is REPLACED by
-    /// a checkmark (accent-filled, on-accent glyph) that accepts and an x (subdued) that cancels,
-    /// in one bordered capsule — so the same slot both opens and confirms the crop. Lives on the
-    /// BOTTOM bar, so tooltips rise.
-    pub(super) fn crop_group(
+    /// The CROP control's buttons (DRAGON-382; DRAGON-392 moved it into the tray group beside
+    /// Select and Hand and made it return ITEMS rather than its own cluster, so it sits inside
+    /// that one group's border). Idle: a plain crop icon. Active (a live crop session): that slot
+    /// becomes the LABELLED **Accept Crop** button plus an x that cancels, so the one slot opens,
+    /// confirms and abandons the crop. Lives on the TOP tray, so tooltips drop below.
+    ///
+    /// **DRAGON-410 — why accept carries a LABEL, and why it is a stock `button::suggested`.**
+    /// A crop session now hides every other top-bar control ([`top_bar_item_state`]), so the pair
+    /// is alone on the bar: nothing is being crowded, and the one control the user must find gets
+    /// named rather than left as a glyph to decode. It is built as
+    /// `button::suggested(..).leading_icon(..)` — the SAME composition as the settings About
+    /// page's donate button — so the icon-to-label gap, the label's size/weight and the accent
+    /// fill are libcosmic's own and match a settings button BY CONSTRUCTION. Copying a spacing
+    /// number here instead would drift the moment the theme's `space_xxxs` moves. The button's
+    /// stock height (`space_l`, 32px) is a hair over the tray's scaled button box (~31px), which
+    /// the cluster absorbs; it is NOT overridden, because overriding it is exactly the
+    /// hand-tuning this composition exists to avoid.
+    ///
+    /// **The accept mark is a CHECKMARK at the set's own stroke weight** — no bold variant. The
+    /// owner's rule (DRAGON-392): the crop, accept and cancel glyphs carry the same weight as
+    /// every other toolbar icon, because out-of-sync variants read as a mistake. A `+1px` pass on
+    /// this pair was tried and withdrawn; a test now pins the whole bundled set to one weight
+    /// (`widgets::icons`).
+    ///
+    /// The accept glyph is still a SPLIT check (two paths, so its vertex is two overlapping round
+    /// caps rather than a stroke join) — that fix is independent of weight and is what stopped
+    /// the tip chipping; see `widgets::icons` for the measurements. Cancel is the stock shared
+    /// `x`, and stays ICON-ONLY: it is the ordinary "get me out of here" affordance every close
+    /// in this chrome wears, and labelling it too would give the destructive half the same visual
+    /// weight as the one the user is meant to reach for.
+    pub(super) fn crop_items(
         self,
         active: bool,
-        applied: bool,
         km: &crate::shortcuts::Keymap,
-    ) -> Element<'static, Msg> {
-        let pos = widget::tooltip::Position::Top;
+    ) -> Vec<Element<'static, Msg>> {
+        let pos = widget::tooltip::Position::Bottom;
+        // The two branches are EXCLUSIVE: the idle crop button is not drawn during a session, and
+        // the accept/reject pair does not exist outside one.
         if active {
-            // Checkmark: the shared accent-filled segment look (on-accent glyph). X: a subdued
-            // plain icon button. Enter/Escape drive the same messages (see `preview_modal_key`).
-            let accept = self.seg_toggle(
-                "emblem-ok-symbolic",
-                true,
-                PreviewMsg::CropAccept,
-                "Apply crop".to_string(),
-                true,
-                true,
+            // Enter/Escape drive the same two messages (see `preview_modal_key`). The tooltip
+            // still carries the key hint even though the button is labelled — the label says
+            // WHAT, the tip says HOW to do it from the keyboard.
+            let accept = self.tip(
+                crate::widgets::arrow_cursor::arrow_cursor(
+                    widget::button::suggested(CROP_ACCEPT_LABEL)
+                        .leading_icon(crate::widgets::icons::handle("crop-accept-symbolic"))
+                        .on_press(Msg::Preview(self.pid, PreviewMsg::CropAccept)),
+                ),
+                widget::text(fixed_key_tip("Apply crop", "Enter")).size(12),
                 pos,
             );
+            // DRAGON-392 correction: the X is PURE foreground — white in the dark themes,
+            // near-black in the light ones — not the `subdued` wash it wore, which read as
+            // "unavailable" next to the accent-filled accept. The glyph is the SHARED stock `x`
+            // (every Close button's), at the set's one stroke weight.
             let cancel = self.tool_button_tinted(
                 "window-close-symbolic",
-                "Cancel crop".to_string(),
+                fixed_key_tip("Cancel crop", "Esc"),
                 PreviewMsg::CropCancel,
                 pos,
-                Some(crate::app::theme::subdued),
+                Some(crate::app::theme::foreground),
             );
-            self.tool_cluster(vec![accept, cancel], ClusterChrome::Surface)
+            vec![accept, cancel]
         } else {
-            let btn = self.tool_toggle(
+            vec![self.tool_toggle(
                 "crop-symbolic",
-                applied,
+                // Never "on" — see the note above. Not a state to compute: a literal, so there is
+                // nothing here for a future edit to wire a document fact back into.
+                false,
                 PreviewMsg::CropEnter,
                 // The tooltip carries the live shortcut hint (DRAGON-385: C).
                 widget::text(action_tip("Crop", crate::shortcuts::Action::PreviewCrop, km))
                     .size(12)
                     .into(),
                 pos,
-            );
-            self.tool_cluster(vec![btn], ClusterChrome::Bare)
+            )]
         }
-    }
-
-    /// The pointer / pan (grabby-hand) tool toggle. DRAGON-357 item 10: the cursor/pan buttons
-    /// wear the SAME bare white/accent glyph treatment as the top tray's tool buttons
-    /// ([`Self::tool_toggle`]) — accent when active, foreground when not, no segment fill or ring
-    /// — instead of the old segmented-capsule look. Lives on the BOTTOM bar, so tooltips rise.
-    pub(super) fn pan_tool_group(
-        self,
-        pan_mode: bool,
-        km: &crate::shortcuts::Keymap,
-    ) -> Element<'static, Msg> {
-        let pos = widget::tooltip::Position::Top;
-        // The pointer/pan toggle's hotkey rides BOTH glyphs.
-        let tip = |name: &str| {
-            widget::text(action_tip(name, crate::shortcuts::Action::PreviewTogglePan, km))
-                .size(12)
-                .into()
-        };
-        self.tool_cluster(
-            vec![
-                self.tool_toggle(
-                    "input-mouse-symbolic",
-                    !pan_mode,
-                    PreviewMsg::SetPanMode(false),
-                    tip("Pointer"),
-                    pos,
-                ),
-                self.tool_toggle(
-                    "object-move-symbolic",
-                    pan_mode,
-                    PreviewMsg::SetPanMode(true),
-                    tip("Pan"),
-                    pos,
-                ),
-            ],
-            ClusterChrome::Surface,
-        )
     }
 
     /// The annotation stroke-width toggle group: Thin (2px) / Medium (5px) / Thick (8px). Each
@@ -1083,9 +1211,7 @@ impl Tb {
     ) -> Element<'static, Msg> {
         if !enabled {
             // Subdued, non-interactive: a dimmed glyph with no `on_press`.
-            let glyph = widget::icon::icon(crate::widgets::icons::handle(icon))
-                .width(Length::Fixed(self.icon_box()))
-                .height(Length::Fixed(self.icon_box()))
+            let glyph = crate::widgets::icons::sized(icon, self.icon_box())
                 .class(cosmic::theme::Svg::custom(|theme| cosmic::widget::svg::Style {
                     color: Some(crate::app::theme::subdued(theme)),
                 }));
@@ -1106,6 +1232,103 @@ impl Tb {
 /// The covermark sliders (and their glyphs) render 20% smaller than the toolbar buttons
 /// in every view — they read fine compact and free up toolbar width.
 pub(super) const SLIDER_SCALE: f32 = 0.8;
+
+/// **The horizontal inset a toolbar cluster gives CONTENT that isn't a button** — the zoom
+/// cluster's slider, which would otherwise hug the group's border.
+pub(super) const CLUSTER_INNER_PAD: f32 = 8.0;
+
+/// **The gap between two items of a toolbar row** ([`toolbar_row`]) — i.e. what separates one
+/// bordered group from the next. Named because the document-info block, which has no group chip
+/// of its own any more, pads itself by exactly this: bare text needs its own gap so it clears
+/// its neighbours' borders instead of nearly touching them (one gap from the row + one of its
+/// own = it reads as separate from the controls, which is what it is).
+pub(super) const TOOLBAR_ROW_GAP: f32 = 8.0;
+
+/// **The QUIET foreground for content drawn on `surface`** — the shared "present but secondary"
+/// tone of the preview chrome: the slider glyphs, the document-info block, and every DISABLED
+/// control (which is why there is exactly one of these rather than a separate disabled tone).
+///
+/// WHY it takes a surface instead of using [`crate::app::theme::subdued`]. That token is the
+/// foreground blended 78% toward `background.base`, the PAGE background — correct for a caption
+/// on the plain background (settings rows, the covermark picker's "None"), and wrong anywhere
+/// else, because the preview chrome paints on OTHER surfaces: a cluster is
+/// `background.component.base` (lighter), a toolbar bar is `primary.base`. Text subdued against
+/// the page can land almost exactly on the fill it is actually sitting on, which is what made the
+/// info block unreadable (DRAGON-392 correction).
+///
+/// So: blend the foreground HALFWAY toward the surface the content really sits on. Same idea,
+/// right backing, and a fixed 50% keeps every quiet thing in the chrome at one strength. Theme
+/// tokens only, so it tracks light/dark and the user's accent. (True alpha is not available
+/// through the icon widget — see [`Tb::slider_with_icon`]'s note — so this is a real, opaque
+/// colour rather than a transparency.)
+fn quiet_on(t: &cosmic::Theme, surface: cosmic::iced::Color) -> cosmic::iced::Color {
+    let fg = crate::app::theme::foreground(t);
+    let mix = |a: f32, b: f32| a + (b - a) * 0.5;
+    cosmic::iced::Color::from_rgb(
+        mix(fg.r, surface.r),
+        mix(fg.g, surface.g),
+        mix(fg.b, surface.b),
+    )
+}
+
+/// **THE cluster BORDER colour** — the 1px hairline [`Tb::tool_cluster`] outlines every toolbar
+/// group with, and (DRAGON-392 correction) the tone a DISABLED control's glyphs/text wear, at the
+/// owner's instruction: "make the subdued color for these toolbar buttons actually match the
+/// button group border". Read through this ONE function by both, so a theme change can never move
+/// the border without moving the disabled tone with it.
+///
+/// It is the theme's `background.divider`, which is ALREADY FLATTENED to an opaque colour by
+/// cosmic-theme (`over(on_bg @ 20% alpha, background.base)`) — so, unlike a raw translucent
+/// token, it is safe as an SVG tint despite the rasterizer discarding colour alpha (see
+/// [`Tb::slider_with_icon`]'s note). Measured: dark `0.266` grey against a `0.182` cluster fill,
+/// light `0.689` against `0.960` — faint in both, deliberately, and never invisible.
+pub(super) fn cluster_border(t: &cosmic::Theme) -> cosmic::iced::Color {
+    t.cosmic().background.divider.into()
+}
+
+/// [`quiet_on`] the CLUSTER fill (`background.component.base`) — content inside a bordered
+/// toolbar group: the slider glyphs, and every control the crop session disables.
+pub(super) fn quiet_on_cluster(t: &cosmic::Theme) -> cosmic::iced::Color {
+    quiet_on(t, t.cosmic().background.component.base.into())
+}
+
+/// [`quiet_on`] the BAR fill (`primary.base`, what [`preview_bar`] paints) — content drawn
+/// directly on a toolbar with no group chip behind it. The document-info block is the one such
+/// case (DRAGON-392 correction: the owner removed its group fill and border).
+///
+/// Note it is NOT `theme::subdued`: the bar is `primary.base`, not `background.base`, so the
+/// plain token is still measured against a surface this text does not sit on. It is close enough
+/// in the light themes and visibly wrong in the dark ones.
+pub(super) fn quiet_on_bar(t: &cosmic::Theme) -> cosmic::iced::Color {
+    quiet_on(t, t.cosmic().primary.base.into())
+}
+
+/// **THE rail width (px) of every slider that rides a toolbar button group** — the covermark
+/// zoom / opacity and the spotlight dim range ([`Tb::slider_with_icon`]). Scaled by
+/// [`SLIDER_SCALE`] at every use, so ONE number moves them together and the width reserve in
+/// `surface.rs` reads the same constant.
+///
+/// The bottom bar's ZOOM rail used to be in this set too (DRAGON-392 brought it here from a
+/// one-off 120px that read oversized beside them). It has since diverged — see
+/// [`ZOOM_SLIDER_W`] — so this is once again the width of the ICON-led sliders only.
+pub(super) const SLIDER_W: f32 = 80.0;
+
+/// **The ZOOM rail's own width (px)** — the shared toolbar rail ([`SLIDER_W`] × [`SLIDER_SCALE`]
+/// = 64) widened by a third, rounded to a whole pixel, at the owner's request.
+///
+/// **This deliberately contradicts DRAGON-392, which unified these widths a few commits ago —
+/// do not "fix" it back.** That unification was right for what it saw: three sliders sitting in
+/// the same toolbar at three different lengths, with no reason for the difference. The reason
+/// arrived afterwards. DRAGON-400 took the zoom rail to a **5× range** (50%–500%), while the
+/// covermark zoom/opacity and the dim range still express a bounded 0–100%. Same visual family,
+/// different amount of information to carry: the zoom rail now has to resolve 450 percentage
+/// points where the others resolve 100, so it needs the extra travel to stay precise — and every
+/// pixel of rail also sharpens the 100% detent, which is specified in RAIL pixels
+/// (`viewport::SNAP_RAIL_PX`). The others gain nothing from extra width.
+///
+/// So: same look, different length, for a stated reason. If the owner ever wants ALL sliders
+/// wider, that is a change to [`SLIDER_W`] — not to this.
+pub(super) const ZOOM_SLIDER_W: f32 = 85.0;
 
 /// **How big the preview editor's slider THUMBS ("nibs") are, relative to the libcosmic
 /// default.** `1.0` is the stock 20px resting / 26px hover-and-drag thumb; `0.5` halves it.
@@ -1175,7 +1398,7 @@ pub(super) fn preview_slider_class() -> cosmic::style::iced::Slider {
 /// builder below: the padding and the glyph ride `Tb`'s scale, while the row gap and the
 /// slider's own fixed width do not.
 pub(super) fn slider_item_w(scale: f32) -> f32 {
-    scale * (2.0 * BTN_PAD + ICON_BOX * SLIDER_SCALE) + 6.0 + 80.0 * SLIDER_SCALE
+    scale * (2.0 * BTN_PAD + ICON_BOX * SLIDER_SCALE) + 6.0 + SLIDER_W * SLIDER_SCALE
 }
 
 /// The little breathing gap the overlay control area keeps between the split's two sides
@@ -1212,19 +1435,11 @@ impl Tb {
         // an OPAQUE colour that reproduces a 50%-opacity foreground glyph on that surface. Theme
         // tokens only (same `foreground` ramp the sibling toggle glyphs ride), no hardcoded
         // colour, no platform arm — so it tracks light/dark and the user's accent.
-        let glyph = widget::icon::icon(crate::widgets::icons::handle(icon))
-            .width(Length::Fixed(self.icon_box() * SLIDER_SCALE))
-            .height(Length::Fixed(self.icon_box() * SLIDER_SCALE))
+        // `icon_box() × SLIDER_SCALE` is 20 × 0.8 = 16.0 today, integral only by luck of those
+        // two numbers — so it goes through the seam like every other computed box (DRAGON-399).
+        let glyph = crate::widgets::icons::sized(icon, self.icon_box() * SLIDER_SCALE)
             .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|t: &cosmic::Theme| {
-                let fg = crate::app::theme::foreground(t);
-                let bg: cosmic::iced::Color = t.cosmic().background.component.base.into();
-                let mix = |a: f32, b: f32| a + (b - a) * 0.5;
-                let c = cosmic::iced::Color::from_rgb(
-                    mix(fg.r, bg.r),
-                    mix(fg.g, bg.g),
-                    mix(fg.b, bg.b),
-                );
-                cosmic::widget::svg::Style { color: Some(c) }
+                cosmic::widget::svg::Style { color: Some(quiet_on_cluster(t)) }
             })));
         let pid = self.pid;
         let slider = widget::slider(range, value, move |v| Msg::Preview(pid, to_msg(v)))
@@ -1233,7 +1448,7 @@ impl Tb {
             .on_release(Msg::Preview(pid, commit))
             // The preview editor's own (smaller) thumb — see `PREVIEW_SLIDER_THUMB`.
             .class(preview_slider_class())
-            .width(Length::Fixed(80.0 * SLIDER_SCALE));
+            .width(Length::Fixed(SLIDER_W * SLIDER_SCALE));
         widget::container(
             widget::row(vec![
                 glyph.into(),
@@ -1319,6 +1534,9 @@ impl App {
     /// bar (see [`Self::edit_tools`]).
     pub(super) fn edit_toolbar<'a>(&'a self, preview: &'a PreviewState, tb: Tb) -> Element<'a, Msg> {
         let km = &self.keymap;
+        // DRAGON-410: a live crop session is modal over this WHOLE bar, not just the tray inside
+        // it — the share group below is swept by the same rule the tray items go through.
+        let cropping = preview.edit.crop_session.is_some();
         // Pointer / pan tools, the color swatch + line-width groups all live on the BOTTOM
         // bar (see [`Self::edit_tools`]). The DRAW tools (Arrow/Highlight/Box/Pixelate/Blur)
         // lead the TOP bar, for IMAGES only (videos have no annotation editor).
@@ -1326,16 +1544,17 @@ impl App {
         if matches!(preview.kind, PreviewKind::Image(_)) {
             left.push(annotation_tools(preview, km, tb));
         }
+        // (The document-info block is NOT here: both media kinds carry it on the BOTTOM bar,
+        // immediately left of the scale/zoom group — see `image.rs` / `video.rs`.)
         // Right: the Save / Save As / Copy / Delete action group — the sharing actions tinted
         // with the accent's companion while there are unsaved edits (Delete stays untinted).
-        // (DRAGON-357 item 8: for IMAGES the filesize block moved to the BOTTOM bar, before the
-        // scaling slider — see `image.rs`. VIDEOS have no bottom zoom cluster, so their filesize
-        // stays here on the top bar.)
+        // A crop session HIDES it (DRAGON-410): every one of those actions commits or discards
+        // the document, and doing that with an uncommitted crop rectangle live plainly
+        // contradicts the session — Save would have written the UN-cropped image.
         let mut right: Vec<Element<'a, Msg>> = Vec::new();
-        if matches!(preview.kind, PreviewKind::Video(_)) {
-            right.extend(tb.size_chip(preview.size));
+        if top_bar_item_state(TopBarItem::Share, cropping) != TrayItemState::Hidden {
+            right.push(tb.share_group(preview.unsaved(), preview.external, km));
         }
-        right.push(tb.share_group(preview.unsaved(), preview.external, km));
         // The Close (x) button normally lives elsewhere: the OVERLAY draws it on its header
         // row, the WINDOWED preview gets it from the native window chrome. DRAGON-268
         // follow-up (fullscreen header vanish): in NATIVE fullscreen the windowed preview's
@@ -1343,6 +1562,13 @@ impl App {
         // app-drawn Close the user has no reachable way to leave the preview — add it back
         // to this bar in that state. macOS-only signal (`preview_fullscreen`, set from the
         // resize handler); off macOS this arm is never reached and the bar carries no Close.
+        //
+        // DRAGON-410 deliberately does NOT sweep it. It is not an editing control that a crop
+        // session could contradict — it is the WINDOW's own chrome, standing in for the titlebar
+        // the OS took away, and it is the only pointer route out of a fullscreen preview. The
+        // same line is drawn everywhere else: the overlay's header row and the windowed
+        // titlebar (appearance / settings / undo / redo / close) are not swept either. What the
+        // modal rule owns is the top bar's EDIT controls.
         #[cfg(target_os = "macos")]
         let show_close = preview.surface.is_window() && self.preview_fullscreen;
         #[cfg(not(target_os = "macos"))]
@@ -1371,13 +1597,10 @@ impl App {
             // DRAGON-357: the color swatch + the three line-width segments share ONE bordered
             // cluster (the same container the top-left tray groups use), instead of two
             // borderless controls.
-            groups.push(tb.tool_cluster(
-                vec![
-                    annot_swatch_flyout(preview, &self.annot_recent_colors, &self.keymap, tb),
-                    tb.stroke_width_group(e.stroke(), &self.keymap),
-                ],
-                ClusterChrome::Surface,
-            ));
+            groups.push(tb.tool_cluster(vec![
+                annot_swatch_flyout(preview, &self.annot_recent_colors, &self.keymap, tb),
+                tb.stroke_width_group(e.stroke(), &self.keymap),
+            ]));
         }
         // Covermark toggle: on = a covermark is applied. It now wears the SAME treatment as
         // every other control in this chrome — a bare glyph tinted accent when on, foreground
@@ -1436,7 +1659,7 @@ impl App {
         }
         // DRAGON-357: the covermark toggle (plus its zoom/opacity sliders when applied) rides a
         // bordered cluster like every other bottom-bar group, not its own borderless surface.
-        groups.push(tb.tool_cluster(covermark_items, ClusterChrome::Surface));
+        groups.push(tb.tool_cluster(covermark_items));
         groups
     }
 }
@@ -1512,19 +1735,6 @@ pub(super) fn flyout<'a>(
         .into()
 }
 
-/// How a [`Tb::tool_cluster`] paints its container — a DECLARED per-group property of the
-/// [`ANNOT_TRAY`] layout, never a special case keyed on which tools a group happens to hold.
-/// (The tray's grouping and styling have been re-cut several times; keep both declarative.)
-#[derive(Clone, Copy, PartialEq)]
-pub(super) enum ClusterChrome {
-    /// The normal frosted, dropdown-bordered surface.
-    Surface,
-    /// Footprint only — same padding and geometry, but no fill and no border. The pointer
-    /// (selection) group uses this: it is a mode, not a family of draw tools, and a chip
-    /// around it read as one more bordered box in the row.
-    Bare,
-}
-
 /// One entry in the annotation tray's DECLARED layout ([`ANNOT_TRAY`]).
 #[derive(Clone, Copy)]
 enum TrayItem {
@@ -1534,14 +1744,16 @@ enum TrayItem {
     /// The global dim ("spotlight range") slider. Not a tool — it belongs to the spotlight's
     /// group but is always usable, whatever tool is armed (DRAGON-329).
     DimSlider,
+    /// The CROP control (DRAGON-392 moved it into the tray, beside Select and Hand). Not a
+    /// [`Tool`]: it opens a crop SESSION rather than arming a draw mode, and while that session
+    /// is live it renders as the accept + cancel pair instead of one button
+    /// ([`Tb::crop_items`]) — which is why it is its own tray item rather than a `Tool` row.
+    Crop,
 }
 
 /// One GROUP of the annotation tray: its chrome treatment, its optional one-key tool SLOT,
 /// plus its ordered items.
 struct TrayGroup {
-    /// Whether this group's [`Tb::tool_cluster`] paints a surface + border, or only occupies
-    /// the footprint.
-    chrome: ClusterChrome,
     /// The group's CYCLE action, when its tools share ONE hotkey (DRAGON-369) — pressing it
     /// arms the group's current member, pressing it again advances to the next, wrapping.
     /// `None` = every tool in the group owns its own key (or has none).
@@ -1557,30 +1769,52 @@ struct TrayGroup {
 
 /// **THE annotation tray layout** (DRAGON-340): the ordered GROUPS of the top bar's draw
 /// tools, each rendered inside one [`Tb::tool_cluster`], in the order given. This list is the
-/// single source of the tray's grouping, its order AND its per-group chrome — the builder
-/// below just walks it, so regrouping or re-styling the tray means editing these rows and
-/// changing nothing else. (Both have already changed several times; keep them declarative.)
+/// single source of the tray's grouping and its order — the builder below just walks it, so
+/// regrouping the tray means editing these rows and changing nothing else. (It has already
+/// been re-cut several times; keep it declarative.)
 ///
 /// A ONE-member group is not special-cased anywhere: it gets exactly the container a
-/// five-member group gets, minus whatever its own [`ClusterChrome`] says.
+/// five-member group gets.
 ///
 /// Adding a tool = add a [`TrayItem::Tool`] row to the right group (plus its [`Tool`] variant +
 /// model/rasterize/bake arms + hotkey; see `annotate.rs`'s module doc).
 const ANNOT_TRAY: &[TrayGroup] = &[
-    // Selection. The POINTER creates nothing (DRAGON-341): click / Ctrl-Shift-click /
-    // rubber-band to build a selection, drag it to move it all. It is a MODE rather than a
-    // family of draw tools, so it wears no chip — only the footprint that keeps it aligned
-    // with the bordered groups after it.
-    TrayGroup { chrome: ClusterChrome::Bare, cycle: None, items: &[TrayItem::Tool(
-        "pointer-select-symbolic",
-        Tool::Pointer,
-        "Select",
-        crate::shortcuts::Action::PreviewAnnotPointer,
-    )] },
+    // NAVIGATION + FRAMING (DRAGON-392): the three controls that never draw anything — CROP,
+    // SELECT, HAND, in that order. The POINTER creates nothing (DRAGON-341): click /
+    // Ctrl-Shift-click / rubber-band to build a selection, drag it to move it all. The HAND pans
+    // (it replaced the old pointer/pan mode toggle that used to sit on the bottom bar). CROP
+    // opens the crop session (it used to sit beside the zoom control). Three peers, so this is a
+    // REAL group with the same bordered surface every other family wears — it lost the `Bare`,
+    // footprint-only treatment that suited the single button it once held. NO cycle key: each
+    // owns its own letter (C / V / H).
+    //
+    // **The order is the owner's final call** (it supersedes the ticket's original "Select, Hand,
+    // Crop" bullets): CROP leads. DRAGON-392 had a second reason for that — the session's
+    // accept/reject pair took the two LEADING slots while SELECT hid, so the group's footprint
+    // never changed — and DRAGON-410 retired it: a session now hides the ENTIRE rest of the bar
+    // ([`top_bar_item_state`]), so this group is redrawn as the crop pair ALONE and there is no
+    // footprint left to preserve. The declared order stands on the idle bar's reading order
+    // alone.
+    TrayGroup { cycle: None, items: &[
+        TrayItem::Crop,
+        TrayItem::Tool(
+            "pointer-select-symbolic",
+            Tool::Pointer,
+            "Select",
+            crate::shortcuts::Action::PreviewAnnotPointer,
+        ),
+        TrayItem::Tool(
+            // lucide `hand`.
+            "hand-symbolic",
+            Tool::Hand,
+            "Hand",
+            crate::shortcuts::Action::PreviewAnnotHand,
+        ),
+    ] },
     // Callouts: point at a thing, or number the steps. NO cycle key — the arrow is the
     // highest-frequency tool in a screenshot annotator and must never cost two presses, and
     // the step marker takes Photoshop's Count key.
-    TrayGroup { chrome: ClusterChrome::Surface, cycle: None, items: &[
+    TrayGroup { cycle: None, items: &[
         TrayItem::Tool(
             "mail-forward-symbolic",
             Tool::Arrow,
@@ -1597,7 +1831,6 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // Destructive redactions: the pixelate mosaic and the strong blur. ONE family (both are
     // drag-a-rect destructive redactions), so ONE cycle key — `M` (DRAGON-369).
     TrayGroup {
-        chrome: ClusterChrome::Surface,
         cycle: Some(crate::shortcuts::Action::PreviewAnnotRedactCycle),
         items: &[
             TrayItem::Tool(
@@ -1620,7 +1853,6 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // so `slot_tools` skips it and the cycle stays a four-tool chain). Membership here IS the
     // cycle: a tray chip and the hotkey slot are the SAME set.
     TrayGroup {
-        chrome: ClusterChrome::Surface,
         cycle: Some(crate::shortcuts::Action::PreviewAnnotShapeCycle),
         items: &[
             TrayItem::Tool(
@@ -1654,7 +1886,7 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // Text captions (DRAGON-354): the lucide `type` glyph arms the text tool. Its size
     // dropdown + font toggle are injected right after this group in `annotation_tools` (they
     // are a flyout + toggle, not tray tool-buttons, so they can't live in the data-driven tray).
-    TrayGroup { chrome: ClusterChrome::Surface, cycle: None, items: &[
+    TrayGroup { cycle: None, items: &[
         TrayItem::Tool(
             "text-tool-symbolic",
             Tool::Text,
@@ -1664,7 +1896,7 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     ] },
     // Freehand ink and the hand-undo that removes it. NO cycle key: inking and erasing are
     // the pair you alternate between fastest, so they keep a key each (`B` / `E`).
-    TrayGroup { chrome: ClusterChrome::Surface, cycle: None, items: &[
+    TrayGroup { cycle: None, items: &[
         TrayItem::Tool(
             "pencil-symbolic",
             Tool::Pen,
@@ -1691,7 +1923,8 @@ pub(super) fn slot_tools(cycle: crate::shortcuts::Action) -> Vec<Tool> {
         .flat_map(|g| g.items.iter())
         .filter_map(|i| match i {
             TrayItem::Tool(_, t, _, _) => Some(*t),
-            TrayItem::DimSlider => None,
+            // Neither is a tool: the dim slider is always-on, the crop control opens a session.
+            TrayItem::DimSlider | TrayItem::Crop => None,
         })
         .collect()
 }
@@ -1752,6 +1985,93 @@ fn tip_action(
     }
 }
 
+/// What the top edit bar does with ONE control while a crop session is (or isn't) live —
+/// **the single statement of the modal rule** (DRAGON-392, completed by DRAGON-410), read by the
+/// builders and asserted by the tests, so a control added later cannot silently stay visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TrayItemState {
+    /// Drawn and usable.
+    Live,
+    /// Drawn in the disabled tone, with no way to act (no `on_press` / no menu).
+    ///
+    /// **No caller produces this today** (DRAGON-410 turned the crop session's greyed controls
+    /// into hidden ones), and it is kept on the owner's explicit instruction — "i like the
+    /// ability to disable" — because the machinery behind it is real and wired: `tool_toggle_gated`
+    /// draws a glyph in [`disabled_label_tone`] with no `on_press`, `dropdown_chip` recolours a
+    /// chip's label AND caret together, and both builders take the enabled flag straight from this
+    /// state. A future modal state that wants "present but unavailable" says so here and gets all
+    /// of that for free. The lint allowance is the honest price of keeping an unused capability
+    /// rather than deleting and re-deriving it.
+    #[allow(dead_code)]
+    Disabled,
+    /// Not drawn at all — it gives up its slot.
+    Hidden,
+}
+
+/// Every control FAMILY the TOP edit bar can draw — the domain the modal rule is stated over.
+///
+/// DRAGON-410 widened that domain from the declared tray to the WHOLE bar. Two of the bar's
+/// controls are not [`TrayItem`] rows and never could be: the text SIZE + FONT dropdowns are
+/// flyout chips INJECTED into the text cluster (see [`annotation_tools`]), and the share group
+/// (Save / Save As / Copy / Delete) sits past the bar's split. A rule stated only over
+/// `ANNOT_TRAY` could not reach either — which is exactly how the ticket's "sweep the whole top
+/// bar, not just `ANNOT_TRAY`" gets satisfied by construction instead of by inspection.
+///
+/// Adding a control to the top bar means adding a variant here (or a tray row, which maps in
+/// through [`TrayItem::top_bar`]); [`top_bar_item_state`] matches EXHAUSTIVELY with no wildcard
+/// arm, so the new variant does not compile until a crop session's treatment of it is decided.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TopBarItem {
+    /// The crop control — one button idle, the labelled accept + cancel pair mid-session.
+    Crop,
+    /// A tray tool button.
+    Tool(Tool),
+    /// The global dim ("spotlight range") slider and its glyph.
+    DimSlider,
+    /// The text SIZE + FONT dropdown chips injected into the text tool's cluster.
+    TextStyle,
+    /// The Save / Save As / Copy / Delete group at the far right of the bar.
+    Share,
+}
+
+impl TrayItem {
+    /// The top-bar family this declared tray row belongs to — the bridge that puts every tray row
+    /// under the same rule as the two controls that are not tray rows.
+    fn top_bar(&self) -> TopBarItem {
+        match self {
+            TrayItem::Tool(_, t, _, _) => TopBarItem::Tool(*t),
+            TrayItem::DimSlider => TopBarItem::DimSlider,
+            TrayItem::Crop => TopBarItem::Crop,
+        }
+    }
+}
+
+/// THE modal rule. Outside a crop session everything is [`TrayItemState::Live`]. Inside one, the
+/// session owns the canvas and the top bar shows the CROP control — the accept / cancel pair, the
+/// two actions the session is for — and **nothing else at all**.
+///
+/// DRAGON-410 made that literal. DRAGON-392 had greyed the tray and carved the DIM slider out of
+/// the rule on the reasoning that dim is a viewing aid rather than an edit; the owner reversed
+/// both. Greying leaves a bar full of dead controls competing with the two live ones, and the dim
+/// carve-out was answering the wrong question — you cannot judge a crop through a dimmed image at
+/// all, so the session forces the dim CLEAR for its duration
+/// ([`super::edit::EditState::view_dim`]) and the slider has nothing left to do. Hiding it is the
+/// same call as hiding the covermark (DRAGON-402): a session shows the picture the user is
+/// framing, not the treatments queued over it.
+fn top_bar_item_state(item: TopBarItem, session: bool) -> TrayItemState {
+    if !session {
+        return TrayItemState::Live;
+    }
+    // Exhaustive on purpose — see [`TopBarItem`].
+    match item {
+        TopBarItem::Crop => TrayItemState::Live,
+        TopBarItem::Tool(_)
+        | TopBarItem::DimSlider
+        | TopBarItem::TextStyle
+        | TopBarItem::Share => TrayItemState::Hidden,
+    }
+}
+
 /// The TOP-bar annotation DRAW tools, rendered from the declared [`ANNOT_TRAY`] grouping: one
 /// bordered, padded [`Tb::tool_cluster`] per group, and inside it bare glyph buttons whose
 /// COLOUR alone shows which tool is armed ([`Tb::tool_toggle`]) — accent when selected, the
@@ -1769,17 +2089,25 @@ fn annotation_tools<'a>(
     // Top toolbar → tooltips drop below. NEUTRAL (`None`) = no tool tinted.
     let pos = widget::tooltip::Position::Bottom;
     let active = e.tool;
+    // A live crop session is MODAL, and since DRAGON-410 literally so: accept and cancel are the
+    // only meaningful actions, so every other control on this bar is REMOVED for the duration.
+    let cropping = e.crop_session.is_some();
     let groups: Vec<Element<'a, Msg>> = ANNOT_TRAY
         .iter()
         .enumerate()
-        .map(|(gi, group)| {
+        .filter_map(|(gi, group)| {
             let mut items: Vec<Element<'static, Msg>> = group
                 .items
                 .iter()
+                // The modal rule, applied once per control (`top_bar_item_state`).
+                .filter(|entry| {
+                    top_bar_item_state(entry.top_bar(), cropping) != TrayItemState::Hidden
+                })
                 .map(|entry| match *entry {
-                    TrayItem::Tool(icon, tool, name, action) => tb.tool_toggle(
+                    TrayItem::Tool(icon, tool, name, action) => tb.tool_toggle_gated(
                         icon,
                         active == Some(tool),
+                        top_bar_item_state(entry.top_bar(), cropping) == TrayItemState::Live,
                         PreviewMsg::ToolPressed(tool),
                         widget::text(action_tip(name, tip_action(action, group.cycle, km), km))
                             .size(12)
@@ -1797,14 +2125,35 @@ fn annotation_tools<'a>(
                         |v| PreviewMsg::SetDim(1.0 - v),
                         PreviewMsg::CommitDimEdit,
                     ),
+                    // DRAGON-392: the crop control renders IN PLACE in its declared slot — one
+                    // button idle, the accept/cancel PAIR while a session is live. It is the only
+                    // tray item that can contribute two buttons, so it carries its own row at the
+                    // cluster's own 2px spacing: nested or not, the buttons sit identically.
+                    TrayItem::Crop => widget::row(tb.crop_items(cropping, km))
+                    .spacing(2.0)
+                    .align_y(Alignment::Center)
+                    .into(),
                 })
                 .collect();
             // DRAGON-357 item 7: the text SIZE + FONT dropdowns live INSIDE the text tool's
             // cluster (one bordered group: icon + size dropdown + style dropdown), not beside it.
-            if gi == TEXT_TRAY_GROUP {
-                items.extend(text_style_controls(preview, tb));
+            // They are injected here rather than declared as tray rows (they are flyout chips,
+            // not tool buttons), so they reach the modal rule through their OWN
+            // [`TopBarItem`] — the state decides both whether they are drawn at all and, if they
+            // are, whether they are live (the `Disabled` capability stays wired for a future
+            // modal state that wants it).
+            let text_state = top_bar_item_state(TopBarItem::TextStyle, cropping);
+            if gi == TEXT_TRAY_GROUP && text_state != TrayItemState::Hidden {
+                items.extend(text_style_controls(
+                    preview,
+                    tb,
+                    text_state == TrayItemState::Live,
+                ));
             }
-            tb.tool_cluster(items, group.chrome)
+            // A group whose every control hid contributes NOTHING — never an empty bordered
+            // cluster, which is what a plain `map` would have drawn once the sweep emptied five
+            // of the six groups.
+            (!items.is_empty()).then(|| tb.tool_cluster(items))
         })
         .collect();
     widget::row(groups)
@@ -1990,19 +2339,34 @@ fn cap_centered_label<'a>(
 /// trim/background as every editor dropdown — so the px, Hand/Clean and Fit chips read as ONE
 /// control family in both light and dark themes (item 2 + the hover addendum, since the hover
 /// styling lives in this ONE shared class, not per call site). `toggle` opens/closes its menu.
+/// `enabled` (DRAGON-392 correction) gates the whole chip: no `on_press` — so the press can't
+/// fire and the menu can't open — AND the CARET is recoloured to the disabled tone with it. The
+/// caret is called out because a chip with dimmed text and a full-strength chevron is the obvious
+/// half-disabled failure: the two must always move together. The LABEL is the caller's (it may
+/// carry its own font/face), so the caller applies the same tone to it — [`disabled_label_tone`]
+/// exists so there is one tone to apply, not two that can drift.
 pub(super) fn dropdown_chip<'a>(
     pid: window::Id,
     label: Element<'a, Msg>,
     width: f32,
     toggle: PreviewMsg,
+    enabled: bool,
 ) -> Element<'a, Msg> {
+    let caret = widget::icon::icon(crate::widgets::icons::handle("pan-down-symbolic")).size(10);
+    // Enabled: the chip's own default caret colour (unchanged). Disabled: the shared quiet tone,
+    // in lockstep with the label.
+    let caret = if enabled {
+        caret
+    } else {
+        caret.class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|t: &cosmic::Theme| {
+            cosmic::widget::svg::Style { color: Some(disabled_label_tone(t)) }
+        })))
+    };
     crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::custom(
             widget::row(vec![
                 widget::container(label).width(Length::Fill).into(),
-                widget::icon::icon(crate::widgets::icons::handle("pan-down-symbolic"))
-                    .size(10)
-                    .into(),
+                caret.into(),
             ])
             .spacing(3.0)
             .align_y(Alignment::Center),
@@ -2010,8 +2374,20 @@ pub(super) fn dropdown_chip<'a>(
         .class(cosmic::theme::Button::Text)
         .padding([2.0, 6.0])
         .width(Length::Fixed(width))
-        .on_press(Msg::Preview(pid, toggle)),
+        .on_press_maybe(enabled.then_some(Msg::Preview(pid, toggle))),
     )
+}
+
+/// THE tone a DISABLED control's text/glyphs wear inside a toolbar cluster — one function so a
+/// dropdown's label and its caret, and every disabled tray button, can never disagree.
+///
+/// It is the group's own BORDER colour (DRAGON-392 correction, superseding the small sliders'
+/// glyph tone this used to share): a disabled control recedes to the faintest line the chrome
+/// already draws, rather than sitting at the "quiet but present" strength that reads as usable.
+/// [`quiet_on_cluster`] keeps its original user — the slider glyphs, which are quiet by nature,
+/// not disabled — untouched.
+pub(super) fn disabled_label_tone(t: &cosmic::Theme) -> cosmic::iced::Color {
+    cluster_border(t)
 }
 
 /// The iced UI font that PREVIEWS a [`text_annot::TextFont`] in its own face (DRAGON-354 item
@@ -2027,17 +2403,34 @@ fn font_preview_face(font: text_annot::TextFont) -> cosmic::iced::Font {
 /// (item 14) with an OPAQUE menu (item 15), and both apply to NEW text and the edited/selected
 /// box. The size button shows the current px; the font button shows the current family's label
 /// rendered in that family's own face (item 19).
-fn text_style_controls(preview: &PreviewState, tb: Tb) -> Vec<Element<'static, Msg>> {
+fn text_style_controls(preview: &PreviewState, tb: Tb, enabled: bool) -> Vec<Element<'static, Msg>> {
     let e = &preview.edit;
     let pid = tb.pid;
     let size = e.text_size();
     let font = e.annot_text_font;
+    // DRAGON-392 correction: a crop session disables these along with the rest of the tray —
+    // LABEL and CARET together (`dropdown_chip` recolours the caret; the label is built here, so
+    // it takes the same tone from the same function). A half-disabled chip — dimmed text, bright
+    // chevron — is the failure this pairing exists to prevent.
+    let label_class = |t: widget::Text<'static, cosmic::Theme>| {
+        if enabled {
+            t
+        } else {
+            t.class(cosmic::theme::Text::Custom(|th: &cosmic::Theme| {
+                cosmic::iced::widget::text::Style {
+                    color: Some(disabled_label_tone(th)),
+                    ..Default::default()
+                }
+            }))
+        }
+    };
     // ── SIZE dropdown ("24px ⌄") ──────────────────────────────────────────────────────────
     let size_btn: Element<'static, Msg> = dropdown_chip(
         pid,
-        widget::text(format!("{}px", size.round() as i32)).size(12).into(),
+        label_class(widget::text(format!("{}px", size.round() as i32)).size(12)).into(),
         TEXT_SIZE_CTRL_W,
         PreviewMsg::ToggleTextSizeFlyout,
+        enabled,
     );
     let size_ctrl: Element<'static, Msg> =
         if e.flyout_kind() == Some(super::edit::FlyoutKind::TextSize) {
@@ -2058,10 +2451,15 @@ fn text_style_controls(preview: &PreviewState, tb: Tb) -> Vec<Element<'static, M
         cap_centered_label(
             font,
             TEXT_CHIP_LABEL_SIZE,
-            widget::text(font.label()).size(TEXT_CHIP_LABEL_SIZE).font(font_preview_face(font)),
+            label_class(
+                widget::text(font.label())
+                    .size(TEXT_CHIP_LABEL_SIZE)
+                    .font(font_preview_face(font)),
+            ),
         ),
         text_font_ctrl_w(),
         PreviewMsg::ToggleTextFontFlyout,
+        enabled,
     );
     let font_ctrl: Element<'static, Msg> =
         if e.flyout_kind() == Some(super::edit::FlyoutKind::TextFont) {
@@ -2281,9 +2679,7 @@ fn annot_palette_panel(
 /// names the live `X` binding via [`action_tip`]. A plain `widget::tooltip` (not [`Tb::tip`]) so
 /// it still shows while the flyout is open, since it draws on the frontmost popover.
 fn annot_swap_swatch(km: &crate::shortcuts::Keymap, tb: Tb) -> Element<'static, Msg> {
-    let glyph = widget::icon::icon(crate::widgets::icons::handle("object-flip-horizontal-symbolic"))
-        .width(Length::Fixed(18.0))
-        .height(Length::Fixed(18.0));
+    let glyph = crate::widgets::icons::sized("object-flip-horizontal-symbolic", 18.0);
     let btn = widget::button::custom(
         widget::container(glyph)
             .width(Length::Fill)
@@ -2552,6 +2948,12 @@ mod tests {
     /// any child whose size hint `is_void` (a `Fixed(0.0)` axis), which would restore the very
     /// child-count change this fix removes — so assert the toast SLOT is occupied (two children
     /// beside the media) with no toast, rather than trusting the placeholder's sizing.
+    ///
+    /// DRAGON-393 re-anchored the toast by moving the fill/centre CONTAINER inside the stack (it
+    /// is the base layer now, with the media inside it). A container carries no `tree::State` and
+    /// adds NO level to `Tree::new`, so the shape these assertions describe is unchanged — which
+    /// is exactly why the re-anchor was safe, and why this test is left as it was rather than
+    /// adjusted to fit it.
     #[test]
     fn the_toast_slot_is_occupied_even_with_no_toast() {
         for windowed in [false, true] {
@@ -2568,6 +2970,60 @@ mod tests {
                 "windowed={windowed}: the media stays the stack's BASE layer"
             );
         }
+    }
+
+    /// DRAGON-393: the toast ANCHOR must report the size it was ASKED for, never the size of
+    /// what it wraps. A `stack` takes its dimensions from its first child, so a base layer that
+    /// inherited a shrink-sized media is precisely what put an opening toast in the middle of the
+    /// window on a small capture.
+    #[test]
+    fn the_toast_region_never_inherits_the_media_size() {
+        use cosmic::iced::core::Length;
+        // A deliberately SHRINK child — the small-capture case.
+        let small = || -> Element<'static, Msg> { widget::text("tiny").into() };
+        assert!(matches!(small().as_widget().size().width, Length::Shrink), "fixture must shrink");
+
+        // Windowed: the whole area between the toolbars, both axes.
+        let win = toast_region(small(), Length::Fill, Length::Fill);
+        assert_eq!(win.as_widget().size().width, Length::Fill);
+        assert_eq!(win.as_widget().size().height, Length::Fill);
+
+        // Overlay: the hugged column's full width; the height is the media row's own.
+        let overlay = toast_region(small(), Length::Fill, Length::Shrink);
+        assert_eq!(overlay.as_widget().size().width, Length::Fill);
+
+        // And a fixed-width anchor (the overlay's loading state, which pins the region to the
+        // width the loaded column will take) reports exactly that width.
+        let fixed = toast_region(small(), Length::Fixed(640.0), Length::Fill);
+        assert_eq!(fixed.as_widget().size().width, Length::Fixed(640.0));
+    }
+
+    /// **The slider widths, and why they are no longer one number.** DRAGON-392 unified them;
+    /// the zoom rail then diverged (see [`ZOOM_SLIDER_W`]) because DRAGON-400 gave it a 5× range
+    /// to express where the icon-led sliders still express a bounded 0–100%. This pins the NEW
+    /// rule — zoom wider, the other two matched — so the divergence reads as intentional to
+    /// whoever finds it, and so re-unifying them has to be a deliberate act with a reason of its
+    /// own rather than a tidy-up.
+    #[test]
+    fn the_zoom_rail_is_wider_than_the_matched_icon_led_sliders() {
+        let shared = SLIDER_W * SLIDER_SCALE;
+        assert_eq!(shared, 64.0, "the covermark + dim rails");
+        // A third wider, to the nearest whole pixel — the owner's ask, stated as arithmetic so
+        // the relationship survives a future retune of the shared width.
+        assert_eq!(ZOOM_SLIDER_W, (shared * 1.33).round(), "the zoom rail is the shared rail +33%");
+        assert!(ZOOM_SLIDER_W > shared);
+
+        // …and the ICON-LED item width still describes the SHARED rail, not the zoom one. This
+        // is the half that would actually break something: `slider_item_w` reserves bottom-bar
+        // width for the covermark's two sliders, so pointing it at the zoom rail would over-
+        // reserve for controls that never grew.
+        let icon_and_gap = 2.0 * BTN_PAD + ICON_BOX * SLIDER_SCALE + 6.0;
+        let rail_in_item = slider_item_w(1.0) - icon_and_gap;
+        assert!((rail_in_item - shared).abs() < 1e-3, "the item carries the shared rail");
+        assert!(
+            (rail_in_item - ZOOM_SLIDER_W).abs() > 1.0,
+            "the icon-led item must NOT have picked up the zoom rail's width"
+        );
     }
 
     #[test]
@@ -2618,7 +3074,7 @@ mod tests {
             .flat_map(|g| g.items.iter())
             .filter_map(|i| match i {
                 TrayItem::Tool(_, t, _, _) => Some(*t),
-                TrayItem::DimSlider => None,
+                TrayItem::DimSlider | TrayItem::Crop => None,
             })
             .collect()
     }
@@ -2632,6 +3088,7 @@ mod tests {
             tray_tools(),
             vec![
                 Tool::Pointer,
+                Tool::Hand,
                 Tool::Arrow,
                 Tool::Badge,
                 Tool::Pixelate,
@@ -2658,10 +3115,10 @@ mod tests {
     #[test]
     fn the_tray_groups_match_the_declared_layout() {
         let shape: Vec<usize> = ANNOT_TRAY.iter().map(|g| g.items.len()).collect();
-        // pointer(1), callouts(2), redact(2), SHAPES(5 = highlight/border/border-highlight/
-        // spotlight + the dim slider, DRAGON-384 folded spotlight and its slider into the shape
-        // slot), TEXT(1, DRAGON-354), pencil+eraser(2).
-        assert_eq!(shape, vec![1, 2, 2, 5, 1, 2]);
+        // NAVIGATION(3 = select/hand/crop, DRAGON-392), callouts(2), redact(2), SHAPES(5 =
+        // highlight/border/border-highlight/spotlight + the dim slider, DRAGON-384 folded
+        // spotlight and its slider into the shape slot), TEXT(1, DRAGON-354), pencil+eraser(2).
+        assert_eq!(shape, vec![3, 2, 2, 5, 1, 2]);
         // A ONE-member group exists and is rendered through the very same container as the
         // others — there is no single-member branch anywhere in the builder.
         assert!(shape.contains(&1));
@@ -2675,19 +3132,262 @@ mod tests {
         ));
     }
 
-    /// The per-group CHROME is declared, not inferred: only the pointer (selection) group is
-    /// `Bare` — every family of draw tools keeps the bordered surface. A future re-style moves
-    /// these flags and touches no builder code.
+    /// DRAGON-392's group, spelled out: Crop, Select and Hand are ONE group, IN THAT ORDER (the
+    /// owner's final call, which supersedes the ticket body's "Select, Hand, Crop"), and the crop
+    /// control is the tray's only non-`Tool` item. Pinned here because the order is what makes
+    /// the crop session redraw as `accept | reject | Hand` with the Hand never moving.
     #[test]
-    fn only_the_pointer_group_is_bare() {
-        for (i, g) in ANNOT_TRAY.iter().enumerate() {
-            let holds_pointer = g
-                .items
-                .iter()
-                .any(|it| matches!(it, TrayItem::Tool(_, Tool::Pointer, _, _)));
-            let want = if holds_pointer { ClusterChrome::Bare } else { ClusterChrome::Surface };
-            assert!(g.chrome == want, "group {i} chrome");
+    fn the_navigation_group_is_crop_then_select_then_hand() {
+        assert!(matches!(
+            ANNOT_TRAY[0].items,
+            [
+                TrayItem::Crop,
+                TrayItem::Tool(_, Tool::Pointer, "Select", _),
+                TrayItem::Tool(_, Tool::Hand, "Hand", _),
+            ]
+        ));
+        // Crop appears exactly once, and nowhere else in the tray.
+        let crops = ANNOT_TRAY
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .filter(|i| matches!(i, TrayItem::Crop))
+            .count();
+        assert_eq!(crops, 1);
+    }
+
+    /// A `Tb` at scale 1 for the pure-arithmetic tests below.
+    fn test_tb() -> Tb {
+        Tb {
+            pid: cosmic::iced::window::Id::unique(),
+            scale: 1.0,
+            glass: None,
+            suppress_tooltips: false,
         }
+    }
+
+    /// How many BUTTONS a tray group actually draws for a given crop state. The crop item is
+    /// measured by BUILDING it ([`Tb::crop_items`]) rather than by a parallel arity table, so the
+    /// invariants below are asserted against the real builder and can't be satisfied by a stale
+    /// count. Sliders and the text dropdowns aren't buttons; a hidden control contributes nothing.
+    fn tray_group_slots(group: &TrayGroup, session: bool) -> usize {
+        let tb = test_tb();
+        let km = crate::shortcuts::Keymap::defaults();
+        group
+            .items
+            .iter()
+            .filter(|i| top_bar_item_state(i.top_bar(), session) != TrayItemState::Hidden)
+            .map(|i| match i {
+                TrayItem::Tool(..) => 1,
+                TrayItem::Crop => tb.crop_items(session, &km).len(),
+                TrayItem::DimSlider => 0,
+            })
+            .sum()
+    }
+
+    /// DRAGON-410 — **the sweep, measured against the real builder**: with a session live the tray
+    /// draws the crop group's accept + cancel PAIR and not one button anywhere else. DRAGON-392's
+    /// footprint invariant (the group kept three slots in both states, SELECT hiding to make room
+    /// for the pair) is deliberately gone: nothing is left beside the pair for a width change to
+    /// shove sideways.
+    #[test]
+    fn a_crop_session_draws_only_the_crop_pair() {
+        assert_eq!(tray_group_slots(&ANNOT_TRAY[0], false), 3, "idle: Crop | Select | Hand");
+        assert_eq!(tray_group_slots(&ANNOT_TRAY[0], true), 2, "session: accept | cancel");
+        for (i, g) in ANNOT_TRAY.iter().enumerate().skip(1) {
+            assert!(tray_group_slots(g, false) > 0, "group {i} draws when idle");
+            assert_eq!(tray_group_slots(g, true), 0, "group {i} must vanish mid-crop");
+        }
+        // …so the whole tray is exactly the pair.
+        let total: usize = ANNOT_TRAY.iter().map(|g| tray_group_slots(g, true)).sum();
+        assert_eq!(total, 2, "the mid-crop top bar is the crop pair and nothing else");
+    }
+
+    /// A group that hides EVERY one of its controls must contribute no cluster at all — an empty
+    /// bordered capsule would be five stray boxes across the mid-crop bar. Asserted on the same
+    /// emptiness test the builder branches on.
+    #[test]
+    fn a_fully_hidden_group_contributes_no_cluster() {
+        let empty = |g: &TrayGroup, session: bool| {
+            g.items
+                .iter()
+                .all(|i| top_bar_item_state(i.top_bar(), session) == TrayItemState::Hidden)
+        };
+        for (i, g) in ANNOT_TRAY.iter().enumerate() {
+            assert!(!empty(g, false), "group {i} must draw when idle");
+            // The text group's cluster survives only via its injected chips, which hide too.
+            let injected_alive = i == TEXT_TRAY_GROUP
+                && top_bar_item_state(TopBarItem::TextStyle, true) != TrayItemState::Hidden;
+            assert_eq!(
+                empty(g, true) && !injected_alive,
+                i != 0,
+                "group {i}: only the crop group survives a session"
+            );
+        }
+    }
+
+    /// DRAGON-392 correction: the DISABLED tone must BE the cluster's border colour — the owner
+    /// asked for exactly that match, and matching it by eye would drift the moment the theme
+    /// moves. Both read [`cluster_border`], so this asserts they still do.
+    ///
+    /// It also pins the tone as VISIBLE in both themes, because a border colour is chosen to read
+    /// as a hairline and is being reused as a glyph FILL here. Measured at the time of writing
+    /// (luminance): dark `0.266` on a `0.182` cluster fill — a 0.084 gap; light `0.689` on
+    /// `0.960` — a 0.272 gap. Dark is the faint case by design, and a 22px glyph carries that
+    /// contrast far better than the 1px border the owner pointed at does. The floor below is
+    /// deliberately low (it guards "vanishes entirely", not "is subtle") — if a theme change
+    /// pushes the tone onto the fill, this fails instead of silently rendering nothing.
+    #[test]
+    fn the_disabled_tone_is_the_cluster_border_and_stays_visible_in_both_themes() {
+        let lum = |c: cosmic::iced::Color| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+        for (name, theme) in [
+            ("dark", cosmic::theme::Theme::dark()),
+            ("light", cosmic::theme::Theme::light()),
+        ] {
+            let tone = disabled_label_tone(&theme);
+            let border = cluster_border(&theme);
+            assert_eq!(
+                (tone.r, tone.g, tone.b),
+                (border.r, border.g, border.b),
+                "{name}: the disabled tone must be the group's border colour"
+            );
+            // Opaque, so the SVG rasterizer's alpha-discarding tint path renders it faithfully
+            // (see `cluster_border`). A translucent token here would silently paint full-strength.
+            assert!((tone.a - 1.0).abs() < f32::EPSILON, "{name}: the tone must be opaque");
+            let fill: cosmic::iced::Color = theme.cosmic().background.component.base.into();
+            let gap = (lum(tone) - lum(fill)).abs();
+            assert!(gap > 0.05, "{name}: the disabled glyph vanished into the cluster fill ({gap})");
+        }
+    }
+
+    /// EVERY top-bar control family, enumerated — the tray's own rows plus the two that are not
+    /// tray rows.
+    ///
+    /// The `witness` below is a TOTAL function over [`TopBarItem`] written without a wildcard
+    /// arm: a variant added to the enum stops this file compiling until it is named here AND
+    /// listed in the vector, so a control added to the top bar cannot skip the sweep test.
+    fn all_top_bar_items() -> Vec<TopBarItem> {
+        fn witness(i: TopBarItem) -> &'static str {
+            match i {
+                TopBarItem::Crop => "crop",
+                TopBarItem::Tool(_) => "tool",
+                TopBarItem::DimSlider => "dim slider",
+                TopBarItem::TextStyle => "text size/font chips",
+                TopBarItem::Share => "save / save as / copy / delete",
+            }
+        }
+        let mut all = vec![
+            TopBarItem::Crop,
+            TopBarItem::DimSlider,
+            TopBarItem::TextStyle,
+            TopBarItem::Share,
+        ];
+        all.extend(tray_tools().into_iter().map(TopBarItem::Tool));
+        // Every listed item resolves through the witness (and so through the enum's own arms).
+        assert!(all.iter().all(|i| !witness(*i).is_empty()));
+        all
+    }
+
+    /// **THE live set during a crop session, enumerated** (DRAGON-410). The session owns the
+    /// canvas, so the top bar shows the CROP control — accept + cancel — and nothing else at all.
+    /// DRAGON-392's two survivors are both gone: the greyed tools are hidden outright, and the DIM
+    /// slider's carve-out was reversed (the session forces the dim clear, so there is nothing for
+    /// the slider to do — see `EditState::view_dim`).
+    ///
+    /// Stated over EVERY top-bar family rather than over `ANNOT_TRAY` alone, because the text
+    /// chips and the share group are not tray rows and a tray-only rule could never have swept
+    /// them.
+    #[test]
+    fn a_crop_session_leaves_only_the_crop_control_live() {
+        for item in all_top_bar_items() {
+            let want = if item == TopBarItem::Crop {
+                TrayItemState::Live
+            } else {
+                TrayItemState::Hidden
+            };
+            assert_eq!(top_bar_item_state(item, true), want, "mid-crop: {item:?}");
+            // Outside a session everything is live again — the rule is a session rule only.
+            assert_eq!(top_bar_item_state(item, false), TrayItemState::Live, "idle: {item:?}");
+        }
+        // Every DECLARED tray row maps into that domain, so none of them is judged by a second
+        // rule of its own.
+        for g in ANNOT_TRAY {
+            for i in g.items {
+                assert!(
+                    all_top_bar_items().contains(&i.top_bar()),
+                    "a tray row maps outside the enumerated top bar"
+                );
+            }
+        }
+    }
+
+    /// `Disabled` is KEPT (the owner: "i like the ability to disable") even though the crop
+    /// session no longer uses it — and it must stay a distinct third state, not quietly become an
+    /// alias for one of the other two, or the capability is gone in all but name.
+    #[test]
+    fn the_disabled_state_is_still_a_distinct_third_state() {
+        assert_ne!(TrayItemState::Disabled, TrayItemState::Live);
+        assert_ne!(TrayItemState::Disabled, TrayItemState::Hidden);
+        // Both builders take their enabled flag as `state == Live` and their drawn-at-all test as
+        // `state != Hidden`. Replayed here so the three states still mean three different
+        // renderings: DRAWN and usable, DRAWN and inert, and not drawn.
+        let drawn = |s: TrayItemState| s != TrayItemState::Hidden;
+        let enabled = |s: TrayItemState| s == TrayItemState::Live;
+        assert_eq!((drawn(TrayItemState::Live), enabled(TrayItemState::Live)), (true, true));
+        assert_eq!(
+            (drawn(TrayItemState::Disabled), enabled(TrayItemState::Disabled)),
+            (true, false),
+            "disabled must still mean DRAWN but inert — not hidden, not usable"
+        );
+        assert_eq!((drawn(TrayItemState::Hidden), enabled(TrayItemState::Hidden)), (false, false));
+    }
+
+    /// The crop control's own arity: one button idle, the accept + cancel pair mid-session — and
+    /// accept is the LABELLED one (DRAGON-410).
+    #[test]
+    fn the_crop_control_is_one_button_idle_and_a_labelled_pair_mid_session() {
+        let tb = test_tb();
+        let km = crate::shortcuts::Keymap::defaults();
+        assert_eq!(tb.crop_items(false, &km).len(), 1);
+        assert_eq!(tb.crop_items(true, &km).len(), 2);
+        assert_eq!(CROP_ACCEPT_LABEL, "Accept Crop");
+    }
+
+    /// DRAGON-410: the labelled accept button WIDENS the crop group, so it must still fit the
+    /// narrowest preview the editor ever opens (`PREVIEW_MIN_W`, the DRAGON-392 floor).
+    ///
+    /// Estimated the same way `about.rs` sizes its fixed-width action buttons — a generous
+    /// per-character advance at the button's own font size — plus libcosmic's OWN metrics for the
+    /// parts we do not choose (`space_s` padding, `space_xxxs` icon-to-label gap, the 16px icon),
+    /// read off the theme rather than copied, so a theme change moves the estimate with it.
+    ///
+    /// The margin is enormous, and that is the finding: mid-crop this bar carries the crop cluster
+    /// ALONE (the share group hides with everything else), where the idle bar's own floor already
+    /// reserves a four-button share group. Labelling accept cannot be what overflows the bar.
+    #[test]
+    fn the_labelled_crop_pair_fits_the_minimum_preview_width() {
+        /// A comfortable over-estimate of one character's advance at the button's 14px label
+        /// (`about.rs` uses 7.5 at the same size; rounding up keeps this a ceiling).
+        const CHAR_W: f32 = 8.0;
+        let theme = cosmic::theme::Theme::dark();
+        let c = theme.cosmic();
+        let s = PreviewSurface::Overlay.btn_scale();
+        // ACCEPT: libcosmic's `button::suggested` — h-padding `space_s` each side, a 16px leading
+        // icon, `space_xxxs` between icon and label, then the label.
+        let accept = 2.0 * f32::from(c.space_s())
+            + 16.0
+            + f32::from(c.space_xxxs())
+            + CROP_ACCEPT_LABEL.chars().count() as f32 * CHAR_W;
+        // CANCEL: an ordinary scaled toolbar icon button.
+        let cancel = s * (ICON_BOX + 2.0 * BTN_PAD);
+        // The cluster: group padding both sides + the pair + the 2px inter-button spacing.
+        let cluster = 2.0 * s * GROUP_PAD + accept + cancel + 2.0;
+        // The bar: the cluster, the row gap to the split, and the split's minimum gap.
+        let bar = cluster + TOOLBAR_ROW_GAP + SPLIT_MIN_GAP;
+        assert!(
+            bar <= crate::app::shell::PREVIEW_MIN_W,
+            "the mid-crop top bar ({bar}px) must fit PREVIEW_MIN_W ({}px)",
+            crate::app::shell::PREVIEW_MIN_W
+        );
     }
 
     /// Every tray entry advertises a hotkey action that lives in the PREVIEW context, and every
@@ -2706,6 +3406,24 @@ mod tests {
                 assert!(km.get(tip).is_some(), "{name} is unreachable from the keyboard");
             }
         }
+    }
+
+    /// DRAGON-392 correction: a crop session DISARMS the tray (nothing may look armed while the
+    /// session owns the canvas) and re-arms on exit. That must not disturb the cycle slots — the
+    /// next `M`/`U` press has to behave exactly as it would have without the crop.
+    ///
+    /// It holds because the disarm moves no cursor (`set_annot_tool(None)` skips the insert) and
+    /// arm-then-advance reads the CURSOR when nothing is armed: with the tool put back, the slot
+    /// is armed again and advances from it; with nothing armed, the slot re-arms its remembered
+    /// member rather than restarting at the first.
+    #[test]
+    fn disarming_for_a_crop_session_leaves_the_cycle_slots_where_they_were() {
+        use crate::shortcuts::Action;
+        let members = slot_tools(Action::PreviewAnnotRedactCycle);
+        // The user had armed the slot's SECOND member, then a crop session disarmed everything.
+        assert_eq!(next_slot_tool(&members, None, Some(Tool::Blur)), Some(Tool::Blur));
+        // With the tool handed back, the key advances from it exactly as before the session.
+        assert_eq!(next_slot_tool(&members, Some(Tool::Blur), Some(Tool::Blur)), members.first().copied());
     }
 
     // ── one-key tool SLOTS (DRAGON-369) ──────────────────────────────────────────────
@@ -3033,3 +3751,4 @@ mod tests {
         }
     }
 }
+

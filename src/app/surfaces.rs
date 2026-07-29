@@ -695,9 +695,12 @@ impl App {
                 super::shell::PREVIEW_WINDOW_TITLE,
             );
             if frosted_windowed {
-                // Mica backdrop (DRAGON-267): the windowed preview is now shown — apply the
-                // DWM Mica material. The chrome already paints translucent from `self.glass`.
-                crate::platform::windows::window::apply_mica(super::shell::PREVIEW_WINDOW_TITLE);
+                // Frosted-windows material (DRAGON-267 Mica on Win11 22H2+; DRAGON-405 blur-behind
+                // on Win10): the windowed preview is now shown — apply it. The chrome already
+                // paints translucent from `self.glass`, at the alpha that material calls for.
+                crate::platform::windows::window::apply_window_glass(
+                    super::shell::PREVIEW_WINDOW_TITLE,
+                );
             }
             // DRAGON-305: a WINDOWED single-window capture pre-opened the fullscreen BLOCKER cover
             // to hide the grab/compose, then swapped it for THIS window (`swap_neutral_spinner_to_window`,
