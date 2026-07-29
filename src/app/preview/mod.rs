@@ -546,6 +546,35 @@ pub(super) fn delete_intent(copy_on_delete: bool) -> ShareIntent {
     if copy_on_delete { ShareIntent::CopyThenDelete } else { ShareIntent::Delete }
 }
 
+/// One media kind's three share-automation settings — the triple [`copy_intent`] and
+/// [`delete_intent`] read (DRAGON-420).
+///
+/// A named triple rather than three loose bools at the call site: the whole point of the
+/// feature is that there are now TWO of these and a document must read exactly one of them,
+/// so passing them as a unit is what makes "the video document accidentally read an image
+/// field" a thing the type system can be asked about instead of a typo nobody notices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ShareAutomation {
+    pub save_on_copy: bool,
+    pub close_on_copy: bool,
+    pub copy_on_delete: bool,
+}
+
+/// WHICH triple a document reads: the Video Editor group's for a recording, the Image
+/// Editor group's for a still (DRAGON-420) — the ONE place the fork lives.
+///
+/// Pure and total, so the "these settings are independent" property is directly testable:
+/// for every combination, flipping a field of one triple can never move the other's answer.
+/// Before this, both kinds read the image triple; the video fields default to the same
+/// values, so an untouched install behaves exactly as it did.
+pub(super) fn share_automation(
+    is_video: bool,
+    image: ShareAutomation,
+    video: ShareAutomation,
+) -> ShareAutomation {
+    if is_video { video } else { image }
+}
+
 /// THE dirty-close gate (DRAGON-353): should a close attempt raise the unsaved-changes
 /// dialog instead of closing?
 ///
@@ -730,6 +759,27 @@ impl App {
         close
     }
 
+
+    /// This document's share-automation settings, chosen by MEDIA KIND (DRAGON-420): a
+    /// recording reads the Video Editor group, a still reads the Image Editor group. A
+    /// document that has already vanished falls back to the image triple — no share can run
+    /// against it anyway, and the arms below re-check for its existence.
+    pub(super) fn preview_share_automation(&self, id: window::Id) -> ShareAutomation {
+        let image = ShareAutomation {
+            save_on_copy: self.preview_save_on_copy,
+            close_on_copy: self.preview_close_on_copy,
+            copy_on_delete: self.preview_copy_on_delete,
+        };
+        let video = ShareAutomation {
+            save_on_copy: self.preview_video_save_on_copy,
+            close_on_copy: self.preview_video_close_on_copy,
+            copy_on_delete: self.preview_video_copy_on_delete,
+        };
+        let is_video = self
+            .preview_for(id)
+            .is_some_and(|p| matches!(p.kind, PreviewKind::Video(_)));
+        share_automation(is_video, image, video)
+    }
 
     pub(super) fn update_preview(
         &mut self,
@@ -1747,7 +1797,23 @@ impl App {
                 // settings then layer on save-first ("Automatically save on copy", a real
                 // SAVE whose result is copied) and/or close-after ("Automatically close on
                 // copy", held so the toast reads and aborted if the copy fails) — DRAGON-355.
-                self.run_share(id, copy_intent(self.preview_save_on_copy, self.preview_close_on_copy))
+                //
+                // DRAGON-420: WHICH pair of settings is read depends on the media kind —
+                // recordings have their own "Video Editor" group. `run_share` is unchanged
+                // and still the one entry point, so a video Copy that OWES a bake it cannot
+                // produce (a recording whose ffprobe never landed) is refused there, whole:
+                // with save-on-copy on, nothing is saved, nothing is copied and nothing
+                // closes, and the editor stays up with the reason (DRAGON-398).
+                let a = self.preview_share_automation(id);
+                self.run_share(id, copy_intent(a.save_on_copy, a.close_on_copy))
+            }
+            PreviewMsg::LoadFailed => {
+                // DRAGON-415: the decode thread died. The capture is SAVED, so this is not a
+                // lost capture, but the editor the user was waiting for is never going to
+                // appear — say so, then close exactly as `Cancel` does (which ends the
+                // process only if this was the last document).
+                self.report_failure();
+                self.update_preview(id, PreviewMsg::Cancel)
             }
             PreviewMsg::Cancel => {
                 // Close without deleting — the file stays where it is. Deleting is the
@@ -1845,7 +1911,12 @@ impl App {
                     p.edit.dismiss_close_dialog();
                 }
                 self.stop_preview_playback(id);
-                self.run_share(id, delete_intent(self.preview_copy_on_delete))
+                // DRAGON-420: recordings read the "Video Editor" group's copy-on-delete.
+                // The refusal ordering is `run_share`'s, unchanged: a `CopyThenDelete` whose
+                // bake cannot be produced is refused BEFORE the copy, so the recording is
+                // never deleted on the back of a share that did not happen.
+                let a = self.preview_share_automation(id);
+                self.run_share(id, delete_intent(a.copy_on_delete))
             }
             PreviewMsg::SaveAs => {
                 // DRAGON-398: refuse BEFORE the picker when the edits this export would have
@@ -2151,6 +2222,61 @@ mod tests {
         // unsaved-changes guard in `finish_share_intent` (verified by the share-flow logic).
         assert!(!copy_intent(false, false).closes_document());
         assert!(copy_intent(true, true).closes_document() && copy_intent(true, true).saves());
+    }
+
+    /// DRAGON-420: a document reads the triple for ITS media kind, and nothing else. The
+    /// regression this exists to catch is a video path still reaching an image field (the
+    /// state before this ticket, when both kinds shared one triple) — which no compile error
+    /// and no visual check would report, because the settings window would look correct and
+    /// only the behaviour would be wrong.
+    #[test]
+    fn video_and_image_share_settings_never_bleed_into_each_other() {
+        let image = ShareAutomation {
+            save_on_copy: true,
+            close_on_copy: true,
+            copy_on_delete: true,
+        };
+        let video = ShareAutomation {
+            save_on_copy: false,
+            close_on_copy: false,
+            copy_on_delete: false,
+        };
+        // Each kind gets its OWN triple, whole — never a field-by-field mix.
+        assert_eq!(share_automation(true, image, video), video);
+        assert_eq!(share_automation(false, image, video), image);
+        // Exhaustive independence: over every combination of the two triples, the answer for
+        // one kind is a function of THAT kind's triple alone. Changing the other cannot move
+        // it, which is precisely "a user can have images auto-close while videos stay open".
+        let all = |bits: u8| ShareAutomation {
+            save_on_copy: bits & 1 != 0,
+            close_on_copy: bits & 2 != 0,
+            copy_on_delete: bits & 4 != 0,
+        };
+        for i in 0..8u8 {
+            for j in 0..8u8 {
+                let (img, vid) = (all(i), all(j));
+                assert_eq!(share_automation(false, img, vid), img, "image reads image");
+                assert_eq!(share_automation(true, img, vid), vid, "video reads video");
+            }
+        }
+        // And the settings reach the INTENTS unchanged — the same two pure rules the image
+        // side has always used, now fed from whichever group the document belongs to. The
+        // fully-parted case: images save-and-close on copy, videos do neither and keep the
+        // recording on a delete.
+        let img = ShareAutomation { save_on_copy: true, close_on_copy: true, copy_on_delete: true };
+        let vid =
+            ShareAutomation { save_on_copy: false, close_on_copy: false, copy_on_delete: false };
+        let i = share_automation(false, img, vid);
+        let v = share_automation(true, img, vid);
+        assert_eq!(copy_intent(i.save_on_copy, i.close_on_copy), ShareIntent::SaveCopyClose);
+        assert_eq!(copy_intent(v.save_on_copy, v.close_on_copy), ShareIntent::Copy);
+        assert_eq!(delete_intent(i.copy_on_delete), ShareIntent::CopyThenDelete);
+        assert_eq!(delete_intent(v.copy_on_delete), ShareIntent::Delete);
+        // The video Copy above closes nothing, so a playing soundtrack is not torn down at
+        // all; with close-on-copy ON it resolves to a closing intent, whose close runs through
+        // `close_preview` — which stops playback and releases the audio duck before the
+        // surface dies (the same path Esc takes), so there is no second teardown to write.
+        assert!(copy_intent(false, true).closes_document());
     }
 
     /// A document that opened on `capture` and has since WRITTEN `written`, in order.

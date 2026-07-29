@@ -84,6 +84,12 @@ pub enum WindowChromeMsg {
     /// plus its `update_*` arm is an accepted per-platform cfg site).
     #[cfg(windows)]
     OpenDiagnosticsFolder,
+    /// DRAGON-419: open the debug log's folder in the desktop's file manager (the Health
+    /// page's Debug row). All platforms — the whole point of this ticket is that macOS and
+    /// Linux stopped being second-class here. A dedicated variant rather than `OpenUrlOwned`
+    /// so the path is built from `diag::log_dir` at press time and never round-trips through
+    /// a shell.
+    OpenDebugLogFolder,
     /// Swallow an input event without doing anything (e.g. a click on a modal
     /// backdrop that must block the window behind it but not dismiss the modal).
     Ignore,
@@ -152,12 +158,10 @@ pub enum WindowChromeMsg {
     /// surface; the window is only ever minted on macOS, so this never fires on
     /// Linux — kept un-cfg'd so the enum + match arms stay platform-uniform).
     PermissionsWindowOpened(window::Id),
-    /// Close the permission-checker window (header ✕). Currently constructed on NO
-    /// platform: the only construction site is the `not(macos)` header-close branch
-    /// inside the macOS-only view module (on mac the traffic lights carry close,
-    /// DRAGON-135; on Linux the window is never minted). Kept for the day the
-    /// checker grows a Linux surface — the `expect` self-expires then.
-    #[expect(dead_code)]
+    /// Close the permission-checker window (header ✕, and — as of DRAGON-412 — the
+    /// "Continue Without These" button, which spends the nag and then routes here).
+    /// That Skip handler is un-cfg'd, so this is now constructed on every platform
+    /// (the `expect(dead_code)` it used to carry self-expired).
     ClosePermissionsWindow,
     /// Permission-checker window titlebar: drag to move.
     #[cfg_attr(not(target_os = "macos"), expect(dead_code))]

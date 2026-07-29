@@ -61,6 +61,17 @@ impl App {
                 }
                 Task::none()
             }
+            // DRAGON-412: "Continue Without These" — record that the recommended /
+            // optional grants have had their one look, then close. The close path spends
+            // the nag too (dismissal is terminal, which is the actual defect this ticket
+            // fixes); this button exists so the guarantee is VISIBLE rather than an
+            // invisible side effect of clicking ✕. Un-cfg'd (carries no macOS type).
+            PermissionsMsg::Skip => {
+                permissions::spend_nag();
+                Task::done(cosmic::Action::App(Msg::WindowChrome(
+                    WindowChromeMsg::ClosePermissionsWindow,
+                )))
+            }
             #[cfg(target_os = "macos")]
             PermissionsMsg::Request(perm) => {
                 use crate::app::permissions::Permission;

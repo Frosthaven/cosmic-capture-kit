@@ -15,11 +15,25 @@ use crate::audio::meter::{db_to_lin, lin_to_db, rms};
 use super::AudioFilter;
 
 // All dBFS, on the meters' scale (see audio-levels.md). Bands: "Normal" body -24..-12, "Ideal
-// Peaks" -12..-6, red above -6. We aim the AVERAGE at the top of the "Normal" band so the louder
+// Peaks" -12..-6, red above -6. We aim the AVERAGE inside the "Normal" band so the louder
 // syllables rise into "Ideal Peaks" using the headroom above it — instead of parking the average
 // in "Ideal" (centre of green), which leaves no room and makes every loud syllable hit the limiter
 // (audible clamping) and the meter go red. Lower target = peaks breathe; loudness stays close.
-const TARGET_DB: f32 = -14.0; // where the AVERAGE speaking level sits (top of the "Normal" band)
+//
+// DRAGON-411: -14 (the top of "Normal") left only 7 dB to CEILING_DB, where speech wants 10-15 for
+// syllable peaks. Measured on a real recording: loudness range 1.9 LU whole-file and 1.2 LU on
+// gap-free audio, with 34% of speech frames inside a single 4 dB band and a hard stop at -7 — the
+// signature of peaks squashing against the ceiling rather than breathing under it. For scale,
+// DRAGON-83's own commit called ~4 LU "compressed / in your face" as the state it was FIXING, so
+// 1.9 was materially worse than what triggered that loosening. Moving to -17 buys 10 dB of
+// headroom and puts the average mid-band instead of hugging its top; integrated loudness lands
+// near -15.8 LUFS, inside the normal band (it was -12.8, slightly hot).
+//
+// This is a TUNING value in the CAUTION zone: it is not a free knob, and it is only correct while
+// the flattening comes from the ceiling. If a future measurement shows the loudness range still
+// collapsed at this target, the cause is the follower or the safety stage's knee, NOT this number
+// — lowering it further would only make the recording quieter and equally flat.
+const TARGET_DB: f32 = -17.0; // where the AVERAGE speaking level sits (mid "Normal" band)
 const NOISE_FLOOR_DB: f32 = -55.0; // below this it isn't speech worth tracking/boosting
 const VAD_SPEECH: f32 = 0.5; // track the level only when we're this sure it's voice
 const MAX_GAIN_DB: f32 = 36.0;
@@ -175,25 +189,32 @@ mod tests {
 
     #[test]
     fn quiet_voice_normalises_to_the_body_band() {
-        // -28 dBFS mic: the AVERAGE should normalise to the top of the "Normal" body band (~0.77),
-        // leaving headroom above for peaks — not parked up in "Ideal Peaks" (0.80..0.90).
+        // -28 dBFS mic: the AVERAGE should normalise into the "Normal" body band, leaving headroom
+        // above for peaks — not parked up in "Ideal Peaks" (0.80..0.90).
+        //
+        // DRAGON-411: the expected position MOVED with TARGET_DB, -14 -> -17. The meter is
+        // `(db + 60) / 60`, so the settled average goes 46/60 = 0.767 -> 43/60 = 0.717. This band
+        // is recomputed from the new target, NOT widened to admit the old one — a range stretched
+        // until it passes would stop pinning anything.
         let m = settle(-28.0, 200);
-        assert!((0.73..=0.80).contains(&m), "settled meter = {m}");
+        assert!((0.68..=0.75).contains(&m), "settled meter = {m}");
     }
 
     #[test]
     fn first_short_word_is_boosted_to_the_body_band() {
         // A short first word (~300 ms = 30 frames) of a quiet mic should already reach the body
         // band — the fast lock-on lands it without waiting for the slow follower.
+        // DRAGON-411: floor tracks TARGET_DB -14 -> -17, i.e. 0.767 -> 0.717 on the meter.
         let m = settle(-28.0, 30);
-        assert!(m >= 0.72, "first short word only reached {m}, should already be at the body level");
+        assert!(m >= 0.67, "first short word only reached {m}, should already be at the body level");
     }
 
     #[test]
     fn hot_voice_is_pulled_down_into_band() {
         // A hot -3 dBFS mic must be brought DOWN to the body band, not left hot.
+        // DRAGON-411: same recomputed band as `quiet_voice_normalises_to_the_body_band`.
         let m = settle(-3.0, 200);
-        assert!((0.73..=0.80).contains(&m), "hot mic settled at {m}, should sit in the body band");
+        assert!((0.68..=0.75).contains(&m), "hot mic settled at {m}, should sit in the body band");
     }
 
     #[test]

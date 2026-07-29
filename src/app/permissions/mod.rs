@@ -126,10 +126,17 @@ pub struct Probe {
     pub notifications: Option<PermStatus>,
     /// Accessibility (DRAGON-311): preflight (granted / not-granted). Like Screen
     /// Recording the preflight is boolean, so `accessibility_request_spent` decides
-    /// whether a not-granted state reads as NotDetermined vs Denied. OPTIONAL.
+    /// whether a not-granted state reads as NotDetermined vs Denied. RECOMMENDED
+    /// (DRAGON-412).
     pub accessibility_granted: bool,
     /// Whether the Accessibility prompt is spent (`mac_accessibility_prompt_seen`).
     pub accessibility_request_spent: bool,
+    /// DRAGON-412: whether the RECOMMENDED / OPTIONAL nag is spent
+    /// (`mac_permission_nag_spent`) — the window has been presented once and left
+    /// without addressing those grants. Once true, no non-required permission can
+    /// force the window open again; only the required Screen Recording grant still
+    /// can. Set by Skip and by simply closing the window.
+    pub nag_spent: bool,
 }
 
 /// All UI state for the permission-checker window, grouped so `App` carries a single
@@ -210,18 +217,45 @@ fn probe_with(include_notifications: bool) -> Probe {
         screen_request_spent: force_danger || crate::state::load().mac_first_run_seen,
         microphone,
         notifications,
-        // Accessibility is OPTIONAL, so FORCE_WARN (not FORCE_DANGER) drives it missing
-        // + prompt spent ⇒ amber Denied (Open Settings), matching how FORCE_WARN
-        // exercises the other optional cards' remediation button.
+        // Accessibility is RECOMMENDED, so FORCE_WARN (not FORCE_DANGER) drives it
+        // missing + prompt spent ⇒ amber Denied (Open Settings), matching how FORCE_WARN
+        // exercises the other non-required cards' remediation button.
         accessibility_granted: !force_warn && tcc::accessibility_granted(),
         accessibility_request_spent: force_warn || crate::state::load().mac_accessibility_prompt_seen,
+        // DRAGON-412: read straight off the store — the review flags exercise CARD
+        // states, and this one only gates AUTO-open, which they don't drive.
+        nag_spent: crate::state::load().mac_permission_nag_spent,
+    }
+}
+
+/// Mark the RECOMMENDED / OPTIONAL nag spent (DRAGON-412): the user has now seen the
+/// permission window once and left it without addressing those grants, so it must
+/// never auto-open for them again. Called from BOTH escape routes — the explicit
+/// "Continue Without These" button and a plain window close — so dismissing and
+/// skipping are one behaviour, and only one of them needs a label.
+///
+/// Deliberately does NOT touch `mac_accessibility_prompt_seen`: that flag records that
+/// the OS prompt itself is spent (which is what turns the card's Request button into
+/// Open System Settings, and what makes a missing grant read as Denied). A dismissal
+/// is not a denial, and must not be rendered as one.
+///
+/// A no-op off macOS (no TCC grants, the window is never minted); kept un-cfg'd so the
+/// shared close path type-checks everywhere.
+pub fn spend_nag() {
+    let mut p = crate::state::load();
+    if !p.mac_permission_nag_spent {
+        p.mac_permission_nag_spent = true;
+        crate::state::save(&p);
     }
 }
 
 /// The Accessibility card's status from a [`Probe`]. Mirrors [`screen_status`]:
 /// granted ⇒ Granted; else the boolean preflight can't tell NotDetermined from Denied,
 /// so the spent flag decides (unspent ⇒ NotDetermined / offer Request, spent ⇒ Denied
-/// / offer Open Settings). OPTIONAL, so the view colours a missing state amber, not red.
+/// / offer Open Settings). RECOMMENDED, so the view colours a missing state amber, not
+/// red. Note the spent flag here is `mac_accessibility_prompt_seen` — the OS prompt —
+/// NOT the DRAGON-412 dismissal flag, which must never make an unanswered grant read
+/// as Denied.
 #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
 pub fn accessibility_status(probe: &Probe) -> PermStatus {
     if probe.accessibility_granted {
@@ -261,26 +295,28 @@ pub fn screen_status(probe: &Probe) -> PermStatus {
 }
 
 /// Whether the permission-checker window should AUTO-OPEN on a capture launch or at
-/// daemon startup. True when EITHER the required Screen Recording grant is missing
-/// (`!screen_granted` — regardless of NotDetermined vs Denied, since it is required
-/// and a missing grant only yields blank captures), OR an OPTIONAL permission is
-/// still NotDetermined (never prompted): microphone NotDetermined, notifications
-/// NotDetermined when the notification card is present (`Some`; `None` = unbundled /
-/// query unanswered = hidden card, never a reason to open), or Accessibility
-/// NotDetermined (never prompted — worth one prompt so "Capture Active Window" can
-/// target the focused window).
+/// daemon startup. Two tiers decide it, and they are not symmetric ([`Tier`]):
 ///
-/// Explicitly DENIED optional permissions (mic / notifications / accessibility)
-/// deliberately do NOT trigger this — a user who declined one must not be nagged.
-/// Only the required Screen Recording keeps forcing the window once every optional
-/// permission has been addressed (granted or denied).
+/// * **Required** ([`Permission::ScreenRecording`]): a missing grant ALWAYS forces the
+///   window, regardless of NotDetermined vs Denied and regardless of `nag_spent` —
+///   capture without it only yields blank frames, so there is nothing to continue to.
+///   This arm is deliberately un-weakened by everything below.
+/// * **Recommended / Optional** (accessibility, microphone, notifications): each may
+///   force the window ONCE, while still NotDetermined (never prompted). `nag_spent`
+///   ends that once, for all of them together.
 ///
-/// Semantics of a NotDetermined trigger: acting on the card fires the OS prompt,
-/// which flips the status to Granted or Denied, so the window stops auto-opening once
-/// everything has been addressed. Dismissing the window WITHOUT acting leaves the
-/// status NotDetermined, so it may reopen on the next capture / daemon start — that
-/// is the chosen semantic (an unaddressed never-prompted permission is worth one more
-/// look, a declined one is not).
+/// `nag_spent` is the DRAGON-412 fix. Before it, "once" was terminated only by the OS
+/// prompt firing (which flips the status to Granted/Denied). Dismissing the window
+/// without acting left every status NotDetermined, so the window came back on the next
+/// capture and the next daemon start, forever — the only escape was to trigger the
+/// prompt and explicitly deny. A customer read that as "the tool just wouldn't open"
+/// and stacked up six retrying processes. Closing the window IS an answer, and this
+/// flag is the record of it, so the escape terminates.
+///
+/// Explicitly DENIED non-required permissions still do not trigger this either — a
+/// user who declined one must not be nagged. Once every non-required permission is
+/// addressed (granted, denied, or skipped) only the required Screen Recording grant
+/// can still force the window.
 ///
 /// Pure over the reduced statuses so the full truth table is unit-testable; callers
 /// pass values assembled by [`probe_now`] (see [`should_auto_open_probe`]).
@@ -291,9 +327,21 @@ pub fn should_auto_open(
     mic: PermStatus,
     notifications: Option<PermStatus>,
     accessibility: PermStatus,
+    nag_spent: bool,
 ) -> bool {
-    !screen_granted
-        || mic == PermStatus::NotDetermined
+    // Required: nothing below can weaken this, and nothing below runs when it fires.
+    if !screen_granted {
+        return true;
+    }
+    // Recommended / Optional: one presentation each, ended for all of them at once by
+    // a Skip or a dismissal. Structurally an early return rather than an `&&` per arm,
+    // so a future non-required permission cannot reintroduce an unbounded nag by
+    // forgetting to consult the flag.
+    if nag_spent {
+        return false;
+    }
+    mic == PermStatus::NotDetermined
+        // `None` = unbundled / query unanswered = hidden card, never a reason to open.
         || notifications == Some(PermStatus::NotDetermined)
         || accessibility == PermStatus::NotDetermined
 }
@@ -309,6 +357,7 @@ pub fn should_auto_open_probe(probe: &Probe) -> bool {
         probe.microphone.unwrap_or(PermStatus::NotDetermined),
         probe.notifications,
         accessibility_status(probe),
+        probe.nag_spent,
     )
 }
 
@@ -360,18 +409,85 @@ pub fn card_action(status: PermStatus, request_spent: bool) -> CardAction {
     }
 }
 
+/// How badly a permission is wanted (DRAGON-412) — the ONE source of both the word
+/// the card prints and the auto-open policy [`should_auto_open`] applies, so the copy
+/// and the behaviour can't drift apart (they had: `Permission::Accessibility`'s doc
+/// claimed it never forced the window while the predicate forced it forever).
+///
+/// * [`Tier::Required`] — capture is broken without it. Forces the window until granted.
+/// * [`Tier::Recommended`] — capture works, but degrades in a way worth one explanation.
+///   Presents itself ONCE; a grant, a denial, OR a dismissal ends that for good.
+/// * [`Tier::Optional`] — a side feature. Same once-only presentation as Recommended;
+///   the tiers differ only in the word on the card and in how strongly it is urged.
+#[cfg_attr(all(not(target_os = "macos"), not(test)), expect(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tier {
+    Required,
+    Recommended,
+    Optional,
+}
+
+impl Tier {
+    /// The word the card leads with. "Recommended" is the DRAGON-412 ask: Accessibility
+    /// used to print "Optional", which undersold it while the code nagged about it
+    /// hardest.
+    #[cfg_attr(all(not(target_os = "macos"), not(test)), expect(dead_code))]
+    pub fn label(self) -> &'static str {
+        match self {
+            Tier::Required => "Required",
+            Tier::Recommended => "Recommended",
+            Tier::Optional => "Optional",
+        }
+    }
+
+    /// Whether a missing grant in this tier is an error (red pill) or a soft state
+    /// (amber). Only Required is red — the others are choices, not faults.
+    #[cfg_attr(all(not(target_os = "macos"), not(test)), expect(dead_code))]
+    pub fn is_required(self) -> bool {
+        matches!(self, Tier::Required)
+    }
+}
+
 /// Which permission a card represents — the stable id the view + update route on.
-#[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+// `not(test)`: the tier tests below construct these variants on every platform.
+#[cfg_attr(all(not(target_os = "macos"), not(test)), expect(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
     ScreenRecording,
     Microphone,
     Notifications,
-    /// Accessibility (DRAGON-311, OPTIONAL): lets "Capture Active Window" / "Capture
-    /// Active Monitor" resolve the FOCUSED window (and capture it in its active
-    /// appearance) via the AX API. Absent, capture degrades gracefully to a z-order
-    /// guess, so its lack never routes/forces the window like Screen Recording does.
+    /// Accessibility (DRAGON-311, RECOMMENDED as of DRAGON-412): lets "Capture Active
+    /// Window" / "Capture Active Monitor" resolve the FOCUSED window (and capture it in
+    /// its active appearance) via the AX API. Absent, capture degrades gracefully to a
+    /// z-order guess, which is usually right but can pick the wrong window.
+    ///
+    /// It therefore forces the permission window AT MOST ONCE (while never prompted),
+    /// unlike the required Screen Recording grant which forces it until granted — and
+    /// unlike the pre-DRAGON-412 behaviour, where "at most once" was a comment here
+    /// that the predicate did not implement.
     Accessibility,
+}
+
+impl Permission {
+    /// This permission's [`Tier`]. See the module tests for the tier's contract.
+    #[cfg_attr(all(not(target_os = "macos"), not(test)), expect(dead_code))]
+    pub fn tier(self) -> Tier {
+        match self {
+            Permission::ScreenRecording => Tier::Required,
+            // DRAGON-412: promoted from Optional. It is the one non-required grant that
+            // changes what a CAPTURE produces (which window you get), rather than adding
+            // a side feature, so it is urged more strongly than mic/notifications — but
+            // it is still a choice, and skipping it is honoured permanently.
+            Permission::Accessibility => Tier::Recommended,
+            // Microphone / Notifications stay OPTIONAL: each gates a separable feature
+            // (voice-over on a recording; a save banner), not the quality of a capture,
+            // and their existing copy is accurate. They DO share the Recommended tier's
+            // once-only presentation — the unbounded-nag defect was never specific to
+            // Accessibility, and fixing one tier while leaving these two able to re-force
+            // the window on every launch would leave the reported symptom intact.
+            Permission::Microphone | Permission::Notifications => Tier::Optional,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -403,54 +519,54 @@ mod tests {
         // Screen missing is required → open, whatever the optional cards say (even all
         // granted, even all denied). Accessibility addressed (Granted) so only the
         // screen grant drives these.
-        assert!(should_auto_open(false, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Granted));
-        assert!(should_auto_open(false, PermStatus::Denied, Some(PermStatus::Denied), PermStatus::Denied));
-        assert!(should_auto_open(false, PermStatus::NotDetermined, None, PermStatus::Granted));
+        assert!(should_auto_open(false, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Granted, false));
+        assert!(should_auto_open(false, PermStatus::Denied, Some(PermStatus::Denied), PermStatus::Denied, false));
+        assert!(should_auto_open(false, PermStatus::NotDetermined, None, PermStatus::Granted, false));
     }
 
     #[test]
     fn auto_open_when_an_optional_is_not_determined() {
         // Screen granted but a never-prompted optional → open (offer the prompt once).
-        assert!(should_auto_open(true, PermStatus::NotDetermined, Some(PermStatus::Granted), PermStatus::Granted));
-        assert!(should_auto_open(true, PermStatus::Granted, Some(PermStatus::NotDetermined), PermStatus::Granted));
-        assert!(should_auto_open(true, PermStatus::NotDetermined, None, PermStatus::Granted));
+        assert!(should_auto_open(true, PermStatus::NotDetermined, Some(PermStatus::Granted), PermStatus::Granted, false));
+        assert!(should_auto_open(true, PermStatus::Granted, Some(PermStatus::NotDetermined), PermStatus::Granted, false));
+        assert!(should_auto_open(true, PermStatus::NotDetermined, None, PermStatus::Granted, false));
         // Accessibility never-prompted alone (mic/notif addressed) → open.
-        assert!(should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::NotDetermined));
+        assert!(should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::NotDetermined, false));
     }
 
     #[test]
     fn no_auto_open_when_everything_addressed() {
         // Screen granted and every optional addressed (granted OR denied) → stay shut.
-        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Granted));
-        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted));
+        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Granted, false));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted, false));
     }
 
     #[test]
     fn denied_optionals_do_not_nag() {
         // The key decision: a user who DECLINED mic / notifications / accessibility is
         // not re-nagged while Screen Recording is granted.
-        assert!(!should_auto_open(true, PermStatus::Denied, Some(PermStatus::Denied), PermStatus::Denied));
-        assert!(!should_auto_open(true, PermStatus::Denied, Some(PermStatus::Granted), PermStatus::Granted));
-        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Denied), PermStatus::Granted));
-        assert!(!should_auto_open(true, PermStatus::Denied, None, PermStatus::Granted));
+        assert!(!should_auto_open(true, PermStatus::Denied, Some(PermStatus::Denied), PermStatus::Denied, false));
+        assert!(!should_auto_open(true, PermStatus::Denied, Some(PermStatus::Granted), PermStatus::Granted, false));
+        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Denied), PermStatus::Granted, false));
+        assert!(!should_auto_open(true, PermStatus::Denied, None, PermStatus::Granted, false));
         // Declined accessibility alone is not a reason to nag.
-        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Denied));
+        assert!(!should_auto_open(true, PermStatus::Granted, Some(PermStatus::Granted), PermStatus::Denied, false));
     }
 
     #[test]
     fn accessibility_not_determined_opens_once() {
         // Never-prompted Accessibility (everything else addressed) → open to offer the
         // one prompt; declined does not, mirroring the other optionals.
-        assert!(should_auto_open(true, PermStatus::Granted, None, PermStatus::NotDetermined));
-        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Denied));
-        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted));
+        assert!(should_auto_open(true, PermStatus::Granted, None, PermStatus::NotDetermined, false));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Denied, false));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted, false));
     }
 
     #[test]
     fn hidden_notification_card_is_never_a_reason_to_open() {
         // Notifications None (unbundled / unanswered) must not trigger the window on
         // its own — only Some(NotDetermined) does.
-        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted, false));
     }
 
     // DRAGON-201: the launch-routing probe skips the (blocking) notification query, so
@@ -461,15 +577,15 @@ mod tests {
     #[test]
     fn routing_without_notifications_still_opens_on_missing_screen_recording() {
         // Screen Recording missing → open, regardless of the (absent) notification status.
-        assert!(should_auto_open(false, PermStatus::Granted, None, PermStatus::Granted));
-        assert!(should_auto_open(false, PermStatus::Denied, None, PermStatus::Granted));
-        assert!(should_auto_open(false, PermStatus::NotDetermined, None, PermStatus::Granted));
+        assert!(should_auto_open(false, PermStatus::Granted, None, PermStatus::Granted, false));
+        assert!(should_auto_open(false, PermStatus::Denied, None, PermStatus::Granted, false));
+        assert!(should_auto_open(false, PermStatus::NotDetermined, None, PermStatus::Granted, false));
     }
 
     #[test]
     fn routing_without_notifications_opens_on_never_prompted_mic() {
         // Screen granted, mic never prompted → still worth one prompt.
-        assert!(should_auto_open(true, PermStatus::NotDetermined, None, PermStatus::Granted));
+        assert!(should_auto_open(true, PermStatus::NotDetermined, None, PermStatus::Granted, false));
     }
 
     #[test]
@@ -477,8 +593,8 @@ mod tests {
         // Screen granted + mic addressed (granted or denied), notifications absent from
         // the fast probe, accessibility addressed → launch is NOT gated on a
         // possibly-NotDetermined notification.
-        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted));
-        assert!(!should_auto_open(true, PermStatus::Denied, None, PermStatus::Granted));
+        assert!(!should_auto_open(true, PermStatus::Granted, None, PermStatus::Granted, false));
+        assert!(!should_auto_open(true, PermStatus::Denied, None, PermStatus::Granted, false));
     }
 
     #[test]
@@ -489,5 +605,123 @@ mod tests {
             card_action(PermStatus::NotDetermined, true),
             CardAction::OpenSettings
         );
+    }
+
+    // ---- DRAGON-412: the tier contract -------------------------------------------
+    //
+    // The failure mode being fixed is UNBOUNDED REPETITION, which no single-shot
+    // assertion catches: the old predicate was correct on any one call and wrong
+    // because the call kept coming back. So these walk the WHOLE truth table rather
+    // than sampling it.
+
+    /// Every reduced status, for exhaustive sweeps.
+    const ALL: [PermStatus; 3] =
+        [PermStatus::Granted, PermStatus::Denied, PermStatus::NotDetermined];
+
+    /// Every notification-card state, including the hidden card.
+    fn all_notifications() -> [Option<PermStatus>; 4] {
+        [
+            None,
+            Some(PermStatus::Granted),
+            Some(PermStatus::Denied),
+            Some(PermStatus::NotDetermined),
+        ]
+    }
+
+    #[test]
+    fn spent_nag_can_never_force_the_window_in_any_combination() {
+        // THE regression net. Once the recommended / optional nag is spent (the user
+        // granted, denied, or DISMISSED), no combination of their statuses may force the
+        // window while the required grant is present — 3 (mic) x 4 (notifications) x 3
+        // (accessibility) = 36 cases, all false.
+        for &mic in &ALL {
+            for notif in all_notifications() {
+                for &ax in &ALL {
+                    assert!(
+                        !should_auto_open(true, mic, notif, ax, true),
+                        "spent nag forced the window: mic={mic:?} notif={notif:?} ax={ax:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spending_the_nag_is_terminal_and_idempotent() {
+        // The customer's loop, played out: a never-prompted Accessibility opens the
+        // window (once), the user closes it (which spends the nag), and every subsequent
+        // launch must decide NOT to open — forever, not just on the next one. Repetition
+        // is the whole bug, so assert over repeated evaluations.
+        let (screen, mic, notif, ax) =
+            (true, PermStatus::Granted, None, PermStatus::NotDetermined);
+        assert!(
+            should_auto_open(screen, mic, notif, ax, false),
+            "the first look must still happen"
+        );
+        for launch in 0..100 {
+            assert!(
+                !should_auto_open(screen, mic, notif, ax, true),
+                "launch {launch} re-opened the window after dismissal"
+            );
+        }
+    }
+
+    #[test]
+    fn required_screen_recording_still_forces_the_window_even_with_the_nag_spent() {
+        // The guard against fixing the recommended tier by weakening the required one:
+        // a missing Screen Recording grant forces the window in EVERY combination,
+        // including nag_spent — 2 (spent) x 3 x 4 x 3 = 72 cases, all true.
+        for &nag_spent in &[false, true] {
+            for &mic in &ALL {
+                for notif in all_notifications() {
+                    for &ax in &ALL {
+                        assert!(
+                            should_auto_open(false, mic, notif, ax, nag_spent),
+                            "missing Screen Recording did not force the window: \
+                             nag_spent={nag_spent} mic={mic:?} notif={notif:?} ax={ax:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unspent_nag_still_offers_the_one_look() {
+        // The tier is "once", not "never": while unspent, a never-prompted recommended /
+        // optional grant must still open the window exactly as before, so this fix can't
+        // be mistaken for silently dropping the onboarding.
+        for &mic in &ALL {
+            for notif in all_notifications() {
+                for &ax in &ALL {
+                    let any_unprompted = mic == PermStatus::NotDetermined
+                        || notif == Some(PermStatus::NotDetermined)
+                        || ax == PermStatus::NotDetermined;
+                    assert_eq!(
+                        should_auto_open(true, mic, notif, ax, false),
+                        any_unprompted,
+                        "unspent nag mis-decided: mic={mic:?} notif={notif:?} ax={ax:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tiers_match_the_documented_policy() {
+        // The contradiction DRAGON-412 also fixes: the tier a card PRINTS is the tier the
+        // predicate applies, because both read `Permission::tier`.
+        assert_eq!(Permission::ScreenRecording.tier(), Tier::Required);
+        assert_eq!(Permission::Accessibility.tier(), Tier::Recommended);
+        assert_eq!(Permission::Microphone.tier(), Tier::Optional);
+        assert_eq!(Permission::Notifications.tier(), Tier::Optional);
+        // Accessibility must read "Recommended", never "Optional" — the ticket's ask.
+        assert_eq!(Permission::Accessibility.tier().label(), "Recommended");
+        assert_eq!(Permission::ScreenRecording.tier().label(), "Required");
+        assert_eq!(Permission::Microphone.tier().label(), "Optional");
+        // Only Required paints a missing grant red.
+        assert!(Tier::Required.is_required());
+        assert!(!Tier::Recommended.is_required());
+        assert!(!Tier::Optional.is_required());
     }
 }

@@ -35,10 +35,48 @@ pub fn open_uri(uri: &str) {
     }
 }
 
-/// Helper: open `uri` with the desktop's default handler (portal `OpenURI`), then
-/// exit. Used for QR-code URLs.
+/// Ask the desktop's FILE MANAGER to open `dir` directly
+/// (`org.freedesktop.FileManager1.ShowFolders`), the same interface [`run_reveal`] uses to
+/// highlight a saved capture. Returns whether the call was accepted.
+///
+/// This exists because the portal is the WRONG tool for a folder. `OpenURI` is documented as
+/// being for real URIs, and the spec directs `file://` at `OpenFile`/`OpenDirectory` (which
+/// take a file descriptor, not a string). On COSMIC the portal call succeeds at the D-Bus
+/// level — it returns a Request handle — and then silently opens nothing, so the caller sees
+/// success and the user sees no window. `ShowFolders` is a direct, synchronous call to the
+/// file manager and simply works; it is what already backs the post-capture reveal.
+#[cfg(target_os = "linux")]
+fn filemanager_show_folder(dir: &str) -> bool {
+    (|| -> Option<()> {
+        let conn = zbus::blocking::Connection::session().ok()?;
+        conn.call_method(
+            Some("org.freedesktop.FileManager1"),
+            "/org/freedesktop/FileManager1",
+            Some("org.freedesktop.FileManager1"),
+            "ShowFolders",
+            &(vec![dir], ""),
+        )
+        .ok()?;
+        Some(())
+    })()
+    .is_some()
+}
+
+/// Helper: open `uri` with the desktop's default handler, then exit. Used for QR-code URLs
+/// and for the settings pages' "open this folder" buttons.
+///
+/// A `file://` URI naming a DIRECTORY goes to the file manager first (see
+/// [`filemanager_show_folder`]); everything else, and any failure, falls through to the
+/// portal, which is correct for real URLs. Before this split every folder button routed
+/// through the portal and silently did nothing on COSMIC.
 #[cfg(target_os = "linux")]
 pub fn run_open_uri(uri: &str) {
+    if let Some(path) = uri.strip_prefix("file://")
+        && std::path::Path::new(path).is_dir()
+        && filemanager_show_folder(uri)
+    {
+        return;
+    }
     let _ = portal_open_uri(uri);
 }
 

@@ -130,14 +130,36 @@ pub(super) fn decode_task(pid: window::Id, path: PathBuf) -> Task<cosmic::Action
                 let handle = shared_rgba_handle(&original);
                 (handle, Some(original))
             }
-            Err(_) => (widget::image::Handle::from_path(&path), None),
+            // DRAGON-419: a decode failure is HANDLED (iced re-reads the file itself), so
+            // this is not a session-ending path — but it is the first sign that a capture we
+            // just wrote is unreadable, and it was discarded entirely. The error text is the
+            // image crate's own ("unsupported colour type", "unexpected EOF"), not a path.
+            Err(e) => {
+                log::warn!("preview decode failed, falling back to a file-backed handle: {e}");
+                (widget::image::Handle::from_path(&path), None)
+            }
         };
         let _ = tx.send(payload);
     });
     Task::perform(rx, move |res| {
         cosmic::Action::App(Msg::Preview(pid, match res {
             Ok((handle, original)) => PreviewMsg::ImageReady(handle, original),
-            Err(_) => PreviewMsg::Cancel,
+            // DRAGON-419 (silent-exit path S4). `Err` here means the DECODE THREAD DIED —
+            // the oneshot sender was dropped without sending, which the arm above cannot
+            // produce because it always sends. The capture is already on disk; the editor is
+            // what was lost, so this presents as "the capture worked, the editor never
+            // appeared" and nothing said so.
+            Err(_) => {
+                crate::diag::note_failure(
+                    crate::diag::Failure::DecodeFailed,
+                    "image decode worker died before reporting (panicked); the preview \
+                     document is being cancelled and the file is already on disk",
+                );
+                // DRAGON-415: a distinct message rather than a plain `Cancel`, which is
+                // indistinguishable from the user closing the window. Its handler reports
+                // the failure and then closes exactly as `Cancel` does.
+                PreviewMsg::LoadFailed
+            }
         }))
     })
 }

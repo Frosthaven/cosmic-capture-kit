@@ -31,11 +31,14 @@ use track::{MixerStats, Track};
 /// Fixed mixing rate (DRAGON-122's design: 48kHz throughout, no per-track override).
 pub(crate) const SAMPLE_RATE: u32 = 48_000;
 
-/// One track's construction-time shape: its channel count (1 = mono, 2 = stereo) and
-/// starting gain before any `TrackGain` event retargets it.
+/// One track's construction-time shape: its channel count (1 = mono, 2 = stereo), the
+/// starting gain before any `TrackGain` event retargets it, and a human name for the
+/// diagnostics `Track` emits (DRAGON-411 — "mic"/"system"; a dropped chunk's log line
+/// is only actionable if it says WHICH source lost audio).
 pub(crate) struct TrackSpec {
     pub(crate) channels: u8,
     pub(crate) initial_gain: f32,
+    pub(crate) label: &'static str,
 }
 
 /// Whether `Mixer::render` applies `TrackGain` automation into the samples it returns
@@ -112,7 +115,7 @@ impl Mixer {
         Self {
             mode,
             clock,
-            tracks: tracks.iter().map(|t| Track::new(t.channels)).collect(),
+            tracks: tracks.iter().map(|t| Track::new(t.channels, t.label)).collect(),
             gains: tracks.iter().map(|t| control::GainRamp::new(t.initial_gain)).collect(),
             control: ControlLane::new(),
             horizon: 0.0,
@@ -140,6 +143,17 @@ impl Mixer {
 
     pub(crate) fn stats(&self, track: usize) -> MixerStats {
         self.tracks[track].stats()
+    }
+
+    /// Take back every track's samples placed at or after media position `media` — what
+    /// `record::pump` calls the instant it freezes the clock for a pause, so audio
+    /// captured after that instant never reaches the file (see `Track::truncate_to` for
+    /// the whole story). Rounds to the same sample position `push`/`render` use.
+    pub(crate) fn truncate_to(&mut self, media: f64) {
+        let frame = (media * SAMPLE_RATE as f64).round() as u64;
+        for track in &mut self.tracks {
+            track.truncate_to(frame);
+        }
     }
 
     /// Advance the render horizon to `until_media`, applying every control event whose
@@ -206,7 +220,7 @@ mod tests {
     }
 
     fn mono_spec(gain: f32) -> TrackSpec {
-        TrackSpec { channels: 1, initial_gain: gain }
+        TrackSpec { channels: 1, initial_gain: gain, label: "test" }
     }
 
     #[test]
@@ -285,9 +299,10 @@ mod tests {
         let mut mixer = Mixer::new(
             MixMode::Final,
             t0,
-            &[TrackSpec { channels: 1, initial_gain: 1.0 }, TrackSpec {
+            &[TrackSpec { channels: 1, initial_gain: 1.0, label: "mono" }, TrackSpec {
                 channels: 2,
                 initial_gain: 1.0,
+                label: "stereo",
             }],
         );
         mixer.push_tap(0, StreamTap::new(vec![1.0; 100], t0, t0)); // 100 mono frames

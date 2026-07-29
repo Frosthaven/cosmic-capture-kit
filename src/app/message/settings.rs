@@ -156,6 +156,10 @@ pub enum SettingsMsg {
     SetShortcutsTab(cosmic::widget::segmented_button::Entity),
     /// Settings: preview editor appearance (windowed vs overlay).
     SetPreviewWindowed(bool),
+    /// Settings → Health → Debug: write the opt-in debug log (DRAGON-419). Takes effect
+    /// immediately, with no restart — a customer turns it on, reproduces the failure once,
+    /// and mails the file.
+    SetDebugLogging(bool),
     /// Settings: a manual Copy in the preview editor saves the document first (DRAGON-355).
     SetPreviewSaveOnCopy(bool),
     /// Settings: a manual Copy in the preview editor closes the document afterwards
@@ -163,6 +167,14 @@ pub enum SettingsMsg {
     SetPreviewCloseOnCopy(bool),
     /// Settings: a Delete in the preview editor copies to the clipboard first.
     SetPreviewCopyOnDelete(bool),
+    /// Settings: the VIDEO editor's own save-on-copy (DRAGON-420) — the three below mirror
+    /// the three above for recordings, and are deliberately separate messages writing
+    /// separate fields, so a video document can differ from an image one.
+    SetPreviewVideoSaveOnCopy(bool),
+    /// Settings: the VIDEO editor's own close-on-copy (DRAGON-420).
+    SetPreviewVideoCloseOnCopy(bool),
+    /// Settings: the VIDEO editor's own copy-on-delete (DRAGON-420).
+    SetPreviewVideoCopyOnDelete(bool),
     /// Settings: open the folder picker for a save directory, then apply it.
     PickDir(DirTarget),
     DirPicked(DirTarget, Option<std::path::PathBuf>),

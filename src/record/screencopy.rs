@@ -261,7 +261,9 @@ fn record_screencopy_owned(
     let is_hevc = plan.is_hevc();
     let frame_dur = std::time::Duration::from_secs_f64(1.0 / fps as f64);
 
-    let OwnedAudioStart { mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx } = owned;
+    let OwnedAudioStart {
+        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } = owned;
     let temp = super::recording_temp_path(out_path);
     let mut child = match crate::encode::spawn_ffmpeg_media_clock(
         bw, bh, ew, eh, fps.max(1), &plan, bitrate_kbps, &temp, &mic_fifo_path, &sys_fifo_path,
@@ -288,9 +290,14 @@ fn record_screencopy_owned(
     // The frame that fixed the crop, cropped to the recorded region — the opening
     // frame both the legacy path's segment 0 and this owned session start with.
     let mut last: Vec<u8> = image::imageops::crop_imm(&first, bx, by, bw, bh).to_image().into_raw();
-    // Media time 0 starts here, right before real ticks/audio start flowing — same
-    // anchor placement as `pipewire::record_pipewire_owned`.
-    let session_start = std::time::Instant::now();
+    // Media time 0 is the instant AUDIO CAPTURE began (the pre-flight), not the
+    // instant the video side finished coming up (DRAGON-417). Everything above —
+    // the capture handshake, the first frame, ffmpeg's spawn — happened while the
+    // mic/system captures were already running and the app's indicator already said
+    // "recording"; anchoring here would place all of that audio at a negative media
+    // position, where the mixer discards it. The opening span is covered on the video
+    // side by the first frame instead (see `capture_start`'s doc).
+    let session_start = capture_start;
     let pump_cfg = super::pump::PumpConfig {
         fps: fps.max(1),
         audio_offset_ms,

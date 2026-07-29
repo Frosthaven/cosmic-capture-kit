@@ -42,6 +42,40 @@ impl EncodePlan {
         self.codec.iter().any(|a| a.contains("hevc") || a.contains("265"))
     }
 
+    /// The stable id of the encoder THIS plan uses, read off the plan itself.
+    ///
+    /// [`resolve_encoder_id`](Self::resolve_encoder_id) answers the same question by
+    /// re-walking the whole probe ladder, which is right for a caller that has no plan yet
+    /// (it sizes the encode before resolving) and wrong for one that does. DRAGON-419's
+    /// session log used it on a plan it had already built, which re-ran every hardware probe
+    /// a second time on every recording start — including `ffmpeg_encoders`, an uncached
+    /// `ffmpeg -encoders` spawn (~100ms measured here), and on Windows a probe-ENCODE per
+    /// tier. That is pure latency on the video side of a recording start, and it is latency
+    /// the user SEES: media 0 is anchored at audio-capture start (DRAGON-417), so every
+    /// millisecond the video side takes to come up is a millisecond the finished recording
+    /// opens on a held first frame.
+    ///
+    /// It is also the more honest answer. The probes are not guaranteed to agree across two
+    /// runs — a VAAPI device that fails to initialise on the second call would have the log
+    /// naming an encoder the session is not using — whereas this reads the plan that is
+    /// actually about to run.
+    pub fn encoder_id(&self) -> &'static str {
+        let has = |needle: &str| self.codec.iter().any(|a| a.contains(needle));
+        if has("_nvenc") {
+            "nvenc"
+        } else if has("_vaapi") {
+            "vaapi"
+        } else if has("_videotoolbox") {
+            "videotoolbox"
+        } else if has("_amf") {
+            "amf"
+        } else if has("_qsv") {
+            "qsv"
+        } else {
+            "software"
+        }
+    }
+
     /// Build a plan for a SPECIFIC backend (`gpu`/`nvenc`, `cpu`/`vaapi`, `sw`) for
     /// benchmarking. `None` if that backend isn't available here.
     pub fn for_backend(backend: &str, w: u32, h: u32, presets: &Presets) -> Option<EncodePlan> {
@@ -88,7 +122,19 @@ impl EncodePlan {
         // (nvenc/vaapi above always no-op on mac: no /dev/nvidia0, no /dev/dri).
         #[cfg(target_os = "macos")]
         let chosen = chosen.or_else(|| videotoolbox_plan(w, h, &presets.codec));
-        chosen.unwrap_or_else(|| software_plan(&presets.x264, &presets.codec, w, h))
+        let plan = chosen.unwrap_or_else(|| software_plan(&presets.x264, &presets.codec, w, h));
+        // DRAGON-419: which encoder a session actually got was never recorded anywhere. It is
+        // the first question of every recording report — a silent fall-through from the
+        // requested hardware tier to software changes CPU load, frame pacing and quality all
+        // at once, and "I picked NVENC" and "NVENC was usable" are different facts. One line
+        // per session; no user content in any of it.
+        log::info!(
+            "encoder plan: requested={preferred} chosen={} encode_size={w}x{h} hevc={} nv12={}",
+            plan.encoder_id(),
+            plan.is_hevc(),
+            plan.nv12,
+        );
+        plan
     }
 
     /// The stable id of the encoder [`resolve`] will actually use (`"nvenc"` / `"vaapi"`
@@ -100,8 +146,17 @@ impl EncodePlan {
     /// side is passed to the probes so hardware availability, not a size limit, decides.
     ///
     /// The mac SCK worker (`record::sck`) and the Windows WGC worker (`record::wgc`,
-    /// DRAGON-229) call this (DRAGON-168 encode-size resolution); it is dead only on the
-    /// Linux workers, hence the `not(any(macos, windows))` allow.
+    /// DRAGON-229) call this (DRAGON-168 encode-size resolution), plus the Windows-gated
+    /// `cli::diagnostics` probe. It is dead on the Linux workers, hence the
+    /// `not(any(macos, windows))` allow — restored here, because DRAGON-419's reason for
+    /// removing it (`resolve` calling it) is exactly what DRAGON-421 undoes.
+    ///
+    /// **Do not call this when you already hold a plan** — use
+    /// [`EncodePlan::encoder_id`], which reads the answer off the plan. Every call here
+    /// re-walks the probe ladder, and the probes SPAWN PROCESSES (`ffmpeg_encoders` is an
+    /// uncached `ffmpeg -encoders`; the Windows tiers each run a probe-encode). DRAGON-419's
+    /// session log did exactly that on an already-resolved plan and doubled the encoder-
+    /// resolution cost of every recording start (DRAGON-421).
     #[cfg_attr(not(any(target_os = "macos", windows)), expect(dead_code))]
     pub fn resolve_encoder_id<'a>(preferred: &'a str, presets: &Presets) -> &'a str {
         // 1x1 is enough for the availability probes; each `*_plan` returns Some when the
@@ -684,6 +739,27 @@ mod tests {
         assert!(plan_with_codec(&["-c:v", "hevc_vaapi", "-tag:v", "hvc1"]).is_hevc());
         // libx265 matches on the "265" substring.
         assert!(plan_with_codec(&["-c:v", "libx265", "-crf", "28"]).is_hevc());
+    }
+
+    /// DRAGON-421: the session log names the encoder from the plan it already has, instead
+    /// of re-walking the probe ladder (spawning `ffmpeg -encoders` again) on every recording
+    /// start. Every tier must be readable off the plan, or the cheap path would have to fall
+    /// back to the expensive one.
+    #[test]
+    fn encoder_id_is_read_off_the_plan_for_every_tier() {
+        for (args, id) in [
+            (&["-c:v", "h264_nvenc", "-cq", "23"][..], "nvenc"),
+            (&["-c:v", "hevc_nvenc"][..], "nvenc"),
+            (&["-c:v", "h264_vaapi", "-bf", "0"][..], "vaapi"),
+            (&["-c:v", "hevc_vaapi", "-tag:v", "hvc1"][..], "vaapi"),
+            (&["-c:v", "h264_videotoolbox"][..], "videotoolbox"),
+            (&["-c:v", "h264_amf"][..], "amf"),
+            (&["-c:v", "h264_qsv"][..], "qsv"),
+            (&["-c:v", "libx264", "-crf", "23"][..], "software"),
+            (&["-c:v", "libx265", "-crf", "28"][..], "software"),
+        ] {
+            assert_eq!(plan_with_codec(args).encoder_id(), id, "{args:?}");
+        }
     }
 
     #[test]

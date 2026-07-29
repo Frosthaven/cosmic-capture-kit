@@ -47,6 +47,14 @@ mod capture_flow;
 // daemon and no global pointer there).
 #[cfg(not(target_os = "linux"))]
 pub(crate) use capture_flow::monitor_for_pointer;
+// DRAGON-415: every non-delivery exit routes through `fail_session` here, which on macOS
+// tells the user what happened before the one-shot child ends. The message TABLE is
+// portable and unit-tested on every platform (it is the part no compiler can check); only
+// the presentation is macOS-native, so off macOS the module is unreferenced outside its
+// own tests. `pub(crate)` because the macOS panic hook in `main.rs` builds its message
+// from here, so a child that dies on the main thread says so instead of vanishing.
+#[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
+pub(crate) mod failure;
 mod preview;
 mod audio_ui;
 mod shell;
@@ -275,6 +283,16 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
         Ok(()) => 0,
         Err(e) => {
             log::error!("cosmic-capture-kit exited with error: {e:?}");
+            // DRAGON-415: the runtime itself failed (it never started, or it unwound), so
+            // no in-app path ever ran and nothing was delivered. On macOS that error goes
+            // to a stderr nobody can read and the process `_exit`s — another silent close.
+            // The alert's own guards keep this to at most one dialog; the message names no
+            // cause, because at this seam we have none.
+            #[cfg(target_os = "macos")]
+            {
+                let msg = failure::runtime_failure_alert();
+                crate::platform::mac::alert::show(&msg.title, &msg.body);
+            }
             1
         }
     };
@@ -1449,6 +1467,11 @@ pub struct App {
     copy_selection_pending: bool,
     /// Preview editor appearance: `true` = resizable window, `false` = overlay (setting).
     preview_windowed: bool,
+    /// DRAGON-419: the opt-in debug log is on (setting; default OFF). Mirrored here so the
+    /// Health page's Debug row can render and toggle it; the SINK's own state lives in
+    /// `crate::diag`, which resolves this same key straight from the config in `main` (a
+    /// launch that never reaches `App::init` still has to be logged).
+    debug_logging: bool,
     /// Preview editor (DRAGON-355): a manual Copy saves the document first (setting; default
     /// on), through the normal save-target rule. Split from the old "save & close on copy" —
     /// independent of `preview_close_on_copy`. The open-time automatic copy never triggers it.
@@ -1461,6 +1484,18 @@ pub struct App {
     /// Preview editor (DRAGON-353): Delete copies to the clipboard first (setting;
     /// default on), so the pixels outlive the file.
     preview_copy_on_delete: bool,
+    /// Preview editor, VIDEO documents (DRAGON-420): the video editor's own copy of
+    /// `preview_save_on_copy`. Same meaning, same default, separate field — a document reads
+    /// one triple or the other by KIND (`preview::share_automation`), never a mix.
+    preview_video_save_on_copy: bool,
+    /// Preview editor, VIDEO documents (DRAGON-420): the video editor's own copy of
+    /// `preview_close_on_copy`. The close still routes through `close_preview`, which stops
+    /// this document's playback and releases its share of the audio duck before the surface
+    /// dies, so closing mid-soundtrack tears down exactly as an Esc close does.
+    preview_video_close_on_copy: bool,
+    /// Preview editor, VIDEO documents (DRAGON-420): the video editor's own copy of
+    /// `preview_copy_on_delete`.
+    preview_video_copy_on_delete: bool,
     /// Mute other apps' audio while a video preview with sound is playing (restored on close).
     mute_others_during_preview: bool,
     /// Duck the recorded system audio while the mic hears speech (DRAGON-128; persisted).
@@ -1805,6 +1840,20 @@ pub struct App {
     /// elapsed-time / size readout).
     recording_started: Option<std::time::Instant>,
     recording_path: Option<std::path::PathBuf>,
+    /// Where the finished recording is being written — the file `finalize` produces from
+    /// `recording_path`. Kept only so the session-level bound (DRAGON-423) can see a stop
+    /// tail making progress; nothing else reads it.
+    recording_out_path: Option<std::path::PathBuf>,
+    /// DRAGON-423: whether the USER has asked this recording to stop (or cancel).
+    ///
+    /// Deliberately not read back off `RecordHandle::stop`. A worker may CLEAR that flag —
+    /// the zero-copy decline does exactly that before it retries on the CPU path — and a
+    /// session that erased the user's stop and carried on recording is one of the things the
+    /// session-level bound exists to catch. What the user asked for is the app's own fact.
+    recording_stopping: bool,
+    /// DRAGON-423: the session-level bound — is this recording still making progress?
+    /// Fed one observation per `RecordingPoll`; see [`crate::record::progress`].
+    recording_progress: Option<crate::record::progress::SessionProgress>,
     /// Pause bookkeeping (DRAGON-111): when the current pause began (`Some` =
     /// paused right now) and the total time spent paused before it. Together
     /// with `recording_started` they yield the RECORDED elapsed time — frozen

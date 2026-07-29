@@ -91,7 +91,8 @@ impl App {
             widget::text::title3("Permissions").into(),
             widget::text::body(
                 "Cosmic Capture Kit needs macOS to allow it to capture your screen. \
-                 Grant the permissions below; statuses update live as you do.",
+                 Screen Recording is required; the rest can be skipped. Statuses update \
+                 live as you grant them.",
             )
             .into(),
         ])
@@ -99,6 +100,7 @@ impl App {
 
         let mut cards: Vec<Element<'_, Msg>> = vec![intro.into()];
         cards.extend(self.permission_cards());
+        cards.extend(self.skip_footer());
 
         let inner = widget::column(cards).spacing(16.0).width(Length::Fill);
 
@@ -145,6 +147,11 @@ impl App {
     /// One card per permission the app needs, in check order (Screen Recording first
     /// — capture is blank without it). Notifications is included only when bundled +
     /// its status probed (`Probe::notifications` is `Some`), matching the Health page.
+    ///
+    /// Each card's tier word ("Required" / "Recommended" / "Optional") comes from
+    /// [`Permission::tier`], NOT from the copy, so the word a user reads and the
+    /// auto-open policy `should_auto_open` applies can never disagree (DRAGON-412).
+    /// The `why` strings below therefore start after that word.
     fn permission_cards(&self) -> Vec<Element<'_, Msg>> {
         let p = &self.permissions.probe;
         let mut out: Vec<Element<'_, Msg>> = Vec::new();
@@ -155,10 +162,9 @@ impl App {
             Permission::ScreenRecording,
             "Screen Recording",
             "camera-photo-symbolic",
-            "Required for capturing screenshots and recordings. macOS applies this grant \
+            "Screenshots and recordings are blank without it. macOS applies this grant \
              on the NEXT launch, so relaunch after granting it.",
             screen,
-            true,
             p.screen_request_spent,
         ));
 
@@ -168,10 +174,9 @@ impl App {
                 Permission::Microphone,
                 "Microphone",
                 "audio-input-microphone-symbolic",
-                "Optional. Records your voice with videos; video-only recording still \
-                 works without it.",
+                "Records your voice with videos. Video-only recording still works \
+                 without it.",
                 mic,
-                false,
                 false,
             ));
         }
@@ -184,38 +189,83 @@ impl App {
                 // `notification-symbolic` → the bundled Lucide `bell` (DRAGON-324): a banner
                 // glyph matching this card's "banner when a capture is saved" wording.
                 "notification-symbolic",
-                "Optional. Shows a banner when a capture is saved, whose click reveals the \
-                 file in Finder.",
+                "Shows a banner when a capture is saved, whose click reveals the file in \
+                 Finder.",
                 notif,
-                false,
                 false,
             ));
         }
 
-        // Accessibility (optional, DRAGON-311). Boolean preflight like Screen Recording,
-        // so `accessibility_request_spent` decides Request-vs-Open-Settings for a
-        // not-granted state. `input-keyboard-symbolic` is in libcosmic's embedded subset
-        // and reads as "controls another app", fitting the AX focus-resolution role.
+        // Accessibility (RECOMMENDED, DRAGON-311 / DRAGON-412). Boolean preflight like
+        // Screen Recording, so `accessibility_request_spent` decides
+        // Request-vs-Open-Settings for a not-granted state. `input-keyboard-symbolic` is
+        // in libcosmic's embedded subset and reads as "controls another app", fitting the
+        // AX focus-resolution role. The copy names the exact feature it buys and the exact
+        // cost of declining, because declining is a supported choice here.
         out.push(self.permission_card(
             Permission::Accessibility,
             "Accessibility",
             "input-keyboard-symbolic",
-            "Optional. Lets Capture Active Window and Capture Active Monitor target the \
-             window you are actually focused on, and capture it in its active appearance. \
-             Without it, capture may target the wrong window when an app has several open.",
+            "Lets Capture Active Window and Capture Active Monitor target the window you \
+             are actually focused on, and capture it in its active appearance. Without it, \
+             the app guesses from window stacking order, which is usually right but can \
+             pick the wrong window.",
             accessibility_status(p),
-            false,
             p.accessibility_request_spent,
         ));
 
         out
     }
 
-    /// Build one permission card. `required` colours a missing state red (vs amber for
-    /// optional). `screen_relaunch` (Screen Recording only) adds the Relaunch button
-    /// once granted, since the grant only takes on a fresh launch. `request_spent`
-    /// decides Request-vs-OpenSettings for a NotDetermined screen grant.
-    #[allow(clippy::too_many_arguments)]
+    /// The escape route (DRAGON-412): a labelled way to continue without the recommended
+    /// / optional grants, plus the sentence that makes the guarantee legible.
+    ///
+    /// Closing the window does the same thing, so this button changes no behaviour — it
+    /// exists because a SILENTLY terminal dismissal cannot tell the user they won't be
+    /// asked again, and "will I be nagged forever?" is exactly the question the old
+    /// behaviour taught them to ask.
+    ///
+    /// Three states, so the footer never over-promises:
+    /// * required grant missing — no button. Skipping cannot help; the window will keep
+    ///   coming back for Screen Recording, and saying otherwise would be a lie.
+    /// * nag already spent — no button, just the standing promise restated, so a user who
+    ///   reopens the window deliberately can see that it will not reopen itself.
+    /// * otherwise — the button.
+    fn skip_footer(&self) -> Option<Element<'_, Msg>> {
+        let p = &self.permissions.probe;
+        if screen_status(p) != PermStatus::Granted {
+            return None;
+        }
+        if p.nag_spent {
+            return Some(
+                widget::text::caption(
+                    "You will not be asked about these again. Grant them any time from \
+                     this window.",
+                )
+                .into(),
+            );
+        }
+        Some(widget::column(vec![
+            widget::button::standard("Continue Without These")
+                .on_press(Msg::Permissions(PermissionsMsg::Skip))
+                .into(),
+            widget::text::caption(
+                "Captures already work. Skipping closes this window and stops it opening \
+                 on its own; grant the rest here whenever you want them.",
+            )
+            .into(),
+        ])
+        .spacing(6.0)
+        .width(Length::Fill)
+        .into())
+    }
+
+    /// Build one permission card. The card's [`Tier`] comes from `perm` and drives both
+    /// the word the copy leads with and whether a missing grant reads red (Required) or
+    /// amber (Recommended / Optional) — one source, so the label can't contradict the
+    /// policy (DRAGON-412). `why` is the rest of the sentence after that word.
+    /// `request_spent` decides Request-vs-OpenSettings for a NotDetermined grant whose
+    /// preflight is boolean (Screen Recording, Accessibility).
     fn permission_card<'a>(
         &self,
         perm: Permission,
@@ -223,9 +273,9 @@ impl App {
         icon: &'a str,
         why: &'a str,
         status: PermStatus,
-        required: bool,
         request_spent: bool,
     ) -> Element<'a, Msg> {
+        let tier = perm.tier();
         // The pill's tone: green granted, red denied (required) / amber otherwise.
         // Colour comes from a Tone enum so both the (fn-pointer-only) text class and
         // the (closure) container background pick it without capturing a fn pointer —
@@ -234,7 +284,7 @@ impl App {
         let (tone, pill_text) = match status {
             PermStatus::Granted => (Tone::Ok, "Granted"),
             PermStatus::NotDetermined => (Tone::Warn, "Not requested"),
-            PermStatus::Denied if required => (Tone::Danger, "Denied"),
+            PermStatus::Denied if tier.is_required() => (Tone::Danger, "Denied"),
             PermStatus::Denied => (Tone::Warn, "Denied"),
         };
 
@@ -252,9 +302,12 @@ impl App {
         .spacing(10.0)
         .align_y(Alignment::Center);
 
+        // "Required. …" / "Recommended. …" / "Optional. …" — the tier word is prepended
+        // here rather than baked into each `why` string, so `Permission::tier` is the only
+        // place the tier is decided.
         let mut col = widget::column(vec![
             head.into(),
-            widget::text::caption(why).into(),
+            widget::text::caption(format!("{}. {why}", tier.label())).into(),
         ])
         .spacing(6.0)
         .width(Length::Fill);

@@ -75,6 +75,7 @@ impl App {
             // seed write them (directly).
             mac_first_run_seen: crate::state::load().mac_first_run_seen,
             mac_accessibility_prompt_seen: crate::state::load().mac_accessibility_prompt_seen,
+            mac_permission_nag_spent: crate::state::load().mac_permission_nag_spent,
             mac_login_item_seeded: crate::state::load().mac_login_item_seeded,
             win_login_item_seeded: crate::state::load().win_login_item_seeded,
             region_overlay_opacity: self.region_overlay_opacity,
@@ -122,6 +123,7 @@ impl App {
             advanced_vad: self.advanced_vad,
             shortcuts: self.keymap.overrides(),
             preview_windowed: self.preview_windowed,
+            debug_logging: self.debug_logging,
             // DRAGON-355: the combined key is deprecated (read-only, skip_serializing) — it is
             // NEVER written, so its snapshot value is inert; only the migrate hook reads it,
             // and only off a freshly-parsed old config. Snapshot the two independent settings.
@@ -129,6 +131,11 @@ impl App {
             preview_save_on_copy: self.preview_save_on_copy,
             preview_close_on_copy: self.preview_close_on_copy,
             preview_copy_on_delete: self.preview_copy_on_delete,
+            // DRAGON-420: the video editor's own three, snapshotted beside (never instead of)
+            // the image ones.
+            preview_video_save_on_copy: self.preview_video_save_on_copy,
+            preview_video_close_on_copy: self.preview_video_close_on_copy,
+            preview_video_copy_on_delete: self.preview_video_copy_on_delete,
             mute_others_during_preview: self.mute_others_during_preview,
             duck_system_audio: self.duck_system_audio,
             appearance_use_system: self.appearance_use_system,
@@ -213,9 +220,17 @@ impl App {
         keymap.apply_overrides(&p.shortcuts);
         self.keymap = keymap;
         self.preview_windowed = p.preview_windowed;
+        // DRAGON-419: a settings-window "Reset to defaults" (or any other whole-config apply)
+        // must reach the SINK too, not just the mirrored field — otherwise the row says off
+        // and the file keeps growing.
+        self.debug_logging = p.debug_logging;
+        crate::diag::set_enabled(p.debug_logging);
         self.preview_save_on_copy = p.preview_save_on_copy;
         self.preview_close_on_copy = p.preview_close_on_copy;
         self.preview_copy_on_delete = p.preview_copy_on_delete;
+        self.preview_video_save_on_copy = p.preview_video_save_on_copy;
+        self.preview_video_close_on_copy = p.preview_video_close_on_copy;
+        self.preview_video_copy_on_delete = p.preview_video_copy_on_delete;
         self.mute_others_during_preview = p.mute_others_during_preview;
         self.duck_system_audio = p.duck_system_audio;
         self.appearance_use_system = p.appearance_use_system;
@@ -290,6 +305,11 @@ impl App {
                 p.preview_save_on_copy = d.preview_save_on_copy;
                 p.preview_close_on_copy = d.preview_close_on_copy;
                 p.preview_copy_on_delete = d.preview_copy_on_delete;
+                // DRAGON-420: the Video Editor group lives on the SAME flat page, so the one
+                // "Reset to defaults" button covers it too — all six share toggles, not three.
+                p.preview_video_save_on_copy = d.preview_video_save_on_copy;
+                p.preview_video_close_on_copy = d.preview_video_close_on_copy;
+                p.preview_video_copy_on_delete = d.preview_video_copy_on_delete;
                 p.covermark_text = d.covermark_text.clone();
             }
             ConfigTab::CaptureModes => {
@@ -381,8 +401,14 @@ impl App {
                     p.capture_active_monitor_hotkey = d.capture_active_monitor_hotkey.clone();
                 }
             }
-            // About and Health are read-only (nothing to reset).
-            ConfigTab::About | ConfigTab::Health => {}
+            // DRAGON-419: Health gained its one real setting (the Debug group's log toggle),
+            // so it is no longer read-only. `apply_persisted` below carries the change into
+            // `crate::diag`, so a reset actually stops the sink rather than only unticking the
+            // row. About is still read-only.
+            ConfigTab::Health => {
+                p.debug_logging = d.debug_logging;
+            }
+            ConfigTab::About => {}
         }
         self.apply_persisted(p);
     }

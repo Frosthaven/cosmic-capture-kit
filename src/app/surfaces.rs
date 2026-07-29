@@ -58,6 +58,13 @@ impl App {
     /// daemon took over.) The macOS pre-exit teardown (resume the tiling WM + release
     /// the AeroSpace babysitter) still runs so the WM is restored before we go.
     pub(super) fn finish_session(&mut self) -> Task<cosmic::Action<Msg>> {
+        // DRAGON-419: the VERDICT line. This is the one seam every ending routes through, so
+        // it is the one place that can guarantee a reader is never left inferring an outcome
+        // from the absence of lines. It names the last `diag::note_failure` this process
+        // recorded — or `delivered` when there was none — plus whether the capture reached
+        // disk, which is the single split that halves the search space on a "nothing
+        // happened" report. Costs nothing when the log is off.
+        crate::diag::session_end("finish_session");
         // DRAGON-174: the per-session status icon lives for the WHOLE session and exits
         // with it — tear it down here (removes an own NSStatusItem / ksni item; reverts a
         // resident relay to idle). Explicit even though the process exits right after, so
@@ -114,6 +121,16 @@ impl App {
     }
 
     pub(super) fn teardown(&mut self) -> Task<cosmic::Action<Msg>> {
+        // DRAGON-419: an explicit Escape / ✕ is an ORDINARY ending, and saying so is what
+        // stops a reader treating it as the failure they came looking for. Recorded only when
+        // nothing has already gone wrong — a cancel AFTER a real failure must not overwrite
+        // the diagnosis with "the user quit".
+        if crate::diag::last_failure().is_none() {
+            crate::diag::note_failure(
+                crate::diag::Failure::Cancelled,
+                "the user closed the session (Escape / the toolbar close button)",
+            );
+        }
         let mut cmds = self.destroy_surfaces();
         cmds.push(self.finish_session());
         Task::batch(cmds)
@@ -292,6 +309,26 @@ impl App {
                 "no displays returned for the capture overlay — Screen Recording \
                  permission may be denied (grant it in System Settings and restart)."
             );
+            // DRAGON-419: this is the DRAGON-413 shape and it is the worst one in the app —
+            // zero overlays are minted, but `no_main_window(true) + exit_on_close(false)` means
+            // the process does NOT exit. It becomes an invisible, immortal child.
+            crate::diag::note_failure(
+                crate::diag::Failure::NoOutputs,
+                "zero displays for the capture overlay — this process mints no window",
+            );
+            // DRAGON-415 (macOS): and now it DOES exit, having said why. This was the worst
+            // silent failure in the app: the user presses the shortcut, sees nothing at all,
+            // and is left with an invisible child per press. It is also the exact shape a
+            // Screen Recording grant that is not usable takes, because ScreenCaptureKit
+            // answers an ungranted enumeration with an EMPTY list rather than an error —
+            // `fail_session` preflights the grant and says which of the two it is.
+            //
+            // Windows keeps the historical warn-and-continue: its display enumeration does
+            // not depend on a grant, an empty list there is a different (unstudied)
+            // condition, and this ticket does not change non-macOS behaviour. Its
+            // `note_failure` line above still records it.
+            #[cfg(target_os = "macos")]
+            return self.fail_session();
         }
         if let Some(id) = focus_id
             .or(primary_id)

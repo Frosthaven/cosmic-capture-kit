@@ -131,7 +131,7 @@ fn chunk_capture_wall(frames: usize, now: Instant) -> Instant {
 /// duration), then stamp every chunk at `anchor + frames_delivered/48000`, using
 /// arrival times only to detect a genuine discontinuity worth re-anchoring on. Pure
 /// (the caller passes `now`), so the placement math is unit-testable without pulse.
-pub(super) struct StreamAnchor {
+pub(crate) struct StreamAnchor {
     /// Wall instant of the contiguous clock's frame 0.
     anchor: Instant,
     /// Frames (at 48 kHz) already stamped since `anchor`.
@@ -145,7 +145,22 @@ impl StreamAnchor {
     /// stretch, a device switch) show up as ~seconds; scheduler/IPC jitter is ~ms.
     /// Half a second sits comfortably between them (and matches the capture backlog
     /// guard's own [`LAG_WARN_THRESHOLD_SECS`]).
-    pub(super) const REANCHOR_THRESHOLD_SECS: f64 = 0.5;
+    ///
+    /// This is also the RECOVERY trigger the recorder's render horizon is sized around
+    /// (DRAGON-411): re-anchoring is how a source that has fallen behind gets back
+    /// inside the window before `mixer::Track` starts discarding its audio, so
+    /// `record::pump`'s `RENDER_LAG_SECS` is held at a multiple of this value and a
+    /// compile-time assert there pins the relationship. The two were once the same
+    /// number, which meant recovery could only ever happen AFTER the loss.
+    ///
+    /// Do not lower it to widen that margin — raise the horizon instead. The test is
+    /// `drift.abs()`, and the NEGATIVE direction (arrivals running ahead of the
+    /// contiguous clock) is what a stalled-then-catching-up reader produces: the mic
+    /// pipe alone banks ~340ms (64KB at 192KB/s) and drains it in a burst. Those
+    /// samples are contiguous CAPTURE data that this threshold correctly absorbs; a
+    /// lower one would re-anchor on a mere delivery hiccup and turn it into a real
+    /// forward jump with a real silence gap.
+    pub(crate) const REANCHOR_THRESHOLD_SECS: f64 = 0.5;
 
     /// Anchor at the first delivery: `now` back-dated by that first chunk's own
     /// duration (`frames` at 48 kHz). The chunk itself is then stamped via

@@ -124,6 +124,12 @@ impl App {
                 crate::platform::windows::diag::open_logs_folder();
                 Task::none()
             }
+            // DRAGON-419: the Health page's Debug row. Creates the folder first, so a
+            // customer who has not reproduced anything yet lands somewhere real.
+            WindowChromeMsg::OpenDebugLogFolder => {
+                crate::diag::open_log_dir();
+                Task::none()
+            }
             WindowChromeMsg::Ignore => Task::none(),
             WindowChromeMsg::KeyPressed(window, modifiers, key, location, text) => {
                 self.handle_key(window, modifiers, key, location, text)
@@ -711,6 +717,13 @@ impl App {
                     // The permission-checker window closed — end this instance (it,
                     // like `--settings`, never returns to a capture overlay). Same
                     // last-surface-out guard as the settings window above.
+                    //
+                    // DRAGON-412: closing IS an answer for the recommended / optional
+                    // grants. Before this, dismissing left them NotDetermined, so the
+                    // window re-forced itself on every capture launch and every daemon
+                    // start with no termination condition. The required Screen Recording
+                    // grant is unaffected and keeps forcing the window while missing.
+                    permissions::spend_nag();
                     self.permissions.window = None;
                     return if self.previews.is_empty() {
                         self.finish_session()
@@ -727,6 +740,16 @@ impl App {
                     // The surface is ALREADY gone (that is what this event reports), so
                     // clear its liveness flag before closing the document — otherwise
                     // `close_preview` would issue a second destroy for a dead id.
+                    // DRAGON-419 (silent-exit path S5). Sampled BEFORE the flag is cleared
+                    // below: a surface still marked open when its destroy arrives did NOT
+                    // route through the editor — the compositor / window manager took it
+                    // away. If it was the last document this ends the process, so a capture
+                    // that SUCCEEDED disappears with no editor and no message. It also covers
+                    // the pre-opened SPINNER (window picks and freeze crops open one before
+                    // the grab completes), where the file may already be written.
+                    let lost_out_of_band =
+                        self.preview_for(id).is_some_and(|p| p.surface_open && !p.edit.baking);
+                    let last_document = self.previews.len() <= 1;
                     if let Some(p) = self.preview_for_mut(id) {
                         p.surface_open = false;
                         // A bake is committing the edits to disk (DRAGON-352): its own
@@ -738,6 +761,15 @@ impl App {
                             p.edit.close_after_bake = true;
                             return Task::none();
                         }
+                    }
+                    if lost_out_of_band {
+                        crate::diag::note_failure(
+                            crate::diag::Failure::PreviewSurfaceLost,
+                            &format!(
+                                "a preview surface was destroyed out of band (not through the \
+                                 editor); last_document={last_document}"
+                            ),
+                        );
                     }
                     return self.close_preview(id);
                 }

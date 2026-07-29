@@ -114,13 +114,84 @@ const TRACK_MIC: usize = 0;
 /// Track index for the stereo system audio (see the module doc).
 const TRACK_SYS: usize = 1;
 
-/// How far behind "now" the mixer's render horizon stays: control events (pause,
-/// resume, per-channel mute) must be PUSHED before the horizon reaches their media
-/// position, so this is the budget for "pushed" to mean "observed by the pump's own
-/// polling cadence and queued" — comfortably wider than many cycles. A recorder
-/// buffers deep; unlike a live-monitoring mixer there is no low-latency budget to
-/// protect here (see `mixer::Mixer`'s own module doc).
-const RENDER_LAG_SECS: f64 = 0.5;
+/// How far behind "now" the mixer's render horizon stays. It buys two things:
+///
+/// 1. **The control budget.** Control events (pause, resume, per-channel mute) must be
+///    PUSHED before the horizon reaches their media position, so this is the budget for
+///    "pushed" to mean "observed by the pump's own polling cadence and queued" —
+///    comfortably wider than many [`CYCLE`]s.
+/// 2. **The source-lateness budget** (DRAGON-411, the reason this is no longer 0.5).
+///    Once the horizon passes a media position, that position is rendered and gone:
+///    audio arriving for it afterwards has nowhere to go and is DISCARDED
+///    (`mixer::Track::push`'s late path). So this is also the maximum amount a source
+///    may fall behind before its real audio starts being destroyed.
+///
+/// A source that falls behind recovers by RE-ANCHORING
+/// ([`StreamAnchor::REANCHOR_THRESHOLD_SECS`](crate::audio::capture::StreamAnchor::REANCHOR_THRESHOLD_SECS)):
+/// it jumps its contiguous stamp forward to the arrival-implied position, which fills
+/// the missing stretch with silence ONCE, honestly, counted in `MixerStats::gap_samples`
+/// — instead of drifting further and further behind until the horizon eats it. That
+/// recovery is only worth anything if it can happen BEFORE the horizon does damage, so
+/// the two constants must not sit at the same value (they both used to be 0.5, which is
+/// the worst possible arrangement: loss could be counted but never avoided — the
+/// DRAGON-411 field failure, 16.3% of a customer's mic track replaced by zeros). See
+/// [`REANCHOR_HEADROOM`] for the margin this keeps.
+///
+/// **Why 1.5s, and why raise THIS side of the pair rather than lower the threshold.**
+/// A recorder buffers deep: unlike a live-monitoring mixer there is no low-latency
+/// budget to protect here (see `mixer::Mixer`'s own module doc), and nobody is
+/// listening to the file while it is being written, so holding audio back costs
+/// nothing a listener could perceive. OBS solves the same problem by GROWING its audio
+/// buffer rather than discarding, up to `MAX_BUFFERING_TICKS` = 45 × 1024/48000 ≈ 960ms
+/// — and it is a live mixer, feeding monitors and a stream. A file recorder can afford
+/// more, so this is set to 3× the re-anchor threshold: the trigger fires a full second
+/// of margin before anything can be dropped. Lowering the THRESHOLD to open the same
+/// gap was rejected: `StreamAnchor` re-anchors on `drift.abs()`, and the NEGATIVE
+/// direction (arrivals running ahead of the contiguous clock) is exactly what a
+/// stalled-then-catching-up reader produces — the mic pipe alone can bank ~340ms of
+/// audio (64KB at 192KB/s) and drain it in a burst. That burst is contiguous CAPTURE
+/// data that the current threshold correctly absorbs; a lower one would re-anchor on
+/// it, converting a delivery hiccup into a real forward jump and a real silence gap.
+/// The threshold sits where the two hazards allow; the horizon is the side with room.
+///
+/// **What it costs.** MEMORY: each track's `VecDeque` holds roughly this much audio
+/// between the render horizon and the write horizon — 1.5s is 288KB (mono mic) + 576KB
+/// (stereo system) ≈ 0.9MB, up from ~0.3MB. STOP-TAIL LATENCY:
+/// [`MediaClockPump::finish`] renders with no holdback, so the last ~1.5s of both
+/// tracks is emitted in one step (≈864KB) and must reach ffmpeg before the FIFOs close.
+/// That is memcpy-scale on the control thread (well inside `PumpHandle::join`'s 2s
+/// grace) plus one extra second of AAC to encode in the writer/muxer — and the BOUND is
+/// unchanged: the writer thread's exit is still guaranteed by the caller's bounded
+/// `wait_or_kill` reap (DRAGON-118), which never grew.
+const RENDER_LAG_SECS: f64 = 1.5;
+
+/// The multiple of the source re-anchor threshold the render horizon must clear (see
+/// [`RENDER_LAG_SECS`]): a source hits its re-anchor trigger, and still has
+/// `(REANCHOR_HEADROOM − 1) × threshold` of further slippage available before the
+/// horizon could discard anything it delivers. Pinned at compile time below AND by
+/// `render_horizon_clears_the_reanchor_threshold` — the DRAGON-411 regression is
+/// precisely these two numbers being allowed to converge again.
+const REANCHOR_HEADROOM: f64 = 3.0;
+
+const _: () = assert!(
+    RENDER_LAG_SECS
+        >= crate::audio::capture::StreamAnchor::REANCHOR_THRESHOLD_SECS * REANCHOR_HEADROOM,
+    "the render horizon must clear the source re-anchor threshold by REANCHOR_HEADROOM \
+     (DRAGON-411): with too little margin a lagging source can never re-anchor early \
+     enough to be saved, and its real audio is discarded as `late_chunks`"
+);
+
+/// MID-STREAM padded silence (seconds, either track) past which
+/// [`MediaClockPump::finish`]'s summary is raised from `info` to `warn`. Lead-in is
+/// excluded at the source (`MixerStats::leading_gap_samples`), so this counts only
+/// silence substituted for audio that should have been there.
+///
+/// Chosen from measurement, not taste: across all seven E2E sessions a mid-stream hole
+/// is 0.000s on an unpaused session and 16-45ms on a paused one (the resume landing a
+/// few ms after the freeze — bounded, and per pause). A quarter second therefore sits
+/// ~5x above the worst healthy value and tolerates a session with a dozen-plus pauses,
+/// while still being far below the 5.07s the DRAGON-411 field failure wrote.
+const GAP_NOTICE_SECS: f64 = 0.25;
 
 /// How often the control thread drains its inputs and renders. One cycle is also
 /// the pause/resume/toggle DETECTION latency (edges are stamped at the polling
@@ -144,6 +215,22 @@ const RENDER_EPSILON_SECS: f64 = 1e-6;
 /// stop" shape).
 const FIFO_OPEN_BUDGET: Duration = Duration::from_secs(15);
 
+/// How long [`PumpHandle::join`] waits for the control thread before synthesizing an
+/// empty result.
+///
+/// On the NORMAL path the thread does no blocking I/O and finishes within one render
+/// cycle, so almost all of this is headroom. It has to cover the ABANDON path too
+/// though (see [`abandon_captures`]): a pump whose rendezvous failed tears its captures
+/// down on this very thread, and each of those teardowns carries its own DRAGON-118
+/// bound (the mic child's graceful stop, the tap reader's join, the monitor thread's
+/// join). At 2s — shorter than the teardown it was waiting on — `join` reported "control
+/// thread never finished" every single time a session failed to start, while the thread
+/// was in fact doing exactly what it should. That is a false alarm in the one log a
+/// failed recording leaves behind, so the grace covers the bound instead of contradicting
+/// it. Nothing waits longer for it: the enclosing `std::thread::scope` joins that thread
+/// before the worker can return either way.
+const JOIN_GRACE: Duration = Duration::from_secs(8);
+
 /// How long `run` holds early system chunks back waiting for the capture client's
 /// FIRST device-latency sample before latching 0.0 — see [`latch_decision`]. Must
 /// stay comfortably under [`RENDER_LAG_SECS`]: chunks released after the latch are
@@ -153,6 +240,31 @@ const FIFO_OPEN_BUDGET: Duration = Duration::from_secs(15);
 /// practice the latch resolves on the first drain; the budget only matters for a
 /// server that never reports (suspended/virtual sinks).
 const SYS_LATENCY_LATCH_BUDGET: Duration = Duration::from_millis(350);
+
+/// How long [`run`]'s startup catch-up drain may run before the render loop starts
+/// regardless. Generous next to what it actually waits for (a few passes over
+/// whatever the source channels buffered while the video side came up, plus the
+/// [`SYS_LATENCY_LATCH_BUDGET`]), and bounded because nothing in the record path
+/// waits unboundedly (DRAGON-118).
+const STARTUP_CATCHUP_BUDGET: Duration = Duration::from_secs(2);
+
+/// One [`run`] drain pass's outcome — what the startup catch-up loop needs to decide
+/// it is level with the live capture.
+struct DrainOutcome {
+    /// Mic taps + system chunks taken off the source channels in this pass.
+    drained: usize,
+    /// Whether the system track's device-latency latch has resolved. Until it has,
+    /// early system chunks sit in `sys_pending` and the render horizon must not pass
+    /// them (see [`latch_decision`]).
+    latch_decided: bool,
+}
+
+/// Whether a drain pass says the pump is level with the live capture rate: a backlog
+/// hands over many items at once, a caught-up pump sees at most the block or two a
+/// couple of milliseconds can have produced. Pure, so the decision is unit-tested.
+fn caught_up(o: &DrainOutcome) -> bool {
+    o.drained <= 2 && o.latch_decided
+}
 
 /// The per-session device-latency latch (the DRAGON-122-integration timing model —
 /// see `crate::audio::capture`'s module doc): the system track's audible-time shift
@@ -303,6 +415,55 @@ fn open_fifo_write_end(
 // `crate::platform::windows::named_pipe::connect_write_end`. [`spawn`]'s
 // `#[cfg(windows)]` arm calls it with the paired `PipeServer` handle instead of a path.
 
+/// The warning for a FIFO/named-pipe write end that never opened, naming the reason it
+/// actually failed rather than guessing at one (DRAGON-422).
+///
+/// PURE, and pinned by tests, because the wrong half of this sent a live investigation
+/// after a wedged ffmpeg that did not exist. [`open_fifo_write_end`] gives up for two
+/// completely different reasons: the budget expired with the session still running (a
+/// muxer that really is stuck — the DRAGON-118/123 wedge this message was written for),
+/// or `stop` was observed (the session is being torn down and the muxer is never going
+/// to open anything). The PipeWire zero-copy worker reaches the second one routinely: it
+/// spawns its muxer lazily, on the first dmabuf frame, so when no frame ever arrives
+/// there was never an ffmpeg here to wedge — and the log said "wedged ffmpeg?" anyway.
+fn rendezvous_failure(channel: &str, stopped: bool) -> String {
+    if stopped {
+        format!(
+            "media-clock pump: session stopped before the muxer opened its {channel} audio \
+             input; nothing was recorded"
+        )
+    } else {
+        format!(
+            "media-clock pump: {channel} FIFO write end never opened within {}s (wedged ffmpeg?)",
+            FIFO_OPEN_BUDGET.as_secs()
+        )
+    }
+}
+
+/// Tear down the captures a pump session never got to use — its ONE abandon path
+/// (DRAGON-422).
+///
+/// The receivers go FIRST, and that ordering is the whole point. The tap reader thread
+/// hands blocks to `mic_rx` over a bounded channel and BLOCKS when it fills (~2.5s of
+/// audio); a rendezvous that spends its budget leaves far more than that undrained, so
+/// the reader is parked in `send` by the time we get here. Killing its ffmpeg does not
+/// wake a blocked send, so `MicTapHandle::drain` used to spend its whole join budget and
+/// then log "tap reader still stuck; detaching from it" — a leaked thread, and two
+/// wasted seconds, on every failed start. Dropping the receivers first makes that send
+/// fail immediately and the reader exit on its own, which is what the tap handle's drain
+/// is written to expect.
+fn abandon_captures(
+    mic_tap: MicTapHandle,
+    mic_rx: Receiver<StreamTap>,
+    monitor: MonitorCapture,
+    sys_rx: Receiver<CaptureChunk>,
+) {
+    drop(mic_rx);
+    drop(sys_rx);
+    drop(mic_tap); // bounded; its own Drop impl
+    let _ = monitor.stop(); // bounded ≤2s (DRAGON-118); no Drop of its own
+}
+
 /// The video-thread half of the pump (see the module doc's threading section): a
 /// cheap, `Arc<Mutex<MediaClock>>`-backed tick counter the owned session's frame
 /// loop queries to know how many copies of its newest frame to feed ffmpeg.
@@ -422,8 +583,8 @@ impl MediaClockPump {
         writer_tx: std::sync::mpsc::Sender<PcmStep>,
     ) -> Self {
         let mixer = Mixer::with_clock(MixMode::Final, clock.clone(), &[
-            TrackSpec { channels: 1, initial_gain: 1.0 }, // TRACK_MIC
-            TrackSpec { channels: 2, initial_gain: 1.0 }, // TRACK_SYS
+            TrackSpec { channels: 1, initial_gain: 1.0, label: "mic" }, // TRACK_MIC
+            TrackSpec { channels: 2, initial_gain: 1.0, label: "system" }, // TRACK_SYS
         ]);
         Self {
             mixer,
@@ -479,12 +640,22 @@ impl MediaClockPump {
         self.was_paused = paused;
         let kind = if paused { ControlKind::Pause } else { ControlKind::Resume };
         self.mixer.push_event(ControlEvent { at, kind });
-        if let Ok(mut c) = self.clock.lock() {
+        let froze_at = self.clock.lock().ok().map(|mut c| {
             if paused {
                 c.pause(at);
             } else {
                 c.resume(at);
             }
+            c.media_at(at)
+        });
+        // Pause = the media clock freezes, and nothing captured past the freeze is
+        // recorded (DRAGON-411). The sources' contiguous stamps run AHEAD of wall time,
+        // so taps already placed may sit past this position — captured after the user
+        // pressed pause, and squatting on the media ground the resume is about to fill.
+        // Take them back now, while the render horizon is still `RENDER_LAG_SECS` behind
+        // and nothing here has reached ffmpeg.
+        if let (true, Some(media)) = (paused, froze_at) {
+            self.mixer.truncate_to(media);
         }
     }
 
@@ -542,13 +713,106 @@ impl MediaClockPump {
         let sys_stats = self.mixer.stats(TRACK_SYS);
         let mic_off = build_intervals(&self.automation, TRACK_MIC, self.mic_on0);
         let sys_off = build_intervals(&self.automation, TRACK_SYS, self.sys_on0);
-        log::info!(
-            "media-clock pump finished: media={final_media:.3}s mic(late={} paused_drop={} \
-             gap={}) sys(late={} paused_drop={} gap={})",
-            mic_stats.late_chunks, mic_stats.discarded_paused_chunks, mic_stats.gap_samples,
-            sys_stats.late_chunks, sys_stats.discarded_paused_chunks, sys_stats.gap_samples,
-        );
+        // THE recording health line — promoted out of `info` by DRAGON-419, classified
+        // by the facts in [`log_audio_health`] (DRAGON-411). One line, one channel:
+        // `crate::diag` wraps the `log` facade, so this reaches the debug file with no
+        // per-call-site opt-in, and so does the discard `error` at the drop site.
+        log_audio_health(final_media, &mic_stats, &sys_stats);
         PumpOut { mic_off, sys_off, mic_stats, sys_stats, final_media }
+    }
+}
+
+/// How a finished session's audio placement reads (DRAGON-411/419). Pure, so the level
+/// choice is unit-tested instead of being inferred from a log line — which is how the
+/// original defect stayed invisible: the summary below was `log::info!` while the
+/// default filter is `warn` (`main.rs`), so no user has ever seen it. It is THE
+/// recording health line: the one read that would have named the DRAGON-411 crackling
+/// (16% of a customer's track replaced by digital silence) on the spot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioHealth {
+    /// Everything captured was placed; nothing meaningful was padded.
+    Clean,
+    /// Nothing was destroyed, but silence was written MID-STREAM — a source genuinely
+    /// stopped delivering for a while (a device stall, a re-anchor's one-time honest
+    /// fill). A source's lead-in never counts: nothing is missing, it had not spoken
+    /// yet.
+    Padded,
+    /// Captured audio reached the mixer behind the render horizon and was DISCARDED.
+    /// Never acceptable: see [`RENDER_LAG_SECS`].
+    Lost,
+}
+
+/// `gap_samples`/`late_frames` are FRAME counts (see [`MixerStats`]) — seconds at the
+/// mixer's fixed rate.
+fn frames_to_secs(frames: u64) -> f64 {
+    frames as f64 / crate::mixer::SAMPLE_RATE as f64
+}
+
+/// Classify a finished session from both tracks' placement stats.
+///
+/// **Read the counters, not their names.** The obvious predicate — `late_chunks +
+/// gap_samples > 0`, which DRAGON-419 first promoted this line with — reports EVERY
+/// healthy recording as a loss, for two independent reasons, and a warning that fires
+/// every time is one everybody learns to scroll past:
+///
+/// - `late_chunks` is non-zero on every session by DESIGN since DRAGON-417. The sources
+///   are already delivering when the recorder anchors its clock, so the opening taps sit
+///   before media 0; signed placement keeps whatever tail of them belongs in the file and
+///   drops the rest. Nothing is missing from the recording. Only [`MixerStats::late_frames`]
+///   — the part of a drop at media >= 0 — is audio the user actually lost.
+/// - `gap_samples` USED to be non-zero on every session too — 54-136ms on both tracks
+///   across all seven E2E sessions — because it lumped the source's LEAD-IN (silence
+///   before its first sample, which is not a defect: nothing is missing, the source had
+///   simply not spoken yet) together with mid-stream holes. Those are now separate
+///   counters ([`MixerStats::leading_gap_samples`]), so `gap_samples` means what the
+///   report needs it to mean: silence substituted for audio that should have been there.
+fn audio_health(mic: &MixerStats, sys: &MixerStats) -> AudioHealth {
+    if mic.late_frames > 0 || sys.late_frames > 0 {
+        return AudioHealth::Lost;
+    }
+    let worst_gap = frames_to_secs(mic.gap_samples.max(sys.gap_samples));
+    if worst_gap > GAP_NOTICE_SECS {
+        return AudioHealth::Padded;
+    }
+    AudioHealth::Clean
+}
+
+/// The session's one audio-placement summary, at a level that MATCHES what happened
+/// (DRAGON-411/419): discarded audio is an `error` — it is unrecoverable data loss from
+/// the user's recording — written silence is a `warn`, and a clean session stays the
+/// historical `info`. `paused_drop` never raises the level on its own (a paused pipeline
+/// captures nothing, by design).
+///
+/// Raw counts stay in the line even when they do not raise the level: `late=2 lost=0.000s
+/// pre_start=2` reads as "two chunks dropped, none of it yours", which is exactly what a
+/// reader needs to not chase it.
+fn log_audio_health(final_media: f64, mic: &MixerStats, sys: &MixerStats) {
+    let line = format!(
+        "media-clock pump finished: media={final_media:.3}s \
+         mic(late={} lost={:.3}s paused_drop={} pre_start={} gap={:.3}s lead_in={:.3}s) \
+         sys(late={} lost={:.3}s paused_drop={} pre_start={} gap={:.3}s lead_in={:.3}s)",
+        mic.late_chunks,
+        frames_to_secs(mic.late_frames),
+        mic.discarded_paused_chunks,
+        mic.pre_start_chunks,
+        frames_to_secs(mic.gap_samples),
+        frames_to_secs(mic.leading_gap_samples),
+        sys.late_chunks,
+        frames_to_secs(sys.late_frames),
+        sys.discarded_paused_chunks,
+        sys.pre_start_chunks,
+        frames_to_secs(sys.gap_samples),
+        frames_to_secs(sys.leading_gap_samples),
+    );
+    match audio_health(mic, sys) {
+        AudioHealth::Lost => log::error!(
+            "{line} — captured audio was DISCARDED (it reached the mixer behind the render \
+             horizon); that much of the recording is silence"
+        ),
+        AudioHealth::Padded => {
+            log::warn!("{line} — silence was written where a source stopped delivering")
+        }
+        AudioHealth::Clean => log::info!("{line}"),
     }
 }
 
@@ -600,15 +864,18 @@ fn run(
     let mut sys_first_seen: Option<Instant> = None;
     let mut latch_drift_logged = false;
     let mut drain_external = |pump: &mut MediaClockPump, at: Instant| {
+        let mut drained_items = 0usize;
         pump.set_paused(paused.load(Ordering::Relaxed), at);
         let drained = events.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default();
         for (t, chan, on) in drained {
             pump.push_toggle(t, chan, on);
         }
         while let Ok(tap) = mic_rx.try_recv() {
+            drained_items += 1;
             pump.push_mic_tap(tap);
         }
         while let Ok(chunk) = sys_rx.try_recv() {
+            drained_items += 1;
             match sys_latch {
                 Some(latency) => pump.push_sys_chunk(chunk.samples, chunk.capture_wall, latency),
                 None => {
@@ -641,7 +908,34 @@ fn run(
                 );
             }
         }
+        DrainOutcome { drained: drained_items, latch_decided: sys_latch.is_some() }
     };
+    // Startup catch-up, BEFORE the first render (DRAGON-417). Media 0 is the instant
+    // audio capture began, which is earlier than this thread's first cycle by the
+    // whole video-side startup plus the FIFO rendezvous. All of that audio is already
+    // queued in the source channels (and the mic reader may be BLOCKED on a full one,
+    // so a single pass can't see it all), while the very first `render_cycle` would
+    // jump the render horizon straight to `media_at(now) − RENDER_LAG_SECS` — past
+    // material still in the queue, which then reads as late and is dropped. Drain
+    // until a pass comes back level with the live capture rate (and the system-latency
+    // latch has resolved, so no chunk is being held back either), bounded so a source
+    // that never settles can't stall the session start.
+    let catchup_deadline = Instant::now() + STARTUP_CATCHUP_BUDGET;
+    loop {
+        let outcome = drain_external(&mut pump, Instant::now());
+        if caught_up(&outcome) || stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if Instant::now() >= catchup_deadline {
+            log::warn!(
+                "media-clock pump: startup catch-up still behind after {STARTUP_CATCHUP_BUDGET:?} \
+                 ({} item(s) in the last pass); starting the render loop anyway",
+                outcome.drained
+            );
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
     loop {
         let now = Instant::now();
         drain_external(&mut pump, now);
@@ -706,7 +1000,7 @@ impl<'scope> PumpHandle<'scope> {
     /// wedged session as lost).
     pub(crate) fn join(self) -> PumpOut {
         let PumpHandle { thread, mic_fifo_path, sys_fifo_path } = self;
-        let grace = Instant::now() + Duration::from_secs(2);
+        let grace = Instant::now() + JOIN_GRACE;
         while !thread.is_finished() && Instant::now() < grace {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -780,6 +1074,18 @@ pub(crate) fn spawn<'scope, 'env>(
     #[cfg(windows)] sys_pipe: crate::platform::windows::named_pipe::PipeServer,
 ) -> Result<(PumpHandle<'scope>, VideoTicker), String> {
     let clock = Arc::new(Mutex::new(MediaClock::new(start)));
+    // The opening span (DRAGON-417): how much media time already elapsed — i.e. how
+    // much audio was already captured — before the caller's video side was ready to
+    // feed its first frame. The caller covers it with copies of that frame. It used
+    // to be invisible AND lossy: audio captured in this window was discarded with no
+    // error and nothing in any log, so a truncated recording could only be found by
+    // listening back. Logged unconditionally so the next one is one `journalctl` away.
+    let opening = Instant::now().saturating_duration_since(start);
+    log::info!(
+        "media-clock session: anchored at audio-capture start, {}ms of it before the \
+         video side was ready (that span opens on the first captured frame)",
+        opening.as_millis()
+    );
     let ticker = VideoTicker { clock: clock.clone(), fps: cfg.fps.max(1), next_tick: 0 };
     let thread_stop = stop;
     #[cfg(not(windows))]
@@ -800,10 +1106,9 @@ pub(crate) fn spawn<'scope, 'env>(
                 mic_pipe, FIFO_OPEN_BUDGET, thread_stop,
             );
             let Some(mic_fifo) = mic_fifo else {
-                log::warn!("media-clock pump: mic FIFO write end never opened (wedged ffmpeg?)");
+                log::warn!("{}", rendezvous_failure("mic", thread_stop.load(Ordering::Relaxed)));
                 thread_stop.store(true, Ordering::Relaxed);
-                drop(mic_tap);
-                let _ = monitor.stop();
+                abandon_captures(mic_tap, mic_rx, monitor, sys_rx);
                 return PumpOut::empty();
             };
             #[cfg(not(windows))]
@@ -813,10 +1118,9 @@ pub(crate) fn spawn<'scope, 'env>(
                 sys_pipe, FIFO_OPEN_BUDGET, thread_stop,
             );
             let Some(sys_fifo) = sys_fifo else {
-                log::warn!("media-clock pump: system FIFO write end never opened (wedged ffmpeg?)");
+                log::warn!("{}", rendezvous_failure("system", thread_stop.load(Ordering::Relaxed)));
                 thread_stop.store(true, Ordering::Relaxed);
-                drop(mic_tap);
-                let _ = monitor.stop();
+                abandon_captures(mic_tap, mic_rx, monitor, sys_rx);
                 return PumpOut::empty();
             };
             // The writer thread (module doc): owns the freshly-opened FIFOs and
@@ -832,8 +1136,7 @@ pub(crate) fn spawn<'scope, 'env>(
             if let Err(e) = writer {
                 log::warn!("media-clock pump: could not spawn its writer thread: {e}");
                 thread_stop.store(true, Ordering::Relaxed);
-                drop(mic_tap);
-                let _ = monitor.stop();
+                abandon_captures(mic_tap, mic_rx, monitor, sys_rx);
                 return PumpOut::empty();
             }
             let auto_device_compensation = cfg.auto_device_compensation;
@@ -876,6 +1179,124 @@ mod tests {
         }
     }
 
+    // ---- The DRAGON-411 invariant: the horizon must clear the recovery trigger ----
+
+    /// THE regression this ticket exists for. `RENDER_LAG_SECS` and
+    /// `StreamAnchor::REANCHOR_THRESHOLD_SECS` were both 0.5 — the same number — so a
+    /// source that fell behind could only ever re-anchor (recover) AFTER the render
+    /// horizon had already discarded its audio. Recovery has to be able to happen
+    /// FIRST, with room to spare; a future edit that lets these converge again
+    /// reintroduces the field failure (16.3% of a customer's mic track written as
+    /// bit-exact zeros, with the splice clicks heard as "static"). The same condition
+    /// is a compile-time `assert!` next to the constants — this test is the one that
+    /// explains itself when it breaks.
+    // ── The rendezvous diagnosis (DRAGON-422) ──────────────────────────────
+
+    #[test]
+    fn a_rendezvous_cut_short_by_a_stop_does_not_blame_ffmpeg() {
+        // The PipeWire zero-copy worker spawns its muxer on the first dmabuf frame, so
+        // when no frame arrives there is no ffmpeg here at all — and this line was the
+        // first symptom in the log of a session that failed for a completely different
+        // reason. It sent a live investigation after a wedge that never existed.
+        let m = rendezvous_failure("mic", true);
+        assert!(!m.contains("ffmpeg"), "nothing here says ffmpeg was involved: {m}");
+        assert!(m.contains("stopped"), "says the session was torn down: {m}");
+        assert!(m.contains("mic"), "names the channel: {m}");
+    }
+
+    #[test]
+    fn a_rendezvous_that_spends_its_budget_still_reports_the_wedge() {
+        // The original diagnosis is still the right one when the session is live and
+        // the budget simply ran out: that IS a muxer that never opened its inputs.
+        let m = rendezvous_failure("system", false);
+        assert!(m.contains("wedged ffmpeg"), "keeps the wedge diagnosis: {m}");
+        assert!(
+            m.contains(&FIFO_OPEN_BUDGET.as_secs().to_string()),
+            "names the budget that was actually spent: {m}"
+        );
+        assert!(m.contains("system"), "names the channel: {m}");
+    }
+
+    #[test]
+    fn the_join_grace_outlasts_the_teardown_it_waits_on() {
+        // `abandon_captures` runs on the control thread, and each step carries its own
+        // DRAGON-118 bound. A grace shorter than their sum reports "control thread never
+        // finished" every time a session fails to start, while the thread is doing
+        // exactly what it should — a false alarm in the one log a failed recording leaves.
+        let teardown = Duration::from_secs(2) // mic child: term_then_wait
+            + Duration::from_secs(2) // tap reader join
+            + Duration::from_secs(2); // monitor capture join
+        assert!(
+            JOIN_GRACE >= teardown,
+            "the join grace ({JOIN_GRACE:?}) must cover the abandon path's own bounded \
+             teardown ({teardown:?})"
+        );
+    }
+
+    #[test]
+    fn render_horizon_clears_the_reanchor_threshold() {
+        let threshold = crate::audio::capture::StreamAnchor::REANCHOR_THRESHOLD_SECS;
+        assert!(
+            RENDER_LAG_SECS > threshold,
+            "the render horizon ({RENDER_LAG_SECS}s) must sit BEHIND the source re-anchor \
+             threshold ({threshold}s), never at or in front of it: equal means a lagging \
+             source's audio is discarded before it can ever recover (DRAGON-411)"
+        );
+        assert!(
+            RENDER_LAG_SECS >= threshold * REANCHOR_HEADROOM,
+            "the horizon ({RENDER_LAG_SECS}s) must clear the re-anchor threshold \
+             ({threshold}s) by {REANCHOR_HEADROOM}x, so a source that trips the recovery \
+             trigger still has {}s of further slippage before anything it delivers can be \
+             dropped (DRAGON-411)",
+            threshold * (REANCHOR_HEADROOM - 1.0)
+        );
+        // And the recovery must be reachable at all: a source is stamped in whole
+        // chunks, so the threshold plus one generous chunk still has to fit.
+        assert!(
+            threshold + 0.1 < RENDER_LAG_SECS,
+            "a chunk stamped right at the re-anchor threshold must still land safely \
+             ahead of the horizon"
+        );
+    }
+
+    #[test]
+    fn audio_health_reads_loss_padding_and_a_clean_session_apart() {
+        let clean = MixerStats::default();
+        assert_eq!(audio_health(&clean, &clean), AudioHealth::Clean);
+        // A trivial pad (under the notice threshold) is still clean.
+        let small_gap = MixerStats { gap_samples: 4_800, ..MixerStats::default() }; // 0.1s
+        assert_eq!(audio_health(&small_gap, &clean), AudioHealth::Clean);
+        // Silence written into the recording, on EITHER track, is worth a warn.
+        let big_gap = MixerStats { gap_samples: 48_000, ..MixerStats::default() }; // 1.0s
+        assert_eq!(audio_health(&big_gap, &clean), AudioHealth::Padded);
+        assert_eq!(audio_health(&clean, &big_gap), AudioHealth::Padded);
+        // Chunks dropped because they PREDATE the recording are not loss, and every
+        // session has some (the sources deliver before the clock is anchored, and
+        // DRAGON-417's signed placement drops whatever has no post-0 tail). The chunk
+        // count alone must therefore never escalate the report — only `late_frames`,
+        // the in-recording audio, may.
+        let pre_start =
+            MixerStats { late_chunks: 3, pre_start_chunks: 3, ..MixerStats::default() };
+        assert_eq!(audio_health(&pre_start, &clean), AudioHealth::Clean);
+        // Same trap on the other counter: a source's LEAD-IN silence is present on
+        // every healthy session (measured at 55-81ms on both tracks in every E2E
+        // session), so it must never raise the level however large it is. Between them,
+        // these two cases are why `late_chunks + gap_samples > 0` reported 7 of 7
+        // healthy sessions as a loss.
+        let lead_in = MixerStats { leading_gap_samples: 96_000, ..MixerStats::default() };
+        assert_eq!(audio_health(&lead_in, &clean), AudioHealth::Clean, "2s of lead-in");
+        // Any discarded audio outranks everything else: that is data loss.
+        let lost = MixerStats { late_chunks: 1, late_frames: 480, ..MixerStats::default() };
+        assert_eq!(audio_health(&lost, &clean), AudioHealth::Lost);
+        assert_eq!(audio_health(&big_gap, &lost), AudioHealth::Lost);
+    }
+
+    #[test]
+    fn frames_to_secs_reports_at_the_mixer_rate() {
+        assert_eq!(frames_to_secs(48_000), 1.0);
+        assert_eq!(frames_to_secs(0), 0.0);
+    }
+
     // ---- latch_decision ------------------------------------------------------
 
     #[test]
@@ -890,6 +1311,20 @@ mod tests {
         // ...and fail open to 0.0 once it's exhausted (suspended/virtual sinks
         // never report — the legacy path's same fail-open).
         assert_eq!(latch_decision(None, SYS_LATENCY_LATCH_BUDGET), Some(0.0));
+    }
+
+    // ---- caught_up (the startup catch-up drain, DRAGON-417) -------------------
+
+    #[test]
+    fn caught_up_needs_both_a_quiet_pass_and_a_decided_latch() {
+        // A backlog hands over many items at once — keep draining.
+        assert!(!caught_up(&DrainOutcome { drained: 40, latch_decided: true }));
+        // Level with the live rate AND nothing held back: start rendering.
+        assert!(caught_up(&DrainOutcome { drained: 2, latch_decided: true }));
+        assert!(caught_up(&DrainOutcome { drained: 0, latch_decided: true }));
+        // System chunks still held for the latch must not be rendered past, however
+        // quiet the pass looks.
+        assert!(!caught_up(&DrainOutcome { drained: 0, latch_decided: false }));
     }
 
     // ---- offset_instant ------------------------------------------------------
@@ -1220,6 +1655,30 @@ mod tests {
         assert_eq!(out.automation[0].media, 1.0);
         assert_eq!(out.automation[1].media, 1.0);
         assert_eq!(out.tracks[TRACK_MIC].len(), (1.5 * crate::mixer::SAMPLE_RATE as f64) as usize);
+    }
+
+    #[test]
+    fn pausing_takes_back_audio_already_placed_past_the_freeze() {
+        // DRAGON-411: sources stamp CONTIGUOUSLY, so their audible times run ahead of
+        // wall time and taps land at media positions the pause has not reached yet.
+        // Those samples were captured after the user pressed pause — they must not be
+        // in the file, and while they sat there the RESUME's own audio arrived for
+        // ground already taken and was discarded as late (an `error`-level loss report
+        // on every paused recording, which is how this was found).
+        let t0 = base();
+        let PumpRig { mut pump, .. } = pump_with_fakes(t0, 30);
+        // One full second of mic audio placed at media 0.0..1.0, then a pause at 0.5.
+        pump.push_mic_tap(StreamTap::new(vec![1.0; 48_000], t0, t0));
+        pump.set_paused(true, t0 + secs(0.5));
+        let out = pump.mixer.render(1.0);
+        let mic = &out.tracks[TRACK_MIC];
+        assert_eq!(mic.len(), 48_000);
+        assert!(mic[..24_000].iter().all(|&s| s == 1.0), "audio before the freeze is kept");
+        assert!(
+            mic[24_000..].iter().all(|&s| s == 0.0),
+            "audio captured past the freeze must not be recorded — pause means the media \
+             clock stops, and leaving it also robs the resume of those positions"
+        );
     }
 
     #[test]

@@ -349,9 +349,16 @@ impl cosmic::Application for App {
                 copy_selection_pending: false,
                 // `--preview` (windowed unless `--overlay`) overrides the persisted setting.
                 preview_windowed: startup.preview_windowed.unwrap_or(persisted.preview_windowed),
+                // DRAGON-419: the mirrored setting only. `diag::init` already resolved the
+                // SINK from this same key back in `main` (before this window, before the
+                // daemon branch), so there is nothing to start here.
+                debug_logging: persisted.debug_logging,
                 preview_save_on_copy: persisted.preview_save_on_copy,
                 preview_close_on_copy: persisted.preview_close_on_copy,
                 preview_copy_on_delete: persisted.preview_copy_on_delete,
+                preview_video_save_on_copy: persisted.preview_video_save_on_copy,
+                preview_video_close_on_copy: persisted.preview_video_close_on_copy,
+                preview_video_copy_on_delete: persisted.preview_video_copy_on_delete,
                 mute_others_during_preview: persisted.mute_others_during_preview,
                 duck_system_audio: persisted.duck_system_audio,
                 appearance_use_system: persisted.appearance_use_system,
@@ -456,6 +463,9 @@ impl cosmic::Application for App {
                 recording: None,
                 recording_started: None,
                 recording_path: None,
+                recording_out_path: None,
+                recording_stopping: false,
+                recording_progress: None,
                 recording_paused_at: None,
                 recording_paused_accum: std::time::Duration::ZERO,
                 recording_cancelled: false,
@@ -664,7 +674,7 @@ impl cosmic::Application for App {
     }
 
     fn update(&mut self, message: Msg) -> Task<cosmic::Action<Msg>> {
-        match message {
+        let task = match message {
             Msg::Capture(message) => self.update_capture(message),
             Msg::Recording(message) => self.update_recording(message),
             Msg::Detect(message) => self.update_detect(message),
@@ -672,12 +682,76 @@ impl cosmic::Application for App {
             Msg::Permissions(message) => self.update_permissions(message),
             Msg::WindowChrome(message) => self.update_window_chrome(message),
             Msg::Preview(id, message) => self.update_preview(id, message),
-        }
+        };
+        // DRAGON-413: publish what this child currently has on screen to the startup
+        // self-exit guard. Here — after the dispatch, on EVERY message — rather than at
+        // each surface's open/close site: the status is recomputed from live `App` state
+        // (`startup_presence`), so no new field is introduced and no mutation site can be
+        // forgotten. One relaxed atomic store. macOS-only (the guard is only armed
+        // there), so Linux/Windows compile exactly as before.
+        #[cfg(target_os = "macos")]
+        crate::startup_guard::report(self.startup_presence());
+        task
     }
 
     fn subscription(&self) -> Subscription<Msg> {
         // Body lives in subscriptions.rs as small named `sub_*` helpers, one per
         // trigger condition (see that file for what drives each tick and why).
         self.subscriptions()
+    }
+}
+
+/// Whether a DRAGON-415 capture-failure alert is on screen (macOS; always false
+/// elsewhere, where nothing is ever presented). Split out so `startup_presence` below
+/// stays one expression on both platforms.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn alert_is_showing() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::platform::mac::alert::is_showing()
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+// `test` as well as macOS: compiling this on the Linux dev box keeps the field list
+// below TYPE-CHECKED by the local suite, which is the only gate this repo has — the
+// macOS build is not run here (see CLAUDE.md). Dead there, hence the allow.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl App {
+    /// This child's [`crate::startup_guard::Presence`], read from the surfaces it
+    /// currently owns (DRAGON-413). The ONE place that maps app state onto the guard's
+    /// three cases; `update` calls it after every dispatch.
+    ///
+    /// The "visible work" list is deliberately broad — every state in which the user can
+    /// see (or is about to see) this session, including the picker overlay, a running
+    /// countdown, a pixel capture in flight, a live recording (an immediate
+    /// `--active-monitor --video` launch mints NO overlay and can legitimately run for
+    /// hours), an open preview editor, and an in-app settings window. Any one of them
+    /// disarms the guard for the rest of the process, so an overlay later torn down for a
+    /// preview handoff can never re-arm it.
+    ///
+    /// The permission checker is the one surface that SUSPENDS instead of disarming: the
+    /// user may sit on it for as long as they like, and reading it must never accumulate
+    /// toward a kill. It is read straight off `permissions.window` — the existing state
+    /// that already drives `sub_permission_poll` and `seed_outputs_mac` — so nothing new
+    /// is coupled to the permission flow (DRAGON-412 owns that module).
+    fn startup_presence(&self) -> crate::startup_guard::Presence {
+        crate::startup_guard::presence(
+            !self.outputs.is_empty()
+                || !self.previews.is_empty()
+                || self.countdown.is_some()
+                || self.capturing.is_some()
+                || self.recording.is_some()
+                || self.settings.window.is_some(),
+            // DRAGON-415: a capture-failure alert is the OTHER window the user must act on,
+            // and reading it must no more cost this child its life than reading the
+            // permission checker does. `report_failure` publishes `AwaitingUser` before the
+            // modal takes the run loop; this keeps the two agreeing on any dispatch that
+            // happens to run while one is up.
+            self.permissions.window.is_some() || alert_is_showing(),
+        )
     }
 }

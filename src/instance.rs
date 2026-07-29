@@ -357,11 +357,24 @@ pub(crate) fn settings_lock_pid() -> Option<u32> {
 const RECORDING_MARKER: &str = "recording";
 /// Marker suffix: this pid has a preview editor open.
 const PREVIEW_MARKER: &str = "preview";
+/// Marker suffix: this pid is showing the capture-failure ALERT (DRAGON-415). The
+/// pile-up case this exists for is a user pressing the hotkey several times because
+/// nothing happened: each press is its own child, each fails the same way, and without a
+/// cross-process marker each would put up its own dialog. The first one to fail speaks;
+/// the rest find this marker and exit quietly (they were about to exit anyway).
+const ALERT_MARKER: &str = "alert";
 /// Marker suffix: this pid is LISTENING for preview handoffs (DRAGON-336) — the
 /// unix-socket sibling of its [`PREVIEW_MARKER`]. Sits in the same per-pid namespace so
 /// the stale sweep below clears a SIGKILLed host's socket file for free; the transport
 /// itself lives in [`crate::preview_ipc`].
 const PREVIEW_SOCKET_MARKER: &str = "preview.sock";
+/// Marker suffix: the recording-session LEDGER (DRAGON-421) — this pid's live recording
+/// names its ffmpeg muxer, its audio FIFOs and its temp file here, so a LATER session can
+/// tell that wreckage apart from a live session's working files. Written and cleared by
+/// [`crate::record::recover`], which is also the only thing that removes stale ones —
+/// deliberately NOT in [`sweep_stale_markers`]'s list, because deleting the ledger is the
+/// LAST step of acting on it, never the first.
+pub(crate) const SESSION_MARKER: &str = "session";
 
 /// Per-pid state-marker sidecar path (`{runtime}/cosmic-capture-kit.<pid>.<suffix>`).
 fn state_marker_path(pid: u32, suffix: &str) -> String {
@@ -374,16 +387,56 @@ fn state_marker_path_in(dir: &str, pid: u32, suffix: &str) -> String {
     format!("{dir}/cosmic-capture-kit.{pid}.{suffix}")
 }
 
+/// The recording-session ledger path for `pid` (DRAGON-421) — a sidecar in the SAME
+/// per-pid namespace as every other marker, so its owner is read off the filename and
+/// its liveness answered by [`pid_is_live`], exactly like the rest.
+pub(crate) fn session_ledger_path(pid: u32) -> String {
+    state_marker_path(pid, SESSION_MARKER)
+}
+
 /// Split a state-marker FILENAME back into its `(pid, suffix)`, or `None` when the name
 /// isn't one of ours. The lock/socket sidecars use a HYPHEN stem
 /// (`cosmic-capture-kit-daemon.lock`), so the dotted prefix here never matches them.
-fn parse_marker_name(name: &str) -> Option<(u32, &str)> {
+pub(crate) fn parse_marker_name(name: &str) -> Option<(u32, &str)> {
     let rest = name.strip_prefix("cosmic-capture-kit.")?;
     let (pid_str, suffix) = rest.split_once('.')?;
     Some((pid_str.parse::<u32>().ok()?, suffix))
 }
 
-/// Remove every state marker whose owning pid is dead — for EVERY marker kind.
+/// Whether a per-pid sidecar with this `suffix` should be removed once its owner is dead.
+///
+/// The rule is uniform — a per-pid file in this namespace describes a process, so it means
+/// nothing once that process is gone — but the SET is worth stating in one place, because
+/// exactly one member of the namespace is deliberately excluded (see below).
+///
+/// DRAGON-421 added the recorder's audio FIFOs (`<pid>.<token>.{mic,sys}mix.pcm`, minted in
+/// `record::owned::try_start_owned_audio`). They are per-pid sidecars like everything else
+/// here, and a crashed recording left them behind to accumulate until the runtime dir
+/// cleared at logout. They are swept by the SAME rule rather than by a second sweeper of
+/// their own — which is also why a plain still capture now clears them, not just a
+/// recording.
+///
+/// The session LEDGER ([`SESSION_MARKER`]) is deliberately NOT in the set. It is the
+/// EVIDENCE a dead session leaves about its own wreckage — which ffmpeg it spawned, which
+/// temp that ffmpeg is holding — and `record::recover` removes it as the LAST step of
+/// acting on it. Sweeping it here would throw away the record before anything read it.
+fn sweep_when_owner_is_dead(suffix: &str) -> bool {
+    // DRAGON-336: the preview-handoff SOCKET rides the same per-pid namespace, so a
+    // host killed with SIGKILL (which leaves its socket file behind) is cleaned up
+    // here too — otherwise a recycled pid would inherit a socket nothing listens on.
+    matches!(suffix, RECORDING_MARKER | PREVIEW_MARKER | PREVIEW_SOCKET_MARKER | ALERT_MARKER)
+        || is_audio_fifo_suffix(suffix)
+}
+
+/// Whether a marker suffix names one of the recorder's audio FIFOs — the `<token>` in
+/// `cosmic-capture-kit.<pid>.<token>.micmix.pcm` is per-pre-flight, so the suffix is
+/// matched by its tail rather than compared whole.
+pub(crate) fn is_audio_fifo_suffix(suffix: &str) -> bool {
+    suffix.ends_with(".micmix.pcm") || suffix.ends_with(".sysmix.pcm")
+}
+
+/// Remove every per-pid sidecar whose owning pid is dead — for EVERY kind
+/// [`sweep_when_owner_is_dead`] covers.
 ///
 /// DRAGON-336: `any_other_recording` already swept the RECORDING markers it scans, but
 /// nothing ever swept the PREVIEW ones — they are only probed by pid, for a sibling
@@ -393,9 +446,21 @@ fn parse_marker_name(name: &str) -> Option<(u32, &str)> {
 /// be wrongly spared from the collapse sweep. Cheap (one readdir) and best-effort
 /// throughout: a marker we fail to remove is simply retried next launch.
 pub(crate) fn sweep_stale_markers() {
-    let self_pid = std::process::id();
-    let Ok(entries) = std::fs::read_dir(crate::util::runtime_dir()) else {
-        return;
+    sweep_stale_markers_in(&crate::util::runtime_dir(), std::process::id(), &pid_is_live);
+}
+
+/// [`sweep_stale_markers`] against an EXPLICIT directory, self pid and liveness oracle (the
+/// `*_in` idiom the other scan helpers here use), returning what it removed so a caller can
+/// report it. DRAGON-421's recovery sweep calls THIS rather than growing a second readdir
+/// with the same rule in it.
+pub(crate) fn sweep_stale_markers_in(
+    dir: &str,
+    self_pid: u32,
+    live: &dyn Fn(u32) -> bool,
+) -> Vec<std::path::PathBuf> {
+    let mut removed = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return removed;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -403,18 +468,17 @@ pub(crate) fn sweep_stale_markers() {
         let Some((pid, suffix)) = parse_marker_name(name) else {
             continue;
         };
-        // DRAGON-336: the preview-handoff SOCKET rides the same per-pid namespace, so a
-        // host killed with SIGKILL (which leaves its socket file behind) is cleaned up
-        // here too — otherwise a recycled pid would inherit a socket nothing listens on.
-        if suffix != RECORDING_MARKER && suffix != PREVIEW_MARKER && suffix != PREVIEW_SOCKET_MARKER
-        {
+        if !sweep_when_owner_is_dead(suffix) {
             continue;
         }
-        if pid == self_pid || pid_is_live(pid) {
+        if pid == self_pid || live(pid) {
             continue;
         }
-        let _ = std::fs::remove_file(entry.path());
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed.push(entry.path());
+        }
     }
+    removed
 }
 
 /// Create (`active`) or remove this instance's RECORDING marker. Set when a recording
@@ -428,6 +492,25 @@ pub(crate) fn set_recording_marker(active: bool) {
 /// editor opens, cleared at `finish_session` (a preview close ends the process).
 pub(crate) fn set_preview_marker(active: bool) {
     set_self_marker(PREVIEW_MARKER, active);
+}
+
+/// Create (`active`) or remove this instance's failure-ALERT marker (DRAGON-415). Held
+/// only while the modal is actually on screen, so nothing is suppressed a moment longer
+/// than the dialog exists.
+///
+/// Called only from the macOS alert presenter — the mechanism itself is portable
+/// `std::fs`, like every other marker, so it stays here with its siblings rather than
+/// growing a second, mac-shaped copy inside the platform plugin.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn set_alert_marker(active: bool) {
+    set_self_marker(ALERT_MARKER, active);
+}
+
+/// Whether ANOTHER live instance is showing a failure alert right now. Sweeps markers left
+/// by dead pids as it scans, so a child killed mid-dialog can never mute the next one.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn any_other_alert() -> bool {
+    any_other_marker_in(&crate::util::runtime_dir(), std::process::id(), ALERT_MARKER)
 }
 
 fn set_self_marker(suffix: &str, active: bool) {
@@ -473,12 +556,20 @@ pub fn video_capture_allowed(external_recording: bool) -> bool {
 /// the video kind while a recording runs elsewhere. Sweeps markers left behind by dead
 /// pids as it scans, so a crashed recorder can't wedge the toggle off forever.
 pub(crate) fn any_other_recording() -> bool {
-    let dir = crate::util::runtime_dir();
-    let self_pid = std::process::id();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    any_other_marker_in(&crate::util::runtime_dir(), std::process::id(), RECORDING_MARKER)
+}
+
+/// Whether any pid OTHER than `self_pid` holds a live `marker` in `dir`. The body
+/// `any_other_recording` has always had, generalised over the marker kind (DRAGON-415
+/// needs the same question for the failure alert) and over the directory, so it can be
+/// exercised against a temp dir like the other `*_in` scan helpers. Stale markers from
+/// dead pids are swept as we scan, so a crashed instance can never hold a state open
+/// forever.
+fn any_other_marker_in(dir: &str, self_pid: u32, marker: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
     };
-    let suffix = format!(".{RECORDING_MARKER}");
+    let suffix = format!(".{marker}");
     let mut found = false;
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -498,7 +589,7 @@ pub(crate) fn any_other_recording() -> bool {
         if pid_is_live(pid) {
             found = true;
         } else {
-            // Stale marker from a crashed recorder — sweep it so the toggle re-enables.
+            // Stale marker from a crashed instance — sweep it so the state re-opens.
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -580,17 +671,17 @@ fn order_preview_hosts(mut found: Vec<(u32, Option<std::time::SystemTime>)>) -> 
 /// the platform body. Best-effort — a false "live" only keeps the video toggle disabled
 /// a little longer, never a hard failure.
 #[cfg(target_os = "linux")]
-fn pid_is_live(pid: u32) -> bool {
+pub(crate) fn pid_is_live(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
 #[cfg(all(unix, not(target_os = "linux")))]
-fn pid_is_live(pid: u32) -> bool {
+pub(crate) fn pid_is_live(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 delivers nothing; it only probes existence/permission.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 #[cfg(windows)]
-fn pid_is_live(pid: u32) -> bool {
+pub(crate) fn pid_is_live(pid: u32) -> bool {
     crate::platform::windows::instance::pid_is_live(pid)
 }
 
@@ -770,6 +861,115 @@ mod tests {
         ] {
             assert_eq!(parse_marker_name(name), None, "should ignore {name}");
         }
+    }
+
+    /// DRAGON-421: the sweep's SET is a contract in both directions. The recorder's audio
+    /// FIFOs joined it (a crashed recording used to leave them until logout, and they are
+    /// per-pid sidecars like everything else) — but the session LEDGER must stay OUT of it,
+    /// because it is the evidence `record::recover` reads before removing it itself.
+    #[test]
+    fn the_dead_owner_sweep_covers_the_audio_fifos_but_never_the_session_ledger() {
+        for suffix in [
+            RECORDING_MARKER,
+            PREVIEW_MARKER,
+            PREVIEW_SOCKET_MARKER,
+            ALERT_MARKER,
+            "0.micmix.pcm",
+            "13.sysmix.pcm",
+        ] {
+            assert!(sweep_when_owner_is_dead(suffix), "should sweep {suffix}");
+        }
+        assert!(
+            !sweep_when_owner_is_dead(SESSION_MARKER),
+            "the ledger is evidence, not litter: sweeping it here would throw away the \
+             record of a crashed session's wreckage before anything acted on it"
+        );
+        // The bench FIFOs (`--bench-record`) are a developer tool with their own cleanup
+        // and no pid-liveness story; they are deliberately not claimed.
+        assert!(!sweep_when_owner_is_dead("bench-mic.pcm"));
+    }
+
+    /// The sweep removes a dead owner's sidecars and NOTHING else — the live pid's files
+    /// and our own are untouched. This is the same guarantee `record::recover` leans on to
+    /// keep a concurrent recording's FIFOs (DRAGON-322/351).
+    #[cfg(unix)]
+    #[test]
+    fn the_dead_owner_sweep_spares_live_and_self_owned_sidecars() {
+        let dir = std::env::temp_dir().join(format!("cck-sweep-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let dead = 999_999_101;
+        let live = 999_999_102;
+        let selfish = 999_999_103;
+        for pid in [dead, live, selfish] {
+            std::fs::File::create(state_marker_path_in(&dir, pid, "0.micmix.pcm")).unwrap();
+            std::fs::File::create(state_marker_path_in(&dir, pid, RECORDING_MARKER)).unwrap();
+        }
+        // A ledger for the dead pid: it must SURVIVE this sweep (recover reads it).
+        std::fs::File::create(state_marker_path_in(&dir, dead, SESSION_MARKER)).unwrap();
+
+        let removed = sweep_stale_markers_in(&dir, selfish, &|p| p == live);
+
+        assert_eq!(removed.len(), 2, "only the dead pid's two sidecars: {removed:?}");
+        assert!(!std::path::Path::new(&state_marker_path_in(&dir, dead, "0.micmix.pcm")).exists());
+        assert!(std::path::Path::new(&state_marker_path_in(&dir, dead, SESSION_MARKER)).exists(),
+            "the ledger survives to be acted on");
+        for pid in [live, selfish] {
+            assert!(
+                std::path::Path::new(&state_marker_path_in(&dir, pid, "0.micmix.pcm")).exists(),
+                "a live (or our own) recording keeps its FIFOs — deleting them would break it"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DRAGON-415: the generalised marker scan (`any_other_recording`'s body, now shared
+    /// with the failure alert) answers only for OTHER pids that are still alive, is keyed
+    /// to the exact marker kind, and sweeps dead pids' markers as it goes — so a child
+    /// killed mid-dialog can never mute the next one.
+    #[cfg(unix)]
+    #[test]
+    fn marker_scan_is_per_kind_live_and_non_self() {
+        let dir = std::env::temp_dir().join(format!("cck-marker-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let live = std::process::id(); // certainly alive
+        let dead = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
+        let selfish = 999_999_002; // stands in as "us" for this scan
+
+        // Nothing at all: the first failure in a quiet system must speak.
+        assert!(!any_other_marker_in(&dir, selfish, ALERT_MARKER));
+
+        // Our OWN marker is never an excuse to stay silent.
+        std::fs::File::create(state_marker_path_in(&dir, selfish, ALERT_MARKER)).unwrap();
+        assert!(!any_other_marker_in(&dir, selfish, ALERT_MARKER));
+
+        // A dead pid's marker is swept, not obeyed.
+        std::fs::File::create(state_marker_path_in(&dir, dead, ALERT_MARKER)).unwrap();
+        assert!(!any_other_marker_in(&dir, selfish, ALERT_MARKER));
+        assert!(
+            !std::path::Path::new(&state_marker_path_in(&dir, dead, ALERT_MARKER)).exists(),
+            "a dead pid's alert marker must be swept"
+        );
+
+        // A different marker kind is a different question.
+        std::fs::File::create(state_marker_path_in(&dir, live, RECORDING_MARKER)).unwrap();
+        assert!(!any_other_marker_in(&dir, selfish, ALERT_MARKER));
+        assert!(any_other_marker_in(&dir, selfish, RECORDING_MARKER));
+
+        // A live sibling actually showing one: stay quiet.
+        std::fs::File::create(state_marker_path_in(&dir, live, ALERT_MARKER)).unwrap();
+        assert!(any_other_marker_in(&dir, selfish, ALERT_MARKER));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// DRAGON-336: the preview-handoff SOCKET is a per-pid sidecar in the same namespace,

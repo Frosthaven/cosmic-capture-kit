@@ -325,9 +325,33 @@ pub fn spawn_ffmpeg_media_clock(
     mic_fifo: &std::path::Path,
     sys_fifo: &std::path::Path,
 ) -> Result<Child, String> {
-    build_media_clock_command(w, h, ew, eh, fps, plan, bitrate_kbps, out_path, mic_fifo, sys_fifo)
-        .spawn()
-        .map_err(|e| format!("could not start ffmpeg (is it installed?): {e}"))
+    spawn_recording_muxer(
+        &mut build_media_clock_command(
+            w, h, ew, eh, fps, plan, bitrate_kbps, out_path, mic_fifo, sys_fifo,
+        ),
+        out_path,
+        mic_fifo,
+        sys_fifo,
+    )
+}
+
+/// Spawn a built recording-muxer command, TETHERED to this process and recorded in the
+/// crash-recovery ledger (DRAGON-421).
+///
+/// Both recording muxer spawns (raw-frame and zero-copy) go through here so neither the
+/// tether nor the ledger depends on a worker remembering to do it — there are four workers
+/// and every one of them must get this right. See [`crate::util::spawn_tethered`] for the
+/// per-platform guarantee and [`crate::record::recover`] for what the ledger buys.
+fn spawn_recording_muxer(
+    cmd: &mut Command,
+    out_path: &std::path::Path,
+    mic_fifo: &std::path::Path,
+    sys_fifo: &std::path::Path,
+) -> Result<Child, String> {
+    let child = crate::util::spawn_tethered(cmd)
+        .map_err(|e| format!("could not start ffmpeg (is it installed?): {e}"))?;
+    crate::record::recover::note_muxer(child.id(), out_path, mic_fifo, sys_fifo);
+    Ok(child)
 }
 
 /// Build the media-clock zero-copy muxer [`Command`] (unspawned) — the pure half of
@@ -388,9 +412,12 @@ pub fn spawn_ffmpeg_encoded_media_clock(
     mic_fifo: &std::path::Path,
     sys_fifo: &std::path::Path,
 ) -> Result<Child, String> {
-    build_media_clock_encoded_command(hevc, fps, out_path, mic_fifo, sys_fifo)
-        .spawn()
-        .map_err(|e| format!("could not start ffmpeg (is it installed?): {e}"))
+    spawn_recording_muxer(
+        &mut build_media_clock_encoded_command(hevc, fps, out_path, mic_fifo, sys_fifo),
+        out_path,
+        mic_fifo,
+        sys_fifo,
+    )
 }
 
 #[cfg(test)]

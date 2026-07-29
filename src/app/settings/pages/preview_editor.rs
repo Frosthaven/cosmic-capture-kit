@@ -6,10 +6,17 @@
 //! editor's picker offers. It sits directly after Capture Modes in the nav, because it is
 //! what happens NEXT.
 //!
-//! Group order — **General** (the surface the editor opens as) → **Image Editor** (what
-//! its actions do) → **Covermarks** (content it OFFERS). Widest-scope first: the
-//! appearance decides how every row below it is experienced, and the covermark text is
-//! not a behaviour at all, which is why it trails rather than joining Image Editor.
+//! Group order — **General** (the surface the editor opens as) → **Image Editor** →
+//! **Video Editor** (what its actions do, per media kind) → **Covermarks** (content it
+//! OFFERS). Widest-scope first: the appearance decides how every row below it is
+//! experienced, and the covermark text is not a behaviour at all, which is why it trails
+//! rather than joining the two editor groups.
+//!
+//! The two editor groups carry the SAME three rows against DIFFERENT fields (DRAGON-420):
+//! the group title is what says which media a row governs, so the row wording stays
+//! identical rather than growing "…(video)" suffixes. Because this function is also the
+//! search index, both copies are searchable, and a query for "copy to clipboard" turns up
+//! all six with their group names attached.
 //!
 //! A single-page section list (no in-page tab strip yet) — `general.rs`'s split is the
 //! precedent for adding one when this outgrows one screen.
@@ -99,6 +106,53 @@ impl crate::app::App {
                     // `share::AUTO_COPY_MAX_MB` and the row is GONE: the editor toasts a
                     // named error when it declines an automatic copy for size, so the knob
                     // only ever pre-empted a failure the user can now simply read.
+                ],
+            },
+            // DRAGON-420: the SAME three rows for recordings, on their own fields. Video
+            // shares have matched image shares since DRAGON-398, and until now they also
+            // borrowed the image SETTINGS — so a user who wanted screenshots to close on copy
+            // had to accept the recording editor closing too, over media that is far more
+            // expensive to reopen. One group per kind, identical wording (the group title is
+            // what disambiguates), identical defaults.
+            SectionSpec {
+                title: "Video Editor",
+                items: vec![
+                    Item::new(
+                        "Automatically save on copy to clipboard",
+                        "",
+                        toggle(self.preview_video_save_on_copy, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewVideoSaveOnCopy(a0))
+                        }),
+                    )
+                    .reset_with(
+                        self.preview_video_save_on_copy,
+                        d.preview_video_save_on_copy,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoSaveOnCopy(a0)),
+                    ),
+                    Item::new(
+                        "Automatically close on copy to clipboard",
+                        "",
+                        toggle(self.preview_video_close_on_copy, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewVideoCloseOnCopy(a0))
+                        }),
+                    )
+                    .reset_with(
+                        self.preview_video_close_on_copy,
+                        d.preview_video_close_on_copy,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoCloseOnCopy(a0)),
+                    ),
+                    Item::new(
+                        "Automatically copy to clipboard on delete",
+                        "",
+                        toggle(self.preview_video_copy_on_delete, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewVideoCopyOnDelete(a0))
+                        }),
+                    )
+                    .reset_with(
+                        self.preview_video_copy_on_delete,
+                        d.preview_video_copy_on_delete,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoCopyOnDelete(a0)),
+                    ),
                 ],
             },
             // Covermarks: the custom-text covermark's content (used by the preview editor's

@@ -183,6 +183,27 @@ GNOME/macOS/Windows branches inside these same functions per DRAGON-93/94/95).
 shared, preview closed, or unrecoverable error all route through it, so the
 resident-app platforms only need to change this one function).
 
+**Failing out loud (DRAGON-415).** A session that ends WITHOUT delivering anything
+calls `diag::note_failure(...)` (DRAGON-419, for us) and then `App::fail_session`
+(`app/failure.rs`, for the user) rather than `finish_session` directly. On macOS
+that presents a native app-modal `NSAlert` (`platform/mac/services/alert.rs`)
+before the child exits; the user dismisses it and the session then ends through
+the normal path. It exists because macOS is the one platform where a `log::warn!`
+reaches nothing at all, so every failure read to the user as "it just closed
+itself and saved nothing".
+
+The two mechanisms share ONE classification, `diag::Failure` — the log names it
+and the alert is built from the same record, so there is no second taxonomy to
+drift. `fail_session` reads `diag::root_failure()` (the FIRST note of the
+session), because failures are recorded in causal order and the last note is the
+symptom, not the diagnosis. The message TABLE (`alert_message`) is pure and
+unit-tested on every platform; presentation is macOS-only, and Linux/Windows
+`fail_session` is byte-identically `finish_session`. The rules the table encodes:
+never blame a permission we have not checked (`CGPreflightScreenCaptureAccess` is
+read live at failure time), never name the macOS 14.0-14.3 `SCShareableContent`
+hang on a build that does not have it, and never surface a `diag` detail string
+except the recording worker's reason (the rest is telemetry, not user copy).
+
 The post-capture preview is either an `Overlay` (fullscreen layer-shell, like
 the capture UI) or a `Window` (resizable CSD toplevel) — `PreviewSurface` in
 `app/preview/surface.rs`. The persisted setting `preview_windowed` decides what to
@@ -229,6 +250,20 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
   bar appears at once); `SetResident(false)` calls `signal_daemon_quit` (SIGTERM
   the daemon-lock holder → AppKit terminates the run loop → menu bar disappears)
   and unregisters the login item. The daemon's Quit menu item is `NSApp terminate:`.
+- **Startup self-exit guard** (`src/startup_guard.rs`, DRAGON-413) — the flip side
+  of "detached, nothing to reap": nothing noticed a child that never reached
+  `finish_session`, so a startup stall silently piled up invisible processes (a
+  customer accumulated six retries). Each CAPTURE child now arms a detached budget
+  clock in `main` — BEFORE `app::run`, so a hang inside `App::init` is covered too —
+  and quietly `process::exit(0)`s (after the same tiling-WM resume + marker drop
+  `finish_session` does) if it never presents anything within `DEFAULT_BUDGET` (90s).
+  "Presents" = a capture overlay, countdown, in-flight capture, live recording,
+  preview editor or settings window, published from `App::update` via
+  `startup_presence()`; the FIRST such report disarms the guard permanently. The
+  permission checker instead SUSPENDS the clock for as long as it is open — a child
+  showing it is doing its job, and reading it must never accumulate toward a kill.
+  macOS-only for now (Linux/Windows are byte-identical; both could opt in by calling
+  `arm` from their launch paths). Decision logic is pure and unit-tested.
 - **`acquire_scene`** (`app/mod.rs`) — the scene grab (precapture thread + frozen
   output snapshots) factored out of `init()`; every capture child runs it once at
   launch (`active = !settings_only && !preview_mode`), exactly as before.

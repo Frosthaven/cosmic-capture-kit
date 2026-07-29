@@ -391,6 +391,15 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            // DRAGON-419. `set_enabled` FIRST, so the "turned on" session header lands before
+            // the config write it causes — the file then shows its own enabling as the first
+            // thing that happened, which is what makes a mid-session toggle readable.
+            SettingsMsg::SetDebugLogging(b) => {
+                crate::diag::set_enabled(b);
+                self.debug_logging = b;
+                self.save_state();
+                Task::none()
+            }
             SettingsMsg::SetPreviewSaveOnCopy(b) => {
                 self.preview_save_on_copy = b;
                 self.save_state();
@@ -403,6 +412,23 @@ impl App {
             }
             SettingsMsg::SetPreviewCopyOnDelete(b) => {
                 self.preview_copy_on_delete = b;
+                self.save_state();
+                Task::none()
+            }
+            // DRAGON-420: the Video Editor group's three. Each writes its OWN field — never
+            // the image one beside it — which is exactly what the independence tests pin.
+            SettingsMsg::SetPreviewVideoSaveOnCopy(b) => {
+                self.preview_video_save_on_copy = b;
+                self.save_state();
+                Task::none()
+            }
+            SettingsMsg::SetPreviewVideoCloseOnCopy(b) => {
+                self.preview_video_close_on_copy = b;
+                self.save_state();
+                Task::none()
+            }
+            SettingsMsg::SetPreviewVideoCopyOnDelete(b) => {
+                self.preview_video_copy_on_delete = b;
                 self.save_state();
                 Task::none()
             }

@@ -190,7 +190,9 @@ fn record_pipewire_owned(
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let OwnedAudioStart { mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx } = owned;
+    let OwnedAudioStart {
+        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } = owned;
 
     // Same PipeWire consumer shape as the legacy path (untouched): a small
     // jitter-buffered channel, dropping (never blocking) when the encoder side is
@@ -281,9 +283,14 @@ fn record_pipewire_owned(
     // freshest one available before the first write (same reasoning as the
     // legacy path's identical step), crediting each skipped frame's lag sample.
     latch_freshest(&frx, &mut last, &mut all_lag_samples);
-    // Media time 0 starts here — right before we start feeding real ticks/audio —
-    // so startup jitter above doesn't skew the clock's anchor.
-    let session_start = std::time::Instant::now();
+    // Media time 0 is the instant AUDIO CAPTURE began (the pre-flight), not the
+    // instant the video side finished coming up (DRAGON-417). Everything above —
+    // the capture handshake, the first frame, ffmpeg's spawn — happened while the
+    // mic/system captures were already running and the app's indicator already said
+    // "recording"; anchoring here would place all of that audio at a negative media
+    // position, where the mixer discards it. The opening span is covered on the video
+    // side by the first frame instead (see `capture_start`'s doc).
+    let session_start = capture_start;
     let pump_cfg = super::pump::PumpConfig {
         fps: fps.max(1),
         audio_offset_ms,

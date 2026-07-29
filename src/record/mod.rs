@@ -70,7 +70,18 @@ mod finalize;
 mod owned;
 #[cfg(target_os = "linux")]
 mod pipewire;
+// The SESSION-level bound (DRAGON-423): the outer ring around every in-process bound below
+// — a recording that stops making PROGRESS ends itself instead of hanging forever. Portable
+// (a pure state machine plus two `fs::metadata` calls); the app drives it from the poll it
+// already runs, which is the one place in the process a wedged worker cannot block.
+pub(crate) mod progress;
 mod pump;
+// Crash RECOVERY (DRAGON-421): the session ledger + the start-of-recording sweep that
+// makes sure a session which died badly cannot poison the next one — and, for a session
+// that HANGS rather than dies, `recover::abandon_session`, the complete teardown that
+// DRAGON-423's bound calls for. Portable — plain `std::fs` over the same per-pid marker
+// namespace `crate::instance` owns.
+pub(crate) mod recover;
 // The SCK worker lives PHYSICALLY under `platform/mac/` (the closed-platform
 // split, DRAGON-226) but stays mounted at `record::sck` — module paths are
 // stable via `#[path]`, exactly like the `platform/mod.rs` mount registry.
@@ -94,9 +105,26 @@ mod screencopy;
 // be driven headlessly (interactive portal grant); it is unit-covered in `pipewire`.
 #[cfg(all(test, target_os = "linux"))]
 mod screencopy_live_tests;
+// LIVE recording-opening proof (DRAGON-421) — `#[ignore]`-gated. Drives the REAL public
+// entry point and verifies the finished file BY WHAT IT SAYS; see its module doc for why
+// the shape-level `media_clock_e2e_tests` twin cannot catch what this catches.
+#[cfg(all(test, target_os = "linux"))]
+mod opening_live_tests;
 mod sync_probe;
+// LIVE proof of the session-level bound (DRAGON-423): the wedge is CAUSED with real ffmpeg
+// processes and real FIFOs, and the whole response is run against it. Skips LOUDLY without
+// ffmpeg (the `av_sync_tests` carve-out); unix-only — it is built on FIFOs and signals.
+#[cfg(all(test, unix))]
+mod wedge_live_tests;
 #[cfg(feature = "zero-copy")]
 mod zero_copy;
+// "One user action starts ONE recording session" (DRAGON-422): drives the REAL
+// `start_pipewire_recording` and counts audio pre-flights, which is what a zero-copy
+// decline answered by a whole second session shows up as. Runs in the normal suite
+// (no compositor needed — see its module doc on the dead portal fd); the one test that
+// needs a working pre-flight loudly skips without a Pulse server.
+#[cfg(all(test, target_os = "linux", feature = "zero-copy"))]
+mod zc_fallback_live_tests;
 #[cfg(test)]
 mod av_sync_tests;
 // The owned media-clock E2E tests exercise the Linux pipewire owned-audio path
@@ -370,6 +398,12 @@ pub struct RecordHandle {
 struct DoneGuard(Arc<Mutex<Option<Result<PathBuf, String>>>>);
 impl Drop for DoneGuard {
     fn drop(&mut self) {
+        // DRAGON-421: this is THE "the recording worker is over" seam — it already exists
+        // precisely because it fires on the paths where nothing else does (a panic, an
+        // early return). Nothing the crash-recovery ledger names is live wreckage once the
+        // worker has stopped, so drop it here rather than at a happy-path call site that a
+        // dying worker would skip.
+        recover::clear_session();
         if let Ok(mut g) = self.0.lock()
             && g.is_none()
         {
@@ -867,6 +901,47 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
     shared.into_handle()
 }
 
+/// Whether a zero-copy DECLINE (`ZcOutcome::Fallback`, i.e. nothing was recorded) may be
+/// answered by starting the session over on the CPU path: `Ok(())` to run it, `Err(msg)`
+/// to fail the recording with `msg` — the user-facing reason, since it is repeated
+/// verbatim into the alert (`app::failure::alert_message`, `Failure::RecordingFailed`).
+///
+/// PURE so this truth table is pinned by tests rather than re-derived by inspection.
+///
+/// ## The field failure this exists for (DRAGON-422)
+///
+/// One user action produced two recording sessions. The zero-copy attempt started, its
+/// portal stream never delivered a dmabuf frame, and four seconds later the user pressed
+/// stop — which set this same `stop` flag and opened the preview's loading spinner. The
+/// attempt then declined, and the fallback CLEARED the flag ("it may have been set by our
+/// watchdog") and started a whole second recording: a new audio pre-flight, a new pump, a
+/// new muxer, all behind a preview the user was already looking at, with no stop button
+/// left anywhere in the UI and nothing that would ever set the flag again. It was still
+/// recording a minute later. Because that second session never finished, `RecordHandle.done`
+/// was never filled, so the app's own failure path (`update_recording`'s `Err` arm →
+/// `diag::note_failure` + `App::fail_session`) never ran either, and the spinner stayed up
+/// for good.
+///
+/// Hence the rule: a stop that has already been asked for is never overridden, and it is
+/// never cleared. The zero-copy worker's own aborts trip a private flag now (see
+/// `zero_copy::record_pipewire_zero_copy_owned`), so a set flag here means the SESSION was
+/// stopped, and the only honest answer to "record this" is to say it did not happen.
+#[cfg(all(target_os = "linux", feature = "zero-copy"))]
+fn zero_copy_fallback(reason: &str, stop_requested: bool, have_fd: bool) -> Result<(), String> {
+    if stop_requested {
+        return Err(format!(
+            "the GPU capture path could not record ({reason}), and the recording was \
+             stopped before the fallback could take over"
+        ));
+    }
+    if !have_fd {
+        // The portal fd could not be duplicated at start, so there is nothing left to
+        // connect the CPU path with (a portal fd cannot be re-opened).
+        return Err(reason.to_string());
+    }
+    Ok(())
+}
+
 /// Record a portal/PipeWire stream (`node_id` on the portal `fd`) to `out_path`,
 /// optionally cropped (stream pixels) for region mode. Mirrors
 /// [`start_region_recording`]'s handle/threading so the app's recording state
@@ -919,23 +994,39 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
                     bitrate_kbps, audio_offset_ms, auto_device_compensation, &out_path,
                     stop.clone(), paused.clone(), &events, dims.clone(), &metadata,
                 ) {
-                    Ok(p) => Ok(p),
-                    // Zero-copy declined/failed: fall back to the CPU path on the dup'd
-                    // fd (the original was consumed). `stop` may have been set by the
-                    // watchdog, so clear it for the fresh attempt. (Errors after a
-                    // pause only reach here when NOTHING was recorded — a paused
-                    // session with segments on disk salvages internally instead.)
-                    Err(e) => match fallback_fd {
-                        Some(cpu_fd) => {
-                            eprintln!(
-                                "zero-copy unavailable ({e}); using the readback path. \
-                                 Frames go via RAM but are still hardware-encoded by ffmpeg"
-                            );
-                            stop.store(false, Ordering::Relaxed);
-                            cpu(cpu_fd, stop)
+                    // The session ran (or failed on its own terms): its result IS the
+                    // recording's result. Never retried — see `ZcOutcome`.
+                    zero_copy::ZcOutcome::Done(r) => r,
+                    // Zero-copy declined and nothing was recorded. Fall back to the CPU
+                    // path on the dup'd fd (the original was consumed) — but only while
+                    // the session is still wanted; see `zero_copy_fallback` for what
+                    // "still wanted" means and why this no longer touches `stop`.
+                    // (Errors after a pause only reach here when NOTHING was recorded —
+                    // a paused session with segments on disk salvages internally.)
+                    zero_copy::ZcOutcome::Fallback(e) => {
+                        let stopped = stop.load(Ordering::Relaxed);
+                        match (zero_copy_fallback(&e, stopped, fallback_fd.is_some()), fallback_fd)
+                        {
+                            (Ok(()), Some(cpu_fd)) => {
+                                log::warn!(
+                                    "zero-copy unavailable ({e}); using the readback path. \
+                                     Frames go via RAM but are still hardware-encoded by ffmpeg"
+                                );
+                                cpu(cpu_fd, stop)
+                            }
+                            (Err(reason), _) => {
+                                log::warn!(
+                                    "zero-copy unavailable ({e}); not falling back: {reason}"
+                                );
+                                Err(reason)
+                            }
+                            // Unreachable by construction — `zero_copy_fallback` only
+                            // says yes when a fallback fd exists, and it is told so by
+                            // the very `Option` matched here. Spelled out rather than
+                            // unwrapped: nothing in a recording worker should panic.
+                            (Ok(()), None) => Err(e),
                         }
-                        None => Err(e),
-                    },
+                    }
                 }
             } else {
                 cpu(fd, stop)
@@ -957,6 +1048,50 @@ mod tests {
     // the portable `muxer_alive` test does not, so gate the import to match.
     #[cfg(not(target_os = "windows"))]
     use std::time::{Duration, Instant};
+
+    // ── The zero-copy fallback's truth table (DRAGON-422) ───────────────────
+    //
+    // The rule these pin: a fallback may only ever start a session that has not been
+    // stopped. See `zero_copy_fallback`'s doc for the field failure.
+
+    #[cfg(all(target_os = "linux", feature = "zero-copy"))]
+    #[test]
+    fn a_plain_decline_falls_back_to_the_cpu_path() {
+        assert!(zero_copy_fallback("no dmabuf frames", false, true).is_ok());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero-copy"))]
+    #[test]
+    fn a_decline_after_a_stop_fails_instead_of_recording_again() {
+        let e = zero_copy_fallback("no dmabuf frames", true, true)
+            .expect_err("a stopped session must never be started over");
+        // The reason is repeated verbatim into the user's alert, so it has to say both
+        // halves: what could not record, and why nothing took over.
+        assert!(e.contains("no dmabuf frames"), "keeps the cause: {e}");
+        assert!(e.contains("stopped"), "says the recording was stopped: {e}");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero-copy"))]
+    #[test]
+    fn a_stop_wins_even_when_a_fallback_fd_is_available() {
+        // The dup'd portal fd is what MAKES a second session possible, so this is the
+        // exact combination the field failure hit. Having the means is not a reason.
+        for have_fd in [true, false] {
+            assert!(
+                zero_copy_fallback("declined", true, have_fd).is_err(),
+                "have_fd={have_fd}: a requested stop must be final"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "zero-copy"))]
+    #[test]
+    fn a_decline_with_nothing_to_fall_back_on_reports_the_cause() {
+        // The portal fd could not be duplicated at start and cannot be re-opened, so
+        // there is no CPU path to run; the zero-copy reason is the whole diagnosis.
+        let e = zero_copy_fallback("no VAAPI device for zero-copy", false, false).unwrap_err();
+        assert_eq!(e, "no VAAPI device for zero-copy");
+    }
 
     // DRAGON-229: these process-management tests spawn a Unix `true`/`sleep` child
     // (absent on Windows → "program not found") and exercise the watchdog SIGKILL,

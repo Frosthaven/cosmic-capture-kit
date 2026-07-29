@@ -4,20 +4,42 @@
 
 use std::path::{Path, PathBuf};
 
-/// Startup-latency instrumentation (investigation only, gated on `CCK_TIMING`).
-/// Prints `[+<ms since process start>] <label>` to stderr. Zero cost unless the
-/// env var is set (the process-start `Instant` is captured lazily on first use).
+/// Startup-latency instrumentation. Prints `[+<ms since process start>] <label>` to stderr
+/// under `CCK_TIMING`, and — since DRAGON-419 — also records the same mark in the debug log
+/// whenever that is enabled. The process-start `Instant` is captured lazily on first use.
 pub fn timing_start() -> std::time::Instant {
     *TIMING_T0.get_or_init(std::time::Instant::now)
 }
 static TIMING_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
+/// `CCK_TIMING`, read once. It used to be a `var_os` call on EVERY mark — a getenv plus an
+/// allocation on a path that runs dozens of times during startup, for a feature that is off.
+static TIMING_STDERR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Record a startup-latency mark.
+///
+/// DRAGON-419 folded this INTO the debug log rather than removing it. The marks blanket
+/// `main` → `App::init` → the permission preflight → `acquire_scene` → `seed_overlays` →
+/// `configure_overlay`, so on a launch that HANGS — the DRAGON-414 report — the last mark in
+/// the file names the call that never returned. That is the whole answer to a launch-hang
+/// report, and it was already written; it was just going to a stderr nobody has.
+///
+/// Cheap when both are off: one `OnceLock` read and one relaxed atomic, and the `label`
+/// argument is a `&'static`-shaped literal at every call site, so nothing is formatted.
 #[inline]
 pub fn timing_mark(label: &str) {
-    if std::env::var_os("CCK_TIMING").is_some() {
-        let t0 = *TIMING_T0.get_or_init(std::time::Instant::now);
-        eprintln!("[+{:>7.1}ms] {label}", t0.elapsed().as_secs_f64() * 1000.0);
+    let to_stderr = *TIMING_STDERR.get_or_init(|| std::env::var_os("CCK_TIMING").is_some());
+    if !to_stderr && !crate::diag::is_enabled() {
+        return;
     }
+    let t0 = *TIMING_T0.get_or_init(std::time::Instant::now);
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if to_stderr {
+        eprintln!("[+{ms:>7.1}ms] {label}");
+    }
+    // Its own target so a reader can isolate the launch timeline with one filter, and so it
+    // never looks like an application warning.
+    log::debug!(target: "timing", "[+{ms:.1}ms] {label}");
 }
 
 /// The app's OWN config directory — `~/.config/cosmic-capture-kit` on EVERY OS, so
@@ -131,6 +153,79 @@ pub fn quiet_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Comm
         cmd.creation_flags(0x0800_0000);
     }
     cmd
+}
+
+/// Spawn `cmd` TETHERED to this process: the child cannot outlive us, however we die.
+///
+/// **Scope, because this has been read as more than it says (DRAGON-423):** the tether is
+/// triggered by our DEATH and by nothing else. It says nothing about a child whose parent is
+/// alive and stuck — while we are hung it is inert, and the child hangs on with us. Bounding
+/// a session that stops making progress is a separate mechanism at a separate level
+/// ([`crate::record::progress`], whose teardown is `record::recover::abandon_session`).
+///
+/// DRAGON-421. The recording muxer is the child this exists for. When our process dies
+/// mid-recording, that ffmpeg is parked in `open()` on an audio FIFO whose only writer was
+/// the process that just died — it never reaches the video pipe, so it never sees the EOF
+/// our death delivered, and it sits there holding the recording temp until someone finds
+/// and kills it. Every bound we have runs INSIDE the process that died, so no amount of
+/// teardown code can help: the case that matters is exactly the case where our code does
+/// not get to run. The kernel has to enforce it.
+///
+/// Per platform:
+///
+/// * **Linux** — `prctl(PR_SET_PDEATHSIG, SIGKILL)` in the child, between `fork` and
+///   `exec`. The kernel kills it when its parent goes, whatever took the parent down
+///   (SIGKILL, a panic, an OOM kill). The classic race — the parent dying in the window
+///   before `prctl` runs, so the signal is missed — is closed by re-reading `getppid()`
+///   immediately after and refusing to `exec` if it already changed.
+/// * **Windows** — a per-process JOB OBJECT with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
+///   (`crate::platform::windows::job`). Every tethered child is assigned to it; when our
+///   last handle to the job closes — which process teardown does unconditionally, killed or
+///   not — the kernel terminates everything still in it. Same guarantee as Linux's, and
+///   without the thread caveat below.
+/// * **macOS** — there is NO kernel equivalent (no `PDEATHSIG`, no job objects; `kqueue`'s
+///   `NOTE_EXIT` needs a live watcher, which is the very thing we do not have). Rather than
+///   ship a babysitter process for one child, macOS relies on the ledger + sweep in
+///   [`crate::record::recover`]: the orphan is reaped at the start of the next recording,
+///   so it never poisons a later take. That is genuinely weaker — the orphan exists in the
+///   meantime — and it is recorded here rather than glossed over.
+///
+/// **Linux caveat, and the rule it implies:** `PR_SET_PDEATHSIG` fires when the parent
+/// THREAD that forked exits, not when the parent process does. So only spawn through this
+/// from a thread that owns the child for the child's whole life — which the recording
+/// workers do by construction (the worker thread spawns its muxer, feeds it, and reaps it
+/// in `run_video_stop_tail` before returning). Do not route a child through here if it is
+/// handed off to another thread to outlive its spawner.
+pub fn spawn_tethered(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let parent = std::process::id();
+        // SAFETY: the closure runs in the forked child before `exec`, where only
+        // async-signal-safe work is allowed. Both calls are bare syscalls through rustix
+        // (`prctl` and `getppid`) — no allocation, no locks, no libc state.
+        unsafe {
+            cmd.pre_exec(move || {
+                let _ = rustix::process::set_parent_process_death_signal(Some(
+                    rustix::process::Signal::KILL,
+                ));
+                // If the parent died in the fork→prctl window the signal was already
+                // missed; refuse to exec rather than become the orphan we are preventing.
+                let still_ours = rustix::process::getppid()
+                    .is_some_and(|p| p.as_raw_nonzero().get() as u32 == parent);
+                if !still_ours {
+                    return Err(std::io::Error::other(
+                        "parent exited before the child could be tethered to it",
+                    ));
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = cmd.spawn()?;
+    #[cfg(windows)]
+    crate::platform::windows::job::tether(&child);
+    Ok(child)
 }
 
 /// [`quiet_command`] for the resolved ffmpeg binary — the console-free spawn seam for
@@ -281,6 +376,213 @@ mod tests {
     fn ffmpeg_and_ffprobe_commands_target_the_resolved_binaries() {
         assert_eq!(ffmpeg_command().get_program(), ffmpeg_path().as_os_str());
         assert_eq!(ffprobe_command().get_program(), ffprobe_path().as_os_str());
+    }
+
+    // ── The child tether (DRAGON-421) ─────────────────────────────────────────
+    //
+    // The whole promise is "if the parent dies, the child dies", and the case that
+    // matters is the one where none of our teardown code runs — so the proof has to
+    // SIGKILL a real parent and watch a real child go with it. That needs three
+    // processes, so this test re-invokes the test binary at the `#[ignore]`d helper
+    // below as the middle one. Linux-only: it is the platform whose guarantee is
+    // `PR_SET_PDEATHSIG`. Windows' job object is the same promise by a different
+    // mechanism and is proven on Windows; macOS deliberately makes no such promise
+    // (see `spawn_tethered`).
+
+    /// The MIDDLE process: spawn a tethered child, publish its pid, then block forever.
+    /// Never runs in an ordinary suite run (`#[ignore]`) — it is a fixture, not a test.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "fixture process for a_tethered_child_dies_when_its_parent_is_sigkilled"]
+    fn tether_fixture_parent() {
+        let pidfile = std::env::var("CCK_TETHER_PIDFILE").expect("fixture needs its pidfile");
+        let mut cmd = quiet_command("tail");
+        cmd.args(["-f", "/dev/null"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let child = spawn_tethered(&mut cmd).expect("tethered spawn");
+        std::fs::write(&pidfile, child.id().to_string()).expect("publish the child pid");
+        // Hold the process (and this thread — `PR_SET_PDEATHSIG` is thread-scoped) open
+        // until the test SIGKILLs us. Far longer than the test's own budgets, so a
+        // timeout can only ever mean the tether failed, never that the fixture gave up.
+        std::mem::forget(child);
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// The MIDDLE process for the ffmpeg reproduction below: start a REAL recording muxer
+    /// against FIFOs nobody will ever write to — the exact wedge from the field report —
+    /// then block until the test SIGKILLs us.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "fixture process for a_wedged_ffmpeg_cannot_outlive_a_sigkilled_recorder"]
+    fn tether_fixture_wedged_ffmpeg() {
+        let pidfile = std::env::var("CCK_TETHER_PIDFILE").expect("fixture needs its pidfile");
+        let mic = std::env::var("CCK_TETHER_MIC").expect("fixture needs its mic fifo");
+        let sys = std::env::var("CCK_TETHER_SYS").expect("fixture needs its sys fifo");
+        let temp = std::env::var("CCK_TETHER_TEMP").expect("fixture needs its temp");
+        // The real recording command, built exactly as a worker builds it. Nothing will
+        // ever open the write end of either FIFO, so ffmpeg parks in `open()` — where it
+        // never reaches stdin and so never observes our death as an EOF. That is precisely
+        // why the owner found one alive 78 seconds after its parent was gone.
+        let child = crate::encode::spawn_ffmpeg_media_clock(
+            64,
+            64,
+            64,
+            64,
+            30,
+            &crate::encode::EncodePlan::for_backend(
+                "sw",
+                64,
+                64,
+                &crate::encode::Presets::default(),
+            )
+            .expect("the software plan is always available"),
+            500,
+            std::path::Path::new(&temp),
+            std::path::Path::new(&mic),
+            std::path::Path::new(&sys),
+        )
+        .expect("spawn the recording muxer");
+        std::fs::write(&pidfile, child.id().to_string()).expect("publish the muxer pid");
+        std::mem::forget(child);
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// The field report, reproduced end to end: a recorder dies without running a line of
+    /// its own teardown, and its ffmpeg — wedged on FIFOs with no writer, holding the
+    /// recording temp — must die with it.
+    ///
+    /// Loudly skips (never silently passes) without ffmpeg, per the repo convention for the
+    /// tests that need a real one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wedged_ffmpeg_cannot_outlive_a_sigkilled_recorder() {
+        use std::time::{Duration, Instant};
+        let ffmpeg_ok = quiet_command(ffmpeg_path())
+            .arg("-version")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ffmpeg_ok {
+            eprintln!(
+                "SKIP a_wedged_ffmpeg_cannot_outlive_a_sigkilled_recorder: no runnable ffmpeg"
+            );
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cck-d421-wedge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mic, sys) = (dir.join("mic.pcm"), dir.join("sys.pcm"));
+        for f in [&mic, &sys] {
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                f,
+                rustix::fs::Mode::from_bits_truncate(0o600),
+            )
+            .unwrap();
+        }
+        let pidfile = dir.join("muxer.pid");
+        let temp = dir.join(".wedge.recording.mkv");
+
+        let mut recorder = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "util::tests::tether_fixture_wedged_ffmpeg",
+                "--ignored",
+                "--test-threads",
+                "1",
+            ])
+            .env("CCK_TETHER_PIDFILE", &pidfile)
+            .env("CCK_TETHER_MIC", &mic)
+            .env("CCK_TETHER_SYS", &sys)
+            .env("CCK_TETHER_TEMP", &temp)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let muxer = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the fixture never spawned its muxer");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        // Let it actually reach the FIFO open — i.e. become the wedged orphan-to-be.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(crate::instance::pid_is_live(muxer), "the muxer should be up and wedged");
+
+        recorder.kill().unwrap(); // SIGKILL: no stop tail, no watchdog, no Drop
+        recorder.wait().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::instance::pid_is_live(muxer) {
+            assert!(
+                Instant::now() < deadline,
+                "a wedged ffmpeg outlived its SIGKILLed recorder — this is the DRAGON-421 \
+                 orphan, still holding the recording temp with nobody left to write its FIFOs"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tethered_child_dies_when_its_parent_is_sigkilled() {
+        use std::time::{Duration, Instant};
+        let pidfile = std::env::temp_dir().join(format!("cck-d421-tether-{}", std::process::id()));
+        let _ = std::fs::remove_file(&pidfile);
+        let mut parent = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "util::tests::tether_fixture_parent",
+                "--ignored",
+                "--test-threads",
+                "1",
+            ])
+            .env("CCK_TETHER_PIDFILE", &pidfile)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        // Wait for the fixture to publish its tethered child's pid.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let child_pid = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "the fixture never spawned its tethered child");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(crate::instance::pid_is_live(child_pid), "the child should be running");
+
+        // SIGKILL the parent: no destructor, no stop tail, no watchdog — nothing of ours
+        // runs. This is exactly the crash that used to leave an ffmpeg holding a temp.
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::instance::pid_is_live(child_pid) {
+            assert!(
+                Instant::now() < deadline,
+                "the tethered child outlived its SIGKILLed parent — an orphaned muxer is \
+                 exactly what DRAGON-421 makes impossible"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = std::fs::remove_file(&pidfile);
     }
 
     // On Windows, CREATE_NO_WINDOW must NOT break spawning or output capture — the flag

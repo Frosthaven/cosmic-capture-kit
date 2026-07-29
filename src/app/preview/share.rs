@@ -900,6 +900,53 @@ mod tests {
         );
     }
 
+    /// DRAGON-420: the Video Editor group's toggles cannot get PAST the DRAGON-398 refusal.
+    ///
+    /// The two dangerous combinations are "save on copy" (which would otherwise report a save
+    /// that dropped the cut) and "copy on delete" (which would otherwise unlink the recording
+    /// after putting the UNEDITED bytes on the clipboard). Both are settings-driven, so this
+    /// walks every one of the eight video-setting combinations and checks the intent each
+    /// resolves to against `bake_blocked` for a dirty, unsaved, unbakeable recording: every
+    /// intent that could write, copy or delete edited content is refused WHOLE — `run_share`
+    /// returns before the bake, so nothing is half-completed and no delete rides on a share
+    /// that did not happen. The single survivor is the plain Delete (copy-on-delete OFF),
+    /// which owes no bake and must stay available or a corrupt recording is undeletable.
+    #[test]
+    fn the_video_toggles_cannot_bypass_the_unbakeable_refusal() {
+        use super::super::{ShareAutomation, copy_intent, delete_intent, share_automation};
+        for bits in 0..8u8 {
+            let vid = ShareAutomation {
+                save_on_copy: bits & 1 != 0,
+                close_on_copy: bits & 2 != 0,
+                copy_on_delete: bits & 4 != 0,
+            };
+            // The image triple is deliberately the OPPOSITE throughout: a video document must
+            // resolve from `vid` alone, so nothing here can be an image setting in disguise.
+            let img = ShareAutomation {
+                save_on_copy: !vid.save_on_copy,
+                close_on_copy: !vid.close_on_copy,
+                copy_on_delete: !vid.copy_on_delete,
+            };
+            let a = share_automation(true, img, vid);
+            assert_eq!(a, vid);
+            // Copy, every flavour: always refused for an unbakeable dirty recording. Nothing
+            // is saved, nothing is copied, nothing closes.
+            let copy = copy_intent(a.save_on_copy, a.close_on_copy);
+            assert!(
+                bake_blocked(copy.owes_bake(true, true), false),
+                "{copy:?} must be refused, not silently completed against the unedited file"
+            );
+            // Delete: copy-on-delete owes the bake (its clipboard copy must carry the edits)
+            // and is refused, so the file survives; a plain Delete is never gated.
+            let del = delete_intent(a.copy_on_delete);
+            assert_eq!(
+                bake_blocked(del.owes_bake(true, true), false),
+                a.copy_on_delete,
+                "{del:?} refusal must track copy-on-delete exactly"
+            );
+        }
+    }
+
     /// DRAGON-398 clipboard naming. Images keep the fixed `cck-copy.<ext>` (their bytes go on
     /// the clipboard, so the name is never seen and a fixed one bounds the runtime dir);
     /// VIDEOS carry the document's own name, because every platform puts a recording on the

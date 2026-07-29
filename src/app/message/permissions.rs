@@ -35,6 +35,13 @@ pub enum PermissionsMsg {
     /// only, but un-cfg'd so the Linux handler type-checks; only the mac view builds it.
     #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     RestartDaemon,
+    /// "Continue Without These" (DRAGON-412): mark the RECOMMENDED / OPTIONAL nag spent
+    /// and close the window. The LABELLED form of dismissing it — closing the window
+    /// does exactly the same thing, so there is one behaviour and this button is the
+    /// place the promise ("you won't be asked again") can actually be written down.
+    /// Un-cfg'd so the Linux handler type-checks; only the mac view builds it.
+    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    Skip,
     /// The live-status poll tick (fired ~1s while the window is open): kick off the
     /// prompt-free re-probe as a `Task` so grants flip in place. The probe may briefly
     /// block on an async settings query, so it runs OFF the UI thread and folds its

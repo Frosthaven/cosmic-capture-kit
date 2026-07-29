@@ -166,6 +166,16 @@ pub struct Persisted {
     /// users keep whatever they saved; only a fresh install picks up the windowed default.
     #[serde(default = "default_true")]
     pub preview_windowed: bool,
+    /// DRAGON-419: write the opt-in debug log. Default **OFF** — a support switch, not a
+    /// feature. Settings → Health → Debug.
+    ///
+    /// Read TWICE by design, from two different places: `crate::diag::init` reads THIS key
+    /// straight out of the TOML as the first statement of `main` (before any subcommand or
+    /// the daemon branch, so a launch that never reaches `App::init` is still covered), and
+    /// the App mirrors it like every other setting so the toggle can take effect immediately.
+    /// Keep the name in step with the one-field struct in `diag::persisted_setting`.
+    #[serde(default)]
+    pub debug_logging: bool,
     /// DEPRECATED (DRAGON-355): the combined "Automatically save & close on copy" toggle,
     /// split into `preview_save_on_copy` + `preview_close_on_copy`. Kept as a read-only
     /// field ONLY so `migrate` (config_version < 8) can seed BOTH new settings from its old
@@ -195,6 +205,30 @@ pub struct Persisted {
     /// survive the file. Default on. Settings → Preview Editor → Image Editor.
     #[serde(default = "default_true")]
     pub preview_copy_on_delete: bool,
+    // DRAGON-420: the three rows above are the IMAGE editor's; the three below are the VIDEO
+    // editor's own copies of the same rules. They are separate FIELDS rather than one shared
+    // set because that separation is the whole feature — a recording is expensive to re-encode
+    // and slow to re-open, so a user who wants a screenshot to save-and-close on copy may well
+    // want a recording to stay put. `serde(default = "default_true")` throughout, matching the
+    // image defaults exactly (an absent key on an existing config therefore reproduces the
+    // pre-DRAGON-420 behaviour, where video read the image settings), so NO `config_version`
+    // bump and no migrate hook: there is nothing to translate.
+    /// Preview editor, VIDEO documents: a manual **Copy** saves the recording first, through
+    /// the same save-target rule as the image side. Default on. Settings → Preview Editor →
+    /// Video Editor. Independent of every `preview_*` image field (DRAGON-420).
+    #[serde(default = "default_true")]
+    pub preview_video_save_on_copy: bool,
+    /// Preview editor, VIDEO documents: a manual **Copy** closes the recording once the
+    /// clipboard has it. Default on. Settings → Preview Editor → Video Editor. Independent of
+    /// `preview_video_save_on_copy` and of the image fields (DRAGON-420). With save OFF and
+    /// close ON, a close over unsaved edits raises the unsaved-changes dialog, exactly as on
+    /// the image side.
+    #[serde(default = "default_true")]
+    pub preview_video_close_on_copy: bool,
+    /// Preview editor, VIDEO documents: **Delete** copies the recording to the clipboard
+    /// first. Default on. Settings → Preview Editor → Video Editor (DRAGON-420).
+    #[serde(default = "default_true")]
+    pub preview_video_copy_on_delete: bool,
     // DRAGON-353: `auto_close_preview` ("Automatically close the preview editor on save or
     // copy") lived here. NO share action closes the editor any more — Save / Save As / Copy
     // all keep the document open — so the setting had no behaviour left to name and a
@@ -286,6 +320,21 @@ pub struct Persisted {
     /// load with it absent (no store-version bump). Default false; Linux never reads it.
     #[serde(default)]
     pub mac_accessibility_prompt_seen: bool,
+    /// macOS (DRAGON-412): whether the permission window's RECOMMENDED / OPTIONAL
+    /// nag is spent — the user has been shown the window once and left it without
+    /// addressing those grants (Skip, or simply closing it). Set on dismissal, which
+    /// is the whole point: before this existed, a never-prompted Accessibility /
+    /// microphone / notification grant re-forced the window on EVERY capture launch
+    /// and every daemon start, forever, because closing the window was not a decision
+    /// the code recognised. It is deliberately SEPARATE from
+    /// `mac_accessibility_prompt_seen`: that flag means "the OS prompt itself is
+    /// spent", which is what decides Request-vs-Open-Settings on the card, and
+    /// claiming it on a dismissal would render a permission the user never denied as
+    /// Denied. Required grants (Screen Recording) ignore this flag entirely and keep
+    /// forcing the window while missing. A serde-defaulted additive bool, so old
+    /// configs load with it absent (no store-version bump). Linux never reads it.
+    #[serde(default)]
+    pub mac_permission_nag_spent: bool,
     /// Opacity (0..1) of the black dim drawn outside the region selection.
     #[serde(default = "default_region_opacity")]
     pub region_overlay_opacity: f32,

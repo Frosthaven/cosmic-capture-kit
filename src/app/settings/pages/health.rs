@@ -7,8 +7,9 @@
 //! messages); this module only lays them out. A missing optional feature is amber;
 //! a missing required capability is red; everything satisfied is green.
 
+use super::super::*;
 use super::super::deps::Dep;
-use super::super::row::{status_icon, Item, SectionSpec, Severity};
+use super::super::row::{open_folder_btn, status_icon, toggle, Item, SectionSpec, Severity};
 
 impl crate::app::App {
     pub(in crate::app::settings) fn health_sections(&self) -> Vec<SectionSpec<'_>> {
@@ -42,7 +43,38 @@ impl crate::app::App {
                 items: optional.iter().map(|d| d.row()).collect(),
             });
         }
+        secs.push(self.debug_section());
 
         secs
+    }
+
+    /// DRAGON-419: the Debug group, at the BOTTOM of the Health page (owner's spec).
+    ///
+    /// One row. The description is JUST the resolved log folder — deliberately no prose: a
+    /// support reply says "turn this on, do it again, send me the file", and the only thing
+    /// the row has to answer is *which* file. Spelling the path out (rather than only offering
+    /// a button) is what makes a remote-support call or a locked-down machine workable.
+    ///
+    /// The control slot pairs the folder button with the toggle so the folder is reachable
+    /// whether or not logging is currently on — a customer who turned it on yesterday needs to
+    /// find the file today.
+    fn debug_section(&self) -> SectionSpec<'_> {
+        let control = widget::row(vec![
+            open_folder_btn(Msg::WindowChrome(WindowChromeMsg::OpenDebugLogFolder)),
+            toggle(self.debug_logging, |b| Msg::Settings(SettingsMsg::SetDebugLogging(b))),
+        ])
+        .spacing(12.0)
+        .align_y(Alignment::Center);
+        SectionSpec {
+            title: "Debug",
+            items: vec![Item::new(
+                "Enable Debug Logging",
+                crate::diag::log_dir_display(),
+                control,
+            )
+            .reset_with(self.debug_logging, false, |b| {
+                Msg::Settings(SettingsMsg::SetDebugLogging(b))
+            })],
+        }
     }
 }

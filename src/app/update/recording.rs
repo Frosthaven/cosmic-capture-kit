@@ -50,17 +50,7 @@ impl App {
                                 self.save_state();
                             }
                         }
-                        self.recording = None;
-                        // DRAGON-322: the recording ended (this process lives on into the
-                        // video preview) — drop the cross-process marker now so other
-                        // overlays re-enable their video kind promptly.
-                        crate::instance::set_recording_marker(false);
-                        self.recording_started = None;
-                        self.recording_paused_at = None;
-                        self.recording_paused_accum = std::time::Duration::ZERO;
-                        self.end_recording_tray();
-                        self.mic_level = 0.0;
-                        self.sys_level = 0.0;
+                        self.clear_recording_state();
                         // `recording_path` was the temp capture (the worker deletes
                         // it during finalize); drop our reference and clean up if it
                         // somehow survived.
@@ -86,12 +76,29 @@ impl App {
                                 self.present_capture(path, size, true, None)
                             }
                             Err(e) => {
+                                // DRAGON-419 (silent-exit path S7). The worker's reason string
+                                // is the whole diagnosis for a recording that produced nothing
+                                // — it names the pre-flight stage or the muxer failure — and it
+                                // was going nowhere but stderr.
                                 log::warn!("recording failed: {e}");
-                                self.finish_session()
+                                crate::diag::note_failure(
+                                    crate::diag::Failure::RecordingFailed,
+                                    &format!("worker reported: {e}"),
+                                );
+                                // DRAGON-415: the worker's own reason is the whole diagnosis
+                                // for a recording that produced nothing, so the alert repeats
+                                // it verbatim rather than inventing a generic one.
+                                self.fail_session()
                             }
                         }
                     }
-                    None => Task::none(),
+                    // Still recording. DRAGON-423: this poll is the ONE place in the process
+                    // a wedged worker cannot block, so it is where the session-level bound
+                    // is judged — is this recording still making progress?
+                    None => match self.observe_recording_progress() {
+                        Some(stall) => self.abandon_wedged_recording(stall),
+                        None => Task::none(),
+                    },
                 };
                 Task::batch([hotkey_task, main])
             }

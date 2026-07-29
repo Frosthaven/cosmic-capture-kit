@@ -102,9 +102,14 @@ pub enum CaptureMsg {
     // the never-constructed lint on this variant alone.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     PipewireCastReady,
-    /// An off-UI-thread screenshot finished saving (path, success) — share or exit.
+    /// An off-UI-thread screenshot finished (path, outcome) — share or report + exit.
     /// Used by both the PipeWire path and the async window-capture path.
-    ShotSaved(std::path::PathBuf, bool),
+    ///
+    /// DRAGON-415: the outcome was a bare `bool`, which collapsed "no image", "could not
+    /// write the file" and "the worker panicked" into one indistinguishable exit. It now
+    /// names which of the three happened so the failure can be reported honestly;
+    /// `Saved` is exactly the old `true`.
+    ShotSaved(std::path::PathBuf, crate::app::failure::ShotOutcome),
     /// Clear the transient overlay toast (fired by its expiry timer).
     DismissToast,
 }

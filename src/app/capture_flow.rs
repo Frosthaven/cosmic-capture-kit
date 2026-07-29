@@ -1231,17 +1231,38 @@ impl App {
             // the result back through a oneshot the Task awaits (executor-agnostic).
             let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
             std::thread::spawn(move || {
-                let ok = crate::platform::pipewire::grab_frame(fd, node_id, crop)
-                    .map(|img| crate::media::png::save_png(&img, &path, &meta))
-                    .unwrap_or(false);
-                let _ = tx.send((path, ok));
+                // DRAGON-415: keep the two failures apart — a portal frame that never
+                // arrived and a frame that could not be written are different problems.
+                let outcome = match crate::platform::pipewire::grab_frame(fd, node_id, crop) {
+                    None => super::failure::ShotOutcome::NoImage,
+                    Some(img) if crate::media::png::save_png(&img, &path, &meta) => {
+                        super::failure::ShotOutcome::Saved
+                    }
+                    Some(_) => super::failure::ShotOutcome::SaveFailed,
+                };
+                let _ = tx.send((path, outcome));
             });
             // DRAGON-336: the portal path grabs its frame from the held stream and never
             // reads the launch scene at all, so it is dead the moment this branch is taken.
             self.release_capture_scene();
             return Task::perform(
-                async move { rx.await.unwrap_or((fallback, false)) },
-                |(path, ok)| cosmic::Action::App(Msg::Capture(CaptureMsg::ShotSaved(path, ok))),
+                // DRAGON-419: `Err` here means the portal grab/save thread PANICKED — see the
+                // window-mode seam below for why that must not be laundered into "failed".
+                // DRAGON-415 carries that as its own `ShotOutcome` rather than as the generic
+                // failure, so the downstream seam does not have to guess which of the three
+                // things went wrong.
+                async move {
+                    rx.await.unwrap_or_else(|_| {
+                        crate::diag::note_failure(
+                            crate::diag::Failure::WorkerPanic,
+                            "portal grab/save worker died before reporting (panicked)",
+                        );
+                        (fallback, super::failure::ShotOutcome::WorkerDied)
+                    })
+                },
+                |(path, outcome)| {
+                    cosmic::Action::App(Msg::Capture(CaptureMsg::ShotSaved(path, outcome)))
+                },
             );
         }
 
@@ -1518,11 +1539,17 @@ impl App {
                 {
                     job.frozen_px = active.or(fallback_px);
                 }
-                let ok = job
-                    .run()
-                    .map(|img| crate::media::png::save_png(&img, &path, &meta))
-                    .unwrap_or(false);
-                let _ = tx.send((path, ok));
+                // DRAGON-415: a window grab that produced nothing and a file that could not
+                // be written are different failures with different advice, and both used to
+                // be `false`.
+                let outcome = match job.run() {
+                    None => super::failure::ShotOutcome::NoImage,
+                    Some(img) if crate::media::png::save_png(&img, &path, &meta) => {
+                        super::failure::ShotOutcome::Saved
+                    }
+                    Some(_) => super::failure::ShotOutcome::SaveFailed,
+                };
+                let _ = tx.send((path, outcome));
             });
             // Open the spinner ON grab-completion — UNLESS begin_capture already pre-opened
             // it as the defocus focus-sink (`window_defocus_uses_spinner`; Linux single-
@@ -1545,8 +1572,43 @@ impl App {
                     cosmic::Action::App(Msg::Capture(CaptureMsg::WindowGrabbed(open_on_grab)))
                 }),
                 Task::perform(
-                    async move { rx.await.unwrap_or((fallback, false)) },
-                    |(path, ok)| cosmic::Action::App(Msg::Capture(CaptureMsg::ShotSaved(path, ok))),
+                    async move {
+                        match rx.await {
+                            Ok(done) => done,
+                            // DRAGON-418: the oneshot resolves to `Err` ONLY when the
+                            // sender was dropped without sending — i.e. the capture
+                            // worker thread DIED (a panic in the focus-then-grab, the
+                            // composite, or the PNG write), never when a grab merely came
+                            // back empty. The old `unwrap_or((fallback, false))` collapsed
+                            // those two into the same `ShotSaved(_, false)`, so a panic
+                            // was indistinguishable from "nothing to capture" and both
+                            // ended as one silent `finish_session()`. That is precisely
+                            // how this class of bug stays invisible, so name it here.
+                            // (The session still ends the same way — giving failures a
+                            // VOICE is DRAGON-415's job, not this seam's — but a panic
+                            // must never again read as an ordinary empty capture.)
+                            //
+                            // DRAGON-419 routes it through `note_failure` so it also
+                            // reaches the debug log with a stable code AND becomes the
+                            // outcome `finish_session` reports — and so the target is
+                            // named by SHAPE rather than by path (the log is emailed to
+                            // us; a capture filename can name the user's document).
+                            Err(_) => {
+                                crate::diag::note_failure(
+                                    crate::diag::Failure::WorkerPanic,
+                                    &format!(
+                                        "capture worker thread died before reporting a result \
+                                         (panicked); no screenshot was written; target {}",
+                                        crate::diag::path_shape(&fallback),
+                                    ),
+                                );
+                                (fallback, super::failure::ShotOutcome::WorkerDied)
+                            }
+                        }
+                    },
+                    |(path, outcome)| {
+                        cosmic::Action::App(Msg::Capture(CaptureMsg::ShotSaved(path, outcome)))
+                    },
                 ),
             ]);
         }
@@ -1610,13 +1672,51 @@ impl App {
         };
 
         let Some(img) = img else {
+            // DRAGON-419 (silent-exit path S1). The most-reported shape of "it just closes
+            // itself": no file, no preview, no message. The branch that produced the `None`
+            // is what a reader needs — a whole-output grab returning nothing is a degraded
+            // capture API, a region grab returning nothing is geometry that intersects no
+            // display, and they have nothing in common. Selection GEOMETRY is ours, not the
+            // user's content; the display NAME is not logged.
             log::warn!("native pixel capture returned no image");
-            return self.finish_session();
+            crate::diag::note_failure(
+                crate::diag::Failure::NoImage,
+                &format!(
+                    "branch={} sel={}x{}@{},{} frozen_flats={} wallpaper={}",
+                    if sel.output.is_some() { "output" } else { "region" },
+                    sel.width,
+                    sel.height,
+                    sel.x,
+                    sel.y,
+                    self.frozen.len(),
+                    extras.wallpaper,
+                ),
+            );
+            // DRAGON-415: and TELL the user. `fail_session` reports the ROOT cause this
+            // process recorded, so an SCK stall or a permission denial noted upstream is
+            // what gets named here rather than the "no image" symptom it produced.
+            return self.fail_session();
         };
         // Save the PNG straight to the screenshots folder (no external tool).
         if !crate::media::png::save_png(&img, &path, &self.screenshot_metadata()) {
+            // DRAGON-419 (silent-exit path S3). `save_png` returns a bool, so the real
+            // `io::Error` is already gone by here — the SHAPE of the target is what is left
+            // to say, and it separates the three real causes (folder deleted, folder
+            // read-only, name/path unusable) without carrying a byte of the path itself.
             log::warn!("failed to write screenshot to {}", path.display());
-            return self.finish_session();
+            crate::diag::note_failure(
+                crate::diag::Failure::SaveFailed,
+                &format!(
+                    "save_png returned false; target {} px={}x{}",
+                    crate::diag::path_shape(&path),
+                    img.width(),
+                    img.height(),
+                ),
+            );
+            // DRAGON-415: the log gets the path SHAPE (it is emailed to us); the alert, shown
+            // only on the user's own screen, can name their actual capture folder — which is
+            // the whole actionable content of a "could not write the file" message.
+            return self.fail_session();
         }
         // DRAGON-336: the region/monitor composite is finished and the PNG is on disk —
         // the frozen flats, the per-window pixels and the picker wallpapers can never be

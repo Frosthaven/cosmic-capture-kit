@@ -53,6 +53,14 @@ mod selection;
 mod share;
 mod shortcuts;
 mod state;
+// The startup self-exit guard (DRAGON-413): a detached budget clock that ends a capture
+// child which never presents anything, so a startup stall can no longer pile up
+// invisible processes. Armed on macOS only (see the module doc for why, and for the
+// permission-window suspension); compiled elsewhere ONLY under `cfg(test)` so its pure
+// decision logic is covered by the Linux suite while Linux/Windows behaviour stays
+// byte-identical.
+#[cfg(any(target_os = "macos", test))]
+mod startup_guard;
 // System-tray recording controls: ksni/StatusNotifierItem (D-Bus) on Linux; a menu-bar
 // NSStatusItem + NSMenu on macOS (DRAGON-159); a no-op stub on any other platform. All
 // three expose the same `TraySession` seam so the app's tray handling is platform-free.
@@ -74,6 +82,11 @@ mod tray;
 #[path = "platform/tray_stub.rs"]
 mod tray;
 mod util;
+// DRAGON-419: the opt-in cross-platform debug log — the ONE logging mechanism. Installs the
+// process logger, resolves the per-platform log folder, owns the failure vocabulary every
+// silent-exit path is classified with, and states the privacy rule every new line must obey.
+// Read its module doc before adding a log line anywhere.
+mod diag;
 mod cli;
 // In-app update channel (DRAGON-175): the manifest fetch/parse, semver compare,
 // and (macOS) the one-click download+verify+swap install flow. The channel is a
@@ -134,6 +147,19 @@ mod preview_ipc;
 /// The app runs bundled (no terminal) in resident mode, where AppKit/winit
 /// panics like the stop→preview `frame_did_change` crash would otherwise be
 /// invisible. Kept tiny: last-writer-wins single file, best-effort I/O.
+///
+/// DRAGON-415: additionally, a panic on the MAIN thread is the one way this app can
+/// "just close itself" with no message at all — `app::run` ends in `libc::_exit`, there is
+/// no crash dialog for a bundled accessory app, and the panic text goes to a stderr no
+/// packaged mac build has. So the hook also puts up the failure alert before the process
+/// dies. It says only what we know (it stopped unexpectedly, nothing was saved, here is
+/// where the details went); it does not diagnose.
+///
+/// MAIN THREAD ONLY, deliberately. Showing it from a worker would mean dispatching
+/// synchronously onto the main thread — which, when the main thread is blocked waiting on
+/// that very worker (the capture oneshot), deadlocks the child forever: precisely the
+/// invisible-immortal-process failure this work exists to remove. A worker panic already
+/// reports itself through `ShotOutcome::WorkerDied` on the seam that awaits it.
 #[cfg(target_os = "macos")]
 fn install_macos_panic_hook() {
     let default_hook = std::panic::take_hook();
@@ -156,6 +182,12 @@ fn install_macos_panic_hook() {
                     let _ = writeln!(f, "\n===== panic @ unix {ts} =====\n{info}\n{bt}");
                 }
             }
+        }
+        // The log is written FIRST, so the breadcrumb exists even if presenting the alert
+        // goes wrong. The alert's own guards make this at most one dialog per process.
+        if objc2_foundation::MainThreadMarker::new().is_some() {
+            let msg = app::failure::crash_alert();
+            platform::mac::alert::show(&msg.title, &msg.body);
         }
         default_hook(info);
     }));
@@ -530,27 +562,19 @@ fn main() -> cosmic::iced::Result {
     #[cfg(windows)]
     platform::windows::console::attach_parent_console();
     util::timing_start();
+    // DRAGON-419: install the logger. This is the FIRST logging statement of `main`, before
+    // every subcommand return and before the resident-daemon branch, so that EVERY way of
+    // starting this program is covered: a hotkey capture, a daemon-spawned child, a CLI run,
+    // Finder / Start Menu, the settings window, each detached share helper. Stderr behaviour
+    // is unchanged (same `warn` default, same `RUST_LOG`); when the opt-in debug log is on it
+    // ALSO appends this crate's records at `debug` and above (plus any dependency's
+    // `warn`/`error`) to one shared, pid-tagged file.
+    //
+    // It replaces the DRAGON-233 `CCK_LOG_FILE` block, which was `#[cfg(windows)]` — which is
+    // precisely why macOS had nothing to show when a customer's captures all failed. The
+    // variable still works, on every platform, through `diag::PATH_ENV`.
+    diag::init();
     util::timing_mark("main() entry (after dyld + static init)");
-    // DRAGON-233: the GUI subsystem hides stderr from a shortcut launch, so gate an
-    // opt-in FILE log behind `CCK_LOG_FILE` for on-device diagnosis (used to root-cause
-    // the settings-gear regression). Windows-only + env-gated, so the default init —
-    // and every Linux/mac build — stays byte-identical.
-    #[cfg(windows)]
-    {
-        let env = env_logger::Env::default().default_filter_or("warn");
-        match std::env::var_os("CCK_LOG_FILE").and_then(|p| {
-            std::fs::OpenOptions::new().create(true).append(true).open(&p).ok()
-        }) {
-            Some(f) => {
-                env_logger::Builder::from_env(env)
-                    .target(env_logger::Target::Pipe(Box::new(f)))
-                    .init();
-            }
-            None => env_logger::Builder::from_env(env).init(),
-        }
-    }
-    #[cfg(not(windows))]
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     // DRAGON-406: start the Windows chrome/transparency diagnostics session. Placed here, in
     // `main` BEFORE every subcommand return and before the daemon branch, so that EVERY way of
     // starting this program produces the report: a Start Menu / shortcut launch, a hotkey or
@@ -711,6 +735,10 @@ fn main() -> cosmic::iced::Result {
         // presence covers it here without consuming the value.
         let bare = bare && !args.iter().any(|a| a == "--preview");
         if bare && state::load().resident {
+            // DRAGON-419: from here on this pid's lines read `daemon`, which is what lets a
+            // reader untangle the long-lived menu-bar process from the one-shot capture
+            // children it spawns into the same shared file.
+            diag::mark_component(diag::Component::Daemon);
             daemon::run(); // never returns — runs the AppKit run loop or exits
         }
     }
@@ -752,6 +780,8 @@ fn main() -> cosmic::iced::Result {
             // handoff lock retry); a truly bare launch is the global hotkey asking
             // to capture (single lock attempt, signal the live daemon immediately).
             let daemon_intent = args.iter().any(|a| a == "resident");
+            // DRAGON-419: re-tag this pid's lines as the resident (see the mac branch).
+            diag::mark_component(diag::Component::Daemon);
             daemon_linux::run(daemon_intent); // never returns — runs the tray loop or exits
         }
     }
@@ -792,6 +822,10 @@ fn main() -> cosmic::iced::Result {
             // process from the one-shot capture children it spawns (that distinction is the
             // whole point of covering all three launch paths). Inert on Windows 11.
             platform::windows::diag::mark_daemon();
+            // DRAGON-419: the same re-tag for the debug log (see the mac branch). Two calls
+            // because the DRAGON-406 report is a separate, always-on Windows-10 instrument
+            // with its own file; DRAGON-407 removes that one, not this.
+            diag::mark_component(diag::Component::Daemon);
             daemon::run(); // never returns — runs the Win32 message loop or exits
         }
     }
@@ -896,6 +930,20 @@ fn main() -> cosmic::iced::Result {
     let countdown_secs = after("--countdown")
         .and_then(|p| p.to_str().and_then(|s| s.parse::<u64>().ok()))
         .map(|s| s.min(u8::MAX as u64));
+    // DRAGON-413: arm the startup self-exit guard for a CAPTURE launch. From here the
+    // child has a bounded window to put something on screen; if it never does — a wedged
+    // TCC probe, a stalled scene grab, a GUI that never maps — it ends itself quietly
+    // instead of lingering forever with nothing to show and nothing to reap it. Armed
+    // BEFORE `app::run` so a hang inside `App::init` is covered too (an in-app timer
+    // could never fire there). `--settings` / `--permissions` are windows the user asked
+    // for and keep their historical unbounded life; `--preview <file>` returned above.
+    // macOS-only, so Linux/Windows stay byte-identical (see the module doc).
+    #[cfg(target_os = "macos")]
+    if !settings_only && !permissions_only {
+        startup_guard::arm(startup_guard::budget_from_env(
+            std::env::var(startup_guard::BUDGET_ENV).ok().as_deref(),
+        ));
+    }
     util::timing_mark("about to call app::run (into iced/cosmic runtime)");
     app::run(app::Startup {
         settings_only,

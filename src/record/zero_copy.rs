@@ -35,6 +35,19 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1
 /// here never risks them — it fails the recording outright with a named, actionable
 /// reason instead of falling back (DRAGON-127 retired the legacy wallclock+CFR+segments
 /// recorder this used to fall back to).
+///
+/// Returns a [`ZcOutcome`], like its screencopy sibling
+/// ([`record_screencopy_zero_copy`]) — NOT a bare `Result` (DRAGON-422). The caller has
+/// to be able to tell "zero-copy declined and nothing was recorded, use the CPU path"
+/// apart from "this session ran and failed"; while both looked like `Err`, EVERY failure
+/// here — including a failed audio pre-flight, which is documented above as fatal — sent
+/// the caller off to start a whole second recording session.
+///
+/// The two siblings classify their audio pre-flight differently, on purpose: the
+/// screencopy one reports `Fallback` because its caller ALREADY holds a working
+/// `OwnedAudioStart` of its own, so the CPU path it falls back to needs no second
+/// pre-flight. This one's caller has nothing in hand, so a failed pre-flight is the
+/// recording's failure and is reported as `Done(Err(..))`.
 #[cfg(feature = "zero-copy")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pipewire_zero_copy(
@@ -54,7 +67,7 @@ pub(crate) fn record_pipewire_zero_copy(
     events: &Mutex<Vec<ToggleEvent>>,
     dims: Arc<Mutex<Option<(u32, u32)>>>,
     metadata: &str,
-) -> Result<PathBuf, String> {
+) -> ZcOutcome {
     match super::owned::try_start_owned_audio() {
         Ok(owned) => {
             log::info!("zero-copy pipeline: media-clock owned path (DRAGON-127)");
@@ -66,7 +79,9 @@ pub(crate) fn record_pipewire_zero_copy(
         }
         Err(reason) => {
             log::error!("zero-copy pipeline: audio pre-flight failed ({reason}); cannot record");
-            Err(format!("could not start recording audio: {reason}"))
+            // Fatal, not `Fallback` (see the fn doc): the CPU path would only run the
+            // SAME pre-flight again and fail the same way, one whole recording later.
+            ZcOutcome::Done(Err(format!("could not start recording audio: {reason}")))
         }
     }
 }
@@ -96,6 +111,18 @@ pub(crate) fn record_pipewire_zero_copy(
 /// period, never a desync. (Contrast `record_screencopy_zero_copy_owned`, which
 /// keeps a small pool of its OWN dmabuf targets alive for the whole session and can
 /// re-submit the pool's last-used target to close this exact gap.)
+///
+/// ## The muxer is spawned LAZILY, and what that costs (DRAGON-422)
+///
+/// Unlike the screencopy sibling — which knows its frame size from `formats.buffer_size`
+/// and so spawns encoder + muxer BEFORE the pump — a PipeWire dmabuf frame's dimensions
+/// are only known when the first frame arrives, so both are created inside the callback.
+/// The pump is therefore already waiting at its FIFO write-end rendezvous for an ffmpeg
+/// that does not exist yet, and if no frame ever arrives (the compositor declining dmabuf
+/// on a cross-vendor GPU) it never will. That is fine — both sides are bounded — but it
+/// means the pump's timeout here is NOT evidence of a wedged ffmpeg, and this attempt
+/// failing is NOT evidence that the session should be restarted. See [`super::pump::spawn`]'s
+/// rendezvous arm for the first, and [`ZcOutcome`] for the second.
 #[cfg(feature = "zero-copy")]
 #[allow(clippy::too_many_arguments)]
 fn record_pipewire_zero_copy_owned(
@@ -116,15 +143,17 @@ fn record_pipewire_zero_copy_owned(
     dims: Arc<Mutex<Option<(u32, u32)>>>,
     metadata: &str,
     owned: super::owned::OwnedAudioStart,
-) -> Result<PathBuf, String> {
+) -> ZcOutcome {
     let Some(node) = crate::encode::gpu::default_vaapi_node() else {
         owned.cleanup();
-        return Err("no VAAPI device for zero-copy".to_string());
+        return ZcOutcome::Fallback("no VAAPI device for zero-copy".to_string());
     };
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let super::owned::OwnedAudioStart { mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx } =
+    let super::owned::OwnedAudioStart {
+        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } =
         owned;
     let temp = super::recording_temp_path(out_path);
 
@@ -148,7 +177,11 @@ fn record_pipewire_zero_copy_owned(
         writer: Option<std::thread::JoinHandle<()>>,
         is_hevc: bool,
         frames: u64,
-        error: Option<String>,
+        /// The session's fatal error, and whether it is a zero-copy DECLINE the CPU
+        /// path can still cover (`true` → [`ZcOutcome::Fallback`]) or this recording's
+        /// own failure (`false` → [`ZcOutcome::Done`]). Only consulted when nothing was
+        /// encoded; once frames exist the session owns the outcome either way.
+        error: Option<(bool, String)>,
     }
     let sess = std::rc::Rc::new(std::cell::RefCell::new(Session {
         node,
@@ -167,16 +200,47 @@ fn record_pipewire_zero_copy_owned(
         error: None,
     }));
 
-    // First-frame watchdog: if no dmabuf frame arrives, stop so `consume_dmabuf`
-    // returns and we report failure (caller falls back to the CPU path).
+    // This attempt's OWN stop flag (DRAGON-422). The session's `stop` belongs to the
+    // USER — `App::stop_recording` sets it, and it is the only record that a stop was
+    // ever asked for. Everything internal here (the first-frame watchdog below, an
+    // encoder or muxer failure in the callback, the stop tail) trips `zc_stop` instead,
+    // so after we return the caller can still tell "the user stopped" apart from
+    // "zero-copy gave up". It could not before: the internal watchdog set the shared
+    // flag, so the caller had to CLEAR it to retry on the CPU path — which erased a
+    // stop the user had already made and started a second recording behind the preview
+    // spinner, with nothing left in the UI able to stop it.
+    let zc_stop = Arc::new(AtomicBool::new(false));
+
+    // First-frame watchdog AND the inward mirror of the session's stop, in one thread:
+    // if no dmabuf frame arrives within the budget, trip `zc_stop` so `consume_dmabuf`
+    // returns and we report a decline; and for as long as the session runs, propagate a
+    // user stop into `zc_stop` (the only way it reaches the capture loop and the pump
+    // now that they read the private flag). Exits as soon as `zc_stop` is set — which
+    // the stop tail always does — so it never outlives the attempt.
     let got_frame = Arc::new(AtomicBool::new(false));
     {
-        let stop = stop.clone();
+        let session_stop = stop.clone();
+        let zc = zc_stop.clone();
         let got = got_frame.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_secs(4));
-            if !got.load(Ordering::Relaxed) {
-                stop.store(true, Ordering::Relaxed);
+            let deadline = std::time::Instant::now() + FIRST_FRAME_BUDGET;
+            loop {
+                if zc.load(Ordering::Relaxed) {
+                    return; // the session is ending; nothing left to mirror
+                }
+                if session_stop.load(Ordering::Relaxed) {
+                    zc.store(true, Ordering::Relaxed);
+                    return;
+                }
+                if !got.load(Ordering::Relaxed) && std::time::Instant::now() >= deadline {
+                    log::warn!(
+                        "zero-copy: no dmabuf frame within {}s; giving up on the GPU path",
+                        FIRST_FRAME_BUDGET.as_secs()
+                    );
+                    zc.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(MIRROR_POLL);
             }
         });
     }
@@ -189,7 +253,14 @@ fn record_pipewire_zero_copy_owned(
         sys_on0: system_audio,
         duck_system: crate::audio::config::recording_duck_system(),
     };
-    let session_start = std::time::Instant::now();
+    // Media time 0 is the instant AUDIO CAPTURE began (the pre-flight), not the
+    // instant the video side finished coming up (DRAGON-417). Everything above —
+    // the capture handshake, the first frame, ffmpeg's spawn — happened while the
+    // mic/system captures were already running and the app's indicator already said
+    // "recording"; anchoring here would place all of that audio at a negative media
+    // position, where the mixer discards it. The opening span is covered on the video
+    // side by the first frame instead (see `capture_start`'s doc).
+    let session_start = capture_start;
 
     // The pump thread borrows `events`/`stop`/`paused` for its own lifetime (see
     // `pump::spawn`'s doc) — `std::thread::scope` is what makes that sound, exactly
@@ -198,24 +269,30 @@ fn record_pipewire_zero_copy_owned(
     /// so the `std::thread::scope` return type below doesn't trip clippy's
     /// `type_complexity` (mirrors `pipewire::MuteIntervals`'s same reason).
     type OwnedZcResult = (Vec<(f64, f64)>, Vec<(f64, f64)>, u64, bool);
-    let scope_result: Result<OwnedZcResult, String> = std::thread::scope(|scope| {
+    /// A failed session, and whether it is a zero-copy decline the caller may still
+    /// cover with the CPU path (`true`) or this recording's own failure (`false`) —
+    /// the scope's error half of the [`ZcOutcome`] split.
+    type OwnedZcError = (bool, String);
+    let scope_result: Result<OwnedZcResult, OwnedZcError> = std::thread::scope(|scope| {
             let (pump_handle, _ticker) = match super::pump::spawn(
                 scope, session_start, pump_cfg, mic_fifo_path.clone(), sys_fifo_path.clone(),
-                mic_tap, mic_rx, monitor, sys_rx, &stop, &paused, events,
+                mic_tap, mic_rx, monitor, sys_rx, &zc_stop, &paused, events,
             ) {
                 Ok(v) => v,
-                Err(e) => return Err(e),
+                // The audio captures are gone with the failed spawn (see `pump::spawn`'s
+                // own note) and nothing was recorded; the CPU path starts clean.
+                Err(e) => return Err((true, e)),
             };
 
             let cb_sess = sess.clone();
-            let cb_stop = stop.clone();
+            let cb_stop = zc_stop.clone();
             let cb_got = got_frame.clone();
             let cb_paused = paused.clone();
             let cb_paused_watchdog = paused.clone();
             let cb_mic_fifo = mic_fifo_path.clone();
             let cb_sys_fifo = sys_fifo_path.clone();
             let cb_dims = dims.clone();
-            let run = crate::platform::pipewire::consume_dmabuf(fd, node_id, stop.clone(), move |frame| {
+            let run = crate::platform::pipewire::consume_dmabuf(fd, node_id, zc_stop.clone(), move |frame| {
                 cb_got.store(true, Ordering::Relaxed);
                 let mut z = cb_sess.borrow_mut();
                 if z.error.is_some() {
@@ -245,7 +322,9 @@ fn record_pipewire_zero_copy_owned(
                     ) {
                         Ok(e) => z.enc = Some(e),
                         Err(e) => {
-                            z.error = Some(format!("encoder init: {e}"));
+                            // Cross-vendor import is exactly what the CPU readback path
+                            // exists for, and nothing has been encoded — a decline.
+                            z.error = Some((true, format!("encoder init: {e}")));
                             cb_stop.store(true, Ordering::Relaxed);
                             return;
                         }
@@ -256,7 +335,9 @@ fn record_pipewire_zero_copy_owned(
                         Ok(mut c) => {
                             let Some(mut stdin) = c.stdin.take() else {
                                 z.enc = None;
-                                z.error = Some("muxer stdin unavailable".to_string());
+                                // ffmpeg itself, not the GPU path: the CPU path would
+                                // meet the same failure (mirrors the screencopy sibling).
+                                z.error = Some((false, "muxer stdin unavailable".to_string()));
                                 cb_stop.store(true, Ordering::Relaxed);
                                 return;
                             };
@@ -283,7 +364,9 @@ fn record_pipewire_zero_copy_owned(
                         }
                         Err(e) => {
                             z.enc = None;
-                            z.error = Some(format!("muxer spawn: {e}"));
+                            // Same reasoning as the stdin arm above: an ffmpeg that will
+                            // not spawn is not a zero-copy problem.
+                            z.error = Some((false, format!("muxer spawn: {e}")));
                             cb_stop.store(true, Ordering::Relaxed);
                             return;
                         }
@@ -307,15 +390,18 @@ fn record_pipewire_zero_copy_owned(
                 match outcome {
                     Ok(()) => z.frames += 1,
                     Err(e) => {
-                        z.error = Some(e);
+                        // A live encode/muxer failure. Only consulted when frames == 0,
+                        // where nothing was recorded and the CPU path is worth a try.
+                        z.error = Some((true, e));
                         cb_stop.store(true, Ordering::Relaxed);
                     }
                 }
             });
 
             // Stop: the pump IS the audio drain — join its control thread first
-            // (mirrors every other owned path's stop tail exactly).
-            stop.store(true, Ordering::Relaxed);
+            // (mirrors every other owned path's stop tail exactly). The PRIVATE flag —
+            // the session's `stop` is the user's to set, never ours (DRAGON-422).
+            zc_stop.store(true, Ordering::Relaxed);
             let pump_out = pump_handle.join();
             log::info!(
                 "media-clock pump stats: mic(late={} paused_drop={} gap={}) sys(late={} \
@@ -363,18 +449,25 @@ fn record_pipewire_zero_copy_owned(
 
             if let Err(e) = run {
                 if frames == 0 {
-                    return Err(format!("zero-copy capture: {e}"));
+                    return Err((true, format!("zero-copy capture: {e}")));
                 }
                 log::warn!("zero-copy capture ended early ({e}); keeping what's recorded");
             }
-            if let Some(e) = error {
+            if let Some((can_fall_back, e)) = error {
                 if frames == 0 {
-                    return Err(e);
+                    return Err((can_fall_back, e));
                 }
                 log::warn!("zero-copy error after recording started ({e}); keeping what's recorded");
             }
             if frames == 0 {
-                return Err("zero-copy: no dmabuf frames (compositor declined dmabuf?)".to_string());
+                // THE field case (DRAGON-422): the compositor never handed us a dmabuf
+                // frame, so the muxer was never spawned and the pump's rendezvous had
+                // nothing to meet. Nothing was recorded — a decline, and the CPU
+                // readback path is exactly the answer, IF the session is still wanted.
+                return Err((
+                    true,
+                    "zero-copy: no dmabuf frames (compositor declined dmabuf?)".to_string(),
+                ));
             }
             match wait_result {
                 Some(Ok(s)) if s.success() => {}
@@ -389,16 +482,24 @@ fn record_pipewire_zero_copy_owned(
                         );
                     } else {
                         let _ = std::fs::remove_file(&temp);
-                        return Err("zero-copy muxer failed".to_string());
+                        // Frames WERE encoded and the mux failed anyway: this session's
+                        // own failure, not something a retry would fix.
+                        return Err((false, "zero-copy muxer failed".to_string()));
                     }
                 }
             }
             Ok((pump_out.mic_off, pump_out.sys_off, frames, is_hevc))
         });
 
-    let (mic_off, sys_off, frames, is_hevc) = scope_result?;
+    let (mic_off, sys_off, frames, is_hevc) = match scope_result {
+        Ok(v) => v,
+        Err((true, e)) => return ZcOutcome::Fallback(e),
+        Err((false, e)) => return ZcOutcome::Done(Err(e)),
+    };
     let _ = frames;
-    super::finalize::finalize_with_intervals(&temp, out_path, &mic_off, &sys_off, is_hevc, metadata)
+    ZcOutcome::Done(super::finalize::finalize_with_intervals(
+        &temp, out_path, &mic_off, &sys_off, is_hevc, metadata,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -658,7 +759,15 @@ pub fn screencopy_dmabuf_test() -> String {
     }
 }
 
-/// Result of attempting screencopy zero-copy recording.
+/// Result of attempting zero-copy recording (both workers — see
+/// [`record_screencopy_zero_copy`] and [`record_pipewire_zero_copy`]).
+///
+/// The distinction is load-bearing, not cosmetic (DRAGON-422): `Fallback` is a promise
+/// that NOTHING was recorded and the session is still free to be started over on the CPU
+/// path, and it is the ONLY outcome a caller may respond to by starting one. Anything
+/// that ran and then failed is this recording's result and must be reported as such —
+/// a second session started behind a user who has already stopped records what they
+/// never asked for and hands back a result nobody is waiting for any more.
 #[cfg(feature = "zero-copy")]
 pub(crate) enum ZcOutcome {
     /// Zero-copy couldn't start (no dmabuf / cross-vendor encoder / spawn failed);
@@ -667,6 +776,18 @@ pub(crate) enum ZcOutcome {
     /// Zero-copy ran to completion — this is the final recording result.
     Done(Result<PathBuf, String>),
 }
+
+/// How long [`record_pipewire_zero_copy_owned`] waits for the portal stream's FIRST
+/// dmabuf frame before declining the GPU path. Unchanged since the path was written;
+/// named here because the failure it produces is now classified rather than guessed at.
+#[cfg(feature = "zero-copy")]
+const FIRST_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Poll interval of the watchdog/mirror thread — the most a user's stop can be delayed
+/// on its way into the zero-copy session's private stop flag. Far below one frame at any
+/// supported rate, so a stop still costs at most a frame of extra recording.
+#[cfg(feature = "zero-copy")]
+const MIRROR_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// How many extra `1/fps` frames [`record_screencopy_zero_copy_owned`] must
 /// re-submit so `frames_encoded` (at `fps`) covers AT LEAST `final_media` seconds —
@@ -827,7 +948,9 @@ fn record_screencopy_zero_copy_owned(
     let damage = [Rect { x: 0, y: 0, width: cw as i32, height: ch as i32 }];
     let frame_dur = std::time::Duration::from_secs_f64(1.0 / fps as f64);
 
-    let super::owned::OwnedAudioStart { mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx } =
+    let super::owned::OwnedAudioStart {
+        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } =
         owned;
     let temp = super::recording_temp_path(out_path);
     let mut child = match crate::encode::spawn_ffmpeg_encoded_media_clock(
@@ -859,7 +982,14 @@ fn record_screencopy_zero_copy_owned(
         sys_on0: system_audio,
         duck_system: crate::audio::config::recording_duck_system(),
     };
-    let session_start = std::time::Instant::now();
+    // Media time 0 is the instant AUDIO CAPTURE began (the pre-flight), not the
+    // instant the video side finished coming up (DRAGON-417). Everything above —
+    // the capture handshake, the first frame, ffmpeg's spawn — happened while the
+    // mic/system captures were already running and the app's indicator already said
+    // "recording"; anchoring here would place all of that audio at a negative media
+    // position, where the mixer discards it. The opening span is covered on the video
+    // side by the first frame instead (see `capture_start`'s doc).
+    let session_start = capture_start;
     let mut last_idx: usize = 0;
 
     type OwnedZcResult = (Vec<(f64, f64)>, Vec<(f64, f64)>);

@@ -366,6 +366,11 @@ impl App {
         sel: Selection,
     ) -> Task<cosmic::Action<Msg>> {
         let out_path = self.record_output_path(&sel);
+        // DRAGON-421: reap whatever a crashed session left behind BEFORE this one creates
+        // anything of its own — an orphaned muxer still holding a temp, its stale FIFOs,
+        // an abandoned take. Only provably-dead wreckage is touched; a concurrent
+        // recording's files are spared (DRAGON-322/351).
+        crate::record::recover::sweep_wreckage(out_path.parent());
         let (max_w, max_h) = self.res_limit();
         let handle = crate::record::start_pipewire_recording(crate::record::PipewireRecordParams {
             fd: held.fd,
@@ -395,7 +400,7 @@ impl App {
         self.recording_started = Some(std::time::Instant::now());
         self.recording_paused_at = None;
         self.recording_paused_accum = std::time::Duration::ZERO;
-        self.recording_path = Some(crate::record::recording_temp_path(&out_path));
+        self.arm_session_bound(&out_path);
         self.pending = Some(sel);
         self.begin_recording_tray();
         self.recreate_active_overlays()
@@ -405,6 +410,8 @@ impl App {
     /// the portal/PipeWire is unavailable).
     fn start_screencopy_recording(&mut self, sel: Selection) -> Task<cosmic::Action<Msg>> {
         let out_path = self.record_output_path(&sel);
+        // DRAGON-421: same start-of-session sweep as the portal path — see there.
+        crate::record::recover::sweep_wreckage(out_path.parent());
         // Record only what's inside the visible line: a region is inset by the
         // line width (the outline, drawn on the original rect, then sits just
         // outside the recorded crop); window/monitor record the full target.
@@ -456,7 +463,7 @@ impl App {
         self.recording_paused_accum = std::time::Duration::ZERO;
         // The live size readout tracks the temp capture as it grows; the final file
         // (after the finalize pass) is what `RecordingPoll` reports on `done`.
-        self.recording_path = Some(crate::record::recording_temp_path(&out_path));
+        self.arm_session_bound(&out_path);
         // Keep the ORIGINAL selection for the overlay/border + toolbar anchor.
         self.pending = Some(sel);
         self.begin_recording_tray();
@@ -658,11 +665,130 @@ impl App {
         Task::none()
     }
 
+    /// Arm the SESSION-level bound for a recording just started to `out_path` (DRAGON-423),
+    /// and note the two files it watches: the temp the muxer writes (which the live size
+    /// readout also tracks) and the finished file finalize will produce from it.
+    ///
+    /// Shared by both entry points so no recording can be started without a bound on it —
+    /// the reason this is a helper rather than four lines copied twice.
+    fn arm_session_bound(&mut self, out_path: &std::path::Path) {
+        self.recording_path = Some(crate::record::recording_temp_path(out_path));
+        self.recording_out_path = Some(out_path.to_path_buf());
+        self.recording_stopping = false;
+        self.recording_progress =
+            Some(crate::record::progress::SessionProgress::new(std::time::Instant::now()));
+    }
+
+    /// Drop every trace of a live recording from the app's own state — the worker handle,
+    /// the cross-process marker, the elapsed/pause bookkeeping, the session-level bound, the
+    /// tray and the meters.
+    ///
+    /// The ONE place that says what "no longer recording" means, shared by the ordinary end
+    /// (`RecordingPoll` seeing a result) and by giving up on a wedged one, so the two cannot
+    /// drift. `recording_path` is deliberately NOT cleared here: what happens to the temp
+    /// differs between them (deleted after a normal finalize, already salvaged after a
+    /// wedge), and that difference is exactly what must not be laundered.
+    pub(super) fn clear_recording_state(&mut self) {
+        self.recording = None;
+        // DRAGON-322: the recording ended (this process lives on into the video preview) —
+        // drop the cross-process marker now so other overlays re-enable their video kind
+        // promptly.
+        crate::instance::set_recording_marker(false);
+        self.recording_started = None;
+        self.recording_paused_at = None;
+        self.recording_paused_accum = std::time::Duration::ZERO;
+        self.recording_stopping = false;
+        self.recording_progress = None;
+        self.recording_out_path = None;
+        self.end_recording_tray();
+        self.mic_level = 0.0;
+        self.sys_level = 0.0;
+    }
+
+    /// Feed the session-level bound one observation (DRAGON-423), from the recording poll.
+    /// `Some` means this recording has gone the whole budget without progress.
+    pub(super) fn observe_recording_progress(
+        &mut self,
+    ) -> Option<crate::record::progress::Stall> {
+        let phase = self.recording_phase();
+        let sample = crate::record::progress::Sample::read(
+            self.recording_path.as_deref(),
+            self.recording_out_path.as_deref(),
+        );
+        self.recording_progress
+            .as_mut()?
+            .observe(std::time::Instant::now(), phase, sample)
+    }
+
+    /// Give up on a recording that stopped making progress (DRAGON-423).
+    ///
+    /// Everything the session started goes — its muxers, its FIFOs, its temp — through
+    /// `recover::abandon_session`, which is the same salvage path a crashed session's
+    /// wreckage takes: a take with real content in it is RENAMED to `<stamp>-recovered.mkv`,
+    /// never deleted. Then the user is told, through the two channels that already exist
+    /// (DRAGON-419's log and DRAGON-415's alert), and the one-shot session ends.
+    ///
+    /// The worker thread is not joined and does not need to be: killing its muxer makes its
+    /// writes fail, and `fail_session` ends this process, which is what the DRAGON-421
+    /// tether is waiting for to reap anything still breathing.
+    pub(super) fn abandon_wedged_recording(
+        &mut self,
+        stall: crate::record::progress::Stall,
+    ) -> Task<cosmic::Action<Msg>> {
+        // Ask the worker to stop too. It may be past caring, but a worker that is merely
+        // slow gets to unwind through its own path rather than being cut off mid-write.
+        if let Some(rec) = &self.recording {
+            rec.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let swept = crate::record::recover::abandon_session();
+        let cancelled = self.recording_cancelled;
+        self.clear_recording_state();
+        self.recording_cancelled = false;
+        // The temp is NOT deleted here (the ordinary end does delete it): `abandon_session`
+        // has already salvaged it into a recovered file, and removing our reference is all
+        // that is left to do.
+        self.recording_path = None;
+        crate::diag::note_failure(
+            crate::diag::Failure::RecordingWedged,
+            &crate::record::progress::wedge_detail(&stall, &swept.recovered),
+        );
+        if cancelled {
+            // The user threw this take away before it wedged, and a wedge does not undo
+            // that: salvaging would hand them the file they said no to, and an alert would
+            // report a failure they had already ended themselves. The log still carries the
+            // full diagnosis (the note above, plus what `abandon_session` reported), so
+            // nothing is hidden from US — only from a user who has moved on.
+            for p in &swept.recovered {
+                let _ = std::fs::remove_file(p);
+            }
+            return self.finish_session();
+        }
+        self.fail_session()
+    }
+
+    /// What the live recording has been asked to do right now — the input the session-level
+    /// bound judges progress against. A stop the user has asked for outranks a pause: the
+    /// worker's `stop` wins over `paused` too, so the session really is stopping.
+    fn recording_phase(&self) -> crate::record::progress::Phase {
+        use crate::record::progress::Phase;
+        if self.recording_stopping {
+            Phase::Stopping
+        } else if self.recording_paused_at.is_some() {
+            Phase::Paused
+        } else {
+            Phase::Running
+        }
+    }
+
     /// Stop the recording: signal the worker (it finalizes the file) and clear the
     /// overlay, opening the video preview overlay (a spinner) right away to cover the
     /// finalize wait. `RecordingPoll` fills in the poster once the file is ready.
     pub(super) fn stop_recording(&mut self) -> Task<cosmic::Action<Msg>> {
         self.end_recording_tray();
+        // DRAGON-423: remember that the USER asked, independently of the flag below — a
+        // worker is free to clear that one, and one that did is what left a recording
+        // running behind a spinner nobody could dismiss.
+        self.recording_stopping = true;
         if let Some(rec) = &self.recording {
             rec.stop
                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -722,6 +848,7 @@ impl App {
     pub(super) fn cancel_recording(&mut self) -> Task<cosmic::Action<Msg>> {
         self.end_recording_tray();
         self.recording_cancelled = true;
+        self.recording_stopping = true; // DRAGON-423 — see `stop_recording`
         if let Some(rec) = &self.recording {
             rec.stop
                 .store(true, std::sync::atomic::Ordering::Relaxed);

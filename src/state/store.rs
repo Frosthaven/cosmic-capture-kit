@@ -12,7 +12,12 @@ use std::path::PathBuf;
 use super::schema::Persisted;
 
 /// The config file (current format, all platforms).
-fn config_path() -> Option<PathBuf> {
+///
+/// Public since DRAGON-419: `diag::init` runs as the first statement of `main` and needs the
+/// one `debug_logging` key BEFORE the daemon branch or any subcommand returns. It reads this
+/// file directly rather than calling [`load`], which runs migrations and can WRITE — side
+/// effects that must not happen that early.
+pub fn config_path() -> Option<PathBuf> {
     Some(crate::util::app_config_dir()?.join("config.toml"))
 }
 
@@ -295,6 +300,11 @@ record_fps = 60\n";
         assert!(d.preview_save_on_copy);
         assert!(d.preview_close_on_copy);
         assert!(d.preview_copy_on_delete);
+        // DRAGON-420: the Video Editor group's three match the image defaults exactly, so an
+        // untouched install behaves as it did when video borrowed the image settings.
+        assert!(d.preview_video_save_on_copy);
+        assert!(d.preview_video_close_on_copy);
+        assert!(d.preview_video_copy_on_delete);
         assert_eq!(d.record_res_preset, 5); // 2K
         assert_eq!(d.nvenc_preset, "p4");
         assert_eq!(d.x264_preset, "fast");
@@ -688,6 +698,68 @@ record_fps = 60\n";
         current.preview_close_on_copy = true;
         migrate(&mut current);
         assert!(!current.preview_save_on_copy && current.preview_close_on_copy);
+    }
+
+    #[test]
+    fn video_editor_share_settings_are_independent_of_the_image_ones() {
+        // DRAGON-420: six SEPARATE persisted fields, not three shared ones. The regression
+        // this pins is a video row wired to an image field (or vice versa), which would look
+        // right in the settings window and silently move the wrong behaviour.
+        //
+        // 1. An existing config that has never seen the video keys picks them up at their
+        //    defaults WITHOUT disturbing the image choices it does carry — no version bump,
+        //    no migrate hook, so absence has to be enough on its own.
+        let mut p: super::Persisted = toml::from_str(
+            "preview_save_on_copy = false\npreview_close_on_copy = false\n\
+             preview_copy_on_delete = false\nconfig_version = 8\n",
+        )
+        .expect("parse");
+        migrate(&mut p);
+        assert!(!p.preview_save_on_copy && !p.preview_close_on_copy && !p.preview_copy_on_delete);
+        assert!(
+            p.preview_video_save_on_copy
+                && p.preview_video_close_on_copy
+                && p.preview_video_copy_on_delete,
+            "absent video keys default ON regardless of the image choices"
+        );
+        // 2. And the reverse: video off, image untouched.
+        let mut q: super::Persisted = toml::from_str(
+            "preview_video_save_on_copy = false\npreview_video_close_on_copy = false\n\
+             preview_video_copy_on_delete = false\nconfig_version = 8\n",
+        )
+        .expect("parse");
+        migrate(&mut q);
+        assert!(
+            q.preview_save_on_copy && q.preview_close_on_copy && q.preview_copy_on_delete,
+            "the image settings must not follow the video ones"
+        );
+        assert!(
+            !q.preview_video_save_on_copy
+                && !q.preview_video_close_on_copy
+                && !q.preview_video_copy_on_delete
+        );
+        // 3. A fully parted choice round-trips through the file: every one of the six is its
+        //    own key on disk, so nothing collapses into a shared value on the next load.
+        let mut parted = defaults();
+        parted.preview_save_on_copy = false;
+        parted.preview_close_on_copy = true;
+        parted.preview_copy_on_delete = false;
+        parted.preview_video_save_on_copy = true;
+        parted.preview_video_close_on_copy = false;
+        parted.preview_video_copy_on_delete = true;
+        let s = toml::to_string(&parted).expect("serialize");
+        let back: super::Persisted = toml::from_str(&s).expect("parse back");
+        assert_eq!(
+            (
+                back.preview_save_on_copy,
+                back.preview_close_on_copy,
+                back.preview_copy_on_delete,
+                back.preview_video_save_on_copy,
+                back.preview_video_close_on_copy,
+                back.preview_video_copy_on_delete,
+            ),
+            (false, true, false, true, false, true)
+        );
     }
 
     #[test]

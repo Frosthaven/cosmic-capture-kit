@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2024"
 description = "Cross-platform screen region, window, and monitor capture with support for glass windows, image, video, voice, QR, barcodes, OCR text and more."
 license = "GPL-3.0-only"
@@ -256,6 +256,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSPanel",
     "NSSavePanel",
     "NSOpenPanel",
+    # DRAGON-415: the capture-failure alert (`platform/mac/services/alert.rs`) — a plain
+    # app-modal NSAlert, so a capture child that fails before it has any window can still
+    # tell the user what happened without standing up the iced/wgpu stack. The feature's
+    # own deps (objc2-foundation NSArray/NSError/NSString) are already enabled, so no new
+    # packages land in the lock.
+    "NSAlert",
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -428,6 +434,7 @@ features = [
     "Win32_System_Com",             # CoInitializeEx, CoCreateInstance
     "Win32_System_Threading",       # OpenProcess, QueryFullProcessImageNameW (owner label), CreateMutexW (single-instance, DRAGON-229 W4)
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot process sweep for close_other_instances (DRAGON-229 W4)
+    "Win32_System_JobObjects",      # DRAGON-421: CreateJobObjectW + JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — the child tether (platform/windows/job.rs)
     # M2 delivery (DRAGON-229): the WinRT capture toast (clipboard image + file list go
     # through arboard). Compile-time-only feature flags on the already-resolved
     # `windows 0.62` — no new Cargo.lock package lands.

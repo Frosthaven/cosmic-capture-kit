@@ -280,8 +280,14 @@ const OWNED_AUDIO_SMOKE_BUDGET: std::time::Duration = std::time::Duration::from_
 /// connects/spawns successfully (its constructor already returned `Some`) but then
 /// either produces nothing before disconnecting (pulse/ffmpeg reject a bad device
 /// fast) or never produces anything at all — either way this returns `false`.
-/// Consumes (loses) at most one real item on success — negligible against a
-/// multi-second recording.
+///
+/// Consumes (loses) at most one real item on success. Since DRAGON-417 that item is
+/// the source's FIRST, so the loss sits at media 0 rather than being absorbed
+/// somewhere harmless — but it is one block (10-25ms), silence-filled by the mixer
+/// and counted in `MixerStats::gap_samples` like any other hole. Handing it on
+/// instead would mean threading two more values through every worker's
+/// `pump::spawn` call, on platforms this tree cannot build; the trade is deliberate,
+/// and recorded here so it is a known 25ms and not a mystery.
 fn smoke_check<T>(rx: &std::sync::mpsc::Receiver<T>, budget: std::time::Duration) -> bool {
     rx.recv_timeout(budget).is_ok()
 }
@@ -323,6 +329,24 @@ fn mkfifo(path: &std::path::Path) -> bool {
 /// live portal is available headlessly, so it cannot go through `record_pipewire`
 /// itself).
 pub(super) struct OwnedAudioStart {
+    /// When the session's audio capture began — the instant this pre-flight was
+    /// entered, which is within a millisecond of the worker thread's own start and
+    /// therefore of the app marking itself "recording"
+    /// (`App::start_screencopy_recording` / `start_held_pipewire_recording` set
+    /// `recording_started` in the same breath as spawning the worker).
+    ///
+    /// This is the session's MEDIA TIME 0 (DRAGON-417). Every owned worker passes it
+    /// straight to [`super::pump::spawn`] rather than stamping a fresh `Instant::now()`
+    /// once its own video side is ready: audio is already being captured from this
+    /// instant, and anything captured before media 0 is silently thrown away by the
+    /// mixer (it lands at a negative media position). Anchoring at the later
+    /// video-ready instant is exactly what discarded the opening seconds of a
+    /// recording — the user speaks into a live-looking indicator while the pipeline
+    /// quietly drops what it hears. The video side covers the resulting opening span
+    /// with copies of its first frame (`VideoTicker::due_video_ticks` already returns
+    /// however many ticks the span is worth), so the recording is honest in both
+    /// streams: audio complete, video frozen on the first frame it ever got.
+    pub(super) capture_start: std::time::Instant,
     pub(super) mic_fifo_path: PathBuf,
     pub(super) sys_fifo_path: PathBuf,
     pub(super) mic_tap: MicTapHandle,
@@ -364,7 +388,43 @@ impl OwnedAudioStart {
 /// recording's failure. Nothing about the video capture is touched here, so a
 /// failure here never risks a portal `fd` — provably so, by construction: this
 /// function doesn't even TAKE an `fd`/`node_id` parameter.
+/// How many audio pre-flights this process has STARTED (see [`try_start_owned_audio`]).
+///
+/// Doubles as the per-call token in the FIFO/pipe names and as the honest answer to "how
+/// many recording sessions did that one user action start?" — the question DRAGON-422
+/// turned on, and one a process list can only answer by inference.
+static PREFLIGHTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The value of [`PREFLIGHTS`] — how many audio pre-flights have been started in this
+/// process. For the tests that pin "one user action starts ONE recording session".
+#[cfg(test)]
+// Its only caller is `record::zc_fallback_live_tests`, which is gated to the Linux
+// zero-copy build (there is no zero-copy fallback to test anywhere else).
+#[cfg_attr(not(all(target_os = "linux", feature = "zero-copy")), allow(dead_code))]
+pub(super) fn preflights_started() -> u32 {
+    PREFLIGHTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
+    // Media time 0 (DRAGON-417) — see `OwnedAudioStart::capture_start`. Taken before
+    // anything is started so no part of the capture predates the anchor.
+    let capture_start = std::time::Instant::now();
+    // Counted (and logged) FIRST, before anything can return early — including the
+    // forced-failure seam below. The count answers "how many recording sessions did that
+    // one user action start?" (DRAGON-422), and a pre-flight that was attempted and
+    // failed started a session just as much as one that succeeded: the field failure's
+    // second session began with a pre-flight that was always going to fail the same way
+    // the first one did. A counter that only recorded the successes would have said one.
+    //
+    // The value doubles as a per-call token in the FIFO/pipe names. The pid alone is NOT
+    // unique enough: the screencopy worker's GPU zero-copy attempt runs its OWN pre-flight
+    // while the CPU path's is already up, and `mkfifo` clears any stale file at the path
+    // first — so with shared names the second pre-flight replaced the first's FIFOs and,
+    // on falling back, `cleanup()` unlinked them. ffmpeg then found no such file and the
+    // recording came out silent, with nothing but an "Error opening input" from a child
+    // process to show for it (measured live while reproducing DRAGON-417).
+    let token = PREFLIGHTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    log::info!("media-clock pipeline: audio pre-flight #{token} starting");
     if test_force_owned_failure() {
         return Err("forced failure (test seam)".to_string());
     }
@@ -377,8 +437,8 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
     #[cfg(not(windows))]
     let (mic_fifo_path, sys_fifo_path) = {
         let dir = crate::util::runtime_dir();
-        let m = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.micmix.pcm"));
-        let s = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.sysmix.pcm"));
+        let m = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.{token}.micmix.pcm"));
+        let s = PathBuf::from(format!("{dir}/cosmic-capture-kit.{pid}.{token}.sysmix.pcm"));
         if !mkfifo(&m) || !mkfifo(&s) {
             let _ = std::fs::remove_file(&m);
             let _ = std::fs::remove_file(&s);
@@ -389,8 +449,8 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
     #[cfg(windows)]
     let (mic_fifo_path, sys_fifo_path, mic_pipe, sys_pipe) = {
         use crate::platform::windows::named_pipe::create_pipe_server;
-        let m = PathBuf::from(format!(r"\\.\pipe\cosmic-capture-kit.{pid}.micmix"));
-        let s = PathBuf::from(format!(r"\\.\pipe\cosmic-capture-kit.{pid}.sysmix"));
+        let m = PathBuf::from(format!(r"\\.\pipe\cosmic-capture-kit.{pid}.{token}.micmix"));
+        let s = PathBuf::from(format!(r"\\.\pipe\cosmic-capture-kit.{pid}.{token}.sysmix"));
         let Some(mp) = create_pipe_server(&m) else {
             return Err("could not create the audio mixer named pipe (mic)".to_string());
         };
@@ -454,6 +514,7 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
         mic_tap.processing_latency_ms()
     );
     let started = OwnedAudioStart {
+        capture_start,
         mic_fifo_path,
         sys_fifo_path,
         mic_tap,

@@ -28,7 +28,7 @@ const ANNOT_PICKER_CONTENT_H: f32 = 214.0;
 /// The LABEL on a live crop session's accept button (DRAGON-410). Named because two places read
 /// it: [`Tb::crop_items`], which draws it, and the test that proves the labelled pair still fits
 /// the narrowest preview the editor will open at.
-pub(super) const CROP_ACCEPT_LABEL: &str = "Accept Crop";
+pub(super) const CROP_ACCEPT_LABEL: &str = "Apply Crop";
 
 /// Format a tool tooltip as `"Name  (KEY)"`, reading the LIVE binding for `action` from the
 /// keymap (the SAME lookup the settings shortcuts page uses: [`crate::shortcuts::Keymap::get`]
@@ -926,7 +926,7 @@ impl Tb {
     /// The CROP control's buttons (DRAGON-382; DRAGON-392 moved it into the tray group beside
     /// Select and Hand and made it return ITEMS rather than its own cluster, so it sits inside
     /// that one group's border). Idle: a plain crop icon. Active (a live crop session): that slot
-    /// becomes the LABELLED **Accept Crop** button plus an x that cancels, so the one slot opens,
+    /// becomes the LABELLED **Apply Crop** button plus an x that cancels, so the one slot opens,
     /// confirms and abandons the crop. Lives on the TOP tray, so tooltips drop below.
     ///
     /// **DRAGON-410 — why accept carries a LABEL, and why it is a stock `button::suggested`.**
@@ -3349,7 +3349,7 @@ mod tests {
         let km = crate::shortcuts::Keymap::defaults();
         assert_eq!(tb.crop_items(false, &km).len(), 1);
         assert_eq!(tb.crop_items(true, &km).len(), 2);
-        assert_eq!(CROP_ACCEPT_LABEL, "Accept Crop");
+        assert_eq!(CROP_ACCEPT_LABEL, "Apply Crop");
     }
 
     /// DRAGON-410: the labelled accept button WIDENS the crop group, so it must still fit the

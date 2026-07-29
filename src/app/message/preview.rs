@@ -83,6 +83,10 @@ pub enum PreviewMsg {
     FrameStep(i32),
     /// A single scrubbed/stepped frame finished decoding (`None` = decode failed).
     SeekFrameReady(Option<Arc<PixelFrame>>),
+    /// The still-image decode never reported back — its thread died (DRAGON-415). The
+    /// capture IS on disk; only the editor is lost, and this used to be indistinguishable
+    /// from an ordinary [`PreviewMsg::Cancel`], i.e. from the user closing the window.
+    LoadFailed,
     /// Close the preview without deleting the file.
     Cancel,
     /// Flip the preview between the fullscreen overlay and a resizable window, live —

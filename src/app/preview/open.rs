@@ -706,6 +706,20 @@ impl App {
         dims: Option<(u32, u32)>,
     ) -> Task<cosmic::Action<Msg>> {
         let Some((output, monitor)) = self.preview_output.clone() else {
+            // DRAGON-419 (silent-exit path S8, the near half). There is no display to open an
+            // editor on, so the editor silently never appears — while the file IS on disk and
+            // a notification may already have been posted. On macOS this means `output_descs()`
+            // came back empty, i.e. ScreenCaptureKit stopped answering; on Linux, that no
+            // output was ever seeded. It returns `Task::none()` rather than ending the
+            // session, which is the one shape where "nothing happened" is literally true.
+            crate::diag::note_failure(
+                crate::diag::Failure::NoPreviewOutput,
+                &format!(
+                    "no display to open the preview editor on (outputs={}, video={is_video}, \
+                     external={external}); the capture IS written",
+                    self.outputs.len(),
+                ),
+            );
             return Task::none();
         };
         let kind = if is_video {
@@ -1034,6 +1048,17 @@ impl App {
                 log::info!(
                     "preview handoff: pid {pid} owns {} now — this process is done",
                     path.display()
+                );
+                // DRAGON-419 (silent-exit path S6). This is a SUCCESS, but from outside it is
+                // indistinguishable from a silent self-close: the capture child vanishes and
+                // whether an editor appears is now another process's problem. Recording it —
+                // as an explicit non-loss — is what lets a reader stop looking here and go
+                // look at pid N instead. The residual exposure the handoff's own module doc
+                // names (a host that acks and then fails to present) is exactly this line
+                // followed by no editor.
+                crate::diag::note_failure(
+                    crate::diag::Failure::HandoffAccepted,
+                    &format!("host pid {pid} accepted the capture; this process is done"),
                 );
                 Some(self.finish_session())
             }

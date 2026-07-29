@@ -348,8 +348,9 @@ fn run_owned_shaped_session(
     std::thread::sleep(Duration::from_millis(300));
 
     let owned = super::owned::try_start_owned_audio().ok()?;
-    let super::owned::OwnedAudioStart { mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx } =
-        owned;
+    let super::owned::OwnedAudioStart {
+        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } = owned;
 
     let out_path = std::env::temp_dir().join(format!("cck-e2e-{prefix}{}.mp4", std::process::id()));
     let temp_path = super::recording_temp_path(&out_path);
@@ -373,7 +374,11 @@ fn run_owned_shaped_session(
     let paused = Arc::new(AtomicBool::new(false));
     let events: Mutex<Vec<ToggleEvent>> = Mutex::new(Vec::new());
 
-    let t0 = Instant::now();
+    // Media time 0 is the pre-flight instant, exactly as every production worker
+    // anchors it (DRAGON-417) — the session's own pacing below still runs off its
+    // own `loop_t0`, so the scenario timings are unchanged.
+    let t0 = capture_start;
+    let loop_t0 = Instant::now();
     let cfg = PumpConfig {
         fps: FPS,
         audio_offset_ms: 0,
@@ -402,7 +407,7 @@ fn run_owned_shaped_session(
         // the reap bound — exactly the field wedge, reproduced headlessly.
         let mut leak_probe: Option<Child> = None;
         loop {
-            let elapsed = t0.elapsed().as_secs_f64();
+            let elapsed = loop_t0.elapsed().as_secs_f64();
             if elapsed >= 1.0 && leak_probe.is_none() {
                 leak_probe = Command::new("sleep")
                     .arg("120")
@@ -908,4 +913,737 @@ fn media_clock_user_shape_pause_no_mute_e2e() {
     assert!(pts.windows(2).all(|w| w[1] > w[0]), "video PTS must be strictly increasing");
 
     let _ = std::fs::remove_file(&out_path);
+}
+
+
+// ===========================================================================
+// Content-identified sessions (DRAGON-417): markers that carry their own
+// capture time, in BOTH streams
+// ===========================================================================
+//
+// Everything above this line measures a recording by its SHAPE — durations, packet
+// counts, edge positions, RMS envelopes. That whole class of assertion passed while
+// recordings were silently throwing away their opening seconds, and passed again
+// while pause was (wrongly) suspected of eating content: a waveform cannot tell
+// "paused" from "nobody was talking", and a duration cannot tell "8 seconds of the
+// right content" from "8 seconds starting 6 seconds late". The only way to answer
+// "is the content that was in front of the recorder at wall time T actually in the
+// file at media position m?" is to record content that IDENTIFIES ITS OWN CAPTURE
+// TIME, and decode it back out.
+//
+// Two markers, one per stream, both self-timestamping:
+//
+// - AUDIO: a linear chirp played into the captured sink. Its instantaneous FREQUENCY
+//   is its own source time ([`CHIRP_F0`] + [`CHIRP_RATE`]·t), recovered per window by
+//   a Goertzel scan. Frequency, not amplitude — a silent stretch is not mistaken for
+//   anything, it simply yields no peak.
+// - VIDEO: each generated frame is a flat grey whose LEVEL encodes the wall instant
+//   the frame was written ([`video_level`]). A still test pattern is what made a
+//   frozen video indistinguishable from a live one; this one cannot be.
+//
+// Both decode back to THIS process's clock (the chirp through a measured onset —
+// see [`calibrate_chirp_onset`]), so every assertion below is absolute, not a fit.
+
+/// The marker chirp's start frequency (Hz) at its own source time 0.
+const CHIRP_F0: f64 = 300.0;
+/// The marker chirp's sweep rate (Hz per second of source time). Chosen so a session
+/// of tens of seconds stays well inside the AAC-preserved band while one 2048-sample
+/// analysis window (~43ms) covers only ~17Hz of sweep — narrower than the scan's own
+/// resolution, so the peak stays sharp.
+const CHIRP_RATE: f64 = 400.0;
+
+/// Plays the marker chirp into `sink` until dropped. `sin(2π(F0·t + (RATE/2)·t²))`
+/// has instantaneous frequency `F0 + RATE·t`, i.e. the source time is readable
+/// straight off the spectrum.
+struct ChirpPlayer(Child);
+impl ChirpPlayer {
+    fn start(sink: &str, duration_secs: f64) -> Option<Self> {
+        let expr = format!(
+            "0.6*sin(2*PI*({CHIRP_F0}*t+{}*t*t))",
+            CHIRP_RATE / 2.0
+        );
+        let child = crate::util::ffmpeg_command()
+            .args(["-hide_banner", "-loglevel", "error"])
+            .args(["-f", "lavfi", "-i", &format!("aevalsrc='{expr}':s=48000:d={duration_secs}")])
+            .args(["-f", "pulse", "-device", sink, "cck-e2e-chirp"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .ok()?;
+        Some(Self(child))
+    }
+}
+impl Drop for ChirpPlayer {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Goertzel power of `x` (Hann-windowed) at `f`, sample rate `sr`.
+fn goertzel_power(x: &[f32], hann: &[f64], f: f64, sr: f64) -> f64 {
+    let w = 2.0 * std::f64::consts::PI * f / sr;
+    let coeff = 2.0 * w.cos();
+    let (mut s1, mut s2) = (0.0f64, 0.0f64);
+    for (i, &v) in x.iter().enumerate() {
+        let s0 = coeff * s1 - s2 + v as f64 * hann[i];
+        s2 = s1;
+        s1 = s0;
+    }
+    s1 * s1 + s2 * s2 - coeff * s1 * s2
+}
+
+/// The number of samples one chirp analysis window spans (~43ms at 48kHz).
+const CHIRP_WIN: usize = 2048;
+
+/// Recover the marker chirp's own SOURCE time from the recorded audio around media
+/// position `at_media`. `None` when the window falls outside the decoded signal or
+/// carries no dominant tone (silence, or content that isn't the chirp) — never a
+/// guess. The candidate scan runs to `max_source_secs` of sweep plus margin.
+fn chirp_source_time(samples: &[f32], at_media: f64, max_source_secs: f64) -> Option<f64> {
+    const SR: f64 = 48_000.0;
+    let center = (at_media * SR) as i64;
+    let lo = center - (CHIRP_WIN as i64) / 2;
+    if lo < 0 || (lo as usize) + CHIRP_WIN > samples.len() {
+        return None;
+    }
+    let win = &samples[lo as usize..lo as usize + CHIRP_WIN];
+    let hann: Vec<f64> = (0..CHIRP_WIN)
+        .map(|i| {
+            0.5 - 0.5
+                * (2.0 * std::f64::consts::PI * i as f64 / (CHIRP_WIN - 1) as f64).cos()
+        })
+        .collect();
+    let step = 20.0;
+    let f_lo = CHIRP_F0 - 100.0;
+    let f_hi = CHIRP_F0 + CHIRP_RATE * max_source_secs + 200.0;
+    let mut powers: Vec<(f64, f64)> = Vec::new();
+    let mut f = f_lo;
+    while f <= f_hi {
+        powers.push((f, goertzel_power(win, &hann, f, SR)));
+        f += step;
+    }
+    let (best_i, &(best_f, best_p)) = powers
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.1.total_cmp(&b.1.1))?;
+    // A real tone towers over the scan's median bin; silence or noise does not.
+    let mut sorted: Vec<f64> = powers.iter().map(|p| p.1).collect();
+    sorted.sort_by(f64::total_cmp);
+    let median = sorted[sorted.len() / 2];
+    if best_p < median * 50.0 {
+        return None;
+    }
+    // Parabolic refinement across the peak's neighbours (sub-bin frequency, so the
+    // recovered source time beats the 20Hz scan step).
+    let refined = if best_i > 0 && best_i + 1 < powers.len() {
+        let (l, c, r) = (powers[best_i - 1].1, best_p, powers[best_i + 1].1);
+        let denom = l - 2.0 * c + r;
+        if denom.abs() > f64::EPSILON {
+            best_f + step * 0.5 * (l - r) / denom
+        } else {
+            best_f
+        }
+    } else {
+        best_f
+    };
+    Some((refined - CHIRP_F0) / CHIRP_RATE)
+}
+
+/// The wall instant at which the marker chirp's own source time 0 reached the sink —
+/// MEASURED, because every absolute audio assertion needs the chirp's clock tied to
+/// this process's, and an ffmpeg spawn + pulse connect is worth a few hundred
+/// unpredictable milliseconds. Listens on `monitor_source` with the app's own
+/// [`MonitorCapture`] and takes the first chunk carrying signal.
+///
+/// This is the ONE place amplitude is used, and legitimately: the chirp is a signal
+/// this test fully controls, silent before its source 0 and at full level from it, so
+/// "first chunk above the floor" is unambiguous. Nothing downstream infers content
+/// from level.
+fn calibrate_chirp_onset(
+    monitor_source: &str,
+    sink: &str,
+    duration_secs: f64,
+) -> Option<(Instant, ChirpPlayer)> {
+    let (monitor, rx) = crate::audio::capture::MonitorCapture::start(Some(monitor_source.to_string()), None)?;
+    // Let the capture settle so the onset isn't attributed to its own spin-up.
+    std::thread::sleep(Duration::from_millis(400));
+    while rx.try_recv().is_ok() {}
+    let player = ChirpPlayer::start(sink, duration_secs)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut onset = None;
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => {
+                let peak = chunk.samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+                if peak > 0.05 {
+                    onset = Some(chunk.capture_wall);
+                    break;
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    let _ = monitor.stop();
+    onset.map(|t| (t, player))
+}
+
+/// Grey level encoding `dt` (seconds since the session's media 0) into a generated
+/// video frame. Linear and monotone across a session of tens of seconds, with enough
+/// spacing per step that h264's intra coding of a flat field can't confuse two.
+fn video_level(dt_secs: f64) -> u8 {
+    (24.0 + dt_secs * 15.0).clamp(24.0, 250.0) as u8
+}
+
+/// A flat RGBA frame at `level` — the video marker's carrier.
+fn frame_level(level: u8, w: u32, h: u32) -> Vec<u8> {
+    let mut f = vec![level; (w * h * 4) as usize];
+    for px in f.as_chunks_mut::<4>().0 {
+        px[3] = 0xFF;
+    }
+    f
+}
+
+/// One decoded byte per output frame: the frame's mean luma (the frames are flat, so
+/// this IS the marker level, up to the encoder's range conversion — which the two
+/// anchors in [`MarkedSession::frame_wall`] calibrate out exactly).
+fn video_frame_levels(path: &std::path::Path) -> Option<Vec<u8>> {
+    let out = crate::util::ffmpeg_command()
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-map", "v:0", "-vf", "scale=1:1:flags=area", "-pix_fmt", "gray"])
+        .args(["-f", "rawvideo", "pipe:1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    Some(out.stdout)
+}
+
+/// One content-identified session's recording plus everything needed to decode its
+/// markers back onto THIS process's clock.
+struct MarkedSession {
+    path: std::path::PathBuf,
+    /// Media time 0: the instant the audio pre-flight started, which is also the
+    /// instant a real app marks itself "recording" (see `OwnedAudioStart::capture_start`).
+    capture_start: Instant,
+    /// Wall instant of the marker chirp's own source time 0 (measured).
+    chirp_zero_at: Instant,
+    /// `(output frame index, wall instant)` of every main-loop video write batch —
+    /// exactly-known points that calibrate the decoded grey level back to wall
+    /// seconds, whatever range conversion the encoder applied. The first and the last
+    /// one still present in the finished file are the two anchors used.
+    writes: Vec<(usize, Instant)>,
+    /// Measured `(pause, resume)` instants, in order.
+    pauses: Vec<(Instant, Instant)>,
+    session_end: Instant,
+    mic_stats: crate::mixer::track::MixerStats,
+    sys_stats: crate::mixer::track::MixerStats,
+    final_media: f64,
+    levels: Vec<u8>,
+    audio: Vec<f32>,
+}
+
+impl MarkedSession {
+    /// Seconds since [`capture_start`](Self::capture_start).
+    fn since_start(&self, t: Instant) -> f64 {
+        t.saturating_duration_since(self.capture_start).as_secs_f64()
+    }
+
+    /// The WALL position (seconds since media 0) a given MEDIA position corresponds
+    /// to: media time plus every pause that has already been frozen out by then.
+    fn wall_at_media(&self, media: f64) -> f64 {
+        let mut wall = media;
+        for (p, r) in &self.pauses {
+            let p_media = self.since_start(*p) - (wall - media);
+            if p_media <= media {
+                wall += r.saturating_duration_since(*p).as_secs_f64();
+            }
+        }
+        wall
+    }
+
+    /// The opening span: media 0 up to here is covered by copies of the FIRST frame
+    /// the worker ever captured (audio was already being recorded; video wasn't ready
+    /// yet), so a frame in this span identifies the video side's ready instant, not
+    /// its own media position.
+    fn opening_span(&self) -> f64 {
+        self.since_start(self.writes[0].1)
+    }
+
+    /// The two calibration points: the first video write, and the last one that
+    /// actually survived into the file.
+    fn anchors(&self) -> Option<((usize, Instant), (usize, Instant))> {
+        let a = *self.writes.first()?;
+        let b = *self.writes.iter().rev().find(|(k, _)| *k + 1 < self.levels.len())?;
+        (b.0 > a.0).then_some((a, b))
+    }
+
+    /// Wall position (seconds since media 0) that output video frame `k` was
+    /// captured at, decoded from the frame's own marker level.
+    fn frame_wall(&self, k: usize) -> Option<f64> {
+        let ((ka, ta), (kb, tb)) = self.anchors()?;
+        let (la, lb) = (*self.levels.get(ka)? as f64, *self.levels.get(kb)? as f64);
+        if (lb - la).abs() < 1.0 {
+            return None;
+        }
+        let (wa, wb) = (self.since_start(ta), self.since_start(tb));
+        let l = *self.levels.get(k)? as f64;
+        Some(wa + (l - la) * (wb - wa) / (lb - la))
+    }
+
+    /// Wall position (seconds since media 0) of the AUDIO sitting at media position
+    /// `media`, decoded from the chirp's own frequency.
+    fn audio_wall(&self, media: f64, max_source: f64) -> Option<f64> {
+        let s = chirp_source_time(&self.audio, media, max_source)?;
+        Some(s + self.since_start(self.chirp_zero_at))
+    }
+}
+
+/// Drive one owned-shaped session whose BOTH streams carry self-timestamping content
+/// (see this section's header). `startup_delay_secs` is an artificial stall between
+/// the audio pre-flight and the moment the video side starts feeding — the real
+/// worker's own startup (capture handshake, first frame, ffmpeg spawn, and on the
+/// portal path a bounded wait for the stream's first frame) made visible and
+/// controllable, because that span is exactly what DRAGON-417 threw away.
+/// `pauses` are `(offset from the video loop's start, length)` in real seconds.
+fn run_marked_session(
+    prefix: &str,
+    total_secs: f64,
+    startup_delay_secs: f64,
+    pauses: &[(f64, f64)],
+) -> Option<MarkedSession> {
+    let mic_sink = NullSink::load(&format!("{prefix}mic"))?;
+    let sys_sink = NullSink::load(&format!("{prefix}sys"))?;
+    crate::audio::config::set_mic_source(&mic_sink.monitor_source());
+    // SAFETY: the caller holds `test_lock()` for this whole call.
+    unsafe {
+        std::env::set_var("CCK_TEST_MONITOR_SOURCE", sys_sink.monitor_source());
+    }
+    let chirp_len = total_secs + startup_delay_secs + 20.0;
+    let (chirp_zero_at, _chirp) =
+        calibrate_chirp_onset(&sys_sink.monitor_source(), &sys_sink.name, chirp_len)?;
+
+    // === the instant a real app marks itself "recording" ===
+    let owned = super::owned::try_start_owned_audio().ok()?;
+    let super::owned::OwnedAudioStart {
+        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } = owned;
+
+    let out_path = std::env::temp_dir().join(format!("cck-e2e-{prefix}{}.mp4", std::process::id()));
+    let temp_path = super::recording_temp_path(&out_path);
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&temp_path);
+
+    let presets = crate::encode::Presets::default();
+    let plan = crate::encode::EncodePlan::resolve("software", W, H, &presets);
+    let Ok(mut child) = crate::encode::spawn_ffmpeg_media_clock(
+        W, H, W, H, FPS, &plan, 4000, &temp_path, &mic_fifo_path, &sys_fifo_path,
+    ) else {
+        drop(mic_tap);
+        let _ = monitor.stop();
+        let _ = std::fs::remove_file(&mic_fifo_path);
+        let _ = std::fs::remove_file(&sys_fifo_path);
+        return None;
+    };
+    let mut stdin = child.stdin.take().expect("piped stdin");
+
+    // The worker's video-side startup, made explicit.
+    let already = capture_start.elapsed().as_secs_f64();
+    if startup_delay_secs > already {
+        std::thread::sleep(Duration::from_secs_f64(startup_delay_secs - already));
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    let events: Mutex<Vec<ToggleEvent>> = Mutex::new(Vec::new());
+    let cfg = PumpConfig {
+        fps: FPS,
+        audio_offset_ms: 0,
+        auto_device_compensation: false,
+        mic_on0: true,
+        sys_on0: true,
+        duck_system: false,
+    };
+
+    let mut measured_pauses: Vec<(Instant, Instant)> = Vec::new();
+    let mut writes: Vec<(usize, Instant)> = Vec::new();
+    let mut session_end = capture_start;
+    let mut stats: Option<(crate::mixer::track::MixerStats, crate::mixer::track::MixerStats, f64)> =
+        None;
+
+    let finished = std::thread::scope(|scope| {
+        let (pump_handle, mut ticker) = super::pump::spawn(
+            scope, capture_start, cfg, mic_fifo_path.clone(), sys_fifo_path.clone(), mic_tap,
+            mic_rx, monitor, sys_rx, &stop, &paused, &events,
+        )
+        .expect("pump spawn must succeed in the E2E harness");
+
+        let loop_t0 = Instant::now();
+        let mut written: usize = 0;
+        let mut pause_state: Vec<(bool, bool)> = vec![(false, false); pauses.len()];
+        let mut last_frame = frame_level(video_level(0.0), W, H);
+        loop {
+            let elapsed = loop_t0.elapsed().as_secs_f64();
+            for (i, &(at, len)) in pauses.iter().enumerate() {
+                if elapsed >= at && !pause_state[i].0 {
+                    paused.store(true, Ordering::Relaxed);
+                    measured_pauses.push((Instant::now(), Instant::now()));
+                    pause_state[i].0 = true;
+                }
+                if elapsed >= at + len && !pause_state[i].1 {
+                    paused.store(false, Ordering::Relaxed);
+                    if let Some(last) = measured_pauses.last_mut() {
+                        last.1 = Instant::now();
+                    }
+                    pause_state[i].1 = true;
+                }
+            }
+            if elapsed >= total_secs {
+                break;
+            }
+            let now = Instant::now();
+            let due = ticker.due_video_ticks(now);
+            if due > 0 {
+                last_frame = frame_level(video_level(capture_start.elapsed().as_secs_f64()), W, H);
+                writes.push((written, now));
+                for _ in 0..due {
+                    let _ = stdin.write_all(&last_frame);
+                    written += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(8));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        session_end = Instant::now();
+        let pump_out = pump_handle.join();
+        stats = Some((pump_out.mic_stats, pump_out.sys_stats, pump_out.final_media));
+        // The stop tail re-feeds the LAST frame (marker unchanged), exactly like the
+        // production workers do — so the anchors stay meaningful.
+        for _ in 0..ticker.ticks_to_cover(pump_out.final_media) {
+            let _ = stdin.write_all(&last_frame);
+        }
+        drop(stdin);
+        let reaped = super::wait_or_kill(&mut child, Duration::from_secs(30));
+        assert!(
+            matches!(&reaped, Ok(s) if s.success()),
+            "capture ffmpeg must exit cleanly after its inputs close (got {reaped:?})"
+        );
+        super::finalize::finalize_with_intervals(
+            &temp_path,
+            &out_path,
+            &pump_out.mic_off,
+            &pump_out.sys_off,
+            plan.is_hevc(),
+            "cck-e2e-marked",
+        )
+        .ok()
+    })?;
+    let _ = std::fs::remove_file(&temp_path);
+
+    let (mic_stats, sys_stats, final_media) = stats?;
+    let levels = video_frame_levels(&finished)?;
+    let audio = audio_mono_f32(&finished)?;
+    Some(MarkedSession {
+        path: finished,
+        capture_start,
+        chirp_zero_at,
+        writes,
+        pauses: measured_pauses,
+        session_end,
+        mic_stats,
+        sys_stats,
+        final_media,
+        levels,
+        audio,
+    })
+}
+
+/// E2E-6 (DRAGON-417 — the opening of a recording survives a slow start): the app
+/// marks itself "recording" the instant it spawns the capture worker, and the worker
+/// starts capturing audio immediately; its VIDEO side then takes a while to come up
+/// (capture handshake, first frame, ffmpeg spawn — and on the portal path a bounded
+/// wait for the stream's first frame). This session makes that span 1.5s and asserts
+/// that everything audible during it is in the file, at the right place.
+///
+/// The bug it pins: media time 0 used to be stamped when the VIDEO side was ready, so
+/// every audio chunk captured before that landed at a negative media position and was
+/// discarded — silently, with no error and nothing in any log. A user speaking the
+/// moment the indicator went live lost the opening of their take and could only find
+/// out by listening back. Measured in the field as ~6 seconds of a 10-second count
+/// missing, with the file itself 6 seconds short.
+///
+/// Every assertion here is on decoded CONTENT (the chirp's own frequency, the frames'
+/// own marker levels) or on the mixer's own discard counters — never on duration
+/// alone, which is exactly the class of check that passed throughout this bug's life.
+#[test]
+fn media_clock_recording_opening_survives_a_slow_start_e2e() {
+    require_e2e_tools!("media_clock_recording_opening_survives_a_slow_start_e2e");
+    let _lock = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = GlobalStateGuard;
+
+    const STARTUP: f64 = 1.5;
+    const TOTAL: f64 = 8.0;
+    let Some(s) = run_marked_session("cck_e2e6_", TOTAL, STARTUP, &[]) else {
+        panic!(
+            "the marked session's pre-flight/chirp calibration failed — this is the \
+             harness itself, not the thing under test; check pactl/ffmpeg are reachable \
+             and no stale cck_e2e6_* pactl modules are lingering"
+        );
+    };
+    let recorded_for = s.since_start(s.session_end);
+    eprintln!(
+        "E2E-6: app was 'recording' for {recorded_for:.3}s (video side ready {STARTUP:.1}s in); \
+         media={:.3}s mic(late={} gap={}) sys(late={} gap={})",
+        s.final_media, s.mic_stats.late_chunks, s.mic_stats.gap_samples,
+        s.sys_stats.late_chunks, s.sys_stats.gap_samples,
+    );
+
+    // ---- Nothing captured after the app went live was thrown away ----
+    assert_eq!(
+        s.mic_stats.late_chunks, 0,
+        "no mic chunk may be discarded as late: every one of them was captured after \
+         the app said it was recording (this counter was 28 on the broken build)"
+    );
+    assert_eq!(
+        s.sys_stats.late_chunks, 0,
+        "no system chunk may be discarded as late (13 on the broken build)"
+    );
+
+    // ---- The recording is as long as the app claimed to be recording ----
+    let adur = probe_stream_duration(&s.path, "a:0").expect("ffprobe audio duration");
+    assert!(
+        (adur - recorded_for).abs() < 0.35,
+        "audio stream {adur:.3}s must cover the whole time the app was recording \
+         ({recorded_for:.3}s) — the broken build came out short by the startup span"
+    );
+
+    // ---- AUDIO CONTENT: media m carries the sound that was playing at wall m ----
+    // The chirp's own frequency says which instant of the source each window is; the
+    // calibrated onset ties that to this process's clock. On the broken build every
+    // one of these reads STARTUP seconds late.
+    let max_source = recorded_for + STARTUP + 10.0;
+    let mut checked = 0;
+    let mut worst: f64 = 0.0;
+    let mut m = 0.4;
+    while m < recorded_for - 0.6 {
+        let w = s
+            .audio_wall(m, max_source)
+            .unwrap_or_else(|| panic!("no chirp tone at media {m:.2}s — audio is missing there"));
+        worst = worst.max((w - m).abs());
+        assert!(
+            (w - m).abs() < 0.35,
+            "the audio at media {m:.2}s was captured at wall {w:.2}s; it must be the \
+             sound that was playing at wall {m:.2}s. A shift of ~{STARTUP:.1}s here IS \
+             the bug: the opening was dropped and everything else slid down to fill it."
+        );
+        checked += 1;
+        m += 0.4;
+    }
+    assert!(checked >= 10, "expected a decent number of audio sample points, got {checked}");
+    eprintln!("E2E-6: {checked} audio points, worst wall error {worst:.3}s");
+
+    // ---- The very start of the file is real captured audio, not a hole ----
+    let earliest = {
+        let mut t = 0.05;
+        loop {
+            if t > 1.2 {
+                panic!("no chirp tone anywhere in the first 1.2s — the opening is empty");
+            }
+            if s.audio_wall(t, max_source).is_some() {
+                break t;
+            }
+            t += 0.05;
+        }
+    };
+    eprintln!("E2E-6: audio first decodable at media {earliest:.2}s");
+    assert!(
+        earliest < 0.45,
+        "the recording must start with captured sound, not silence: first decodable \
+         audio at media {earliest:.2}s (only the capture's own spin-up may be missing)"
+    );
+
+    // ---- VIDEO CONTENT: the opening span is the first frame held, then live ----
+    let opening_frames = (STARTUP * FPS as f64) as usize;
+    for k in [0usize, opening_frames / 3, opening_frames.saturating_sub(3)] {
+        let w = s.frame_wall(k).expect("decode frame marker");
+        assert!(
+            (w - STARTUP).abs() < 0.25,
+            "video frame {k} (media {:.2}s) must still be the first frame the worker \
+             ever captured (wall ~{STARTUP:.2}s), not a later one: decoded {w:.2}s",
+            k as f64 / FPS as f64
+        );
+    }
+    let mut k = opening_frames + FPS as usize / 2;
+    while k + 2 < s.levels.len() {
+        let media = k as f64 / FPS as f64;
+        let w = s.frame_wall(k).expect("decode frame marker");
+        assert!(
+            (w - media).abs() < 0.25,
+            "past the opening span, video frame {k} (media {media:.2}s) must be the \
+             frame captured at wall {media:.2}s; decoded {w:.2}s"
+        );
+        k += FPS as usize;
+    }
+
+    let _ = std::fs::remove_file(&s.path);
+}
+
+/// Locate a jump of at least `min_jump` in a `(media, wall)` series — the media
+/// position where the recorded content skips forward, i.e. a seam. Returns the
+/// midpoint of the largest such step, or `None` if the content runs continuously.
+fn seam_position(series: &[(f64, f64)], min_jump: f64) -> Option<f64> {
+    let mut best: Option<(f64, f64)> = None; // (jump, media midpoint)
+    for w in series.windows(2) {
+        let jump = w[1].1 - w[0].1;
+        if jump >= min_jump && best.is_none_or(|(b, _)| jump > b) {
+            best = Some((jump, (w[0].0 + w[1].0) / 2.0));
+        }
+    }
+    best.map(|(_, m)| m)
+}
+
+/// E2E-7 (pause cuts BOTH streams, at the SAME place, every time): three pause/resume
+/// cycles in one session, verified by decoding what each stream actually contains.
+///
+/// What the older pause tests could not establish, and why it mattered: they assert
+/// pause ARITHMETIC (durations and packet counts against a replayed `MediaClock`) on a
+/// STATIC test pattern. On a still picture a frozen video and a live one are
+/// byte-identical, so "video honoured the pause" was never actually observed — and an
+/// energy view of the audio cannot tell a pause from a quiet moment either. When pause
+/// was accused of eating a recording, nothing in the suite could clear it; that took
+/// hand-transcribing a real take. This test replaces both blind spots with content:
+/// every frame's grey level says which wall instant it was captured at, and the audio
+/// chirp's frequency says the same for the sound.
+///
+/// It asserts, per stream: no content from inside any pause survived; the content that
+/// did survive sits at the media position the media clock says it should; and the seam
+/// in the audio lands at the same media position as the seam in the video, for every
+/// cycle — a freeze that took hold slightly earlier in one stream than the other would
+/// desync everything downstream and no per-stream test could see it.
+#[test]
+fn media_clock_pause_jump_cuts_both_streams_e2e() {
+    require_e2e_tools!("media_clock_pause_jump_cuts_both_streams_e2e");
+    let _lock = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = GlobalStateGuard;
+
+    const TOTAL: f64 = 13.0;
+    let schedule = [(2.0, 1.8), (6.0, 2.2), (10.0, 1.6)];
+    let Some(s) = run_marked_session("cck_e2e7_", TOTAL, 0.4, &schedule) else {
+        panic!(
+            "the marked session's pre-flight/chirp calibration failed — this is the \
+             harness itself, not the thing under test; check pactl/ffmpeg are reachable \
+             and no stale cck_e2e7_* pactl modules are lingering"
+        );
+    };
+    assert_eq!(s.pauses.len(), 3, "all three pause cycles must have been driven");
+
+    // Expected media position of each pause, from a clock fed the SAME history.
+    let mut expect = MediaClock::new(s.capture_start);
+    for (p, r) in &s.pauses {
+        expect.pause(*p);
+        expect.resume(*r);
+    }
+    let seams: Vec<f64> = s.pauses.iter().map(|(p, _)| expect.media_at(*p)).collect();
+    let paused_walls: Vec<(f64, f64)> =
+        s.pauses.iter().map(|(p, r)| (s.since_start(*p), s.since_start(*r))).collect();
+    let recorded_media = expect.media_at(s.session_end);
+    eprintln!(
+        "E2E-7: media={:.3}s (expected {recorded_media:.3}s); pauses at media {seams:?}; \
+         paused walls {paused_walls:?}",
+        s.final_media
+    );
+
+    let max_source = s.since_start(s.session_end) + 15.0;
+    let inside_a_pause = |w: f64, margin: f64| {
+        paused_walls.iter().any(|&(p, r)| w > p + margin && w < r - margin)
+    };
+
+    // ---- VIDEO: no frame from inside a pause; every frame where the clock says ----
+    let mut video_series: Vec<(f64, f64)> = Vec::new();
+    // Skip the opening span (see `opening_span`): those frames are copies of the first
+    // captured frame by design, not evidence about pause.
+    let from_frame = ((s.opening_span() + 0.15) * FPS as f64).ceil() as usize;
+    for k in from_frame..s.levels.len() {
+        let media = k as f64 / FPS as f64;
+        let Some(w) = s.frame_wall(k) else { continue };
+        video_series.push((media, w));
+        assert!(
+            !inside_a_pause(w, 0.12),
+            "video frame {k} (media {media:.2}s) was captured at wall {w:.2}s, which is \
+             INSIDE a pause — paused time must not be recorded"
+        );
+        // The frame slot that STRADDLES a seam legitimately carries post-resume
+        // content (its slot spans the freeze), so it is not evidence either way.
+        if seams.iter().any(|&c| (media - c).abs() < 2.0 / FPS as f64) {
+            continue;
+        }
+        assert!(
+            (w - s.wall_at_media(media)).abs() < 0.30,
+            "video frame {k} at media {media:.2}s should be the frame captured at wall \
+             {:.2}s; decoded {w:.2}s",
+            s.wall_at_media(media)
+        );
+    }
+    assert!(video_series.len() > 100, "expected a full video track, got {} frames", video_series.len());
+
+    // ---- AUDIO: same two questions, asked of the chirp ----
+    let mut audio_series: Vec<(f64, f64)> = Vec::new();
+    let mut m = 0.3;
+    while m < s.final_media - 0.3 {
+        if let Some(w) = s.audio_wall(m, max_source) {
+            audio_series.push((m, w));
+            assert!(
+                seams.iter().any(|&c| (m - c).abs() < 0.1) || !inside_a_pause(w, 0.25),
+                "the audio at media {m:.2}s was captured at wall {w:.2}s, INSIDE a pause"
+            );
+            // An analysis window straddling a seam holds both sides at once; its
+            // reading is meaningless, and the seam checks below cover that boundary.
+            if !seams.iter().any(|&c| (m - c).abs() < 0.1) {
+                assert!(
+                    (w - s.wall_at_media(m)).abs() < 0.40,
+                    "the audio at media {m:.2}s should be the sound playing at wall \
+                     {:.2}s; decoded {w:.2}s",
+                    s.wall_at_media(m)
+                );
+            }
+        }
+        m += 0.05;
+    }
+    assert!(audio_series.len() > 100, "expected a decodable audio track, got {} points", audio_series.len());
+
+    // ---- The two streams cut at the SAME media position, on every cycle ----
+    for (i, &seam) in seams.iter().enumerate() {
+        let len = paused_walls[i].1 - paused_walls[i].0;
+        let near = |v: &[(f64, f64)]| -> Vec<(f64, f64)> {
+            v.iter().copied().filter(|(m, _)| (*m - seam).abs() < 0.8).collect()
+        };
+        let vseam = seam_position(&near(&video_series), len * 0.5)
+            .unwrap_or_else(|| panic!("no video seam near media {seam:.2}s (cycle {i})"));
+        let aseam = seam_position(&near(&audio_series), len * 0.5)
+            .unwrap_or_else(|| panic!("no audio seam near media {seam:.2}s (cycle {i})"));
+        eprintln!(
+            "E2E-7: cycle {i}: expected seam at media {seam:.3}s — video {vseam:.3}s, \
+             audio {aseam:.3}s (pause was {len:.2}s)"
+        );
+        assert!(
+            (vseam - seam).abs() < 0.25,
+            "cycle {i}: the video's jump cut must land at media {seam:.3}s, not {vseam:.3}s"
+        );
+        assert!(
+            (aseam - seam).abs() < 0.30,
+            "cycle {i}: the audio's jump cut must land at media {seam:.3}s, not {aseam:.3}s"
+        );
+        assert!(
+            (vseam - aseam).abs() < 0.25,
+            "cycle {i}: audio and video must cut at the SAME media position (video \
+             {vseam:.3}s vs audio {aseam:.3}s) — a stream that freezes early or late \
+             desyncs everything after it"
+        );
+    }
+
+    let _ = std::fs::remove_file(&s.path);
 }

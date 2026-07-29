@@ -191,6 +191,21 @@ pub(super) fn folder_btn<'a>(target: DirTarget) -> Element<'a, Msg> {
     )
 }
 
+/// The folder icon button that OPENS a folder, as opposed to [`folder_btn`], which picks
+/// one. Identical material and glyph — same `folder-open-symbolic` at the same size in the
+/// same translucent pill — so the two read as one affordance throughout settings; only the
+/// message differs. Introduced by DRAGON-419 for the Health page's debug-log row.
+pub(super) fn open_folder_btn<'a>(msg: Msg) -> Element<'a, Msg> {
+    crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::custom(
+            crate::widgets::icons::sized("folder-open-symbolic", 20.0),
+        )
+        .class(standard_button_class())
+        .on_press(msg)
+        .padding(8.0),
+    )
+}
+
 /// A standard text button used as a settings row's control — e.g. a Health row's
 /// remediation action ("Open Settings" / "Request"). `msg` fires on press.
 /// Translucent fill (see [`standard_button_class`]).

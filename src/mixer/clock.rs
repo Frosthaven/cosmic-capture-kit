@@ -83,6 +83,27 @@ impl MediaClock {
         }
     }
 
+    /// Media time at `wall`, allowed to go NEGATIVE for a `wall` before the clock
+    /// started — the honest position of a chunk captured before media 0.
+    ///
+    /// [`media_at`](Self::media_at) CLAMPS that case to 0.0, which is right for the
+    /// video ticker and the render horizon (neither has any use for a position that
+    /// predates the recording) but wrong for placing captured samples: every
+    /// pre-start chunk clamps to the SAME position, frame 0, so they collide — the
+    /// first one lands and every later one reads as entirely-before-the-horizon and
+    /// is dropped whole, even the part of it that belongs in the recording
+    /// (DRAGON-417). With the signed position, a chunk straddling media 0
+    /// contributes exactly its post-0 tail, at the right offset, and only a chunk
+    /// that is wholly before the recording is dropped.
+    pub(crate) fn media_at_signed(&self, wall: Instant) -> f64 {
+        let first = &self.anchors[0];
+        if wall < first.wall {
+            -first.wall.saturating_duration_since(wall).as_secs_f64()
+        } else {
+            self.media_at(wall)
+        }
+    }
+
     /// Whether the clock is paused AT `wall` (same boundary convention as `media_at`).
     pub(crate) fn is_paused_at(&self, wall: Instant) -> bool {
         !self.anchor_at(wall).running
@@ -115,6 +136,27 @@ mod tests {
         let t0 = base();
         let clock = MediaClock::new(t0);
         assert_eq!(clock.media_at(t0 + secs(4.5)), 4.5);
+    }
+
+    #[test]
+    fn media_at_signed_reads_negative_before_the_clock_started() {
+        // The clamping `media_at` does is what collapsed every pre-start audio chunk
+        // onto frame 0, where all but the first were dropped whole (DRAGON-417).
+        let t0 = base();
+        let clock = MediaClock::new(t0);
+        assert_eq!(clock.media_at_signed(t0 - secs(1.25)), -1.25);
+        assert_eq!(clock.media_at_signed(t0), 0.0);
+    }
+
+    #[test]
+    fn media_at_signed_matches_media_at_from_the_start_onward() {
+        let t0 = base();
+        let mut clock = MediaClock::new(t0);
+        clock.pause(t0 + secs(10.0));
+        clock.resume(t0 + secs(25.0));
+        for at in [0.0, 4.5, 10.0, 17.3, 25.0, 28.0] {
+            assert_eq!(clock.media_at_signed(t0 + secs(at)), clock.media_at(t0 + secs(at)));
+        }
     }
 
     #[test]

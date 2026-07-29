@@ -338,10 +338,26 @@ impl App {
                 Task::none()
             }
             CaptureMsg::PipewireCastReady => self.on_pipewire_cast_ready(),
-            CaptureMsg::ShotSaved(path, ok) => {
-                if !ok {
-                    log::warn!("async screenshot failed to save");
-                    return self.finish_session();
+            CaptureMsg::ShotSaved(path, outcome) => {
+                if let Some(failure) = outcome.failure() {
+                    // DRAGON-419 (silent-exit path S2) + DRAGON-415. This was ONE boolean
+                    // collapsing three genuinely different situations, into a silent exit.
+                    // `ShotOutcome` now names which of the three the worker actually hit, so
+                    // the note below is the RIGHT code rather than "grab returned nothing, or
+                    // the write failed" — and the alert can offer the matching advice. A
+                    // worker panic was already noted at its own seam in `capture_flow` (it
+                    // fires first and stays the root cause), so it is not re-noted here.
+                    log::warn!("async screenshot did not deliver: {outcome:?}");
+                    if failure != crate::diag::Failure::WorkerPanic {
+                        crate::diag::note_failure(
+                            failure,
+                            &format!(
+                                "async capture reported {outcome:?}; target {}",
+                                crate::diag::path_shape(&path),
+                            ),
+                        );
+                    }
+                    return self.fail_session();
                 }
                 // Restore focus to where we launched, then share (same as the
                 // direct screencopy screenshot path).
