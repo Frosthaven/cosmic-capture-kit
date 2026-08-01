@@ -203,6 +203,10 @@ fn a_failed_audio_preflight_does_not_start_a_second_session() {
 /// attempt then declines, and the only correct answer is to report that the recording
 /// did not happen. Starting another one records something nobody asked for and hands
 /// back a result nobody is waiting for any more.
+///
+/// WHICH pre-flight the stop lands in now depends on the box (DRAGON-425): the node
+/// pre-flight runs first and can decline before any audio capture is started, so the
+/// count this test reads is 0 or 1 rather than always 1. See the assertion below.
 #[test]
 fn a_stop_during_a_declined_attempt_is_not_answered_with_a_second_recording() {
     let _lock = test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -231,8 +235,16 @@ fn a_stop_during_a_declined_attempt_is_not_answered_with_a_second_recording() {
     let result = wait_done(&handle, Duration::from_secs(90));
     let started = preflights_started() - before;
 
-    assert_eq!(
-        started, 1,
+    // AT MOST one. The claim is that the fallback did not start a second recording, and
+    // both readings satisfy it; which one a box produces is a property of its hardware
+    // (DRAGON-425). Where the node pre-flight can `Use` a node, the attempt starts its
+    // audio pre-flight and is then stopped -> 1. Where it `Decline`s, because the session
+    // renders on a GPU no VAAPI node here can import, the attempt returns before any audio
+    // exists and the stop keeps the CPU path from starting one -> 0. Pinning exactly 1
+    // pinned the pre-DRAGON-425 ordering, in which every attempt paid for real audio
+    // capture before it was allowed to discover it could never encode at all.
+    assert!(
+        started <= 1,
         "a stop was requested during the attempt, so the fallback must not start a second \
          recording; {started} audio pre-flights ran"
     );

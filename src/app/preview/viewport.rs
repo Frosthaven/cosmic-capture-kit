@@ -238,7 +238,7 @@ impl App {
         // Fit the media's NATURAL (logical-point) size, then express it as a fraction of
         // the PHYSICAL pixels (the divisor). A floored hidpi window thus reads ≤ 100%
         // visual at fit — the picture is shown at its natural size, not physical 1:1
-        // (rule 2, DRAGON-221). `source_scale == 1.0` (Linux 1x) makes points ==
+        // (rule 2, DRAGON-221). `source_scale == 1.0` (an unscaled output) makes points ==
         // physical, so `dw / iw` is byte-identical to before.
         let (pw, ph) = preview.display_frame_points();
         let (avail_w, avail_h) = self.preview_viewport(preview);
@@ -317,8 +317,8 @@ impl App {
         // Hug the sizing media: a video's captured footprint (the encode upscales
         // back into it), a still's decoded pixels — in LOGICAL points (the physical
         // dims divided by the source display's backing scale, so a macOS Retina grab
-        // hugs at its true on-screen size, not 2×; `source_scale` is always 1.0 on
-        // Linux, keeping this byte-identical there).
+        // hugs at its true on-screen size, not 2×; `source_scale` is 1.0 on an
+        // unscaled output, keeping this byte-identical there).
         overlay_fit_box(preview.sizing_media_points(), avail, min_w)
     }
 

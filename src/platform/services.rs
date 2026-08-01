@@ -18,6 +18,6 @@
 //! implementation detail of this platform, wired in `main.rs`).
 
 pub use crate::share::{
-    AUTO_COPY_MAX_BYTES, auto_copy_limit_label, copy_text, copy_to_clipboard, join_wifi, notify,
-    open_uri, save_and_open,
+    AUTO_COPY_MAX_BYTES, CopyOutcome, NotifyKind, auto_copy_limit_label, copy_embeds_bytes,
+    copy_text, copy_to_clipboard, join_wifi, notify, open_uri, save_and_open,
 };

@@ -74,16 +74,25 @@ pub enum WindowChromeMsg {
     /// Open a dynamically-sourced URL (a markdown release-note link, DRAGON-177,
     /// whose target is only known at runtime — the `&'static` form can't carry it).
     OpenUrlOwned(String),
-    /// DRAGON-406: open the Windows 10 diagnostics log folder in Explorer (the About
-    /// page's button). The row that emits this only exists on a Windows 10 run — the
-    /// point is that a non-technical customer can reach the file to mail it, without
-    /// being told to navigate to `%LOCALAPPDATA%` by hand. Removed by DRAGON-407.
-    /// A dedicated variant rather than `OpenUrlOwned` so the path never round-trips
-    /// through `cmd /C start`, whose quoting mangles a username with a space in it.
-    /// `cfg(windows)` so Linux and macOS are byte-identical (a message-domain variant
-    /// plus its `update_*` arm is an accepted per-platform cfg site).
+    /// DRAGON-436 (Windows) / DRAGON-415 (macOS): the native failure alert was dismissed
+    /// (or its wait ran out) — end the one-shot session now. `App::fail_session` emits this
+    /// from a `Task` instead of blocking on either platform: `MessageBoxW` does not pump our
+    /// event loop at all (waiting inline would park the thread that owns every one of our
+    /// windows and DWM would ghost them "(Not Responding)"), and `NSAlert::runModal` pumps
+    /// ITS OWN loop but panics winit's re-entrancy guard if that pump nests inside the
+    /// winit-dispatched callback that is still on the stack. `cfg(any(windows,
+    /// target_os = "macos"))` so Linux stays byte-identical (a message-domain variant plus
+    /// its `update_*` arm is an accepted per-platform cfg site).
+    #[cfg(any(windows, target_os = "macos"))]
+    FailureAlertDismissed,
+    /// DRAGON-437: re-drive the capture overlays' native placement. Parameterless like
+    /// `PreviewFinalizeTick` — the handler reads `self.outputs`, so it can never act on a
+    /// stale id. Emitted by `sub_overlay_finalize` (~80ms) while any overlay is still
+    /// unplaced; that timer is the only driver that survives cck being a BACKGROUND process,
+    /// and the only one with a deadline. `cfg(windows)` so Linux and macOS are
+    /// byte-identical.
     #[cfg(windows)]
-    OpenDiagnosticsFolder,
+    OverlayFinalizeTick,
     /// DRAGON-419: open the debug log's folder in the desktop's file manager (the Health
     /// page's Debug row). All platforms — the whole point of this ticket is that macOS and
     /// Linux stopped being second-class here. A dedicated variant rather than `OpenUrlOwned`

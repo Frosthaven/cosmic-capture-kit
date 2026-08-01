@@ -8,4 +8,8 @@ mod detect;
 mod recording;
 mod settings;
 mod permissions;
-mod window_chrome;
+// Visible inside `crate::app` (not just `update`) because `subscriptions` reads its pure
+// decision fns — `overlay_finalize_active` decides whether `sub_overlay_finalize` runs, and
+// that rule belongs next to the tick handler that consumes it, not duplicated at the
+// subscription. Its items stay `pub(in crate::app)`, so nothing leaks past the app.
+pub(in crate::app) mod window_chrome;

@@ -31,11 +31,18 @@ use self::row::{reset_button, severity_caption, severity_title, Severity, Sectio
 pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Settings";
 
 /// Minimum settings-window size (logical px): the window can never open or resize smaller than
-/// this, on all platforms (DRAGON-268 follow-up). Kept in sync with
-/// `App::apply_nav_auto_collapse_on_spawn`'s spawn-width floor in update/window_chrome.rs.
+/// this, on all platforms (DRAGON-268 follow-up). `App::apply_nav_auto_collapse_on_spawn`'s
+/// spawn-width floor in update/window_chrome.rs reads this constant directly.
 /// DRAGON-299: the Windows resize handler also treats a resize BELOW this as winit's spurious
 /// post-show stomp (never a real user resize — the resize border enforces the minimum).
-pub(crate) const MIN_W: f32 = 800.0;
+///
+/// The WIDTH is `924` (DRAGON-435): the settings window shares the preview editor's floor
+/// (`shell::PREVIEW_MIN_W`, the DRAGON-392 owner-measured width — the owner's live settings
+/// window measured 921 on 2026-07-31, same convention, same value). Saved widths below this
+/// are bumped up at the next open (`open_config_window` floors at `MIN_W`). The floor stays
+/// BELOW `NAV_AUTO_COLLAPSE_W` (990), so the nav rail's auto-collapse band (924..990)
+/// remains reachable.
+pub(crate) const MIN_W: f32 = 924.0;
 pub(crate) const MIN_H: f32 = 600.0;
 
 /// macOS (DRAGON-135): width reserved at the header's leading edge for the native
@@ -191,6 +198,28 @@ impl ShortcutsTab {
     }
 }
 
+/// DRAGON-452: what just happened to a global capture-hotkey row, so the rows can SAY it
+/// instead of a duplicate being accepted in silence. Set by the `SetCaptureHotkey` handler
+/// when a chord is recorded, cleared when the next rebind is armed; UI-only, never persisted
+/// (it describes an edit, not a setting).
+///
+/// Gated to the two OSes with daemon-owned global hotkeys, like the rows themselves, so the
+/// Linux settings state stays byte-identical.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CaptureHotkeyNotice {
+    /// The slot the user just recorded a chord into.
+    pub slot: crate::app::CaptureHotkeySlot,
+    /// The slot the chord was TAKEN FROM, if it was already bound elsewhere. That slot is
+    /// now unbound (we steal rather than refuse; see the `SetCaptureHotkey` handler).
+    pub taken_from: Option<crate::app::CaptureHotkeySlot>,
+    /// The OS refused to register the chord: another APP already owns it globally. A second,
+    /// separate failure from our own duplicates, and indistinguishable from them at the
+    /// keyboard, so the row states it too. Windows only, where the settings process can ask
+    /// the OS directly (see `crate::daemon::chord_is_free`).
+    pub os_refused: bool,
+}
+
 /// A pending "reset to defaults" awaiting confirmation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResetScope {
@@ -270,6 +299,11 @@ pub struct SettingsState {
     /// daemon-hotkey OSes so the Linux settings state stays byte-identical.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     pub capture_hotkey_rebinding: Option<crate::app::CaptureHotkeySlot>,
+    /// DRAGON-452: the outcome of the last recorded global capture chord (a binding stolen
+    /// from another row, and/or an OS refusal), shown on the affected rows. `None` until a
+    /// chord is recorded, and cleared again when the next rebind is armed.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub capture_hotkey_notice: Option<CaptureHotkeyNotice>,
 }
 
 impl Default for SettingsState {
@@ -425,6 +459,8 @@ impl SettingsState {
             border_editor: None,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             capture_hotkey_rebinding: None,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            capture_hotkey_notice: None,
         }
     }
 
@@ -672,6 +708,37 @@ impl App {
         {
             if let Ok(exe) = std::env::current_exe() {
                 let _ = std::process::Command::new(exe).arg("--settings").spawn();
+            }
+            return self.teardown();
+        }
+        // Windows 10 (DRAGON-427): the same hand-off, for the renderer instead of the
+        // activation policy. THIS process is rendering with the software rasterizer so its
+        // capture overlay is translucent, and iced binds one compositor per process — so
+        // converting it into the settings pane would give the settings window a CPU
+        // rasterizer. That is the configuration DRAGON-336 tested and rejected: the
+        // microphone test is a live, continuously redrawing level meter, the worst case for
+        // software rasterization, and it starves the audio work it is meant to visualise.
+        // A fresh `--settings` process opens no overlay, so it keeps wgpu.
+        //
+        // Windows 11 (and any build we could not identify) is untouched and still converts
+        // this process in place, exactly as it does today.
+        #[cfg(windows)]
+        if crate::platform::software_overlays() {
+            // The pane is single-instance across processes; a live holder is focused by the
+            // child's own `--settings` launch path, which then exits. So this one spawn is
+            // correct whether or not a pane already exists.
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    let mut cmd = std::process::Command::new(exe);
+                    cmd.arg("--settings");
+                    // Hand the child the user's own `ICED_BACKEND` back rather than ours —
+                    // a child inherits the parent's environment, and ours says software.
+                    crate::app::restore_user_backend_env(&mut cmd);
+                    if let Err(e) = cmd.spawn() {
+                        log::warn!("windows 10: could not spawn the settings process ({e})");
+                    }
+                }
+                Err(e) => log::warn!("windows 10: current_exe failed, no settings window ({e})"),
             }
             return self.teardown();
         }

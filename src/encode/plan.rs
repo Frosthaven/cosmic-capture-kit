@@ -544,28 +544,17 @@ fn vaapi_supports_qvbr(dev: &str, driver: &str, encoder: &str) -> bool {
 
 /// Find a VAAPI-capable render node and its libva driver, skipping nvidia (whose
 /// VAAPI support is unreliable): amdgpu→`radeonsi`, Intel i915/xe→`iHD`.
+///
+/// DRAGON-425 re-expressed this over the shared [`crate::encode::list_render_nodes`] +
+/// [`crate::encode::libva_driver_for`]. Behaviour is unchanged — same sorted walk, same two
+/// mappings, same first-match-wins — but this was the FOURTH copy of the `/dev/dri` walk and
+/// the second copy of the libva table, and the zero-copy path now has to agree with it about
+/// which node is which.
 pub(crate) fn vaapi_device() -> Option<(String, String)> {
-    let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with("renderD").then_some(n)
-        })
-        .collect();
-    nodes.sort();
-    for node in nodes {
-        let driver = std::fs::read_link(format!("/sys/class/drm/{node}/device/driver"))
-            .ok()
-            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()));
-        let libva = match driver.as_deref() {
-            Some("amdgpu") => "radeonsi",
-            Some("i915") | Some("xe") => "iHD",
-            _ => continue,
-        };
-        return Some((format!("/dev/dri/{node}"), libva.to_string()));
-    }
-    None
+    crate::encode::list_render_nodes().into_iter().find_map(|(path, driver)| {
+        let libva = crate::encode::libva_driver_for(&driver)?;
+        Some((path.to_string_lossy().into_owned(), libva.to_string()))
+    })
 }
 
 // ── Windows hardware encoder tier (DRAGON-238) ──────────────────────────────────────

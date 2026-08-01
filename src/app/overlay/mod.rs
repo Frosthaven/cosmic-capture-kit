@@ -44,7 +44,36 @@ fn cursor_sprite_scale(_cursor: &crate::screenshot::CursorSprite, out_scale: f32
 
 /// See the Linux twin above; on macOS the sprite's own scale is the 4th tuple
 /// element. A degenerate (`<= 0`) sprite scale falls back to the output scale.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn cursor_sprite_scale(cursor: &crate::screenshot::CursorSprite, out_scale: f32) -> f32 {
+    let s = cursor.3;
+    if s > 0.0 {
+        s
+    } else {
+        out_scale
+    }
+}
+
+/// Windows (DRAGON-448): a raw cursor-sprite pixel IS one point, so this is always `1.0`.
+///
+/// The 4th `CursorSprite` element means something different here — `platform::windows::
+/// cursor` deliberately stores `96 / dpi`, not a pixels-per-point, because its consumer is
+/// `cursor_for_canvas`, which must UPSCALE the base sprite by `dpi / 96` to reach the
+/// capture's PHYSICAL size. Take that contract at its word and the point size falls out:
+/// if `physical = raw × dpi/96`, then `points = physical / (dpi/96) = raw`. One raw pixel,
+/// one point.
+///
+/// Passing `cursor.3` through (what the shared non-Linux arm did) divided by `96/dpi`
+/// instead, drawing the indicator `(dpi/96)²`-ish too large — a 150% monitor showed a
+/// pointer half again too big, 200% showed it double. Invisible at 96 DPI, where the value
+/// is `1.0` and every reading agrees, which is why a dev box never caught it.
+#[cfg(target_os = "windows")]
+fn cursor_sprite_scale(_cursor: &crate::screenshot::CursorSprite, _out_scale: f32) -> f32 {
+    1.0
+}
+
+/// Any other non-Linux target: keep the macOS reading (the sprite's own scale).
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn cursor_sprite_scale(cursor: &crate::screenshot::CursorSprite, out_scale: f32) -> f32 {
     let s = cursor.3;
     if s > 0.0 {
@@ -66,7 +95,7 @@ impl App {
         // Match the recording border placement (outside for window/monitor) so the
         // outline doesn't shift when the countdown hands off to recording.
         let windowed = sel.is_some_and(|s| s.window_id.is_some() || s.output.is_some());
-        let mut rs = RegionSelection::new(o.logical_pos, rect, |a0| Msg::Capture(CaptureMsg::RegionChange(a0)), Msg::Capture(CaptureMsg::RegionDone))
+        let mut rs = RegionSelection::new(o.units(), rect, |a0| Msg::Capture(CaptureMsg::RegionChange(a0)), Msg::Capture(CaptureMsg::RegionDone))
             .non_interactive()
             .dim_alpha(self.active_overlay_opacity)
             .line_alpha(self.active_overlay_opacity);
@@ -94,7 +123,7 @@ impl App {
             && let Some(s) = self.pending.as_ref()
         {
             let rect = Some(GlobalRect::new(s.x, s.y, s.x + s.width as i32, s.y + s.height as i32));
-            let rs = RegionSelection::new(o.logical_pos, rect, |a0| Msg::Capture(CaptureMsg::RegionChange(a0)), Msg::Capture(CaptureMsg::RegionDone))
+            let rs = RegionSelection::new(o.units(), rect, |a0| Msg::Capture(CaptureMsg::RegionChange(a0)), Msg::Capture(CaptureMsg::RegionDone))
                 .non_interactive()
                 .dim_alpha(self.active_overlay_opacity)
                 .line_alpha(self.active_overlay_opacity);
@@ -165,7 +194,12 @@ impl App {
             // column count is chosen to MAXIMIZE the tile scale for this display, so a
             // monitor with many windows still shows large, legible tiles (DRAGON-193).
             let n = thumbs.len();
-            let (pw, ph) = (o.logical_size.0 as f32, o.logical_size.1 as f32);
+            // The panel is the iced VIEWPORT, so POINTS (DRAGON-448) — every other number
+            // in this block (GAP, the paddings, the toolbar reserve) is already a point
+            // constant. On a scaled Windows monitor `logical_size` is `point_scale`×
+            // bigger, which sized the tiles for a screen that does not exist and spilled
+            // the grid past the bottom of the overlay.
+            let (pw, ph) = o.point_size();
             const GAP: f32 = 24.0;
             // Reserve a band at the BOTTOM for the capture toolbar (stacked over this view,
             // bottom-centred near the screen edge) so the grid never overlaps it: the
@@ -322,7 +356,7 @@ impl App {
         let background: Element<'_, Msg> = match self.mode {
             Mode::Region => {
                 let sel: Element<'_, Msg> = RegionSelection::new(
-                    o.logical_pos,
+                    o.units(),
                     self.region,
                     |a0| Msg::Capture(CaptureMsg::RegionChange(a0)),
                     Msg::Capture(CaptureMsg::RegionDone),
@@ -430,6 +464,11 @@ impl App {
     }
 
     /// Whether the current region (if any) overlaps this output.
+    ///
+    /// Stays entirely in CAPTURE space (DRAGON-448): both the region and the output rect
+    /// are already in it, so there is nothing to bridge — converting either would only
+    /// introduce rounding. The rule is "convert at the boundary with iced", and this
+    /// answers a bool that never reaches one.
     fn region_on_output(&self, o: &OutputState) -> bool {
         let Some(rect) = self.region else {
             return false;
@@ -520,8 +559,12 @@ impl App {
         let sprite_scale = cursor_sprite_scale(self.frozen_cursor.as_ref()?, out_scale);
         let dw = img.width() as f32 / sprite_scale;
         let dh = img.height() as f32 / sprite_scale;
-        let lx = ((*gx - ox) as f32 - *hx as f32 / sprite_scale).max(0.0);
-        let ly = ((*gy - oy) as f32 - *hy as f32 / sprite_scale).max(0.0);
+        // The pointer position is CAPTURE space; the padding below is POINTS (DRAGON-448).
+        // Cross once through this output's bridge, then back off by the hotspot, which is
+        // already expressed in the sprite's own pixels-per-point.
+        let (px, py) = o.units().to_point((*gx, *gy));
+        let lx = (px - *hx as f32 / sprite_scale).max(0.0);
+        let ly = (py - *hy as f32 / sprite_scale).max(0.0);
         // The sprite's handle is built ONCE when the cursor lands (never in view():
         // a per-frame from_rgba mints a new id each call, forcing a GPU re-upload
         // and a fresh atlas entry on every redraw of the drag).

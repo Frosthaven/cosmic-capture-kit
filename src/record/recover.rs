@@ -610,6 +610,7 @@ fn kill_pid(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::time::Instant;
 
     /// A directory of our own, so a test never reads the live runtime dir. Tagged with the
@@ -784,8 +785,15 @@ mod tests {
         let ledger = write_ledger(&run, live_pid, &ledger_lines(777, &temp, &[&mic, &sys]));
         // Make the temp look ANCIENT, so only the ledger stands between it and the
         // unclaimed-temp pass: a paused recording writes nothing for as long as it likes.
+        // Write access: Windows' SetFileTime needs FILE_WRITE_ATTRIBUTES, which a
+        // read-only handle is denied.
         let old = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::File::open(&temp).unwrap().set_modified(old).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
 
         let swept = sweep_in(run.to_str().unwrap(), Some(&cap), 1, true, &|p| p == live_pid);
 
@@ -830,8 +838,14 @@ mod tests {
         let cap = tmp("noclaim-cap");
         let temp = cap.join(".old-take.recording.mkv");
         grown(&temp);
+        // Write access: see a_live_sessions_fifos_and_temp_are_never_touched.
         let old = std::time::SystemTime::now() - Duration::from_secs(3600);
-        std::fs::File::open(&temp).unwrap().set_modified(old).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temp)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         // Stale AND unclaimed — but another instance holds a recording marker, so the
         // inference is refused outright.
         let swept = sweep_in(run.to_str().unwrap(), Some(&cap), 1, false, &|_| false);

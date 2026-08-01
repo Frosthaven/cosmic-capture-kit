@@ -191,7 +191,7 @@ pub struct OpenRequest {
     /// The capture's ON-SCREEN footprint in physical px, when known — `PreviewState::display_dims`.
     pub display_dims: Option<(u32, u32)>,
     /// The SOURCE display's point→pixel backing scale — `PreviewState::source_scale`
-    /// (always `1.0` on Linux). Must be finite and positive.
+    /// (`1.0` on an unscaled output, on every platform). Must be finite and positive.
     pub source_scale: f32,
     /// `true` when previewing a pre-existing file (`--preview`) rather than a fresh
     /// capture — `PreviewState::external`.

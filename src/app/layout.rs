@@ -145,6 +145,12 @@ fn axis_inset(extent: u32) -> i32 {
 /// (where it lays out *vertically* with dims `vbw`×`vbh`). The returned bool is
 /// true for a horizontal placement. The box is centred on the region along its
 /// free axis and clamped on-screen.
+///
+/// **Units (DRAGON-448)**: `sx`/`sy`/`sw`/`sh` are the selection in CAPTURE space (what
+/// `normalized_region` and every `Selection` carry); the box dims and the returned
+/// rectangle are POINTS, because the rectangle becomes iced `Padding` and an input zone.
+/// The crossing happens once, here, through the output's [`OverlayUnits`] — nothing above
+/// or below this function scales anything.
 #[allow(clippy::too_many_arguments)]
 // OutputState is private to app; placement is pub(crate) only to satisfy the
 // re-export in mod.rs; callers are always within app.
@@ -160,12 +166,29 @@ pub(crate) fn placement(
     vbw: f32,
     vbh: f32,
 ) -> Option<(cosmic::iced::Rectangle, bool)> {
-    let ow = o.logical_size.0 as f32;
-    let oh = o.logical_size.1 as f32;
-    let lx = (sx - o.logical_pos.0) as f32;
-    let ly = (sy - o.logical_pos.1) as f32;
-    let lw = sw as f32;
-    let lh = sh as f32;
+    placement_in(o.units(), o.point_size(), (sx, sy, sw, sh), hbw, hbh, vbw, vbh)
+}
+
+/// [`placement`]'s pure body: the same math with the output expressed as its units bridge
+/// plus its POINT extent, so the placement rules can be unit-tested without an
+/// `OutputState` (which owns a live surface id and an output handle). Split out for
+/// DRAGON-448; the arithmetic below is unchanged, only its inputs are now converted.
+#[allow(clippy::too_many_arguments)]
+fn placement_in(
+    units: crate::geometry::OverlayUnits,
+    out_pt: (f32, f32),
+    sel: (i32, i32, u32, u32),
+    hbw: f32,
+    hbh: f32,
+    vbw: f32,
+    vbh: f32,
+) -> Option<(cosmic::iced::Rectangle, bool)> {
+    let (sx, sy, sw, sh) = sel;
+    let (ow, oh) = out_pt;
+    // The selection is CAPTURE space; the box we are placing is POINTS. Cross once.
+    let (lx, ly) = units.to_point((sx, sy));
+    let lw = units.len_to_point(sw as f32);
+    let lh = units.len_to_point(sh as f32);
     if lx + lw <= 0.0 || ly + lh <= 0.0 || lx >= ow || ly >= oh {
         return None;
     }
@@ -202,6 +225,173 @@ pub(crate) fn placement(
         }
     };
     Some((cosmic::iced::Rectangle { x, y, width: bw, height: bh }, horizontal))
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+    use crate::geometry::OverlayUnits;
+
+    /// A toolbar-shaped box: the real horizontal footprint of the non-active toolbar
+    /// (`W_KIND + W_MODE + W_UTIL` plus gaps ≈ 420) and its stacked twin.
+    const H: (f32, f32) = (420.0, 44.0);
+    const V: (f32, f32) = (148.0, 140.0);
+
+    /// One output: its units bridge plus its POINT extent, the two things `placement_in`
+    /// takes. `px` is the monitor's CAPTURE size.
+    fn out(origin: (i32, i32), px: (u32, u32), factor: f32) -> (OverlayUnits, (f32, f32)) {
+        let u = OverlayUnits::new(origin, factor);
+        (u, u.size_to_point(px))
+    }
+
+    fn place(
+        o: (OverlayUnits, (f32, f32)),
+        sel: (i32, i32, u32, u32),
+    ) -> Option<(cosmic::iced::Rectangle, bool)> {
+        placement_in(o.0, o.1, sel, H.0, H.1, V.0, V.1)
+    }
+
+    /// THE regression pin: at factor 1.0 the placement is bit-for-bit what it always was —
+    /// the point extent IS the capture extent and the selection needs no conversion, so
+    /// every existing platform and every 96-DPI Windows box is untouched.
+    #[test]
+    fn factor_one_placement_is_unchanged() {
+        let o = out((0, 0), (1920, 1080), 1.0);
+        // A 600x400 region at (100, 200): the toolbar goes just BELOW it, centred.
+        let (r, horizontal) = place(o, (100, 200, 600, 400)).unwrap();
+        assert!(horizontal);
+        assert_eq!(r.y, 200.0 + 400.0 + BADGE_GAP);
+        assert_eq!(r.x, 100.0 + (600.0 - H.0) / 2.0);
+        assert_eq!((r.width, r.height), H);
+        // A whole-monitor selection has no outside room at all: the inside-top-right
+        // fallback, still horizontal.
+        let (r, horizontal) = place(o, (0, 0, 1920, 1080)).unwrap();
+        assert!(horizontal);
+        assert_eq!(r.x, 1920.0 - H.0 - BADGE_GAP);
+        assert_eq!(r.y, BADGE_GAP);
+    }
+
+    /// The DRAGON-448 defect, in numbers. A 5120x2880 monitor at 150% is a 3413x1920
+    /// VIEWPORT; a region drawn across its right half sits at capture x≈2560, which the old
+    /// code fed straight in as a point coordinate. That is past the viewport's right edge,
+    /// so iced handed the toolbar whatever few points were left and it compressed instead of
+    /// moving — the owner's "started squishing instead of repositioning". Converted, the box
+    /// lands inside the viewport at its NATURAL size.
+    #[test]
+    fn a_scaled_monitor_places_the_toolbar_inside_its_viewport_at_full_size() {
+        let o = out((0, 0), (5120, 2880), 1.5);
+        assert_eq!(o.1, (3413.3333, 1920.0));
+        let (r, _) = place(o, (3000, 200, 2000, 800)).unwrap();
+        // Full natural footprint — the box is never squeezed.
+        assert_eq!((r.width, r.height), H);
+        // ...and entirely inside the viewport iced actually laid out.
+        assert!(r.x >= 0.0 && r.x + r.width <= o.1.0, "x {} escapes {}", r.x, o.1.0);
+        assert!(r.y >= 0.0 && r.y + r.height <= o.1.1, "y {} escapes {}", r.y, o.1.1);
+        // The un-converted number the old code produced was past the viewport's right edge,
+        // which is what left the toolbar only a sliver of width to lay out in.
+        let raw_cx = 3000.0 + (2000.0 - H.0) / 2.0;
+        assert!(raw_cx > o.1.0, "the pre-fix x {raw_cx} was past the {}pt viewport", o.1.0);
+        assert!(r.x + r.width <= raw_cx, "the converted x must be well left of the old one");
+    }
+
+    /// The placement never leaves the viewport, at any scale, for any selection anywhere on
+    /// the monitor — the property the toolbar's reachability depends on.
+    #[test]
+    fn the_placed_box_never_escapes_the_viewport() {
+        for factor in [1.0f32, 1.25, 1.5, 2.0, 3.0] {
+            let o = out((0, 0), (3840, 2160), factor);
+            let (ow, oh) = o.1;
+            for x in [0i32, 500, 1920, 3000, 3839] {
+                for y in [0i32, 500, 1080, 2159] {
+                    for (w, h) in [(1u32, 1u32), (400, 300), (2000, 1200), (3840, 2160)] {
+                        let Some((r, _)) = place(o, (x, y, w, h)) else {
+                            continue;
+                        };
+                        assert!(r.x >= 0.0, "factor {factor} sel {x},{y} {w}x{h}: x {}", r.x);
+                        assert!(r.y >= 0.0, "factor {factor} sel {x},{y} {w}x{h}: y {}", r.y);
+                        // The box itself may legitimately be wider than a tiny viewport;
+                        // otherwise it must fit entirely inside.
+                        if r.width <= ow {
+                            assert!(
+                                r.x + r.width <= ow + 0.001,
+                                "factor {factor} sel {x},{y} {w}x{h}: right {} > {ow}",
+                                r.x + r.width
+                            );
+                        }
+                        if r.height <= oh {
+                            assert!(
+                                r.y + r.height <= oh + 0.001,
+                                "factor {factor} sel {x},{y} {w}x{h}: bottom {} > {oh}",
+                                r.y + r.height
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A two-monitor desktop with DIFFERENT factors — the owner's 150% primary next to a
+    /// 100% secondary — resolves EACH overlay against its own viewport. A selection wholly
+    /// on one monitor places nothing on the other, and the same capture rect straddling both
+    /// lands at a different point position on each.
+    #[test]
+    fn mixed_dpi_monitors_place_independently() {
+        // Primary: 5120x2880 at 150% (3413x1920 points), at the origin.
+        let hi = out((0, 0), (5120, 2880), 1.5);
+        // Secondary: an 800x480 panel at 100%, abutting it at capture x=5120.
+        let lo = out((5120, 0), (800, 480), 1.0);
+        assert_eq!(lo.1, (800.0, 480.0));
+
+        // A region entirely on the secondary: the primary declines it, the secondary places
+        // it just below, in its own (unscaled) point space.
+        let on_lo = (5200, 100, 300, 200);
+        assert!(place(hi, on_lo).is_none(), "a region on the other monitor must not place");
+        let (r, _) = place(lo, on_lo).unwrap();
+        assert_eq!(r.y, 100.0 + 200.0 + BADGE_GAP);
+        assert!(r.x >= 0.0 && r.x + r.width <= lo.1.0);
+
+        // A region entirely on the primary: the secondary declines it.
+        let on_hi = (200, 200, 600, 400);
+        assert!(place(lo, on_hi).is_none());
+        let (r, _) = place(hi, on_hi).unwrap();
+        // Converted through 1.5: the region is at 133,133 points, 400x267 points.
+        assert!((r.y - (400.0 / 1.5 + 200.0 / 1.5 + BADGE_GAP)).abs() < 0.01);
+
+        // A region STRADDLING both gets a placement on each, each inside its own viewport —
+        // and at different point coordinates, because the factors differ. Note the two
+        // monitors even pick DIFFERENT SIDES: the same capture rect leaves room below it on
+        // the tall 1920pt primary and none on the 480pt secondary, which puts it above
+        // there. That is each output being judged on its own extent, which is the whole
+        // point of a per-output factor.
+        let both = (4800, 300, 800, 200);
+        let (rh, _) = place(hi, both).unwrap();
+        let (rl, _) = place(lo, both).unwrap();
+        assert!(rh.x >= 0.0 && rh.x + rh.width <= hi.1.0 + 0.001);
+        assert!(rl.x >= 0.0 && rl.x + rl.width <= lo.1.0 + 0.001);
+        assert!(rh.y + rh.height <= hi.1.1 && rl.y + rl.height <= lo.1.1);
+        assert_ne!(rh.y, rl.y, "one global scale would have given both the same y");
+        // Primary: below the region, in ITS point space (300/1.5 + 200/1.5 + gap).
+        assert!((rh.y - (300.0 / 1.5 + 200.0 / 1.5 + BADGE_GAP)).abs() < 0.01, "{}", rh.y);
+        // Secondary: no room below on a 480pt-tall panel, so above it (300 - gap - 44).
+        assert_eq!(rl.y, 300.0 - BADGE_GAP - H.1);
+    }
+
+    /// A selection that touches none of this output places nothing — the check that decides
+    /// it now runs in POINT space, so it has to survive scaling too (DRAGON-207 then routes
+    /// that output's toolbar to its own bottom-centre).
+    #[test]
+    fn a_selection_off_this_output_places_nothing_at_any_scale() {
+        for factor in [1.0f32, 1.5, 2.0, 3.0] {
+            let o = out((0, 0), (3840, 2160), factor);
+            assert!(place(o, (-500, 100, 200, 200)).is_none(), "left of it, factor {factor}");
+            assert!(place(o, (100, -500, 200, 200)).is_none(), "above it, factor {factor}");
+            assert!(place(o, (4000, 100, 200, 200)).is_none(), "right of it, factor {factor}");
+            assert!(place(o, (100, 3000, 200, 200)).is_none(), "below it, factor {factor}");
+            // Just overlapping by one capture unit still counts.
+            assert!(place(o, (-199, 100, 200, 200)).is_some(), "factor {factor}");
+        }
+    }
 }
 
 #[cfg(test)]

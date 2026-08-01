@@ -212,8 +212,12 @@ pub struct PreviewState {
     /// The SOURCE display's point→pixel backing scale (2.0 on a Retina panel). The
     /// capture arrives in PHYSICAL pixels; dividing by this yields the LOGICAL points
     /// the picture occupied on screen, which is what the WINDOW preview opens at (so a
-    /// Retina grab isn't shown 2× too large). Always `1.0` on Linux — the compositor's
-    /// screencopy already lands logical-sized — so the open-fit math there is unchanged.
+    /// Retina grab isn't shown 2× too large). Resolved on EVERY platform from the SOURCE
+    /// output's own reported scale (`App::scale_for_selection`: the COSMIC output's buffer
+    /// scale on Linux, `NSScreen.backingScaleFactor` on macOS, `GetDpiForMonitor / 96` on
+    /// Windows) — `1.0` only on an unscaled panel, on a `--preview` file, or when the
+    /// source output can't be resolved. On those `1.0` cases every consumer stays
+    /// byte-identical, which is what makes this safe to thread everywhere.
     pub source_scale: f32,
     /// Index into the kind's loading-message array (picked at open time).
     pub loading_msg: usize,
@@ -403,9 +407,10 @@ impl PreviewState {
     /// [`Self::sizing_media`] converted from PHYSICAL pixels into the LOGICAL points
     /// the picture occupied on its SOURCE display — what the WINDOW preview opens to
     /// and re-fits against, so a high-DPI capture is shown at its true on-screen size
-    /// rather than 2× (`source_scale` is the source display's backing scale). On Linux
-    /// `source_scale` is always `1.0`, so this returns the physical dims unchanged and
-    /// the open-fit math stays byte-identical.
+    /// rather than 2× (`source_scale` is the source display's backing scale, resolved on
+    /// every platform — see [`PreviewState::source_scale`]). On an UNSCALED output
+    /// `source_scale` is `1.0`, so this returns the physical dims unchanged and the
+    /// open-fit math stays byte-identical.
     pub(super) fn sizing_media_points(&self) -> (u32, u32) {
         sizing::to_points(self.sizing_media(), self.source_scale)
     }
@@ -413,7 +418,7 @@ impl PreviewState {
     /// The decoded frame (`edit.frame`, PHYSICAL capture pixels) in LOGICAL points —
     /// the media's true on-screen size. The DISPLAY fit caps at this (rule 2): a hidpi
     /// capture is never drawn larger than its natural size, even in a floored window
-    /// whose canvas is bigger than the picture. `source_scale == 1.0` (all Linux 1x)
+    /// whose canvas is bigger than the picture. `source_scale == 1.0` (an unscaled output)
     /// returns the physical dims unchanged, so the fit is byte-identical there.
     pub(super) fn frame_points(&self) -> (u32, u32) {
         sizing::to_points(self.edit.frame, self.source_scale)
@@ -810,6 +815,10 @@ impl App {
         }
         match message {
             PreviewMsg::ImageReady(handle, original) => {
+                // DRAGON-454: back on the UI thread with the decoded pixels. The body below
+                // COPIES them again for the effects shader, which on a 5K capture is tens of
+                // megabytes of memcpy in the update loop — worth its own pair of marks.
+                crate::util::timing_mark("preview: ImageReady on the UI thread (begin)");
                 if let Some(PreviewState { kind: PreviewKind::Image(img), edit, .. }) =
                     self.preview_for_mut(id)
                 {
@@ -824,6 +833,9 @@ impl App {
                     img.image = Some(handle);
                     img.original = original;
                 }
+                crate::util::timing_mark(
+                    "preview: ImageReady stored (fx_base copied; the media is now loaded)",
+                );
                 // Launch default is "Fit to screen" (the whole picture in view). When the shot
                 // fits at native size, Fit and 100% are identical — so we keep the "Fit to
                 // screen" label rather than relabelling it 100%.
@@ -837,7 +849,14 @@ impl App {
                 // first configure).
                 let refit = match self.preview_for(id) {
                     Some(p) if p.surface.is_window() => {
-                        let out = self.preview_output.as_ref().map(|(_, o)| *o);
+                        // LOGICAL POINTS (DRAGON-449), the same space the OPEN fit measured in
+                        // and the same space `target` below is in. Leaving this bound in CAPTURE
+                        // space would make the re-fit disagree with the size the window just
+                        // opened at on a scaled display, and "fix" it every time.
+                        let out = self
+                            .preview_output
+                            .as_ref()
+                            .map(|(n, o)| monitor_fit_points(*o, monitor_point_scale(Some(n))));
                         // Windows (DRAGON-288): an external `--preview` has no capture anchor,
                         // so `out` is None and the shared fit below would native-size the
                         // window (spilling a large picture off-screen). Fall back to the
@@ -845,7 +864,7 @@ impl App {
                         // like the open fit — additive, Linux/mac keep `out` unchanged.
                         #[cfg(windows)]
                         let out = out.or_else(|| {
-                            crate::platform::windows::window::preview_window_monitor_size(
+                            crate::platform::windows::window::preview_window_monitor_points(
                                 super::shell::PREVIEW_WINDOW_TITLE,
                             )
                         });
@@ -889,6 +908,15 @@ impl App {
                 // Keep the window focused as the spinner gives way to the image (the surface
                 // teardown behind the load could otherwise steal focus).
                 Task::batch([refit.unwrap_or_else(Task::none), self.focus_preview_window(id)])
+            }
+            PreviewMsg::AutoCopied(ok) => {
+                // The open-time copy's worker finished (DRAGON-454). Its whole visible effect
+                // is this toast — which is exactly why the write itself no longer sits on the
+                // UI thread. A document that closed while the copy was in flight simply has no
+                // toast queue left, and `preview_toast_icon` is already a no-op for one.
+                crate::util::timing_mark("preview: auto-copy outcome landed (toast posted)");
+                self.toast_copy_outcome(id, ok);
+                Task::none()
             }
             PreviewMsg::Covermark => {
                 // Toggle the covermark flyout. Open with the APPLIED mark highlighted (its
@@ -1721,14 +1749,19 @@ impl App {
                 // The overlay needs nothing: its hugging viewport re-reads live.
                 let refit = match (self.preview_for(id), meta) {
                     (Some(p), Some(_)) if p.surface.is_window() => {
-                        let out = self.preview_output.as_ref().map(|(_, o)| *o);
+                        // LOGICAL POINTS (DRAGON-449) — the open fit's space; see the still
+                        // path's note above for why the two must agree.
+                        let out = self
+                            .preview_output
+                            .as_ref()
+                            .map(|(n, o)| monitor_fit_points(*o, monitor_point_scale(Some(n))));
                         // Windows (DRAGON-288): an external `--preview` video has no capture
                         // anchor (`out` None) — bound the fit to the preview window's LIVE
                         // monitor instead of native-sizing it off-screen. Additive; Linux/mac
                         // keep `out` unchanged.
                         #[cfg(windows)]
                         let out = out.or_else(|| {
-                            crate::platform::windows::window::preview_window_monitor_size(
+                            crate::platform::windows::window::preview_window_monitor_points(
                                 super::shell::PREVIEW_WINDOW_TITLE,
                             )
                         });
@@ -1812,7 +1845,45 @@ impl App {
                 // lost capture, but the editor the user was waiting for is never going to
                 // appear — say so, then close exactly as `Cancel` does (which ends the
                 // process only if this was the last document).
+                //
+                // DRAGON-436 round 2 (Windows) / DRAGON-415 (macOS): "say so, THEN close" has
+                // to be sequenced by hand on both platforms — neither may close inline. A
+                // `MessageBox` does not block, and on Windows this close almost always ends
+                // the PROCESS — the preview is single-document there (`preview_host` is
+                // cfg(unix), and a handoff spawns a fresh process), so `Cancel` reaches
+                // `finish_session` and its 1.5s hard exit within milliseconds, killing the
+                // alert thread before anyone could read a word. `NSAlert::runModal` DOES
+                // block, but only safely off the winit thread (see `platform::mac::alert`'s
+                // module doc), so mac needs the exact same deferral. Both wait for the
+                // dismissal (or, on Windows, its 120s bound) before closing.
+                #[cfg(windows)]
+                if let Some(dismissal) = self.show_failure_alert() {
+                    return Task::perform(super::failure::await_dismissal(dismissal), move |()| {
+                        cosmic::Action::App(Msg::Preview(
+                            id,
+                            PreviewMsg::LoadFailedAlertDismissed,
+                        ))
+                    });
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(dismissal) = self.report_failure_deferred() {
+                    return Task::perform(super::failure::await_mac_dismissal(dismissal), move |()| {
+                        cosmic::Action::App(Msg::Preview(
+                            id,
+                            PreviewMsg::LoadFailedAlertDismissed,
+                        ))
+                    });
+                }
+                // Nothing was shown (suppressed, or no presenter), so there is nothing to
+                // wait for and the close happens now, exactly as it always did.
+                #[cfg(not(any(windows, target_os = "macos")))]
                 self.report_failure();
+                self.update_preview(id, PreviewMsg::Cancel)
+            }
+            #[cfg(any(windows, target_os = "macos"))]
+            PreviewMsg::LoadFailedAlertDismissed => {
+                // The alert has been read (or, on Windows, waited out). Run the close the
+                // `LoadFailed` arm was holding — the SAME `Cancel` it would have run inline.
                 self.update_preview(id, PreviewMsg::Cancel)
             }
             PreviewMsg::Cancel => {
@@ -1973,11 +2044,21 @@ impl App {
                         };
                         // Annotations + dim + crop are IMAGES only; a video never accumulates them.
                         // The curve radius is a POINT preset baked at SOURCE px (DRAGON-383);
-                        // identity on Linux/1x.
+                        // identity on an unscaled (1x) output.
                         (src, p.edit.covermark.clone(), p.edit.annotations.clone(), annotate::points_to_source_px(p.edit.curve_radius(), p.source_scale), p.edit.dim, p.edit.crop, video, is_video, p.dirty())
                     }
                     None => return self.close_preview(id),
                 };
+                // DRAGON-455: a STILL is written as PNG, so the destination NAMES png
+                // whatever the user typed into the box. Forced HERE, in the shared tree, on
+                // the path the dialog handed back — the three native panels each let a
+                // foreign extension through in their own way (the Windows Common Item
+                // Dialog through its all-files entry, `NSSavePanel` and the xdg portal by
+                // simply allowing it), so one platform-local guard could never hold the
+                // rule. `png_name` is idempotent, so a panel that already appended `.png`
+                // is left exactly as it is. A RECORDING keeps the container the user chose;
+                // `bake_video` really does honour it.
+                let dest = if is_video { dest } else { naming::png_name(&dest) };
                 // Only bake when there's something to apply AND we can (video needs meta).
                 // The `video.is_some()` term is now unreachable defence: `PreviewMsg::SaveAs`
                 // REFUSES a dirty document whose media can't bake before the picker even
@@ -1996,9 +2077,9 @@ impl App {
                     p.edit.baking = true;
                     p.edit.processing_msg = processing_msg;
                 }
-                // Export in the BACKGROUND: bake straight to the destination, or plainly
-                // COPY when nothing needs baking. Await it via a task only so the app
-                // stays alive until the file lands.
+                // Export in the BACKGROUND: bake straight to the destination, or deliver
+                // the file as it stands when nothing needs baking. Await it via a task
+                // only so the app stays alive until the file lands.
                 //
                 // DRAGON-353: never a MOVE. Save As RETARGETS the document at `dest` (a
                 // later Save writes there, with no `-edited` derivation — the user chose
@@ -2028,18 +2109,41 @@ impl App {
                         }
                         result.is_ok()
                     } else {
-                        // Nothing to bake: copy the file as it stands. Saving over ITSELF
-                        // (dest == src) would truncate it, so that degenerate pick is a
-                        // success with no work.
+                        // Nothing to bake. Saving over ITSELF (dest == src) would truncate
+                        // it, so that degenerate pick is a success with no work.
                         let same_file = std::fs::canonicalize(&src)
                             .ok()
                             .zip(std::fs::canonicalize(&dest).ok())
                             .is_some_and(|(a, b)| a == b);
-                        same_file || std::fs::copy(&src, &dest).is_ok()
+                        if same_file {
+                            true
+                        } else if is_video {
+                            // A recording is already in one of the containers `bake_video`
+                            // writes, so its bytes go straight across.
+                            std::fs::copy(&src, &dest).is_ok()
+                        } else {
+                            // DRAGON-455: a STILL never reached `bake_image` on this path —
+                            // it was a bare `fs::copy` here, which is how an unedited Save As
+                            // to `shot.jpg` produced PNG bytes under a `.jpg` name while an
+                            // edited one produced a real JPEG. The destination is forced to
+                            // `.png` above, so a byte copy is now the CORRECT answer for a
+                            // PNG source (and keeps its `--inspect` chunk for free); a
+                            // non-PNG source is re-written as a real PNG instead. That whole
+                            // decision, and why the copy is deliberate rather than
+                            // incidental, lives in `edit::save_unedited_still`.
+                            match edit::save_unedited_still(&src, &dest) {
+                                Ok(_) => true,
+                                Err(e) => {
+                                    log::warn!("preview save failed (Save As, unedited): {e}");
+                                    false
+                                }
+                            }
+                        }
                     };
-                    if ok {
-                        crate::platform::services::notify(&dest, false);
-                    }
+                    // DRAGON-451: a system notification used to fire here on success. Save As
+                    // is driven from an editor that stays on screen and reports the result in
+                    // its own toast (`SaveAsBaked` below), so a desktop banner for it was a
+                    // duplicate. The system channel is now the editor-LESS one.
                     let _ = tx.send(ok);
                 });
                 Task::perform(rx, move |res| {

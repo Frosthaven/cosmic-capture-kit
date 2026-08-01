@@ -12,6 +12,14 @@
 //! border + corner handles, reporting the rectangle in GLOBAL compositor
 //! coordinates (which the native screencopy capture crops to). Single-surface
 //! for now.
+//!
+//! **Units (DRAGON-448).** Everything iced gives this widget — cursor positions, the
+//! layout bounds — is POINT space, while the rectangle it reports and the marks/words it
+//! hit-tests are CAPTURE space (physical pixels on Windows, points elsewhere). The
+//! [`OverlayUnits`] handed to [`RegionSelection::new`] is the only bridge, and the
+//! on-screen "feel" constants below (grab radii, drag thresholds, the monitor-edge wall
+//! break) are POINT distances converted through it, so a handle stays the same size on
+//! screen at 100% and at 300%.
 
 use cosmic::iced::core::renderer::Quad;
 use cosmic::iced::core::widget::{Tree, tree};
@@ -20,7 +28,7 @@ use cosmic::iced::core::{
     keyboard, mouse,
 };
 use cosmic::widget::Widget;
-use crate::geometry::{Corner, Edge, GlobalRect, point_in_quad};
+use crate::geometry::{Corner, Edge, GlobalRect, OverlayUnits, point_in_quad};
 
 /// Callback for a right-click on an OCR word: `(reading index, global x, global y)`.
 type WordMenuFn<Msg> = dyn Fn(usize, i32, i32) -> Msg;
@@ -32,6 +40,10 @@ type TextExpandFn<Msg> = dyn Fn(usize, u8) -> Msg;
 const HANDLE_GRAB: f32 = 16.0; // corner hit radius (px)
 const EDGE_GRAB: f32 = 8.0; // edge hit thickness (px)
 const NEW_THRESHOLD: f32 = 4.0; // px of movement before a click becomes a new drag
+/// How far a second press may land from the first and still count as a double/triple
+/// click. Point-space like the rest of the feel constants (DRAGON-448) — it was an inline
+/// `5` before, which on a 300% monitor meant under two points of tolerance.
+const CLICK_SLOP: f32 = 5.0;
 // DRAGON-206/210 monitor-edge WALL: a dragged edge STOPS at the border and stays pinned
 // there until the cursor pushes `EDGE_BREAK` px past it, then it breaks through and tracks
 // the cursor 1:1 (offset by the break, so it is continuous with no jump). You must
@@ -236,7 +248,9 @@ fn wall_rect(
 }
 
 pub struct RegionSelection<Msg> {
-    origin: (i32, i32),
+    /// CAPTURE ↔ POINT bridge for the output this overlay covers (DRAGON-448): its origin
+    /// in capture space plus that monitor's capture-units-per-point.
+    units: OverlayUnits,
     region: Option<GlobalRect>,
     on_change: Box<dyn Fn(GlobalRect) -> Msg>,
     on_done: Msg,
@@ -277,13 +291,13 @@ pub struct RegionSelection<Msg> {
 
 impl<Msg> RegionSelection<Msg> {
     pub fn new(
-        origin: (i32, i32),
+        units: OverlayUnits,
         region: Option<GlobalRect>,
         on_change: impl Fn(GlobalRect) -> Msg + 'static,
         on_done: Msg,
     ) -> Self {
         Self {
-            origin,
+            units,
             region,
             on_change: Box::new(on_change),
             on_done,
@@ -324,6 +338,16 @@ impl<Msg> RegionSelection<Msg> {
         self.on_hover_mark = Some(Box::new(on_hover));
         self.on_activate_mark = Some(Box::new(on_activate));
         self
+    }
+
+    /// An on-screen "feel" distance (a grab radius, a drag threshold, the monitor-edge
+    /// wall break) in CAPTURE units (DRAGON-448). The constants are tuned in POINTS —
+    /// what the user's hand actually experiences — while the hit-testing they feed runs
+    /// in capture space, so they cross once here. Identity at `factor == 1.0`, so every
+    /// existing platform keeps its exact tuning; on a 300% Windows monitor a 16-point
+    /// corner handle stays 16 points wide instead of shrinking to 5.
+    fn grab(&self, points: f32) -> f32 {
+        self.units.len_to_capture(points)
     }
 
     /// The app index of the mark containing global point `g`, if any.
@@ -471,14 +495,18 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
             Grab::None => {}
         }
         if let (Some(p), Some(rect)) = (cursor.position(), self.region.map(GlobalRect::normalize)) {
-            let g = (p.x as i32 + self.origin.0, p.y as i32 + self.origin.1);
-            if let Some(c) = rect.corner_at(g, HANDLE_GRAB) {
+            let g = self.units.to_capture((p.x, p.y));
+            if let Some(c) = rect.corner_at(g, self.grab(HANDLE_GRAB)) {
                 return corner_cursor(c);
             }
             // DRAGON-208: the wall handle is a bigger, easier target than the thin edge...
             if let Some(e) = rect
-                .edge_handle_at(g, WALL_HANDLE_LEN / 2.0 + GRAB_PAD, HANDLE_GRAB_PERP)
-                .or_else(|| rect.edge_at(g, EDGE_GRAB))
+                .edge_handle_at(
+                    g,
+                    self.grab(WALL_HANDLE_LEN / 2.0 + GRAB_PAD),
+                    self.grab(HANDLE_GRAB_PERP),
+                )
+                .or_else(|| rect.edge_at(g, self.grab(EDGE_GRAB)))
             {
                 // ...but the whole edge still resizes.
                 return edge_cursor(e);
@@ -517,7 +545,12 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
         // Post-enter cursor re-assert (DRAGON-331; see `crate::widgets::cursor_reassert`): maintain
         // the entry stamp + schedule the dip/deadline redraws. Non-consuming.
         crate::widgets::cursor_reassert::arm(&mut state.entered_at, event, shell);
-        let to_global = |p: Point| (p.x as i32 + self.origin.0, p.y as i32 + self.origin.1);
+        // POINT (iced) → CAPTURE (the reported rectangle + the hit-tested marks/words).
+        let to_global = |p: Point| self.units.to_capture((p.x, p.y));
+        // The on-screen feel constants, in capture units for this output.
+        let (new_threshold, edge_break) =
+            (self.grab(NEW_THRESHOLD), self.grab(EDGE_BREAK as f32) as i32);
+        let click_slop = self.grab(CLICK_SLOP) as i32;
         match event {
             // Right-click on a word opens its copy menu.
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
@@ -551,8 +584,8 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                 state.click_count = match state.last_click {
                     Some((t, lp))
                         if now.duration_since(t).as_millis() <= 400
-                            && (lp.0 - g.0).abs() <= 5
-                            && (lp.1 - g.1).abs() <= 5 =>
+                            && (lp.0 - g.0).abs() <= click_slop
+                            && (lp.1 - g.1).abs() <= click_slop =>
                     {
                         state.click_count + 1
                     }
@@ -560,7 +593,7 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                 };
                 state.last_click = Some((now, g));
                 if let Some(rect) = self.region.map(GlobalRect::normalize) {
-                    if let Some(c) = rect.corner_at(g, HANDLE_GRAB) {
+                    if let Some(c) = rect.corner_at(g, self.grab(HANDLE_GRAB)) {
                         state.orig = rect.to_tuple();
                         state.grab = Grab::Resize(c);
                         return shell.capture_event();
@@ -568,8 +601,12 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                     // DRAGON-208: the wall handle is the easy target, but the whole edge
                     // still starts an edge resize.
                     if let Some(e) = rect
-                        .edge_handle_at(g, WALL_HANDLE_LEN / 2.0 + GRAB_PAD, HANDLE_GRAB_PERP)
-                        .or_else(|| rect.edge_at(g, EDGE_GRAB))
+                        .edge_handle_at(
+                            g,
+                            self.grab(WALL_HANDLE_LEN / 2.0 + GRAB_PAD),
+                            self.grab(HANDLE_GRAB_PERP),
+                        )
+                        .or_else(|| rect.edge_at(g, self.grab(EDGE_GRAB)))
                     {
                         state.orig = rect.to_tuple();
                         state.grab = Grab::ResizeEdge(e);
@@ -650,7 +687,7 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                     // (otherwise the release toggles the single word).
                     if state.ctrl_pending.is_some() {
                         let (dx, dy) = ((q.0 - state.press.0) as f32, (q.1 - state.press.1) as f32);
-                        if dx.hypot(dy) <= NEW_THRESHOLD {
+                        if dx.hypot(dy) <= new_threshold {
                             return shell.capture_event();
                         }
                         state.ctrl_pending = None;
@@ -668,7 +705,7 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                 if !state.moved {
                     let dx = (q.0 - state.press.0) as f32;
                     let dy = (q.1 - state.press.1) as f32;
-                    if dx.hypot(dy) > NEW_THRESHOLD {
+                    if dx.hypot(dy) > new_threshold {
                         state.moved = true;
                     }
                 }
@@ -677,7 +714,7 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                     Grab::PendingNew => {
                         let dx = (q.0 - state.press.0) as f32;
                         let dy = (q.1 - state.press.1) as f32;
-                        if dx.hypot(dy) <= NEW_THRESHOLD {
+                        if dx.hypot(dy) <= new_threshold {
                             return shell.capture_event();
                         }
                         state.grab = Grab::New;
@@ -705,13 +742,16 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                 let new = if state.mods.alt() {
                     new
                 } else {
+                    // The surface's bounds are POINTS; the wall is fought in CAPTURE
+                    // space, so widen them to the output's true capture rect.
+                    let (ox, oy) = self.units.origin();
                     let ob = (
-                        self.origin.0,
-                        self.origin.1,
-                        self.origin.0 + bounds.width.round() as i32,
-                        self.origin.1 + bounds.height.round() as i32,
+                        ox,
+                        oy,
+                        ox + self.units.len_to_capture(bounds.width).round() as i32,
+                        oy + self.units.len_to_capture(bounds.height).round() as i32,
                     );
-                    wall_rect(new, state.grab, ob, EDGE_BREAK)
+                    wall_rect(new, state.grab, ob, edge_break)
                 };
                 shell.publish((self.on_change)(GlobalRect::from_tuple(new)));
                 shell.capture_event();
@@ -801,12 +841,13 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
             );
         };
 
+        // CAPTURE (the reported rectangle) → POINT (what the renderer draws in).
         let local = self.region.and_then(|reg| {
             let (l, t, r, bm) = reg.normalize().to_tuple();
-            let ll = ((l - self.origin.0) as f32).clamp(0.0, w);
-            let tt = ((t - self.origin.1) as f32).clamp(0.0, h);
-            let rr = ((r - self.origin.0) as f32).clamp(0.0, w);
-            let bb = ((bm - self.origin.1) as f32).clamp(0.0, h);
+            let (ll, tt) = self.units.to_point((l, t));
+            let (rr, bb) = self.units.to_point((r, bm));
+            let (ll, tt) = (ll.clamp(0.0, w), tt.clamp(0.0, h));
+            let (rr, bb) = (rr.clamp(0.0, w), bb.clamp(0.0, h));
             (rr - ll >= 1.0 && bb - tt >= 1.0).then_some((ll, tt, rr, bb))
         });
 
@@ -823,10 +864,11 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                 // selection continues onto an adjacent output) is hidden, so a
                 // cross-monitor selection looks seamless.
                 let (gl, gt, gr, gb) = self.region.map(|r| r.normalize().to_tuple()).unwrap_or_default();
-                let mx0 = self.origin.0;
-                let my0 = self.origin.1;
-                let mx1 = mx0 + w as i32;
-                let my1 = my0 + h as i32;
+                // The monitor's own borders, in CAPTURE space (the space `gl..gb` are in):
+                // the surface bounds are points, so widen them by this output's factor.
+                let (mx0, my0) = self.units.origin();
+                let mx1 = mx0 + self.units.len_to_capture(w) as i32;
+                let my1 = my0 + self.units.len_to_capture(h) as i32;
                 let (show_l, show_r, show_t, show_b) = (gl >= mx0, gr <= mx1, gt >= my0, gb <= my1);
                 let mut accent = crate::app::theme::accent(theme);
                 accent.a = self.line_alpha;

@@ -65,16 +65,14 @@ impl crate::app::App {
             "Free forever. Donations help keep development going.",
             donate_button(),
         )];
-        let mut sections = vec![
+        let sections = vec![
             SectionSpec { title: "About this software", items },
             SectionSpec { title: "Supporting this project", items: support },
         ];
-        // DRAGON-406: on WINDOWS, a section that names the diagnostics report folder and
-        // opens it. Telling someone to navigate to %LOCALAPPDATA% by hand is how "please
-        // send me the log" fails in practice. `diagnostics_section` returns `None` on every
-        // other platform. DRAGON-408 widened it from Windows 10 to all Windows builds, since
-        // a control sample from a machine where the overlay WORKS is now the point.
-        sections.extend(diagnostics_section());
+        // DRAGON-407 removed the Windows-only "Troubleshooting" section that named the
+        // DRAGON-406 report folder and opened it. That instrument is gone; the Health page's
+        // Debug row (DRAGON-419) is the one place that offers a log folder now, on every
+        // platform.
         sections
     }
 
@@ -169,48 +167,6 @@ impl crate::app::App {
             ),
         ]
     }
-}
-
-/// DRAGON-406: the Windows diagnostics section — the report folder's path as the row
-/// description, with a button that opens it in Explorer. `None` on every other platform.
-/// DRAGON-408: shown on every Windows build (`diag::enabled()` is now unconditionally true),
-/// because a report from a machine where the overlay renders CORRECTLY is as wanted as one
-/// from a machine where it does not.
-fn diagnostics_section<'a>() -> Option<SectionSpec<'a>> {
-    #[cfg(windows)]
-    {
-        if !crate::platform::windows::diag::enabled() {
-            return None;
-        }
-        let dir = crate::platform::windows::diag::logs_dir()?;
-        const BLURB: &str =
-            "This build records Windows display and window diagnostics. Send the file to \
-             support if you were asked for it.";
-        // The blurb AND the literal folder path: a customer who cannot use the button (a
-        // remote-support call, a locked-down machine) can still be read the path.
-        let desc = widget::column(vec![
-            super::super::row::subdued_caption(BLURB),
-            super::super::row::subdued_caption(dir.display().to_string()),
-        ])
-        .spacing(2.0);
-        let items = vec![
-            Item::new(
-                "Diagnostics log",
-                BLURB,
-                super::super::row::centered_button(
-                    None,
-                    "Open logs folder",
-                    Length::Fixed(action_button_width()),
-                    super::super::row::standard_button_class(),
-                    Some(Msg::WindowChrome(WindowChromeMsg::OpenDiagnosticsFolder)),
-                ),
-            )
-            .desc_el(desc),
-        ];
-        Some(SectionSpec { title: "Troubleshooting", items })
-    }
-    #[cfg(not(windows))]
-    None
 }
 
 /// The Version row's action button for an available update. macOS/Windows: a suggested

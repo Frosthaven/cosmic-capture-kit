@@ -87,6 +87,16 @@ pub enum PreviewMsg {
     /// capture IS on disk; only the editor is lost, and this used to be indistinguishable
     /// from an ordinary [`PreviewMsg::Cancel`], i.e. from the user closing the window.
     LoadFailed,
+    /// Windows (DRAGON-436 round 2) / macOS (DRAGON-415): the failure alert raised by
+    /// [`Self::LoadFailed`] has been dismissed (or, on Windows, its bounded wait ran out),
+    /// so the close it was holding up may now run. Neither platform may close inline: a
+    /// `MessageBox` does not block, so closing right after raising it would take the
+    /// process down within milliseconds and the box with it, unread; `NSAlert::runModal`
+    /// DOES block, but only safely off the winit thread, so mac's "say so, then close" has
+    /// to be sequenced through this message the same way. `cfg(any(windows,
+    /// target_os = "macos"))` so Linux stays byte-identical.
+    #[cfg(any(windows, target_os = "macos"))]
+    LoadFailedAlertDismissed,
     /// Close the preview without deleting the file.
     Cancel,
     /// Flip the preview between the fullscreen overlay and a resizable window, live —
@@ -106,6 +116,11 @@ pub enum PreviewMsg {
     /// The decoded image is ready — replace the loading spinner with it. Carries the
     /// raw pixels too, so preview edits recomposite from the untouched original.
     ImageReady(cosmic::widget::image::Handle, Option<Arc<::image::RgbaImage>>),
+    /// The open-time automatic clipboard copy (DRAGON-353) finished on its worker thread —
+    /// `true` if the platform reported the write as done. Its ONLY job is to post the toast
+    /// that used to be posted inline; nothing gates on it (DRAGON-454, which moved the copy
+    /// off the UI thread — see [`crate::app::App::auto_copy_preview_on_open`]).
+    AutoCopied(bool),
     /// Open/close the covermark picker flyout.
     Covermark,
     /// Apply a specific covermark picker entry (mouse click).
@@ -424,6 +439,11 @@ mod tests {
             PreviewMsg::PlayerTick,
             PreviewMsg::FrameStep(1),
             PreviewMsg::ToastTick,
+            // DRAGON-454: the open-time copy's completion POSTS a toast, so it belongs with
+            // the producers above — an arrival that shortened its own confirmation would be
+            // the exact bug that rule exists to prevent, and this one arrives from a worker
+            // thread rather than from anything the user did.
+            PreviewMsg::AutoCopied(true),
             // Toolbar sliders.
             PreviewMsg::SetOpacity(0.5),
             PreviewMsg::SetDim(0.3),

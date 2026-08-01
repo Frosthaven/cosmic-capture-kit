@@ -142,8 +142,8 @@ pub type AnnotColor = [u8; 4];
 /// AND arrow — the single source of truth a future width control drives (see
 /// [`super::edit::EditState::stroke`]). A preset/preference is a POINT measure so a "4px" stroke
 /// spans the SAME visual size on a 1x and a 2x capture; it becomes concrete SOURCE-pixel
-/// geometry through [`points_to_source_px`] at the moment a shape is born. On Linux (and any 1x
-/// panel) points == source px, so this is unchanged there.
+/// geometry through [`points_to_source_px`] at the moment a shape is born. On any UNSCALED (1x)
+/// output — on every platform — points == source px, so this is unchanged there.
 pub const DEFAULT_ANNOT_STROKE: f32 = 4.0;
 
 /// The selectable stroke-width presets in logical POINTS (DRAGON-383) the toggle group offers,
@@ -153,9 +153,10 @@ pub const DEFAULT_ANNOT_STROKE: f32 = 4.0;
 /// same POINT units, so the ladder, [`stroke_width_nearest_index`] and the chrome flyout all
 /// compare in ONE unit and the highlighted segment stays correct on a 2x document; only the
 /// value re-stroked ONTO a shape is scaled to source px. Migration: a width persisted by an
-/// older build was effectively source px — on Linux 1x that number is unchanged (px == pt); on a
-/// 2x mac it now reads as points (numerically identical, so a "8" stays "8", just reinterpreted),
-/// which self-corrects the instant a preset is picked.
+/// older build was effectively source px — on an UNSCALED output that number is unchanged
+/// (px == pt); on a scaled one (2x mac, a 200% Windows monitor, a scaled COSMIC output) it now
+/// reads as points (numerically identical, so a "8" stays "8", just reinterpreted), which
+/// self-corrects the instant a preset is picked.
 pub const STROKE_WIDTHS: [f32; 7] = [1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0];
 
 /// Convert a preset / persisted annotation dimension expressed in logical POINTS into the SOURCE
@@ -163,9 +164,11 @@ pub const STROKE_WIDTHS: [f32; 7] = [1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0];
 /// (macOS Retina = 2.0). Annotation GEOMETRY lives in SOURCE px (`AnnotRect`, a shape's own
 /// `stroke_w`, a text box's `size_px`); every PRESET and PERSISTED PREFERENCE (the stroke ladder,
 /// the badge/text sizes, the curve radius) is a POINT measure so the same preset spans the same
-/// visual size across DPIs (DRAGON-383). On Linux — and any 1x panel — `scale` is always `1.0`,
-/// so this is the identity and every seeding path stays byte-identical. A non-positive scale is
-/// treated as `1.0` (defensive). Pure — unit-tested.
+/// visual size across DPIs (DRAGON-383). `scale` is the SOURCE output's own reported scale on
+/// EVERY platform (COSMIC buffer scale, macOS backing scale, Windows per-monitor DPI — see
+/// `PreviewState::source_scale`); it is `1.0` on an UNSCALED panel, and there this is the
+/// identity so every seeding path stays byte-identical. A non-positive scale is treated as
+/// `1.0` (defensive). Pure — unit-tested.
 pub fn points_to_source_px(points: f32, scale: f32) -> f32 {
     points * if scale > 0.0 { scale } else { 1.0 }
 }
@@ -174,7 +177,7 @@ pub fn points_to_source_px(points: f32, scale: f32) -> f32 {
 /// logical POINTS the presets + persisted preferences are kept in — used when a badge RESIZE or a
 /// placed badge's settled side seeds the remembered default, so the number stored matches the
 /// preset ladder's unit and re-seeds correctly on a DIFFERENT-scale document (DRAGON-383).
-/// Identity on Linux/1x. Pure — unit-tested.
+/// Identity on an unscaled (1x) output, on every platform. Pure — unit-tested.
 pub fn source_px_to_points(px: f32, scale: f32) -> f32 {
     px / if scale > 0.0 { scale } else { 1.0 }
 }
@@ -207,7 +210,8 @@ pub fn cycle_stroke_width(current: f32) -> f32 {
 /// too small to fit it) and the arrow (round caps/joins when > 0) — the single source of truth a
 /// future curve control drives (see [`super::edit::EditState::curve_radius`]). Like every other
 /// preset it is a POINT measure, scaled to source px through [`points_to_source_px`] at each
-/// render/bake site so the corner reads the same on a 1x and a 2x capture; identity on Linux/1x.
+/// render/bake site so the corner reads the same on a 1x and a 2x capture; identity on an
+/// unscaled (1x) output.
 pub const DEFAULT_ANNOT_CURVE_RADIUS: f32 = 8.0;
 
 /// A stable per-item identity (scene z-order is the vector order, so ids only identify).
@@ -3461,47 +3465,6 @@ fn text_raster_is_current(
     held == Some((scale, want))
 }
 
-/// DRAGON-366 (TEMPORARY): name an in-flight gesture as `(verb, item-kind)` for the diagnostic
-/// channels. Shared by the VIEW probe (`image.rs`'s `d366_interaction`) and the UPDATE probe in
-/// [`App::annot_gesture_to`], so both label the same drag with the same words. Remove with
-/// `crate::widgets::dragon366`.
-pub(super) fn d366_gesture_words(
-    gesture: &AnnotGesture,
-    items: &[AnnotationItem],
-) -> (&'static str, &'static str) {
-    fn kind_word(k: &AnnotKind) -> &'static str {
-        match k {
-            AnnotKind::Box { .. } => "box",
-            AnnotKind::Arrow { .. } => "arrow",
-            AnnotKind::Highlight { .. } => "highlight",
-            AnnotKind::BoxHighlight { .. } => "box-highlight",
-            AnnotKind::Spotlight { .. } => "spotlight",
-            AnnotKind::Pixelate { .. } => "pixelate",
-            AnnotKind::Badge { .. } => "badge",
-            AnnotKind::Blur { .. } => "blur",
-            AnnotKind::Pen { .. } => "pen",
-            AnnotKind::Text { .. } => "text",
-        }
-    }
-    let word_of = |id: AnnotId| -> &'static str {
-        items.iter().find(|it| it.id == id).map(|it| kind_word(&it.kind)).unwrap_or("?")
-    };
-    match gesture {
-        AnnotGesture::New { id, .. } => ("create", word_of(*id)),
-        AnnotGesture::Edit { id, grab, .. } => (
-            if matches!(grab, crate::widgets::annotation_canvas::Grab::Move) {
-                "drag"
-            } else {
-                "resize"
-            },
-            word_of(*id),
-        ),
-        AnnotGesture::MoveMany { .. } => ("move-many", "-"),
-        AnnotGesture::ScaleMany { .. } => ("scale-many", "-"),
-        AnnotGesture::Erase { .. } => ("erase", "pen"),
-    }
-}
-
 // ── app-side gesture + scene handlers ────────────────────────────────────────────────
 
 impl App {
@@ -4006,20 +3969,12 @@ impl App {
         y: f32,
         scale_type: bool,
     ) -> Task<cosmic::Action<Msg>> {
-        // DRAGON-366 (TEMPORARY): time the whole UPDATE-path handling of this motion event. The
-        // original instrumentation only measured the VIEW path, which is precisely why the text
-        // drag's cost was invisible. Remove with `crate::widgets::dragon366`.
-        let mut d366 = crate::widgets::dragon366::GestureTimer::start();
         let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
         };
         let Some(gesture) = p.edit.gesture.clone() else {
             return Task::none();
         };
-        {
-            let (verb, item) = d366_gesture_words(&gesture, &p.edit.annotations);
-            d366.note(verb, item);
-        }
         // Clamp all gesture geometry to the ANNOTATABLE canvas (source ∪ crop; DRAGON-389),
         // zoom-independent, in source px — so a shape can be drawn / moved over the crop extension.
         let canvas = p.edit.annot_bounds();
@@ -4195,14 +4150,10 @@ impl App {
             // follows the drag live. DISPLAY only — dragging a handle is not the user picking a
             // size, so the persisted default is untouched (see the display-vs-remember comment).
             self.sync_text_style_to_selection(id, TextStyleSource::HandleScale);
-            if let Some(xf) = self.proxy_text_layer(id, text_before.as_deref()) {
-                d366.proxied(xf.scale);
+            if self.proxy_text_layer(id, text_before.as_deref()).is_some() {
                 return Task::none();
             }
-            let t = std::time::Instant::now();
-            let task = self.refresh_text_display(id);
-            d366.rastered(t.elapsed().as_secs_f64() * 1000.0, self.d366_text_region(id));
-            return task;
+            return self.refresh_text_display(id);
         }
         // A live drag mutates the model; the GPU effects shader re-renders from it every frame.
         Task::none()
@@ -4264,21 +4215,6 @@ impl App {
             }
         }
         Some(moved)
-    }
-
-    /// DRAGON-366 (TEMPORARY): the BIGGEST text layer's raster dimensions, for the update-path
-    /// diagnostic line — this is the quantity the owner's "big text lags, small text doesn't"
-    /// report predicts a re-render's cost from. Remove with `crate::widgets::dragon366`.
-    fn d366_text_region(&self, id: window::Id) -> (u32, u32) {
-        self.preview_for(id)
-            .and_then(|p| {
-                p.edit
-                    .text_layers
-                    .iter()
-                    .map(|l| l.geom.px)
-                    .max_by_key(|(w, h)| (*w as u64) * (*h as u64))
-            })
-            .unwrap_or((0, 0))
     }
 
     /// Commit the active gesture: discard a degenerate new shape, else push ONE undo entry
@@ -5227,7 +5163,7 @@ impl App {
         };
         p.edit.flyout = None;
         // The picked `size` is a POINT preset; the box's `size_px` geometry is SOURCE px, so
-        // scale the preset before it seeds the box (DRAGON-383). Identity on Linux/1x.
+        // scale the preset before it seeds the box (DRAGON-383). Identity on an unscaled (1x) output.
         let scale = p.source_scale;
         let size_px_seed = size.map(|pt| points_to_source_px(pt, scale));
         let bounds = p.edit.annot_bounds();
@@ -6417,10 +6353,43 @@ mod tests {
         assert_eq!(stroke_width_nearest_index(100.0), 6); // huge → thickest
     }
 
+    /// DRAGON-447: the line-width guarantee, pinned rather than assumed. Every platform
+    /// resolves a REAL per-output scale into `PreviewState::source_scale` (COSMIC buffer
+    /// scale / macOS backing scale / Windows `GetDpiForMonitor`), so the points↔source-px
+    /// ladder is live everywhere — not a macOS-only path with a Linux no-op. A preset must
+    /// survive the round trip at every step of the scale ladder, or a stroke width /
+    /// badge size / text size drifts each time it is re-seeded on a scaled display.
     #[test]
-    fn points_to_source_px_is_identity_on_linux_1x() {
-        // DRAGON-383: on Linux (and any 1x panel) scale is always 1.0, so EVERY seeding path
-        // that routes through this must stay byte-identical — the no-op safety property.
+    fn the_point_ladder_round_trips_at_every_scale_on_every_platform() {
+        const PRESETS: [f32; 7] =
+            [1.0, 4.0, 8.0, 16.0, 32.0, DEFAULT_ANNOT_STROKE, DEFAULT_BADGE_SIZE];
+        for scale in [1.0f32, 1.5, 2.0, 3.0] {
+            for pt in PRESETS {
+                let px = points_to_source_px(pt, scale);
+                // The preset really is `scale`× bigger in source pixels — that is what keeps
+                // a "4pt" stroke the same VISUAL width on a 1x and a 3x capture.
+                assert!((px - pt * scale).abs() < 1e-4, "{pt}pt @ {scale}x -> {px}px");
+                // ...and comes back to the same points, so a resize-settled default re-seeds
+                // correctly on a document grabbed from a DIFFERENT-scale display.
+                let back = source_px_to_points(px, scale);
+                assert!((back - pt).abs() < 1e-4, "round trip {pt}pt @ {scale}x -> {back}");
+            }
+        }
+        // The whole persisted stroke ladder keeps its identity in POINTS at every scale:
+        // the flyout highlight is chosen off the point value, never the scaled pixels.
+        for scale in [1.0f32, 1.5, 2.0, 3.0] {
+            for (i, w) in STROKE_WIDTHS.iter().enumerate() {
+                let px = points_to_source_px(*w, scale);
+                assert_eq!(stroke_width_nearest_index(source_px_to_points(px, scale)), i);
+            }
+        }
+    }
+
+    #[test]
+    fn points_to_source_px_is_identity_on_an_unscaled_output() {
+        // DRAGON-383: on any UNSCALED (1x) output — on every platform — scale is 1.0, so
+        // EVERY seeding path that routes through this stays byte-identical: the no-op
+        // safety property that makes the conversion safe to thread everywhere.
         for pt in [1.0, 4.0, 8.0, 32.0, 75.0, DEFAULT_ANNOT_STROKE, DEFAULT_BADGE_SIZE] {
             assert_eq!(points_to_source_px(pt, 1.0), pt);
             assert_eq!(source_px_to_points(pt, 1.0), pt);

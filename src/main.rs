@@ -198,9 +198,81 @@ fn install_macos_panic_hook() {
 /// default hook. A shortcut / daemon-spawned capture launch has NO console (GUI subsystem), so
 /// a winit/wgpu panic on the stop→preview path — reported as a silent crash — would otherwise
 /// leave no trace. Kept tiny: append to one file, best-effort I/O, backtrace forced on.
+///
+/// DRAGON-442: it also puts the failure alert up now. Writing `panic.log` fixed the half of
+/// the problem that faces US; the user still watched the app vanish. There is no console on a
+/// shortcut launch, no crash dialog for a GUI-subsystem process that unwinds, and
+/// `app::run` ends in `libc::_exit` — so a panic was the one way this app could close itself
+/// with nothing said at all.
+///
+/// MAIN THREAD ONLY, like the mac twin, but for a DIFFERENT reason worth stating because the
+/// mac one does not apply here. Mac gates to avoid a deadlock: showing from a worker means
+/// dispatching synchronously onto a main thread that may be blocked waiting on that very
+/// worker. Windows has no such risk — `alert::show` spawns its own presenting thread and
+/// returns at once. The reason here is that a worker panic is usually RECOVERED: the capture
+/// worker's panic drops its oneshot sender, the app reads that as `ShotOutcome::WorkerDied`,
+/// and reports it properly through `fail_session`. Two things would go wrong if we spoke from
+/// a worker. The dialog would be the wrong one (a crash box for a failure the app is about to
+/// explain in its own words), and — worse — blocking the panicking thread here delays its
+/// unwind, so the sender is not dropped, so the app's own recovery is stalled for the whole
+/// budget. A recovered panic must stay recovered.
+///
+/// The main thread is identified by the `ThreadId` captured at install time, which runs on it
+/// in `main`. That is exact, needs no Win32, and cannot drift.
+/// The panic alert's message, with both real folders resolved (DRAGON-442).
+///
+/// The two logs live in DIFFERENT places on Windows — `panic.log` in the app config dir and
+/// the DRAGON-419 debug log under `%LOCALAPPDATA%` — so both are named. The copy itself is
+/// `app::failure::windows_crash_alert`, which is pure and unit-tested; this only resolves the
+/// paths, and hands `None` for either one that cannot be resolved.
+#[cfg(windows)]
+fn windows_crash_alert_message() -> app::failure::AlertMessage {
+    let panic_dir = util::app_config_dir().map(|d| d.display().to_string());
+    let debug_dir = diag::log_dir().map(|d| d.display().to_string());
+    app::failure::windows_crash_alert(panic_dir.as_deref(), debug_dir.as_deref())
+}
+
+/// DRAGON-442 QA hook (Windows only, inert unless set). A crash is not something you can
+/// ask a machine for, so the alert this ticket adds has no other way to be checked by hand.
+///
+/// * `CCK_TEST_PANIC=1` panics on the MAIN thread — the alert should appear, and the process
+///   should not die until it is dismissed or the 120s budget elapses.
+/// * `CCK_TEST_PANIC=worker` panics on a worker thread and joins it, which is a RECOVERED
+///   panic. No box may appear: that is the main-thread gate doing its job. `panic.log` still
+///   gets both, so the difference is visible.
+///
+/// A review aid in the same spirit as `CCK_TEST_FORCE_NO_OUTPUTS` and
+/// `CCK_STARTUP_BUDGET_SECS`, not a supported setting: read once, here, and nowhere else.
+/// Called straight after the hook is installed, so both shapes exercise the real hook.
+#[cfg(windows)]
+fn maybe_forced_panic() {
+    const ENV: &str = "CCK_TEST_PANIC";
+    let Some(mode) = std::env::var_os(ENV) else { return };
+    match mode.to_string_lossy().as_ref() {
+        "1" => {
+            log::warn!("{ENV}=1: panicking on the main thread to exercise the crash alert");
+            panic!("{ENV}=1: forced main-thread panic (DRAGON-442 QA hook)");
+        }
+        "worker" => {
+            log::warn!(
+                "{ENV}=worker: panicking on a worker thread; the panic is RECOVERED by the \
+                 join below, so NO alert should appear"
+            );
+            let h = std::thread::Builder::new()
+                .name("cck-test-panic".into())
+                .spawn(|| panic!("{ENV}=worker: forced worker panic (DRAGON-442 QA hook)"))
+                .expect("spawn the forced-panic thread");
+            let _ = h.join();
+            log::warn!("{ENV}=worker: the worker panic was recovered; continuing");
+        }
+        other => log::warn!("{ENV}={other}: not a recognised mode (use 1 or worker); ignored"),
+    }
+}
+
 #[cfg(windows)]
 fn install_windows_panic_hook() {
     let default_hook = std::panic::take_hook();
+    let main_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
         if let Some(dir) = crate::util::app_config_dir()
             && std::fs::create_dir_all(&dir).is_ok()
@@ -223,6 +295,25 @@ fn install_windows_panic_hook() {
                     "\n===== panic @ unix {ts} (thread {tname}) =====\n{info}\n{bt}"
                 );
             }
+        }
+        // The log is written FIRST, so the breadcrumb exists even if presenting the alert
+        // goes wrong.
+        //
+        // Only from the main thread (see the fn doc). `show` returns `None` when this
+        // session already put an alert up — a session that reported a failure and THEN
+        // panicked gets one box, not two, which is the DRAGON-436 latch doing its job — and
+        // then there is nothing to wait for.
+        if std::thread::current().id() == main_thread
+            && let msg = windows_crash_alert_message()
+            && let Some(dismissal) = platform::windows::alert::show(&msg.title, &msg.body)
+        {
+            // Blocking the thread that owns our windows is normally forbidden (DWM ghosts
+            // them after ~5s). Here it is right: the process is unwinding to its death, those
+            // windows have no future to protect, and the alternative is the box vanishing
+            // before it can be read. `wait` also arms the alert module's own process
+            // backstop, so this can never become a permanent hang.
+            let outcome = dismissal.wait(app::failure::ALERT_DISMISS_BUDGET);
+            log::warn!("DRAGON-442: crash alert ended as {outcome:?}");
         }
         default_hook(info);
     }));
@@ -438,8 +529,11 @@ fn driver_from_uevent(text: &str) -> Option<&str> {
 /// type — the protocol explicitly leaves primary-vs-render unspecified, and both
 /// character devices hang off the same physical device in sysfs, so
 /// `/sys/dev/char/<major>:<minor>/device/uevent` answers for both.
+///
+/// `pub(crate)` since DRAGON-425: the zero-copy recorder's pre-flight asks the same two
+/// questions this file's Vulkan pin does — which GPU is the session on, and what drives it.
 #[cfg(target_os = "linux")]
-fn drm_driver_for_dev(dev: u64) -> Option<String> {
+pub(crate) fn drm_driver_for_dev(dev: u64) -> Option<String> {
     let (major, minor) = major_minor(dev);
     let uevent =
         std::fs::read_to_string(format!("/sys/dev/char/{major}:{minor}/device/uevent")).ok()?;
@@ -468,8 +562,14 @@ fn dev_t_from_bytes(bytes: &[u8]) -> Option<u64> {
 /// version 4 — returns `None`, and the caller then does nothing. `main_device`
 /// is gone from version 6 on (clients read the sampling tranche instead), so we
 /// bind the 4..=5 window that still sends it.
+///
+/// `pub(crate)` since DRAGON-425. It is NOT cached anywhere: the Vulkan pin below is
+/// self-disabling and skips this round-trip entirely on a single-ICD box, so there is no
+/// startup value to read. The zero-copy pre-flight therefore asks again, once per recording
+/// — a short-lived private connection with bounded round-trips, paid only when a recording
+/// starts.
 #[cfg(target_os = "linux")]
-fn compositor_main_device() -> Option<u64> {
+pub(crate) fn compositor_main_device() -> Option<u64> {
     use wayland_client::globals::{GlobalListContents, registry_queue_init};
     use wayland_client::protocol::wl_registry;
     use wayland_client::{Connection, Dispatch, QueueHandle};
@@ -575,21 +675,12 @@ fn main() -> cosmic::iced::Result {
     // variable still works, on every platform, through `diag::PATH_ENV`.
     diag::init();
     util::timing_mark("main() entry (after dyld + static init)");
-    // DRAGON-406: start the Windows chrome/transparency diagnostics session. Placed here, in
-    // `main` BEFORE every subcommand return and before the daemon branch, so that EVERY way of
-    // starting this program produces the report: a Start Menu / shortcut launch, a hotkey or
-    // CLI capture, the resident daemon, and each capture child the daemon spawns (they are
-    // this same exe and run this same line). A child inheriting a console it does not have is
-    // exactly how a log comes back empty, so it writes to a file under %LOCALAPPDATA% that all
-    // of them append to. DRAGON-408 removed the Windows-10 gate — it now records on every
-    // Windows run, with no trigger — and everything it does is best-effort, so it cannot fail
-    // startup. Removed by DRAGON-407.
-    #[cfg(windows)]
-    platform::windows::diag::init();
     #[cfg(target_os = "macos")]
     install_macos_panic_hook();
     #[cfg(windows)]
     install_windows_panic_hook();
+    #[cfg(windows)]
+    maybe_forced_panic();
     // GUI launches (Spotlight, login item, the resident daemon + every capture child
     // it spawns) inherit launchd's minimal PATH — missing /opt/homebrew/bin etc. — so
     // bare-name tools (tesseract, and the PATH-scan probes behind it) fail to resolve
@@ -640,6 +731,26 @@ fn main() -> cosmic::iced::Result {
         share::run_reveal(&p);
         return Ok(());
     }
+    // DRAGON-450 (Windows): clicking a capture toast activates us through our OWN URI
+    // scheme (`activationType="protocol"` — no COM activator), so the click arrives as a
+    // bare URI argument rather than a flag. It is the same helper job as `--reveal` above
+    // and belongs in the same place: before any GUI init, before the resident-daemon
+    // branch.
+    //
+    // The branch is taken on the SCHEME and returns either way. A stale toast — clicked
+    // long after its capture was moved or deleted — must end here as a no-op; falling
+    // through would reach the normal launch path and take a fresh CAPTURE, which is not
+    // what any click on an old notification means. `reveal_uri_path` is what decides
+    // whether there is anything to reveal (ours, well-formed, an absolute path that
+    // exists); nothing from the URI is ever executed.
+    #[cfg(windows)]
+    if let Some(uri) = args.iter().skip(1).find(|a| platform::windows::services::is_reveal_uri(a)) {
+        match platform::windows::services::reveal_uri_path(uri) {
+            Some(p) => share::run_reveal(&p),
+            None => log::warn!("toast click: the reveal URI names no file we can show"),
+        }
+        return Ok(());
+    }
     if let Some(p) = after("--inspect") {
         cli::inspect(&p);
         return Ok(());
@@ -666,12 +777,17 @@ fn main() -> cosmic::iced::Result {
         platform::compositor::activate_title(app::WINDOW_TITLE);
         return Ok(());
     }
+    // The banner's wording rides the helper's own argv (DRAGON-450): which flag launched
+    // it says whether the capture reached the clipboard, and the optional `--notify-kind` /
+    // `--notify-reason` tokens say what was captured and, when it was not copied, why.
     if let Some(p) = after(share::reexec::NOTIFY_COPIED) {
-        share::run_notify(&p, true);
+        let (kind, outcome) = share::notify_from_argv(&args, true);
+        share::run_notify(&p, kind, outcome);
         return Ok(());
     }
     if let Some(p) = after(share::reexec::NOTIFY_SAVED) {
-        share::run_notify(&p, false);
+        let (kind, outcome) = share::notify_from_argv(&args, false);
+        share::run_notify(&p, kind, outcome);
         return Ok(());
     }
     // Babysitter for pausing other apps' media while a preview soundtrack is open — runs here, in a
@@ -723,6 +839,7 @@ fn main() -> cosmic::iced::Result {
                     | "--all-in-one"
                     | "--active-window"
                     | "--active-monitor"
+                    | "--no-editor"
                     | "--image"
                     | "--video"
                     | "--scan"
@@ -733,7 +850,10 @@ fn main() -> cosmic::iced::Result {
         });
         // `--preview <file>` set `after("--preview")` below; a bare check for the flag
         // presence covers it here without consuming the value.
-        let bare = bare && !args.iter().any(|a| a == "--preview");
+        // DRAGON-427 adds `--preview-handoff` (the spawned editor child) to the same
+        // check: a resident install must not read an editor launch as a bare one.
+        let bare = bare
+            && !args.iter().any(|a| a == "--preview" || a == "--preview-handoff");
         if bare && state::load().resident {
             // DRAGON-419: from here on this pid's lines read `daemon`, which is what lets a
             // reader untangle the long-lived menu-bar process from the one-shot capture
@@ -765,6 +885,7 @@ fn main() -> cosmic::iced::Result {
                     | "--all-in-one"
                     | "--active-window"
                     | "--active-monitor"
+                    | "--no-editor"
                     | "--image"
                     | "--video"
                     | "--scan"
@@ -772,6 +893,10 @@ fn main() -> cosmic::iced::Result {
                     | "--countdown"
                     | "--overlay"
                     | "--preview"
+                    // DRAGON-427: the spawned preview EDITOR child. Without it here a
+                    // resident install would read the editor launch as bare and run the
+                    // tray daemon instead of opening the capture the user just took.
+                    | "--preview-handoff"
             )
         });
         if bare && state::load().resident {
@@ -807,6 +932,7 @@ fn main() -> cosmic::iced::Result {
                     | "--all-in-one"
                     | "--active-window"
                     | "--active-monitor"
+                    | "--no-editor"
                     | "--image"
                     | "--video"
                     | "--scan"
@@ -814,19 +940,39 @@ fn main() -> cosmic::iced::Result {
                     | "--countdown"
                     | "--overlay"
                     | "--preview"
+                    // DRAGON-427: the spawned preview EDITOR child. Without it here a
+                    // resident install would read the editor launch as bare and run the
+                    // tray daemon instead of opening the capture the user just took.
+                    | "--preview-handoff"
             )
         });
         if bare && state::load().resident {
-            // DRAGON-406: re-tag this process's diagnostics lines as the DAEMON before its
-            // message loop takes over, so the shared file distinguishes the long-lived tray
-            // process from the one-shot capture children it spawns (that distinction is the
-            // whole point of covering all three launch paths). Inert on Windows 11.
-            platform::windows::diag::mark_daemon();
-            // DRAGON-419: the same re-tag for the debug log (see the mac branch). Two calls
-            // because the DRAGON-406 report is a separate, always-on Windows-10 instrument
-            // with its own file; DRAGON-407 removes that one, not this.
-            diag::mark_component(diag::Component::Daemon);
-            daemon::run(); // never returns — runs the Win32 message loop or exits
+            // Intent from the argv shape (DRAGON-180, mirroring the Linux branch above):
+            // the autostart entry and the resident toggle launch with a literal `resident`
+            // argument (daemon-intent — keep the restart-handoff lock retry); a truly bare
+            // launch is the user asking to CAPTURE (one lock attempt, then hand the request
+            // to the live daemon).
+            let daemon_intent = args.iter().any(|a| a == "resident");
+            // DRAGON-438: THE choke point. Either we become the daemon, or a live daemon
+            // acknowledged taking this capture (and `claim_or_signal` exited), or we fall
+            // through below to a one-shot capture. What used to happen instead was a silent
+            // `exit(0)` on any held lock, which turned every capture launch into a no-op
+            // whenever the daemon was wedged. These launcher-side lines stay tagged `app` —
+            // this process is not the daemon unless the call says so.
+            if daemon::claim_or_signal(daemon_intent) {
+                // DRAGON-419: re-tag this process's debug-log lines as the DAEMON before its
+                // message loop takes over, so the shared file distinguishes the long-lived tray
+                // process from the one-shot capture children it spawns (see the mac branch).
+                diag::mark_component(diag::Component::Daemon);
+                // Never returns — runs the Win32 message loop or exits. A capture-intent
+                // launch that became the daemon still owes the user their overlay
+                // (DRAGON-181's rule, which Linux has had all along).
+                daemon::run(!daemon_intent);
+            }
+            // Otherwise: no daemon could be reached AND none could be started. Fall through
+            // to `app::run` for a one-shot capture — the historical behaviour of a bare
+            // launch with the tray turned off. The worst case of a stuck daemon is now "the
+            // tray is broken", not "the app does nothing".
         }
     }
     // DRAGON-336: every path from here on either returns without a GUI or ends in
@@ -835,6 +981,44 @@ fn main() -> cosmic::iced::Result {
     // `pin_vulkan_icd` for the six conditions it insists on before touching anything.
     #[cfg(target_os = "linux")]
     pin_vulkan_icd();
+    // DRAGON-427 (Windows 10): this process IS the preview EDITOR for a capture another
+    // process just took. The argument is one `preview_ipc::OpenRequest` line — the very same
+    // wire format the unix socket handoff sends — so the document opens with the capture's
+    // own fields (dims, scale, size, and `external=0`, which is what makes the editor treat
+    // the file as ours to manage) rather than as a bare `--preview` viewer.
+    //
+    // Spawning is the transport here, not a socket: the capture child creates this process
+    // rather than finding one already running, so there is nothing to connect to and no ack
+    // to wait for. That also means it needs no `#[cfg(unix)]` transport — it works on
+    // Windows, which is the whole point (`preview_ipc` has no named-pipe host yet).
+    //
+    // A malformed line is a hard error rather than a fallback: only our own capture child
+    // ever writes one, so a bad line means the two halves disagree and silently opening
+    // something slightly different would be exactly the wrongness the wire format's strict
+    // parser exists to prevent.
+    if let Some(line) = after("--preview-handoff") {
+        let line = line.to_string_lossy().into_owned();
+        match crate::preview_ipc::OpenRequest::parse(&line) {
+            Ok(req) => {
+                if !req.path.is_file() {
+                    eprintln!("--preview-handoff: file not found: {}", req.path.display());
+                    std::process::exit(1);
+                }
+                return app::run(app::Startup {
+                    // The editor is ALWAYS the windowed variant on Windows 10 (this flag's
+                    // only user): the overlay one would need the software rasterizer that
+                    // cannot draw the preview's `iced::widget::shader` layers at all.
+                    preview_windowed: Some(true),
+                    preview_handoff: Some(req),
+                    ..Default::default()
+                });
+            }
+            Err(e) => {
+                eprintln!("--preview-handoff: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     // `--preview <file>` opens the preview overlay directly for an existing image/video
     // (no capture overlay, no lock — it's a viewer). Reject unsupported types up front.
     if let Some(p) = after("--preview") {
@@ -916,6 +1100,12 @@ fn main() -> cosmic::iced::Result {
     } else {
         None
     };
+    // DRAGON-428: a MODIFIER, not a mode — it composes with every capture launch above
+    // (bare picker, --region/--window/--monitor, --active-window/--active-monitor) so one
+    // flag gives a no-editor variant of each. Named for the editor rather than the
+    // "preview" because `--preview <file>` already means something else entirely (open a
+    // file in the viewer), and `--no-preview` would read as that flag's opposite.
+    let no_editor = has("--no-editor");
     let kind = if has("--scan") || has("--scanner") {
         Some(app::Kind::Scanner)
     } else if has("--video") {
@@ -954,6 +1144,14 @@ fn main() -> cosmic::iced::Result {
         countdown_secs,
         immediate,
         preview_windowed: None,
+        preview_handoff: None,
+        no_editor,
+        // DRAGON-440 / DRAGON-443: both filled in by `app::run`'s macOS preamble, which is
+        // the only place early enough to influence the boot-time activation policy.
+        #[cfg(target_os = "macos")]
+        route_probe: None,
+        #[cfg(target_os = "macos")]
+        post_update: false,
     })
 }
 
@@ -972,6 +1170,8 @@ Launch (opens the capture overlay by default):\n\
     --all-in-one            Open the full capture picker overlay\n\
     --active-window         Capture the active window immediately (no picker)\n\
     --active-monitor        Capture the monitor under the cursor immediately (no picker)\n\
+    --no-editor             Skip the preview editor: save, copy and notify instead\n\
+                            (combines with any launch flag above)\n\
     --image                 Capture a screenshot (default)\n\
     --video                 Capture a screen recording\n\
     --scan                  Start the QR/OCR scanner (forces region)\n\
@@ -980,6 +1180,7 @@ Launch (opens the capture overlay by default):\n\
 Other:\n\
     --preview <file>        Open an existing image/video in the preview (windowed)\n\
     --overlay               With --preview: use the fullscreen overlay, not a window\n\
+                            (ignored on Windows 10, which has no overlay editor)\n\
     --inspect <file>        Print a capture's embedded metadata and exit\n\
     --make-sync-clip [path] Write the A/V-sync reference clip (flash + beep) and exit\n\
     --calibrate-sync <file> Measure a recording of the reference clip; --apply stores it\n\

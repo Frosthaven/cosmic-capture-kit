@@ -24,15 +24,16 @@ windows, image, video, voice, QR, barcodes, OCR text and more.
 These are the platforms currently planned for support, along with their current
 status.
 
-| Platform                                                 | Capture backend                     | Status  |
-| -------------------------------------------------------- | ----------------------------------- | ------- |
-| macOS 13+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      |
-| Windows 11                                               | Windows Capture                     | ✅      |
-| Linux (Wayland): COSMIC                                  | Cosmic Compositor / PipeWire Portal | ✅      |
-| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | ❓                                  | 📅      |
-| Linux (Wayland): KDE Plasma                              | ❓                                  | 📅      |
-| Linux (Wayland): GNOME                                   | ❓                                  | 📅      |
-| Linux (X11)                                              | ❓                                  | ❓      |
+| Platform                                                 | Capture backend                     | Status  | Notes                                                     |
+| -------------------------------------------------------- | ----------------------------------- | ------- | --------------------------------------------------------- |
+| macOS 13+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      |                                                             |
+| Windows 11                                               | Windows Capture                     | ✅      |                                                           |
+| Windows 10                                               | Windows Capture                     | ✅      | Reported working, but we do not provide official support. |
+| Linux (Wayland): COSMIC                                  | Cosmic Compositor / PipeWire Portal | ✅      |                                                           |
+| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | ❓                                  | 📅      |                                                           |
+| Linux (Wayland): KDE Plasma                              | ❓                                  | 📅      |                                                           |
+| Linux (Wayland): GNOME                                   | ❓                                  | 📅      |                                                           |
+| Linux (X11)                                              | ❓                                  | 📅      |                                                           |
 
 ### Supported Compositor Extras
 
@@ -153,6 +154,17 @@ these commands:
 | `cosmic-capture-kit --region`         | `Alt+Shift+1`            |
 | `cosmic-capture-kit --active-window`  | `Alt+Shift+2`            |
 | `cosmic-capture-kit --active-monitor` | `Alt+Shift+3`            |
+
+Add `--no-editor` to any of these for a variant that skips the preview editor — the
+capture is saved, copied to the clipboard and notified, with no editor to dismiss. The
+notification names what it captured and clicking it opens the folder with the file
+selected. Bind both variants of a mode and pick per keypress:
+
+| Command                                             | Suggested keys           |
+| --------------------------------------------------- | ------------------------ |
+| `cosmic-capture-kit --region --no-editor`           | `Alt+Shift+4`            |
+| `cosmic-capture-kit --active-window --no-editor`    | `Alt+Shift+5`            |
+| `cosmic-capture-kit --active-monitor --no-editor`   | `Alt+Shift+6`            |
 
 #### Dependencies
 

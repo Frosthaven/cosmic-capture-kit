@@ -143,9 +143,10 @@ impl Presence {
 ///
 /// **"Presented a capture" is defined as: the child owns at least one surface or
 /// in-flight capture the user can see the result of.** Concretely the caller passes
-/// `visible_work = true` once ANY of these holds — a capture overlay is mapped, a
-/// countdown is ticking, a pixel capture is in flight, a recording is running, a
-/// preview editor is open, or a settings window is up.
+/// `visible_work = true` once ANY of these holds — a capture overlay is PLACED (a
+/// minted-but-unplaced overlay renders a transparent `Space` and the user sees NOTHING,
+/// DRAGON-439), a countdown is ticking, a pixel capture is in flight, a recording is
+/// running, a preview editor is open, or a settings window is up.
 ///
 /// Why that point and not, say, "a file was written": it is the first moment the
 /// child is demonstrably not the failure this ticket is about. Before it, the child
@@ -166,6 +167,60 @@ pub fn presence(visible_work: bool, awaiting_user: bool) -> Presence {
     } else {
         Presence::Starting
     }
+}
+
+/// What the child currently has on screen, as plain data (DRAGON-439).
+///
+/// The app fills this in from the surfaces it owns (`App::startup_presence`) and hands it
+/// to [`classify`]. Splitting the snapshot from the decision is what makes the decision
+/// testable: the fields are the app's real state, but nothing here needs an `App`, a
+/// compositor or a Mac, so the whole table is exercised by the local suite on any
+/// platform. Every field is "is this thing visible RIGHT NOW", never "was it ever".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Surfaces {
+    /// A capture overlay is PLACED — raised to the shielding level and framed to its
+    /// display, which is the first moment it draws anything.
+    ///
+    /// Deliberately not "an overlay exists". macOS mints the overlay window first and
+    /// places it a frame or two later; between the two it renders a fully transparent
+    /// `Space` (the DRAGON-204 anti-flicker gate). Reading the MINT as presented is the
+    /// DRAGON-439 bug: a runtime that wedged in that gap disarmed the guard while the
+    /// user saw an empty screen, leaving exactly the invisible immortal child this
+    /// module exists to stop.
+    pub overlay_placed: bool,
+    /// A preview editor window/overlay is open.
+    pub preview_open: bool,
+    /// A capture countdown is ticking (the user can see the counter).
+    pub countdown: bool,
+    /// A pixel capture is in flight.
+    pub capturing: bool,
+    /// A recording is running (an immediate `--active-monitor --video` launch mints NO
+    /// overlay at all and can legitimately run for hours).
+    pub recording: bool,
+    /// The in-app settings window is open.
+    pub settings_open: bool,
+    /// The macOS permission checker is up — the user owns the clock (DRAGON-412).
+    pub permission_window: bool,
+    /// A capture-failure alert is up — likewise the user's to dismiss (DRAGON-415).
+    pub alert: bool,
+}
+
+/// Map a [`Surfaces`] snapshot onto the guard's three cases.
+///
+/// The split is simply which column each surface belongs in: the work ones DISARM the
+/// guard for good, the two user-owned windows FREEZE it, and nothing at all burns the
+/// budget. Real work outranks a user-owned window, exactly as in [`presence`], which this
+/// delegates to so there is only ever one copy of that rule.
+pub fn classify(s: &Surfaces) -> Presence {
+    presence(
+        s.overlay_placed
+            || s.preview_open
+            || s.countdown
+            || s.capturing
+            || s.recording
+            || s.settings_open,
+        s.permission_window || s.alert,
+    )
 }
 
 /// What the guard should do after one step of the clock.
@@ -194,6 +249,7 @@ impl Budget {
     }
 
     /// Unsuspended time accumulated so far (test/reasoning aid).
+    #[cfg_attr(not(test), allow(dead_code))] // test-only; no production caller yet
     pub fn spent(&self) -> Duration {
         self.spent
     }
@@ -326,6 +382,86 @@ mod tests {
         // Both at once (a capture overlay up while the checker is still open):
         // Presented wins, because it is the terminal, stronger signal.
         assert_eq!(presence(true, true), Presence::Presented);
+    }
+
+    // ── `classify`: the surface snapshot (DRAGON-439) ─────────────────────────
+    //
+    // These pin `classify`'s truth table, which is the whole of the decision. They do
+    // NOT cover the line that FILLS the snapshot — `App::startup_presence`'s
+    // `outputs.iter().any(|o| o.user_visible())` — because that needs a live `App` and a
+    // real overlay. Off macOS `user_visible` is hardcoded `true`, so even the local
+    // suite's type-check cannot tell whether the mac arm reads the right field. That one
+    // line is mac-QA only.
+
+    #[test]
+    fn a_minted_but_unplaced_overlay_is_not_presented() {
+        // THE regression this ticket is about. The overlay window exists — the app has
+        // an `OutputState` for it — but `place_overlay` has not landed, so it draws a
+        // transparent `Space` and the user is looking at nothing. The guard must keep
+        // watching, i.e. the mint→placement stretch BURNS budget like any other part of
+        // a slow start.
+        assert_eq!(classify(&Surfaces::default()), Presence::Starting);
+    }
+
+    #[test]
+    fn a_placed_overlay_presents_and_outranks_a_permission_window() {
+        let s = Surfaces { overlay_placed: true, ..Surfaces::default() };
+        assert_eq!(classify(&s), Presence::Presented);
+        // Both at once (the checker still up while the overlay lands): Presented wins.
+        let s = Surfaces { overlay_placed: true, permission_window: true, ..Surfaces::default() };
+        assert_eq!(classify(&s), Presence::Presented);
+    }
+
+    #[test]
+    fn a_user_owned_window_freezes_the_clock_while_the_overlay_is_still_unplaced() {
+        // Waiting on the permission checker (or on a failure alert) is the user's time,
+        // and an overlay that has not been placed yet does not change that.
+        let s = Surfaces { permission_window: true, ..Surfaces::default() };
+        assert_eq!(classify(&s), Presence::AwaitingUser);
+        let s = Surfaces { alert: true, ..Surfaces::default() };
+        assert_eq!(classify(&s), Presence::AwaitingUser);
+    }
+
+    #[test]
+    fn every_other_kind_of_work_presents_on_its_own() {
+        // None of these mints an overlay, and each is a legitimate whole session: an
+        // `--active-window` still, a countdown, an overlay-less `--active-monitor
+        // --video` recording, a preview handed off from another child, `--settings`.
+        // Any one of them alone must disarm the guard, or the guard kills real work.
+        let none = Surfaces::default();
+        for (what, s) in [
+            ("preview", Surfaces { preview_open: true, ..none }),
+            ("countdown", Surfaces { countdown: true, ..none }),
+            ("capturing", Surfaces { capturing: true, ..none }),
+            ("recording", Surfaces { recording: true, ..none }),
+            ("settings", Surfaces { settings_open: true, ..none }),
+        ] {
+            assert_eq!(classify(&s), Presence::Presented, "{what} alone must present");
+        }
+    }
+
+    #[test]
+    fn a_mint_then_wedge_still_exits() {
+        // The customer's exact shape, driven through the real clock: the overlay window
+        // is minted (so the old `!outputs.is_empty()` test would have reported
+        // Presented and disarmed here), placement never lands, and the runtime is stuck.
+        // 90s later the child must end itself.
+        let minted_unplaced = Surfaces::default();
+        let mut c = Budget::new(B);
+        let step = Duration::from_millis(250);
+        let mut verdict = Verdict::Wait;
+        for _ in 0..(90 * 4) {
+            verdict = c.advance(step, classify(&minted_unplaced));
+            if verdict != Verdict::Wait {
+                break;
+            }
+        }
+        assert_eq!(verdict, Verdict::Exit);
+        // And the same timeline with placement landing on the first step disarms
+        // instead — the guard is not simply killing every launch.
+        let placed = Surfaces { overlay_placed: true, ..Surfaces::default() };
+        let mut c = Budget::new(B);
+        assert_eq!(c.advance(step, classify(&placed)), Verdict::Disarm);
     }
 
     // ── The clock ─────────────────────────────────────────────────────────────

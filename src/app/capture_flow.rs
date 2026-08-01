@@ -1,5 +1,27 @@
 use super::*;
 
+/// The extension every still capture is auto-saved with.
+pub(in crate::app) const STILL_EXT: &str = "png";
+/// The extension every recording is auto-saved with.
+pub(in crate::app) const RECORDING_EXT: &str = "mp4";
+
+/// The auto-save file NAME for a still capture whose stem is `stem`.
+///
+/// One line, and it is the line DRAGON-429 is about. The extension is appended HERE and
+/// nowhere else on the still auto-save path, so "can a capture be saved without one?" is a
+/// question about this function alone rather than about every branch that reaches it.
+/// `App::capture_stem` returns a stem for EVERY kind (window, monitor, region), and all
+/// three still branches join it through here.
+pub(in crate::app) fn still_save_name(stem: &str) -> String {
+    format!("{stem}.{STILL_EXT}")
+}
+
+/// The auto-save file NAME for a recording whose stem is `stem`. The `.mp4` twin of
+/// [`still_save_name`]; see it for why this exists as a function at all.
+pub(in crate::app) fn recording_save_name(stem: &str) -> String {
+    format!("{stem}.{RECORDING_EXT}")
+}
+
 /// DRAGON-228: whether the capture overlays are in the PICKING phase — the phase
 /// where they should hold EXCLUSIVE keyboard so Escape (and the other overlay
 /// shortcuts) work without a focusing click first. cosmic-comp only ever
@@ -453,8 +475,13 @@ impl App {
         {
             self.win_preview_preopen = mac_preopen;
         }
-        let preview_pre_open =
-            immediate && (sel.window_id.is_none() || self.window_defocus_uses_spinner(&sel));
+        // DRAGON-428: `--no-editor` suppresses this pre-open too. `neutral_spinner` and
+        // `mac_preopen` already carry the term inside their own decisions; this third one is
+        // computed inline, so it takes the term here. All three exist only to cover the gap
+        // until the editor appears, and this launch opens none.
+        let preview_pre_open = immediate
+            && !self.no_editor
+            && (sel.window_id.is_none() || self.window_defocus_uses_spinner(&sel));
         let preview_open = if neutral_spinner || preview_pre_open || mac_preopen {
             // The selection sizes the windowed preview at open, before the grab/decode
             // reports exact dims. The whole preview pipeline speaks PHYSICAL capture
@@ -706,53 +733,81 @@ impl App {
         }
     }
 
-    /// Finish a capture WITHOUT the preview editor: it's already saved. Copy it to the
-    /// clipboard when it's within the size limit, then post a notification — "Copied
-    /// to clipboard" when we did, otherwise "Saved" with the location. Clicking the
-    /// notification reveals the file. The clipboard + notifier run as detached
-    /// helper processes, so we just exit.
+    /// Which capture this was, for the notification's first line (DRAGON-450). The picker
+    /// mode IS the answer — an immediate `--active-window` / `--active-monitor` launch pins
+    /// it at startup, and an overlay capture follows whatever the user last switched to.
+    fn notify_kind(&self) -> crate::platform::services::NotifyKind {
+        use crate::platform::services::NotifyKind;
+        match self.mode {
+            Mode::Region => NotifyKind::Region,
+            Mode::Window => NotifyKind::Window,
+            Mode::Monitor => NotifyKind::Monitor,
+        }
+    }
+
+    /// Put the finished capture on the clipboard and report WHAT ACTUALLY HAPPENED.
     ///
-    /// DRAGON-353: the copy is UNCONDITIONAL (bar the size limit) — the "Automatically
-    /// copy to clipboard" setting is gone, and the editor's own open-time auto-copy is
-    /// this path's mirror for the (normal) case where an editor does open. This path
-    /// survives only for captures that CANNOT open one (no known output).
+    /// Two things this deliberately does not do (DRAGON-450, both regressions of the old
+    /// two-line version):
+    ///
+    /// * It does not gate a REFERENCE copy on size. A recording — or any non-image path —
+    ///   goes onto the clipboard as a path (`CF_HDROP` / a `file://` URL / `text/uri-list`),
+    ///   a few hundred bytes however long the recording is. The old size check refused
+    ///   exactly those, which is the one case it could never help; it now applies only to a
+    ///   still image, whose bytes really are copied (see [`crate::share::copy_embeds_bytes`]).
+    /// * It does not PREDICT the result. The old code compared the size, copied, threw the
+    ///   copy's own return value away, and told the user "Copied to clipboard" whether or
+    ///   not the write had landed.
+    ///
+    /// What the returned outcome is worth differs by platform, exactly as
+    /// [`crate::share::copy_to_clipboard`] documents: on macOS/Windows the write is
+    /// synchronous, so `Copied` is verified. On Linux the selection is served by a detached
+    /// worker, so `Failed` is real (no worker started at all) while `Copied` means "handed
+    /// to a worker that normally succeeds" — the furthest a one-shot process can honestly go
+    /// there, and no weaker than what this path used to claim unconditionally.
+    fn copy_for_delivery(
+        &self,
+        path: &std::path::Path,
+        size: u64,
+        is_video: bool,
+    ) -> crate::platform::services::CopyOutcome {
+        use crate::platform::services::{AUTO_COPY_MAX_BYTES, CopyOutcome};
+        if crate::platform::services::copy_embeds_bytes(path, is_video) && size > AUTO_COPY_MAX_BYTES
+        {
+            log::warn!(
+                "capture ({size} bytes) is over the automatic clipboard limit for an image \
+                 copy; saved to {} but not copied",
+                path.display()
+            );
+            return CopyOutcome::TooLarge;
+        }
+        if crate::platform::services::copy_to_clipboard(path, is_video) {
+            CopyOutcome::Copied
+        } else {
+            CopyOutcome::Failed
+        }
+    }
+
+    /// Finish a capture WITHOUT the preview editor: it's already saved. Copy it to the
+    /// clipboard, then post a notification naming what was captured and where it went —
+    /// "Region copied to clipboard", or "Region saved" with the reason when the copy did
+    /// not happen. Clicking the notification reveals the file. The clipboard + notifier run
+    /// as detached helper processes, so we just exit.
+    ///
+    /// This is the whole feedback a "(no editor)" capture gives (DRAGON-428), which is why
+    /// DRAGON-450 made the text specific and the click work.
+    ///
+    /// DRAGON-353: the copy is UNCONDITIONAL — the "Automatically copy to clipboard"
+    /// setting is gone, and the editor's own open-time auto-copy is this path's mirror for
+    /// the (normal) case where an editor does open.
     pub(super) fn finish_share(
         &mut self,
         path: &std::path::Path,
         size: u64,
         is_video: bool,
     ) -> Task<cosmic::Action<Msg>> {
-        let copied = size <= crate::platform::services::AUTO_COPY_MAX_BYTES;
-        if copied {
-            crate::platform::services::copy_to_clipboard(path, is_video);
-        }
-        crate::platform::services::notify(path, copied);
-        self.finish_session()
-    }
-
-    /// The region "Copy selection" quick-action's completion: like [`Self::finish_share`],
-    /// but ALWAYS copies to the clipboard (the shortcut exists to copy, so it ignores the
-    /// persisted `copy_to_clipboard` toggle) — still only within the clipboard size limit,
-    /// past which copying would fail anyway. The capture is saved to disk exactly as a
-    /// normal region shot (the save happens upstream in `do_pixel_capture`); this only
-    /// changes the SHARE disposition to a forced copy, then notifies + finishes.
-    pub(super) fn finish_share_forced_copy(
-        &mut self,
-        path: &std::path::Path,
-        size: u64,
-        is_video: bool,
-    ) -> Task<cosmic::Action<Msg>> {
-        let within_limit = size <= crate::platform::services::AUTO_COPY_MAX_BYTES;
-        if within_limit {
-            crate::platform::services::copy_to_clipboard(path, is_video);
-        } else {
-            log::warn!(
-                "copy-selection: capture ({size} bytes) exceeds the clipboard size limit; \
-                 saved to {} but not copied",
-                path.display()
-            );
-        }
-        crate::platform::services::notify(path, within_limit);
+        let outcome = self.copy_for_delivery(path, size, is_video);
+        crate::platform::services::notify(path, self.notify_kind(), outcome);
         self.finish_session()
     }
 
@@ -872,6 +927,7 @@ impl App {
             immediate,
             sel.window_id.is_some(),
             self.window_defocus_uses_spinner(sel),
+            !self.no_editor,
         )
     }
 
@@ -893,7 +949,7 @@ impl App {
     /// appearances now (immediate window pick with the post-capture preview on).
     #[cfg(target_os = "macos")]
     fn window_pick_preopens_window(&self, sel: &Selection, immediate: bool) -> bool {
-        window_pick_preopen_decision(immediate, sel.window_id.is_some())
+        window_pick_preopen_decision(immediate, sel.window_id.is_some(), !self.no_editor)
     }
 
     /// DRAGON-305 (Windows): a WINDOWED single-window capture pre-opens its fullscreen loading
@@ -909,6 +965,7 @@ impl App {
             immediate,
             sel.window_id.is_some(),
             self.preview_windowed,
+            !self.no_editor,
         )
     }
 
@@ -1007,6 +1064,7 @@ impl App {
     /// delayed shot); this only governs the during-selection preview.
     pub(super) fn freeze_backdrop_active(&self) -> bool {
         freeze_backdrop_active(self.freezing(), self.configured_delay_secs())
+            || scanner_backdrop_active(self.kind, self.mode, !self.frozen.is_empty())
     }
 
     /// The frozen scene's windows that intersect the region (global logical coords), in z-order, as
@@ -1149,6 +1207,9 @@ impl App {
     /// Filename stem `<timestamp>[-<descriptor>]` for a capture/recording of `sel`:
     /// a window appends its slugified title (or the literal `window`), a monitor
     /// its slugified name (or `monitor`), a region nothing extra.
+    ///
+    /// Deliberately EXTENSIONLESS — it is a stem, and every auto-save path turns it into a
+    /// file name through [`still_save_name`] / [`recording_save_name`].
     pub(super) fn capture_stem(&self, sel: &Selection) -> String {
         let ts = capture_timestamp();
         let descriptor = if let Some(id) = &sel.window_id {
@@ -1217,7 +1278,7 @@ impl App {
         };
         let dir = crate::util::expand_tilde(raw_dir);
         let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join(format!("{}.png", self.capture_stem(&sel)));
+        let path = dir.join(still_save_name(&self.capture_stem(&sel)));
 
         // PipeWire screenshot: a portal stream was granted at commit. Grab a single
         // frame off the UI thread, save it, then share via `PipewireShotSaved`.
@@ -1623,6 +1684,10 @@ impl App {
         // between the region/window/monitor selectors.
         let cursor_overlay = self.frozen_cursor.as_ref().filter(|_| extras.cursor);
         let frozen_source = frozen_region_source(extras.wallpaper);
+        // DRAGON-454: the window path above hands its grab to a worker thread, but this one
+        // composites AND encodes on the UI thread — and it sits directly in front of the
+        // editor opening. Bracketed so the launch timeline says how much of the wait is here.
+        crate::util::timing_mark("do_pixel_capture: region/monitor composite (begin, UI thread)");
         let img = if frozen && frozen_source == FrozenRegionSource::WindowsOnly {
             // Freeze + no wallpaper: recomposite the frozen windows over the correct
             // background (transparent if transparency-ON, else black) — same compositing
@@ -1697,6 +1762,13 @@ impl App {
             // what gets named here rather than the "no image" symptom it produced.
             return self.fail_session();
         };
+        if crate::util::timing_on() {
+            crate::util::timing_mark(&format!(
+                "do_pixel_capture: region/monitor composite (done, {}x{})",
+                img.width(),
+                img.height()
+            ));
+        }
         // Save the PNG straight to the screenshots folder (no external tool).
         if !crate::media::png::save_png(&img, &path, &self.screenshot_metadata()) {
             // DRAGON-419 (silent-exit path S3). `save_png` returns a bool, so the real
@@ -1718,6 +1790,7 @@ impl App {
             // the whole actionable content of a "could not write the file" message.
             return self.fail_session();
         }
+        crate::util::timing_mark("do_pixel_capture: save_png (done, capture is on disk)");
         // DRAGON-336: the region/monitor composite is finished and the PNG is on disk —
         // the frozen flats, the per-window pixels and the picker wallpapers can never be
         // read again in this process (the preview reads the saved file). Release them
@@ -1883,14 +1956,23 @@ impl App {
 /// DRAGON-308 (Windows): whether to float an opaque backdrop below a picked GLASS window
 /// during the grab so its acrylic composites against the wallpaper, not the user's other
 /// windows — `Some(true)` = the aligned desktop wallpaper, `Some(false)` = solid black,
-/// `None` = float nothing. Only a transparency-PRESERVING grab has glass in the capture to
-/// fix (an opaque PrintWindow grab renders the window in isolation), and a FULLSCREEN window
-/// fills its output so there is no glass/wallpaper-behind — so both suppress the float. When
-/// wallpaper is on we float the wallpaper (the ticket's ask); when off we float black so the
-/// glass still never leaks the user's other windows. Pure so the decision is unit-testable.
+/// `None` = float nothing. When wallpaper is on we float the wallpaper (the ticket's ask);
+/// when off we float black, so the glass never shows the user's other windows either way.
+///
+/// DRAGON-426 dropped the FULLSCREEN suppression, and the reason is worth stating: this stopped
+/// being a decision about how the capture LOOKS and became the precondition that lets it
+/// preserve transparency at all (`wm/focus.rs`). The old reasoning — "a fullscreen window fills
+/// its output, so there is nothing behind it" — is true of an OPAQUE fullscreen window and
+/// false of a translucent one, which shows the desktop, and every other window on it, straight
+/// through. Suppressing the backdrop there left exactly the case with the most to leak taking
+/// an unprotected grab. Now the answer turns only on whether this grab keeps transparency;
+/// `fullscreen` is accepted and ignored, kept in the signature because the caller's own
+/// fullscreen handling (no padding, no rounding, no wallpaper composite) still reads from it.
+/// Pure so the decision is unit-testable.
 #[cfg(windows)]
 pub(super) fn window_backdrop_kind(transparency: bool, wallpaper: bool, fullscreen: bool) -> Option<bool> {
-    (transparency && !fullscreen).then_some(wallpaper)
+    let _ = fullscreen;
+    transparency.then_some(wallpaper)
 }
 
 /// Whether the DRAGON-292 macOS wallpaper-backdrop recomposite is active for this window
@@ -1941,6 +2023,26 @@ pub(super) fn is_fullscreen(win: (i32, i32, i32, i32), out: (i32, i32, i32, i32)
 /// already false). No delay re-freezes.
 pub(super) fn freeze_backdrop_active(freezing: bool, delay_secs: u64) -> bool {
     freezing && delay_secs == 0
+}
+
+/// DRAGON-456: whether the SCANNER shows the frozen backdrop on its own account, i.e.
+/// regardless of the user's `freeze` preference.
+///
+/// The scanner reads its pixels out of the launch-instant flats (`crop_frozen`), and with
+/// freeze off the overlay was transparent — so the user watched the LIVE desktop while the
+/// scanner read a snapshot of it. Alt-tab to another window and the scan still returned the
+/// old window's text, with nothing on screen to say why. That is the bug this closes: what
+/// is shown and what is read are now the same pixels, always.
+///
+/// Deliberately NOT gated on the delay: the scanner never counts down (`proceed_capture`
+/// skips it, the chip is hidden), so a delay left over from image mode cannot make the scan
+/// source live and must not release the backdrop.
+///
+/// `has_flats` self-gates the whole thing: a session with no snapshot to show (a portal
+/// Linux session, or before the deferred grab lands) simply keeps the live view it has
+/// today. Pure so the rule is testable on any OS.
+pub(super) fn scanner_backdrop_active(kind: Kind, mode: Mode, has_flats: bool) -> bool {
+    kind == Kind::Scanner && mode == Mode::Region && has_flats
 }
 
 /// Whether to re-grab the cursor AT THE CAPTURE MOMENT (vs reuse the launch-locked
@@ -2079,11 +2181,15 @@ fn window_pick_neutral_spinner_decision(
     immediate: bool,
     is_window_pick: bool,
     is_defocus_sink: bool,
+    wants_editor: bool,
 ) -> bool {
-    // DRAGON-353: the `preview_enabled` term is gone with the "Open in preview editor"
-    // setting — the editor always opens, so a window pick always has a spinner to cover
-    // the grab with.
-    immediate && is_window_pick && !is_defocus_sink
+    // DRAGON-353 removed the old `preview_enabled` term with the "Open in preview editor"
+    // SETTING. DRAGON-428 reintroduces the same shape for a different reason: not a
+    // persisted preference, but a per-launch `--no-editor`. The spinner exists ONLY to
+    // cover the grab until the editor appears, so a launch that will never open one must
+    // not mint it — otherwise the user sees a spinner overlay flash and vanish for a
+    // capture that was always going straight to the clipboard.
+    immediate && is_window_pick && !is_defocus_sink && wants_editor
 }
 
 /// DRAGON-216: the pure decision behind [`App::window_pick_preopens_window`] (macOS). A
@@ -2096,10 +2202,12 @@ fn window_pick_neutral_spinner_decision(
 /// (tested on every platform); the macOS and Windows callers consult it (DRAGON-305), so it is
 /// dead code only on Linux + exotic targets.
 #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
-fn window_pick_preopen_decision(immediate: bool, is_window_pick: bool) -> bool {
-    // DRAGON-353: the `preview_enabled` term is gone with the "Open in preview editor"
-    // setting — the editor always opens.
-    immediate && is_window_pick
+fn window_pick_preopen_decision(immediate: bool, is_window_pick: bool, wants_editor: bool) -> bool {
+    // DRAGON-353 removed the old `preview_enabled` term with the "Open in preview editor"
+    // SETTING; DRAGON-428 reintroduces the same shape for the per-launch `--no-editor`.
+    // The pre-open exists only to cover the focus-then-grab until the editor appears, so a
+    // launch that opens no editor must not pre-open a surface it will never fill.
+    immediate && is_window_pick && wants_editor
 }
 
 /// DRAGON-305: the pure decision behind the Windows [`App::window_pick_preopens_window`] arm. A
@@ -2108,8 +2216,13 @@ fn window_pick_preopen_decision(immediate: bool, is_window_pick: bool) -> bool {
 /// shows the fullscreen blocker after the grab, so it needs no pre-open. Otherwise it is exactly
 /// [`window_pick_preopen_decision`] (immediate window pick with preview enabled). Windows-only.
 #[cfg(windows)]
-fn windows_window_pick_preopens(immediate: bool, is_window_pick: bool, windowed: bool) -> bool {
-    windowed && window_pick_preopen_decision(immediate, is_window_pick)
+fn windows_window_pick_preopens(
+    immediate: bool,
+    is_window_pick: bool,
+    windowed: bool,
+    wants_editor: bool,
+) -> bool {
+    windowed && window_pick_preopen_decision(immediate, is_window_pick, wants_editor)
 }
 
 /// The [`WindowFocusIntent`] for a single-window capture given the persisted
@@ -2285,6 +2398,95 @@ where
     F: FnOnce() -> Vec<crate::screenshot::OutputGeom>,
 {
     if frozen.is_empty() { live() } else { frozen }
+}
+
+/// DRAGON-429: the auto-save naming invariant — a capture is NEVER written without its
+/// extension, whatever kind it is or what the window/monitor was called.
+///
+/// The ticket arrived as "region captures save with no extension". Triage falsified that for
+/// the auto-save path (the real seam was the Windows Save As dialog, see
+/// `platform::windows::file_panel`) — but the reason it took triage to falsify is that
+/// nothing pinned it. These tests are that pin.
+#[cfg(test)]
+mod save_name_tests {
+    use super::{recording_save_name, still_save_name, RECORDING_EXT, STILL_EXT};
+    use crate::app::{capture_timestamp, slugify};
+
+    /// Stems standing in for what `App::capture_stem` can build: a bare timestamp (a REGION
+    /// capture — the kind the report named), and a timestamp plus each descriptor shape the
+    /// window / monitor branches produce, including their empty-title fallbacks.
+    fn representative_stems() -> Vec<String> {
+        let ts = capture_timestamp();
+        vec![
+            // Region: no descriptor at all.
+            ts.clone(),
+            // Window, with a title, with the fallback, and with a title that is nothing but
+            // punctuation (slugify eats it, so the fallback is what `capture_stem` uses).
+            format!("{ts}-{}", slugify("My Document - Editor")),
+            format!("{ts}-window"),
+            format!("{ts}-{}", slugify("app v1.2 (beta)")),
+            // Monitor, named and fallback.
+            format!("{ts}-{}", slugify("DP-1")),
+            format!("{ts}-monitor"),
+        ]
+    }
+
+    #[test]
+    fn every_still_save_name_ends_in_png() {
+        for stem in representative_stems() {
+            let name = still_save_name(&stem);
+            assert!(name.ends_with(".png"), "{stem:?} produced {name:?}");
+            // And the extension is the ONLY dot, so nothing can be read as a different type.
+            assert_eq!(name.matches('.').count(), 1, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn every_recording_save_name_ends_in_mp4() {
+        for stem in representative_stems() {
+            let name = recording_save_name(&stem);
+            assert!(name.ends_with(".mp4"), "{stem:?} produced {name:?}");
+            assert_eq!(name.matches('.').count(), 1, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn the_helpers_are_exactly_the_format_they_replaced() {
+        // Byte-identity with the inlined `format!` at both former call sites: this extraction
+        // is a testability change, never a behaviour one.
+        for stem in representative_stems() {
+            assert_eq!(still_save_name(&stem), format!("{stem}.png"));
+            assert_eq!(recording_save_name(&stem), format!("{stem}.mp4"));
+        }
+        assert_eq!(STILL_EXT, "png");
+        assert_eq!(RECORDING_EXT, "mp4");
+    }
+
+    #[test]
+    fn a_stem_can_never_smuggle_in_a_dot_or_a_path_separator() {
+        // WHY the two tests above can stand in for driving `capture_stem` itself (which needs
+        // a live `App`): a stem is only ever a timestamp plus an optional slugified
+        // descriptor, and NEITHER part can contain a dot or a separator. So appending
+        // ".png" can never produce a second extension, a hidden file, or an escape from the
+        // capture folder, no matter what a window is called.
+        assert!(!capture_timestamp().contains(['.', '/', '\\']));
+        for title in [
+            "app v1.2 (beta)",
+            "notes.txt",
+            "../../etc/passwd",
+            "C:\\Windows\\System32",
+            ".hidden",
+            "....",
+            "Ünïcödé — dashes",
+            "",
+        ] {
+            let slug = slugify(title);
+            assert!(
+                !slug.contains(['.', '/', '\\']),
+                "slugify({title:?}) leaked a path character: {slug:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2610,7 +2812,7 @@ mod neutral_spinner_tests {
     // The happy path: immediate window pick, not the defocus sink.
     #[test]
     fn window_pick_pre_opens_neutral() {
-        assert!(decide(true, true, false));
+        assert!(decide(true, true, false, true));
     }
 
     // WINDOWED mode also pre-opens the neutral overlay now (DRAGON-216 follow-up): the
@@ -2620,14 +2822,14 @@ mod neutral_spinner_tests {
     #[test]
     fn both_appearances_pre_open_neutral() {
         // Same inputs regardless of preview_windowed — the decision no longer takes it.
-        assert!(decide(true, true, false));
+        assert!(decide(true, true, false, true));
     }
 
     // The single-toplevel defocus sink deliberately pre-opens Exclusive to BE the focus
     // sink, so it must NOT be routed through the neutral path.
     #[test]
     fn defocus_sink_is_not_neutral() {
-        assert!(!decide(true, true, true));
+        assert!(!decide(true, true, true, true));
     }
 
     // A delayed shot (not immediate) never pre-opens; nor does a non-window pick
@@ -2635,8 +2837,16 @@ mod neutral_spinner_tests {
     // always opens.
     #[test]
     fn other_misses_defer() {
-        assert!(!decide(false, true, false)); // delayed
-        assert!(!decide(true, false, false)); // region/monitor
+        assert!(!decide(false, true, false, true)); // delayed
+        assert!(!decide(true, false, false, true)); // region/monitor
+    }
+
+    /// DRAGON-428: a `--no-editor` launch opens no editor, so there is nothing for the
+    /// spinner to cover. Minting it anyway would flash an overlay on screen and tear it
+    /// down again for a capture that went straight to the clipboard.
+    #[test]
+    fn a_no_editor_launch_never_pre_opens() {
+        assert!(!decide(true, true, false, false));
     }
 }
 
@@ -2649,14 +2859,20 @@ mod mac_preopen_tests {
     // (DRAGON-216: the fullscreen overlay preview covers the grab too, not just windowed).
     #[test]
     fn window_pick_pre_opens_both_appearances() {
-        assert!(decide(true, true));
+        assert!(decide(true, true, true));
     }
 
     // Delayed / non-window both defer (DRAGON-353: "preview off" no longer exists).
     #[test]
     fn other_misses_defer() {
-        assert!(!decide(false, true)); // delayed
-        assert!(!decide(true, false)); // region/monitor
+        assert!(!decide(false, true, true)); // delayed
+        assert!(!decide(true, false, true)); // region/monitor
+    }
+
+    /// DRAGON-428: same rule as the Linux neutral spinner — no editor coming, no pre-open.
+    #[test]
+    fn a_no_editor_launch_never_pre_opens() {
+        assert!(!decide(true, true, false));
     }
 }
 
@@ -2668,21 +2884,28 @@ mod windows_preopen_tests {
     // blocker cover.
     #[test]
     fn windowed_window_pick_pre_opens() {
-        assert!(decide(true, true, true));
+        assert!(decide(true, true, true, true));
     }
 
     // Overlay-preview mode (windowed = false) does NOT pre-open — it already shows the fullscreen
     // blocker after the grab.
     #[test]
     fn overlay_mode_defers() {
-        assert!(!decide(true, true, false));
+        assert!(!decide(true, true, false, true));
     }
 
     // The base misses (delayed / non-window) still defer even in windowed mode.
     #[test]
     fn base_misses_defer_even_when_windowed() {
-        assert!(!decide(false, true, true)); // delayed
-        assert!(!decide(true, false, true)); // region/monitor
+        assert!(!decide(false, true, true, true)); // delayed
+        assert!(!decide(true, false, true, true)); // region/monitor
+    }
+
+    /// DRAGON-428: no editor coming, so no blocker cover — even in windowed mode, which is
+    /// the one shape that otherwise always pre-opens.
+    #[test]
+    fn a_no_editor_launch_never_pre_opens() {
+        assert!(!decide(true, true, true, false));
     }
 }
 
@@ -2707,12 +2930,22 @@ mod windows_backdrop_kind_tests {
         assert_eq!(kind(false, false, false), None);
     }
 
-    // A FULLSCREEN window fills its output (no glass / wallpaper-behind), so it floats nothing
-    // even with transparency on.
+    // DRAGON-426: a FULLSCREEN window floats a backdrop too. It used to float nothing, on the
+    // reasoning that a fullscreen window has nothing behind it — true when it is opaque, false
+    // when it is translucent, and the translucent case is the one with a whole desktop's worth
+    // of other windows to show through. The backdrop is the precondition for keeping
+    // transparency at all now, so it must not be suppressed by a size.
     #[test]
-    fn fullscreen_floats_nothing() {
-        assert_eq!(kind(true, true, true), None);
-        assert_eq!(kind(true, false, true), None);
+    fn fullscreen_still_floats_a_backdrop() {
+        assert_eq!(kind(true, true, true), Some(true));
+        assert_eq!(kind(true, false, true), Some(false));
+    }
+
+    // An opaque grab floats nothing whatever its size — there is no transparency to protect.
+    #[test]
+    fn opaque_fullscreen_still_floats_nothing() {
+        assert_eq!(kind(false, true, true), None);
+        assert_eq!(kind(false, false, true), None);
     }
 }
 
@@ -2813,6 +3046,44 @@ mod freeze_backdrop_tests {
     fn freeze_off_never_shows_backdrop() {
         assert!(!freeze_backdrop_active(false, 0));
         assert!(!freeze_backdrop_active(false, 5));
+    }
+}
+
+#[cfg(test)]
+mod scanner_backdrop_tests {
+    use super::scanner_backdrop_active;
+    use crate::app::{Kind, Mode};
+
+    // DRAGON-456, the whole point: the scanner shows the still it is READING, even with the
+    // freeze preference off (its default). Before this, freeze-off showed the live desktop
+    // while the scan read the launch snapshot, so alt-tabbing produced text from a window
+    // that was no longer on screen.
+    #[test]
+    fn the_scanner_shows_its_snapshot_even_with_freeze_off() {
+        assert!(scanner_backdrop_active(Kind::Scanner, Mode::Region, true));
+    }
+
+    // No snapshot to show (portal session, or the deferred grab hasn't landed): keep the
+    // live view rather than painting an empty backdrop.
+    #[test]
+    fn no_flats_keeps_the_live_view() {
+        assert!(!scanner_backdrop_active(Kind::Scanner, Mode::Region, false));
+    }
+
+    // Image / video kinds are untouched — their backdrop stays the user's freeze setting's
+    // business (`freeze_backdrop_active`), including the countdown release.
+    #[test]
+    fn other_kinds_are_untouched() {
+        assert!(!scanner_backdrop_active(Kind::Image, Mode::Region, true));
+        assert!(!scanner_backdrop_active(Kind::Video, Mode::Region, true));
+    }
+
+    // Region only, mirroring where scanning actually runs (`MarksPoll` requires it, and
+    // the scanner pins the mode on entry). A monitor/window pick has no scan to match.
+    #[test]
+    fn only_region_mode() {
+        assert!(!scanner_backdrop_active(Kind::Scanner, Mode::Monitor, true));
+        assert!(!scanner_backdrop_active(Kind::Scanner, Mode::Window, true));
     }
 }
 

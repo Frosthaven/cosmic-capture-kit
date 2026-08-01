@@ -279,8 +279,11 @@ where
 /// DRM_FORMAT_MOD_INVALID — "implicit modifier": ask the compositor for a dmabuf and
 /// let it pick the tiling, reporting it back. The simplest negotiation that avoids
 /// the explicit modifier-list dance (callers verify on real hardware).
+///
+/// DRAGON-425 unified the three copies of this literal behind one ungated const; the alias
+/// keeps every use site below reading exactly as it did.
 #[cfg(feature = "zero-copy")]
-const DRM_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+const DRM_MOD_INVALID: u64 = crate::encode::DRM_FORMAT_MOD_INVALID;
 
 /// A captured DMA-BUF frame: per-plane `(fd, offset, stride)` plus the DRM format and
 /// modifier, for zero-copy import into a GPU encoder. The fds are owned by PipeWire

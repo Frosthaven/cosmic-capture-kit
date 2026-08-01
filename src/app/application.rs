@@ -31,7 +31,11 @@ impl cosmic::Application for App {
             .preview
             .as_ref()
             .map(|p| (p.clone(), super::preview::is_video_path(p)));
-        let preview_mode = startup_preview.is_some();
+        // DRAGON-427 (Windows 10): a `--preview-handoff` launch is a preview launch too —
+        // same suppression of every capture surface, just fed from the wire fields instead
+        // of a bare path.
+        let startup_handoff = startup.preview_handoff.clone();
+        let preview_mode = startup_preview.is_some() || startup_handoff.is_some();
         let dummy_id = window::Id::unique();
         let dummy = super::shell::bootstrap_surface(dummy_id);
         // Detect the very first launch (no state file yet) before anything writes
@@ -72,13 +76,33 @@ impl cosmic::Application for App {
         // decision AND seeds the window (its poll fills the Notifications card shortly
         // after open); a `--permissions` launch, which takes no snapshot here, probes
         // fully at seed time below.
+        // DRAGON-440: this snapshot is normally ALREADY TAKEN — `app::run`'s macOS preamble
+        // needs it before the boot-time activation policy is set, and hands it over on
+        // `Startup::route_probe`. Consuming it here rather than re-probing is what keeps the
+        // policy decision and the routing decision reading ONE snapshot, with no window
+        // between them for a grant to change under us. The `or_else` is belt-and-braces for
+        // a caller that did not fill it in, and reproduces the original guard exactly
+        // (`opens_overlays()` IS `!settings_only && !preview_mode && !permissions_only`).
         #[cfg(target_os = "macos")]
-        crate::util::timing_mark("App::init -> permissions::probe_now_fast (begin)");
+        crate::util::timing_mark("App::init -> permissions probe (normally already taken in app::run)");
+        // DRAGON-443: `boot_post_update` mirrors `run`'s gate exactly. A post-update relaunch
+        // becomes a settings launch below, so it must not probe here either — this fallback
+        // would otherwise re-introduce, on the one path `run` deliberately skips, precisely
+        // the routed-permission open that would hide the release notes.
+        //
+        // Read into a local BEFORE the `or_else`: that expression moves `route_probe` out of
+        // `startup`, and reading another field from inside the closure afterwards would lean
+        // on closure capture-disjointness to stay legal. One `bool` copy costs nothing and
+        // owes the borrow checker no argument.
         #[cfg(target_os = "macos")]
-        let route_probe = (!settings_only && !preview_mode && !permissions_only)
-            .then(permissions::probe_now_fast);
+        let boot_post_update = startup.post_update;
         #[cfg(target_os = "macos")]
-        crate::util::timing_mark("App::init <- permissions::probe_now_fast (done)");
+        let route_probe = startup.route_probe.or_else(|| {
+            (!settings_only && !preview_mode && !permissions_only && !boot_post_update)
+                .then(permissions::probe_now_fast)
+        });
+        #[cfg(target_os = "macos")]
+        crate::util::timing_mark("App::init <- permissions probe (done)");
         // Route to the checker when a real capture launch still has an UNADDRESSED
         // permission: Screen Recording missing (required), or an optional grant never
         // prompted (mic / notifications NotDetermined). Denied optionals don't nag —
@@ -92,6 +116,33 @@ impl cosmic::Application for App {
         // Open the permission window either on an explicit `--permissions`, or when a
         // capture launch is missing the Screen Recording grant.
         let open_permissions = permissions_only || route_to_permissions;
+        // DRAGON-431 BELT ONE (floor lowered to 13.0 by DRAGON-444): can this macOS capture at
+        // all?
+        //
+        // We install on 13 (`LSMinimumSystemVersion` is 13.0 and stays there). DRAGON-444
+        // added the pre-14 capture path (a one-shot `SCStream` grab plus CoreGraphics sizing in
+        // place of `SCScreenshotManager` / `SCShareableContent.infoForFilter:`, the two 14.0+
+        // selectors — the latter HARD-ABORTS the process on 13 with no exception handler), so
+        // capture now works down to 13.0. This guard only stops macOS 12 and older, where the
+        // audio-capture selectors the recording pipeline needs do not exist; such a launch
+        // must say why instead of vanishing.
+        //
+        // Decided HERE, at the top of init, because everything below it is what fires those
+        // calls: the AeroSpace pause, then `acquire_scene`'s window pre-capture / frozen
+        // flats / wallpaper threads, then `seed_outputs_mac`'s `output_descs`. Suppressing
+        // the scene the way a permission-routed launch does keeps every one of them from
+        // starting; `seed_outputs_mac` then reports the failure and shows the dialog (it has
+        // the `&mut self` and the `Task` this does not). `mac::shareable_content_uncached`
+        // is belt two.
+        //
+        // `os_version` is safe to ask: `NSProcessInfo.operatingSystemVersion` is 10.10+, so
+        // the probe itself can never be the thing that aborts. `capture_supported` is the ONE
+        // seam all three guards ask, so the `CCK_TEST_FORCE_UNSUPPORTED_OS` review aid cannot
+        // be honoured here and forgotten somewhere else.
+        #[cfg(target_os = "macos")]
+        let unsupported_os = !crate::platform::mac::capture_supported();
+        #[cfg(not(target_os = "macos"))]
+        let unsupported_os = false;
         let radius = window_radius();
         // Frosted-glass config (DRAGON-217), read once — theme is fixed for this
         // one-shot session. `None` off COSMIC / when frosted windows are off, which
@@ -110,12 +161,16 @@ impl cosmic::Application for App {
         // for real capture launches (the same guard the scene grab and seed use); a
         // no-AeroSpace machine returns fast and the latch signals immediately.
         #[cfg(target_os = "macos")]
-        if !settings_only && !preview_mode && !open_permissions {
+        if !settings_only && !preview_mode && !open_permissions && !unsupported_os {
             crate::util::timing_mark("App::init -> early_pause_tiling_wm (detached, overlaps scene grab)");
             crate::platform::mac::window::early_pause_tiling_wm();
         }
         crate::util::timing_mark("App::init -> acquire_scene (begin)");
-        let scene_active = !settings_only && !preview_mode && !open_permissions;
+        // DRAGON-431: `unsupported_os` joins the same suppression a permission-routed launch
+        // uses. Nothing this gates is optional on macOS 13 — every one of the scene threads
+        // reaches ScreenCaptureKit, and reaching it there aborts the process.
+        let scene_active =
+            !settings_only && !preview_mode && !open_permissions && !unsupported_os;
         // The launch capture mode, resolved from the CLI overrides (Scanner forces
         // Region). Computed HERE (before the App struct) so `acquire_scene` can gate the
         // ~1s window pre-capture on a WINDOW-mode launch (DRAGON-204) — every other mode
@@ -214,10 +269,19 @@ impl cosmic::Application for App {
             persisted.appearance_contrast_boost,
         ));
         // Post-update relaunch (DRAGON-177): the installer's swap helper relaunches
-        // the app bare; consuming the marker turns THIS launch into a settings
-        // launch that lands on About, so the new version's notes are front and
-        // center. (With the resident on, the daemon consumes the marker instead and
-        // spawns a --settings child; this path covers non-resident relaunches.)
+        // the app bare; the marker turns THIS launch into a settings launch that lands
+        // on About, so the new version's notes are front and center. (With the resident
+        // on, the daemon consumes the marker instead and spawns a --settings child; this
+        // path covers non-resident relaunches.)
+        //
+        // DRAGON-443: on macOS the marker was already CONSUMED in `app::run`'s preamble,
+        // which needed the answer before the boot-time activation policy was set, and handed
+        // it down here. Reading the field rather than taking again is what keeps the marker
+        // single-shot AND keeps this decision identical to the one the policy was based on.
+        // Off macOS there is no preamble, so it is taken right here, exactly as before.
+        #[cfg(target_os = "macos")]
+        let post_update = boot_post_update;
+        #[cfg(not(target_os = "macos"))]
         let post_update = crate::update::take_post_update_marker();
         let settings_only = settings_only || post_update;
         // The launch settings window is minted a message-drain LATER (via
@@ -343,12 +407,22 @@ impl cosmic::Application for App {
                 settings_size_ready: false,
                 #[cfg(windows)]
                 preview_shown_confirmed: None,
+                #[cfg(windows)]
+                overlay_finalize_pending: false,
+                #[cfg(windows)]
+                overlay_finalize_deadline: None,
                 settings,
                 permissions,
                 keymap,
-                copy_selection_pending: false,
-                // `--preview` (windowed unless `--overlay`) overrides the persisted setting.
-                preview_windowed: startup.preview_windowed.unwrap_or(persisted.preview_windowed),
+                // DRAGON-428: `--no-editor`, carried through from the launch flags.
+                no_editor: startup.no_editor,
+                // `--preview` (windowed unless `--overlay`) overrides the persisted setting;
+                // DRAGON-427 then has the last word on Windows 10 (see `effective_preview_windowed`).
+                preview_windowed: super::effective_preview_windowed(
+                    startup.preview_windowed.unwrap_or(persisted.preview_windowed),
+                    startup.opens_overlays(),
+                    crate::platform::overlay_preview_available(),
+                ),
                 // DRAGON-419: the mirrored setting only. `diag::init` already resolved the
                 // SINK from this same key back in `main` (before this window, before the
                 // daemon branch), so there is nothing to start here.
@@ -385,6 +459,7 @@ impl cosmic::Application for App {
                 preview_output_scale: 1.0,
                 preview_open_size: None,
                 startup_preview,
+                startup_handoff,
                 preview_mode,
                 startup_immediate: startup.immediate,
                 #[cfg(target_os = "linux")]
@@ -411,6 +486,14 @@ impl cosmic::Application for App {
                 capture_hotkey: persisted.capture_hotkey.clone(),
                 capture_active_window_hotkey: persisted.capture_active_window_hotkey.clone(),
                 capture_active_monitor_hotkey: persisted.capture_active_monitor_hotkey.clone(),
+                // DRAGON-428: the three "(no editor)" twins.
+                capture_no_editor_hotkey: persisted.capture_no_editor_hotkey.clone(),
+                capture_active_window_no_editor_hotkey: persisted
+                    .capture_active_window_no_editor_hotkey
+                    .clone(),
+                capture_active_monitor_no_editor_hotkey: persisted
+                    .capture_active_monitor_no_editor_hotkey
+                    .clone(),
                 #[cfg(target_os = "macos")]
                 aerospace_guard: None,
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -451,6 +534,7 @@ impl cosmic::Application for App {
                 ocr_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_code_region: None,
                 last_ocr_region: None,
+                scan_refresh: ScanRefresh::Idle,
                 code_marks: Vec::new(),
                 marks: Vec::new(),
                 hovered_mark: None,
@@ -658,6 +742,19 @@ impl cosmic::Application for App {
             return self.preview_view(id);
         }
         if let Some(o) = self.outputs.iter().find(|o| o.id == id) {
+            // DRAGON-456: a scan refresh is re-reading the screen, and our own overlay is
+            // part of what a screen grab sees. Paint NOTHING (the surface is transparent,
+            // so it composites to nothing) until the new flats land — chrome, marks, dim
+            // wash and, most importantly, the frozen backdrop, which would otherwise make
+            // the re-grab a photograph of the still it is meant to replace. ONE place, so
+            // no layer can be forgotten. The overlay is untouched otherwise: same surface,
+            // same input, same state — it just skips a couple of frames.
+            if overlay_blanked_for_scan_refresh(self.scan_refresh) {
+                return widget::space::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
             if self.recording.is_some() {
                 self.recording_view(o)
             } else if self.countdown.is_some() {
@@ -738,20 +835,33 @@ impl App {
     /// toward a kill. It is read straight off `permissions.window` — the existing state
     /// that already drives `sub_permission_poll` and `seed_outputs_mac` — so nothing new
     /// is coupled to the permission flow (DRAGON-412 owns that module).
+    ///
+    /// DRAGON-439: the overlay counts once it is PLACED, not once it is MINTED. `outputs`
+    /// gains its entries in `seed_overlays`, at winit-window creation, and on macOS the
+    /// view deliberately draws a transparent `Space` until `configure_overlay` lands
+    /// (`OutputState::user_visible`). Latching Presented at the mint disarmed the guard
+    /// over a stretch in which the user still sees nothing at all — an iced/wgpu runtime
+    /// that wedged there produced exactly the invisible immortal child DRAGON-413 exists
+    /// to bound. That stretch now BURNS budget like the rest of a slow start. It cannot
+    /// make the guard trigger-happy on a working launch: placement normally lands within a
+    /// frame or two, and `configure_overlay` forces `placed = true` when its 30 × 40ms
+    /// (~1.2s) title-match retries run out, so even an overlay whose NSWindow is never
+    /// matched still latches. Only a runtime that stops answering keeps burning.
     fn startup_presence(&self) -> crate::startup_guard::Presence {
-        crate::startup_guard::presence(
-            !self.outputs.is_empty()
-                || !self.previews.is_empty()
-                || self.countdown.is_some()
-                || self.capturing.is_some()
-                || self.recording.is_some()
-                || self.settings.window.is_some(),
+        crate::startup_guard::classify(&crate::startup_guard::Surfaces {
+            overlay_placed: self.outputs.iter().any(|o| o.user_visible()),
+            preview_open: !self.previews.is_empty(),
+            countdown: self.countdown.is_some(),
+            capturing: self.capturing.is_some(),
+            recording: self.recording.is_some(),
+            settings_open: self.settings.window.is_some(),
+            permission_window: self.permissions.window.is_some(),
             // DRAGON-415: a capture-failure alert is the OTHER window the user must act on,
             // and reading it must no more cost this child its life than reading the
             // permission checker does. `report_failure` publishes `AwaitingUser` before the
             // modal takes the run loop; this keeps the two agreeing on any dispatch that
             // happens to run while one is up.
-            self.permissions.window.is_some() || alert_is_showing(),
-        )
+            alert: alert_is_showing(),
+        })
     }
 }

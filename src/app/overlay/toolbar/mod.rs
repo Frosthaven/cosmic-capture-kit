@@ -265,18 +265,44 @@ impl App {
             }
         })));
 
+        // DRAGON-456: the scan segment carries two meanings. While the scanner is ALREADY
+        // the active kind there is no kind to switch to, so a press re-reads the screen —
+        // and hovering it says so by swapping the glyph for the counter-clockwise refresh.
+        // Both the face and the action come from the SAME rule (`scan_press_refreshes`), so
+        // the button can never offer a refresh it won't perform. In every other state the
+        // segment is byte-identical to before: same glyph, same message, and no mouse_area
+        // in its event path at all.
+        let scan_refreshes = scan_press_refreshes(self.kind, Kind::Scanner);
+        let scan_icon = if scan_refreshes && self.hover == Hover::ScanKind {
+            "scan-refresh-symbolic"
+        } else {
+            "document-properties-symbolic"
+        };
+        let scan_seg = kind_btn(
+            scan_icon,
+            self.kind == Kind::Scanner,
+            Msg::Capture(CaptureMsg::SetKind(Kind::Scanner)),
+            true,
+            false,
+            true,
+        );
+        // The hover tracking exists ONLY for that swap. `mouse_area` runs its child first
+        // and bails when the child captured the event, so the button keeps its own press
+        // handling untouched — enter/exit ride `CursorMoved`, which a button never captures.
+        let scan_seg: Element<'_, Msg> = if scan_refreshes {
+            widget::mouse_area(scan_seg)
+                .on_enter(Msg::Capture(CaptureMsg::SetHover(Hover::ScanKind)))
+                .on_exit(Msg::Capture(CaptureMsg::SetHover(Hover::None)))
+                .into()
+        } else {
+            scan_seg
+        };
+
         // Kind toggle: camera (image) | video. Recording isn't wired up yet, but
         // the toggle is live (mirrors the bottom toolbar).
         let kind_pair: Element<'_, Msg> = widget::row(vec![
             // Scanner kind: captures as a photo, and the only kind QR/OCR runs in.
-            kind_btn(
-                "document-properties-symbolic",
-                self.kind == Kind::Scanner,
-                Msg::Capture(CaptureMsg::SetKind(Kind::Scanner)),
-                true,
-                false,
-                true,
-            ),
+            scan_seg,
             kind_btn(
                 "camera-photo-symbolic",
                 self.kind == Kind::Image,

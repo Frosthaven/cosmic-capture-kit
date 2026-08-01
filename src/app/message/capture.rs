@@ -77,6 +77,10 @@ pub enum CaptureMsg {
     CaptureWindow { id: String, rect: WinRect },
     /// Fires one tick after teardown: grab pixels now that the overlay is gone.
     DoPixelCapture,
+    /// DRAGON-456: fires one tick after a scan refresh blanked the overlay — the screen is
+    /// clean of our own UI now, so run the re-grab. The twin of `DoPixelCapture` for a
+    /// session that CONTINUES (nothing was torn down; the overlay just stopped painting).
+    ScanRefreshTick,
     /// Linux: run a DEFERRED overlay-less immediate capture
     /// (`--active-window` / `--active-monitor`). Kicked once, a short settle after the FIRST
     /// output registers, so the REST of the outputs have populated `self.outputs` first —
@@ -84,11 +88,11 @@ pub enum CaptureMsg {
     /// Only constructed on Linux (mac/Windows resolve immediately in `seed_outputs_mac`).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     RunImmediate,
-    /// Region quick-action (default primary+C in region-draw mode): capture the
-    /// CURRENT drawn selection, force-copy it to the clipboard (regardless of the
-    /// persisted "copy to clipboard" setting), skip the preview, and finish the
-    /// session. A no-op when no region is drawn yet.
-    CopySelection,
+    // DRAGON-451: `CopySelection` lived here — the region quick-action (primary+C in
+    // region-draw mode) that captured the drawn selection, force-copied it and skipped the
+    // editor. Retired with its shortcut: the global "(no editor)" hotkeys (DRAGON-428) do
+    // the same thing without needing the overlay, and the "force" stopped meaning anything
+    // when DRAGON-353 removed the copy-to-clipboard setting.
     /// Drag delta (logical px) moving the toolbar on a given output (by name, so each
     /// monitor's toolbar moves independently).
     ToolbarPan(String, f32, f32),

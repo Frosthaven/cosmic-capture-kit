@@ -15,6 +15,7 @@ impl App {
                 self.sub_external_recording(),
                 self.sub_toast(),
                 self.sub_pixel_capture(),
+                self.sub_scan_refresh(),
                 self.sub_loading_tick(),
                 self.sub_playback_poll(),
                 self.sub_preview_toasts(),
@@ -33,6 +34,8 @@ impl App {
                 self.sub_settings_liveness(),
                 #[cfg(windows)]
                 self.sub_preview_finalize(),
+                #[cfg(windows)]
+                self.sub_overlay_finalize(),
                 #[cfg(target_os = "macos")]
                 self.sub_preview_pinch(),
                 // DRAGON-212: the frozen-flats grab is deferred on both platforms now.
@@ -176,6 +179,44 @@ impl App {
         }
     }
 
+    /// Windows (DRAGON-437): while any capture overlay has NOT been confirmed placed,
+    /// re-drive its native placement every ~80ms. The overlay's twin of
+    /// `sub_preview_finalize`, and it exists because the overlay had NO re-driver at all
+    /// while the settings window and the preview both did.
+    ///
+    /// Two independent failures made that gap fatal rather than cosmetic. The overlay is
+    /// minted HIDDEN (komorebi opt-out) and shown only by `place_overlay`'s two-phase dance,
+    /// kicked by the one-shot `window::open` follow-up — which is NOT delivered while cck is
+    /// a BACKGROUND process (a tray-daemon-spawned child). And even when it IS delivered, the
+    /// follow-up chain stops after 30 × 40ms, while phase 2 requires a call at least 120ms
+    /// after phase 1: a title landing near the end of that budget leaves the window CLOAKED
+    /// and parked off-screen, invisible forever, in a process that never exits. Timer
+    /// subscriptions DO pump while backgrounded, so this is the reliable driver, and the one
+    /// that owns the give-up deadline.
+    ///
+    /// Off the moment every output reports `placed`, so it cannot keep ticking under a live
+    /// capture UI. Also off once the give-up has run, and whenever the overlays are torn down
+    /// (`stop_overlay_finalize`), so it can never outlive the windows it drives.
+    ///
+    /// The condition reads `overlay_finalize_pending`, NOT the deadline clock: the clock is
+    /// stamped by the first delivered tick, so letting it gate the subscription would mean
+    /// the driver could never start. No macOS/Linux analog, so they stay byte-identical.
+    #[cfg(windows)]
+    fn sub_overlay_finalize(&self) -> Option<Subscription<Msg>> {
+        let waiting = crate::app::update::window_chrome::overlay_finalize_active(
+            self.overlay_finalize_pending,
+            self.outputs.iter().any(|o| !o.placed.get()),
+        );
+        if waiting {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(80))
+                    .map(|_| Msg::WindowChrome(WindowChromeMsg::OverlayFinalizeTick)),
+            )
+        } else {
+            None
+        }
+    }
+
     /// macOS (DRAGON-151) / Windows (DRAGON-276): while the countdown/recording
     /// overlays are click-through, poll the pointer against the toolbar-chip rects
     /// (~60ms — hover latency, not animation) so the hovered overlay re-solidifies
@@ -263,6 +304,22 @@ impl App {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(200))
                     .map(|_| Msg::Capture(CaptureMsg::DoPixelCapture)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// DRAGON-456: one short tick to let the BLANKED overlay clear off the screen before a
+    /// scan refresh re-grabs it. The twin of [`Self::sub_pixel_capture`] for a session that
+    /// continues: nothing was torn down, the overlay just stopped painting, so the same
+    /// 200ms is what the compositor needs to present the empty surface. Stops immediately
+    /// once the grab is away (`Grabbing`), so it is one tick, not a poll.
+    fn sub_scan_refresh(&self) -> Option<Subscription<Msg>> {
+        if self.scan_refresh == ScanRefresh::Blanking {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(200))
+                    .map(|_| Msg::Capture(CaptureMsg::ScanRefreshTick)),
             )
         } else {
             None

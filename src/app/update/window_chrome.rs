@@ -19,20 +19,81 @@ pub(in crate::app) fn nav_should_open(width: f32) -> bool {
     width >= NAV_AUTO_COLLAPSE_W
 }
 
+/// Windows (DRAGON-437): how long `sub_overlay_finalize` keeps re-driving an overlay's
+/// native placement before giving up on it.
+///
+/// Generous on purpose. The normal case resolves in a handful of 80ms ticks, so nothing
+/// healthy ever approaches this; the number only has to be larger than the worst legitimate
+/// first-present. On Windows 10 that can be seconds, not milliseconds — the DRAGON-427
+/// fallback drives this UI on a CPU rasterizer, where shader compile plus the full-scene
+/// texture upload dominate. Ten seconds is comfortably past that and still short enough
+/// that a user staring at nothing gets an answer rather than a hang.
+#[cfg(any(windows, test))]
+pub(in crate::app) const OVERLAY_FINALIZE_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// Whether `sub_overlay_finalize` should be running.
+///
+/// Pure, and separate from the deadline on purpose (DRAGON-437 round 2). The driver's
+/// deadline clock is stamped by the first tick it DELIVERS, so if the clock also gated the
+/// subscription the driver could never start at all. Keeping the two apart is what makes
+/// that impossible to reintroduce by accident.
+#[cfg(any(windows, test))]
+pub(in crate::app) fn overlay_finalize_active(pending: bool, any_unplaced: bool) -> bool {
+    pending && any_unplaced
+}
+
+/// Whether the overlay finalize driver has run out of time. Pure so the boundary is pinned
+/// by a test rather than by reading the call site.
+///
+/// `elapsed` is measured from the first DELIVERED tick, never from the mint — see
+/// `App::overlay_finalize_deadline`.
+#[cfg(any(windows, test))]
+pub(in crate::app) fn overlay_finalize_expired(
+    elapsed: std::time::Duration,
+    deadline: std::time::Duration,
+) -> bool {
+    elapsed >= deadline
+}
+
+/// What a finalize give-up should do, as a pure function of whether ANY overlay was ever
+/// confirmed placed.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum OverlayGiveUp {
+    /// Nothing appeared anywhere: the session cannot be used at all, so end it visibly.
+    FailSession,
+    /// At least one display got a working overlay: the user can select, capture or press
+    /// Escape there. Losing the others is worth a log line, not the session.
+    ContinueDegraded,
+}
+
+/// The give-up rule (see [`OverlayGiveUp`]). The distinction is the whole point: "no UI at
+/// all" is the invisible-immortal-child bug and must end the process with something said,
+/// while "UI on 1 of 2 monitors" is a degraded session the user can still finish.
+#[cfg(any(windows, test))]
+pub(in crate::app) fn overlay_giveup_action(any_placed: bool) -> OverlayGiveUp {
+    if any_placed {
+        OverlayGiveUp::ContinueDegraded
+    } else {
+        OverlayGiveUp::FailSession
+    }
+}
+
 impl App {
     /// Derive `nav_open` from the width the settings window will actually spawn
     /// at. Mirrors `open_config_window`'s clamp: the saved width (or the default)
-    /// floored at `MIN_W` (800.0). Call this at every spawn site BEFORE the window
+    /// floored at `settings::MIN_W`. Call this at every spawn site BEFORE the window
     /// is minted so the first paint carries the right rail + toggle icon (the icon
     /// derives from `nav_open` in `config_window_view`, so it follows for free).
     pub(in crate::app) fn apply_nav_auto_collapse_on_spawn(&mut self) {
         // Same effective width `open_config_window` computes: saved width, else the
-        // default, floored at MIN_W = 800.0 (kept in sync with open_config_window).
+        // default, floored at the shared constant (DRAGON-435: no more hardcoded copy).
         let spawn_w = self
             .settings_size
             .map(|(w, _)| w as f32)
-            .unwrap_or(800.0)
-            .max(800.0);
+            .unwrap_or(settings::MIN_W)
+            .max(settings::MIN_W);
         self.settings.nav_open = nav_should_open(spawn_w);
     }
 
@@ -116,13 +177,83 @@ impl App {
                 crate::platform::services::open_uri(&url);
                 Task::none()
             }
-            // DRAGON-406: the About page's "Open logs folder" button. Windows-only, so the
-            // variant and this arm are both `cfg(windows)` and Linux/macOS are byte-identical.
-            // The row that sends it only exists on a Windows 10 run. DRAGON-407.
+            // DRAGON-436 (Windows) / DRAGON-415 (macOS): the other half of `fail_session`.
+            // The alert has been dismissed (or, on Windows, its 120s wait elapsed), so the
+            // session ends exactly as it would have if the wait had been inline — this is
+            // the SAME `finish_session`, just reached without blocking the thread that owns
+            // our windows (Windows) or nesting a run loop pump inside winit's own (macOS).
+            #[cfg(any(windows, target_os = "macos"))]
+            WindowChromeMsg::FailureAlertDismissed => self.finish_session(),
             #[cfg(windows)]
-            WindowChromeMsg::OpenDiagnosticsFolder => {
-                crate::platform::windows::diag::open_logs_folder();
-                Task::none()
+            WindowChromeMsg::OverlayFinalizeTick => {
+                // DRAGON-437: re-drive the capture overlay's native placement from a timer
+                // (which pumps even while cck is a background process, unlike the one-shot
+                // `window::open` follow-up that normally starts the chain). Reading self —
+                // never a captured id — keeps it stale-proof, like `PreviewFinalizeTick`.
+                if !self.overlay_finalize_pending {
+                    // Already finished, given up, or the overlays are gone; the subscription
+                    // is about to stop. Nothing to do.
+                    return Task::none();
+                }
+                // The deadline is measured from the first tick we actually HANDLE, not from
+                // the mint. A stalled process (or a timer delivering a coalesced backlog) can
+                // put the first handled tick well past the mint, and measuring from there
+                // would give up having never attempted anything — reporting a slow start as
+                // a failure. See `App::overlay_finalize_deadline`.
+                let started = *self
+                    .overlay_finalize_deadline
+                    .get_or_insert_with(std::time::Instant::now);
+                // Attempt EVERY unplaced output, every tick, BEFORE judging the deadline.
+                // Not just the first: while cck is backgrounded this tick is the ONLY driver
+                // for ALL of them, so taking one per tick means a single permanently
+                // unplaceable output starves every other monitor for the whole budget and a
+                // perfectly healthy display dies with the session. N `place_overlay` calls
+                // per 80ms is fine — the cost that mattered was overlapping retry CHAINS
+                // (see `try_place_overlay_once`), not attempts. Each is one attempt, and
+                // `place_overlay`'s idempotency guard makes overlap with the follow-up chain
+                // a no-op rather than a re-cloak (the shape the preview already runs).
+                for o in self.outputs.iter().filter(|o| !o.placed.get()) {
+                    self.try_place_overlay_once(o);
+                }
+                if self.outputs.iter().all(|o| o.placed.get()) {
+                    // Everything landed: stop the driver.
+                    self.stop_overlay_finalize();
+                    return Task::none();
+                }
+                if !overlay_finalize_expired(started.elapsed(), OVERLAY_FINALIZE_DEADLINE) {
+                    return Task::none();
+                }
+                // Out of time. Abandon whatever is still mid-dance (a cloaked window must
+                // never outlive the driver) and decide whether this session can go on at all.
+                let placed = self.abandon_unplaced_overlays();
+                let total = self.outputs.len();
+                match overlay_giveup_action(placed > 0) {
+                    OverlayGiveUp::ContinueDegraded => {
+                        // At least one display has a working, interactive overlay: the user
+                        // can select, capture, or press Escape. Losing the others is bad, and
+                        // worth a line, but ending the session would be worse.
+                        log::warn!(
+                            "DRAGON-437: {placed} of {total} capture overlays were placed \
+                             within {}s; continuing with the ones that appeared",
+                            OVERLAY_FINALIZE_DEADLINE.as_secs()
+                        );
+                        Task::none()
+                    }
+                    OverlayGiveUp::FailSession => {
+                        // Nothing ever appeared. This is the invisible-immortal-child shape:
+                        // a live process the user cannot see or reach. Say so and end, through
+                        // the one failure vocabulary.
+                        crate::diag::note_failure(
+                            crate::diag::Failure::OverlayNeverShown,
+                            &format!(
+                                "none of {total} capture overlays could be placed within {}s \
+                                 (the window was minted but never brought on screen)",
+                                OVERLAY_FINALIZE_DEADLINE.as_secs()
+                            ),
+                        );
+                        self.fail_session()
+                    }
+                }
             }
             // DRAGON-419: the Health page's Debug row. Creates the folder first, so a
             // customer who has not reproduced anything yet lands somewhere real.
@@ -413,29 +544,48 @@ impl App {
                 if Some(id) == self.settings.window && w >= 1.0 && h >= 1.0 {
                     // Windows (DRAGON-299/313): the settings window opens hidden and is centered +
                     // natively shown (`center_settings_window`, the preview's `show_centered` twin)
-                    // on the FIRST poll now that the title is born-set, so the DRAGON-299 sub-min
-                    // size STOMP is not observed. These two guards remain as a DEFENSIVE net, both
-                    // keyed off the enforced minimum (a real USER resize can never go below it — the
-                    // resize border enforces min_size — so nothing below is ever legitimate):
-                    //   * ANY sub-min resize is treated as a stomp — NEVER adopt it; re-assert the
-                    //     intended (persisted, unpolluted) size natively. Unconditional on
-                    //     `settings_size_ready` so it can't race the settle timer.
+                    // on the FIRST poll now that the title is born-set, so the DRAGON-299 open-time
+                    // sub-min size STOMP is no longer observed. Two guards remain, both keyed off
+                    // `settings::MIN_*` — which is a CLIENT minimum, and `w`/`h` here are the
+                    // CLIENT (inner) size winit reports:
+                    //   * ANY sub-min resize is NEVER adopted; the floor is re-asserted natively,
+                    //     in client terms. Unconditional on `settings_size_ready` so it can't race
+                    //     the settle timer.
                     //   * a ≥min resize is adopted only once the window has SETTLED
                     //     (`settings_size_ready`, flipped by `ConfigWindowResettle`) — before that
                     //     it's an open-time transient (incl. any re-assert's own resize), ignored so
                     //     none is persisted as the remembered size.
-                    // mac/Linux open the settings window visible + compositor-managed (no such
-                    // stomp), so they adopt every resize as before.
+                    //
+                    // DRAGON-446 corrects what DRAGON-299 wrote here. The old note claimed "a real
+                    // USER resize can never go below it — the resize border enforces min_size", and
+                    // that premise is FALSE: the resize border enforces an OUTER minimum. winit puts
+                    // our logical `min_size` into `WM_GETMINMAXINFO`'s `ptMinTrackSize` verbatim
+                    // (measured: 924x600), but `ptMinTrackSize` is the OUTER rect, and on Win11 our
+                    // caption subclass carves a real 16x8 non-client band out of the client. So a
+                    // DRAG bottomed out at outer 924x600 handed us a CLIENT of 908x592 — 16px under
+                    // `MIN_W`, 8 under `MIN_H`. `caption_subproc` now adds that carve to
+                    // `ptMinTrackSize`, fixing the drag at the source; THIS bounce is what actually
+                    // holds the client floor for anything that still arrives under it, and
+                    // `enforce_client_floor` takes CLIENT dimensions and adds the MEASURED band
+                    // itself (its predecessor `resize_settings_to` predicted the band from the
+                    // caption carve, and re-centered the window while it was at it).
+                    //
+                    // mac/Linux enforce inner minimums correctly (AppKit / the compositor), so they
+                    // adopt every resize as before.
                     #[cfg(windows)]
                     {
                         if w < settings::MIN_W || h < settings::MIN_H {
+                            // The floor to hold, in CLIENT terms: the persisted size when it is
+                            // larger (the DRAGON-299 out-of-band-stomp restore), else the bare
+                            // minimum. During a drag the persisted size tracks the drag down to the
+                            // floor, so a sub-floor drag settles at exactly MIN_W x MIN_H.
                             let (tw, th) = self
                                 .settings_size
                                 .map(|(a, b)| {
                                     (a.max(settings::MIN_W as u32), b.max(settings::MIN_H as u32))
                                 })
                                 .unwrap_or((settings::MIN_W as u32, settings::MIN_H as u32));
-                            crate::platform::windows::window::resize_settings_to(
+                            crate::platform::windows::window::enforce_client_floor(
                                 settings::WINDOW_TITLE,
                                 (tw, th),
                             );
@@ -517,6 +667,20 @@ impl App {
             }
             WindowChromeMsg::PermissionsWindowOpened(id) => {
                 let title_task = self.set_window_title(permissions::WINDOW_TITLE.to_string(), id);
+                // macOS (DRAGON-440): request activation the MODERN way, in addition to
+                // `gain_focus` below — NOT instead of it. `gain_focus` reaches winit's
+                // `focus_window`, whose AppKit backend already does
+                // `activateIgnoringOtherApps(true)` + `makeKeyAndOrderFront`, so it does
+                // bring the app forward; do not delete it as redundant. What it cannot do is
+                // use `-[NSApplication activate]`, the macOS 14+ cooperative form, because
+                // winit never calls it. That matters here: on Sonoma and later the
+                // "ignore other apps" form is deprecated and activation through it can be
+                // silently DECLINED (the DRAGON-361 notes), which would leave this window
+                // key but behind whatever the user was looking at. Both launches that open
+                // it are spawned by a process that is not itself frontmost, so a declined
+                // activation is exactly the case worth covering.
+                #[cfg(target_os = "macos")]
+                crate::platform::mac::window::activate_our_app();
                 // macOS (DRAGON-135): same traffic-light centering as the settings window.
                 #[cfg(target_os = "macos")]
                 return Task::batch([
@@ -818,7 +982,11 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{nav_should_open, NAV_AUTO_COLLAPSE_W};
+    use super::{
+        nav_should_open, overlay_finalize_active, overlay_finalize_expired,
+        overlay_giveup_action, OverlayGiveUp, NAV_AUTO_COLLAPSE_W, OVERLAY_FINALIZE_DEADLINE,
+    };
+    use std::time::Duration;
 
     #[test]
     fn nav_collapses_below_breakpoint_expands_at_or_above() {
@@ -832,5 +1000,57 @@ mod tests {
         // Sanity at extremes.
         assert!(!nav_should_open(460.0));
         assert!(nav_should_open(1920.0));
+    }
+
+    // ── DRAGON-437: the overlay finalize driver's decisions ─────────────────
+
+    #[test]
+    fn the_finalize_driver_runs_only_while_armed_and_unfinished() {
+        assert!(overlay_finalize_active(true, true), "armed with work to do");
+        // Everything landed: stop, or it ticks under a live capture UI.
+        assert!(!overlay_finalize_active(true, false));
+        // Disarmed (finished, gave up, or the overlays were torn down): stop, even though
+        // outputs still LOOK unplaced — this is the settings-via-gear case, where
+        // `self.outputs` is deliberately kept after the HWNDs are destroyed.
+        assert!(!overlay_finalize_active(false, true));
+        assert!(!overlay_finalize_active(false, false));
+    }
+
+    #[test]
+    fn the_finalize_deadline_is_ten_seconds_and_the_boundary_is_inclusive() {
+        // The value itself is load-bearing: too short and a Windows 10 CPU-rasterizer
+        // first-present (DRAGON-427) gets declared a failure on a machine that was merely
+        // slow; too long and an invisible child lingers.
+        assert_eq!(OVERLAY_FINALIZE_DEADLINE, Duration::from_secs(10));
+        assert!(!overlay_finalize_expired(Duration::ZERO, OVERLAY_FINALIZE_DEADLINE));
+        assert!(!overlay_finalize_expired(
+            Duration::from_millis(9_999),
+            OVERLAY_FINALIZE_DEADLINE
+        ));
+        // Exactly at the deadline counts as expired, so the driver cannot sit one tick
+        // short of giving up forever.
+        assert!(overlay_finalize_expired(
+            Duration::from_secs(10),
+            OVERLAY_FINALIZE_DEADLINE
+        ));
+        assert!(overlay_finalize_expired(
+            Duration::from_secs(11),
+            OVERLAY_FINALIZE_DEADLINE
+        ));
+    }
+
+    #[test]
+    fn a_give_up_with_nothing_on_screen_ends_the_session() {
+        // The bug this ticket exists for: a live process the user can neither see nor
+        // reach. It must end, and say why.
+        assert_eq!(overlay_giveup_action(false), OverlayGiveUp::FailSession);
+    }
+
+    #[test]
+    fn a_give_up_with_some_overlay_showing_keeps_the_session() {
+        // One working overlay is a usable session: the user can select, capture, or press
+        // Escape. Ending it because a second monitor's overlay never landed would take away
+        // a capture they could still have made.
+        assert_eq!(overlay_giveup_action(true), OverlayGiveUp::ContinueDegraded);
     }
 }

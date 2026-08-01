@@ -313,32 +313,63 @@ impl CaptureAction {
 /// Windows tray daemon (DRAGON-237), and the child-owned recording trays (`crate::tray`), so
 /// a "Capture Menu" launch is byte-identical everywhere. Present on mac + Linux + Windows
 /// (the platforms with a resident/tray surface); other platforms never call it.
+///
+/// Returns whether a child process was actually created (DRAGON-438). Windows needs that
+/// answer because its tray daemon ACKNOWLEDGES the spawn to a waiting launcher, and an ack
+/// for a spawn that never happened is just the silent failure moved one step along. Every
+/// other caller ignores it, and mac/Linux behaviour is unchanged — the unix body already
+/// knew this and only logged it.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-pub fn spawn_capture_child(flag: &str) {
-    spawn_capture_child_with_env(flag, &[]);
+pub fn spawn_capture_child(flag: &str) -> bool {
+    spawn_capture_child_with_env(flag, &[])
 }
 
 /// Windows body of [`spawn_capture_child_with_env`] (DRAGON-237): the detach mechanism is
 /// platform logic, so it lives under `platform/windows/` behind this thin dispatch (strict
 /// split). Same contract as the unix body — a detached one-shot child, best-effort.
 #[cfg(windows)]
-pub fn spawn_capture_child_with_env(flag: &str, envs: &[(&str, &str)]) {
-    crate::platform::windows::process::spawn_detached_child(flag, envs);
+pub fn spawn_capture_child_with_env(flag: &str, envs: &[(&str, &str)]) -> bool {
+    spawn_capture_child_args(&[flag], envs)
+}
+
+/// DRAGON-428: [`spawn_capture_child_with_env`] for a child that needs MORE THAN ONE flag.
+/// The daemon's "(no editor)" capture hotkeys pass `--active-window --no-editor`, and argv
+/// is the daemon's only channel to the child, so the spawn seam has to carry a list.
+///
+/// Additive: the single-flag entry points delegate here with a one-element slice, so every
+/// existing caller keeps its exact behaviour — including the DRAGON-438 spawn-happened
+/// answer, which is what the tray daemon's capture ack is allowed to depend on.
+#[cfg(windows)]
+pub fn spawn_capture_child_args(args: &[&str], envs: &[(&str, &str)]) -> bool {
+    crate::platform::windows::process::spawn_detached_child(args, envs)
 }
 
 /// [`spawn_capture_child`] with extra environment variables for the child (e.g.
 /// `CCK_SETTINGS_TAB=about` so a post-update settings child opens on About).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub fn spawn_capture_child_with_env(flag: &str, envs: &[(&str, &str)]) {
+pub fn spawn_capture_child_with_env(flag: &str, envs: &[(&str, &str)]) -> bool {
+    spawn_capture_child_args(&[flag], envs)
+}
+
+/// DRAGON-428: [`spawn_capture_child_with_env`] for a child that needs MORE THAN ONE flag.
+/// The daemon's "(no editor)" capture hotkeys pass `--active-window --no-editor`, and argv
+/// is the daemon's only channel to the child, so the spawn seam has to carry a list.
+///
+/// Additive: the single-flag entry points delegate here with a one-element slice, so every
+/// existing caller keeps its exact behaviour — including the DRAGON-438 spawn-happened
+/// answer the return value carries.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn spawn_capture_child_args(args: &[&str], envs: &[(&str, &str)]) -> bool {
+    let flag = args.first().copied().unwrap_or("");
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
             log::warn!("spawn_capture_child: current_exe failed, cannot spawn {flag}: {e}");
-            return;
+            return false;
         }
     };
     let mut cmd = std::process::Command::new(&exe);
-    cmd.arg(flag);
+    cmd.args(args);
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -366,8 +397,12 @@ pub fn spawn_capture_child_with_env(flag: &str, envs: &[(&str, &str)]) {
                 .spawn(move || {
                     let _ = child.wait();
                 });
+            true
         }
-        Err(e) => log::warn!("spawn capture child {flag} failed: {e}"),
+        Err(e) => {
+            log::warn!("spawn capture child {flag} failed: {e}");
+            false
+        }
     }
 }
 

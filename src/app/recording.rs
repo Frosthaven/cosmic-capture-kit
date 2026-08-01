@@ -606,16 +606,21 @@ impl App {
         if self.mode == Mode::Window && sel.width <= 1 && sel.height <= 1 {
             return true;
         }
-        let (cx, cy, cw, ch) = (sel.x as f32, sel.y as f32, sel.width as f32, sel.height as f32);
         // The toolbar overlaps the capture on the output it sits on → no outside room.
         self.outputs.iter().any(|o| {
             let Some((tb, _)) = self.toolbar_layout(o) else {
                 return false;
             };
-            // `toolbar_layout` returns output-local coords; shift to global to compare.
-            let (tx, ty) = (tb.x + o.logical_pos.0 as f32, tb.y + o.logical_pos.1 as f32);
-            let overlap_x = tx < cx + cw && tx + tb.width > cx;
-            let overlap_y = ty < cy + ch && ty + tb.height > cy;
+            // `toolbar_layout` returns output-local POINTS while the selection is CAPTURE
+            // space, so bring the SELECTION into this output's point space to compare
+            // (DRAGON-448 — the old shift-the-toolbar-to-global direction compared a point
+            // rect against a physical one on a scaled Windows monitor).
+            let units = o.units();
+            let (cx, cy) = units.to_point((sel.x, sel.y));
+            let cw = units.len_to_point(sel.width as f32);
+            let ch = units.len_to_point(sel.height as f32);
+            let overlap_x = tb.x < cx + cw && tb.x + tb.width > cx;
+            let overlap_y = tb.y < cy + ch && tb.y + tb.height > cy;
             overlap_x && overlap_y
         })
     }
@@ -865,7 +870,7 @@ impl App {
             self.record_dir.trim()
         };
         let dir = crate::util::expand_tilde(raw);
-        dir.join(format!("{}.mp4", self.capture_stem(sel)))
+        dir.join(super::capture_flow::recording_save_name(&self.capture_stem(sel)))
     }
 }
 

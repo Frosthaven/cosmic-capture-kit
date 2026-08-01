@@ -79,9 +79,20 @@ fn tmpdir(tag: &str) -> PathBuf {
 }
 
 /// A real FIFO, exactly as the audio pre-flight makes them.
+/// rustix's `mkfifoat` is unavailable on Apple targets (see `owned::mkfifo`'s doc);
+/// this mirrors that split rather than introducing a second one.
 fn mkfifo(path: &Path) {
-    rustix::fs::mkfifoat(rustix::fs::CWD, path, rustix::fs::Mode::from_bits_truncate(0o600))
-        .expect("mkfifo");
+    #[cfg(not(target_os = "macos"))]
+    {
+        rustix::fs::mkfifoat(rustix::fs::CWD, path, rustix::fs::Mode::from_bits_truncate(0o600))
+            .expect("mkfifo");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("mkfifo path");
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0, "mkfifo");
+    }
 }
 
 /// THE WEDGE. An ffmpeg with a video source and an audio FIFO nobody will ever write to.

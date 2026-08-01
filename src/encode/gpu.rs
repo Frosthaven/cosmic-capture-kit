@@ -650,6 +650,280 @@ impl Drop for Encoder {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NVENC, fed from CUDA memory (DRAGON-457)
+// ---------------------------------------------------------------------------
+
+/// `av_hwdevice_ctx_create` flag (hwcontext_cuda.h): ADOPT the CUDA context that is
+/// already current on this thread, instead of creating a private one.
+///
+/// Load-bearing, not a tuning knob. [`crate::encode::cuda`] imports the compositor's
+/// buffer into its own context, and a device pointer means nothing in a different
+/// context — without this, ffmpeg opens a second one and NVENC reads garbage or fails.
+///
+/// The sibling flag `AV_CUDA_USE_PRIMARY_CONTEXT` (1) looks like it would do as well
+/// and does not: on this stack `av_hwdevice_ctx_create` answers `EOPNOTSUPP` (-95) for
+/// it, while unflagged creation succeeds. Adopting the current context is both the
+/// precise thing to ask for and the one that works.
+#[cfg(target_os = "linux")]
+const AV_CUDA_USE_CURRENT_CONTEXT: libc::c_int = 2;
+
+/// An in-process NVENC encoder that reads frames already sitting in CUDA memory.
+///
+/// This is the NVIDIA counterpart to [`Encoder`]: same job, different reason for
+/// existing. VAAPI cannot encode on an NVIDIA-rendered session at all (no VAAPI encode
+/// node exists), so without this the whole recording falls back to a CPU readback of
+/// every frame — on a 5120x1440 display, 29.5 MB across PCIe per frame, to encode on
+/// the very GPU the frame started on.
+///
+/// **No scaling.** NVENC does not resize, and `scale_cuda` cannot handle RGB in an
+/// `--enable-cuda-llvm` build (its PTX has no RGB kernels). So a session that needs a
+/// different encode size is declined here rather than silently ignored, and the CPU
+/// path takes it — see [`NvencEncoder::new`].
+///
+/// **H.264 stops at 4096 pixels wide.** On an ultrawide desktop (5120x1440 is the box
+/// this was written on) `h264_nvenc` refuses to open with "Width 5120 exceeds 4096",
+/// which libav reports as a bare `ENOSYS`. Since this path cannot downscale,
+/// [`NvencEncoder::new`] DECLINES rather than switching the codec: which codec to use
+/// is the user's setting, `plan.rs` owns that policy, and quietly handing someone who
+/// chose H.264 an HEVC file is not this module's call to make. The CPU path can
+/// downscale, so declining keeps their choice.
+///
+/// **No colour conversion either**, which is the pleasant surprise: `h264_nvenc`
+/// accepts a CUDA frames context whose `sw_format` is `bgr0` and does RGB→YUV itself.
+#[cfg(target_os = "linux")]
+pub struct NvencEncoder {
+    device: *mut AVBufferRef,
+    frames: *mut AVBufferRef,
+    ctx: *mut AVCodecContext,
+    pkt: *mut AVPacket,
+    pts: i64,
+}
+
+// Same discipline as `Encoder`: one recording thread owns it.
+#[cfg(target_os = "linux")]
+unsafe impl Send for NvencEncoder {}
+
+#[cfg(target_os = "linux")]
+impl NvencEncoder {
+    /// Open an NVENC encoder for `w`×`h` BGR0 frames living in CUDA memory.
+    ///
+    /// `dst_w`/`dst_h` must equal `w`/`h`; a mismatch is an error rather than a silent
+    /// full-size encode, because the caller asked for a smaller file and would
+    /// otherwise not get one.
+    pub fn new(
+        hevc: bool,
+        w: u32,
+        h: u32,
+        dst_w: u32,
+        dst_h: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self, String> {
+        if libav().is_none() {
+            return Err("libavutil/libavcodec not available".into());
+        }
+        // The ENCODE size is what matters here: the GL blit inside `encode::cuda`
+        // scales the captured frame into it, so the user's max-resolution cap is
+        // honoured on the GPU and `w`/`h` (the capture size) only bound the source.
+        let even = |v: u32| (v & !1) as i32;
+        let _ = (even(w), even(h));
+        let (w, h) = (even(dst_w), even(dst_h));
+        if w < 2 || h < 2 {
+            return Err("invalid encode size".into());
+        }
+        // H.264 tops out at 4096 wide. DECLINE rather than quietly switch to HEVC: the
+        // codec is the user's setting, and `plan.rs::software_plan` already draws that
+        // line ("h264" => false, only `auto` switches above 4096). Overriding here
+        // would hand somebody who chose H.264 an HEVC file with nothing said. The CPU
+        // path takes it instead, and their choice survives.
+        if !hevc && w > 4096 {
+            return Err(format!(
+                "H.264 cannot encode {w} pixels wide (its limit is 4096); \
+                 the CPU path handles it"
+            ));
+        }
+        unsafe { Self::open(hevc, w, h, fps.max(1) as i32, bitrate_kbps.max(100)) }
+    }
+
+    unsafe fn open(
+        hevc: bool,
+        w: i32,
+        h: i32,
+        fps: i32,
+        bitrate_kbps: u32,
+    ) -> Result<Self, String> {
+        let mut enc = NvencEncoder {
+            device: ptr::null_mut(),
+            frames: ptr::null_mut(),
+            ctx: ptr::null_mut(),
+            pkt: ptr::null_mut(),
+            pts: 0,
+        };
+
+        // The import's context must be current BEFORE this, so ffmpeg adopts it — see
+        // `AV_CUDA_USE_CURRENT_CONTEXT`. The guard pops it when `open` returns.
+        let cuda = crate::encode::cuda::CudaDevice::get()
+            .ok_or("no CUDA/EGL import on this machine")?;
+        let _ctx_guard = cuda.make_current()?;
+
+        let dev = cstr("0");
+        let r = av_hwdevice_ctx_create(
+            &mut enc.device,
+            AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            dev.as_ptr(),
+            ptr::null_mut(),
+            AV_CUDA_USE_CURRENT_CONTEXT,
+        );
+        if r < 0 {
+            return Err(format!("open CUDA device: {} (code {r})", averr(r)));
+        }
+
+        enc.frames = av_hwframe_ctx_alloc(enc.device);
+        if enc.frames.is_null() {
+            return Err("alloc CUDA hwframe context".into());
+        }
+        let fctx = (*enc.frames).data as *mut AVHWFramesContext;
+        (*fctx).format = AVPixelFormat::AV_PIX_FMT_CUDA;
+        // The compositor hands us XR24, which is BGR0. NVENC takes it directly.
+        (*fctx).sw_format = AVPixelFormat::AV_PIX_FMT_BGR0;
+        (*fctx).width = w;
+        (*fctx).height = h;
+        (*fctx).initial_pool_size = 4;
+        let r = av_hwframe_ctx_init(enc.frames);
+        if r < 0 {
+            return Err(format!("init CUDA hwframe context: {}", averr(r)));
+        }
+
+        let name = cstr(if hevc { "hevc_nvenc" } else { "h264_nvenc" });
+        let codec = avcodec_find_encoder_by_name(name.as_ptr());
+        if codec.is_null() {
+            return Err("NVENC encoder not built into ffmpeg".into());
+        }
+        enc.ctx = avcodec_alloc_context3(codec);
+        if enc.ctx.is_null() {
+            return Err("alloc encoder context".into());
+        }
+        (*enc.ctx).width = w;
+        (*enc.ctx).height = h;
+        (*enc.ctx).time_base = AVRational { num: 1, den: fps };
+        (*enc.ctx).framerate = AVRational { num: fps, den: 1 };
+        (*enc.ctx).pix_fmt = AVPixelFormat::AV_PIX_FMT_CUDA;
+        (*enc.ctx).bit_rate = (bitrate_kbps as i64) * 1000;
+        (*enc.ctx).rc_max_rate = (bitrate_kbps as i64) * 1000;
+        (*enc.ctx).rc_buffer_size = (bitrate_kbps as i32).saturating_mul(2000);
+        // Matches the VAAPI encoder: no B-frames, 2s GOP.
+        (*enc.ctx).max_b_frames = 0;
+        (*enc.ctx).gop_size = (fps * 2).max(1);
+        (*enc.ctx).hw_frames_ctx = av_buffer_ref(enc.frames);
+
+        let r = avcodec_open2(enc.ctx, codec, ptr::null_mut());
+        if r < 0 {
+            return Err(format!("open NVENC encoder: {}", averr(r)));
+        }
+        enc.pkt = av_packet_alloc();
+        if enc.pkt.is_null() {
+            return Err("alloc packet".into());
+        }
+        Ok(enc)
+    }
+
+    /// Encode one frame straight out of an imported compositor buffer.
+    ///
+    /// Takes a frame from ffmpeg's own CUDA pool and has the import write INTO it, so
+    /// the pixels make exactly one device-to-device hop and never enter system memory.
+    pub fn encode_import(
+        &mut self,
+        import: &crate::encode::cuda::CudaImport,
+    ) -> Result<Vec<u8>, String> {
+        unsafe {
+            let mut frame = av_frame_alloc();
+            if frame.is_null() {
+                return Err("alloc cuda frame".into());
+            }
+            let r = av_hwframe_get_buffer(self.frames, frame, 0);
+            if r < 0 {
+                av_frame_free(&mut frame);
+                return Err(format!("get cuda frame: {}", averr(r)));
+            }
+            // For AV_PIX_FMT_CUDA, `data[0]` IS the device pointer and `linesize[0]`
+            // its pitch — which is exactly what the import needs to write to.
+            let dst = (*frame).data[0] as usize;
+            let pitch = (*frame).linesize[0] as usize;
+            if let Err(e) = import.refresh_into(dst, pitch) {
+                av_frame_free(&mut frame);
+                return Err(e);
+            }
+            let res = self.submit(frame);
+            av_frame_free(&mut frame);
+            res
+        }
+    }
+
+    /// Send a frame and drain whatever packets the encoder is ready to hand back.
+    unsafe fn submit(&mut self, frame: *mut AVFrame) -> Result<Vec<u8>, String> {
+        (*frame).pts = self.pts;
+        self.pts += 1;
+        let r = avcodec_send_frame(self.ctx, frame);
+        if r < 0 {
+            return Err(format!("send frame to NVENC: {}", averr(r)));
+        }
+        self.drain()
+    }
+
+    /// Flush the encoder at end of session and return its remaining packets.
+    pub fn flush(&mut self) -> Result<Vec<u8>, String> {
+        unsafe {
+            let r = avcodec_send_frame(self.ctx, ptr::null());
+            if r < 0 {
+                return Err(format!("flush NVENC: {}", averr(r)));
+            }
+            self.drain()
+        }
+    }
+
+    unsafe fn drain(&mut self) -> Result<Vec<u8>, String> {
+        let mut out = Vec::new();
+        loop {
+            let r = avcodec_receive_packet(self.ctx, self.pkt);
+            // EAGAIN / EOF are "nothing more right now", not failures.
+            if r == AVERROR(EAGAIN) || r == AVERROR_EOF {
+                break;
+            }
+            if r < 0 {
+                return Err(format!("receive packet: {}", averr(r)));
+            }
+            let data = (*self.pkt).data;
+            let size = (*self.pkt).size as usize;
+            if !data.is_null() && size > 0 {
+                out.extend_from_slice(std::slice::from_raw_parts(data, size));
+            }
+            av_packet_unref(self.pkt);
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for NvencEncoder {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.pkt.is_null() {
+                av_packet_free(&mut self.pkt);
+            }
+            if !self.ctx.is_null() {
+                avcodec_free_context(&mut self.ctx);
+            }
+            if !self.frames.is_null() {
+                av_buffer_unref(&mut self.frames);
+            }
+            if !self.device.is_null() {
+                av_buffer_unref(&mut self.device);
+            }
+        }
+    }
+}
+
 /// Build a `CString` from a `&str` we KNOW has no interior NUL byte — a filter/pad
 /// name literal, or `w=..:h=..` built from validated (even, non-negative) dimensions
 /// via `format!`. Centralizes that invariant instead of repeating the same
@@ -672,26 +946,27 @@ fn averr(code: i32) -> String {
     }
 }
 
+/// Every `/dev/dri/renderD*` node paired with its sysfs driver name, sorted by node name.
+///
+/// A thin alias for the ungated [`crate::encode::list_render_nodes`], which is THE one
+/// listing of this box's render nodes (DRAGON-425) — shared with `plan::vaapi_device` so the
+/// zero-copy and ordinary VAAPI paths can never disagree about what hardware is present.
+/// Kept as a name here because the zero-copy call sites read better for it.
+pub fn vaapi_nodes_with_drivers() -> Vec<(std::path::PathBuf, String)> {
+    crate::encode::list_render_nodes()
+}
+
 /// The first VAAPI-capable render node (amdgpu/Intel), so tests + callers without a
 /// specific device can find one. `None` if there's no usable node.
+///
+/// Behaviour is unchanged (DRAGON-425 only re-expressed it): the same sorted walk, the same
+/// driver set, the same "first match wins". Both halves now live somewhere they can be
+/// tested — the listing in [`vaapi_nodes_with_drivers`], the RULE in the ungated
+/// [`crate::encode::default_vaapi_node_from`] — so the guess this makes and the correction
+/// the recorder applies to it are decided from one place.
 pub fn default_vaapi_node() -> Option<String> {
-    let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")
-        .ok()?
-        .flatten()
-        .filter_map(|e| {
-            let n = e.file_name().to_string_lossy().into_owned();
-            n.starts_with("renderD").then(|| format!("/dev/dri/{n}"))
-        })
-        .collect();
-    nodes.sort();
-    nodes.into_iter().find(|dev| {
-        let node = dev.rsplit('/').next().unwrap_or("");
-        std::fs::read_link(format!("/sys/class/drm/{node}/device/driver"))
-            .ok()
-            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
-            .map(|drv| matches!(drv.as_str(), "amdgpu" | "i915" | "xe"))
-            .unwrap_or(false)
-    })
+    crate::encode::default_vaapi_node_from(&vaapi_nodes_with_drivers())
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

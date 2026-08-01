@@ -5,6 +5,77 @@
 
 use super::*;
 
+// ── The editor's own launch timeline (DRAGON-454) ────────────────────────────────────
+//
+// `App::init` → `acquire_scene` → `configure_overlay` were instrumented with
+// `util::timing_mark`; the PREVIEW OPEN path was not, so the seconds between "the capture is
+// written" and "the toolbar answers a click" were invisible to the DRAGON-419 debug log — the
+// reason a stall everyone could feel could not be pointed at. These marks are the permanent
+// instrument for that stretch, exactly as the launch marks are for the one before it. They are
+// `timing_mark`, i.e. debug-level and silent unless the debug log (or `CCK_TIMING`) is on.
+//
+// The chain, in the order a capture walks it:
+//   present_capture -> open_preview / spinner -> surface minted -> auto-copy -> decode thread
+//   -> ImageReady -> view build #1 (spinner) -> window shown -> first view build WITH MEDIA
+//
+// View builds are marked with an index for the first [`MARKED_VIEW_BUILDS`] of them, because
+// the GAP BETWEEN CONSECUTIVE BUILDS is the measurement that matters: a UI thread stuck in
+// first-frame GPU work does not build views, so a long gap between #n and #n+1 is the stall,
+// located to the frame.
+
+/// How many preview view builds carry an indexed mark. Enough to cover the whole open
+/// sequence — the spinner frames, the swap to media, the first painted frames, AND the
+/// [`toast::TOAST_TTL`] window that follows it at one `ToastTick` redraw every 250ms (~16
+/// ticks) — and no more. The instrument is for the OPEN, not for the editing session after it.
+const MARKED_VIEW_BUILDS: u32 = 32;
+
+/// Times one preview view build and records it on the launch timeline when it drops — so the
+/// mark carries the build's own COST, not just when it started (DRAGON-454 follow-up: the
+/// owner's "the editor became usable when the toast went away" points at the per-tick redraw,
+/// and the only way to accept or reject that is to know what a build costs).
+///
+/// A guard rather than a pair of calls because `preview_view` has several early returns.
+struct ViewBuildMark {
+    started: std::time::Instant,
+    index: u32,
+    loaded: bool,
+}
+
+impl Drop for ViewBuildMark {
+    fn drop(&mut self) {
+        let ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        let what = if self.loaded { "media" } else { "spinner" };
+        crate::util::timing_mark(&format!(
+            "preview: view build #{} ({what}) took {ms:.1}ms",
+            self.index
+        ));
+    }
+}
+
+/// Start timing one preview view build (see the note above). `loaded` says whether this build
+/// carries the decoded media or the loading spinner; the first loaded build also gets its own
+/// mark, since that is the frame the user is waiting for. `None` once the open sequence's
+/// [`MARKED_VIEW_BUILDS`] budget is spent — an editing session is not instrumented.
+fn mark_preview_view(loaded: bool) -> Option<ViewBuildMark> {
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    static BUILDS: AtomicU32 = AtomicU32::new(0);
+    static FIRST_LOADED: AtomicBool = AtomicBool::new(false);
+    if loaded && !FIRST_LOADED.swap(true, Ordering::Relaxed) {
+        crate::util::timing_mark(
+            "preview: FIRST view build carrying the media (widget tree built; the frame it \
+             describes has NOT been drawn yet)",
+        );
+    }
+    if !crate::util::timing_on() {
+        return None;
+    }
+    let n = BUILDS.fetch_add(1, Ordering::Relaxed);
+    (n < MARKED_VIEW_BUILDS).then(|| ViewBuildMark {
+        started: std::time::Instant::now(),
+        index: n + 1,
+        loaded,
+    })
+}
 
 /// One ACTION button on the unsaved-changes dialog: the action's own toolbar glyph beside
 /// its name, as a standard button. `tint` colours the glyph when the action deserves a
@@ -68,6 +139,7 @@ impl App {
         kind: PreviewKind,
         dims: Option<(u32, u32)>,
     ) -> Task<cosmic::Action<Msg>> {
+        crate::util::timing_mark("preview: open_preview_spinner (pre-open, no path yet)");
         let Some((output, monitor)) = self.preview_output.clone() else {
             return Task::none();
         };
@@ -119,8 +191,10 @@ impl App {
     /// (DRAGON-309): the media is physical pixels of the display it was grabbed from, so
     /// reading the TRIGGER's scale here (as this used to on macOS, via the passed `output`)
     /// shrank cross-display captures — a 1× grab shown on a 2× trigger opened half-size.
-    /// Linux (and any capture with no known output, incl. `--preview`) resolves `1.0`, so the
-    /// sizing math stays byte-identical there. `_output` is retained for call-site symmetry.
+    /// Every platform resolves the real per-output scale here (COSMIC buffer scale, macOS
+    /// backing scale, Windows per-monitor DPI); `1.0` means an UNSCALED output, a capture
+    /// with no known output, or a `--preview` file — and on `1.0` the sizing math is
+    /// byte-identical. `_output` is retained for call-site symmetry.
     pub(super) fn preview_source_scale(&self, _output: Option<&OutputHandle>) -> f32 {
         let s = self.preview_output_scale;
         if s > 0.0 { s } else { 1.0 }
@@ -157,6 +231,9 @@ impl App {
         media_hint: Option<(u32, u32)>,
         extra_h: f32,
     ) -> (window::Id, Task<cosmic::Action<Msg>>, (u32, u32), PreviewSurface) {
+        // DRAGON-454: the ONE mint choke point, so the launch timeline records every preview
+        // surface — spinner, capture, handoff, appearance toggle — from a single place.
+        crate::util::timing_mark("preview: preview_surface_for (mint decision, begin)");
         // DRAGON-336 phase 3b: BIND THE HANDOFF LISTENER BEFORE THE MARKER BELOW. The
         // marker IS the discovery record — a child that finds it goes looking for the
         // socket beside it — so binding second would open a window in which a capture
@@ -203,6 +280,10 @@ impl App {
         // doesn't count: its old surface is being torn down in the same pass. Never true
         // with a single preview open, so the single-document decision is byte-identical.
         let overlay_taken = self.overlay_barred(existing);
+        // Bound rather than returned from each arm purely so ONE mark below records what was
+        // minted, whichever branch produced it (DRAGON-454). The branches themselves are
+        // unchanged.
+        let minted =
         // Linux (layer-shell), macOS, and now Windows (DRAGON-233 fix 5 — a real
         // PlainWindows overlay, below) all honor `preview_windowed`. The cfg! folds to
         // `false` on all three (it only forces the WINDOW on an exotic platform with no
@@ -273,7 +354,13 @@ impl App {
                 };
                 (id, task, capture_monitor, PreviewSurface::Overlay)
             }
-        }
+        };
+        crate::util::timing_mark(if minted.3.is_window() {
+            "preview: surface minted (WINDOW; open task queued, not yet created)"
+        } else {
+            "preview: surface minted (OVERLAY; open task queued, not yet created)"
+        });
+        minted
     }
 
     /// Mint the preview WINDOW itself: the open-fit sizing, the surface, and its title —
@@ -286,6 +373,13 @@ impl App {
     ///
     /// `existing` names the preview being RE-minted (its already-loaded media supplies the
     /// size when the caller has no hint); `None` for a fresh document.
+    ///
+    /// UNITS (DRAGON-449): `capture_monitor` is the target display in `output`'s CAPTURE
+    /// space — PHYSICAL pixels on Windows, points on macOS and Linux. When `output` is
+    /// `None` there is no capture space to name it in, so the caller has already resolved
+    /// LOGICAL POINTS itself ([`largest_output_points`], or a window's own last size) and
+    /// the conversion below is the identity. Everything past that conversion — the fit, the
+    /// max-size hint, the `min_size` clamp, the returned content size — is points.
     fn mint_preview_window(
         &mut self,
         existing: Option<window::Id>,
@@ -314,6 +408,14 @@ impl App {
         // `1.0` on Linux (and any unknown output), so `media` is unchanged there.
         let source_scale = self.preview_source_scale(output.as_ref());
         let media = media.map(|px| sizing::to_points(px, source_scale));
+        // The MONITOR arrives in CAPTURE space as well (PHYSICAL pixels on Windows), while
+        // EVERY number derived from it below is LOGICAL POINTS: the fit budgets, the
+        // size-unknown fallback's 80%/90% of the display, and the max-size hint plus the
+        // `min_size` clamp `preview_window` builds from it. Cross once, here (DRAGON-449) —
+        // feeding the physical rect straight through made all of them `dpi/96`x too
+        // permissive, so at 300% the window could open TALLER than its own display.
+        // `1.0` (unchanged) on Linux, macOS, and every 96-DPI Windows monitor.
+        let monitor = monitor_fit_points(capture_monitor, monitor_point_scale(output.as_ref()));
         // Both platforms size through the SAME `windowed_fit_size`, which caps the
         // window at 90% of the monitor height (rule 3, DRAGON-221) so it clears the
         // Dock / menu bar / panels neither compositor can measure client-side —
@@ -323,10 +425,10 @@ impl App {
         // pre-opened spinner still decoding), since the compositor won't shrink an
         // over-large window later.
         let (w, h) = match media {
-            Some(m) => windowed_fit_size(m, Some(capture_monitor), extra_h),
+            Some(m) => windowed_fit_size(m, Some(monitor), extra_h),
             None => (
-                (capture_monitor.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
-                (capture_monitor.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
+                (monitor.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
+                (monitor.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
             ),
         };
         // DRAGON-309: remember the intended open size so the macOS native finalize can
@@ -339,7 +441,7 @@ impl App {
         // always opens visible and takes focus normally.
         let (id, open) = super::shell::preview_window(
             (w, h),
-            (capture_monitor.0 as f32, capture_monitor.1 as f32),
+            (monitor.0 as f32, monitor.1 as f32),
         );
         // Title the window (server-side decorations show it in the titlebar; on
         // macOS the native finalize matches this exact title — hence the shared const).
@@ -416,8 +518,8 @@ impl App {
         // capture being minted for, which is NOT this document's (a demotion is triggered by
         // some OTHER document opening, and a handed-over one carries the scale of the
         // display IT was grabbed from). Swap in this document's own scale for the mint and
-        // put the caller's back, the same dance `open_handoff_preview` does. Always 1.0 on
-        // Linux, so the sizing math there is unchanged.
+        // put the caller's back, the same dance `open_handoff_preview` does. `1.0` on an
+        // unscaled output, where the sizing math is unchanged.
         let saved_scale = self.preview_output_scale;
         self.preview_output_scale = source_scale;
         // No media hint: `mint_preview_window` reads the already-loaded content's size off
@@ -522,6 +624,13 @@ impl App {
     /// every edit survive. The new appearance is also persisted as the default.
     /// No-op when no preview is open.
     pub(super) fn toggle_preview_appearance(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        // DRAGON-427: nothing to flip TO on Windows 10 — the overlay editor would inherit the
+        // software rasterizer that cannot draw its shader layers. The button is hidden there
+        // (`chrome.rs`), so this only catches a keyboard/message route reaching it anyway; it
+        // must still refuse, or the flip would strand the user on an unusable surface.
+        if !crate::platform::overlay_preview_available() {
+            return Task::none();
+        }
         let Some(p) = self.preview_for(id) else {
             return Task::none();
         };
@@ -738,6 +847,7 @@ impl App {
         } else {
             image::decode_task(id, path.clone())
         };
+        crate::util::timing_mark("preview: content prep task queued (decode / poster)");
         self.previews.push(PreviewState {
             window: id,
             surface,
@@ -768,9 +878,10 @@ impl App {
         self.engage_preview_duck(id, is_video && (self.record_mic || self.record_system_audio));
         // DRAGON-353: the editor copies the capture to the clipboard as it opens (the old
         // "Automatically copy to clipboard" setting, now unconditional). The path is
-        // already known on this path, so it happens right here.
-        self.auto_copy_preview_on_open(id);
-        Task::batch([open_task, task])
+        // already known on this path, so it starts right here — on a worker thread since
+        // DRAGON-454, so it no longer stands between this call and the surface opening.
+        let copy = self.auto_copy_preview_on_open(id);
+        Task::batch([open_task, task, copy])
     }
 
     /// Open a preview for a pre-existing file (`--preview <file>`) on the *active* output
@@ -796,12 +907,9 @@ impl App {
         } else {
             ::image::image_dimensions(&path).ok()
         };
-        let monitor = self
-            .outputs
-            .iter()
-            .map(|o| o.logical_size)
-            .max_by_key(|(w, h)| *w as u64 * *h as u64)
-            .unwrap_or((1920, 1080));
+        // In LOGICAL POINTS (DRAGON-449): there is no capture anchor here, so `mint_preview_window`
+        // has no display to resolve a factor from and takes this bound as-is.
+        let monitor = largest_output_points(&self.outputs).unwrap_or((1920, 1080));
         let extra_h = transport_h_for(&kind, PreviewSurface::Window);
         let (id, open_task, monitor, surface) =
             self.preview_surface_for(None, None, monitor, dims, extra_h);
@@ -905,8 +1013,13 @@ impl App {
     /// names) so the document is the one the child would have opened.
     ///
     /// `None` = we will not take it, and the caller must reject the handoff.
-    #[cfg(unix)]
-    fn open_handoff_preview(
+    ///
+    /// DRAGON-427 made this PORTABLE (it was `#[cfg(unix)]` alongside the socket transport,
+    /// though nothing in the body ever was). Windows 10's spawned editor child feeds the same
+    /// `OpenRequest` in from its command line at startup, and it must land on the identical
+    /// mapping — two transports that opened subtly different documents would be exactly the
+    /// drift the wire format's strictness exists to prevent.
+    pub(in crate::app) fn open_handoff_preview(
         &mut self,
         req: &crate::preview_ipc::OpenRequest,
     ) -> Option<Task<cosmic::Action<Msg>>> {
@@ -925,23 +1038,19 @@ impl App {
         // its capture monitor, else on the largest known output, else a placeholder the
         // first resize corrects (the `open_external_preview` fallback) — a long-lived host
         // may have finished its own capture long ago.
+        // With a capture anchor the size is that display's CAPTURE space (the mint converts
+        // it); without one it is already LOGICAL POINTS (DRAGON-449) — see
+        // [`largest_output_points`] and the `open_external_preview` fallback it mirrors.
         let (output, monitor) = match self.preview_output.clone() {
             Some((o, m)) => (Some(o), m),
-            None => (
-                None,
-                self.outputs
-                    .iter()
-                    .map(|o| o.logical_size)
-                    .max_by_key(|(w, h)| *w as u64 * *h as u64)
-                    .unwrap_or((1920, 1080)),
-            ),
+            None => (None, largest_output_points(&self.outputs).unwrap_or((1920, 1080))),
         };
         let extra_h = transport_h_for(&kind, PreviewSurface::Window);
         // `preview_surface_for` sizes through `self.preview_output_scale` — THIS process's
         // capture scale. A handed-over document carries the scale of the display IT was
         // grabbed from, so swap that in for the mint and put ours back afterwards (an
-        // in-flight capture of our own keeps its value). Both sides are always 1.0 on Linux,
-        // so the sizing math there is unchanged.
+        // in-flight capture of our own keeps its value). Both sides are `1.0` on an unscaled
+        // output, where the sizing math is unchanged.
         let saved_scale = self.preview_output_scale;
         self.preview_output_scale = req.source_scale;
         let (id, open_task, monitor, surface) =
@@ -986,8 +1095,8 @@ impl App {
         self.engage_preview_duck(id, req.video && (self.record_mic || self.record_system_audio));
         // A handed-over capture is still a capture the user just took: copy it on open,
         // exactly as a locally-opened one is (DRAGON-353).
-        self.auto_copy_preview_on_open(id);
-        Some(Task::batch([open_task, task]))
+        let copy = self.auto_copy_preview_on_open(id);
+        Some(Task::batch([open_task, task, copy]))
     }
 
     /// DRAGON-336 phase 3b — the CHILD half: try to hand this finished capture to an
@@ -1069,6 +1178,87 @@ impl App {
         }
     }
 
+    /// DRAGON-427 (Windows 10) — the SPAWN handoff: start the preview editor as its own
+    /// process and end this one.
+    ///
+    /// **Why a whole process.** On Windows 10 this process is rendering in SOFTWARE, because
+    /// that is the only way its overlays are translucent (`platform::win_build_software_overlays`).
+    /// iced binds ONE compositor for a process's whole life, chosen at the first window, so
+    /// an editor minted here would inherit that rasterizer — and the editor draws its media
+    /// through `iced::widget::shader`, which tiny-skia cannot render at all. The two surfaces
+    /// genuinely cannot share a process.
+    ///
+    /// That is not merely tidier for the picker flow; it is REQUIRED by the picker-free
+    /// captures (`--active-window` / `--active-monitor`), where a fullscreen loader that must
+    /// be transparent is followed immediately by an editor that must not be, with no selector
+    /// in between and no ordering trick available.
+    ///
+    /// Unlike the socket handoff there is no host to acknowledge us — we are creating the
+    /// peer, not finding one — so the proof of life is narrower by construction: a spawn that
+    /// the OS refused. `Some(task)` means a child process exists and this one is done;
+    /// `None` means the caller must deliver the capture some other way. The caller's `None`
+    /// branch is deliberately NOT "open our own preview" here (see [`Self::present_capture`]).
+    #[cfg(windows)]
+    fn try_spawn_editor_child(
+        &mut self,
+        path: &std::path::Path,
+        size: u64,
+        is_video: bool,
+        dims: Option<(u32, u32)>,
+    ) -> Option<Task<cosmic::Action<Msg>>> {
+        // Windows 11 renders everything on wgpu and keeps its single-process editor exactly
+        // as it ships today. Only the software-rendered band splits.
+        if !crate::platform::software_overlays() {
+            return None;
+        }
+        let req = crate::preview_ipc::OpenRequest {
+            path: path.to_path_buf(),
+            video: is_video,
+            display_dims: dims,
+            source_scale: self.preview_source_scale(None),
+            // The capture is OURS — a file we wrote, which the editor may manage, save in
+            // place and discard. `--preview`'s viewer semantics (`external = true`) would
+            // quietly refuse all of that.
+            external: false,
+            size: Some(size),
+        };
+        match crate::platform::windows::process::spawn_editor_child(&req.encode()) {
+            Ok(pid) => {
+                log::info!(
+                    "windows 10 preview handoff: spawned editor child pid {pid} for {} \
+                     — this process is done",
+                    path.display()
+                );
+                // The same classification the socket handoff records (DRAGON-419 path S6):
+                // a SUCCESS that from outside looks like a silent self-close, so the log has
+                // to say which pid to go and look at.
+                crate::diag::note_failure(
+                    crate::diag::Failure::HandoffAccepted,
+                    &format!("spawned editor child pid {pid}; this process is done"),
+                );
+                Some(self.finish_session())
+            }
+            Err(e) => {
+                log::warn!("windows 10 preview handoff: could not spawn the editor child ({e})");
+                None
+            }
+        }
+    }
+
+    /// Off Windows nothing spawns an editor child — every platform keeps its historical
+    /// single-process preview. A stub so [`Self::present_capture`] stays one code path.
+    #[cfg(not(windows))]
+    #[allow(clippy::unused_self)]
+    fn try_spawn_editor_child(
+        &mut self,
+        _path: &std::path::Path,
+        _size: u64,
+        _is_video: bool,
+        _dims: Option<(u32, u32)>,
+    ) -> Option<Task<cosmic::Action<Msg>>> {
+        None
+    }
+
     /// Update the open preview's monitor size when its surface is (re)sized — needed for
     /// `--preview`, which opens on the active output before its size is known. Also the
     /// windowed preview's post-map hook: the first configure means the surface is mapped,
@@ -1081,6 +1271,36 @@ impl App {
         }
         if self.preview_for(id).is_none() {
             return Task::none();
+        }
+        // Windows (DRAGON-446): hold the windowed preview's CLIENT floor, exactly as the settings
+        // window's `ConfigWindowResized` arm does. Same cause: winit hands our logical `min_size`
+        // to `WM_GETMINMAXINFO` as `ptMinTrackSize` verbatim, but that is an OUTER minimum, and on
+        // Win11 the DRAGON-284 caption subclass carves a real 16x8 band out of the client — so a
+        // drag could bottom out 16x8 UNDER `PREVIEW_MIN_W`/`PREVIEW_MIN_H` and clip the toolbars
+        // the floor exists to protect. `caption_subproc` now raises `ptMinTrackSize` by that carve;
+        // this is the app-level net behind it. `enforce_client_floor` measures the band itself,
+        // caps the floor at what the monitor can hold (mirroring `preview_window`'s own `min_size`
+        // clamp on small displays), raises only the short axis, and leaves the window where it is.
+        //
+        // WINDOW surface only — the OVERLAY preview is fullscreen and has no floor to hold. And
+        // only with ONE document open: the native helper resolves by TITLE and every preview
+        // window carries the same one, so with siblings (DRAGON-336) it could grow the wrong
+        // window. The `ptMinTrackSize` fix is per-HWND and covers those correctly regardless.
+        //
+        // mac/Linux enforce inner minimums correctly, so they are untouched.
+        #[cfg(windows)]
+        if ((w as f32) < crate::app::shell::PREVIEW_MIN_W
+            || (h as f32) < crate::app::shell::PREVIEW_MIN_H)
+            && self.previews.len() == 1
+            && self.preview_for(id).is_some_and(|p| p.surface.is_window())
+        {
+            crate::platform::windows::window::enforce_client_floor(
+                crate::app::shell::PREVIEW_WINDOW_TITLE,
+                (
+                    crate::app::shell::PREVIEW_MIN_W as u32,
+                    crate::app::shell::PREVIEW_MIN_H as u32,
+                ),
+            );
         }
         // This configure is the WINDOW's FIRST map iff the transient max-size hint was still
         // pending (set at mint, cleared here exactly once) — the signal DRAGON-317's re-home
@@ -1205,11 +1425,31 @@ impl App {
         is_video: bool,
         dims: Option<(u32, u32)>,
     ) -> Task<cosmic::Action<Msg>> {
-        // Region "Copy selection" quick-action: force-copy to the clipboard and finish,
-        // bypassing BOTH the preview and the persisted copy-to-clipboard toggle. Consume
-        // the one-shot flag so a later capture in the same process behaves normally.
-        if std::mem::take(&mut self.copy_selection_pending) {
-            return self.finish_share_forced_copy(&path, size, is_video);
+        // DRAGON-454: the head of the editor's launch timeline — the capture is on disk and a
+        // route is about to be chosen. Everything after this mark is the stretch the user
+        // experiences as "the editor opening".
+        crate::util::timing_mark("preview: present_capture (capture written; choosing a route)");
+        // DRAGON-451: the region "Copy selection" quick-action (primary+C while a region was
+        // drawn) branched to a forced-copy delivery HERE. It is retired — the DRAGON-428
+        // global "(no editor)" hotkeys do the same job from outside the overlay, and by then
+        // the two paths were identical: DRAGON-353 had already removed the copy-to-clipboard
+        // setting the quick-action existed to bypass.
+        //
+        // DRAGON-428: this launch asked for no editor (`--no-editor`, or a daemon
+        // "(no editor)" capture hotkey). Deliver through `finish_share` — the SAME
+        // editor-less path a capture takes when no editor can be opened at all — so there
+        // is exactly one no-editor delivery in the app rather than a second one that could
+        // drift from it.
+        //
+        // It has to sit HERE, above everything else, because all three routes below open an
+        // editor of some kind: the handoff hands the file to a running preview HOST, the
+        // Windows 10 branch SPAWNS an editor child, and the pre-opened-spinner branch fills
+        // a surface that is already up. Checking any lower would still produce an editor.
+        //
+        // Read, not taken: this describes the launch, so a second capture in the same
+        // process (there is none today) would honour it too.
+        if self.no_editor {
+            return self.finish_share(&path, size, is_video);
         }
         // DRAGON-353: the editor is the capture's destination unconditionally (the "Open in
         // preview editor" setting is gone); the preview-less `finish_share` fallback below
@@ -1223,6 +1463,30 @@ impl App {
         if let Some(done) = self.try_handoff_capture(&path, size, is_video, dims) {
             return done;
         }
+        // DRAGON-427 (Windows 10): the editor cannot live in THIS process — it is rendering
+        // in software so its overlays are translucent, and the editor cannot draw at all
+        // under that rasterizer. Spawn it as its own GPU-rendered process and end here.
+        //
+        // Inert everywhere else, and on Windows 11 (which keeps its single-process editor).
+        if crate::platform::software_overlays() {
+            if let Some(done) = self.try_spawn_editor_child(&path, size, is_video, dims) {
+                return done;
+            }
+            // The spawn failed. Falling through would open the editor HERE — visibly broken,
+            // because tiny-skia cannot render its shader layers. So take the app's existing
+            // editor-less delivery instead: copy to the clipboard, notify, exit. The capture
+            // is already written to disk at this point, so nothing is lost — the user gets the
+            // file and the clipboard, just no editor. `finish_share` routes through
+            // `finish_session` like every other "we're done" path.
+            // Not a `diag::note_failure`: this delivers, so it is not a "we delivered
+            // NOTHING" path. It is loud in the log because it is a degraded experience the
+            // user WILL notice (no editor at all) and a reader needs the reason.
+            log::warn!(
+                "windows 10: no editor child, delivering {} without the preview editor",
+                path.display()
+            );
+            return self.finish_share(&path, size, is_video);
+        }
         // Pre-opened (window/freeze grab, or a stopped recording): the spinner overlay is
         // already up — record where the capture landed and kick off the content prep into
         // the existing surface (image decode, or video poster extraction).
@@ -1234,7 +1498,11 @@ impl App {
             // A PRE-OPENED spinner had no path when it opened, so the open-time automatic
             // clipboard copy (DRAGON-353) waits for this moment — the file has just landed.
             // Idempotent, so the swap below can't double-copy.
-            self.auto_copy_preview_on_open(id);
+            //
+            // THIS is the seam DRAGON-454 was reported against: the editor is ALREADY on
+            // screen here, so running the copy inline froze a surface the user was looking at.
+            // It is a worker thread now, and its outcome arrives as `AutoCopied`.
+            let copy = self.auto_copy_preview_on_open(id);
             // DRAGON-221 follow-up: a WINDOWED window-pick deferred its cover→window
             // swap to THIS moment, when the COMPOSED dims are finally known (the
             // selection dims under-size the window — padding/shadow/wallpaper margins
@@ -1257,7 +1525,7 @@ impl App {
                 Some(PreviewKind::Video(_)) => video::poster_task(id, path),
                 None => Task::none(),
             };
-            return Task::batch([swap, prep]);
+            return Task::batch([swap, prep, copy]);
         }
         // Not pre-opened (live region/monitor image grab, which needs a clean screen):
         // open the overlay now (spinner), then prep the content. The caller's `dims` let the
@@ -1302,6 +1570,10 @@ impl App {
         // `compose_preview` in `chrome.rs`: a dissolve is not expressible in this iced, and a
         // scrim standing in for one was rejected.)
         let toasts = toast::toast_layer(&preview.toasts, glass);
+        // DRAGON-454: one entry on the launch timeline per view build (bounded) carrying the
+        // build's own cost. Both halves matter — the GAP between consecutive builds is where a
+        // blocked UI thread shows up, and the COST says whether the block is this build.
+        let _build_mark = mark_preview_view(!preview.is_loading());
         let content: Element<'_, Msg> = if preview.is_loading() {
             self.preview_loading_view(preview, tb, toasts)
         } else {

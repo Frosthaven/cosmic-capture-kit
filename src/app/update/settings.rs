@@ -387,6 +387,14 @@ impl App {
                 Task::none()
             }
             SettingsMsg::SetPreviewWindowed(b) => {
+                // DRAGON-427: on Windows 10 the appearance is not the user's to choose — the
+                // row is inert there and this arm is unreachable from the UI, but the write
+                // is refused rather than merely hidden. Persisting `false` would put the NEXT
+                // process (which re-reads the setting through `effective_preview_windowed`)
+                // one bug away from an overlay editor the software rasterizer cannot draw.
+                if !crate::platform::overlay_preview_available() {
+                    return Task::none();
+                }
                 self.preview_windowed = b;
                 self.save_state();
                 Task::none()
@@ -681,13 +689,70 @@ impl App {
                 // see `crate::daemon` SuspendWindow). So a PrintScreen pressed during
                 // recording reaches THIS app and is captured like any other key, then the
                 // daemon re-registers a couple of seconds after recording ends.
+                //
+                // DRAGON-452: the six slots share ONE keyboard, and only one of them can win
+                // an OS registration, so a chord already held by ANOTHER slot must not be
+                // accepted in silence. We STEAL rather than refuse: the recorded row gets the
+                // chord and the previous owner is cleared, with both rows saying so. Refusing
+                // would leave the user hunting for which of six rows already holds the chord;
+                // stealing is the outcome they asked for, and the notice plus the loser's now
+                // "Unbound" button make the cost visible and one click to undo.
+                //
+                // Only a chord being SET can conflict: clearing a row (the "x" / the reset)
+                // frees a chord and can never take one. The check is the pure
+                // `capture_hotkey_conflict`, which compares NORMALIZED chords, so a different
+                // modifier order or case is still the same chord.
+                let mut notice = crate::app::settings::CaptureHotkeyNotice {
+                    slot,
+                    taken_from: None,
+                    os_refused: false,
+                };
+                let conflict = {
+                    let specs = self.capture_hotkey_specs();
+                    crate::shortcuts::capture_hotkey_conflict(&specs, slot.index(), &spec)
+                };
+                if let Some(loser) = conflict.map(|i| crate::app::CaptureHotkeySlot::ALL[i]) {
+                    *self.capture_hotkey_slot_mut(loser) = String::new();
+                    notice.taken_from = Some(loser);
+                    log::info!(
+                        "capture hotkey \"{spec}\" moved to {} and taken from {} (it was bound to both)",
+                        slot.label(),
+                        loser.label()
+                    );
+                }
+                // DRAGON-452, the SECOND way a hotkey can silently do nothing: another APP
+                // owns the chord globally, so `RegisterHotKey` refuses it. From the keyboard
+                // that is indistinguishable from our own duplicate, so ask the OS now and say
+                // so on the row. NO IPC is involved: the daemon is a separate process, and
+                // this is a transient registration in THIS process that is released
+                // immediately. It is asked exactly here, at record time, because the chord
+                // recorder has the daemon's own hotkeys SUSPENDED (see
+                // `sub_hotkey_suspend_ping`), which is the one moment our own registrations
+                // cannot answer for someone else's. macOS has no equivalent probe: its daemon
+                // registers through `global_hotkey`'s Carbon manager, and standing one up
+                // inside this GUI process just to test a chord is not a thing we can verify
+                // here, so mac gets the duplicate check + rows and leaves this to the daemon
+                // log.
+                //
+                // No Windows-version gate: `RegisterHotKey`/`UnregisterHotKey` behave the
+                // same all the way back through Windows 10, and the answer needs no IPC, so
+                // it holds when the settings window is its own process (DRAGON-427's Win10
+                // settings split) exactly as it does in-process.
+                #[cfg(windows)]
+                if !crate::daemon::hotkey_spec_is_cleared(&spec)
+                    && let Err(reason) = crate::daemon::chord_is_free(&spec)
+                {
+                    notice.os_refused = true;
+                    log::warn!("capture hotkey \"{spec}\" for {}: {reason}", slot.label());
+                }
+                // Nothing to report about a CLEARED row, so a clear also wipes a previous
+                // notice: the rows go back to plain labels rather than keeping stale advice
+                // about an edit the user has since undone.
+                self.settings.capture_hotkey_notice =
+                    (!crate::daemon::hotkey_spec_is_cleared(&spec)).then_some(notice);
                 // DRAGON-295: route the spec to the slot the row edits (All In One / Active
                 // Window / Active Monitor); each is an independent persisted spec.
                 *self.capture_hotkey_slot_mut(slot) = spec;
-                // On Windows `slot` is consumed only by the mut-setter above (the daemon's
-                // config poll re-registers all slots); silence the unused warning there.
-                #[cfg(target_os = "windows")]
-                let _ = slot;
                 // Persist the new spec. On Windows this is the WHOLE job (DRAGON-259): the
                 // running daemon's config-mtime poll notices the changed spec and re-registers
                 // the global hotkey IN PLACE — no quit, no respawn. The old code SIGTERM'd +
@@ -733,6 +798,10 @@ impl App {
                 // clicking a different row moves the recorder to it. Clear any in-app rebind
                 // so the two capture modes are never armed at once.
                 self.settings.rebinding = None;
+                // DRAGON-452: the previous edit's notice belongs to the previous edit. Drop it
+                // as soon as a row is armed, so what the rows say always describes the LAST
+                // recorded chord and never an older one.
+                self.settings.capture_hotkey_notice = None;
                 self.settings.capture_hotkey_rebinding =
                     if self.settings.capture_hotkey_rebinding == Some(slot) {
                         None
@@ -1072,16 +1141,23 @@ impl App {
 
     /// macOS/Windows (DRAGON-295): the persisted spec string for one of the three global
     /// capture-hotkey slots. Central accessor so the message handler + settings row + the
-    /// daemon-restart decision all read the same field per slot. Only the macOS
-    /// daemon-restart decision reads it (Windows re-registers via the daemon's config poll,
-    /// so it needs only the mut setter), so it is honestly dead off macOS.
+    /// daemon-restart decision all read the same field per slot. Read on BOTH daemon OSes
+    /// since DRAGON-452 (the duplicate check reads every slot through
+    /// [`Self::capture_hotkey_specs`]); macOS additionally reads it for the daemon-restart
+    /// decision.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(in crate::app) fn capture_hotkey_slot(&self, slot: crate::app::CaptureHotkeySlot) -> &str {
         match slot {
             crate::app::CaptureHotkeySlot::AllInOne => &self.capture_hotkey,
             crate::app::CaptureHotkeySlot::ActiveWindow => &self.capture_active_window_hotkey,
             crate::app::CaptureHotkeySlot::ActiveMonitor => &self.capture_active_monitor_hotkey,
+            crate::app::CaptureHotkeySlot::AllInOneNoEditor => &self.capture_no_editor_hotkey,
+            crate::app::CaptureHotkeySlot::ActiveWindowNoEditor => {
+                &self.capture_active_window_no_editor_hotkey
+            }
+            crate::app::CaptureHotkeySlot::ActiveMonitorNoEditor => {
+                &self.capture_active_monitor_no_editor_hotkey
+            }
         }
     }
 
@@ -1095,7 +1171,22 @@ impl App {
             crate::app::CaptureHotkeySlot::AllInOne => &mut self.capture_hotkey,
             crate::app::CaptureHotkeySlot::ActiveWindow => &mut self.capture_active_window_hotkey,
             crate::app::CaptureHotkeySlot::ActiveMonitor => &mut self.capture_active_monitor_hotkey,
+            crate::app::CaptureHotkeySlot::AllInOneNoEditor => &mut self.capture_no_editor_hotkey,
+            crate::app::CaptureHotkeySlot::ActiveWindowNoEditor => {
+                &mut self.capture_active_window_no_editor_hotkey
+            }
+            crate::app::CaptureHotkeySlot::ActiveMonitorNoEditor => {
+                &mut self.capture_active_monitor_no_editor_hotkey
+            }
         }
+    }
+
+    /// DRAGON-452: every capture-hotkey slot's current spec, in [`CaptureHotkeySlot::ALL`]
+    /// order — the input the pure [`crate::shortcuts::capture_hotkey_conflict`] check reads.
+    /// One accessor so the check can never see a different set of slots than the rows do.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(in crate::app) fn capture_hotkey_specs(&self) -> [&str; 6] {
+        crate::app::CaptureHotkeySlot::ALL.map(|slot| self.capture_hotkey_slot(slot))
     }
 
     /// Reconcile the OS "launch at login" item with the current settings (DRAGON-296).

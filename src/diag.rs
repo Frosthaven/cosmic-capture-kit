@@ -28,9 +28,10 @@
 //! a hotkey capture, a daemon-spawned child, a CLI run, Finder / Start Menu, the settings
 //! window, each detached share helper. They all APPEND to the same file, so a multi-process
 //! session reads as one story ordered by time, with `pid=` and the component tag to untangle
-//! the strands. Shape borrowed wholesale from `platform/windows/diag.rs` (DRAGON-406), which
-//! already proved it: one open-append-write-close per line, so processes interleave BETWEEN
-//! lines and never split one, and no process holds a handle that would block a rotation.
+//! the strands. Shape borrowed wholesale from the DRAGON-406 Windows report (since deleted by
+//! DRAGON-407), which already proved it: one open-append-write-close per line, so processes
+//! interleave BETWEEN lines and never split one, and no process holds a handle that would
+//! block a rotation.
 //!
 //! **All platforms.** The predecessor (`CCK_LOG_FILE`) was `#[cfg(windows)]`, which is exactly
 //! why macOS had nothing to show. This is portable by construction: only [`log_dir`] has
@@ -76,7 +77,7 @@
 //!
 //! A customer enables the log, reproduces the failure once, and mails the file. That only
 //! works if the file contains their session and nothing else, so a build/test process never
-//! writes to it: [`is_dev_process`] sends anything cargo runs — the test harness, `cargo run`,
+//! writes to it: [`crate::util::is_dev_process`] sends anything cargo runs — the test harness, `cargo run`,
 //! and every child they spawn — to a temp sandbox instead, and an explicit [`PATH_ENV`] that
 //! points inside the user's folder is refused there. The rule lives in [`resolve_path`], which
 //! is pure and unit-tested, and `tests/log_isolation.rs` proves it end to end against a real
@@ -107,11 +108,12 @@
 //!   last mark in the file names the call that never returned. That is the whole answer for a
 //!   launch-hang report, and it came for free.
 //!
-//! NOT consolidated, deliberately: the DRAGON-406 Windows-10 report
-//! (`platform/windows/diag.rs`). It is a live instrument for the unresolved DRAGON-408 and
-//! carries content this log does not reproduce (the swapchain/DirectComposition probe and the
-//! per-window style read-backs). It writes into the SAME folder as this log, so "send me the
-//! logs folder" gets both. See DRAGON-407 for the removal accounting.
+//! There was one other log alongside this: the DRAGON-406 Windows-10 chrome/transparency
+//! report, a deliberately TEMPORARY instrument with its own file in the same folder.
+//! DRAGON-407 deleted it. This is now the only debug log on every platform, and "send me the
+//! logs folder" means this one. The durable parts of that instrument were kept as `log::warn!`
+//! at their call sites (a refused `DwmSetWindowAttribute`, an ex-style read-back mismatch), so
+//! they land HERE when this log is on.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -153,9 +155,9 @@ pub const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_SESSION_BYTES: u64 = 512 * 1024;
 
 /// How much THIS process may write between rotation checks. Rotation at process start alone
-/// is not enough for a daemon that outlives many rotations (the DRAGON-406 report has exactly
-/// that hole); re-checking every 64 KiB closes it at the cost of one `metadata` call per
-/// 64 KiB written.
+/// is not enough for a daemon that outlives many rotations (the DRAGON-406 report had exactly
+/// that hole, which is why this log does not); re-checking every 64 KiB closes it at the cost
+/// of one `metadata` call per 64 KiB written.
 pub const ROTATE_CHECK_BYTES: u64 = 64 * 1024;
 
 /// The level at which OUR OWN records reach the FILE when the log is enabled. `Debug`, not
@@ -334,6 +336,17 @@ pub fn component_from_args<S: AsRef<str>>(args: &[S]) -> Component {
     if HELPER_FLAGS.iter().any(|f| has(f)) {
         return Component::Helper;
     }
+    // DRAGON-450: a Windows toast click re-enters us through our own URI scheme, so that
+    // helper launch carries a bare URI where every other one carries a flag. Without this
+    // it would read as a plain GUI launch — the one shape that makes a multi-process file
+    // misleading rather than merely terse.
+    if args
+        .iter()
+        .skip(1)
+        .any(|a| a.as_ref().starts_with(crate::share::reexec::REVEAL_URI_PREFIX))
+    {
+        return Component::Helper;
+    }
     const CLI_FLAGS: &[&str] =
         &["--test", "--inspect", "--help", "-h", "--make-sync-clip", "--calibrate-sync"];
     if CLI_FLAGS.iter().any(|f| has(f)) {
@@ -346,6 +359,7 @@ pub fn component_from_args<S: AsRef<str>>(args: &[S]) -> Component {
         "--all-in-one",
         "--active-window",
         "--active-monitor",
+        "--no-editor",
         "--image",
         "--video",
         "--scan",
@@ -358,7 +372,11 @@ pub fn component_from_args<S: AsRef<str>>(args: &[S]) -> Component {
     if has("--settings") {
         return Component::Settings;
     }
-    if has("--preview") {
+    // DRAGON-427: `--preview-handoff` is a preview process too — the editor child a Windows 10
+    // capture spawns so the editor keeps the GPU renderer the capture overlay gave up. It must
+    // read as `preview` in the shared log, not as the generic `app`, or the two halves of one
+    // capture cannot be told apart by a reader.
+    if has("--preview") || has("--preview-handoff") {
         return Component::Preview;
     }
     if has("--permissions") {
@@ -407,6 +425,22 @@ pub enum Failure {
     /// with none" moment to record.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     NoOutputs,
+    /// Displays WERE found and an overlay window was minted for them, but it could never be
+    /// brought on screen, so the user had nothing to interact with (DRAGON-437).
+    ///
+    /// A member of the SAME vocabulary, not a second one — it earns its place for the reason
+    /// [`Failure::RecordingWedged`] does: it needs something different said. [`Self::NoOutputs`]
+    /// means the machine reported no displays, and "restart your computer" is the answer.
+    /// This means the displays were fine and OUR window never made it out of the two-phase
+    /// placement dance, which is a different bug with a different fix, and merging the two
+    /// would send every report of it looking at the wrong half of the system. The detail
+    /// names how many outputs were involved and how long the finalize driver tried for.
+    ///
+    /// Windows-only in practice: it is recorded by the finalize give-up in
+    /// `update_window_chrome`, and only Windows mints its overlays hidden and places them
+    /// natively in two phases.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    OverlayNeverShown,
     /// A screen-recording / capture permission the platform requires is missing or was
     /// refused. macOS TCC — the only platform with a preflight that can answer "no" while
     /// the app keeps running.
@@ -456,6 +490,17 @@ pub enum Failure {
     /// The user cancelled — the session ended as designed. Recorded so a reader can tell a
     /// cancel apart from a failure without guessing.
     Cancelled,
+    /// This macOS is too old to capture (DRAGON-431, floor lowered to 13.0 by DRAGON-444). The
+    /// app installs on 13 and captures there through the pre-14 path (a one-shot `SCStream`
+    /// grab plus CoreGraphics sizing, in place of the 14.0+ `SCScreenshotManager` /
+    /// `SCShareableContent.infoForFilter:`). Only macOS 12 and older still lands here, where
+    /// the audio-capture selectors the recording pipeline needs do not exist.
+    ///
+    /// So this variant exists to make a pre-13 launch fail LOUDLY instead of vanishing (on 12
+    /// `infoForFilter` would HARD-ABORT the process — no panic hook, no note, no dialog), and
+    /// it is recorded BEFORE any SCK call can fire.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    UnsupportedOs,
 }
 
 impl Failure {
@@ -463,6 +508,7 @@ impl Failure {
     pub fn code(self) -> &'static str {
         match self {
             Failure::NoOutputs => "no-outputs",
+            Failure::OverlayNeverShown => "overlay-never-shown",
             Failure::PermissionDenied => "permission-denied",
             Failure::SceneGrabTimeout => "scene-grab-timeout",
             Failure::NoImage => "no-image",
@@ -475,6 +521,7 @@ impl Failure {
             Failure::RecordingFailed => "recording-failed",
             Failure::RecordingWedged => "recording-wedged",
             Failure::Cancelled => "cancelled",
+            Failure::UnsupportedOs => "unsupported-os",
         }
     }
 
@@ -572,75 +619,16 @@ pub fn session_end(where_from: &str) {
 
 // ── Path resolution ──────────────────────────────────────────────────────────
 
-/// The environment variable cargo sets for every binary it RUNS (DRAGON-424).
-///
-/// Cargo exports this into the environment of a `cargo test` harness, of `cargo run`, and —
-/// because environments are inherited — of every child those processes spawn. A shipped build
-/// never has it: a COSMIC shortcut, a `.desktop` launch, a packaged `.app`, a Start Menu
-/// shortcut and the resident daemon all start with the user's own environment, and cargo does
-/// not export anything into a login shell.
-///
-/// That inheritance is the whole reason this is the marker. See [`is_dev_process`].
-const CARGO_ENV: &str = "CARGO_MANIFEST_DIR";
-
-/// Whether this process is part of a build/test run rather than a real user session.
-///
-/// **The bug this exists for (DRAGON-424).** `cargo test` was appending to the owner's live
-/// `debug.log` — a debug-profile 0.24.0 test binary interleaving its lines into the record of a
-/// release 0.23.0 session, caught while that very log was being read to diagnose a recording
-/// wedge. Three separate costs: it corrupts the evidence during exactly the investigation the
-/// log exists for, it spends the [`MAX_SESSION_BYTES`] budget, and a suite that spawns many
-/// short-lived processes can push a real session out through [`MAX_LOG_BYTES`] rotation.
-///
-/// **Why not `cfg!(test)` alone.** The observed leak was NOT the test harness writing. It was
-/// `tests/cli.rs` spawning the REAL binary as a subprocess — a child built without `cfg(test)`,
-/// which resolves its own path and knows nothing about the harness that started it. Any check
-/// that lives only in test-compiled code misses the one case that actually happened.
-///
-/// **Why not "the binary sits under `target/`".** The owner's PrintScreen shortcut launches
-/// `target/release/cosmic-capture-kit` directly. Treating a target-dir binary as a test would
-/// silence the log for the person the log is for.
-///
-/// So the test is the inherited cargo environment, which is present for the harness AND its
-/// children and absent for every shipped launch. `cfg!(test)` is kept as a cheap second
-/// condition for the harness itself.
-fn is_dev_process() -> bool {
-    cfg!(test) || std::env::var_os(CARGO_ENV).is_some()
-}
-
-/// The sandbox folder a dev/test process writes to instead of the user's log folder.
+/// The dev/test sandbox folder this process's log goes to instead of the user's log folder.
 ///
 /// Under the temp dir, not the user's data dir: a test run leaves nothing to clean up in a
-/// place a customer might later be asked to send us. Keyed by the cargo manifest dir so
-/// concurrent runs in different worktrees do not interleave into one file (and so two users
-/// on one machine never collide over a `/tmp` folder the other created), but STABLE within a
-/// run — a test's spawned children inherit `CARGO_MANIFEST_DIR` and so land in the same file
-/// as the harness, which keeps the one-file multi-process story readable here too.
+/// place a customer might later be asked to send us. The "is this a dev process" predicate and
+/// the per-worktree key both live in [`crate::util`] now (DRAGON-433 needed the identical
+/// question for the CONFIG directory), so a run's log sandbox and config sandbox are keyed the
+/// same way and a spawned child lands in the same pair as its harness.
 fn sandbox_log_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("cosmic-capture-kit-dev-logs-{}", sandbox_key()))
-}
-
-/// A short, deterministic key for [`sandbox_log_dir`].
-///
-/// FNV-1a, written out rather than taken from `DefaultHasher`, because the parent harness and
-/// the child app are two different binaries that must agree on the answer, and std's hasher
-/// only promises stability within one build.
-fn sandbox_key() -> String {
-    let seed = std::env::var_os(CARGO_ENV)
-        .map(|v| v.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "cargo".to_string());
-    fnv1a_hex(&seed)
-}
-
-/// FNV-1a as 16 hex digits. Pure, so [`sandbox_key`]'s "two binaries agree" property is
-/// testable without spawning anything.
-fn fnv1a_hex(seed: &str) -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in seed.as_bytes() {
-        h ^= *b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    format!("{h:016x}")
+    std::env::temp_dir()
+        .join(format!("cosmic-capture-kit-dev-logs-{}", crate::util::sandbox_key()))
 }
 
 /// The caller's explicit [`PATH_ENV`] choice, if any.
@@ -680,8 +668,8 @@ fn resolve_path(
 /// * **macOS** — `~/Library/Logs/cosmic-capture-kit`. The documented place for an app's logs,
 ///   visible in Console.app, and already home to `panic.log` (the crash hook in `main`), so
 ///   "send me that folder" gets the panic trace and the debug log together.
-/// * **Windows** — `%LOCALAPPDATA%\cosmic-capture-kit\logs`. The same folder the DRAGON-406
-///   report already uses, so the two files sit side by side and one instruction reaches both.
+/// * **Windows** — `%LOCALAPPDATA%\cosmic-capture-kit\logs`. Also where the DRAGON-426 leak
+///   probe drops its images, so one instruction reaches everything support asks for.
 /// * **Linux** — `$XDG_STATE_HOME/cosmic-capture-kit/logs` (`~/.local/state/…`), which is
 ///   what the XDG basedir spec designates for logs, falling back to `$XDG_DATA_HOME`.
 ///
@@ -693,7 +681,7 @@ fn resolve_path(
 /// the settings row displays and its button opens, so "where it says it writes" and "where it
 /// writes" stay the same statement under cargo as they are for a customer.
 pub fn log_dir() -> Option<PathBuf> {
-    if is_dev_process() {
+    if crate::util::is_dev_process() {
         return Some(sandbox_log_dir());
     }
     user_log_dir()
@@ -724,7 +712,7 @@ fn user_log_dir() -> Option<PathBuf> {
 /// The log file's full path — [`PATH_ENV`] when set, else `debug.log` in [`log_dir`], and
 /// never the user's file when this is a dev/test process (see [`resolve_path`]).
 pub fn log_path() -> Option<PathBuf> {
-    resolve_path(is_dev_process(), explicit_override(), user_log_dir(), &sandbox_log_dir())
+    resolve_path(crate::util::is_dev_process(), explicit_override(), user_log_dir(), &sandbox_log_dir())
 }
 
 /// The resolved log folder as a display string for the settings row, or a plain statement
@@ -946,7 +934,7 @@ fn session_header(reason: &str) {
 /// silent redirect. Both are skipped entirely for a real launch, which is every launch a
 /// customer ever makes.
 fn announce_sandbox() {
-    if !is_dev_process() {
+    if !crate::util::is_dev_process() {
         return;
     }
     write_line(
@@ -975,7 +963,7 @@ fn parent_pid_display() -> String {
 
 /// Append ONE line to the shared file.
 ///
-/// Open-append-write-close per line, exactly as the DRAGON-406 report does and for the same
+/// Open-append-write-close per line, exactly as the DRAGON-406 report did and for the same
 /// reasons: an `O_APPEND` write of a single line is atomic on every filesystem we ship on, so
 /// concurrent processes interleave BETWEEN lines and never split one, and holding no handle is
 /// what lets the next process rotate the file out from under us. Every failure is silent — a
@@ -1128,6 +1116,112 @@ pub fn path_shape(path: &Path) -> String {
     )
 }
 
+/// Replace filesystem paths inside FREE-FORM text with their [`path_shape`].
+///
+/// [`path_shape`] is for a path we hold as a `Path`. This is for text we did NOT write, where
+/// a path may be embedded in a sentence — an ffmpeg diagnostic, another tool's stderr. It
+/// exists because ffmpeg's commonest fatal lines name the output file ("No such file or
+/// directory", "Permission denied", "Error opening output file …"), so without it the debug
+/// log would carry the customer's capture folder, their filename and often their username on
+/// exactly the failures we most want them to send us (DRAGON-432).
+///
+/// Everything that does not look like a path is left EXACTLY as it was — the error vocabulary
+/// is the whole value of the line, and mangling it would trade one useless log for another.
+///
+/// ## The honest limits
+///
+/// A path is recognised by how it STARTS (absolute, `~/`, explicitly relative, a drive letter,
+/// or a UNC share) and then runs to the end of the line, a quote, or ffmpeg's `path: message`
+/// separator. So:
+///
+/// * A path with spaces in it (`C:\Users\Jane Smith\Videos\clip.mp4`) is fully covered — that
+///   is why this consumes to a terminator rather than to the next space.
+/// * Prose that follows a path on the same line can be swallowed with it. That is the safe
+///   direction: over-redacting costs a few words of context, under-redacting mails us the
+///   user's filesystem.
+/// * A BARE relative filename with no separator (`clip.mp4`) is not recognised. Nothing on
+///   the record path hands ffmpeg one — every output path we build is absolute.
+pub fn redact_paths(text: &str) -> String {
+    // Line by line, so a terminator can be "the end of this line" rather than "the end of the
+    // whole block".
+    let mut out = String::with_capacity(text.len());
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut rest = line;
+        while let Some(start) = path_start(rest) {
+            out.push_str(&rest[..start]);
+            let tail = &rest[start..];
+            let end = path_end(tail);
+            out.push_str(&path_shape(Path::new(&tail[..end])));
+            rest = &tail[end..];
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
+/// The byte index where the next path in `line` begins, if any.
+///
+/// A path can only START at a token boundary: the beginning of the line, after whitespace, or
+/// straight after a quote / `=` / an opening bracket — the ways ffmpeg introduces one
+/// (`'…'`, `--prefix=…`, `[…]`). Requiring a boundary is what keeps component tags like
+/// `[vost#0:0/libx264 @ 0x1]` out of it: the `/` in there does not start a token.
+fn path_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    for (i, _) in line.char_indices() {
+        let at_boundary = i == 0
+            || matches!(bytes[i - 1], b' ' | b'\t' | b'\'' | b'"' | b'=' | b'(' | b'[' | b'<');
+        if at_boundary && looks_like_a_path(&line[i..]) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// How far the path starting at `s` runs.
+///
+/// To the closing quote, or to ffmpeg's `path: message` separator, or to the end of the line.
+/// The `": "` form must be checked as colon-THEN-SPACE so a Windows drive (`C:\…`) is never
+/// mistaken for a terminator.
+fn path_end(s: &str) -> usize {
+    let quote = s.find(['\'', '"']);
+    let colon = s.find(": ");
+    match (quote, colon) {
+        (Some(q), Some(c)) => q.min(c),
+        (Some(q), None) => q,
+        (None, Some(c)) => c,
+        (None, None) => s.len(),
+    }
+}
+
+/// Whether `s` begins with something only a filesystem path begins with.
+///
+/// Every form needs a real character AFTER its separator — a lone `/` in a sentence is
+/// punctuation, and treating it as a path would redact the sentence.
+fn looks_like_a_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    // `C:\…` / `C:/…` — a drive letter. Checked first because it is the only form that does
+    // not lead with a separator.
+    if b.len() >= 4
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && matches!(b[2], b'\\' | b'/')
+        && !b[3].is_ascii_whitespace()
+    {
+        return true;
+    }
+    for p in ["\\\\", "~/", "./", "../", ".\\", "..\\", "/"] {
+        if let Some(after) = s.strip_prefix(p)
+            && after.chars().next().is_some_and(|c| !c.is_whitespace())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1244,6 +1338,60 @@ mod tests {
         assert_eq!(redact_args(&["x".to_string(), "a".repeat(64)]), "<value>");
     }
 
+    /// THE PRIVACY TEST for free-form text (DRAGON-432). These are the real shapes ffmpeg
+    /// prints when a recording dies, and every one of them names the output file.
+    #[test]
+    fn redact_paths_removes_every_path_ffmpeg_prints() {
+        for line in [
+            "[out#0/mp4 @ 0x7f2a] Error opening output file /home/jane/Capture/Q4 layoffs.mp4",
+            "/home/jane/Capture/Q4 layoffs.mp4: Permission denied",
+            "Could not open file '/Users/jane/Movies/board minutes.mp4'",
+            "[file @ 0x1] Unable to open C:\\Users\\Jane Smith\\Videos\\standup.mp4",
+            "av_interleaved_write_frame(): No space left on device writing \\\\nas\\share\\x.mp4",
+            "  configuration: --prefix=/home/builder/ffmpeg-static",
+        ] {
+            let out = redact_paths(line);
+            for secret in [
+                "jane", "Jane", "layoffs", "board", "minutes", "standup", "builder", "Capture",
+                "Movies", "Videos", "nas",
+            ] {
+                assert!(!out.contains(secret), "leaked {secret:?} from {line:?} -> {out:?}");
+            }
+            assert!(out.contains("path("), "nothing was redacted in {line:?} -> {out:?}");
+        }
+    }
+
+    /// The other half of the bargain: a line with no path in it must come back untouched, or
+    /// the log loses the error vocabulary that is the whole point of keeping it.
+    #[test]
+    fn redact_paths_leaves_ordinary_ffmpeg_output_alone() {
+        for line in [
+            "ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers",
+            "[libx264 @ 0x55f1c0] height not divisible by 2 (1920x1081)",
+            "[vost#0:0/libx264 @ 0x55f200] Error initializing output stream",
+            "frame=  120 fps= 30 q=28.0 size=    512kB time=00:00:04.00 bitrate=1048.6kbits/s",
+            "Conversion failed!",
+            "Unknown encoder 'h264_nvenc'",
+            "he said 1/2 and 3 / 4",
+            "",
+        ] {
+            assert_eq!(redact_paths(line), line, "{line:?} was altered");
+        }
+    }
+
+    /// The error text AFTER a path has to survive — "Permission denied" is the diagnosis, and
+    /// a redactor that ate it would leave a log that says nothing.
+    #[test]
+    fn redact_paths_keeps_the_message_that_follows_the_path() {
+        let out = redact_paths("/home/jane/x.mp4: No space left on device");
+        assert!(out.ends_with(": No space left on device"), "{out}");
+        assert!(out.starts_with("path("), "{out}");
+        // Multi-line blocks keep their line structure (the log block is one).
+        let block = redact_paths("first\n/home/jane/x.mp4: denied\nlast");
+        assert_eq!(block.lines().count(), 3);
+        assert!(block.starts_with("first\n") && block.ends_with("\nlast"), "{block}");
+    }
+
     #[test]
     fn path_shape_carries_the_shape_and_never_the_value() {
         // THE PRIVACY TEST for paths. Everything a save failure needs, nothing a customer
@@ -1289,6 +1437,7 @@ mod tests {
         // silently merge two different diagnoses.
         const ALL: &[Failure] = &[
             Failure::NoOutputs,
+            Failure::OverlayNeverShown,
             Failure::PermissionDenied,
             Failure::SceneGrabTimeout,
             Failure::NoImage,
@@ -1326,6 +1475,8 @@ mod tests {
         assert!(Failure::NoImage.is_loss());
         assert!(Failure::SaveFailed.is_loss());
         assert!(Failure::DecodeFailed.is_loss());
+        // DRAGON-437: an overlay that never appeared cost the user the whole session.
+        assert!(Failure::OverlayNeverShown.is_loss());
     }
 
     #[test]
@@ -1333,7 +1484,14 @@ mod tests {
         // This is the split that halves the search space in a "nothing happened" report: no
         // file in the capture folder means the capture died; a file with no editor means
         // delivery did. The fixes have nothing in common.
-        for f in [Failure::NoImage, Failure::SaveFailed, Failure::WorkerPanic, Failure::NoOutputs] {
+        for f in [
+            Failure::NoImage,
+            Failure::SaveFailed,
+            Failure::WorkerPanic,
+            Failure::NoOutputs,
+            // DRAGON-437: the session died before the user could ask for anything.
+            Failure::OverlayNeverShown,
+        ] {
             assert!(!f.reached_disk(), "{f:?} must not claim the bytes reached disk");
         }
         for f in [Failure::DecodeFailed, Failure::PreviewSurfaceLost, Failure::NoPreviewOutput] {
@@ -1364,6 +1522,16 @@ mod tests {
         let c = |v: &[&str]| component_from_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
         assert_eq!(c(&["cck", "--notify-saved", "/x/y.png"]), Component::Helper);
         assert_eq!(c(&["cck", "--reveal", "/x/y.png"]), Component::Helper);
+        // DRAGON-450: the toast-click launch carries a URI instead of a flag, and is just as
+        // much a helper. The kind/reason tokens ride the notify helper and change nothing.
+        assert_eq!(
+            c(&["cck", "cosmic-capture-kit:reveal?path=%2Fx%2Fy.png"]),
+            Component::Helper
+        );
+        assert_eq!(
+            c(&["cck", "--notify-copied", "/x/y.png", "--notify-kind", "region"]),
+            Component::Helper
+        );
         // argv[0] is never inspected: an exe path that happens to contain a flag-like word
         // must not classify the process.
         assert_eq!(c(&["/opt/--region/cck"]), Component::App);
@@ -1405,21 +1573,14 @@ mod tests {
         assert_eq!(resolve_path(true, None, None, sandbox), Some(expected_sandbox));
     }
 
-    /// The harness and the child it spawns are two different binaries that have to agree on
-    /// the sandbox folder, or a test's own child writes somewhere the test cannot see.
-    #[test]
-    fn the_sandbox_key_is_stable_and_per_worktree() {
-        assert_eq!(fnv1a_hex("/home/jane/repo"), fnv1a_hex("/home/jane/repo"));
-        assert_ne!(fnv1a_hex("/home/jane/repo"), fnv1a_hex("/home/jane/worktrees/other"));
-        assert_eq!(fnv1a_hex("x").len(), 16);
-        assert!(fnv1a_hex("x").chars().all(|c| c.is_ascii_hexdigit()));
-    }
-
     /// The live assertion, made by the harness about ITSELF: this very process is a dev
     /// process, and the path it would write to is not the user's.
     #[test]
     fn this_test_binary_resolves_away_from_the_user_s_log() {
-        assert!(is_dev_process(), "a cargo test binary must classify itself as dev/test");
+        assert!(
+            crate::util::is_dev_process(),
+            "a cargo test binary must classify itself as dev/test"
+        );
         // A run that named its own file is a controlled experiment; the invariant under test
         // is where we land when nobody said.
         if explicit_override().is_some() {

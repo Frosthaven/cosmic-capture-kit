@@ -22,12 +22,30 @@ screenshot — identical to a bare launch.
 | `--image` | Capture a screenshot (default) |
 | `--video` | Capture a screen recording |
 | `--scan` | Start the QR / OCR scanner (forces region mode) |
+| `--all-in-one` | Open the full capture picker overlay |
+| `--active-window` | Capture the active window immediately, no picker |
+| `--active-monitor` | Capture the monitor under the cursor immediately, no picker |
+| `--no-editor` | With any launch flag: skip the preview editor — save, copy and notify instead |
 | `--countdown <secs>` | Pre-capture countdown, in seconds — any value works (e.g. `7`), not just the UI presets |
 
 Mode and kind flags combine — e.g. `--monitor --video` records a monitor. `--scan`
 always uses region mode (its capture invariant), so a mode flag alongside it is
 ignored. When several mode (or several kind) flags are passed, the most specific
 wins in this order: monitor > window > region, and scan > video > image.
+
+`--no-editor` is a modifier rather than a mode, so it combines with every launch flag
+above: `--region --no-editor`, `--active-window --no-editor`, and so on. The capture is
+still saved to the capture folder, copied to the clipboard and announced by a
+notification — exactly what happens today when no editor can be opened. Only the editor
+is skipped. It is named for the editor, not the preview, because `--preview <file>`
+already means "open this file in the viewer".
+
+The notification is the whole feedback for such a capture, so it names what it delivered
+— "Region copied to clipboard", "Window saved", "Monitor saved" — and clicking it opens
+the capture's folder with the file selected. It says "saved" rather than "copied"
+whenever the clipboard write did not happen, and the body then gives the reason. (A
+still image over 1 GB is not copied automatically; a recording is copied at any size,
+because it goes on the clipboard as a file reference rather than as pixels.)
 
 ## Other flags
 

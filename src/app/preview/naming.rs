@@ -16,11 +16,66 @@
 //! [`save_target`] is the whole rule; `PreviewState::save_in_place` is the "the user chose
 //! this path" bit it consults. Everything is a pure function over a path plus an
 //! `exists` predicate, so the collision policy is unit-testable with no filesystem.
+//!
+//! [`png_name`] is the other half (DRAGON-455): a still is WRITTEN as PNG, so its name has
+//! to say PNG. It composes over `save_target` at the one call site,
+//! `App::preview_save_target`.
 
 use std::path::{Path, PathBuf};
 
 /// The marker appended to a capture's stem when an EDITED copy is saved beside it.
 pub(super) const EDITED_SUFFIX: &str = "-edited";
+
+/// The one extension a still is ever saved under. See [`png_name`].
+pub(super) const PNG_EXT: &str = "png";
+
+/// THE STILL FORMAT RULE, as path arithmetic (DRAGON-455).
+///
+/// A still is written as PNG — the destination extension does not select a format (see
+/// [`super::edit::bake_image`]). So the name a still is saved under has to say PNG too, or
+/// the file lies about itself, which is the whole bug.
+///
+/// Three arms, and the split is about how much is really KNOWN about the current tail:
+///
+/// * already `.png` in any case — a `.PNG` capture IS a PNG — is returned untouched. We do
+///   not re-case a name the user chose.
+/// * another still-image extension we can open (`.jpg`, `.webp`, … — [`super::is_image_path`])
+///   is REPLACED. That tail is certainly a format name, so nothing of the user's own name is
+///   lost: an edited `clip.JPG` saves as `clip-edited.png`.
+/// * anything else — no extension at all, a bare trailing dot, or a dotted NAME like
+///   `report.v2` — gets `.png` APPENDED, never substituted. `Path::extension` reads `v2`
+///   there as an extension, and replacing it would silently eat part of a name the user
+///   typed (the same trap `platform::windows::file_panel`'s allow-list guards). `report.v2.png`
+///   is ugly and honest; `report.png` is tidy and wrong.
+///
+/// A name with no extension at all lands in the second arm too, through `set_extension`,
+/// which fills an empty slot rather than appending past a trailing dot — so `shot` and
+/// `shot.` both become `shot.png`, never `shot..png`.
+///
+/// RECORDINGS never come here: [`super::edit::bake_video`] really does honour the
+/// destination container, so a recording keeps its own extension.
+pub(super) fn png_name(path: &Path) -> PathBuf {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default();
+    if ext.eq_ignore_ascii_case(PNG_EXT) {
+        return path.to_path_buf();
+    }
+    if ext.is_empty() || super::is_image_path(path) {
+        let mut out = path.to_path_buf();
+        out.set_extension(PNG_EXT);
+        return out;
+    }
+    // A non-empty extension implies a file name, so the fallback below is unreachable
+    // defence rather than a real arm.
+    match path.file_name() {
+        Some(name) => {
+            let mut name = name.to_os_string();
+            name.push(".");
+            name.push(PNG_EXT);
+            path.with_file_name(name)
+        }
+        None => path.with_extension(PNG_EXT),
+    }
+}
 
 /// How many `-edited-N` variants to try before giving up and overwriting the plain
 /// `-edited` name. Absurdly high on purpose: the loop exists so a pre-existing
@@ -139,10 +194,14 @@ mod tests {
             edited_target(Path::new("/shots/Screenshot 2026.png"), &none),
             PathBuf::from("/shots/Screenshot 2026-edited.png")
         );
-        // A capitalised / multi-part extension keeps its exact spelling.
+        // A capitalised extension keeps its exact spelling. Shown on a RECORDING since
+        // DRAGON-455: this derivation is format-agnostic (it is the video half's rule too),
+        // and a still never reaches it with a foreign extension any more — `png_name` runs
+        // first, so `clip.JPG` derives from `clip.png`. See
+        // `a_still_target_is_always_png_before_the_edited_derivation`.
         assert_eq!(
-            edited_target(Path::new("/shots/clip.JPG"), &none),
-            PathBuf::from("/shots/clip-edited.JPG")
+            edited_target(Path::new("/shots/clip.MOV"), &none),
+            PathBuf::from("/shots/clip-edited.MOV")
         );
         // RECORDINGS derive identically (DRAGON-398: the video editor's Save writes the same
         // `-edited` sibling as an image's, from this same rule — there is no second naming
@@ -261,5 +320,100 @@ mod tests {
             // The ORIGINAL capture is never a target after step 1.
             assert_ne!(first, capture.to_path_buf());
         }
+    }
+
+    // ── DRAGON-455: a still's name says PNG, because a still IS a PNG ────────────────
+
+    /// The already-PNG arm: nothing moves, and a `.PNG` capture is not re-cased. The name
+    /// the user chose is theirs.
+    #[test]
+    fn png_name_leaves_a_png_alone_whatever_its_case() {
+        for name in ["/shots/a.png", "/shots/a.PNG", "/shots/a.Png", "a.png", "/shots/a.b.png"] {
+            assert_eq!(png_name(Path::new(name)), PathBuf::from(name), "{name}");
+        }
+    }
+
+    /// The REPLACE arm: a tail that certainly names a still format is swapped for `png`,
+    /// so an edited external JPEG saves as a `.png` rather than PNG bytes wearing `.JPG`.
+    #[test]
+    fn png_name_replaces_an_image_extension() {
+        for (given, want) in [
+            ("/shots/clip.JPG", "/shots/clip.png"),
+            ("/shots/clip.jpeg", "/shots/clip.png"),
+            ("/shots/clip.webp", "/shots/clip.png"),
+            ("/shots/clip.tiff", "/shots/clip.png"),
+            ("/shots/clip.avif", "/shots/clip.png"),
+            // The directory and a dotted STEM both survive — only the format tail moves.
+            ("/shots/report.v2.gif", "/shots/report.v2.png"),
+        ] {
+            assert_eq!(png_name(Path::new(given)), PathBuf::from(want), "{given}");
+        }
+    }
+
+    /// A missing extension (DRAGON-429's user-facing case, now handled portably rather than
+    /// only in the Windows panel) and a bare trailing dot both simply GAIN `.png`.
+    #[test]
+    fn png_name_fills_in_a_missing_extension() {
+        for (given, want) in [
+            ("/shots/my shot", "/shots/my shot.png"),
+            ("my shot", "my shot.png"),
+            ("/shots/shot.", "/shots/shot.png"),
+        ] {
+            assert_eq!(png_name(Path::new(given)), PathBuf::from(want), "{given}");
+        }
+    }
+
+    /// The APPEND arm, and the reason it exists: `Path::extension` reads the tail of a
+    /// dotted NAME as an extension, so replacing it would eat part of what the user typed.
+    /// `.png` goes on the end instead.
+    #[test]
+    fn png_name_appends_to_a_tail_that_is_not_a_format() {
+        for (given, want) in [
+            // A dotted name, not a type — the same shape the Windows dialog's allow-list
+            // exists for.
+            ("/shots/Recording 2026-07-29 at 10.30", "/shots/Recording 2026-07-29 at 10.30.png"),
+            ("/shots/report.v2", "/shots/report.v2.png"),
+            ("/shots/shot.xyz", "/shots/shot.xyz.png"),
+            // A container the user typed on a STILL save: honest, not obeyed.
+            ("/shots/shot.mp4", "/shots/shot.mp4.png"),
+        ] {
+            assert_eq!(png_name(Path::new(given)), PathBuf::from(want), "{given}");
+        }
+    }
+
+    /// Idempotent, which is what lets it run on both the SUGGESTED name and the picked
+    /// path: the native panels already force `.png` in their own ways, and a second pass
+    /// must not stack a second extension.
+    #[test]
+    fn png_name_is_idempotent() {
+        for name in [
+            "/shots/a.png",
+            "/shots/clip.JPG",
+            "/shots/shot.xyz",
+            "/shots/my shot",
+            "/shots/Recording at 10.30",
+        ] {
+            let once = png_name(Path::new(name));
+            assert_eq!(png_name(&once), once, "{name}");
+        }
+    }
+
+    /// THE COMPOSITION `App::preview_save_target` performs: force PNG FIRST, then derive
+    /// `-edited`. Order matters — deriving first would produce `clip-edited.JPG` and run the
+    /// collision walk against a name nothing will ever be written to.
+    #[test]
+    fn a_still_target_is_always_png_before_the_edited_derivation() {
+        let none = taken(&[]);
+        let external = png_name(Path::new("/shots/clip.JPG"));
+        assert_eq!(
+            save_target(&external, false, &none),
+            PathBuf::from("/shots/clip-edited.png")
+        );
+        // And the collision walk now checks the name that WILL be written.
+        let clash = taken(&["/shots/clip-edited.png"]);
+        assert_eq!(
+            save_target(&external, false, &clash),
+            PathBuf::from("/shots/clip-edited-2.png")
+        );
     }
 }

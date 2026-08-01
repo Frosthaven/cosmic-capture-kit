@@ -296,10 +296,9 @@ fn build_media_clock_command(
     // correct: adding a replacement flag would fight a stream that's already
     // exactly what cfr would produce, for no benefit.
     cmd.args(["-flush_packets", "1"]);
-    cmd.arg(out_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+    // stderr is deliberately NOT set here (DRAGON-432): `spawn_recording_muxer` pipes it and
+    // attaches the drain, so the raw-frame and zero-copy muxers cannot drift apart.
+    cmd.arg(out_path).stdin(Stdio::piped()).stdout(Stdio::null());
     cmd
 }
 
@@ -348,8 +347,19 @@ fn spawn_recording_muxer(
     mic_fifo: &std::path::Path,
     sys_fifo: &std::path::Path,
 ) -> Result<Child, String> {
-    let child = crate::util::spawn_tethered(cmd)
+    // DRAGON-432: capture the muxer's stderr. Set HERE rather than in the builders because
+    // this is the one place BOTH recording muxers pass through (the raw-frame one and the
+    // feature-gated zero-copy one), so the drain cannot be wired up for one and forgotten
+    // for the other. It was `Stdio::inherit()`, which on a Windows GUI-subsystem launch and
+    // on a Linux hotkey launch inherits nothing at all — ffmpeg's explanation of why a
+    // recording failed was written straight into a black hole.
+    cmd.stderr(Stdio::piped());
+    let mut child = crate::util::spawn_tethered(cmd)
         .map_err(|e| format!("could not start ffmpeg (is it installed?): {e}"))?;
+    // MUST happen before anything writes to this child's stdin. A piped stderr that nobody
+    // drains fills its pipe and blocks ffmpeg's writes, deadlocking against our frame feed —
+    // see `ffmpeg_log::attach`, which owns that contract.
+    crate::record::ffmpeg_log::attach(&mut child);
     crate::record::recover::note_muxer(child.id(), out_path, mic_fifo, sys_fifo);
     Ok(child)
 }
@@ -358,6 +368,30 @@ fn spawn_recording_muxer(
 /// [`spawn_ffmpeg_encoded_media_clock`], mirroring how [`build_media_clock_command`]
 /// splits out of [`spawn_ffmpeg_media_clock`] for the same reason (argv shape
 /// unit-testable without spawning a process).
+/// How far apart the zero-copy muxer's streams may drift before libavformat flushes,
+/// in microseconds. See the long note at its use site in
+/// [`build_media_clock_encoded_command`] for why this is a band with two live edges.
+#[cfg(feature = "zero-copy")]
+pub(crate) const INTERLEAVE_DELTA_US: u64 = 1_000_000;
+
+// Both edges of that band, pinned at COMPILE time (the same treatment
+// `RENDER_LAG_SECS` gets against `REANCHOR_THRESHOLD_SECS`), because each one cost a
+// recording in a different way and neither is visible to any other test here:
+// at libavformat's 10s default the watchdog killed the muxer before it wrote a packet
+// (no file at all), and at 1us the streams decoupled far enough that the stop tail
+// ended the file with the audio still queued (a playable, correctly sized, MUTE file).
+#[cfg(feature = "zero-copy")]
+const _: () = assert!(
+    INTERLEAVE_DELTA_US * 10 <= crate::record::MUXER_LIVENESS_SECS * 1_000_000,
+    "the interleave window must stay an order of magnitude inside the muxer-liveness \
+     budget, or ffmpeg is killed as wedged before it writes its first packet"
+);
+#[cfg(feature = "zero-copy")]
+const _: () = assert!(
+    INTERLEAVE_DELTA_US >= 100_000,
+    "too small decouples the streams and the stop tail strands a whole audio track"
+);
+
 #[cfg(feature = "zero-copy")]
 fn build_media_clock_encoded_command(
     hevc: bool,
@@ -387,13 +421,61 @@ fn build_media_clock_encoded_command(
     cmd.args([
         "-c:a", "aac", "-b:a", "192k",
         "-metadata:s:a:0", "title=mic", "-metadata:s:a:1", "title=system",
-        "-shortest",
     ]);
+    // DRAGON-457: NO `-shortest` here, and its absence is the fix — on this path it
+    // silently threw away EVERY audio packet.
+    //
+    // ffmpeg 8 implements `-shortest` with an output SYNC QUEUE. The raw-frame sibling
+    // encodes all three streams, so its queue behaves; here video is `-c:v copy` from a
+    // pre-encoded elementary stream while both audio tracks go through the AAC encoders,
+    // and the queue discards the audio outright. ffmpeg's own accounting, muxing the same
+    // 11.9s of h264 plus both audio FIFOs on the owner's box:
+    //
+    //   with `-shortest`:     video 358 packets muxed
+    //                         audio  8 frames ENCODED, 0 PACKETS MUXED  (both tracks)
+    //   without `-shortest`:  video 358 packets muxed
+    //                         audio 563 frames encoded, 564 packets muxed (576000 samples)
+    //
+    // `-shortest_buf_duration` does not rescue it; the packets are dropped, not buffered.
+    // The failure is invisible downstream: finalize's `amix` faithfully produced nothing
+    // from nothing, so the recording arrived playable, correctly sized, and MUTE.
+    //
+    // Losing it costs us nothing here. `-shortest` existed to trim the video back to the
+    // audio's end, and this pipeline already guarantees the relationship the other way
+    // round: we own the clock, and the stop tail deliberately writes covering video ticks
+    // until video ends >= the audio's media end (see `record::zero_copy`'s stop tail and
+    // CLAUDE.md's stop-tail rule). What remains is at most a few frames of video past the
+    // last audio sample, which is the side the invariant was always willing to pay.
     cmd.args(["-flush_packets", "1"]);
-    cmd.arg(out_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
+    // DRAGON-457: WITHOUT this, nothing reaches the file until an input ends.
+    //
+    // libavformat holds the interleave queue until it has a packet from every stream, or
+    // until the queue spans `max_interleave_delta` — which defaults to TEN SECONDS. The
+    // raw-frame sibling never notices, because there ffmpeg encodes the video itself and
+    // so produces video and audio packets in lockstep. Here input 0 is a pre-encoded
+    // elementary stream with no container timestamps, parsed by the raw `h264`/`hevc`
+    // demuxer, and the queue condition is not met promptly enough — so ffmpeg sat on the
+    // WHOLE recording, wrote its 928-byte header and nothing else, and `MuxerWatchdog`
+    // (`MUXER_LIVENESS_SECS`, 12s, and rightly) killed it as wedged. That is why
+    // zero-copy had never once produced a file on the owner's box.
+    //
+    // The value is a BAND, not a minimum, and both edges are real:
+    //
+    // * Too large (the 10s default) and the watchdog kills the muxer before its first
+    //   packet — no recording at all.
+    // * Too small and the streams decouple: at 1µs, ffmpeg wrote video far ahead of
+    //   audio, and when the stop tail closed video stdin, `-shortest` ended the file
+    //   while the audio was still queued. That produced a clean, playable, 19s
+    //   recording WITH NO AUDIO TRACK — the worst kind of failure, since it looks
+    //   delivered. Measured on the owner's box.
+    //
+    // One second sits an order of magnitude inside the watchdog budget while keeping the
+    // streams close enough that the stop tail cannot strand a whole track.
+    // `interleave_window_sits_inside_the_muxer_liveness_budget` pins that relationship.
+    cmd.args(["-max_interleave_delta", &INTERLEAVE_DELTA_US.to_string()]);
+    // stderr is deliberately NOT set here (DRAGON-432): `spawn_recording_muxer` pipes it and
+    // attaches the drain, so the raw-frame and zero-copy muxers cannot drift apart.
+    cmd.arg(out_path).stdin(Stdio::piped()).stdout(Stdio::null());
     cmd
 }
 
@@ -586,6 +668,64 @@ mod tests {
         assert!(!h264.iter().any(|a| a == "hvc1"), "{h264:?}");
         let hevc = media_clock_encoded_args(true);
         assert!(hevc.windows(2).any(|w| w == ["-tag:v", "hvc1"]), "{hevc:?}");
+    }
+
+    /// DRAGON-457: the zero-copy muxer must not be left on libavformat's default
+    /// ten-second interleave window.
+    ///
+    /// It is a shape test because the failure it guards is invisible in one: ffmpeg
+    /// buffered the entire recording, wrote its header and nothing else, and the
+    /// `MuxerWatchdog` killed it at 12s as wedged — so zero-copy produced no file at all
+    /// on the owner's box. The value must stay SMALL and NON-ZERO; `0` means the
+    /// opposite ("buffer until every stream has a packet") and reinstates the wedge.
+    #[cfg(feature = "zero-copy")]
+    #[test]
+    fn media_clock_encoded_command_does_not_sit_on_the_default_interleave_window() {
+        for hevc in [false, true] {
+            let args = media_clock_encoded_args(hevc);
+            let i = args
+                .iter()
+                .position(|a| a == "-max_interleave_delta")
+                .unwrap_or_else(|| panic!("no -max_interleave_delta (hevc={hevc}): {args:?}"));
+            let v: u64 = args[i + 1].parse().expect("numeric");
+            assert_eq!(v, INTERLEAVE_DELTA_US, "hevc={hevc}: {args:?}");
+        }
+    }
+
+    /// The raw-frame path stays exactly as it was: it encodes every stream itself, so
+    /// neither the interleave window nor the `-shortest` sync queue ever bit it. Pinned
+    /// so the two fixes above cannot be "tidied" into the shared shape and change a
+    /// command that works.
+    #[test]
+    fn the_raw_frame_media_clock_command_is_left_alone() {
+        let args = media_clock_args(&test_plan());
+        assert!(
+            !args.iter().any(|a| a == "-max_interleave_delta"),
+            "the raw-frame muxer must keep its historical argv: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "-shortest"),
+            "the raw-frame muxer KEEPS -shortest; only the zero-copy one drops it: {args:?}"
+        );
+    }
+
+    /// DRAGON-457: `-shortest` must never come back to the zero-copy muxer.
+    ///
+    /// On this path ffmpeg 8's `-shortest` sync queue discarded every audio packet — the
+    /// AAC encoders ran, and 0 packets were muxed — so recordings arrived playable,
+    /// correctly sized and completely silent. Nothing downstream can detect that: the
+    /// finalize `amix` produces a valid (empty) result from empty inputs. This test is
+    /// the only thing standing between that and a re-added flag.
+    #[cfg(feature = "zero-copy")]
+    #[test]
+    fn the_zero_copy_muxer_never_carries_shortest() {
+        for hevc in [false, true] {
+            let args = media_clock_encoded_args(hevc);
+            assert!(
+                !args.iter().any(|a| a == "-shortest"),
+                "-shortest drops ALL audio on the stream-copy path (hevc={hevc}): {args:?}"
+            );
+        }
     }
 
     #[test]

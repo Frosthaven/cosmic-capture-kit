@@ -17,6 +17,10 @@ impl App {
     /// Keep only rects that fall inside the region and are centred on output `o`,
     /// tagging each with its source index. Shared by the code-mark + OCR-word layers
     /// and their hit-testing (so they never block a region drag).
+    ///
+    /// All CAPTURE space (DRAGON-448): mark rects come off the scanned pixels, the region
+    /// and the output rect are capture space too, and the answer is a filtered list that
+    /// stays capture space (the widget hit-tests it there). Nothing here meets iced.
     fn shown_in_region<'a>(
         &self,
         o: &OutputState,
@@ -72,7 +76,9 @@ impl App {
         if codes.is_empty() && words.is_empty() {
             return None;
         }
-        let (ox, oy) = (o.logical_pos.0 as f32, o.logical_pos.1 as f32);
+        // Mark/word polys are CAPTURE space (they come off the scanned pixels); the canvas
+        // and the tooltip placement below are POINTS. Cross once, here (DRAGON-448).
+        let units = o.units();
         let mut shapes: Vec<MarkShape> = Vec::new();
         let mut tooltip: Option<Element<'_, Msg>> = None;
 
@@ -88,7 +94,10 @@ impl App {
                 0.15
             };
             // Output-local corners (follow the text slant), padded outward from centroid.
-            let pts = poly.map(|(px, py)| cosmic::iced::Point::new(px as f32 - ox, py as f32 - oy));
+            let pts = poly.map(|g| {
+                let (lx, ly) = units.to_point(g);
+                cosmic::iced::Point::new(lx, ly)
+            });
             let cx = pts.iter().map(|p| p.x).sum::<f32>() / 4.0;
             let cy = pts.iter().map(|p| p.y).sum::<f32>() / 4.0;
             const PAD: f32 = 4.0;
@@ -108,9 +117,10 @@ impl App {
         for (idx, (gx, gy, _gw, _gh)) in codes {
             let hit = &self.marks[idx];
             let hovered = self.hovered_mark == Some(idx);
-            let quad = hit
-                .poly
-                .map(|(px, py)| cosmic::iced::Point::new(px as f32 - ox, py as f32 - oy));
+            let quad = hit.poly.map(|g| {
+                let (lx, ly) = units.to_point(g);
+                cosmic::iced::Point::new(lx, ly)
+            });
             shapes.push(MarkShape {
                 quad,
                 fill: hovered.then_some(0.22),
@@ -118,8 +128,8 @@ impl App {
             });
 
             if hovered {
-                let lx = (gx as f32 - ox).max(0.0);
-                let ly = (gy as f32 - oy).max(0.0);
+                let (lx, ly) = units.to_point((gx, gy));
+                let (lx, ly) = (lx.max(0.0), ly.max(0.0));
                 tooltip = Some(positioned_mark(lx, (ly - 30.0).max(0.0), tooltip_box(&hit.label)));
             }
         }
@@ -148,20 +158,19 @@ impl App {
             return None;
         }
         let (rx, ry, rw, rh) = self.normalized_region()?;
+        // SIZE / INSET are POINT constants (the badge's on-screen footprint), so the whole
+        // inset is computed in POINTS: convert the region's bottom-right corner once
+        // (DRAGON-448) and stay there. The on-output test below is the same comparison in
+        // point space — the output's own extent is `(0, 0)..point_size()`.
         const SIZE: f32 = 26.0;
         const INSET: f32 = 10.0;
-        let (right, bottom) = ((rx + rw as i32) as f32, (ry + rh as i32) as f32);
-        let (ox, oy) = o.logical_pos;
-        let (ow, oh) = o.logical_size;
-        let lx = right - INSET - SIZE - ox as f32;
-        let ly = bottom - INSET - SIZE - oy as f32;
+        let (ow, oh) = o.point_size();
+        let (right, bottom) = o.units().to_point((rx + rw as i32, ry + rh as i32));
+        let lx = right - INSET - SIZE;
+        let ly = bottom - INSET - SIZE;
         // Render only on the output containing the spinner's centre.
         let (cx, cy) = (right - INSET - SIZE / 2.0, bottom - INSET - SIZE / 2.0);
-        if cx < ox as f32
-            || cx >= (ox + ow as i32) as f32
-            || cy < oy as f32
-            || cy >= (oy + oh as i32) as f32
-        {
+        if cx < 0.0 || cx >= ow || cy < 0.0 || cy >= oh {
             return None;
         }
         // libcosmic's official spinner has no opacity/style hook (its `crate::Theme`

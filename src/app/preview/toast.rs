@@ -247,6 +247,19 @@ const TOAST_OPACITY: f32 = 0.85;
 /// Deliberately inert: no `mouse_area`, no button, nothing that captures a press — so a
 /// toast can never eat a click meant for the picture or the chrome beneath it. It expires
 /// on its own; there is nothing to dismiss.
+///
+/// **DRAGON-454 checked that claim against iced rather than trusting it**, because the owner
+/// reported the editor becoming usable at about the moment the opening toast disappeared, and
+/// this repo elsewhere records that `stack` does not reliably pass an ignored mouse event from
+/// an upper sibling down to a lower one (see `image.rs`, where the annotation canvas OWNS the
+/// ZoomPan for exactly that reason). What `stack::update` actually does: it calls `update` on
+/// EVERY child, top-down, stopping early only when one CAPTURES the event, and it makes the
+/// cursor levitate for the children below an upper child only when that upper child's
+/// `mouse_interaction()` is something other than `Interaction::None`. This layer is
+/// `container(column(container(row(icon, text))))` — `container` delegates, `column` takes the
+/// `max` of its children, and neither the icon nor the text overrides the `Widget` default,
+/// which is `Interaction::None`. So a live toast neither captures a press nor levitates the
+/// cursor away from the media beneath it. The inertness is real, not merely intended.
 pub(super) fn toast_layer(
     toasts: &Toasts,
     glass: Option<crate::app::theme::GlassConfig>,

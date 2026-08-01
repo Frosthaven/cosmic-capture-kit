@@ -797,6 +797,14 @@ impl App {
     /// in ONE window would fight over slot pruning; slots are keyed per window, not per
     /// widget). The opaque windowed surface, Linux and macOS compile
     /// only the portable `widget::image` paths below (byte-identical there).
+    ///
+    /// DRAGON-395: this is the sibling of `preview::image`'s fold and the same QA hook skips
+    /// it — `CCK_TEST_UNFOLD_COVERMARK=1` drops through to the portable poster + separate
+    /// covermark stack below. Unlike the still mount, unfolding here changes NO z-order: this
+    /// path has no effects shader, so the covermark sits over the poster either way. What it
+    /// does test is the other half of the DRAGON-235 premise — whether the poster survives
+    /// `widget::image` on the transparent surface, and whether two `LayerStack`s in one window
+    /// really do fight over slot pruning.
     fn video_still_content(
         &self,
         preview: &PreviewState,
@@ -807,6 +815,7 @@ impl App {
     ) -> Element<'static, Msg> {
         #[cfg(windows)]
         if !preview.surface.is_window()
+            && !super::layers::unfold_covermark()
             && let Some(poster) = &vid.poster
             && let Some(m) = vid.meta
             && let Some(pf) = super::layers::rgba_handle_frame(poster)

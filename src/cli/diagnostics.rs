@@ -77,6 +77,11 @@ pub fn run_test(name: &str, rest: &[String]) {
         // a real recording (monitor mode) through the owned media-clock pipeline.
         #[cfg(target_os = "windows")]
         "windows-wgc-frame" => windows_wgc_frame_test(arg(0), arg(1), arg(2), arg(3), arg(4)),
+        // DRAGON-426: the window-capture leak probe. Settles, ON THE MACHINE THAT LEAKS, whether
+        // WGC hands us the window in isolation or already composited with the desktop behind it
+        // — the one question about this bug that cannot be answered anywhere else.
+        #[cfg(target_os = "windows")]
+        "windows-window-leak" => crate::platform::windows::leak_probe::leak_probe(arg(0)),
         #[cfg(target_os = "windows")]
         "windows-record" => windows_record_test(rest),
         // DRAGON-282: the ACTIVE WASAPI render endpoints (id + friendly name) the Output-device
@@ -111,6 +116,8 @@ pub fn run_test(name: &str, rest: &[String]) {
         "dmabuf" => dmabuf_test(source_type(rest)),
         #[cfg(feature = "zero-copy")]
         "screencopy-dmabuf" => println!("{}", crate::record::screencopy_dmabuf_test()),
+        #[cfg(all(target_os = "linux", feature = "zero-copy"))]
+        "cuda-import" => println!("{}", crate::record::cuda_import_test()),
         "" | "help" | "list" => print_test_help(),
         other => {
             eprintln!("unknown test '{other}'\nbackend                           probe every capture backend (caps + outputs + windows + cursor)\n");
@@ -1542,6 +1549,7 @@ fn print_test_help() {
          windows-window-composite <hwnd> [black]  single-window-on-wallpaper composite -> PNG\n\
          windows-shot-region <x> <y> <w> <h>  a stitched region flat -> PNG\n\
          windows-wgc-frame <monitor|window|region> [args]  grab one WGC frame -> PNG\n\
+         windows-window-leak <hwnd>        DRAGON-426: does a window grab carry what is BEHIND the window? -> PNGs + verdict\n\
          windows-record <secs> [mic] [nosys] [pause] [enc]  record via the owned media-clock pipeline -> mp4\n\
          windows-audio-endpoints           list the ACTIVE WASAPI render endpoints (id + name) the Output picker offers\n"
     );
@@ -1799,17 +1807,12 @@ fn dmabuf_test(src: ashpd::desktop::screencast::SourceType) {
                 if n <= 2 {
                     let cc = f.fourcc.to_le_bytes();
                     let fourcc: String = cc.iter().map(|&b| b as char).collect();
-                    let vendor = if f.modifier == 0x00ff_ffff_ffff_ffff {
-                        "INVALID/unfixated".to_string()
-                    } else {
-                        match (f.modifier >> 56) & 0xff {
-                            0 => "none/linear".to_string(),
-                            1 => "Intel".to_string(),
-                            2 => "AMD".to_string(),
-                            3 => "NVIDIA".to_string(),
-                            v => format!("vendor 0x{v:02x}"),
-                        }
-                    };
+                    // DRAGON-425: the decode moved to `encode::modifier_vendor_label`, which
+                    // the RECORDER now decides its VAAPI node on. It used to live only here,
+                    // with a comment saying the source GPU ought to pick the encoder and
+                    // nothing wiring it up; sharing the table means this diagnostic and that
+                    // decision can never disagree about who made a frame. Output unchanged.
+                    let vendor = crate::encode::modifier_vendor_label(f.modifier);
                     let fds: Vec<i32> = f.planes.iter().map(|p| p.0).collect();
                     eprintln!(
                         "dmabuf-test: frame {n}: {}x{} fourcc={fourcc:?} modifier=0x{:016x} \

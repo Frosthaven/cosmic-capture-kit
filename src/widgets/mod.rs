@@ -6,9 +6,6 @@ pub mod arrow_cursor;
 pub mod crop_canvas;
 pub mod crop_window;
 pub mod drag_area;
-/// DRAGON-366 — TEMPORARY per-frame preview-editor diagnostics. Remove with its call sites
-/// (all tagged `DRAGON-366`) once the large-capture lag report is settled.
-pub mod dragon366;
 /// What the GPU will accept for a shader primitive's viewport (DRAGON-401) — observed from
 /// the shader `prepare`s that are handed a `wgpu::Device`, read by the preview's zoom ceiling.
 pub mod gpu;

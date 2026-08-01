@@ -57,11 +57,20 @@ fn build_mrduck() {
     // crate's `compile()` (it builds a static archive for linking INTO our
     // binary); we need a loadable dylib the perl driver `dl_load_file`s at
     // runtime. So drive the same compiler `cc` discovers, with our own flags.
+    // Pin the dylib's MINIMUM OS explicitly. Built on the CI macos-26 runner the compiler
+    // otherwise stamps the runner's own version (minos 26.0) into the load command, and
+    // dyld on a 14.x machine then REFUSES to load it — the preview ducker silently never
+    // engages, with nothing in the app to say why. The app's own floor is
+    // LSMinimumSystemVersion 13.0 (`scripts/mac-package.sh`), so that is the default here;
+    // an explicit MACOSX_DEPLOYMENT_TARGET still wins, which is how the two stay in step.
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+    let min = std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "13.0".into());
     let compiler = cc::Build::new().get_compiler();
     let mut cmd = compiler.to_command();
     cmd.arg("-dynamiclib")
         .arg("-fobjc-arc")
         .arg("-fvisibility=hidden")
+        .arg(format!("-mmacosx-version-min={min}"))
         .arg("-framework")
         .arg("Foundation")
         .arg("-o")

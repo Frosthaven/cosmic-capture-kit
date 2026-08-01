@@ -48,8 +48,43 @@ pub fn native_backend_id() -> &'static str {
     }
 }
 
-/// A backend-agnostic monitor description: name + logical geometry (global,
-/// top-left origin — the coordinate model the whole app uses).
+/// A backend-agnostic monitor description: name + geometry in the GLOBAL, top-left-origin
+/// space that platform's whole app coordinate model uses (selections, window rects,
+/// pointer positions, capture crops).
+///
+/// # The units contract — READ THIS BEFORE ADDING A PLATFORM (DRAGON-447)
+///
+/// The fields are named `logical_*` for their ORIGINAL home, Linux/mac, where they hold
+/// points. **They are not points on every platform, and they cannot be**: what they hold
+/// is whatever the platform's global coordinate space is actually defined in.
+///
+/// | Platform | What `output_descs()` returns | Why |
+/// |---|---|---|
+/// | **Linux (COSMIC)** | The compositor's LOGICAL output size + position (`wl_output`), with the buffer scale kept separately on `OutputState.scale`. | Wayland defines a global logical space; the layer surface is sized by the compositor, so nothing is seeded from these. |
+/// | **macOS** | `CGDisplayBounds` POINTS. | AppKit defines a single global point space across mixed-backing-scale displays; a window seed IS points, and `platform::mac::scale_for` recovers the backing scale where pixels are needed. |
+/// | **Windows** | `rcMonitor` PHYSICAL virtual-screen pixels. | Under Per-Monitor-Aware-V2 the virtual screen — `GetWindowRect`, `GetCursorPos`, `SetWindowPos`, `BitBlt`, the WGC monitor rects — is DEFINED in physical pixels, and each monitor has its OWN DPI. There is no OS-defined global point space to convert into, so physical is the only globally coherent choice. `platform::windows::scale_for` carries the per-monitor DPI for the places that need it. |
+///
+/// **The rule that follows from this**: anything comparing against a pointer position or a
+/// window rect, or indexing captured PIXELS, consumes these values AS-IS — that is what
+/// they are for, on every platform. Anything handed to iced/winit as a window SIZE or
+/// POSITION is LOGICAL POINTS by definition, so on Windows it must be converted first, and
+/// `platform::windows::overlay_seed_rect` is the ONE sanctioned place that does it.
+///
+/// The same rule holds INSIDE the overlay once it is open, where it bites much more often
+/// (DRAGON-448): the overlay's iced viewport is points, so every layout, hit-test and
+/// widget placement that meets this geometry has to cross. That crossing has exactly one
+/// implementation — [`crate::geometry::OverlayUnits`], fed per output by
+/// [`crate::platform::overlay_point_scale`]. Read its doc before adding anything that
+/// mixes an `OutputDesc`/`OutputState` rect with an iced coordinate, and never open-code
+/// a `* scale` next to one.
+///
+/// Skipping that conversion is not a cosmetic error. Seeding winit with a physical monitor
+/// rect asks for a surface `dpi/96`× too large in each axis; on a customer's 3840x2160
+/// display at 300% that was an 11520x6480 request against an 8192 GPU limit, and wgpu
+/// ABORTS the process on an oversized `Surface::configure` rather than returning an error —
+/// so every capture child died ~430ms after minting its overlays and every capture silently
+/// "did nothing". A 96-DPI dev machine cannot reproduce it, because there physical and
+/// logical are the same number.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputDesc {
     pub name: String,

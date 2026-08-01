@@ -248,24 +248,7 @@ impl shader::Primitive for EffectsPrimitive {
         // DRAGON-401: this primitive's viewport is scaled by the view zoom exactly as the
         // layer stack's is, so it reports the same device facts (see `widgets::gpu`).
         crate::widgets::gpu::observe(device, viewport);
-        // DRAGON-366 (TEMPORARY): time the whole prepare from OUTSIDE, so every exit inside
-        // (the dim-only fast path as well as the full effect plan) is covered by one probe.
-        // Remove with `crate::widgets::dragon366`.
-        let d366_start = std::time::Instant::now();
-        let d366_base_seq =
-            pipeline.windows.get(&self.window).and_then(|w| w.base.as_ref()).map(|b| b.seq);
         pipeline.prepare(device, queue, self, bounds, viewport);
-        let d366_ms = d366_start.elapsed().as_secs_f64() * 1000.0;
-        let d366_wfx = pipeline.windows.get(&self.window);
-        crate::widgets::dragon366::fx_prepared(
-            d366_ms,
-            // `(0, 0)` here means the accumulator was never needed — the dim-only fast path,
-            // which paints straight over the crisp base and skips the ping-pong entirely.
-            d366_wfx.map(|w| w.ping_dims).unwrap_or((0, 0)),
-            self.items.len(),
-            d366_wfx.map(|w| w.plan.len()).unwrap_or(0) as u32,
-            d366_base_seq != d366_wfx.and_then(|w| w.base.as_ref()).map(|b| b.seq),
-        );
     }
 
     // The offscreen ping-pong passes + the final blit need the CommandEncoder, so opt into the

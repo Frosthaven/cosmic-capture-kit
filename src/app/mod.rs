@@ -104,7 +104,8 @@ pub struct Startup {
     /// Launch straight into the macOS permission-checker window (`--permissions`),
     /// with no capture machinery — mirrors `settings_only`. On Linux the flag has no
     /// window to open (no TCC grants), so it falls through to a normal launch.
-    #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
+    // Read on EVERY platform since DRAGON-427: `opens_overlays` consults it to decide the
+    // renderer, so it is no longer dead off macOS.
     pub permissions_only: bool,
     pub preview: Option<std::path::PathBuf>,
     /// Launch straight into this capture mode (`--region`/`--window`/`--monitor`);
@@ -125,6 +126,79 @@ pub struct Startup {
     /// `Some(false)` = overlay. `--preview` defaults to windowed unless `--overlay` is
     /// also given; `None` uses the persisted setting.
     pub preview_windowed: Option<bool>,
+    /// DRAGON-427 (Windows 10): this process IS the preview EDITOR for a capture another
+    /// process just took (`--preview-handoff <line>`). Carries the whole
+    /// [`crate::preview_ipc::OpenRequest`] — the same six fields the socket handoff sends —
+    /// so the editor opens the document the capture child would have opened, not a bare
+    /// `--preview` viewer (which would mark it `external` and refuse to manage the file).
+    ///
+    /// Like `preview`, a process launched this way opens NO capture overlay, so it keeps
+    /// the GPU renderer while the capture child that spawned it runs on the software one.
+    pub preview_handoff: Option<crate::preview_ipc::OpenRequest>,
+    /// DRAGON-428: `--no-editor` — deliver this capture WITHOUT opening the preview editor.
+    /// The file is still saved, copied to the clipboard and notified exactly as it is when
+    /// no editor can be opened; only the editor is skipped.
+    ///
+    /// A MODIFIER, not a mode: it composes with every capture launch — a bare (region
+    /// picker) launch, `--region` / `--window` / `--monitor`, and the picker-free
+    /// `--active-window` / `--active-monitor`. That is what lets one flag give the user a
+    /// no-editor variant of each capture shortcut rather than needing a second flag per mode.
+    ///
+    /// DRAGON-353 removed the persisted "Open in preview editor" setting, making the editor
+    /// the unconditional destination; this is a per-LAUNCH opt-out, not that setting coming
+    /// back. Nothing persists it, so it can only ever be asked for explicitly.
+    pub no_editor: bool,
+    /// macOS (DRAGON-440): the prompt-free permission snapshot, taken in [`run`]'s mac
+    /// preamble for launches that would open overlays, and carried into `App::init`.
+    ///
+    /// It lives here because the ACTIVATION POLICY is boot-time-only (see [`run`]) and has
+    /// to know whether this launch will route to the permission checker — a decision
+    /// `App::init` used to make, far too late to influence the policy. Moving the probe
+    /// forward keeps it at ONE call per launch: `App::init` consumes this snapshot instead
+    /// of taking its own, so the policy decision and the routing decision can never
+    /// disagree (no second probe, no TOCTOU window between them).
+    ///
+    /// `None` on a launch that never routes (settings / permissions / either preview), and
+    /// as a belt-and-braces fallback if `run` somehow did not fill it — `App::init` probes
+    /// for itself in that case, exactly as it did before.
+    #[cfg(target_os = "macos")]
+    pub route_probe: Option<permissions::Probe>,
+    /// macOS (DRAGON-443): whether this launch is the FIRST after an update install — the
+    /// single-shot marker `update::take_post_update_marker` consumes.
+    ///
+    /// Here for the same reason [`Self::route_probe`] is: a post-update relaunch is a
+    /// SETTINGS-shaped launch (`App::init` ORs the marker into `settings_only` to land the
+    /// user on About), and the activation policy is boot-time-only. Reading the marker inside
+    /// `App::init` — which is where it used to happen, and only there — decided that far too
+    /// late, so a post-update relaunch presented the settings window from an Accessory
+    /// process: no Dock icon, no Cmd-Tab, and the overlay chrome strip installed for a launch
+    /// that mints no overlay.
+    ///
+    /// CONSUMED exactly once, in `run`'s macOS preamble, and handed down here. `App::init`
+    /// reads this field instead of taking the marker again, so the marker stays single-shot
+    /// and the boot decision and the settings decision can never disagree. Off macOS there is
+    /// no preamble, so `App::init` still consumes it in place, byte-identically.
+    #[cfg(target_os = "macos")]
+    pub post_update: bool,
+}
+
+impl Startup {
+    /// Will this launch put a CAPTURE OVERLAY (or a fullscreen preview cover/spinner) on
+    /// screen? DRAGON-427 keys the software-renderer decision on exactly this, so every
+    /// launch path — daemon-spawned child, global hotkey, Start Menu shortcut, a bare CLI
+    /// run, `--active-window`'s picker-free capture — answers it the same way, from this
+    /// process's OWN flags rather than from anything it inherited.
+    ///
+    /// The three launches that show only ordinary WINDOWS answer `false` and keep wgpu:
+    /// `--settings` (whose live mic level-meter starves under a CPU rasterizer — the
+    /// DRAGON-336 finding), the macOS `--permissions` checker, and either preview flavour
+    /// (`--preview <file>` cold, or `--preview-handoff` as a capture's editor child).
+    pub fn opens_overlays(&self) -> bool {
+        !self.settings_only
+            && !self.permissions_only
+            && self.preview.is_none()
+            && self.preview_handoff.is_none()
+    }
 }
 
 // Re-exported so the message enum can carry a decoded shader frame across a task.
@@ -158,6 +232,157 @@ fn present_mode_env_override(existing: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// DRAGON-427: this process's effective preview appearance, given the `chosen` one (the
+/// persisted setting, or a `--preview` launch's override), whether this process
+/// [`opens overlays`](Startup::opens_overlays), and whether the machine can show the
+/// preview EDITOR as a fullscreen overlay at all ([`crate::platform::overlay_preview_available`]).
+///
+/// Pure, and the ONE place the Windows 10 rule is expressed:
+///
+/// * **Where the overlay editor is available** (Linux, macOS, Windows 11) nothing changes —
+///   the chosen value is returned untouched, so those platforms stay byte-identical.
+/// * **A Windows 10 process that opens overlays** is the CAPTURE half. It renders in
+///   software and must therefore never mint the real editor, but it still shows fullscreen
+///   loaders and covers — which ARE preview surfaces, and which want to be translucent
+///   overlays. So it answers `false` (overlay), and the editor it would otherwise open is
+///   spawned as its own process instead (`preview::open`'s `try_spawn_editor_child`).
+/// * **A Windows 10 process that opens no overlays** is the EDITOR half (`--preview-handoff`,
+///   or a cold `--preview <file>`). It kept the GPU renderer, and the editor is always the
+///   WINDOW there, so a stored `preview_windowed = false` — or an explicit `--overlay` — is
+///   overridden rather than honoured. Hiding the setting while still applying it would drop
+///   such a user onto an overlay editor that cannot draw its own media.
+pub fn effective_preview_windowed(
+    chosen: bool,
+    opens_overlays: bool,
+    overlay_preview_available: bool,
+) -> bool {
+    if overlay_preview_available {
+        return chosen;
+    }
+    !opens_overlays
+}
+
+/// The iced renderer name for the software (CPU) rasterizer — the one value DRAGON-427
+/// selects on Windows 10. Matches `iced_tiny_skia`'s own backend word.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const SOFTWARE_BACKEND: &str = "tiny-skia";
+
+/// DRAGON-427: the `ICED_BACKEND` value to force, given whatever the environment already
+/// carries and whether this process wants the software rasterizer.
+///
+/// `Some("tiny-skia")` only when software rendering is wanted AND nothing meaningful is
+/// already set — a user (or a debug session) who chose a backend themselves always wins,
+/// and is never silently overridden. Pure, so that rule is unit-tested without touching the
+/// process environment.
+///
+/// **On why this is an env var at all.** iced picks ONE compositor per process, in
+/// `iced_winit`'s `create_compositor`, which calls `Compositor::new(..)` — the `backend`
+/// argument of `graphics::Compositor::with_backend` is hardcoded `None` there, and neither
+/// `iced_graphics::Settings` nor `cosmic::app::Settings` carries a backend field. So in the
+/// libcosmic we pin there is NO in-process API for this choice: `ICED_BACKEND` is the only
+/// lever, and reaching a real in-process one would mean forking BOTH pop-os/libcosmic and
+/// its vendored pop-os/iced submodule. See [`user_backend_for_child`] for the one hazard
+/// that creates and how it is closed.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn backend_env_override(existing: Option<&str>, want_software: bool) -> Option<&'static str> {
+    if !want_software {
+        return None;
+    }
+    match existing {
+        Some(v) if !v.trim().is_empty() => None,
+        _ => Some(SOFTWARE_BACKEND),
+    }
+}
+
+/// The value `ICED_BACKEND` held BEFORE this process touched it — captured once, at the
+/// moment [`run`] decides, and `None` when the user had not set one.
+///
+/// **This is what keeps the env-var mechanism from leaking down the process tree.** A child
+/// inherits its parent's environment, so a Windows 10 CAPTURE process (software) spawning
+/// the preview editor — or a settings window — would otherwise hand it `tiny-skia` and
+/// break exactly the surface this ticket exists to keep on the GPU. Every GUI child spawn
+/// therefore restores this value instead of passing ours on: set it back when the user had
+/// one, remove it when they did not. A user's own choice still reaches their children.
+#[cfg_attr(not(windows), allow(dead_code))]
+static USER_ICED_BACKEND: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The `ICED_BACKEND` a GUI child of ours must see: the user's own value, or `None` to
+/// remove the variable entirely. `Some(None)` means "remove it"; the outer `None` means
+/// this process never forced anything, so a child's environment needs no correction at all.
+///
+/// Apply with [`restore_user_backend_env`] rather than by hand.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn user_backend_for_child() -> Option<Option<&'static str>> {
+    USER_ICED_BACKEND
+        .get()
+        .map(|v| v.as_deref())
+}
+
+/// Undo this process's DRAGON-427 backend forcing in a child `Command`'s environment, so
+/// the child chooses its own renderer exactly as if it had been launched from the user's
+/// shell. A no-op when we never forced anything (every non-Windows-10 machine, and every
+/// Windows 10 launch that shows no overlay).
+///
+/// Call this on EVERY GUI child spawn. A non-GUI child (ffmpeg, the ducker) is unaffected
+/// either way, so calling it there is harmless.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn restore_user_backend_env(cmd: &mut std::process::Command) {
+    match user_backend_for_child() {
+        Some(Some(v)) => {
+            cmd.env("ICED_BACKEND", v);
+        }
+        Some(None) => {
+            cmd.env_remove("ICED_BACKEND");
+        }
+        None => {}
+    }
+}
+
+/// Whether this launch boots the macOS REGULAR activation policy (DRAGON-153, widened by
+/// DRAGON-440) — i.e. whether its UI is a real WINDOW rather than a capture overlay.
+///
+/// Regular means a Dock icon, a Cmd+Tab entry, and the app name in the menu bar. That is
+/// right for a window the user is meant to look at and wrong for a capture: DRAGON-151
+/// found that promoting a capture launch stamps "Cosmic Capture Kit" into the menu bar,
+/// which then appears in captures of the menu-bar area. So the answer must stay FALSE for
+/// a healthy capture launch, and the tests pin exactly that.
+///
+/// The fourth argument is the DRAGON-440 addition: a capture launch that routes to the
+/// permission checker shows the checker WINDOW and no overlay, so it belongs with the
+/// other three.
+///
+/// The fifth is DRAGON-443's: a POST-UPDATE relaunch. The installer's swap helper relaunches
+/// the app with bare argv, and `App::init` turns that into a settings launch on the About
+/// page by ORing the marker into `settings_only`. It is therefore window-shaped by exactly
+/// the same reasoning — but the OR happened inside `App::init`, long after the policy was
+/// decided from `startup.settings_only == false`, so the new version's release notes were
+/// presented by an Accessory process. It is the last hole in "Regular policy ⟺ the UI is a
+/// real window".
+///
+/// Pure so the table is unit-testable — the two macOS gates in [`run`] (the policy, and the
+/// inverted overlay chrome strip) both read this one function rather than repeating the
+/// condition.
+///
+/// `preview_launch` is EITHER preview flavour — `--preview <file>` or the
+/// `--preview-handoff` editor child — matching [`Startup::opens_overlays`], which counts
+/// both. Windows is the only platform that spawns a handoff child today, but keying this
+/// on the bare `preview` field alone would mean that if one ever reached macOS it would
+/// boot Accessory AND install the overlay chrome strip, for a launch that is a pure editor
+/// window. Both flavours answer the question this predicate actually asks.
+// `test` as well as macOS so the Linux/Windows suites exercise the table; the two callers
+// are macOS-only, hence dead elsewhere.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn boots_regular_policy(
+    settings_only: bool,
+    permissions_only: bool,
+    preview_launch: bool,
+    routed_to_permissions: bool,
+    post_update: bool,
+) -> bool {
+    settings_only || permissions_only || preview_launch || routed_to_permissions || post_update
+}
+
 pub fn run(startup: Startup) -> cosmic::iced::Result {
     // macOS (DRAGON-150 -> DRAGON-151): the installed bundle carries LSUIElement=true
     // (for the menu-bar DAEMON), so a GUI child spawned from it runs as a
@@ -176,15 +401,72 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
     // probe).
     #[cfg(target_os = "macos")]
     crate::platform::mac::window::enable_background_cursor();
+    // macOS (DRAGON-440): take the permission snapshot HERE, before the policy block below,
+    // for launches that would otherwise open capture overlays.
+    //
+    // WHY it moved out of `App::init`: the activation policy is BOOT-TIME-ONLY (see the
+    // DRAGON-153 note below), and a capture launch that ROUTES to the permission checker
+    // shows a real window — so the policy has to know about the routing before the window
+    // exists. `App::init` decided routing long after this point, which is how a routed
+    // launch ended up presenting an Accessory-policy checker: no Dock icon, no Cmd+Tab,
+    // free to sit behind whatever the user was looking at. The startup guard then SUSPENDED
+    // its budget for that invisible window, and the nag was never spent, so every capture
+    // launch repeated it.
+    //
+    // The probe MOVES rather than being duplicated — it is the same prompt-free
+    // `probe_now_fast`, handed to `App::init` on `Startup::route_probe` so both decisions
+    // read ONE snapshot. `opens_overlays()` is exactly `App::init`'s old guard
+    // (`!settings_only && !preview_mode && !permissions_only`), so no launch changes which
+    // side of it it lands on.
+    // macOS (DRAGON-443): consume the post-update marker HERE too, and for the same reason —
+    // it decides that this bare relaunch is really a SETTINGS launch (`App::init` ORs it into
+    // `settings_only` to land on About), and the policy below cannot wait for `App::init` to
+    // say so.
+    //
+    // CONSUMED, not peeked, and handed down on `Startup::post_update`. The marker is
+    // single-shot by construction (it is a file `take` removes), so a peek here plus a take in
+    // `App::init` would be TWO readings of the same fact with a window between them — exactly
+    // the TOCTOU shape DRAGON-440 removed for the permission probe. One read, passed forward,
+    // is the pattern that already works. Off macOS there is no preamble at all, so `App::init`
+    // keeps taking the marker itself, in the same place, byte-identically.
+    #[cfg(target_os = "macos")]
+    let (startup, routed_to_permissions) = {
+        let mut startup = startup;
+        startup.post_update = crate::update::take_post_update_marker();
+        // Skipped for a post-update relaunch as well as for the window launches: it shows the
+        // About page, mints no overlay, and has no capture to be missing a grant for. Probing
+        // there would be the nag interrupting the release notes — and would leave the policy
+        // gate and the routing decision reading different pictures of this launch, which is
+        // the disagreement DRAGON-440 exists to prevent.
+        let routed = if startup.opens_overlays() && !startup.post_update {
+            crate::util::timing_mark("app::run -> permissions::probe_now_fast (begin)");
+            let probe = permissions::probe_now_fast();
+            crate::util::timing_mark("app::run <- permissions::probe_now_fast (done)");
+            let routed = permissions::should_auto_open_probe(&probe);
+            startup.route_probe = Some(probe);
+            routed
+        } else {
+            false
+        };
+        (startup, routed)
+    };
     // macOS (DRAGON-153): launches whose UI is a REAL window (settings /
     // permissions / a --preview viewer) should behave like a normal app — Cmd+Tab
     // presence, Dock icon, focusable from other apps — so they boot with the
     // REGULAR policy. Policy is boot-time-only (the DRAGON-150 lesson: a
     // post-launch flip half-activates the app and kills key-window delivery), which
     // is why this is decided here and capture children never change theirs.
+    // DRAGON-440 added the fourth case: a capture launch ROUTED to the checker is also
+    // "a launch whose UI is a real window", and is now treated as one. DRAGON-443 added the
+    // fifth: a POST-UPDATE relaunch, which `App::init` turns into a settings launch on About.
     #[cfg(target_os = "macos")]
-    if (startup.settings_only || startup.permissions_only || startup.preview.is_some())
-        && let Some(mtm) = objc2_foundation::MainThreadMarker::new()
+    if boots_regular_policy(
+        startup.settings_only,
+        startup.permissions_only,
+        startup.preview.is_some() || startup.preview_handoff.is_some(),
+        routed_to_permissions,
+        startup.post_update,
+    ) && let Some(mtm) = objc2_foundation::MainThreadMarker::new()
     {
         objc2_app_kit::NSApplication::sharedApplication(mtm)
             .setActivationPolicy(objc2_app_kit::NSApplicationActivationPolicy::Regular);
@@ -198,8 +480,20 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
     // a policy: an explicit boot-time `setActivationPolicy(Accessory)` was tried
     // here and stamped the app name into the menu bar on unbundled dev launches —
     // the DRAGON-150/151 lesson again; do not re-add it).
+    // DRAGON-440 makes this the exact INVERSE of the policy gate above, which is a
+    // deliberate behaviour delta for the routed case: a routed launch never mints an
+    // overlay (the strip's only purpose), and the strip is a global swizzle that mangles
+    // the chrome of ANY window above level 0 — including the panel a DRAGON-415 failure
+    // alert puts up. Installing it for a launch that shows only the checker would be all
+    // cost and no benefit.
     #[cfg(target_os = "macos")]
-    if !(startup.settings_only || startup.permissions_only || startup.preview.is_some()) {
+    if !boots_regular_policy(
+        startup.settings_only,
+        startup.permissions_only,
+        startup.preview.is_some() || startup.preview_handoff.is_some(),
+        routed_to_permissions,
+        startup.post_update,
+    ) {
         crate::platform::mac::window::install_overlay_chrome_strip();
     }
     // DRAGON-303: on macOS 26 an NSGlassContainerView in the titlebar swallows clicks meant
@@ -237,6 +531,46 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
         // thing to spawn the runtime / renderer threads, so no other thread can be reading
         // the environment concurrently with this write.
         unsafe { std::env::set_var("ICED_PRESENT_MODE", mode) };
+    }
+    // Windows 10 (DRAGON-427): render THIS process with iced's SOFTWARE rasterizer when it
+    // is going to put an overlay on screen. wgpu cannot make a Windows 10 window translucent
+    // on any backend (the evidence is in `platform::win_build_software_overlays`), and a
+    // customer on real Windows 10 hardware proved tiny-skia is translucent where wgpu is
+    // solid black. Windows 11 never reaches this — `platform::software_overlays()` is the
+    // closed [10240, 22000) band — so it keeps wgpu byte-for-byte.
+    //
+    // The decision is made HERE, from this process's OWN `Startup`, which is why it is right
+    // on every launch path: a daemon-spawned capture child, a global hotkey that runs the
+    // binary directly, a Start Menu shortcut, a bare CLI run and `--active-window`'s
+    // picker-free capture all arrive at this one line with their own flags. Nothing about it
+    // depends on what the launcher's environment happened to contain.
+    //
+    // The editor is deliberately NOT here: it runs as its OWN process (see
+    // `preview::open`'s `try_spawn_editor_child`), so it keeps the GPU renderer. iced picks
+    // one compositor per process, so that separation is the only way to have both.
+    #[cfg(windows)]
+    {
+        let want_software = startup.opens_overlays() && crate::platform::software_overlays();
+        let existing = std::env::var("ICED_BACKEND").ok();
+        if let Some(backend) = backend_env_override(existing.as_deref(), want_software) {
+            // Remember what the user had (nothing, here) BEFORE we write, so every GUI child
+            // this process spawns can be given their environment back rather than ours.
+            let _ = USER_ICED_BACKEND.set(existing);
+            log::info!(
+                "windows 10: rendering this process's overlays with the {backend} \
+                 software rasterizer (wgpu cannot present a translucent HWND surface here)"
+            );
+            // SAFETY: single-threaded at this point, exactly as for `ICED_PRESENT_MODE`
+            // above — `cosmic::app::run` below is what spawns the runtime/renderer threads,
+            // so nothing can be reading the environment concurrently with this write.
+            unsafe { std::env::set_var("ICED_BACKEND", backend) };
+        } else if want_software && existing.is_some() {
+            log::info!(
+                "windows 10: ICED_BACKEND={:?} is already set — honouring it and not \
+                 forcing the software rasterizer",
+                existing.unwrap_or_default()
+            );
+        }
     }
     // DRAGON-354: register the two embedded annotation faces (Excalifont / Inter) with the
     // GLOBAL cosmic-text font system SYNCHRONOUSLY, here — BEFORE `cosmic::app::run` below
@@ -292,6 +626,30 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
             {
                 let msg = failure::runtime_failure_alert();
                 crate::platform::mac::alert::show(&msg.title, &msg.body);
+            }
+            // DRAGON-442: the same seam on Windows, which had nothing here at all. A
+            // shortcut / daemon-spawned launch has no console, so the `log::error!` above
+            // reaches only the debug log — the user just watched the app fail to open.
+            //
+            // Blocking here is correct and is NOT the thing `alert`'s module doc forbids:
+            // that rule protects the thread owning our windows while a session runs on. By
+            // this point `cosmic::app::run` has returned, the `App` and every window it
+            // owned are dropped, and the next statement is `_exit`. There is nothing left to
+            // keep pumping for, and waiting is the only way the box can be read.
+            //
+            // `show` returns `None` if this session already put an alert up (the DRAGON-436
+            // one-per-process latch), in which case there is nothing to wait for — a session
+            // that reported a failure and then failed to run gets one box, not two.
+            #[cfg(windows)]
+            {
+                let msg = failure::windows_runtime_failure_alert(
+                    crate::diag::log_dir().map(|d| d.display().to_string()).as_deref(),
+                );
+                if let Some(dismissal) = crate::platform::windows::alert::show(&msg.title, &msg.body)
+                {
+                    let outcome = dismissal.wait(failure::ALERT_DISMISS_BUDGET);
+                    log::warn!("DRAGON-442: runtime-failure alert ended as {outcome:?}");
+                }
             }
             1
         }
@@ -354,6 +712,34 @@ pub enum Kind {
 pub enum Hover {
     None,
     Cancel,
+    /// The SCAN kind button (DRAGON-456). Only meaningful while the scanner is ALREADY
+    /// the active kind, where a press re-reads the screen rather than switching kind —
+    /// that is the one state whose hover face changes (to the refresh glyph).
+    ScanKind,
+}
+
+/// DRAGON-456: how far a scanner REFRESH has got. Re-pressing the scan kind button while
+/// the scanner is already open re-grabs the launch flats, so a scan reads the screen as it
+/// is NOW rather than as it was at launch.
+///
+/// It is three states rather than a bool because the re-grab must not photograph our own
+/// overlay. The overlay is mapped and (since this ticket) painting the frozen backdrop, so
+/// grabbing straight away would return a picture of our own dim wash, toolbar and marks —
+/// or worse, of the previous still. So the overlay paints NOTHING for one tick first, and
+/// only then does the grab run. That is the same hide-then-grab dance `begin_capture`
+/// already performs before a live capture, minus the teardown (the session continues).
+///
+/// ONE snapshot per user action: the frozen-scene model still holds, the user just gets to
+/// say when the snapshot is taken.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScanRefresh {
+    /// Nothing in flight.
+    Idle,
+    /// The overlay is painting nothing so the re-grab sees a clean screen; the grab fires
+    /// on the next `ScanRefreshTick`.
+    Blanking,
+    /// The grab is on its thread. `FrozenReady` lands it, un-blanks, and re-arms the scan.
+    Grabbing,
 }
 
 /// Pre-capture countdown options (label, seconds).
@@ -700,6 +1086,51 @@ fn launch_flats_needed(active: bool, want_freeze: bool, launch_kind: Kind) -> bo
     active && (want_freeze || launch_kind == Kind::Scanner)
 }
 
+/// DRAGON-456: whether pressing the scan kind button REFRESHES the scan rather than
+/// switching kind. It refreshes exactly when the scanner is already the active kind — the
+/// press has no kind to change, so it re-reads the screen instead.
+///
+/// This is the whole of the "same button, new meaning" rule, and both the update path and
+/// the button's hover face read it, so the affordance can never disagree with the action.
+/// Pure so the rule is unit-testable without the App.
+fn scan_press_refreshes(current: Kind, pressed: Kind) -> bool {
+    current == Kind::Scanner && pressed == Kind::Scanner
+}
+
+/// DRAGON-456: whether the capture overlay must paint NOTHING this frame.
+///
+/// True only while a scan refresh is blanking or grabbing. The re-grab reads the composited
+/// screen, and our overlay is part of that composite — a transparent surface that draws
+/// nothing composites to nothing, which is the platform-independent way to keep our own UI
+/// out of the picture (it is why freeze-off already shows the live desktop through the
+/// overlay on all three platforms, DRAGON-234). Blanking covers the frozen backdrop too,
+/// which matters more than the chrome: without it the re-grab would photograph the PREVIOUS
+/// still and "refresh" would be a no-op that looked like it worked.
+///
+/// Pure so the gating is unit-testable without the App.
+fn overlay_blanked_for_scan_refresh(scan_refresh: ScanRefresh) -> bool {
+    matches!(scan_refresh, ScanRefresh::Blanking | ScanRefresh::Grabbing)
+}
+
+/// DRAGON-456: whether a landing frozen-flats delivery should REPLACE the flats the app
+/// already holds (`CaptureMsg::FrozenReady`).
+///
+/// Always yes, with ONE exception: a re-grab that came back EMPTY while we hold real flats.
+/// That is a failed refresh (no compositor connection, no outputs), and taking it would
+/// leave the scanner with no source at all — strictly worse than the stale pixels the user
+/// was trying to replace. A failed refresh is a no-op, never a downgrade.
+///
+/// The launch and lazy grabs are deliberately NOT covered: their empty map is a real
+/// result (`acquire_scene` parks one on purpose for a launch that skips the grab), and
+/// they only ever land when `frozen` is still empty anyway. Pure so the rule is testable.
+fn frozen_delivery_accepted(
+    scan_refresh: ScanRefresh,
+    delivered_empty: bool,
+    held_empty: bool,
+) -> bool {
+    !(scan_refresh == ScanRefresh::Grabbing && delivered_empty && !held_empty)
+}
+
 fn acquire_scene(
     active: bool,
     launch_mode: Mode,
@@ -849,6 +1280,14 @@ struct OutputState {
     name: String,
     logical_pos: (i32, i32),
     logical_size: (u32, u32),
+    /// CAPTURE units per POINT for THIS output (DRAGON-448) — the factor behind
+    /// [`Self::units`]. `logical_pos` / `logical_size` above are CAPTURE space (physical
+    /// pixels on Windows, points on macOS and Linux); the overlay's iced viewport is
+    /// POINTS. This is the whole gap, resolved per output at mint time by
+    /// `platform::overlay_point_scale`, so a mixed-DPI desktop gives each overlay its OWN
+    /// factor instead of one global scale. `1.0` everywhere except a Windows monitor above
+    /// 100% scaling, which is what keeps every other platform byte-identical.
+    point_scale: f32,
     /// The output's point→pixel buffer scale (physical / logical), COSMIC integer OR
     /// fractional. Cached into `preview_output_scale` when a capture picks this output,
     /// so the windowed preview opens at the capture's true on-screen (logical) size on
@@ -856,14 +1295,73 @@ struct OutputState {
     /// backing scale live from `NSScreen` (`platform::mac::scale_for`).
     #[cfg(target_os = "linux")]
     scale: f32,
+    /// Whether this overlay has been natively placed. Interior-mutable because
+    /// `configure_overlay` observes placement behind `&self`.
+    ///
     /// macOS (DRAGON-204): whether `place_overlay` has raised this overlay to the shielding
     /// level and framed it to the full display. The overlay is CREATED clamped below the
     /// menu bar (winit's AlwaysOnTop level), so it renders TRANSPARENT (empty) until this is
     /// set — the clamp-then-reframe jump happens on an invisible window, never seen. Set on a
     /// successful placement AND when placement gives up (so a never-matched overlay still
-    /// draws). Interior-mutable because `configure_overlay` observes placement behind `&self`.
-    #[cfg(target_os = "macos")]
+    /// draws).
+    ///
+    /// Windows (DRAGON-437): the same flag with a NARROWER meaning — it is set ONLY on a
+    /// confirmed placement, never on give-up, because on Windows it is what tells
+    /// `sub_overlay_finalize` this output is done. Nothing on Windows reads it to decide
+    /// what to draw (the window is hidden until placed, so there is no transparent phase to
+    /// gate), which is why `overlay_view`'s gate stays macOS-only and mac behaviour is
+    /// byte-identical.
+    #[cfg(not(target_os = "linux"))]
     placed: std::cell::Cell<bool>,
+}
+
+impl OutputState {
+    /// This overlay's units bridge (DRAGON-448): CAPTURE space ↔ POINT space, for THIS
+    /// output. Every crossing between `OutputState` geometry and anything iced hands us or
+    /// renders goes through the returned [`OverlayUnits`] — see its doc for the contract.
+    fn units(&self) -> crate::geometry::OverlayUnits {
+        crate::geometry::OverlayUnits::new(self.logical_pos, self.point_scale)
+    }
+
+    /// This overlay surface's extent in POINTS — the iced viewport every layout on it must
+    /// fit inside. `logical_size` is CAPTURE space and is `point_scale`× larger on a scaled
+    /// Windows monitor, so laying out against it directly is what pushed the toolbar off
+    /// the screen (DRAGON-448).
+    fn point_size(&self) -> (f32, f32) {
+        self.units().size_to_point(self.logical_size)
+    }
+}
+
+// `test` as well as macOS so the Linux/Windows suites TYPE-CHECK this alongside its one
+// caller (`App::startup_presence`), which is compiled under the same cfg for the same
+// reason — the macOS build is not run on those boxes (see CLAUDE.md). Dead there, hence
+// the allow.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl OutputState {
+    /// Whether this overlay is something the USER can actually SEE (DRAGON-439).
+    ///
+    /// On macOS that is exactly `placed` (see its doc above): the window is minted
+    /// clamped below the menu bar and draws a fully transparent `Space` until
+    /// `place_overlay` raises and reframes it, so an overlay that merely EXISTS shows the
+    /// user nothing.
+    ///
+    /// Off macOS this answers `true`, which is NOT a claim that those overlays are visible
+    /// the moment they are minted — Windows opens the overlay HIDDEN on purpose (`shell.rs`,
+    /// the komorebi opt-out) and shows it natively later, so it has the same mint→visible
+    /// gap. It answers `true` because nothing off macOS ARMS the startup guard, so the
+    /// value is never read outside `cfg(test)` and Linux/Windows stay byte-identical. A
+    /// platform opting the guard in later must give this a real per-platform signal (the
+    /// Windows one being "the native show has run"); inheriting the `true` would hand it
+    /// exactly the DRAGON-439 bug this accessor exists to fix.
+    fn user_visible(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.placed.get()
+        }
+        #[cfg(not(target_os = "macos"))]
+        true
+    }
 }
 
 /// A pre-captured window thumbnail (screencopy at launch) + its global rect and
@@ -1451,6 +1949,32 @@ pub struct App {
     /// re-fires for the fresh surface. Never set off Windows.
     #[cfg(windows)]
     preview_shown_confirmed: Option<window::Id>,
+    /// Windows (DRAGON-437): whether the overlay finalize driver still has work. Armed when
+    /// overlays are minted, cleared when every one is CONFIRMED placed (`OutputState::placed`),
+    /// when the driver gives up, and whenever the overlays are torn down.
+    ///
+    /// Gates `sub_overlay_finalize`, the overlay's answer to the same problem
+    /// `sub_preview_finalize` solves for the preview: the overlay is minted HIDDEN (komorebi
+    /// opt-out) and only `place_overlay`'s two-phase dance shows it, driven by the one-shot
+    /// `window::open` follow-up — which is NOT delivered while cck is a BACKGROUND process
+    /// (a tray-daemon-spawned child). Worse, that chain gives up after 30 × 40ms, and
+    /// `place_overlay`'s phase 2 needs a call LATER than 120ms after phase 1: a title that
+    /// only matches near the end of the budget leaves the window CLOAKED and off-screen
+    /// forever, in a process that is still alive. Never set off Windows.
+    #[cfg(windows)]
+    overlay_finalize_pending: bool,
+    /// Windows (DRAGON-437): the give-up deadline's origin, set by the FIRST DELIVERED tick.
+    ///
+    /// Deliberately NOT stamped at mint, and this is the whole point of it being a separate
+    /// field. A stalled process (or a timer that coalesces a backlog) can leave the first
+    /// tick we actually HANDLE arriving well past the deadline; measuring from the mint
+    /// would then read "expired" on that first tick and give up having never attempted a
+    /// placement at all — turning a slow start into a reported failure. Measuring from the
+    /// first tick we handle means the budget counts the driver's own attempts, which is what
+    /// it was ever supposed to bound. `overlay_finalize_pending` (not this) drives the
+    /// subscription, so the clock cannot decide whether the driver runs.
+    #[cfg(windows)]
+    overlay_finalize_deadline: Option<std::time::Instant>,
     /// Settings window UI state (the toplevel window, nav rail, search, …).
     settings: SettingsState,
     /// Permission-checker window UI state (macOS onboarding surface; only ever
@@ -1459,12 +1983,21 @@ pub struct App {
     /// Live keyboard-shortcut bindings (`Action -> Shortcut`) — the single source of
     /// truth for key handling and the Keyboard Shortcuts settings page.
     keymap: crate::shortcuts::Keymap,
-    /// Set by the "Copy selection" region quick-action (primary+C in region-draw mode):
-    /// the in-flight capture must force-copy to the clipboard and finish WITHOUT ever
-    /// opening the preview editor. Consumed once by the capture-completion share path.
-    /// (DRAGON-353: the editor otherwise ALWAYS opens — the `preview_after_capture`
-    /// setting is gone — so this flag is the one remaining deliberate bypass.)
-    copy_selection_pending: bool,
+    // DRAGON-451: `copy_selection_pending` lived here — the one-shot flag the region
+    // "Copy selection" quick-action (primary+C in region-draw mode) set so the in-flight
+    // capture would force-copy and skip the editor. Both the flag and the shortcut are
+    // retired: the DRAGON-428 global "(no editor)" hotkeys cover the use case from outside
+    // the overlay, and the "force" had already become a no-op when DRAGON-353 removed the
+    // copy-to-clipboard setting it was bypassing.
+    /// DRAGON-428: this LAUNCH asked for no preview editor (`--no-editor`, or a daemon
+    /// "(no editor)" capture hotkey, which passes that flag). The capture is saved, copied
+    /// and notified through `finish_share` — the same editor-less delivery a capture gets
+    /// when no editor CAN be opened — and no editor surface is ever minted.
+    ///
+    /// It is NOT one-shot: it describes the LAUNCH, so every capture in the process honours
+    /// it. In practice the process is one-shot anyway, but reading it non-destructively is
+    /// what lets the two spinner-suppression sites consult it before the capture completes.
+    no_editor: bool,
     /// Preview editor appearance: `true` = resizable window, `false` = overlay (setting).
     preview_windowed: bool,
     /// DRAGON-419: the opt-in debug log is on (setting; default OFF). Mirrored here so the
@@ -1613,7 +2146,7 @@ pub struct App {
     /// LOGICAL points it occupied on screen — a scaled COSMIC grab opens at its true
     /// on-screen size, not `scale`× too large (DRAGON-221, the Linux counterpart of the
     /// macOS `NSScreen.backingScaleFactor` used by [`Self::preview_source_scale`]).
-    /// Always `1.0` on 1× outputs (every field stays byte-identical there).
+    /// `1.0` on 1× outputs (every field stays byte-identical there).
     preview_output_scale: f32,
     /// The windowed preview's INTENDED open size (logical points), captured when the window
     /// is minted (`preview_surface_for`) so the macOS native finalize can re-assert it after
@@ -1626,7 +2159,13 @@ pub struct App {
     /// `--preview <file>` launch: the file (and whether it's a video) to open straight
     /// into the preview overlay once an output appears. Taken once consumed.
     startup_preview: Option<(std::path::PathBuf, bool)>,
-    /// Whether this is a `--preview` launch — suppresses the capture overlays entirely.
+    /// DRAGON-427 (Windows 10): the same idea for `--preview-handoff` — the capture another
+    /// process just took, handed to this one as the whole `OpenRequest` so the document opens
+    /// with the capture's own dims / scale / size and `external = false`. Taken once consumed,
+    /// at the same seam `startup_preview` is.
+    startup_handoff: Option<crate::preview_ipc::OpenRequest>,
+    /// Whether this is a `--preview` / `--preview-handoff` launch — suppresses the capture
+    /// overlays entirely.
     preview_mode: bool,
     /// DRAGON-295 (macOS/Windows): an IMMEDIATE picker-free capture requested at launch
     /// (`--active-window` / `--active-monitor`). Consumed by `seed_outputs_mac` instead of
@@ -1724,6 +2263,13 @@ pub struct App {
     /// cursor, no picker. Same round-trip/settings-row role as `capture_hotkey`; Linux
     /// never reads it.
     capture_active_monitor_hotkey: String,
+    /// DRAGON-428: the three "(no editor)" capture hotkeys — the same three captures, but
+    /// the daemon adds `--no-editor` so the finished capture is saved, copied and notified
+    /// without the preview editor. Same round-trip/settings-row role as the three above;
+    /// Linux never reads them.
+    capture_no_editor_hotkey: String,
+    capture_active_window_no_editor_hotkey: String,
+    capture_active_monitor_no_editor_hotkey: String,
     /// macOS (DRAGON-130): the death-pipe babysitter guard held for a capture session
     /// that paused a tiling WM (AeroSpace). Armed once the pause completes
     /// (`seed_overlays_mac`), dropped on session end (`finish_session`/`quit_now` +
@@ -1812,6 +2358,9 @@ pub struct App {
     /// Region the last QR / OCR pass ran for, to re-scan only when it changes.
     last_code_region: Option<(i32, i32, u32, u32)>,
     last_ocr_region: Option<(i32, i32, u32, u32)>,
+    /// DRAGON-456: a user-requested re-read of the screen, mid-flight (see [`ScanRefresh`]).
+    /// Driven by re-pressing the scan kind button; `Idle` at every other moment.
+    scan_refresh: ScanRefresh,
     /// QR/barcode marks for the current region (the clickable overlay). `marks` is the
     /// live, toggle-filtered set used for the overlay / hover / click.
     code_marks: Vec<crate::detect::Mark>,
@@ -2284,6 +2833,233 @@ mod tests {
         assert_eq!(present_mode_env_override(Some("fifo")), None);
     }
 
+    // ── DRAGON-427: the Windows 10 software-renderer decision ────────────────────
+    // Pure and testable on ANY host, deliberately: the Windows arms these gate can only be
+    // compiled on Windows, and nobody on this project has a Windows 10 machine to run them
+    // on. `backend_env_override` is `cfg(windows)`-only code, so its test is too; the two
+    // decisions that shape the app's own behaviour are portable and always run.
+
+    /// The backend override forces the software rasterizer ONLY when this process wants it
+    /// AND the user has not chosen a backend themselves. A user's `ICED_BACKEND` is never
+    /// silently overridden — that is the whole reason this is a function and not an
+    /// unconditional `set_var`.
+    #[cfg(windows)]
+    #[test]
+    fn backend_override_forces_software_only_when_wanted_and_unset() {
+        // Wanted + nothing set (or only whitespace): force it.
+        assert_eq!(backend_env_override(None, true), Some(SOFTWARE_BACKEND));
+        assert_eq!(backend_env_override(Some(""), true), Some(SOFTWARE_BACKEND));
+        assert_eq!(backend_env_override(Some("   "), true), Some(SOFTWARE_BACKEND));
+        // The user chose — including choosing the SAME value, or a comma list, or junk.
+        // Every one of these is theirs to own; we must not write over any of them.
+        for chosen in ["wgpu", "tiny-skia", "wgpu,tiny-skia", "nonsense"] {
+            assert_eq!(backend_env_override(Some(chosen), true), None, "{chosen}");
+        }
+        // Not wanted (Windows 11, or a process that opens no overlays): never touched,
+        // whatever the environment says.
+        for existing in [None, Some(""), Some("wgpu"), Some("tiny-skia")] {
+            assert_eq!(backend_env_override(existing, false), None, "{existing:?}");
+        }
+    }
+
+    /// Which launches open an overlay — the ONE input the renderer decision keys off, so
+    /// that every launch path (daemon-spawned child, global hotkey, Start Menu shortcut,
+    /// a bare CLI run, the picker-free immediate captures) answers it from its own flags.
+    #[test]
+    fn only_overlay_launches_ask_for_the_software_renderer() {
+        // A capture launch of ANY shape opens overlays: the picker, the countdown, the
+        // window-pick cover, the fullscreen loader before an immediate capture resolves.
+        assert!(Startup::default().opens_overlays(), "a bare capture launch");
+        assert!(
+            Startup { mode: Some(Mode::Region), ..Default::default() }.opens_overlays(),
+            "--region"
+        );
+        assert!(
+            Startup {
+                immediate: Some(ImmediateCapture::ActiveWindow),
+                ..Default::default()
+            }
+            .opens_overlays(),
+            "--active-window still shows a fullscreen loader before its editor"
+        );
+        // The three window-only launches keep the GPU renderer.
+        assert!(!Startup { settings_only: true, ..Default::default() }.opens_overlays());
+        assert!(!Startup { permissions_only: true, ..Default::default() }.opens_overlays());
+        assert!(
+            !Startup {
+                preview: Some(std::path::PathBuf::from("/tmp/a.png")),
+                ..Default::default()
+            }
+            .opens_overlays(),
+            "--preview <file> opened cold"
+        );
+        assert!(
+            !Startup {
+                preview_handoff: Some(crate::preview_ipc::OpenRequest {
+                    path: std::path::PathBuf::from("/tmp/a.png"),
+                    video: false,
+                    display_dims: None,
+                    source_scale: 1.0,
+                    external: false,
+                    size: None,
+                }),
+                ..Default::default()
+            }
+            .opens_overlays(),
+            "the spawned editor child"
+        );
+    }
+
+    // ── DRAGON-440: which launches boot the macOS REGULAR activation policy ───────
+    // Pure and run on every host: the two gates that read this are macOS-only, and the
+    // macOS build is not run here (see CLAUDE.md), so this table is the only net the
+    // decision has.
+
+    /// A launch whose UI is a real WINDOW boots Regular, so it gets a Dock icon and a
+    /// Cmd+Tab entry. Routing is irrelevant to these three — they never route.
+    #[test]
+    fn the_window_launches_boot_regular_whatever_the_routing_says() {
+        for routed in [false, true] {
+            assert!(boots_regular_policy(true, false, false, routed, false), "--settings");
+            assert!(boots_regular_policy(false, true, false, routed, false), "--permissions");
+            assert!(boots_regular_policy(false, false, true, routed, false), "--preview");
+        }
+    }
+
+    /// Either preview flavour counts, exactly as `opens_overlays` counts both. The
+    /// `--preview-handoff` editor child is a pure WINDOW launch: keying this on the bare
+    /// `preview` field would boot it Accessory and install the overlay chrome strip on it.
+    #[test]
+    fn both_preview_flavours_are_window_launches() {
+        let handoff = crate::preview_ipc::OpenRequest {
+            path: std::path::PathBuf::from("/tmp/a.png"),
+            video: false,
+            display_dims: None,
+            source_scale: 1.0,
+            external: false,
+            size: None,
+        };
+        for startup in [
+            Startup { preview: Some(std::path::PathBuf::from("/tmp/a.png")), ..Default::default() },
+            Startup { preview_handoff: Some(handoff), ..Default::default() },
+        ] {
+            // The call sites feed exactly this expression; assert against it so a change to
+            // one and not the other cannot slip past.
+            let preview_launch =
+                startup.preview.is_some() || startup.preview_handoff.is_some();
+            assert!(!startup.opens_overlays(), "a preview launch opens no overlays");
+            assert!(boots_regular_policy(
+                startup.settings_only,
+                startup.permissions_only,
+                preview_launch,
+                false,
+                false,
+            ));
+        }
+    }
+
+    /// THE DRAGON-440 case: a capture launch that routes to the permission checker shows
+    /// the checker window and no overlay, so it must boot Regular too. Without this the
+    /// checker had no Dock icon and no Cmd+Tab entry and could sit behind everything —
+    /// invisible, while the startup guard suspended its budget for it.
+    #[test]
+    fn a_routed_capture_launch_boots_regular() {
+        assert!(boots_regular_policy(false, false, false, true, false));
+    }
+
+    /// THE DRAGON-443 case: the installer's swap helper relaunches the app with BARE argv,
+    /// and `App::init` turns that into a settings launch on the About page. So it shows a
+    /// real window and must boot Regular — otherwise the release notes for the version the
+    /// user just installed are presented by an Accessory process with no Dock icon and no
+    /// Cmd-Tab entry, and the overlay chrome strip is installed for a launch that mints no
+    /// overlay.
+    ///
+    /// Note the first four arguments are all FALSE here: that IS the shape of the bug. From
+    /// `startup` alone a post-update relaunch is indistinguishable from a plain capture
+    /// launch, which is why the marker has to reach the boot decision.
+    #[test]
+    fn a_post_update_relaunch_boots_regular() {
+        assert!(boots_regular_policy(false, false, false, false, true));
+    }
+
+    /// The DRAGON-151 pin, and the reason this predicate is not simply "always true": a
+    /// HEALTHY capture launch must stay Accessory. Promoting it puts a Dock icon up and
+    /// stamps the app name into the menu bar, which then shows up inside captures of the
+    /// menu-bar area.
+    ///
+    /// DRAGON-443: "healthy" now includes "not a post-update relaunch" — the fifth argument
+    /// is the only difference between this case and the one above it.
+    #[test]
+    fn a_healthy_capture_launch_never_boots_regular() {
+        assert!(!boots_regular_policy(false, false, false, false, false));
+    }
+
+    /// The whole table, so a future argument cannot be added without a decision about it:
+    /// the predicate is an OR, and each input is on its own sufficient and on its own
+    /// insufficient.
+    #[test]
+    fn every_window_shaped_reason_is_sufficient_on_its_own() {
+        let inputs: [fn(bool) -> bool; 5] = [
+            |b| boots_regular_policy(b, false, false, false, false),
+            |b| boots_regular_policy(false, b, false, false, false),
+            |b| boots_regular_policy(false, false, b, false, false),
+            |b| boots_regular_policy(false, false, false, b, false),
+            |b| boots_regular_policy(false, false, false, false, b),
+        ];
+        for (i, f) in inputs.iter().enumerate() {
+            assert!(f(true), "argument {i} alone must boot Regular");
+            assert!(!f(false), "argument {i} alone must not");
+        }
+    }
+
+    /// The Windows 10 preview-appearance rule, and its total absence everywhere else.
+    #[test]
+    fn windows_10_forces_the_windowed_editor_without_touching_other_platforms() {
+        // Overlay editor available (Linux, macOS, Windows 11): the chosen value is returned
+        // untouched for every combination — these platforms are byte-identical.
+        for chosen in [false, true] {
+            for opens in [false, true] {
+                assert_eq!(
+                    effective_preview_windowed(chosen, opens, true),
+                    chosen,
+                    "chosen={chosen} opens_overlays={opens}"
+                );
+            }
+        }
+        // Windows 10, the EDITOR half (opens no overlays): always the window, even when the
+        // persisted setting says overlay or `--preview --overlay` asked for one. Hiding the
+        // setting while still honouring it would strand such a user on a broken editor.
+        assert!(effective_preview_windowed(false, false, false));
+        assert!(effective_preview_windowed(true, false, false));
+        // Windows 10, the CAPTURE half (opens overlays): its preview surfaces are fullscreen
+        // loaders and covers, which must stay translucent overlays in the software-rendered
+        // process. The real editor is spawned as its own process instead.
+        assert!(!effective_preview_windowed(false, true, false));
+        assert!(!effective_preview_windowed(true, true, false));
+    }
+
+    /// A spawned editor child receives its request as ONE argv word-set with no trailing
+    /// newline, while the socket transport sends the same line newline-terminated. Both
+    /// must parse back to the identical request, or the two transports would open subtly
+    /// different documents.
+    #[test]
+    fn the_spawn_argument_is_the_same_wire_line_the_socket_sends() {
+        let req = crate::preview_ipc::OpenRequest {
+            path: std::path::PathBuf::from("/tmp/capture 1.mp4"),
+            video: true,
+            display_dims: Some((2560, 1440)),
+            source_scale: 1.5,
+            external: false,
+            size: Some(4_242_424),
+        };
+        let line = req.encode();
+        assert!(line.ends_with('\n'), "the socket form is newline-terminated");
+        let argv = line.trim_end();
+        assert!(!argv.contains('\n'), "the argv form carries no terminator");
+        assert_eq!(crate::preview_ipc::OpenRequest::parse(argv), Ok(req.clone()));
+        assert_eq!(crate::preview_ipc::OpenRequest::parse(&line), Ok(req));
+    }
+
     #[test]
     fn countdown_index_rounds_to_the_nearest_preset() {
         assert_eq!(countdown_index(1), 0); // closer to 0 than to 3
@@ -2416,6 +3192,51 @@ mod tests {
         assert!(!launch_flats_needed(false, true, Kind::Scanner));
         assert!(!launch_flats_needed(false, true, Kind::Image));
         assert!(!launch_flats_needed(false, false, Kind::Scanner));
+    }
+
+    // DRAGON-456: the scan kind button carries two meanings, and which one it carries
+    // depends ONLY on whether the scanner is already the active kind.
+    #[test]
+    fn pressing_scan_refreshes_only_when_the_scanner_is_already_open() {
+        // Already in the scanner: the press has no kind to change, so it re-reads.
+        assert!(scan_press_refreshes(Kind::Scanner, Kind::Scanner));
+        // Entering the scanner from another kind is a kind SWITCH, never a refresh —
+        // that path kicks the lazy first grab instead (`kick_frozen_flats`).
+        assert!(!scan_press_refreshes(Kind::Image, Kind::Scanner));
+        assert!(!scan_press_refreshes(Kind::Video, Kind::Scanner));
+        // Pressing any OTHER kind is a plain switch, including while the scanner is open.
+        assert!(!scan_press_refreshes(Kind::Scanner, Kind::Image));
+        assert!(!scan_press_refreshes(Kind::Scanner, Kind::Video));
+        assert!(!scan_press_refreshes(Kind::Image, Kind::Video));
+    }
+
+    // DRAGON-456: the overlay paints nothing for the WHOLE refresh, not just the tick
+    // before the grab. Un-blanking while the grab thread is still reading the screen would
+    // put our chrome (and the previous still) back into the very picture being taken.
+    #[test]
+    fn the_overlay_stays_blank_for_the_whole_scan_refresh() {
+        assert!(!overlay_blanked_for_scan_refresh(ScanRefresh::Idle));
+        assert!(overlay_blanked_for_scan_refresh(ScanRefresh::Blanking));
+        assert!(overlay_blanked_for_scan_refresh(ScanRefresh::Grabbing));
+    }
+
+    // DRAGON-456: a refresh that fails must cost the user NOTHING. The one delivery we
+    // decline is an empty re-grab landing on top of real flats — taking it would leave the
+    // scanner with no source at all, which is worse than the staleness being refreshed away.
+    #[test]
+    fn a_failed_refresh_never_destroys_the_snapshot_it_could_not_replace() {
+        // The exception: empty re-grab, real flats held.
+        assert!(!frozen_delivery_accepted(ScanRefresh::Grabbing, true, false));
+        // A re-grab that actually returned pixels is taken.
+        assert!(frozen_delivery_accepted(ScanRefresh::Grabbing, false, false));
+        // An empty re-grab with nothing held is taken (there is nothing to lose, and it
+        // keeps the "empty map == no freeze" state every reader already handles).
+        assert!(frozen_delivery_accepted(ScanRefresh::Grabbing, true, true));
+        // The launch / lazy grabs are never declined — including the deliberate EMPTY
+        // placeholder `acquire_scene` parks for a launch that skips the grab.
+        assert!(frozen_delivery_accepted(ScanRefresh::Idle, true, true));
+        assert!(frozen_delivery_accepted(ScanRefresh::Idle, true, false));
+        assert!(frozen_delivery_accepted(ScanRefresh::Idle, false, true));
     }
 
     #[test]

@@ -18,6 +18,14 @@
 //!
 //! Each child runs against a PRIVATE home so the assertion is "the child did not write to the
 //! log folder IT resolved", made without reading, touching or depending on the real one.
+//!
+//! # DRAGON-433 rides along
+//!
+//! The CONFIG directory had the identical leak — a test process reading (and potentially
+//! writing) the developer's real `config.toml` — fixed with the identical mechanism, sharing
+//! `util::is_dev_process` and `util::sandbox_key`. So it gets its proof here, against the same
+//! spawned child and the same fake home, rather than in a second file that would duplicate all
+//! of this to ask one more question of one more path.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -135,12 +143,21 @@ fn the_path_override_is_honoured_but_never_into_the_user_s_folder() {
 
     // Refused: the same variable aimed at the user's own log lands in the sandbox instead,
     // and the user's file is still not created.
-    let home = FakeHome::new("override-refused");
-    let user_log = home.user_log();
-    let out = home.run(&[("CCK_LOG_FILE", &user_log)]);
-    assert!(out.status.success());
-    assert!(!user_log.exists(), "an override into the user's folder must be refused");
-    assert!(announced_path(&out).starts_with(std::env::temp_dir()));
+    //
+    // Not on Windows: the app resolves the user's log folder through the known-folder API
+    // (see `user_log_dir`), so the fake home cannot stand in for it — the fake path reads as
+    // neutral and is rightly honoured. Aiming the override at the REAL folder instead would
+    // risk the exact pollution DRAGON-424 forbids, so the refused half is Linux/mac-only;
+    // the honoured half above still runs everywhere.
+    #[cfg(not(windows))]
+    {
+        let home = FakeHome::new("override-refused");
+        let user_log = home.user_log();
+        let out = home.run(&[("CCK_LOG_FILE", &user_log)]);
+        assert!(out.status.success());
+        assert!(!user_log.exists(), "an override into the user's folder must be refused");
+        assert!(announced_path(&out).starts_with(std::env::temp_dir()));
+    }
 }
 
 /// Nothing at all is written when the log is off, which is the default a customer has.
@@ -163,6 +180,57 @@ fn a_child_with_the_log_off_writes_nowhere() {
 }
 
 /// Whether any `*.log` exists anywhere beneath `root`.
+/// DRAGON-433: the same child, asked the same question about its CONFIG.
+///
+/// The log leak and the config leak are the same shape — a spawned child resolving a
+/// user-facing path for itself — so they get the same proof. `state::load()` in a test used to
+/// read whoever-ran-the-suite's `config.toml`, which made test behaviour depend on the
+/// developer's settings, and a test that SAVED could overwrite them.
+///
+/// The child here has a private `$HOME`, so the config directory it would resolve as a real
+/// user lands inside it. Nothing may appear there: a dev process resolves into the temp
+/// sandbox instead, and it must do so whether it reads or writes.
+#[test]
+fn a_spawned_child_of_a_test_never_touches_the_user_s_config() {
+    let home = FakeHome::new("config");
+    let out = home.run(&[]);
+    assert!(out.status.success(), "the child should exit 0");
+    for dir in [
+        // The uniform location the app pins to on every OS (`~/.config/cosmic-capture-kit`).
+        home.root.join(".config").join("cosmic-capture-kit"),
+        // And the XDG one Linux resolves through, which the fake home also redirects.
+        home.root.join("config").join("cosmic-capture-kit"),
+    ] {
+        assert!(
+            !dir.exists(),
+            "a test's child created a config dir in the user's home: {dir:?}"
+        );
+    }
+    assert!(no_config_files_under(&home.root), "a test's child left config under {:?}", home.root);
+}
+
+/// Whether `root` is free of anything this app would recognise as its own config state — the
+/// config file itself, and the two sidecars that live beside it (`update.rs`'s manifest cache,
+/// `preview::edit`'s covermark drop folder). Named files rather than an extension sweep,
+/// because a fake home legitimately contains other `.toml`/`.json` from nothing to do with us.
+fn no_config_files_under(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else { return true };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if p.file_name().is_some_and(|n| n == "covermarks") || !no_config_files_under(&p) {
+                return false;
+            }
+        } else if p
+            .file_name()
+            .is_some_and(|n| n == "config.toml" || n == "update-manifest.json")
+        {
+            return false;
+        }
+    }
+    true
+}
+
 fn no_log_files_under(root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else { return true };
     for e in entries.flatten() {

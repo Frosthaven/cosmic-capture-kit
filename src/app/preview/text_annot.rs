@@ -81,7 +81,7 @@ pub const UI_FONT_FACES: [(&str, &[u8]); 2] = [("Excalifont", EXCALIFONT), ("Int
 /// small → large. [`DEFAULT_TEXT_SIZE`] (32pt) is the mid default. The upper reach continues the
 /// scale's own doubling cadence (…48, 64, 96, 128) so the top entry lands exactly on 128 (DRAGON-354
 /// item 8). A preset is a POINT measure so a "32px" box reads the same on a 1x and a 2x capture;
-/// the box's stored `size_px` is the scaled SOURCE-px value. Identity on Linux/1x.
+/// the box's stored `size_px` is the scaled SOURCE-px value. Identity on an unscaled (1x) output.
 pub const TEXT_SIZES: [f32; 10] = [12.0, 14.0, 16.0, 18.0, 24.0, 32.0, 48.0, 64.0, 96.0, 128.0];
 
 /// The default text size in logical POINTS (DRAGON-383) a fresh editor starts at — the

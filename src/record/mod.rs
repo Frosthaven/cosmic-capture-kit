@@ -59,6 +59,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 mod finalize;
+/// DRAGON-432: the bounded ring that keeps an ffmpeg child's last stderr lines, plus the
+/// parser that picks the one line worth showing a user. Portable and pure — no spawning
+/// here, so every platform's suite covers it.
+pub(crate) mod ffmpeg_log;
 // The Wayland screencopy + portal PipeWire capture workers are the Linux capture
 // paths; macOS records via ScreenCaptureKit (DRAGON-94 phase 3). pump/finalize/
 // sync_probe are pure ffmpeg/audio and stay portable. `owned` holds the portable
@@ -134,10 +138,17 @@ mod media_clock_e2e_tests;
 
 pub(crate) use sync_probe::{measure_av_offset, write_sync_clip, SYNC_CLIP_NAME};
 // DRAGON-229 M3: the isolated WGC single-frame grab behind `--test windows-wgc-frame`.
+// DRAGON-426 adds the explicitly-budgeted form, for the window-capture ladder's WGC rescue
+// (which runs inside the scene enumeration and cannot afford the generous default wait).
 #[cfg(windows)]
-pub(crate) use wgc::capture_one_frame as wgc_capture_one_frame;
+pub(crate) use wgc::{
+    capture_one_frame as wgc_capture_one_frame,
+    capture_one_frame_within as wgc_capture_one_frame_within,
+};
 #[cfg(feature = "zero-copy")]
 pub use zero_copy::screencopy_dmabuf_test;
+#[cfg(all(target_os = "linux", feature = "zero-copy"))]
+pub use zero_copy::cuda_import_test;
 
 /// (Debug) End-to-end capture→encode of the FULL largest output at `fps` for
 /// `secs` seconds (heaviest case), forcing a specific encoder `backend`
@@ -295,7 +306,22 @@ pub fn bench_record(secs: u64, fps: u32, backend: &str) {
     audio_stop.store(true, Ordering::Relaxed);
     let _ = mic_writer.join();
     let _ = sys_writer.join();
-    let _ = child.wait();
+    // DRAGON-432: this reap was a bare `let _ = child.wait()`, so `--bench-record` was the one
+    // record-path ffmpeg whose failure said nothing at all — the bench printed its fps line and
+    // exited 0 over a muxer that had died. It does not go through `wait_or_kill` (a bench is
+    // not a stop tail and has no budget to enforce), so it reports for itself.
+    let pid = child.id();
+    match child.wait() {
+        Ok(s) if s.success() => ffmpeg_log::discard(pid),
+        Ok(s) => {
+            eprintln!("bench: ffmpeg exited with {s}");
+            ffmpeg_log::report(pid, &format!("bench muxer exited with {s}"));
+        }
+        Err(e) => {
+            eprintln!("bench: could not reap ffmpeg: {e}");
+            ffmpeg_log::report(pid, "bench muxer could not be reaped");
+        }
+    }
     let _ = std::fs::remove_file(&mic_fifo_path);
     let _ = std::fs::remove_file(&sys_fifo_path);
     eprintln!(
@@ -423,17 +449,40 @@ pub(crate) fn wait_or_kill(
     child: &mut std::process::Child,
     timeout: std::time::Duration,
 ) -> std::io::Result<std::process::ExitStatus> {
+    let pid = child.id();
     let deadline = std::time::Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(s)) => return Ok(s),
+            Ok(Some(s)) => {
+                // DRAGON-432: every record-path ffmpeg is reaped here, so this is the one
+                // place that can report what it said without touching each worker — including
+                // the feature-gated zero-copy ones, which cannot be compiled on every dev
+                // machine. A healthy exit drops the ring silently; anything else writes the
+                // tail to the debug log.
+                if s.success() {
+                    ffmpeg_log::discard(pid);
+                } else {
+                    ffmpeg_log::report(pid, &format!("exited with {s}"));
+                }
+                return Ok(s);
+            }
             Ok(None) => {}
-            Err(e) => return Err(e),
+            Err(e) => {
+                ffmpeg_log::report(pid, "could not be reaped");
+                return Err(e);
+            }
         }
         if std::time::Instant::now() >= deadline {
             log::warn!("ffmpeg still running {timeout:?} after its inputs closed; killing it");
             let _ = child.kill();
-            return child.wait();
+            // Killed after outliving its budget: whatever it last printed is the best
+            // evidence for WHY it would not exit. Report AFTER the reap, not before — `kill`
+            // is asynchronous, and while the child is still dying its stderr pipe is still
+            // open and the drain is still reading. Reporting first raced the drain and printed
+            // a ring missing exactly the lines that explain the kill.
+            let status = child.wait();
+            ffmpeg_log::report(pid, "killed after outliving its stop budget");
+            return status;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }

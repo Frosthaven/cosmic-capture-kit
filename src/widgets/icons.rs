@@ -124,6 +124,11 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "window-close-symbolic" => "x",
         "emblem-system-symbolic" => "settings", // gear
         "document-properties-symbolic" => "view", // scanner kind (QR/OCR "look")
+        // DRAGON-456: the scan kind button's HOVER face while the scanner is ALREADY the
+        // active kind, where a press re-reads the screen instead of switching kind. The
+        // COUNTER-clockwise arrows, deliberately distinct from `view-refresh-symbolic`'s
+        // clockwise `refresh-cw` (a general "reload"): this one means "read it again".
+        "scan-refresh-symbolic" => "refresh-ccw",
         "preferences-system-symbolic" => "settings",
         "audio-input-microphone-symbolic" => "mic",
         "audio-x-generic-symbolic" => "audio-lines", // Audio settings tab
@@ -248,6 +253,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "bell" => svg!("bell"),
         "keyboard" => svg!("keyboard"),
         "refresh-cw" => svg!("refresh-cw"),
+        "refresh-ccw" => svg!("refresh-ccw"), // scanner re-read (DRAGON-456)
         "save" => svg!("save"),
         "save-all" => svg!("save-all"),
         "copy" => svg!("copy"),
@@ -323,7 +329,8 @@ mod tests {
             "preferences-system-symbolic", "audio-input-microphone-symbolic",
             "audio-x-generic-symbolic", "object-merge-symbolic",
             "audio-volume-high-symbolic", "notification-symbolic", "input-keyboard-symbolic",
-            "view-refresh-symbolic", "document-save-symbolic", "document-save-as-symbolic",
+            "view-refresh-symbolic", "scan-refresh-symbolic",
+            "document-save-symbolic", "document-save-as-symbolic",
             "edit-copy-symbolic", "view-fullscreen-symbolic", "view-restore-symbolic",
             "edit-undo-symbolic", "edit-redo-symbolic", "crop-symbolic", "crop-accept-symbolic",
             "insert-image-symbolic",
@@ -477,6 +484,11 @@ mod tests {
         assert_eq!(lucide_name("input-mouse-symbolic"), Some("mouse-pointer"));
         // DRAGON-354 item 5: the text tool wears lucide's `type` glyph (was `case-sensitive`).
         assert_eq!(lucide_name("text-tool-symbolic"), Some("type"));
+        // DRAGON-456: the scanner's re-read hover face is the COUNTER-clockwise refresh, and
+        // it must stay distinct from the clockwise one every other "reload" control wears —
+        // the two are one character apart in lucide's own naming, so pin both.
+        assert_eq!(lucide_name("scan-refresh-symbolic"), Some("refresh-ccw"));
+        assert_eq!(lucide_name("view-refresh-symbolic"), Some("refresh-cw"));
     }
 
     /// The DRAGON-338 pencil + eraser glyphs embed and are real SVGs (the tools' toolbar icons).

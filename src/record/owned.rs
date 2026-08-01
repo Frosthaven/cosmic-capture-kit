@@ -224,9 +224,16 @@ pub(super) fn run_video_stop_tail(
     }
     // Bounded reap (DRAGON-118): a healthy ffmpeg flushes its backlog and exits well
     // inside this; one that survives it is wedged and gets killed.
+    let pid = child.id();
     let wait_result = super::wait_or_kill(child, Duration::from_secs(30));
     let temp_alive = super::muxer_alive(temp);
-    let outcome = salvage_decision(&wait_result, muxer_wedged, temp_alive);
+    // DRAGON-432: `wait_or_kill` has already written any stderr tail to the debug log; this
+    // picks up the ONE line worth showing a user. `salvage_decision`'s own strings say only
+    // what WE observed from outside ("ffmpeg exited with …"), and ffmpeg's own sentence is
+    // usually the whole answer — it reaches the dialog because `RecordingFailed` is the one
+    // failure whose detail is shown verbatim.
+    let outcome = salvage_decision(&wait_result, muxer_wedged, temp_alive)
+        .map_err(|e| super::ffmpeg_log::with_hint(e, super::ffmpeg_log::take_hint(pid)));
     match &outcome {
         Ok(()) if !matches!(&wait_result, Ok(s) if s.success() && !muxer_wedged) => {
             // Salvaged a stop-tail-only death (the temp is sound; see `salvage_decision`).

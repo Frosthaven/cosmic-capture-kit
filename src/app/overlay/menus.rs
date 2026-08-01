@@ -11,7 +11,9 @@ impl App {
         if gx < ox || gx >= ox + ow as i32 || gy < oy || gy >= oy + oh as i32 {
             return None;
         }
-        let (lx, ly) = ((gx - ox) as f32, (gy - oy) as f32);
+        // The stored menu anchor is CAPTURE space (it came from the region widget); the
+        // padding it drives is POINTS (DRAGON-448).
+        let (lx, ly) = o.units().to_point((gx, gy));
 
         let backdrop: Element<'_, Msg> = widget::mouse_area(
             widget::Space::new().width(Length::Fill).height(Length::Fill),
@@ -66,7 +68,8 @@ impl App {
         if gx < ox || gx >= ox + ow as i32 || gy < oy || gy >= oy + oh as i32 {
             return None;
         }
-        let (lx, ly) = ((gx - ox) as f32, (gy - oy) as f32);
+        // CAPTURE anchor → POINT padding, exactly as in `text_menu_layer` (DRAGON-448).
+        let (lx, ly) = o.units().to_point((gx, gy));
 
         let backdrop: Element<'_, Msg> = widget::mouse_area(
             widget::Space::new().width(Length::Fill).height(Length::Fill),

@@ -161,6 +161,68 @@ pub(super) fn windowed_fit_size(media: (u32, u32), monitor: Option<(u32, u32)>, 
     )
 }
 
+/// CAPTURE units per POINT for the display a windowed preview is SIZED AGAINST
+/// (DRAGON-449) — the same per-output factor the capture overlay's units bridge carries
+/// ([`crate::geometry::OverlayUnits`]), read through the one platform seam
+/// ([`crate::platform::overlay_point_scale`]) so "how far apart are the two spaces on this
+/// OS" keeps a single answer. Windows: that monitor's `dpi / 96`. macOS / Linux: `1.0`.
+///
+/// `None` = no NAMED display anchors this preview (`--preview`, a handed-over document, a
+/// capture whose outputs are already torn down). There is then no capture space to convert
+/// FROM, so the caller has already resolved points and the answer is the identity — exactly
+/// the pre-DRAGON-449 behaviour, never a guess.
+///
+/// The `cfg` is about the HANDLE, not about the units: off Linux an [`OutputHandle`] IS the
+/// display name the seam takes, while on Linux it is a `WlOutput` carrying no name — and
+/// Linux's answer is `1.0` regardless (a layer surface's app space IS point space), so the
+/// arm gives nothing up.
+pub(super) fn monitor_point_scale(output: Option<&OutputHandle>) -> f32 {
+    #[cfg(not(target_os = "linux"))]
+    {
+        output.map(|name| crate::platform::overlay_point_scale(name)).unwrap_or(1.0)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = output;
+        1.0
+    }
+}
+
+/// A monitor's extent in LOGICAL POINTS — the ONLY units the windowed preview's open fit
+/// may measure against (DRAGON-449).
+///
+/// Three consumers, all point-space by definition, all fed from here:
+/// [`windowed_fit_size`]'s monitor bound (the full-width / [`sizing::USABLE_H_FRAC`]-height
+/// budgets), and [`super::shell::preview_window`]'s transient max-size hint plus its
+/// `min_size` clamp — a `window::Settings` size is logical points on every backend.
+///
+/// `capture` is that monitor in CAPTURE space (PHYSICAL pixels on Windows, points on macOS
+/// and Linux — the [`crate::platform::backend::OutputDesc`] units contract), and
+/// `point_scale` comes from [`monitor_point_scale`]. Feeding the capture-space rect straight
+/// in made every budget and the floor clamp `dpi/96`× too permissive on Windows: at 300% the
+/// window could open TALLER than the display it landed on.
+///
+/// At `point_scale <= 1.0` this returns `capture` UNCHANGED (see [`sizing::to_points`]), so
+/// Linux, macOS and every 96-DPI Windows box are byte-identical.
+pub(super) fn monitor_fit_points(capture: (u32, u32), point_scale: f32) -> (u32, u32) {
+    // The SAME rule-6 primitive `preview_source_scale` already uses for the MEDIA
+    // dimensions — one physical→points conversion, not two that can drift.
+    sizing::to_points(capture, point_scale)
+}
+
+/// The largest known output, in LOGICAL POINTS — the monitor bound a preview with NO capture
+/// anchor opens against (`--preview`, and a handed-over document on a host whose own capture
+/// is long finished). Each output converts through its OWN [`OutputState::point_scale`]
+/// (DRAGON-448/449), so a mixed-DPI desktop compares like with like instead of letting a
+/// high-DPI panel win on physical pixels alone. `None` when no output is known — the caller
+/// keeps its placeholder.
+pub(super) fn largest_output_points(outputs: &[OutputState]) -> Option<(u32, u32)> {
+    outputs
+        .iter()
+        .map(|o| monitor_fit_points(o.logical_size, o.point_scale))
+        .max_by_key(|(w, h)| *w as u64 * *h as u64)
+}
+
 /// The vertical space `kind`'s TRANSPORT strip takes on `surface`: the play/seek
 /// strip for videos (between the canvas and the action toolbar), zero for stills.
 /// EVERY sizing path funnels through here — the live viewport
@@ -447,5 +509,125 @@ mod dpi_proof_tests {
         // ...and the buggy window's canvas was 2× that (the reported user symptom).
         assert!((buggy.0 - 2.0 - 2800.0).abs() < 0.5, "buggy w {}", buggy.0);
         assert!(((buggy.0 - 2.0) - 2.0 * (fixed.0 - 2.0)).abs() < 1.0, "buggy must be ~2× fixed");
+    }
+}
+
+/// DRAGON-449: the windowed open fit's MONITOR bound (and the max-size hint / `min_size`
+/// clamp built from it) in LOGICAL POINTS, not the capture-space rect Windows reports.
+#[cfg(test)]
+mod monitor_points_tests {
+    use super::*;
+
+    /// THE byte-identity pin. At factor 1.0 — Linux, macOS, and every 96-DPI Windows box —
+    /// the conversion returns the capture rect UNCHANGED, so `windowed_fit_size`, the
+    /// max-size hint and the `min_size` clamp all see the EXACT expression they saw before
+    /// the fix (`Some(capture_monitor)` / `capture_monitor.0 as f32`). If this moves, the
+    /// change has touched platforms it had no business touching.
+    #[test]
+    fn factor_one_is_byte_identical_to_the_old_capture_monitor() {
+        for capture in [(1920u32, 1080u32), (3840, 2160), (5120, 1440), (800, 480), (1, 1)] {
+            let pts = monitor_fit_points(capture, 1.0);
+            assert_eq!(pts, capture, "the bound must be the same tuple at 1.0");
+            for media in [(1280u32, 720u32), (3840, 2160), (400, 300)] {
+                for extra_h in [0.0f32, PreviewSurface::Window.transport_h()] {
+                    assert_eq!(
+                        windowed_fit_size(media, Some(pts), extra_h),
+                        windowed_fit_size(media, Some(capture), extra_h),
+                    );
+                }
+            }
+            assert_eq!(
+                (pts.0 as f32, pts.1 as f32),
+                (capture.0 as f32, capture.1 as f32),
+            );
+            assert_eq!(
+                super::shell::preview_min_size((pts.0 as f32, pts.1 as f32)),
+                super::shell::preview_min_size((capture.0 as f32, capture.1 as f32)),
+            );
+        }
+        // An UNKNOWN display (no name to resolve, a `--preview` file, a torn-down capture)
+        // is the identity too — never a guess.
+        assert_eq!(monitor_point_scale(None), 1.0);
+    }
+
+    /// The customer's display (DRAGON-447): 3840x2160 at 300% is 1280x720 POINTS, and every
+    /// Windows scale step divides the same way.
+    #[test]
+    fn a_scaled_windows_monitor_reads_back_as_its_point_extent() {
+        for (px, factor, want) in [
+            ((3840u32, 2160u32), 3.0f32, (1280u32, 720u32)),
+            ((3840, 2160), 2.0, (1920, 1080)),
+            ((3840, 2160), 1.5, (2560, 1440)),
+            ((2560, 1440), 1.25, (2048, 1152)),
+            ((5120, 1440), 1.0, (5120, 1440)),
+        ] {
+            assert_eq!(monitor_fit_points(px, factor), want, "{px:?} at {factor}x");
+        }
+    }
+
+    /// The ticket's symptom, end to end: a size-unknown open (a spinner still decoding) on
+    /// the customer's 3840x2160 @ 300% display asked for 1600x1000 — on a screen that is
+    /// only 1280x720 POINTS, i.e. TALLER and WIDER than the display it lands on. In points
+    /// it fits, and the height lands on the floor rather than past the screen.
+    #[test]
+    fn the_size_unknown_fallback_no_longer_exceeds_the_display() {
+        let capture = (3840u32, 2160u32);
+        let fallback = |m: (u32, u32)| {
+            (
+                (m.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
+                (m.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
+            )
+        };
+        let pts = monitor_fit_points(capture, 3.0);
+        assert_eq!(pts, (1280, 720));
+        let (bw, bh) = fallback(capture);
+        assert!(bw > pts.0 as f32 && bh > pts.1 as f32, "the bug: {bw}x{bh} on a {pts:?} screen");
+        let (fw, fh) = fallback(pts);
+        assert!(fw <= pts.0 as f32, "fixed width {fw} must fit {}", pts.0);
+        // The 924x732 control floor is itself taller than a 720pt screen — the window can only
+        // shrink to what the display holds, which is what the `min_size` clamp is for.
+        assert_eq!((fw, fh), (1024.0, super::shell::PREVIEW_MIN_H));
+        let (mw, mh) = super::shell::preview_min_size((pts.0 as f32, pts.1 as f32));
+        assert_eq!((mw, mh), (super::shell::PREVIEW_MIN_W, 720.0), "the floor clamps to the screen");
+        // ...and against the physical rect it never clamped at all (the bug).
+        assert_eq!(
+            super::shell::preview_min_size((capture.0 as f32, capture.1 as f32)),
+            (super::shell::PREVIEW_MIN_W, super::shell::PREVIEW_MIN_H),
+        );
+    }
+
+    /// A media-sized open on a scaled display: the fit is bounded by the POINT extent, so the
+    /// window fits the screen instead of overflowing it by the scale factor.
+    #[test]
+    fn a_full_screen_capture_fits_the_display_it_opens_on() {
+        // The whole 3840x2160 @ 200% display captured: 3840x2160 physical media, which is
+        // 1920x1080 points on a 1920x1080-point screen.
+        let capture = (3840u32, 2160u32);
+        let pts = monitor_fit_points(capture, 2.0);
+        let media = sizing::to_points(capture, 2.0);
+        let (w, h) = windowed_fit_size(media, Some(pts), 0.0);
+        assert!(w <= pts.0 as f32 + 0.5, "width {w} spills off a {}pt screen", pts.0);
+        assert!(
+            h <= pts.1 as f32 * sizing::USABLE_H_FRAC + 0.5,
+            "height {h} exceeds the {}% budget of a {}pt screen",
+            sizing::USABLE_H_FRAC * 100.0,
+            pts.1,
+        );
+        // The un-divided bound let the SAME capture ask for a window taller than the screen.
+        let (_, buggy_h) = windowed_fit_size(media, Some(capture), 0.0);
+        assert!(buggy_h > pts.1 as f32, "the bug: {buggy_h}pt tall on a {}pt screen", pts.1);
+    }
+
+    /// Mixed DPI: the largest output is chosen by its POINT area, so a small high-DPI panel
+    /// can't out-vote a big 100% display on physical pixels alone. (The `--preview` /
+    /// handed-over-document bound.)
+    #[test]
+    fn the_largest_output_is_measured_in_points() {
+        // A 2560x1440 panel at 200% is only 1280x720 points — smaller than a plain 1920x1080,
+        // though its physical pixel count is larger.
+        let hi = monitor_fit_points((2560, 1440), 2.0);
+        let lo = monitor_fit_points((1920, 1080), 1.0);
+        assert_eq!(hi, (1280, 720));
+        assert!(lo.0 as u64 * lo.1 as u64 > hi.0 as u64 * hi.1 as u64);
     }
 }

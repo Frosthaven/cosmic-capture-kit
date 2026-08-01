@@ -8,17 +8,44 @@ use super::*;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Warn ONCE per process when a content-aware pixelate cell hits the
+/// Note ONCE per process that a content-aware pixelate cell hit the
 /// [`annotate::PIXELATE_BLOCK_MAX`] ceiling — the block is safely clamped there (bounding the
 /// GPU shader's O(block²) mosaic loop), so this is a perf heads-up, not an error. Once-guarded
 /// so a live drag over coarse content can't spam the log.
-fn warn_pixelate_cap() {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        log::warn!(
+///
+/// DRAGON-453: at `debug`, not `warn`. Clamping here is the design working — a coarse-content
+/// region resolves to the ceiling and both the display and the bake use it, so nothing is
+/// degraded and there is nothing for the user to act on. At `warn` it printed to the terminal
+/// during an ordinary pixelate drag, which reads as a fault and is not one. `debug` still puts
+/// it in the DRAGON-419 debug log (our own records go to the file from `debug` up), which is
+/// where a "why is my redaction this coarse?" question gets answered.
+fn note_pixelate_cap() {
+    static NOTED: AtomicBool = AtomicBool::new(false);
+    if !NOTED.swap(true, Ordering::Relaxed) {
+        log::debug!(
             "pixelate: content-aware cell clamped to the {}px ceiling (bounds the GPU mosaic \
              loop); very large redaction regions stay capped",
             annotate::PIXELATE_BLOCK_MAX
+        );
+    }
+}
+
+/// Warn ONCE per process that the scene holds more knockout rects than the dim/spotlight shader
+/// can carry, so the LIVE view is showing fewer than the document has (the CPU bake has no cap
+/// and stays faithful).
+///
+/// Kept at `warn` — unlike [`note_pixelate_cap`] this one says what you see is not what you get,
+/// which is worth a terminal line. DRAGON-453 added the once-guard: this sits in the view build,
+/// so before it the SAME line was emitted on every frame for as long as the document stayed over
+/// the cap — a per-frame `warn!` that would flood a customer's debug log.
+fn warn_knockout_cap(count: usize) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        log::warn!(
+            "dim/spotlight: {count} knockout rects exceeds the {}-rect shader cap; only the \
+             first {} are rendered (the bake stays faithful)",
+            crate::widgets::annotation_fx::MAX_KNOCKOUTS,
+            crate::widgets::annotation_fx::MAX_KNOCKOUTS,
         );
     }
 }
@@ -121,6 +148,10 @@ impl ImagePreview {
 pub(super) fn decode_task(pid: window::Id, path: PathBuf) -> Task<cosmic::Action<Msg>> {
     let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
+        // DRAGON-454: the decode is the longest single step of the editor open on a large
+        // capture, and it runs HERE — off the UI thread. Marking both ends is what lets a
+        // reader tell "the picture was still decoding" from "the UI thread was busy".
+        crate::util::timing_mark("preview: image decode thread (begin)");
         let payload = match ::image::open(&path) {
             Ok(img) => {
                 // Wrap in Arc FIRST so the handle can SHARE the decoded pixel allocation
@@ -128,6 +159,12 @@ pub(super) fn decode_task(pid: window::Id, path: PathBuf) -> Task<cosmic::Action
                 // original stays available as the edit recomposite source either way.
                 let original = Arc::new(img.into_rgba8());
                 let handle = shared_rgba_handle(&original);
+                if crate::util::timing_on() {
+                    let (w, h) = original.dimensions();
+                    crate::util::timing_mark(&format!(
+                        "preview: image decode thread (done, {w}x{h})"
+                    ));
+                }
                 (handle, Some(original))
             }
             // DRAGON-419: a decode failure is HANDLED (iced re-reads the file itself), so
@@ -192,14 +229,8 @@ impl App {
         // source scale), so a hidpi capture is never drawn larger than 100% even when a
         // floored window's canvas is bigger than the picture (rule 2, DRAGON-221). The
         // image HANDLE stays the hi-res physical pixels, downsampled into this box, so
-        // it's sharp on hidpi. `source_scale == 1.0` (Linux 1x) makes points == physical
+        // it's sharp on hidpi. `source_scale == 1.0` (an unscaled output) makes points == physical
         // — byte-identical to the old `edit.frame` fit.
-        // DRAGON-366 (TEMPORARY): the view build's own wall clock. See
-        // `crate::widgets::dragon366` — remove with the probe call at the end of this fn.
-        let d366_view_start = std::time::Instant::now();
-        let mut d366_still_ms = 0.0f64;
-        let mut d366_shown = (0.0f32, 0.0f32);
-        let mut d366_avail = (0.0f32, 0.0f32);
         // Every persistent-texture layer key this window draws this frame (DRAGON-373): the
         // covermark's, the Windows-overlay base's, and one per text annotation. EVERY LayerStack
         // this window mounts must carry the same set, or their prepares take turns freeing each
@@ -227,8 +258,6 @@ impl App {
             let (avail_w, avail_h) = self.preview_viewport(preview);
             // The crop window's on-screen size (whole picture's when un-cropped).
             let (dw, dh) = video::fit_dims(ow, oh, avail_w, avail_h);
-            d366_avail = (avail_w, avail_h);
-            d366_shown = (dw, dh);
             // The media stack ALWAYS renders the WHOLE frame (base + effect passes); a crop just
             // frames a sub-region of it through a CropWindow. So render at the FULL frame's
             // on-screen size (the whole picture at the crop's scale), then clip to the crop window.
@@ -260,7 +289,6 @@ impl App {
                 }
                 None => (dw, dh, None),
             };
-            let t = std::time::Instant::now();
             // `false` withholds the covermark from the media stack — because it is mounted over the
             // crop window below instead (DRAGON-391), or because a crop session is live and it is
             // not drawn at all (DRAGON-402).
@@ -272,7 +300,6 @@ impl App {
                 &window_keys,
                 view_crop.is_none() && preview.edit.covermark_visible(),
             );
-            d366_still_ms = t.elapsed().as_secs_f64() * 1000.0;
             match crop_wrap {
                 Some((window, content, offset)) => {
                     let framed: Element<'a, Msg> =
@@ -397,7 +424,7 @@ impl App {
             let items = annotate::widget_items(
                 &preview.edit.annotations,
                 // The curve radius is a POINT preset; the vector geometry is SOURCE px, so scale
-                // it to this document's backing scale (DRAGON-383). Identity on Linux/1x.
+                // it to this document's backing scale (DRAGON-383). Identity on an unscaled (1x) output.
                 annotate::points_to_source_px(preview.edit.curve_radius(), preview.source_scale),
                 &preview.edit.erase_marks,
             );
@@ -568,7 +595,7 @@ impl App {
         // preview carries those in its titlebar instead (DRAGON-337).
         let header = (!preview.surface.is_window())
             .then(|| self.overlay_header_row(preview, tb));
-        let composed = compose_preview(
+        compose_preview(
             preview.surface.is_window(),
             self.overlay_control_width(preview),
             header,
@@ -578,65 +605,7 @@ impl App {
             toolbar,
             tb.glass,
             toasts,
-        );
-        // DRAGON-366 (TEMPORARY): one line per new interaction plus a sampled stream within it,
-        // carrying the redraw cadence, our own CPU cost, the scene shape, and WHAT THE USER WAS
-        // DOING — the split the ticket hangs on. Remove this call, `d366_interaction`, and the
-        // timers above with the diagnostic.
-        let (d366_verb, d366_item) = self.d366_interaction(preview);
-        let mut d366_fx = (0usize, 0usize, 0usize);
-        for it in &preview.edit.annotations {
-            match it.kind {
-                annotate::AnnotKind::Blur { .. } => d366_fx.0 += 1,
-                annotate::AnnotKind::Pixelate { .. } => d366_fx.1 += 1,
-                annotate::AnnotKind::Highlight { .. }
-                | annotate::AnnotKind::BoxHighlight { .. } => d366_fx.2 += 1,
-                _ => {}
-            }
-        }
-        crate::widgets::dragon366::view_built(crate::widgets::dragon366::FrameFacts {
-            verb: d366_verb,
-            item: d366_item,
-            build_ms: d366_view_start.elapsed().as_secs_f64() * 1000.0,
-            still_ms: d366_still_ms,
-            source: preview.edit.frame,
-            shown: d366_shown,
-            avail: d366_avail,
-            zoom: preview.view.zoom,
-            overlay: !preview.surface.is_window(),
-            annots: preview.edit.annotations.len(),
-            fx_blur: d366_fx.0,
-            fx_pixelate: d366_fx.1,
-            fx_highlight: d366_fx.2,
-            // The dim this frame actually DREW (`view_dim`), which is what a scene-shape
-            // diagnostic is for — a crop session renders undimmed (DRAGON-410).
-            dim: preview.edit.view_dim(),
-            covermark: preview.edit.cm_raster.frame().is_some(),
-            text_layer: !preview.edit.text_layers.is_empty(),
-        });
-        composed
-    }
-
-    /// DRAGON-366 (TEMPORARY): name the interaction currently on screen, as
-    /// `(verb, item-kind)`, from state the view can already see. This is what makes the
-    /// diagnostic self-interpreting — comparing `idle` against `drag/text` against
-    /// `create/blur` on the SAME capture is what separates a per-frame cost that is paid
-    /// regardless (the base image) from one driven by a specific interaction.
-    ///
-    /// An in-flight pointer gesture wins over text editing, because during a drag of a text box
-    /// both are live and the DRAG is what is being measured.
-    fn d366_interaction(&self, preview: &PreviewState) -> (&'static str, &'static str) {
-        match &preview.edit.gesture {
-            // Rubber-band drawing / moving / resizing / erasing — named by the SHARED helper, so
-            // the view channel and the update channel label one drag identically.
-            Some(g) => annotate::d366_gesture_words(g, &preview.edit.annotations),
-            // No pointer gesture: typing into a text box, or genuinely idle. The idle frames
-            // between the owner's actions are the ONLY no-effect baseline this ticket gets.
-            None => match &preview.edit.text_edit {
-                Some(_) => ("type", "text"),
-                None => ("idle", "-"),
-            },
-        }
+        )
     }
 
     /// The base still plus the effect + covermark overlays for the loaded-image view, fitted to
@@ -703,7 +672,7 @@ impl App {
                         .map(|f| annotate::content_pixelate_block_px(&f.rgba, f.w, f.h, rect))
                         .unwrap_or(annotate::PIXELATE_BLOCK);
                     if b >= annotate::PIXELATE_BLOCK_MAX {
-                        warn_pixelate_cap();
+                        note_pixelate_cap();
                     }
                     b as f32
                 } else {
@@ -731,13 +700,7 @@ impl App {
             .map(|r| [r.x, r.y, r.w, r.h])
             .collect();
         if knockouts.len() > crate::widgets::annotation_fx::MAX_KNOCKOUTS {
-            log::warn!(
-                "dim/spotlight: {} knockout rects exceeds the {}-rect shader cap; only the first \
-                 {} are rendered (the bake stays faithful)",
-                knockouts.len(),
-                crate::widgets::annotation_fx::MAX_KNOCKOUTS,
-                crate::widgets::annotation_fx::MAX_KNOCKOUTS,
-            );
+            warn_knockout_cap(knockouts.len());
             knockouts.truncate(crate::widgets::annotation_fx::MAX_KNOCKOUTS);
         }
         // The real-time effects shader element runs when there are region effects OR a non-zero
@@ -764,7 +727,7 @@ impl App {
                         src,
                         (dw, dh),
                         // POINT curve preset → SOURCE px, matching the source-px effect geometry
-                        // (DRAGON-383). Identity on Linux/1x.
+                        // (DRAGON-383). Identity on an unscaled (1x) output.
                         annotate::points_to_source_px(preview.edit.curve_radius(), preview.source_scale),
                         consts,
                         dim,
@@ -803,11 +766,25 @@ impl App {
         // The base element, plus whether the covermark is folded into it. Windows OVERLAY
         // (DRAGON-235): iced's raster-image pipeline doesn't composite on the transparent
         // surface, so base + covermark ride ONE LayerStack; the effects shader is a distinct
-        // primitive type (its own per-window state), stacked on top —
-        // over the covermark on Windows (a z-order deviation vs Linux/mac to VERIFY, as Linux
-        // builds can't exercise this cfg arm). Note the text layers are NOT folded in here on
-        // either platform: they are canvas-drawn (DRAGON-373), which keeps this arm's z-order
-        // exactly as it was — text has always ridden above base, effects and covermark alike.
+        // primitive type (its own per-window state), stacked on top.
+        //
+        // THE COST (DRAGON-395): that puts the effects OVER the covermark here, and UNDER it
+        // on Linux and macOS. A real z-order deviation, accepted because the alternative was
+        // a covermark that did not render at all. It is documented as a known platform
+        // difference in `docs/ARCHITECTURE.md`.
+        //
+        // TO A/B IT: set `CCK_TEST_UNFOLD_COVERMARK=1` (see `layers::unfold_covermark`) and
+        // this arm is skipped, so the overlay takes the portable path below — exactly what
+        // Linux and macOS compile. Open the same capture with a covermark AND an effect on
+        // both settings and compare. If the unfolded rendering is correct, the fold and this
+        // comment can go; if the base or the covermark comes back blank, DRAGON-235 stands.
+        // This used to say the arm could not be verified because Linux builds cannot compile
+        // it — that is no longer the reason it is unverified: DRAGON-427 made this arm
+        // Windows-11-only, and a Windows 11 machine can now run both sides.
+        //
+        // Note the text layers are NOT folded in here on either platform: they are
+        // canvas-drawn (DRAGON-373), which keeps this arm's z-order exactly as it was — text
+        // has always ridden above base, effects and covermark alike.
         // DRAGON-391: with a crop applied `cm_layers` is empty here on EVERY platform (the
         // covermark rides over the crop window instead), so this arm then folds the base alone —
         // the covermark still draws, through its own `LayerStack` one level up.
@@ -815,6 +792,7 @@ impl App {
         let (base_element, cm_folded): (Element<'static, Msg>, bool) = if !preview
             .surface
             .is_window()
+            && !super::layers::unfold_covermark()
             && let Some(base) = super::layers::rgba_handle_frame(handle)
         {
             let mut layers = vec![Layer::full(LayerKey::video(preview.window), base)];

@@ -30,11 +30,21 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1
 /// only (no region crop — those use the CPU path) and the A/V auto-calibration isn't
 /// updated (the saved offset still applies). VAAPI only.
 ///
-/// The audio-side pre-flight check ([`super::owned::try_start_owned_audio`]) runs
-/// FIRST, before this function touches the portal `fd`/`node_id` at all, so a failure
-/// here never risks them — it fails the recording outright with a named, actionable
-/// reason instead of falling back (DRAGON-127 retired the legacy wallclock+CFR+segments
-/// recorder this used to fall back to).
+/// Two pre-flights run before this function touches the portal `fd`/`node_id` at all, in
+/// this order:
+///
+/// 1. The NODE pre-flight ([`preflight_vaapi_node`], DRAGON-425): can this box's VAAPI
+///    hardware import what this session renders? A no means zero-copy is impossible here,
+///    and declining now costs nothing at all — no audio capture has been started, no pump
+///    exists, and media 0 has not been anchored.
+/// 2. The AUDIO pre-flight ([`super::owned::try_start_owned_audio`]), so a failure there
+///    never risks the portal handles either — it fails the recording outright with a named,
+///    actionable reason instead of falling back (DRAGON-127 retired the legacy
+///    wallclock+CFR+segments recorder this used to fall back to).
+///
+/// The order matters: the audio pre-flight starts real capture streams, so asking the
+/// cheap, answerable question first is what keeps a box that can never do zero-copy from
+/// paying for a session it cannot run.
 ///
 /// Returns a [`ZcOutcome`], like its screencopy sibling
 /// ([`record_screencopy_zero_copy`]) — NOT a bare `Result` (DRAGON-422). The caller has
@@ -68,22 +78,123 @@ pub(crate) fn record_pipewire_zero_copy(
     dims: Arc<Mutex<Option<(u32, u32)>>>,
     metadata: &str,
 ) -> ZcOutcome {
-    match super::owned::try_start_owned_audio() {
-        Ok(owned) => {
-            log::info!("zero-copy pipeline: media-clock owned path (DRAGON-127)");
-            record_pipewire_zero_copy_owned(
-                fd, node_id, fps, codec, max_res, mic, system_audio, bitrate_kbps,
-                audio_offset_ms, auto_device_compensation, out_path, stop, paused, events, dims,
-                metadata, owned,
-            )
+    // DRAGON-425 PRE-FLIGHT — before the audio pre-flight, the pump, and media 0.
+    //
+    // The node this path encodes on used to be a GUESS (`default_vaapi_node`: the first
+    // amdgpu/i915/xe render node, alphabetically) with no idea what the session renders on.
+    // On a multi-GPU box that can be the wrong GPU, and the reported failure is the worst
+    // shape of it: a compositor that DECLINES cross-vendor dmabuf never fixates a modifier,
+    // so no frame is ever delivered — the session stalls through its whole first-frame
+    // budget and only then falls back, having already paid for everything below.
+    //
+    // The compositor answers this with no frame and no capture: the `zwp_linux_dmabuf_v1`
+    // default-feedback `main_device` is the protocol's own statement of which GPU clients
+    // should render on. Ask it here, decide, and on a decline give the CPU path the whole
+    // recording immediately — nothing has been started, so this genuinely costs nothing.
+    match preflight_vaapi_node() {
+        PreflightNode::Use(node) => {
+            match super::owned::try_start_owned_audio() {
+                Ok(owned) => {
+                    log::info!("zero-copy pipeline: media-clock owned path (DRAGON-127)");
+                    record_pipewire_zero_copy_owned(
+                        fd, node_id, fps, codec, max_res, mic, system_audio, bitrate_kbps,
+                        audio_offset_ms, auto_device_compensation, out_path, stop, paused,
+                        events, dims, metadata, owned, node,
+                    )
+                }
+                Err(reason) => {
+                    log::error!(
+                        "zero-copy pipeline: audio pre-flight failed ({reason}); cannot record"
+                    );
+                    // Fatal, not `Fallback` (see the fn doc): the CPU path would only run the
+                    // SAME pre-flight again and fail the same way, one whole recording later.
+                    ZcOutcome::Done(Err(format!("could not start recording audio: {reason}")))
+                }
+            }
         }
-        Err(reason) => {
-            log::error!("zero-copy pipeline: audio pre-flight failed ({reason}); cannot record");
-            // Fatal, not `Fallback` (see the fn doc): the CPU path would only run the
-            // SAME pre-flight again and fail the same way, one whole recording later.
-            ZcOutcome::Done(Err(format!("could not start recording audio: {reason}")))
-        }
+        PreflightNode::Decline(reason) => ZcOutcome::Fallback(reason),
     }
+}
+
+/// What the DRAGON-425 pre-flight decided, before any recording machinery is started.
+#[cfg(feature = "zero-copy")]
+enum PreflightNode {
+    /// Encode on this render node. Either the default was already right, or the session's
+    /// GPU moved us to a different one.
+    Use(String),
+    /// Zero-copy cannot work on this box at all; the carried string is the USER-facing
+    /// reason, since a fallback reason can reach a failure dialog verbatim.
+    Decline(String),
+}
+
+/// Choose the VAAPI render node for this session BEFORE anything is started (DRAGON-425).
+///
+/// Asks the compositor which GPU the session renders on (`main_device` of the default
+/// `zwp_linux_dmabuf_v1` feedback, via `crate::compositor_main_device`), resolves that to a
+/// kernel driver, and runs the shared decision against this box's render nodes. Learning
+/// nothing — no Wayland, a compositor too old for feedback, an unknown driver — keeps the
+/// historical default, so no single-GPU box changes behaviour.
+///
+/// A `SwitchTo` also names the libva driver for the new node: libva often cannot auto-pick
+/// one when an nvidia node is present, which is exactly the box a switch happens on, so an
+/// encoder opened without it can fail on the very machine the switch was made for.
+#[cfg(feature = "zero-copy")]
+fn preflight_vaapi_node() -> PreflightNode {
+    let Some(default_node) = crate::encode::gpu::default_vaapi_node() else {
+        return PreflightNode::Decline("no VAAPI device for zero-copy".to_string());
+    };
+    let nodes = crate::encode::gpu::vaapi_nodes_with_drivers();
+    let session_driver = crate::compositor_main_device().and_then(crate::drm_driver_for_dev);
+    let decision =
+        crate::encode::resolve_vaapi_node_for_session(&nodes, session_driver.as_deref());
+    let vendor = session_driver.as_deref().and_then(crate::encode::vendor_from_driver);
+    log::info!(
+        "{}",
+        crate::encode::decision_log_line(std::path::Path::new(&default_node), vendor, &decision)
+    );
+    match decision {
+        crate::encode::NodeDecision::KeepDefault => PreflightNode::Use(default_node),
+        crate::encode::NodeDecision::SwitchTo(path) => {
+            let node = path.to_string_lossy().into_owned();
+            set_libva_driver_for(&nodes, &path);
+            PreflightNode::Use(node)
+        }
+        // The USER half, not the technical one: this string can reach a failure dialog.
+        crate::encode::NodeDecision::Decline { user, .. } => PreflightNode::Decline(user),
+    }
+}
+
+/// Name the libva driver for `node` in this process's environment, so the in-process VAAPI
+/// encoder loads the right one (DRAGON-425).
+///
+/// `plan.rs` does the equivalent for its ffmpeg CHILD through `EncodePlan::env`, which needs
+/// no process-wide mutation. The zero-copy path has no child — libva is loaded into THIS
+/// process — so the process variable is the only equivalent, and `gpu.rs`'s own tests already
+/// set it for the same reason ("driver name matters when an nvidia node is also present").
+///
+/// A value the user set themselves is never overwritten.
+#[cfg(feature = "zero-copy")]
+fn set_libva_driver_for(nodes: &[(std::path::PathBuf, String)], node: &std::path::Path) {
+    if std::env::var_os("LIBVA_DRIVER_NAME").is_some() {
+        return; // the user chose; never write over it
+    }
+    let Some(libva) = nodes
+        .iter()
+        .find(|(p, _)| p == node)
+        .and_then(|(_, drv)| crate::encode::libva_driver_for(drv))
+    else {
+        return;
+    };
+    log::info!("zero-copy: LIBVA_DRIVER_NAME={libva} for {}", node.display());
+    // SAFETY: `set_var` is unsound only if another thread may read or write the environment
+    // concurrently. This runs on the recording worker thread, and the process IS
+    // multi-threaded here — so this is the one genuinely uncomfortable line in the change.
+    // It is done as early as a recording can do it (before the audio pre-flight, before the
+    // pump, before any encoder thread exists), it writes a variable nothing else in this
+    // program reads or writes, and it is skipped entirely when the user has set one. The
+    // alternative — opening the encoder without naming the driver — is the documented
+    // failure mode on exactly the multi-GPU boxes this code path exists for.
+    unsafe { std::env::set_var("LIBVA_DRIVER_NAME", libva) };
 }
 
 /// The media-clock owned GPU zero-copy PipeWire session (DRAGON-127): ONE
@@ -143,11 +254,10 @@ fn record_pipewire_zero_copy_owned(
     dims: Arc<Mutex<Option<(u32, u32)>>>,
     metadata: &str,
     owned: super::owned::OwnedAudioStart,
+    // DRAGON-425: chosen by `preflight_vaapi_node` BEFORE the audio pre-flight ran, so a box
+    // where zero-copy cannot work never reaches this function at all.
+    node: String,
 ) -> ZcOutcome {
-    let Some(node) = crate::encode::gpu::default_vaapi_node() else {
-        owned.cleanup();
-        return ZcOutcome::Fallback("no VAAPI device for zero-copy".to_string());
-    };
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -307,6 +417,52 @@ fn record_pipewire_zero_copy_owned(
                     return;
                 }
                 if z.enc.is_none() {
+                    // DRAGON-425 belt two — CONFIRMATION. The node was already chosen by
+                    // `preflight_vaapi_node`, from the compositor's own statement of which
+                    // GPU this session renders on. This frame is the second opinion: its DRM
+                    // modifier's top byte names the GPU that actually produced it, so a
+                    // compositor whose frames contradict its own feedback is still caught.
+                    //
+                    // What each belt saves is different, and only the pre-flight saves the
+                    // expensive part. Declining THERE costs nothing: no audio pre-flight, no
+                    // pump, no media-0 anchor, no capture handshake. Declining HERE happens
+                    // after all of that is already paid for — it saves only the encoder, the
+                    // muxer and the doomed rest of the session, and the CPU path then starts
+                    // a second recording from scratch. That is why the pre-flight exists and
+                    // why this is a backstop, not the mechanism.
+                    //
+                    // Runs exactly once per session: `enc` is set immediately below, and
+                    // every failure path here sets `error`, which returns early at the top of
+                    // this callback.
+                    let vendor = crate::encode::vendor_from_modifier(frame.modifier);
+                    let nodes = crate::encode::gpu::vaapi_nodes_with_drivers();
+                    let decision = crate::encode::resolve_vaapi_node_for_vendor(&nodes, vendor);
+                    // The DRAGON-419 line for this session: one log entry naming which GPU
+                    // the frames came from and what that meant for the encoder.
+                    log::info!(
+                        "{}",
+                        crate::encode::decision_log_line(
+                            std::path::Path::new(&z.node),
+                            vendor,
+                            &decision
+                        )
+                    );
+                    match decision {
+                        crate::encode::NodeDecision::KeepDefault => {}
+                        crate::encode::NodeDecision::SwitchTo(path) => {
+                            set_libva_driver_for(&nodes, &path);
+                            z.node = path.to_string_lossy().into_owned();
+                        }
+                        crate::encode::NodeDecision::Decline { user, .. } => {
+                            // A zero-copy DECLINE (`true`), not this recording's failure:
+                            // nothing has been encoded and the CPU path can do it all. The
+                            // USER half of the reason, because a fallback reason can reach a
+                            // failure dialog verbatim.
+                            z.error = Some((true, user));
+                            cb_stop.store(true, Ordering::Relaxed);
+                            return;
+                        }
+                    }
                     let (mw, mh) = crate::encode::codec_capped_resolution(z.max_res, &z.codec);
                     let (dw, dh) = crate::encode::fit_within(frame.width, frame.height, mw, mh);
                     if let Ok(mut g) = cb_dims.lock() {
@@ -515,9 +671,10 @@ fn record_pipewire_zero_copy_owned(
 // the caller falls back to the CPU path.
 // ---------------------------------------------------------------------------
 
-/// DRM modifier sentinel meaning "implicit / driver's choice".
+/// DRM modifier sentinel meaning "implicit / driver's choice". DRAGON-425 unified the three
+/// copies of this literal behind one ungated const; the alias keeps the use sites unchanged.
 #[cfg(feature = "zero-copy")]
-const DRM_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+const DRM_MOD_INVALID: u64 = crate::encode::DRM_FORMAT_MOD_INVALID;
 
 /// DRM fourccs the in-process VAAPI import understands, most-opaque first.
 #[cfg(feature = "zero-copy")]
@@ -671,6 +828,135 @@ impl DmabufTarget {
     }
 }
 
+/// Which in-process GPU encoder a zero-copy session is running on.
+///
+/// VAAPI is the historical path and stays the default everywhere it works. NVENC
+/// exists because it is the ONLY one that works on a session rendering on NVIDIA:
+/// the proprietary driver exposes no VAAPI encode node, so `encode::vaapi_node`
+/// has nothing to pick and DRAGON-425 declines. Without this arm the recording
+/// falls back to reading every frame back to the CPU (29.5 MB per frame at
+/// 5120x1440) only to re-upload it to the same GPU for NVENC anyway.
+#[cfg(all(target_os = "linux", feature = "zero-copy"))]
+enum ZcEncoder {
+    Vaapi(crate::encode::gpu::Encoder),
+    /// NVENC fed from CUDA. The imports are cached per capture buffer: screencopy
+    /// cycles a small pool of them, and importing is ~45ms of setup that must happen
+    /// ONCE per buffer, not once per frame (a refresh is ~0.25ms).
+    Nvenc {
+        enc: crate::encode::gpu::NvencEncoder,
+        imports: std::collections::HashMap<i32, crate::encode::cuda::CudaImport>,
+        /// Encode size. The GL blit inside the import scales the captured frame to
+        /// this, which is how the max-resolution cap is honoured without a CPU step.
+        ew: u32,
+        eh: u32,
+        /// How many opening frames have been logged (see `encode`).
+        seen: u32,
+    },
+}
+
+#[cfg(all(target_os = "linux", feature = "zero-copy"))]
+impl ZcEncoder {
+    /// Open the encoder for this session, preferring NVENC when the capture buffers
+    /// live on an NVIDIA node (where VAAPI cannot encode them at all).
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        node: &str,
+        hevc: bool,
+        cw: u32,
+        ch: u32,
+        ew: u32,
+        eh: u32,
+        fps: u32,
+        bitrate_kbps: u32,
+    ) -> Result<Self, String> {
+        let nvidia = crate::encode::list_render_nodes()
+            .iter()
+            .any(|(p, drv)| drv == "nvidia" && p.to_string_lossy() == node);
+        if nvidia && crate::encode::cuda::available() {
+            // A decline here is honest and specific (an H.264 request too wide to
+            // encode without a downscale we cannot do), so it goes to the caller as
+            // the fallback reason rather than being retried as VAAPI, which on this
+            // node cannot work either.
+            let enc = crate::encode::gpu::NvencEncoder::new(hevc, cw, ch, ew, eh, fps, bitrate_kbps)?;
+            log::info!(
+                "zero-copy: NVENC on {node} (frames stay on the GPU; no CPU readback)"
+            );
+            return Ok(ZcEncoder::Nvenc { enc, imports: std::collections::HashMap::new(), ew, eh, seen: 0 });
+        }
+        crate::encode::gpu::Encoder::new(node, hevc, cw, ch, ew, eh, fps, bitrate_kbps)
+            .map(ZcEncoder::Vaapi)
+    }
+
+    /// Encode one captured frame from `target`, returning the compressed bytes.
+    fn encode(&mut self, target: &DmabufTarget) -> Result<Vec<u8>, String> {
+        match self {
+            ZcEncoder::Vaapi(enc) => {
+                enc.encode_dmabuf(target.fourcc, target.modifier, &target.encode_planes())
+            }
+            ZcEncoder::Nvenc { enc, imports, ew, eh, seen } => {
+                use std::os::fd::{AsFd, AsRawFd};
+                let (fd, offset, stride) =
+                    target.planes.first().ok_or("dmabuf target has no planes")?;
+                // Keyed by fd: screencopy hands back the same buffers round-robin, so
+                // this imports each one once and then only refreshes it.
+                let key = fd.as_raw_fd();
+                if let std::collections::hash_map::Entry::Vacant(slot) = imports.entry(key) {
+                    if !crate::encode::cuda::CudaDevice::format_supported(target.fourcc) {
+                        return Err(format!(
+                            "the compositor's format 0x{:08x} is not a packed 32-bit RGB \
+                             format NVENC can take without a conversion",
+                            target.fourcc
+                        ));
+                    }
+                    let dev = crate::encode::cuda::CudaDevice::get()
+                        .ok_or("CUDA import went away mid-session")?;
+                    let desc = crate::encode::cuda::DmabufDesc {
+                        fd: fd.as_fd(),
+                        fourcc: target.fourcc,
+                        modifier: target.modifier,
+                        width: target.width,
+                        height: target.height,
+                        offset: *offset,
+                        stride: *stride,
+                        dst_width: *ew,
+                        dst_height: *eh,
+                    };
+                    slot.insert(dev.import(desc)?);
+                }
+                // Guaranteed present: inserted directly above when absent.
+                let import = imports.get(&key).expect("just inserted");
+                let t0 = std::time::Instant::now();
+                let out = enc.encode_import(import);
+                // The muxer watchdog gives the first frame a bounded budget, so the
+                // opening frames are exactly where a stall would hide. Log a few and
+                // then stop: this is the difference between "we fed it nothing" and
+                // "we fed it something it would not write".
+                if *seen < 3 {
+                    *seen += 1;
+                    match &out {
+                        Ok(b) => log::info!(
+                            "zero-copy NVENC: frame {} -> {} bytes in {:.1}ms",
+                            *seen,
+                            b.len(),
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        ),
+                        Err(e) => log::error!("zero-copy NVENC: frame {} failed: {e}", *seen),
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Flush the encoder at end of session and return its remaining packets.
+    fn finish(&mut self) -> Result<Vec<u8>, String> {
+        match self {
+            ZcEncoder::Vaapi(enc) => enc.finish(),
+            ZcEncoder::Nvenc { enc, .. } => enc.flush(),
+        }
+    }
+}
+
 /// Diagnostic: validate the screencopy DMA-BUF capture pipeline on this machine —
 /// allocate a GPU buffer on the compositor's reported device and have it copy one
 /// frame in, with no encoder involved. Reports what we learned so we can tell
@@ -756,6 +1042,188 @@ pub fn screencopy_dmabuf_test() -> String {
             target.render_node, target.fourcc, target.modifier,
         ),
         None => format!("screencopy-dmabuf-test: timed out waiting for the frame on output {name}"),
+    }
+}
+
+/// Diagnostic: the DRAGON-457 proof — take one real compositor dmabuf and import it
+/// into CUDA, so an NVIDIA-rendered session can be encoded by NVENC where it lies
+/// instead of paying a readback.
+///
+/// Separate from [`screencopy_dmabuf_test`] rather than folded into it: that probe
+/// answers "does dmabuf capture work at all", which is a question every vendor has,
+/// and its output is quoted in tickets. This one answers the NVIDIA-only follow-up
+/// and is expected to decline on AMD and Intel boxes.
+#[cfg(all(target_os = "linux", feature = "zero-copy"))]
+pub fn cuda_import_test() -> String {
+    use std::os::fd::AsFd;
+
+    if crate::encode::cuda::CudaDevice::get().is_none() {
+        return "cuda-import-test: no CUDA/EGL import on this machine (no NVIDIA driver, or \
+                EGL_EXT_image_dma_buf_import missing). Expected on AMD/Intel — VAAPI is their \
+                path."
+            .into();
+    }
+    let Some((conn, mut queue, mut data)) = connect(false) else {
+        return "cuda-import-test: wayland connect failed".into();
+    };
+    let qh = queue.handle();
+    let Some((output, name, _, _)) = outputs(&data).into_iter().next() else {
+        return "cuda-import-test: no outputs".into();
+    };
+    let src = CaptureSource::Output(output);
+    data.formats = None;
+    data.result = None;
+    let Ok(session) = data.screencopy_state.capturer().create_session(
+        &src,
+        CaptureOptions::empty(),
+        &qh,
+        ScreencopySessionData::default(),
+    ) else {
+        return "cuda-import-test: screencopy session failed".into();
+    };
+    let _ = conn.flush();
+    let mut guard = 0;
+    while data.formats.is_none() {
+        if queue.blocking_dispatch(&mut data).is_err() {
+            return "cuda-import-test: dispatch failed".into();
+        }
+        guard += 1;
+        if guard > 200 {
+            return "cuda-import-test: capture formats never arrived".into();
+        }
+    }
+    let formats = data.formats.clone().expect("format wait loop above exits only when Some");
+    let target = match DmabufTarget::new(&formats, &data.dmabuf_state, &qh) {
+        Ok(t) => t,
+        Err(e) => return format!("cuda-import-test: could not allocate a dmabuf target: {e}"),
+    };
+    data.result = None;
+    session.capture(&target.buffer, &[], &qh, ScreencopyFrameData::default());
+    let _ = conn.flush();
+    let mut guard = 0;
+    while data.result.is_none() {
+        if queue.blocking_dispatch(&mut data).is_err() {
+            break;
+        }
+        guard += 1;
+        if guard > 400 {
+            break;
+        }
+    }
+    if !matches!(data.result.clone(), Some(Ok(_))) {
+        return format!("cuda-import-test: the compositor never filled the buffer on {name}");
+    }
+
+    if !crate::encode::cuda::CudaDevice::format_supported(target.fourcc) {
+        return format!(
+            "cuda-import-test: the compositor's format 0x{:08x} is not a packed 32-bit RGB \
+             format, so this import path declines it (NVENC would need a conversion first).",
+            target.fourcc
+        );
+    }
+    let Some((fd, offset, stride)) = target.planes.first() else {
+        return "cuda-import-test: the buffer reported no planes".into();
+    };
+    // Guaranteed Some by the `get().is_none()` check at the top.
+    let dev = crate::encode::cuda::CudaDevice::get().expect("checked above");
+    let t0 = std::time::Instant::now();
+    let desc = crate::encode::cuda::DmabufDesc {
+        fd: fd.as_fd(),
+        fourcc: target.fourcc,
+        modifier: target.modifier,
+        width: target.width,
+        height: target.height,
+        offset: *offset,
+        stride: *stride,
+        dst_width: (target.width / 2) & !1,
+        dst_height: (target.height / 2) & !1,
+    };
+    match dev.import(desc) {
+        Ok(import) => {
+            let (ptr, pitch) = import.device_ptr();
+            let import_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let t1 = std::time::Instant::now();
+            let refresh = import.refresh();
+            let refresh_ms = t1.elapsed().as_secs_f64() * 1000.0;
+            // The half that matters: can NVENC actually read what we imported? Encode a
+            // few frames and report the compressed bytes, so "the import worked" cannot
+            // be mistaken for "a recording would work".
+            // The probe picks HEVC for a wide capture because H.264 cannot encode it
+            // and this path cannot downscale. A real session takes that decision from
+            // the user's codec setting via `plan.rs`, not from here.
+            let ew = (target.width / 2) & !1;
+            let eh = (target.height / 2) & !1;
+            let encode = match crate::encode::gpu::NvencEncoder::new(
+                ew > 4096,
+                target.width,
+                target.height,
+                ew,
+                eh,
+                30,
+                8000,
+            ) {
+                Ok(mut enc) => {
+                    let t2 = std::time::Instant::now();
+                    let mut bytes = 0usize;
+                    let mut stream: Vec<u8> = Vec::new();
+                    let mut err = None;
+                    for _ in 0..30 {
+                        match enc.encode_import(&import) {
+                            Ok(pkt) => {
+                                bytes += pkt.len();
+                                stream.extend_from_slice(&pkt);
+                            }
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(tail) = enc.flush() {
+                        bytes += tail.len();
+                        stream.extend_from_slice(&tail);
+                    }
+                    // Write the elementary stream out so it can be fed to ffprobe: the
+                    // muxer downstream takes raw Annex-B on stdin, and "NVENC produced
+                    // bytes" is not the same claim as "those bytes are a parseable
+                    // stream".
+                    let dump = std::env::temp_dir().join("cck-nvenc-probe.h265");
+                    let _ = std::fs::write(&dump, &stream);
+                    log::info!("cuda-import-test: elementary stream written to {}", dump.display());
+                    let per_frame = t2.elapsed().as_secs_f64() * 1000.0 / 30.0;
+                    match err {
+                        Some(e) => format!("NVENC encode FAILED: {e}"),
+                        None => format!(
+                            "NVENC encoded 30 frames -> {bytes} bytes, {per_frame:.2}ms per \
+                             frame (import + encode, no CPU copy)"
+                        ),
+                    }
+                }
+                Err(e) => format!("NVENC encoder would not open: {e}"),
+            };
+            format!(
+                "cuda-import-test: SUCCESS on output {name}\n  \
+                 device={} size={}x{} format=0x{:08x} modifier=0x{:016x}\n  \
+                 imported to CUDA device memory: ptr=0x{ptr:x} pitch={pitch}\n  \
+                 import={import_ms:.2}ms, per-frame refresh={refresh_ms:.2}ms \
+                 (device-to-device blit){}\n  \
+                 {encode}",
+                target.render_node,
+                target.width,
+                target.height,
+                target.fourcc,
+                target.modifier,
+                match refresh {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(" (refresh FAILED: {e})"),
+                },
+            )
+        }
+        Err(e) => format!(
+            "cuda-import-test: import FAILED on output {name}: {e}\n  \
+             device={} size={}x{} format=0x{:08x} modifier=0x{:016x}",
+            target.render_node, target.width, target.height, target.fourcc, target.modifier,
+        ),
     }
 }
 
@@ -922,7 +1390,7 @@ fn record_screencopy_zero_copy_owned(
         "hevc" => true,
         _ => ew.max(eh) > 4096,
     };
-    let mut enc = match crate::encode::gpu::Encoder::new(
+    let mut enc = match ZcEncoder::new(
         &targets[0].render_node,
         hevc,
         cw,
@@ -943,8 +1411,8 @@ fn record_screencopy_zero_copy_owned(
     }
 
     // --- committed: run the capture+encode session to completion ---
-    let fourcc = targets[0].fourcc;
-    let modifier = targets[0].modifier;
+    // The format/modifier travel with each target now: `ZcEncoder::encode` reads them
+    // off the buffer it is handed, since the NVENC arm keys its imports per buffer.
     let damage = [Rect { x: 0, y: 0, width: cw as i32, height: ch as i32 }];
     let frame_dur = std::time::Duration::from_secs_f64(1.0 / fps as f64);
 
@@ -1058,7 +1526,7 @@ fn record_screencopy_zero_copy_owned(
                 }
             }
             match data.result.clone() {
-                Some(Ok(_)) => match enc.encode_dmabuf(fourcc, modifier, &target.encode_planes()) {
+                Some(Ok(_)) => match enc.encode(target) {
                     Ok(bytes) => {
                         if !bytes.is_empty() && stdin.write_all(&bytes).is_err() {
                             break 'grab;
@@ -1119,7 +1587,7 @@ fn record_screencopy_zero_copy_owned(
                 let extra = trailing_frames_needed(frames, fps, pump_out.final_media);
                 let last_target = &targets[last_idx.wrapping_sub(1) % POOL];
                 for _ in 0..extra {
-                    match enc.encode_dmabuf(fourcc, modifier, &last_target.encode_planes()) {
+                    match enc.encode(last_target) {
                         Ok(bytes) => {
                             if !bytes.is_empty() && stdin.write_all(&bytes).is_err() {
                                 break;

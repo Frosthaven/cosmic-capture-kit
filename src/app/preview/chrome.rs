@@ -1174,24 +1174,29 @@ impl App {
         preview: &PreviewState,
     ) -> Vec<Element<'static, Msg>> {
         let pid = preview.window;
-        let mut items = vec![
-            titlebar_button(
+        let mut items: Vec<Element<'static, Msg>> = Vec::new();
+        // DRAGON-427: no "pop out to fullscreen" button on Windows 10 — there is no overlay
+        // editor to pop out to there (the overlay would inherit the software rasterizer that
+        // cannot draw these shader layers). Offering a button that refuses is worse than not
+        // offering it. Every other platform keeps the button exactly where it was.
+        if crate::platform::overlay_preview_available() {
+            items.push(titlebar_button(
                 pid,
                 "view-fullscreen-symbolic",
                 "Fullscreen overlay".to_string(),
                 PreviewMsg::ToggleAppearance,
                 crate::app::theme::accent,
-            ),
-            // DRAGON-353: Settings, immediately to the RIGHT of the appearance toggle — the
-            // same slot the overlay header puts it in, so the two chromes agree.
-            titlebar_button(
-                pid,
-                "emblem-system-symbolic",
-                "Settings".to_string(),
-                PreviewMsg::OpenSettings,
-                crate::app::theme::accent,
-            ),
-        ];
+            ));
+        }
+        // DRAGON-353: Settings, immediately to the RIGHT of the appearance toggle — the
+        // same slot the overlay header puts it in, so the two chromes agree.
+        items.push(titlebar_button(
+            pid,
+            "emblem-system-symbolic",
+            "Settings".to_string(),
+            PreviewMsg::OpenSettings,
+            crate::app::theme::accent,
+        ));
         items.extend(Tb::flat_history(&preview.edit, &self.keymap, move |i, t, m, c| {
             titlebar_button(pid, i, t, m, c)
         }));

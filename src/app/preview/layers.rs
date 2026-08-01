@@ -308,21 +308,19 @@ impl shader::Primitive for LayerStackPrimitive {
         // iced multiplies our bounds by), which is what bounds the preview's zoom. The app
         // never holds a `wgpu::Device`; `prepare` is the only place both facts are in hand.
         crate::widgets::gpu::observe(device, viewport);
-        // DRAGON-366 (TEMPORARY): time the prepare and record, per layer, whether this frame
-        // actually re-uploaded its raster — a layer re-uploading every frame is paying its
-        // full raster cost per frame. Remove with `crate::widgets::dragon366`.
-        let d366_start = std::time::Instant::now();
-        let mut d366_uploads: Vec<(u32, u32, u32, bool)> = Vec::with_capacity(self.layers.len());
-        for layer in &self.layers {
-            let before = pipeline.slots.get(&layer.key).map(|s| s.seq);
-            pipeline.upsert(device, queue, layer.key, &layer.frame, layer.dest);
-            let uploaded = before != Some(layer.frame.seq);
-            d366_uploads.push((layer.key.slot.0, layer.frame.w, layer.frame.h, uploaded));
+        // DRAGON-454: the first time any layer reaches the GPU. Pipeline + bind-group creation
+        // and the first texture upload all happen under this call, on the render thread — so on
+        // the editor's launch timeline this is where "first-frame wgpu work" lands.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static FIRST: AtomicBool = AtomicBool::new(false);
+            if !self.layers.is_empty() && !FIRST.swap(true, Ordering::Relaxed) {
+                crate::util::timing_mark("preview: FIRST layer-stack GPU prepare (begin)");
+            }
         }
-        crate::widgets::dragon366::layers_prepared(
-            d366_start.elapsed().as_secs_f64() * 1000.0,
-            &d366_uploads,
-        );
+        for layer in &self.layers {
+            pipeline.upsert(device, queue, layer.key, &layer.frame, layer.dest);
+        }
         // Two reclaims in one pass over the process-wide slot map:
         //  * WITHIN a window this primitive drew, anything the WINDOW stopped drawing (e.g. the
         //    covermark was cleared, or a text box was deleted) is freed — `window_keys` is that
@@ -697,6 +695,35 @@ pub(super) fn rgba_handle_frame(handle: &cosmic::widget::image::Handle) -> Optio
         }
         _ => None,
     }
+}
+
+/// Windows QA hook (DRAGON-395): whether to BYPASS the DRAGON-235 fold and let the overlay
+/// preview take the portable `widget::image` + separate-covermark path instead.
+///
+/// `CCK_TEST_UNFOLD_COVERMARK=1`. A review aid in the same spirit as
+/// `CCK_STARTUP_BUDGET_SECS`, not a supported setting — it exists because the DRAGON-235
+/// premise (iced's raster pipeline does not composite on the premultiplied transparent
+/// overlay surface) has never been verified on a machine that could run it, and the fold it
+/// justifies costs a z-order deviation from Linux and macOS (see [`rgba_handle_frame`] and
+/// the fold sites in `preview::image` / `preview::video`). DRAGON-427 removed the overlay
+/// editor from Windows 10, so the arm is Windows-11-only now — which is finally a machine we
+/// have. One toggle, one A/B, and the answer either deletes the fold or documents it.
+///
+/// Read ONCE per process and cached: the view path this gates runs every frame.
+#[cfg(windows)]
+pub(super) fn unfold_covermark() -> bool {
+    static UNFOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNFOLD.get_or_init(|| {
+        let on = std::env::var_os("CCK_TEST_UNFOLD_COVERMARK").is_some_and(|v| v == "1");
+        if on {
+            log::warn!(
+                "CCK_TEST_UNFOLD_COVERMARK=1: the overlay preview will draw its base through \
+                 widget::image with the covermark as a separate layer (the DRAGON-235 fold is \
+                 bypassed). If the base or the covermark renders blank, DRAGON-235 still holds."
+            );
+        }
+        on
+    })
 }
 
 /// The CPU-side producer state a dynamic layer needs to coalesce off-thread refreshes:

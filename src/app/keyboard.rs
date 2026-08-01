@@ -19,7 +19,6 @@ impl App {
             Action::CopyText => Msg::Detect(DetectMsg::TextCopy),
             Action::SelectAllText => Msg::Detect(DetectMsg::TextSelectAll),
             Action::DeselectText => Msg::Detect(DetectMsg::TextDeselect),
-            Action::RegionCopy => Msg::Capture(CaptureMsg::CopySelection),
             Action::PreviewSave => return pv(PreviewMsg::Save),
             Action::PreviewSaveAs => return pv(PreviewMsg::SaveAs),
             Action::PreviewCopy => return pv(PreviewMsg::Copy),
@@ -207,20 +206,12 @@ impl App {
         {
             return self.update(Msg::WindowChrome(WindowChromeMsg::Close));
         }
-        // Region quick-actions (Copy selection) fire in region-draw mode. This lane is
-        // checked BEFORE the Overlay lane so the shared primary+C prefers "copy the drawn
-        // region" here over "copy recognized text" (Overlay/OCR) whenever a region is
-        // actually drawn — the two live in SEPARATE contexts (Region vs Overlay) so
-        // neither steals the other's bind, and only one is active at a time. With no
-        // region drawn yet the lane is skipped and primary+C falls through to the OCR
-        // copy (scanner) exactly as before, so nothing regresses.
-        if self.mode == Mode::Region
-            && self.normalized_region().is_some()
-            && let Some(action) = self.keymap.action_for(Context::Region, modifiers, &key)
-            && let Some(msg) = Self::action_msg(action, self.focused_preview_id())
-        {
-            return self.update(msg);
-        }
+        // DRAGON-451: a Region lane sat here, checked BEFORE the Overlay lane so that with a
+        // region drawn, primary+C meant "copy the drawn region and finish" instead of the
+        // OCR "copy recognized text". That quick-action is retired — the global "(no editor)"
+        // hotkeys cover it from outside the overlay — so primary+C now always reaches the
+        // Overlay lane below, which is what it already did whenever no region was drawn.
+        //
         // "Search settings" is a FIXED, non-configurable shortcut (DRAGON-158):
         // Ctrl+F on Linux/Windows, Cmd+F on macOS. It is not part of the editable
         // keymap, so match it here directly (the handler no-ops unless the settings

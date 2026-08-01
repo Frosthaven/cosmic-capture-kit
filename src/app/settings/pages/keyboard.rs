@@ -5,6 +5,8 @@
 
 use super::super::*;
 use super::super::row::{Item, SectionSpec};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use super::super::row::Severity;
 use crate::shortcuts::{Action, Shortcut};
 
 impl crate::app::App {
@@ -13,33 +15,30 @@ impl crate::app::App {
         // the current section while the group matches, else start a new one.
         let mut secs: Vec<SectionSpec<'_>> = Vec::new();
 
-        // macOS (DRAGON-130) / Windows (DRAGON-237) / DRAGON-295: the resident daemon's three
-        // global capture hotkeys sit FIRST, in their own section at the TOP. Unlike the in-app
-        // bindings below (iced key-capture), these are process-wide OS hotkeys owned by the
-        // tray/menu-bar daemon, so each is edited as a validated SPEC string ("PrintScreen",
-        // "Cmd+Shift+2", …). All three default UNSET (opt-in). cfg-gated so the Linux page
-        // stays byte-identical (Linux's capture key is a COSMIC custom shortcut, not owned here).
+        // macOS (DRAGON-130) / Windows (DRAGON-237) / DRAGON-295 / DRAGON-428: the resident
+        // daemon's six global capture hotkeys sit FIRST, in their own section at the TOP.
+        // Unlike the in-app bindings below (iced key-capture), these are process-wide OS
+        // hotkeys owned by the tray/menu-bar daemon, so each is edited as a validated SPEC
+        // string ("PrintScreen", "Cmd+Shift+2", …). All six default UNSET (opt-in). cfg-gated
+        // so the Linux page stays byte-identical, AND because these rows do not apply there at
+        // all: Linux's capture key is a COSMIC custom shortcut in the user's own desktop
+        // config, and its only in-app global bindings are the RECORDING hotkeys, which go
+        // through the xdg portal (`platform::global_shortcuts`) and are bound by the desktop.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             use crate::app::CaptureHotkeySlot;
             // One row per slot, byte-for-byte the SAME anatomy as the in-app shortcut rows
             // below (label + chord button + "x" clear), just wired to a daemon global hotkey
-            // slot instead of an in-app `Action`.
-            let items: Vec<Item<'_>> = [
-                (CaptureHotkeySlot::AllInOne, "Capture All In One", self.capture_hotkey.as_str()),
-                (
-                    CaptureHotkeySlot::ActiveWindow,
-                    "Capture Active Window",
-                    self.capture_active_window_hotkey.as_str(),
-                ),
-                (
-                    CaptureHotkeySlot::ActiveMonitor,
-                    "Capture Active Monitor",
-                    self.capture_active_monitor_hotkey.as_str(),
-                ),
-            ]
+            // slot instead of an in-app `Action`. The order and the labels come from
+            // `CaptureHotkeySlot::ALL` / `label`, which the DRAGON-452 duplicate check and
+            // both daemons' registration tables share, so the three can never drift.
+            // DRAGON-428's "(no editor)" twins sit after all three originals (that is the
+            // order `ALL` declares) so the pairs read as a group rather than interleaving.
+            let items: Vec<Item<'_>> = CaptureHotkeySlot::ALL
             .into_iter()
-            .map(|(slot, label_text, spec)| {
+            .map(|slot| {
+                let label_text = slot.label();
+                let spec = self.capture_hotkey_slot(slot);
                 let capturing = self.settings.capture_hotkey_rebinding == Some(slot);
                 // The current chord rendered as native modifier SYMBOLS on macOS (DRAGON-294:
                 // ⌃⌥⇧⌘), or Windows-native modifier NAMES on Windows (Ctrl/Alt/Shift/Win — the
@@ -79,12 +78,20 @@ impl crate::app::App {
                 ])
                     .spacing(4.0)
                     .align_y(Alignment::Center);
-                // All three default UNSET, so the row reset slot re-clears WITHOUT recording
+                // DRAGON-452: what the last recorded chord did to THIS row, in the helper
+                // line. A row that took a chord says where it came from; the row that lost
+                // one says who took it. A duplicate is never accepted in silence.
+                let (note, sev) = self.capture_hotkey_row_note(slot);
+                // All six default UNSET, so the row reset slot re-clears WITHOUT recording
                 // a keypress; shown only when the row currently holds a value.
-                Item::new(label_text, "", control).reset_to(
+                let mut item = Item::new(label_text, note, control).reset_to(
                     Msg::Settings(SettingsMsg::SetCaptureHotkey(slot, String::new())),
                     !spec.is_empty(),
-                )
+                );
+                if let Some(sev) = sev {
+                    item = item.status(sev);
+                }
+                item
             })
             .collect();
             secs.push(SectionSpec {
@@ -138,5 +145,53 @@ impl crate::app::App {
             }
         }
         secs
+    }
+
+    /// DRAGON-452: the helper line for ONE global capture-hotkey row, describing what the
+    /// last recorded chord did to it, plus the severity that colours it. Empty (and `None`)
+    /// when this row was not involved, which is the normal case.
+    ///
+    /// Three things can be said, and the winning row can say two of them at once:
+    ///
+    /// * the row TOOK a chord that another row held, and that row is now unbound;
+    /// * the row LOST its chord to another row;
+    /// * the OS refused to register the chord because another app already owns it globally
+    ///   (Windows, where the settings process can ask; see the `SetCaptureHotkey` handler).
+    ///
+    /// The point is that a duplicate is never accepted in silence: whichever way the collision
+    /// resolved, the rows involved say so in plain words.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn capture_hotkey_row_note(
+        &self,
+        slot: crate::app::CaptureHotkeySlot,
+    ) -> (String, Option<Severity>) {
+        let Some(notice) = self.settings.capture_hotkey_notice else {
+            return (String::new(), None);
+        };
+        let mut parts: Vec<String> = Vec::new();
+        let mut sev: Option<Severity> = None;
+        if notice.slot == slot {
+            if let Some(from) = notice.taken_from {
+                parts.push(format!(
+                    "This shortcut was taken from {}. That shortcut is now unbound.",
+                    from.label()
+                ));
+                sev = Some(Severity::Warn);
+            }
+            if notice.os_refused {
+                parts.push(
+                    "Another app is already using this shortcut, so it will not work here."
+                        .to_string(),
+                );
+                sev = Some(Severity::Error);
+            }
+        } else if notice.taken_from == Some(slot) {
+            parts.push(format!(
+                "Unbound. {} now uses this shortcut.",
+                notice.slot.label()
+            ));
+            sev = Some(Severity::Warn);
+        }
+        (parts.join(" "), sev)
     }
 }

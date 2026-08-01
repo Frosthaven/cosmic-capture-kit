@@ -1474,6 +1474,22 @@ pub fn apply_covermark(base: &mut RgbaImage, cm: Option<&Covermark>) {
 /// edited file WITHOUT touching the saved original). Returns `dst`'s size. At least one
 /// of a covermark or a non-empty annotation scene must hold (the image edits).
 ///
+/// # A still is written as PNG. The destination extension does not select a format.
+///
+/// That is the whole format rule (DRAGON-455), and it is stated here once because the two
+/// halves of this code drifting apart IS the bug it fixes. This function used to branch on
+/// `dst`'s extension: with a pixel edit it round-tripped through a temp PNG and re-encoded
+/// to whatever the name said, while an UNEDITED save never reached here at all and plainly
+/// copied PNG bytes under the same name. The identical user action therefore produced a
+/// real JPEG or a mislabeled PNG depending on whether they had happened to draw on the
+/// capture first. There is now one answer: PNG, always, through
+/// [`crate::media::png::save_png`] — which is also what carries the `--inspect` `Comment`
+/// chunk (DRAGON-445).
+///
+/// The naming side is [`super::naming::png_name`], which makes every still destination SAY
+/// png before it gets here, so no caller can produce a name this write would contradict.
+/// RECORDINGS are a separate world: [`bake_video`] does honour the destination container.
+///
 /// Compositing order (DRAGON-330 true-layer stack) — display and bake share the ONE core:
 /// 0. the global DIM (DRAGON-329) darkens the base at the very bottom, punched out by the
 ///    knockout rects (spotlight / box / highlight / box-highlight) via
@@ -1495,7 +1511,6 @@ pub fn bake_image(
     crop: Option<CropRect>,
 ) -> std::io::Result<u64> {
     let err = |e: String| std::io::Error::other(e);
-    let dst_png = super::ext_of(dst).as_deref() == Some("png");
     if cm.is_some() || !annotations.is_empty() || dim > 0.0 || crop.is_some() {
         let mut rgba = ::image::open(src).map_err(|e| err(e.to_string()))?.into_rgba8();
         // The PRISTINE full-res source, used ONLY to size the content-aware pixelate cell — the
@@ -1539,20 +1554,80 @@ pub fn bake_image(
             }
             None => super::annotate::apply_annotations(&mut rgba, annotations, curve),
         }
-        if dst_png {
-            rgba.save_with_format(dst, ::image::ImageFormat::Png).map_err(|e| err(e.to_string()))?;
-        } else {
-            // Encode PNG to a temp, then transcode to dst's own format (extension stays
-            // truthful for a non-PNG external target).
-            let tmp = dst.with_extension("baking.tmp.png");
-            rgba.save_with_format(&tmp, ::image::ImageFormat::Png).map_err(|e| err(e.to_string()))?;
-            let decoded = ::image::open(&tmp).map_err(|e| err(e.to_string()))?;
-            decoded.save(dst).map_err(|e| err(e.to_string()))?;
-            let _ = std::fs::remove_file(&tmp);
+        // DRAGON-445: write through `media::png::save_png`, NOT `save_with_format`, so the
+        // baked file keeps the `Comment` text chunk `--inspect` reads
+        // (`type/source/mode/cursor`). `save_with_format` writes no ancillary chunks, so
+        // every edited save silently lost the provenance a plain capture keeps — and it is
+        // exactly the edited files someone is most likely to be asked about later.
+        //
+        // The metadata carried forward is the SOURCE's own comment, not a freshly built
+        // one: this file IS that capture, edited. Re-deriving it here would describe the
+        // editor session rather than the capture, and the fields (source compositor,
+        // selection mode, cursor on/off) are facts about the grab that editing cannot
+        // change. A source without a comment (an imported/external image) yields `None`
+        // and `save_png` then writes no chunk — the honest answer, not an invented one.
+        let provenance = crate::media::png::read_png_metadata(src).unwrap_or_default();
+        if !crate::media::png::save_png(&rgba, dst, &provenance) {
+            return Err(err(format!("could not write the baked PNG to {}", dst.display())));
         }
-    } else if src != dst {
-        // No pixel edit but a distinct dst (Copy): start from a copy.
-        std::fs::copy(src, dst)?;
+        std::fs::metadata(dst).map(|m| m.len())
+    } else {
+        // No pixel edit at all: this is the plain delivery, which has its own (documented)
+        // rule about when bytes may be copied instead of re-encoded.
+        save_unedited_still(src, dst)
+    }
+}
+
+/// The 8-byte PNG signature — the ONLY honest way to ask "is this file a PNG". Deliberately
+/// not `ext_of(path) == "png"`: a file's name is the one thing that has already been wrong
+/// here, and the whole of DRAGON-455 is about not trusting it.
+fn is_png_file(path: &Path) -> bool {
+    use std::io::Read;
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    let mut head = [0u8; 8];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && head == SIGNATURE
+}
+
+/// Deliver an UNEDITED still to `dst` — a Save As (or a Copy) of a capture nobody has drawn
+/// on. Returns `dst`'s size.
+///
+/// `dst` always NAMES png ([`super::naming::png_name`]) and a still is always WRITTEN as PNG
+/// ([`bake_image`]), so there are exactly two cases, and the byte copy is a decision rather
+/// than something we fell into:
+///
+/// * a source that already IS a PNG is copied BYTE FOR BYTE. Re-encoding identical pixels
+///   would gain nothing, churn the file, and drop the `--inspect` `Comment` chunk unless we
+///   re-attached it (DRAGON-445) — the original bytes carry it for free. PNG in, the same
+///   PNG out, is the honest answer.
+/// * a source that is NOT a PNG — an external image opened with `--preview`, since the
+///   editor reads jpg/webp/gif/… too — is decoded and RE-WRITTEN as a PNG. Copying it would
+///   put foreign bytes in a file whose name says PNG, which is the same lie from the other
+///   direction (DRAGON-455).
+///
+/// Which case applies is read from the source's MAGIC BYTES ([`is_png_file`]), never from
+/// its name. `dst == src` is a no-op: copying a file onto itself truncates it.
+///
+/// The DECODE in the second case is still `image`'s, which picks its decoder from the
+/// source's extension — so a MISLABELED source (JPEG bytes called `.png`) fails loudly here
+/// rather than converting. That is deliberate and it keeps the two halves agreeing:
+/// [`bake_image`] decodes the same way, and so does the preview's own open path
+/// (`super::image`), which means such a file could never have been displayed in the first
+/// place. Making the READ side content-based is a separate, larger call.
+pub fn save_unedited_still(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    if src != dst {
+        if is_png_file(src) {
+            std::fs::copy(src, dst)?;
+        } else {
+            let rgba = ::image::open(src).map_err(|e| std::io::Error::other(e.to_string()))?.into_rgba8();
+            // No provenance to carry: a non-PNG source cannot have held a PNG text chunk.
+            if !crate::media::png::save_png(&rgba, dst, "") {
+                return Err(std::io::Error::other(format!(
+                    "could not write {} as a PNG to {}",
+                    src.display(),
+                    dst.display()
+                )));
+            }
+        }
     }
     std::fs::metadata(dst).map(|m| m.len())
 }
@@ -2914,6 +2989,73 @@ mod tests {
         TmpPng(std::env::temp_dir().join(format!("cck-dragon389-{}-{tag}.png", std::process::id())))
     }
 
+    // ── DRAGON-445: the bake keeps the --inspect provenance ──────────────────
+
+    /// The capture comment a real grab embeds, in the exact shape
+    /// `App::screenshot_metadata` writes.
+    const PROVENANCE: &str =
+        "Cosmic Capture Kit | type=photo | source=cosmic | mode=region | cursor=off";
+
+    /// THE regression: an edited/baked PNG keeps the `Comment` chunk `--inspect` reads.
+    ///
+    /// `bake_image` wrote through `image::save_with_format`, which emits no ancillary
+    /// chunks, so every save that went through the editor silently dropped the provenance a
+    /// plain capture keeps — and an edited file is exactly the one someone is later asked
+    /// where it came from.
+    #[test]
+    fn dragon445_a_baked_png_keeps_its_capture_provenance() {
+        let src = tmp_png("prov-src");
+        let dst = tmp_png("prov-dst");
+        // Write the source the way a real capture does: pixels PLUS the comment.
+        assert!(crate::media::png::save_png(&flat(40, 40, 128), &src.0, PROVENANCE));
+        assert_eq!(crate::media::png::read_png_metadata(&src.0).as_deref(), Some(PROVENANCE));
+
+        // Any real edit takes the bake path; a filled box is the cheapest.
+        let items = vec![filled_box(1, 4.0, 4.0, 12.0, 12.0)];
+        bake_image(&src.0, &dst.0, None, &items, CURVE, 0.0, None).unwrap();
+
+        assert_eq!(
+            crate::media::png::read_png_metadata(&dst.0).as_deref(),
+            Some(PROVENANCE),
+            "the baked PNG must carry the source capture's Comment chunk"
+        );
+        // And it is still a real edited image, not a copy of the source.
+        let out = ::image::open(&dst.0).unwrap().into_rgba8();
+        assert_eq!(out.dimensions(), (40, 40));
+        assert!(is_red(out.get_pixel(9, 9)), "the edit is present in the baked pixels");
+    }
+
+    /// An IN-PLACE save (src == dst, the ordinary "Save" button) keeps it too — the read of
+    /// the source comment has to happen before the file is rewritten.
+    #[test]
+    fn dragon445_an_in_place_bake_keeps_its_provenance() {
+        let f = tmp_png("prov-inplace");
+        assert!(crate::media::png::save_png(&flat(40, 40, 128), &f.0, PROVENANCE));
+        let items = vec![filled_box(1, 4.0, 4.0, 12.0, 12.0)];
+        bake_image(&f.0, &f.0, None, &items, CURVE, 0.0, None).unwrap();
+        assert_eq!(crate::media::png::read_png_metadata(&f.0).as_deref(), Some(PROVENANCE));
+    }
+
+    /// A source with NO comment (an imported/external image opened with `--preview`) must
+    /// not gain an invented one. `save_png` writes no chunk for an empty string, which is
+    /// the honest answer: we do not know where that file came from.
+    #[test]
+    fn dragon445_a_source_without_provenance_gains_none() {
+        let src = tmp_png("prov-none-src");
+        let dst = tmp_png("prov-none-dst");
+        // Written the plain way — no Comment chunk, like any third-party PNG.
+        flat(40, 40, 128).save_with_format(&src.0, ::image::ImageFormat::Png).unwrap();
+        assert_eq!(crate::media::png::read_png_metadata(&src.0), None);
+
+        let items = vec![filled_box(1, 4.0, 4.0, 12.0, 12.0)];
+        bake_image(&src.0, &dst.0, None, &items, CURVE, 0.0, None).unwrap();
+        assert_eq!(
+            crate::media::png::read_png_metadata(&dst.0),
+            None,
+            "a bake must not invent provenance the source never had"
+        );
+    }
+
     #[test]
     fn dragon389_bake_carries_annotation_onto_the_extension() {
         let src = tmp_png("survive-src");
@@ -3066,5 +3208,133 @@ mod tests {
         let out = ::image::open(&dst.0).unwrap().into_rgba8();
         assert_eq!(out.dimensions(), (40, 40));
         assert_eq!(out.as_raw(), expected.as_raw(), "an uncropped bake stays the historical apply_annotations, byte-for-byte");
+    }
+
+    // ── DRAGON-455: a still is written as PNG, whatever the destination is called ─────
+
+    /// A temp path with an ARBITRARY extension, removed on drop — the point of these tests
+    /// is that the name does not decide the contents, so they need names that are not `.png`.
+    fn tmp_named(tag: &str, ext: &str) -> TmpPng {
+        TmpPng(
+            std::env::temp_dir()
+                .join(format!("cck-dragon455-{}-{tag}.{ext}", std::process::id())),
+        )
+    }
+
+    /// What a file ACTUALLY is, read from its first bytes. Every assertion below goes
+    /// through this: trusting the extension is precisely the mistake that produced the bug.
+    fn sniff(path: &std::path::Path) -> &'static str {
+        let bytes = std::fs::read(path).expect("written file");
+        match bytes.as_slice() {
+            [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, ..] => "png",
+            [0xFF, 0xD8, 0xFF, ..] => "jpeg",
+            _ => "unknown",
+        }
+    }
+
+    /// THE RULE: an EDITED still bakes to PNG no matter what the destination is called. This
+    /// used to be the transcode branch — `shot.jpg` really became a JPEG — while the
+    /// unedited half of the same action copied PNG bytes under the same name.
+    #[test]
+    fn dragon455_an_edited_still_is_png_whatever_the_destination_is_called() {
+        let src = tmp_png("rule-src");
+        assert!(crate::media::png::save_png(&flat(40, 40, 128), &src.0, PROVENANCE));
+        let items = vec![filled_box(1, 4.0, 4.0, 12.0, 12.0)];
+        for ext in ["png", "jpg", "JPG", "webp", "xyz"] {
+            let dst = tmp_named("rule-dst", ext);
+            bake_image(&src.0, &dst.0, None, &items, CURVE, 0.0, None).unwrap();
+            assert_eq!(sniff(&dst.0), "png", "a .{ext} destination must still receive PNG bytes");
+            // And it is a real edited image, decodable as the PNG it claims to be.
+            let out = ::image::load(
+                std::io::BufReader::new(std::fs::File::open(&dst.0).unwrap()),
+                ::image::ImageFormat::Png,
+            )
+            .unwrap()
+            .into_rgba8();
+            assert_eq!(out.dimensions(), (40, 40));
+            assert!(is_red(out.get_pixel(9, 9)), "the edit is present in the .{ext} file");
+            // DRAGON-445 rides along on every one of them now, not just the `.png` arm.
+            assert_eq!(
+                crate::media::png::read_png_metadata(&dst.0).as_deref(),
+                Some(PROVENANCE),
+                "provenance must survive to a .{ext} destination too"
+            );
+        }
+    }
+
+    /// The UNEDITED half, which never reached `bake_image` at all: a PNG source is delivered
+    /// BYTE FOR BYTE. That is the deliberate answer, not a shortcut — identical pixels, and
+    /// the `--inspect` chunk carried through for free (DRAGON-445).
+    #[test]
+    fn dragon455_an_unedited_png_is_delivered_byte_for_byte() {
+        let src = tmp_png("copy-src");
+        let dst = tmp_png("copy-dst");
+        assert!(crate::media::png::save_png(&flat(40, 40, 128), &src.0, PROVENANCE));
+        save_unedited_still(&src.0, &dst.0).unwrap();
+        assert_eq!(sniff(&dst.0), "png");
+        assert_eq!(
+            std::fs::read(&dst.0).unwrap(),
+            std::fs::read(&src.0).unwrap(),
+            "a PNG to PNG save must not re-encode"
+        );
+        assert_eq!(crate::media::png::read_png_metadata(&dst.0).as_deref(), Some(PROVENANCE));
+        // Saving onto ITSELF is a no-op, not a truncation.
+        save_unedited_still(&src.0, &src.0).unwrap();
+        assert_eq!(crate::media::png::read_png_metadata(&src.0).as_deref(), Some(PROVENANCE));
+    }
+
+    /// The other direction, and the one that would have re-created the bug: the editor opens
+    /// external jpg/webp/… files, so an UNEDITED save of one must be RE-WRITTEN as a PNG.
+    /// Copying its bytes to a `.png` name is the same lie, just from the source side.
+    #[test]
+    fn dragon455_an_unedited_non_png_source_is_rewritten_as_a_real_png() {
+        let src = tmp_named("jpeg-src", "jpg");
+        let dst = tmp_png("jpeg-dst");
+        // A real JPEG on disk, sniffed to prove the fixture itself is honest.
+        ::image::DynamicImage::ImageRgba8(flat(40, 40, 128))
+            .to_rgb8()
+            .save_with_format(&src.0, ::image::ImageFormat::Jpeg)
+            .unwrap();
+        assert_eq!(sniff(&src.0), "jpeg", "the fixture must really be a JPEG");
+
+        save_unedited_still(&src.0, &dst.0).unwrap();
+        assert_eq!(sniff(&dst.0), "png", "a non-PNG source must be re-written, never copied");
+        let out = ::image::load(
+            std::io::BufReader::new(std::fs::File::open(&dst.0).unwrap()),
+            ::image::ImageFormat::Png,
+        )
+        .unwrap()
+        .into_rgba8();
+        assert_eq!(out.dimensions(), (40, 40));
+        // No provenance is invented for a file that never carried any.
+        assert_eq!(crate::media::png::read_png_metadata(&dst.0), None);
+    }
+
+    /// The decision is read from the SOURCE'S BYTES, never from its name — a mislabeled file
+    /// is exactly what this bug used to produce, so it must not be able to steer the write.
+    #[test]
+    fn dragon455_the_copy_shortcut_is_decided_by_magic_bytes() {
+        // PNG bytes under a `.jpg` name: still a byte copy, because it IS a PNG.
+        let liar = tmp_named("liar-src", "jpg");
+        let dst = tmp_png("liar-dst");
+        assert!(crate::media::png::save_png(&flat(8, 8, 200), &liar.0, PROVENANCE));
+        assert!(is_png_file(&liar.0), "the sniff reads the bytes, not the .jpg name");
+        save_unedited_still(&liar.0, &dst.0).unwrap();
+        assert_eq!(std::fs::read(&dst.0).unwrap(), std::fs::read(&liar.0).unwrap());
+
+        // The mirror image — JPEG bytes under a `.png` name — takes the re-write arm rather
+        // than the copy arm, so the lie is never propagated. It then FAILS there, loudly and
+        // with nothing written, because `image`'s decoder is chosen by the extension: the
+        // same way `bake_image` and the preview's own open path read a file, so a source
+        // like this could never have been displayed to edit in the first place.
+        let other = tmp_named("liar2-src", "png");
+        let dst2 = tmp_png("liar2-dst");
+        ::image::DynamicImage::ImageRgba8(flat(8, 8, 200))
+            .to_rgb8()
+            .save_with_format(&other.0, ::image::ImageFormat::Jpeg)
+            .unwrap();
+        assert!(!is_png_file(&other.0));
+        assert!(save_unedited_still(&other.0, &dst2.0).is_err(), "a mislabeled source must not be copied");
+        assert!(!dst2.0.exists(), "a refused save writes nothing");
     }
 }

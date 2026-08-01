@@ -18,6 +18,55 @@ pub enum CaptureHotkeySlot {
     ActiveWindow,
     /// "Capture Active Monitor" — immediately captures the monitor under the cursor, no picker.
     ActiveMonitor,
+    /// DRAGON-428: "Capture All In One (no editor)" — the same picker overlay, but the
+    /// capture is saved, copied and notified without the preview editor opening.
+    AllInOneNoEditor,
+    /// DRAGON-428: "Capture Active Window (no editor)".
+    ActiveWindowNoEditor,
+    /// DRAGON-428: "Capture Active Monitor (no editor)".
+    ActiveMonitorNoEditor,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+impl CaptureHotkeySlot {
+    /// Every slot, in the order the settings page lists them AND the order both daemons
+    /// register them (`load_specs` on Windows, the `Spawn` slot list on macOS). One order,
+    /// three consumers: change it here and the rows, the registration and the DRAGON-452
+    /// duplicate check move together.
+    pub const ALL: [Self; 6] = [
+        Self::AllInOne,
+        Self::ActiveWindow,
+        Self::ActiveMonitor,
+        Self::AllInOneNoEditor,
+        Self::ActiveWindowNoEditor,
+        Self::ActiveMonitorNoEditor,
+    ];
+
+    /// This slot's position in [`Self::ALL`] — the index the pure
+    /// [`crate::shortcuts::capture_hotkey_conflict`] check speaks in.
+    pub fn index(self) -> usize {
+        match self {
+            Self::AllInOne => 0,
+            Self::ActiveWindow => 1,
+            Self::ActiveMonitor => 2,
+            Self::AllInOneNoEditor => 3,
+            Self::ActiveWindowNoEditor => 4,
+            Self::ActiveMonitorNoEditor => 5,
+        }
+    }
+
+    /// The row label, and the name used when telling the user which shortcut lost its
+    /// binding (DRAGON-452). Matches the daemons' slot names word for word.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllInOne => "Capture All In One",
+            Self::ActiveWindow => "Capture Active Window",
+            Self::ActiveMonitor => "Capture Active Monitor",
+            Self::AllInOneNoEditor => "Capture All In One (no editor)",
+            Self::ActiveWindowNoEditor => "Capture Active Window (no editor)",
+            Self::ActiveMonitorNoEditor => "Capture Active Monitor (no editor)",
+        }
+    }
 }
 
 /// Which window-capture border a colour-picker edit targets (DRAGON-191).

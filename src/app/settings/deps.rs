@@ -51,6 +51,10 @@ pub(in crate::app::settings) enum DepId {
     Pactl,
     /// Optional: hardware video encoding (NVENC / VAAPI).
     HwEncoder,
+    /// Optional (Linux): GPU-resident recording on an NVIDIA-rendered session, which
+    /// needs the CUDA driver and EGL dmabuf import (DRAGON-457).
+    #[cfg(all(target_os = "linux", feature = "zero-copy"))]
+    CudaImport,
     /// Required (macOS): the Screen Recording TCC grant — capture is blank without it.
     #[cfg(target_os = "macos")]
     ScreenRecording,
@@ -319,6 +323,24 @@ impl crate::app::App {
                     missing,
                 )
             }
+            #[cfg(all(target_os = "linux", feature = "zero-copy"))]
+            DepId::CudaImport => {
+                // Only meaningful on a session that renders on NVIDIA. Anywhere else
+                // VAAPI is the zero-copy path and this row would be noise, so the whole
+                // row is omitted from `deps()` there rather than reported as missing.
+                (
+                    "NVIDIA GPU recording",
+                    crate::encode::cuda::available(),
+                    Requirement::Optional,
+                    "Recordings are encoded on the GPU without copying each frame through \
+                     system memory."
+                        .into(),
+                    "Each frame is copied through system memory before encoding, which costs \
+                     CPU on large displays. Install the NVIDIA driver's CUDA libraries \
+                     (libcuda) to avoid it."
+                        .into(),
+                )
+            }
             #[cfg(target_os = "macos")]
             DepId::ScreenRecording => (
                 "Screen Recording",
@@ -417,6 +439,14 @@ impl crate::app::App {
             DepId::Pactl,
             DepId::HwEncoder,
         ]);
+        // Linux: the NVIDIA GPU-recording row only when this machine HAS an NVIDIA
+        // render node (DRAGON-457). On an AMD or Intel box VAAPI is the GPU path and
+        // CUDA is irrelevant, so the row would be an amber warning about something the
+        // user neither has nor needs — the Health page must not manufacture problems.
+        #[cfg(all(target_os = "linux", feature = "zero-copy"))]
+        if crate::encode::list_render_nodes().iter().any(|(_, drv)| drv == "nvidia") {
+            ids.push(DepId::CudaImport);
+        }
         // macOS: the Microphone TCC grant is an Optional feature (video-only still works).
         #[cfg(target_os = "macos")]
         ids.push(DepId::Microphone);

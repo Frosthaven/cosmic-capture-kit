@@ -115,8 +115,12 @@ impl App {
         // Centre on the bottom of this output — the placement window/monitor capture uses,
         // and (DRAGON-207) the fallback for a region-mode output that holds no selection.
         let bottom_centre = || {
-            let ow = o.logical_size.0 as f32;
-            let oh = o.logical_size.1 as f32;
+            // POINTS, not `logical_size` (DRAGON-448): the group widths above are point
+            // constants and the rect below becomes iced padding, so the output extent it
+            // is centred/clamped against has to be the iced VIEWPORT. On a scaled Windows
+            // monitor `logical_size` is `point_scale`× bigger, which centred the toolbar
+            // on a screen that does not exist and dropped it off the bottom.
+            let (ow, oh) = o.point_size();
             let cx = ((ow - h_w) / 2.0).max(0.0);
             let cy = (oh - h_h - BOTTOM_MARGIN).max(0.0);
             (
@@ -141,8 +145,10 @@ impl App {
         // Apply this output's drag nudge (kept across countdown/recording so the toolbar
         // stays where it was dragged), clamped onto the output. Per-output so dragging one
         // monitor's toolbar never moves another's (DRAGON-207).
-        let ow = o.logical_size.0 as f32;
-        let oh = o.logical_size.1 as f32;
+        // POINTS again (DRAGON-448): the drag nudge arrives from `DragArea` as point
+        // deltas, so the clamp that keeps the dragged toolbar on screen must be the
+        // viewport, not the capture extent.
+        let (ow, oh) = o.point_size();
         let (offx, offy) = self.toolbar_offset.get(&o.name).copied().unwrap_or((0.0, 0.0));
         let rect = cosmic::iced::Rectangle {
             x: (rect.x + offx).clamp(0.0, (ow - rect.width).max(0.0)),

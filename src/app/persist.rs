@@ -69,6 +69,13 @@ impl App {
             capture_hotkey: self.capture_hotkey.clone(),
             capture_active_window_hotkey: self.capture_active_window_hotkey.clone(),
             capture_active_monitor_hotkey: self.capture_active_monitor_hotkey.clone(),
+            capture_no_editor_hotkey: self.capture_no_editor_hotkey.clone(),
+            capture_active_window_no_editor_hotkey: self
+                .capture_active_window_no_editor_hotkey
+                .clone(),
+            capture_active_monitor_no_editor_hotkey: self
+                .capture_active_monitor_no_editor_hotkey
+                .clone(),
             // Not cached on App (they're one-time lifecycle markers, not live
             // settings): carry whatever's on disk forward so a normal save never
             // clobbers them. Only init's first-run flow / the daemon's login-item
@@ -173,6 +180,11 @@ impl App {
         self.capture_hotkey = p.capture_hotkey.clone();
         self.capture_active_window_hotkey = p.capture_active_window_hotkey.clone();
         self.capture_active_monitor_hotkey = p.capture_active_monitor_hotkey.clone();
+        self.capture_no_editor_hotkey = p.capture_no_editor_hotkey.clone();
+        self.capture_active_window_no_editor_hotkey =
+            p.capture_active_window_no_editor_hotkey.clone();
+        self.capture_active_monitor_no_editor_hotkey =
+            p.capture_active_monitor_no_editor_hotkey.clone();
         self.region_overlay_opacity = p.region_overlay_opacity.clamp(0.0, 1.0);
         self.active_overlay_opacity = p.active_overlay_opacity.clamp(0.0, 1.0);
         self.preview_overlay_opacity = p.preview_overlay_opacity.clamp(0.0, 1.0);
@@ -399,6 +411,11 @@ impl App {
                     p.capture_hotkey = d.capture_hotkey.clone();
                     p.capture_active_window_hotkey = d.capture_active_window_hotkey.clone();
                     p.capture_active_monitor_hotkey = d.capture_active_monitor_hotkey.clone();
+                    p.capture_no_editor_hotkey = d.capture_no_editor_hotkey.clone();
+                    p.capture_active_window_no_editor_hotkey =
+                        d.capture_active_window_no_editor_hotkey.clone();
+                    p.capture_active_monitor_no_editor_hotkey =
+                        d.capture_active_monitor_no_editor_hotkey.clone();
                 }
             }
             // DRAGON-419: Health gained its one real setting (the Debug group's log toggle),

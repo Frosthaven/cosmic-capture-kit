@@ -52,15 +52,36 @@ pub(crate) fn finalize_with_intervals(
         .arg(out_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-    let status = cmd
-        .status()
+        // DRAGON-432: was `inherit`, which on a Windows GUI-subsystem launch and a Linux
+        // hotkey launch inherits nothing — the finalize re-encode's explanation of why it
+        // failed went nowhere. `output()` below both captures AND drains it, so unlike a
+        // hand-rolled pipe there is no way to fill it and deadlock.
+        .stderr(Stdio::piped());
+    // `output()` waits for exit, exactly as `status()` did — no new unbounded wait is
+    // introduced here, and this one was already unbounded (it is not a stop tail; the
+    // process is not being torn down around it).
+    let out = cmd
+        .output()
         .map_err(|e| format!("could not start ffmpeg finalize: {e}"))?;
-    if status.success() {
-        Ok(out_path.to_path_buf())
-    } else {
-        Err(format!("ffmpeg finalize exited with {status}"))
+    if out.status.success() {
+        return Ok(out_path.to_path_buf());
     }
+    let text = String::from_utf8_lossy(&out.stderr);
+    let mut tail = super::ffmpeg_log::StderrTail::new();
+    for line in text.lines() {
+        tail.push_line(line);
+    }
+    if tail.len() > 0 {
+        log::error!(
+            "DRAGON-432: ffmpeg finalize failed; stderr tail:\n{}",
+            tail.log_block(super::ffmpeg_log::LOG_TAIL_LINES)
+        );
+    }
+    let lines: Vec<&str> = tail.lines().collect();
+    Err(super::ffmpeg_log::with_hint(
+        format!("ffmpeg finalize exited with {}", out.status),
+        super::ffmpeg_log::likely_error_line(&lines),
+    ))
 }
 
 /// One channel's finalize filter chain: gate it to its on-intervals. A no-op chain

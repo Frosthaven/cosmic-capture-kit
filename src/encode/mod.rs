@@ -15,10 +15,21 @@ mod pixfmt;
 mod plan;
 mod preset;
 mod resolution;
+/// Which VAAPI render node a captured frame can be encoded on (DRAGON-425). UNGATED
+/// policy — pure decisions over plain data, so the macOS/Windows suites cover it even
+/// though the `zero-copy` glue that calls it is Linux-DRM-only.
+mod vaapi_node;
 
 /// In-process VAAPI GPU encoder for the experimental zero-copy recording path.
 #[cfg(feature = "zero-copy")]
 pub mod gpu;
+
+/// Importing a compositor dmabuf into CUDA so NVENC can encode it in place
+/// (DRAGON-457) — the NVIDIA answer to the question `vaapi_node` answers for
+/// AMD/Intel. Linux-only and `dlopen`-based, so a machine with no NVIDIA driver
+/// simply reports it as unavailable.
+#[cfg(all(target_os = "linux", feature = "zero-copy"))]
+pub mod cuda;
 
 pub use self::command::*;
 pub use self::device::*;
@@ -26,3 +37,7 @@ pub use self::pixfmt::*;
 pub use self::plan::*;
 pub use self::preset::*;
 pub use self::resolution::*;
+// Re-exported ungated so `crate::encode::…` is the one path to it, but every consumer is
+// behind `zero-copy`, so off-feature the re-export itself reads as unused.
+#[cfg_attr(not(feature = "zero-copy"), allow(unused_imports))]
+pub use self::vaapi_node::*;

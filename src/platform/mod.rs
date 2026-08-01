@@ -228,11 +228,11 @@ pub mod linux_autostart;
 #[cfg(target_os = "windows")]
 #[path = "windows/autostart.rs"]
 pub mod windows_autostart;
-// DRAGON-406: the PURE half of the Windows 10 diagnostics log (formatting, redaction,
-// rotation policy). Compiled on EVERY platform on purpose — it contains no Win32, and
-// living in the shared tree is what lets the Linux gate unit-test the redaction rules that
-// keep a customer's filenames out of the file. The Win32 half is
-// `platform/windows/diag.rs` (closed split). Removed wholesale by DRAGON-407.
+// Portable Windows chrome helpers: ex-style bit names, `HRESULT` formatting, and the
+// Windows 10-vs-11 build classification. Compiled on EVERY platform on purpose — it contains
+// no Win32, and living in the shared tree is what lets the Linux gate unit-test it. What is
+// left is the residue of DRAGON-406's diagnostics report after DRAGON-407 deleted that
+// instrument: see the module doc for which three helpers survived and why.
 pub mod win_diag;
 
 /// Opt OUR-app window titled `title` OUT of automatic tiling by the user's tiling window
@@ -355,6 +355,47 @@ pub fn window_current_display(title: &str) -> Option<String> {
     }
 }
 
+/// CAPTURE units per POINT for the output named `name` — the ONE per-platform input to
+/// [`crate::geometry::OverlayUnits`], the capture-overlay units bridge (DRAGON-448).
+///
+/// Read [`OverlayUnits`](crate::geometry::OverlayUnits) for what the two spaces are and why
+/// they differ; this only answers "by how much, on this output, on this OS":
+///
+/// - **Windows**: that monitor's `dpi / 96` (`GetDpiForMonitor`, per-monitor under
+///   Per-Monitor-Aware-V2). Its `OutputDesc`s are PHYSICAL virtual-screen pixels while the
+///   overlay's iced viewport is logical points, so this is the whole gap. A 100% monitor
+///   answers `1.0`, which is why a 96-DPI box is byte-identical.
+/// - **macOS**: `1.0`. Its `OutputDesc`s are CoreGraphics POINTS and the overlay's app space
+///   is points too, so the two spaces already coincide. A Retina display is `1.0` HERE even
+///   though its backing scale is 2.0 — that factor belongs to captured MEDIA
+///   (`scale_for_selection` / `source_scale`), not to overlay layout, and conflating them
+///   would halve every mac overlay.
+/// - **Linux**: `1.0`. The layer surface is sized by the compositor in its own logical
+///   space, which is what `output_descs()` reports; app space IS point space.
+///
+/// An unknown name (a display that vanished between enumeration and here) answers `1.0`:
+/// the unscaled identity, i.e. exactly the pre-DRAGON-448 behaviour, never a guess.
+// Dead on LINUX, honestly: both callers are compiled out there — `seed_overlays_mac` is
+// `cfg(not(linux))`, and `preview::surface::monitor_point_scale` asks only on its
+// `cfg(not(linux))` arm. Linux never needs to ask, because its answer is the identity by
+// construction (the compositor sizes the layer surface in the same logical space
+// `output_descs()` reports). The body stays portable rather than Windows-only so the
+// Linux/macOS answers remain stated here, where the doc above explains all three.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub fn overlay_point_scale(name: &str) -> f32 {
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::windows::scale_for(name)
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(1.0)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = name;
+        1.0
+    }
+}
+
 // ── Windows OS-build gates (DRAGON-403) ───────────────────────────────────────
 // PURE build-number predicates, deliberately kept in the SHARED tree (not under
 // `platform/windows/`) so `cargo test` proves them on ANY host — the Windows arms they
@@ -455,16 +496,93 @@ pub fn win_build_has_blur_behind_glass(build: u32) -> bool {
 /// Pure: is this OS `build` **Windows 10** — the closed band `[10240, 22000)`?
 ///
 /// Extracted (DRAGON-406) from [`win_build_has_blur_behind_glass`], which had carried the
-/// band inline since DRAGON-405 and now delegates here. It is ONE definition of "this is
-/// Windows 10" on purpose: the DRAGON-406 diagnostics log is gated on the same predicate as
-/// the blur-behind material, so the instrument can never disagree with the thing it is
-/// instrumenting about which builds it applies to.
+/// band inline since DRAGON-405 and now delegates here — ONE definition of "this is Windows
+/// 10" for every caller that needs one.
 ///
-/// DRAGON-407 KEEP: removing the diagnostics must NOT remove this — `win_build_has_blur_behind_glass`
-/// (a shipped Win10 feature) is defined in terms of it.
+/// KEPT by DRAGON-407 when the diagnostics instrument that shared it was deleted:
+/// `win_build_has_blur_behind_glass` is a shipped Win10 feature and is defined in terms of
+/// this.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn win_build_is_windows_10(build: u32) -> bool {
     (WIN10_MIN_BUILD..WIN11_MIN_BUILD).contains(&build)
+}
+
+// ── DRAGON-427: Windows 10 renders its overlays in SOFTWARE ───────────────────
+//
+// wgpu cannot make a Windows 10 window translucent on ANY backend, and this is settled
+// rather than suspected:
+//
+// * DX12 — `wgpu-hal/src/dx12/adapter.rs` returns a constant keyed on the surface target,
+//   and an HWND surface is ALWAYS `[Opaque]`. There is no OS check to differ on.
+// * GLES — a hardcoded `vec![Opaque]` carrying a literal `//TODO`.
+// * Vulkan — queries the driver, but WezTerm (Rust, same stack) tested it directly and
+//   found window transparency broken on Windows; they left wgpu for their own renderer.
+//
+// Windows 11 is translucent anyway, riding composition behaviour that Windows 10's DWM
+// does not honour (see the DRAGON-408 note above). So the split is real and not ours to
+// fix inside wgpu.
+//
+// What a customer PROVED on real Windows 10 hardware: running with iced's SOFTWARE
+// rasterizer (tiny-skia) makes the capture overlay actually translucent. That is the fix,
+// and it is why these two predicates exist. They are separate names, not one, because they
+// answer different questions and only happen to share a band today.
+
+/// Pure: must this OS `build` render our OVERLAY surfaces with iced's software rasterizer
+/// (DRAGON-427)? Windows 10 ONLY — the closed band [`win_build_is_windows_10`].
+///
+/// Windows 11 stays on wgpu, byte-identical: it is translucent there today and moving it to
+/// a CPU rasterizer would cost frame rate for nothing.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_build_software_overlays(build: u32) -> bool {
+    win_build_is_windows_10(build)
+}
+
+/// Pure: may the preview EDITOR be the fullscreen OVERLAY on this OS `build` (DRAGON-427)?
+///
+/// Everywhere except Windows 10. On Windows 10 the overlay-shaped editor would inherit the
+/// software rasterizer that makes overlays translucent there — and the editor draws its
+/// media through `cosmic::iced::widget::shader` (`app/preview/layers.rs`), which tiny-skia
+/// cannot render at all. So the editor is ALWAYS the windowed variant on Windows 10, and
+/// the setting that offers the choice is disabled there rather than merely hidden: a user
+/// whose config already says `preview_windowed = false` must land on the window, not on a
+/// broken overlay.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_build_has_overlay_preview(build: u32) -> bool {
+    !win_build_is_windows_10(build)
+}
+
+/// Runtime seam: must THIS machine software-render its overlays? Windows 10 only; `false`
+/// everywhere else, so Linux and macOS keep their exact behaviour with no `cfg` at the
+/// call site. The build number itself comes from the Windows-native reader.
+pub fn software_overlays() -> bool {
+    #[cfg(windows)]
+    {
+        // An UNREADABLE build number reads as "not Windows 10" — the safe side: we keep the
+        // GPU renderer that works on every OS we ship for rather than silently degrading a
+        // machine we could not identify. Same convention as `native_caption_buttons_supported`.
+        crate::platform::windows::window::os_build().is_some_and(win_build_software_overlays)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Runtime seam: may the preview editor open as the fullscreen overlay on THIS machine?
+/// `true` everywhere except Windows 10 (see [`win_build_has_overlay_preview`]).
+pub fn overlay_preview_available() -> bool {
+    #[cfg(windows)]
+    {
+        // An unreadable build keeps the overlay editor — the same safe side as
+        // `software_overlays` (the two must agree, or a process could end up software-rendered
+        // WITH an overlay editor, which is the one combination that cannot draw).
+        crate::platform::windows::window::os_build()
+            .is_none_or(win_build_has_overlay_preview)
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 /// The env var that flips the Windows 10 overlay between the two candidate window shapes
@@ -512,6 +630,81 @@ pub fn win_overlay_is_layered(build: u32, env: Option<&str>) -> bool {
         return true;
     }
     env != Some("0")
+}
+
+// ── DRAGON-426: proving nothing of the user's is behind a captured window ─────
+//
+// A Windows single-window capture may preserve the window's transparency (DRAGON-275). The
+// moment it does, whatever the DWM composited BEHIND that window is visible through it — so a
+// capture of one window can contain another window entirely, and the person sharing it has no
+// way to notice. That is a confidentiality failure, not a cosmetic one.
+//
+// DRAGON-308's answer is to float our own opaque wallpaper backdrop directly beneath the
+// target, so the only thing behind it is something we drew. The answer is sound; what was
+// missing is that nothing ever CHECKED it landed. These predicates are that check, kept pure
+// and in the shared tree so the Linux gate covers the reasoning even though the Win32 that
+// feeds them can only run on Windows.
+
+/// One rung of the z-order chain beneath a captured window: `(hwnd bits, frame rect)`, where
+/// the rect is physical `(x, y, w, h)`. The handle travels as `isize` rather than an `HWND` so
+/// the whole decision stays portable and testable off Win32.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub type WinZOrderRung = (isize, (i32, i32, i32, i32));
+
+/// Whether two `(x, y, w, h)` rects share any area (half-open edges).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_rects_overlap(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    ax < bx + bw && bx < ax + aw && ay < by + bh && by < ay + ah
+}
+
+/// Whether `outer` fully contains `inner` (both `(x, y, w, h)`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_rect_contains(outer: (i32, i32, i32, i32), inner: (i32, i32, i32, i32)) -> bool {
+    let (ox, oy, ow, oh) = outer;
+    let (ix, iy, iw, ih) = inner;
+    ix >= ox && iy >= oy && ix + iw <= ox + ow && iy + ih <= oy + oh
+}
+
+/// Pure: is our floated backdrop genuinely the ONLY thing behind the target, across the whole
+/// of the target's rect (DRAGON-426)?
+///
+/// `below` is the z-order chain beneath the target, TOP-FIRST, as `(hwnd bits, frame rect)`
+/// (`platform::windows::window_list::windows_below`). The answer is yes only when the FIRST
+/// window in that chain that touches the target's rect is our backdrop AND that backdrop covers
+/// the rect completely.
+///
+/// Every other shape is a leak waiting to happen, and each one has a real cause:
+///
+/// * **A foreign window reached first** — `SetWindowPos` seated the backdrop somewhere other
+///   than immediately below the target (a topmost band mismatch, an owner relationship, a
+///   window raised between the float and the grab).
+/// * **The desktop reached first** — `Progman` / a `WorkerW`. That is where Wallpaper Engine,
+///   Lively Wallpaper and every other animated-desktop tool reparent themselves: below normal
+///   windows, above the wallpaper bitmap. A hide-other-windows sweep written against "normal
+///   top-level application windows" misses them by construction, which is why this check is
+///   about Z-ORDER and coverage rather than about what kind of window anything is.
+/// * **A partly-covering backdrop** — a strip of the real desktop is still behind the target.
+/// * **An empty chain** — the float did not take at all.
+///
+/// Fails CLOSED: anything it cannot prove is treated as unsafe, because the cost of a false
+/// "safe" is the user mailing someone else's window to a colleague, and the cost of a false
+/// "unsafe" is a capture that keeps its glass a little less faithfully.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_backdrop_seated_below(
+    below: &[WinZOrderRung],
+    backdrop: isize,
+    target: (i32, i32, i32, i32),
+) -> bool {
+    for &(hwnd, rect) in below {
+        if !win_rects_overlap(target, rect) {
+            continue; // does not touch the target — cannot show through it
+        }
+        // The first window that DOES touch it decides: ours and covering, or unsafe.
+        return hwnd == backdrop && win_rect_contains(rect, target);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -585,10 +778,11 @@ mod tests {
         }
     }
 
-    // DRAGON-406: the diagnostics log and the blur-behind material must key off the SAME
-    // notion of "this is Windows 10", so they can never drift into disagreeing about which
-    // builds they apply to. `win_build_has_blur_behind_glass` delegates to
-    // `win_build_is_windows_10`; this pins that they stay one band, band-for-band.
+    // Every caller that asks "is this Windows 10" must get the SAME answer, so they can never
+    // drift into disagreeing about which builds they apply to.
+    // `win_build_has_blur_behind_glass` delegates to `win_build_is_windows_10`; this pins that
+    // they stay one band, band-for-band. (Introduced by DRAGON-406, when its diagnostics log
+    // was the second caller; kept by DRAGON-407, which deleted that log.)
     #[test]
     fn windows_10_band_is_one_definition() {
         for build in [0, 9600, 10240, 19041, 19045, 21999, 22000, 22621, 26100, u32::MAX] {
@@ -606,6 +800,42 @@ mod tests {
         // An unreadable build reads as "not Windows 10" -> diagnostics stay off, which is
         // the safe side: a Win11 user must never be able to tell the feature exists.
         assert!(!win_build_is_windows_10(0));
+    }
+
+    /// DRAGON-427: the software-renderer gate and the overlay-editor gate are BOTH the
+    /// Windows 10 band and nothing else, band-for-band with `win_build_is_windows_10`. Two
+    /// names for one band on purpose (they answer different questions), so this is what
+    /// stops them drifting apart — and what pins that **Windows 11 is untouched**, which is
+    /// the ticket's hard constraint: it renders correctly on wgpu today and must not be
+    /// moved onto a CPU rasterizer or lose its overlay editor.
+    #[test]
+    fn the_software_renderer_gate_is_exactly_the_windows_10_band() {
+        for build in [0, 9600, 10240, 19041, 19045, 21999, 22000, 22621, 26100, u32::MAX] {
+            assert_eq!(
+                win_build_software_overlays(build),
+                win_build_is_windows_10(build),
+                "build {build}: software overlays must be exactly the Win10 band"
+            );
+            // The overlay EDITOR is the complement: available everywhere the software
+            // rasterizer is not forced.
+            assert_eq!(
+                win_build_has_overlay_preview(build),
+                !win_build_software_overlays(build),
+                "build {build}: the two gates must stay exact complements"
+            );
+        }
+        // Spelled out at the edges, so a future band edit has to break a named assertion.
+        assert!(!win_build_software_overlays(10239)); // Windows 8.1 and older
+        assert!(win_build_software_overlays(10240)); // Win10 RTM
+        assert!(win_build_software_overlays(19045)); // Win10 22H2, the last one
+        assert!(win_build_software_overlays(21999)); // just under the Win11 floor
+        assert!(!win_build_software_overlays(22000)); // Win11 21H2 — wgpu, as today
+        assert!(!win_build_software_overlays(26100)); // Win11 24H2 — wgpu, as today
+        // An unreadable build reads as "not Windows 10", i.e. keep the GPU renderer and the
+        // overlay editor. That is the SAFE side: a machine we cannot identify keeps the
+        // path that works on every OS we ship for, rather than being silently degraded.
+        assert!(!win_build_software_overlays(0));
+        assert!(win_build_has_overlay_preview(0));
     }
 
     #[test]
@@ -656,5 +886,80 @@ mod tests {
             assert!(win_build_paints_native_caption_buttons(build));
         }
         assert!(win_build_paints_native_caption_buttons(22000));
+    }
+
+    // ── DRAGON-426: the backdrop seating predicate ────────────────────────────
+    //
+    // Each case below is a distinct way a capture of ONE window could come back containing
+    // another. They are written as such, not as geometry trivia.
+
+    /// The window being captured, for the seating cases.
+    const TARGET: (i32, i32, i32, i32) = (100, 100, 400, 300);
+
+    #[test]
+    fn seated_when_our_backdrop_is_first_below_and_covers_the_target() {
+        // The good case: our backdrop is exactly the target's footprint and first in the chain,
+        // so the only thing the glass can show is what we drew.
+        let below = [(7, TARGET), (9, (0, 0, 1920, 1080))];
+        assert!(win_backdrop_seated_below(&below, 7, TARGET));
+    }
+
+    #[test]
+    fn a_larger_backdrop_still_counts_as_covering() {
+        // Covering MORE than the target is fine — every pixel of the target is backed.
+        assert!(win_backdrop_seated_below(&[(7, (0, 0, 1920, 1080))], 7, TARGET));
+    }
+
+    #[test]
+    fn windows_that_miss_the_target_never_veto_the_grab() {
+        // A window below the target but nowhere near it cannot show through the glass, so it
+        // must not block the good path — the backdrop behind it still decides.
+        let below = [(3, (1400, 700, 200, 200)), (7, TARGET)];
+        assert!(win_backdrop_seated_below(&below, 7, TARGET));
+    }
+
+    #[test]
+    fn a_foreign_window_reached_first_is_not_seated() {
+        // THE reported bug: something of the user's sits between the target and our backdrop,
+        // so its pixels are behind the target's translucency and land in the saved capture.
+        let below = [(3, (200, 150, 600, 400)), (7, TARGET)];
+        assert!(!win_backdrop_seated_below(&below, 7, TARGET));
+    }
+
+    #[test]
+    fn the_desktop_reached_first_is_not_seated() {
+        // Progman / WorkerW — where Wallpaper Engine and Lively Wallpaper reparent themselves.
+        // Reaching the DESKTOP before our backdrop means a live wallpaper is what shows through
+        // the glass, which is exactly the second half of the customer's report. Note the check
+        // never asks what KIND of window this is: keying on a product or a window class is what
+        // makes such a sweep miss the next tool that uses the same trick.
+        let below = [(11, (0, 0, 1920, 1080)), (7, TARGET)];
+        assert!(!win_backdrop_seated_below(&below, 7, TARGET));
+    }
+
+    #[test]
+    fn a_backdrop_that_only_partly_covers_the_target_is_not_seated() {
+        // A short backdrop leaves a strip of the real desktop behind the target's lower edge…
+        assert!(!win_backdrop_seated_below(&[(7, (100, 100, 400, 200))], 7, TARGET));
+        // …and an offset one leaves a strip along the top.
+        assert!(!win_backdrop_seated_below(&[(7, (100, 150, 400, 300))], 7, TARGET));
+    }
+
+    #[test]
+    fn an_empty_chain_is_not_seated() {
+        // `SetWindowPos` silently did not take, or the backdrop never became visible: nothing
+        // of ours is behind the target, so there is no guarantee at all. Fail CLOSED.
+        assert!(!win_backdrop_seated_below(&[], 7, TARGET));
+    }
+
+    #[test]
+    fn rect_helpers_agree_with_their_names() {
+        // Half-open edges: touching is not overlapping.
+        assert!(win_rects_overlap((0, 0, 100, 100), (50, 50, 100, 100)));
+        assert!(!win_rects_overlap((0, 0, 100, 100), (100, 0, 100, 100)));
+        // Containment is inclusive of coincident edges.
+        assert!(win_rect_contains((0, 0, 100, 100), (0, 0, 100, 100)));
+        assert!(win_rect_contains((0, 0, 100, 100), (10, 10, 10, 10)));
+        assert!(!win_rect_contains((0, 0, 100, 100), (10, 10, 100, 10)));
     }
 }

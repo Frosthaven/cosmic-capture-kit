@@ -200,8 +200,11 @@ symptom, not the diagnosis. The message TABLE (`alert_message`) is pure and
 unit-tested on every platform; presentation is macOS-only, and Linux/Windows
 `fail_session` is byte-identically `finish_session`. The rules the table encodes:
 never blame a permission we have not checked (`CGPreflightScreenCaptureAccess` is
-read live at failure time), never name the macOS 14.0-14.3 `SCShareableContent`
-hang on a build that does not have it, and never surface a `diag` detail string
+read live at failure time), never name the Sonoma (macOS 14) `SCShareableContent`
+hang on a build that does not have it — DRAGON-439 widened that from 14.0-14.3
+to all of macOS 14, since Apple's 14.4 fix made the stall rarer but did not end
+it, and the minor version now only picks whether to advise the update — and
+never surface a `diag` detail string
 except the recording worker's reason (the rest is telemetry, not user copy).
 
 The post-capture preview is either an `Overlay` (fullscreen layer-shell, like
@@ -257,9 +260,14 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
   clock in `main` — BEFORE `app::run`, so a hang inside `App::init` is covered too —
   and quietly `process::exit(0)`s (after the same tiling-WM resume + marker drop
   `finish_session` does) if it never presents anything within `DEFAULT_BUDGET` (90s).
-  "Presents" = a capture overlay, countdown, in-flight capture, live recording,
-  preview editor or settings window, published from `App::update` via
-  `startup_presence()`; the FIRST such report disarms the guard permanently. The
+  "Presents" = a PLACED capture overlay, countdown, in-flight capture, live
+  recording, preview editor or settings window, snapshotted into a
+  `startup_guard::Surfaces` by `startup_presence()` on every `App::update` and
+  classified by `startup_guard::classify`; the FIRST such report disarms the guard
+  permanently. PLACED, not merely minted (DRAGON-439): `outputs` gains its entry at
+  winit-window creation, but the macOS overlay draws a transparent `Space` until
+  `configure_overlay` raises and reframes it, so counting the mint disarmed the guard
+  while the user could still see nothing at all. The
   permission checker instead SUSPENDS the clock for as long as it is open — a child
   showing it is doing its job, and reading it must never accumulate toward a kill.
   macOS-only for now (Linux/Windows are byte-identical; both could opt in by calling
@@ -285,6 +293,50 @@ texture slot — a real defect in the previous single-texture design. `RasterSlo
 behind each editable layer's off-thread raster job — never hand-roll a
 generation counter for a new layer. To add one: see the 3-step recipe in
 `layers.rs`'s module doc.
+
+### Known platform difference: the Windows-overlay covermark fold (DRAGON-235 / DRAGON-395)
+
+On the **Windows OVERLAY** preview surface only, the still base (and the video
+poster) is drawn through the `LayerStack` shader rather than `widget::image`,
+with the covermark folded into that same stack. Everywhere else — Linux, macOS,
+and the Windows *windowed* preview — the base is a `widget::image` and the
+covermark is its own element stacked above.
+
+**Why.** DRAGON-235 found that iced's raster-image pipeline does not composite
+on the premultiplied transparent overlay surface: the identical opaque pixels
+show through the opaque windowed surface but vanish on the overlay, while the
+shader (same alpha blending) composites them correctly. The fold keeps the
+covermark to a single `LayerStack` per window, because slots are keyed per
+window rather than per widget and two stacks in one window would fight over
+slot pruning.
+
+**What it costs.** A z-order deviation. The real-time effects shader is a
+distinct primitive stacked on top of the base element, so on the Windows
+overlay the effects draw **over** the covermark, and **under** it on every
+other platform and surface. Text annotations are unaffected — they are
+canvas-drawn (DRAGON-373) and have always ridden above everything.
+
+**Status.** The DRAGON-235 premise has never been verified by anyone who could
+run both sides: it was found on Windows 10, and Linux builds cannot compile the
+arm. The libcosmic/iced pin has not moved since, so it cannot have been fixed
+upstream by accident either. DRAGON-427 then removed the overlay editor from
+Windows 10 entirely, so this arm now fires on **Windows 11 only** — which is a
+configuration that can finally be A/B'd.
+
+**To A/B it.** The overlay editor is not the default (`preview_windowed`
+defaults true), so first set Settings → Editor appearance → fullscreen overlay.
+Then take a capture, apply a covermark *and* an effect, and compare the
+stacking with and without `CCK_TEST_UNFOLD_COVERMARK=1`, which bypasses the
+fold and takes the portable path (`app::preview::layers::unfold_covermark`).
+Use the same machine's windowed preview as the reference rendering.
+
+**If the A/B clears it.** If the unfolded overlay renders the base and the
+covermark correctly and stacks them like the windowed preview, then DRAGON-235
+no longer holds: delete the two `#[cfg(windows)]` fold arms
+(`preview::image::…`, `preview::video::video_still_content`), the
+`unfold_covermark` hook, `layers::rgba_handle_frame`, and this section. If the
+unfolded rendering blanks or mis-composites, DRAGON-235 stands and this
+deviation is the accepted answer — say so here and keep the hook.
 
 ## Capture → record → encode pipeline
 

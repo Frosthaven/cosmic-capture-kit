@@ -22,7 +22,7 @@
 //! precedent for adding one when this outgrows one screen.
 
 use super::super::*;
-use super::super::row::{toggle, Item, SectionSpec};
+use super::super::row::{gated_row, toggle, Item, SectionSpec, Severity};
 
 /// The "Editor appearance" dropdown options (index 0 = overlay, 1 = windowed — matches
 /// `preview_windowed` as a bool). Moved here from `general.rs` with the row it serves
@@ -45,7 +45,14 @@ impl crate::app::App {
             // ("Preview Editor") and this group now supply for free.
             SectionSpec {
                 title: "General",
-                items: vec![
+                // DRAGON-427: Windows 10 has no overlay editor to choose, so there is no
+                // choice to offer. The row stays (searchable, and it says what you get)
+                // but goes INERT — a gated row, the same shape the missing-tesseract OCR
+                // toggle uses. Disabling it here is only half the job: `App::preview_windowed`
+                // is forced windowed in `effective_preview_windowed` too, so a config that
+                // already says `preview_windowed = false` lands on the window rather than on
+                // an overlay editor the software rasterizer cannot draw.
+                items: vec![if crate::platform::overlay_preview_available() {
                     Item::new(
                         "Editor appearance",
                         "",
@@ -59,8 +66,19 @@ impl crate::app::App {
                         usize::from(self.preview_windowed),
                         usize::from(d.preview_windowed),
                         |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                    ),
-                ],
+                    )
+                } else {
+                    let mut it = gated_row(
+                        "Editor appearance",
+                        PREVIEW_APPEARANCES[1],
+                        Severity::Warn,
+                    );
+                    it.desc = std::borrow::Cow::Borrowed(
+                        "Windows 10 only draws the editor as a window — the overlay editor \
+                         needs a translucent surface this version of Windows cannot give it.",
+                    );
+                    it
+                }],
             },
             SectionSpec {
                 title: "Image Editor",

@@ -18,7 +18,7 @@
 //! 6. display scaling is handled by working in LOGICAL POINTS (`physical /
 //!    source_scale`, see [`to_points`]): the hi-res capture is KEPT and downsampled at
 //!    draw time (sharp on hidpi), while every size the user perceives is its true
-//!    on-screen size. `source_scale == 1.0` (all Linux 1x, non-Retina panels) makes
+//!    on-screen size. `source_scale == 1.0` (an UNSCALED output on any platform) makes
 //!    every function here the identity, so those paths stay byte-identical.
 //! 7. pan/scroll clamping (no overscroll past the media edges) lives in
 //!    `widgets::zoom_pan` (`clamp_pan_of`), the one clamp both platforms share.
@@ -32,7 +32,7 @@ pub(crate) const USABLE_H_FRAC: f32 = 0.9;
 
 /// Convert PHYSICAL capture pixels to the LOGICAL points the picture occupied on its
 /// SOURCE display: `physical / source_scale`, rounded, never zero. `source_scale <=
-/// 1.0` (all Linux 1x, non-Retina mac) returns the dims unchanged, keeping every
+/// 1.0` (an UNSCALED output on any platform) returns the dims unchanged, keeping every
 /// caller byte-identical there. (rule 6)
 pub(crate) fn to_points(px: (u32, u32), source_scale: f32) -> (u32, u32) {
     if source_scale <= 1.0 || px.0 == 0 || px.1 == 0 {

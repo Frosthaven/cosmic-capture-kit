@@ -73,12 +73,182 @@ pub(crate) fn acquire_daemon_lock() -> bool {
     acquire_daemon_lock_attempts(31)
 }
 
-/// Windows (DRAGON-237): the daemon single-instance guard. Body under
-/// `platform::windows::instance` (strict split — a named mutex + a recorded pid). Returns
-/// false if another daemon already holds it; fails OPEN if the mutex can't be created.
-#[cfg(windows)]
-pub(crate) fn acquire_daemon_lock() -> bool {
-    crate::platform::windows::instance::acquire_daemon_lock()
+// DRAGON-438: the Windows arm of `acquire_daemon_lock` is GONE. Windows now takes the lock
+// through `platform::windows::instance::acquire_daemon_lock_attempts`, driven by
+// [`daemon_lock_attempts`] below, because the number of attempts depends on the launch
+// INTENT there exactly as it does on Linux. The whole Windows claim/signal/recover sequence
+// lives in `platform::windows::daemon::claim_or_signal`; there is no longer a bare
+// "take the lock" dispatch to call, which is the point — taking the lock is only half of
+// what a Windows bare launch has to decide.
+
+// ── DRAGON-438: the Windows daemon-lock launch protocol (pure decisions) ──────────
+//
+// The bug this closes: on Windows `resident` defaults ON, so a BARE launch (the user
+// pressing their capture key, or double-clicking the app) runs the tray daemon path. If
+// the daemon lock was held it pulsed the daemon's capture event and exited(0) SILENTLY.
+// But a successful pulse only proves `OpenEventW` + `SetEvent` worked — it proves nothing
+// about anyone DRAINING that event. A wedged daemon therefore turned every capture launch
+// into a silent no-op, with no window, no error, and nothing in the UI to retry against.
+//
+// Three shapes produce it:
+//
+// 1. The daemon's `GetMessageW` loop is blocked because its own capture spawn ran monitor
+//    enumeration ON the message thread.
+// 2. PERMANENT: the daemon's signal events failed to create at startup, it warned and ran
+//    on, so `OpenEventW` fails forever and every later launch no-ops until it is killed.
+// 3. Windows took a SINGLE lock attempt where mac/Linux retry for ~1.5s, so a restart
+//    handoff could be read as "somebody else owns this".
+//
+// The fix is to stop trusting the pulse and make the daemon answer — in TWO stages, because
+// one signal could not separate the three things that matter:
+//
+// * The RECEIPT ("your request reached my message loop") is the only thing a wedged daemon
+//   cannot produce, so it is the ONLY signal the kill decision keys on.
+// * The SPAWN ACK ("the capture child exists") comes later and may legitimately take much
+//   longer. A daemon that sends a receipt but no ack is alive and working; it just could not
+//   start a process. Killing it would fix nothing.
+//
+// Only when no receipt arrives, AND the lock holder is provably one of OUR live processes,
+// is the lock taken over. These are the pure decisions behind that; the Win32 bodies live in
+// `platform::windows::instance` and `platform::windows::daemon`. Compiled (and tested) on
+// every platform like `crate::startup_guard`, because a Windows-only decision still has to
+// be verifiable on the machine the suite runs on.
+
+/// What signalling the running daemon actually told us. The distinction that matters is
+/// "somebody acted on it" versus "the call returned success".
+///
+/// The daemon answers in TWO stages, and the split is what keeps the takeover honest:
+///
+/// * The RECEIPT says its message loop pumped our request — the one thing a wedged daemon
+///   cannot fake, and therefore the only signal the KILL decision is allowed to key on.
+/// * The SPAWN ACK says the capture child actually exists. It comes later and can legitimately
+///   take much longer (a worker thread, monitor enumeration, then `CreateProcess` on a ~40MB
+///   exe with an antivirus reading every page of it).
+///
+/// One combined signal could not tell "wedged" from "slow", so a merely-slow healthy daemon
+/// would have been terminated. It also could not tell "spawned" from "tried to spawn".
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalProbe {
+    /// Both stages: the loop pumped AND the capture child was created. The only answer that
+    /// proves the whole path works end to end.
+    Acked,
+    /// The loop pumped (receipt arrived) but no spawn ack followed. The daemon is ALIVE and
+    /// doing its job — it simply could not start a child, which is what an antivirus block or
+    /// an exe locked mid-update looks like. Killing it would fix nothing and destroy a healthy
+    /// tray, so this is the one unanswered state that must NOT escalate.
+    ReceiptOnly,
+    /// The capture event exists but the receipt/ack pair does not, which means the running
+    /// daemon PREDATES this protocol. Treated as delivered: assuming an old daemon is healthy
+    /// is the upgrade-safe direction, and killing one for being old would be a far worse bug
+    /// than the one being fixed.
+    AckUnavailable,
+    /// The capture event was pulsed and the RECEIPT never came. Nothing drained it, so the
+    /// message loop is not running — the wedge this ticket exists for.
+    NotAcked,
+    /// The capture event could not be opened even after the startup grace. On a machine where
+    /// the lock IS held that is a daemon which never managed to create its events, and can
+    /// therefore never be reached again by anything.
+    NoCaptureEvent,
+}
+
+/// How many times to try the daemon lock, by launch INTENT (DRAGON-180's rule, ported to
+/// Windows by DRAGON-438). `31` is ~1.5s at the 50ms step: the first attempt is immediate
+/// so a cold start pays nothing, and the rest bridge a restart handoff.
+///
+/// A capture-intent launch gets ONE attempt on purpose. A held lock there just means a
+/// live daemon, and the user is waiting for an overlay — so the answer is to signal that
+/// daemon at once, and the ACK (not a longer wait) is what tells us whether it worked.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn daemon_lock_attempts(daemon_intent: bool) -> u32 {
+    if daemon_intent {
+        31
+    } else {
+        1
+    }
+}
+
+/// What a launch that found the daemon lock held should do next.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaunchAction {
+    /// A live daemon has the request. Exit — but SAY so; the silent exit is the bug.
+    ExitDelivered,
+    /// Nobody acted, and the recorded lock holder is a live process running OUR
+    /// executable. Terminate it and try the lock again: we are the user's only remaining
+    /// route to a capture, and the holder has proven it cannot serve one.
+    KillHolderAndRetry,
+    /// Nobody acted, but there is nothing safe to kill — the recorded pid is dead, or it
+    /// belongs to some OTHER program (a recycled pid). Just retry the lock; a dead holder
+    /// releases it to us anyway.
+    RetryLock,
+    /// The daemon is demonstrably ALIVE (its loop pumped) but could not spawn the child.
+    /// Leave it completely alone — do not kill it, and do not try to take its lock — and let
+    /// [`after_failed_takeover`] decide what THIS process does instead. Replacing a working
+    /// tray would not make `CreateProcess` succeed.
+    FallBackWithoutKilling,
+}
+
+/// The recovery decision for a launch whose signal went unanswered.
+///
+/// The safety rule is in the third argument and it is absolute: we only ever terminate a
+/// pid that is BOTH alive and running our own executable image. A recorded pid can be
+/// stale and Windows recycles pids, so "the pid file said so" is never enough on its own.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn relaunch_action(
+    probe: SignalProbe,
+    holder_live: bool,
+    holder_is_ours: bool,
+) -> RelaunchAction {
+    match probe {
+        // Somebody is serving the request (or is old enough that we must assume so).
+        SignalProbe::Acked | SignalProbe::AckUnavailable => RelaunchAction::ExitDelivered,
+        // Alive but unable to spawn. The holder state is deliberately IGNORED here: even a
+        // live holder of ours is not a candidate, because it is not the thing that is broken.
+        SignalProbe::ReceiptOnly => RelaunchAction::FallBackWithoutKilling,
+        // Nothing drained the request: the loop is not running.
+        SignalProbe::NotAcked | SignalProbe::NoCaptureEvent => {
+            if holder_live && holder_is_ours {
+                RelaunchAction::KillHolderAndRetry
+            } else {
+                RelaunchAction::RetryLock
+            }
+        }
+    }
+}
+
+/// What to do when even the takeover failed to win the lock.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterFailedTakeover {
+    /// A `resident` launch asked for a DAEMON, and some other daemon holds the lock. There
+    /// is nothing for this process to do, so exit — loudly, at `warn`, never the silent
+    /// `exit(0)` this ticket exists to remove.
+    ExitLoud,
+    /// A bare launch asked for a CAPTURE. We could not become the daemon, but we can still
+    /// give the user what they pressed the key for: fall through to the one-shot capture
+    /// overlay, which is exactly the historical non-resident behaviour.
+    FallThroughToCapture,
+}
+
+/// Whether a failed takeover should end the process or fall through to a capture.
+///
+/// The asymmetry is the whole point: a daemon-intent launch has no work left, while a
+/// capture-intent launch still owes the user an overlay. Falling through means the worst
+/// case of a truly stuck daemon is "the tray is broken", not "the app does nothing".
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn after_failed_takeover(daemon_intent: bool) -> AfterFailedTakeover {
+    if daemon_intent {
+        AfterFailedTakeover::ExitLoud
+    } else {
+        AfterFailedTakeover::FallThroughToCapture
+    }
 }
 
 /// Single-attempt variant (DRAGON-180): a CAPTURE-intent bare launch (the global
@@ -158,13 +328,15 @@ pub(crate) fn signal_existing_capture() -> bool {
     }
 }
 
-/// Windows (DRAGON-237): the "capture NOW" second-launch UX. Body under
-/// `platform::windows::instance` (strict split — pulses the daemon's named capture event).
-/// Returns true if a running daemon was signalled.
-#[cfg(windows)]
-pub(crate) fn signal_existing_capture() -> bool {
-    crate::platform::windows::instance::signal_existing_capture()
-}
+// DRAGON-438: the Windows arm of `signal_existing_capture` is GONE, and deliberately not
+// replaced by an `allow(dead_code)` shim. It pulsed the daemon's named capture event and
+// reported the pulse as success — but `OpenEventW` + `SetEvent` succeed against an event
+// nobody is draining, so it reported success for a wedged daemon just as readily as for a
+// healthy one, and the launch then exited(0) having delivered nothing. Its replacement is
+// `platform::windows::instance::signal_capture_and_wait_ack`, which requires the daemon to
+// say it SPAWNED the child. Leaving the old function callable would leave the silent no-op
+// one call site away from coming back. mac and Linux keep theirs above: their SIGUSR1 goes
+// to a pid whose liveness they check, so it does not carry this failure mode.
 
 /// Resident UX (DRAGON-130/173): ask the running resident (macOS daemon / Linux
 /// resident) to EXIT (SIGTERM the daemon-lock holder), used by `SetResident(false)`
@@ -498,17 +670,23 @@ pub(crate) fn set_preview_marker(active: bool) {
 /// only while the modal is actually on screen, so nothing is suppressed a moment longer
 /// than the dialog exists.
 ///
-/// Called only from the macOS alert presenter — the mechanism itself is portable
-/// `std::fs`, like every other marker, so it stays here with its siblings rather than
-/// growing a second, mac-shaped copy inside the platform plugin.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// Called only from the macOS and Windows alert presenters (DRAGON-436 added the second) —
+/// the mechanism itself is portable `std::fs`, like every other marker, so it stays here
+/// with its siblings rather than growing a second, platform-shaped copy inside each plugin.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub(crate) fn set_alert_marker(active: bool) {
     set_self_marker(ALERT_MARKER, active);
 }
 
 /// Whether ANOTHER live instance is showing a failure alert right now. Sweeps markers left
 /// by dead pids as it scans, so a child killed mid-dialog can never mute the next one.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+///
+/// BEST-EFFORT, and the callers treat it that way. Both presenters ask this and then call
+/// [`set_alert_marker`], which is check-then-set: two children failing in the same instant
+/// can both find no marker and both put a dialog up. The cost of that race is one extra
+/// dialog in the rare case; a real mutual exclusion (a named mutex, an atomic create) would
+/// buy little on a path that is already the unhappy one. Do not document it as a guarantee.
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub(crate) fn any_other_alert() -> bool {
     any_other_marker_in(&crate::util::runtime_dir(), std::process::id(), ALERT_MARKER)
 }
@@ -533,8 +711,29 @@ fn set_self_marker(suffix: &str, active: bool) {
 /// a process per preview and depend on it (Windows has no preview-handoff transport at
 /// all, so its sweep is the only thing standing between a recording session and a fresh
 /// capture).
-pub fn should_spare_sibling(recording: bool, preview: bool) -> bool {
-    recording || preview
+///
+/// DRAGON-438 added `alert`. A sibling showing the DRAGON-415 capture-failure dialog is
+/// mid-conversation with the user: the sweep would `TerminateProcess` it, so the dialog
+/// explaining why a capture failed would vanish the instant the user retried — and retrying
+/// after a failure is the single most likely thing they do. Worse, that child holds the
+/// cross-process alert marker (the one that makes the FIRST failure speak and the rest stay
+/// quiet), so killing it mid-dialog can leave a pile of failures with nobody left to explain
+/// any of them. It is a window the user must act on, like a recording or a preview, so it is
+/// spared like one.
+///
+/// Both sweeps read this flag, and each platform pairs a WRITER with a READER:
+///
+/// * macOS: `platform/mac/services/alert.rs` writes the marker; the `/proc`-style sweep body
+///   below reads it.
+/// * Windows: `platform/windows/alert.rs` writes it as of DRAGON-436 (the Windows failure
+///   alert, in review on its own branch); the Toolhelp sweep in
+///   `platform::windows::instance::close_other_instances` reads it through [`marker_flags`].
+///   The reader landed here first ON PURPOSE — it composes with that branch, so the sparing
+///   is live the moment the two merge rather than needing a follow-up.
+/// * Linux writes no alert marker (its failures reach a terminal), so the flag is always
+///   false there and the sweep is byte-identical.
+pub fn should_spare_sibling(recording: bool, preview: bool, alert: bool) -> bool {
+    recording || preview || alert
 }
 
 /// Whether the VIDEO capture kind should be offered. Disabled while another instance is
@@ -696,7 +895,12 @@ pub(crate) fn pid_is_live(pid: u32) -> bool {
 /// DRAGON-322 (unconditional since DRAGON-351): a RECORDING or PREVIEW sibling is also
 /// spared (its per-pid state marker) so a recording session + a capture — including a
 /// self-capture of the open preview — coexist. A bare selector sibling still collapses.
-#[cfg(not(windows))]
+///
+/// LINUX ONLY (DRAGON-459). This body enumerates `/proc`, which does not exist on
+/// macOS: it used to be `#[cfg(not(windows))]` and so compiled there, but every run
+/// hit the `read_dir("/proc")` failure below and returned immediately — the sweep was
+/// inert on mac, closing nothing. See the mac twin further down for the real fix.
+#[cfg(target_os = "linux")]
 pub fn close_other_instances() {
     // DRAGON-336: drop dead pids' markers BEFORE reading them below, so a recycled pid
     // can never inherit a crashed preview's marker and be wrongly spared.
@@ -729,9 +933,11 @@ pub fn close_other_instances() {
         let recording =
             std::path::Path::new(&state_marker_path(pid, RECORDING_MARKER)).exists();
         let preview = std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists();
-        if should_spare_sibling(recording, preview) {
+        // DRAGON-438: and a sibling mid-failure-dialog.
+        let alert = std::path::Path::new(&state_marker_path(pid, ALERT_MARKER)).exists();
+        if should_spare_sibling(recording, preview, alert) {
             log::info!(
-                "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview})"
+                "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview} alert={alert})"
             );
             continue;
         }
@@ -741,6 +947,182 @@ pub fn close_other_instances() {
         // spawned this very capture). Two complementary checks: the daemon-lock
         // holder covers a bare-launch daemon (DRAGON-181), the `resident` argv
         // covers a daemon mid-restart before it wins the lock.
+        if is_resident_instance(pid) {
+            continue;
+        }
+        if let Some(p) = rustix::process::Pid::from_raw(pid as i32) {
+            let _ = rustix::process::kill_process(p, rustix::process::Signal::TERM);
+        }
+    }
+}
+
+/// macOS (DRAGON-459): every live pid on the system, via `libproc`'s `proc_listallpids`
+/// — the mac analog of Linux's `/proc` readdir. Part of `libSystem` (linked into every
+/// process already), so no new crate or framework. `None` becomes an empty sweep rather
+/// than a panic: a transient failure here should cost one skipped sweep, never a crash.
+///
+/// Sized generously above the reported byte count: the live process count can grow
+/// between the size query and the fetch (a process starting is normal churn, unlike
+/// `mac_argv`'s single already-exec'd target), and a short buffer here would silently
+/// truncate the list rather than error, which would degrade back toward DRAGON-459's
+/// original bug (siblings quietly never found) instead of away from it.
+#[cfg(target_os = "macos")]
+fn mac_all_pids() -> Vec<u32> {
+    // SAFETY: a null buffer with the documented sentinel; the raw byte count needed is
+    // handed back rather than written through, per `proc_listallpids`'s contract.
+    let needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return Vec::new();
+    }
+    let capacity = (needed as usize / std::mem::size_of::<libc::pid_t>()) + 64;
+    let mut buf: Vec<libc::pid_t> = vec![0; capacity];
+    // SAFETY: `buf` is sized for `capacity` pid_t entries; the byte length passed
+    // matches that allocation exactly.
+    let bytes = unsafe {
+        libc::proc_listallpids(
+            buf.as_mut_ptr() as *mut libc::c_void,
+            (capacity * std::mem::size_of::<libc::pid_t>()) as libc::c_int,
+        )
+    };
+    if bytes <= 0 {
+        return Vec::new();
+    }
+    let count = (bytes as usize / std::mem::size_of::<libc::pid_t>()).min(buf.len());
+    buf.truncate(count);
+    buf.into_iter().map(|p| p as u32).collect()
+}
+
+/// macOS (DRAGON-459): `pid`'s executable path via `libproc`'s `proc_pidpath` — the mac
+/// analog of Linux's `/proc/<pid>/exe` readlink. `None` for a dead/inaccessible pid,
+/// exactly like the Linux body's `read_link` failure.
+#[cfg(target_os = "macos")]
+fn mac_exe_path(pid: u32) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: `buf` is exactly `PROC_PIDPATHINFO_MAXSIZE` bytes, the size this call
+    // documents as sufficient for any path it can return.
+    let len = unsafe {
+        libc::proc_pidpath(pid as libc::c_int, buf.as_mut_ptr() as *mut libc::c_void, buf.len() as u32)
+    };
+    if len <= 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+/// macOS (DRAGON-459): the pure parsing half of [`mac_argv`] — pulled apart from the
+/// `sysctl` call so the buffer layout (undocumented by Apple, but stable and the same
+/// one `ps`/Activity Monitor read) is unit-testable without a live process.
+///
+/// Layout: a leading `argc` (native-endian `i32`), then the saved executable path
+/// (NUL-terminated), then NUL padding out to the first non-NUL byte, then exactly
+/// `argc` NUL-terminated strings (`argv[0..argc)`), then the environment (ignored —
+/// we stop once `argc` strings are read).
+#[cfg(target_os = "macos")]
+fn parse_procargs2(buf: &[u8]) -> Vec<String> {
+    if buf.len() < 4 {
+        return Vec::new();
+    }
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+    if argc == 0 {
+        return Vec::new();
+    }
+    let mut i = 4;
+    // Skip the saved executable path.
+    while i < buf.len() && buf[i] != 0 {
+        i += 1;
+    }
+    // Skip the NUL padding between the exec path and argv[0].
+    while i < buf.len() && buf[i] == 0 {
+        i += 1;
+    }
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if i >= buf.len() {
+            break;
+        }
+        let start = i;
+        while i < buf.len() && buf[i] != 0 {
+            i += 1;
+        }
+        argv.push(String::from_utf8_lossy(&buf[start..i]).into_owned());
+        i += 1; // the NUL terminator
+    }
+    argv
+}
+
+/// macOS (DRAGON-459): `pid`'s argv via `sysctl(KERN_PROCARGS2)` — the mac analog of
+/// Linux's `/proc/<pid>/cmdline`. Empty on any failure (permission, dead pid, or a
+/// buffer `sysctl` rejects), matching the Linux body's `unwrap_or(false)` fallback shape
+/// one level up in [`is_resident_instance`] / [`is_settings_instance`].
+#[cfg(target_os = "macos")]
+fn mac_argv(pid: u32) -> Vec<String> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: `oldp` null + a valid `oldlenp` is the documented size-query form.
+    let queried = unsafe {
+        libc::sysctl(mib.as_mut_ptr(), mib.len() as libc::c_uint, std::ptr::null_mut(), &mut size, std::ptr::null_mut(), 0)
+    };
+    if queried != 0 || size == 0 {
+        return Vec::new();
+    }
+    // A target's argv is fixed at exec time and cannot grow between the two calls, but
+    // sysctl still wants oldlenp to be strictly enough — pad a little rather than retry.
+    size += 16;
+    let mut buf = vec![0u8; size];
+    let mut got = size;
+    // SAFETY: `buf` is exactly `got` bytes, matching `oldlenp`.
+    let fetched = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut got,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if fetched != 0 || got < 4 {
+        return Vec::new();
+    }
+    buf.truncate(got);
+    parse_procargs2(&buf)
+}
+
+/// macOS (DRAGON-459): the same sibling sweep as Linux, byte-for-byte the same DECISION
+/// (identity by executable path, then the settings / recording / preview / alert /
+/// resident sparing rules, unwidened), sourced from `libproc` instead of `/proc` (which
+/// does not exist on macOS — see the Linux twin's doc comment for the bug this replaces).
+#[cfg(target_os = "macos")]
+pub fn close_other_instances() {
+    sweep_stale_markers();
+    let self_pid = std::process::id();
+    let Some(self_exe) = mac_exe_path(self_pid) else {
+        return;
+    };
+    for pid in mac_all_pids() {
+        if pid == self_pid {
+            continue;
+        }
+        if mac_exe_path(pid).as_ref() != Some(&self_exe) {
+            continue;
+        }
+        if is_settings_instance(pid) {
+            continue; // never close a settings window
+        }
+        // DRAGON-322: keep a live recording / preview sibling.
+        let recording =
+            std::path::Path::new(&state_marker_path(pid, RECORDING_MARKER)).exists();
+        let preview = std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists();
+        // DRAGON-438: and a sibling mid-failure-dialog.
+        let alert = std::path::Path::new(&state_marker_path(pid, ALERT_MARKER)).exists();
+        if should_spare_sibling(recording, preview, alert) {
+            log::info!(
+                "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview} alert={alert})"
+            );
+            continue;
+        }
         if is_resident_instance(pid) {
             continue;
         }
@@ -766,24 +1148,27 @@ pub fn close_other_instances() {
     crate::platform::windows::instance::close_other_instances();
 }
 
-/// DRAGON-322: whether `pid`'s per-pid RECORDING / PREVIEW marker exists. The predicate
-/// the Windows sibling sweep uses (its pids come from a live Toolhelp snapshot, so no
-/// liveness probe is needed here). Windows-only — the unix sweep inlines the same two
-/// `Path::exists` checks against [`state_marker_path`].
+/// DRAGON-322: whether `pid`'s per-pid RECORDING / PREVIEW / ALERT marker exists. The
+/// predicate the Windows sibling sweep uses (its pids come from a live Toolhelp snapshot,
+/// so no liveness probe is needed here). Windows-only — the unix sweep inlines the same
+/// three `Path::exists` checks against [`state_marker_path`].
+///
+/// The ALERT flag is DRAGON-438: see [`should_spare_sibling`] for why a child showing the
+/// failure dialog must survive the next capture's sweep.
 #[cfg(windows)]
-pub(crate) fn marker_flags(pid: u32) -> (bool, bool) {
+pub(crate) fn marker_flags(pid: u32) -> (bool, bool, bool) {
     (
         std::path::Path::new(&state_marker_path(pid, RECORDING_MARKER)).exists(),
         std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists(),
+        std::path::Path::new(&state_marker_path(pid, ALERT_MARKER)).exists(),
     )
 }
 
 /// Whether `pid` is the resident daemon: the daemon-lock holder, or a process
 /// launched with the literal `resident` argument (the autostart / toggle-on shape;
 /// also covers a restarting daemon that hasn't won the lock yet). Never swept by
-/// [`close_other_instances`]. `not(windows)`: the daemon-lock pid + `/proc` sweep it
-/// serves are Linux/macOS-only.
-#[cfg(not(windows))]
+/// [`close_other_instances`]. LINUX ONLY (DRAGON-459) — see the mac twin below.
+#[cfg(target_os = "linux")]
 fn is_resident_instance(pid: u32) -> bool {
     if daemon_lock_pid() == Some(pid) {
         return true;
@@ -796,8 +1181,8 @@ fn is_resident_instance(pid: u32) -> bool {
 /// Whether `pid` is a settings window — either launched with `--settings` (cmdline)
 /// or the instance that became the settings pane via the gear button (it owns the
 /// settings lock and recorded its pid there). Such instances are never auto-closed.
-/// `not(windows)`: only the `/proc` sweep in [`close_other_instances`] calls it.
-#[cfg(not(windows))]
+/// LINUX ONLY (DRAGON-459) — see the mac twin below.
+#[cfg(target_os = "linux")]
 fn is_settings_instance(pid: u32) -> bool {
     if settings_lock_pid() == Some(pid) {
         return true;
@@ -805,6 +1190,26 @@ fn is_settings_instance(pid: u32) -> bool {
     std::fs::read(format!("/proc/{pid}/cmdline"))
         .map(|b| b.split(|&c| c == 0).any(|a| a == b"--settings"))
         .unwrap_or(false)
+}
+
+/// macOS (DRAGON-459) twin of [`is_resident_instance`]: same two checks, argv sourced
+/// from [`mac_argv`] instead of `/proc/<pid>/cmdline`.
+#[cfg(target_os = "macos")]
+fn is_resident_instance(pid: u32) -> bool {
+    if daemon_lock_pid() == Some(pid) {
+        return true;
+    }
+    mac_argv(pid).iter().any(|arg| arg == "resident")
+}
+
+/// macOS (DRAGON-459) twin of [`is_settings_instance`]: same two checks, argv sourced
+/// from [`mac_argv`] instead of `/proc/<pid>/cmdline`.
+#[cfg(target_os = "macos")]
+fn is_settings_instance(pid: u32) -> bool {
+    if settings_lock_pid() == Some(pid) {
+        return true;
+    }
+    mac_argv(pid).iter().any(|arg| arg == "--settings")
 }
 
 #[cfg(test)]
@@ -817,10 +1222,169 @@ mod tests {
     /// predicate survives the setting's removal instead of becoming `true`.
     #[test]
     fn spare_recording_and_preview_siblings_but_never_a_bare_selector() {
-        assert!(!should_spare_sibling(false, false)); // bare selector overlay -> collapse
-        assert!(should_spare_sibling(true, false)); // recording session
-        assert!(should_spare_sibling(false, true)); // open preview (self-capture)
-        assert!(should_spare_sibling(true, true)); // recording WITH a preview open
+        assert!(!should_spare_sibling(false, false, false)); // bare selector overlay -> collapse
+        assert!(should_spare_sibling(true, false, false)); // recording session
+        assert!(should_spare_sibling(false, true, false)); // open preview (self-capture)
+        assert!(should_spare_sibling(true, true, false)); // recording WITH a preview open
+    }
+
+    /// DRAGON-438: a sibling showing the capture-failure dialog is spared.
+    ///
+    /// The scenario, which is the whole reason the flag exists: a capture fails and puts up
+    /// the dialog; the user's next move is to press the capture key again; that new child
+    /// commits and runs the sibling sweep, which would `TerminateProcess` the dialog the
+    /// user was still reading. The alert child is a window the user must ACT ON, so it
+    /// belongs with the recording and preview cases, not with the bare selector overlay that
+    /// is meant to collapse.
+    #[test]
+    fn spare_a_sibling_that_is_showing_the_failure_dialog() {
+        // A child doing nothing but showing the dialog — no recording, no preview — is
+        // exactly the shape the sweep used to kill, and is spared on the alert flag alone.
+        assert!(should_spare_sibling(false, false, true));
+        // Sparing is additive: adding the dialog to an already-spared sibling cannot make it
+        // collapsible, and the bare selector (nothing at all) is still the ONLY case that
+        // collapses. That last assertion is the one worth keeping — the rule is "spare every
+        // window the user must act on", not "spare everything".
+        for recording in [false, true] {
+            for preview in [false, true] {
+                assert!(
+                    should_spare_sibling(recording, preview, true),
+                    "an alert must survive whatever else the sibling is doing \
+                     (recording={recording} preview={preview})"
+                );
+            }
+        }
+        assert!(
+            !should_spare_sibling(false, false, false),
+            "a sibling showing nothing the user must act on still collapses"
+        );
+    }
+
+    // ── DRAGON-438: the Windows daemon-lock launch protocol ──────────────────
+    // Windows-only decisions, run on every host: this is a dual-boot shared tree and the
+    // suite is the only gate, so the table has to be verifiable wherever it runs.
+
+    /// The intent split (DRAGON-180's Linux rule, now Windows'): a daemon-intent launch
+    /// keeps the ~1.5s restart-handoff window, a capture-intent launch takes ONE attempt
+    /// and relies on the ACK rather than on waiting longer.
+    #[test]
+    fn lock_attempts_follow_launch_intent() {
+        assert_eq!(daemon_lock_attempts(true), 31);
+        assert_eq!(daemon_lock_attempts(false), 1);
+        // The retry window must be a real one, or the handoff it exists for cannot happen.
+        assert!(daemon_lock_attempts(true) > daemon_lock_attempts(false));
+    }
+
+    /// An ACK, or an old daemon that cannot give one, both mean the request is somebody
+    /// else's now. The `AckUnavailable` arm is the upgrade-safety rule: a daemon from
+    /// before this protocol has no ack event, and must never be killed for being old.
+    #[test]
+    fn an_acked_or_pre_ack_daemon_is_treated_as_having_delivered() {
+        for probe in [SignalProbe::Acked, SignalProbe::AckUnavailable] {
+            for holder_live in [false, true] {
+                for holder_is_ours in [false, true] {
+                    assert_eq!(
+                        relaunch_action(probe, holder_live, holder_is_ours),
+                        RelaunchAction::ExitDelivered,
+                        "{probe:?} live={holder_live} ours={holder_is_ours}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE bug: a pulse that nobody drains, and a capture event that cannot even be
+    /// opened (the daemon whose events failed to create at startup, which is permanent).
+    /// Both mean the message loop is not running, so both take over — but only from a
+    /// holder we can prove is ours.
+    #[test]
+    fn an_unanswered_signal_takes_over_only_a_live_holder_that_is_ours() {
+        for probe in [SignalProbe::NotAcked, SignalProbe::NoCaptureEvent] {
+            assert_eq!(
+                relaunch_action(probe, true, true),
+                RelaunchAction::KillHolderAndRetry,
+                "{probe:?}"
+            );
+        }
+    }
+
+    /// A daemon that PUMPED but could not spawn is never killed, whatever the holder state
+    /// says. The receipt already proved its message loop is running, so it is not the wedge
+    /// this ticket hunts — it is a machine that cannot start a process right now (antivirus
+    /// blocking the exe, or the exe locked mid-update). Terminating a healthy tray would not
+    /// make `CreateProcess` succeed, and would cost the user their tray on top of their
+    /// capture.
+    ///
+    /// This is the row that keeps the single-signal version's worst failure from coming
+    /// back: with one combined ack, a merely SLOW spawn (a ~40MB exe under an AV scan) read
+    /// identically to a wedge, and got the daemon terminated for it.
+    #[test]
+    fn a_daemon_that_pumped_but_could_not_spawn_is_never_killed() {
+        for holder_live in [false, true] {
+            for holder_is_ours in [false, true] {
+                assert_eq!(
+                    relaunch_action(SignalProbe::ReceiptOnly, holder_live, holder_is_ours),
+                    RelaunchAction::FallBackWithoutKilling,
+                    "live={holder_live} ours={holder_is_ours}"
+                );
+            }
+        }
+    }
+
+    /// The safety rule, stated as its own test because getting it wrong means killing a
+    /// stranger's process. A recorded pid can be stale, and Windows RECYCLES pids, so a
+    /// pid that is alive but running someone else's image must never be terminated —
+    /// only retried against.
+    #[test]
+    fn a_foreign_or_dead_holder_is_never_killed() {
+        for probe in [SignalProbe::NotAcked, SignalProbe::NoCaptureEvent] {
+            // Alive, but NOT our executable: a recycled pid. Retry, never terminate.
+            assert_eq!(relaunch_action(probe, true, false), RelaunchAction::RetryLock);
+            // Dead: nothing to kill, and its lock is already ours for the taking.
+            assert_eq!(relaunch_action(probe, false, true), RelaunchAction::RetryLock);
+            assert_eq!(relaunch_action(probe, false, false), RelaunchAction::RetryLock);
+        }
+    }
+
+    /// The whole matrix in one sweep, so a new `SignalProbe` variant cannot be added
+    /// without a decision being made for it here.
+    #[test]
+    fn the_relaunch_table_is_total() {
+        for probe in [
+            SignalProbe::Acked,
+            SignalProbe::ReceiptOnly,
+            SignalProbe::AckUnavailable,
+            SignalProbe::NotAcked,
+            SignalProbe::NoCaptureEvent,
+        ] {
+            for holder_live in [false, true] {
+                for holder_is_ours in [false, true] {
+                    let expect = match probe {
+                        SignalProbe::Acked | SignalProbe::AckUnavailable => {
+                            RelaunchAction::ExitDelivered
+                        }
+                        SignalProbe::ReceiptOnly => RelaunchAction::FallBackWithoutKilling,
+                        _ if holder_live && holder_is_ours => RelaunchAction::KillHolderAndRetry,
+                        _ => RelaunchAction::RetryLock,
+                    };
+                    assert_eq!(
+                        relaunch_action(probe, holder_live, holder_is_ours),
+                        expect,
+                        "{probe:?} live={holder_live} ours={holder_is_ours}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// After a takeover that still could not win the lock: a `resident` launch has no work
+    /// left and exits (loudly — the silent exit IS the bug), while a bare capture launch
+    /// still owes the user the overlay they pressed a key for. That fall-through is what
+    /// downgrades the worst case from "the app does nothing" to "the tray is broken".
+    #[test]
+    fn a_failed_takeover_still_gives_a_capture_launch_its_capture() {
+        assert_eq!(after_failed_takeover(false), AfterFailedTakeover::FallThroughToCapture);
+        assert_eq!(after_failed_takeover(true), AfterFailedTakeover::ExitLoud);
     }
 
     #[test]
@@ -1050,5 +1614,52 @@ mod tests {
             vec![3, 7, 9]
         );
         assert!(order_preview_hosts(Vec::new()).is_empty());
+    }
+
+    /// DRAGON-459: `parse_procargs2`'s buffer layout, pinned against a hand-built
+    /// `KERN_PROCARGS2` buffer (real values in a synthetic byte layout — no live process
+    /// needed, matching the project's "unit-test the pure logic island" convention).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_procargs2_reads_argv_after_the_exec_path_and_its_padding() {
+        // argc=3, exec path "/bin/foo", three NULs of padding, then three argv strings.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3i32.to_ne_bytes());
+        buf.extend_from_slice(b"/bin/foo\0");
+        buf.extend_from_slice(&[0u8; 3]); // padding before argv[0]
+        buf.extend_from_slice(b"foo\0--region\0--no-editor\0");
+        // Trailing bytes (environment) must never be read past argc strings.
+        buf.extend_from_slice(b"SOME_ENV=1\0");
+        assert_eq!(parse_procargs2(&buf), vec!["foo", "--region", "--no-editor"]);
+    }
+
+    /// A resident daemon's argv is a single bare token — the exact shape
+    /// `is_resident_instance` looks for.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_procargs2_finds_the_bare_resident_argument() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1i32.to_ne_bytes());
+        buf.extend_from_slice(b"/Applications/Cosmic Capture Kit.app/Contents/MacOS/cosmic-capture-kit\0");
+        buf.extend_from_slice(&[0u8; 1]);
+        buf.extend_from_slice(b"resident\0");
+        assert_eq!(parse_procargs2(&buf), vec!["resident"]);
+    }
+
+    /// `argc=0` and a too-short buffer both yield an empty argv rather than panicking —
+    /// the shape a truncated or unreadable `sysctl` answer would produce.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn parse_procargs2_degrades_to_empty_rather_than_panicking() {
+        assert!(parse_procargs2(&[]).is_empty());
+        assert!(parse_procargs2(&[1, 2, 3]).is_empty()); // shorter than the argc field itself
+        assert!(parse_procargs2(&0i32.to_ne_bytes()).is_empty()); // argc=0
+        // argc claims more strings than the buffer actually holds.
+        let mut truncated = Vec::new();
+        truncated.extend_from_slice(&5i32.to_ne_bytes());
+        truncated.extend_from_slice(b"/bin/foo\0");
+        truncated.extend_from_slice(&[0u8]);
+        truncated.extend_from_slice(b"only-one\0");
+        assert_eq!(parse_procargs2(&truncated), vec!["only-one"]);
     }
 }

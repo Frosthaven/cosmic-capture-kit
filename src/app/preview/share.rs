@@ -72,12 +72,19 @@ impl App {
         is_video: bool,
     ) -> bool {
         let ok = crate::platform::services::copy_to_clipboard(path, is_video);
+        self.toast_copy_outcome(id, ok);
+        ok
+    }
+
+    /// Post the clipboard outcome's toast. Shared by the synchronous Copy action above and by
+    /// the asynchronous open-time copy's completion ([`PreviewMsg::AutoCopied`], DRAGON-454),
+    /// so the two can never word the same outcome differently.
+    pub(super) fn toast_copy_outcome(&mut self, id: window::Id, ok: bool) {
         if ok {
             self.preview_toast_icon(id, ToastKind::Success, "Copied to clipboard", "clipboard-check-symbolic");
         } else {
             self.preview_toast_icon(id, ToastKind::Error, "Couldn't copy to clipboard", "clipboard-x-symbolic");
         }
-        ok
     }
 
     /// Copy `src` to a throwaway temp beside the other runtime files and return it, so the
@@ -88,11 +95,21 @@ impl App {
     /// recording) from a detached child, so unlinking the original right after spawning it
     /// is a race at best and a dead URI at worst. Staging first removes the question —
     /// the same trick the edited-copy bake already uses.
+    ///
+    /// A STILL is staged through [`edit::save_unedited_still`] rather than a raw copy, for
+    /// the same reason the name it is staged under says png (DRAGON-455): the staged file
+    /// has to BE what it claims. For our own captures — every still that is not an external
+    /// `--preview` image — that is a byte copy and nothing moves.
     fn stage_clipboard_copy(src: &std::path::Path, is_video: bool) -> Option<PathBuf> {
         let temp = PathBuf::from(crate::util::runtime_dir())
             .join(clipboard_temp_name(src, is_video, false));
-        match std::fs::copy(src, &temp) {
-            Ok(_) => Some(temp),
+        let staged = if is_video {
+            std::fs::copy(src, &temp).map(|_| ())
+        } else {
+            edit::save_unedited_still(src, &temp).map(|_| ())
+        };
+        match staged {
+            Ok(()) => Some(temp),
             Err(e) => {
                 log::warn!("preview: could not stage a clipboard copy of {}: {e}", src.display());
                 None
@@ -108,24 +125,54 @@ impl App {
     ///
     /// * A `--preview` file is NOT copied: it is the user's own file, opened as a viewer,
     ///   and silently hijacking their clipboard for it was never asked for.
-    /// * Over the clipboard SIZE LIMIT ([`crate::share::AUTO_COPY_MAX_BYTES`], a fixed
-    ///   constant since DRAGON-353 removed the setting) it is skipped with an error toast
-    ///   naming the limit — that toast is why the knob was no longer needed.
+    /// * An IMAGE over the clipboard SIZE LIMIT ([`crate::share::AUTO_COPY_MAX_BYTES`], a
+    ///   fixed constant since DRAGON-353 removed the setting) is skipped with an error toast
+    ///   naming the limit — that toast is why the knob was no longer needed. A RECORDING is
+    ///   never skipped for size (DRAGON-450): it copies as a path, not as bytes, so the
+    ///   limit has nothing to bound and refusing a long recording only cost the user their
+    ///   copy. See [`crate::share::copy_embeds_bytes`].
     /// * It never saves and never closes, whatever the "Automatically save on copy" /
     ///   "Automatically close on copy" settings say: those are about the user's Copy ACTION.
     ///   An editor that shut itself the instant it opened would be unusable.
-    pub(super) fn auto_copy_preview_on_open(&mut self, id: window::Id) {
-        let Some(p) = self.preview_for(id) else { return };
+    ///
+    /// # Why this one is asynchronous and the Copy ACTION is not (DRAGON-454)
+    ///
+    /// The clipboard write itself is real work — on Windows it DECODES the capture's PNG a
+    /// second time and re-encodes it for the clipboard, and `OpenClipboard` can be held by
+    /// another app (a clipboard manager) for as long as it likes. Measured at ~55-75 ms for a
+    /// 5120x1440 still on the dev box, and unbounded in the contended case.
+    ///
+    /// It used to run inline, inside `update`. On the routes that pre-open a spinner (a window
+    /// grab, a freeze crop, a stopped recording) that put the whole cost in front of a user who
+    /// was already looking at the editor: the surface was up and the toolbar simply did not
+    /// answer. On the routes that open the editor here, it ran BEFORE the surface's own open
+    /// task, so it delayed the editor appearing at all. Nothing in the editor reads the result
+    /// — the only output is a toast — so it has no business on the UI thread.
+    ///
+    /// The user's explicit Copy stays SYNCHRONOUS on purpose: `finish_share_intent` gates the
+    /// delete and the close on its outcome (DRAGON-355), so that one must answer before the
+    /// action continues. This one answers to nobody.
+    ///
+    /// Returns the task carrying the outcome back as [`PreviewMsg::AutoCopied`]; the
+    /// `copied_on_open` latch is set BEFORE the work starts, so the several seams that call
+    /// this still copy exactly once even while a copy is in flight.
+    pub(super) fn auto_copy_preview_on_open(
+        &mut self,
+        id: window::Id,
+    ) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for(id) else { return Task::none() };
         if p.copied_on_open || p.external {
-            return;
+            return Task::none();
         }
-        let Some(path) = p.path.clone() else { return };
+        let Some(path) = p.path.clone() else { return Task::none() };
         let size = p.size.unwrap_or(0);
         let is_video = matches!(p.kind, PreviewKind::Video(_));
         if let Some(p) = self.preview_for_mut(id) {
             p.copied_on_open = true;
         }
-        if size > crate::platform::services::AUTO_COPY_MAX_BYTES {
+        if crate::platform::services::copy_embeds_bytes(&path, is_video)
+            && size > crate::platform::services::AUTO_COPY_MAX_BYTES
+        {
             // The limit is a fixed constant since DRAGON-353 (the "Clipboard size limit"
             // setting is gone), so this toast is the ONLY place it is visible — it names
             // the number rather than a vague "too large".
@@ -136,9 +183,26 @@ impl App {
                 format!("Too large to copy automatically (over {limit})"),
                 "clipboard-x-symbolic",
             );
-            return;
+            return Task::none();
         }
-        self.copy_to_clipboard_now(id, &path, is_video);
+        // DRAGON-454: OFF the UI thread, bracketed on the launch timeline at both ends. A
+        // plain OS thread rather than `spawn_blocking`, matching every other "this blocks, get
+        // it off the loop" worker in the app (the image decode right beside it, the capture
+        // worker): the executor's blocking pool is not something the one-shot process wants to
+        // wait on at teardown.
+        crate::util::timing_mark("preview: auto-copy on open (begin, worker thread)");
+        let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            let ok = crate::platform::services::copy_to_clipboard(&path, is_video);
+            crate::util::timing_mark("preview: auto-copy on open (done, worker thread)");
+            let _ = tx.send(ok);
+        });
+        Task::perform(rx, move |res| {
+            // A dropped sender means the worker died mid-write. Nothing was put on the
+            // clipboard, so it reads as the failure it is — the same toast a refused write
+            // gets. The capture is on disk either way; only the courtesy copy is lost.
+            cosmic::Action::App(Msg::Preview(id, PreviewMsg::AutoCopied(res.unwrap_or(false))))
+        })
     }
 
     /// Run one of the unsaved-changes dialog's ACTION buttons: dismiss the dialog, arm
@@ -189,10 +253,16 @@ impl App {
     /// chooser over itself, so it stays open.
     pub(super) fn save_as_dialog(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
         self.stop_preview_playback(id);
+        let is_video = self.preview_for(id).is_some_and(|p| matches!(p.kind, PreviewKind::Video(_)));
         let name = self.preview_for(id)
-            .and_then(|p| p.path.as_ref())
-            .and_then(|path| path.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
+            .and_then(|p| p.path.clone())
+            // DRAGON-455: OFFER a `.png` name for a still, because a still is what we are
+            // going to write — suggesting `clip.JPG` for a file that will come out as a PNG
+            // is the mismatch this ticket removes, just before the user has touched
+            // anything. This is only the starting text; the PICK is forced through the same
+            // rule in `SaveAsResult`, so retyping cannot get around it.
+            .map(|path| if is_video { path } else { naming::png_name(&path) })
+            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "capture".to_string());
         let hide = match self.preview_for(id) {
             Some(p) if !p.surface.is_window() => {
@@ -268,7 +338,16 @@ impl App {
     pub(super) fn preview_save_target(&self, id: window::Id) -> Option<PathBuf> {
         let p = self.preview_for(id)?;
         let current = p.saved_path.as_ref().or(p.path.as_ref())?;
-        Some(naming::save_target(current, p.save_in_place, &naming::on_disk))
+        // DRAGON-455: a STILL is written as PNG, so its target NAMES png — and it has to be
+        // forced BEFORE the `-edited` derivation, not after. An external `clip.JPG` would
+        // otherwise derive `clip-edited.JPG` and run its collision walk against a name
+        // nothing is ever written to. A recording keeps whatever container it is in;
+        // `bake_video` honours that.
+        let current = match p.kind {
+            PreviewKind::Video(_) => current.clone(),
+            PreviewKind::Image(_) => naming::png_name(current),
+        };
+        Some(naming::save_target(&current, p.save_in_place, &naming::on_disk))
     }
 
     /// The file this document IS on disk right now — its last save if it has one, else the
@@ -411,7 +490,7 @@ impl App {
         // Annotations are IMAGES only (a video preview never accumulates them).
         let annotations = p.edit.annotations.clone();
         // The curve radius is a POINT preset baked into SOURCE-px geometry (DRAGON-383);
-        // identity on Linux/1x.
+        // identity on an unscaled (1x) output.
         let annot_curve = super::annotate::points_to_source_px(p.edit.curve_radius(), p.source_scale);
         let dim = p.edit.dim;
         // The committed crop (DRAGON-382; IMAGES only) — applied as the bake's final step.
@@ -507,7 +586,11 @@ impl App {
                 Some(dest) => {
                     let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
                     self.stop_preview_playback(id);
-                    crate::platform::services::notify(dest, false);
+                    // DRAGON-451: a system notification USED to fire here as well. It was a
+                    // second banner for a document the user is looking at, announcing a save
+                    // they just asked for, on top of the in-app toast below — so the system
+                    // channel is now reserved for deliveries with no editor on screen
+                    // (`finish_share`). The in-app toast is unchanged.
                     self.preview_toast_icon(
                         id,
                         ToastKind::Success,
@@ -782,10 +865,13 @@ pub(super) fn bake_blocked(owed: bool, media_bakeable: bool) -> bool {
 
 /// The runtime-dir FILENAME a clipboard copy is served from (DRAGON-398).
 ///
-/// * **Images** keep the fixed `cck-copy.<ext>` — byte-identical to before. Every platform
-///   hands the clipboard IMAGE BYTES (Linux reads the file in the selection worker; macOS
-///   writes `NSData`; Windows CF_DIBV5), so the name is never user-visible and a fixed one
-///   keeps the runtime dir bounded no matter how many copies a session makes.
+/// * **Images** get the fixed `cck-copy.png` — a still is written as PNG (DRAGON-455), so
+///   the staged file says png rather than echoing whatever the source was named. Every
+///   platform hands the clipboard IMAGE BYTES (Linux reads the file in the selection worker;
+///   macOS writes `NSData`; Windows CF_DIBV5), so the name is never user-visible and a fixed
+///   one keeps the runtime dir bounded no matter how many copies a session makes. For our own
+///   `.png` captures — every copy that is not of an external `--preview` image — this is
+///   byte-identical to before.
 /// * **Videos** take the document's OWN name, because there the name IS user-visible:
 ///   every platform puts a recording on the clipboard as a FILE REFERENCE (Linux a
 ///   `text/uri-list` URI, macOS an `NSURL`, Windows CF_HDROP), so pasting into a file
@@ -797,9 +883,9 @@ pub(super) fn bake_blocked(owed: bool, media_bakeable: bool) -> bool {
 /// Always a single path component (`file_name`, never a directory), so the caller's
 /// `runtime_dir().join(..)` can't be walked out of.
 pub(super) fn clipboard_temp_name(src: &std::path::Path, is_video: bool, edited: bool) -> String {
-    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or(naming::PNG_EXT);
     if !is_video {
-        return format!("cck-copy.{ext}");
+        return format!("cck-copy.{}", naming::PNG_EXT);
     }
     let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     if stem.is_empty() {
@@ -954,10 +1040,12 @@ mod tests {
     #[test]
     fn a_copied_recording_pastes_under_its_own_name_and_a_still_does_not() {
         use std::path::Path;
-        // Images: unchanged in both flavours.
+        // Images: one fixed name in both flavours, and it SAYS png — DRAGON-455, because
+        // png is what the staged file now contains whatever the source was called. An
+        // external `--preview a.JPG` used to echo its name into `cck-copy.JPG`.
         for edited in [true, false] {
             assert_eq!(clipboard_temp_name(Path::new("/shots/a.png"), false, edited), "cck-copy.png");
-            assert_eq!(clipboard_temp_name(Path::new("/shots/a.JPG"), false, edited), "cck-copy.JPG");
+            assert_eq!(clipboard_temp_name(Path::new("/shots/a.JPG"), false, edited), "cck-copy.png");
         }
         // Videos: the BAKED variant is marked `-edited` (matching what a Save would have
         // written beside the original); the staged copy of the untouched file is not, so the

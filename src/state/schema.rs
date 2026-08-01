@@ -143,14 +143,15 @@ pub struct Persisted {
     /// absent key, which reads the same) means UNSET: the caller falls back to
     /// `app::preview::annotate::DEFAULT_BADGE_SIZE`, which is why this has no `default = …` fn
     /// of its own. MIGRATION as for `annot_stroke_w`: a pre-fix value was source px (identity on
-    /// Linux 1x; reinterpreted as points on 2x mac, self-correcting on the next placement).
+    /// an unscaled output; reinterpreted as points on a scaled one, self-correcting on the next
+    /// placement).
     #[serde(default)]
     pub annot_badge_size: f32,
     /// The last-selected TEXT annotation size in logical POINTS (DRAGON-383), so a fresh preview
     /// opens the text tool at it (scaled to SOURCE px when it seeds a box). `0.0` / absent =
     /// UNSET (falls back to `preview::text_annot::DEFAULT_TEXT_SIZE`), so no `default = …` fn.
-    /// DRAGON-354. MIGRATION as for `annot_stroke_w` (identity on Linux 1x; reinterpreted as
-    /// points on 2x mac, self-correcting on the next dropdown pick).
+    /// DRAGON-354. MIGRATION as for `annot_stroke_w` (identity on an unscaled output;
+    /// reinterpreted as points on a scaled one, self-correcting on the next dropdown pick).
     #[serde(default)]
     pub annot_text_size: f32,
     /// The last-selected TEXT font family ("hand" | "clean"). `None` / unknown = the default
@@ -305,6 +306,24 @@ pub struct Persisted {
     /// Windows-only.
     #[serde(default = "default_capture_active_monitor_hotkey")]
     pub capture_active_monitor_hotkey: String,
+    /// macOS/Windows (DRAGON-428): the "no editor" twin of [`Self::capture_hotkey`] — the
+    /// same All In One capture picker, but the finished capture is saved, copied and
+    /// notified WITHOUT opening the preview editor (the daemon adds `--no-editor`).
+    /// Default UNSET (empty), like every capture hotkey. A serde-defaulted additive field,
+    /// so old configs load with it absent (no store-version bump). Linux ignores it; the
+    /// settings row is macOS/Windows-only.
+    #[serde(default = "default_capture_hotkey")]
+    pub capture_no_editor_hotkey: String,
+    /// macOS/Windows (DRAGON-428): the "no editor" twin of
+    /// [`Self::capture_active_window_hotkey`]. Same picker-free frontmost-window capture,
+    /// delivered without the editor. Default UNSET (empty).
+    #[serde(default = "default_capture_hotkey")]
+    pub capture_active_window_no_editor_hotkey: String,
+    /// macOS/Windows (DRAGON-428): the "no editor" twin of
+    /// [`Self::capture_active_monitor_hotkey`]. Same picker-free monitor capture, delivered
+    /// without the editor. Default UNSET (empty).
+    #[serde(default = "default_capture_hotkey")]
+    pub capture_active_monitor_no_editor_hotkey: String,
     /// macOS (DRAGON-130): whether the first-run Screen Recording permission prompt
     /// has already been fired. On the first ever capture launch, if the grant is
     /// absent, the app requests it once (the OS dialog) and sets this so it never
@@ -525,8 +544,10 @@ pub struct Persisted {
     // DRAGON-353: `preview_after_capture` ("Open in preview editor") lived here. The editor
     // is now the capture's destination unconditionally — it copies to the clipboard on open
     // and owns every save/share action — so the toggle is REMOVED. The preview-less
-    // save+copy+notify path still exists for the cases where no editor CAN open (no known
-    // output) and for the region "Copy selection" quick-action, which is a deliberate bypass.
+    // save+copy+notify path still exists for a `--no-editor` launch (DRAGON-428, including
+    // the daemon's "(no editor)" hotkeys) and for the cases where no editor CAN open (no
+    // known output). DRAGON-451 retired the third user of it, the region "Copy selection"
+    // quick-action.
     /// Pause other media players (via MPRIS) while a video preview with sound is playing,
     /// resuming them when it closes. Default on.
     #[serde(default = "default_true")]

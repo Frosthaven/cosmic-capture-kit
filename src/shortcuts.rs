@@ -22,14 +22,10 @@ use serde::{Deserialize, Serialize};
 pub enum Context {
     /// The capture overlay (region/window/monitor select, OCR, settings search).
     Overlay,
-    /// A drawn region selection on the capture overlay — the quick-action lane
-    /// (copy the selection and finish). A SEPARATE context from [`Self::Overlay`]
-    /// so a chord like primary+C can mean "copy the drawn region" here AND "copy
-    /// recognized text" in [`Self::Overlay`] without the two fighting over the bind
-    /// (the dispatcher picks the region lane first when a selection is drawn — see
-    /// `app::handle_key`). Same pattern as Esc, which is one action shared across
-    /// [`Self::Overlay`] and [`Self::Preview`].
-    Region,
+    // DRAGON-451: a `Region` context lived here — a drawn region selection, its own lane so
+    // primary+C could mean "copy the drawn region" there and "copy recognized text" in
+    // [`Self::Overlay`] without the two fighting. Its sole action (`RegionCopy`) is retired,
+    // so the context went with it and primary+C in the overlay is the OCR copy outright.
     /// The post-capture preview overlay.
     Preview,
     /// An in-progress recording (stop / toggle mic / toggle system audio).
@@ -52,9 +48,6 @@ pub enum Action {
     /// DESELECTS something must join this key in its own context; [`Keymap::set`] de-duplicates
     /// only WITHIN a context, so that is a no-conflict addition by construction.
     DeselectText,
-    /// Region select: copy the drawn selection to the clipboard and finish
-    /// (default Ctrl+C on Linux, Cmd+C on macOS).
-    RegionCopy,
     /// Preview: keep the capture where it was saved (default Ctrl+S).
     PreviewSave,
     /// Preview: save the capture to a chosen location (default Ctrl+Shift+S).
@@ -212,11 +205,10 @@ impl Action {
     /// [`Keymap::apply_overrides`] — which does not de-duplicate against changed defaults —
     /// a no-op for anyone who had rebound a tool, and it gives the third member of a slot a
     /// first-class escape hatch. Keep the ordering when adding tools.
-    pub const ALL: [Action; 41] = [
+    pub const ALL: [Action; 40] = [
         Action::SelectAllText,
         Action::DeselectText,
         Action::CopyText,
-        Action::RegionCopy,
         Action::PreviewSave,
         Action::PreviewSaveAs,
         Action::PreviewCopy,
@@ -266,7 +258,6 @@ impl Action {
             Action::CopyText => "Copy selected text",
             Action::SelectAllText => "Select all text",
             Action::DeselectText => "Deselect all text",
-            Action::RegionCopy => "Copy selection",
             Action::PreviewSave => "Save",
             Action::PreviewSaveAs => "Save As",
             Action::PreviewCopy => "Copy to clipboard",
@@ -314,9 +305,6 @@ impl Action {
             Action::CopyText => "",
             Action::SelectAllText => "",
             Action::DeselectText => "",
-            Action::RegionCopy => {
-                "Immediately copies the selected region to the clipboard and exits."
-            }
             // Action Shortcuts group: descriptions removed per DRAGON-158.
             Action::PreviewSave => "",
             Action::PreviewSaveAs => "",
@@ -379,7 +367,6 @@ impl Action {
             Action::CopyText | Action::SelectAllText | Action::DeselectText => {
                 "OCR Text Recognition"
             }
-            Action::RegionCopy => "Region Selection",
             Action::PreviewSave
             | Action::PreviewSaveAs
             | Action::PreviewCopy
@@ -426,7 +413,6 @@ impl Action {
             Action::CopyText
             | Action::SelectAllText
             | Action::DeselectText => Context::Overlay,
-            Action::RegionCopy => Context::Region,
             Action::PreviewSave
             | Action::PreviewSaveAs
             | Action::PreviewCopy
@@ -480,7 +466,6 @@ impl Action {
             Action::CopyText => Shortcut::primary_char('c'),
             Action::SelectAllText => Shortcut::primary_char('a'),
             Action::DeselectText => Shortcut::primary_char('d'),
-            Action::RegionCopy => Shortcut::primary_char('c'),
             Action::PreviewSave => Shortcut::primary_char('s'),
             Action::PreviewSaveAs => Shortcut::primary_shift_char('s'),
             Action::PreviewCopy => Shortcut::primary_char('c'),
@@ -1242,6 +1227,130 @@ fn mac_key_glyph(tok: &str) -> String {
     }
 }
 
+/// DRAGON-452: canonical form of a daemon capture-hotkey SPEC string, so two spellings of
+/// the SAME physical chord compare equal. Returns `None` for a spec that binds nothing —
+/// the cleared/empty state, modifiers with no key, or two different keys in one spec (which
+/// the daemon parsers reject too), because none of those can collide with anything.
+///
+/// The canonical form is `cmd+ctrl+alt+shift+<key>`: modifiers in a FIXED order (so
+/// "Shift+Ctrl+K" and "Ctrl+Shift+K" match), every token lowercased (so "ctrl+k" and
+/// "Ctrl+K" match), each modifier alias folded to one name (Cmd/Command/Super/Win/Logo/Meta
+/// are all the same key, and it is the one `daemon_spec` writes as "Cmd" but Windows shows
+/// as "Win"), and the key token folded through the alias set the daemon parsers accept
+/// ("Print"/"PrtSc" are "PrintScreen", "Esc" is "Escape", "Up" is "ArrowUp", …).
+///
+/// This is the ONE place chords are compared. Everything a user records arrives through
+/// `Shortcut::daemon_spec`, which is already canonical, so the folding only matters for a
+/// hand-edited config; it is here so a hand edit can never smuggle a duplicate past the
+/// check. NOT folded: the macOS bare-PrintScreen alias (the mac daemon also registers F13
+/// for it), so a slot on bare "F13" and a slot on bare "PrintScreen" are not reported as a
+/// conflict even though mac registers both. That alias is a mac registration detail, not a
+/// chord identity, and treating it as one would report a phantom conflict on Windows.
+///
+/// Compiled everywhere (pure, unit-tested on Linux) but only CALLED on the two OSes with
+/// daemon-owned global hotkeys, so Linux marks it honestly dead rather than hiding it.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub fn normalized_chord(spec: &str) -> Option<String> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return None;
+    }
+    let (mut ctrl, mut alt, mut shift, mut logo) = (false, false, false, false);
+    let mut key: Option<String> = None;
+    for tok in spec.split('+') {
+        let t = tok.trim();
+        // An EMPTY segment (the gap in "Ctrl++" or the trailing one in "Ctrl+") is skipped,
+        // exactly as the daemon parsers skip it. Such a spec therefore ends up with no key
+        // and binds nothing, which is the truth: neither daemon can register a "+" key
+        // written this way, so two slots holding one cannot fight over a registration.
+        if t.is_empty() {
+            continue;
+        }
+        let token = t.to_ascii_lowercase();
+        match token.as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "alt" | "option" | "opt" => alt = true,
+            "shift" => shift = true,
+            "cmd" | "command" | "super" | "logo" | "win" | "meta" => logo = true,
+            _ => {
+                let folded = canonical_key_token(&token);
+                match &key {
+                    // A SECOND, different key is a malformed spec that registers nothing
+                    // (the Windows parser rejects it outright), so it collides with nothing.
+                    Some(existing) if *existing != folded => return None,
+                    Some(_) => {}
+                    None => key = Some(folded),
+                }
+            }
+        }
+    }
+    // Modifiers with no key bind nothing.
+    let key = key?;
+    let mut out = String::new();
+    if logo {
+        out.push_str("cmd+");
+    }
+    if ctrl {
+        out.push_str("ctrl+");
+    }
+    if alt {
+        out.push_str("alt+");
+    }
+    if shift {
+        out.push_str("shift+");
+    }
+    out.push_str(&key);
+    Some(out)
+}
+
+/// Fold a lowercased spec KEY token onto its canonical name. The alias set mirrors the
+/// Windows daemon parser's `key_to_vk` table (the mac parser, `global_hotkey`'s, accepts the
+/// long names), so the two spellings of one physical key normalize together. Anything
+/// unrecognized passes through unchanged, which is right: an unknown token still compares
+/// equal to itself and unequal to everything else.
+fn canonical_key_token(tok: &str) -> String {
+    match tok {
+        "printscreen" | "print" | "prtsc" | "snapshot" => "printscreen",
+        "escape" | "esc" => "escape",
+        "enter" | "return" => "enter",
+        "delete" | "del" => "delete",
+        "insert" | "ins" => "insert",
+        "pageup" | "pgup" => "pageup",
+        "pagedown" | "pgdn" => "pagedown",
+        "arrowup" | "up" => "arrowup",
+        "arrowdown" | "down" => "arrowdown",
+        "arrowleft" | "left" => "arrowleft",
+        "arrowright" | "right" => "arrowright",
+        other => other,
+    }
+    .to_string()
+}
+
+/// DRAGON-452: which OTHER capture-hotkey slot already holds `proposed`, if any.
+///
+/// `specs` is every slot's current spec in slot order and `slot` is the index being recorded
+/// into, so re-recording a slot to the chord it ALREADY holds is not a conflict (its own
+/// entry is skipped). An unset/empty slot holds no chord and can never conflict, and neither
+/// can a `proposed` that binds nothing. The comparison is by [`normalized_chord`], so a
+/// different modifier ORDER or CASE still counts as the same chord.
+///
+/// Pure and slot-index-based on purpose: the caller owns the slot vocabulary (the settings
+/// UI's `CaptureHotkeySlot`, whose `ALL` array defines this order), and this compiles and
+/// unit-tests on Linux where that enum does not exist.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub fn capture_hotkey_conflict(specs: &[&str], slot: usize, proposed: &str) -> Option<usize> {
+    let want = normalized_chord(proposed)?;
+    for (i, other) in specs.iter().enumerate() {
+        if i == slot {
+            continue;
+        }
+        if normalized_chord(other).as_deref() == Some(want.as_str()) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// The live `Action → Shortcut` table. The single source of truth for matching key
 /// events and for the settings UI; persisted as a list of overrides from default.
 #[derive(Clone, Debug)]
@@ -1674,57 +1783,17 @@ mod tests {
         assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("c")), Some(Action::PreviewCopy));
     }
 
-    /// The region "Copy selection" quick-action shares primary+C with the OCR CopyText
-    /// (Overlay) and the Preview copy, but lives in its OWN context (Region). Each context
-    /// resolves the chord to its own action independently — no context steals another's
-    /// bind. The dispatcher (`app::handle_key`) picks the Region lane first when a region
-    /// is drawn; here we assert the keymap keeps all three distinct on the same chord.
+    /// DRAGON-451 retired `RegionCopy` (the region "Copy selection" quick-action), and with
+    /// it the whole `Context::Region` lane. Three tests covered its shared-primary+C
+    /// arrangement; what survives them is the thing that still matters — primary+C in the
+    /// capture overlay is the OCR copy, unconditionally, with nothing left to take it first.
     #[test]
-    fn region_copy_shares_primary_c_across_contexts() {
+    fn primary_c_in_the_overlay_is_the_ocr_copy() {
         let km = Keymap::defaults();
-        assert_eq!(km.action_for(Context::Region, PRIMARY, &ch("c")), Some(Action::RegionCopy));
-        // The other two contexts keep their own primary+C actions untouched.
         assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("c")), Some(Action::CopyText));
         assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("c")), Some(Action::PreviewCopy));
-        // A wrong key in the Region context resolves to nothing.
-        assert_eq!(km.action_for(Context::Region, PRIMARY, &ch("x")), None);
-        // RegionCopy is the sole action in the Region context.
-        assert_eq!(Action::RegionCopy.context(), Context::Region);
-    }
-
-    /// RegionCopy defaults to the platform PRIMARY modifier + C: Ctrl+C on Linux/Windows,
-    /// Cmd+C on macOS — the same convention as the other editor chords, asserted on both
-    /// cfg branches so a future modifier tweak can't silently diverge them.
-    #[test]
-    fn region_copy_default_is_primary_c() {
-        let sc = def(Action::RegionCopy);
-        assert!(matches!(&sc.key, ShortcutKey::Char(c) if c == "c"));
-        assert!(!sc.alt && !sc.shift);
-        assert!(sc.matches(PRIMARY, &ch("c")));
-        assert!(sc.matches(PRIMARY, &ch("C"))); // case-insensitive
-        #[cfg(target_os = "macos")]
-        {
-            assert!(sc.logo && !sc.ctrl, "RegionCopy should default to Cmd on macOS");
-            assert_eq!(sc.label(), "⌘C");
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert!(sc.ctrl && !sc.logo, "RegionCopy should default to Ctrl off macOS");
-            assert_eq!(sc.label(), "Ctrl+C");
-        }
-    }
-
-    /// Rebinding RegionCopy does NOT disturb CopyText (they are in different contexts, so
-    /// `set`'s conflict-stealing — which is per-context — never touches the other). This is
-    /// the guarantee that the shared-chord design keeps the OCR scanner copy intact.
-    #[test]
-    fn region_copy_rebind_leaves_copytext_intact() {
-        let mut km = Keymap::defaults();
-        km.set(Action::RegionCopy, Shortcut::ctrl_char('y'));
-        // RegionCopy moved; CopyText's primary+C in the Overlay context is untouched.
-        assert_eq!(km.action_for(Context::Region, Modifiers::CTRL, &ch("y")), Some(Action::RegionCopy));
-        assert_eq!(km.get(Action::CopyText), Some(def(Action::CopyText)));
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("c")), Some(Action::CopyText));
+        // No action claims a region-draw context any more.
+        assert!(!Action::ALL.iter().any(|a| a.label() == "Copy selection"));
     }
 
     #[test]
@@ -1831,5 +1900,116 @@ mod win_readable_spec_tests {
     fn empty_is_empty() {
         assert_eq!(win_readable_spec(""), "");
         assert_eq!(win_readable_spec("   "), "");
+    }
+}
+
+/// DRAGON-452: the truth table for the six global capture-hotkey slots. The bug this pins is
+/// that every slot could be recorded to the SAME chord with no warning, and only one of them
+/// can win the OS registration. Pure, so it runs on EVERY platform including Linux, where
+/// the slots themselves do not exist.
+#[cfg(test)]
+mod capture_hotkey_conflict_tests {
+    use super::{capture_hotkey_conflict, normalized_chord};
+
+    /// The six slots in their fixed order (All In One / Active Window / Active Monitor, then
+    /// the DRAGON-428 "(no editor)" twins), all UNSET — the fresh-install state.
+    fn empty_slots() -> [&'static str; 6] {
+        [""; 6]
+    }
+
+    #[test]
+    fn a_fresh_chord_is_free() {
+        let mut slots = empty_slots();
+        slots[0] = "Ctrl+Alt+K";
+        // A chord no slot holds is accepted for any slot.
+        assert_eq!(capture_hotkey_conflict(&slots, 1, "Ctrl+Alt+J"), None);
+        assert_eq!(capture_hotkey_conflict(&slots, 5, "PrintScreen"), None);
+    }
+
+    #[test]
+    fn a_chord_another_slot_holds_conflicts_and_names_it() {
+        let mut slots = empty_slots();
+        slots[2] = "Ctrl+Alt+K";
+        // Recording the SAME chord into any other slot reports slot 2 as the owner.
+        assert_eq!(capture_hotkey_conflict(&slots, 0, "Ctrl+Alt+K"), Some(2));
+        assert_eq!(capture_hotkey_conflict(&slots, 5, "Ctrl+Alt+K"), Some(2));
+    }
+
+    #[test]
+    fn re_recording_a_slot_to_the_chord_it_already_holds_is_not_a_conflict() {
+        let mut slots = empty_slots();
+        slots[3] = "Cmd+Shift+2";
+        assert_eq!(capture_hotkey_conflict(&slots, 3, "Cmd+Shift+2"), None);
+        // Even spelled differently: it is still that slot's own chord.
+        assert_eq!(capture_hotkey_conflict(&slots, 3, "shift+cmd+2"), None);
+    }
+
+    #[test]
+    fn unset_slots_never_conflict() {
+        // Every slot empty: nothing to collide with, and an empty PROPOSED chord (the row's
+        // "x" clear) collides with nothing either, not even with other empty slots.
+        let slots = empty_slots();
+        assert_eq!(capture_hotkey_conflict(&slots, 0, "PrintScreen"), None);
+        assert_eq!(capture_hotkey_conflict(&slots, 0, ""), None);
+        let mut held = empty_slots();
+        held[1] = "PrintScreen";
+        held[4] = "Ctrl+K";
+        assert_eq!(capture_hotkey_conflict(&held, 0, ""), None);
+        assert_eq!(capture_hotkey_conflict(&held, 0, "   "), None);
+    }
+
+    #[test]
+    fn comparison_is_by_normalized_chord_not_by_text() {
+        let mut slots = empty_slots();
+        slots[0] = "Ctrl+Alt+Shift+K";
+        // Different modifier ORDER, different CASE, and a modifier ALIAS all still collide.
+        assert_eq!(capture_hotkey_conflict(&slots, 1, "Shift+Alt+Ctrl+K"), Some(0));
+        assert_eq!(capture_hotkey_conflict(&slots, 1, "ctrl+alt+shift+k"), Some(0));
+        assert_eq!(capture_hotkey_conflict(&slots, 1, "control+option+shift+K"), Some(0));
+        // The logo key is written "Cmd" by `daemon_spec` and shown as "Win" on Windows: the
+        // same physical key, so the two spellings must collide.
+        let mut logo = empty_slots();
+        logo[0] = "Cmd+Shift+2";
+        assert_eq!(capture_hotkey_conflict(&logo, 3, "Win+Shift+2"), Some(0));
+        assert_eq!(capture_hotkey_conflict(&logo, 3, "super+shift+2"), Some(0));
+        // A DIFFERENT chord is still different: one missing modifier is not a match.
+        assert_eq!(capture_hotkey_conflict(&logo, 3, "Shift+2"), None);
+    }
+
+    #[test]
+    fn key_aliases_fold_together() {
+        let mut slots = empty_slots();
+        slots[0] = "PrintScreen";
+        assert_eq!(capture_hotkey_conflict(&slots, 1, "printscreen"), Some(0));
+        assert_eq!(capture_hotkey_conflict(&slots, 1, "PrtSc"), Some(0));
+        // A modifier on the same key is a DIFFERENT chord.
+        assert_eq!(capture_hotkey_conflict(&slots, 1, "Ctrl+PrintScreen"), None);
+        let mut named = empty_slots();
+        named[2] = "Ctrl+ArrowUp";
+        assert_eq!(capture_hotkey_conflict(&named, 0, "Ctrl+Up"), Some(2));
+    }
+
+    #[test]
+    fn the_first_owner_is_reported_when_several_already_collide() {
+        // A config written before this check existed can hold the same chord in several
+        // slots. The lowest-numbered other owner is named; clearing it and re-recording
+        // walks the rest one at a time rather than silently dropping bindings in bulk.
+        let mut slots = empty_slots();
+        slots[1] = "Ctrl+Alt+K";
+        slots[4] = "ctrl+alt+k";
+        assert_eq!(capture_hotkey_conflict(&slots, 0, "Ctrl+Alt+K"), Some(1));
+    }
+
+    #[test]
+    fn specs_that_bind_nothing_normalize_to_none() {
+        // Cleared, whitespace, modifiers with no key, a dangling separator, and two
+        // different keys in one spec: none of these register anything on either daemon, so
+        // none can conflict.
+        for dead in ["", "   ", "Ctrl+", "Ctrl++", "Ctrl+Shift", "Ctrl+A+B"] {
+            assert_eq!(normalized_chord(dead), None, "{dead:?} should bind nothing");
+        }
+        // A real chord normalizes to its canonical text.
+        assert_eq!(normalized_chord("Ctrl+Alt+K").as_deref(), Some("ctrl+alt+k"));
+        assert_eq!(normalized_chord("  shift + cmd + 2  ").as_deref(), Some("cmd+shift+2"));
     }
 }

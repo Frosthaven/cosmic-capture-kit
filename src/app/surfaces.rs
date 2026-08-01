@@ -23,6 +23,11 @@ impl App {
             crate::platform::mac::window::resume_tiling_wm();
             self.aerospace_guard = None;
         }
+        // DRAGON-437 (Windows): the overlays are going away, so the finalize driver has
+        // nothing left to drive. Without this the tick keeps hunting for destroyed HWNDs and
+        // eventually reports a give-up for overlays nobody is waiting on.
+        #[cfg(windows)]
+        self.stop_overlay_finalize();
         // Windows (DRAGON-281): the countdown/recording overlays may have been made
         // click-through (`recreate_active_overlays` set `passthrough_active`); this is a
         // PERMANENT overlay close (capture committed → preview, recording stopped → preview,
@@ -108,6 +113,16 @@ impl App {
         // file/clipboard/notify work (finalize/bake results are awaited before this seam), so
         // the delayed exit can cut nothing off. Linux/macOS never arm this — their
         // `iced::exit()` reliably terminates — keeping their behavior byte-identical.
+        //
+        // DRAGON-436 — THE INVARIANT THIS WATCHDOG DOES *NOT* COVER, read before adding any
+        // wait to a failure path: this thread is armed HERE, which is to say only once
+        // `finish_session` has been REACHED. Anything that can stop a session from reaching
+        // it is outside this budget entirely. The Windows failure alert is exactly such a
+        // thing (a modal with nobody at the screen to dismiss it), which is why
+        // `platform::windows::alert::show` arms its OWN absolute process budget before the
+        // box goes up, and why `fail_session` bounds its dismissal wait. Neither of those is
+        // redundant with this 1.5s grace: they cover the span BEFORE it exists. If you add
+        // another user-blocking step ahead of `finish_session`, it needs the same treatment.
         #[cfg(windows)]
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(1500));
@@ -179,6 +194,35 @@ impl App {
         if self.settings.only {
             return Task::none();
         }
+        // DRAGON-431: a macOS too old to capture. `App::init` already suppressed the scene
+        // grab and the tiling-WM pause, so nothing has touched ScreenCaptureKit — this is
+        // where the session ENDS, because it is the first point that has both a `&mut self`
+        // and a `Task` to route through `fail_session` (which records the failure, shows the
+        // DRAGON-415 alert, and exits cleanly).
+        //
+        // Checked after the `--settings` guard and before everything else on purpose: a
+        // settings launch is perfectly usable on 13 and must not be interrupted, while every
+        // branch below this leads to a capture one way or another.
+        #[cfg(target_os = "macos")]
+        if !crate::platform::mac::capture_supported() {
+            let (major, minor) = crate::platform::mac::os_version();
+            let forced = if crate::platform::mac::force_unsupported_os() {
+                " [FORCED by CCK_TEST_FORCE_UNSUPPORTED_OS]"
+            } else {
+                ""
+            };
+            log::error!(
+                "capture needs macOS 13 or later; this is {major}.{minor}{forced} \
+                 (DRAGON-431/DRAGON-444). Ending the session with a message instead of aborting \
+                 inside ScreenCaptureKit."
+            );
+            crate::diag::note_failure(
+                crate::diag::Failure::UnsupportedOs,
+                "capture launch on a macOS older than 13.0, whose ScreenCaptureKit lacks the \
+                 selectors every capture path needs",
+            );
+            return self.fail_session();
+        }
         // The permission-checker window (`--permissions` / missing-grant routing) is
         // likewise a standalone window — no capture overlays, and no tiling-WM pause
         // (nothing is being captured). Same guard shape as settings.
@@ -188,6 +232,12 @@ impl App {
         // `--preview <file>`: no capture overlays — open the preview on the active
         // output, mirroring `on_output`'s preview branch.
         if self.preview_mode {
+            // DRAGON-427: the spawned editor child opens the handed-over capture through the
+            // SAME mapping the unix socket host uses, so the two transports can never drift
+            // into opening slightly different documents.
+            if let Some(req) = self.startup_handoff.take() {
+                return self.open_handoff_preview(&req).unwrap_or_else(Task::none);
+            }
             if let Some((path, is_video)) = self.startup_preview.take() {
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 return self.open_external_preview(path, size, is_video);
@@ -270,7 +320,62 @@ impl App {
         let pointer = Some(crate::platform::mac::global_pointer_position());
         #[cfg(not(target_os = "macos"))]
         let pointer: Option<(i32, i32)> = None;
-        for desc in crate::screenshot::output_descs() {
+        // DRAGON-436 QA hook (Windows only). The zero-display path below is invisible by
+        // construction and needs a genuinely broken machine to reach, so there is no way to
+        // check by hand that it now speaks. Setting `CCK_TEST_FORCE_NO_OUTPUTS=1` makes the
+        // enumeration answer EMPTY and drives that path on a working machine. A review aid
+        // in the same spirit as `CCK_STARTUP_BUDGET_SECS` (see `startup_guard`), not a
+        // supported setting: it is read once, here, and nothing else consults it.
+        #[cfg(windows)]
+        let descs = {
+            const FORCE_NO_OUTPUTS_ENV: &str = "CCK_TEST_FORCE_NO_OUTPUTS";
+            // How long to wait before asking the system a second time (below).
+            const RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
+            if std::env::var_os(FORCE_NO_OUTPUTS_ENV).is_some_and(|v| v == "1") {
+                log::warn!("{FORCE_NO_OUTPUTS_ENV}=1: pretending the system returned no displays");
+                Vec::new()
+            } else {
+                let first = crate::screenshot::output_descs();
+                if first.is_empty() {
+                    // DRAGON-436: ask ONCE more before believing it. `EnumDisplayMonitors`
+                    // can legitimately answer empty for a moment during a display-mode
+                    // change, a dock/undock, or a monitor waking — and the hotkey that
+                    // starts a capture is exactly the kind of thing a user presses right
+                    // then. Without this, a transient blip becomes a modal telling somebody
+                    // with working monitors to restart their computer. One retry, 100ms,
+                    // paid only on a path that is already about to fail: imperceptible when
+                    // it is a blip, and it costs a broken machine nothing that matters.
+                    log::warn!(
+                        "no displays on the first enumeration — re-checking once in {}ms \
+                         before treating it as a failure",
+                        RETRY_AFTER.as_millis()
+                    );
+                    std::thread::sleep(RETRY_AFTER);
+                    crate::screenshot::output_descs()
+                } else {
+                    first
+                }
+            }
+        };
+        #[cfg(not(windows))]
+        let descs = crate::screenshot::output_descs();
+        // DRAGON-437 QA hook (Windows only): `CCK_TEST_BREAK_OVERLAY_TITLE=1` skips the
+        // overlay titling below, so `find_by_title` can never match and `place_overlay` can
+        // never succeed. That is the only way to exercise the finalize driver's give-up path
+        // (10s deadline → `Failure::OverlayNeverShown` → the visible alert) on a healthy
+        // machine. A review aid in the same spirit as `CCK_STARTUP_BUDGET_SECS`, not a
+        // supported setting. Read ONCE, here, outside the per-display loop.
+        #[cfg(windows)]
+        let skip_title = std::env::var_os("CCK_TEST_BREAK_OVERLAY_TITLE").is_some_and(|v| v == "1");
+        #[cfg(not(windows))]
+        let skip_title = false;
+        if skip_title {
+            log::warn!(
+                "CCK_TEST_BREAK_OVERLAY_TITLE=1: overlays will not be titled, so their native \
+                 placement can never match"
+            );
+        }
+        for desc in descs {
             if self.outputs.iter().any(|o| o.name == desc.name) {
                 continue;
             }
@@ -293,21 +398,50 @@ impl App {
             // Title the window with the display name (hidden in the UI, but AppKit
             // keeps it) so `place_overlay` can match this exact NSWindow to its
             // display when the `OverlayOpened` handler configures it natively.
-            cmds.push(self.set_window_title(desc.name.clone(), id));
+            // (`skip_title`, read once above, is the DRAGON-437 QA hook.)
+            if !skip_title {
+                cmds.push(self.set_window_title(desc.name.clone(), id));
+            }
+            // DRAGON-448: this display's CAPTURE-units-per-POINT, resolved per output (a
+            // mixed-DPI desktop gives each overlay its own). Windows reads the monitor's
+            // own `dpi / 96`; macOS answers 1.0, so its overlays are byte-identical.
+            let point_scale = crate::platform::overlay_point_scale(&desc.name);
             self.outputs.push(OutputState {
                 output: desc.name.clone(),
                 id,
                 name: desc.name,
                 logical_pos: desc.logical_pos,
                 logical_size,
-                #[cfg(target_os = "macos")]
+                point_scale,
+                #[cfg(not(target_os = "linux"))]
                 placed: std::cell::Cell::new(false),
             });
         }
+        // DRAGON-437 (Windows): arm the finalize re-driver the moment overlays exist. Armed
+        // on EVERY mint (a re-seed re-arms it), cleared by the tick once every output is
+        // confirmed placed, by a give-up, and by any overlay teardown. The DEADLINE is not
+        // stamped here — the first delivered tick does that; see `overlay_finalize_deadline`.
+        // macOS does not need any of this: its `place_overlay` is single-phase, its open
+        // follow-up is delivered, and a give-up there still draws the overlay.
+        #[cfg(windows)]
+        if self.outputs.iter().any(|o| !o.placed.get()) {
+            self.overlay_finalize_pending = true;
+            self.overlay_finalize_deadline = None;
+        }
         if self.outputs.is_empty() {
+            // DRAGON-436: the macOS line is unchanged. Windows gets its own, because there is
+            // no Screen Recording grant there to deny, and sending a Windows user to a
+            // privacy pane that does not exist is the exact mistake the alert's honesty rule
+            // is written against (see `app::failure`).
+            #[cfg(target_os = "macos")]
             log::warn!(
                 "no displays returned for the capture overlay — Screen Recording \
                  permission may be denied (grant it in System Settings and restart)."
+            );
+            #[cfg(windows)]
+            log::warn!(
+                "no displays returned for the capture overlay — the system reported no \
+                 monitors, so this session can mint no window."
             );
             // DRAGON-419: this is the DRAGON-413 shape and it is the worst one in the app —
             // zero overlays are minted, but `no_main_window(true) + exit_on_close(false)` means
@@ -316,18 +450,20 @@ impl App {
                 crate::diag::Failure::NoOutputs,
                 "zero displays for the capture overlay — this process mints no window",
             );
-            // DRAGON-415 (macOS): and now it DOES exit, having said why. This was the worst
-            // silent failure in the app: the user presses the shortcut, sees nothing at all,
-            // and is left with an invisible child per press. It is also the exact shape a
-            // Screen Recording grant that is not usable takes, because ScreenCaptureKit
-            // answers an ungranted enumeration with an EMPTY list rather than an error —
-            // `fail_session` preflights the grant and says which of the two it is.
+            // DRAGON-415 (macOS) and DRAGON-436 (Windows): and now it DOES exit, having said
+            // why. This was the worst silent failure in the app: the user presses the
+            // shortcut, sees nothing at all, and is left with an invisible child per press.
             //
-            // Windows keeps the historical warn-and-continue: its display enumeration does
-            // not depend on a grant, an empty list there is a different (unstudied)
-            // condition, and this ticket does not change non-macOS behaviour. Its
-            // `note_failure` line above still records it.
-            #[cfg(target_os = "macos")]
+            // Both platforms take the SAME exit for the same reason — a session that mints
+            // no window can deliver nothing, and must not linger. What differs is only what
+            // `fail_session` can say about the cause. On macOS this is also the exact shape a
+            // Screen Recording grant that is not usable takes, because ScreenCaptureKit
+            // answers an ungranted enumeration with an EMPTY list rather than an error, so
+            // the preflight there says which of the two it is. Windows has no such grant, so
+            // it reports the plain "no displays came back" message and nothing more.
+            //
+            // Linux never compiles this function at all (see the cfg on it), so its
+            // warn-and-continue is untouched.
             return self.fail_session();
         }
         if let Some(id) = focus_id
@@ -554,62 +690,158 @@ impl App {
         {
             const MAX_ATTEMPTS: u8 = 30;
             const RETRY_MS: u64 = 40;
-            let placed = crate::platform::windows::window::place_overlay(
-                &o.name,
-                o.logical_pos,
-                o.logical_size,
-                // DRAGON-298: a transient capture SELECTOR must show NO taskbar button (clears
-                // the winit-set WS_EX_APPWINDOW that overrides its WS_EX_TOOLWINDOW).
-                false,
-                // The selector needs keyboard focus for Escape / shortcuts.
-                true,
-            );
-            if placed || attempt >= MAX_ATTEMPTS {
-                if attempt >= MAX_ATTEMPTS {
-                    log::warn!(
-                        "overlay for '{}' never matched its window after {MAX_ATTEMPTS} attempts \
-                         — it may be mispositioned",
-                        o.name
-                    );
-                }
-                // DRAGON-280: now the overlay is on-screen (phase 2 done), re-assert HWND_TOPMOST
-                // once. place_overlay's two-phase off-screen->on-screen show can race a fullscreen
-                // app's own topmost / DWM independent-flip state; a cheap z-order-only SetWindowPos
-                // after the present grace pins us above it. No-op if the window is already gone.
-                if placed {
-                    // Opt the overlay out of the user's tiling WM via the portable seam.
-                    // `place_overlay` already set the komorebi bit pre-show; this is the
-                    // idempotent, title-scoped confirmation through the shared entry point.
-                    crate::platform::opt_out_of_tiling(&o.name);
-                    crate::platform::windows::window::reassert_topmost(&o.name);
-                }
-                // DRAGON-276: during a COUNTDOWN or RECORDING the overlay must be click-through
-                // so the user can use the screen being captured (the SELECTION overlay stays
-                // interactive — you drag a region). The overlay is recreated per phase, so this
-                // only ever tags the countdown/recording overlays, never the selection one.
-                if self.countdown.is_some() || self.recording.is_some() {
-                    crate::platform::windows::window::set_click_through(&o.name, true);
-                }
-                Task::none()
-            } else {
-                Task::perform(
-                    async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
-                    },
-                    move |()| {
-                        cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::OverlayOpened(
-                            id,
-                            attempt + 1,
-                        )))
-                    },
-                )
+            if self.try_place_overlay_once(o) {
+                return Task::none();
             }
+            if attempt >= MAX_ATTEMPTS {
+                // DRAGON-437: NOT a give-up any more. This chain is only the FIRST of two
+                // drivers; `sub_overlay_finalize` keeps re-driving from a timer (which, unlike
+                // this one-shot follow-up chain, is delivered to a backgrounded process) and
+                // owns the real deadline. Ending the chain here used to strand the window
+                // CLOAKED and off-screen forever: a title that only matches near the end of
+                // the budget leaves `place_overlay` in phase 1, and phase 2 needs a LATER call
+                // that never came.
+                log::warn!(
+                    "overlay for '{}' not placed after {MAX_ATTEMPTS} chain attempts — chain \
+                     budget exhausted; the finalize subscription keeps driving",
+                    o.name
+                );
+                // Parity with the pre-DRAGON-437 shape, which applied this on BOTH the placed
+                // and the exhausted branch. Cheap and idempotent, and if the finalize driver
+                // does land this window later the countdown/recording overlay must not be
+                // interactive — better applied twice than dropped once.
+                self.apply_overlay_click_through(&o.name);
+                return Task::none();
+            }
+            Task::perform(
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                },
+                move |()| {
+                    cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::OverlayOpened(
+                        id,
+                        attempt + 1,
+                    )))
+                },
+            )
         }
         #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
         {
             let _ = (o, attempt);
             Task::none()
         }
+    }
+
+    /// Windows (DRAGON-437): ONE attempt to place `o`'s overlay, recording the placement and
+    /// running the post-placement steps if it lands. Returns whether it is now placed.
+    ///
+    /// The single source both drivers share. `configure_overlay`'s follow-up chain wraps it
+    /// in a 40ms retry loop; `sub_overlay_finalize`'s tick calls it exactly once per tick and
+    /// starts no loop of its own. That asymmetry is deliberate: re-entering the whole chain
+    /// per tick would leave ~15 overlapping chains alive at once (a 1.2s chain started every
+    /// 80ms), each calling `place_overlay` — which enumerates every top-level window — on the
+    /// UI thread, for the full 10s deadline, in exactly the already-broken case this driver
+    /// exists for. One attempt per tick is all the two-phase dance ever needed: phase 2 just
+    /// wants A call after the grace, not a fast one.
+    ///
+    /// `placed` is set here and NOWHERE else on Windows — in particular never on a give-up,
+    /// unlike macOS, where the flag also gates drawing and a give-up must still draw.
+    #[cfg(windows)]
+    pub(super) fn try_place_overlay_once(&self, o: &OutputState) -> bool {
+        let placed = crate::platform::windows::window::place_overlay(
+            &o.name,
+            o.logical_pos,
+            o.logical_size,
+            // DRAGON-298: a transient capture SELECTOR must show NO taskbar button (clears
+            // the winit-set WS_EX_APPWINDOW that overrides its WS_EX_TOOLWINDOW).
+            false,
+            // The selector needs keyboard focus for Escape / shortcuts.
+            true,
+        );
+        if placed {
+            o.placed.set(true);
+            self.on_overlay_placed(&o.name);
+        }
+        placed
+    }
+
+    /// Windows (DRAGON-437): everything that must happen ONCE a capture overlay is confirmed
+    /// on screen. The single source for those steps, because TWO drivers now reach them —
+    /// the `OverlayOpened` follow-up chain and `sub_overlay_finalize`'s tick — and a step
+    /// that ran on only one of them would be a bug that appears solely in whichever case is
+    /// harder to reproduce.
+    ///
+    /// Every step is idempotent, so it does not matter which driver gets there first or how
+    /// often a straggler repeats it.
+    #[cfg(windows)]
+    fn on_overlay_placed(&self, name: &str) {
+        // Opt the overlay out of the user's tiling WM via the portable seam. `place_overlay`
+        // already set the komorebi bit pre-show; this is the idempotent, title-scoped
+        // confirmation through the shared entry point.
+        crate::platform::opt_out_of_tiling(name);
+        // DRAGON-280: now the overlay is on-screen (phase 2 done), re-assert HWND_TOPMOST
+        // once. place_overlay's two-phase off-screen->on-screen show can race a fullscreen
+        // app's own topmost / DWM independent-flip state; a cheap z-order-only SetWindowPos
+        // after the present grace pins us above it. No-op if the window is already gone.
+        crate::platform::windows::window::reassert_topmost(name);
+        self.apply_overlay_click_through(name);
+    }
+
+    /// Windows (DRAGON-276): during a COUNTDOWN or RECORDING the overlay must be
+    /// click-through so the user can use the screen being captured (the SELECTION overlay
+    /// stays interactive — you drag a region). The overlay is recreated per phase, so this
+    /// only ever tags the countdown/recording overlays, never the selection one.
+    ///
+    /// Its own method (DRAGON-437) because both the placed path and the chain-exhausted path
+    /// need it, which is exactly what the pre-437 code did before the two were split.
+    #[cfg(windows)]
+    fn apply_overlay_click_through(&self, name: &str) {
+        if self.countdown.is_some() || self.recording.is_some() {
+            crate::platform::windows::window::set_click_through(name, true);
+        }
+    }
+
+    /// Windows (DRAGON-437): the finalize driver has run out of time. Stop trying, and leave
+    /// no overlay stranded.
+    ///
+    /// Returns how many outputs were EVER confirmed placed, which is what decides whether the
+    /// session can continue (see `overlay_giveup_action`).
+    ///
+    /// The abandon step is not optional politeness: a window left mid-dance is DWM-CLOAKED,
+    /// and a cloaked window is excluded from composition entirely — invisible on every
+    /// display AND absent from screen captures — while the process stays alive holding it.
+    /// `abandon_placement` uncloaks and HIDES it, which returns it to the ordinary hidden
+    /// state it was minted in.
+    #[cfg(windows)]
+    pub(super) fn abandon_unplaced_overlays(&mut self) -> usize {
+        let mut placed = 0usize;
+        for o in &self.outputs {
+            if o.placed.get() {
+                placed += 1;
+                continue;
+            }
+            log::warn!(
+                "DRAGON-437: giving up on the overlay for '{}' — abandoning its placement so \
+                 it cannot stay cloaked",
+                o.name
+            );
+            crate::platform::windows::window::abandon_placement(&o.name);
+        }
+        // The driver is done either way: nothing may keep ticking after a give-up.
+        self.stop_overlay_finalize();
+        placed
+    }
+
+    /// Windows (DRAGON-437): stop the overlay finalize driver.
+    ///
+    /// One place, because a clock that outlives its outputs is its own bug: the tick would
+    /// keep enumerating every top-level window looking for HWNDs that no longer exist, and
+    /// then report a give-up for overlays nobody was waiting on. Called on completion, on
+    /// give-up, and from every overlay teardown path.
+    #[cfg(windows)]
+    pub(super) fn stop_overlay_finalize(&mut self) {
+        self.overlay_finalize_pending = false;
+        self.overlay_finalize_deadline = None;
     }
 
     /// macOS (DRAGON-130 crash-dodge): strip the native titlebar buttons from the
@@ -644,6 +876,9 @@ impl App {
             self.preview_open_size,
         );
         if matched {
+            crate::util::timing_mark(
+                "finalize_preview_window: matched + placed *** USER SEES THE EDITOR ***",
+            );
             // Window vibrancy (DRAGON-268): the windowed preview (a CSD toplevel) is the mac
             // analog of Linux's frosted window / Windows' Mica — reveal the winit-inserted
             // vibrancy by clearing its Metal layer. NEVER the fullscreen OVERLAY preview
@@ -720,6 +955,9 @@ impl App {
         let shown =
             crate::platform::windows::window::show_centered(super::shell::PREVIEW_WINDOW_TITLE, monitor);
         if shown {
+            crate::util::timing_mark(
+                "finalize_preview_window: shown + centred *** USER SEES THE EDITOR ***",
+            );
             // DRAGON-281: the native show is confirmed — record it so `sub_preview_finalize`
             // stops re-driving this finalize (it was the safety net for the one-shot open
             // follow-up not being delivered while cck was a background process).
@@ -805,6 +1043,9 @@ impl App {
             !self.win_preview_preopen,
         );
         if placed {
+            crate::util::timing_mark(
+                "finalize_preview_overlay: placed + shown *** USER SEES THE EDITOR ***",
+            );
             // DRAGON-281: the overlay is placed + shown — record it so `sub_preview_finalize`
             // stops re-driving this finalize (the safety net for the one-shot open follow-up
             // not being delivered while cck was a background process).
@@ -1048,11 +1289,11 @@ impl App {
         let (px, py) = crate::platform::mac::global_pointer_position();
         let hovered = self.outputs.iter().find_map(|o| {
             let (r, _) = self.toolbar_layout(o)?;
-            let local = cosmic::iced::Point::new(
-                px as f32 - o.logical_pos.0 as f32,
-                py as f32 - o.logical_pos.1 as f32,
-            );
-            r.contains(local).then_some(o.id)
+            // Global pointer (CAPTURE space) against the toolbar rect (POINTS) — one
+            // crossing, through this output's bridge (DRAGON-448). The identity on macOS,
+            // where the two spaces coincide.
+            let (lx, ly) = o.units().to_point((px, py));
+            r.contains(cosmic::iced::Point::new(lx, ly)).then_some(o.id)
         });
         if hovered == self.passthrough_solid {
             return Task::none();
@@ -1134,6 +1375,11 @@ impl App {
             .iter()
             .map(|o| super::shell::close_surface(o.id))
             .collect();
+        // DRAGON-437: `self.outputs` is deliberately KEPT here (see the doc above), so the
+        // finalize driver's "any output unplaced" condition would still hold and it would go
+        // on hammering `find_by_title` against HWNDs that are being destroyed, then report a
+        // spurious give-up — over a settings window the user opened on purpose.
+        self.stop_overlay_finalize();
         Task::batch(cmds)
     }
 
@@ -1269,6 +1515,12 @@ impl App {
                 // output once outputs exist, then ignore the rest. (The surface targets
                 // the active monitor itself; we don't need this event's specific output.)
                 if self.preview_mode {
+                    // DRAGON-427: see the `seed_outputs_mac` twin above. Never taken on
+                    // Linux today (nothing spawns an editor child there), but wired at both
+                    // seeds so the flag cannot mean different things per platform.
+                    if let Some(req) = self.startup_handoff.take() {
+                        return self.open_handoff_preview(&req).unwrap_or_else(Task::none);
+                    }
                     if let Some((path, is_video)) = self.startup_preview.take() {
                         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         return self.open_external_preview(path, size, is_video);
@@ -1285,11 +1537,33 @@ impl App {
                     name: info.name.unwrap(),
                     logical_pos: (lx, ly),
                     logical_size: (lw as u32, lh as u32),
+                    // DRAGON-448: on Linux the compositor sizes the layer surface in the
+                    // SAME logical space `logical_size` is reported in, so capture space
+                    // and point space already coincide — the identity, always. (This is
+                    // NOT `scale` below: that is the output's BUFFER scale, which the
+                    // windowed preview uses to undo a capture's physical pixels.)
+                    point_scale: 1.0,
                     #[cfg(target_os = "linux")]
                     scale,
-                    #[cfg(target_os = "macos")]
+                    // Never taken on Linux (this whole fn is cfg(linux) and the field is
+                    // cfg(not(linux))); kept in step with the struct so the two cannot drift.
+                    #[cfg(not(target_os = "linux"))]
                     placed: std::cell::Cell::new(false),
                 });
+                // Arm the button meters now that an output exists — the Linux twin of
+                // `seed_overlays_mac`'s call, and until DRAGON-457 the parity that side
+                // already claimed to have.
+                //
+                // A launch that STARTS in video kind (`--video`, a bound recording hotkey,
+                // an immediate `--active-monitor --video`) sets `self.kind` at init and
+                // never passes through `SetKind`, which off this seam is the only thing on
+                // Linux that calls `sync_meters`. So the mic and system meters were never
+                // spawned at all, `mic_level`/`sys_level` sat at 0.0, and both buttons
+                // stayed flat for the WHOLE session — no green behind the icons while
+                // recording, whatever the microphone was doing. Only a mid-session toggle
+                // brought them to life. Idempotent, so the later output events and any
+                // toggle are all no-ops.
+                self.sync_meters();
                 // Linux: a picker-free IMMEDIATE capture (`--active-window` /
                 // `--active-monitor`). This event carries only ONE output, but the capture's
                 // cursor-output probe + the post-capture preview need the COMPLETE output list

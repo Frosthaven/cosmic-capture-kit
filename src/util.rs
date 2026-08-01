@@ -24,8 +24,9 @@ static TIMING_STDERR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 /// the file names the call that never returned. That is the whole answer to a launch-hang
 /// report, and it was already written; it was just going to a stderr nobody has.
 ///
-/// Cheap when both are off: one `OnceLock` read and one relaxed atomic, and the `label`
-/// argument is a `&'static`-shaped literal at every call site, so nothing is formatted.
+/// Cheap when both are off: one `OnceLock` read and one relaxed atomic. The `label` is a
+/// literal at nearly every call site, so nothing is formatted; the few marks that carry a
+/// measured number ask [`timing_on`] first so they don't build a string for a disabled log.
 #[inline]
 pub fn timing_mark(label: &str) {
     let to_stderr = *TIMING_STDERR.get_or_init(|| std::env::var_os("CCK_TIMING").is_some());
@@ -42,6 +43,89 @@ pub fn timing_mark(label: &str) {
     log::debug!(target: "timing", "[+{ms:.1}ms] {label}");
 }
 
+/// Whether [`timing_mark`] would record anything right now.
+///
+/// The gate for a mark whose LABEL costs something to build. Most marks pass a literal, but
+/// the preview-open timeline (DRAGON-454) carries measured values — the decoded pixel count,
+/// the view-build index — and formatting those on a launch with the debug log off would be
+/// work for nobody. Same two reads `timing_mark` makes, so asking first is free.
+#[inline]
+pub fn timing_on() -> bool {
+    *TIMING_STDERR.get_or_init(|| std::env::var_os("CCK_TIMING").is_some())
+        || crate::diag::is_enabled()
+}
+
+// ── The dev/test sandbox key (DRAGON-424, shared by DRAGON-433) ──────────────
+
+/// Cargo sets this for anything IT runs, and a child process inherits it. Absent from every
+/// shipped launch — a `.desktop` entry, a Finder/Start Menu launch, a login item and the
+/// user's PrintScreen shortcut all start from a session that never had it, and `cargo` does
+/// not export anything into a login shell.
+///
+/// That inheritance is the whole reason this is the marker. See [`is_dev_process`].
+const CARGO_ENV: &str = "CARGO_MANIFEST_DIR";
+
+/// Whether this process is part of a build/test run rather than a real user session.
+///
+/// **Why it lives here.** Introduced by DRAGON-424 inside `diag` to keep test output out of
+/// the owner's debug log; DRAGON-433 needed the identical question for the CONFIG directory,
+/// and "is this process a dev/test run" is a fact about the process, not about logging. One
+/// definition, so the two sandboxes can never disagree about what a test process is.
+///
+/// **Why not `cfg!(test)` alone.** The observed leak was NOT the test harness. It was
+/// `tests/cli.rs` spawning the REAL binary as a subprocess — a child built without
+/// `cfg(test)`, which resolves its own paths and knows nothing about the harness that started
+/// it. Any check that lives only in test-compiled code misses the case that actually happened.
+///
+/// **Why not "the binary sits under `target/`".** The owner's PrintScreen shortcut launches
+/// `target/release/cosmic-capture-kit` directly. Treating a target-dir binary as a test would
+/// sandbox the person the app is for.
+///
+/// So the test is the inherited cargo environment, present for the harness AND its children
+/// and absent for every shipped launch. `cfg!(test)` is kept as a cheap second condition for
+/// the harness itself.
+pub(crate) fn is_dev_process() -> bool {
+    cfg!(test) || std::env::var_os(CARGO_ENV).is_some()
+}
+
+/// A short, deterministic key that separates one checkout's sandbox from another's.
+///
+/// Keyed by the cargo manifest dir so concurrent runs in different worktrees never share a
+/// sandbox (and so two users on one machine never collide over a `/tmp` folder the other
+/// created), but STABLE within a run — a test's spawned children inherit `CARGO_MANIFEST_DIR`
+/// and so resolve to the same sandbox as the harness, which is what makes the isolation hold
+/// across process boundaries.
+pub(crate) fn sandbox_key() -> String {
+    let seed = std::env::var_os(CARGO_ENV)
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "cargo".to_string());
+    fnv1a_hex(&seed)
+}
+
+/// FNV-1a as 16 hex digits. Pure, so [`sandbox_key`]'s "two binaries agree" property is
+/// testable without spawning anything.
+///
+/// Written out rather than taken from `DefaultHasher` because the parent harness and the
+/// child app are two different binaries that must agree on the answer, and std's hasher only
+/// promises stability within one build.
+fn fnv1a_hex(seed: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in seed.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// The config directory a dev/test process gets instead of the user's real one (DRAGON-433).
+///
+/// Under the temp dir, for the same reason the log sandbox is: a test run leaves nothing
+/// behind in a place the user (or a support request) would later look. Starts EMPTY, which is
+/// the point — a test sees schema defaults, not whatever the developer happens to have set.
+fn sandbox_config_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("cosmic-capture-kit-dev-config-{}", sandbox_key()))
+}
+
 /// The app's OWN config directory — `~/.config/cosmic-capture-kit` on EVERY OS, so
 /// the user-facing paths (the covermark drop folder, `config.toml`) read the same
 /// everywhere. Linux resolves through `dirs::config_dir()` (XDG-respecting —
@@ -49,7 +133,21 @@ pub fn timing_mark(label: &str) {
 /// instead of their native config homes (`~/Library/Application Support` /
 /// `%APPDATA%`), MIGRATING anything an older build left in the native location
 /// (a one-time whole-directory rename, checked once per process).
+///
+/// **DRAGON-433: a dev/test process gets a sandbox instead** ([`sandbox_config_dir`]), and
+/// the real directory is unreachable from one. THE choke point for that rule, deliberately:
+/// every config-adjacent path in the app derives from this one function — `config.toml` load
+/// AND save (`state::store::config_path`), `diag::init`'s early direct read of the same file,
+/// the update manifest cache (`update.rs`), and the covermark drop folder
+/// (`preview::edit`). Sandboxing here means a test can neither READ the developer's real
+/// settings nor WRITE over them, with no second mechanism to keep in step.
+///
+/// See [`is_dev_process`] for why the marker is the inherited cargo environment rather than
+/// `cfg!(test)` — the same reasoning, and the same predicate, as the DRAGON-424 log sandbox.
 pub fn app_config_dir() -> Option<PathBuf> {
+    if is_dev_process() {
+        return Some(sandbox_config_dir());
+    }
     #[cfg(target_os = "linux")]
     {
         Some(dirs::config_dir()?.join("cosmic-capture-kit"))
@@ -825,5 +923,60 @@ mod tests {
         assert!(ff.is_file());
         let fp = locate_tool("ffprobe", "CCK_FFPROBE_UNSET_FOR_TEST");
         assert_eq!(fp, vendor.join("ffprobe"), "ffprobe should resolve to the vendor dir");
+    }
+
+    // ── The dev/test sandbox (DRAGON-424's key, DRAGON-433's config dir) ─────
+
+    /// The harness and the child it spawns are two different binaries that have to agree on
+    /// the sandbox folder, or a test's own child reads and writes somewhere the test cannot
+    /// see. Moved here from `diag` by DRAGON-433, which made this key serve two sandboxes.
+    #[test]
+    fn the_sandbox_key_is_stable_and_per_worktree() {
+        assert_eq!(fnv1a_hex("/home/jane/repo"), fnv1a_hex("/home/jane/repo"));
+        assert_ne!(fnv1a_hex("/home/jane/repo"), fnv1a_hex("/home/jane/worktrees/other"));
+        assert_eq!(fnv1a_hex("x").len(), 16);
+        assert!(fnv1a_hex("x").chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// The live assertion, made by the harness about ITSELF: this very process is a dev
+    /// process, so the config it resolves is a sandbox and NOT the developer's real one.
+    ///
+    /// DRAGON-433. Before this, `state::load()` in a test read the `config.toml` of whoever
+    /// ran the suite — so a test could pass or fail on the developer's settings, and a test
+    /// that saved could overwrite them.
+    #[test]
+    fn this_test_binary_resolves_config_into_the_sandbox() {
+        assert!(is_dev_process(), "a cargo test binary must classify itself as dev/test");
+        let resolved = app_config_dir().expect("a dev process always has a sandbox");
+        assert!(
+            resolved.starts_with(std::env::temp_dir()),
+            "config {resolved:?} must be under the temp dir, not the user's home"
+        );
+        // And specifically not the real location, whatever this OS calls it.
+        if let Some(home) = dirs::home_dir() {
+            let real = home.join(".config").join("cosmic-capture-kit");
+            assert_ne!(resolved, real, "a test must never resolve the real config dir");
+        }
+    }
+
+    /// The config FILE the app actually opens — asserted through `state::config_path` rather
+    /// than re-derived here, so this covers the seam `state::load` uses.
+    #[test]
+    fn the_config_file_a_test_would_load_is_inside_the_sandbox() {
+        let path = crate::state::config_path().expect("a dev process always has one");
+        assert!(path.starts_with(std::env::temp_dir()), "config file at {path:?}");
+        assert!(path.ends_with("config.toml"), "{path:?}");
+    }
+
+    /// The two sandboxes are SEPARATE folders sharing one key: a run's logs and its config
+    /// never land in the same directory, but they always belong to the same run.
+    #[test]
+    fn the_log_and_config_sandboxes_are_distinct_but_share_a_key() {
+        let cfg = sandbox_config_dir();
+        let logs = crate::diag::log_dir().expect("a dev process always has a log sandbox");
+        assert_ne!(cfg, logs);
+        let key = sandbox_key();
+        assert!(cfg.to_string_lossy().ends_with(&key), "{cfg:?}");
+        assert!(logs.to_string_lossy().ends_with(&key), "{logs:?}");
     }
 }

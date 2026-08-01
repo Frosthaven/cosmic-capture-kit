@@ -88,6 +88,17 @@ pub(super) fn overlay_surface_with(
 /// top-left in both iced and CoreGraphics, so the [`coords`] flip is NOT applied
 /// here — that pair is for Cocoa/AppKit geometry, which this isn't).
 ///
+/// **Windows (DRAGON-447)**: `logical_pos` / `logical_size` arrive as PHYSICAL
+/// virtual-screen pixels there (see [`crate::platform::backend::OutputDesc`]'s units
+/// contract — physical is the only globally-coherent space Windows offers), so they are
+/// converted to the LOGICAL point seed winit actually wants by
+/// [`crate::platform::windows::overlay_seed_rect`], which also clamps it under the GPU's
+/// surface limit. Handing winit the raw physical rect asked for a `dpi/96`×-too-large
+/// surface: on a customer's 3840x2160 display at 300% that was an 11520x6480 request
+/// against an 8192 limit, and wgpu aborts — not errors — on that, so EVERY capture child
+/// died ~430ms after minting its overlays and every capture "did nothing". macOS is
+/// untouched: its `output_descs` already returns true points.
+///
 /// `decorations: true` is a CRASH-DODGE, not a real titlebar: a borderless mac
 /// window trips a winit abort ("view must be installed in a window") because
 /// libcosmic polls `is_maximized` on every resize and winit's `is_zoomed` flips a
@@ -103,12 +114,21 @@ pub(super) fn overlay_window(
     logical_pos: (i32, i32),
     logical_size: (u32, u32),
 ) -> (window::Id, Task<cosmic::Action<Msg>>) {
-    let (w, h) = (logical_size.0.max(1) as f32, logical_size.1.max(1) as f32);
+    // Windows: physical rect → the clamped LOGICAL point seed winit reads (DRAGON-447).
+    // The caller keeps the PHYSICAL rect for `place_overlay`, which sets the real frame
+    // natively right after open — the seed only has to be a surface wgpu accepts, on the
+    // right monitor. mac passes its points straight through, byte-identical.
+    #[cfg(windows)]
+    let (seed_pos, seed_size) =
+        crate::platform::windows::overlay_seed_rect(logical_pos, logical_size);
+    #[cfg(not(windows))]
+    let (seed_pos, seed_size) = (logical_pos, logical_size);
+    let (w, h) = (seed_size.0.max(1) as f32, seed_size.1.max(1) as f32);
     let (id, task) = window::open(window::Settings {
         size: cosmic::iced::Size::new(w, h),
         position: window::Position::Specific(cosmic::iced::Point::new(
-            logical_pos.0 as f32,
-            logical_pos.1 as f32,
+            seed_pos.0 as f32,
+            seed_pos.1 as f32,
         )),
         // decorations + resizable keep `Titled | Resizable` in the style mask (the
         // is_zoomed crash-dodge above); the titlebar is hidden natively after open.
@@ -234,17 +254,26 @@ pub(super) fn preview_overlay_window(
 /// its hotkeys (Save / Copy / Escape) work). Doing the native step mid-creation races
 /// winit, hence the post-open follow-up. Distinct [`PREVIEW_OVERLAY_TITLE`] so the
 /// finalize never matches a still-closing capture overlay.
+///
+/// DRAGON-447: `preview_overlay_rect` hands this a PHYSICAL monitor rect (what
+/// `place_overlay` needs), so the winit seed goes through the same
+/// [`crate::platform::windows::overlay_seed_rect`] conversion the capture
+/// [`overlay_window`] uses — this surface is exactly as fatal at 300% as that one, and it
+/// is minted after EVERY capture that commits to a fullscreen preview. The PHYSICAL rect
+/// still rides the `PreviewOverlayOpened` message, untouched, for the native placement.
 #[cfg(windows)]
 pub(super) fn preview_overlay_window(
     logical_pos: (i32, i32),
     logical_size: (u32, u32),
 ) -> (window::Id, Task<cosmic::Action<Msg>>) {
-    let (w, h) = (logical_size.0.max(1) as f32, logical_size.1.max(1) as f32);
+    let (seed_pos, seed_size) =
+        crate::platform::windows::overlay_seed_rect(logical_pos, logical_size);
+    let (w, h) = (seed_size.0.max(1) as f32, seed_size.1.max(1) as f32);
     let (id, task) = window::open(window::Settings {
         size: cosmic::iced::Size::new(w, h),
         position: window::Position::Specific(cosmic::iced::Point::new(
-            logical_pos.0 as f32,
-            logical_pos.1 as f32,
+            seed_pos.0 as f32,
+            seed_pos.1 as f32,
         )),
         // Borderless, no is_zoomed trap on Windows (unlike mac); native placement below
         // sets the real physical rect, so the winit position/size are only a hidden seed.
@@ -291,10 +320,29 @@ pub(super) fn preview_overlay_window(
 pub(super) const PREVIEW_MIN_W: f32 = 924.0;
 pub(super) const PREVIEW_MIN_H: f32 = 732.0;
 
+/// The windowed preview's `min_size` (LOGICAL POINTS): the [`PREVIEW_MIN_W`] /
+/// [`PREVIEW_MIN_H`] floor with each axis clamped down to `output`, so the floor can never
+/// exceed the display the window opens on (DRAGON-357 item 11).
+///
+/// `output` MUST be the target display in POINTS. Handing it a PHYSICAL rect is why the
+/// clamp did nothing on a scaled Windows display (DRAGON-449): at 300% a 3840x2160 monitor is
+/// 1280x720 points, so the 732pt floor is TALLER than the screen — yet compared against 2160
+/// it never bit. Pure, so the clamp is pinned by tests rather than by a running compositor.
+pub(super) fn preview_min_size(output: (f32, f32)) -> (f32, f32) {
+    (
+        PREVIEW_MIN_W.min(output.0.max(1.0)),
+        PREVIEW_MIN_H.min(output.1.max(1.0)),
+    )
+}
+
 /// The post-capture preview as a normal RESIZABLE WINDOW (the "Windowed" appearance)
 /// instead of the fullscreen overlay — so it can be moved / resized / min / maximized.
 /// Mints its own `window::Id` (returned so the caller stores it in `PreviewState`); the
 /// open task is mapped to a no-op since the state is set up-front.
+///
+/// `size` and `output` are both LOGICAL POINTS — a `window::Settings` size is points on every
+/// backend, and on Windows that is NOT the capture-space rect `output_descs()` reports
+/// (DRAGON-449; the caller crosses via `preview::monitor_fit_points`).
 ///
 /// `output` (the target monitor's logical size) becomes a TRANSIENT `max_size` hint:
 /// cosmic-comp (`FloatingLayout::map_internal`, floating/mod.rs:405-468 @ 9d52653d)
@@ -333,10 +381,10 @@ pub(super) fn preview_window(
         // never clamp and clip over each other — see DRAGON-106. Clamped to the output so the
         // floor never EXCEEDS a small display's usable area (DRAGON-357 item 11): on a monitor
         // narrower/shorter than the preferred floor, the min shrinks to the output instead.
-        min_size: Some(cosmic::iced::Size::new(
-            PREVIEW_MIN_W.min(output.0.max(1.0)),
-            PREVIEW_MIN_H.min(output.1.max(1.0)),
-        )),
+        min_size: Some({
+            let (w, h) = preview_min_size(output);
+            cosmic::iced::Size::new(w, h)
+        }),
         resizable: true,
         resize_border: 8,
         // CLIENT-side decorations (like the settings window): we draw our own header bar
