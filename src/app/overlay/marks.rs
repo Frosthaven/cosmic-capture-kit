@@ -144,41 +144,30 @@ impl App {
         Some(cosmic::iced::widget::stack(layers).into())
     }
 
-    /// Whether a QR or OCR scan pass is currently running (drives the spinner).
+    /// Whether the scanner is busy — a QR/OCR pass running, OR the live region shot those
+    /// passes read being taken (DRAGON-460).
+    ///
+    /// The shot counts because from the user's side it is all one wait: they press refresh,
+    /// the screen is read, the passes run, marks appear. Reporting busy only for the passes
+    /// would leave the toolbar button idle-looking for the read, then spin — a flicker on
+    /// every scan rather than one continuous "working".
     pub(in crate::app) fn scanning(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        self.code_busy.load(Relaxed) || self.ocr_busy.load(Relaxed)
+        self.code_busy.load(Relaxed)
+            || self.ocr_busy.load(Relaxed)
+            || self.scan_shot != crate::app::ScanShot::Idle
     }
 
-    /// A small, half-transparent accent spinner inset in the bottom-right of the
-    /// selected region while a QR/OCR pass is in flight, on the output that corner
-    /// lands on.
-    pub(super) fn scan_spinner_layer(&self, o: &OutputState) -> Option<Element<'_, Msg>> {
-        if self.mode != Mode::Region || !self.scanning() {
-            return None;
-        }
-        let (rx, ry, rw, rh) = self.normalized_region()?;
-        // SIZE / INSET are POINT constants (the badge's on-screen footprint), so the whole
-        // inset is computed in POINTS: convert the region's bottom-right corner once
-        // (DRAGON-448) and stay there. The on-output test below is the same comparison in
-        // point space — the output's own extent is `(0, 0)..point_size()`.
-        const SIZE: f32 = 26.0;
-        const INSET: f32 = 10.0;
-        let (ow, oh) = o.point_size();
-        let (right, bottom) = o.units().to_point((rx + rw as i32, ry + rh as i32));
-        let lx = right - INSET - SIZE;
-        let ly = bottom - INSET - SIZE;
-        // Render only on the output containing the spinner's centre.
-        let (cx, cy) = (right - INSET - SIZE / 2.0, bottom - INSET - SIZE / 2.0);
-        if cx < 0.0 || cx >= ow || cy < 0.0 || cy >= oh {
-            return None;
-        }
-        // libcosmic's official spinner has no opacity/style hook (its `crate::Theme`
-        // StyleSheet style is `()`, and iced exposes no layer-opacity primitive), so
-        // the old 50%-subtle badge is rendered at the widget's native accent instead.
-        let spinner = cosmic::widget::indeterminate_circular().size(SIZE);
-        Some(positioned_mark(lx.max(0.0), ly.max(0.0), spinner.into()))
-    }
+    // DRAGON-460 removed `scan_spinner_layer` — the small accent spinner inset in the
+    // bottom-right of the selection while a pass ran.
+    //
+    // The scanner's progress now shows on the toolbar's refresh button, which spins and
+    // disables itself while [`Self::scanning`]. That is where the user's attention already
+    // is (they pressed it), it cannot be clipped off-screen by a region drawn at the edge
+    // of a display the way an inset badge could, and it says WHICH control is unavailable
+    // rather than only that something is happening.
+    //
+    // It also stops the spinner sitting INSIDE the crop the scanner is about to read.
 }
 
 /// The hover tooltip bubble (theme-styled, clamped to 600 chars). Shared by code

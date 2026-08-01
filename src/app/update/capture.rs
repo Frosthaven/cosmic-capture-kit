@@ -56,22 +56,21 @@ impl App {
                     self.text_sel.clear();
                     self.text_menu = None;
                 }
-                // DRAGON-336: the QR/OCR scanners crop their scan source out of the
-                // frozen flats, which a freeze-off non-scanner launch no longer grabs.
-                // Entering the scanner is therefore the one live toggle that must
-                // acquire them lazily (the same shape as the deferred window
-                // pre-capture below). Checked BEFORE `self.kind` moves, so it fires
-                // once per entry into the scanner, not on every scanner-kind click.
-                if k == Kind::Scanner && self.kind != Kind::Scanner {
-                    self.kick_frozen_flats();
-                }
-                // DRAGON-456: the SAME button, pressed again while the scanner is already
-                // open, re-reads the screen. There is no kind to switch to, so the press
-                // would otherwise be inert — and a stale scan is exactly the state a user
-                // reaches for a button in. Everything below still runs (it is all
-                // idempotent for a Scanner->Scanner press).
-                if scan_press_refreshes(self.kind, k) {
-                    self.begin_scan_refresh();
+                // Entering the scanner, or pressing its button again while it is already
+                // open, both mean the same thing now: READ THE SCREEN.
+                //
+                // DRAGON-336 had to distinguish them — entering kicked a lazy grab of the
+                // whole-screen flats, re-pressing (DRAGON-456) re-grabbed them — because the
+                // scan source was a crop of those flats. DRAGON-460 made the source a live
+                // shot of the selection, so there is one action with one shape, and
+                // `begin_scan_shot`'s own `!= Idle` guard makes a double-press harmless.
+                //
+                // Checked BEFORE `self.kind` moves, so `scan_press_refreshes` still sees the
+                // kind we are coming FROM.
+                if (k == Kind::Scanner && self.kind != Kind::Scanner)
+                    || scan_press_refreshes(self.kind, k)
+                {
+                    self.begin_scan_shot();
                 }
                 self.kind = k;
                 if k == Kind::Scanner {
@@ -150,32 +149,31 @@ impl App {
                 // so the overlay switches from the live (dimmed) screen to the still.
                 if let Some(flats) = self.frozen_slot.lock().ok().and_then(|mut g| g.take()) {
                     crate::util::timing_mark("FrozenReady: deferred flats drained into self.frozen");
-                    // DRAGON-456: a REFRESH that came back with NOTHING (the re-grab failed —
-                    // no compositor connection, no outputs) must not destroy the working
-                    // snapshot the scanner is currently reading. Keep what we have and leave
-                    // the scan untouched: a failed refresh is a no-op, never a downgrade.
-                    // Only the refresh path can decline the delivery — the launch/lazy grabs
-                    // still assign unconditionally, including their deliberate EMPTY
-                    // placeholder (`acquire_scene`), so their behavior is unchanged.
-                    let refreshed = frozen_delivery_accepted(
-                        self.scan_refresh,
-                        flats.is_empty(),
-                        self.frozen.is_empty(),
-                    );
-                    if refreshed {
-                        self.frozen = flats;
-                    }
+                    // DRAGON-460: these flats are the CAPTURE's scene, and nothing else now.
+                    // The scanner reads its own live region shot (`scan_shot_slot`), so a
+                    // flats delivery can no longer be a scan refresh — it is always the
+                    // launch grab, which assigns unconditionally including its deliberate
+                    // EMPTY placeholder from `acquire_scene`.
+                    //
+                    // The DRAGON-456 decline (`frozen_delivery_accepted`) and the re-arm
+                    // (`finish_scan_shot`) both went with that: they existed because a
+                    // refresh wrote through this same slot, and calling the re-arm here now
+                    // would reset a shot in flight the moment unrelated launch flats landed.
+                    self.frozen = flats;
                     self.frozen_pending = false;
-                    // If these flats are a user-requested re-read, the scan keys are cleared
-                    // HERE and nowhere earlier — see `finish_scan_refresh`.
-                    self.finish_scan_refresh(refreshed);
                 }
                 Task::none()
             }
-            // DRAGON-456: the overlay has had a frame to paint nothing; the screen is clean
-            // of our own UI, so take the new snapshot now.
-            CaptureMsg::ScanRefreshTick => {
-                self.run_scan_refresh_grab();
+            // DRAGON-460: the frame without the marks is on screen, so take the region shot.
+            CaptureMsg::ScanSpinTick => {
+                // One step per ~33ms tick; a full turn takes about a second. Wrapped so the
+                // float cannot drift upward for the life of a long scan.
+                const STEP: f32 = std::f32::consts::TAU / 30.0;
+                self.scan_spin = (self.scan_spin + STEP) % std::f32::consts::TAU;
+                Task::none()
+            }
+            CaptureMsg::ScanShotTick => {
+                self.run_scan_shot();
                 Task::none()
             }
             CaptureMsg::CursorReady => {
@@ -473,124 +471,35 @@ impl App {
         true
     }
 
-    /// DRAGON-336: kick a LAZY frozen-flats grab for a launch that skipped it
-    /// (`launch_flats_needed` false — freeze off, non-scanner kind). Mirrors
-    /// [`Self::kick_window_precapture`]: spawn the same grab onto its own OS thread,
-    /// deposit into `frozen_slot`, and re-arm `frozen_pending` so the existing
-    /// `FrozenReady` drain poll lands it exactly like a launch grab.
+    /// DRAGON-460 step 1 of 2: start a read of the screen.
     ///
-    /// LIMITATION (deliberate, and why this is only wired to the SCANNER): a lazy grab
-    /// is NOT the launch instant — our capture overlay is already mapped, so the flat it
-    /// returns carries the region selector's dim wash everywhere OUTSIDE the currently
-    /// drawn selection. The selection's INTERIOR is drawn fully transparent
-    /// (`RegionSelection::draw` fills only the four surrounding bands), so the crop the
-    /// scanner actually reads is clean whenever a region is already drawn at kick time —
-    /// the common case, since the region is restored from the persisted state at launch.
-    /// A region drawn AFTER this grab, over screen area that was dimmed, scans a dimmed
-    /// source (QR still decodes; OCR degrades). That is strictly better than the
-    /// alternative (no flats at all = the scanner silently never produces a mark), but it
-    /// is the one place where a lazy flat is not equivalent to a launch flat.
+    /// Only the mark CLEAR happens here. The shot reads the composited screen, and the one
+    /// thing of ours inside the crop is the scanner's own marks — QR boxes and text-word
+    /// highlights, drawn over the very pixels about to be photographed. Shooting with those
+    /// up would scan our own highlights and feed them back in. So they go now, and
+    /// [`Self::run_scan_shot`] takes the picture one tick later (`sub_scan_shot`), by which
+    /// time the frame without them has reached the screen.
     ///
-    /// The FREEZE setting deliberately does NOT call this: a freeze toggled on mid-session
-    /// would snapshot the settings window sitting over the desktop and then show/capture
-    /// that as the "frozen screen" — corrupting, where the no-flats fallback (`freezing()`
-    /// is false on an empty map, so the capture stays live) is merely inert until the next
-    /// launch.
-    pub(in crate::app) fn kick_frozen_flats(&mut self) {
-        if !self.frozen.is_empty() {
-            // A freeze / scanner launch already grabbed them; nothing to do.
+    /// Clearing rather than hiding is deliberate: a shot is only ever taken because the
+    /// region changed or the user asked for a re-read, and in both cases the marks on
+    /// screen describe pixels that are about to stop being the answer.
+    ///
+    /// **Nothing else is hidden, and that is the point of DRAGON-460.** The rest of the
+    /// overlay keeps painting. `RegionSelection::draw` fills the dim as four bands AROUND
+    /// the selection and never fills the interior, so the crop is clean with the chrome
+    /// still up. DRAGON-456 had to blank everything only because it re-read the whole
+    /// screen; reading just the selection removes the reason.
+    ///
+    /// A shot already in flight wins — re-pressing during the clear must not start a second
+    /// one racing the first into the same slot.
+    pub(in crate::app) fn begin_scan_shot(&mut self) {
+        if self.scan_shot != ScanShot::Idle {
             return;
         }
-        crate::util::timing_mark("kick_frozen_flats: lazy frozen-flats grab (begin)");
-        let slot = self.frozen_slot.clone();
-        // Clear the EMPTY placeholder `acquire_scene` parked here for the skipped grab:
-        // if the drain poll took it after we re-armed `frozen_pending`, it would clear
-        // the flag again and stop polling before the real flats land.
-        if let Ok(mut g) = slot.lock() {
-            *g = None;
-        }
-        self.frozen_pending = true;
-        let want_cursor = self.capture_cursor;
-        std::thread::spawn(move || {
-            let flats = grab_frozen_flats(want_cursor);
-            crate::util::timing_mark("kick_frozen_flats: lazy frozen-flats grab (done)");
-            if let Ok(mut g) = slot.lock() {
-                *g = Some(flats);
-            }
-        });
-    }
-
-    /// DRAGON-456 step 1 of 3: start a user-requested re-read of the screen.
-    ///
-    /// Only the BLANK happens here. The re-grab reads the composited screen, and our own
-    /// overlay is part of that composite — since this ticket it is painting the frozen
-    /// backdrop, so grabbing now would photograph the PREVIOUS still and the refresh would
-    /// silently do nothing. So the overlay stops painting, and [`Self::run_scan_refresh_grab`]
-    /// takes the picture one tick later (`sub_scan_refresh`), the same hide-then-grab shape
-    /// `begin_capture` uses before a live capture.
-    ///
-    /// A grab already in flight wins, and `frozen_pending` is the test for BOTH of them:
-    /// re-pressing during the ~1 frame of blank must not start a second thread racing the
-    /// first into the same slot, and neither must a press that lands while the LAUNCH (or
-    /// lazy) grab is still running — that one is already delivering pixels at least as
-    /// fresh as ours, and racing it could leave the older result as the last writer.
-    fn begin_scan_refresh(&mut self) {
-        if self.scan_refresh != ScanRefresh::Idle || self.frozen_pending {
-            return;
-        }
-        crate::util::timing_mark("scan refresh: blanking the overlay for the re-grab");
-        self.scan_refresh = ScanRefresh::Blanking;
-    }
-
-    /// DRAGON-456 step 2 of 3: the overlay has painted nothing for a tick, so take the new
-    /// snapshot. Deposits into the SAME `frozen_slot` the launch/lazy grabs use, so it lands
-    /// through the existing `FrozenReady` drain with no second delivery path.
-    fn run_scan_refresh_grab(&mut self) {
-        if self.scan_refresh != ScanRefresh::Blanking {
-            return;
-        }
-        self.scan_refresh = ScanRefresh::Grabbing;
-        crate::util::timing_mark("scan refresh: re-grab (begin)");
-        let slot = self.frozen_slot.clone();
-        // Clear anything parked in the slot (the empty placeholder, or a previous
-        // delivery) so the drain can only ever see OUR result.
-        if let Ok(mut g) = slot.lock() {
-            *g = None;
-        }
-        self.frozen_pending = true;
-        let want_cursor = self.capture_cursor;
-        std::thread::spawn(move || {
-            let flats = grab_frozen_flats(want_cursor);
-            crate::util::timing_mark("scan refresh: re-grab (done)");
-            if let Ok(mut g) = slot.lock() {
-                *g = Some(flats);
-            }
-        });
-    }
-
-    /// DRAGON-456 step 3 of 3: the new flats have landed — un-blank and re-arm the scan.
-    ///
-    /// The scan keys (`last_code_region` / `last_ocr_region`) are cleared HERE, not at the
-    /// press, and the ORDER is the whole point: clearing them early would let the next
-    /// `MarksPoll` (250ms) re-scan the OLD flats, re-set the keys, and leave the fresh
-    /// pixels unscanned — a refresh that returned the stale answer it was pressed to fix.
-    ///
-    /// The cached marks are dropped with them. They describe pixels that no longer exist,
-    /// and they carry positions the overlay would draw over the new still until the passes
-    /// land a beat later.
-    ///
-    /// `refreshed` false = the re-grab came back empty and was DECLINED (see `FrozenReady`):
-    /// un-blank, but leave the scan alone — the pixels it already holds are still the ones
-    /// on screen, so re-running the passes would only spend OCR time to reach the same answer.
-    fn finish_scan_refresh(&mut self, refreshed: bool) {
-        if self.scan_refresh != ScanRefresh::Grabbing {
-            return;
-        }
-        crate::util::timing_mark("scan refresh: new flats landed, re-arming the scan");
-        self.scan_refresh = ScanRefresh::Idle;
-        if !refreshed {
-            return;
-        }
+        crate::util::timing_mark("scan shot: clearing marks for the read");
+        self.scan_shot = ScanShot::Clearing;
+        // The marks (and the keys that say which region they describe) go together, so the
+        // poll below cannot decide the region is unchanged and skip the re-read.
         self.last_code_region = None;
         self.last_ocr_region = None;
         self.code_marks.clear();
@@ -602,6 +511,47 @@ impl App {
         self.code_menu = None;
         self.rebuild_marks();
     }
+
+    /// DRAGON-460 step 2 of 2: the frame without marks is on screen, so take the shot.
+    ///
+    /// A LIVE region shot through `crate::screenshot::region` — the portable seam, with an
+    /// identical signature on all three platforms (`platform/{linux/native,mac,windows}/
+    /// screenshot.rs`), so the scanner reads current pixels everywhere with no `cfg` in this
+    /// path at all.
+    ///
+    /// The cursor is deliberately NOT drawn in: it is not part of what the user is asking
+    /// the scanner to read, and a pointer sitting over a word is exactly the kind of thing
+    /// that makes OCR return nonsense.
+    ///
+    /// Deposits into `scan_shot_slot`; `MarksPoll` picks it up and runs the passes.
+    fn run_scan_shot(&mut self) {
+        if self.scan_shot != ScanShot::Clearing {
+            return;
+        }
+        let Some((x, y, w, h)) = self.normalized_region() else {
+            // Nothing selected — nothing to read. Drop straight back to idle rather than
+            // sitting in a state the tick would keep firing on.
+            self.scan_shot = ScanShot::Idle;
+            return;
+        };
+        self.scan_shot = ScanShot::Shooting;
+        crate::util::timing_mark("scan shot: live region read (begin)");
+        let slot = self.scan_shot_slot.clone();
+        if let Ok(mut g) = slot.lock() {
+            *g = None;
+        }
+        std::thread::spawn(move || {
+            let shot = crate::screenshot::region(x, y, w, h, None);
+            crate::util::timing_mark("scan shot: live region read (done)");
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(shot);
+            }
+        });
+    }
+
+    // DRAGON-460 removed `finish_scan_shot`. It re-armed the scan when refreshed FLATS
+    // landed; the scanner reads its own live region shot now, which `MarksPoll` picks up
+    // directly, so there is no second landing path to re-arm from.
 
     fn kick_window_precapture(&mut self) {
         if self.window_precapture_started {

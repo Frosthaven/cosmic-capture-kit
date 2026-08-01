@@ -407,9 +407,8 @@ impl App {
         if let Some(marks) = self.marks_layer(o) {
             layers.push(marks);
         }
-        if let Some(spinner) = self.scan_spinner_layer(o) {
-            layers.push(spinner);
-        }
+        // DRAGON-460: no scan spinner layer here any more — scanner progress is the
+        // toolbar refresh button spinning. See `marks::scanning`.
         if let Some(cap) = self.capture_button_layer(o) {
             layers.push(cap);
         }

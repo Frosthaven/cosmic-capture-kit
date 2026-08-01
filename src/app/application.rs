@@ -534,7 +534,9 @@ impl cosmic::Application for App {
                 ocr_busy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 last_code_region: None,
                 last_ocr_region: None,
-                scan_refresh: ScanRefresh::Idle,
+                scan_shot: ScanShot::Idle,
+                scan_shot_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                scan_spin: 0.0,
                 code_marks: Vec::new(),
                 marks: Vec::new(),
                 hovered_mark: None,
@@ -749,12 +751,16 @@ impl cosmic::Application for App {
             // the re-grab a photograph of the still it is meant to replace. ONE place, so
             // no layer can be forgotten. The overlay is untouched otherwise: same surface,
             // same input, same state — it just skips a couple of frames.
-            if overlay_blanked_for_scan_refresh(self.scan_refresh) {
-                return widget::space::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into();
-            }
+            // DRAGON-460 removed the blank that stood here.
+            //
+            // DRAGON-456 needed it because a scan re-read the WHOLE screen, so everything we
+            // draw had to come off first. Reading only the selection removes the reason: the
+            // region interior is the one part of the overlay we never paint, so a shot of it
+            // is clean while the chrome stays up. The only thing hidden now is the marks
+            // layer, cleared in `begin_scan_shot`, because that IS inside the crop.
+            //
+            // Do not reintroduce a blank here. It was also the mechanism by which a refresh
+            // "hid the region selection", which is the behaviour this ticket removes.
             if self.recording.is_some() {
                 self.recording_view(o)
             } else if self.countdown.is_some() {

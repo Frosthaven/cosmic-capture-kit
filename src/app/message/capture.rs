@@ -80,7 +80,10 @@ pub enum CaptureMsg {
     /// DRAGON-456: fires one tick after a scan refresh blanked the overlay — the screen is
     /// clean of our own UI now, so run the re-grab. The twin of `DoPixelCapture` for a
     /// session that CONTINUES (nothing was torn down; the overlay just stopped painting).
-    ScanRefreshTick,
+    ScanShotTick,
+    /// DRAGON-460: advance the refresh button's spin while a scan is in flight. Carries no
+    /// data — the angle lives on the App and this only says "another frame".
+    ScanSpinTick,
     /// Linux: run a DEFERRED overlay-less immediate capture
     /// (`--active-window` / `--active-monitor`). Kicked once, a short settle after the FIRST
     /// output registers, so the REST of the outputs have populated `self.outputs` first —

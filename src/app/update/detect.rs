@@ -76,15 +76,37 @@ impl App {
                     && region != self.last_ocr_region
                     && !self.region_dragging
                     && !self.ocr_busy.load(Relaxed);
-                // ONE crop feeds both scanners: crop_frozen stitches the frozen outputs
-                // and copies the sub-rect out (~2x the region's bytes in transients), so
-                // when QR + OCR settle on the same region — the common case — don't pay
-                // the stitch/crop twice.
-                let crop: Option<std::sync::Arc<image::RgbaImage>> = match region {
-                    Some((x, y, w, h)) if want_codes || want_ocr => {
-                        self.crop_frozen(x, y, w, h).map(std::sync::Arc::new)
+                // DRAGON-460: the scan source is a LIVE shot of the selection, not a crop of
+                // the launch-instant flats. What is on screen and what gets read are the
+                // same pixels because they ARE the same pixels — no freeze, no backdrop, and
+                // nothing to go stale behind the user's back.
+                //
+                // The shot is asynchronous (a real screen capture, tens of ms), so it cannot
+                // be taken inline here the way `crop_frozen`'s memory copy could. The
+                // sequence is: decide a read is wanted -> `begin_scan_shot` clears the marks
+                // -> one tick later the shot is taken off-thread -> it lands in
+                // `scan_shot_slot` -> this poll picks it up and runs the passes against it.
+                //
+                // ONE shot feeds both scanners, as one crop used to: QR and OCR settle on
+                // the same region in the common case and must not photograph the screen
+                // twice (they would also be reading two DIFFERENT instants of it).
+                let landed = self.scan_shot_slot.lock().ok().and_then(|mut g| g.take());
+                let crop: Option<std::sync::Arc<image::RgbaImage>> = match landed {
+                    Some(shot) => {
+                        self.scan_shot = ScanShot::Idle;
+                        // `Some(None)` = the platform returned nothing. Leave the previous
+                        // answer standing rather than clearing to an empty result: a failed
+                        // read must never be indistinguishable from "there is nothing here".
+                        shot.map(std::sync::Arc::new)
                     }
-                    _ => None,
+                    None => {
+                        // No shot in hand. If one is wanted and none is in flight, start it;
+                        // the passes run on the next poll once it lands.
+                        if (want_codes || want_ocr) && self.scan_shot == ScanShot::Idle {
+                            self.begin_scan_shot();
+                        }
+                        None
+                    }
                 };
                 // (Re-)scan the region's QR codes / barcodes when it settles + changes.
                 if want_codes {

@@ -15,7 +15,8 @@ impl App {
                 self.sub_external_recording(),
                 self.sub_toast(),
                 self.sub_pixel_capture(),
-                self.sub_scan_refresh(),
+                self.sub_scan_shot(),
+                self.sub_scan_spin(),
                 self.sub_loading_tick(),
                 self.sub_playback_poll(),
                 self.sub_preview_toasts(),
@@ -315,11 +316,28 @@ impl App {
     /// continues: nothing was torn down, the overlay just stopped painting, so the same
     /// 200ms is what the compositor needs to present the empty surface. Stops immediately
     /// once the grab is away (`Grabbing`), so it is one tick, not a poll.
-    fn sub_scan_refresh(&self) -> Option<Subscription<Msg>> {
-        if self.scan_refresh == ScanRefresh::Blanking {
+    /// DRAGON-460: drive the refresh button's spin while the scanner is busy.
+    ///
+    /// ~30fps, and ONLY while `scanning()` — an idle scanner ticks nothing, so this cannot
+    /// become a background redraw the way an always-on animation clock would. It stops on
+    /// its own when the passes finish, which is also when the button becomes pressable
+    /// again, so the animation and the affordance can never disagree.
+    fn sub_scan_spin(&self) -> Option<Subscription<Msg>> {
+        if self.scanning() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(33))
+                    .map(|_| Msg::Capture(CaptureMsg::ScanSpinTick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn sub_scan_shot(&self) -> Option<Subscription<Msg>> {
+        if self.scan_shot == ScanShot::Clearing {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(200))
-                    .map(|_| Msg::Capture(CaptureMsg::ScanRefreshTick)),
+                    .map(|_| Msg::Capture(CaptureMsg::ScanShotTick)),
             )
         } else {
             None

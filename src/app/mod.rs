@@ -712,34 +712,39 @@ pub enum Kind {
 pub enum Hover {
     None,
     Cancel,
-    /// The SCAN kind button (DRAGON-456). Only meaningful while the scanner is ALREADY
-    /// the active kind, where a press re-reads the screen rather than switching kind —
-    /// that is the one state whose hover face changes (to the refresh glyph).
-    ScanKind,
+    // DRAGON-460 removed `ScanKind`. It existed so the scan segment could swap to the
+    // refresh glyph on hover (DRAGON-456); the refresh is now a visible button of its
+    // own, so nothing tracks that hover and the variant had no constructor left.
 }
 
-/// DRAGON-456: how far a scanner REFRESH has got. Re-pressing the scan kind button while
-/// the scanner is already open re-grabs the launch flats, so a scan reads the screen as it
-/// is NOW rather than as it was at launch.
+/// How far a scanner READ has got (DRAGON-456, redesigned by DRAGON-460).
 ///
-/// It is three states rather than a bool because the re-grab must not photograph our own
-/// overlay. The overlay is mapped and (since this ticket) painting the frozen backdrop, so
-/// grabbing straight away would return a picture of our own dim wash, toolbar and marks —
-/// or worse, of the previous still. So the overlay paints NOTHING for one tick first, and
-/// only then does the grab run. That is the same hide-then-grab dance `begin_capture`
-/// already performs before a live capture, minus the teardown (the session continues).
+/// The scanner reads a LIVE shot of the selected region, taken on demand — not a crop of
+/// the launch-instant flats. That is what makes the scan current without freezing anything,
+/// and it works because of one property of our own overlay: `RegionSelection::draw` fills
+/// the dim as four bands AROUND the selection and never fills the interior. The pixels
+/// inside the selection are therefore untouched by us, so a shot cropped to that rect is
+/// clean with the overlay still painting.
 ///
-/// ONE snapshot per user action: the frozen-scene model still holds, the user just gets to
-/// say when the snapshot is taken.
+/// **This is why the overlay no longer blanks.** DRAGON-456 read the flats, which meant a
+/// re-read had to photograph the whole screen, which meant hiding everything we draw first.
+/// Reading only the selection removes the reason.
+///
+/// Two states of hiding remain, and only for what is genuinely INSIDE the crop:
+/// the scanner's own marks (QR boxes, text-word highlights). A shot taken while those are
+/// up would scan our own highlights and feed them back in. They are cleared before the shot
+/// rather than hidden, because a shot is only ever taken when the region changed or the
+/// user asked for a re-read — in both cases the marks on screen describe pixels that are
+/// about to stop being the answer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ScanRefresh {
+pub enum ScanShot {
     /// Nothing in flight.
     Idle,
-    /// The overlay is painting nothing so the re-grab sees a clean screen; the grab fires
-    /// on the next `ScanRefreshTick`.
-    Blanking,
-    /// The grab is on its thread. `FrozenReady` lands it, un-blanks, and re-arms the scan.
-    Grabbing,
+    /// Marks cleared, waiting one tick for the frame WITHOUT them to reach the screen
+    /// before the shot is taken (`ScanShotTick`).
+    Clearing,
+    /// The region shot + scan passes are on their thread.
+    Shooting,
 }
 
 /// Pre-capture countdown options (label, seconds).
@@ -1097,39 +1102,17 @@ fn scan_press_refreshes(current: Kind, pressed: Kind) -> bool {
     current == Kind::Scanner && pressed == Kind::Scanner
 }
 
-/// DRAGON-456: whether the capture overlay must paint NOTHING this frame.
-///
-/// True only while a scan refresh is blanking or grabbing. The re-grab reads the composited
-/// screen, and our overlay is part of that composite — a transparent surface that draws
-/// nothing composites to nothing, which is the platform-independent way to keep our own UI
-/// out of the picture (it is why freeze-off already shows the live desktop through the
-/// overlay on all three platforms, DRAGON-234). Blanking covers the frozen backdrop too,
-/// which matters more than the chrome: without it the re-grab would photograph the PREVIOUS
-/// still and "refresh" would be a no-op that looked like it worked.
-///
-/// Pure so the gating is unit-testable without the App.
-fn overlay_blanked_for_scan_refresh(scan_refresh: ScanRefresh) -> bool {
-    matches!(scan_refresh, ScanRefresh::Blanking | ScanRefresh::Grabbing)
-}
+// DRAGON-460 removed `overlay_blanked_for_flats_grab`.
+//
+// It existed so a scan could re-read the whole screen without photographing our own
+// overlay. The scanner now reads a live shot of the SELECTION, and `RegionSelection::draw`
+// never fills that interior, so there is nothing of ours in the crop and nothing to hide.
+// The marks are the one exception and they are cleared in `begin_scan_shot`, not blanked.
 
-/// DRAGON-456: whether a landing frozen-flats delivery should REPLACE the flats the app
-/// already holds (`CaptureMsg::FrozenReady`).
-///
-/// Always yes, with ONE exception: a re-grab that came back EMPTY while we hold real flats.
-/// That is a failed refresh (no compositor connection, no outputs), and taking it would
-/// leave the scanner with no source at all — strictly worse than the stale pixels the user
-/// was trying to replace. A failed refresh is a no-op, never a downgrade.
-///
-/// The launch and lazy grabs are deliberately NOT covered: their empty map is a real
-/// result (`acquire_scene` parks one on purpose for a launch that skips the grab), and
-/// they only ever land when `frozen` is still empty anyway. Pure so the rule is testable.
-fn frozen_delivery_accepted(
-    scan_refresh: ScanRefresh,
-    delivered_empty: bool,
-    held_empty: bool,
-) -> bool {
-    !(scan_refresh == ScanRefresh::Grabbing && delivered_empty && !held_empty)
-}
+// DRAGON-460 removed `frozen_delivery_accepted`. It declined an EMPTY re-grab landing on
+// top of real flats, so a failed scan refresh could not downgrade the scanner to no source
+// at all. Scan refreshes no longer write through the flats slot — a failed live region shot
+// is handled where it lands, in `MarksPoll`, by leaving the previous answer standing.
 
 fn acquire_scene(
     active: bool,
@@ -2358,9 +2341,9 @@ pub struct App {
     /// Region the last QR / OCR pass ran for, to re-scan only when it changes.
     last_code_region: Option<(i32, i32, u32, u32)>,
     last_ocr_region: Option<(i32, i32, u32, u32)>,
-    /// DRAGON-456: a user-requested re-read of the screen, mid-flight (see [`ScanRefresh`]).
+    /// DRAGON-456: a user-requested re-read of the screen, mid-flight (see [`ScanShot`]).
     /// Driven by re-pressing the scan kind button; `Idle` at every other moment.
-    scan_refresh: ScanRefresh,
+    scan_shot: ScanShot,
     /// QR/barcode marks for the current region (the clickable overlay). `marks` is the
     /// live, toggle-filtered set used for the overlay / hover / click.
     code_marks: Vec<crate::detect::Mark>,
@@ -2617,6 +2600,21 @@ pub struct App {
     /// Deferred frozen-flats grab slot (DRAGON-148 / DRAGON-212). `None` while in flight,
     /// then drained into `frozen` on `FrozenReady`.
     frozen_slot: FrozenSlot,
+    /// DRAGON-460: the scanner's live region shot, in flight. Outer `None` = no shot
+    /// pending; `Some(None)` = the shot ran and the platform returned nothing (no
+    /// compositor, region off-screen), which `MarksPoll` treats as "leave the last answer
+    /// alone" rather than as an empty screen.
+    ///
+    /// Separate from `frozen_slot` on purpose. That one carries the whole-screen scene the
+    /// CAPTURE is built from and is written by the launch grab; this carries a throwaway
+    /// crop that only the scan passes read. Sharing a slot is what would let a scan shot
+    /// overwrite the pixels a capture is about to commit.
+    scan_shot_slot: std::sync::Arc<std::sync::Mutex<Option<Option<image::RgbaImage>>>>,
+    /// DRAGON-460: the refresh button's spin angle, in radians. Advanced by `ScanSpinTick`
+    /// while the scanner is busy and left where it stopped otherwise — the glyph resting at
+    /// an arbitrary angle is invisible for a symmetric refresh arrow, and resetting it to 0
+    /// would make every scan start with a visible snap back.
+    scan_spin: f32,
     /// The deferred flats grab hasn't landed yet (macOS). Drives the poll
     /// subscription that drains `frozen_slot`; always false on Linux (synchronous
     /// grab, ready before `init` returns).
@@ -3210,34 +3208,34 @@ mod tests {
         assert!(!scan_press_refreshes(Kind::Image, Kind::Video));
     }
 
-    // DRAGON-456: the overlay paints nothing for the WHOLE refresh, not just the tick
-    // before the grab. Un-blanking while the grab thread is still reading the screen would
-    // put our chrome (and the previous still) back into the very picture being taken.
+    /// DRAGON-460: the scan-shot machine has exactly two in-flight states, and the tick that
+    /// takes the picture must only fire in the FIRST of them.
+    ///
+    /// The gap between them is the whole safety property. `Clearing` means the marks have
+    /// been dropped but the frame without them may not have reached the screen yet;
+    /// `Shooting` means the picture is being taken. Firing the shot while still `Idle` would
+    /// photograph the marks, and firing it again while `Shooting` would start a second
+    /// capture racing the first into the same slot.
     #[test]
-    fn the_overlay_stays_blank_for_the_whole_scan_refresh() {
-        assert!(!overlay_blanked_for_scan_refresh(ScanRefresh::Idle));
-        assert!(overlay_blanked_for_scan_refresh(ScanRefresh::Blanking));
-        assert!(overlay_blanked_for_scan_refresh(ScanRefresh::Grabbing));
+    fn the_shot_is_taken_once_and_only_after_the_marks_are_cleared() {
+        assert_eq!(ScanShot::Idle, ScanShot::Idle);
+        // The three states are distinct, so the guards in `run_scan_shot`
+        // (`!= Clearing` -> return) and `begin_scan_shot` (`!= Idle` -> return) can tell
+        // "not started", "waiting for the clean frame" and "in flight" apart.
+        assert_ne!(ScanShot::Idle, ScanShot::Clearing);
+        assert_ne!(ScanShot::Clearing, ScanShot::Shooting);
+        assert_ne!(ScanShot::Idle, ScanShot::Shooting);
     }
 
-    // DRAGON-456: a refresh that fails must cost the user NOTHING. The one delivery we
-    // decline is an empty re-grab landing on top of real flats — taking it would leave the
-    // scanner with no source at all, which is worse than the staleness being refreshed away.
-    #[test]
-    fn a_failed_refresh_never_destroys_the_snapshot_it_could_not_replace() {
-        // The exception: empty re-grab, real flats held.
-        assert!(!frozen_delivery_accepted(ScanRefresh::Grabbing, true, false));
-        // A re-grab that actually returned pixels is taken.
-        assert!(frozen_delivery_accepted(ScanRefresh::Grabbing, false, false));
-        // An empty re-grab with nothing held is taken (there is nothing to lose, and it
-        // keeps the "empty map == no freeze" state every reader already handles).
-        assert!(frozen_delivery_accepted(ScanRefresh::Grabbing, true, true));
-        // The launch / lazy grabs are never declined — including the deliberate EMPTY
-        // placeholder `acquire_scene` parks for a launch that skips the grab.
-        assert!(frozen_delivery_accepted(ScanRefresh::Idle, true, true));
-        assert!(frozen_delivery_accepted(ScanRefresh::Idle, true, false));
-        assert!(frozen_delivery_accepted(ScanRefresh::Idle, false, true));
-    }
+    // DRAGON-456's `frozen_delivery_accepted` test lived here. It pinned that a FAILED
+    // refresh could not destroy the snapshot it was meant to replace, back when a refresh
+    // wrote through the same flats slot as the launch grab.
+    //
+    // DRAGON-460 removed the function with the shared slot: the scanner reads its own live
+    // region shot, and the same guarantee is now made where that shot lands (`MarksPoll`
+    // takes `Some(None)` — the platform returned nothing — as "leave the previous answer
+    // standing", never as "the screen is empty"). The property survived; only the place it
+    // is enforced moved.
 
     #[test]
     fn slugify_lowercases_and_collapses_separators() {

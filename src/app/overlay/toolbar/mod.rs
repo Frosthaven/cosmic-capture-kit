@@ -222,6 +222,44 @@ impl App {
                     .padding(BTN_PAD),
             )
         };
+        // DRAGON-460: a SELECTOR-looking button that isn't tied to a `Mode` — the accent
+        // glyph and footprint of the region/window/monitor buttons in their inactive
+        // state, which is the look the scanner's refresh has to match to read as one of
+        // them. Deliberately not `action_btn` (that is the subdued settings/close face)
+        // and not `mode_btn` (that one's message is derived from a `Mode` it would have
+        // to be given a fake of).
+        let mode_icon_btn = |name: &'static str, msg: Msg| {
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(mode_icon(name, true))
+                    .class(cosmic::theme::Button::Icon)
+                    .on_press(msg)
+                    .width(btn_width)
+                    .padding(BTN_PAD),
+            )
+        };
+        // The selector-group shell: background + rounding, shared by the mode group and
+        // (DRAGON-460) the scanner's refresh group that stands in its place. Extracted
+        // rather than copied so the two can never drift into looking different — the
+        // whole point of the refresh group is that it reads as one of these.
+        let group_class = || {
+            cosmic::theme::Container::Custom(Box::new(|theme| {
+                let c = theme.cosmic();
+                cosmic::iced::widget::container::Style {
+                    background: Some(Background::Color(c.background.component.base.into())),
+                    border: Border {
+                        // The button token: groups round like the buttons they hold
+                        // (a capsule under the "round" preference). Capped at the group
+                        // half-height so it matches the stacked kind+timer group and
+                        // never over-rounds; byte-identical for this short group.
+                        radius: crate::app::theme::rounding(theme)
+                            .xl_capped(GROUP_H_BASE / 2.0)
+                            .into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            }))
+        };
         let mode_group = widget::container(
             widget::row(vec![
                 mode_btn(
@@ -247,56 +285,90 @@ impl App {
         .width(group_width)
         .align_x(Alignment::Center)
         .padding(GROUP_PAD)
-        .class(cosmic::theme::Container::Custom(Box::new(|theme| {
-            let c = theme.cosmic();
-            cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background.component.base.into())),
-                border: Border {
-                    // The button token: groups round like the buttons they hold
-                    // (a capsule under the "round" preference). Capped at the group
-                    // half-height so it matches the stacked kind+timer group and
-                    // never over-rounds; byte-identical for this short group.
-                    radius: crate::app::theme::rounding(theme)
-                        .xl_capped(GROUP_H_BASE / 2.0)
-                        .into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }
-        })));
+        .class(group_class());
 
-        // DRAGON-456: the scan segment carries two meanings. While the scanner is ALREADY
-        // the active kind there is no kind to switch to, so a press re-reads the screen —
-        // and hovering it says so by swapping the glyph for the counter-clockwise refresh.
-        // Both the face and the action come from the SAME rule (`scan_press_refreshes`), so
-        // the button can never offer a refresh it won't perform. In every other state the
-        // segment is byte-identical to before: same glyph, same message, and no mouse_area
-        // in its event path at all.
-        let scan_refreshes = scan_press_refreshes(self.kind, Kind::Scanner);
-        let scan_icon = if scan_refreshes && self.hover == Hover::ScanKind {
-            "scan-refresh-symbolic"
+        // DRAGON-460: the scanner's own selector group — a re-read of the screen, sitting
+        // exactly where the region/window/monitor group sits in every other kind and
+        // wearing the same shell, because it is the same class of control: the thing you
+        // reach for to change what is about to be captured.
+        //
+        // It REPLACES the mode group rather than joining it. Scanning pins `Mode::Region`
+        // (there is nothing to pick), so that group is hidden in scanner kind and this one
+        // takes the slot — the toolbar keeps its shape instead of losing a group.
+        //
+        // This is also what retires DRAGON-456's hover face. That swapped the scan
+        // segment's glyph to the refresh icon on hover, which meant the only thing telling
+        // you the button had changed meaning was already having your pointer on it. A
+        // visible button says it without being hunted for, and the face/action rule
+        // DRAGON-456 set is kept trivially: this button is only built while the scanner is
+        // active, so a press is always a refresh.
+        // While a scan is in flight the button IS the progress indicator: the SAME refresh
+        // glyph turns, tinted to the off/disabled wash, and takes no press.
+        //
+        // The glyph itself rotates rather than being swapped for a spinner widget. Swapping
+        // changes the button's face mid-interaction, and libcosmic's `indeterminate_circular`
+        // also exposes no style hook (its stylesheet style is `()`), so it would render at
+        // accent and could not be tinted to match a disabled control. Rotating our own SVG
+        // keeps both the identity and the colour under our control.
+        //
+        // Disabling is not decoration: `begin_scan_shot` ignores a press that arrives
+        // mid-shot, so an enabled-looking button would silently do nothing.
+        //
+        // This replaces the small spinner that used to sit inset in the selection's
+        // bottom-right corner. That badge could be clipped off-screen by a region drawn at a
+        // display edge, said only that something was happening rather than which control was
+        // busy, and — since the scanner now reads the selection — sat INSIDE the very crop it
+        // was reporting on.
+        let scanning = self.scanning();
+        let refresh_btn: Element<'_, Msg> = if scanning {
+            // The same subdued wash the mic/speaker toggles wear when they are off, so
+            // "unavailable" reads identically across the whole toolbar.
+            let spin_class = cosmic::theme::Svg::Custom(Rc::new(|t: &cosmic::Theme| {
+                cosmic::widget::svg::Style { color: Some(state_mix(t, MIX_OFF)) }
+            }));
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(
+                    widget::container(crate::widgets::icons::sized_rotated(
+                        "scan-refresh-symbolic",
+                        ICON_BOX,
+                        self.scan_spin,
+                        spin_class,
+                    ))
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center),
+                )
+                // No `on_press` => disabled: the press is refused by the model anyway.
+                .class(cosmic::theme::Button::Icon)
+                .width(btn_width)
+                .padding(BTN_PAD),
+            )
         } else {
-            "document-properties-symbolic"
+            mode_icon_btn("scan-refresh-symbolic", Msg::Capture(CaptureMsg::SetKind(Kind::Scanner)))
         };
-        let scan_seg = kind_btn(
-            scan_icon,
+        let scan_group = widget::container(
+            widget::row(vec![refresh_btn]).spacing(2.0).align_y(Alignment::Center),
+        )
+        .align_x(Alignment::Center)
+        .padding(GROUP_PAD)
+        .class(group_class());
+
+        // DRAGON-460: the scan segment is a KIND selector again, and only that. It keeps
+        // its glyph in every state and carries no hover tracking.
+        //
+        // DRAGON-456 had it swap to the refresh glyph on hover while the scanner was
+        // already active, because a press in that state re-reads the screen rather than
+        // switching kind. The rule was sound and is unchanged — `scan_press_refreshes`
+        // still governs what the press DOES — but a face that only appears under the
+        // pointer cannot advertise anything. The refresh now has its own visible button in
+        // `scan_group`, so the segment no longer has to hint at a second meaning.
+        let scan_seg: Element<'_, Msg> = kind_btn(
+            "document-properties-symbolic",
             self.kind == Kind::Scanner,
             Msg::Capture(CaptureMsg::SetKind(Kind::Scanner)),
             true,
             false,
             true,
         );
-        // The hover tracking exists ONLY for that swap. `mouse_area` runs its child first
-        // and bails when the child captured the event, so the button keeps its own press
-        // handling untouched — enter/exit ride `CursorMoved`, which a button never captures.
-        let scan_seg: Element<'_, Msg> = if scan_refreshes {
-            widget::mouse_area(scan_seg)
-                .on_enter(Msg::Capture(CaptureMsg::SetHover(Hover::ScanKind)))
-                .on_exit(Msg::Capture(CaptureMsg::SetHover(Hover::None)))
-                .into()
-        } else {
-            scan_seg
-        };
 
         // Kind toggle: camera (image) | video. Recording isn't wired up yet, but
         // the toggle is live (mirrors the bottom toolbar).
@@ -724,7 +796,11 @@ impl App {
             if video {
                 g.push(audio_group.into());
             }
-            if self.kind != Kind::Scanner {
+            // DRAGON-460: one selector group occupies this slot in every kind — the
+            // mode group normally, the scanner's refresh in its place while scanning.
+            if self.kind == Kind::Scanner {
+                g.push(scan_group.into());
+            } else {
                 g.push(mode_group.into());
             }
             g.push(util_group.into());

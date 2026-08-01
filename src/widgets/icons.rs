@@ -69,6 +69,40 @@ pub fn sized(name: &str, box_px_logical: f32) -> icon::Icon {
         .height(cosmic::iced::Length::Fixed(px))
 }
 
+/// [`sized`], ROTATED by `radians` about the glyph's centre (DRAGON-460).
+///
+/// The same glyph the control shows at rest, turning — not a different widget swapped in
+/// for the duration. That is what lets a button spin its own icon to say "working" without
+/// the face changing under the user.
+///
+/// Goes through iced's `svg` widget rather than `icon::Icon`, because rotation lives on the
+/// former. So it only works for a BUNDLED Lucide name, whose raw bytes we hold; an unmapped
+/// name has no bytes here (it resolves through the system icon theme) and falls back to the
+/// unrotated [`sized`] rather than silently rendering nothing. `.class(..)` chains on the
+/// result exactly as it does for `sized`, so the caller still owns the tint.
+///
+/// The whole-pixel box from [`box_px`] is kept: a rotated glyph is resampled anyway, but
+/// starting from an exactly-rasterized texture is still the sharper input.
+/// `class` is taken rather than chained because the fallback below returns a DIFFERENT
+/// widget type; passing the tint in keeps one call shape for the caller either way.
+pub fn sized_rotated(
+    name: &str,
+    box_px_logical: f32,
+    radians: f32,
+    class: cosmic::theme::Svg,
+) -> cosmic::Element<'static, crate::app::Msg> {
+    let px = box_px(box_px_logical);
+    let Some(file) = lucide_name(name) else {
+        return sized(name, box_px_logical).class(class).into();
+    };
+    cosmic::widget::svg(cosmic::widget::svg::Handle::from_memory(lucide_bytes(file)))
+        .width(cosmic::iced::Length::Fixed(px))
+        .height(cosmic::iced::Length::Fixed(px))
+        .rotation(cosmic::iced::Radians(radians))
+        .class(class)
+        .into()
+}
+
 /// Whether `name` resolves to a BUNDLED Lucide glyph rather than falling through to the
 /// system/embedded theme (which renders blank off Linux for most names). The one public
 /// probe over [`lucide_name`], so callers can assert a glyph really ships without exposing

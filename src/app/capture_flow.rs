@@ -1062,9 +1062,11 @@ impl App {
     /// "No delay" re-freezes. The actual CAPTURE-time freeze decision is unchanged
     /// (`freezing() && !capture_live` already skips the frozen reconstruction for a
     /// delayed shot); this only governs the during-selection preview.
+    /// DRAGON-460 dropped the scanner's own arm here: it reads a live region shot now, so
+    /// it needs no frozen view to agree with. The freeze PREFERENCE still applies to it
+    /// exactly as it does to any other kind.
     pub(super) fn freeze_backdrop_active(&self) -> bool {
         freeze_backdrop_active(self.freezing(), self.configured_delay_secs())
-            || scanner_backdrop_active(self.kind, self.mode, !self.frozen.is_empty())
     }
 
     /// The frozen scene's windows that intersect the region (global logical coords), in z-order, as
@@ -2025,25 +2027,22 @@ pub(super) fn freeze_backdrop_active(freezing: bool, delay_secs: u64) -> bool {
     freezing && delay_secs == 0
 }
 
-/// DRAGON-456: whether the SCANNER shows the frozen backdrop on its own account, i.e.
-/// regardless of the user's `freeze` preference.
-///
-/// The scanner reads its pixels out of the launch-instant flats (`crop_frozen`), and with
-/// freeze off the overlay was transparent — so the user watched the LIVE desktop while the
-/// scanner read a snapshot of it. Alt-tab to another window and the scan still returned the
-/// old window's text, with nothing on screen to say why. That is the bug this closes: what
-/// is shown and what is read are now the same pixels, always.
-///
-/// Deliberately NOT gated on the delay: the scanner never counts down (`proceed_capture`
-/// skips it, the chip is hidden), so a delay left over from image mode cannot make the scan
-/// source live and must not release the backdrop.
-///
-/// `has_flats` self-gates the whole thing: a session with no snapshot to show (a portal
-/// Linux session, or before the deferred grab lands) simply keeps the live view it has
-/// today. Pure so the rule is testable on any OS.
-pub(super) fn scanner_backdrop_active(kind: Kind, mode: Mode, has_flats: bool) -> bool {
-    kind == Kind::Scanner && mode == Mode::Region && has_flats
-}
+// DRAGON-460 removed `scanner_backdrop_active`.
+//
+// DRAGON-456 added it to close a real bug: the scanner read the launch-instant flats while
+// the overlay showed the LIVE desktop, so alt-tabbing left the scan returning the old
+// window's text with nothing on screen to say why. Freezing the view made what is shown and
+// what is read the same pixels.
+//
+// It is unnecessary now, because the scanner reads a live shot of the selection instead
+// (`begin_scan_shot` / `run_scan_shot`). Shown and read are the same pixels for the stronger
+// reason that they ARE the same pixels, so the overlay goes back to transparent and the user
+// watches the real screen.
+//
+// Removing it also deletes the defect it introduced. The backdrop was the launch-instant
+// flat, and that grab is deferred off the init thread (DRAGON-212 / DRAGON-148) so the
+// overlay is already mapped while it runs — meaning the still had our own toolbar and region
+// chrome photographed into it, which the user then saw presented as their screen.
 
 /// Whether to re-grab the cursor AT THE CAPTURE MOMENT (vs reuse the launch-locked
 /// `frozen_cursor`). DRAGON-186 Phase 3 (spec §"Preserve mouse cursor"): a delayed/
@@ -3051,39 +3050,25 @@ mod freeze_backdrop_tests {
 
 #[cfg(test)]
 mod scanner_backdrop_tests {
-    use super::scanner_backdrop_active;
-    use crate::app::{Kind, Mode};
+    use super::freeze_backdrop_active;
 
-    // DRAGON-456, the whole point: the scanner shows the still it is READING, even with the
-    // freeze preference off (its default). Before this, freeze-off showed the live desktop
-    // while the scan read the launch snapshot, so alt-tabbing produced text from a window
-    // that was no longer on screen.
+    /// DRAGON-460: the scanner has NO backdrop rule of its own any more.
+    ///
+    /// DRAGON-456's four tests here pinned `scanner_backdrop_active` — that the scanner
+    /// froze the view even with the freeze preference off, so that what was shown matched
+    /// what was read. Reading a live region shot satisfies that property directly, so the
+    /// function is gone and the tests with it.
+    ///
+    /// What must NOT come back is a scanner arm inside `freeze_backdrop_active`: that is
+    /// what showed the user a launch-instant still with our own toolbar photographed into
+    /// it. The freeze PREFERENCE still governs the scanner exactly as it governs any other
+    /// kind, which is all this checks.
     #[test]
-    fn the_scanner_shows_its_snapshot_even_with_freeze_off() {
-        assert!(scanner_backdrop_active(Kind::Scanner, Mode::Region, true));
-    }
-
-    // No snapshot to show (portal session, or the deferred grab hasn't landed): keep the
-    // live view rather than painting an empty backdrop.
-    #[test]
-    fn no_flats_keeps_the_live_view() {
-        assert!(!scanner_backdrop_active(Kind::Scanner, Mode::Region, false));
-    }
-
-    // Image / video kinds are untouched — their backdrop stays the user's freeze setting's
-    // business (`freeze_backdrop_active`), including the countdown release.
-    #[test]
-    fn other_kinds_are_untouched() {
-        assert!(!scanner_backdrop_active(Kind::Image, Mode::Region, true));
-        assert!(!scanner_backdrop_active(Kind::Video, Mode::Region, true));
-    }
-
-    // Region only, mirroring where scanning actually runs (`MarksPoll` requires it, and
-    // the scanner pins the mode on entry). A monitor/window pick has no scan to match.
-    #[test]
-    fn only_region_mode() {
-        assert!(!scanner_backdrop_active(Kind::Scanner, Mode::Monitor, true));
-        assert!(!scanner_backdrop_active(Kind::Scanner, Mode::Window, true));
+    fn the_scanner_has_no_backdrop_rule_of_its_own() {
+        // Freeze off = live view, whatever the kind. No scanner exception.
+        assert!(!freeze_backdrop_active(false, 0));
+        // Freeze on, no delay = frozen, again with no kind involved in the decision.
+        assert!(freeze_backdrop_active(true, 0));
     }
 }
 
