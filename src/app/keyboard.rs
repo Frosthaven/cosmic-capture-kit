@@ -20,12 +20,10 @@ impl App {
             Action::SelectAllText => Msg::Detect(DetectMsg::TextSelectAll),
             Action::DeselectText => Msg::Detect(DetectMsg::TextDeselect),
             Action::PreviewSave => return pv(PreviewMsg::Save),
-            Action::PreviewSaveAs => return pv(PreviewMsg::SaveAs),
             Action::PreviewCopy => return pv(PreviewMsg::Copy),
             Action::PreviewPlay => return pv(PreviewMsg::Play),
             Action::PreviewFramePrev => return pv(PreviewMsg::FrameStep(-1)),
             Action::PreviewFrameNext => return pv(PreviewMsg::FrameStep(1)),
-            Action::PreviewDelete => return pv(PreviewMsg::Delete),
             Action::PreviewCancel => return pv(PreviewMsg::Cancel),
             Action::PreviewCovermark => return pv(PreviewMsg::Covermark),
             Action::PreviewUndo => return pv(PreviewMsg::Undo),
@@ -206,12 +204,28 @@ impl App {
         {
             return self.update(Msg::WindowChrome(WindowChromeMsg::Close));
         }
-        // DRAGON-451: a Region lane sat here, checked BEFORE the Overlay lane so that with a
-        // region drawn, primary+C meant "copy the drawn region and finish" instead of the
-        // OCR "copy recognized text". That quick-action is retired — the global "(no editor)"
-        // hotkeys cover it from outside the overlay — so primary+C now always reaches the
-        // Overlay lane below, which is what it already did whenever no region was drawn.
+        // **The region-copy chord** (DRAGON-479), checked BEFORE the Overlay lane so that the
+        // scanner-vs-region precedence for primary+C is ONE visible decision rather than two
+        // scattered checks: `region_copy_fires` says when the region meaning wins, and its
+        // `kind != Scanner` term is exactly what leaves the OCR `Action::CopyText` binding in
+        // the Overlay lane below untouched in scanner kind.
         //
+        // History: DRAGON-451 retired a CONFIGURABLE version of this (`Action::RegionCopy` and a
+        // whole `Context::Region` keymap lane) on the grounds that the global "(no editor)"
+        // hotkeys covered it. The owner wants the in-overlay chord back — it is the one that
+        // works when you have already drawn the region — and DRAGON-479 restores the BEHAVIOUR
+        // without the configurability that made the two meanings of Ctrl+C collide. See
+        // `shortcuts::is_region_copy_chord` for why it is fixed rather than bindable.
+        if crate::shortcuts::is_region_copy_chord(modifiers, &key)
+            && region_copy_fires(
+                self.mode,
+                self.kind,
+                self.normalized_region().is_some(),
+                self.countdown.is_some() || self.recording.is_some(),
+            )
+        {
+            return self.update(Msg::Capture(CaptureMsg::CopySelection));
+        }
         // "Search settings" is a FIXED, non-configurable shortcut (DRAGON-158):
         // Ctrl+F on Linux/Windows, Cmd+F on macOS. It is not part of the editable
         // keymap, so match it here directly (the handler no-ops unless the settings
@@ -373,16 +387,40 @@ impl App {
         // Annotation selection: when a shape is selected, Esc deselects (before falling
         // through to Close/Cancel) and Delete/Backspace removes it (before the timeline's
         // Delete). No selection → both fall through to their normal keymap actions.
-        if self.preview_for(id).is_some_and(|p| !p.edit.sel.is_empty()) {
-            match &key {
-                Key::Named(Named::Escape) => {
-                    return self.update(Msg::Preview(id, PreviewMsg::SelectAnnotation(None)));
-                }
-                Key::Named(Named::Delete) | Key::Named(Named::Backspace) => {
-                    return self.update(Msg::Preview(id, PreviewMsg::DeleteSelected));
-                }
-                _ => {}
-            }
+        //
+        // DRAGON-468: the Esc half is the pure, unit-tested
+        // `annotate::escape_stage` — the ONE statement of "what does this press give up first",
+        // shared with the live-text-edit lane above (`text_edit_key`), where the numpad-Enter twin
+        // ends a typing session and drops the selections with it. The two lanes consult it
+        // separately because the modal lanes between them (unsaved-changes dialog, colour picker,
+        // flyout) own Escape first and must keep doing so. A `Pass` here reaches the keymap, i.e.
+        // `PreviewCancel` → the window's own close-or-confirm decision; nothing about that
+        // decision is restated here.
+        //
+        // "Selected" spans BOTH selections: the annotation set and the video timeline's segments.
+        // A text edit is always settled by now (its lane returns above), so `text_editing` is
+        // false at this call site — it is passed honestly rather than hard-coded.
+        let stage = self.preview_for(id).map(|p| {
+            preview::escape_stage(
+                &key,
+                location,
+                p.edit.text_edit.is_some(),
+                !p.edit.sel.is_empty(),
+                p.timeline_selected(),
+            )
+        });
+        if stage == Some(preview::EscapeStage::Deselect) {
+            return self.deselect_everything(id);
+        }
+        // Delete/Backspace stays the ANNOTATION lane: it removes the selected annotations before
+        // the keymap's plain-Delete binding (`PreviewDeleteSegment`) can see the press. With no
+        // annotations selected it falls through, and after an Escape has cleared everything that
+        // binding finds an empty timeline selection and does nothing (`Timeline::delete_selected`
+        // refuses an empty set) — no surprise deletion.
+        if self.preview_for(id).is_some_and(|p| !p.edit.sel.is_empty())
+            && matches!(&key, Key::Named(Named::Delete) | Key::Named(Named::Backspace))
+        {
+            return self.update(Msg::Preview(id, PreviewMsg::DeleteSelected));
         }
         match self
             .keymap
@@ -391,6 +429,97 @@ impl App {
         {
             Some(msg) => self.update(msg),
             None => Task::none(),
+        }
+    }
+}
+
+/// **Pure**, unit-tested: whether the fixed region-copy chord ([`crate::shortcuts::is_region_copy_chord`])
+/// FIRES in the capture overlay right now (DRAGON-479). The chord itself is matched separately;
+/// this is the whole of "does it mean anything here", split out so the four-way precedence is
+/// testable without a compositor, an overlay or a keypress.
+///
+/// All four terms, and why each is a term rather than an assumption:
+///
+/// * `mode == Region` — the action copies THE DRAWN REGION. In window or monitor mode there is
+///   no rectangle for it to mean.
+/// * `kind != Scanner` — the scanner OWNS this chord: primary+C there is `Action::CopyText`,
+///   which copies the recognized text out of the scan. That binding is untouched, and this
+///   term is the only thing standing between the two meanings (see the lane in `handle_key`).
+///   The scanner pins `Mode::Region`, so without this term the region meaning would ALWAYS win
+///   in scanner kind and the OCR copy would become unreachable.
+/// * `region_drawn` — with nothing drawn there is nothing to capture; the press falls through
+///   to whatever handled it before (in practice the Overlay lane's OCR copy).
+/// * `!busy` — a countdown or a live recording owns the session. Committing a still capture
+///   underneath either one would end a session the user is in the middle of.
+///
+/// Every `false` here is a FALL-THROUGH, never a swallow: the caller only returns early when
+/// this is true, so a chord that does not fire behaves exactly as it did before DRAGON-479.
+fn region_copy_fires(mode: Mode, kind: Kind, region_drawn: bool, busy: bool) -> bool {
+    mode == Mode::Region && kind != Kind::Scanner && region_drawn && !busy
+}
+
+/// DRAGON-479: the fixed region-copy chord's gate.
+#[cfg(test)]
+mod region_copy_tests {
+    use super::*;
+
+    /// The happy path, and the one shape that produces it: a drawn region, in region mode, in a
+    /// non-scanner kind, with nothing else running.
+    #[test]
+    fn it_fires_only_with_a_drawn_region_in_an_idle_region_capture() {
+        assert!(region_copy_fires(Mode::Region, Kind::Image, true, false));
+        assert!(region_copy_fires(Mode::Region, Kind::Video, true, false));
+        // Nothing drawn yet.
+        assert!(!region_copy_fires(Mode::Region, Kind::Image, false, false));
+        // Busy: a countdown or a recording owns the session.
+        assert!(!region_copy_fires(Mode::Region, Kind::Image, true, true));
+    }
+
+    /// The SCANNER keeps primary+C for its own "copy recognized text" (`Action::CopyText`). The
+    /// scanner pins `Mode::Region`, so this term is load-bearing rather than defensive: without
+    /// it the region meaning would take the chord in every scan.
+    #[test]
+    fn the_scanner_never_loses_its_own_copy_chord() {
+        for drawn in [true, false] {
+            for busy in [true, false] {
+                assert!(
+                    !region_copy_fires(Mode::Region, Kind::Scanner, drawn, busy),
+                    "scanner kind must fall through (drawn={drawn} busy={busy})"
+                );
+            }
+        }
+    }
+
+    /// Window and monitor mode have no drawn rectangle, whatever else is true.
+    #[test]
+    fn only_region_mode_has_a_region_to_copy() {
+        for mode in [Mode::Window, Mode::Monitor] {
+            for kind in [Kind::Image, Kind::Video, Kind::Scanner] {
+                assert!(!region_copy_fires(mode, kind, true, false), "{mode:?} / {kind:?}");
+            }
+        }
+    }
+
+    /// EVERY combination that is not the happy shape falls through — stated exhaustively, so a
+    /// term added or dropped later cannot quietly widen what the chord swallows.
+    #[test]
+    fn every_other_combination_falls_through() {
+        for mode in [Mode::Region, Mode::Window, Mode::Monitor] {
+            for kind in [Kind::Image, Kind::Video, Kind::Scanner] {
+                for drawn in [true, false] {
+                    for busy in [true, false] {
+                        let want = mode == Mode::Region
+                            && kind != Kind::Scanner
+                            && drawn
+                            && !busy;
+                        assert_eq!(
+                            region_copy_fires(mode, kind, drawn, busy),
+                            want,
+                            "{mode:?} / {kind:?} / drawn={drawn} / busy={busy}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

@@ -42,9 +42,12 @@ pub use video::VideoPreview;
 pub use layers::PixelFrame;
 pub use edit::covermark_dir;
 pub(crate) use annotate::AnnotId;
+// The STAGED escape (DRAGON-468): `keyboard.rs` asks what a press gives up before the keymap
+// sees it. Re-exported rather than reached into, like every other cross-module preview item.
+pub(crate) use annotate::{escape_stage, EscapeStage};
 
 use annotate::Reorder;
-use edit::{Covermark, CovermarkKind, EditKind, EditState, Picker, ShareIntent};
+use edit::{Covermark, CovermarkKind, EditKind, EditState, Picker};
 use toast::{ToastKind, Toasts};
 // The split-out halves of this module (DRAGON-115), glob-imported back so the
 // `use super::*;` at the top of every sibling keeps resolving the same names.
@@ -184,28 +187,37 @@ pub struct PreviewState {
     /// still renders base + scene, so undo still means something. Repointing this at a
     /// baked file would double-apply every edit on the next undo.
     pub path: Option<PathBuf>,
-    /// Where this document last SAVED, when it has (DRAGON-353 follow-up) — the `-edited`
-    /// sibling a dirty Save minted, or a Save As destination. `None` = never saved.
+    /// The PRISTINE media every bake reads, when it is no longer [`Self::path`]
+    /// (DRAGON-467 review, blocker 1). `None` = `path` is still pristine, which is the
+    /// normal case.
     ///
-    /// It is the document's IDENTITY on disk (what a further Save overwrites, what a Copy
-    /// puts on the clipboard, what the toasts name), while [`Self::path`] stays the media
-    /// it renders from. [`App::preview_save_target`] resolves the next save target from
-    /// this plus [`Self::save_in_place`].
+    /// It becomes `Some` exactly once: when a STILL is saved over its own source, the bytes
+    /// are snapshotted into the session runtime directory first and this is repointed at the
+    /// snapshot. Everything downstream keeps compositing the live scene onto untouched
+    /// pixels, so undo still works and a second save does not double every annotation.
+    /// See [`edit::bake_prep`] for the whole rule, including why a RECORDING commits instead
+    /// of snapshotting.
+    pub bake_src: Option<PathBuf>,
+    /// Where this document last SAVED, when it has (DRAGON-353 follow-up) — the destination
+    /// the user picked in the Save dialog. `None` = never saved.
+    ///
+    /// It is the document's IDENTITY on disk (what a further Save offers to overwrite, what a
+    /// Copy puts on the clipboard, what the toasts name), while [`Self::path`] stays the media
+    /// it renders from. [`App::preview_save_target`] resolves the next save target from this
+    /// plus the user's configured save folder.
     pub saved_path: Option<PathBuf>,
-    /// Every path this document has WRITTEN, in write order — the `-edited` variants and
-    /// any Save As destinations (deduped; [`Self::path`] is not in here, it was written by
-    /// the capture, not by us).
-    ///
-    /// Delete removes exactly this set plus the original (see [`Self::delete_paths`]). It
-    /// is TRACKED rather than derived because deriving it would mean globbing for
-    /// `<stem>-edited*`, which would sweep up a `-edited` file the user made last week.
-    /// Only paths we actually wrote are ours to remove.
-    pub written: Vec<PathBuf>,
+    // DRAGON-467 removed `written` from here, with `note_written` and `delete_paths`. The
+    // three existed solely so Delete could unlink every file this document produced (the
+    // capture plus each save destination, wherever the user pointed them), tracked rather
+    // than derived so a neighbouring file from an earlier session could never be swept up.
+    // The editor does not delete anything any more, so nothing read them. If a delete ever
+    // comes back it needs this again: deriving the set from a name pattern is what the
+    // tracking existed to avoid.
     /// The saved file's size in bytes (shown as a chip), once known.
     pub size: Option<u64>,
     /// `true` when previewing a pre-existing file (`--preview`) rather than a fresh
-    /// capture: the file isn't ours to manage, so Save is hidden, Cancel doesn't delete,
-    /// and Save As copies instead of moving.
+    /// capture: the file isn't ours to manage, so it is never auto-copied to the clipboard
+    /// on open and a Save offers its OWN folder rather than the capture folder.
     pub external: bool,
     /// The monitor's logical size — scales the content within the space above the toolbar.
     pub monitor: (u32, u32),
@@ -239,18 +251,22 @@ pub struct PreviewState {
     /// may be closed later without ever re-minting. [`App::close_preview`] reads this so it
     /// never issues a SECOND destroy for an already-dead surface, which used to be
     /// invisible only because the process exited immediately afterwards.
+    ///
+    /// It is also the "WE did this" signal ([`surface_closed`], DRAGON-469). Off Linux a
+    /// preview surface is a real winit window and `window::close` echoes a
+    /// `window::Event::Closed` back for our own teardown, indistinguishable from a window
+    /// manager destroying it — so every path that tears a surface down while keeping the
+    /// document MUST clear this BEFORE issuing the close.
     pub surface_open: bool,
     /// This document's transient success / error notices (DRAGON-353) — always
     /// PER-DOCUMENT, so a toast renders in the surface whose button produced it. See
     /// [`toast`]'s module doc.
     pub toasts: Toasts,
-    /// Whether `path` is a save target the USER chose, so a Save writes straight back to
-    /// it instead of deriving a fresh `-edited` sibling (DRAGON-353). True after a Save As
-    /// (the destination is explicit) and after the first `-edited` save (the document
-    /// ADOPTS that file). False for a fresh capture's auto-saved original and for a
-    /// `--preview` file — both are protected. The rule itself is
-    /// [`naming::save_target`].
-    pub save_in_place: bool,
+    // DRAGON-467 removed `save_in_place` from here. It recorded "the user chose this path",
+    // which was the input that told `naming::save_target` to write straight back instead of
+    // deriving a fresh `-edited` sibling. With the suffix gone and Save asking for a
+    // destination every time, the same question is answered by whether `saved_path` is set at
+    // all, so the flag had one writer and no readers left.
     /// The open-time automatic clipboard copy already ran for this document (DRAGON-353).
     /// The path can arrive later than the surface (a pre-opened spinner), so the copy is
     /// attempted at several seams; this makes it happen exactly once.
@@ -284,6 +300,22 @@ pub enum PreviewKind {
 }
 
 impl PreviewState {
+    /// Record that this document's surface is (about to be) GONE while the document itself
+    /// stays loaded — THE only way [`Self::surface_open`] is ever cleared (DRAGON-469).
+    ///
+    /// It is a named method rather than a bare `p.surface_open = false` so the invariant is
+    /// greppable: `rg mark_surface_torn_down` lists every teardown in the codebase, and
+    /// [`surface_closed`] reads the flag those calls set. The ordering that matters (clear
+    /// BEFORE the destroy is issued, or our own echoed `Closed` reads as a lost surface and
+    /// ends the process) is made structural by [`App::hide_preview_surface`], which mints the
+    /// flag clear and the close task together; call that rather than this wherever a task is
+    /// what you want.
+    ///
+    /// Idempotent, and safe on a document whose surface is already down.
+    pub fn mark_surface_torn_down(&mut self) {
+        self.surface_open = false;
+    }
+
     /// Whether the content is still being prepared (decode / finalize + poster
     /// extraction) — drives the spinner and its tick subscription.
     pub fn is_loading(&self) -> bool {
@@ -312,49 +344,15 @@ impl PreviewState {
         edit::unsaved_at(self.edit.saved_depth, self.edit.undo_stack.len(), self.dirty())
     }
 
-    /// Record a path this document just WROTE, for [`Self::delete_paths`]. Idempotent: a
-    /// repeated save to the same target does not stack duplicates.
-    pub fn note_written(&mut self, path: &std::path::Path) {
-        if !self.written.iter().any(|p| p == path) {
-            self.written.push(path.to_path_buf());
-        }
-    }
-
-    /// EVERY file Delete removes for this document (DRAGON-353 follow-up): the capture it
-    /// opened with, plus every path it has written — `-edited` variants and Save As
-    /// destinations alike, wherever on disk they landed.
+    /// THE PRISTINE MEDIA every bake composites the live scene onto (DRAGON-467 review,
+    /// blocker 1): [`Self::bake_src`] once a still has been saved over its own source, and
+    /// [`Self::path`] otherwise.
     ///
-    /// # The two rulings this encodes
-    ///
-    /// * **A file we WROTE is fair game; a file we merely OPENED is not.** An external
-    ///   `--preview` document returns an EMPTY set even if it saved an `-edited` sibling —
-    ///   the Delete button is hidden there anyway, and the user's own file must never be
-    ///   removed by an editor they pointed at it. (The saved sibling is spared with it:
-    ///   Delete is not offered, so there is no action to attach that cleanup to.)
-    /// * **Save As destinations ARE included** (owner's ruling): Delete is a deliberate,
-    ///   explicitly-chosen action, and a file this session produced is part of the set the
-    ///   document made — including one the user pointed somewhere else. This is why the
-    ///   delete toast reports the COUNT: a multi-directory delete must not be silent.
-    ///
-    /// Tracked, never derived: nothing here is reconstructed from name patterns, so a
-    /// pre-existing `shot-edited.png` from an earlier session can never be swept up.
-    pub fn delete_paths(&self) -> Vec<PathBuf> {
-        if self.external {
-            return Vec::new();
-        }
-        let mut out: Vec<PathBuf> = Vec::new();
-        let mut push = |p: &std::path::Path| {
-            if !out.iter().any(|q| q == p) {
-                out.push(p.to_path_buf());
-            }
-        };
-        if let Some(p) = &self.path {
-            push(p);
-        }
-        for p in &self.written {
-            push(p);
-        }
-        out
+    /// Every bake reads THIS, never `path` directly and never the last save. The saved file
+    /// already has the scene burned into it, so baking from it would double every annotation
+    /// and re-apply a recording's cut to a file the cut has already been taken out of.
+    pub fn bake_source(&self) -> Option<&std::path::Path> {
+        self.bake_src.as_deref().or(self.path.as_deref())
     }
 
     /// Whether the video timeline has content DELETED (razor cuts alone leave
@@ -362,6 +360,17 @@ impl PreviewState {
     pub fn timeline_edited(&self) -> bool {
         match &self.kind {
             PreviewKind::Video(v) => v.timeline.as_ref().is_some_and(|t| t.edited()),
+            PreviewKind::Image(_) => false,
+        }
+    }
+
+    /// Whether the video timeline is holding a SEGMENT selection (DRAGON-468). It is a visible
+    /// selection like any other — highlighted segments in the lane — so the staged Escape
+    /// (`annotate::escape_stage`) counts it, and one press gives it up before the press that
+    /// reaches the close decision. Always false for a still: there is no timeline to select in.
+    pub fn timeline_selected(&self) -> bool {
+        match &self.kind {
+            PreviewKind::Video(v) => v.timeline.as_ref().is_some_and(|t| !t.selected.is_empty()),
             PreviewKind::Image(_) => false,
         }
     }
@@ -522,47 +531,28 @@ impl DuckRefs {
 }
 
 
-/// WHAT A COPY MEANS, from the two INDEPENDENT "Automatically save on copy" and
-/// "Automatically close on copy" settings (DRAGON-355 split the old combined toggle) — the
-/// ONE place the rule lives.
-///
-/// The four combinations map onto the four copy-family intents: both on is the historical
-/// save-and-close (`SaveCopyClose`); save-only writes the document but stays open
-/// (`SaveCopy`); close-only copies then closes without touching the saved file
-/// (`CopyClose`); both off is a plain `Copy`.
-///
-/// The toolbar's Copy and the unsaved-changes dialog's Copy both arrive at
-/// `PreviewMsg::Copy` and therefore both read this: the dialog's button delegates to the
-/// plain toolbar message through [`App::share_then_close`], which only layers "and then
-/// close" on top. There is no second implementation to drift.
-pub(super) fn copy_intent(save_on_copy: bool, close_on_copy: bool) -> ShareIntent {
-    match (save_on_copy, close_on_copy) {
-        (true, true) => ShareIntent::SaveCopyClose,
-        (true, false) => ShareIntent::SaveCopy,
-        (false, true) => ShareIntent::CopyClose,
-        (false, false) => ShareIntent::Copy,
-    }
-}
+// DRAGON-467 removed `copy_intent` and `delete_intent` from here. They fanned the
+// "Automatically save on copy" / "Automatically close on copy" / "Automatically copy to
+// clipboard on delete" settings out into the compound `ShareIntent` flavours that are also
+// gone. There is one action left to run (a copy) and no setting left to consult, so the
+// toolbar messages name it directly through `App::run_copy`.
 
-/// WHAT A DELETE MEANS, from the "Automatically copy to clipboard on delete" setting — the mirror of
-/// [`copy_intent`], and read by the toolbar's Delete and the dialog's alike (both land on
-/// `PreviewMsg::Delete`).
-pub(super) fn delete_intent(copy_on_delete: bool) -> ShareIntent {
-    if copy_on_delete { ShareIntent::CopyThenDelete } else { ShareIntent::Delete }
-}
-
-/// One media kind's three share-automation settings — the triple [`copy_intent`] and
-/// [`delete_intent`] read (DRAGON-420).
+/// One media kind's three preview-editor settings — the triple every editor decision reads
+/// (DRAGON-420's split, re-pointed at DRAGON-467's rows).
 ///
 /// A named triple rather than three loose bools at the call site: the whole point of the
-/// feature is that there are now TWO of these and a document must read exactly one of them,
-/// so passing them as a unit is what makes "the video document accidentally read an image
-/// field" a thing the type system can be asked about instead of a typo nobody notices.
+/// feature is that there are TWO of these and a document must read exactly one of them, so
+/// passing them as a unit is what makes "the video document accidentally read an image field"
+/// a thing the type system can be asked about instead of a typo nobody notices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct ShareAutomation {
-    pub save_on_copy: bool,
-    pub close_on_copy: bool,
-    pub copy_on_delete: bool,
+pub(super) struct PreviewAutomation {
+    /// Put the edited result on the clipboard as the editor closes.
+    pub copy_on_exit: bool,
+    /// Write the capture into the user's configured folder as it is taken (off = the session
+    /// runtime directory until the user saves).
+    pub save_originals: bool,
+    /// Ask before closing over edits that were never saved.
+    pub ask_to_save: bool,
 }
 
 /// WHICH triple a document reads: the Video Editor group's for a recording, the Image
@@ -570,28 +560,103 @@ pub(super) struct ShareAutomation {
 ///
 /// Pure and total, so the "these settings are independent" property is directly testable:
 /// for every combination, flipping a field of one triple can never move the other's answer.
-/// Before this, both kinds read the image triple; the video fields default to the same
-/// values, so an untouched install behaves exactly as it did.
-pub(super) fn share_automation(
+pub(super) fn preview_automation(
     is_video: bool,
-    image: ShareAutomation,
-    video: ShareAutomation,
-) -> ShareAutomation {
+    image: PreviewAutomation,
+    video: PreviewAutomation,
+) -> PreviewAutomation {
     if is_video { video } else { image }
 }
 
-/// THE dirty-close gate (DRAGON-353): should a close attempt raise the unsaved-changes
-/// dialog instead of closing?
+/// THE dirty-close gate (DRAGON-353, settings-gated since DRAGON-467): should a close attempt
+/// raise the unsaved-changes dialog instead of closing?
 ///
-/// Yes exactly when the document has unbaked edits AND the dialog is not already up. The
-/// second term is what makes the dialog's own buttons work: they re-enter the very close
-/// paths this guards (Delete closes, and `share_then_close` clears the flag before acting),
-/// so without it a close could bounce off its own dialog forever.
+/// Three terms, and each removes a different way of getting it wrong:
 ///
-/// A clean document always closes straight away — the file on disk is already what the
-/// editor is showing, so there is nothing to lose and nothing to ask about.
-pub(super) fn close_needs_confirmation(dirty: bool, already_confirming: bool) -> bool {
-    dirty && !already_confirming
+/// * `ask` is the "Ask to save edited screenshots" / "…videos" setting for this document's
+///   media kind. OFF means close straight away and let the un-baked edits go, which is a
+///   coherent choice next to "Automatically copy changes on exit" — the edited result still
+///   reaches the clipboard, it just never reaches the disk.
+/// * `dirty` is `PreviewState::unsaved`: there is something to lose. A clean document always
+///   closes straight away, whatever the setting says, because the file on disk already IS
+///   what the editor is showing.
+/// * `already_confirming` is what makes the dialog's own buttons work: they re-enter the very
+///   close paths this guards, so without it a close could bounce off its own dialog forever.
+///
+/// Pure; unit-tested below.
+pub(super) fn close_needs_confirmation(ask: bool, dirty: bool, already_confirming: bool) -> bool {
+    ask && dirty && !already_confirming
+}
+
+/// Whether two paths name the SAME file on disk, resolving symlinks and `..` so a save over
+/// the source is recognised however the two were spelled.
+///
+/// Non-existent is not "the same": a destination the user is about to create cannot be the
+/// source, and `canonicalize` fails on it, so the `zip` yields `None` and the answer is
+/// false. That is the wanted behaviour for every ordinary Save As.
+pub(super) fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    std::fs::canonicalize(a)
+        .ok()
+        .zip(std::fs::canonicalize(b).ok())
+        .is_some_and(|(a, b)| a == b)
+}
+
+/// Where a recording renders while it is replacing itself: a hidden sibling of `dest`
+/// (DRAGON-467 review, blocker 1).
+///
+/// Beside the destination rather than in a temp dir, so the rename that swaps it in stays
+/// within one filesystem and is therefore atomic. A cross-device rename would fall back to a
+/// full copy, which is exactly the multi-GB cost this whole arm exists to avoid.
+pub(super) fn bake_temp_path(dest: &std::path::Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "capture".to_string());
+    dest.with_file_name(format!(".{name}.cck-saving"))
+}
+
+/// Copy a still's PRISTINE bytes into the session runtime directory and return the snapshot,
+/// so a save over the capture's own file cannot cost the document its editable source
+/// (DRAGON-467 review, blocker 1). `None` when the copy failed, which REFUSES the save.
+///
+/// The name is fixed per document rather than unique: one snapshot is all a document can
+/// need (the first in-place save takes it, and the bake source stays pointed at it
+/// thereafter), and a fixed name keeps the runtime directory bounded.
+fn snapshot_bake_source(src: &std::path::Path) -> Option<PathBuf> {
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or(naming::PNG_EXT);
+    let dst = PathBuf::from(crate::util::runtime_dir()).join(format!("cck-source.{ext}"));
+    match std::fs::copy(src, &dst) {
+        Ok(_) => {
+            log::debug!("preview: snapshotted the pristine source before an in-place save");
+            Some(dst)
+        }
+        Err(e) => {
+            log::warn!("preview: could not snapshot the source before an in-place save: {e}");
+            None
+        }
+    }
+}
+
+/// THE exit-copy gate (DRAGON-467): as this document closes, should its edited state go on
+/// the clipboard?
+///
+/// Three terms, and each removes a different piece of pointless work:
+///
+/// * `copy_on_exit` is the setting for this document's media kind.
+/// * `dirty` is not an optimisation: the untouched capture went on the clipboard when it was
+///   taken, so a clean document's exit copy would re-copy identical bytes and (on Linux) hand
+///   the selection to a fresh worker process for no reason at all.
+/// * `clipboard_current` ([`edit::clipboard_is_current`]) is the DRAGON-467 review's major 4:
+///   an explicit toolbar Copy followed straight away by Escape must not copy twice. The
+///   clipboard already holds exactly this state.
+///
+/// Pure; unit-tested below.
+pub(super) fn exit_copies_changes(
+    copy_on_exit: bool,
+    dirty: bool,
+    clipboard_current: bool,
+) -> bool {
+    copy_on_exit && dirty && !clipboard_current
 }
 
 /// Position of the open preview whose surface is `id`. The one lookup rule behind
@@ -638,6 +703,110 @@ pub(super) fn overlay_taken(previews: &[PreviewState], existing: Option<window::
         // Any other open document bars the overlay outright.
         _ => true,
     })
+}
+
+/// What an iced `window::Event::Closed` for a STILL-REGISTERED preview document means
+/// (DRAGON-469). See [`surface_closed`] for the rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::app) enum SurfaceClosed {
+    /// WE tore this surface down on purpose and kept the document loaded, so the event is
+    /// the echo of our own request. Ignore it entirely.
+    Ours,
+    /// A bake / Save As export is mid-write. The document must close, but only once the
+    /// worker is done (`close_after_bake`).
+    DeferToBake,
+    /// The surface went away WITHOUT routing through the editor — the window manager or
+    /// compositor took it. Close the document (and, if it was the last one, the process).
+    LostOutOfBand,
+}
+
+/// Pure, unit-tested: what to do when a preview surface reports `Closed` while its document
+/// is still registered.
+///
+/// **Why this is a decision and not an `if` at the call site (DRAGON-469).** Off Linux a
+/// preview surface is a real winit window, and `window::close` pushes
+/// `window::Event::Closed` for OUR OWN teardown — the runtime cannot tell us apart from the
+/// WM. On Linux the overlay is a layer surface, whose destroy reports a Wayland
+/// `LayerEvent::Done` that this app never subscribes to, so the same teardown is silent
+/// there. That asymmetry is what made the Save As dialog fatal on Windows 11:
+/// [`App::save_as_dialog`] tears the fullscreen overlay down (a file chooser cannot render
+/// over it), keeps the document loaded for [`App::reopen_preview_surface`], and the echoed
+/// `Closed` was read as "the surface was lost" — so the document closed, it was the last
+/// one, and `finish_session` ENDED THE PROCESS while the chooser was still on screen. The
+/// user never got back to the editor and the export never ran.
+///
+/// `surface_open` is the document's own record of whether `window` is a LIVE surface, and it
+/// is cleared BEFORE the destroy is issued by every path that keeps the document. It
+/// therefore dominates: a cleared flag means the teardown was ours, whatever else is going
+/// on — including a bake, whose `close_after_bake` must not be armed for a surface we
+/// intend to re-mint.
+///
+/// The re-minting paths (the appearance toggle, the demotion, the cover→window swap) do not
+/// arrive here at all: they re-point the document onto the new surface in the same pass, so
+/// the dead id is no longer any document's `window`.
+pub(in crate::app) fn surface_closed(surface_open: bool, baking: bool) -> SurfaceClosed {
+    if !surface_open {
+        SurfaceClosed::Ours
+    } else if baking {
+        SurfaceClosed::DeferToBake
+    } else {
+        SurfaceClosed::LostOutOfBand
+    }
+}
+
+/// Pure, unit-tested: the `preview_windowed` value the appearance toggle must adopt, given
+/// the surface that is ACTUALLY OPEN (DRAGON-469).
+///
+/// The toggle used to INVERT the persisted setting, which is the same answer only while the
+/// setting and the open surface agree. Reading the OPEN surface instead makes the button mean
+/// what it says: whatever is up, mint the other one.
+///
+/// **Every state where the two disagree**, because "only a demotion" was the first version of
+/// this note and it was wrong:
+///
+/// * **A FORCED demotion**, setting says overlay while a WINDOW is open.
+///   [`App::demote_preview_to_window`] deliberately leaves the appearance alone (the demotion
+///   is forced, not chosen). Inverting there asked for a window, so the open window was torn
+///   down and an identical one minted: the ticket's "clicking the button just seems to reload
+///   our window". Two demotions produce this state and they are NOT equally reachable. The
+///   Settings-from-preview one ([`App::open_settings_from_preview`]) reaches the toggle
+///   immediately, and is the live trigger. The DRAGON-336 second-document one is blocked
+///   WHILE the sibling is open, by the early return above `toggle_preview_appearance`'s flip
+///   — but that early return asks whether a sibling is open NOW, so once the sibling closes
+///   the survivor is alone, still demoted, and reaches the bug too.
+/// * **A window-pick PRE-OPEN cover**, setting says window while an OVERLAY is open. All
+///   three platforms force the overlay branch for the cover that hides the grab (Linux
+///   `window_spinner_neutral`, macOS `mac_preview_preopen`, Windows `win_preview_preopen` —
+///   see `preview_surface_for`). No toggle can be pressed there today, because the cover
+///   renders the loading view and that view carries no appearance chrome. It is listed
+///   because the new answer is also the SAFE one if that ever changes: it asks for the window
+///   the cover is about to be swapped for anyway, and re-persists the setting's existing
+///   value, where the old inversion would have silently written "overlay" as the user's
+///   default off the back of a transient cover.
+///
+/// Byte-identical whenever the setting and the surface agree, which is every other state.
+pub(in crate::app) fn toggled_preview_windowed(open: PreviewSurface) -> bool {
+    !open.is_window()
+}
+
+/// Pure, unit-tested: must an appearance toggle heading for the fullscreen OVERLAY be
+/// REFUSED because the settings pane is open (DRAGON-469)?
+///
+/// The fullscreen preview overlay and the settings window cannot coexist. That is not a new
+/// opinion: it is why [`App::open_settings_from_preview`] demotes an overlay document to a
+/// window before spawning the pane at all. On Linux the preview overlay is an `Exclusive`
+/// layer surface, so it holds the keyboard hostage from every other window (the DRAGON-109
+/// hazard) as well as covering the screen, and the pane is a SEPARATE process with no way to
+/// defend itself. Fixing the toggle's DIRECTION made the promotion newly reachable from that
+/// exact state (demote for settings, then press the button), so the rule that demoted the
+/// document has to hold for the trip back.
+///
+/// Only the overlay direction is blocked. Going the other way, from the overlay to a window,
+/// is the direction settings WANTS and is never refused. The caller keeps the persisted
+/// appearance untouched on a refusal and mints nothing, so a refusal can never reintroduce
+/// the close-and-remint it replaced.
+pub(in crate::app) fn overlay_promotion_blocked(to_overlay: bool, settings_open: bool) -> bool {
+    to_overlay && settings_open
 }
 
 /// The open documents that must come DOWN from the fullscreen overlay because a preview is
@@ -765,25 +934,45 @@ impl App {
     }
 
 
-    /// This document's share-automation settings, chosen by MEDIA KIND (DRAGON-420): a
-    /// recording reads the Video Editor group, a still reads the Image Editor group. A
-    /// document that has already vanished falls back to the image triple — no share can run
-    /// against it anyway, and the arms below re-check for its existence.
-    pub(super) fn preview_share_automation(&self, id: window::Id) -> ShareAutomation {
-        let image = ShareAutomation {
-            save_on_copy: self.preview_save_on_copy,
-            close_on_copy: self.preview_close_on_copy,
-            copy_on_delete: self.preview_copy_on_delete,
+    /// This document's editor settings, chosen by MEDIA KIND (DRAGON-420, carried into
+    /// DRAGON-467): a recording reads the Video Editor group, a still reads the Image Editor
+    /// group. A document that has already vanished falls back to the image triple — no action
+    /// can run against it anyway, and the arms below re-check for its existence.
+    pub(super) fn preview_automation(&self, id: window::Id) -> PreviewAutomation {
+        let image = PreviewAutomation {
+            copy_on_exit: self.preview_copy_on_exit,
+            save_originals: self.preview_save_originals,
+            ask_to_save: self.preview_ask_to_save,
         };
-        let video = ShareAutomation {
-            save_on_copy: self.preview_video_save_on_copy,
-            close_on_copy: self.preview_video_close_on_copy,
-            copy_on_delete: self.preview_video_copy_on_delete,
+        let video = PreviewAutomation {
+            copy_on_exit: self.preview_video_copy_on_exit,
+            save_originals: self.preview_video_save_originals,
+            ask_to_save: self.preview_video_ask_to_save,
         };
         let is_video = self
             .preview_for(id)
             .is_some_and(|p| matches!(p.kind, PreviewKind::Video(_)));
-        share_automation(is_video, image, video)
+        preview_automation(is_video, image, video)
+    }
+
+    /// Give up EVERYTHING the editor is holding (DRAGON-468): the annotation selection, settling
+    /// a live text edit on the way, plus the video timeline's segment selection. THE action
+    /// behind [`annotate::EscapeStage::Deselect`], so the two Escape lanes that can produce it
+    /// (the live text edit, then the selection lane) can never disagree about what "deselect
+    /// everything" covers.
+    ///
+    /// It COMPOSES the two existing per-domain deselect messages rather than reaching into state:
+    /// `SelectAnnotation(None)` is the canvas's own deselect (and already settles a live edit
+    /// before it clears), `TimelineSelect(None, false, false)` is the timeline's own click-away
+    /// deselect, a no-op on a still. No new message and no second deselect route.
+    ///
+    /// Ctrl+D ([`crate::shortcuts::Action::PreviewDeselectAll`]) deliberately stays
+    /// annotation-only for now: it is an annotation-tray binding, and widening it is a
+    /// behaviour change this ticket was not asked to make.
+    pub(super) fn deselect_everything(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let annotations = self.update_preview(id, PreviewMsg::SelectAnnotation(None));
+        let timeline = self.update_preview(id, PreviewMsg::TimelineSelect(None, false, false));
+        Task::batch([annotations, timeline])
     }
 
     pub(super) fn update_preview(
@@ -871,8 +1060,12 @@ impl App {
                         // Logical (backing-scale-divided) size, so a hidpi capture
                         // re-fits to its true on-screen size (rule 6).
                         let target = p.sizing_media_points();
-                        let want =
-                            windowed_fit_size(target, out, transport_h_for(&p.kind, p.surface));
+                        let want = windowed_fit_size(
+                            target,
+                            out,
+                            transport_h_for(&p.kind, p.surface),
+                            self.preview_toolbar_labels,
+                        );
                         // Only when meaningfully off — the open-time size is composed-
                         // dims-exact on the deferred-swap path, so this is a belt for
                         // the hidpi/external cases (note: window::resize is dropped on
@@ -1638,26 +1831,42 @@ impl App {
                 p.edit.baking = false;
                 // A `WindowClosed` arrived mid-bake (DRAGON-352) and was deferred so the
                 // process couldn't exit with the bake thread mid-write. The surface is
-                // gone, so the document must close once the bake has landed, whatever the
-                // intent says — a surfaceless document would otherwise linger as a zombie.
+                // gone, so the document must close once the bake has landed — a surfaceless
+                // document would otherwise linger as a zombie.
                 let deferred_close = std::mem::take(&mut p.edit.close_after_bake);
-                let intent = p.edit.pending.take();
                 let output = p.edit.pending_output.take();
+                // Which completion this bake feeds (DRAGON-474): the clipboard, or the
+                // share sheet. Taken unconditionally so a failed share bake cannot leave
+                // the flag armed for an unrelated later copy.
+                let for_share = std::mem::take(&mut p.edit.bake_for_share);
                 if deferred_close
                     && let Some(p) = self.preview_for_mut(id)
                 {
                     p.edit.close_after_share = true;
                 }
-                let Some(intent) = intent else {
-                    // No pending intent (shouldn't happen — `begin_bake` always sets one):
-                    // still honor a deferred close so the surfaceless document can't linger.
-                    return if deferred_close { self.close_preview(id) } else { Task::none() };
-                };
                 match baked {
                     Some(_) => {
+                        // DRAGON-467 review, major 4: remember WHAT was rendered and from
+                        // WHERE in the history, so a copy standing on this same state (the
+                        // exit copy right after an explicit Copy) serves the artifact instead
+                        // of running the encoder again.
+                        if let (Some(p), Some(out)) = (self.preview_for_mut(id), output.as_ref()) {
+                            p.edit.mark_baked(out);
+                        }
                         // `pending_output` is where the bake wrote; the size it reported is
                         // re-read from disk by the completion seam.
-                        self.finish_share_intent(id, intent, output)
+                        if for_share {
+                            // A share bake whose surface died mid-flight has no window to
+                            // anchor a sheet to — honour the deferred close instead of
+                            // flashing a failure toast at a dead document.
+                            if deferred_close {
+                                self.close_preview(id)
+                            } else {
+                                self.finish_share_sheet(id, output)
+                            }
+                        } else {
+                            self.finish_copy(id, output)
+                        }
                     }
                     None => {
                         // Bake failed (ffmpeg / encode error). The ORIGINAL file on disk is
@@ -1697,10 +1906,31 @@ impl App {
             PreviewMsg::DiscardAndClose => {
                 // "Close without saving" / "Exit anyway" — ONE discard route for both, so a
                 // deliberate exit after a failed save is the same code path as a deliberate
-                // exit before one. Only the PENDING edits are abandoned; every file on disk
-                // is untouched.
+                // exit before one. Only the pending edits are abandoned as FILES; every file
+                // on disk is untouched.
+                //
+                // DRAGON-467 review, major 2: it still honours "Automatically copy changes on
+                // exit". "Without saving" is about the DISK, and the setting is about the
+                // CLIPBOARD, so skipping the copy here contradicted both the setting's own
+                // description and the exit path two arms up — the user answered a question
+                // about files and silently lost the clipboard behaviour they had switched on.
+                // For a recording that means an encode behind the spinner on the way out,
+                // which is the cost of the toggle they enabled.
                 if let Some(p) = self.preview_for_mut(id) {
                     p.edit.dismiss_close_dialog();
+                }
+                let a = self.preview_automation(id);
+                let carry = self.preview_for(id).is_some_and(|p| {
+                    exit_copies_changes(
+                        a.copy_on_exit,
+                        p.dirty(),
+                        edit::clipboard_is_current(p.edit.copied_depth, p.edit.undo_stack.len()),
+                    )
+                });
+                if carry {
+                    // The same "act, then close" route the exit path takes, so a failed copy
+                    // keeps the editor up rather than discarding over a clipboard miss.
+                    return self.share_then_close(id, PreviewMsg::Copy);
                 }
                 self.stop_preview_playback(id);
                 self.close_preview(id)
@@ -1709,9 +1939,6 @@ impl App {
             // delegate to the plain TOOLBAR message, so the share flow never learns about
             // closing and the two entry points can never drift.
             PreviewMsg::SaveAndClose => self.share_then_close(id, PreviewMsg::Save),
-            PreviewMsg::SaveAsAndClose => self.share_then_close(id, PreviewMsg::SaveAs),
-            PreviewMsg::CopyAndClose => self.share_then_close(id, PreviewMsg::Copy),
-            PreviewMsg::DeleteAndClose => self.share_then_close(id, PreviewMsg::Delete),
             PreviewMsg::ToastTick => {
                 if let Some(p) = self.preview_for_mut(id) {
                     p.toasts.expire(std::time::Instant::now());
@@ -1768,8 +1995,12 @@ impl App {
                         // Logical (backing-scale-divided) footprint so a Retina recording
                         // re-fits to its true on-screen size, matching the open fit.
                         let target = p.sizing_media_points();
-                        let want =
-                            windowed_fit_size(target, out, transport_h_for(&p.kind, p.surface));
+                        let want = windowed_fit_size(
+                            target,
+                            out,
+                            transport_h_for(&p.kind, p.surface),
+                            self.preview_toolbar_labels,
+                        );
                         // Only when meaningfully off — the open-time guess is often exact.
                         ((want.0 - p.monitor.0 as f32).abs() > 2.0
                             || (want.1 - p.monitor.1 as f32).abs() > 2.0)
@@ -1816,29 +2047,53 @@ impl App {
             PreviewMsg::TimelineMenuClose => self.timeline_menu_close(id),
             PreviewMsg::WaveformReady(peaks) => self.on_waveform(id, peaks),
             PreviewMsg::Save => {
-                // DRAGON-353: Save never overwrites an ORIGINAL. A dirty document bakes to
-                // its save target — the `-edited` sibling for a capture whose path the user
-                // never chose, or the chosen path itself once Save As (or a previous
-                // `-edited` save) made it explicit. There is nothing left to confirm, so
-                // the old "Overwrite original file?" modal is gone. A CLEAN document is a
-                // no-op with a toast; both cases stay in the editor.
-                self.run_share(id, ShareIntent::Save)
+                // DRAGON-467: Save IS Save As. The picker opens pre-filled with the path a
+                // plain overwrite-save would have written — the configured save folder plus
+                // the capture's own name, or the document's own file once it has saved once
+                // (`naming::save_prefill`) — and the native dialog's replace prompt is what
+                // guards an existing file. That is the Snipping Tool's flow, and it retires
+                // both the silent `-edited` sibling and the separate Save As button.
+                if self.refuse_unbakeable_save_as(id) {
+                    return Task::none();
+                }
+                self.save_as_dialog(id)
             }
             PreviewMsg::Copy => {
-                // The clipboard gets the edited capture: pending edits bake first (to a
-                // throwaway temp, so the saved file stays clean). The two independent
-                // settings then layer on save-first ("Automatically save on copy", a real
-                // SAVE whose result is copied) and/or close-after ("Automatically close on
-                // copy", held so the toast reads and aborted if the copy fails) — DRAGON-355.
+                // The clipboard gets the CURRENT state: pending edits bake first (to a
+                // throwaway temp, so nothing on disk moves). Nothing else happens —
+                // DRAGON-467 removed the save-first and close-after settings that used to
+                // layer onto this, so a Copy is exactly a copy and the editor stays up.
                 //
-                // DRAGON-420: WHICH pair of settings is read depends on the media kind —
-                // recordings have their own "Video Editor" group. `run_share` is unchanged
-                // and still the one entry point, so a video Copy that OWES a bake it cannot
-                // produce (a recording whose ffprobe never landed) is refused there, whole:
-                // with save-on-copy on, nothing is saved, nothing is copied and nothing
-                // closes, and the editor stays up with the reason (DRAGON-398).
-                let a = self.preview_share_automation(id);
-                self.run_share(id, copy_intent(a.save_on_copy, a.close_on_copy))
+                // `run_share` is still the one entry point, so a video Copy that OWES a bake
+                // it cannot produce (a recording whose ffprobe never landed) is refused there,
+                // whole, with the editor up and the reason on it (DRAGON-398).
+                self.run_copy(id)
+            }
+            PreviewMsg::Share => {
+                // DRAGON-474 fix: share the document's CURRENT STATE, not the base file.
+                // The first wiring handed `preview_current_file` straight to the sheet —
+                // the last save, or the pristine capture — so every unsaved edit was
+                // silently absent from what the share target received. `run_share_sheet`
+                // runs the same refuse / reuse / bake funnel as Copy, so the two actions
+                // can never disagree about what "the current state" means.
+                self.run_share_sheet(id)
+            }
+            PreviewMsg::ShareDone(result) => {
+                // DRAGON-480 (macOS only — see `finish_share_sheet`): the picker finished
+                // presenting off the synchronous `update()` path, so its outcome arrives
+                // here instead of inline. Same toast Windows/Linux show inline on `Err`;
+                // `Ok` is silent there too, so this stays consistent across platforms.
+                if let Err(reason) = result {
+                    self.preview_toast_icon(id, ToastKind::Error, reason, "share-symbolic");
+                }
+                Task::none()
+            }
+            PreviewMsg::Upload => {
+                // DRAGON-467: the accounts feature does not exist yet, so the toolbar button
+                // ships DISABLED and never emits this. The arm exists so the enum is handled
+                // and the wiring is already in place for the account work.
+                log::debug!("preview: upload pressed with no accounts feature to run");
+                Task::none()
             }
             PreviewMsg::LoadFailed => {
                 // DRAGON-415: the decode thread died. The capture is SAVED, so this is not a
@@ -1887,22 +2142,45 @@ impl App {
                 self.update_preview(id, PreviewMsg::Cancel)
             }
             PreviewMsg::Cancel => {
-                // Close without deleting — the file stays where it is. Deleting is the
-                // explicit Delete (trash) action.
+                // THE EXIT PATH. Close without deleting — the file stays where it is (or, when
+                // "Automatically save originals" is off, stays in the runtime directory).
+                // Deleting is the explicit Delete (trash) action.
                 //
-                // DRAGON-353: with UNSAVED edits this raises the unsaved-changes dialog
-                // instead. THE gate for every close path that can still show UI — the
-                // Esc / Close-button `Cancel`, the CSD ✕ and the WM close (both routed here
-                // through `WindowCloseRequested`). A `WindowClosed` cannot be gated: the
-                // surface is already destroyed by then, so there is nowhere to draw.
-                if self
-                    .preview_for(id)
-                    .is_some_and(|p| close_needs_confirmation(p.unsaved(), p.edit.confirm_close))
-                {
+                // Two gates, in this order, and the order is the point:
+                //
+                // 1. ASK. With unsaved edits and "Ask to save edited …" on, raise the
+                //    unsaved-changes dialog instead of closing (DRAGON-353's card, now
+                //    settings-gated). THE gate for every close path that can still show UI —
+                //    the Esc / Close-button `Cancel`, the CSD ✕ and the WM close (both routed
+                //    here through `WindowCloseRequested`). A `WindowClosed` cannot be gated:
+                //    the surface is already destroyed by then, so there is nowhere to draw.
+                // 2. COPY. With "Automatically copy changes on exit" on and something to
+                //    carry, put the EDITED result on the clipboard and close once it lands
+                //    (DRAGON-467). This runs AFTER the ask gate so the two compose the way
+                //    the user reads them: you are asked about the disk first, and whatever
+                //    you answer, the clipboard ends up holding what you were looking at.
+                let a = self.preview_automation(id);
+                if self.preview_for(id).is_some_and(|p| {
+                    close_needs_confirmation(a.ask_to_save, p.unsaved(), p.edit.confirm_close)
+                }) {
                     if let Some(p) = self.preview_for_mut(id) {
                         p.edit.confirm_close = true;
                     }
                     return Task::none();
+                }
+                let carry = self.preview_for(id).is_some_and(|p| {
+                    exit_copies_changes(
+                        a.copy_on_exit,
+                        p.dirty(),
+                        edit::clipboard_is_current(p.edit.copied_depth, p.edit.undo_stack.len()),
+                    )
+                });
+                if carry {
+                    // `share_then_close` is the SAME "act, then close" route the dialog's own
+                    // buttons take: it arms `close_after_share` and dispatches the plain Copy,
+                    // so the close waits for the bake and the clipboard write, and a FAILED
+                    // copy leaves the editor up instead of closing over a lost edit.
+                    return self.share_then_close(id, PreviewMsg::Copy);
                 }
                 self.stop_preview_playback(id);
                 self.close_preview(id)
@@ -1940,69 +2218,6 @@ impl App {
                     None => Task::none(),
                 }
             }
-            PreviewMsg::Delete => {
-                // Never delete a pre-existing `--preview` file (no trash button there).
-                if self.preview_for(id).is_some_and(|p| p.external) {
-                    return Task::none();
-                }
-                // DRAGON-353: Delete is the ONE action that still closes its document —
-                // "no auto-close" is about the SHARE actions; an editor sitting over a file
-                // that no longer exists is nonsense. It closes THIS document only
-                // (`close_preview`), so siblings survive and the process ends solely when
-                // it was the last one.
-                //
-                // "Automatically copy to clipboard on delete" (setting, default on) puts the
-                // media on the clipboard first, from a STAGED temp so the unlink can never
-                // strand the clipboard worker. DRAGON-355: a FAILED copy now ABORTS the delete
-                // (the file survives the clipboard miss and the editor stays open) rather than
-                // deleting anyway; on success the document closes IMMEDIATELY (DRAGON-371 —
-                // the 1s hold that existed so the copy toast could be read is gone).
-                //
-                // DRAGON-352: the courtesy copy carries the EDITED picture, so this routes
-                // through `run_share` (not straight to `finish_share_intent`). A dirty
-                // `CopyThenDelete` bakes the scene to a throwaway temp FIRST, and only its
-                // `BakeDone` runs the copy-then-delete — so the clipboard gets the composited
-                // image, never the untouched base. The ordering falls out of that: the delete
-                // lives past the bake by construction, and a bake FAILURE lands in `BakeDone`'s
-                // error arm, which aborts the delete (the original survives) and re-raises the
-                // failure notice rather than copying the base and destroying the file. A plain
-                // Delete (copy setting off) bakes nothing — `begin_bake` returns `None` for it
-                // — and completes synchronously, then toasts "Capture deleted" and closes at
-                // once (DRAGON-371). That confirmation is therefore not readable in practice:
-                // deliberate, since the files are already gone and the surface vanishing says
-                // so. The toast still posts because the FAILURE branch beside it keeps the
-                // editor open, and there the text is the whole point.
-                //
-                // Delete closes the document by definition, so an open unsaved-changes
-                // dialog is moot the moment it is pressed — dismiss it rather than leaving
-                // a modal card floating over the delete's own feedback. (The dialog's own
-                // Delete button routes here through `share_then_close`, which already
-                // cleared it; this covers the toolbar/hotkey press while the dialog is up.)
-                if let Some(p) = self.preview_for_mut(id) {
-                    p.edit.dismiss_close_dialog();
-                }
-                self.stop_preview_playback(id);
-                // DRAGON-420: recordings read the "Video Editor" group's copy-on-delete.
-                // The refusal ordering is `run_share`'s, unchanged: a `CopyThenDelete` whose
-                // bake cannot be produced is refused BEFORE the copy, so the recording is
-                // never deleted on the back of a share that did not happen.
-                let a = self.preview_share_automation(id);
-                self.run_share(id, delete_intent(a.copy_on_delete))
-            }
-            PreviewMsg::SaveAs => {
-                // DRAGON-398: refuse BEFORE the picker when the edits this export would have
-                // to render cannot be produced (a recording whose probe never landed). Making
-                // the user choose a destination for a save that is going to silently drop
-                // their cut is worse than saying so up front.
-                if self.refuse_unbakeable_save_as(id) {
-                    return Task::none();
-                }
-                // Ask WHERE to save first — no bake up front. The bake (if any) runs in the
-                // background against the chosen destination in `SaveAsResult`, behind the
-                // editor's own processing overlay, so the user isn't blocked before the
-                // dialog.
-                self.save_as_dialog(id)
-            }
             PreviewMsg::SaveAsResult(opt) => {
                 let Some(dest) = opt else {
                     // Cancelled. A window is still open (only overlays close for the dialog),
@@ -2010,6 +2225,16 @@ impl App {
                     // BACK — the capture and its edits are still loaded, and a cancelled
                     // dialog must return the user to where they were, not exit
                     // (DRAGON-157).
+                    //
+                    // DRAGON-467 review, major 5: DISARM the close first. A Save reached from
+                    // the unsaved-changes card (or from the exit path) armed
+                    // `close_after_share`, and cancelling the picker means the action did not
+                    // happen — leaving it armed made the NEXT unrelated Copy close the editor
+                    // out from under the user. Pre-existing, but the picker is the primary
+                    // Save path now, so it went from a corner to the mainstream.
+                    if let Some(p) = self.preview_for_mut(id) {
+                        p.edit.close_after_share = false;
+                    }
                     return if self.preview_for(id).is_some_and(|p| p.surface.is_window()) {
                         Task::none()
                     } else {
@@ -2023,7 +2248,10 @@ impl App {
                 let processing_msg = random_processing_msg();
                 let (src, covermark, annotations, annot_curve, dim, crop, video, is_video, dirty) = match self.preview_for(id) {
                     Some(p) => {
-                        let Some(src) = p.path.clone() else {
+                        // The document's PRISTINE media, not `path` (DRAGON-467 review,
+                        // blocker 1): after a still has been saved over its own capture, the
+                        // untouched bytes live in a runtime-dir snapshot.
+                        let Some(src) = p.bake_source().map(|s| s.to_path_buf()) else {
                             return self.close_preview(id);
                         };
                         let is_video = matches!(p.kind, PreviewKind::Video(_));
@@ -2068,6 +2296,55 @@ impl App {
                 // alone never re-encode (DRAGON-352 unification; two parallel predicates
                 // here had already begun to drift).
                 let can_bake = dirty && (!is_video || video.is_some());
+                // ── THE PRISTINE-SOURCE GUARD (DRAGON-467 review, blocker 1) ─────────────
+                // Saving in place is the DEFAULT gesture now (the picker pre-fills the
+                // overwrite target), so a bake whose destination IS its source is the common
+                // case rather than an oddity. Left alone it would read its own output on the
+                // NEXT bake — doubled annotations for a still, a re-applied cut for a
+                // recording — and for video it would also have ffmpeg reading and writing one
+                // file at once. `edit::bake_prep` is the rule; the two arms differ because a
+                // still can be snapshotted for a few MB and a take cannot.
+                let prep = edit::bake_prep(can_bake && same_file(&src, &dest), is_video);
+                let src = match prep {
+                    edit::BakePrep::SnapshotStill => {
+                        // Copy the pristine bytes aside and repoint the document at them, so
+                        // the scene stays fully editable across the save: undo, retouch, save
+                        // again, all still compositing onto untouched pixels. Synchronous on
+                        // purpose (one file copy of a decoded still) — the invariant must hold
+                        // before the worker starts, not eventually.
+                        match snapshot_bake_source(&src) {
+                            Some(snap) => {
+                                if let Some(p) = self.preview_for_mut(id) {
+                                    p.bake_src = Some(snap.clone());
+                                }
+                                snap
+                            }
+                            None => {
+                                // The snapshot is what makes the save safe, so a failed one
+                                // REFUSES the save rather than baking over the source. The
+                                // editor stays up with everything intact.
+                                log::warn!("preview: refusing an in-place save we can't protect");
+                                self.preview_toast_icon(
+                                    id,
+                                    ToastKind::Error,
+                                    "Couldn't save over the original, so nothing was written",
+                                    "save-off-symbolic",
+                                );
+                                self.fail_close_action(
+                                    id,
+                                    "This capture couldn't be saved over itself safely, so \
+                                     nothing was written. Try saving it somewhere else.",
+                                );
+                                return Task::none();
+                            }
+                        }
+                    }
+                    // A recording bakes through a temp beside the destination and is renamed
+                    // over it by the worker, then COMMITTED in `SaveAsBaked`. Nothing to do
+                    // here: the source stays where it is until the rename replaces it.
+                    edit::BakePrep::CommitVideo | edit::BakePrep::Direct => src,
+                };
+                let via_temp = matches!(prep, edit::BakePrep::CommitVideo);
                 // Mark the export in flight (DRAGON-352): the SAME single-flight `baking`
                 // guard the bake path uses, so a `WindowClosed` mid-export DEFERS
                 // (`close_after_bake`) instead of exiting with the worker mid-write —
@@ -2081,21 +2358,30 @@ impl App {
                 // the file as it stands when nothing needs baking. Await it via a task
                 // only so the app stays alive until the file lands.
                 //
-                // DRAGON-353: never a MOVE. Save As RETARGETS the document at `dest` (a
-                // later Save writes there, with no `-edited` derivation — the user chose
-                // that path), and the source file is left exactly where it was. Moving it
-                // would delete a fresh capture's auto-saved original behind the user's
-                // back, which is the very thing the `-edited` rule exists to prevent.
+                // DRAGON-353: never a MOVE. A save RETARGETS the document at `dest` (the next
+                // Save's picker opens there) and leaves the source file exactly where it was.
+                // Moving it would delete a fresh capture's auto-saved original behind the
+                // user's back. Where the source lives makes no difference to this: with
+                // "Automatically save originals" off it is a runtime-dir file the OS clears at
+                // logout, and it still must not vanish mid-session while the editor renders
+                // from it (DRAGON-467).
                 let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
                 let bake_dest = dest.clone();
                 std::thread::spawn(move || {
                     let dest = bake_dest;
                     let ok = if can_bake {
+                        // A recording saving over ITSELF renders to a temp beside the
+                        // destination and renames over it (DRAGON-467 review, blocker 1):
+                        // ffmpeg cannot read and write one file at once, and a rename is the
+                        // only way to replace a take without a second full-size copy. Same
+                        // directory, so the rename stays atomic rather than crossing devices.
+                        let staged = via_temp.then(|| bake_temp_path(&dest));
+                        let write_to = staged.as_ref().unwrap_or(&dest);
                         let result = match &video {
-                            Some(v) => edit::bake_video(&src, &dest, covermark.as_ref(), v),
+                            Some(v) => edit::bake_video(&src, write_to, covermark.as_ref(), v),
                             None => edit::bake_image(
                                 &src,
-                                &dest,
+                                write_to,
                                 covermark.as_ref(),
                                 &annotations,
                                 annot_curve,
@@ -2107,7 +2393,24 @@ impl App {
                         if let Err(e) = &result {
                             log::warn!("preview edit bake failed (Save As): {e}");
                         }
-                        result.is_ok()
+                        match (result.is_ok(), staged) {
+                            // Swap the finished render over the original. A failed rename
+                            // leaves BOTH files intact, so the take is never lost; the temp
+                            // is cleaned up either way.
+                            (true, Some(tmp)) => match std::fs::rename(&tmp, &dest) {
+                                Ok(()) => true,
+                                Err(e) => {
+                                    log::warn!("preview: couldn't replace the recording: {e}");
+                                    let _ = std::fs::remove_file(&tmp);
+                                    false
+                                }
+                            },
+                            (false, Some(tmp)) => {
+                                let _ = std::fs::remove_file(&tmp);
+                                false
+                            }
+                            (ok, None) => ok,
+                        }
                     } else {
                         // Nothing to bake. Saving over ITSELF (dest == src) would truncate
                         // it, so that degenerate pick is a success with no work.
@@ -2154,12 +2457,10 @@ impl App {
                 })
             }
             PreviewMsg::SaveAsBaked(done) => {
-                // DRAGON-353: Save As RETARGETS. The chosen destination becomes the
-                // document's working file (`save_in_place`), so a later Save writes THERE
-                // — with no `-edited` derivation, because the user picked that path — and
-                // the source file is left untouched. The editor stays open on the
-                // destination, reloaded so the committed pixels are the new baseline
-                // (carrying the old edit state forward would apply them twice).
+                // DRAGON-353: a save RETARGETS. The chosen destination becomes the document's
+                // working file (`saved_path`), so the NEXT Save opens its picker pre-filled
+                // with that path rather than with the capture folder again — and the source
+                // file is left untouched. The editor stays open on it.
                 //
                 // First, clear the in-flight export guard and take any close DEFERRED
                 // while the worker ran (DRAGON-352): a `WindowClosed` mid-export means
@@ -2220,21 +2521,63 @@ impl App {
                     ),
                     "save-check-symbolic",
                 );
-                // RETARGET, never reload — the same rule as the in-place Save
-                // (`finish_share_intent` step 1, DRAGON-353 follow-up). The document keeps
-                // rendering its untouched media plus the live scene, so the undo history
-                // survives the export; only the save-side bookkeeping moves. The
+                // RETARGET, never reload — the same rule as before (DRAGON-353 follow-up).
+                // The document keeps rendering its pristine media plus the live scene, so the
+                // undo history survives the export; only the save-side bookkeeping moves. The
                 // destination joins `written` because Delete removes every file this
                 // document produced, wherever the user pointed it.
+                let committed = self.preview_for(id).is_some_and(|p| {
+                    matches!(p.kind, PreviewKind::Video(_)) && p.bake_source() == Some(dest.as_path())
+                });
                 if let Some(p) = self.preview_for_mut(id) {
                     p.saved_path = Some(dest.clone());
                     p.size = Some(size);
-                    p.save_in_place = true;
-                    p.note_written(&dest);
                     p.edit.mark_saved();
+                    // DRAGON-467 review, major 4: the artifact for this exact state IS the
+                    // file just written, so an exit copy right after a save reuses it rather
+                    // than running the encoder a second time.
+                    p.edit.mark_baked(&dest);
+                }
+                // ── THE VIDEO COMMIT (DRAGON-467 review, blocker 1) ──────────────────────
+                // A recording that saved over its OWN source has no pristine media left: the
+                // rename replaced it. Copying a take aside is not an option (they are
+                // multi-GB), so the document commits instead — the file now IS the edit. The
+                // scene and the whole history are cleared, and the recording is re-probed, so
+                // the timeline comes back describing the file that actually exists. Saying so
+                // is not optional: undo just stopped being able to reach the pre-cut take.
+                let mut recommit = Task::none();
+                if committed {
+                    let was_dirty = self.preview_for(id).is_some_and(|p| p.dirty());
+                    if let Some(PreviewState { kind: PreviewKind::Video(vid), edit, bake_src, .. }) =
+                        self.preview_for_mut(id)
+                    {
+                        edit.reset_after_commit();
+                        *bake_src = None;
+                        vid.timeline = None;
+                        vid.meta = None;
+                        vid.extracted = false;
+                    }
+                    if was_dirty {
+                        self.preview_toast_icon(
+                            id,
+                            ToastKind::Success,
+                            "Saved over the recording, so the edits are now part of it",
+                            "save-check-symbolic",
+                        );
+                    }
+                    recommit = video::poster_task(id, dest.clone());
                 }
                 if close_after {
-                    return self.close_preview(id);
+                    return Task::batch([recommit, self.close_preview(id)]);
+                }
+                if committed {
+                    // Only the OVERLAY needs its surface back; either way the re-probe runs.
+                    let back = if self.preview_for(id).is_some_and(|p| p.surface.is_window()) {
+                        Task::none()
+                    } else {
+                        self.reopen_preview_surface(id)
+                    };
+                    return Task::batch([recommit, back]);
                 }
                 // Only the OVERLAY needs anything back: its surface was torn down for the
                 // file chooser. A window kept its own.
@@ -2280,176 +2623,115 @@ mod tests {
         assert!(!is_image_path(p));
     }
 
-    /// TASK-8 UNIFICATION: the unsaved-changes dialog's buttons and the action bar's
-    /// buttons resolve to the SAME behaviour for the same settings, because they dispatch
-    /// the same messages — `share_then_close` only layers "and then close" onto the plain
-    /// toolbar message. This pins the settings-driven halves of that: a dialog Delete
-    /// honours "Automatically copy to clipboard on delete" and a dialog Copy honours the
-    /// two independent save-on-copy / close-on-copy settings (DRAGON-355), exactly as the
-    /// toolbar does.
+    /// TASK-8 UNIFICATION: the unsaved-changes card and the action bar resolve to the SAME
+    /// behaviour, because they dispatch the same messages — `share_then_close` only layers
+    /// "and then close" onto the plain toolbar message.
+    ///
+    /// DRAGON-467 is what makes this short. The card is down to THREE options (Save /
+    /// Continue editing / Close without saving), and only one of them is an action at all, so
+    /// what is left to pin is that it routes through the toolbar's own Save rather than a
+    /// parallel implementation, and that the two ways OUT are the exit gates the `Cancel` path
+    /// already uses (`the_exit_gates_read_the_settings_and_the_document`).
     #[test]
-    fn the_dialog_and_the_toolbar_resolve_the_same_intents() {
-        // Delete, both entry points → one rule.
-        assert_eq!(delete_intent(true), ShareIntent::CopyThenDelete);
-        assert_eq!(delete_intent(false), ShareIntent::Delete);
-        assert!(delete_intent(true).copies(), "copy-on-delete must actually copy");
-        assert!(delete_intent(true).deletes() && delete_intent(false).deletes());
-        assert!(!delete_intent(false).copies(), "with the setting off, no copy is attempted");
-        // Copy, the four (save, close) combinations → four distinct intents (DRAGON-355).
-        assert_eq!(copy_intent(true, true), ShareIntent::SaveCopyClose);
-        assert_eq!(copy_intent(true, false), ShareIntent::SaveCopy);
-        assert_eq!(copy_intent(false, true), ShareIntent::CopyClose);
-        assert_eq!(copy_intent(false, false), ShareIntent::Copy);
-        // save-on-copy drives `saves()`, independent of close.
-        for close in [true, false] {
-            assert!(copy_intent(true, close).saves(), "save-on-copy must save");
-            assert!(!copy_intent(false, close).saves(), "no save-on-copy, no save");
-            assert!(copy_intent(false, close).copies(), "a Copy always copies");
-        }
-        // close-on-copy drives `closes_document()`, independent of save.
-        for save in [true, false] {
-            assert!(copy_intent(save, true).closes_document(), "close-on-copy must close");
-            assert!(!copy_intent(save, false).closes_document(), "no close-on-copy, no close");
-        }
-        // A save WITHOUT close leaves the saved file written but the editor open, and does
-        // NOT bake to a temp (it is a real save); a close WITHOUT save copies from a temp so
-        // the saved file is left alone.
-        assert!(copy_intent(true, false).saves() && !copy_intent(true, false).bakes_to_temp());
-        assert!(!copy_intent(false, true).saves() && copy_intent(false, true).bakes_to_temp());
-        // Every intent a DELETE resolves to closes the document by itself, which is why the
-        // dialog's Delete needs no close-after of its own (and can never close twice).
-        for on in [true, false] {
-            assert!(delete_intent(on).closes_document());
-        }
-        // A plain Copy never closes. A toolbar Copy therefore never closes a dirty document
-        // WITHOUT the settings saying so; and a close-without-save is protected by the
-        // unsaved-changes guard in `finish_share_intent` (verified by the share-flow logic).
-        assert!(!copy_intent(false, false).closes_document());
-        assert!(copy_intent(true, true).closes_document() && copy_intent(true, true).saves());
+    fn the_card_and_the_toolbar_resolve_the_same_action() {
+        // The card's ONE action is the toolbar's Save with a close armed around it, and
+        // `share_then_close`'s dispatch is what guarantees that — a second Save
+        // implementation is exactly what this pins against. The message it delegates to is
+        // the same variant the toolbar button emits.
+        let from_card = PreviewMsg::SaveAndClose;
+        let from_toolbar = PreviewMsg::Save;
+        // Neither counts as hands-on document interaction, so neither shortens the toast it
+        // is about to produce (the classifier lives beside the enum).
+        assert!(!from_card.is_document_interaction());
+        assert!(!from_toolbar.is_document_interaction());
+        // "Close without saving" is a DISCARD, not an action: it produces no toast of its own
+        // and is classified with the card's other exits.
+        assert!(!PreviewMsg::DiscardAndClose.is_document_interaction());
+        assert!(!PreviewMsg::KeepEditing.is_document_interaction());
     }
 
     /// DRAGON-420: a document reads the triple for ITS media kind, and nothing else. The
     /// regression this exists to catch is a video path still reaching an image field (the
-    /// state before this ticket, when both kinds shared one triple) — which no compile error
+    /// state before that ticket, when both kinds shared one triple) — which no compile error
     /// and no visual check would report, because the settings window would look correct and
     /// only the behaviour would be wrong.
     #[test]
-    fn video_and_image_share_settings_never_bleed_into_each_other() {
-        let image = ShareAutomation {
-            save_on_copy: true,
-            close_on_copy: true,
-            copy_on_delete: true,
+    fn video_and_image_preview_settings_never_bleed_into_each_other() {
+        let image = PreviewAutomation {
+            copy_on_exit: true,
+            save_originals: true,
+            ask_to_save: true,
         };
-        let video = ShareAutomation {
-            save_on_copy: false,
-            close_on_copy: false,
-            copy_on_delete: false,
+        let video = PreviewAutomation {
+            copy_on_exit: false,
+            save_originals: false,
+            ask_to_save: false,
         };
         // Each kind gets its OWN triple, whole — never a field-by-field mix.
-        assert_eq!(share_automation(true, image, video), video);
-        assert_eq!(share_automation(false, image, video), image);
+        assert_eq!(preview_automation(true, image, video), video);
+        assert_eq!(preview_automation(false, image, video), image);
         // Exhaustive independence: over every combination of the two triples, the answer for
         // one kind is a function of THAT kind's triple alone. Changing the other cannot move
-        // it, which is precisely "a user can have images auto-close while videos stay open".
-        let all = |bits: u8| ShareAutomation {
-            save_on_copy: bits & 1 != 0,
-            close_on_copy: bits & 2 != 0,
-            copy_on_delete: bits & 4 != 0,
+        // it, which is precisely "a user can have screenshots asked about while recordings
+        // just close".
+        let all = |bits: u8| PreviewAutomation {
+            copy_on_exit: bits & 1 != 0,
+            save_originals: bits & 2 != 0,
+            ask_to_save: bits & 4 != 0,
         };
         for i in 0..8u8 {
             for j in 0..8u8 {
                 let (img, vid) = (all(i), all(j));
-                assert_eq!(share_automation(false, img, vid), img, "image reads image");
-                assert_eq!(share_automation(true, img, vid), vid, "video reads video");
+                assert_eq!(preview_automation(false, img, vid), img, "image reads image");
+                assert_eq!(preview_automation(true, img, vid), vid, "video reads video");
             }
         }
-        // And the settings reach the INTENTS unchanged — the same two pure rules the image
-        // side has always used, now fed from whichever group the document belongs to. The
-        // fully-parted case: images save-and-close on copy, videos do neither and keep the
-        // recording on a delete.
-        let img = ShareAutomation { save_on_copy: true, close_on_copy: true, copy_on_delete: true };
-        let vid =
-            ShareAutomation { save_on_copy: false, close_on_copy: false, copy_on_delete: false };
-        let i = share_automation(false, img, vid);
-        let v = share_automation(true, img, vid);
-        assert_eq!(copy_intent(i.save_on_copy, i.close_on_copy), ShareIntent::SaveCopyClose);
-        assert_eq!(copy_intent(v.save_on_copy, v.close_on_copy), ShareIntent::Copy);
-        assert_eq!(delete_intent(i.copy_on_delete), ShareIntent::CopyThenDelete);
-        assert_eq!(delete_intent(v.copy_on_delete), ShareIntent::Delete);
-        // The video Copy above closes nothing, so a playing soundtrack is not torn down at
-        // all; with close-on-copy ON it resolves to a closing intent, whose close runs through
-        // `close_preview` — which stops playback and releases the audio duck before the
-        // surface dies (the same path Esc takes), so there is no second teardown to write.
-        assert!(copy_intent(false, true).closes_document());
+        // And the settings reach the DECISIONS unchanged. The fully-parted case: screenshots
+        // ask and carry their edits out, recordings do neither.
+        let i = preview_automation(false, image, video);
+        let v = preview_automation(true, image, video);
+        assert!(close_needs_confirmation(i.ask_to_save, true, false), "images ask");
+        assert!(!close_needs_confirmation(v.ask_to_save, true, false), "videos do not");
+        assert!(exit_copies_changes(i.copy_on_exit, true, false), "images carry the edits out");
+        assert!(!exit_copies_changes(v.copy_on_exit, true, false), "videos do not");
     }
 
-    /// A document that opened on `capture` and has since WRITTEN `written`, in order.
-    fn doc_with(capture: Option<&str>, written: &[&str], external: bool) -> PreviewState {
-        let mut p = still_at((100, 100), 1.0);
-        p.path = capture.map(PathBuf::from);
-        p.external = external;
-        for w in written {
-            p.note_written(std::path::Path::new(w));
-        }
-        p
-    }
-
-    /// THE over-delete guard (DRAGON-353 follow-up): Delete removes the capture plus every
-    /// path the document actually WROTE — and nothing else, ever. Nothing here is derived
-    /// from a name pattern, so a `-edited` file from an earlier session cannot be caught.
+    /// THE exit gates (DRAGON-467), which together decide what closing the editor does.
     #[test]
-    fn delete_covers_every_file_the_document_wrote_and_no_others() {
-        // (a) Never saved: just the capture.
-        assert_eq!(
-            doc_with(Some("/shots/a.png"), &[], false).delete_paths(),
-            vec![PathBuf::from("/shots/a.png")]
-        );
-        // (b) Saved once to the `-edited` sibling: both.
-        assert_eq!(
-            doc_with(Some("/shots/a.png"), &["/shots/a-edited.png"], false).delete_paths(),
-            vec![PathBuf::from("/shots/a.png"), PathBuf::from("/shots/a-edited.png")]
-        );
-        // (c) Saved TWICE: the second save writes the same adopted file, so the set does
-        // not grow (the tracking is deduped).
-        assert_eq!(
-            doc_with(
-                Some("/shots/a.png"),
-                &["/shots/a-edited.png", "/shots/a-edited.png"],
-                false
-            )
-            .delete_paths(),
-            vec![PathBuf::from("/shots/a.png"), PathBuf::from("/shots/a-edited.png")]
-        );
-        // (d) Save As elsewhere: the chosen destination IS ours to remove (owner's ruling —
-        // Delete is a deliberate action and this file is one this session produced), even
-        // though it lives in another directory entirely.
-        assert_eq!(
-            doc_with(
-                Some("/shots/a.png"),
-                &["/shots/a-edited.png", "/home/me/final.png"],
-                false
-            )
-            .delete_paths(),
-            vec![
-                PathBuf::from("/shots/a.png"),
-                PathBuf::from("/shots/a-edited.png"),
-                PathBuf::from("/home/me/final.png"),
-            ]
-        );
-        // (e) An EXTERNAL `--preview` document deletes NOTHING — not the file it merely
-        // opened, and not a sibling it saved beside it. Delete isn't even offered there.
+    fn the_exit_gates_read_the_settings_and_the_document() {
+        // ── Ask to save ──────────────────────────────────────────────────────────────
+        // All three terms are required, and each one alone can veto the card.
+        assert!(close_needs_confirmation(true, true, false), "unsaved edits must be confirmed");
+        assert!(!close_needs_confirmation(false, true, false), "the setting can turn it off");
+        assert!(!close_needs_confirmation(true, false, false), "a clean document just closes");
+        assert!(!close_needs_confirmation(true, true, true), "the dialog must not re-raise itself");
+        // A clean document closes straight away whatever the setting says — there is nothing
+        // to lose, so asking would be a speed bump with no question in it.
+        for ask in [true, false] {
+            assert!(!close_needs_confirmation(ask, false, false));
+        }
+        // ── Copy changes on exit ─────────────────────────────────────────────────────
+        assert!(exit_copies_changes(true, true, false), "an edited document carries its edits out");
+        assert!(!exit_copies_changes(false, true, false), "the setting can turn it off");
         assert!(
-            doc_with(Some("/home/me/theirs.png"), &["/home/me/theirs-edited.png"], true)
-                .delete_paths()
-                .is_empty()
+            !exit_copies_changes(true, false, false),
+            "a clean document must not re-copy the bytes the capture already put there"
         );
-        // A pre-existing `-edited` file that this document never wrote is untouched — it
-        // simply never enters the set, because the set is tracked and not derived.
-        let d = doc_with(Some("/shots/a.png"), &[], false);
-        assert!(!d.delete_paths().contains(&PathBuf::from("/shots/a-edited.png")));
-        // A document with no file at all has nothing to delete.
-        assert!(doc_with(None, &[], false).delete_paths().is_empty());
+        assert!(!exit_copies_changes(false, false, false));
+        // DRAGON-467 review, major 4: an explicit Copy followed by Escape must not copy the
+        // same bytes twice, however dirty the scene is.
+        assert!(
+            !exit_copies_changes(true, true, true),
+            "the clipboard already holds this exact state"
+        );
     }
+
+    // DRAGON-467: `doc_with` and `delete_covers_every_file_the_document_wrote_and_no_others`
+    // lived here. They pinned the over-delete guard — Delete removed the capture plus every
+    // path the document actually WROTE and nothing else, tracked rather than derived so a
+    // neighbouring file from an earlier session could never be swept up. The editor does not
+    // delete anything now, so there is no set to guard. Any future delete needs the guard and
+    // the test back together.
 
     /// A still preview whose decoded (physical) frame is `frame`, sourced from a
     /// display of the given backing `scale` — just enough state for the sizing math.
@@ -2472,11 +2754,10 @@ mod tests {
             ducking: false,
             surface_open: true,
             toasts: Toasts::default(),
-            save_in_place: false,
             copied_on_open: false,
             demoted: false,
+            bake_src: None,
             saved_path: None,
-            written: Vec::new(),
         }
     }
 
@@ -2516,7 +2797,8 @@ mod tests {
     // ── Multi-document previews (DRAGON-336 phase 2) ────────────────────────────
 
     /// A preview open on `surface`, carrying only what the routing/close rules read.
-    fn doc(surface: PreviewSurface) -> PreviewState {
+    /// `pub(super)` so the DRAGON-469 module beside this one can build one too.
+    pub(super) fn doc(surface: PreviewSurface) -> PreviewState {
         PreviewState { surface, ..still_at((100, 100), 1.0) }
     }
 
@@ -2619,7 +2901,7 @@ mod tests {
     #[test]
     fn a_torn_down_surface_is_not_demoted() {
         let mut hidden = doc(PreviewSurface::Overlay);
-        hidden.surface_open = false;
+        hidden.mark_surface_torn_down();
         let docs = vec![hidden, doc(PreviewSurface::Window)];
         assert!(overlay_siblings(&docs, None).is_empty(), "a dead surface is not demoted");
         assert!(overlay_taken(&docs, None), "but it still bars the overlay for a newcomer");
@@ -2662,104 +2944,31 @@ mod tests {
         assert!(refs.held());
     }
 
-    // ── DRAGON-353: the share-action model ──────────────────────────────────────
+    // ── The copy action's gates ─────────────────────────────────────────────────
+    //
+    // DRAGON-467: three tests here pinned `ShareIntent`'s table (which of save / copy /
+    // delete each flavour performed), that no plain share closed the editor by itself, and
+    // that a copy never persisted edits. The enum is gone with the last of those actions, so
+    // what is left to pin is the copy itself — and the rules did not change, they just have
+    // one subject now: a copy renders to a THROWAWAY temp, never closes on its own, and only
+    // owes a render when the scene has something in it.
+    //
+    // `bake_need` / `clipboard_is_current` (edit.rs's `bake_need_tests`) carry the rest.
 
-    /// THE intent table. Each action is defined by WHICH of the four steps it performs,
-    /// and `finish_share_intent` runs exactly those, in this order. Pinning the table here
-    /// is what stops a fifth flavour from quietly acquiring (or losing) a step.
+    /// A COPY renders to a throwaway temp and closes nothing by itself. The close it can
+    /// appear to perform is `close_after_share`, armed AROUND it by the exit path or the
+    /// unsaved-changes card, which is what keeps "act, then close" in one place.
     #[test]
-    fn every_share_intent_declares_exactly_what_it_does() {
-        use ShareIntent::*;
-        // (intent, saves, copies, deletes, closes, bakes to a temp)
-        let table = [
-            (Save, true, false, false, false, false),
-            (Copy, false, true, false, false, true),
-            (SaveCopyClose, true, true, false, true, false),
-            // DRAGON-355 split the old save-&-close into these two independent halves:
-            (SaveCopy, true, true, false, false, false),
-            (CopyClose, false, true, false, true, true),
-            (CopyThenDelete, false, true, true, true, true),
-            (Delete, false, false, true, true, false),
-        ];
-        for (i, saves, copies, deletes, closes, temp) in table {
-            assert_eq!(i.saves(), saves, "{i:?}.saves()");
-            assert_eq!(i.copies(), copies, "{i:?}.copies()");
-            assert_eq!(i.deletes(), deletes, "{i:?}.deletes()");
-            assert_eq!(i.closes_document(), closes, "{i:?}.closes_document()");
-            assert_eq!(i.bakes_to_temp(), temp, "{i:?}.bakes_to_temp()");
-        }
-    }
-
-    /// The headline rule of the ticket: **no share action closes the editor by default**.
-    /// Only the SETTINGS-driven flavours (close-on-copy in any of its combinations, and
-    /// copy-on-delete) and the plain Delete do — and Delete only because there is no file
-    /// left to edit. A save-on-copy WITHOUT close-on-copy (`SaveCopy`, DRAGON-355) stays open.
-    #[test]
-    fn a_plain_share_never_closes_the_document() {
-        assert!(!ShareIntent::Save.closes_document());
-        assert!(!ShareIntent::Copy.closes_document());
-        assert!(!ShareIntent::SaveCopy.closes_document(), "save-on-copy alone must not close");
-        // ...while every closing flavour is one the user opted into, or a delete.
-        for i in [
-            ShareIntent::SaveCopyClose,
-            ShareIntent::CopyClose,
-            ShareIntent::CopyThenDelete,
-            ShareIntent::Delete,
-        ] {
-            assert!(i.closes_document(), "{i:?}");
-        }
-    }
-
-    /// A COPY must never persist edits into the saved file UNLESS it is a save: the
-    /// non-saving copy flavours bake to a throwaway temp. The saving copy flavours
-    /// (`SaveCopyClose`, `SaveCopy`) are the deliberate exception — they ARE saves, and the
-    /// clipboard then gets the very bytes that landed on disk (one bake, not two).
-    #[test]
-    fn copying_leaves_the_saved_file_alone_unless_it_is_a_save() {
-        // Non-saving copies bake to a temp and do not save.
-        for i in [ShareIntent::Copy, ShareIntent::CopyThenDelete, ShareIntent::CopyClose] {
-            assert!(i.bakes_to_temp() && !i.saves(), "{i:?} must copy from a temp");
-        }
-        // Saving copies write the save target instead (no temp).
-        for i in [ShareIntent::SaveCopyClose, ShareIntent::SaveCopy] {
-            assert!(i.saves() && !i.bakes_to_temp(), "{i:?} copies the saved bytes");
-        }
-    }
-
-    /// DRAGON-352: the bug this branch fixes. A dirty `CopyThenDelete` MUST owe a bake so the
-    /// courtesy copy carries the composited picture, not the untouched base — the whole point
-    /// of routing Delete through `run_share`/`begin_bake` instead of straight to
-    /// `finish_share_intent`. The rest of the table pins the rule so no flavour drifts:
-    ///
-    /// * copy-to-temp flavours (`Copy`, `CopyThenDelete`) bake on `dirty` ALONE — the temp is
-    ///   new, so any scene needs rendering onto it, saved-or-not;
-    /// * saving flavours (`Save`, `SaveCopyClose`) bake only when `dirty && unsaved` (a save
-    ///   standing on its own save point is the clean-save no-op);
-    /// * a plain `Delete` never bakes, however dirty — the file is being discarded.
-    #[test]
-    fn copy_on_delete_bakes_the_edits_and_plain_delete_never_does() {
-        use ShareIntent::*;
-        // The headline: a dirty copy-on-delete owes a bake (so the clipboard gets the edits);
-        // a clean one does not (the base IS what's displayed).
-        assert!(CopyThenDelete.owes_bake(true, true), "dirty copy-on-delete must bake the edits");
-        assert!(CopyThenDelete.owes_bake(true, false), "saved-but-dirty still bakes to the temp");
-        assert!(!CopyThenDelete.owes_bake(false, true), "a clean copy-on-delete copies the base");
-
-        // A plain Delete never bakes — the source is about to be unlinked and nothing reads
-        // the output.
-        for (dirty, unsaved) in [(true, true), (true, false), (false, true), (false, false)] {
-            assert!(!Delete.owes_bake(dirty, unsaved), "plain Delete must never bake");
-        }
-
-        // Copy (to temp) tracks `dirty` alone, exactly like CopyThenDelete.
-        assert!(Copy.owes_bake(true, false) && !Copy.owes_bake(false, false));
-
-        // Saving flavours need BOTH dirty and unsaved (the clean-save no-op otherwise).
-        for i in [Save, SaveCopyClose] {
-            assert!(i.owes_bake(true, true), "{i:?} bakes when there is uncommitted work");
-            assert!(!i.owes_bake(true, false), "{i:?} on its own save point is a no-op");
-            assert!(!i.owes_bake(false, true), "{i:?} with no edits is a no-op");
-        }
+    fn a_copy_renders_to_a_temp_and_closes_nothing_by_itself() {
+        // The rule that matters: nothing a copy writes lands where the user's file is. The
+        // temp's name is what enforces it (`clipboard_temp_name`'s `-copy` marker), and that
+        // is tested in `share.rs`; here we pin the shape of the decision that reaches it.
+        assert!(
+            !edit::bake_need(false, 0, None).eq(&edit::BakeNeed::Fresh),
+            "a clean document renders nothing at all"
+        );
+        assert_eq!(edit::bake_need(true, 1, None), edit::BakeNeed::Fresh);
+        assert_eq!(edit::bake_need(true, 1, Some(1)), edit::BakeNeed::Reuse);
     }
 
     /// A VIDEO preview carrying `timeline` and nothing else — enough for the share gates.
@@ -2773,17 +2982,16 @@ mod tests {
         }
     }
 
-    /// DRAGON-398 — the intent matrix reaching the VIDEO kind. `owes_bake` is media-agnostic;
+    /// DRAGON-398 — the bake gate reaching the VIDEO kind. `owes_bake` is media-agnostic;
     /// what differs for a recording is where its `dirty` comes from, so this pins the whole
-    /// chain from timeline state through `PreviewState::dirty()` into each intent's decision.
+    /// chain from timeline state through `PreviewState::dirty()` into the decision.
     ///
     /// **The invariant that matters**: an uncut recording — including one the user razored to
-    /// pieces without deleting any of them — is NOT dirty, so NO intent owes it a bake and its
+    /// pieces without deleting any of them — is NOT dirty, so nothing owes it a bake and its
     /// ffmpeg invocations never change (see `edit::video_bake_args`'s uncut test for the other
     /// end of that chain). A recording only starts re-encoding once content is actually gone.
     #[test]
     fn a_video_owes_a_bake_only_once_content_is_deleted() {
-        use ShareIntent::*;
         // No timeline at all (the probe never landed) — nothing to bake.
         assert!(!video_with(None).dirty());
 
@@ -2800,69 +3008,66 @@ mod tests {
         assert_eq!(razored.spans.len(), 3, "the razor split the timeline");
         let p = video_with(Some(razored.clone()));
         assert!(!p.dirty(), "razor cuts alone must never re-encode");
-        for i in [Save, Copy, SaveCopy, SaveCopyClose, CopyClose, CopyThenDelete, Delete] {
-            assert!(!i.owes_bake(p.dirty(), p.unsaved()), "{i:?} must not bake an uncut recording");
-        }
+        assert_eq!(
+            edit::bake_need(p.dirty(), p.edit.undo_stack.len(), None),
+            edit::BakeNeed::None,
+            "an uncut recording renders nothing"
+        );
+        // And nothing is carried out on exit either: there is no change to carry.
+        assert!(!exit_copies_changes(true, p.dirty(), false));
 
-        // DELETE one segment: now the output differs from the source, so it is dirty and the
-        // baking flavours owe a re-encode (Delete still never bakes — the file is being binned).
+        // DELETE one segment: now the output differs from the source, so it is dirty and a
+        // Copy owes a re-encode (Delete still never bakes — the file is being binned).
         let mut cut = razored;
         assert!(cut.delete(1));
         let p = video_with(Some(cut));
         assert!(p.dirty(), "deleted content must bake");
         assert!(p.unsaved(), "and it has never been saved");
-        for i in [Save, Copy, SaveCopy, SaveCopyClose, CopyClose, CopyThenDelete] {
-            assert!(i.owes_bake(p.dirty(), p.unsaved()), "{i:?} must bake the cut");
-        }
-        assert!(!Delete.owes_bake(p.dirty(), p.unsaved()), "a plain Delete never bakes");
+        assert_eq!(
+            edit::bake_need(p.dirty(), p.edit.undo_stack.len(), None),
+            edit::BakeNeed::Fresh,
+            "a copy must render the cut"
+        );
+        // The exit copy now has something to carry, and the ask gate something to ask about.
+        assert!(exit_copies_changes(true, p.dirty(), false));
+        assert!(close_needs_confirmation(true, p.unsaved(), false));
     }
 
-    /// DRAGON-398 — a recording's Save writes the `-edited` sibling exactly like an image's,
-    /// because `preview_save_target`'s rule is `naming::save_target` for both. The ORIGINAL
-    /// recording survives its first edit; the second save writes back to the file it adopted.
+    /// DRAGON-467 — a recording's Save prefills exactly like an image's, because
+    /// `preview_save_target`'s rule is `naming::save_prefill` for both: the configured folder
+    /// plus the capture's own name until the document has saved once, then the file it
+    /// adopted. There is no `-edited` derivation any more (see `naming`'s module doc for the
+    /// survey that retired it); the picker's own replace prompt is what guards an existing
+    /// file.
     #[test]
-    fn a_recordings_first_save_writes_the_edited_sibling() {
-        let none = |_: &std::path::Path| false;
-        let rec = std::path::Path::new("/rec/take.mp4");
+    fn a_recordings_save_prefills_the_configured_folder_then_its_own_file() {
+        let dir = std::path::Path::new("/home/me/Videos");
+        // Never saved, and living in the runtime dir because originals are off: the picker
+        // still opens on the configured folder.
+        let rec = std::path::Path::new("/run/user/1000/take.mp4");
         assert_eq!(
-            naming::save_target(rec, false, &none),
-            PathBuf::from("/rec/take-edited.mp4"),
-            "the untouched recording must survive the first save"
+            naming::save_prefill(None, rec, Some(dir)),
+            PathBuf::from("/home/me/Videos/take.mp4"),
+            "the save folder setting is what the picker opens on"
         );
-        // Once adopted (`save_in_place`), further saves land on it rather than compounding.
-        let adopted = std::path::Path::new("/rec/take-edited.mp4");
-        assert_eq!(naming::save_target(adopted, true, &none), PathBuf::from(adopted));
-    }
-
-    /// DRAGON-398 — Delete removes BOTH variants of a recording. `delete_paths` is tracked,
-    /// not derived, so the `-edited` file a Save minted goes with the original and nothing is
-    /// orphaned; a `-edited` file from an EARLIER session is never swept up.
-    #[test]
-    fn deleting_a_recording_removes_the_original_and_its_edited_variant() {
-        let mut p = video_with(Some(timeline::Timeline::new(10.0)));
-        assert_eq!(p.delete_paths(), vec![PathBuf::from("/rec/take.mp4")]);
-        // A Save minted (and adopted) the `-edited` sibling: both are now this document's.
-        p.note_written(std::path::Path::new("/rec/take-edited.mp4"));
-        assert_eq!(
-            p.delete_paths(),
-            vec![PathBuf::from("/rec/take.mp4"), PathBuf::from("/rec/take-edited.mp4")]
-        );
-        // A Save As destination elsewhere joins the set too.
-        p.note_written(std::path::Path::new("/home/me/final.mp4"));
-        assert!(p.delete_paths().contains(&PathBuf::from("/home/me/final.mp4")));
-        // An `-edited` file this document never wrote is NOT in the set.
-        assert!(!p.delete_paths().contains(&PathBuf::from("/rec/take-edited-2.mp4")));
+        // Once saved, further saves prefill the file it adopted rather than deriving anything.
+        let adopted = std::path::Path::new("/home/me/Videos/take.mp4");
+        assert_eq!(naming::save_prefill(Some(adopted), rec, Some(dir)), PathBuf::from(adopted));
     }
 
     /// The unsaved-changes gate: a dirty close asks first, a clean one just goes — and a
     /// close attempted while the dialog is ALREADY up must not re-raise it, or the dialog's
-    /// own buttons (which re-enter these paths) could never get past themselves.
+    /// own buttons (which re-enter these paths) could never get past themselves. The `ask`
+    /// term is DRAGON-467's setting, exercised in `the_exit_gates_read_the_settings_and_the_document`.
     #[test]
     fn only_a_dirty_close_asks_and_only_once() {
-        assert!(close_needs_confirmation(true, false), "unsaved edits must be confirmed");
-        assert!(!close_needs_confirmation(false, false), "a clean document just closes");
-        assert!(!close_needs_confirmation(true, true), "the dialog must not re-raise itself");
-        assert!(!close_needs_confirmation(false, true));
+        assert!(close_needs_confirmation(true, true, false), "unsaved edits must be confirmed");
+        assert!(!close_needs_confirmation(true, false, false), "a clean document just closes");
+        assert!(
+            !close_needs_confirmation(true, true, true),
+            "the dialog must not re-raise itself"
+        );
+        assert!(!close_needs_confirmation(true, false, true));
     }
 
     /// A document that re-mints its surface keeps its hold under the NEW id — the guard
@@ -2878,5 +3083,174 @@ mod tests {
         assert!(refs.held());
         assert!(refs.release(new), "the new id owns the hold");
         assert!(!refs.held());
+    }
+}
+
+/// DRAGON-469: what a preview surface's `Closed` event means, and which appearance the
+/// toggle must mint. Both are the "leaving the overlay" machinery the Save As chooser and
+/// the forced demotion exercise.
+#[cfg(test)]
+mod leaving_the_overlay_tests {
+    use super::*;
+
+    /// THE ticket's first symptom. Off Linux `window::close` echoes a `Closed` event back for
+    /// OUR OWN teardown, and `save_as_dialog` tears the fullscreen overlay down while keeping
+    /// the document loaded. Reading that echo as a lost surface closed the document, which was
+    /// the last one, which ended the process — with the file chooser still on screen. A
+    /// cleared `surface_open` is the "we did this on purpose" signal, and it must win.
+    #[test]
+    fn our_own_teardown_is_never_a_lost_surface() {
+        assert_eq!(surface_closed(false, false), SurfaceClosed::Ours);
+        // Even mid-bake: the document is coming back on a fresh surface, so arming
+        // `close_after_bake` would close a document we are about to re-mint.
+        assert_eq!(surface_closed(false, true), SurfaceClosed::Ours);
+    }
+
+    /// The two pre-existing meanings are unchanged, so nothing that worked before moves: a
+    /// live surface taken away out of band still closes the document (and records the
+    /// DRAGON-419 failure), and one taken away mid-bake still defers to the worker.
+    #[test]
+    fn a_live_surface_keeps_its_historical_meaning() {
+        assert_eq!(surface_closed(true, false), SurfaceClosed::LostOutOfBand);
+        assert_eq!(surface_closed(true, true), SurfaceClosed::DeferToBake);
+    }
+
+    /// Only a genuinely lost surface may end the session, so the classification is the whole
+    /// gate: exactly one of the three outcomes closes the document.
+    #[test]
+    fn exactly_one_outcome_closes_the_document() {
+        let closes = |a: SurfaceClosed| a == SurfaceClosed::LostOutOfBand;
+        let all = [
+            surface_closed(false, false),
+            surface_closed(false, true),
+            surface_closed(true, false),
+            surface_closed(true, true),
+        ];
+        assert_eq!(all.iter().filter(|a| closes(**a)).count(), 1);
+    }
+
+    /// THE ticket's second symptom. The toggle asks for the OTHER surface than the one that
+    /// is open, so the button always changes something.
+    #[test]
+    fn the_toggle_asks_for_the_other_surface() {
+        assert!(
+            toggled_preview_windowed(PreviewSurface::Overlay),
+            "on the overlay, the button pops out into a window"
+        );
+        assert!(
+            !toggled_preview_windowed(PreviewSurface::Window),
+            "in a window, the button goes fullscreen"
+        );
+    }
+
+    /// BYTE-IDENTITY PIN: whenever the persisted setting and the open surface AGREE — every
+    /// ordinary state on all three platforms — the new expression equals the old
+    /// `!self.preview_windowed`.
+    #[test]
+    fn it_matches_the_old_inversion_whenever_setting_and_surface_agree() {
+        for (setting, open) in
+            [(true, PreviewSurface::Window), (false, PreviewSurface::Overlay)]
+        {
+            assert_eq!(
+                toggled_preview_windowed(open),
+                !setting,
+                "in agreement the toggle must not change behaviour (setting={setting})"
+            );
+        }
+    }
+
+    /// The OTHER disagreeing state, which the first version of this fix missed: a window
+    /// pick's PRE-OPEN cover is an OVERLAY while the setting says window, on all three
+    /// platforms (Linux `window_spinner_neutral`, macOS `mac_preview_preopen`, Windows
+    /// `win_preview_preopen`). No toggle can be pressed there today — the loading view carries
+    /// no appearance chrome — so this pins that the new answer is the SAFE one if that ever
+    /// changes: it re-persists the setting's existing value, where the old inversion would
+    /// have written "overlay" as the user's default off the back of a transient cover.
+    #[test]
+    fn a_window_pick_pre_open_cover_cannot_persist_a_wrong_appearance() {
+        let setting_windowed = true; // what the pre-open cover runs under
+        let open = PreviewSurface::Overlay; // ...while an overlay is what is up
+        assert_eq!(
+            toggled_preview_windowed(open),
+            setting_windowed,
+            "the toggle re-states the setting, so nothing is silently rewritten"
+        );
+        assert_ne!(
+            toggled_preview_windowed(open),
+            !setting_windowed,
+            "the old inversion would have persisted OVERLAY off a transient loading cover"
+        );
+    }
+
+    /// The DESYNCED state, which is the bug. A document DEMOTED out of the overlay is a WINDOW
+    /// while the setting still says overlay — `demote_preview_to_window` deliberately never
+    /// touches the appearance. Inverting the setting there asked for a window, so the toggle
+    /// tore the window down and minted an identical one; reading the surface asks for the
+    /// overlay. The LIVE trigger is the Settings-from-preview demotion; the DRAGON-336
+    /// second-document one produces the same state but the toggle's sibling early-return
+    /// blocks it until that sibling closes.
+    #[test]
+    fn a_forced_demotion_no_longer_makes_the_toggle_reload_the_window() {
+        // The state after a demotion: the surface is a WINDOW, the setting still says
+        // overlay (`false`), because `demote_preview_to_window` never touches it.
+        let open = PreviewSurface::Window;
+        let setting_windowed = false;
+        assert!(
+            !toggled_preview_windowed(open),
+            "the toggle must ask for the overlay the user can see it is not on"
+        );
+        // The old inversion produced `!false` = a WINDOW, the kind already open: the two
+        // answers differ here, and that difference is the bug.
+        assert_ne!(toggled_preview_windowed(open), !setting_windowed);
+    }
+
+    /// The teardown ORDERING the whole fix rests on, pinned at the model level: after the one
+    /// named mutator, the classification is `Ours`. If a later edit issues a destroy without
+    /// going through it, the flag is still set when the echo lands and the document is closed
+    /// (which, on the last document, ends the process mid-dialog).
+    #[test]
+    fn a_marked_teardown_classifies_as_ours_and_an_unmarked_one_does_not() {
+        let mut p = tests::doc(PreviewSurface::Overlay);
+        assert_eq!(
+            surface_closed(p.surface_open, p.edit.baking),
+            SurfaceClosed::LostOutOfBand,
+            "an un-marked destroy is a lost surface, which is what ends the session"
+        );
+        p.mark_surface_torn_down();
+        assert_eq!(
+            surface_closed(p.surface_open, p.edit.baking),
+            SurfaceClosed::Ours,
+            "marking first is what makes our own destroy survivable"
+        );
+        // Idempotent: the `WindowClosed` handler marks again on arrival.
+        p.mark_surface_torn_down();
+        assert_eq!(surface_closed(p.surface_open, p.edit.baking), SurfaceClosed::Ours);
+    }
+
+    /// DRAGON-469 follow-up: promotion to the fullscreen overlay is refused while the settings
+    /// pane is open, because the overlay would take the keyboard (Linux `Exclusive`) and the
+    /// screen from a window in ANOTHER process. Only that direction is blocked.
+    #[rstest::rstest]
+    #[case::to_overlay_with_settings_open(true, true, true)]
+    #[case::to_overlay_with_no_settings(true, false, false)]
+    #[case::to_window_with_settings_open(false, true, false)]
+    #[case::to_window_with_no_settings(false, false, false)]
+    fn only_the_overlay_direction_is_refused_while_settings_is_open(
+        #[case] to_overlay: bool,
+        #[case] settings_open: bool,
+        #[case] want: bool,
+    ) {
+        assert_eq!(overlay_promotion_blocked(to_overlay, settings_open), want);
+    }
+
+    /// The refusal reads the same `toggled_preview_windowed` the mint does, so the two can
+    /// never disagree about which direction the press is heading: pressing the button on a
+    /// WINDOW is the overlay direction, pressing it on the overlay is not.
+    #[test]
+    fn the_refusal_and_the_mint_agree_on_the_direction() {
+        assert!(!toggled_preview_windowed(PreviewSurface::Window), "window ⇒ heading to overlay");
+        assert!(overlay_promotion_blocked(!toggled_preview_windowed(PreviewSurface::Window), true));
+        assert!(toggled_preview_windowed(PreviewSurface::Overlay), "overlay ⇒ heading to window");
+        assert!(!overlay_promotion_blocked(!toggled_preview_windowed(PreviewSurface::Overlay), true));
     }
 }

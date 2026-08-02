@@ -14,9 +14,24 @@
 //!
 //! The two editor groups carry the SAME three rows against DIFFERENT fields (DRAGON-420):
 //! the group title is what says which media a row governs, so the row wording stays
-//! identical rather than growing "…(video)" suffixes. Because this function is also the
-//! search index, both copies are searchable, and a query for "copy to clipboard" turns up
-//! all six with their group names attached.
+//! identical rather than growing "…(video)" suffixes. The one exception is the ask-to-save
+//! row, which names its media outright ("edited screenshots" / "edited videos") because the
+//! ticket does, and because a warning is clearer when it says what it is warning about.
+//! Because this function is also the search index, both copies are searchable, and a query
+//! for "copy changes" turns up both with their group names attached.
+//!
+//! DRAGON-467 replaced the three rows each group used to carry ("Automatically save on copy
+//! to clipboard", "Automatically close on copy to clipboard", "Automatically copy to
+//! clipboard on delete"). The Windows 11 Snipping Tool is the model for two of the new ones,
+//! down to the wording: it ships exactly "Automatically save original screenshots" and "Ask
+//! to save edited screenshots".
+//!
+//! DRAGON-478 stripped the DESCRIPTION text from all six of those rows (owner's call): the
+//! labels already say what each one does, and six paragraphs of explanation under six
+//! near-identical rows made the page read as documentation rather than as settings. The rows
+//! themselves, their fields, their order and their behaviour are untouched — only the
+//! second line is gone. The same change added "Show toolbar group labels" to General, also
+//! label-only, for the same reason.
 //!
 //! A single-page section list (no in-page tab strip yet) — `general.rs`'s split is the
 //! precedent for adding one when this outgrows one screen.
@@ -52,124 +67,148 @@ impl crate::app::App {
                 // is forced windowed in `effective_preview_windowed` too, so a config that
                 // already says `preview_windowed = false` lands on the window rather than on
                 // an overlay editor the software rasterizer cannot draw.
-                items: vec![if crate::platform::overlay_preview_available() {
-                    Item::new(
-                        "Editor appearance",
-                        "",
-                        crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                            &PREVIEW_APPEARANCES,
-                            Some(usize::from(self.preview_windowed)),
+                items: vec![
+                    if crate::platform::overlay_preview_available() {
+                        Item::new(
+                            "Editor appearance",
+                            "",
+                            crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
+                                &PREVIEW_APPEARANCES,
+                                Some(usize::from(self.preview_windowed)),
+                                |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
+                            )),
+                        )
+                        .reset_with(
+                            usize::from(self.preview_windowed),
+                            usize::from(d.preview_windowed),
                             |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                        )),
+                        )
+                    } else {
+                        let mut it = gated_row(
+                            "Editor appearance",
+                            PREVIEW_APPEARANCES[1],
+                            Severity::Warn,
+                        );
+                        it.desc = std::borrow::Cow::Borrowed(
+                            "Windows 10 only draws the editor as a window — the overlay editor \
+                             needs a translucent surface this version of Windows cannot give it.",
+                        );
+                        it
+                    },
+                    // DRAGON-478: the small captions under the top toolbar's groups ("Canvas",
+                    // "Shape", "Redact", …). It belongs beside the appearance row because it is
+                    // the same kind of choice — what the editor LOOKS like before what it does —
+                    // and it is a layout switch as much as a cosmetic one: the caption band
+                    // makes the top bar taller, which `PreviewSurface::chrome_h` reads. No
+                    // description: the label says the whole of it.
+                    Item::new(
+                        "Show toolbar group labels",
+                        "",
+                        toggle(self.preview_toolbar_labels, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewToolbarLabels(a0))
+                        }),
                     )
                     .reset_with(
-                        usize::from(self.preview_windowed),
-                        usize::from(d.preview_windowed),
-                        |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                    )
-                } else {
-                    let mut it = gated_row(
-                        "Editor appearance",
-                        PREVIEW_APPEARANCES[1],
-                        Severity::Warn,
-                    );
-                    it.desc = std::borrow::Cow::Borrowed(
-                        "Windows 10 only draws the editor as a window — the overlay editor \
-                         needs a translucent surface this version of Windows cannot give it.",
-                    );
-                    it
-                }],
+                        self.preview_toolbar_labels,
+                        d.preview_toolbar_labels,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewToolbarLabels(a0)),
+                    ),
+                ],
             },
             SectionSpec {
                 title: "Image Editor",
                 items: vec![
                     Item::new(
-                        "Automatically save on copy to clipboard",
+                        "Automatically copy changes on exit",
                         "",
-                        toggle(self.preview_save_on_copy, |a0| {
-                            Msg::Settings(SettingsMsg::SetPreviewSaveOnCopy(a0))
+                        toggle(self.preview_copy_on_exit, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewCopyOnExit(a0))
                         }),
                     )
                     .reset_with(
-                        self.preview_save_on_copy,
-                        d.preview_save_on_copy,
-                        |a0| Msg::Settings(SettingsMsg::SetPreviewSaveOnCopy(a0)),
+                        self.preview_copy_on_exit,
+                        d.preview_copy_on_exit,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewCopyOnExit(a0)),
                     ),
                     Item::new(
-                        "Automatically close on copy to clipboard",
+                        "Automatically save originals",
                         "",
-                        toggle(self.preview_close_on_copy, |a0| {
-                            Msg::Settings(SettingsMsg::SetPreviewCloseOnCopy(a0))
+                        toggle(self.preview_save_originals, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewSaveOriginals(a0))
                         }),
                     )
                     .reset_with(
-                        self.preview_close_on_copy,
-                        d.preview_close_on_copy,
-                        |a0| Msg::Settings(SettingsMsg::SetPreviewCloseOnCopy(a0)),
+                        self.preview_save_originals,
+                        d.preview_save_originals,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewSaveOriginals(a0)),
                     ),
                     Item::new(
-                        "Automatically copy to clipboard on delete",
+                        "Ask to save edited screenshots",
                         "",
-                        toggle(self.preview_copy_on_delete, |a0| {
-                            Msg::Settings(SettingsMsg::SetPreviewCopyOnDelete(a0))
+                        toggle(self.preview_ask_to_save, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewAskToSave(a0))
                         }),
                     )
                     .reset_with(
-                        self.preview_copy_on_delete,
-                        d.preview_copy_on_delete,
-                        |a0| Msg::Settings(SettingsMsg::SetPreviewCopyOnDelete(a0)),
+                        self.preview_ask_to_save,
+                        d.preview_ask_to_save,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewAskToSave(a0)),
                     ),
                     // DRAGON-353: a "Clipboard size limit" row briefly lived here (relocated
                     // from General → "After a Capture"). The limit is now the fixed
                     // `share::AUTO_COPY_MAX_MB` and the row is GONE: the editor toasts a
                     // named error when it declines an automatic copy for size, so the knob
                     // only ever pre-empted a failure the user can now simply read.
+                    //
+                    // DRAGON-467: "Automatically save on copy to clipboard", "Automatically
+                    // close on copy to clipboard" and "Automatically copy to clipboard on
+                    // delete" lived here (and in the group below) until the actions they
+                    // modified stopped working that way. See `state::schema` for the fields
+                    // and `state::store`'s v9 note for why nothing was carried forward.
                 ],
             },
-            // DRAGON-420: the SAME three rows for recordings, on their own fields. Video
-            // shares have matched image shares since DRAGON-398, and until now they also
-            // borrowed the image SETTINGS — so a user who wanted screenshots to close on copy
-            // had to accept the recording editor closing too, over media that is far more
-            // expensive to reopen. One group per kind, identical wording (the group title is
-            // what disambiguates), identical defaults.
+            // The SAME three rows for recordings, on their own fields (the DRAGON-420 split).
+            // One group per kind, near-identical wording — the group title is what
+            // disambiguates, so only the row that must name the media ("edited videos") does
+            // — and identical defaults.
             SectionSpec {
                 title: "Video Editor",
                 items: vec![
                     Item::new(
-                        "Automatically save on copy to clipboard",
+                        "Automatically copy changes on exit",
                         "",
-                        toggle(self.preview_video_save_on_copy, |a0| {
-                            Msg::Settings(SettingsMsg::SetPreviewVideoSaveOnCopy(a0))
+                        toggle(self.preview_video_copy_on_exit, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewVideoCopyOnExit(a0))
                         }),
                     )
                     .reset_with(
-                        self.preview_video_save_on_copy,
-                        d.preview_video_save_on_copy,
-                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoSaveOnCopy(a0)),
+                        self.preview_video_copy_on_exit,
+                        d.preview_video_copy_on_exit,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoCopyOnExit(a0)),
                     ),
                     Item::new(
-                        "Automatically close on copy to clipboard",
+                        "Automatically save originals",
                         "",
-                        toggle(self.preview_video_close_on_copy, |a0| {
-                            Msg::Settings(SettingsMsg::SetPreviewVideoCloseOnCopy(a0))
+                        toggle(self.preview_video_save_originals, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewVideoSaveOriginals(a0))
                         }),
                     )
                     .reset_with(
-                        self.preview_video_close_on_copy,
-                        d.preview_video_close_on_copy,
-                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoCloseOnCopy(a0)),
+                        self.preview_video_save_originals,
+                        d.preview_video_save_originals,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoSaveOriginals(a0)),
                     ),
                     Item::new(
-                        "Automatically copy to clipboard on delete",
+                        "Ask to save edited videos",
                         "",
-                        toggle(self.preview_video_copy_on_delete, |a0| {
-                            Msg::Settings(SettingsMsg::SetPreviewVideoCopyOnDelete(a0))
+                        toggle(self.preview_video_ask_to_save, |a0| {
+                            Msg::Settings(SettingsMsg::SetPreviewVideoAskToSave(a0))
                         }),
                     )
                     .reset_with(
-                        self.preview_video_copy_on_delete,
-                        d.preview_video_copy_on_delete,
-                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoCopyOnDelete(a0)),
+                        self.preview_video_ask_to_save,
+                        d.preview_video_ask_to_save,
+                        |a0| Msg::Settings(SettingsMsg::SetPreviewVideoAskToSave(a0)),
                     ),
                 ],
             },

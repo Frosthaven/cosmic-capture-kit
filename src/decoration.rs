@@ -151,6 +151,243 @@ pub fn corner_radius_from_alpha(img: &image::RgbaImage) -> Option<f32> {
     }
 }
 
+// ─── The portable decoration assembly (DRAGON-463) ───────────────────────────
+//
+// Until this ticket, the steps that turn a captured window into the picture the user
+// asked for — keep-or-flatten transparency, ring, shadow-or-padding, the 3-way
+// backdrop, the cursor overlay — were written out THREE times, once per platform
+// (`platform/linux/native/screenshot.rs`, `platform/mac/screenshot.rs`,
+// `platform/windows/screenshot.rs`). They had drifted only slightly, which is worse
+// than drifting a lot: nobody could see it.
+//
+// That duplication is why the capture-extras behaviour could not be tested for real.
+// A pixel test written against one platform proved nothing about the others, and a new
+// compositor would have written a fourth copy that no test could see. Sharing the
+// assembly is the precondition for the matrix tests, not a tidy-up.
+//
+// What deliberately did NOT move: how each platform obtains its window pixels, its
+// wallpaper pixels, and its corner shape. Those are genuinely native.
+
+/// How a captured window's corners are already shaped, and therefore what the
+/// decoration must do about them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CornerStyle {
+    /// The capture has SQUARE corners and must be rounded to this radius in physical
+    /// px. Linux and Windows: the compositor hands back the full rectangle.
+    Rounded(u32),
+    /// The capture already carries its native rounded-corner alpha, so rounding again
+    /// would carve a second ring off real pixels. macOS: SCK delivers the window's own
+    /// squircle. The border is drawn by dilating that alpha instead of by a circle.
+    ///
+    /// Only macOS SELECTS this. Gated honestly rather than blanket-allowed: if a future
+    /// compositor starts delivering native corners, deleting one attribute is the whole
+    /// change. (The window-decoration matrix will construct it everywhere once it lands,
+    /// which is the point of un-gating the native-corner helpers in `compose`.)
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Native,
+}
+
+/// What sits behind the window in the finished picture. The three arms ARE the
+/// wallpaper/transparency matrix; see [`backdrop_for`].
+pub enum Backdrop {
+    /// Composite over these pixels. The platform prepares them (Linux re-renders the
+    /// wallpaper file as its compositor placed it; macOS and Windows pass their own
+    /// grab), because where wallpaper pixels come from is native. What to DO with them
+    /// is not.
+    ///
+    /// No platform SELECTS this today: all three own a `composite_over_wallpaper` that
+    /// computes its own crop and does its own `over`, so they never hand prepared pixels
+    /// back. It is the seam's honest expression of the three-way rule and the matrix
+    /// tests assert through it, so it is gated to test builds rather than deleted.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Behind(image::RgbaImage),
+    /// Opaque flat black.
+    Black,
+    /// Keep the window's own alpha, plus whatever halo the shadow drew.
+    Transparent,
+}
+
+/// Which backdrop the wallpaper + transparency toggles ask for.
+///
+/// The rule, and the reason it is not two independent bits: turning the wallpaper off
+/// only asks "do not show the desktop behind this window". It does not say what to show
+/// instead, and that answer depends on transparency. With transparency ON the honest
+/// answer is nothing (the window keeps its own alpha); with it OFF there is no alpha to
+/// keep, so the capture needs an opaque backing and gets black.
+///
+/// Pure, so the matrix can assert it directly and the pixel tests can assert what each
+/// arm then produces.
+#[must_use]
+pub fn backdrop_for(wallpaper: bool, transparency: bool) -> BackdropKind {
+    if wallpaper {
+        BackdropKind::Wallpaper
+    } else if !transparency {
+        BackdropKind::Black
+    } else {
+        BackdropKind::Transparent
+    }
+}
+
+/// [`backdrop_for`]'s answer, before the platform supplies any wallpaper pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackdropKind {
+    Wallpaper,
+    Black,
+    Transparent,
+}
+
+/// Everything the decoration needs that is NOT platform-specific.
+pub struct DecorationOpts {
+    /// Keep the window's own alpha. False flattens it to opaque.
+    pub keep_transparency: bool,
+    /// See [`CornerStyle`].
+    pub corners: CornerStyle,
+    /// The ring: LOGICAL width + colour, already resolved to the active or inactive
+    /// spec by the caller (`WindowBorders::for_active`). `None` draws no ring.
+    pub border: Option<(f32, [u8; 4])>,
+    /// Draw the reconstructed drop shadow into the margin.
+    pub shadow: bool,
+    /// Shadow tuning for a dark theme.
+    pub dark: bool,
+    /// TOTAL margin from the window edge, LOGICAL px. The ring lives INSIDE it, so the
+    /// transparent padding is this minus the border width.
+    pub pad_logical: f32,
+    /// The captured display's backing scale, for converting the logical values above.
+    pub scale: f32,
+    /// Floor for the scaled border width, in physical px.
+    ///
+    /// A DIVERGENCE, preserved rather than unified (DRAGON-463 step 2 is byte-identity).
+    /// macOS clamps the scaled ring to at least 1px so a configured border can never
+    /// round away to nothing; Linux and Windows do not, so at a sub-1.0 scale their ring
+    /// can vanish. Worth settling deliberately, but not inside a refactor.
+    pub min_border_px: u32,
+}
+
+/// A decorated window plus the measurements its caller still needs.
+pub struct Decorated {
+    pub img: image::RgbaImage,
+    /// Border + padding, LOGICAL px: the offset from the canvas edge to the window
+    /// content. The cursor overlay and the wallpaper crop both position from this.
+    pub total_margin_logical: f32,
+    /// The window content's physical size inside the canvas, before margins.
+    ///
+    /// Only Linux reads it, for the frosted-glass footprint; the other platforms have no
+    /// frosting, so they construct `Decorated` without ever consuming this. Gated to say
+    /// exactly that rather than blanket-allowed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub content: (u32, u32),
+    /// Radius of the outer (post-ring) shape, for the shadow footprint.
+    ///
+    /// `decorate` uses it internally; no CALLER needs it yet, because each platform's
+    /// wallpaper composite derives its own footprint. Kept because it is the only way a
+    /// caller could reproduce the shadow's shape, and asserted by the matrix tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub outer_radius: u32,
+}
+
+/// Turn a captured window into a decorated canvas: transparency, ring, then shadow or
+/// plain padding. The backdrop and the cursor are applied separately
+/// ([`apply_backdrop`], [`overlay_cursor`]) because both need pixels the platform owns.
+///
+/// This is the shared half of what were three near-identical bodies. Read the module
+/// note above for what stayed native and why.
+pub fn decorate(img: image::RgbaImage, opts: &DecorationOpts) -> Decorated {
+    let (fin, base_radius) = match opts.corners {
+        CornerStyle::Rounded(r) => {
+            (crate::compose::finish_window(img, r, opts.keep_transparency), r)
+        }
+        // No radius of our own: the alpha already carries the real corner shape.
+        CornerStyle::Native => {
+            (crate::compose::finish_window_native_corners(img, opts.keep_transparency), 0)
+        }
+    };
+    let (content_w, content_h) = (fin.width(), fin.height());
+    let bw_logical = opts.border.map(|(w, _)| w).unwrap_or(0.0);
+    let (bordered, outer_radius) = match opts.border {
+        Some((_, color)) => {
+            let bw = ((bw_logical * opts.scale).round() as u32).max(opts.min_border_px);
+            let ringed = match opts.corners {
+                CornerStyle::Rounded(r) => {
+                    crate::compose::add_border(fin, bw, color, r + bw)
+                }
+                // Dilate the window's own alpha so the ring hugs the real corner shape
+                // concentrically; a circular ring bulges past a squircle's edge.
+                CornerStyle::Native => {
+                    crate::compose::add_border_native_corners(fin, bw, color)
+                }
+            };
+            (ringed, base_radius + bw)
+        }
+        None => (fin, base_radius),
+    };
+    // The ring is drawn INSIDE the user's padding, so it subtracts from the margin.
+    // Without this, turning a border on would silently grow the whole canvas.
+    let margin_logical = (opts.pad_logical - bw_logical).max(0.0);
+    let margin_px = (margin_logical * opts.scale).round() as u32;
+    // The shadow draws into whatever margin exists and is clipped when there is not
+    // room (padding off). The canvas is never grown to fit it.
+    let out = if opts.shadow {
+        crate::compose::with_shadow(bordered, margin_px, outer_radius, opts.scale, opts.dark)
+    } else if margin_px > 0 {
+        crate::compose::pad_transparent(bordered, margin_px)
+    } else {
+        bordered
+    };
+    Decorated {
+        img: out,
+        total_margin_logical: bw_logical + margin_logical,
+        content: (content_w, content_h),
+        outer_radius,
+    }
+}
+
+/// Apply the backdrop chosen by [`backdrop_for`].
+pub fn apply_backdrop(img: image::RgbaImage, backdrop: Backdrop) -> image::RgbaImage {
+    match backdrop {
+        Backdrop::Behind(bg) => crate::compose::over(bg, &img),
+        Backdrop::Black => crate::compose::on_black(img),
+        Backdrop::Transparent => img,
+    }
+}
+
+/// Where the cursor sprite lands on a decorated canvas.
+///
+/// Pure, and separate from the drawing, because the offset is the part that was subtly
+/// re-derived on each platform: the canvas extends past the window content by the total
+/// margin, so a sprite positioned from the canvas origin drifts by exactly that much.
+///
+/// `pointer` is in GLOBAL logical coords, `sel_origin` is the window's logical origin,
+/// and `hotspot` is the sprite's hotspot in physical px.
+///
+/// The three are taken as PAIRS rather than six scalars because that is how every caller
+/// already holds them (`CursorSprite` carries `(i32, i32)` hotspots on all three
+/// platforms), so the call site does no unpacking and no casting. Six loose `i32`s also
+/// put this one argument over clippy's limit, which was a fair complaint about a
+/// signature nobody could read.
+#[must_use]
+pub fn cursor_offset(
+    pointer: (i32, i32),
+    sel_origin: (i32, i32),
+    total_margin_logical: f32,
+    scale: f32,
+    hotspot: (i32, i32),
+) -> (i64, i64) {
+    let off = (total_margin_logical * scale).round() as i64;
+    let px = ((pointer.0 - sel_origin.0) as f32 * scale).round() as i64 + off - hotspot.0 as i64;
+    let py = ((pointer.1 - sel_origin.1) as f32 * scale).round() as i64 + off - hotspot.1 as i64;
+    (px, py)
+}
+
+/// Whether the launch-locked pointer lies within the picked window's logical rect.
+///
+/// The window-capture cursor overlay is gated on this (DRAGON-213): the decorated canvas
+/// extends past the window content, so relying on canvas clipping alone floated a cursor
+/// beside the window whenever the pointer merely happened to be nearby at launch.
+#[must_use]
+pub fn cursor_over_window(gx: i32, gy: i32, sel_x: i32, sel_y: i32, w: u32, h: u32) -> bool {
+    gx >= sel_x && gx < sel_x + w as i32 && gy >= sel_y && gy < sel_y + h as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

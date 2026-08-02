@@ -30,6 +30,88 @@ const ANNOT_PICKER_CONTENT_H: f32 = 214.0;
 /// the narrowest preview the editor will open at.
 pub(super) const CROP_ACCEPT_LABEL: &str = "Apply Crop";
 
+// ── The top bar's GROUP CAPTIONS (DRAGON-478) ────────────────────────────────────────────────
+//
+// Each cluster on the TOP edit bar gets a small, very subdued word under it saying what the
+// family is for ("Canvas", "Shape", "Redact", …). The words live where the grouping lives: on
+// [`TrayGroup::caption`] for the declared annotation tray, and in [`SHARE_GROUP_CAPTION`] for the
+// one top-bar group that is not a tray row. Nothing else may spell one.
+//
+// The band is OPTIONAL (the "Show toolbar group labels" setting) and it is a LAYOUT feature, not
+// only a cosmetic one: it makes the top bar taller, so [`caption_band_h`] is added into
+// `PreviewSurface::chrome_h` — THE one chrome-height source the windowed open fit, the overlay
+// column and the fit/zoom math all read. With the setting off the band is exactly zero and the
+// editor's geometry is byte-identical to the pre-DRAGON-478 build.
+
+/// The caption's font size in UNSCALED px (multiplied by [`Tb::scale`], then snapped to a whole
+/// pixel). **An owner-tuned dial, settled on screen, not derived**: 10.0 rendered 8px and read
+/// as a squished smear (the owner's screenshot), doubling to 20.0 rendered 16px and read too
+/// large, and a third off (13.4, 11px rendered) is where the owner landed. Retune by eye, and
+/// keep [`CAPTION_LINE_H`] moving proportionally with it.
+pub(super) const CAPTION_TEXT_SIZE: f32 = 13.4;
+
+/// The caption's LINE BOX in unscaled px, pinned absolutely rather than left to the font's own
+/// line height. That is what makes the band's height arithmetic exact: what
+/// [`caption_band_h`] reserves is what the text draws into, at every scale and on every
+/// platform's font stack. Tracks [`CAPTION_TEXT_SIZE`] at the same proportion: the glyphs
+/// centre inside this box, so the box clearing the text is what keeps the word from hugging
+/// the cluster above it.
+pub(super) const CAPTION_LINE_H: f32 = 16.0;
+
+/// The unscaled gap between a cluster's bottom edge and its caption's line box — the label's
+/// top padding, owner-tuned by eye (4px in the round that settled the size, then 6). Also
+/// the label's BOTTOM padding when the captions are on, via [`top_bar_bottom_pad`]: one
+/// dial moves both sides of the word together.
+pub(super) const CAPTION_GAP: f32 = 6.0;
+
+/// The toolbar bars' standard vertical padding (flat px) — the 8 in [`preview_bar`]'s
+/// historical `[8, 12]` — named so the caption-symmetry seam below and
+/// `PreviewSurface::chrome_h` read the SAME number the bar draws with.
+pub(super) const BAR_V_PAD: f32 = 8.0;
+
+/// The TOP bar's BOTTOM padding: [`BAR_V_PAD`] as always, except with the captions on,
+/// where it becomes [`CAPTION_GAP`] at the same scale the gap above the word uses.
+///
+/// This is the fix for the owner's "padding doesn't do what I think" screenshot: the space
+/// ABOVE a caption is the gap (~5px scaled), but BELOW it sat the bar's full 8px padding on
+/// top of the line box's slack, so the word read top-heavy in a band of dead bar. Swapping
+/// the bar's bottom padding for the scaled gap makes the band symmetric BY CONSTRUCTION —
+/// the line box's own slack already sits evenly around the glyphs — and keeps it symmetric
+/// through every future retune of the gap. The OVERLAY is deliberately out of scope: it has
+/// no bar fill under its toolbar, so the space below its captions is column rhythm, not a
+/// bar that can read as empty.
+///
+/// Pure and unit-tested; `PreviewSurface::chrome_h` reserves exactly this, so the view and
+/// the open fit cannot drift.
+pub(super) fn top_bar_bottom_pad(labels: bool, scale: f32) -> f32 {
+    if labels { CAPTION_GAP * scale } else { BAR_V_PAD }
+}
+
+const _: () = assert!(
+    CAPTION_LINE_H > CAPTION_TEXT_SIZE,
+    "the caption's pinned line box must clear its glyph size, or the reserved band clips the label"
+);
+
+/// The caption under the Save / Copy / Share / Upload group ([`Tb::share_group`]) — the one
+/// top-bar cluster that is not an [`ANNOT_TRAY`] row, so it carries its caption here rather than
+/// as a declared field.
+pub(super) const SHARE_GROUP_CAPTION: &str = "File Actions";
+
+/// The EXTRA vertical space the top edit bar takes when the group captions are drawn: the gap
+/// plus the caption's pinned line box, at the chrome scale. Zero when they are off, which is
+/// what returns the whole editor to its pre-DRAGON-478 geometry.
+///
+/// Pure (no theme, no widgets, no platform) and unit-tested, because it is read from two
+/// different places that must not drift: the view (`Tb::captioned`, which builds the column this
+/// measures) and `PreviewSurface::chrome_h` (which reserves it).
+pub(super) fn caption_band_h(labels: bool, scale: f32) -> f32 {
+    if labels {
+        scale * (CAPTION_GAP + CAPTION_LINE_H)
+    } else {
+        0.0
+    }
+}
+
 /// Format a tool tooltip as `"Name  (KEY)"`, reading the LIVE binding for `action` from the
 /// keymap (the SAME lookup the settings shortcuts page uses: [`crate::shortcuts::Keymap::get`]
 /// → [`crate::shortcuts::Shortcut::label`]). Falls back to just `"Name"` when the action is
@@ -83,6 +165,11 @@ pub(super) struct Tb {
     /// the flyout (its text above, background below — an overlay layer-batching artifact).
     /// `false` restores the normal tooltips.
     pub(super) suppress_tooltips: bool,
+    /// Draw the group CAPTIONS under the top bar's clusters (DRAGON-478; the "Show toolbar
+    /// group labels" setting). Threaded on `Tb` because that is how every other view-wide
+    /// chrome fact already reaches the builders — and it must agree with the SAME flag
+    /// `PreviewSurface::chrome_h` is given, or the bar would draw a band nothing reserved.
+    pub(super) labels: bool,
 }
 
 impl Tb {
@@ -125,6 +212,48 @@ impl Tb {
     /// lives, so an upward flyout's offset matches exactly what [`Tb::panel_container`] draws.
     pub(super) fn flyout_panel_h(self, content_h: f32) -> f32 {
         content_h + 2.0 * FLYOUT_PAD * self.scale
+    }
+
+    /// Put `caption` under a built top-bar cluster (DRAGON-478), centred on it. Returns the
+    /// cluster UNCHANGED when the labels setting is off, so that path is byte-identical to the
+    /// pre-DRAGON-478 bar.
+    ///
+    /// An EMPTY `caption` still reserves the band and draws no word. That is how a top-bar group
+    /// with no caption of its own (the macOS fullscreen Close) stays on the same line as its
+    /// captioned neighbours: the row centres its items vertically, so an item shorter by the band
+    /// would visibly sink.
+    ///
+    /// TONE: [`quiet_on_bar`], not [`quiet_on_cluster`]. The caption sits on the BAR, OUTSIDE the
+    /// cluster's chip, and the two tokens are measured against different surfaces
+    /// (`primary.base` vs `background.component.base`) — the document-info block made the same
+    /// call for the same reason. The fullscreen OVERLAY draws this bar with no `preview_bar`
+    /// fill behind it at all, so `primary.base` is an approximation there; it is still the closer
+    /// of the two, and the alternative would be a third token for one word.
+    pub(super) fn captioned<'a>(
+        self,
+        cluster: Element<'a, Msg>,
+        caption: &'static str,
+    ) -> Element<'a, Msg> {
+        if !self.labels {
+            return cluster;
+        }
+        let label = widget::text(caption)
+            // Snapped to a whole pixel like every other scaled chrome measure, and floored so a
+            // future smaller scale can never render it as an unreadable smear.
+            .size((CAPTION_TEXT_SIZE * self.scale).round().max(8.0))
+            .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+                cosmic::iced::Pixels(CAPTION_LINE_H * self.scale),
+            ))
+            .class(cosmic::theme::Text::Custom(|t: &cosmic::Theme| {
+                cosmic::iced::widget::text::Style {
+                    color: Some(quiet_on_bar(t)),
+                    ..Default::default()
+                }
+            }));
+        widget::column(vec![cluster, label.into()])
+            .spacing(CAPTION_GAP * self.scale)
+            .align_x(Alignment::Center)
+            .into()
     }
 }
 
@@ -170,6 +299,50 @@ impl Tb {
             )
             .class(cosmic::theme::Button::Icon)
             .on_press(Msg::Preview(self.pid, msg))
+            .padding(self.btn_pad()),
+        );
+        self.tip(button, widget::text(tip).size(12), pos)
+    }
+
+    /// [`Self::tool_button_tinted`] that can be INERT (DRAGON-467) — the action-group twin of
+    /// [`Self::history_button`]'s disabled arm, for a capability this build does not have
+    /// (Share) or a feature that does not exist yet (Upload).
+    ///
+    /// Disabled means three things at once, and all three matter:
+    ///
+    /// * **no `on_press`**, so the message is never emitted. That is the real gate; the
+    ///   colour is only how it is communicated.
+    /// * **the [`disabled_label_tone`] glyph**, the cluster-border token shared with every
+    ///   other disabled control here, so "off" reads the same across the editor.
+    /// * **the tooltip stays**. `history_button` drops its tooltip when it greys out, which is
+    ///   right for undo/redo (an empty stack needs no explanation). It is wrong here: a
+    ///   permanently disabled Share or Upload is exactly the button a user WILL hover to ask
+    ///   why, and the tooltip is the only place the answer can live.
+    ///
+    /// The `tint` argument is accepted and deliberately IGNORED while disabled, so a caller
+    /// can pass the group's shared dirty tint without having to special-case these two.
+    pub(super) fn tool_button_gated(
+        self,
+        name: &'static str,
+        tip: String,
+        msg: PreviewMsg,
+        pos: widget::tooltip::Position,
+        enabled: bool,
+        tint: Option<fn(&cosmic::Theme) -> cosmic::iced::Color>,
+    ) -> Element<'static, Msg> {
+        if enabled {
+            return self.tool_button_tinted(name, tip, msg, pos, tint);
+        }
+        let glyph = crate::widgets::icons::sized(name, self.icon_box()).class(
+            cosmic::theme::Svg::custom(|theme| cosmic::widget::svg::Style {
+                color: Some(disabled_label_tone(theme)),
+            }),
+        );
+        let button = crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::custom(
+                widget::container(glyph).width(Length::Fill).align_x(Alignment::Center),
+            )
+            .class(cosmic::theme::Button::Icon)
             .padding(self.btn_pad()),
         );
         self.tip(button, widget::text(tip).size(12), pos)
@@ -317,33 +490,61 @@ impl Tb {
             .into()
     }
 
-    /// THE action group (DRAGON-353): Save / Save As / Copy / Delete, in one capsule.
+    /// THE action group (DRAGON-467): Save / Copy / Share / Upload, then Delete, in one
+    /// capsule.
     ///
-    /// Delete joined the share actions here (it used to sit beside the size chip, which
-    /// now stands alone — see [`Self::info_chip`]) so every way of DISPOSING of the capture
-    /// reads as one set. `--preview` (`external`) files drop Delete: that file is the
-    /// user's, not ours to remove.
+    /// The four leading buttons and their lucide glyphs are the ticket's own list:
     ///
-    /// **The dirty tint**: while the document has unsaved edits, the three SHARING actions
-    /// wear the accent's COMPANION colour (its complement — see
-    /// [`super::annotate::companion`]) — each of them is the thing that would commit or
-    /// carry those edits, so "there is something here you haven't dealt with" belongs on
-    /// exactly those glyphs. Delete never takes the tint: it destroys rather than commits,
-    /// and inviting the eye to it while work is unsaved would be a trap.
+    /// * **Save** (`save`) opens the destination picker pre-filled with the path a plain
+    ///   overwrite-save would have written. The separate "Save As" button is GONE — with the
+    ///   prefill there is nothing left for it to do differently.
+    /// * **Copy** (`copy`) puts the current state on the clipboard and nothing else.
+    /// * **Share** (`share`, the box-with-an-arrow-out; DRAGON-478 moved it off `share-2`, the
+    ///   three-node graph that reads as social sharing) hands the file to the system share
+    ///   sheet, and appears only on
+    ///   systems that HAVE one (`platform::services::share_available`), which the ticket
+    ///   scoped it to. WINDOWS has one since DRAGON-474, so the button is there; macOS and
+    ///   Linux do not, so it is absent there (see `share::share_sheet`'s module doc for what
+    ///   each platform would call). It differs from Upload deliberately: Upload is a feature
+    ///   that does not exist ANYWHERE yet, so showing it disabled advertises what is coming,
+    ///   while Share is a capability of the MACHINE, and a permanently dead control on a
+    ///   desktop that will never have one is just noise.
+    /// * **Upload** (`cloud-upload` since DRAGON-478 — the cloud is what says "account", where
+    ///   plain `upload` was one arrow away from Save) is the accounts feature, which does not
+    ///   exist yet, so it ships
+    ///   permanently disabled (the ticket says so outright).
+    ///
+    /// **Delete is GONE** (user decision after testing DRAGON-467: "remove delete from the
+    /// preview editor, not needed anymore"). It made sense when every capture was written to
+    /// the user's folder the instant it was taken, so the editor needed a way to take it back.
+    /// It does not now: with "Automatically save originals" off, an unwanted capture is never
+    /// in the user's folder at all, and closing the editor is the whole of "no thanks". The
+    /// trash button, its Ctrl+Shift+X action, the ask-card's Delete option and the file-unlink
+    /// plumbing behind them all went together — see `PreviewState`'s note where `written` and
+    /// `delete_paths` used to live.
+    ///
+    /// **The dirty tint**: while the document has unsaved edits, the ENABLED committing
+    /// actions wear the accent's COMPANION colour (its complement — see
+    /// [`super::annotate::companion`]) — each is the thing that would commit or carry those
+    /// edits, so "there is something here you haven't dealt with" belongs on exactly those
+    /// glyphs. Delete never takes the tint: it destroys rather than commits, and inviting the
+    /// eye to it while work is unsaved would be a trap. A DISABLED button never takes it
+    /// either: it already has a tone that says "not now", and two states on one glyph is one
+    /// too many.
     pub(super) fn share_group(
         self,
         dirty: bool,
-        external: bool,
         km: &crate::shortcuts::Keymap,
     ) -> Element<'static, Msg> {
         use crate::shortcuts::Action;
         // Top toolbar → tooltips drop below.
         let pos = widget::tooltip::Position::Bottom;
-        // One shared tint for the three sharing actions, so they can never disagree about
+        // One shared tint for the committing actions, so they can never disagree about
         // whether the document is dirty. The accent's COMPANION (its complement), not the
         // WARNING amber — an unsaved document is a normal working state, not an alarm.
         let tint: Option<fn(&cosmic::Theme) -> cosmic::iced::Color> =
             dirty.then_some(super::annotate::companion as fn(&cosmic::Theme) -> cosmic::iced::Color);
+        let can_share = crate::platform::services::share_available();
         let mut buttons = vec![
             self.tool_button_tinted(
                 "document-save-symbolic",
@@ -353,34 +554,37 @@ impl Tb {
                 tint,
             ),
             self.tool_button_tinted(
-                "document-save-as-symbolic",
-                action_tip("Save As", Action::PreviewSaveAs, km),
-                PreviewMsg::SaveAs,
-                pos,
-                tint,
-            ),
-            self.tool_button_tinted(
-                // DRAGON-357: the lucide clipboard-copy glyph, tooltip "Copy to clipboard" with
-                // the live hotkey appended by `action_tip`.
-                "clipboard-copy-symbolic",
+                "document-copy-symbolic",
                 action_tip("Copy to clipboard", Action::PreviewCopy, km),
                 PreviewMsg::Copy,
                 pos,
                 tint,
             ),
-        ];
-        if !external {
-            // A plain (non-destructive-styled, never warning-tinted) trash button.
-            buttons.push(self.tool_button(
-                "edit-delete-symbolic",
-                action_tip("Delete", Action::PreviewDelete, km),
-                PreviewMsg::Delete,
+            self.tool_button_gated(
+                "upload-symbolic",
+                "Upload  (accounts are not available yet)".to_string(),
+                PreviewMsg::Upload,
                 pos,
-            ));
+                false,
+                tint,
+            ),
+        ];
+        if can_share {
+            // Between Copy and Upload, so the group reads share-with-this-machine then
+            // share-with-an-account. Inserted rather than pushed for exactly that ordering.
+            buttons.insert(
+                2,
+                self.tool_button_gated(
+                    "share-symbolic",
+                    "Share".to_string(),
+                    PreviewMsg::Share,
+                    pos,
+                    true,
+                    tint,
+                ),
+            );
         }
-        // DRAGON-357: the same bordered cluster the top-left tray groups wear (the per-button
-        // companion tint on Save/Save As/Copy and the untinted Delete are unchanged — only the
-        // group container gains its 1px border).
+        // DRAGON-357: the same bordered cluster the top-left tray groups wear.
         self.tool_cluster(buttons)
     }
 
@@ -538,6 +742,7 @@ impl Tb {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compose_preview<'a>(
     windowed: bool,
+    labels: bool,
     overlay_width: f32,
     overlay_header: Option<Element<'a, Msg>>,
     edit_toolbar: Element<'a, Msg>,
@@ -586,14 +791,26 @@ pub(super) fn compose_preview<'a>(
     if windowed {
         // The windowed preview's titlebar owns those controls; nothing to slot in here.
         drop(overlay_header);
-        let mut col: Vec<Element<'a, Msg>> = vec![preview_bar(edit_toolbar, false, glass), image];
+        // The TOP bar's bottom padding is the caption-symmetry seam (`top_bar_bottom_pad`):
+        // both surfaces share the one chrome scale, which is what lets this arm read it
+        // without a `Tb` in hand.
+        let mut col: Vec<Element<'a, Msg>> = vec![
+            preview_bar(
+                edit_toolbar,
+                false,
+                glass,
+                top_bar_bottom_pad(labels, super::surface::CHROME_SCALE),
+            ),
+            image,
+        ];
         // The video transport strip sits between the canvas and the action bar.
         if let Some(t) = transport {
             col.push(transport_bar(t, true, glass));
         }
         // The bottom bar sits at the window's bottom edge, so round its bottom corners
         // to match the CSD window's rounded corners (no square nubs past the rounding).
-        col.push(preview_bar(action_toolbar, true, glass));
+        // No caption band below it, so it keeps the standard symmetric padding.
+        col.push(preview_bar(action_toolbar, true, glass, BAR_V_PAD));
         widget::column(col)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -690,16 +907,24 @@ pub(super) fn transport_bar(
 /// A full-width top/bottom toolbar bar for the windowed preview: the toolbar row
 /// centred on a standard surface colour (light/dark respecting) that spans the window.
 /// `round_bottom` rounds the bottom corners so the bottom bar meets the CSD window's
-/// rounded corners cleanly.
+/// rounded corners cleanly. `bottom_pad` is [`BAR_V_PAD`] for the bottom bar and the
+/// caption-symmetry answer ([`top_bar_bottom_pad`]) for the top one — explicit rather than
+/// derived here, so the ONE seam `chrome_h` reserves from is also the one the caller reads.
 pub(super) fn preview_bar(
     row: Element<'_, Msg>,
     round_bottom: bool,
     glass: Option<crate::app::theme::GlassConfig>,
+    bottom_pad: f32,
 ) -> Element<'_, Msg> {
     widget::container(row)
         .width(Length::Fill)
         .align_x(Alignment::Center)
-        .padding([8.0, 12.0])
+        .padding(cosmic::iced::Padding {
+            top: BAR_V_PAD,
+            right: 12.0,
+            bottom: bottom_pad,
+            left: 12.0,
+        })
         .class(cosmic::theme::Container::custom(move |theme| {
             let c = theme.cosmic();
             let br = if round_bottom {
@@ -1276,20 +1501,13 @@ fn quiet_on(t: &cosmic::Theme, surface: cosmic::iced::Color) -> cosmic::iced::Co
     )
 }
 
-/// **THE cluster BORDER colour** — the 1px hairline [`Tb::tool_cluster`] outlines every toolbar
-/// group with, and (DRAGON-392 correction) the tone a DISABLED control's glyphs/text wear, at the
-/// owner's instruction: "make the subdued color for these toolbar buttons actually match the
-/// button group border". Read through this ONE function by both, so a theme change can never move
-/// the border without moving the disabled tone with it.
-///
-/// It is the theme's `background.divider`, which is ALREADY FLATTENED to an opaque colour by
-/// cosmic-theme (`over(on_bg @ 20% alpha, background.base)`) — so, unlike a raw translucent
-/// token, it is safe as an SVG tint despite the rasterizer discarding colour alpha (see
-/// [`Tb::slider_with_icon`]'s note). Measured: dark `0.266` grey against a `0.182` cluster fill,
-/// light `0.689` against `0.960` — faint in both, deliberately, and never invisible.
-pub(super) fn cluster_border(t: &cosmic::Theme) -> cosmic::iced::Color {
-    t.cosmic().background.divider.into()
-}
+// **THE cluster BORDER colour** — the 1px hairline [`Tb::tool_cluster`] outlines every toolbar
+// group with, and (DRAGON-392 correction) the tone a DISABLED control's glyphs/text wear, at the
+// owner's instruction: "make the subdued color for these toolbar buttons actually match the
+// button group border". Read through this ONE import by both, so a theme change can never move
+// the border without moving the disabled tone with it. The body (and the token's full story)
+// moved to `app::theme` in DRAGON-475, when the capture toolbar became its second consumer.
+pub(super) use crate::app::theme::cluster_border;
 
 /// [`quiet_on`] the CLUSTER fill (`background.component.base`) — content inside a bordered
 /// toolbar group: the slider glyphs, and every control the crop session disables.
@@ -1537,6 +1755,12 @@ impl App {
     /// ([`App::preview_header_controls`]) and the overlay's own header row
     /// ([`Self::overlay_header_row`]). The do-not-train + covermark tools live on the BOTTOM
     /// bar (see [`Self::edit_tools`]).
+    ///
+    /// DRAGON-478: every group present on THIS bar (and only this bar) carries a small caption
+    /// under it ([`Tb::captioned`]), when the "Show toolbar group labels" setting is on. Only
+    /// groups actually drawn get one — the conditions are the same `if`s that decide whether the
+    /// group is built at all — and the extra height is reserved once, on the same flag, by
+    /// [`PreviewSurface::chrome_h`].
     pub(super) fn edit_toolbar<'a>(&'a self, preview: &'a PreviewState, tb: Tb) -> Element<'a, Msg> {
         let km = &self.keymap;
         // DRAGON-410: a live crop session is modal over this WHOLE bar, not just the tray inside
@@ -1558,7 +1782,9 @@ impl App {
         // contradicts the session — Save would have written the UN-cropped image.
         let mut right: Vec<Element<'a, Msg>> = Vec::new();
         if top_bar_item_state(TopBarItem::Share, cropping) != TrayItemState::Hidden {
-            right.push(tb.share_group(preview.unsaved(), preview.external, km));
+            // DRAGON-478: captioned like every tray cluster, and on the SAME presence condition,
+            // so a crop session (which hides this group whole) hides its caption with it.
+            right.push(tb.captioned(tb.share_group(preview.unsaved(), km), SHARE_GROUP_CAPTION));
         }
         // The Close (x) button normally lives elsewhere: the OVERLAY draws it on its header
         // row, the WINDOWED preview gets it from the native window chrome. DRAGON-268
@@ -1579,7 +1805,11 @@ impl App {
         #[cfg(not(target_os = "macos"))]
         let show_close = false;
         if show_close {
-            right.push(tb.cancel_group(km));
+            // No caption of its own (it is the WINDOW's chrome, not an editing family), but it
+            // takes the empty-caption band so it stays on the same line as the captioned groups
+            // beside it — the row centres its items vertically, so an item short by the band
+            // would visibly sink.
+            right.push(tb.captioned(tb.cancel_group(km), ""));
         }
         toolbar_row(left, Vec::new(), right)
     }
@@ -1769,6 +1999,12 @@ struct TrayGroup {
     /// it through [`slot_tools`] / [`slot_for_tool`]; the per-slot cursor is runtime preview
     /// state ([`super::edit::EditState::slot_cursor`]).
     cycle: Option<crate::shortcuts::Action>,
+    /// The group's CAPTION (DRAGON-478) — the one word drawn under the cluster naming what the
+    /// family is for. Declared HERE for the same reason `cycle` is: the tray is the single
+    /// source of the grouping, so the caption is a property of the group rather than a lookup
+    /// keyed on its index. Never empty for a tray group; see [`Tb::captioned`] for what an
+    /// empty one means elsewhere on the bar.
+    caption: &'static str,
     items: &'static [TrayItem],
 }
 
@@ -1800,7 +2036,7 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // ([`top_bar_item_state`]), so this group is redrawn as the crop pair ALONE and there is no
     // footprint left to preserve. The declared order stands on the idle bar's reading order
     // alone.
-    TrayGroup { cycle: None, items: &[
+    TrayGroup { cycle: None, caption: "Canvas", items: &[
         TrayItem::Crop,
         TrayItem::Tool(
             "pointer-select-symbolic",
@@ -1819,7 +2055,7 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // Callouts: point at a thing, or number the steps. NO cycle key — the arrow is the
     // highest-frequency tool in a screenshot annotator and must never cost two presses, and
     // the step marker takes Photoshop's Count key.
-    TrayGroup { cycle: None, items: &[
+    TrayGroup { cycle: None, caption: "Shape", items: &[
         TrayItem::Tool(
             "mail-forward-symbolic",
             Tool::Arrow,
@@ -1837,6 +2073,7 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // drag-a-rect destructive redactions), so ONE cycle key — `M` (DRAGON-369).
     TrayGroup {
         cycle: Some(crate::shortcuts::Action::PreviewAnnotRedactCycle),
+        caption: "Redact",
         items: &[
             TrayItem::Tool(
                 "view-grid-symbolic",
@@ -1859,6 +2096,12 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // cycle: a tray chip and the hotkey slot are the SAME set.
     TrayGroup {
         cycle: Some(crate::shortcuts::Action::PreviewAnnotShapeCycle),
+        // The owner's caption for this cluster, and it deliberately does NOT match the group's
+        // internal name (the SHAPE cycle slot, `U`). The captions name what a user reaches the
+        // family FOR, not what the hotkey model calls it; the cycle slot's own name stays on
+        // `cycle` above. Note the neighbouring Arrow/Step-Marker group is captioned "Shape" for
+        // the same reason — do not "correct" either to the other.
+        caption: "Box Highlight",
         items: &[
             TrayItem::Tool(
                 "format-text-highlight-symbolic",
@@ -1891,7 +2134,7 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     // Text captions (DRAGON-354): the lucide `type` glyph arms the text tool. Its size
     // dropdown + font toggle are injected right after this group in `annotation_tools` (they
     // are a flyout + toggle, not tray tool-buttons, so they can't live in the data-driven tray).
-    TrayGroup { cycle: None, items: &[
+    TrayGroup { cycle: None, caption: "Text", items: &[
         TrayItem::Tool(
             "text-tool-symbolic",
             Tool::Text,
@@ -1901,11 +2144,15 @@ const ANNOT_TRAY: &[TrayGroup] = &[
     ] },
     // Freehand ink and the hand-undo that removes it. NO cycle key: inking and erasing are
     // the pair you alternate between fastest, so they keep a key each (`B` / `E`).
-    TrayGroup { cycle: None, items: &[
+    TrayGroup { cycle: None, caption: "Draw", items: &[
         TrayItem::Tool(
             "pencil-symbolic",
             Tool::Pen,
-            "Pencil",
+            // DRAGON-478: DISPLAY copy only. The tool, its `Tool::Pen` variant, its
+            // `PreviewAnnotPen` action and the keymap's "Pencil tool" entry are unchanged —
+            // the owner renamed what the tooltip SAYS, because the glyph is a pencil but the
+            // thing it does is freehand ink.
+            "Freehand",
             crate::shortcuts::Action::PreviewAnnotPen,
         ),
         TrayItem::Tool(
@@ -2157,8 +2404,9 @@ fn annotation_tools<'a>(
             }
             // A group whose every control hid contributes NOTHING — never an empty bordered
             // cluster, which is what a plain `map` would have drawn once the sweep emptied five
-            // of the six groups.
-            (!items.is_empty()).then(|| tb.tool_cluster(items))
+            // of the six groups. DRAGON-478's caption rides the SAME condition, so a caption can
+            // never float over a group that is not there.
+            (!items.is_empty()).then(|| tb.captioned(tb.tool_cluster(items), group.caption))
         })
         .collect();
     widget::row(groups)
@@ -2915,6 +3163,7 @@ mod tests {
             let header = (!windowed).then(|| widget::Space::new().into());
             compose_preview(
                 windowed,
+                false,
                 600.0,
                 header,
                 widget::Space::new().into(),
@@ -3167,6 +3416,7 @@ mod tests {
             scale: 1.0,
             glass: None,
             suppress_tooltips: false,
+            labels: true,
         }
     }
 
@@ -3264,6 +3514,35 @@ mod tests {
         }
     }
 
+    /// DRAGON-467: the Share BUTTON and the Share ACTION read ONE capability, so the group can
+    /// never offer something the platform will refuse.
+    ///
+    /// A headless test cannot look at the toolbar, so this drives the real seam rather than a
+    /// hardcoded expectation: whatever `share_available()` says on the host running the suite,
+    /// `share_file` must agree with it. That is what makes the test survive a platform arm
+    /// landing later — it starts exercising the OTHER branch on its own.
+    #[test]
+    fn the_share_button_and_the_share_action_read_one_capability() {
+        let path = std::path::Path::new("/shots/a.png");
+        match crate::platform::services::share_available() {
+            // No sheet: the button is not built at all (see `share_group`), and the action
+            // refuses with a sentence rather than silently doing nothing.
+            false => {
+                let err = crate::platform::services::share_file(path, false)
+                    .expect_err("a system with no share sheet must refuse the action");
+                assert!(err.contains("Sharing"), "the reason names the action: {err:?}");
+            }
+            // A sheet exists: the action must not be the permanent-refusal stub any more.
+            true => {
+                let err = crate::platform::services::share_file(path, false).err();
+                assert!(
+                    !err.is_some_and(|e| e.contains("isn't available on this system")),
+                    "a platform that advertises a share sheet must have a real body"
+                );
+            }
+        }
+    }
+
     /// EVERY top-bar control family, enumerated — the tray's own rows plus the two that are not
     /// tray rows.
     ///
@@ -3277,7 +3556,7 @@ mod tests {
                 TopBarItem::Tool(_) => "tool",
                 TopBarItem::DimSlider => "dim slider",
                 TopBarItem::TextStyle => "text size/font chips",
-                TopBarItem::Share => "save / save as / copy / delete",
+                TopBarItem::Share => "save / copy / share / upload / delete",
             }
         }
         let mut all = vec![
@@ -3757,3 +4036,111 @@ mod tests {
     }
 }
 
+/// DRAGON-478: the top bar's GROUP CAPTIONS — the declared words, and the height band they cost.
+#[cfg(test)]
+mod caption_tests {
+    use super::*;
+
+    /// The owner's caption list, in TRAY ORDER. Spelled out here rather than derived from
+    /// `ANNOT_TRAY` (which would only prove the list equals itself): this is the review-approved
+    /// copy, so a tray regroup that silently re-labels a family fails here.
+    ///
+    /// Two of these deliberately do NOT match their group's internal name — "Shape" captions the
+    /// Arrow / Step-Marker group while the SHAPE cycle slot is the one captioned "Box Highlight".
+    /// That is the owner's mapping, matched to the tools each cluster actually holds; see the
+    /// note on the shape group in [`ANNOT_TRAY`].
+    const EXPECTED: [&str; 6] = ["Canvas", "Shape", "Redact", "Box Highlight", "Text", "Draw"];
+
+    #[test]
+    fn every_tray_group_carries_its_declared_caption() {
+        assert_eq!(ANNOT_TRAY.len(), EXPECTED.len(), "a tray group was added or removed");
+        for (i, (g, want)) in ANNOT_TRAY.iter().zip(EXPECTED).enumerate() {
+            assert_eq!(g.caption, want, "tray group {i}");
+            assert!(!g.caption.is_empty(), "tray group {i} must be captioned");
+        }
+        // The one top-bar cluster that is not a tray row carries its own.
+        assert_eq!(SHARE_GROUP_CAPTION, "File Actions");
+    }
+
+    /// The captions name what the FAMILY is for; the tool tooltips name the individual tools. In
+    /// a MULTI-tool group a caption repeating one member's name would read as a label for that
+    /// one button rather than for the row (which is why the highlight family is not captioned
+    /// "Highlight"). A group holding exactly ONE tool is exempt by definition — naming the family
+    /// and naming the tool are the same fact there, and the Text group is the case.
+    ///
+    /// This also pins the DRAGON-478 rename, since "Draw" now sits over "Freehand".
+    #[test]
+    fn a_multi_tool_caption_never_repeats_one_of_its_own_members() {
+        for (i, g) in ANNOT_TRAY.iter().enumerate() {
+            let tools = g
+                .items
+                .iter()
+                .filter(|i| matches!(i, TrayItem::Tool(..)))
+                .count();
+            if tools < 2 {
+                continue;
+            }
+            for item in g.items {
+                if let TrayItem::Tool(_, _, name, _) = item {
+                    assert_ne!(*name, g.caption, "group {i}: caption repeats its tool's name");
+                }
+            }
+        }
+        // The pencil's DISPLAY copy (its `Tool`/`Action`/keymap names are untouched).
+        let pen = ANNOT_TRAY
+            .iter()
+            .flat_map(|g| g.items.iter())
+            .find_map(|i| match i {
+                TrayItem::Tool(_, Tool::Pen, name, _) => Some(*name),
+                _ => None,
+            });
+        assert_eq!(pen, Some("Freehand"));
+    }
+
+    /// The band is the gap plus the caption's PINNED line box, scaled — and it is a literal zero
+    /// when the labels are off, which is what makes `PreviewSurface::chrome_h(false)` the
+    /// historical number rather than a near miss.
+    #[test]
+    fn the_caption_band_is_the_gap_plus_the_line_box_and_zero_when_off() {
+        for scale in [1.0f32, 0.82, 0.5, 2.0] {
+            assert_eq!(caption_band_h(false, scale), 0.0, "off must cost nothing at {scale}");
+            assert_eq!(caption_band_h(true, scale), scale * (CAPTION_GAP + CAPTION_LINE_H));
+        }
+        // Monotonic in the scale, and never zero while on — a band that rounded to nothing
+        // would draw a caption into no reserved space at all.
+        assert!(caption_band_h(true, super::super::surface::CHROME_SCALE) > 0.0);
+    }
+
+    /// The caption band is symmetric by construction: the padding UNDER the word (what the
+    /// top bar draws at its bottom edge with the labels on) is the same scaled value as the
+    /// gap ABOVE it, so retuning [`CAPTION_GAP`] can never re-open the top-heavy look the
+    /// owner's screenshot showed. Labels off is the historical bar padding, untouched.
+    #[test]
+    fn the_pad_under_a_caption_equals_the_gap_above_it() {
+        for scale in [1.0f32, 0.82, 0.5] {
+            assert_eq!(top_bar_bottom_pad(true, scale), CAPTION_GAP * scale);
+        }
+        assert_eq!(top_bar_bottom_pad(false, 0.82), BAR_V_PAD);
+    }
+
+    /// The caption's MECHANICS, deliberately not its size. The size is an owner-tuned dial
+    /// that has moved three times on sight (10 to 20 to 13.4), and the first two rounds each
+    /// broke a test that had pinned the then-current value against the other label sizes, so
+    /// no relative-size claim belongs here. What holds through every retune: the 8px floor,
+    /// whole-pixel rasterization, and a line box that clears the word it reserves space for.
+    #[test]
+    fn the_caption_mechanics_hold_at_any_owner_tuned_size() {
+        let rendered = |scale: f32| (CAPTION_TEXT_SIZE * scale).round().max(8.0);
+        assert_eq!(rendered(0.1), 8.0, "the floor holds at any scale");
+        for scale in [1.0f32, 0.82, 0.5] {
+            // Whole pixels, so the text rasterizes at the size it draws at.
+            assert_eq!(rendered(scale).fract(), 0.0, "scale {scale} left a fractional size");
+            // The reserved line box always clears the glyphs it holds, at the same scale
+            // arithmetic `caption_band_h` uses, so the band can never clip its own word.
+            assert!(
+                CAPTION_LINE_H * scale >= rendered(scale) * 0.9,
+                "scale {scale}: the line box no longer clears the floored glyph size"
+            );
+        }
+    }
+}

@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.25.1"
+version = "0.26.0"
 edition = "2024"
 description = "Cross-platform screen region, window, and monitor capture with support for glass windows, image, video, voice, QR, barcodes, OCR text and more."
 license = "GPL-3.0-only"
@@ -262,6 +262,11 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     # own deps (objc2-foundation NSArray/NSError/NSString) are already enabled, so no new
     # packages land in the lock.
     "NSAlert",
+    # DRAGON-480: the native share sheet (`platform/mac/services/share.rs`) —
+    # NSSharingServicePicker, anchored to the preview window's own NSView. Pulls its own
+    # objc2-foundation sub-features (NSArray/NSError/NSGeometry/NSItemProvider/NSString/
+    # NSURL) additively; no new packages land in the lock.
+    "NSSharingService",
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -415,6 +420,14 @@ arboard = "3"
 # Native folder picker (IFileDialog) for the save-directory setting — replaces the
 # ashpd portal picker, same crate the mac partition uses.
 rfd = "0.15"
+# DRAGON-474 share sheet: `DataPackage::SetStorageItemsReadOnly` takes an
+# `IIterable<IStorageItem>`, and the `windows` crate names that type from its OWN
+# dependency rather than re-exporting it under `windows::Foundation::Collections`. So the
+# only way to build one is to name the crate directly. It is ALREADY in Cargo.lock as
+# `windows 0.62`'s own dependency at this exact version, so no new package resolves: this
+# adds a dependency EDGE, not a package. Version "0.3" so it unifies with that copy (a
+# second windows-collections would be two incompatible sets of the same generic types).
+windows-collections = "0.3"
 # Win32 bindings for the M1 capture backend (DRAGON-229): GDI BitBlt monitor flats,
 # PrintWindow per-window grabs, EnumWindows + DWM window list, GetCursorInfo cursor,
 # GetDpiForMonitor DPI, and the IDesktopWallpaper COM wallpaper resolver. Pinned to
@@ -480,6 +493,13 @@ features = [
     # async `.get()`; `Foundation_Collections` is the `IVectorView` GetSessions returns.
     "Media_Control",                    # GlobalSystemMediaTransportControlsSessionManager/Session + PlaybackStatus
     "Foundation_Collections",           # IVectorView<GlobalSystemMediaTransportControlsSession> (Size/GetAt)
+    # DRAGON-474 share sheet: the preview editor's Share button opens the Windows share
+    # flyout via IDataTransferManagerInterop (which is already under the enabled
+    # `Win32_UI_Shell`). These two add the WinRT payload side. Compile-time-only flags on
+    # the SAME already-resolved `windows 0.62`, so no new Cargo.lock package lands
+    # (verified byte-identical, like M2/M3).
+    "ApplicationModel_DataTransfer",     # DataTransferManager + DataPackage (DataRequested, SetStorageItemsReadOnly, Properties().SetTitle)
+    "Storage_Streams",                   # the StorageFile CLASS itself is gated on this (its statics return IRandomAccessStream), and it implies `Storage`, which is what gates IStorageItem + DataPackage::SetStorageItemsReadOnly
 ]
 
 # DRAGON-233 fix 4: embed the multi-resolution .ico into the exe so Explorer / the

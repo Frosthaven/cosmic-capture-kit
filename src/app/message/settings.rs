@@ -205,25 +205,28 @@ pub enum SettingsMsg {
     SetShortcutsTab(cosmic::widget::segmented_button::Entity),
     /// Settings: preview editor appearance (windowed vs overlay).
     SetPreviewWindowed(bool),
+    /// Settings: draw the group captions under the preview editor's top toolbar
+    /// (DRAGON-478). Also changes the top bar's HEIGHT, so an open editor re-fits.
+    SetPreviewToolbarLabels(bool),
     /// Settings → Health → Debug: write the opt-in debug log (DRAGON-419). Takes effect
     /// immediately, with no restart — a customer turns it on, reproduces the failure once,
     /// and mails the file.
     SetDebugLogging(bool),
-    /// Settings: a manual Copy in the preview editor saves the document first (DRAGON-355).
-    SetPreviewSaveOnCopy(bool),
-    /// Settings: a manual Copy in the preview editor closes the document afterwards
-    /// (DRAGON-355; independent of save-on-copy).
-    SetPreviewCloseOnCopy(bool),
-    /// Settings: a Delete in the preview editor copies to the clipboard first.
-    SetPreviewCopyOnDelete(bool),
-    /// Settings: the VIDEO editor's own save-on-copy (DRAGON-420) — the three below mirror
+    /// Settings: the image editor puts its edits on the clipboard as it closes (DRAGON-467).
+    SetPreviewCopyOnExit(bool),
+    /// Settings: write every screenshot to the configured save folder as it is taken
+    /// (DRAGON-467). Off routes it through the session runtime directory instead.
+    SetPreviewSaveOriginals(bool),
+    /// Settings: ask before closing the image editor over unsaved edits (DRAGON-467).
+    SetPreviewAskToSave(bool),
+    /// Settings: the VIDEO editor's own copy-on-exit (DRAGON-467) — the three below mirror
     /// the three above for recordings, and are deliberately separate messages writing
     /// separate fields, so a video document can differ from an image one.
-    SetPreviewVideoSaveOnCopy(bool),
-    /// Settings: the VIDEO editor's own close-on-copy (DRAGON-420).
-    SetPreviewVideoCloseOnCopy(bool),
-    /// Settings: the VIDEO editor's own copy-on-delete (DRAGON-420).
-    SetPreviewVideoCopyOnDelete(bool),
+    SetPreviewVideoCopyOnExit(bool),
+    /// Settings: the VIDEO editor's own save-originals (DRAGON-467), over `record_dir`.
+    SetPreviewVideoSaveOriginals(bool),
+    /// Settings: the VIDEO editor's own ask-to-save (DRAGON-467).
+    SetPreviewVideoAskToSave(bool),
     /// Settings: open the folder picker for a save directory, then apply it.
     PickDir(DirTarget),
     DirPicked(DirTarget, Option<std::path::PathBuf>),

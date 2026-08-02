@@ -78,36 +78,248 @@ pub fn seeded_status_from_cache() -> Option<UpdateStatus> {
     Some(UpdateStatus::from_manifest(&manifest, env!("CARGO_PKG_VERSION")))
 }
 
-/// Write the post-update marker: the installer drops it just before the swap
-/// helper relaunches the app, and the relaunch consumes it to land the user on
-/// Settings > About (the new version's "What's new" front and center).
-/// The macOS one-click install flow and the Windows MSI updater
-/// (`crate::platform::windows::update_install`) both write it; compiled (and
-/// type-checked) everywhere on purpose.
+/// The payload the CURRENT code writes into the post-update marker (DRAGON-465). It is a
+/// version tag, and the only thing it has to be is "not what the old builds wrote".
+///
+/// What it buys: a marker written by THIS code proves the installer that wrote it also
+/// relaunches with [`crate::instance::RESIDENT_ARG`], so a BARE launch found next to it
+/// cannot be that relaunch and must be a real keypress. Builds up to and including the one
+/// this ticket ships against wrote `"1"`, and could only relaunch bare, so their marker
+/// cannot carry that proof. See [`PostUpdateMarker`].
+const MARKER_V2: &str = "2";
+
+/// Which installer wrote the post-update marker this launch found, which is really a
+/// question about what a BARE launch next to it can mean.
+///
+/// The distinction exists because the marker outlives the install window it belongs to. An
+/// MSI install takes 30 to 90 seconds, the marker is on disk for all of it, and the user can
+/// press the capture key in the middle. Without a version there is no way to tell that press
+/// apart from the installer's own relaunch, and the DRAGON-465 owed-capture gate answered
+/// "post-update relaunch" for both, so a real keypress lost its capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostUpdateMarker {
+    /// Written by a build that predates [`MARKER_V2`] (payload `"1"`, empty, or unreadable).
+    /// Those installers always relaunched BARE, so a bare launch beside this marker is
+    /// ambiguous: it is probably the relaunch, and it might be a keypress. Resolved in favour
+    /// of the relaunch, which costs a keypress its capture exactly once, on the single update
+    /// that installs this code.
+    Legacy,
+    /// Written by this code or later. Its installer relaunches with the resident token, so a
+    /// BARE launch found beside it is NOT the relaunch and can only be a real keypress.
+    V2,
+}
+
+/// Write the post-update marker: the installer drops it once the swap helper is really on
+/// its way, and the relaunch consumes it to land the user on Settings > About (the new
+/// version's "What's new" front and center).
+///
+/// Always writes [`MARKER_V2`], including on a re-arm. A re-arm is written BY this code, so
+/// the proof the payload stands for holds for it too: whatever relaunch was pending has
+/// already happened, and a later bare launch is a keypress.
+///
+/// Writers, and only the first two are installers. The macOS one-click flow and the Windows
+/// MSI updater (`crate::platform::windows::update_install`) ARM it. The Windows daemon
+/// RE-ARMS it in two places: when a capture-key press arrives mid-install and takes its
+/// capture instead of the About window (DRAGON-465), and when a reader took the marker but
+/// could not deliver the notes (DRAGON-472), because taking it without showing anything
+/// would destroy the only record that they are still owed. See [`post_update_marker_spent`]
+/// for that invariant.
+///
+/// Compiled (and type-checked) everywhere on purpose.
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), expect(dead_code))]
 pub(crate) fn write_post_update_marker() {
     if let Some(path) = state_file("post-update") {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        match std::fs::write(&path, b"1") {
-            Ok(()) => log::info!("update: wrote post-update marker at {}", path.display()),
+        match std::fs::write(&path, MARKER_V2.as_bytes()) {
+            // The path is described, never printed: it sits under the user's home and a
+            // username is exactly what the debug log may not carry (CLAUDE.md's privacy rule).
+            Ok(()) => log::info!(
+                "update: wrote post-update marker ({})",
+                crate::diag::path_shape(&path)
+            ),
             Err(e) => log::warn!("update: could not write post-update marker: {e}"),
         }
     }
 }
 
-/// Consume (remove) the post-update marker; true when this launch is the first
-/// one after an update install.
-pub fn take_post_update_marker() -> bool {
-    let Some(path) = state_file("post-update") else {
-        return false;
-    };
-    let taken = std::fs::remove_file(&path).is_ok();
-    if taken {
-        log::info!("update: consumed post-update marker; landing on Settings > About");
+/// Consume (remove) the post-update marker and say WHICH installer wrote it, or `None` when
+/// there is none to take.
+///
+/// Reads the payload BEFORE removing, because the answer is the file's content and a removed
+/// file has none. An unreadable or unrecognised payload is [`PostUpdateMarker::Legacy`]: the
+/// version tag is a POSITIVE proof about the writer, so anything that cannot present it does
+/// not get its benefit.
+pub fn take_post_update_marker_kind() -> Option<PostUpdateMarker> {
+    let path = state_file("post-update")?;
+    // Read first: after the remove there is nothing left to classify.
+    let payload = std::fs::read_to_string(&path).ok();
+    if let Err(e) = std::fs::remove_file(&path) {
+        // A marker we cannot remove is a marker that will be found again, so the ONLY safe
+        // answer is "no marker" — reporting one we did not consume would let two launches act
+        // on the same update. Worth a warn: it silently demotes the post-update handling of
+        // this launch to an ordinary one, and nothing else in the log would say why.
+        if path.exists() {
+            log::warn!(
+                "update: found a post-update marker but could not consume it ({e}); treating \
+                 this launch as an ordinary one, so Settings > About will not open for it"
+            );
+        }
+        return None;
     }
-    taken
+    let kind = match payload.as_deref().map(str::trim) {
+        Some(MARKER_V2) => PostUpdateMarker::V2,
+        _ => PostUpdateMarker::Legacy,
+    };
+    log::info!("update: consumed post-update marker ({kind:?})");
+    Some(kind)
+}
+
+/// Consume the post-update marker; true when this launch is the first one after an update
+/// install. The kind-blind wrapper over [`take_post_update_marker_kind`], for the readers
+/// that only ask "is this a post-update launch": every non-Windows resident, and `app::run`.
+pub fn take_post_update_marker() -> bool {
+    take_post_update_marker_kind().is_some()
+}
+
+/// The arguments a post-update RELAUNCH must be started with, given the persisted
+/// `resident` setting. Pure + unit-tested.
+///
+/// An installer's last act is to start the app again. That relaunch has to say what it is,
+/// because this binary reads a launch with no arguments as "the user pressed the capture
+/// key" (see [`crate::instance::daemon_intent_from_args`]): on Windows a bare launch with
+/// `resident` on becomes the tray daemon AND spawns the overlay it thinks it owes the user,
+/// and Linux's resident has the same rule. A finished update owes the user nothing of the
+/// kind, so DRAGON-465 makes the relaunch state its intent instead:
+///
+/// * `resident` on: come back as the RESIDENT, exactly as the autostart entry does. The
+///   daemon then consumes the post-update marker and opens Settings > About.
+/// * `resident` off: come back with no arguments. There is no daemon to raise, and the
+///   marker turns this launch into a settings window on About inside `app::run` — the
+///   historical non-resident path, unchanged.
+///
+/// The setting is the only input: it is what decides which of the two shapes the app was
+/// running in before the update, and the relaunch's whole job is to restore that shape.
+///
+/// The macOS installer does not use this yet — its swap helper relaunches with `open`,
+/// which raises the daemon WITHOUT the capture-intent rule (`mac/daemon.rs`'s `run` takes
+/// no intent argument), so the mac flow was never affected. It lives in the shared tree
+/// anyway because the rule belongs to the update channel, not to one platform's installer,
+/// and because Linux would inherit the exact Windows defect the day it gains an in-app
+/// install flow.
+// Consumed by the Windows swap helper (`platform::windows::update_install::run_swap`) and by
+// the tests below; honestly dead on the platforms whose installers do not (yet) call it.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn post_update_relaunch_args(resident: bool) -> &'static [&'static str] {
+    if resident {
+        &[crate::instance::RESIDENT_ARG]
+    } else {
+        &[]
+    }
+}
+
+/// What a launch that has just become the resident must do, given the post-update marker it
+/// found. Both fields together, because they are one decision: whether to spawn the capture
+/// this launch would otherwise owe, and whether to write the marker back for a later launch
+/// to deliver the About window.
+///
+/// One function rather than two so the pair can never disagree. "The capture proceeds" and
+/// "About is deferred, so re-arm the marker" are the same fact stated twice, and splitting
+/// them into two predicates would let a future edit break the tie silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub struct PostUpdateStart {
+    /// Spawn the capture overlay this launch owes the user.
+    pub owes_capture: bool,
+    /// Write the marker back: the release notes are still owed, and THIS launch is not the
+    /// one delivering them.
+    pub rearm_marker: bool,
+}
+
+/// What a launch that has just become the resident should do about the capture it may owe
+/// and the marker it may have found. Pure + unit-tested.
+///
+/// The owed capture (DRAGON-181 on Linux, DRAGON-438 on Windows) exists because a user who
+/// presses the capture key with no daemon running becomes the daemon and would otherwise get
+/// nothing. A post-update RELAUNCH reaches that same code path with nobody having pressed
+/// anything, so the debt is not real there and the overlay is noise over the release notes.
+/// Telling the two apart is the whole job, and the marker's version is what makes it possible.
+///
+/// The table, and why each cell is what it is:
+///
+/// | capture intent | marker | capture | re-arm |
+/// |---|---|---|---|
+/// | no  | any     | no  | no  | A daemon-intent launch owes no capture. About is delivered by this launch's own marker check, so nothing is deferred. |
+/// | yes | none    | YES | no  | An ordinary keypress. Untouched by any of this. |
+/// | yes | Legacy  | no  | no  | The TRANSITIONAL cell. A pre-DRAGON-465 installer relaunches BARE, so a bare launch beside its marker is almost certainly that relaunch; suppress the overlay and show About. It costs a real keypress its capture if the user pressed the key during that ONE update's install window, which is the price of the old installer having left no way to tell. |
+/// | yes | V2      | YES | YES | A real keypress. This marker's writer relaunches with the resident token, so a bare launch CANNOT be the relaunch. The capture proceeds, and the marker goes back so the relaunch (or the next daemon start) still shows the notes. |
+///
+/// The V2 cell is the one this exists for. An MSI install runs for 30 to 90 seconds with the
+/// marker on disk, and a user pressing the capture key in that window is not unusual. Before
+/// DRAGON-465's review this dropped their capture AND spent the marker, so the finished
+/// update then came back to a marker-free disk, read as an ordinary launch, and pulsed a
+/// surprise overlay with no About: one wrong answer becoming two wrong outcomes.
+///
+/// Suppressing a capture is the heavier cost and it is confined to `Legacy`. The rule
+/// elsewhere in this launch path is the one [`crate::instance::held_lock_action`] states:
+/// a person pressing a key keeps their capture, because a redundant About window is cheap and
+/// a dropped capture is not.
+// Consumed by the Windows tray daemon's `finish_startup`; dead elsewhere until another
+// resident gains an in-app install flow (Linux's owed capture has the identical shape).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn post_update_start(capture_intent: bool, marker: Option<PostUpdateMarker>) -> PostUpdateStart {
+    match (capture_intent, marker) {
+        // Daemon intent: no capture is owed, and this launch shows About itself.
+        (false, _) => PostUpdateStart { owes_capture: false, rearm_marker: false },
+        // A keypress with no update in flight: the ordinary case.
+        (true, None) => PostUpdateStart { owes_capture: true, rearm_marker: false },
+        // The transitional cell: an old installer's bare relaunch is indistinguishable from a
+        // keypress, and the relaunch is the likelier reading.
+        (true, Some(PostUpdateMarker::Legacy)) => {
+            PostUpdateStart { owes_capture: false, rearm_marker: false }
+        }
+        // A keypress DURING an install: the new installer never relaunches bare, so this is a
+        // person. Serve them, and hand the release notes to the next daemon-intent start.
+        (true, Some(PostUpdateMarker::V2)) => {
+            PostUpdateStart { owes_capture: true, rearm_marker: true }
+        }
+    }
+}
+
+/// Whether an attempt to restore the post-update About window SPENT the marker, given
+/// whether the settings child was actually STARTED. Pure + unit-tested.
+///
+/// The rule it names (DRAGON-472): **any reader that can OBSERVE its own delivery failure
+/// must write the marker back.** Taking the marker is a `remove_file`, so a reader that
+/// takes it and then delivers nothing has destroyed the only record that the notes are still
+/// owed, and no later launch can put them up.
+///
+/// Deliberately NOT stated as a universal invariant, because it is not enforceable at every
+/// take. A reader can only put the marker back for a failure it SEES. Both Windows takers
+/// (`claim_or_signal`'s held-lock restore and `finish_startup`'s About spawn) see theirs,
+/// because the spawn seam returns whether the child was created, and both write it back. The
+/// Linux resident's take is unreachable (no in-app install flow writes a marker there), and
+/// the macOS daemon's take is left alone under the byte-identity rule, so a mac About spawn
+/// that fails still defers nothing: that residual is real and named rather than papered over.
+/// A process that is KILLED between the take and the spawn observes nothing and cannot
+/// comply either; `finish_startup`'s doc carries that window explicitly.
+///
+/// `about_child_started` is exactly what the spawn seam proves: `CreateProcess` succeeded.
+/// It is NOT "the About page is on screen". The child can still exit early, and the
+/// settings-mutex case is the concrete one: if a settings window is already open, the child
+/// pokes the live holder to come forward and exits, and that holder does NOT switch to the
+/// About tab. Treating the spawn as delivery is the right trade anyway, because the
+/// alternative is an ack protocol for a release-notes window, and a marker that survives a
+/// successful spawn would re-open About on every later start.
+///
+/// It exists as a named function rather than a bare `!` at the call site because it is a
+/// RULE, and the rule is what a reader needs to find.
+// Consumed by both Windows About-restore sites; dead elsewhere until another platform grows
+// an in-app install flow.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub fn post_update_marker_spent(about_child_started: bool) -> bool {
+    about_child_started
 }
 
 /// Minimum perceived duration of an INTERACTIVE update check (DRAGON-177). When a
@@ -881,6 +1093,177 @@ mod tests {
             check_floor_remainder(Duration::from_secs(5), floor),
             Duration::ZERO
         );
+    }
+
+    /// DRAGON-465. The bug this pins: the Windows installer relaunched the app with NO
+    /// arguments, `main` read that as "the user pressed the capture key", and a resident
+    /// install came back with the About page AND a capture overlay over it.
+    ///
+    /// The assertion that matters is the second one — the relaunch argv is run through the
+    /// SAME predicate `main` uses, so the two can never drift into disagreeing about what a
+    /// post-update relaunch is asking for.
+    #[test]
+    fn a_post_update_relaunch_never_asks_for_a_capture() {
+        // Resident on: the relaunch says so, exactly as the autostart entry does.
+        assert_eq!(post_update_relaunch_args(true), [crate::instance::RESIDENT_ARG]);
+        // Resident off: nothing to raise; the marker turns this into a settings launch.
+        assert!(post_update_relaunch_args(false).is_empty());
+
+        // The property, stated through `main`'s own reader: a resident relaunch is daemon
+        // intent, so the daemon it starts owes no overlay.
+        assert!(crate::instance::daemon_intent_from_args(post_update_relaunch_args(true)));
+        // A non-resident relaunch is not daemon intent, and must not be: with `resident`
+        // off there is no daemon branch to reach at all, and the launch has to fall through
+        // to `app::run` for the marker to become the About window.
+        assert!(!crate::instance::daemon_intent_from_args(post_update_relaunch_args(false)));
+
+        // Neither shape may ever carry a capture-mode flag: those are what `main` turns into
+        // a mode/kind, and they would open an overlay even with the daemon out of the way.
+        for resident in [true, false] {
+            for arg in post_update_relaunch_args(resident) {
+                assert!(
+                    !arg.starts_with("--"),
+                    "a post-update relaunch must pass no CLI flags, got {arg}"
+                );
+            }
+        }
+
+        // The argv has to be spendable AS argv. `Command` is cross-platform, so compiling
+        // this on the Linux gate type-checks the one line of the Windows swap helper that
+        // no machine here can build. Constructed and dropped; nothing is spawned.
+        for resident in [true, false] {
+            let mut cmd = std::process::Command::new("cosmic-capture-kit");
+            cmd.args(post_update_relaunch_args(resident));
+            assert_eq!(cmd.get_args().count(), post_update_relaunch_args(resident).len());
+        }
+    }
+
+    /// DRAGON-472: the marker is consumed exactly when the About window was delivered. A
+    /// reader that takes it and then fails has destroyed the only record that the release
+    /// notes are still owed, so it must put the marker back.
+    #[test]
+    fn the_post_update_marker_is_only_spent_by_a_delivered_about_window() {
+        assert!(
+            post_update_marker_spent(true),
+            "the settings child started: the marker did its job"
+        );
+        assert!(
+            !post_update_marker_spent(false),
+            "no child started: the notes are still owed, so the marker must go back"
+        );
+    }
+
+    /// DRAGON-465, the second half: the receiving side refuses the owed capture on a
+    /// post-update relaunch, whatever the argv said. This is what covers the ONE update
+    /// the argv fix cannot — the one whose swap helper is still the old exe.
+    ///
+    /// Every cell of the table, because the interesting ones are the two that look alike:
+    /// a bare launch beside a LEGACY marker (probably the old installer's relaunch) and a
+    /// bare launch beside a V2 marker (certainly a person, since the new installer never
+    /// relaunches bare).
+    #[test]
+    fn a_post_update_relaunch_is_never_owed_a_capture() {
+        let legacy = Some(PostUpdateMarker::Legacy);
+        let v2 = Some(PostUpdateMarker::V2);
+
+        // An ordinary keypress with no update in flight: capture, nothing deferred.
+        assert_eq!(
+            post_update_start(true, None),
+            PostUpdateStart { owes_capture: true, rearm_marker: false }
+        );
+        // The transitional cell: a pre-DRAGON-465 installer relaunched bare, so suppress.
+        // Nothing is re-armed, because About is delivered by this very launch.
+        assert_eq!(
+            post_update_start(true, legacy),
+            PostUpdateStart { owes_capture: false, rearm_marker: false }
+        );
+        // A REAL keypress during an install window. The capture must survive, and the
+        // release notes must not be thrown away with it.
+        assert_eq!(
+            post_update_start(true, v2),
+            PostUpdateStart { owes_capture: true, rearm_marker: true }
+        );
+        // Daemon intent owes no capture and defers nothing, marker or not.
+        for marker in [None, legacy, v2] {
+            assert_eq!(
+                post_update_start(false, marker),
+                PostUpdateStart { owes_capture: false, rearm_marker: false },
+                "daemon intent with marker {marker:?}"
+            );
+        }
+
+        // The invariant that ties the two fields together: the marker is only ever re-armed
+        // by a launch that is NOT delivering About, which here means one taking its capture
+        // instead. Never re-arm on a launch that shows the notes.
+        for intent in [true, false] {
+            for marker in [None, legacy, v2] {
+                let plan = post_update_start(intent, marker);
+                if plan.rearm_marker {
+                    assert!(plan.owes_capture, "re-armed without taking the capture instead");
+                    assert!(marker.is_some(), "re-armed a marker that was never there");
+                }
+            }
+        }
+    }
+
+    /// DRAGON-465 review, the CASCADE. One press of the capture key during an MSI install
+    /// used to cost the user both things: the capture was suppressed AND the marker was
+    /// spent, so the installer's own relaunch arrived to a marker-free disk, read as an
+    /// ordinary launch, and put up a surprise overlay with no release notes.
+    ///
+    /// Walked as a sequence, because neither step is wrong on its own.
+    #[test]
+    fn a_keypress_during_an_install_keeps_its_capture_and_still_gets_the_notes() {
+        // Step 1: the install is running, its V2 marker is on disk, the user presses the
+        // capture key. Bare launch, no daemon (the app quit for the update), so this launch
+        // becomes the daemon with capture intent.
+        let press = post_update_start(true, Some(PostUpdateMarker::V2));
+        assert!(press.owes_capture, "the user pressed a key and must get their overlay");
+        assert!(press.rearm_marker, "the notes are still owed, so the marker goes back");
+
+        // Step 2: the marker written back is a V2 one (`write_post_update_marker` only ever
+        // writes that payload), so the state the next launch finds is unchanged in kind.
+        assert_eq!(MARKER_V2.trim(), MARKER_V2, "the payload carries no stray whitespace");
+
+        // Step 3: the swap helper's relaunch arrives. It is DAEMON intent, because
+        // `post_update_relaunch_args` gave it the resident token, and it finds the re-armed
+        // marker. No capture, nothing deferred: this is the launch that shows About.
+        let relaunch_argv = post_update_relaunch_args(true);
+        assert!(crate::instance::daemon_intent_from_args(relaunch_argv));
+        let relaunch = post_update_start(false, Some(PostUpdateMarker::V2));
+        assert!(!relaunch.owes_capture, "the relaunch must not add an overlay of its own");
+        assert!(!relaunch.rearm_marker, "the relaunch delivers the notes, so it spends them");
+
+        // Both things happened exactly once across the sequence.
+        assert_eq!(
+            [press.owes_capture, relaunch.owes_capture].iter().filter(|x| **x).count(),
+            1,
+            "exactly one overlay: the one the user asked for"
+        );
+    }
+
+    /// The marker's version tag has to survive a round trip through the file's text, and
+    /// anything that is NOT the tag has to read as Legacy. This is the classification
+    /// `take_post_update_marker_kind` applies to the payload it reads.
+    #[test]
+    fn only_the_exact_version_payload_reads_as_v2() {
+        // The classifier, as the taker applies it (trimmed payload vs the tag).
+        let classify = |payload: Option<&str>| match payload.map(str::trim) {
+            Some(MARKER_V2) => PostUpdateMarker::V2,
+            _ => PostUpdateMarker::Legacy,
+        };
+        assert_eq!(classify(Some(MARKER_V2)), PostUpdateMarker::V2);
+        // Trailing newlines happen to any file written by hand or by a text editor.
+        assert_eq!(classify(Some("2\n")), PostUpdateMarker::V2);
+        assert_eq!(classify(Some(" 2 \r\n")), PostUpdateMarker::V2);
+        // What the shipped builds wrote, plus every shape of "we cannot tell".
+        assert_eq!(classify(Some("1")), PostUpdateMarker::Legacy);
+        assert_eq!(classify(Some("")), PostUpdateMarker::Legacy);
+        assert_eq!(classify(None), PostUpdateMarker::Legacy, "unreadable is not proof");
+        assert_eq!(classify(Some("22")), PostUpdateMarker::Legacy);
+        assert_eq!(classify(Some("v2")), PostUpdateMarker::Legacy);
+        // The tag must never be the old payload, or every legacy marker would read as V2.
+        assert_ne!(MARKER_V2, "1");
     }
 
     #[test]

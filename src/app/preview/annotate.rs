@@ -115,6 +115,27 @@
 //! (the preview of what's going) and RELEASE deletes them all as ONE undo entry. Only pen
 //! groups erase — a sweep must never silently take out a redaction it passed over.
 //!
+//! # The arrow's third handle (DRAGON-470)
+//! An arrow is still two points, but a selected one now wears THREE nodes: the two endpoints and a
+//! BEND handle on the middle of its shaft. Dragging that handle bows the arrow, dragging it back
+//! onto the chord straightens it again. The handle is a point the curve passes THROUGH (the shaft
+//! is the quadratic Bezier through tail, handle and head), so it stays under the pointer instead
+//! of floating off the ink the way a raw Bezier control does.
+//!
+//! [`AnnotKind::Arrow`] carries the bend as a [`crate::arrow_curve::Bend`], stored RELATIVE to the
+//! chord, so a translate or group scale carries the whole arrow with no mapping at all. Dragging
+//! ONE node moves ONLY that node, though (the repo owner's rule): an endpoint drag re-derives the
+//! bend through the handle's unchanged position
+//! ([`crate::arrow_curve::bend_pinning_handle`]), so the bend you placed to dodge something in the
+//! picture stays on it. A straight arrow stays straight, and a bow that would leave the canvas is
+//! reduced until it fits; those are the only two things that move a node you are not holding.
+//! Every drawn quantity — the
+//! control point, the head's tangent, the shaft's arc length, the hit-test polyline, the exact
+//! bounding box — comes from `crate::arrow_curve`, which the live canvas and [`rasterize_scene`]
+//! BOTH read, so the exported curve is the one on screen. The bend joins the existing gesture and
+//! undo lanes untouched: it is a [`Grab`] like any other, so `annot_grab_begin` snapshots for it
+//! and `annot_gesture_end` commits it as one entry.
+//!
 //! # The pointer + multi-selection (DRAGON-341)
 //! `Tool::Pointer` creates NOTHING: it is the mode in which the selection
 //! ([`super::edit::Selection`], an ordered set whose last member is the PRIMARY) is edited —
@@ -133,6 +154,9 @@
 
 use super::*;
 use crate::widgets::annotation_canvas::{FxKind, Grab, Item, ItemKind, Tool};
+// The arrow's curve maths (DRAGON-470), shared with the live canvas so display and bake draw one
+// parabola. `Bend` is named directly because it is a FIELD of the model below.
+use crate::arrow_curve::{self, Bend};
 use ::image::RgbaImage;
 
 /// A straight-alpha RGBA color.
@@ -347,8 +371,17 @@ fn spawn_placement_in_bounds(tool: Tool, bounds: AnnotRect, margin: f32, badge_w
 pub enum AnnotKind {
     /// A rectangle outline (with optional fill).
     Box { rect: AnnotRect, stroke_w: f32, fill: Option<AnnotColor> },
-    /// An arrow from `a` (tail) to `b` (head).
-    Arrow { a: AnnotPoint, b: AnnotPoint, stroke_w: f32 },
+    /// An arrow from `a` (tail) to `b` (head), optionally BENT (DRAGON-470).
+    ///
+    /// `bend` is the third handle: it sits on the middle of the shaft, and dragging it bows the
+    /// arrow into the quadratic Bezier through tail, handle and head. It is stored RELATIVE to the
+    /// chord ([`Bend`]), which is what lets a translate / group scale carry the whole arrow with
+    /// no mapping at all; an ENDPOINT drag re-derives it so the handle holds its place
+    /// ([`arrow_curve::bend_pinning_handle`]), because moving one node must not move the others.
+    /// [`Bend::STRAIGHT`] is the arrow this editor has always drawn, and every renderer
+    /// early-returns the straight path for it — so a shape nobody has bent is byte-identical to
+    /// before the handle existed.
+    Arrow { a: AnnotPoint, b: AnnotPoint, bend: Bend, stroke_w: f32 },
     /// A highlighter (DRAGON-326): an ADAPTIVE multiply/screen-blended rounded box, weighted
     /// by [`HIGHLIGHT_ALPHA`]. Composites through the shared CPU core [`apply_one_effect`] on
     /// BOTH display and bake; NOT a source-over fill. Same geometry + interaction as
@@ -672,6 +705,9 @@ pub fn spawn_kind(tool: Tool, rect: AnnotRect, stroke_w: f32) -> Option<AnnotKin
         Tool::Arrow => AnnotKind::Arrow {
             a: AnnotPoint { x: rect.x, y: rect.y },
             b: AnnotPoint { x: rect.x + rect.w, y: rect.y + rect.h },
+            // A pre-placed arrow is STRAIGHT: the bend is something the user asks for by
+            // dragging the middle handle, never something a spawn decides for them.
+            bend: Bend::STRAIGHT,
             stroke_w,
         },
         // A badge is ALWAYS 1:1, so the placement rect is squared down to its shorter axis and
@@ -791,6 +827,73 @@ pub fn text_edit_exits(
     }
 }
 
+/// What an Escape (or its numpad-Enter twin) press GIVES UP in the preview editor before the
+/// preview keymap sees it (DRAGON-468, the STAGED escape).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscapeStage {
+    /// The editor is holding something, so the press is CONSUMED here: any live text edit
+    /// settles and EVERY selection is dropped, in ONE press. The action is
+    /// `App::deselect_everything`, which composes the annotation deselect
+    /// (`PreviewMsg::SelectAnnotation(None)`, itself the path that settles a live edit before it
+    /// clears) with the timeline's own click-away deselect — there is ONE deselect route per
+    /// domain, not a second one grown for the keyboard.
+    Deselect,
+    /// The editor holds nothing this press can give up, so it falls through: to the live text
+    /// editor while typing (where the key is ordinary input), and otherwise to the preview
+    /// keymap, where Escape is `PreviewCancel` — the window's own close-or-confirm decision.
+    Pass,
+}
+
+/// The staged meaning of a press in the preview editor (DRAGON-468).
+///
+/// The rule the ticket asks for, in one place: a press that can end something ends ONE thing at a
+/// time, outside in. With a text box being typed into, or with anything SELECTED, Escape gives
+/// that up and stops there; only a press with nothing left to give up reaches the window's close
+/// decision (which is where the user's close/confirm setting is consulted — this function never
+/// duplicates it). Before this, settling a text edit LEFT its box selected (entering one selects
+/// it, and settling does not undo that), so leaving a caption and closing the editor took THREE
+/// presses: one to stop typing, one to drop the selection the settle handed back, one to close.
+///
+/// # "Selected" means BOTH selections
+///
+/// `annotations_selected` is the canvas set (`EditState::sel`), `timeline_selected` the video
+/// timeline's highlighted segments (`Timeline::selected`, always false on a still). They are
+/// separate terms rather than one pre-ORed bool so this function, not its callers, is what
+/// states the rule, and so the table below can pin each one. Missing the timeline term is a real
+/// bug and was one: a selected segment stayed lit while Escape went straight to the close
+/// decision, which is exactly the "Escape closed my editor while something was selected"
+/// complaint the staging exists to prevent.
+///
+/// The numpad-Enter twin ([`text_edit_exits`], DRAGON-364) rides the same staging: it is the other
+/// key that ends a typing session, so it now drops the selections with it. It qualifies ONLY while
+/// `text_editing` — outside a text edit a keypad Enter is an ordinary key and must never eat a
+/// selection. MAIN Enter never qualifies at all (it inserts a newline).
+///
+/// Consulted from the two lanes of `keyboard.rs`'s `preview_modal_key` that can hold something:
+/// the live text edit (`App::text_edit_key`, below) and, once that lane has passed, the
+/// selection lane. They are separate call sites because the modal lanes (the unsaved-changes
+/// dialog, the colour picker, the flyout) sit BETWEEN them and own Escape first; each site acts on
+/// the arm its lane can produce.
+///
+/// Pure — unit-tested.
+pub fn escape_stage(
+    key: &cosmic::iced::keyboard::Key,
+    location: cosmic::iced::keyboard::Location,
+    text_editing: bool,
+    annotations_selected: bool,
+    timeline_selected: bool,
+) -> EscapeStage {
+    use cosmic::iced::keyboard::{key::Named, Key};
+    let ends_typing = text_editing && text_edit_exits(key, location);
+    let held = annotations_selected || timeline_selected;
+    let escapes_selection = held && matches!(key, Key::Named(Named::Escape));
+    if ends_typing || escapes_selection {
+        EscapeStage::Deselect
+    } else {
+        EscapeStage::Pass
+    }
+}
+
 /// What a PRIMARY-modifier press means to a LIVE text-annotation edit (DRAGON-354 item 13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextEditChord {
@@ -818,16 +921,18 @@ pub enum TextEditChord {
 /// complete inventory of primary chords that do anything at all while you are typing —
 /// everything else is silently dropped and NEVER reaches an editor binding.
 ///
-/// That is a SAFETY property, not an implementation detail, because the Preview context binds
-/// two chords whose stray arrival mid-typing would be destructive: `Ctrl+D`
-/// ([`crate::shortcuts::Action::PreviewDeselectAll`]) and `Ctrl+Shift+X`
-/// ([`crate::shortcuts::Action::PreviewDelete`] — a hard `remove_file` on the capture). Neither
-/// `d` nor a bare `x`-with-Shift-as-a-different-meaning is claimed here, so:
-/// * `Ctrl+D` while typing does NOTHING (swallowed) — it cannot deselect out from under an
-///   active edit;
-/// * `Ctrl+Shift+X` while typing cuts the TEXT SELECTION (the [`TextEditChord::Cut`] arm — the
-///   arms are modifier-insensitive apart from Shift+Z, so it behaves exactly like `Ctrl+X`) and
-///   can never delete the capture file.
+/// That is a SAFETY property, not an implementation detail. `Ctrl+D`
+/// ([`crate::shortcuts::Action::PreviewDeselectAll`]) is not claimed here, so pressing it while
+/// typing does NOTHING (swallowed) and cannot deselect out from under an active edit.
+///
+/// It used to guard something sharper: `Ctrl+Shift+X` was the file DELETE (a hard
+/// `remove_file` on the capture), and this table is what kept a stray press mid-typing from
+/// destroying the capture — it cut the TEXT SELECTION instead (the [`TextEditChord::Cut`] arm;
+/// the arms are modifier-insensitive apart from Shift+Z, so it behaves exactly like `Ctrl+X`).
+/// DRAGON-467 removed the delete action entirely, so that chord is no longer bound to anything
+/// destructive. The swallowing rule stays as it is: it is what makes the inventory complete,
+/// and it is the reason a future destructive binding would be safe here by default rather than
+/// by remembering.
 ///
 /// Pure — unit-tested, including both of those.
 pub fn text_edit_chord(key: &cosmic::iced::keyboard::Key, shift: bool) -> Option<TextEditChord> {
@@ -1220,7 +1325,7 @@ pub fn square_for_grab(r: AnnotRect, grab: Grab, fw: f32, fh: f32, m: f32) -> An
     use crate::geometry::{Corner, Edge};
     let squared = match grab {
         // A move never resizes: the rect is already square, just clamp it.
-        Grab::Move | Grab::ArrowA | Grab::ArrowB => r,
+        Grab::Move | Grab::ArrowA | Grab::ArrowB | Grab::ArrowBend => r,
         Grab::Corner(Corner::Nw) => square_rect(r, (true, true)),
         Grab::Corner(Corner::Ne) => square_rect(r, (false, true)),
         Grab::Corner(Corner::Sw) => square_rect(r, (true, false)),
@@ -1356,7 +1461,7 @@ pub fn text_scale_factor(w: f32, h: f32, grab: Grab, dx: f32, dy: f32) -> f32 {
         Grab::Edge(Edge::W) => (-1.0, 0.0),
         Grab::Edge(Edge::E) => (1.0, 0.0),
         // A move never resizes; arrow grabs never apply to a box.
-        Grab::Move | Grab::ArrowA | Grab::ArrowB => return 1.0,
+        Grab::Move | Grab::ArrowA | Grab::ArrowB | Grab::ArrowBend => return 1.0,
     };
     // Project the drag onto that direction and divide by the extent ALONG it: for a corner that
     // is the squared diagonal (w² + h²), for an edge simply its own axis.
@@ -1396,7 +1501,7 @@ pub fn anchor_scaled_text_rect(
         Grab::Edge(Edge::S) => (l, t),
         Grab::Edge(Edge::W) => (r - new_w, t),
         Grab::Edge(Edge::E) => (l, t),
-        Grab::Move | Grab::ArrowA | Grab::ArrowB => (orig.x, orig.y),
+        Grab::Move | Grab::ArrowA | Grab::ArrowB | Grab::ArrowBend => (orig.x, orig.y),
     };
     let (fw, fh) = frame;
     // DRAGON-368: held to [`TEXT_MIN_ON_CANVAS_PX`] on the picture rather than wholly inside it,
@@ -1950,8 +2055,8 @@ pub fn rasterize_scene(
                 };
                 pixmap.stroke_path(&path, &paint, &stroke, ident, None);
             }
-            AnnotKind::Arrow { a, b, stroke_w } => {
-                draw_arrow(&mut pixmap, (a.x, a.y), (b.x, b.y), *stroke_w, item.color, scale, cap, join);
+            AnnotKind::Arrow { a, b, bend, stroke_w } => {
+                draw_arrow(&mut pixmap, (a.x, a.y), (b.x, b.y), *bend, *stroke_w, item.color, scale, cap, join);
             }
             // The SEQUENCE BADGE (DRAGON-340) at FULL capture resolution: the exact same
             // `crate::badge` metrics the canvas draws, multiplied by the raster `scale`
@@ -2188,11 +2293,17 @@ fn draw_badge(
 /// an OPEN "V" head — two short barbs diverging from the tip back along the shaft, like a
 /// real arrow glyph (NOT a filled triangle). `cap`/`join` (the shared curviness style) keep
 /// the tip and barb ends soft.
+///
+/// A BENT arrow (DRAGON-470) draws the same figure on a quadratic Bezier shaft: the control point
+/// and the head's tangent both come from [`crate::arrow_curve`], the module the live canvas reads
+/// too, so the baked curve is the on-screen curve at another resolution. A straight bend takes the
+/// original line path, untouched.
 #[allow(clippy::too_many_arguments)]
 fn draw_arrow(
     pixmap: &mut resvg::tiny_skia::Pixmap,
     a: (f32, f32),
     b: (f32, f32),
+    bend: Bend,
     stroke_w: f32,
     color: AnnotColor,
     scale: f32,
@@ -2208,18 +2319,38 @@ fn draw_arrow(
     let sw = ((stroke_w + 2.0) * scale).max(0.5);
     let dx = bx - ax;
     let dy = by - ay;
-    let len = (dx * dx + dy * dy).sqrt();
+    // The BENT shaft is longer than its chord, so the head is sized against the arc; a straight
+    // one keeps the chord it always used, computed exactly as before.
+    let straight = bend.is_straight();
+    // Derived from the SCALED endpoints: `control` commutes with the similarity `scale` is, so
+    // this is the canvas's control point at raster resolution.
+    let ctrl = arrow_curve::control((ax, ay), (bx, by), bend);
+    let len = if straight {
+        (dx * dx + dy * dy).sqrt()
+    } else {
+        arrow_curve::arc_len((ax, ay), ctrl, (bx, by))
+    };
     if len < 0.5 {
         return;
     }
-    let (ux, uy) = (dx / len, dy / len);
+    // The barbs splay around the direction the shaft ARRIVES from — the chord for a straight
+    // arrow, the curve's end tangent for a bent one.
+    let (ux, uy) = if straight {
+        (dx / len, dy / len)
+    } else {
+        arrow_curve::head_dir((ax, ay), ctrl, (bx, by))
+    };
     let mut paint = sk::Paint { anti_alias: true, ..Default::default() };
     paint.set_color(sk_color(color));
     let stroke = sk::Stroke { width: sw, line_cap: cap, line_join: join, ..Default::default() };
     // Shaft: tail all the way to the tip.
     let mut pb = sk::PathBuilder::new();
     pb.move_to(ax, ay);
-    pb.line_to(bx, by);
+    if straight {
+        pb.line_to(bx, by);
+    } else {
+        pb.quad_to(ctrl.0, ctrl.1, bx, by);
+    }
     if let Some(path) = pb.finish() {
         pixmap.stroke_path(&path, &paint, &stroke, ident, None);
     }
@@ -2227,12 +2358,14 @@ fn draw_arrow(
     // `back` is -unit(shaft); rotate it ±ang for the two barbs. `.min(len * 0.7)` on the
     // floor keeps the clamp bounds ordered (min ≤ max) so a very short arrow can't hit
     // `f32::clamp`'s min > max panic (DRAGON-324, matching the vector display path).
-    // Head length = 12.5% of the shaft (GROWS with the line), floored at 40% of the 53px cap so a
-    // short arrow still shows a substantial head, capped at 53px (source) so a long line doesn't get
-    // a huge head, and never past 70% of the shaft. Independent of stroke width (barbs get THICKER,
-    // not longer). In sync with the vector display (`annotation_canvas`, same 0.125 / 0.40·53 / 53).
-    let head_cap = (53.0 * scale).min(len * 0.7);
-    let head = (len * 0.125).clamp((53.0 * 0.40 * scale).min(head_cap), head_cap);
+    // Head length = 12.5% of the shaft (GROWS with the line), floored at 40% of the 39.75px cap
+    // so a short arrow still shows a substantial head, capped at 39.75px (source; the historical
+    // 53 cut by 25% at the owner's request, DRAGON-477) so a long line doesn't get a huge head,
+    // and never past 70% of the shaft. Independent of stroke width (barbs get THICKER, not
+    // longer). In sync with the vector display (`annotation_canvas`, same 0.125 / 0.40·39.75 /
+    // 39.75, via its `ARROW_HEAD_*` constants).
+    let head_cap = (39.75 * scale).min(len * 0.7);
+    let head = (len * 0.125).clamp((39.75 * 0.40 * scale).min(head_cap), head_cap);
     let ang = 0.52_f32; // ~30° half-angle
     let (ca, sa) = (ang.cos(), ang.sin());
     let back = (-ux, -uy);
@@ -2940,8 +3073,11 @@ pub fn widget_items(items: &[AnnotationItem], curve_radius: f32, erasing: &[Anno
                     fill.map(to_iced_color),
                     FxKind::None,
                 ),
-                AnnotKind::Arrow { a, b, stroke_w } => (
-                    ItemKind::Arrow { ax: a.x, ay: a.y, bx: b.x, by: b.y },
+                AnnotKind::Arrow { a, b, bend, stroke_w } => (
+                    // The BEND rides along verbatim (DRAGON-470): the canvas derives its control
+                    // point from it through the same `crate::arrow_curve` the bake uses, so the
+                    // two draw one parabola.
+                    ItemKind::Arrow { ax: a.x, ay: a.y, bx: b.x, by: b.y, bend: *bend },
                     *stroke_w,
                     None,
                     FxKind::None,
@@ -3506,6 +3642,9 @@ impl App {
             Tool::Arrow => AnnotKind::Arrow {
                 a: AnnotPoint { x, y },
                 b: AnnotPoint { x, y },
+                // A new arrow is straight; the drag only moves the head (see `annot_gesture_to`),
+                // and the bend handle appears once it is selected.
+                bend: Bend::STRAIGHT,
                 stroke_w,
             },
             Tool::Rect => AnnotKind::Box {
@@ -4507,7 +4646,8 @@ impl App {
     /// PRODUCED text (so shifted / dead-key / precomposed characters insert correctly),
     /// Backspace/Delete remove (a whole grapheme, or the selection), the arrows + Home/End move
     /// the caret (Shift extends a selection), Cmd/Ctrl+C/X/V do clipboard, Escape or NUMPAD
-    /// Enter settles ([`text_edit_exits`], DRAGON-364). A non-clipboard primary-modifier chord
+    /// Enter settles ([`text_edit_exits`], DRAGON-364) AND deselects ([`escape_stage`],
+    /// DRAGON-468). A non-clipboard primary-modifier chord
     /// is SWALLOWED. Called from `keyboard.rs` before the keymap sees the press.
     pub(crate) fn text_edit_key(
         &mut self,
@@ -4521,8 +4661,26 @@ impl App {
         use super::text_annot as ta;
         // Escape / numpad Enter END the session. Checked BEFORE the modifier lanes so a stray
         // Shift or AltGr can't turn the exit key into a swallowed chord.
-        if text_edit_exits(&key, location) {
-            return self.settle_text_edit(id);
+        //
+        // DRAGON-468: the exit is STAGED with the selection, so ONE press both settles the box and
+        // drops the selection it left behind — entering an edit selects the box
+        // (`edit_existing_text`), so settling alone used to leave chrome on screen and make the
+        // next Escape look like it did nothing. `deselect_everything` is the shared action: the
+        // annotation deselect (which settles a live edit before it clears) plus the video
+        // timeline's, so a caption typed over a recording with a segment selected gives up both.
+        // The press with nothing left to give up is the one that reaches `PreviewCancel` and the
+        // window's close-or-confirm decision.
+        let stage = self.preview_for(id).map(|p| {
+            escape_stage(
+                &key,
+                location,
+                p.edit.text_edit.is_some(),
+                !p.edit.sel.is_empty(),
+                p.timeline_selected(),
+            )
+        });
+        if stage == Some(EscapeStage::Deselect) {
+            return self.deselect_everything(id);
         }
         let Some(p) = self.preview_for_mut(id) else {
             return Task::none();
@@ -5457,7 +5615,11 @@ fn kind_center(kind: &AnnotKind) -> (f32, f32) {
         | AnnotKind::Badge { rect, .. }
         | AnnotKind::Text { rect, .. }
         | AnnotKind::Spotlight { rect } => (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5),
-        AnnotKind::Arrow { a, b, .. } => ((a.x + b.x) * 0.5, (a.y + b.y) * 0.5),
+        // The middle of the drawn SHAFT (DRAGON-470), i.e. the bend handle: on a bowed arrow the
+        // chord midpoint can sit well off the ink, and the only consumer is the duplicate nudge,
+        // which should push a copy away from where the arrow actually is. Identical arithmetic to
+        // the old chord midpoint for a straight arrow.
+        AnnotKind::Arrow { a, b, bend, .. } => arrow_curve::handle((a.x, a.y), (b.x, b.y), *bend),
         AnnotKind::Pen { paths, .. } => {
             let r = pen_bounds(paths);
             (r.x + r.w * 0.5, r.y + r.h * 0.5)
@@ -5512,7 +5674,13 @@ fn kind_drawn_bounds(kind: &AnnotKind) -> AnnotRect {
         | AnnotKind::Badge { rect, .. }
         | AnnotKind::Text { rect, .. }
         | AnnotKind::Blur { rect } => *rect,
-        AnnotKind::Arrow { a, b, .. } => AnnotRect::from_points((a.x, a.y), (b.x, b.y)),
+        // A BENT arrow bows past its chord, so the outer extent is the CURVE's exact box
+        // (DRAGON-470) — a straight one returns the very same corners the chord's rect gave.
+        AnnotKind::Arrow { a, b, bend, .. } => {
+            let (x0, y0, x1, y1) =
+                arrow_curve::spanned_bounds((a.x, a.y), (b.x, b.y), *bend);
+            AnnotRect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+        }
         AnnotKind::Pen { paths, .. } => pen_bounds(paths),
     };
     AnnotRect { x: base.x - m, y: base.y - m, w: base.w + 2.0 * m, h: base.h + 2.0 * m }
@@ -5616,9 +5784,12 @@ fn translated_kind(kind: &AnnotKind, dx: f32, dy: f32) -> AnnotKind {
             constrained: *constrained,
             stroke_w: *stroke_w,
         },
-        AnnotKind::Arrow { a, b, stroke_w } => AnnotKind::Arrow {
+        // The bend is stored in the chord's OWN frame, so a translation leaves it alone — the
+        // curve travels with the endpoints for free (DRAGON-470).
+        AnnotKind::Arrow { a, b, bend, stroke_w } => AnnotKind::Arrow {
             a: AnnotPoint { x: a.x + dx, y: a.y + dy },
             b: AnnotPoint { x: b.x + dx, y: b.y + dy },
+            bend: *bend,
             stroke_w: *stroke_w,
         },
         // A pure translation keeps the point count, so the pressure signal rides unchanged.
@@ -5663,8 +5834,8 @@ fn group_scale_anchor(bounds: AnnotRect, grab: Grab) -> (f32, f32) {
         Grab::Edge(Edge::S) => (l, t),
         Grab::Edge(Edge::W) => (r, t),
         Grab::Edge(Edge::E) => (l, t),
-        // A move never scales; arrow-endpoint grabs never open a group scale.
-        Grab::Move | Grab::ArrowA | Grab::ArrowB => (l, t),
+        // A move never scales; an arrow's own grabs (endpoints, bend) never open a group scale.
+        Grab::Move | Grab::ArrowA | Grab::ArrowB | Grab::ArrowBend => (l, t),
     }
 }
 
@@ -5759,12 +5930,15 @@ fn group_scaled_kind(kind: &AnnotKind, anchor: (f32, f32), k: f32, frame: (f32, 
         }
         AnnotKind::Pixelate { rect } => AnnotKind::Pixelate { rect: scale_rect(rect) },
         AnnotKind::Blur { rect } => AnnotKind::Blur { rect: scale_rect(rect) },
-        AnnotKind::Arrow { a, b, stroke_w } => {
+        // A uniform scale about a point is a SIMILARITY, and the bend is expressed in the chord's
+        // own frame, so the bow scales with the arrow and the stored numbers never move.
+        AnnotKind::Arrow { a, b, bend, stroke_w } => {
             let (ax, ay) = map(a.x, a.y);
             let (bx, by) = map(b.x, b.y);
             AnnotKind::Arrow {
                 a: AnnotPoint { x: ax, y: ay },
                 b: AnnotPoint { x: bx, y: by },
+                bend: *bend,
                 stroke_w: *stroke_w,
             }
         }
@@ -5853,16 +6027,34 @@ pub fn band_hit_ids(
     items_in_band(items, AnnotRect::from_points((x0, y0), (x1, y1)))
 }
 
+/// How closely a BENT arrow's shaft is followed when a rubber band tests it (SOURCE px). Half a
+/// source pixel is finer than the stroke it is standing in for, and the band's own edges are
+/// dragged by hand, so nothing tighter is observable.
+const BAND_CURVE_TOL: f32 = 0.5;
+
 /// Every annotation the rubber `band` (SOURCE px, normalized) TOUCHES, in scene z-order
 /// (DRAGON-341). Rect-geometry kinds test their DRAWN rect against the band; an arrow tests its
-/// shaft as a segment; a pen group tests every stroke segment — so a band drawn through the
-/// empty middle of a scribble's bounding box does NOT take it, exactly like clicking. Pure —
-/// unit-tested.
+/// shaft as a segment (its flattened CURVE when bent, DRAGON-470); a pen group tests every stroke
+/// segment — so a band drawn through the empty middle of a scribble's bounding box does NOT take
+/// it, exactly like clicking. Pure — unit-tested.
 pub fn items_in_band(items: &[AnnotationItem], band: AnnotRect) -> Vec<AnnotId> {
     items
         .iter()
         .filter(|it| match &it.kind {
-            AnnotKind::Arrow { a, b, .. } => segment_hits_rect((a.x, a.y), (b.x, b.y), band),
+            // The band tests the SHAFT the user can see: the chord for a straight arrow (one
+            // segment, exactly as before), the flattened curve for a bent one (DRAGON-470) — so a
+            // band drawn through the hollow of a bow does not take it, and one drawn across the
+            // bow does.
+            AnnotKind::Arrow { a, b, bend, .. } => {
+                let (a, b) = ((a.x, a.y), (b.x, b.y));
+                let pts = arrow_curve::flatten(
+                    a,
+                    arrow_curve::control(a, b, *bend),
+                    b,
+                    BAND_CURVE_TOL,
+                );
+                pts.windows(2).any(|w| segment_hits_rect(w[0], w[1], band))
+            }
             AnnotKind::Pen { paths, .. } => paths.iter().any(|path| match path.len() {
                 0 => false,
                 1 => segment_hits_rect((path[0].x, path[0].y), (path[0].x, path[0].y), band),
@@ -5914,7 +6106,7 @@ fn edit_rect(rect: &AnnotRect, grab: Grab, dx: f32, dy: f32, fw: f32, fh: f32, m
         Grab::Edge(Edge::W) => AnnotRect::from_points((cx(l + dx), t), (r, b)),
         Grab::Edge(Edge::E) => AnnotRect::from_points((l, t), (cx(r + dx), b)),
         // Arrow grabs never apply to a box (defensive: leave it be).
-        Grab::ArrowA | Grab::ArrowB => *rect,
+        Grab::ArrowA | Grab::ArrowB | Grab::ArrowBend => *rect,
     }
 }
 
@@ -6060,29 +6252,73 @@ fn edited_kind(
                 stroke_w: *stroke_w,
             }
         }
-        AnnotKind::Arrow { a, b, stroke_w } => {
+        AnnotKind::Arrow { a, b, bend, stroke_w } => {
             // `m` is the round-cap overhang; clamp each endpoint (and shift a Move) so the caps
             // stay inside the image, not just the endpoint positions.
             let clamp = |px: f32, py: f32| AnnotPoint {
                 x: px.clamp(m, (fw - m).max(m)),
                 y: py.clamp(m, (fh - m).max(m)),
             };
-            let (mut na, mut nb) = (*a, *b);
+            let (mut na, mut nb, mut nbend) = (*a, *b, *bend);
             match grab {
                 Grab::Move => {
                     // Translate both, then shift so the whole arrow (caps included) stays inside.
+                    // The span is the CURVE's box (DRAGON-470), so a bow that reaches past the
+                    // chord is what gets held on the picture; a straight arrow's box IS its chord.
                     let (ax, ay, bx, by) = (a.x + dx, a.y + dy, b.x + dx, b.y + dy);
-                    let sx = shift_into(ax.min(bx) - m, ax.max(bx) + m, fw);
-                    let sy = shift_into(ay.min(by) - m, ay.max(by) + m, fh);
+                    let (x0, y0, x1, y1) =
+                        arrow_curve::spanned_bounds((ax, ay), (bx, by), *bend);
+                    let sx = shift_into(x0 - m, x1 + m, fw);
+                    let sy = shift_into(y0 - m, y1 + m, fh);
                     na = AnnotPoint { x: ax + sx, y: ay + sy };
                     nb = AnnotPoint { x: bx + sx, y: by + sy };
                 }
-                Grab::ArrowA => na = clamp(a.x + dx, a.y + dy),
-                Grab::ArrowB => nb = clamp(b.x + dx, b.y + dy),
+                // An ENDPOINT drag moves ONLY that endpoint (DRAGON-470, the repo owner's
+                // node-independence rule): the bend is re-derived so the handle stays exactly
+                // where it is, instead of the stored fractions carrying it along with the chord.
+                // `original` is the gesture's pre-drag snapshot, so the pin is the same point for
+                // the whole drag and cannot creep frame to frame.
+                Grab::ArrowA | Grab::ArrowB => {
+                    if matches!(grab, Grab::ArrowA) {
+                        na = clamp(a.x + dx, a.y + dy);
+                    } else {
+                        nb = clamp(b.x + dx, b.y + dy);
+                    }
+                    nbend = arrow_curve::bend_pinning_handle(
+                        (a.x, a.y),
+                        (b.x, b.y),
+                        *bend,
+                        (na.x, na.y),
+                        (nb.x, nb.y),
+                    );
+                }
+                // The BEND handle (DRAGON-470): it rides ON the curve's middle, so the drag moves
+                // it by the same relative delta every other handle uses, and the new bend is
+                // simply whichever one puts the curve's midpoint there.
+                Grab::ArrowBend => {
+                    let h = arrow_curve::handle((a.x, a.y), (b.x, b.y), *bend);
+                    let want = clamp(h.0 + dx, h.1 + dy);
+                    nbend =
+                        arrow_curve::bend_from_handle((a.x, a.y), (b.x, b.y), (want.x, want.y));
+                }
                 // Box grabs never apply to an arrow.
                 Grab::Corner(_) | Grab::Edge(_) => {}
             }
-            AnnotKind::Arrow { a: na, b: nb, stroke_w: *stroke_w }
+            // Whichever of the three arrow grabs ran, the SHAFT is what has to stay on the
+            // picture, and clamping the dragged POINT does not achieve that on its own
+            // ([`arrow_curve::fit_bend`]: an along-chord handle drag overshoots past the head,
+            // and a chord dragged short of a pinned handle re-derives a bend big enough to run
+            // past its own endpoints). So the bow gives way, just enough, and only when it has
+            // to: a bend that already fits comes back with its bits unchanged. This is also the
+            // ONE thing that can move a node the user is not dragging, and staying on the canvas
+            // is worth that. A Move is exempt because it has already shifted the WHOLE curve
+            // inside by its own bounds.
+            if matches!(grab, Grab::ArrowA | Grab::ArrowB | Grab::ArrowBend) {
+                let lo = (m, m);
+                let hi = ((fw - m).max(m), (fh - m).max(m));
+                nbend = arrow_curve::fit_bend((na.x, na.y), (nb.x, nb.y), nbend, lo, hi);
+            }
+            AnnotKind::Arrow { a: na, b: nb, bend: nbend, stroke_w: *stroke_w }
         }
     }
 }
@@ -6308,6 +6544,7 @@ mod tests {
         let arrow = AnnotKind::Arrow {
             a: AnnotPoint { x: 0.0, y: 0.0 },
             b: AnnotPoint { x: 100.0, y: 40.0 },
+            bend: Bend::STRAIGHT,
             stroke_w: 2.0,
         };
         assert_eq!(kind_center(&arrow), (50.0, 20.0));
@@ -6581,7 +6818,7 @@ mod tests {
 
     #[test]
     fn edited_arrow_endpoints_and_move() {
-        let orig = AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 100.0, y: 0.0 }, stroke_w: 6.0 };
+        let orig = AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 100.0, y: 0.0 }, bend: Bend::STRAIGHT, stroke_w: 6.0 };
         // Drag endpoint B to (120, 30): A unchanged.
         let k = edited_kind(&orig, Grab::ArrowB, (100.0, 0.0), (120.0, 30.0), (10000.0, 10000.0), false);
         let AnnotKind::Arrow { a, b, .. } = k else { panic!() };
@@ -6599,7 +6836,7 @@ mod tests {
         let tiny_arrow = AnnotationItem {
             id: AnnotId(2),
             color: [0; 4],
-            kind: AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 1.0, y: 1.0 }, stroke_w: 4.0 },
+            kind: AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 1.0, y: 1.0 }, bend: Bend::STRAIGHT, stroke_w: 4.0 },
         };
         assert!(is_degenerate(&tiny_arrow), "a near-zero-length arrow is degenerate");
     }
@@ -6611,7 +6848,7 @@ mod tests {
             AnnotationItem {
                 id: AnnotId(2),
                 color: [0, 128, 255, 255],
-                kind: AnnotKind::Arrow { a: AnnotPoint { x: 5.0, y: 5.0 }, b: AnnotPoint { x: 90.0, y: 70.0 }, stroke_w: 6.0 },
+                kind: AnnotKind::Arrow { a: AnnotPoint { x: 5.0, y: 5.0 }, b: AnnotPoint { x: 90.0, y: 70.0 }, bend: Bend::STRAIGHT, stroke_w: 6.0 },
             },
         ];
         let raster = rasterize_scene(&items, 100, 80, 1.0, DEFAULT_ANNOT_CURVE_RADIUS).expect("rasterizes");
@@ -6642,6 +6879,7 @@ mod tests {
                 kind: AnnotKind::Arrow {
                     a: AnnotPoint { x: 40.0, y: 40.0 },
                     b: AnnotPoint { x: 40.0, y: 40.0 }, // zero length
+                    bend: Bend::STRAIGHT,
                     stroke_w: 6.0,
                 },
             },
@@ -6651,6 +6889,7 @@ mod tests {
                 kind: AnnotKind::Arrow {
                     a: AnnotPoint { x: 10.0, y: 10.0 },
                     b: AnnotPoint { x: 11.0, y: 10.0 }, // 1px
+                    bend: Bend::STRAIGHT,
                     stroke_w: 6.0,
                 },
             },
@@ -7126,7 +7365,7 @@ mod tests {
         let base = RgbaImage::from_pixel(16, 16, ::image::Rgba([70, 70, 70, 255]));
         let vectors = vec![
             effect(1, AnnotKind::Box { rect: AnnotRect { x: 1.0, y: 1.0, w: 8.0, h: 8.0 }, stroke_w: 4.0, fill: None }, [255, 0, 0, 255]),
-            effect(2, AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 9.0, y: 9.0 }, stroke_w: 4.0 }, [0, 0, 255, 255]),
+            effect(2, AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 9.0, y: 9.0 }, bend: Bend::STRAIGHT, stroke_w: 4.0 }, [0, 0, 255, 255]),
         ];
         let mut baked = base.clone();
         apply_effects(&mut baked, &base, &vectors, DEFAULT_ANNOT_CURVE_RADIUS);
@@ -7146,6 +7385,7 @@ mod tests {
             AnnotKind::Arrow {
                 a: AnnotPoint { x: 0.0, y: 0.0 },
                 b: AnnotPoint { x: 1.0, y: 1.0 },
+                bend: Bend::STRAIGHT,
                 stroke_w: 4.0
             }
             .is_colorable()
@@ -7303,7 +7543,7 @@ mod tests {
             effect(4, AnnotKind::BoxHighlight { rect: r(4.0), stroke_w: 4.0 }, [1; 4]),
             effect(5, AnnotKind::Pixelate { rect: r(5.0) }, [0; 4]),
             effect(6, AnnotKind::Blur { rect: r(6.0) }, [0; 4]),
-            effect(7, AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 9.0, y: 9.0 }, stroke_w: 4.0 }, [1; 4]),
+            effect(7, AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 0.0 }, b: AnnotPoint { x: 9.0, y: 9.0 }, bend: Bend::STRAIGHT, stroke_w: 4.0 }, [1; 4]),
         ];
         let ko = knockout_rects(&items);
         assert_eq!(ko.len(), 4, "spotlight + box + highlight + box-highlight only");
@@ -7413,6 +7653,7 @@ mod tests {
             Some(AnnotKind::Arrow {
                 a: AnnotPoint { x: 10.0, y: 20.0 },
                 b: AnnotPoint { x: 210.0, y: 120.0 },
+                bend: Bend::STRAIGHT,
                 stroke_w: 4.0,
             })
         );
@@ -7452,6 +7693,7 @@ mod tests {
             AnnotKind::Arrow {
                 a: AnnotPoint { x: 0.0, y: 0.0 },
                 b: AnnotPoint { x: 9.0, y: 9.0 },
+                bend: Bend::STRAIGHT,
                 stroke_w: 4.0,
             },
             AnnotKind::Badge { rect: r, ring_w: 4.0 },
@@ -7500,6 +7742,7 @@ mod tests {
         let arrow = AnnotKind::Arrow {
             a: AnnotPoint { x: 0.0, y: 0.0 },
             b: AnnotPoint { x: 10.0, y: 10.0 },
+            bend: Bend::STRAIGHT,
             stroke_w: 2.0,
         };
         assert_eq!(
@@ -7507,6 +7750,7 @@ mod tests {
             AnnotKind::Arrow {
                 a: AnnotPoint { x: -4.0, y: 6.0 },
                 b: AnnotPoint { x: 6.0, y: 16.0 },
+                bend: Bend::STRAIGHT,
                 stroke_w: 2.0,
             }
         );
@@ -7567,7 +7811,7 @@ mod tests {
         // vectors BETWEEN members are identical before and after — the arrangement is rigid.
         let a = AnnotKind::Box { rect: AnnotRect { x: 20.0, y: 20.0, w: 30.0, h: 30.0 }, stroke_w: 4.0, fill: None };
         let b = AnnotKind::Highlight { rect: AnnotRect { x: 90.0, y: 60.0, w: 20.0, h: 20.0 } };
-        let c = AnnotKind::Arrow { a: AnnotPoint { x: 40.0, y: 100.0 }, b: AnnotPoint { x: 70.0, y: 130.0 }, stroke_w: 2.0 };
+        let c = AnnotKind::Arrow { a: AnnotPoint { x: 40.0, y: 100.0 }, b: AnnotPoint { x: 70.0, y: 130.0 }, bend: Bend::STRAIGHT, stroke_w: 2.0 };
         let members = [&a, &b, &c];
         let union = group_drawn_bounds(members).expect("non-empty");
         // Primary = `a` (top-left), image large enough that the nudge applies unclamped.
@@ -7656,7 +7900,7 @@ mod tests {
             // 2: a box far away.
             mk(2, AnnotKind::Box { rect: AnnotRect { x: 300.0, y: 300.0, w: 10.0, h: 10.0 }, stroke_w: 4.0, fill: None }),
             // 3: an arrow whose SHAFT crosses the band though both ends sit outside it.
-            mk(3, AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 70.0 }, b: AnnotPoint { x: 200.0, y: 70.0 }, stroke_w: 4.0 }),
+            mk(3, AnnotKind::Arrow { a: AnnotPoint { x: 0.0, y: 70.0 }, b: AnnotPoint { x: 200.0, y: 70.0 }, bend: Bend::STRAIGHT, stroke_w: 4.0 }),
             // 4: an "L" pen whose bbox SPANS the band but whose ink never enters it.
             mk(4, AnnotKind::Pen {
                 paths: vec![
@@ -8029,6 +8273,7 @@ mod tests {
             AnnotKind::Arrow {
                 a: AnnotPoint { x: 12.0, y: 18.0 },
                 b: AnnotPoint { x: 44.0, y: 60.0 },
+                bend: Bend::STRAIGHT,
                 stroke_w: 6.0,
             },
             AnnotKind::Badge { rect: AnnotRect { x: 30.0, y: 30.0, w: 24.0, h: 24.0 }, ring_w: 3.0 },
@@ -8199,6 +8444,7 @@ mod tests {
         let mut arrow = AnnotKind::Arrow {
             a: AnnotPoint { x: 0.0, y: 0.0 },
             b: AnnotPoint { x: 0.5, y: 0.0 },
+            bend: Bend::STRAIGHT,
             stroke_w: 4.0,
         };
         assert!(!normalize_pen_tap(&mut arrow, None));
@@ -9957,6 +10203,133 @@ mod tests {
         }
     }
 
+    // ── DRAGON-468: the STAGED escape (deselect first, close second) ───────────────────────
+
+    /// Escape gives up ONE thing at a time, outside in. The table is the whole rule: with
+    /// something held the press is consumed here, and only a press with nothing left to give up
+    /// falls through to the keymap, i.e. to `PreviewCancel` and the window's close-or-confirm
+    /// decision. Nothing about that decision is restated in `escape_stage`.
+    #[test]
+    fn escape_deselects_before_it_ever_reaches_the_close_decision() {
+        use cosmic::iced::keyboard::{key::Named, Key, Location};
+        let esc = Key::Named(Named::Escape);
+        // Typing: Escape settles the box AND drops the selections, in one press, whatever is
+        // selected on either axis.
+        for annots in [false, true] {
+            for segs in [false, true] {
+                assert_eq!(
+                    escape_stage(&esc, Location::Standard, true, annots, segs),
+                    EscapeStage::Deselect,
+                    "Escape mid-typing settles + deselects (annots={annots} segs={segs})",
+                );
+            }
+        }
+        // Not typing, something selected: the selection goes, and the press stops there.
+        assert_eq!(
+            escape_stage(&esc, Location::Standard, false, true, false),
+            EscapeStage::Deselect,
+        );
+        // Nothing held: THIS is the press the window's close decision gets.
+        assert_eq!(
+            escape_stage(&esc, Location::Standard, false, false, false),
+            EscapeStage::Pass,
+            "with nothing selected Escape must reach PreviewCancel, not be eaten",
+        );
+    }
+
+    /// The TIMELINE's segment selection counts as "something is selected" (DRAGON-468 review
+    /// finding): highlighted segments are a visible selection, so Escape must give them up on the
+    /// press BEFORE the one that reaches the close decision. Missing this term meant a recording
+    /// with a segment lit went straight to closing, which is the exact complaint the staging
+    /// exists to prevent. Either selection alone is enough; the terms are a plain OR.
+    #[test]
+    fn a_selected_timeline_segment_holds_the_first_escape_too() {
+        use cosmic::iced::keyboard::{key::Named, Key, Location};
+        let esc = Key::Named(Named::Escape);
+        // Timeline only (a recording with no annotations at all).
+        assert_eq!(
+            escape_stage(&esc, Location::Standard, false, false, true),
+            EscapeStage::Deselect,
+            "a lit segment must not sail past the first Escape",
+        );
+        // Annotations only, and both at once: the same answer.
+        assert_eq!(escape_stage(&esc, Location::Standard, false, true, false), EscapeStage::Deselect);
+        assert_eq!(escape_stage(&esc, Location::Standard, false, true, true), EscapeStage::Deselect);
+        // A still can never set the timeline term, and with neither set the press falls through.
+        assert_eq!(escape_stage(&esc, Location::Standard, false, false, false), EscapeStage::Pass);
+        // The term only qualifies for the ESCAPE key: a keypad Enter outside a text edit must not
+        // eat a segment selection either.
+        assert_eq!(
+            escape_stage(&Key::Named(Named::Enter), Location::Numpad, false, false, true),
+            EscapeStage::Pass,
+        );
+    }
+
+    /// The numpad-Enter twin rides the same staging (the ticket's "extend it to the numpad enter
+    /// logic"), and ONLY while typing: outside a text edit a keypad Enter is an ordinary key and
+    /// must never eat a selection. MAIN Enter never qualifies at all — the box is multi-line.
+    #[test]
+    fn only_a_typing_session_lets_numpad_enter_deselect() {
+        use cosmic::iced::keyboard::{key::Named, Key, Location};
+        let enter = Key::Named(Named::Enter);
+        assert_eq!(
+            escape_stage(&enter, Location::Numpad, true, true, false),
+            EscapeStage::Deselect,
+            "numpad Enter ends the session and drops the selection with it",
+        );
+        assert_eq!(
+            escape_stage(&enter, Location::Standard, true, true, false),
+            EscapeStage::Pass,
+            "MAIN Enter keeps inserting a newline mid-typing",
+        );
+        for annots in [false, true] {
+            for segs in [false, true] {
+                assert_eq!(
+                    escape_stage(&enter, Location::Numpad, false, annots, segs),
+                    EscapeStage::Pass,
+                    "outside a text edit a keypad Enter holds no selection hostage",
+                );
+            }
+        }
+        // Every other key is untouched by the staging, whatever is held — Delete/Backspace in
+        // particular keep their OWN lane (they remove the selection, they don't deselect it).
+        for k in [
+            Key::Named(Named::Delete),
+            Key::Named(Named::Backspace),
+            Key::Named(Named::Tab),
+            Key::Named(Named::ArrowLeft),
+            Key::Character("a".into()),
+        ] {
+            for typing in [false, true] {
+                for annots in [false, true] {
+                    for segs in [false, true] {
+                        assert_eq!(
+                            escape_stage(&k, Location::Standard, typing, annots, segs),
+                            EscapeStage::Pass,
+                            "{k:?} typing={typing} annots={annots} segs={segs}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The LADDER, walked as the user walks it: typing in a caption over a recording that also
+    /// has a segment selected, one Escape lands on the editor (settle + deselect BOTH), and the
+    /// NEXT one has nothing to give up so it reaches the close decision. TWO presses now, where
+    /// the settle handing the box back as a selection used to make it three.
+    #[test]
+    fn two_escapes_walk_from_a_live_caption_to_the_close_decision() {
+        use cosmic::iced::keyboard::{key::Named, Key, Location};
+        let esc = Key::Named(Named::Escape);
+        // Press 1: a live text edit on a selected box, plus a lit timeline segment.
+        assert_eq!(escape_stage(&esc, Location::Standard, true, true, true), EscapeStage::Deselect);
+        // The Deselect arm runs `App::deselect_everything`: the edit settles, the annotation set
+        // clears and the timeline's selection clears with it.
+        // Press 2: nothing is held.
+        assert_eq!(escape_stage(&esc, Location::Standard, false, false, false), EscapeStage::Pass);
+    }
+
     // ── DRAGON-369: what a live text edit does with the DESTRUCTIVE preview chords ────────
 
     /// **The safety pin.** A live text edit swallows every PRIMARY chord it does not claim, and
@@ -10867,5 +11240,267 @@ mod tests {
         let mut d = RgbaImage::from_pixel(60, 60, ::image::Rgba([0, 0, 0, 255]));
         apply_annotations(&mut d, &[boxed(1, 0.0, 0.0, 20.0, 20.0)], DEFAULT_ANNOT_CURVE_RADIUS);
         assert_eq!(c.as_raw(), d.as_raw(), "offset shifts the overlay by -offset");
+    }
+}
+
+// ── DRAGON-470: the arrow's third handle ─────────────────────────────────────────────────
+//
+// The curve MATHS lives in `crate::arrow_curve` (and is unit-tested there, next to it). What is
+// pinned here is the MODEL side: which gestures write the bend, which ones must leave it alone,
+// and that a straight arrow still behaves exactly as it did before the handle existed.
+#[cfg(test)]
+mod arrow_bend_tests {
+    use super::*;
+
+    /// A straight arrow from `a` to `b` at stroke 6.
+    fn arrow(a: (f32, f32), b: (f32, f32)) -> AnnotKind {
+        AnnotKind::Arrow {
+            a: AnnotPoint { x: a.0, y: a.1 },
+            b: AnnotPoint { x: b.0, y: b.1 },
+            bend: Bend::STRAIGHT,
+            stroke_w: 6.0,
+        }
+    }
+
+    fn parts(k: &AnnotKind) -> ((f32, f32), (f32, f32), Bend) {
+        let AnnotKind::Arrow { a, b, bend, .. } = k else { panic!("not an arrow") };
+        ((a.x, a.y), (b.x, b.y), *bend)
+    }
+
+    const FRAME: (f32, f32) = (10_000.0, 10_000.0);
+
+    #[test]
+    fn a_new_arrow_is_straight() {
+        let (_, _, bend) = parts(&arrow((0.0, 0.0), (100.0, 0.0)));
+        assert!(bend.is_straight());
+        let spawned = spawn_kind(Tool::Arrow, AnnotRect { x: 0.0, y: 0.0, w: 200.0, h: 100.0 }, 4.0)
+            .expect("the arrow tool pre-places");
+        assert!(parts(&spawned).2.is_straight(), "a double-click spawn is straight too");
+    }
+
+    #[test]
+    fn dragging_the_bend_handle_puts_the_curve_through_the_pointer() {
+        let orig = arrow((10.0, 100.0), (110.0, 100.0));
+        // Press on the handle (the chord midpoint) and pull 40px up.
+        let k = edited_kind(&orig, Grab::ArrowBend, (60.0, 100.0), (60.0, 60.0), FRAME, false);
+        let (a, b, bend) = parts(&k);
+        assert_eq!((a, b), ((10.0, 100.0), (110.0, 100.0)), "the endpoints do not move");
+        assert!(!bend.is_straight());
+        let h = arrow_curve::handle(a, b, bend);
+        assert!((h.0 - 60.0).abs() < 1e-3 && (h.1 - 60.0).abs() < 1e-3, "{h:?}");
+    }
+
+    #[test]
+    fn dragging_the_bend_handle_back_to_the_middle_straightens_the_arrow() {
+        let bowed = AnnotKind::Arrow {
+            a: AnnotPoint { x: 10.0, y: 100.0 },
+            b: AnnotPoint { x: 110.0, y: 100.0 },
+            bend: Bend { along: 0.0, across: -0.4 },
+            stroke_w: 6.0,
+        };
+        // The handle is at (60, 60); drag it back down onto the chord.
+        let k = edited_kind(&bowed, Grab::ArrowBend, (60.0, 60.0), (60.0, 100.0), FRAME, false);
+        assert!(parts(&k).2.is_straight(), "back on the chord = straight again");
+    }
+
+    /// Every corner of the drawn curve is on the picture, margins included — the invariant all
+    /// three arrow grabs owe (DRAGON-470 review finding 1).
+    fn assert_on_picture(k: &AnnotKind, frame: (f32, f32), what: &str) {
+        let (a, b, bend) = parts(k);
+        let m = kind_draw_margin(k);
+        let (x0, y0, x1, y1) = arrow_curve::spanned_bounds(a, b, bend);
+        assert!(x0 >= m - 1e-2, "{what}: left edge {x0} < margin {m}");
+        assert!(y0 >= m - 1e-2, "{what}: top edge {y0} < margin {m}");
+        assert!(x1 <= frame.0 - m + 1e-2, "{what}: right edge {x1} past {}", frame.0 - m);
+        assert!(y1 <= frame.1 - m + 1e-2, "{what}: bottom edge {y1} past {}", frame.1 - m);
+    }
+
+    #[test]
+    fn dragging_the_bend_handle_along_the_chord_keeps_the_shaft_on_the_picture() {
+        // Review finding 1, repro (a): dragged ALONG the chord toward the head, the handle stays
+        // comfortably inside the frame while the SHAFT overshoots past the head by up to ⅛ of the
+        // chord. Clamping the handle alone never sees it.
+        let frame = (300.0, 300.0);
+        let orig = arrow((20.0, 150.0), (280.0, 150.0));
+        // Pull the handle from the middle all the way onto the head, and then some.
+        let k = edited_kind(&orig, Grab::ArrowBend, (150.0, 150.0), (400.0, 150.0), frame, false);
+        assert_on_picture(&k, frame, "handle dragged along the chord");
+    }
+
+    #[test]
+    fn dragging_an_endpoint_shrinks_a_bow_that_would_leave_the_picture() {
+        // Review finding 1, repro (b), re-aimed at the node-independence semantics: holding the
+        // handle while the TAIL is dragged away from it grows the along-offset, and a shaft that
+        // already ran close to the right edge then overshoots past its own head, off the picture.
+        // The bow gives way; the dragged endpoint still lands where it was put.
+        let frame = (300.0, 300.0);
+        let (oa, ob) = ((60.0, 150.0), (290.0, 150.0));
+        let bend = arrow_curve::bend_from_handle(oa, ob, (250.0, 150.0));
+        let bowed = AnnotKind::Arrow {
+            a: AnnotPoint { x: oa.0, y: oa.1 },
+            b: AnnotPoint { x: ob.0, y: ob.1 },
+            bend,
+            stroke_w: 6.0,
+        };
+        assert_on_picture(&bowed, frame, "the fixture itself fits");
+        let k = edited_kind(&bowed, Grab::ArrowA, oa, (-40.0, 150.0), frame, false);
+        let (a, _, fitted) = parts(&k);
+        let m = kind_draw_margin(&k);
+        assert!((a.0 - m).abs() < 1e-3, "the dragged endpoint lands on the margin");
+        assert_on_picture(&k, frame, "tail dragged away from a pinned handle");
+        // It really was the FIT that saved it: the pinned re-derivation alone does not fit.
+        let unfitted = arrow_curve::bend_pinning_handle(oa, ob, bend, a, ob);
+        assert!(fitted.along.abs() < unfitted.along.abs(), "{fitted:?} vs {unfitted:?}");
+        assert!(!fitted.is_straight(), "flattened only as far as it had to be: {fitted:?}");
+    }
+
+    #[test]
+    fn the_bend_handle_stays_on_the_picture() {
+        let orig = arrow((10.0, 100.0), (210.0, 100.0));
+        // Yank the handle far above a 300×300 image: it clamps to the drawn margin, and the fit
+        // then holds the rest of the curve on the picture with it.
+        let frame = (300.0, 300.0);
+        let k = edited_kind(&orig, Grab::ArrowBend, (110.0, 100.0), (110.0, -5000.0), frame, false);
+        let (a, b, bend) = parts(&k);
+        let h = arrow_curve::handle(a, b, bend);
+        let m = kind_draw_margin(&k);
+        assert!(h.1 >= m - 1e-3, "handle {h:?} held inside the picture (margin {m})");
+        assert_on_picture(&k, frame, "handle yanked off the top");
+        let (_, y0, _, _) = arrow_curve::spanned_bounds(a, b, bend);
+        assert!(y0 >= m - 1e-3, "and so is the curve's own top edge ({y0})");
+    }
+
+    #[test]
+    fn moving_an_endpoint_leaves_the_other_two_nodes_where_they_are() {
+        // THE node-independence rule (the repo owner's, overriding the shape-preserving
+        // convention the first cut shipped): drag one node and the other two hold still.
+        let bend = Bend { along: 0.1, across: -0.3 };
+        let (oa, ob) = ((100.0, 200.0), (200.0, 200.0));
+        let bowed = AnnotKind::Arrow {
+            a: AnnotPoint { x: oa.0, y: oa.1 },
+            b: AnnotPoint { x: ob.0, y: ob.1 },
+            bend,
+            stroke_w: 6.0,
+        };
+        let pinned = arrow_curve::handle(oa, ob, bend);
+        for (grab, press) in [(Grab::ArrowA, oa), (Grab::ArrowB, ob)] {
+            for drag in [(37.0, 21.0), (300.0, -60.0), (-45.0, 90.0)] {
+                let cur = (press.0 + drag.0, press.1 + drag.1);
+                let k = edited_kind(&bowed, grab, press, cur, FRAME, false);
+                let (a, b, nbend) = parts(&k);
+                // The dragged endpoint went where it was put; the OTHER one never moved.
+                let (dragged, still, orig_still) = match grab {
+                    Grab::ArrowA => (a, b, ob),
+                    _ => (b, a, oa),
+                };
+                assert!((dragged.0 - cur.0).abs() < 1e-3 && (dragged.1 - cur.1).abs() < 1e-3);
+                assert_eq!(still, orig_still, "{grab:?} moved the other endpoint");
+                // And the bend handle is still on its old spot.
+                let now = arrow_curve::handle(a, b, nbend);
+                assert!(
+                    (now.0 - pinned.0).abs() < 1e-2 && (now.1 - pinned.1).abs() < 1e-2,
+                    "{grab:?} {drag:?}: handle {pinned:?} → {now:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_endpoint_drag_leaves_a_straight_arrow_straight() {
+        // The one node that DOES follow an endpoint: a straight arrow's middle is derived, not
+        // placed, so re-deriving it against the old midpoint would invent a bend.
+        let orig = arrow((100.0, 200.0), (200.0, 200.0));
+        let k = edited_kind(&orig, Grab::ArrowB, (200.0, 200.0), (500.0, 420.0), FRAME, false);
+        let (a, b, bend) = parts(&k);
+        assert!(bend.is_straight(), "{bend:?}");
+        // Its handle is exactly the new chord's midpoint, as a straight arrow's always is.
+        let h = arrow_curve::handle(a, b, bend);
+        assert!((h.0 - 300.0).abs() < 1e-3 && (h.1 - 310.0).abs() < 1e-3, "{h:?}");
+    }
+
+    #[test]
+    fn an_endpoint_dragged_onto_the_other_degrades_without_panicking() {
+        let bend = Bend { along: 0.0, across: -0.3 };
+        let bowed = AnnotKind::Arrow {
+            a: AnnotPoint { x: 100.0, y: 200.0 },
+            b: AnnotPoint { x: 200.0, y: 200.0 },
+            bend,
+            stroke_w: 6.0,
+        };
+        // Head dragged exactly onto the tail: a chord of nothing, which has no frame to hold a
+        // handle in, so the bend degrades to straight rather than to NaN.
+        let k = edited_kind(&bowed, Grab::ArrowB, (200.0, 200.0), (100.0, 200.0), FRAME, false);
+        let (a, b, collapsed) = parts(&k);
+        assert_eq!(a, b, "the chord really did collapse");
+        assert!(collapsed.is_straight(), "{collapsed:?}");
+        // Still inside the SAME gesture, dragging back out restores the curve: every event
+        // re-derives from the pre-drag snapshot, so nothing latched.
+        let k = edited_kind(&bowed, Grab::ArrowB, (200.0, 200.0), (260.0, 200.0), FRAME, false);
+        let (a, b, back) = parts(&k);
+        assert!(!back.is_straight(), "{back:?}");
+        let now = arrow_curve::handle(a, b, back);
+        let pinned = arrow_curve::handle((100.0, 200.0), (200.0, 200.0), bend);
+        assert!((now.0 - pinned.0).abs() < 1e-2 && (now.1 - pinned.1).abs() < 1e-2, "{now:?}");
+    }
+
+    #[test]
+    fn a_move_and_a_group_scale_carry_the_bend_untouched() {
+        let bend = Bend { along: -0.05, across: 0.35 };
+        let bowed = AnnotKind::Arrow {
+            a: AnnotPoint { x: 10.0, y: 10.0 },
+            b: AnnotPoint { x: 110.0, y: 10.0 },
+            bend,
+            stroke_w: 6.0,
+        };
+        assert_eq!(parts(&translated_kind(&bowed, 7.0, -3.0)).2, bend, "translate");
+        assert_eq!(
+            parts(&group_scaled_kind(&bowed, (0.0, 0.0), 2.0, FRAME)).2,
+            bend,
+            "group scale"
+        );
+        assert_eq!(
+            parts(&edited_kind(&bowed, Grab::Move, (0.0, 0.0), (5.0, 5.0), FRAME, false)).2,
+            bend,
+            "move gesture"
+        );
+    }
+
+    #[test]
+    fn a_bent_arrows_bounds_cover_its_bow() {
+        let straight = arrow((0.0, 50.0), (100.0, 50.0));
+        let flat = kind_drawn_bounds(&straight);
+        // The straight arrow's box is its chord grown by the cap margin — unchanged behaviour.
+        let m = kind_draw_margin(&straight);
+        assert!((flat.y - (50.0 - m)).abs() < 1e-4 && (flat.h - 2.0 * m).abs() < 1e-4, "{flat:?}");
+        let bowed = AnnotKind::Arrow {
+            a: AnnotPoint { x: 0.0, y: 50.0 },
+            b: AnnotPoint { x: 100.0, y: 50.0 },
+            bend: Bend { along: 0.0, across: -0.3 },
+            stroke_w: 6.0,
+        };
+        let bowed_box = kind_drawn_bounds(&bowed);
+        // The bow reaches 30px above the chord, and the box reaches with it.
+        assert!((bowed_box.y - (20.0 - m)).abs() < 1e-3, "{bowed_box:?}");
+    }
+
+    #[test]
+    fn a_band_takes_a_bent_arrow_by_its_bow_not_its_chord() {
+        let bowed = AnnotationItem {
+            id: AnnotId(1),
+            color: [255, 0, 0, 255],
+            kind: AnnotKind::Arrow {
+                a: AnnotPoint { x: 0.0, y: 50.0 },
+                b: AnnotPoint { x: 100.0, y: 50.0 },
+                bend: Bend { along: 0.0, across: -0.3 },
+                stroke_w: 6.0,
+            },
+        };
+        let items = [bowed];
+        // A band around the bow's apex (50, 20) takes it…
+        let apex = AnnotRect { x: 45.0, y: 15.0, w: 10.0, h: 10.0 };
+        assert_eq!(items_in_band(&items, apex), vec![AnnotId(1)], "the ink is there");
+        // …while one around the (now empty) chord midpoint does not.
+        let hollow = AnnotRect { x: 45.0, y: 45.0, w: 10.0, h: 10.0 };
+        assert!(items_in_band(&items, hollow).is_empty(), "the chord is not the shaft");
     }
 }

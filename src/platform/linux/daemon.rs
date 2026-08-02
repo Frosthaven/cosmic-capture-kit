@@ -502,6 +502,14 @@ pub fn run(daemon_intent: bool) -> ! {
     // the tray/SNI setup on purpose: the no-SNI-host path exits without ever reaching
     // the trigger loop, and the capture must happen regardless. Daemon-intent
     // (`resident`) launches raise only the tray, as always.
+    //
+    // DRAGON-465 (Windows) was this exact rule firing for nobody: an installer relaunched
+    // the app BARE, `main` read that as capture intent, and a finished update came back with
+    // an overlay over the release notes. Linux cannot hit it — there is no in-app install
+    // flow here, so the post-update marker is never written and the marker check further
+    // down is a no-op. If one is ever added, relaunch through
+    // `update::post_update_relaunch_args` and gate this spawn with
+    // `update::owes_capture_on_start`, both of which are shared and already tested.
     if !daemon_intent {
         log::info!("resident: capture-intent launch became the resident; spawning the capture");
         spawn_child(REGION_FLAG);

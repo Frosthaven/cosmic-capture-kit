@@ -690,10 +690,21 @@ impl App {
     /// Shown only in the alert, which is on the user's own screen. The debug log keeps
     /// using `diag::path_shape`, because that file gets emailed to us and a capture path
     /// can name the user's documents.
+    ///
+    /// **It names the folder actually WRITTEN TO, not the configured one** (DRAGON-467
+    /// review, minor 9). With "Automatically save originals" off, the capture goes to a
+    /// transient folder, and an alert that said "couldn't save to ~/Capture" would send the
+    /// user to check permissions on a folder the save never touched. `capture_write_dir` is
+    /// the same reader the write itself used, so the two cannot disagree.
     #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     fn capture_folder_display(&self) -> Option<String> {
-        let raw = self.screenshot_dir.trim();
-        (!raw.is_empty()).then(|| raw.to_string())
+        // A recording failure names the recording folder; everything else the still one.
+        // `recording` is still set at the point a failure is reported, so this is the same
+        // question the write asked.
+        let is_video = self.recording.is_some();
+        let dir = self.capture_write_dir_display(is_video);
+        let dir = dir.trim();
+        (!dir.is_empty()).then(|| dir.to_string())
     }
 }
 

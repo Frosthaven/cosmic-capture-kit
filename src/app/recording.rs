@@ -863,14 +863,15 @@ impl App {
 
     /// Destination file for a new recording of `sel`: `<dir>/<stem>.mp4` (same
     /// `<timestamp>[-<descriptor>]` naming as screenshots).
+    ///
+    /// DRAGON-467: `<dir>` is the configured `record_dir`, or the session runtime directory
+    /// when the Video Editor's "Automatically save originals" is off — the same fork stills
+    /// take (`App::capture_write_dir`). The recording TEMP (`record::recording_temp_path`)
+    /// is derived from this path, so it follows the recording rather than being stranded in
+    /// a folder the finished file never reaches.
     pub(super) fn record_output_path(&self, sel: &Selection) -> std::path::PathBuf {
-        let raw = if self.record_dir.trim().is_empty() {
-            "~/Capture"
-        } else {
-            self.record_dir.trim()
-        };
-        let dir = crate::util::expand_tilde(raw);
-        dir.join(super::capture_flow::recording_save_name(&self.capture_stem(sel)))
+        self.capture_write_dir(true)
+            .join(super::capture_flow::recording_save_name(&self.capture_stem(sel)))
     }
 }
 

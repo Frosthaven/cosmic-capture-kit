@@ -776,6 +776,7 @@ impl App {
             .then(|| self.overlay_header_row(preview, tb));
         compose_preview(
             preview.surface.is_window(),
+            tb.labels,
             self.overlay_control_width(preview),
             header,
             self.edit_toolbar(preview, tb),

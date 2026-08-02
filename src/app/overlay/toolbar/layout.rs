@@ -158,3 +158,62 @@ impl App {
         Some((rect, horizontal))
     }
 }
+
+/// Which side of the toolbar its buttons' hover tooltips open on (DRAGON-475). Pure
+/// geometry over the placed rect, unit-tested below.
+///
+/// A fixed side cannot work here: the toolbar sits bottom-centred by default, anchors to
+/// ANY side of a region selection, and can be dragged anywhere on the output. The rule is
+/// "open into the larger free band" — above/below the bar when it lays out horizontally,
+/// beside it when it is stacked — so a tooltip never opens toward an edge the toolbar is
+/// hugging, where it would only be clamped back over the very buttons it labels.
+pub(super) fn tooltip_side(
+    horizontal: bool,
+    rect: &cosmic::iced::Rectangle,
+    ow: f32,
+    oh: f32,
+) -> widget::tooltip::Position {
+    use widget::tooltip::Position;
+    if horizontal {
+        if rect.y >= oh - (rect.y + rect.height) { Position::Top } else { Position::Bottom }
+    } else if rect.x >= ow - (rect.x + rect.width) {
+        Position::Left
+    } else {
+        Position::Right
+    }
+}
+
+#[cfg(test)]
+mod tooltip_side_tests {
+    use super::*;
+    use cosmic::iced::Rectangle;
+    use widget::tooltip::Position;
+
+    /// The default bottom-centred toolbar has more room above it than below → open UP.
+    #[test]
+    fn the_bottom_toolbar_opens_its_tooltips_upward() {
+        let r = Rectangle { x: 800.0, y: 1000.0, width: 320.0, height: 48.0 };
+        assert!(matches!(tooltip_side(true, &r, 1920.0, 1080.0), Position::Top));
+    }
+
+    /// Dragged to hug the top edge, opening up would clamp back over the bar → open DOWN.
+    #[test]
+    fn a_toolbar_dragged_to_the_top_edge_opens_downward() {
+        let r = Rectangle { x: 800.0, y: 8.0, width: 320.0, height: 48.0 };
+        assert!(matches!(tooltip_side(true, &r, 1920.0, 1080.0), Position::Bottom));
+    }
+
+    /// Stacked beside a region on the LEFT half of the output → open toward the free right.
+    #[test]
+    fn a_left_anchored_stack_opens_rightward() {
+        let r = Rectangle { x: 40.0, y: 300.0, width: 148.0, height: 400.0 };
+        assert!(matches!(tooltip_side(false, &r, 1920.0, 1080.0), Position::Right));
+    }
+
+    /// Stacked on the RIGHT half → open toward the free left.
+    #[test]
+    fn a_right_anchored_stack_opens_leftward() {
+        let r = Rectangle { x: 1700.0, y: 300.0, width: 148.0, height: 400.0 };
+        assert!(matches!(tooltip_side(false, &r, 1920.0, 1080.0), Position::Left));
+    }
+}

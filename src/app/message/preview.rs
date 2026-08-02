@@ -24,10 +24,10 @@ pub struct VideoMeta {
 
 #[derive(Debug, Clone)]
 pub enum PreviewMsg {
-    /// Keep the capture where it was auto-saved, then finish.
+    /// Save the document: open the destination picker, pre-filled with the path a plain
+    /// overwrite-save would have written (DRAGON-467 — Save IS Save As now, so there is one
+    /// message and one button where there were two).
     Save,
-    /// Save As: open a file picker to choose a destination.
-    SaveAs,
     /// Save As result: the chosen destination (`None` = cancelled, stay open). A non-null
     /// pick kicks off the background export (bake/move to the destination).
     SaveAsResult(Option<PathBuf>),
@@ -36,10 +36,24 @@ pub enum PreviewMsg {
     /// app alive until it lands, then closes (auto-close on) or reopens the editor on the
     /// just-saved file (auto-close off).
     SaveAsBaked(Option<PathBuf>),
-    /// Copy the capture to the clipboard. DRAGON-353: this NEVER closes the editor —
-    /// pending edits bake to a throwaway temp so the saved file stays clean, and a toast
-    /// reports the outcome.
+    /// Copy the capture to the clipboard. This NEVER closes the editor by itself — pending
+    /// edits bake to a throwaway temp so the saved file stays clean, and a toast reports the
+    /// outcome. The exit path arms a close around it when "Automatically copy changes on
+    /// exit" is on (DRAGON-467).
     Copy,
+    /// Hand the current file to the system share sheet (DRAGON-467). Only pressable where
+    /// `platform::services::share_available()` is true (Windows since DRAGON-474, macOS
+    /// since DRAGON-480). See `share::share_sheet`'s module doc for where the other
+    /// platforms stand.
+    Share,
+    /// The share sheet finished presenting (DRAGON-480, macOS only — Windows and Linux share
+    /// synchronously and never produce this). `Err` shows a toast; `Ok` is silent, exactly
+    /// like the synchronous platforms' success case.
+    ShareDone(Result<(), String>),
+    /// Upload the capture to a configured account (DRAGON-467). The accounts feature does not
+    /// exist yet, so the toolbar button ships DISABLED and never emits this; the variant is
+    /// the wiring that account work will land on.
+    Upload,
     /// Open the SETTINGS pane from the preview editor's chrome. A fullscreen-overlay
     /// document converts itself to a window first (an exclusive layer surface would sit
     /// over the settings window); the pane itself is a detached `--settings` child, or a
@@ -111,8 +125,10 @@ pub enum PreviewMsg {
     /// minimize button (DRAGON-284) instead.
     #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
     WindowMinimize,
-    /// Delete the file, then finish.
-    Delete,
+    // DRAGON-467: `Delete` (unlink the capture and close) lived here. The editor no longer
+    // deletes anything — with "Automatically save originals" off an unwanted capture never
+    // reaches the user's folder in the first place, so closing IS the discard. Its button,
+    // its `Ctrl+Shift+X` action and the unlink plumbing went with it.
     /// The decoded image is ready — replace the loading spinner with it. Carries the
     /// raw pixels too, so preview edits recomposite from the untouched original.
     ImageReady(cosmic::widget::image::Handle, Option<Arc<::image::RgbaImage>>),
@@ -182,17 +198,15 @@ pub enum PreviewMsg {
     /// Close the document, abandoning the pending edits ("Close without saving"). The
     /// FILE is untouched — only the un-baked edits are lost.
     DiscardAndClose,
-    /// The unsaved-changes dialog's action buttons: do the share, THEN close the document.
-    /// Each arms `EditState::close_after_share` and delegates to the plain action, so the
-    /// share flow itself never learns about closing.
+    /// The unsaved-changes dialog's ONE action button: save, THEN close the document. Arms
+    /// `EditState::close_after_share` and delegates to the plain toolbar action, so the save
+    /// flow itself never learns about closing.
+    ///
+    /// DRAGON-467 reduced the card to three options (Save / Continue editing / Close without
+    /// saving), so its siblings are gone: `SaveAsAndClose` with the separate Save As button,
+    /// `CopyAndClose` because a copy neither saves nor discards the edits the card is asking
+    /// about, and `DeleteAndClose` with the delete feature itself.
     SaveAndClose,
-    SaveAsAndClose,
-    CopyAndClose,
-    /// The dialog's Delete button. Delete closes the document by itself, so the "and then
-    /// close" here buys nothing functionally — it exists so all FOUR dialog buttons take
-    /// the identical route (`share_then_close` → the plain toolbar message), which is what
-    /// dismisses the dialog before the action's own feedback appears.
-    DeleteAndClose,
     /// Sweep this document's expired toasts (the `sub_preview_toasts` tick).
     ToastTick,
     /// A recording's poster frame + probed metadata finished (`None` poster = none could
@@ -424,12 +438,12 @@ mod tests {
         for m in [
             // The actions that create toasts must never shorten the toast they create.
             PreviewMsg::Save,
-            PreviewMsg::SaveAs,
             PreviewMsg::Copy,
-            PreviewMsg::Delete,
+            PreviewMsg::Share,
+            PreviewMsg::Upload,
             PreviewMsg::SaveAndClose,
-            PreviewMsg::CopyAndClose,
-            PreviewMsg::DeleteAndClose,
+            PreviewMsg::KeepEditing,
+            PreviewMsg::DiscardAndClose,
             // Looking, not editing.
             PreviewMsg::Zoom(1.0, 0.0, 0.0),
             PreviewMsg::ZoomPreset(1),

@@ -17,8 +17,10 @@ UI) when its dependency is missing.
 |---|---|---|
 | **Wayland compositor (COSMIC)** | The whole app is a native COSMIC overlay. | See protocols below — capture relies on COSMIC's screencopy, so it does **not** work on non-COSMIC compositors. |
 | **Vulkan-capable GPU + driver** | The overlay is rendered with `wgpu` (via libcosmic/iced), whose primary Linux backend is Vulkan. | Needs the Vulkan loader (`libvulkan.so.1`) and an ICD — NVIDIA's driver, or Mesa (RADV/ANV). Loaded at runtime (not shown by `ldd`). |
-| **libxkbcommon** (`libxkbcommon.so.0`) | Keyboard handling (Escape to cancel, etc.). | The only extra system library linked directly into the binary. |
-| **libwayland-client** | Wayland client transport. | `dlopen`ed at runtime by the Wayland client stack. |
+| **libxkbcommon** (`libxkbcommon.so.0`) | Keyboard handling (Escape to cancel, etc.). | **Linked** into the binary, so building needs its dev package too. See §7. |
+| **libpulse** (`libpulse.so.0`) | The shared PulseAudio client FFI (`src/audio/pulse_ffi.rs`): the device-latency probe and the system-audio monitor capture. | **Linked** into the binary (`#[link(name = "pulse")]`, not `dlopen`ed), so it is a build requirement of every Linux build, including one that will never record. See §7. |
+| **libpipewire** (`libpipewire-0.3.so.0`) | The xdg-portal ScreenCast capture path (the `pipewire` crate binds it). | **Linked** into the binary, and an unconditional Linux dependency rather than a feature-gated one. See §7. |
+| **libwayland-client** | Wayland client transport. | `dlopen`ed at runtime by the Wayland client stack, so no dev package is needed to build. |
 | **libgbm** (`libgbm.so.1`) | Allocates the GPU buffer for **zero-copy recording** (via the `gbm` crate): the compositor copies each frame straight into it. | Part of Mesa; present on any GPU desktop. Used only when GPU zero-copy is enabled. |
 | **libavcodec / libavutil** | **In-process** hardware video encoding for the zero-copy path (via `ffmpeg-next`), distinct from the external `ffmpeg` binary. | Linked at build time, version-matched to ffmpeg 8.1. Used only for GPU zero-copy. |
 | **DRM render node** (`/dev/dri/renderD*`) | The GPU the compositor renders on — zero-copy allocates its capture buffer and runs the in-process encoder on this same device. | Requires membership in the `render` / `video` group. Zero-copy only. |
@@ -81,11 +83,24 @@ either just yields a generic label; encoding is unaffected.
 
 ---
 
-## 4. Audio capture — optional (recordings with sound)
+## 4. Audio capture: **required for recording**, at build time and run time
+
+Two things here are stronger than "optional", and both used to be mis-stated in
+this file:
+
+- **libpulse is LINKED into the binary**, not `dlopen`ed (§1). Its dev package is
+  needed to compile every Linux build, even one that will never record.
+- **A recording FAILS if the audio pre-flight cannot start.** It does not fall
+  back to a silent video. `record::owned::try_start_owned_audio` starts the mic
+  chain and the system-audio monitor **unconditionally**, before any video, and
+  returns an error if either will not come up. The mic / system toggles are gain
+  automation applied later, so turning them off does not skip the capture. A
+  recording on a machine with no Pulse-compatible server ends with a named
+  failure instead of a file.
 
 | Dependency | Why | Without it |
 |---|---|---|
-| **PulseAudio** or **PipeWire** (with `pipewire-pulse`) | Microphone and system-audio capture for recordings; ffmpeg reads via `-f pulse`. | The mic / system-audio toggles produce no audio; recordings are video-only. |
+| **PulseAudio** or **PipeWire** (with `pipewire-pulse`) | Microphone and system-audio capture for recordings; ffmpeg reads via `-f pulse`. | **Recording fails**, with the reason surfaced (`system audio (pulse monitor) connection failed to start`). Screenshots are unaffected. |
 | **`pactl`** (from `libpulse` / `pipewire-pulse`) | Enumerating input + output devices for the "Input device" / "Output device" pickers in Settings (labelled to match COSMIC's sound settings). | The pickers just offer "System (automatic)" (the default source / monitor). |
 
 > **The whole mic input chain is built in — no external dependency.** The Audio
@@ -133,10 +148,11 @@ Extra runtime needs for this path: **libgbm**, a **DRM render node**
 (`/dev/dri/renderD*`, `render` group), the **`zwp_linux_dmabuf_v1`** protocol, and
 the in-process **libavcodec / libavutil** (all listed in §1).
 
-This whole path is a compile-time cargo feature — **`zero-copy`**, on by default.
+This whole path is a compile-time cargo feature, **`zero-copy`**, on by default.
 Build with **`--no-default-features`** to drop `ffmpeg-next` + `libgbm` entirely;
 the app then builds on distros without ffmpeg 8 (Debian/Ubuntu/Pop!_OS LTS) and
-recording uses only the external `ffmpeg` binary (no in-process zero-copy).
+recording uses only the external `ffmpeg` binary (no in-process zero-copy). **See
+§7** for when this is mandatory rather than optional.
 
 ---
 
@@ -149,6 +165,74 @@ recording uses only the external `ffmpeg` binary (no in-process zero-copy).
 | **XDG base dirs** | `XDG_RUNTIME_DIR` for short-lived handoff files (clipboard payload, OCR temp PNG); `XDG_STATE_HOME`/cache for persisted settings (`state.ron`). |
 | **System fonts** | UI text rendering (cosmic-text). Uses installed fonts via the system font database. |
 | **`dev.frosthaven.CosmicCaptureKit.desktop`** (desktop entry) | Matches the app's `app_id` so the desktop and xdg-desktop-portal resolve its name (**"Cosmic Capture Kit"**) instead of a generic / wrong fallback in the screencast picker. Shipped in `res/`; install to `~/.local/share/applications/`. |
+
+---
+
+## 7. Building from source
+
+Everything above is a RUNTIME dependency unless its row says otherwise. This
+section is the BUILD side: a missing entry here fails the compile, it does not
+degrade a feature.
+
+### The linked libraries
+
+Three system libraries are linked directly into the binary, so building needs
+their development packages (the headers, and the unversioned `.so` symlink that
+only the dev package ships). A desktop system normally has the runtime library
+and not the dev package, which is what makes a first build fail.
+
+| Build dependency | Why it is needed to build | Arch / CachyOS | Debian / Ubuntu / Mint / Pop!_OS |
+|---|---|---|---|
+| **libxkbcommon** | `smithay-client-toolkit`'s build script pkg-configs it. | `libxkbcommon` | `libxkbcommon-dev` |
+| **libpulse** | `src/audio/pulse_ffi.rs` declares `#[link(name = "pulse")]` (§4). | `libpulse` | `libpulse-dev` |
+| **libpipewire** | The `pipewire` crate, an unconditional Linux dependency. | `libpipewire` | `libpipewire-0.3-dev` |
+| **libclang** | Not linked, but `libspa-sys` generates the PipeWire bindings with bindgen. | `clang` | `libclang-dev` |
+| a C toolchain, pkg-config | Build scripts and the final link step. | `base-devel` | `build-essential`, `pkg-config` |
+
+Two package-name traps, both verified rather than guessed:
+
+- On Arch the headers and the `libpipewire-0.3.pc` / `libspa-0.2.pc` files are in
+  **`libpipewire`**, the client-library package. The `pipewire` package is the
+  daemon and ships no headers and no `.pc` files, so installing it alone leaves
+  the build failing.
+- On Debian the SPA headers are a separate package, but `libpipewire-0.3-dev`
+  depends on `libspa-0.2-dev`, so installing the one pulls the other. Both are
+  needed: `libspa-sys` pkg-configs `libspa-0.2`.
+
+```sh
+# Debian / Ubuntu / Linux Mint / Pop!_OS
+sudo apt install build-essential pkg-config libclang-dev \
+                 libxkbcommon-dev libpulse-dev libpipewire-0.3-dev
+```
+
+`libwayland` is deliberately absent: the Wayland client stack is `dlopen`ed
+(§1), so no dev package is required for it.
+
+### `zero-copy` needs ffmpeg 8, which LTS distros do not have
+
+The default `zero-copy` feature links the system libavcodec/libavutil through
+`ffmpeg-next`, which binds the **ffmpeg 8.1** headers. Rolling distros (Arch,
+CachyOS, recent Fedora) have that. The LTS distros do not: Ubuntu 24.04 (and so
+Mint 22) ships ffmpeg **6.1.1**, and no `-dev` package there can satisfy an
+ffmpeg 8 binding at any version, so the build stops inside `ffmpeg-sys-next`.
+
+On those distros, build with the feature off:
+
+```sh
+cargo build --release --no-default-features
+```
+
+Two things to know about that flag:
+
+1. It is needed on **every** cargo invocation (`build`, `test`, `run`,
+   `install`), not just the first. Leaving it off restores the default feature
+   set and the same failure.
+2. Cargo has no way to disable one feature by name, only `--features` to add
+   one, so `--no-default-features` is the whole lever. `zero-copy` is this
+   crate's only feature, so the two mean the same thing here.
+
+Nothing is lost but the in-process GPU zero-copy path (§5). Recording still
+works through the external `ffmpeg` binary, which is fine on ffmpeg 5+.
 
 ---
 
@@ -169,3 +253,29 @@ sudo pacman -S pipewire-pulse                 # or pulseaudio
 
 > Wayland/Vulkan/D-Bus and the COSMIC compositor are assumed present on any COSMIC
 > desktop, so they are not listed in the install command.
+
+## Quick install (Debian / Ubuntu / Mint / Pop!_OS)
+
+Runtime packages only. The build packages are in §7, and on these distros the
+build also needs `--no-default-features`.
+
+```sh
+# Recording and OCR:
+sudo apt install ffmpeg tesseract-ocr tesseract-ocr-eng
+
+# Sound for recordings, which is REQUIRED for recording to work at all (§4).
+# Usually already present, but confirm rather than assume:
+sudo apt install pipewire-pulse pulseaudio-utils   # pactl lives in -utils
+
+# Optional hardware-encoder labelling / accel (install what matches your GPU):
+sudo apt install pciutils                          # lspci (GPU naming)
+sudo apt install vainfo va-driver-all              # VAAPI (AMD/Intel)
+```
+
+> The xdg-desktop-portal BACKEND is desktop-specific and has no single package
+> name here: COSMIC uses `xdg-desktop-portal-cosmic`, which these distros may not
+> package. Without a backend the folder pickers in Settings will not open, though
+> the directory can still be typed in.
+>
+> These distros are not a supported target yet. See the README's support table;
+> what runs there beyond the build is a separate open question.

@@ -170,11 +170,10 @@ impl App {
             ducking: false,
             surface_open: true,
             toasts: Toasts::default(),
-            save_in_place: false,
             copied_on_open: false,
             demoted: false,
+            bake_src: None,
             saved_path: None,
-            written: Vec::new(),
         });
         // This is the in-flight capture's document; the capture flow addresses it by id.
         self.capture_preview = Some(id);
@@ -425,7 +424,7 @@ impl App {
         // pre-opened spinner still decoding), since the compositor won't shrink an
         // over-large window later.
         let (w, h) = match media {
-            Some(m) => windowed_fit_size(m, Some(monitor), extra_h),
+            Some(m) => windowed_fit_size(m, Some(monitor), extra_h, self.preview_toolbar_labels),
             None => (
                 (monitor.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
                 (monitor.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
@@ -488,6 +487,38 @@ impl App {
     /// is nothing on screen to demote, and re-minting a window for it would resurrect a
     /// surface that was closed on purpose. Such a document re-opens through
     /// [`Self::reopen_preview_surface`], which consults the same rule and gets a window.
+    /// Tear ONE preview surface down while the document stays loaded, and hand back the close
+    /// task — the ONE seam every such teardown goes through (DRAGON-469).
+    ///
+    /// This exists to make an ordering STRUCTURAL that the whole Save As fix rests on. Off
+    /// Linux a preview surface is a real winit window, so the destroy this returns will echo a
+    /// `window::Event::Closed` back at us, indistinguishable from a window manager taking the
+    /// surface away. [`super::surface_closed`] tells the two apart by reading
+    /// [`PreviewState::surface_open`] — which therefore has to be cleared BEFORE the destroy
+    /// is issued, not after. Two statements in the right order is a rule a later edit can
+    /// break silently (and DRAGON-467 is rewriting `save_as_dialog` right now); minting the
+    /// flag clear and the task TOGETHER is a rule it cannot.
+    ///
+    /// The surface is torn down via its ACTUALLY RECORDED kind, never the appearance setting.
+    /// A document whose surface is already down yields `Task::none()`, so a second call can
+    /// never issue a destroy for a dead id.
+    ///
+    /// This is NOT a document close: `close_preview` is still the "this document is finished"
+    /// seam, and it removes the document BEFORE destroying its surface, which is why its own
+    /// echo lands on a document that no longer exists.
+    pub(super) fn hide_preview_surface(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for_mut(id) else {
+            return Task::none();
+        };
+        if !p.surface_open {
+            return Task::none();
+        }
+        let (surface, window) = (p.surface, p.window);
+        // Ordered, and inseparable: the flag first, the destroy second.
+        p.mark_surface_torn_down();
+        surface.close(window)
+    }
+
     pub(super) fn demote_preview_to_window(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
         let Some(p) = self.preview_for(id) else {
             return Task::none();
@@ -496,7 +527,6 @@ impl App {
             return Task::none();
         }
         let old_id = p.window;
-        let old_surface = p.surface;
         let external = p.external;
         let fallback_monitor = p.monitor;
         let source_scale = p.source_scale;
@@ -512,8 +542,11 @@ impl App {
                 None => (None, fallback_monitor),
             }
         };
-        // Tear the overlay down via its ACTUAL recorded kind (never the setting).
-        let close = old_surface.close(old_id);
+        // Tear the overlay down through the ONE teardown seam (DRAGON-469): its ACTUAL
+        // recorded kind, never the setting, with the liveness flag cleared first. The
+        // `repoint_preview` below re-arms that flag for the fresh surface, so the net state
+        // is exactly what it was before this went through the seam.
+        let close = self.hide_preview_surface(old_id);
         // `mint_preview_window` sizes through `self.preview_output_scale` — the scale of the
         // capture being minted for, which is NOT this document's (a demotion is triggered by
         // some OTHER document opening, and a handed-over one carries the scale of the
@@ -648,6 +681,36 @@ impl App {
         if old_surface.is_window() && self.previews.iter().any(|p| p.window != old_id) {
             return Task::none();
         }
+        // NOT WHILE THE SETTINGS PANE IS UP (DRAGON-469). Promoting back to the fullscreen
+        // overlay would undo, on purpose, the very thing
+        // [`Self::open_settings_from_preview`] demoted this document for: on Linux the
+        // preview overlay is an `Exclusive` layer surface, so it takes the keyboard away from
+        // the settings window AND covers it, and the pane is a SEPARATE process that cannot
+        // defend itself. Fixing the toggle's direction made that newly reachable, so it is
+        // refused rather than shipped as a trap. The refusal leaves the persisted appearance
+        // alone and mints nothing, so it cannot reintroduce the reload it replaced; the toast
+        // is there because a button that silently does nothing is the complaint this ticket
+        // opened with.
+        //
+        // Honest platform note: `settings_pane_is_open` answers `false` on Windows BY DESIGN
+        // (a named mutex with no non-retaining probe — see its doc), so this refusal cannot
+        // fire there and a Windows user can still cover their settings window with the
+        // overlay. That is acceptable where it would not be on Linux: the Windows overlay is
+        // an ordinary topmost window with no keyboard grab, so the pane stays alt-tabbable and
+        // fully usable underneath. Not worth a named-event probe of its own.
+        if overlay_promotion_blocked(
+            !toggled_preview_windowed(old_surface),
+            self.settings.window.is_some() || crate::instance::settings_pane_is_open(),
+        ) {
+            self.preview_toast_icon(
+                id,
+                ToastKind::Error,
+                "Close the settings window to go fullscreen",
+                "emblem-system-symbolic",
+            );
+            return Task::none();
+        }
+
         // An explicit appearance choice clears a forced demotion's sticky pin (see
         // [`Self::demote_preview_to_window`]) — the "stays windowed" rule is about never
         // re-entering fullscreen SILENTLY, not about overriding the user.
@@ -656,12 +719,23 @@ impl App {
         }
 
         // Persist the flip so it also becomes the default for the next capture.
-        self.preview_windowed = !self.preview_windowed;
+        //
+        // DRAGON-469: derived from the surface that is ACTUALLY OPEN, never by inverting the
+        // setting. The two can disagree, and inverting in a disagreeing state asked for the
+        // kind that was already up, so the button tore the window down and minted an identical
+        // one ("clicking the button just seems to reload our window"). Identical to the old
+        // expression whenever the setting and the surface agree; see
+        // [`toggled_preview_windowed`], whose doc enumerates every disagreeing state.
+        self.preview_windowed = toggled_preview_windowed(old_surface);
         self.save_state();
 
-        // Tear down the CURRENT surface — via the kind that's ACTUALLY open, not the
-        // (already-flipped) setting, so this can't mis-close a surface mid-toggle.
-        let close = old_surface.close(old_id);
+        // Tear down the CURRENT surface through the ONE teardown seam (DRAGON-469): its
+        // ACTUALLY open kind, not the (already-flipped) setting, so this can't mis-close a
+        // surface mid-toggle, and with the liveness flag honoured both ways — a document
+        // whose surface is already down (a Save As chooser is up) now yields no destroy at all
+        // instead of one for a dead id. `repoint_preview` below re-arms the flag on the fresh
+        // surface, so the net state is unchanged for every reachable toggle.
+        let close = self.hide_preview_surface(old_id);
 
         // `--preview` files anchor to the active output (None); in-app captures to the
         // capture monitor. Fall back to the preview's last-known monitor size otherwise.
@@ -865,11 +939,10 @@ impl App {
             ducking: false,
             surface_open: true,
             toasts: Toasts::default(),
-            save_in_place: false,
             copied_on_open: false,
             demoted: false,
+            bake_src: None,
             saved_path: None,
-            written: Vec::new(),
         });
         // This is the in-flight capture's document; the capture flow addresses it by id.
         self.capture_preview = Some(id);
@@ -938,11 +1011,10 @@ impl App {
             ducking: false,
             surface_open: true,
             toasts: Toasts::default(),
-            save_in_place: false,
             copied_on_open: false,
             demoted: false,
+            bake_src: None,
             saved_path: None,
-            written: Vec::new(),
         });
         // A `--preview` launch has exactly this one document; the capture flow's
         // deferred-open paths address it the same way a captured preview is addressed.
@@ -1079,11 +1151,10 @@ impl App {
             ducking: false,
             surface_open: true,
             toasts: Toasts::default(),
-            save_in_place: false,
             copied_on_open: false,
             demoted: false,
+            bake_src: None,
             saved_path: None,
-            written: Vec::new(),
         });
         // NOT `capture_preview` (see above) — but it IS what the user just captured, so it
         // takes the keyboard-routing focus.
@@ -1429,12 +1500,6 @@ impl App {
         // route is about to be chosen. Everything after this mark is the stretch the user
         // experiences as "the editor opening".
         crate::util::timing_mark("preview: present_capture (capture written; choosing a route)");
-        // DRAGON-451: the region "Copy selection" quick-action (primary+C while a region was
-        // drawn) branched to a forced-copy delivery HERE. It is retired — the DRAGON-428
-        // global "(no editor)" hotkeys do the same job from outside the overlay, and by then
-        // the two paths were identical: DRAGON-353 had already removed the copy-to-clipboard
-        // setting the quick-action existed to bypass.
-        //
         // DRAGON-428: this launch asked for no editor (`--no-editor`, or a daemon
         // "(no editor)" capture hotkey). Deliver through `finish_share` — the SAME
         // editor-less path a capture takes when no editor can be opened at all — so there
@@ -1448,7 +1513,13 @@ impl App {
         //
         // Read, not taken: this describes the launch, so a second capture in the same
         // process (there is none today) would honour it too.
-        if self.no_editor {
+        //
+        // DRAGON-479 ORs in the region-copy chord's one-shot override rather than adding a
+        // second early return, so the two ways of asking for an editor-less capture reach the
+        // one delivery through the one decision. It is TAKEN (not read): it describes this
+        // capture only, and a later capture in the same process behaves normally again.
+        let one_shot = std::mem::take(&mut self.copy_selection_pending);
+        if self.no_editor || one_shot {
             return self.finish_share(&path, size, is_video);
         }
         // DRAGON-353: the editor is the capture's destination unconditionally (the "Open in
@@ -1560,7 +1631,16 @@ impl App {
         // overlay layer-batching artifact). Normal tooltips otherwise.
         let suppress_tooltips =
             preview.edit.flyout.is_some() || preview.edit.annot_picker.is_some();
-        let tb = Tb { pid: preview.window, scale: preview.surface.btn_scale(), glass, suppress_tooltips };
+        // DRAGON-478: the top bar's group captions, from the setting. The SAME flag every
+        // sizing path hands `PreviewSurface::chrome_h`, so what the bar draws and what the
+        // layout reserved can never disagree.
+        let tb = Tb {
+            pid: preview.window,
+            scale: preview.surface.btn_scale(),
+            glass,
+            suppress_tooltips,
+            labels: self.preview_toolbar_labels,
+        };
         // The document's toasts (DRAGON-353), built once and handed to whichever content
         // branch draws. They anchor to the MEDIA area, so the builders own the placement
         // rather than this function stacking them over the whole surface (which would cover
@@ -1781,12 +1861,23 @@ impl App {
     /// that have never been baked into a file. Returns the backdrop + the centred card, to
     /// be stacked over the editor by [`Self::preview_view`].
     ///
-    /// The action buttons ACT — they are the editor's own Save / Save As / Copy / Delete,
-    /// and each closes the document once it lands (`share_then_close`). A dialog that only
-    /// dismissed you back into the editor to press the same buttons would be a speed bump,
-    /// not an answer to "what do you want to do with these edits". "Keep editing" is the
-    /// dismiss; "Close without saving" abandons the pending edits (the FILE is untouched —
-    /// nothing on disk is lost, only the un-baked overlay).
+    /// **EXACTLY THREE OPTIONS** (user decision after testing DRAGON-467), and the card is
+    /// the question "you are leaving with unsaved edits, what now?" answered completely:
+    ///
+    /// * **Save** — the ordinary save-then-close (`share_then_close` → the destination
+    ///   picker). Cancelling the picker returns to the editor with the close disarmed.
+    /// * **Continue editing** — dismiss the card and stay.
+    /// * **Close without saving** — the discard route, which still honours "Automatically
+    ///   copy changes on exit": "without saving" is about the DISK, and that setting is about
+    ///   the clipboard.
+    ///
+    /// The card used to mirror the whole action bar (Save / Save As / Copy / Delete). Save As
+    /// went when Save became the picker, and Copy and Delete go here: Delete no longer exists
+    /// anywhere in the editor, and Copy was never an answer to "what about your unsaved
+    /// edits" — it neither saves them nor discards them, so offering it as a way OUT of the
+    /// card invited a close that quietly dropped work the user thought they had dealt with.
+    /// Anyone who wants a copy can take one from the toolbar and then leave, and the exit
+    /// setting does it for them anyway.
     ///
     /// Rendered in-app rather than as a real dialog window so it is clickable over the
     /// fullscreen overlay's exclusive keyboard grab as well as inside the CSD window. The
@@ -1815,31 +1906,11 @@ impl App {
         .interaction(cosmic::iced::mouse::Interaction::Idle)
         .into();
 
-        // The SAME lineup as the action bar (minus the size chip): every way out of the
-        // document is offered here, so the dialog never sends you back to hunt for one.
-        // Delete is present because it IS one of the four actions, and it is tinted
-        // DANGER so it can't be mistaken for a save.
-        let mut actions: Vec<Element<'a, Msg>> = vec![
-            dialog_action("document-save-symbolic", "Save", PreviewMsg::SaveAndClose, id, None),
-            dialog_action(
-                "document-save-as-symbolic",
-                "Save As",
-                PreviewMsg::SaveAsAndClose,
-                id,
-                None,
-            ),
-            dialog_action("edit-copy-symbolic", "Copy", PreviewMsg::CopyAndClose, id, None),
-        ];
-        // Never offer to delete a `--preview` file: it isn't ours (same rule as the bar).
-        if !preview.external {
-            actions.push(dialog_action(
-                "edit-delete-symbolic",
-                "Delete",
-                PreviewMsg::DeleteAndClose,
-                id,
-                Some(crate::app::theme::danger),
-            ));
-        }
+        // ONE action: Save. The other two ways out are the buttons below (Continue editing /
+        // Close without saving), which together with this make the three options the card
+        // offers. See this function's doc for why Copy and Delete are not among them.
+        let actions: Vec<Element<'a, Msg>> =
+            vec![dialog_action("document-save-symbolic", "Save", PreviewMsg::SaveAndClose, id, None)];
 
         // A FAILED attempt turns this card into the failure report (DRAGON-353 follow-up):
         // same four actions (so the top row IS the retry), but the wording says what went
@@ -1851,8 +1922,8 @@ impl App {
             Some(reason) => ("Couldn't finish that", reason, "Exit anyway"),
             None => (
                 "Unsaved changes",
-                "Your edits haven't been written to a file yet. Save them, put them on the \
-                 clipboard, or keep working.",
+                "Your edits haven't been written to a file yet. Save them, keep working, or \
+                 close and let them go.",
                 "Close without saving",
             ),
         };

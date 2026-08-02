@@ -901,41 +901,60 @@ impl App {
                 // destroy), where it is the only signal that this document is gone — and, if
                 // it was the last one, that the process should end.
                 if self.is_preview_window(id) {
-                    // The surface is ALREADY gone (that is what this event reports), so
-                    // clear its liveness flag before closing the document — otherwise
-                    // `close_preview` would issue a second destroy for a dead id.
-                    // DRAGON-419 (silent-exit path S5). Sampled BEFORE the flag is cleared
-                    // below: a surface still marked open when its destroy arrives did NOT
-                    // route through the editor — the compositor / window manager took it
-                    // away. If it was the last document this ends the process, so a capture
-                    // that SUCCEEDED disappears with no editor and no message. It also covers
-                    // the pre-opened SPINNER (window picks and freeze crops open one before
-                    // the grab completes), where the file may already be written.
-                    let lost_out_of_band =
-                        self.preview_for(id).is_some_and(|p| p.surface_open && !p.edit.baking);
+                    // What this destroy MEANS is a pure decision (DRAGON-469,
+                    // `preview::surface_closed`): our own teardown echoed back, a bake still
+                    // mid-write, or a surface the window manager took away. Sampled BEFORE
+                    // the liveness flag is cleared below — that flag IS the "we did this on
+                    // purpose" signal, so reading it afterwards would classify everything as
+                    // a loss.
+                    let action = match self.preview_for(id) {
+                        Some(p) => preview::surface_closed(p.surface_open, p.edit.baking),
+                        // Unreachable: `is_preview_window` just proved the document exists.
+                        // Treat it as the ordinary loss rather than inventing a fourth case.
+                        None => preview::SurfaceClosed::LostOutOfBand,
+                    };
                     let last_document = self.previews.len() <= 1;
                     if let Some(p) = self.preview_for_mut(id) {
-                        p.surface_open = false;
+                        // The surface is ALREADY gone (that is what this event reports), so
+                        // clear its liveness flag — otherwise `close_preview` would issue a
+                        // second destroy for a dead id. Through the named seam, like every
+                        // other teardown (DRAGON-469).
+                        p.mark_surface_torn_down();
                         // A bake is committing the edits to disk (DRAGON-352): its own
                         // background teardown reports Closed HERE, outside the
                         // `update_preview` baking guard — closing the document now would
                         // `finish_session` and exit with the bake thread mid-write.
                         // Defer: `BakeDone` reads the flag and completes the close.
-                        if p.edit.baking {
+                        if action == preview::SurfaceClosed::DeferToBake {
                             p.edit.close_after_bake = true;
-                            return Task::none();
                         }
                     }
-                    if lost_out_of_band {
-                        crate::diag::note_failure(
-                            crate::diag::Failure::PreviewSurfaceLost,
-                            &format!(
-                                "a preview surface was destroyed out of band (not through the \
-                                 editor); last_document={last_document}"
-                            ),
-                        );
-                    }
-                    return self.close_preview(id);
+                    return match action {
+                        // DRAGON-469: the Save As dialog tore the fullscreen overlay down and
+                        // is still on screen; the document stays loaded and
+                        // `reopen_preview_surface` brings the overlay back when the dialog
+                        // resolves. Closing here would end the process mid-dialog.
+                        preview::SurfaceClosed::Ours => Task::none(),
+                        preview::SurfaceClosed::DeferToBake => Task::none(),
+                        preview::SurfaceClosed::LostOutOfBand => {
+                            // DRAGON-419 (silent-exit path S5): a surface still marked open
+                            // when its destroy arrives did NOT route through the editor — the
+                            // compositor / window manager took it away. If it was the last
+                            // document this ends the process, so a capture that SUCCEEDED
+                            // disappears with no editor and no message. It also covers the
+                            // pre-opened SPINNER (window picks and freeze crops open one
+                            // before the grab completes), where the file may already be
+                            // written.
+                            crate::diag::note_failure(
+                                crate::diag::Failure::PreviewSurfaceLost,
+                                &format!(
+                                    "a preview surface was destroyed out of band (not through \
+                                     the editor); last_document={last_document}"
+                                ),
+                            );
+                            self.close_preview(id)
+                        }
+                    };
                 }
                 Task::none()
             }

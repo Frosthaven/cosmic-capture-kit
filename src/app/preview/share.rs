@@ -1,21 +1,38 @@
-//! Share plumbing: the Save As dialog, the in-place reload after an export, the
-//! background bake that commits pending edits, and the ONE completion seam every share
-//! action lands on.
+//! Share plumbing: the save destination picker, the background bake that renders pending
+//! edits, and the completion seam a copy lands on.
 //!
-//! # The DRAGON-353 model
+//! # The model (DRAGON-353, reshaped by DRAGON-467)
 //!
-//! Every action here is expressed as a [`ShareIntent`], and every one of them completes in
-//! [`App::finish_share_intent`] — whether a bake ran (asynchronously, via `BakeDone`) or
-//! not (synchronously, when the document was clean). That single funnel is what keeps
-//! "save writes the `-edited` sibling", "copy leaves the saved file untouched", "delete
-//! copies first when the setting says so" and "only the settings-driven flavours close the
-//! document" from drifting apart across four call sites.
+//! The editor has TWO ways of getting a document out, and they are deliberately different
+//! shapes:
 //!
-//! Two rules the funnel enforces that used to be scattered:
+//! * **Save** opens the destination picker ([`App::save_as_dialog`], pre-filled with
+//!   [`App::preview_save_target`]) and the pick runs its own export in
+//!   `PreviewMsg::SaveAsResult` → `SaveAsBaked`, which bakes straight to the chosen path and
+//!   retargets the document onto it.
+//! * **Copy** runs through [`App::run_copy`] → [`App::finish_copy`], whether a bake ran
+//!   (asynchronously, via `BakeDone`), was reused, or was not needed at all. That funnel is
+//!   what keeps "copy leaves what is on disk alone", "a failed copy never closes anything"
+//!   and "who closes the document" from drifting across the three callers (the toolbar, the
+//!   exit path, and the ask card's discard).
 //!
-//! * **A share NEVER closes the editor by itself.** The auto-close setting is gone; only
-//!   [`ShareIntent::closes_document`] (the two settings-driven flavours) and an explicit
-//!   `close_after_share` (the unsaved-changes dialog's action buttons) close anything.
+//! * **Share** (DRAGON-474) runs through [`App::run_share_sheet`] →
+//!   [`App::finish_share_sheet`] — the same refuse / reuse / bake fork as Copy, delivering
+//!   to the system share sheet instead of the clipboard.
+//!
+//! There is no fourth. DELETE used to be here, with its own `ShareIntent` flavour, its
+//! file-unlink step and a copy-first setting; the editor stopped deleting anything in
+//! DRAGON-467, so the intent enum, the delete step and the tracked `written` set all went
+//! (the share sheet brought back exactly one bit of it, `bake_for_share`).
+//!
+//! Rules this file enforces that used to be scattered:
+//!
+//! * **An action NEVER closes the editor by itself.** Only an explicit `close_after_share`
+//!   closes anything, and exactly two callers arm it: the unsaved-changes card's Save button,
+//!   and the exit path's "Automatically copy changes on exit".
+//! * **A close never rides on a failed action.** Every failing step returns early with the
+//!   surface still up, so the exit copy cannot close over a clipboard write that did not
+//!   happen.
 //! * **Feedback is a per-document TOAST**, not a desktop notification. The processing
 //!   notification is gone too — the editor stays up and shows its own spinner instead
 //!   (see `PREVIEW_PROCESSING_MESSAGES`).
@@ -23,21 +40,13 @@
 use super::*;
 
 impl App {
-    /// Post a toast on `id`'s document. A no-op for a document that has already closed, so
-    /// a late async completion can never resurrect state.
-    pub(super) fn preview_toast(
-        &mut self,
-        id: window::Id,
-        kind: ToastKind,
-        text: impl Into<String>,
-    ) {
-        if let Some(p) = self.preview_for_mut(id) {
-            p.toasts.push(kind, text);
-        }
-    }
-
-    /// [`Self::preview_toast`] carrying an explicit per-toast icon (DRAGON-357) — the outcome's
-    /// own glyph (copied / saved / deleted, and their failures) instead of the severity default.
+    /// Post a toast on `id`'s document, carrying the outcome's own glyph (copied / saved, and
+    /// their failures) rather than a severity default. A no-op for a document that has already
+    /// closed, so a late async completion can never resurrect state.
+    ///
+    /// DRAGON-467: there used to be an icon-LESS `preview_toast` beside this. Its only caller
+    /// was the delete's partial-failure toast, so it went with the delete feature and every
+    /// notice now names its glyph.
     pub(super) fn preview_toast_icon(
         &mut self,
         id: window::Id,
@@ -48,14 +57,6 @@ impl App {
         if let Some(p) = self.preview_for_mut(id) {
             p.toasts.push_icon(kind, text, icon);
         }
-    }
-
-    /// The user-facing name of a path — what a toast says instead of a full path (which
-    /// would wrap the card in a fullscreen overlay).
-    fn display_name(path: &std::path::Path) -> String {
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
     }
 
     /// Put `path` on the clipboard and TOAST the outcome. Returns what was reported.
@@ -76,10 +77,16 @@ impl App {
         ok
     }
 
-    /// Post the clipboard outcome's toast. Shared by the synchronous Copy action above and by
-    /// the asynchronous open-time copy's completion ([`PreviewMsg::AutoCopied`], DRAGON-454),
-    /// so the two can never word the same outcome differently.
+    /// Post the clipboard outcome's toast, and record the history position the clipboard now
+    /// holds. Shared by the synchronous Copy action above and by the asynchronous open-time
+    /// copy's completion ([`PreviewMsg::AutoCopied`], DRAGON-454), so the two can never word
+    /// the same outcome differently, and so BOTH count as "the clipboard has this state"
+    /// (DRAGON-467 review, major 4 — the auto-copy lands at depth 0, which is what makes an
+    /// immediate Escape on an untouched capture copy nothing a second time).
     pub(super) fn toast_copy_outcome(&mut self, id: window::Id, ok: bool) {
+        if ok && let Some(p) = self.preview_for_mut(id) {
+            p.edit.mark_copied();
+        }
         if ok {
             self.preview_toast_icon(id, ToastKind::Success, "Copied to clipboard", "clipboard-check-symbolic");
         } else {
@@ -87,35 +94,15 @@ impl App {
         }
     }
 
-    /// Copy `src` to a throwaway temp beside the other runtime files and return it, so the
-    /// clipboard can be served from a file that OUTLIVES `src`.
-    ///
-    /// This exists for the delete-with-copy path. The Linux clipboard worker is handed a
-    /// PATH, not bytes: it reads the file (a still) or advertises its `file://` URI (a
-    /// recording) from a detached child, so unlinking the original right after spawning it
-    /// is a race at best and a dead URI at worst. Staging first removes the question —
-    /// the same trick the edited-copy bake already uses.
-    ///
-    /// A STILL is staged through [`edit::save_unedited_still`] rather than a raw copy, for
-    /// the same reason the name it is staged under says png (DRAGON-455): the staged file
-    /// has to BE what it claims. For our own captures — every still that is not an external
-    /// `--preview` image — that is a byte copy and nothing moves.
-    fn stage_clipboard_copy(src: &std::path::Path, is_video: bool) -> Option<PathBuf> {
-        let temp = PathBuf::from(crate::util::runtime_dir())
-            .join(clipboard_temp_name(src, is_video, false));
-        let staged = if is_video {
-            std::fs::copy(src, &temp).map(|_| ())
-        } else {
-            edit::save_unedited_still(src, &temp).map(|_| ())
-        };
-        match staged {
-            Ok(()) => Some(temp),
-            Err(e) => {
-                log::warn!("preview: could not stage a clipboard copy of {}: {e}", src.display());
-                None
-            }
-        }
-    }
+    // DRAGON-467 removed `stage_clipboard_copy` from here. It copied the document to a
+    // throwaway runtime-dir file so the clipboard could be served from something that
+    // OUTLIVED an imminent unlink — the copy-on-delete path, where the Linux worker is handed
+    // a PATH (it reads a still's bytes, or advertises a recording's `file://` URI) from a
+    // detached child, so unlinking the original right after spawning it was a race at best
+    // and a dead URI at worst. With copy-on-delete gone (the capture reaches the clipboard at
+    // capture time instead) no share both copies and deletes, so nothing needs staging. If a
+    // copy-then-delete flavour ever comes back, it needs this again: serving the clipboard
+    // from a file you are about to remove does not work.
 
     /// The AUTOMATIC clipboard copy a preview editor performs as it opens (DRAGON-353 —
     /// the "Automatically copy to clipboard" setting became unconditional behaviour, and
@@ -227,56 +214,95 @@ impl App {
         self.update_preview(id, action)
     }
 
-    /// A dialog-initiated action FAILED (DRAGON-353 follow-up): keep the document, re-raise
-    /// the unsaved-changes dialog and give it the real reason.
+    /// An action that had a CLOSE armed behind it FAILED (DRAGON-353 follow-up): keep the
+    /// document and say so.
     ///
-    /// ONE path for all four dialog actions — a failed Save, Save As, Copy or Delete lands
-    /// here and produces the same card, so the user always gets the same three ways out
-    /// (retry, Exit anyway, Continue editing) whatever went wrong. The close intent is
-    /// DISARMED: the whole point is that we are not closing, and leaving it armed would let
-    /// an unrelated later completion close on the back of a failure.
+    /// ONE path for every such action — a failed Save, Copy or Delete lands here, so the user
+    /// always gets the same ways out whatever went wrong. The close intent is DISARMED: the
+    /// whole point is that we are not closing, and leaving it armed would let an unrelated
+    /// later completion close on the back of a failure.
     ///
-    /// A no-op when the action did NOT come from the dialog — a toolbar action's failure is
-    /// reported by its toast and the editor simply stays up, which is already the ruling.
+    /// A no-op when nothing armed a close: a toolbar action's failure is reported by its toast
+    /// and the editor simply stays up, which is already the ruling.
+    ///
+    /// # Why the card is not always the right answer (DRAGON-467 review, minor 6)
+    ///
+    /// The card is titled "unsaved changes", and it offers Save / Copy / Delete / Exit anyway.
+    /// That is exactly right for a failure the user reached FROM it. It is wrong for a failed
+    /// EXIT COPY on a document that has nothing unsaved, or whose owner turned "Ask to save"
+    /// off: raising it there invents a claim ("you have unsaved changes") that is not true,
+    /// and re-asks a question the setting already answered. Those cases get the honest thing
+    /// instead, a toast, which the caller has already posted. `raise_card` is that decision.
     pub(super) fn fail_close_action(&mut self, id: window::Id, reason: impl Into<String>) {
+        let raise_card = {
+            let a = self.preview_automation(id);
+            self.preview_for(id)
+                .is_some_and(|p| card_answers_the_failure(a.ask_to_save, p.unsaved()))
+        };
         if let Some(p) = self.preview_for_mut(id) {
-            p.edit.note_action_failure(reason);
+            if raise_card {
+                p.edit.note_action_failure(reason);
+            } else {
+                // Disarm the close without raising anything. The editor stays up over the
+                // toast the caller posted, which is all a failure with nothing to lose owes.
+                p.edit.close_after_share = false;
+            }
         }
     }
 
-    /// Open the native Save As file chooser, then route the pick to `SaveAsResult`.
+    /// Open the native save file chooser PRE-FILLED with [`Self::preview_save_target`], then
+    /// route the pick to `SaveAsResult`.
+    ///
+    /// DRAGON-467: this IS the Save button now. The prefill is a full PATH, not just a name —
+    /// the user's configured save folder plus the filename a plain overwrite-save would have
+    /// written — so the picker opens where the setting says captures live even when the bytes
+    /// are still in the runtime directory ("Automatically save originals" off). The native
+    /// dialog's own replace prompt is what protects an existing file.
     ///
     /// Only a fullscreen OVERLAY is torn down first: it's a layer-shell surface with an
     /// exclusive keyboard grab, so the file chooser would render behind it and be
     /// unusable. A cancelled dialog re-mints the overlay on the still-loaded capture
     /// ([`Self::reopen_preview_surface`], DRAGON-157). A normal WINDOW can show the
     /// chooser over itself, so it stays open.
+    ///
+    /// The teardown goes through [`Self::hide_preview_surface`], and that is not tidiness: it
+    /// is what keeps this process ALIVE (DRAGON-469). Off Linux the overlay is a real winit
+    /// window, so the `window::close` it issues echoes a `window::Event::Closed` straight back
+    /// — the runtime cannot tell our own teardown from a window manager's. That echo used to
+    /// close the document, which was the last one, which ran `finish_session`: the process
+    /// exited with the chooser still on screen, so nothing was ever exported and the editor
+    /// never came back. [`super::surface_closed`] tells the two apart by reading
+    /// `surface_open`, which the seam clears BEFORE minting the destroy — an ordering that is
+    /// structural there rather than a rule this function has to remember.
     pub(super) fn save_as_dialog(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
         self.stop_preview_playback(id);
-        let is_video = self.preview_for(id).is_some_and(|p| matches!(p.kind, PreviewKind::Video(_)));
-        let name = self.preview_for(id)
-            .and_then(|p| p.path.clone())
-            // DRAGON-455: OFFER a `.png` name for a still, because a still is what we are
-            // going to write — suggesting `clip.JPG` for a file that will come out as a PNG
-            // is the mismatch this ticket removes, just before the user has touched
-            // anything. This is only the starting text; the PICK is forced through the same
-            // rule in `SaveAsResult`, so retyping cannot get around it.
-            .map(|path| if is_video { path } else { naming::png_name(&path) })
-            .and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "capture".to_string());
+        // `preview_save_target` already forces `.png` for a still (DRAGON-455: a still is
+        // what we are going to write, so suggesting `clip.JPG` for a file that comes out as a
+        // PNG is a mismatch shown before the user has touched anything) and already places the
+        // name in the configured folder. This is only the starting path; the PICK is forced
+        // through the same png rule in `SaveAsResult`, so retyping cannot get around it.
+        let suggested = self
+            .preview_save_target(id)
+            .unwrap_or_else(|| PathBuf::from("capture"));
+        // DRAGON-467 review, minor 8: the folder has to EXIST before the portal is asked to
+        // open in it. With "Automatically save originals" off nothing has created it yet, and
+        // a missing `current_folder` is not an error the portal reports — it silently opens
+        // somewhere else, so the pre-fill the ticket asked for would quietly not happen on
+        // exactly the configuration that needs it most. Best-effort: a folder we cannot
+        // create is the portal's own fallback, which is where we would have been anyway.
+        if let Some(dir) = suggested.parent().filter(|d| !d.as_os_str().is_empty()) {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // A fullscreen OVERLAY comes down for the chooser; a WINDOW keeps its surface and
+        // shows the chooser over itself. The teardown goes through the ONE seam
+        // ([`App::hide_preview_surface`], DRAGON-469), which clears the liveness flag and
+        // mints the destroy TOGETHER — the document stays loaded, so a later close cannot
+        // double-destroy it and our own echoed `Closed` cannot end the session.
         let hide = match self.preview_for(id) {
-            Some(p) if !p.surface.is_window() => {
-                let close = p.surface.close(p.window);
-                // The document stays loaded but its surface is gone until the dialog
-                // resolves — record that so a later close doesn't double-destroy it.
-                if let Some(p) = self.preview_for_mut(id) {
-                    p.surface_open = false;
-                }
-                close
-            }
+            Some(p) if !p.surface.is_window() => self.hide_preview_surface(id),
             _ => Task::none(),
         };
-        let pick = Task::perform(super::pick_save_path(name), move |opt| {
+        let pick = Task::perform(super::pick_save_path(suggested), move |opt| {
             cosmic::Action::App(Msg::Preview(id, PreviewMsg::SaveAsResult(opt)))
         });
         Task::batch([hide, pick])
@@ -289,7 +315,7 @@ impl App {
     //
     // The editor is non-destructive instead: `path` stays pinned to the untouched media,
     // the scene stays live on top of it, and a save only moves the bookkeeping
-    // (`saved_path` / `size` / `save_in_place` / `edit.mark_saved`). The displayed result
+    // (`saved_path` / `size` / `note_written` / `edit.mark_saved`). The displayed result
     // is identical — base + scene IS what the save wrote — but Ctrl+Z still works
     // afterwards. Do not reintroduce a reload-on-save: it would resurrect exactly this bug.
 
@@ -327,27 +353,34 @@ impl App {
         open_task
     }
 
-    /// WHERE a Save writes: [`naming::save_target`] over the document's CURRENT save
-    /// identity and its `save_in_place` bit. `None` when the document has no file at all.
+    /// WHERE a Save writes, i.e. what the destination picker opens PRE-FILLED with:
+    /// [`naming::save_prefill`] over the document's save identity and the user's configured
+    /// save folder. `None` when the document has no file at all.
     ///
-    /// The identity is `saved_path` once the document has saved once, and the capture's own
-    /// `path` before that (DRAGON-353 follow-up — `path` stays pinned to the media, so the
-    /// naming rule reads the save side explicitly rather than assuming the two are the
-    /// same). The behaviour is unchanged: first dirty save → the `-edited` sibling; every
-    /// save after that → straight back to it.
+    /// Three inputs, assembled here because only `App` knows two of them:
+    ///
+    /// * `saved_path` once the document has saved once, else the capture's own `path`
+    ///   (DRAGON-353 follow-up — `path` stays pinned to the media, so the naming rule reads
+    ///   the save side explicitly rather than assuming the two are the same).
+    /// * the configured folder for this media kind (`screenshot_dir` / `record_dir`), which
+    ///   DRAGON-467 keeps as THE basis for the Save action. An EXTERNAL `--preview` document
+    ///   gets `None` instead: it is the user's own file, so it saves back to its own folder,
+    ///   not into the capture folder.
+    /// * DRAGON-455: a STILL is written as PNG, so its target NAMES png — forced BEFORE the
+    ///   folder is applied, so the name placed in the save folder is the one that will
+    ///   actually be written. A recording keeps whatever container it is in; `bake_video`
+    ///   honours that.
     pub(super) fn preview_save_target(&self, id: window::Id) -> Option<PathBuf> {
         let p = self.preview_for(id)?;
-        let current = p.saved_path.as_ref().or(p.path.as_ref())?;
-        // DRAGON-455: a STILL is written as PNG, so its target NAMES png — and it has to be
-        // forced BEFORE the `-edited` derivation, not after. An external `clip.JPG` would
-        // otherwise derive `clip-edited.JPG` and run its collision walk against a name
-        // nothing is ever written to. A recording keeps whatever container it is in;
-        // `bake_video` honours that.
-        let current = match p.kind {
-            PreviewKind::Video(_) => current.clone(),
-            PreviewKind::Image(_) => naming::png_name(current),
+        let is_video = matches!(p.kind, PreviewKind::Video(_));
+        let current = p.path.as_ref().or(p.saved_path.as_ref())?;
+        let current = if is_video { current.clone() } else { naming::png_name(current) };
+        let dir = if p.external {
+            None
+        } else {
+            Some(self.capture_save_dir(is_video))
         };
-        Some(naming::save_target(&current, p.save_in_place, &naming::on_disk))
+        Some(naming::save_prefill(p.saved_path.as_deref(), &current, dir.as_deref()))
     }
 
     /// The file this document IS on disk right now — its last save if it has one, else the
@@ -417,28 +450,154 @@ impl App {
         true
     }
 
-    /// THE share entry point (DRAGON-353): run `intent` against `id`, baking first when
-    /// there are edits to commit. Every action bar button, hotkey and unsaved-changes
-    /// dialog button routes through here, so the bake-vs-no-bake fork exists once.
-    pub(super) fn run_share(
-        &mut self,
-        id: window::Id,
-        intent: ShareIntent,
-    ) -> Task<cosmic::Action<Msg>> {
-        // DRAGON-398: a share that OWES a bake it cannot produce must not quietly complete
+    /// THE copy entry point: put `id`'s current state on the clipboard, baking first when
+    /// there are edits to render. The toolbar's Copy, the exit copy and the discard-with-copy
+    /// all route through here, so the bake-vs-reuse-vs-nothing fork exists once.
+    ///
+    /// It used to take a `ShareIntent` naming which of save / copy / delete to run. Save moved
+    /// to the destination picker (DRAGON-467) and Delete left the editor entirely, so there is
+    /// one action left and the parameter said nothing.
+    pub(super) fn run_copy(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        // DRAGON-398: a copy that OWES a bake it cannot produce must not quietly complete
         // against the unedited file. Refuse it loudly instead (the editor stays up).
-        let owed = self
-            .preview_for(id)
-            .map(|p| intent.owes_bake(p.dirty(), p.unsaved()))
-            .unwrap_or(false);
+        let owed = self.preview_for(id).is_some_and(|p| p.dirty());
         if self.refuse_unbakeable(id, owed) {
             return Task::none();
         }
-        match self.begin_bake(id, intent) {
-            // A bake is in flight; `BakeDone` calls `finish_share_intent` with its output.
+        // DRAGON-467 review, major 4: a copy standing on its own last bake REUSES that
+        // artifact. Without this, "Save then Escape" ran the scene through the encoder twice,
+        // because `dirty()` stays true after a save by design. `Reuse` hands the artifact
+        // straight to the completion seam, which copies it exactly as it would a fresh bake's.
+        let reuse = self.preview_for(id).and_then(|p| {
+            match edit::bake_need(
+                p.dirty(),
+                p.edit.undo_stack.len(),
+                p.edit.baked.as_ref().map(|(d, _)| *d),
+            ) {
+                // The artifact has to still BE there — a runtime-dir temp can be swept, and a
+                // saved file can be moved out from under us between actions.
+                edit::BakeNeed::Reuse => {
+                    p.edit.baked.as_ref().map(|(_, f)| f.clone()).filter(|f| f.exists())
+                }
+                _ => None,
+            }
+        });
+        if let Some(artifact) = reuse {
+            log::debug!("preview: reusing the last bake instead of rendering it again");
+            return self.finish_copy(id, Some(artifact));
+        }
+        match self.begin_bake(id) {
+            // A bake is in flight; `BakeDone` calls `finish_copy` with its output.
             Some(task) => task,
-            // Nothing to commit — complete the intent right now against the file as it is.
-            None => self.finish_share_intent(id, intent, None),
+            // Nothing to render — copy the file as it stands.
+            None => self.finish_copy(id, None),
+        }
+    }
+
+    /// THE share-sheet entry point (DRAGON-474): hand `id`'s current state to the system
+    /// share sheet, baking first when there are edits to render — the same refuse / reuse /
+    /// bake fork as [`Self::run_copy`], so Share and Copy can never disagree about what
+    /// "the current state" means.
+    ///
+    /// This funnel is the fix for the bug the first wiring shipped: it handed
+    /// `preview_current_file` straight to the sheet, which is the last save (or the pristine
+    /// capture), so every unsaved edit was silently absent from what the share target
+    /// received. DRAGON-398's rule applies here exactly as it does to Copy: a share that
+    /// OWES a bake it cannot produce is refused loudly with the editor up, never quietly
+    /// served the unedited file.
+    pub(super) fn run_share_sheet(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        let owed = self.preview_for(id).is_some_and(|p| p.dirty());
+        if self.refuse_unbakeable(id, owed) {
+            return Task::none();
+        }
+        // A share standing on the last bake's exact state serves that artifact, exactly as
+        // a copy does (DRAGON-467 review, major 4) — and the artifact is SHARED between the
+        // two actions: a Copy's bake serves the Share that follows it, and vice versa.
+        let reuse = self.preview_for(id).and_then(|p| {
+            match edit::bake_need(
+                p.dirty(),
+                p.edit.undo_stack.len(),
+                p.edit.baked.as_ref().map(|(d, _)| *d),
+            ) {
+                edit::BakeNeed::Reuse => {
+                    p.edit.baked.as_ref().map(|(_, f)| f.clone()).filter(|f| f.exists())
+                }
+                _ => None,
+            }
+        });
+        if let Some(artifact) = reuse {
+            log::debug!("preview: sharing the last bake instead of rendering it again");
+            return self.finish_share_sheet(id, Some(artifact));
+        }
+        match self.begin_bake(id) {
+            Some(task) => {
+                // The bake is in flight — tell `BakeDone` its artifact is for the share
+                // sheet, not the clipboard.
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.bake_for_share = true;
+                }
+                task
+            }
+            // Nothing to render — the file on disk IS the current state; share it.
+            None => self.finish_share_sheet(id, None),
+        }
+    }
+
+    /// THE completion seam a share lands on — after a bake (`baked` = the temp it wrote), on
+    /// a reused artifact, or straight away for a clean document (`baked` = `None`).
+    ///
+    /// Unlike [`Self::finish_copy`] there is no close step: Share is a toolbar action only,
+    /// no exit-card button arms a close behind it, and handing a file to another app is not
+    /// an "I'm done here" signal the way a save is. The one deferred-close interaction (the
+    /// surface dying mid-bake) is handled at `BakeDone`, which closes instead of anchoring
+    /// a sheet to a window that no longer exists.
+    pub(super) fn finish_share_sheet(
+        &mut self,
+        id: window::Id,
+        baked: Option<PathBuf>,
+    ) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for(id) else { return Task::none() };
+        let is_video = matches!(p.kind, PreviewKind::Video(_));
+        let Some(path) = baked.or_else(|| self.preview_current_file(id)) else {
+            self.preview_toast_icon(id, ToastKind::Error, "Nothing to share yet", "share-symbolic");
+            return Task::none();
+        };
+
+        // DRAGON-480: macOS's picker needs the exact preview VIEW, which only window
+        // IDENTITY can give us (DRAGON-336 allows several simultaneous previews open at
+        // once) — reached through `window::run_with_handle`, the same route
+        // `app::keyboard::show_character_palette` uses for the identical reason. See
+        // `platform::mac::share`'s module doc for why this bypasses the portable seam
+        // function every other platform calls directly below.
+        #[cfg(target_os = "macos")]
+        {
+            window::run_with_handle(id, move |handle| {
+                use window::raw_window_handle::RawWindowHandle;
+                match handle.as_raw() {
+                    // SAFETY: `run_with_handle` runs synchronously on the main thread while
+                    // this exact window's handle is held live, matching the caller contract
+                    // `share_file_at_view` documents.
+                    RawWindowHandle::AppKit(h) => unsafe {
+                        crate::platform::mac::share::share_file_at_view(&path, is_video, h.ns_view)
+                    },
+                    // Belt-and-braces: `run_with_handle` not handing back an AppKit handle
+                    // would be new winit/iced behavior, not something expected to happen.
+                    // Fall back to the portable seam's best-effort (key-window) body rather
+                    // than refuse outright.
+                    _ => crate::platform::services::share_file(&path, is_video),
+                }
+            })
+            .map(move |result| {
+                cosmic::Action::App(Msg::Preview(id, PreviewMsg::ShareDone(result)))
+            })
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            if let Err(reason) = crate::platform::services::share_file(&path, is_video) {
+                self.preview_toast_icon(id, ToastKind::Error, reason, "share-symbolic");
+            }
+            Task::none()
         }
     }
 
@@ -456,36 +615,28 @@ impl App {
     /// Kick off a bake before running `intent`, or `None` when none is needed (no pending
     /// edits, no path, or a video without probed dims).
     ///
-    /// DRAGON-353: the bake now runs with the EDITOR STILL UP. It used to vanish the
-    /// surface and span the re-encode with a desktop "Processing capture" notification;
-    /// instead the editor draws its own processing overlay (the same spinner the load
-    /// state uses) while `edit.baking` holds every input. Copy flavours still bake to a
-    /// throwaway TEMP so the saved file stays clean; saving flavours bake to the
-    /// document's SAVE TARGET, which for a fresh capture is the `-edited` sibling rather
-    /// than the capture itself.
-    pub(super) fn begin_bake(&mut self, id: window::Id, intent: ShareIntent) -> Option<Task<cosmic::Action<Msg>>> {
-        // The save target reads `self`, so resolve it before borrowing the preview.
-        let save_target = self.preview_save_target(id);
+    /// DRAGON-353: the bake runs with the EDITOR STILL UP. It used to vanish the surface and
+    /// span the re-encode with a desktop "Processing capture" notification; instead the editor
+    /// draws its own processing overlay (the same spinner the load state uses) while
+    /// `edit.baking` holds every input. The output is always a throwaway TEMP, because the
+    /// things that bake here — a COPY, or a SHARE (DRAGON-474) — must both leave whatever
+    /// is on disk alone. (A SAVE bakes too, but straight to the destination the user
+    /// picked, in `PreviewMsg::SaveAsResult`.)
+    pub(super) fn begin_bake(&mut self, id: window::Id) -> Option<Task<cosmic::Action<Msg>>> {
         let processing_msg = random_processing_msg();
         let p = self.preview_for_mut(id)?;
-        // WHEN a bake is owed. A copy flavour bakes to a throwaway temp that does not exist
-        // yet, so any scene content needs one (this is what makes copy-on-delete put the
-        // EDITED picture on the clipboard, DRAGON-352). A SAVING flavour writes the
-        // document's save target — which, since the history now survives a save (DRAGON-353
-        // follow-up), may ALREADY hold exactly this scene. Re-encoding identical pixels
-        // would churn the file's mtime and (for a lossy format) its quality, so a save that
-        // is standing on its own save point is the clean-save no-op instead, toast and all.
-        // A plain Delete (no copy, no save) never bakes: baking output nobody reads only to
-        // unlink the source would be pure waste — the user is discarding the file. The whole
-        // decision is `ShareIntent::owes_bake` (pure, unit-tested there).
-        let owed = intent.owes_bake(p.dirty(), p.unsaved());
-        if !owed || p.edit.baking {
+        // WHEN a bake is owed: the throwaway temp does not exist yet, so ANY scene content
+        // needs rendering onto it (DRAGON-352 — this is what puts the EDITED picture on the
+        // clipboard, and what makes "copy changes on exit" carry the edits).
+        if !p.dirty() || p.edit.baking {
             return None;
         }
-        // The bake ALWAYS reads the untouched media (`path`), never the last save: the
-        // saved file already has the scene burned in, and baking it again would double
-        // every annotation. This is the other half of the non-destructive model.
-        let src = p.path.clone()?;
+        // The bake ALWAYS reads the document's PRISTINE media, never the last save: the
+        // saved file already has the scene burned in, and baking it again would double every
+        // annotation. That is `bake_source()`, not `path` — after a still has been saved over
+        // its own capture the pristine bytes live in a runtime-dir snapshot instead
+        // (DRAGON-467 review, blocker 1; see `edit::bake_prep`).
+        let src = p.bake_source()?.to_path_buf();
         let covermark = p.edit.covermark.clone();
         // Annotations are IMAGES only (a video preview never accumulates them).
         let annotations = p.edit.annotations.clone();
@@ -519,16 +670,13 @@ impl App {
                 })
             }
         };
-        // Copy flavours target a throwaway temp (leave the saved file clean); saving
-        // flavours write the document's save target.
-        let dst = if intent.bakes_to_temp() {
-            PathBuf::from(crate::util::runtime_dir())
-                .join(clipboard_temp_name(&src, is_video, true))
-        } else {
-            save_target.clone().unwrap_or_else(|| src.clone())
-        };
+        // Always a throwaway temp: Copy and Share (DRAGON-474) are the baking intents that
+        // reach here, and both leave whatever is on disk alone. `clipboard_temp_name`'s
+        // `-copy` marker is what stops this colliding with `src` when the capture itself
+        // lives in the runtime directory ("Automatically save originals" off).
+        let dst = PathBuf::from(crate::util::runtime_dir())
+            .join(clipboard_temp_name(&src, is_video));
         p.edit.baking = true;
-        p.edit.pending = Some(intent);
         p.edit.pending_output = Some(dst.clone());
         p.edit.processing_msg = processing_msg;
         let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
@@ -553,178 +701,81 @@ impl App {
         }))
     }
 
-    /// THE completion seam every share action lands on — after a bake (`baked` = the file
-    /// the bake wrote) or straight away when the document was clean (`baked` = `None`).
+    /// THE completion seam a copy lands on — after a bake (`baked` = the file the bake wrote)
+    /// or straight away when the document was clean (`baked` = `None`).
     ///
-    /// Order matters and is deliberate: **save → copy → delete → close**. The copy reads
-    /// whatever the save just produced (so "save & close on copy" puts the SAVED bytes on
-    /// the clipboard, not a second re-encode), and the delete happens only after the
-    /// clipboard has been served from a file that outlives it.
-    pub(super) fn finish_share_intent(
+    /// Two steps: **copy, then close if one was armed**. The close only runs once the
+    /// clipboard write has actually succeeded, which is the whole point of the ordering.
+    ///
+    /// It used to run save / copy / delete / close and take a `ShareIntent` saying which.
+    /// Save moved to the destination picker (its bookkeeping now lives in
+    /// `PreviewMsg::SaveAsBaked`, one implementation rather than a lost one), and Delete left
+    /// the editor with the whole delete feature, so what is left is the copy.
+    pub(super) fn finish_copy(
         &mut self,
         id: window::Id,
-        intent: ShareIntent,
         baked: Option<PathBuf>,
     ) -> Task<cosmic::Action<Msg>> {
         let Some(p) = self.preview_for(id) else { return Task::none() };
         let is_video = matches!(p.kind, PreviewKind::Video(_));
-        let external = p.external;
-        let current = self.preview_current_file(id);
-        // The dialog's action buttons ask for a close once the action lands. Read, NOT
-        // taken: a failure below hands the flag to `fail_close_action`, which needs to know
-        // the request came from the dialog in order to re-raise it. It is cleared on the
-        // way out of every path that does not fail.
-        let from_dialog = self.preview_for(id).is_some_and(|p| p.edit.close_after_share);
-        let close_after = from_dialog || intent.closes_document();
+        // The dialog's Save button — and the exit path — ask for a close once the action
+        // lands. Read, NOT taken: a failure below hands the flag to `fail_close_action`,
+        // which needs to know a close was requested in order to re-raise the card. It is
+        // cleared on the way out of every path that does not fail.
+        let close_after = self.preview_for(id).is_some_and(|p| p.edit.close_after_share);
 
-        let mut tasks: Vec<Task<cosmic::Action<Msg>>> = Vec::new();
+        let tasks: Vec<Task<cosmic::Action<Msg>>> = Vec::new();
 
-        // ── 1. SAVE ───────────────────────────────────────────────────────────────────
-        if intent.saves() {
-            match &baked {
-                // The bake wrote the save target: ADOPT it as the working document.
-                Some(dest) => {
-                    let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-                    self.stop_preview_playback(id);
-                    // DRAGON-451: a system notification USED to fire here as well. It was a
-                    // second banner for a document the user is looking at, announcing a save
-                    // they just asked for, on top of the in-app toast below — so the system
-                    // channel is now reserved for deliveries with no editor on screen
-                    // (`finish_share`). The in-app toast is unchanged.
-                    self.preview_toast_icon(
-                        id,
-                        ToastKind::Success,
-                        format!("Saved {}", Self::display_name(dest)),
-                        "save-check-symbolic",
-                    );
-                    // RETARGET, never reload (DRAGON-353 follow-up). The old flow re-decoded
-                    // the baked file and reset the edit state so nothing double-applied —
-                    // and took the whole undo history with it. The document now keeps
-                    // rendering the untouched media plus its live scene (which looks
-                    // identical to the file it just wrote), so every edit stays undoable
-                    // across the save; only the save-side bookkeeping moves. `mark_saved`
-                    // pins the history position the file corresponds to, which is what makes
-                    // `unsaved()` go false now and true again if the user undoes past it.
-                    if let Some(p) = self.preview_for_mut(id) {
-                        p.saved_path = Some(dest.clone());
-                        p.size = Some(size);
-                        p.save_in_place = true;
-                        p.note_written(dest);
-                        p.edit.mark_saved();
-                    }
-                }
-                // Nothing to commit. A clean Save is a NO-OP with a toast, not a rewrite:
-                // re-encoding identical pixels would only churn the file's mtime and (for
-                // a lossy format) its quality. DRAGON-353's clean-save ruling.
-                None => {
-                    let msg = if external {
-                        "No changes to save".to_string()
-                    } else {
-                        match &current {
-                            Some(path) => {
-                                format!("Already saved as {}", Self::display_name(path))
-                            }
-                            None => "Nothing to save yet".to_string(),
-                        }
-                    };
-                    self.preview_toast_icon(id, ToastKind::Success, msg, "save-check-symbolic");
-                }
+        // ── 1. COPY ───────────────────────────────────────────────────────────────────
+        // The document's file as it stands NOW, or the throwaway temp a dirty copy just
+        // baked (or the artifact a previous bake left at this same state — see `run_copy`).
+        let source = match &baked {
+            Some(temp) => Some(temp.clone()),
+            None => self.preview_current_file(id),
+        };
+        let copy_ok = match source {
+            Some(src) => self.copy_to_clipboard_now(id, &src, is_video),
+            None => {
+                self.preview_toast_icon(id, ToastKind::Error, "Nothing to copy yet", "clipboard-x-symbolic");
+                false
             }
+        };
+        // DRAGON-355: a failed COPY aborts the rest. Closing the editor when the state never
+        // reached the clipboard destroys work over a failure the user can SEE.
+        // `copy_to_clipboard_now` (or the "Nothing to copy" arm above) already TOASTED the
+        // miss; `fail_close_action` additionally re-raises the unsaved-changes card when a
+        // close was armed AND the card actually answers the failure (DRAGON-467 review, minor
+        // 6), so "Automatically copy changes on exit" cannot close the editor over a copy that
+        // did not happen. Nothing was baked and no history moved, so retrying is live. Where a
+        // platform cannot detect a late failure (the detached Linux worker's own write, in
+        // another process) `copy_ok` is `true` and the flow proceeds exactly as before —
+        // honest per platform, never faked (see `share::clipboard::copy_to_clipboard`).
+        if !copy_ok {
+            self.fail_close_action(id, COPY_FAILURE_REASON);
+            return Task::batch(tasks);
         }
 
-        // ── 2. COPY ───────────────────────────────────────────────────────────────────
-        if intent.copies() {
-            // The document's file as it stands NOW: a save in step 1 may have retargeted it.
-            let path = self.preview_current_file(id);
-            let source = match (&baked, intent) {
-                // A save-flavoured copy puts the SAVED file on the clipboard.
-                (_, i) if i.saves() => path.clone(),
-                // A copy-flavoured bake wrote the throwaway temp — copy that.
-                (Some(temp), _) => Some(temp.clone()),
-                // Nothing baked. A plain Copy serves the file directly (it isn't going
-                // anywhere); a DELETE-flavoured one must serve a STAGED temp, because the
-                // clipboard worker is handed a path and the original is about to be
-                // unlinked out from under it.
-                (None, i) if i.deletes() => path
-                    .as_deref()
-                    .and_then(|p| Self::stage_clipboard_copy(p, is_video))
-                    .or_else(|| path.clone()),
-                (None, _) => path.clone(),
-            };
-            let copy_ok = match source {
-                Some(src) => self.copy_to_clipboard_now(id, &src, is_video),
-                None => {
-                    self.preview_toast_icon(id, ToastKind::Error, "Nothing to copy yet", "clipboard-x-symbolic");
-                    false
-                }
-            };
-            // DRAGON-355: a failed COPY aborts the WHOLE action, including a copy-on-delete.
-            // The DRAGON-353 carve-out that let a delete proceed on a "courtesy copy" miss is
-            // gone: deleting (or closing) the capture when it never reached the clipboard
-            // destroys the user's only copy over a failure they can SEE. `copy_to_clipboard_now`
-            // (or the "Nothing to copy" arm above) already TOASTED the miss; `fail_close_action`
-            // additionally re-raises the unsaved-changes dialog when the action came from it (a
-            // no-op for a toolbar press, whose editor simply stays up). Nothing was baked and no
-            // history moved, so retry / save / exit-anyway are all live. Where a platform cannot
-            // detect a late failure (the detached Linux worker's own write, in another process)
-            // `copy_ok` is `true` and the flow proceeds exactly as before — honest per platform,
-            // never faked (see `share::clipboard::copy_to_clipboard`).
-            if copy_failure_aborts(intent, copy_ok) {
-                self.fail_close_action(id, copy_failure_reason(intent.deletes()));
-                return Task::batch(tasks);
-            }
-        }
-
-        // ── 3. DELETE ─────────────────────────────────────────────────────────────────
-        // Reached only once step 2's copy (if any) SUCCEEDED — a copy-on-delete whose copy
-        // failed aborted above, so the file survives the clipboard miss.
-        if intent.deletes() {
-            self.stop_preview_playback(id);
-            // A delete that could NOT remove everything has not done what was asked. Say so
-            // honestly and STAY: the document is untouched (nothing was baked, no history
-            // moved), so retrying or exiting anyway are both live options. `copies()` tells it
-            // whether a courtesy-copy toast is already speaking for this action, so a PLAIN
-            // delete gets its own "Capture deleted" confirmation instead of closing silently.
-            if let Err(reason) = self.delete_owned_files(id) {
-                self.fail_close_action(id, reason);
-                return Task::batch(tasks);
-            }
-        }
-
-        // ── 4. CLOSE (guarded) ────────────────────────────────────────────────────────
+        // ── 2. CLOSE ──────────────────────────────────────────────────────────────────
         self.clear_close_intent(id);
         if !close_after {
             return Task::batch(tasks);
         }
-        // A close that neither SAVED nor DELETED would silently drop unsaved edits — the
-        // close-on-copy-WITHOUT-save case (DRAGON-355). Route it through the SAME
-        // unsaved-changes guard the Esc / ✕ close uses, so the user gets Save / Discard /
-        // Keep editing instead of losing work. EXCEPT when the action came from that very
-        // dialog (`from_dialog`): it already asked, and re-raising would bounce it off
-        // itself. A saving close committed the edits; a deleting close discarded the file on
-        // purpose; neither needs the guard.
-        if close_guards_unsaved(intent, from_dialog)
-            && self
-                .preview_for(id)
-                .is_some_and(|p| close_needs_confirmation(p.unsaved(), p.edit.confirm_close))
-        {
-            if let Some(p) = self.preview_for_mut(id) {
-                p.edit.confirm_close = true;
-            }
-            return Task::batch(tasks);
-        }
-        // Everything asked for has happened, so CLOSE NOW — no hold, whatever the flavour
-        // (DRAGON-371). A close-after-copy / -delete used to sit here for a second
-        // (`COPY_CLOSE_HOLD`, driven by a `PendingClose` hold state) purely so its SUCCESS
-        // toast could be read; both are gone. The user's instruction was "make it as fast as
-        // possible - just dont exit if the copy/delete/whatever failed", and the not-exiting
-        // half is not the hold's job at all: every failing step above ALREADY returned early
-        // with the editor still up (`copy_failure_aborts` for the clipboard,
-        // `delete_owned_files`'s `Err` for the unlink, the unsaved-changes guard for edits).
-        // The hold only ever protected the SUCCESS toasts, and on success the surface going
-        // away IS the feedback — including the delete's "Capture deleted", which step 3 posts
-        // after it has already unlinked, so nothing is lost by never showing it. Reading
-        // matters only on the failure path, and that path does not reach here.
+        // Nothing reaches this point unasked. `close_after_share` has exactly two setters: the
+        // unsaved-changes card's Save button (the card already asked) and the exit path (which
+        // ran the ask gate itself, and whose setting may legitimately say "do not ask"). An
+        // earlier `close_guards_unsaved` re-ran the card here for the old
+        // close-on-copy-WITHOUT-save setting; with that setting gone it had no live input, and
+        // re-asking would bounce the card off itself in the first case and override the user's
+        // setting in the second. Bring it back only if some future caller can arm a close
+        // WITHOUT having asked first.
+        //
+        // The close is IMMEDIATE (DRAGON-371). A close-after-copy used to sit here for a
+        // second purely so its success toast could be read; the user's instruction was "make
+        // it as fast as possible - just dont exit if the copy/delete/whatever failed", and the
+        // not-exiting half is not a hold's job at all — the failure branch above already
+        // returned early with the editor still up. On success the surface going away IS the
+        // feedback.
+        let mut tasks = tasks;
         tasks.push(self.close_preview(id));
         Task::batch(tasks)
     }
@@ -739,105 +790,50 @@ impl App {
         }
     }
 
-    /// Unlink every file this document owns, and toast the outcome.
-    ///
-    /// Deletes [`PreviewState::delete_paths`]: the capture plus every path the document
-    /// WROTE (the `-edited` variants and any Save As destinations, wherever they landed).
-    /// A path that is already gone is not a failure — it is the outcome we wanted — so only
-    /// a real unlink error counts. A partial failure is reported as an `Err`, on which the
-    /// caller does NOT close (DRAGON-355): the editor stays up over whatever survived, with
-    /// the toast naming it, so retrying or exiting anyway are both live.
-    ///
-    /// A successful delete still posts ONE "Capture deleted" toast, though since DRAGON-371
-    /// its close is immediate, so in practice only the FAILURE text is ever read (which is
-    /// the text that matters — see `copy_failure_aborts`). The file COUNT is
-    /// deliberately not named on success: the original and its `-edited` / Save As
-    /// siblings are the SAME image to the user, and "Deleted 2 files" reads as a surprise
-    /// rather than a receipt (user decision, 2026-07-27; only the failure toast still
-    /// talks in files, because a partial failure is exactly where the distinction
-    /// matters). On a copy-on-delete the confirmation STACKS beside the copy toast (the
-    /// DRAGON-353 queue): the delete is its own action and deserves its own receipt.
-    fn delete_owned_files(&mut self, id: window::Id) -> Result<(), String> {
-        let paths = self.preview_for(id).map(|p| p.delete_paths()).unwrap_or_default();
-        let mut gone = 0usize;
-        let mut failures: Vec<String> = Vec::new();
-        for path in &paths {
-            match std::fs::remove_file(path) {
-                Ok(()) => gone += 1,
-                // Already absent: the desired end state, not an error.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    log::warn!("preview: could not delete {}: {e}", path.display());
-                    failures.push(format!("{}: {e}", Self::display_name(path)));
-                }
-            }
-        }
-        log::info!(
-            "preview delete: {gone} removed, {} failed, {} considered",
-            failures.len(),
-            paths.len()
-        );
-        if !failures.is_empty() {
-            self.preview_toast(
-                id,
-                ToastKind::Error,
-                format!("Deleted {gone} of {} files", gone + failures.len()),
-            );
-            return Err(format!("These files couldn't be deleted: {}", failures.join("; ")));
-        }
-        self.preview_toast_icon(id, ToastKind::Success, "Capture deleted", "edit-delete-symbolic");
-        Ok(())
-    }
+    // DRAGON-467 removed `delete_owned_files` from here. It unlinked
+    // `PreviewState::delete_paths` (the capture plus every path the document wrote) and
+    // toasted the outcome, reporting a PARTIAL failure as an `Err` so the caller would keep
+    // the editor up over whatever survived. It went with the delete feature itself.
 }
 
-/// DRAGON-355: does a failed clipboard copy ABORT the share before its delete/close steps?
+/// The reason handed to [`App::fail_close_action`] when a copy step aborts.
 ///
-/// Yes for EVERY copy flavour whose copy did not succeed. This REPLACES the DRAGON-353
-/// carve-out that let a copy-on-delete proceed to delete on a failed courtesy copy: deleting
-/// (or closing) the capture when it never reached the clipboard would destroy the user's only
-/// copy over a failure they can see, so the destructive step is vetoed and the editor stays
-/// open. A non-copying intent (a plain Save, a plain Delete) is never gated on the clipboard.
-///
-/// # This veto IS the "don't exit if it failed" rule (DRAGON-371)
-///
-/// It, and not any timed hold, is what keeps the editor up when something went wrong: the
-/// share returns early with the surface still live, so retry / save / exit-anyway all stay
-/// reachable. That is why dropping `COPY_CLOSE_HOLD` cost nothing — the hold only ever held
-/// open on SUCCESS, where the closing surface is itself the confirmation.
+/// A failed copy stops everything after it, and that veto IS the "don't exit if it failed"
+/// rule (DRAGON-371): `finish_copy` returns early with the surface still live, so retrying
+/// stays reachable. It is not a timed hold, and a hold would not have helped — the hold that
+/// used to sit there only ever held open on SUCCESS.
 ///
 /// # How much the veto can actually promise, per platform
 ///
-/// `copy_ok` is honest per platform (see `share::clipboard::copy_to_clipboard`): macOS/Windows
-/// report the real synchronous pasteboard result, so there the guarantee is exactly what it
-/// sounds like. **On LINUX it is weaker**: `copy_ok` reports only whether the detached
-/// selection worker could be SPAWNED. A worker that spawns and then fails inside its own
-/// process reads as success here — it happens after we have let go, with no channel back, so
-/// it is undetectable rather than ignored. So on Linux "we never destroy/close over a failed
-/// copy" holds for every failure this side can SEE, which is not every failure there is.
+/// The `copy_ok` it reads is honest per platform (see `share::clipboard::copy_to_clipboard`):
+/// macOS/Windows report the real synchronous pasteboard result, so there the guarantee is
+/// exactly what it sounds like. **On LINUX it is weaker**: `copy_ok` reports only whether the
+/// detached selection worker could be SPAWNED. A worker that spawns and then fails inside its
+/// own process reads as success here — it happens after we have let go, with no channel back,
+/// so it is undetectable rather than ignored. So on Linux "we never close over a failed copy"
+/// holds for every failure this side can SEE, which is not every failure there is.
 /// Pre-existing and not introduced by DRAGON-371; recorded here because this is where the
 /// promise is made.
 ///
 /// The reassuring corollary of that same detachment: closing INSTANTLY is safe for the
 /// clipboard on Linux. The worker is a separate process that owns the Wayland selection until
-/// something else is copied, so the copied data outlives the editor (and this one-shot process)
-/// by construction — there is nothing for a hold to protect.
-pub(super) fn copy_failure_aborts(intent: ShareIntent, copy_ok: bool) -> bool {
-    intent.copies() && !copy_ok
-}
+/// something else is copied, so the copied data outlives the editor (and this one-shot
+/// process) by construction — there is nothing for a hold to protect.
+pub(super) const COPY_FAILURE_REASON: &str =
+    "The capture couldn't be put on the clipboard, so nothing was copied.";
 
-/// DRAGON-355: must a settings-driven CLOSE consult the unsaved-changes guard before it
-/// runs, instead of closing straight away?
+/// Does the unsaved-changes CARD actually answer this failure (DRAGON-467 review, minor 6)?
 ///
-/// Yes exactly for a close that neither SAVED nor DELETED — the close-on-copy-WITHOUT-save
-/// case — and only when it did NOT originate from the unsaved-changes dialog itself. Such a
-/// close would otherwise silently drop the in-memory edits (the file on disk keeps its last
-/// saved bytes; the clipboard has the edited ones), so it is routed through the same
-/// Save / Discard / Keep-editing card the Esc / ✕ close uses. A saving close already committed
-/// the edits; a deleting close discarded the file on purpose; a `from_dialog` close was chosen
-/// AT that card and must not bounce off it. (The document's own `unsaved()` is the final term,
-/// applied at the call site.)
-pub(super) fn close_guards_unsaved(intent: ShareIntent, from_dialog: bool) -> bool {
-    !from_dialog && !intent.saves() && !intent.deletes()
+/// Yes only when there is unsaved work AND the user wants to be asked about it. The card
+/// says "your edits haven't been written to a file yet" and offers Save / Copy / Delete /
+/// Exit anyway, so raising it over a document with nothing to lose states something false,
+/// and raising it when "Ask to save edited …" is OFF re-asks a question the setting already
+/// answered. In both cases the toast the action already posted is the honest report, and the
+/// editor simply stays up.
+///
+/// Pure; unit-tested below.
+pub(super) fn card_answers_the_failure(ask_to_save: bool, unsaved: bool) -> bool {
+    ask_to_save && unsaved
 }
 
 /// DRAGON-398: must a share be REFUSED because the bake it owes cannot be produced?
@@ -866,23 +862,26 @@ pub(super) fn bake_blocked(owed: bool, media_bakeable: bool) -> bool {
 /// The runtime-dir FILENAME a clipboard copy is served from (DRAGON-398).
 ///
 /// * **Images** get the fixed `cck-copy.png` — a still is written as PNG (DRAGON-455), so
-///   the staged file says png rather than echoing whatever the source was named. Every
+///   the baked file says png rather than echoing whatever the source was named. Every
 ///   platform hands the clipboard IMAGE BYTES (Linux reads the file in the selection worker;
 ///   macOS writes `NSData`; Windows CF_DIBV5), so the name is never user-visible and a fixed
-///   one keeps the runtime dir bounded no matter how many copies a session makes. For our own
-///   `.png` captures — every copy that is not of an external `--preview` image — this is
-///   byte-identical to before.
-/// * **Videos** take the document's OWN name, because there the name IS user-visible:
-///   every platform puts a recording on the clipboard as a FILE REFERENCE (Linux a
-///   `text/uri-list` URI, macOS an `NSURL`, Windows CF_HDROP), so pasting into a file
-///   manager or a chat client writes a file called whatever this returns. `cck-copy.mp4`
-///   was a poor thing to hand someone; `Recording 2026-edited.mp4` is the file they think
-///   they copied. `edited` marks the BAKED variant (a cut / covermarked export) so it can
-///   never collide with the staged copy of the untouched original.
+///   one keeps the runtime dir bounded no matter how many copies a session makes.
+/// * **Videos** take the document's own stem plus `-copy`, because there the name IS
+///   user-visible: every platform puts a recording on the clipboard as a FILE REFERENCE
+///   (Linux a `text/uri-list` URI, macOS an `NSURL`, Windows CF_HDROP), so pasting into a
+///   file manager or a chat client writes a file called whatever this returns. `cck-copy.mp4`
+///   was a poor thing to hand someone; `Recording 2026-copy.mp4` says what it is.
+///
+/// **The `-copy` marker is load-bearing, not decoration** (DRAGON-467). The temp lives in the
+/// session runtime directory, and since "Automatically save originals" can put the CAPTURE
+/// there too, a temp named exactly like its source would BE its source: the bake would read
+/// and write one file at once. The marker is what keeps them apart. (It replaced `-edited`,
+/// which existed to separate the baked temp from a staged copy of the untouched original;
+/// that staging retired with copy-on-delete.)
 ///
 /// Always a single path component (`file_name`, never a directory), so the caller's
 /// `runtime_dir().join(..)` can't be walked out of.
-pub(super) fn clipboard_temp_name(src: &std::path::Path, is_video: bool, edited: bool) -> String {
+pub(super) fn clipboard_temp_name(src: &std::path::Path, is_video: bool) -> String {
     let ext = src.extension().and_then(|e| e.to_str()).unwrap_or(naming::PNG_EXT);
     if !is_video {
         return format!("cck-copy.{}", naming::PNG_EXT);
@@ -891,74 +890,62 @@ pub(super) fn clipboard_temp_name(src: &std::path::Path, is_video: bool, edited:
     if stem.is_empty() {
         return format!("cck-copy.{ext}");
     }
-    if edited {
-        format!("{stem}{}.{ext}", naming::EDITED_SUFFIX)
-    } else {
-        format!("{stem}.{ext}")
-    }
-}
-
-/// The failure reason handed to [`App::fail_close_action`] when a copy step aborts — spells
-/// out that the destructive half did NOT run, so the dialog's re-raised card is truthful.
-fn copy_failure_reason(deletes: bool) -> &'static str {
-    if deletes {
-        "The capture couldn't be put on the clipboard, so nothing was copied and the file was kept."
-    } else {
-        "The capture couldn't be put on the clipboard, so nothing was copied."
-    }
+    format!("{stem}-copy.{ext}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// DRAGON-355: a failed copy aborts the destructive step for EVERY copy flavour — the
-    /// copy-on-delete carve-out is gone. A successful copy never aborts, and a non-copying
-    /// intent is never gated on the clipboard at all.
+    /// DRAGON-355: a failed copy aborts the rest of the action. A successful copy never
+    /// aborts, and a non-copying intent is never gated on the clipboard at all.
+    ///
+    /// The case that matters most since DRAGON-467 is the EXIT copy: it arms a close around a
+    /// plain `Copy`, so this veto is what stops "Automatically copy changes on exit" from
+    /// closing the editor over a clipboard write that did not happen.
     #[test]
-    fn a_failed_copy_aborts_every_copy_flavour_including_copy_on_delete() {
-        use ShareIntent::*;
-        // A successful copy proceeds, whatever the flavour.
-        for i in [Copy, SaveCopy, CopyClose, SaveCopyClose, CopyThenDelete] {
-            assert!(!copy_failure_aborts(i, true), "{i:?} with a good copy must proceed");
-        }
-        // A failed copy aborts the plain copies, the closing copies AND copy-on-delete
-        // alike — the whole point of the ticket (the delete no longer proceeds on a miss).
-        for i in [Copy, SaveCopy, CopyClose, SaveCopyClose, CopyThenDelete] {
-            assert!(copy_failure_aborts(i, false), "{i:?} with a failed copy must abort");
-        }
-        // Non-copying intents never consult the clipboard, pass or fail.
-        for i in [Save, Delete] {
-            assert!(!copy_failure_aborts(i, false), "{i:?} is never gated on the clipboard");
-            assert!(!copy_failure_aborts(i, true));
-        }
+    fn the_copy_failure_reason_is_truthful_and_dash_free() {
+        // It names what did NOT happen, so a re-raised card is truthful about the clipboard.
+        assert!(COPY_FAILURE_REASON.contains("clipboard"));
+        assert!(COPY_FAILURE_REASON.contains("nothing was copied"));
+        // It must NOT claim anything about files: since DRAGON-467 a failed copy has no
+        // destructive half to have spared, so mentioning one would be a leftover lie.
+        assert!(!COPY_FAILURE_REASON.contains("file was kept"));
+        // The runtime-string house rule: no em/en-dashes in user-facing copy.
+        assert!(
+            !COPY_FAILURE_REASON.contains('\u{2014}') && !COPY_FAILURE_REASON.contains('\u{2013}'),
+            "no em/en-dash in {COPY_FAILURE_REASON:?}"
+        );
     }
 
-    /// DRAGON-355 copy-close gating: a close that neither saved nor deleted (the
-    /// close-on-copy-WITHOUT-save case) must consult the unsaved-changes guard so it cannot
-    /// silently drop edits — but a saving/deleting close, and a close that came from the
-    /// dialog itself, must not.
+    /// DRAGON-467 review, minor 6: the unsaved-changes card is raised only when it is TRUE
+    /// and WANTED. It claims "your edits haven't been written to a file yet" and offers the
+    /// committing actions, so it answers a failure only where there is unsaved work and the
+    /// user asked to be asked about it.
+    ///
+    /// The case that motivated the rule: a failed EXIT COPY. That path arms a close on a
+    /// document that may be perfectly saved, or whose owner turned the ask off, and raising
+    /// the card there both lied and re-asked a settled question.
     #[test]
-    fn only_a_non_saving_non_deleting_toolbar_close_guards_unsaved_edits() {
-        use ShareIntent::*;
-        // The one intent that needs the guard: close-on-copy without save, from the toolbar.
-        assert!(close_guards_unsaved(CopyClose, false), "close without save must ask");
-        // A save committed the edits; a delete discarded the file on purpose — no guard.
-        for i in [SaveCopyClose, SaveCopy, CopyThenDelete, Delete, Save] {
-            assert!(!close_guards_unsaved(i, false), "{i:?} needs no unsaved guard");
-        }
-        // From the dialog, nothing re-guards (the card already asked) — including CopyClose.
-        for i in [CopyClose, SaveCopyClose, Copy, Delete] {
-            assert!(!close_guards_unsaved(i, true), "{i:?} from the dialog must not re-ask");
-        }
+    fn the_unsaved_card_is_raised_only_when_it_is_true_and_wanted() {
+        assert!(card_answers_the_failure(true, true), "unsaved work the user wants asked about");
+        assert!(
+            !card_answers_the_failure(true, false),
+            "a SAVED document has no unsaved changes to report"
+        );
+        assert!(
+            !card_answers_the_failure(false, true),
+            "ask-to-save off means the question is already settled"
+        );
+        assert!(!card_answers_the_failure(false, false));
     }
 
     /// DRAGON-398: a share that OWES a bake the media cannot produce is refused; one that owes
     /// nothing is never gated on it.
     ///
     /// The second half is the important one for video. An UNCUT, un-covermarked recording owes
-    /// no bake, so a failed ffprobe must not stop it being saved, copied or deleted — those
-    /// paths never invoke ffmpeg at all, which is the same reason they stay byte-identical.
+    /// no bake, so a failed ffprobe must not stop it being saved or copied — those paths never
+    /// invoke ffmpeg at all, which is the same reason they stay byte-identical.
     #[test]
     fn a_bake_that_cannot_run_blocks_only_the_actions_that_need_it() {
         // Owed + unbakeable (a recording whose probe never landed) => refuse.
@@ -970,110 +957,90 @@ mod tests {
         assert!(!bake_blocked(false, true));
     }
 
-    /// DRAGON-398: the refusal is reachable for exactly the intents that can owe a bake, and
-    /// never for a plain Delete (which never bakes — `owes_bake` is false for it whatever the
-    /// document's state, so a corrupt recording can still be thrown away).
+    /// DRAGON-398: a CLEAN document is never refused, however unreadable its media. It owes
+    /// no render, so the copy path never invokes ffmpeg at all — which is what keeps a
+    /// recording whose ffprobe failed still copyable as it stands.
     #[test]
-    fn a_plain_delete_is_never_refused_for_an_unbakeable_recording() {
-        use ShareIntent::*;
-        // Worst case: dirty AND unsaved AND unbakeable.
-        for i in [Copy, CopyClose, CopyThenDelete, Save, SaveCopy, SaveCopyClose] {
-            assert!(bake_blocked(i.owes_bake(true, true), false), "{i:?} owes a bake");
-        }
-        assert!(
-            !bake_blocked(Delete.owes_bake(true, true), false),
-            "a plain Delete never bakes, so an unreadable recording is still deletable"
-        );
+    fn a_clean_document_is_never_refused_for_unreadable_media() {
+        assert!(bake_blocked(true, false), "a dirty document with unrenderable media is refused");
+        assert!(!bake_blocked(false, false), "a clean one is not, and copies the file as it is");
     }
 
-    /// DRAGON-420: the Video Editor group's toggles cannot get PAST the DRAGON-398 refusal.
+    /// DRAGON-467: the Video Editor group's toggles cannot get PAST the DRAGON-398 refusal.
     ///
-    /// The two dangerous combinations are "save on copy" (which would otherwise report a save
-    /// that dropped the cut) and "copy on delete" (which would otherwise unlink the recording
-    /// after putting the UNEDITED bytes on the clipboard). Both are settings-driven, so this
-    /// walks every one of the eight video-setting combinations and checks the intent each
-    /// resolves to against `bake_blocked` for a dirty, unsaved, unbakeable recording: every
-    /// intent that could write, copy or delete edited content is refused WHOLE — `run_share`
-    /// returns before the bake, so nothing is half-completed and no delete rides on a share
-    /// that did not happen. The single survivor is the plain Delete (copy-on-delete OFF),
-    /// which owes no bake and must stay available or a corrupt recording is undeletable.
+    /// The dangerous combination is the EXIT copy: with "Automatically copy changes on exit"
+    /// on, closing a dirty recording whose probe never landed must not quietly close over the
+    /// unedited bytes. It routes through a plain `Copy`, so this walks every one of the eight
+    /// video-setting combinations and checks that whatever the settings say, the intent a
+    /// close can reach is refused WHOLE for a dirty, unsaved, unbakeable recording —
+    /// `run_share` returns before the bake, nothing is half-completed, and the editor stays up
+    /// with the reason. Delete is the deliberate survivor: it owes no bake and must stay
+    /// available or a corrupt recording is undeletable.
     #[test]
     fn the_video_toggles_cannot_bypass_the_unbakeable_refusal() {
-        use super::super::{ShareAutomation, copy_intent, delete_intent, share_automation};
+        use super::super::{PreviewAutomation, preview_automation};
         for bits in 0..8u8 {
-            let vid = ShareAutomation {
-                save_on_copy: bits & 1 != 0,
-                close_on_copy: bits & 2 != 0,
-                copy_on_delete: bits & 4 != 0,
+            let vid = PreviewAutomation {
+                copy_on_exit: bits & 1 != 0,
+                save_originals: bits & 2 != 0,
+                ask_to_save: bits & 4 != 0,
             };
             // The image triple is deliberately the OPPOSITE throughout: a video document must
             // resolve from `vid` alone, so nothing here can be an image setting in disguise.
-            let img = ShareAutomation {
-                save_on_copy: !vid.save_on_copy,
-                close_on_copy: !vid.close_on_copy,
-                copy_on_delete: !vid.copy_on_delete,
+            let img = PreviewAutomation {
+                copy_on_exit: !vid.copy_on_exit,
+                save_originals: !vid.save_originals,
+                ask_to_save: !vid.ask_to_save,
             };
-            let a = share_automation(true, img, vid);
+            let a = preview_automation(true, img, vid);
             assert_eq!(a, vid);
-            // Copy, every flavour: always refused for an unbakeable dirty recording. Nothing
-            // is saved, nothing is copied, nothing closes.
-            let copy = copy_intent(a.save_on_copy, a.close_on_copy);
+            // The copy (the toolbar's, and the exit path's) is always refused for an
+            // unrenderable dirty recording, whatever the settings say: nothing is copied and
+            // nothing closes.
             assert!(
-                bake_blocked(copy.owes_bake(true, true), false),
-                "{copy:?} must be refused, not silently completed against the unedited file"
+                bake_blocked(true, false),
+                "a dirty copy must be refused, not silently completed against the unedited file"
             );
-            // Delete: copy-on-delete owes the bake (its clipboard copy must carry the edits)
-            // and is refused, so the file survives; a plain Delete is never gated.
-            let del = delete_intent(a.copy_on_delete);
-            assert_eq!(
-                bake_blocked(del.owes_bake(true, true), false),
-                a.copy_on_delete,
-                "{del:?} refusal must track copy-on-delete exactly"
-            );
+            // A clean one is never gated, so an unreadable recording stays copyable as it is.
+            assert!(!bake_blocked(false, false));
         }
     }
 
-    /// DRAGON-398 clipboard naming. Images keep the fixed `cck-copy.<ext>` (their bytes go on
-    /// the clipboard, so the name is never seen and a fixed one bounds the runtime dir);
-    /// VIDEOS carry the document's own name, because every platform puts a recording on the
-    /// clipboard as a FILE REFERENCE and that name is what a paste writes to disk.
+    /// Clipboard temp naming (DRAGON-398, re-marked by DRAGON-467). Images keep the fixed
+    /// `cck-copy.png` (their bytes go on the clipboard, so the name is never seen and a fixed
+    /// one bounds the runtime dir); VIDEOS carry the document's own stem plus `-copy`, because
+    /// every platform puts a recording on the clipboard as a FILE REFERENCE and that name is
+    /// what a paste writes to disk.
     #[test]
     fn a_copied_recording_pastes_under_its_own_name_and_a_still_does_not() {
         use std::path::Path;
-        // Images: one fixed name in both flavours, and it SAYS png — DRAGON-455, because
-        // png is what the staged file now contains whatever the source was called. An
-        // external `--preview a.JPG` used to echo its name into `cck-copy.JPG`.
-        for edited in [true, false] {
-            assert_eq!(clipboard_temp_name(Path::new("/shots/a.png"), false, edited), "cck-copy.png");
-            assert_eq!(clipboard_temp_name(Path::new("/shots/a.JPG"), false, edited), "cck-copy.png");
-        }
-        // Videos: the BAKED variant is marked `-edited` (matching what a Save would have
-        // written beside the original); the staged copy of the untouched file is not, so the
-        // two can never collide in the runtime dir.
+        // Images: one fixed name, and it SAYS png — DRAGON-455, because png is what the baked
+        // file contains whatever the source was called. An external `--preview a.JPG` used to
+        // echo its name into `cck-copy.JPG`.
+        assert_eq!(clipboard_temp_name(Path::new("/shots/a.png"), false), "cck-copy.png");
+        assert_eq!(clipboard_temp_name(Path::new("/shots/a.JPG"), false), "cck-copy.png");
+        // Videos: the document's own name plus the `-copy` marker.
         let rec = Path::new("/rec/Recording 2026.mp4");
-        assert_eq!(clipboard_temp_name(rec, true, true), "Recording 2026-edited.mp4");
-        assert_eq!(clipboard_temp_name(rec, true, false), "Recording 2026.mp4");
+        assert_eq!(clipboard_temp_name(rec, true), "Recording 2026-copy.mp4");
         // The extension rides along whatever it is.
-        assert_eq!(clipboard_temp_name(Path::new("/rec/t.mkv"), true, true), "t-edited.mkv");
-        assert_eq!(clipboard_temp_name(Path::new("/rec/t.webm"), true, false), "t.webm");
+        assert_eq!(clipboard_temp_name(Path::new("/rec/t.mkv"), true), "t-copy.mkv");
+        assert_eq!(clipboard_temp_name(Path::new("/rec/t.webm"), true), "t-copy.webm");
+        // THE collision the marker exists for: a capture that lives in the runtime dir
+        // because "Automatically save originals" is off. The temp must not be its source, or
+        // the bake reads and writes one file.
+        let transient = Path::new("/run/user/1000/Recording 2026.mp4");
+        assert_ne!(
+            clipboard_temp_name(transient, true),
+            transient.file_name().unwrap().to_string_lossy(),
+            "the bake temp must never be the file it bakes FROM"
+        );
         // A path with no file name at all falls back rather than producing an empty name.
-        assert_eq!(clipboard_temp_name(Path::new("/"), true, true), "cck-copy.png");
+        assert_eq!(clipboard_temp_name(Path::new("/"), true), "cck-copy.png");
         // Always ONE path component: a `join` onto the runtime dir can't be walked out of.
         for (p, v) in [("/rec/a/b.mp4", true), ("/shots/a/b.png", false)] {
-            let name = clipboard_temp_name(Path::new(p), v, true);
+            let name = clipboard_temp_name(Path::new(p), v);
             assert_eq!(Path::new(&name).components().count(), 1, "{name}");
         }
     }
 
-    /// The abort reason names the destructive half that did NOT run, so a re-raised dialog is
-    /// truthful, and carries no em/en-dash (the runtime-string house rule).
-    #[test]
-    fn the_copy_failure_reason_is_truthful_and_dash_free() {
-        assert!(copy_failure_reason(true).contains("file was kept"));
-        assert!(!copy_failure_reason(false).contains("file was kept"));
-        for deletes in [true, false] {
-            let r = copy_failure_reason(deletes);
-            assert!(!r.contains('—') && !r.contains('–'), "no em/en-dash in {r:?}");
-        }
-    }
 }

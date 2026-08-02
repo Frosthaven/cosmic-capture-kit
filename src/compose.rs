@@ -79,7 +79,7 @@ pub fn finish_window(mut img: RgbaImage, radius: u32, keep_transparency: bool) -
 ///
 /// A window with no readable rounded corner (square / opaque-cornered) has nothing to
 /// restore, so it is simply flattened opaque (identical to the old behaviour there).
-#[cfg(target_os = "macos")]
+// Portable since DRAGON-463 (see `finish_window_native_corners`, its only caller).
 fn opacify_body_keep_corners(img: &mut RgbaImage) {
     let (w, h) = (img.width(), img.height());
     // The corner span (physical px) from the captured alpha arc, read while the window
@@ -133,9 +133,13 @@ fn opacify_body_keep_corners(img: &mut RgbaImage) {
 /// (DRAGON-268) via [`opacify_body_keep_corners`] — the downstream `on_black` /
 /// `composite_over_wallpaper` supplies the opaque interior backing, and the border
 /// still traces the real rounded corners instead of squaring them.
-/// `#[cfg(macos)]` keeps the Linux build byte-identical (Linux screencopy delivers
-/// SQUARE corners, so it always rounds via [`finish_window`]).
-#[cfg(target_os = "macos")]
+/// Portable since DRAGON-463, though only macOS SELECTS it: the maths is plain alpha
+/// work with nothing mac-specific in it, and the old `#[cfg(macos)]` existed only to
+/// avoid compiling something the other platforms did not call. Keeping it compiled
+/// everywhere is what lets the shared decoration seam offer [`CornerStyle::Native`] and
+/// lets the behaviour matrix test macOS's corner path from any host.
+///
+/// [`CornerStyle::Native`]: crate::decoration::CornerStyle::Native
 pub fn finish_window_native_corners(mut img: RgbaImage, keep_transparency: bool) -> RgbaImage {
     if !keep_transparency {
         opacify_body_keep_corners(&mut img);
@@ -250,9 +254,11 @@ pub fn add_border(win: RgbaImage, border: u32, color: [u8; 4], outer_radius: u32
 /// shape (circle, squircle, square) by construction and is `border` px thick on every
 /// straight edge, matching the live JankyBorders overlay to ~1px. No-op for border 0.
 ///
-/// `#[cfg(macos)]` keeps the Linux build byte-identical — Linux never calls this
-/// (its screencopy corners are circular, so [`add_border`] is exactly right there).
-#[cfg(target_os = "macos")]
+/// Portable since DRAGON-463 for the same reason as
+/// [`finish_window_native_corners`]: the dilation is generic alpha work, and compiling
+/// it everywhere is what lets the behaviour matrix cover the native-corner path without
+/// a Mac. Linux and Windows still never SELECT it (their screencopy corners are
+/// circular, so [`add_border`] is exactly right there).
 pub fn add_border_native_corners(win: RgbaImage, border: u32, color: [u8; 4]) -> RgbaImage {
     if border == 0 {
         return win;

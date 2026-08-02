@@ -48,28 +48,25 @@ pub enum Action {
     /// DESELECTS something must join this key in its own context; [`Keymap::set`] de-duplicates
     /// only WITHIN a context, so that is a no-conflict addition by construction.
     DeselectText,
-    /// Preview: keep the capture where it was saved (default Ctrl+S).
+    /// Preview: save the capture, choosing where (default Ctrl+S). DRAGON-467 folded the
+    /// separate `PreviewSaveAs` (Ctrl+Shift+S) into this one: Save opens the destination
+    /// picker pre-filled with what a plain overwrite-save would have written, so the two
+    /// actions had become the same action. An override stored against the retired name
+    /// deserializes to `None` and is dropped (see `state::schema`'s `shortcut_overrides`).
     PreviewSave,
-    /// Preview: save the capture to a chosen location (default Ctrl+Shift+S).
-    PreviewSaveAs,
     /// Preview: copy the capture to the clipboard (default Ctrl+C).
     PreviewCopy,
     /// Preview: close without deleting (default Esc).
     PreviewCancel,
-    /// Preview: delete the file and close (default Ctrl+Shift+X).
-    ///
-    /// WHY that chord (DRAGON-369, a deliberate pick — do not "tidy" it): this action is
-    /// `std::fs::remove_file` on the capture (both variants since DRAGON-353) — a hard unlink,
-    /// no trash, fully irreversible. It used to be `Ctrl+D`, which Photoshop spells Deselect,
-    /// so it was the one muscle-memory mismatch in the app that DESTROYS work. Of the
-    /// candidates, `Ctrl+X` was rejected as a two-key chord for an irreversible delete sitting
-    /// next to Ctrl+C/Ctrl+S (and it is the natural home of a future annotation Cut), and
-    /// `Shift+Delete` — the exact OS "delete permanently" convention — was rejected because it
-    /// is ONE modifier away from [`Self::PreviewDeleteSegment`] (plain Delete) on the very same
-    /// screen. `Ctrl+Shift+X` collides with no universal meaning and no other destructive
-    /// binding, and its awkwardness is a FEATURE. No Photoshop parity is forfeited: Photoshop
-    /// never touches your source file, so there is nothing to be faithful to here.
-    PreviewDelete,
+    // DRAGON-467: `PreviewDelete` (Ctrl+Shift+X, "delete the file and close") lived here,
+    // with a long note on why that awkward chord was chosen for an irreversible unlink. The
+    // editor does not delete anything any more, so the action went with the button. The
+    // reasoning is still worth having if a destructive binding ever returns: Ctrl+D was
+    // rejected because Photoshop spells it Deselect, Ctrl+X because it sits next to
+    // Ctrl+C/Ctrl+S and is the natural home of a future annotation Cut, and Shift+Delete
+    // because it is ONE modifier away from `PreviewDeleteSegment` (plain Delete) on the very
+    // same screen. An override stored against the retired name deserializes to `None` and is
+    // dropped (see `state::schema`'s `shortcut_overrides`).
     /// Preview: open/close the covermark picker (default W).
     PreviewCovermark,
     /// Preview: undo the last edit (default Ctrl+Z).
@@ -205,15 +202,13 @@ impl Action {
     /// [`Keymap::apply_overrides`] — which does not de-duplicate against changed defaults —
     /// a no-op for anyone who had rebound a tool, and it gives the third member of a slot a
     /// first-class escape hatch. Keep the ordering when adding tools.
-    pub const ALL: [Action; 40] = [
+    pub const ALL: [Action; 38] = [
         Action::SelectAllText,
         Action::DeselectText,
         Action::CopyText,
         Action::PreviewSave,
-        Action::PreviewSaveAs,
         Action::PreviewCopy,
         Action::PreviewCancel,
-        Action::PreviewDelete,
         Action::PreviewCovermark,
         Action::PreviewUndo,
         Action::PreviewRedo,
@@ -259,12 +254,10 @@ impl Action {
             Action::SelectAllText => "Select all text",
             Action::DeselectText => "Deselect all text",
             Action::PreviewSave => "Save",
-            Action::PreviewSaveAs => "Save As",
             Action::PreviewCopy => "Copy to clipboard",
             Action::PreviewPlay => "Play",
             Action::PreviewFramePrev => "Previous frame",
             Action::PreviewFrameNext => "Next frame",
-            Action::PreviewDelete => "Delete",
             Action::PreviewCancel => "Close",
             Action::PreviewCovermark => "Covermark",
             Action::PreviewUndo => "Undo",
@@ -307,9 +300,7 @@ impl Action {
             Action::DeselectText => "",
             // Action Shortcuts group: descriptions removed per DRAGON-158.
             Action::PreviewSave => "",
-            Action::PreviewSaveAs => "",
             Action::PreviewCopy => "",
-            Action::PreviewDelete => "",
             Action::PreviewCancel => "",
             Action::PreviewCovermark => "",
             Action::PreviewUndo => "",
@@ -368,10 +359,8 @@ impl Action {
                 "OCR Text Recognition"
             }
             Action::PreviewSave
-            | Action::PreviewSaveAs
             | Action::PreviewCopy
             | Action::PreviewCancel
-            | Action::PreviewDelete
             | Action::PreviewCovermark
             | Action::PreviewUndo
             | Action::PreviewRedo => "Action Shortcuts",
@@ -414,12 +403,10 @@ impl Action {
             | Action::SelectAllText
             | Action::DeselectText => Context::Overlay,
             Action::PreviewSave
-            | Action::PreviewSaveAs
             | Action::PreviewCopy
             | Action::PreviewPlay
             | Action::PreviewFramePrev
             | Action::PreviewFrameNext
-            | Action::PreviewDelete
             | Action::PreviewCancel
             | Action::PreviewCovermark
             | Action::PreviewUndo
@@ -467,12 +454,10 @@ impl Action {
             Action::SelectAllText => Shortcut::primary_char('a'),
             Action::DeselectText => Shortcut::primary_char('d'),
             Action::PreviewSave => Shortcut::primary_char('s'),
-            Action::PreviewSaveAs => Shortcut::primary_shift_char('s'),
             Action::PreviewCopy => Shortcut::primary_char('c'),
             Action::PreviewPlay => Shortcut::char('p'),
             Action::PreviewFramePrev => Shortcut::char(','),
             Action::PreviewFrameNext => Shortcut::char('.'),
-            Action::PreviewDelete => Shortcut::primary_shift_char('x'),
             Action::PreviewCancel => Shortcut::named(NamedKey::Escape),
             Action::PreviewCovermark => Shortcut::char('w'),
             Action::PreviewUndo => Shortcut::primary_char('z'),
@@ -1122,6 +1107,50 @@ pub fn is_character_palette_chord(modifiers: Modifiers, key: &Key) -> bool {
     matches!(key, Key::Character(c) if c.as_str() == " " || c.as_str() == "\0")
 }
 
+/// **THE region-copy chord** (DRAGON-479): the platform's primary command modifier plus `C` —
+/// `Ctrl+C` on Linux and Windows, `⌘C` on macOS, exactly like every other in-app primary chord
+/// ([`Shortcut::primary_char`]).
+///
+/// **It is deliberately NOT a [`Keymap`] entry, and must not become one.** Everything in the
+/// keymap is user-configurable by construction — that is what the keymap IS — and this chord
+/// cannot be, for two reasons that both point the same way:
+///
+/// * it is the operating system's own copy convention, not an app preference. A user who rebound
+///   it would be rebinding "copy" itself, which no other app on their desktop lets them do here.
+/// * `Ctrl+C` ALREADY has a second, different meaning in this overlay: in SCANNER kind it is
+///   [`Action::CopyText`], which copies recognized text. Two configurable bindings on one chord
+///   is a conflict the settings page would have to explain and the user would have to resolve.
+///   Fixed, the precedence is a single readable rule in `keyboard.rs` (`region_copy_fires`):
+///   scanner kind never fires this, so the OCR copy keeps the chord there untouched.
+///
+/// This mirrors "Search settings" (Ctrl+F / Cmd+F, DRAGON-158), the other fixed chord that lives
+/// outside the keymap for the same reason. DRAGON-451 retired the CONFIGURABLE version of this
+/// action (`Action::RegionCopy` and its whole `Context::Region` lane); DRAGON-479 brings the
+/// behaviour back without the configurability that made it collide.
+pub fn is_region_copy_chord(modifiers: Modifiers, key: &Key) -> bool {
+    // Built from the same `Shortcut` its LABEL is rendered from, so the chord the app listens
+    // for and the chord the tooltip advertises cannot drift. `matches` compares all four
+    // modifier flags exactly, so a stray Shift or Alt does NOT fire it.
+    Shortcut::primary_char('c').matches(modifiers, key)
+}
+
+/// [`is_region_copy_chord`]'s DISPLAY form, for the capture toolbar's tooltip: `"Ctrl+C"` on
+/// Linux and Windows, `"⌘C"` on macOS.
+///
+/// Rendered by [`Shortcut::label`] — the ONE in-app chord formatter, the same one `action_tip`
+/// shows every configurable binding through — rather than by `mac_symbolic_spec` /
+/// `win_readable_spec`, which render daemon SPEC STRINGS (a different input and a different
+/// vocabulary: they say "Win" where an in-app chord says "Super"). Same per-OS symbols, right
+/// source.
+///
+/// Memoized into a `&'static str` so the tooltip stays a borrow: `capture_button_layer` rebuilds
+/// on every frame, and its other thirteen labels are `&'static str` literals that allocate
+/// nothing.
+pub fn region_copy_chord_label() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| Shortcut::primary_char('c').label()).as_str()
+}
+
 /// macOS (DRAGON-294): render a daemon "Start Capture" hotkey SPEC string (the form
 /// `Shortcut::daemon_spec` produces / the daemon parses — e.g. `"Cmd+Shift+2"`,
 /// `"Ctrl+Alt+K"`, `"PrintScreen"`) into the native macOS modifier SYMBOLS: Control ⌃,
@@ -1646,21 +1675,19 @@ mod tests {
         assert_eq!(km.get(Action::PreviewAnnotShapeCycle), Some(Shortcut::char('u')));
     }
 
-    /// The destructive binding moved OFF Ctrl+D (Photoshop's Deselect) to Ctrl+Shift+X, and
-    /// neither of the two chords it vacated was reassigned opportunistically — Ctrl+X stays
-    /// reserved for a future annotation Cut.
+    /// DRAGON-467 retired the file-delete binding with the feature. Its chords must stay
+    /// FREE rather than being reassigned opportunistically: Ctrl+X is still the natural home
+    /// of a future annotation Cut, and Ctrl+Shift+X should not be silently inherited by
+    /// something else just because it became available.
     #[test]
-    fn delete_is_the_awkward_chord_and_the_freed_ones_stay_free() {
+    fn the_retired_delete_chords_stay_free() {
         let km = Keymap::defaults();
         let shift = PRIMARY | Modifiers::SHIFT;
-        assert_eq!(
-            km.action_for(Context::Preview, shift, &ch("x")),
-            Some(Action::PreviewDelete)
-        );
+        assert_eq!(km.action_for(Context::Preview, shift, &ch("x")), None);
         assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("x")), None);
         assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("x")), None);
-        // Plain Delete still belongs to the timeline, one modifier away from nothing
-        // destructive (which is why Shift+Delete was rejected for the file delete).
+        // Plain Delete still belongs to the TIMELINE (deleting a segment, which is undoable
+        // and touches no file). That one stays.
         assert_eq!(
             km.action_for(Context::Preview, Modifiers::empty(), &Key::Named(Named::Delete)),
             Some(Action::PreviewDeleteSegment)
@@ -1701,9 +1728,7 @@ mod tests {
             Action::SelectAllText,
             Action::DeselectText,
             Action::PreviewSave,
-            Action::PreviewSaveAs,
             Action::PreviewCopy,
-            Action::PreviewDelete,
             Action::PreviewUndo,
             Action::PreviewRedo,
         ] {
@@ -1723,9 +1748,7 @@ mod tests {
             Action::SelectAllText,
             Action::DeselectText,
             Action::PreviewSave,
-            Action::PreviewSaveAs,
             Action::PreviewCopy,
-            Action::PreviewDelete,
             Action::PreviewUndo,
             Action::PreviewRedo,
         ] {
@@ -1734,14 +1757,13 @@ mod tests {
             assert!(!sc.ctrl, "{action:?} should not default to Ctrl on macOS");
         }
         // The shifted chords keep Shift alongside Cmd.
-        assert!(def(Action::PreviewSaveAs).shift);
         assert!(def(Action::PreviewRedo).shift);
         // Bare-key defaults stay unmodified on macOS too.
         let play = def(Action::PreviewPlay);
         assert!(!play.ctrl && !play.logo && !play.alt && !play.shift);
         // macOS labels render the ⌘ glyph.
         assert_eq!(def(Action::CopyText).label(), "⌘C");
-        assert_eq!(def(Action::PreviewSaveAs).label(), "⇧⌘S");
+        assert_eq!(def(Action::PreviewSave).label(), "⌘S");
     }
 
     /// A persisted override (e.g. a Linux config carried to a Mac) is applied

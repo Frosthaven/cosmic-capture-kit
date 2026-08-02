@@ -153,6 +153,58 @@ pub enum SignalProbe {
     NoCaptureEvent,
 }
 
+/// The argv token that asks this binary to come back as the RESIDENT (the macOS menu-bar
+/// daemon, the Windows tray daemon, the Linux ksni resident) rather than as a capture.
+///
+/// It is not a `--flag` because it is not a user-facing option: it is how a LAUNCHER
+/// states its intent to `main`. `main`'s bare-launch check ignores it on purpose, so a
+/// launch carrying it still counts as "bare" and still reads the persisted `resident`
+/// setting.
+///
+/// Every launcher that builds an ARGV uses this constant: the settings resident toggle
+/// (`app::update::settings`, `SetResident`) and the Windows post-update relaunch
+/// (`update::post_update_relaunch_args`), plus `daemon_intent_from_args`, which is what
+/// `main` reads them back with.
+///
+/// The two autostart modules (`platform::{linux,windows}::autostart`) are the exception and
+/// keep their own private copies, because they build a command LINE for a `.desktop` Exec=
+/// key and an HKCU Run value, not an argv. Each pins the literal in a test, so those two
+/// cannot drift silently either. Before DRAGON-465 the resident toggle held a fourth raw
+/// copy with no test at all; that is the shape this constant exists to stop.
+// Live on all three real platforms: the settings toggle builds an argv with it everywhere,
+// `daemon_intent_from_args` reads it on Linux + Windows, and the post-update relaunch spends
+// it on Windows. No dead-code allowance is honest here.
+pub const RESIDENT_ARG: &str = "resident";
+
+/// Whether an argv carries DAEMON intent: an explicit request to raise the resident, as
+/// opposed to a truly bare launch, which means "capture NOW" (DRAGON-180).
+///
+/// The distinction is load-bearing and, until DRAGON-465, it was spelled out twice inline in
+/// `main`. It decides three things at once: how hard to try for the daemon lock
+/// ([`daemon_lock_attempts`]), what a failed takeover does ([`after_failed_takeover`]), and —
+/// the one that bit us — whether a launch that BECOMES the daemon also owes the user a
+/// capture overlay (`daemon::run(!daemon_intent)` on Windows, the `if !daemon_intent` spawn on
+/// Linux). So any launcher that spawns this binary bare is asking for a capture, whether it
+/// meant to or not. The Windows post-update relaunch did exactly that, which is why an update
+/// install came back with both the About page (wanted) and a capture overlay (not).
+///
+/// It scans the WHOLE argv including `argv[0]`, deliberately: that is what both former
+/// inline sites in `main` did, and this must stay a faithful move of them. The contrast is
+/// [`crate::diag::component_from_args`], which DOES `skip(1)` because it matches `--flags`
+/// and a path could plausibly contain one. Here the token is matched whole against one
+/// argument, so only an executable literally invoked as `resident` could false-positive, and
+/// ours is `cosmic-capture-kit`. Do not "fix" this into a skip without checking `main`.
+///
+/// Pure + unit-tested; the callers in `main` are the only readers.
+// Compiled on Linux + Windows (the two `main` branches that ask) and under `cfg(test)`
+// everywhere so the decision is proven on any host; dead on macOS, whose `daemon::run` takes
+// no intent argument.
+#[cfg(any(target_os = "linux", windows, test))]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub fn daemon_intent_from_args<S: AsRef<str>>(args: &[S]) -> bool {
+    args.iter().any(|a| a.as_ref() == RESIDENT_ARG)
+}
+
 /// How many times to try the daemon lock, by launch INTENT (DRAGON-180's rule, ported to
 /// Windows by DRAGON-438). `31` is ~1.5s at the 50ms step: the first attempt is immediate
 /// so a cold start pays nothing, and the rest bridge a restart handoff.
@@ -167,6 +219,66 @@ pub fn daemon_lock_attempts(daemon_intent: bool) -> u32 {
         31
     } else {
         1
+    }
+}
+
+/// What a launch that found the daemon lock HELD should ASK the running daemon for
+/// (DRAGON-471). This comes BEFORE [`RelaunchAction`], which judges the answer: this decides
+/// whether to put the question at all.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldLockAction {
+    /// Hand this launch's CAPTURE to the running daemon and judge the two-stage answer.
+    /// Every ordinary launch: the tray menu, the capture hotkey, a plain double-click, and
+    /// a `resident` launch too, whose pulse doubles as the DRAGON-438 wedge probe.
+    SignalCapture,
+    /// Ask for NOTHING. Deliver the post-update About window from this process and exit,
+    /// leaving the running daemon completely alone.
+    RestoreAbout,
+}
+
+/// Whether a launch that found the daemon lock held should hand over a capture, or restore
+/// the post-update About window instead. Pure + unit-tested.
+///
+/// The bug (DRAGON-471): the held-lock branch pulsed `.capture` unconditionally, because it
+/// keys on the LOCK being held rather than on what the launch wanted. After DRAGON-465 the
+/// post-update relaunch carries `resident` intent, so an update that finds a surviving daemon
+/// asked it for a capture and exited without ever taking the marker. The user got an overlay
+/// and no release notes: the same visible symptom DRAGON-465 fixed, reached down a different
+/// path.
+///
+/// BOTH inputs are required, and the `daemon_intent` half is the safety one. A capture-intent
+/// launch is a person pressing a key, and it must keep handing its capture over even when a
+/// marker happens to be on disk, because dropping a real capture is worse than one redundant
+/// About window.
+///
+/// State the predicate as it really is: `RestoreAbout` answers for ANY daemon-intent launch
+/// that finds a marker, not only for the installer's relaunch. The autostart entry and the
+/// settings resident toggle can both reach it if a marker is on disk at that moment, and that
+/// is fine — the marker means the release notes are owed, and a daemon-intent launch is a
+/// launch with no capture to serve, so showing them is the only useful thing it can do.
+///
+/// The transitional cost is narrow and named: an update installed by a pre-DRAGON-465 build
+/// relaunches BARE, which reads as capture intent, so if a daemon also survived the swap that
+/// one update still pulses a capture. The marker survives that path too (nothing on the
+/// `SignalCapture` side takes it), so it is spent by the next launch that reaches a taker,
+/// which is where the About window shows up instead.
+///
+/// `RestoreAbout` leaves the holder alone on purpose, and that is a real trade: the capture
+/// pulse is also the wedge probe, so declining to pulse means this launch cannot tell a
+/// healthy daemon from a wedged one. It is still the right call. An update is the worst
+/// moment to terminate a tray on a guess, and the user's very next capture press runs the
+/// full DRAGON-438 protocol, so wedge recovery is deferred by one keypress rather than lost.
+/// The caller does re-probe the LOCK once after delivering About, so a holder that died in
+/// the meantime is still taken over rather than leaving the user with no tray at all.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn held_lock_action(daemon_intent: bool, post_update: bool) -> HeldLockAction {
+    if daemon_intent && post_update {
+        HeldLockAction::RestoreAbout
+    } else {
+        HeldLockAction::SignalCapture
     }
 }
 
@@ -226,28 +338,61 @@ pub fn relaunch_action(
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterFailedTakeover {
-    /// A `resident` launch asked for a DAEMON, and some other daemon holds the lock. There
-    /// is nothing for this process to do, so exit — loudly, at `warn`, never the silent
-    /// `exit(0)` this ticket exists to remove.
-    ExitLoud,
+    /// A `resident` launch asked for a DAEMON, and a live one is demonstrably SERVING the
+    /// tray. There is nothing left for this process to do and nothing was lost, so exit and
+    /// say which of the two endings this was, at `info`.
+    ExitDaemonServing,
+    /// A `resident` launch asked for a DAEMON, and NOTHING is known to be serving: the lock
+    /// holder never answered, we dealt with it, and the lock still could not be taken. The
+    /// user asked for a tray and has none. Exit at `warn`, naming that, never the silent
+    /// `exit(0)` DRAGON-438 removed.
+    ExitNothingServing,
     /// A bare launch asked for a CAPTURE. We could not become the daemon, but we can still
     /// give the user what they pressed the key for: fall through to the one-shot capture
     /// overlay, which is exactly the historical non-resident behaviour.
     FallThroughToCapture,
 }
 
-/// Whether a failed takeover should end the process or fall through to a capture.
+/// Whether a failed takeover should end the process or fall through to a capture, and if it
+/// ends, WHICH ending it was. Pure + unit-tested.
 ///
-/// The asymmetry is the whole point: a daemon-intent launch has no work left, while a
-/// capture-intent launch still owes the user an overlay. Falling through means the worst
-/// case of a truly stuck daemon is "the tray is broken", not "the app does nothing".
+/// The first asymmetry is the original one: a daemon-intent launch has no capture to serve,
+/// while a capture-intent launch still owes the user an overlay. Falling through means the
+/// worst case of a truly stuck daemon is "the tray is broken", not "the app does nothing".
+///
+/// The second (DRAGON-472) splits the daemon-intent ending in two, because one `ExitLoud`
+/// was reporting two opposite situations at `warn` as though they were the same:
+///
+/// * `daemon_serving` — reached from the receipt-but-no-ack arm, where the holder PROVED its
+///   message loop is pumping. A tray is up and working; this launch was simply redundant
+///   (a second autostart, a settings toggle racing a live daemon). Warning about it teaches
+///   a reader to distrust the warning.
+/// * not serving — reached after the holder failed to answer at all and the lock still could
+///   not be taken. Nobody is running the tray. That is a real ending with nothing delivered,
+///   and it must read as one.
+///
+/// `post_update` is deliberately NOT an input, and this is the DRAGON-472 finding's resolution
+/// rather than an omission. Be precise about why, because the tidy version of this sentence
+/// ("a post-update relaunch cannot reach here") is false: a daemon-intent launch DOES reach
+/// this decision whenever [`held_lock_action`] answered `SignalCapture`, and a marker can be
+/// absent for several reasons, including one that was just consumed by another process or one
+/// that could not be deleted.
+///
+/// The true statement is narrower and enough: in every case that reaches here, `post_update`
+/// was genuinely FALSE. `held_lock_action` returns `RestoreAbout` for daemon intent plus a
+/// marker, and that branch exits or becomes the daemon without ever coming back (DRAGON-471).
+/// So a launch arriving here either had no marker to find or was told it had none, and the
+/// About window is not this decision's to deliver either way. Adding the flag would be a dead
+/// input whose only possible value is `false`.
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn after_failed_takeover(daemon_intent: bool) -> AfterFailedTakeover {
-    if daemon_intent {
-        AfterFailedTakeover::ExitLoud
-    } else {
+pub fn after_failed_takeover(daemon_intent: bool, daemon_serving: bool) -> AfterFailedTakeover {
+    if !daemon_intent {
         AfterFailedTakeover::FallThroughToCapture
+    } else if daemon_serving {
+        AfterFailedTakeover::ExitDaemonServing
+    } else {
+        AfterFailedTakeover::ExitNothingServing
     }
 }
 
@@ -1264,6 +1409,82 @@ mod tests {
     // Windows-only decisions, run on every host: this is a dual-boot shared tree and the
     // suite is the only gate, so the table has to be verifiable wherever it runs.
 
+    /// DRAGON-465: intent comes from the argv shape, and ONLY the resident token sets it.
+    /// Every other launch — including one carrying capture flags, and including a launch
+    /// with no arguments at all — is capture intent, which is what makes a launcher that
+    /// spawns this binary bare an implicit request for an overlay.
+    #[test]
+    fn daemon_intent_is_the_resident_token_and_nothing_else() {
+        // REAL argv shapes, argv[0] included: that is what `main` passes, and it is the
+        // shape that matters. A launcher's exe path plus the token is daemon intent; the
+        // exe path ALONE is the bare launch the post-update relaunch used to be.
+        const EXE: &str = r"C:\Users\x\AppData\Local\Programs\cosmic-capture-kit\cosmic-capture-kit.exe";
+        assert!(daemon_intent_from_args(&[EXE, "resident"]));
+        assert!(!daemon_intent_from_args(&[EXE]));
+        assert!(daemon_intent_from_args(&["/usr/bin/cosmic-capture-kit", "resident"]));
+        assert!(!daemon_intent_from_args(&["/usr/bin/cosmic-capture-kit"]));
+
+        // Token-only shapes, for the rule itself.
+        assert!(daemon_intent_from_args(&["resident"]));
+        // Position does not matter (the autostart entry and the settings toggle both pass
+        // it as the only argument, but nothing depends on that).
+        assert!(daemon_intent_from_args(&["--settings", "resident"]));
+        // An empty argv can't happen in practice, but the predicate must not care.
+        assert!(!daemon_intent_from_args::<&str>(&[]));
+        // Near misses are not the token: it is matched whole, not by prefix or substring.
+        for argv in [
+            vec!["--resident"],
+            vec!["resident-mode"],
+            vec!["Resident"],
+            vec!["--region"],
+            vec!["--settings"],
+        ] {
+            assert!(!daemon_intent_from_args(&argv), "{argv:?} is not daemon intent");
+        }
+        // A path that CONTAINS the token as a directory component is still one argument,
+        // so it cannot match. This is why not skipping argv[0] is safe.
+        assert!(!daemon_intent_from_args(&["/opt/resident/cosmic-capture-kit"]));
+        // The documented false-positive, pinned so the no-skip decision stays visible: an
+        // executable invoked as literally `resident` would read as daemon intent. Ours
+        // never is, and both former inline sites in `main` behaved exactly this way.
+        assert!(daemon_intent_from_args(&["resident"]));
+        // It reads an owned argv (what `main` has) the same as a borrowed one.
+        assert!(daemon_intent_from_args(&[String::from(RESIDENT_ARG)]));
+    }
+
+    /// DRAGON-471: the held-lock branch used to pulse a capture on the LOCK being held,
+    /// which is not a statement about what the launch wanted. Only the post-update relaunch
+    /// (daemon intent AND a marker) restores About instead; everything else still hands its
+    /// capture over.
+    #[test]
+    fn only_a_post_update_resident_launch_declines_to_ask_for_a_capture() {
+        assert_eq!(held_lock_action(true, true), HeldLockAction::RestoreAbout);
+        // A plain `resident` launch (autostart, the settings toggle) keeps today's path,
+        // pulse and all: the pulse is also the wedge probe.
+        assert_eq!(held_lock_action(true, false), HeldLockAction::SignalCapture);
+        // The safety rule: a capture-intent launch is a person pressing a key. A marker on
+        // disk may be stale, and losing a real capture is worse than one extra About window,
+        // so intent wins over the marker here.
+        assert_eq!(held_lock_action(false, true), HeldLockAction::SignalCapture);
+        assert_eq!(held_lock_action(false, false), HeldLockAction::SignalCapture);
+    }
+
+    /// The two DRAGON-465 / DRAGON-471 halves have to agree about one launch: the relaunch
+    /// argv that `post_update_relaunch_args` builds for a resident install must be the argv
+    /// that reaches `RestoreAbout` when a daemon is already up. Stated end to end so the two
+    /// tickets' decisions cannot drift into disagreeing.
+    #[test]
+    fn the_post_update_relaunch_argv_is_what_reaches_restore_about() {
+        let argv = crate::update::post_update_relaunch_args(true);
+        let intent = daemon_intent_from_args(argv);
+        assert!(intent, "the resident relaunch must read as daemon intent");
+        assert_eq!(held_lock_action(intent, true), HeldLockAction::RestoreAbout);
+        // With `resident` off there is no daemon branch at all, so the held-lock decision is
+        // never reached; if it somehow were, it must not silently ask for a capture either.
+        let bare = crate::update::post_update_relaunch_args(false);
+        assert!(!daemon_intent_from_args(bare));
+    }
+
     /// The intent split (DRAGON-180's Linux rule, now Windows'): a daemon-intent launch
     /// keeps the ~1.5s restart-handoff window, a capture-intent launch takes ONE attempt
     /// and relies on the ACK rather than on waiting longer.
@@ -1377,14 +1598,50 @@ mod tests {
         }
     }
 
-    /// After a takeover that still could not win the lock: a `resident` launch has no work
-    /// left and exits (loudly — the silent exit IS the bug), while a bare capture launch
-    /// still owes the user the overlay they pressed a key for. That fall-through is what
-    /// downgrades the worst case from "the app does nothing" to "the tray is broken".
+    /// After a takeover that still could not win the lock, a bare CAPTURE launch still owes
+    /// the user the overlay they pressed a key for, and gets it whatever state the daemon is
+    /// in. That fall-through is what downgrades the worst case from "the app does nothing" to
+    /// "the tray is broken". The `resident` endings are the sibling test's subject.
     #[test]
     fn a_failed_takeover_still_gives_a_capture_launch_its_capture() {
-        assert_eq!(after_failed_takeover(false), AfterFailedTakeover::FallThroughToCapture);
-        assert_eq!(after_failed_takeover(true), AfterFailedTakeover::ExitLoud);
+        // A capture launch keeps its overlay whatever the daemon's state is.
+        for serving in [true, false] {
+            assert_eq!(
+                after_failed_takeover(false, serving),
+                AfterFailedTakeover::FallThroughToCapture,
+                "capture intent, daemon_serving={serving}"
+            );
+        }
+    }
+
+    /// DRAGON-472: the daemon-intent ending is TWO endings, and reporting both at `warn` was
+    /// telling a reader that a healthy machine had a problem. The split is exactly "is
+    /// anything serving the tray".
+    #[test]
+    fn a_failed_takeover_says_whether_anything_is_still_serving() {
+        // The holder proved its loop pumps (receipt, no ack). A tray is up; this launch was
+        // redundant, and nothing was lost.
+        assert_eq!(
+            after_failed_takeover(true, true),
+            AfterFailedTakeover::ExitDaemonServing
+        );
+        // Nobody answered and the lock stayed out of reach. The user asked for a tray and
+        // has none: the one ending here that genuinely delivered nothing.
+        assert_eq!(
+            after_failed_takeover(true, false),
+            AfterFailedTakeover::ExitNothingServing
+        );
+        // The table is total and the three outcomes are distinct.
+        let all = [
+            after_failed_takeover(false, false),
+            after_failed_takeover(true, true),
+            after_failed_takeover(true, false),
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "each failed-takeover ending must be its own answer");
+            }
+        }
     }
 
     #[test]

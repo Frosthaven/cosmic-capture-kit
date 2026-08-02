@@ -13,6 +13,7 @@ pub(crate) mod reexec;
 mod clipboard;
 mod notify;
 mod open;
+mod share_sheet;
 mod wifi;
 
 pub use clipboard::{
@@ -21,4 +22,5 @@ pub use clipboard::{
 };
 pub use notify::{CopyOutcome, NotifyKind, notify, notify_from_argv, run_notify};
 pub use open::{open_uri, run_open_uri, run_reveal, save_and_open};
+pub use share_sheet::{share_available, share_file};
 pub use wifi::join_wifi;

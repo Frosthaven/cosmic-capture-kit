@@ -1109,7 +1109,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-capture-kit"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "arboard",
  "ashpd 0.12.3",
@@ -1165,6 +1165,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "windows 0.62.2",
+ "windows-collections 0.3.2",
  "winres",
  "wl-clipboard-rs",
  "zbus",

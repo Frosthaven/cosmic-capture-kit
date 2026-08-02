@@ -85,8 +85,19 @@ impl PreviewSurface {
     /// content sizing ([`App::preview_content_height`]) derive from, so a windowed
     /// preview opens exactly media-sized and its canvas fills the space between the
     /// bars with no dead bands.
-    pub(super) fn chrome_h(self) -> f32 {
-        match self {
+    ///
+    /// `labels` is the "Show toolbar group labels" setting (DRAGON-478). It adds
+    /// [`super::chrome::caption_band_h`] ONCE, for the TOP bar, which is the only bar that
+    /// draws captions. **At `false` this returns the pre-DRAGON-478 value exactly** — the band
+    /// is a literal zero, not a small number — so turning the labels off restores the editor's
+    /// historical geometry rather than approximating it. Every caller threads the same flag the
+    /// view builds its `Tb` from; a caller that reserved one answer while the bar drew the other
+    /// would clip the picture or leave a dead band.
+    pub(super) fn chrome_h(self, labels: bool) -> f32 {
+        // The top bar's caption band, on whichever surface — the composition above it is the
+        // same view on both (see the Overlay arm's portability note).
+        let captions = super::chrome::caption_band_h(labels, self.btn_scale());
+        captions + match self {
             // THREE rows in a 12px-spaced column, plus the centred group's 40px top & bottom
             // insets: both toolbars (at the shared [`CHROME_SCALE`], like the window's), and
             // above them the DRAGON-337 header row (windowed-swap / undo / redo ⟨split⟩
@@ -98,11 +109,20 @@ impl PreviewSurface {
                 2.0 * (self.btn_scale() * GROUP_H_BASE + 12.0) + (OVERLAY_HEADER_H + 12.0) + 80.0
             }
             // The CSD header + two edge-pinned bars: each a toolbar group at the
-            // windowed button scale inside `preview_bar`'s 8px vertical padding.
+            // windowed button scale inside `preview_bar`'s vertical padding.
             // No column spacing, no insets — the canvas fills everything between.
+            //
+            // The TOP bar's bottom padding is the caption-symmetry seam
+            // (`chrome::top_bar_bottom_pad`): the historical `BAR_V_PAD` with the labels
+            // off, the scaled caption gap with them on, so this reserves exactly what
+            // `preview_bar` draws and the word sits with equal air above and below it.
             Self::Window => {
-                let bar = self.btn_scale() * GROUP_H_BASE + 2.0 * 8.0;
-                self.header_px() + 2.0 * bar
+                let top_bar = self.btn_scale() * GROUP_H_BASE
+                    + super::chrome::BAR_V_PAD
+                    + super::chrome::top_bar_bottom_pad(labels, self.btn_scale());
+                let bottom_bar =
+                    self.btn_scale() * GROUP_H_BASE + 2.0 * super::chrome::BAR_V_PAD;
+                self.header_px() + top_bar + bottom_bar
             }
         }
     }
@@ -139,15 +159,25 @@ impl PreviewSurface {
 /// transport strip's height at open time (0 for stills); passed in rather than
 /// derived so this stays in lockstep with whatever `preview_transport_h` reserves.
 ///
+/// `labels` is the "Show toolbar group labels" setting, handed straight to
+/// [`PreviewSurface::chrome_h`] (DRAGON-478). It is an argument rather than a read of app
+/// state for the same reason `extra_h` is: this function is pure, and every caller already
+/// holds the `App` the flag lives on.
+///
 /// `monitor` is the target output's FULL logical size; panels/docks (the compositor's
 /// non-exclusive zone) are unknowable client-side, so a request may still overshoot
 /// that axis — the compositor clamps it at map time and the resize event re-fits the
 /// content. The `max_size` hint set at open (see [`super::shell::preview_window`])
 /// keeps cosmic-comp from reshaping the request to 2/3-per-axis on the way.
-pub(super) fn windowed_fit_size(media: (u32, u32), monitor: Option<(u32, u32)>, extra_h: f32) -> (f32, f32) {
+pub(super) fn windowed_fit_size(
+    media: (u32, u32),
+    monitor: Option<(u32, u32)>,
+    extra_h: f32,
+    labels: bool,
+) -> (f32, f32) {
     // Horizontal chrome is just the 1px CSD border each side; vertical is the
     // header + toolbars + the media kind's transport strip.
-    let chrome = (2.0, PreviewSurface::Window.chrome_h() + extra_h);
+    let chrome = (2.0, PreviewSurface::Window.chrome_h(labels) + extra_h);
     // ALL the rule 1-5 math lives in the portable, unit-tested `sizing` module —
     // this only supplies THIS surface's chrome, floor, and the shared 80% height
     // budget (rule 3). `media` is already in LOGICAL points (callers divide the
@@ -334,6 +364,12 @@ fn overlay_min_content_width_for(video: bool, covermark: bool) -> f32 {
 mod tests {
     use super::*;
 
+    /// The SHIPPING default of the "Show toolbar group labels" setting (DRAGON-478). The tests
+    /// that are about fit geometry rather than about the captions run at it, so they measure
+    /// what a default install actually gets; the two tests that OWN the setting name both
+    /// states explicitly instead.
+    const LABELS: bool = true;
+
     /// The windowed chrome is the header plus two scaled, padded bars — strictly less
     /// than the overlay's reserve (whose 40px insets and full-scale bars don't exist in
     /// a window). This is the invariant behind the no-dead-bands open fit.
@@ -341,8 +377,71 @@ mod tests {
     fn windowed_chrome_is_the_header_plus_two_scaled_bars() {
         let w = PreviewSurface::Window;
         let bar = w.btn_scale() * GROUP_H_BASE + 16.0;
-        assert_eq!(w.chrome_h(), w.header_px() + 2.0 * bar);
-        assert!(w.chrome_h() < PreviewSurface::Overlay.chrome_h() + w.header_px());
+        assert_eq!(w.chrome_h(false), w.header_px() + 2.0 * bar);
+        assert!(w.chrome_h(false) < PreviewSurface::Overlay.chrome_h(false) + w.header_px());
+    }
+
+    /// DRAGON-478, **the labels-OFF byte-identity pin**: with the "Show toolbar group labels"
+    /// setting off, both surfaces' chrome reserve is EXACTLY the historical expression it was
+    /// before the caption band existed — the two literals below are the pre-DRAGON-478 bodies of
+    /// `chrome_h`, copied verbatim. Nothing about the editor's geometry may move for a user who
+    /// turns the captions off; if this fails, the band leaked into the zero case.
+    #[test]
+    fn labels_off_is_the_historical_chrome_reserve_exactly() {
+        let s = CHROME_SCALE;
+        let historical_overlay =
+            2.0 * (s * GROUP_H_BASE + 12.0) + (OVERLAY_HEADER_H + 12.0) + 80.0;
+        let historical_window = PreviewSurface::Window.header_px() + 2.0 * (s * GROUP_H_BASE + 16.0);
+        assert_eq!(PreviewSurface::Overlay.chrome_h(false), historical_overlay);
+        assert_eq!(PreviewSurface::Window.chrome_h(false), historical_window);
+        // And the open fit that reads it is byte-identical too, media by media.
+        for media in [(1280u32, 720u32), (3840, 2160), (400, 300)] {
+            let (w, h) = windowed_fit_size(media, Some((2560, 1440)), 0.0, false);
+            let want = sizing::spawn_window_size(
+                media,
+                Some((2560, 1440)),
+                (2.0, historical_window),
+                (super::shell::PREVIEW_MIN_W, super::shell::PREVIEW_MIN_H),
+                sizing::USABLE_H_FRAC,
+            );
+            assert_eq!((w, h), want, "media {media:?} drifted with the labels off");
+        }
+    }
+
+    /// DRAGON-478, labels ON: the OVERLAY reserves exactly one caption band more; the WINDOW
+    /// reserves one band minus the bottom padding its top bar TRADES for the symmetric
+    /// caption pad (`chrome::top_bar_bottom_pad` — the owner's "equal air above and below the
+    /// word" round). A drifting reserve either pushes the picture out of its fitted box or
+    /// lets the bar draw over it, so both deltas are pinned to the same expressions the view
+    /// draws with.
+    #[test]
+    fn labels_on_reserve_the_band_and_the_window_trades_its_bottom_pad() {
+        let band = super::chrome::caption_band_h(true, CHROME_SCALE);
+        assert!(band > 0.0, "the band must be real when the labels are on");
+        // Overlay: no bar fill, nothing traded — exactly one band.
+        let o = PreviewSurface::Overlay;
+        assert!(
+            (o.chrome_h(true) - o.chrome_h(false) - band).abs() < 0.001,
+            "the overlay's labels-on reserve is not exactly one band taller"
+        );
+        // Window: one band, minus the traded padding.
+        let traded =
+            super::chrome::BAR_V_PAD - super::chrome::top_bar_bottom_pad(true, CHROME_SCALE);
+        assert!(traded > 0.0, "the symmetric pad should undercut the historical bar padding");
+        let w = PreviewSurface::Window;
+        assert!(
+            (w.chrome_h(true) - w.chrome_h(false) - (band - traded)).abs() < 0.001,
+            "the window's labels-on reserve is not band-minus-traded-padding taller"
+        );
+        // The window's open fit spends that delta on chrome, not on the canvas: the SAME
+        // media opens exactly that much taller and no wider.
+        let off = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0, false);
+        let on = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0, true);
+        assert_eq!(on.0, off.0);
+        assert!(
+            (on.1 - (off.1 + band - traded)).abs() < 0.001,
+            "{on:?} vs {off:?} + {band} - {traded}"
+        );
     }
 
     /// DRAGON-337: the overlay reserves its two toolbars PLUS the header row — each with one of
@@ -356,7 +455,7 @@ mod tests {
         let s = o.btn_scale();
         // The header row + its gap is the ONLY delta vs the historical two-bar reserve...
         let two_bars = 2.0 * (s * GROUP_H_BASE + 12.0) + 80.0;
-        assert!(((o.chrome_h() - two_bars) - (OVERLAY_HEADER_H + 12.0)).abs() < 0.001);
+        assert!(((o.chrome_h(false) - two_bars) - (OVERLAY_HEADER_H + 12.0)).abs() < 0.001);
         // ...and a flat row is exactly the (scaled) group padding shorter than a capsuled bar.
         assert!(((s * GROUP_H_BASE - OVERLAY_HEADER_H) - s * 2.0 * GROUP_PAD).abs() < 0.001);
     }
@@ -410,10 +509,10 @@ mod tests {
     /// across the acceptance outputs incl. the 5120x1440 super-ultrawide.
     #[test]
     fn windowed_fit_keeps_the_media_aspect_on_every_output() {
-        let chrome_h = PreviewSurface::Window.chrome_h();
+        let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
         for output in [(3840, 2160), (5120, 1440), (2560, 1440), (1920, 1080), (3440, 1440)] {
             for media in [(3840u32, 2160u32), (5120, 1440), (1920, 1080), (1280, 720)] {
-                let (w, h) = windowed_fit_size(media, Some(output), 0.0);
+                let (w, h) = windowed_fit_size(media, Some(output), 0.0, LABELS);
                 let (cw, ch) = (w - 2.0, h - chrome_h);
                 // Skip combinations where the PREVIEW_MIN floor bites (aspect yields there).
                 if w > super::shell::PREVIEW_MIN_W && h > super::shell::PREVIEW_MIN_H {
@@ -433,8 +532,8 @@ mod tests {
     #[test]
     fn video_open_reserves_the_transport_strip() {
         let transport = PreviewSurface::Window.transport_h();
-        let still = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0);
-        let video = windowed_fit_size((1280, 720), Some((3840, 2160)), transport);
+        let still = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0, LABELS);
+        let video = windowed_fit_size((1280, 720), Some((3840, 2160)), transport, LABELS);
         assert_eq!(video.0, still.0);
         assert!((video.1 - (still.1 + transport)).abs() < 0.001);
     }
@@ -443,8 +542,8 @@ mod tests {
     /// floors permitting), not a blown-up one.
     #[test]
     fn windowed_fit_never_upscales_past_native() {
-        let chrome_h = PreviewSurface::Window.chrome_h();
-        let (w, h) = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0);
+        let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
+        let (w, h) = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0, LABELS);
         assert_eq!((w - 2.0).round(), 1280.0);
         assert_eq!((h - chrome_h).round(), 720.0);
     }
@@ -452,7 +551,7 @@ mod tests {
     /// The floor always wins (toolbars must not clip), even for tiny media.
     #[test]
     fn windowed_fit_respects_the_floor() {
-        let (w, h) = windowed_fit_size((320, 200), Some((1920, 1080)), 0.0);
+        let (w, h) = windowed_fit_size((320, 200), Some((1920, 1080)), 0.0, LABELS);
         assert_eq!(w, super::shell::PREVIEW_MIN_W);
         assert_eq!(h, super::shell::PREVIEW_MIN_H);
     }
@@ -478,8 +577,8 @@ mod tests {
     /// clamp plus the resize re-fit handle any overshoot.
     #[test]
     fn windowed_fit_without_a_monitor_is_native_sized() {
-        let chrome_h = PreviewSurface::Window.chrome_h();
-        let (w, h) = windowed_fit_size((1600, 900), None, 0.0);
+        let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
+        let (w, h) = windowed_fit_size((1600, 900), None, 0.0, LABELS);
         assert_eq!((w - 2.0).round(), 1600.0);
         assert_eq!((h - chrome_h).round(), 900.0);
     }
@@ -488,6 +587,10 @@ mod tests {
 #[cfg(test)]
 mod dpi_proof_tests {
     use super::*;
+
+    /// The shipping default of the toolbar-labels setting — see `tests::LABELS`. These proofs
+    /// are about the DPI conversion, not about the captions; both answers convert identically.
+    const LABELS: bool = true;
 
     /// PROOF of the DRAGON-130 DPI fix, region case (the monitor clamp does NOT
     /// mask it): a 1400×900 LOGICAL region on a 2× display captures to 2800×1800
@@ -498,11 +601,11 @@ mod dpi_proof_tests {
         // A wide logical monitor so neither result is clamped by the monitor bound,
         // and a region above the PREVIEW_MIN floor so neither is floored.
         let monitor = Some((6000u32, 3400u32));
-        let chrome_h = PreviewSurface::Window.chrome_h();
+        let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
         // BUG: physical pixels treated as logical.
-        let buggy = windowed_fit_size((2800, 1800), monitor, 0.0);
+        let buggy = windowed_fit_size((2800, 1800), monitor, 0.0, LABELS);
         // FIX: physical / source_scale(2.0) = the 1400×900 logical footprint.
-        let fixed = windowed_fit_size((1400, 900), monitor, 0.0);
+        let fixed = windowed_fit_size((1400, 900), monitor, 0.0, LABELS);
         // The fixed window's canvas IS the true 1400×900 logical footprint...
         assert!((fixed.0 - (1400.0 + 2.0)).abs() < 0.5, "fixed w {}", fixed.0);
         assert!((fixed.1 - (900.0 + chrome_h)).abs() < 0.5, "fixed h {}", fixed.1);
@@ -518,6 +621,10 @@ mod dpi_proof_tests {
 mod monitor_points_tests {
     use super::*;
 
+    /// The shipping default of the toolbar-labels setting — see `tests::LABELS`. These proofs
+    /// are about the point conversion, not about the captions; both answers convert identically.
+    const LABELS: bool = true;
+
     /// THE byte-identity pin. At factor 1.0 — Linux, macOS, and every 96-DPI Windows box —
     /// the conversion returns the capture rect UNCHANGED, so `windowed_fit_size`, the
     /// max-size hint and the `min_size` clamp all see the EXACT expression they saw before
@@ -531,8 +638,8 @@ mod monitor_points_tests {
             for media in [(1280u32, 720u32), (3840, 2160), (400, 300)] {
                 for extra_h in [0.0f32, PreviewSurface::Window.transport_h()] {
                     assert_eq!(
-                        windowed_fit_size(media, Some(pts), extra_h),
-                        windowed_fit_size(media, Some(capture), extra_h),
+                        windowed_fit_size(media, Some(pts), extra_h, LABELS),
+                        windowed_fit_size(media, Some(capture), extra_h, LABELS),
                     );
                 }
             }
@@ -605,7 +712,7 @@ mod monitor_points_tests {
         let capture = (3840u32, 2160u32);
         let pts = monitor_fit_points(capture, 2.0);
         let media = sizing::to_points(capture, 2.0);
-        let (w, h) = windowed_fit_size(media, Some(pts), 0.0);
+        let (w, h) = windowed_fit_size(media, Some(pts), 0.0, LABELS);
         assert!(w <= pts.0 as f32 + 0.5, "width {w} spills off a {}pt screen", pts.0);
         assert!(
             h <= pts.1 as f32 * sizing::USABLE_H_FRAC + 0.5,
@@ -614,7 +721,7 @@ mod monitor_points_tests {
             pts.1,
         );
         // The un-divided bound let the SAME capture ask for a window taller than the screen.
-        let (_, buggy_h) = windowed_fit_size(media, Some(capture), 0.0);
+        let (_, buggy_h) = windowed_fit_size(media, Some(capture), 0.0, LABELS);
         assert!(buggy_h > pts.1 as f32, "the bug: {buggy_h}pt tall on a {}pt screen", pts.1);
     }
 

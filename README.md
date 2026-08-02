@@ -66,10 +66,11 @@ along with their statuses.
 | Core: Preview editor (overlay)                      | ✅      |
 | Core: System tray daemon                            | ✅      |
 | Preview editor (shared): Clipboard toggle           | ✅      |
-| Preview editor (shared): Delete                     | ✅      |
-| Preview editor (shared): Save                       | ✅      |
-| Preview editor (shared): Save as                    | ✅      |
+| Preview editor (shared): Save (choose where)        | ✅      |
 | Preview editor (shared): Copy                       | ✅      |
+| Preview editor (shared): Share sheet (Windows)      | ✅      |
+| Preview editor (shared): Share sheet (macOS)        | ✅      |
+| Preview editor (shared): Upload to an account       | 📅      |
 | Preview editor (images): Covermarks                 | ✅      |
 | Preview editor (images): Color selector             | ✅      |
 | Preview editor (images): Arrows                     | ✅      |
@@ -126,6 +127,24 @@ along with their statuses.
 
 Build from source for now (packaged channels are on the way).
 
+#### Build dependencies
+
+The binary links libxkbcommon, libpulse and libpipewire, so their development
+packages have to be installed before the first build. A desktop system has the
+runtime libraries already but usually not the dev packages.
+
+```sh
+# Arch / CachyOS
+sudo pacman -S base-devel clang libxkbcommon libpulse libpipewire
+
+# Debian / Ubuntu / Linux Mint / Pop!_OS
+sudo apt install build-essential pkg-config libclang-dev \
+                 libxkbcommon-dev libpulse-dev libpipewire-0.3-dev
+```
+
+See [dependencies.md](dependencies.md) for what each one is for, plus the
+runtime extras (ffmpeg for recording, tesseract for OCR).
+
 #### Build from source
 
 ```sh
@@ -133,6 +152,38 @@ git clone https://github.com/Frosthaven/cosmic-capture-kit
 cd cosmic-capture-kit
 cargo build --release
 ```
+
+**On Debian, Ubuntu, Mint and Pop!_OS, add `--no-default-features` to every
+cargo command**, including `test`, `run` and `install`:
+
+```sh
+cargo build --release --no-default-features
+```
+
+Those distros ship an older ffmpeg (Ubuntu 24.04, and so Mint 22, has 6.1.1),
+while the default `zero-copy` feature needs ffmpeg 8 headers, so the build
+otherwise stops inside `ffmpeg-sys-next`. The only thing dropped is the
+in-process GPU zero-copy encoding path. Recording still works through the
+`ffmpeg` binary.
+
+#### Run it
+
+The build puts the binary at `target/release/cosmic-capture-kit`, inside the
+folder you cloned into. There is no app window to open and nothing is added to
+your application menu by building: Cosmic Capture Kit is a one-shot tool. It
+launches straight into a capture, does the job, and exits.
+
+```sh
+./target/release/cosmic-capture-kit             # region screenshot (a bare launch)
+./target/release/cosmic-capture-kit --settings  # the settings window, no capture
+./target/release/cosmic-capture-kit --help      # every flag
+```
+
+Start with `--settings` to look around and set your save folders. A bare launch
+immediately dims the screen for a region selection, which is surprising the
+first time if you were expecting a normal application window.
+
+See [CLI.md](CLI.md) for the full flag list.
 
 #### Install from source
 
@@ -142,6 +193,29 @@ terminal can launch it by name instead of a full path:
 ```sh
 cargo install --path .
 ```
+
+On Debian, Ubuntu, Mint and Pop!_OS this needs the same flag as the build:
+`cargo install --path . --no-default-features`.
+
+Once installed, the commands above become `cosmic-capture-kit`,
+`cosmic-capture-kit --settings`, and so on, from any directory. That is also the
+form the keyboard shortcuts below expect. If your shell cannot find it, make
+sure `~/.cargo/bin` is on your `PATH`.
+
+To get an entry in the application menu, install the shipped desktop file and
+its icon. Do this after `cargo install`, because the entry launches the binary
+by name and so needs it on your `PATH`:
+
+```sh
+install -Dm644 res/dev.frosthaven.CosmicCaptureKit.desktop \
+  ~/.local/share/applications/dev.frosthaven.CosmicCaptureKit.desktop
+install -Dm644 res/icons/dev.frosthaven.CosmicCaptureKit.svg \
+  ~/.local/share/icons/hicolor/scalable/apps/dev.frosthaven.CosmicCaptureKit.svg
+```
+
+Launching from the menu is a bare launch, so it starts a region screenshot.
+Installing the entry is worth doing anyway: it is what makes the desktop and
+xdg-desktop-portal show the app's real name instead of a generic fallback.
 
 #### Shortcuts
 

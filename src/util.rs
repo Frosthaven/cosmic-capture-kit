@@ -201,6 +201,79 @@ pub fn runtime_dir() -> String {
         .unwrap_or_else(|_| std::env::temp_dir().to_string_lossy().into_owned())
 }
 
+/// How long an unclaimed transient RECORDING is kept before the startup sweep removes it
+/// (DRAGON-467 review, major 3).
+///
+/// Seven days is chosen to be forgiving rather than tidy: the file is the user's capture, and
+/// the only thing that makes it disposable is that they closed the editor without saving it.
+/// A week means "I meant to keep that" is still recoverable from the cache folder, while the
+/// folder still cannot grow without bound.
+pub const TRANSIENT_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// The DISK-BACKED transient directory for recordings that the user has not saved
+/// (`~/.cache/cosmic-capture-kit/transient`), created on demand. `None` when the OS has no
+/// cache dir to offer.
+///
+/// # Why recordings do not use [`runtime_dir`] (DRAGON-467 review, major 3)
+///
+/// `$XDG_RUNTIME_DIR` is a **tmpfs**, so it is RAM, and it is small: the systemd default is
+/// 10% of physical memory. A recording buffers its live `.recording` temp AND its finished
+/// file there, so a long take with "Automatically save originals" off could fill it and
+/// ENOSPC mid-capture, losing the take it was in the middle of. `/tmp` is no answer either:
+/// on this project's own distro (Arch) it is tmpfs as well.
+///
+/// Stills stay in the runtime dir on purpose. They are a few MB, they are written once, and
+/// the runtime dir's clear-at-logout lifetime is exactly right for them.
+///
+/// The Linux clipboard constraint is what stops this being a temp file we delete on close: a
+/// copied recording is served to the desktop as a `file://` URI by a DETACHED worker, so the
+/// file must outlive this process for a paste to work at all. Bounded accumulation is handled
+/// by age instead, in [`sweep_transient_recordings`].
+pub fn transient_recording_dir() -> Option<PathBuf> {
+    let dir = if is_dev_process() {
+        // The same sandbox rule as `app_config_dir`: nothing a cargo run does may litter the
+        // developer's real cache folder.
+        PathBuf::from(runtime_dir()).join("cck-dev-transient")
+    } else {
+        dirs::cache_dir()?.join("cosmic-capture-kit").join("transient")
+    };
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// Remove transient recordings older than [`TRANSIENT_MAX_AGE`] (DRAGON-467 review, major 3).
+///
+/// Called once per launch, off the UI thread, and deliberately forgiving: every step is
+/// best-effort, an unreadable entry is skipped rather than reported, and a file whose age
+/// cannot be determined is KEPT. Deleting a capture is the destructive direction, so anything
+/// uncertain resolves toward keeping it.
+///
+/// Only plain files directly in the folder are considered, so a stray directory (or a
+/// recording's sibling `.recording` temp, which shares the same age) is handled by the same
+/// rule without special cases.
+pub fn sweep_transient_recordings() {
+    let Some(dir) = transient_recording_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        // `modified` is unavailable on a few filesystems; an unknown age keeps the file.
+        let Ok(modified) = meta.modified() else { continue };
+        let Ok(age) = now.duration_since(modified) else { continue };
+        if age > TRANSIENT_MAX_AGE && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        log::debug!("swept {removed} unsaved transient recording(s) older than a week");
+    }
+}
+
 // `is_cosmic()` moved into the COSMIC desktop profile
 // (`platform::linux::cosmic`) with the rest of the per-desktop COSMIC config
 // knowledge (DRAGON-220).

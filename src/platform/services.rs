@@ -9,6 +9,7 @@
 //! | Clipboard          | wl-clipboard-rs via re-exec (`share`)      | arboard (NSPasteboard)         | arboard (CF_DIB/file list) |
 //! | Notifications      | zbus → org.freedesktop.Notifications       | UNUserNotificationCenter       | WinRT toast                |
 //! | Open / reveal      | portal OpenURI (xdg-open fallback)         | NSWorkspace / `open`           | `explorer /select`         |
+//! | Share sheet        | (none exists)                              | (NSSharingServicePicker, TODO) | DataTransferManager interop |
 //! | Wi-Fi join (QR)    | nmcli (copy-password fallback)             | `networksetup` (copy fallback) | `netsh wlan` (copy fallback)|
 //! | Single instance    | flock in the runtime dir (`crate::instance`)| flock                          | named mutex                |
 //! | Media pause (duck) | MPRIS babysitter (`crate::audio::ducking`) | (no public API — gated off)    | GSMTC babysitter (`crate::audio::ducking`) |
@@ -19,5 +20,6 @@
 
 pub use crate::share::{
     AUTO_COPY_MAX_BYTES, CopyOutcome, NotifyKind, auto_copy_limit_label, copy_embeds_bytes,
-    copy_text, copy_to_clipboard, join_wifi, notify, open_uri, save_and_open,
+    copy_text, copy_to_clipboard, join_wifi, notify, open_uri, save_and_open, share_available,
+    share_file,
 };

@@ -91,11 +91,20 @@ pub enum CaptureMsg {
     /// Only constructed on Linux (mac/Windows resolve immediately in `seed_outputs_mac`).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     RunImmediate,
-    // DRAGON-451: `CopySelection` lived here — the region quick-action (primary+C in
-    // region-draw mode) that captured the drawn selection, force-copied it and skipped the
-    // editor. Retired with its shortcut: the global "(no editor)" hotkeys (DRAGON-428) do
-    // the same thing without needing the overlay, and the "force" stopped meaning anything
-    // when DRAGON-353 removed the copy-to-clipboard setting.
+    /// DRAGON-479: capture the CURRENTLY drawn region and deliver it WITHOUT the preview
+    /// editor — the clipboard + system-notification path every editor-less capture takes
+    /// (`finish_share`). Raised by the fixed primary+C chord in the capture overlay
+    /// (`shortcuts::is_region_copy_chord`, gated by `keyboard::region_copy_fires`).
+    ///
+    /// This restores what DRAGON-451 retired as `CopySelection` — same name, same job — minus
+    /// the configurable `Action::RegionCopy` / `Context::Region` keymap lane that made two
+    /// meanings of Ctrl+C collide. The old variant also called itself a FORCED copy; there is
+    /// nothing left to force (DRAGON-353 removed the copy-to-clipboard setting it bypassed),
+    /// so this is simply the editor-less delivery, reached one keypress earlier.
+    ///
+    /// A no-op unless the gate's conditions hold; the message re-checks them, since it could
+    /// arrive by some other route than the chord.
+    CopySelection,
     /// Drag delta (logical px) moving the toolbar on a given output (by name, so each
     /// monitor's toolbar moves independently).
     ToolbarPan(String, f32, f32),

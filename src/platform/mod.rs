@@ -632,6 +632,33 @@ pub fn win_overlay_is_layered(build: u32, env: Option<&str>) -> bool {
     env != Some("0")
 }
 
+/// Pure, unit-tested: may the OVERLAY PREVIEW take the foreground after a successful native
+/// placement (DRAGON-469)?
+///
+/// Two independent terms, and BOTH have to hold:
+///
+/// * `pre_open` — this surface is the DRAGON-305 pre-open BLOCKER cover, not the editor. That
+///   cover exists to hide a single-window grab that is running RIGHT NOW on another thread,
+///   and `place_overlay` is already handed `activate = !pre_open` for exactly that reason:
+///   taking the foreground would flip the window being grabbed to its INACTIVE chrome
+///   (the DRAGON-278 bug) and can make `foreground_and_verify` fail, which silently skips the
+///   DRAGON-308 glass region grab. So a pre-open cover may NEVER be raised, no matter who
+///   holds the foreground. This term is the whole reason the rule is a predicate and not an
+///   `if` at the call site: the first version had only the second term, and it fired straight
+///   into the middle of a live grab.
+/// * `foreground_is_other` — somebody ELSE owns the foreground, so our activating show was
+///   refused by the foreground lock. When we already hold it there is nothing to take, and
+///   asking anyway would be a needless `AttachThreadInput` dance.
+///
+/// Kept in the shared tree rather than in `platform/windows/` for the reason the whole
+/// `win_build_*` family is: nobody here can run the Windows path, so the reasoning has to be
+/// provable on Linux. The two READS (`win_preview_preopen` off the app, the live foreground
+/// owner off Win32) stay native.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn overlay_preview_should_refocus(pre_open: bool, foreground_is_other: bool) -> bool {
+    !pre_open && foreground_is_other
+}
+
 // ── DRAGON-426: proving nothing of the user's is behind a captured window ─────
 //
 // A Windows single-window capture may preserve the window's transparency (DRAGON-275). The
@@ -950,6 +977,36 @@ mod tests {
         // `SetWindowPos` silently did not take, or the backdrop never became visible: nothing
         // of ours is behind the target, so there is no guarantee at all. Fail CLOSED.
         assert!(!win_backdrop_seated_below(&[], 7, TARGET));
+    }
+
+    // ── DRAGON-469: raising the overlay preview after its native placement ──────
+
+    /// The rule, row by row. The pre-open BLOCKER cover is NEVER raised, whoever holds the
+    /// foreground: it is covering a single-window grab that is running on another thread, and
+    /// stealing the foreground there flips the target to its inactive chrome and can fail
+    /// `foreground_and_verify` (which silently skips the DRAGON-308 glass grab). Only a real
+    /// editor surface that has actually LOST the foreground is raised.
+    #[rstest::rstest]
+    #[case::editor_backgrounded(false, true, true)]
+    #[case::editor_already_foreground(false, false, false)]
+    #[case::pre_open_cover_backgrounded(true, true, false)]
+    #[case::pre_open_cover_foreground(true, false, false)]
+    fn the_overlay_preview_is_raised_only_when_it_is_the_editor_and_lost_the_foreground(
+        #[case] pre_open: bool,
+        #[case] foreground_is_other: bool,
+        #[case] want: bool,
+    ) {
+        assert_eq!(overlay_preview_should_refocus(pre_open, foreground_is_other), want);
+    }
+
+    /// The pre-open term is the DOMINANT one, and it must stay that way: `place_overlay` is
+    /// handed `activate = !pre_open` three lines from the call site, so a raise during a
+    /// pre-open would contradict the show that produced the window.
+    #[test]
+    fn a_pre_open_cover_is_never_raised_whatever_the_foreground_says() {
+        for foreground_is_other in [false, true] {
+            assert!(!overlay_preview_should_refocus(true, foreground_is_other));
+        }
     }
 
     #[test]

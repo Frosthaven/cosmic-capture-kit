@@ -164,14 +164,19 @@ impl App {
                 }
                 Task::none()
             }
-            // DRAGON-460: the frame without the marks is on screen, so take the region shot.
             CaptureMsg::ScanSpinTick => {
                 // One step per ~33ms tick; a full turn takes about a second. Wrapped so the
-                // float cannot drift upward for the life of a long scan.
+                // float cannot drift upward over a long scan.
+                //
+                // ADDED, and screen space is y-down, so the glyph turns CLOCKWISE. That is
+                // why `scan-refresh-symbolic` maps to Lucide's `refresh-cw`: the arrowheads
+                // have to point the way the icon actually moves, or the motion reads as an
+                // animation bug rather than as a spinner.
                 const STEP: f32 = std::f32::consts::TAU / 30.0;
                 self.scan_spin = (self.scan_spin + STEP) % std::f32::consts::TAU;
                 Task::none()
             }
+            // DRAGON-460: the frame without the marks is on screen, so take the region shot.
             CaptureMsg::ScanShotTick => {
                 self.run_scan_shot();
                 Task::none()
@@ -400,6 +405,24 @@ impl App {
                 // Cheap header read (no full decode) so the windowed preview opens sized.
                 let dims = ::image::image_dimensions(&path).ok();
                 self.present_capture(path, size, false, dims)
+            }
+            CaptureMsg::CopySelection => {
+                // DRAGON-479: capture the CURRENTLY drawn region and skip the editor. The
+                // chord's lane in `keyboard.rs` already applied `region_copy_fires`; re-check
+                // the two conditions the capture itself cannot survive without, because a
+                // message can arrive by routes the lane does not own.
+                if self.mode != Mode::Region || self.normalized_region().is_none() {
+                    return Task::none();
+                }
+                // Route through the SAME capture plumbing as a normal region commit — nothing
+                // about the grab, the compose or the save changes. The one-shot flag below is
+                // read at the very top of `present_capture`, where it overrides the
+                // skip-the-editor decision `no_editor` normally makes alone, so this delivers
+                // through `finish_share` (clipboard + notification) and ends the session.
+                // `capture` builds the selection from the drawn region in region mode, so the
+                // output name it takes is ignored here.
+                self.copy_selection_pending = true;
+                self.capture("")
             }
             CaptureMsg::DismissToast => {
                 self.toast = None;

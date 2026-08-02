@@ -16,6 +16,13 @@ impl cosmic::Application for App {
 
     fn init(core: app::Core, startup: super::Startup) -> (Self, Task<cosmic::Action<Msg>>) {
         crate::util::timing_mark("App::init entry (iced runtime + winit + wgpu preinit done)");
+        // DRAGON-467 review, major 3: bound the disk-backed transient folder by AGE. A
+        // recording the user never saved has to outlive this process (the Linux clipboard
+        // worker serves it as a `file://` URI), so it cannot be cleaned up on close; a sweep
+        // at launch is what keeps the folder from growing forever. Detached because it is a
+        // directory walk and nothing here waits on it, on a plain OS thread like every other
+        // "this touches the disk, get it off the loop" worker in the app.
+        std::thread::spawn(crate::util::sweep_transient_recordings);
         let settings_only = startup.settings_only;
         // `--permissions` (macOS): open only the permission-checker window; like
         // `--settings`/`--preview` it captures nothing. On Linux the flag is inert
@@ -416,6 +423,8 @@ impl cosmic::Application for App {
                 keymap,
                 // DRAGON-428: `--no-editor`, carried through from the launch flags.
                 no_editor: startup.no_editor,
+                // DRAGON-479: armed only by the in-overlay region-copy chord, never at launch.
+                copy_selection_pending: false,
                 // `--preview` (windowed unless `--overlay`) overrides the persisted setting;
                 // DRAGON-427 then has the last word on Windows 10 (see `effective_preview_windowed`).
                 preview_windowed: super::effective_preview_windowed(
@@ -423,16 +432,17 @@ impl cosmic::Application for App {
                     startup.opens_overlays(),
                     crate::platform::overlay_preview_available(),
                 ),
+                preview_toolbar_labels: persisted.preview_toolbar_labels,
                 // DRAGON-419: the mirrored setting only. `diag::init` already resolved the
                 // SINK from this same key back in `main` (before this window, before the
                 // daemon branch), so there is nothing to start here.
                 debug_logging: persisted.debug_logging,
-                preview_save_on_copy: persisted.preview_save_on_copy,
-                preview_close_on_copy: persisted.preview_close_on_copy,
-                preview_copy_on_delete: persisted.preview_copy_on_delete,
-                preview_video_save_on_copy: persisted.preview_video_save_on_copy,
-                preview_video_close_on_copy: persisted.preview_video_close_on_copy,
-                preview_video_copy_on_delete: persisted.preview_video_copy_on_delete,
+                preview_copy_on_exit: persisted.preview_copy_on_exit,
+                preview_save_originals: persisted.preview_save_originals,
+                preview_ask_to_save: persisted.preview_ask_to_save,
+                preview_video_copy_on_exit: persisted.preview_video_copy_on_exit,
+                preview_video_save_originals: persisted.preview_video_save_originals,
+                preview_video_ask_to_save: persisted.preview_video_ask_to_save,
                 mute_others_during_preview: persisted.mute_others_during_preview,
                 duck_system_audio: persisted.duck_system_audio,
                 appearance_use_system: persisted.appearance_use_system,

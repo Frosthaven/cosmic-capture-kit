@@ -1050,6 +1050,25 @@ impl App {
             // stops re-driving this finalize (the safety net for the one-shot open follow-up
             // not being delivered while cck was a background process).
             self.preview_shown_confirmed = Some(id);
+            // DRAGON-469: and take the FOREGROUND if another process holds it — the same tail
+            // `finalize_preview_window` has run since DRAGON-281, which this arm never got.
+            // The re-mint after the Save As chooser is exactly that case: the chooser was our
+            // only window, so when it closes the foreground is somebody else's and
+            // `place_overlay`'s activating show is refused. Without this the editor comes back
+            // topmost but deaf to its own hotkeys.
+            //
+            // `win_preview_preopen` rides along and is the DOMINANT term (the decision is
+            // `platform::overlay_preview_should_refocus`, pure + tested on Linux): it is the
+            // SAME flag that made `place_overlay` show non-activating three lines above, and
+            // for the same DRAGON-305 reason. That surface is the blocker cover over a
+            // single-window grab running off-thread, and raising it would flip the target to
+            // its inactive chrome (DRAGON-278) and can fail `foreground_and_verify`, silently
+            // skipping the DRAGON-308 glass grab. Inert for a normal capture → preview open,
+            // where cck already holds the foreground.
+            crate::platform::windows::window::refocus_overlay_preview(
+                super::shell::PREVIEW_OVERLAY_TITLE,
+                self.win_preview_preopen,
+            );
         }
         if placed || attempt >= MAX_ATTEMPTS {
             if attempt >= MAX_ATTEMPTS {

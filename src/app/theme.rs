@@ -462,6 +462,24 @@ pub(crate) fn accent_text(theme: &Theme) -> Color {
     theme.cosmic().accent_text_color().into()
 }
 
+/// The 1px outline every bordered toolbar CLUSTER wears — the preview editor's tool
+/// groups, and (DRAGON-475) the capture toolbar's groups, so the two toolbars carry one
+/// chrome. Also the preview's disabled tone (`preview::chrome::disabled_label_tone`), on
+/// purpose: one quiet colour for "chrome, not state".
+///
+/// It is the theme's `background.divider`, which is ALREADY FLATTENED to an opaque colour
+/// by cosmic-theme (`over(on_bg @ 20% alpha, background.base)`) — so, unlike a raw
+/// translucent token, it is safe as an SVG tint despite the rasterizer discarding colour
+/// alpha (see the slider-icon note in `preview::chrome`). Measured: dark `0.266` grey
+/// against a `0.182` cluster fill, light `0.689` against `0.960` — faint in both,
+/// deliberately, and never invisible.
+///
+/// Lived in `preview::chrome` until DRAGON-475 gave it a second consumer; moved here
+/// rather than copied, so the two toolbars can never drift apart.
+pub(crate) fn cluster_border(theme: &Theme) -> Color {
+    theme.cosmic().background.divider.into()
+}
+
 // ── Shared segmented-pair styling ────────────────────────────────────────────
 
 /// The ONE segmented-toggle segment style — the capture toolbar's

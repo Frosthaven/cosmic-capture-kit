@@ -1556,24 +1556,53 @@ async fn pick_folder() -> Option<std::path::PathBuf> {
 }
 
 /// Windows (DRAGON-254): the native "Save As" file chooser (rfd wrapping
-/// `IFileSaveDialog`), pre-filled with `suggested_name`. Modal with its own COM STA
+/// `IFileSaveDialog`), pre-filled with BOTH halves of `suggested` — the folder it opens
+/// in and the default file name (DRAGON-476). Modal with its own COM STA
 /// apartment, so run it on a dedicated blocking thread and await the pick over a
 /// oneshot (same reasoning as `pick_folder`). Used by the preview window's Save As;
 /// the overlay-vs-window return semantics around the result are platform-agnostic
 /// (see `save_as_dialog` / `SaveAsResult`).
 #[cfg(target_os = "windows")]
-async fn pick_save_path(suggested_name: String) -> Option<std::path::PathBuf> {
+async fn pick_save_path(suggested: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    // DRAGON-476: the directory half used to be dropped here on the theory that
+    // `IFileSaveDialog` remembering its last folder was good enough ("only the Linux
+    // portal accepts a folder" — wrong: rfd's `set_directory` is `SetFolder`). The
+    // remembered folder is wherever the dialog last happened to be, which broke the
+    // DRAGON-467 contract that the picker opens in the folder the Save setting names.
+    // `save_as_dialog` has already best-effort created this folder.
+    let name = suggested_file_name(&suggested);
+    let dir = suggested
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(std::path::Path::to_path_buf);
     let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(crate::platform::windows::file_panel::pick_save_file(&suggested_name));
+        let _ = tx
+            .send(crate::platform::windows::file_panel::pick_save_file(dir.as_deref(), &name));
     });
     rx.await.ok().flatten()
 }
 
 /// Fallback for any other target: no native save panel. Stubbed.
 #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
-async fn pick_save_path(_suggested_name: String) -> Option<std::path::PathBuf> {
+async fn pick_save_path(_suggested: std::path::PathBuf) -> Option<std::path::PathBuf> {
     None
+}
+
+/// The FILE-NAME half of a suggested save path, for the native panels that take a name only
+/// (macOS `NSSavePanel`, Windows `IFileSaveDialog`). Falls back to `"capture"` for a path with
+/// no file name at all, which is the same fallback the picker has always used.
+///
+/// Pure; unit-tested in `pick_save_path_tests`. It is compiled everywhere (its callers are
+/// not) so the Linux gate covers the rule, in the house style for a decision whose only
+/// consumers live behind a `cfg`.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn suggested_file_name(suggested: &std::path::Path) -> String {
+    suggested
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "capture".to_string())
 }
 
 /// macOS (DRAGON-157): the native `NSSavePanel` "Save As" panel, pre-filled with
@@ -1582,27 +1611,58 @@ async fn pick_save_path(_suggested_name: String) -> Option<std::path::PathBuf> {
 /// by the preview window's Save As; the overlay-vs-window return semantics around the
 /// result are platform-agnostic (see `save_as_dialog` / `SaveAsResult`).
 #[cfg(target_os = "macos")]
-async fn pick_save_path(suggested_name: String) -> Option<std::path::PathBuf> {
+async fn pick_save_path(suggested: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    // The panel takes a NAME; `NSSavePanel` remembers the last directory itself, so the
+    // folder half of the suggestion is dropped here. NOTE (DRAGON-476): the old rationale
+    // ("only the Linux portal accepts a folder") is wrong — `setDirectoryURL` exists, and
+    // the Windows arm now passes its folder through. This arm was left byte-identical
+    // because the change needs mac hardware to build and verify, and because
+    // remember-last-folder is a real macOS convention the owner may prefer; the ticket
+    // holds that decision.
+    let name = suggested_file_name(&suggested);
     let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(crate::platform::mac::file_panel::pick_save_path(suggested_name));
+        let _ = tx.send(crate::platform::mac::file_panel::pick_save_path(name));
     });
     rx.await.ok().flatten()
 }
 
-/// Open the XDG desktop-portal "save file" picker (pre-filled with `suggested_name`),
-/// returning the chosen destination path. Used by the preview window's "Save As".
+/// Open the XDG desktop-portal "save file" picker pre-filled with `suggested` — both halves
+/// of it, the FOLDER and the NAME (DRAGON-467). Used by the preview editor's Save.
+///
+/// The folder matters: with "Automatically save originals" off the capture's bytes live in
+/// the session runtime directory, and opening the picker THERE would be useless. The
+/// suggestion is built from the user's configured save folder instead
+/// (`App::preview_save_target`), which is what the setting is for.
 #[cfg(target_os = "linux")]
-async fn pick_save_path(suggested_name: String) -> Option<std::path::PathBuf> {
-    let files = ashpd::desktop::file_chooser::SelectedFiles::save_file()
+async fn pick_save_path(suggested: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let name = suggested
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "capture".to_string());
+    let req = ashpd::desktop::file_chooser::SelectedFiles::save_file()
         .title("Save capture as")
-        .current_name(suggested_name.as_str())
-        .modal(true)
-        .send()
-        .await
-        .ok()?
-        .response()
-        .ok()?;
+        .current_name(name.as_str())
+        .modal(true);
+    // A folder the portal rejects (it validates the path, e.g. an interior NUL) must not take
+    // the whole dialog down with it — fall back to the portal's own default location, which
+    // is what happened before this pre-fill existed.
+    let req = match suggested.parent().filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => match ashpd::desktop::file_chooser::SelectedFiles::save_file()
+            .title("Save capture as")
+            .current_name(name.as_str())
+            .modal(true)
+            .current_folder(dir)
+        {
+            Ok(with_dir) => with_dir,
+            Err(e) => {
+                log::debug!("save picker: no pre-set folder ({e})");
+                req
+            }
+        },
+        None => req,
+    };
+    let files = req.send().await.ok()?.response().ok()?;
     files.uris().first()?.to_file_path().ok()
 }
 
@@ -1966,12 +2026,19 @@ pub struct App {
     /// Live keyboard-shortcut bindings (`Action -> Shortcut`) — the single source of
     /// truth for key handling and the Keyboard Shortcuts settings page.
     keymap: crate::shortcuts::Keymap,
-    // DRAGON-451: `copy_selection_pending` lived here — the one-shot flag the region
-    // "Copy selection" quick-action (primary+C in region-draw mode) set so the in-flight
-    // capture would force-copy and skip the editor. Both the flag and the shortcut are
-    // retired: the DRAGON-428 global "(no editor)" hotkeys cover the use case from outside
-    // the overlay, and the "force" had already become a no-op when DRAGON-353 removed the
-    // copy-to-clipboard setting it was bypassing.
+    /// DRAGON-479: the ONE-SHOT override on the skip-the-editor decision. Set by the fixed
+    /// primary+C region-copy chord just before it commits the capture; `present_capture`
+    /// takes it and delivers through `finish_share` — the SAME editor-less path
+    /// [`Self::no_editor`] uses, never a second flow.
+    ///
+    /// One-shot (`mem::take`) because it describes a pending ACTION — one keypress, one
+    /// capture — where `no_editor` describes the LAUNCH and is read non-destructively. That
+    /// distinction is the whole reason there are two fields rather than one.
+    ///
+    /// (It was here before, as DRAGON-451's `copy_selection_pending`, and was retired with the
+    /// configurable shortcut that set it. The behaviour is back; the configurability is not.
+    /// See `shortcuts::is_region_copy_chord`.)
+    copy_selection_pending: bool,
     /// DRAGON-428: this LAUNCH asked for no preview editor (`--no-editor`, or a daemon
     /// "(no editor)" capture hotkey, which passes that flag). The capture is saved, copied
     /// and notified through `finish_share` — the same editor-less delivery a capture gets
@@ -1983,35 +2050,36 @@ pub struct App {
     no_editor: bool,
     /// Preview editor appearance: `true` = resizable window, `false` = overlay (setting).
     preview_windowed: bool,
+    /// Preview editor (DRAGON-478): draw the group CAPTIONS under the top toolbar's clusters
+    /// (setting; default on). Read by the view AND by `PreviewSurface::chrome_h`, since the
+    /// caption band changes the top bar's height; off is the pre-DRAGON-478 geometry exactly.
+    preview_toolbar_labels: bool,
     /// DRAGON-419: the opt-in debug log is on (setting; default OFF). Mirrored here so the
     /// Health page's Debug row can render and toggle it; the SINK's own state lives in
     /// `crate::diag`, which resolves this same key straight from the config in `main` (a
     /// launch that never reaches `App::init` still has to be logged).
     debug_logging: bool,
-    /// Preview editor (DRAGON-355): a manual Copy saves the document first (setting; default
-    /// on), through the normal save-target rule. Split from the old "save & close on copy" —
-    /// independent of `preview_close_on_copy`. The open-time automatic copy never triggers it.
-    preview_save_on_copy: bool,
-    /// Preview editor (DRAGON-355): a manual Copy closes the document once the clipboard has
-    /// it (setting; default on), held briefly so the copy toast can be read and aborted if
-    /// the copy fails. Split from the old "save & close on copy"; independent of
-    /// `preview_save_on_copy`. With save off, a close over unsaved edits asks first.
-    preview_close_on_copy: bool,
-    /// Preview editor (DRAGON-353): Delete copies to the clipboard first (setting;
-    /// default on), so the pixels outlive the file.
-    preview_copy_on_delete: bool,
-    /// Preview editor, VIDEO documents (DRAGON-420): the video editor's own copy of
-    /// `preview_save_on_copy`. Same meaning, same default, separate field — a document reads
-    /// one triple or the other by KIND (`preview::share_automation`), never a mix.
-    preview_video_save_on_copy: bool,
-    /// Preview editor, VIDEO documents (DRAGON-420): the video editor's own copy of
-    /// `preview_close_on_copy`. The close still routes through `close_preview`, which stops
-    /// this document's playback and releases its share of the audio duck before the surface
-    /// dies, so closing mid-soundtrack tears down exactly as an Esc close does.
-    preview_video_close_on_copy: bool,
-    /// Preview editor, VIDEO documents (DRAGON-420): the video editor's own copy of
-    /// `preview_copy_on_delete`.
-    preview_video_copy_on_delete: bool,
+    /// Preview editor (DRAGON-467): put the EDITED result on the clipboard as the editor
+    /// closes (setting; default on). The untouched capture already went on the clipboard when
+    /// it was taken, so this is about carrying the edits forward.
+    preview_copy_on_exit: bool,
+    /// Preview editor (DRAGON-467): write every screenshot into `screenshot_dir` as it is
+    /// captured (setting; default on). Off routes the capture through the session runtime
+    /// directory instead, so nothing reaches the user's folder until they choose Save.
+    preview_save_originals: bool,
+    /// Preview editor (DRAGON-467): ask before closing over edits that were never saved
+    /// (setting; default on) — the gate on the unsaved-changes card.
+    preview_ask_to_save: bool,
+    /// Preview editor, VIDEO documents (DRAGON-467): the video editor's own copy of
+    /// `preview_copy_on_exit`. Same meaning, same default, separate field — a document reads
+    /// one triple or the other by KIND (`preview::preview_automation`), never a mix.
+    preview_video_copy_on_exit: bool,
+    /// Preview editor, VIDEO documents (DRAGON-467): the video editor's own copy of
+    /// `preview_save_originals`, over `record_dir`.
+    preview_video_save_originals: bool,
+    /// Preview editor, VIDEO documents (DRAGON-467): the video editor's own copy of
+    /// `preview_ask_to_save`.
+    preview_video_ask_to_save: bool,
     /// Mute other apps' audio while a video preview with sound is playing (restored on close).
     mute_others_during_preview: bool,
     /// Duck the recorded system audio while the mic hears speech (DRAGON-128; persisted).
@@ -2803,6 +2871,37 @@ pub enum Msg {
     /// [`App::preview_for`]; an id with no live preview is a silent no-op (the
     /// document closed while its task was in flight).
     Preview(window::Id, PreviewMsg),
+}
+
+#[cfg(test)]
+mod pick_save_path_tests {
+    use super::suggested_file_name;
+    use std::path::Path;
+
+    /// The native panels (macOS `NSSavePanel`, Windows `IFileSaveDialog`) take a NAME, while
+    /// the suggestion `App::preview_save_target` builds is a full PATH. This is the reduction,
+    /// and it is compiled on every host so the Linux gate covers it even though both callers
+    /// are `cfg`-ed out here.
+    #[test]
+    fn the_name_half_of_a_suggested_path_is_taken() {
+        assert_eq!(suggested_file_name(Path::new("/home/me/Capture/shot.png")), "shot.png");
+        // Spaces and dots survive: the panels get exactly the name the picker would show.
+        assert_eq!(
+            suggested_file_name(Path::new("/rec/Recording 2026-07-29 at 10.30.mp4")),
+            "Recording 2026-07-29 at 10.30.mp4"
+        );
+        // A bare name is already the answer.
+        assert_eq!(suggested_file_name(Path::new("shot.png")), "shot.png");
+    }
+
+    /// A path with no file name falls back rather than handing the panel an empty box — the
+    /// same `"capture"` fallback the picker has always used.
+    #[test]
+    fn a_path_with_no_file_name_falls_back() {
+        for p in ["/", "..", ""] {
+            assert_eq!(suggested_file_name(Path::new(p)), "capture", "{p:?}");
+        }
+    }
 }
 
 #[cfg(test)]

@@ -153,9 +153,10 @@ points to.
   (DRAGON-115 split): `surface.rs` (overlay-vs-window + all sizing math),
   `chrome.rs` (the `Tb` toolbar builders + bars + edit-toolbar views),
   `viewport.rs` (zoom/pan state + math + the zoom control), `open.rs`
-  (surface lifecycle + composed views), `share.rs` (Save As / reload / the
-  background bake), `covermark.rs` (picker + overlay re-raster), plus the
-  media modules `image.rs`, `video.rs`, `timeline.rs`, `playback.rs`,
+  (surface lifecycle + composed views), `share.rs` (the save destination picker,
+  the background bake, and the copy/delete completion seam), `naming.rs` (what
+  path the save picker opens on), `covermark.rs` (picker + overlay re-raster),
+  plus the media modules `image.rs`, `video.rs`, `timeline.rs`, `playback.rs`,
   `layers.rs`, `edit.rs`.
 - `message/` — `Msg`'s per-domain sub-enums.
 - `num_field.rs`, `persist.rs`, `portal.rs`, `audio_ui.rs`, `capture_flow.rs`,
@@ -280,6 +281,92 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
   even across a crash (see `platform::mac::window`). Only engaged when the
   `CCK_AEROSPACE_PAUSE=1` escape hatch actually paused the WM — the DRAGON-154
   default never disables AeroSpace at all.
+
+## Where a capture lives, and what the editor's actions do (DRAGON-467)
+
+Four rules, and every one of them is a pure decision with tests beside it.
+
+1. **Where the file is written** — `capture_flow::capture_write_dir`. The
+   "Automatically save originals" setting (per media kind) picks between the
+   user's configured folder (`screenshot_dir` / `record_dir`) and a transient
+   location. ON is the default and reproduces every earlier version. OFF means
+   an untouched capture leaves no file behind.
+
+   The transient location differs by MEDIUM (`capture_flow::transient_dir`).
+   Stills go to the session runtime directory. RECORDINGS go to a disk-backed
+   cache folder (`util::transient_recording_dir`,
+   `~/.cache/cosmic-capture-kit/transient`), because `$XDG_RUNTIME_DIR` is a
+   tmpfs sized at ~10% of RAM and a take buffers both its live `.recording`
+   temp and its finished file there, so a long recording could ENOSPC
+   mid-capture. `/tmp` is no answer either: it is tmpfs on Arch too.
+
+   The transient file is deliberately never cleaned up on close: on Linux the
+   clipboard worker is a detached process holding a `file://` URI for a
+   recording, so removing it would break a paste the user can still perform.
+   Accumulation is bounded by AGE instead, by
+   `util::sweep_transient_recordings` at `util::TRANSIENT_MAX_AGE` (7 days),
+   run detached from `App::init`.
+2. **Where a Save writes** — `preview/naming.rs`'s `save_prefill`, reached through
+   `App::preview_save_target`. Save IS Save As: it opens the destination picker
+   pre-filled with the document's own file once it has saved, else the configured
+   folder plus the capture's name. The native dialog's replace prompt is what
+   guards an existing file. There is no `-edited` suffix and no collision walk;
+   `naming.rs`'s module doc carries the survey of CleanShot X / ShareX / the
+   Windows Snipping Tool / Preview / Flameshot / Greenshot / Snagit that retired
+   them (none of them names a derived copy; a known path means overwrite).
+3. **The clipboard** — every capture goes on it as it is taken:
+   `finish_share` for an editor-less delivery, `auto_copy_preview_on_open`
+   otherwise. There is one exception, and it is a size cap rather than a
+   setting: an IMAGE over `share::AUTO_COPY_MAX_BYTES` is skipped with a toast
+   naming the limit (a recording is never skipped, since it copies as a path).
+   "Automatically copy changes on exit" then re-copies the EDITED result as the
+   editor closes (`exit_copies_changes`), because the clipboard would otherwise
+   still hold the untouched grab.
+4. **The exit path** — `PreviewMsg::Cancel` runs two gates in order: the
+   settings-driven ask (`close_needs_confirmation`), then the exit copy, which
+   arms `close_after_share` around a plain copy so a FAILED copy leaves the
+   editor up instead of closing over lost work.
+
+   The ask card offers exactly THREE options: **Save** (the picker, then
+   close), **Continue editing** (dismiss), and **Close without saving** (the
+   discard, which runs the SAME exit copy, because "without saving" is about
+   the disk and the setting is about the clipboard). Copy and Delete used to be
+   on it and are not: a copy neither saves nor discards the edits the card is
+   asking about, so offering it as a way out invited a close that quietly
+   dropped work.
+
+Two economies keep those four from doing redundant work, both pure decisions in
+`preview/edit.rs`. `bake_need` serves the LAST bake's artifact when the scene
+has not moved since (so "Save then Escape" does not encode twice), and
+`clipboard_is_current` skips the exit copy when the clipboard already holds this
+exact state. Both are keyed on the undo depth and both are invalidated by
+`EditState::push_op` on an abandoned redo branch, exactly like `saved_depth`.
+
+**The pristine-source invariant** (`edit::bake_prep`, `PreviewState::bake_src`):
+every bake composites the live scene onto UNTOUCHED media, so a bake must never
+read its own output. Saving in place is now the default gesture, so a still
+saving over its own capture snapshots the pristine bytes into the runtime dir
+and repoints `bake_src` at them, while a recording (too large to copy) bakes
+through a temp, renames over the destination, and then COMMITS: the document is
+repointed at the result, the scene and history are reset, the file is re-probed
+and the user is told the edits are now part of it.
+
+The top-right toolbar group (`chrome.rs`'s `share_group`) is Save / Copy /
+Share / Upload. There is no Delete: the editor stopped deleting files at all
+(user decision), which is coherent with rule 1 above, since with
+"Automatically save originals" off an unwanted capture never reaches the
+user's folder and closing the editor IS the discard. The trash button, its
+`Ctrl+Shift+X` action, `PreviewState::delete_paths` and the whole unlink path
+went together. Share only APPEARS where
+`platform::services::share_available()` says the system has a share sheet:
+Windows since DRAGON-474, macOS since DRAGON-480, and nowhere else
+(`share/share_sheet.rs` documents where each platform stands; the Windows body
+is in `platform/windows/services.rs`, the macOS body in
+`platform/mac/services/share.rs`);
+Upload is always shown but disabled, because it is a feature that does not exist
+anywhere rather than a capability of the machine. Upload renders through
+`Tb::tool_button_gated`, which keeps the tooltip so a permanently-off button can
+explain itself.
 
 ## The preview layer stack
 

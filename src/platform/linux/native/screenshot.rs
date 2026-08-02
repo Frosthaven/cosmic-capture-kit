@@ -999,30 +999,18 @@ impl WindowCaptureJob {
             .flatten()
             .filter(|g| g.frosted_windows)
             .filter(|g| crate::glass::looks_frosted(&img, g.alpha));
-        let fin = crate::compose::finish_window(img, r, self.capture_transparency);
-        // Window-content dims within the decorated canvas — the frosted-glass
-        // footprint (DRAGON-218), captured before decoration consumes `fin`.
-        let (win_w, win_h) = (fin.width(), fin.height());
         let bw_logical = self.border.to_compose().map(|(w, _)| w).unwrap_or(0.0);
-        let (bordered, outer_r) = match self.border.to_compose() {
-            Some((_, color)) => {
-                let bw = (bw_logical * scale).round() as u32;
-                (crate::compose::add_border(fin, bw, color, r + bw), r + bw)
-            }
-            None => (fin, r),
-        };
-        let margin_logical = (self.pad_logical - bw_logical).max(0.0);
-        let margin_px = (margin_logical * scale).round() as u32;
-        let total_margin_logical = bw_logical + margin_logical; // == padding when on
-        // The shadow draws into whatever margin exists and is clipped at the edges
-        // when there isn't room (padding off) — we never grow the canvas to fit it.
-        let decorated = if self.window_shadow {
-            crate::compose::with_shadow(bordered, margin_px, outer_r, scale, self.dark)
-        } else if margin_px > 0 {
-            crate::compose::pad_transparent(bordered, margin_px)
-        } else {
-            bordered
-        };
+        // Transparency, ring, then shadow-or-padding — the portable half (DRAGON-463).
+        let dec = self.decorate(img, r, scale);
+        // Window-content dims within the decorated canvas — the frosted-glass
+        // footprint (DRAGON-218).
+        let (win_w, win_h) = dec.content;
+        let total_margin_logical = dec.total_margin_logical; // == padding when on
+        // The padding margin in PHYSICAL px, on its own. The frost footprint below
+        // rounds the padding and the ring SEPARATELY and adds them; rounding the fused
+        // `total_margin_logical` instead can land a pixel off, so keep the two roundings.
+        let margin_px = ((self.pad_logical - bw_logical).max(0.0) * scale).round() as u32;
+        let decorated = dec.img;
         // Frosted glass (DRAGON-218): when the window reads as a frosted libcosmic
         // surface (decided above) the re-rendered wallpaper is blurred within the
         // window's rounded footprint before the composite, so the preserved alpha
@@ -1036,24 +1024,34 @@ impl WindowCaptureJob {
             radius: r,
             sigma: crate::glass::sigma_for_strength(g.strength_ordinal),
         });
-        let mut out = if self.capture_wallpaper {
+        // Which backdrop the two toggles ask for is shared (DRAGON-463); WHERE the
+        // wallpaper pixels come from is not, so that arm stays native below.
+        let mut out = match crate::decoration::backdrop_for(
+            self.capture_wallpaper,
+            self.capture_transparency,
+        ) {
             // Composite over JUST the wallpaper behind the window (no other windows);
             // rounded corners + the margin reveal the desktop whether or not the window
-            // is translucent.
-            composite_over_wallpaper(
+            // is translucent. The crop, the frost and the `over` all happen inside, so
+            // this arm does its own `Backdrop::Behind` — it can't hand the pixels out
+            // before it knows the footprint.
+            crate::decoration::BackdropKind::Wallpaper => composite_over_wallpaper(
                 decorated,
                 &self.sel,
                 total_margin_logical,
                 scale,
                 &self.frozen_geom,
                 frost,
-            )
-        } else if !self.capture_transparency {
+            ),
             // Opaque, flat-black background.
-            crate::compose::on_black(decorated)
-        } else {
+            crate::decoration::BackdropKind::Black => {
+                crate::decoration::apply_backdrop(decorated, crate::decoration::Backdrop::Black)
+            }
             // Keep the window's own transparency, plus the shadow halo.
-            decorated
+            crate::decoration::BackdropKind::Transparent => crate::decoration::apply_backdrop(
+                decorated,
+                crate::decoration::Backdrop::Transparent,
+            ),
         };
         // Freeze grabbed the window without a cursor; overlay the captured sprite. The window's
         // content starts at the total margin offset in the decorated image, at `scale`.
@@ -1062,27 +1060,52 @@ impl WindowCaptureJob {
         // behind), so relying on canvas clipping alone floated a cursor beside the
         // window whenever the pointer was merely nearby at launch.
         if let Some((sprite, (gx, gy), (hx, hy))) = self.cursor_overlay.as_ref()
-            && cursor_over_window(*gx, *gy, &self.sel)
+            && crate::decoration::cursor_over_window(
+                *gx,
+                *gy,
+                self.sel.x,
+                self.sel.y,
+                self.sel.width,
+                self.sel.height,
+            )
         {
-            let off = (total_margin_logical * scale).round() as i64;
-            let px = ((*gx - self.sel.x) as f32 * scale).round() as i64 + off - *hx as i64;
-            let py = ((*gy - self.sel.y) as f32 * scale).round() as i64 + off - *hy as i64;
+            let (px, py) = crate::decoration::cursor_offset(
+                (*gx, *gy),
+                (self.sel.x, self.sel.y),
+                total_margin_logical,
+                scale,
+                (*hx, *hy),
+            );
             image::imageops::overlay(&mut out, sprite, px, py);
         }
         Some(out)
     }
-}
 
-/// Whether the launch-locked pointer position (global logical) lies within the
-/// picked window's logical rect (post gutter-trim — the caller already bumped
-/// `sel` for any trimmed margin). The window-capture cursor overlay is gated on
-/// this (DRAGON-213): a pointer outside the window must not render in the
-/// capture's padding/shadow/wallpaper margins.
-fn cursor_over_window(gx: i32, gy: i32, sel: &crate::selection::Selection) -> bool {
-    gx >= sel.x
-        && gx < sel.x + sel.width as i32
-        && gy >= sel.y
-        && gy < sel.y + sel.height as i32
+    /// Transparency, ring, then shadow-or-padding for the captured window — the portable
+    /// half of the decoration (DRAGON-463), so the body above reads as "grab, decorate,
+    /// back it, overlay the cursor". `r` is the theme corner radius and `scale` the
+    /// display's backing scale, both derived from the raw grab.
+    ///
+    /// Linux hands the shared seam SQUARE corners (`CornerStyle::Rounded`): screencopy
+    /// returns the full rectangle, so the radius is ours to draw. `min_border_px: 0` is
+    /// deliberate — macOS floors the scaled ring at 1px, Linux does not, and DRAGON-463
+    /// preserved that divergence rather than quietly changing what a sub-1.0-scale
+    /// capture looks like here.
+    fn decorate(&self, img: RgbaImage, r: u32, scale: f32) -> crate::decoration::Decorated {
+        crate::decoration::decorate(
+            img,
+            &crate::decoration::DecorationOpts {
+                keep_transparency: self.capture_transparency,
+                corners: crate::decoration::CornerStyle::Rounded(r),
+                border: self.border.to_compose(),
+                shadow: self.window_shadow,
+                dark: self.dark,
+                pad_logical: self.pad_logical,
+                scale,
+                min_border_px: 0,
+            },
+        )
+    }
 }
 
 /// Composite a finished (bordered/padded) window over ONLY the desktop wallpaper
@@ -1223,13 +1246,216 @@ mod cursor_coord_tests {
     }
 }
 
+/// The decoration matrix, pinned to the PIXELS it produced before DRAGON-463 moved the
+/// assembly onto the shared seam (`crate::decoration`).
+///
+/// Why a hash and not an eyeball: the rewire had to be byte-identical, and the only
+/// honest way to say that is to fingerprint the real composite of every toggle
+/// combination — transparency, ring, shadow, padding, at two backing scales — before the
+/// move and demand the same numbers after. A dimensions-only or "looks right" check
+/// passes happily while a rounding change shifts every pixel by one.
+///
+/// If one of these ever fails, the composite CHANGED. Find out why before touching the
+/// expected string.
+#[cfg(test)]
+mod decoration_pin_tests {
+    use super::WindowCaptureJob;
+    use crate::selection::Selection;
+    use image::RgbaImage;
+
+    /// A deterministic stand-in for a captured window: a colour ramp with a repeating
+    /// translucent stripe, so `keep_transparency` and the wallpaper/black backdrops all
+    /// have something real to act on.
+    fn window(w: u32, h: u32) -> RgbaImage {
+        RgbaImage::from_fn(w, h, |x, y| {
+            let a = if (x + y) % 5 == 0 { 90 } else { 255 };
+            image::Rgba([(x * 7 + y * 3) as u8, (x * 5) as u8, (y * 11) as u8, a])
+        })
+    }
+
+    /// FNV-1a over the raw RGBA bytes. Local so the pin needs no dependency.
+    fn hash(img: &RgbaImage) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in img.as_raw() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        h
+    }
+
+    /// One line of the fingerprint: size, byte hash, the measurements the caller uses,
+    /// and three sampled pixels (a corner, the centre, and a point just inside the ring)
+    /// so a drift is readable and not just a changed number.
+    fn line(case: &str, d: &crate::decoration::Decorated) -> String {
+        let img = &d.img;
+        let (w, h) = (img.width(), img.height());
+        let px = |x: u32, y: u32| {
+            let p = img.get_pixel(x.min(w - 1), y.min(h - 1)).0;
+            format!("{},{},{},{}", p[0], p[1], p[2], p[3])
+        };
+        format!(
+            "{case} {w}x{h} {:016x} margin={:.2} content={}x{} outer_r={} tl=[{}] mid=[{}] ring=[{}]",
+            hash(img),
+            d.total_margin_logical,
+            d.content.0,
+            d.content.1,
+            d.outer_radius,
+            px(0, 0),
+            px(w / 2, h / 2),
+            px(3, h / 2),
+        )
+    }
+
+    /// A capture job carrying just the fields the decoration reads. Going through the
+    /// real struct is the point: it pins the job's field-to-`DecorationOpts` wiring too,
+    /// which is exactly where a rewire could silently swap two toggles.
+    fn job(border_width: u32, pad: f32, shadow: bool, dark: bool, keep: bool) -> WindowCaptureJob {
+        WindowCaptureJob {
+            id: String::new(),
+            cursor: false,
+            sel: Selection { x: 0, y: 0, width: 40, height: 28, output: None, window_id: None },
+            capture_transparency: keep,
+            capture_wallpaper: false,
+            window_radius: 12.0,
+            border: crate::decoration::BorderSpec {
+                width: border_width,
+                color: [220, 80, 40, 255],
+            },
+            window_shadow: shadow,
+            pad_logical: pad,
+            dark,
+            frozen_geom: Vec::new(),
+            frozen_px: None,
+            cursor_overlay: None,
+        }
+    }
+
+    #[test]
+    fn the_decoration_matrix_is_pixel_stable() {
+        let mut out: Vec<String> = Vec::new();
+        for &scale in &[1.0f32, 1.5] {
+            for &keep in &[true, false] {
+                for &(bname, bw) in &[("noborder", 0), ("border", 2)] {
+                    for &shadow in &[false, true] {
+                        for &pad in &[0.0f32, 8.0] {
+                            // The radius the job derives from its theme value at `scale`.
+                            let r = (12.0 * scale).round() as u32;
+                            let d = job(bw, pad, shadow, true, keep).decorate(
+                                window(40, 28),
+                                r,
+                                scale,
+                            );
+                            out.push(line(
+                                &format!(
+                                    "s{scale}/{}/{bname}/shadow={shadow}/pad={pad}",
+                                    if keep { "keep" } else { "flat" }
+                                ),
+                                &d,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // The light-theme shadow is a different opacity — pin it too, at both ring states.
+        for &(bname, bw) in &[("noborder", 0), ("border", 2)] {
+            let d = job(bw, 8.0, true, false, true).decorate(window(40, 28), 12, 1.0);
+            out.push(line(&format!("light/{bname}"), &d));
+        }
+        assert_eq!(out.len(), EXPECTED.len(), "the matrix lost or gained a case");
+        for (got, want) in out.iter().zip(EXPECTED) {
+            assert_eq!(got, want, "the decoration matrix drifted");
+        }
+    }
+
+    #[test]
+    fn the_backdrops_and_the_cursor_overlay_are_pixel_stable() {
+        use crate::decoration::{Backdrop, apply_backdrop};
+        let d = job(2, 8.0, true, true, true).decorate(window(40, 28), 12, 1.0);
+        let kept = apply_backdrop(d.img.clone(), Backdrop::Transparent);
+        let black = apply_backdrop(d.img.clone(), Backdrop::Black);
+        // A stand-in for the platform's wallpaper pixels, same size as the canvas.
+        let bg = RgbaImage::from_fn(kept.width(), kept.height(), |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255])
+        });
+        let behind = apply_backdrop(d.img.clone(), Backdrop::Behind(bg));
+        // The cursor lands at the window origin plus the total margin, less its hotspot.
+        let mut cur = kept.clone();
+        let sprite = RgbaImage::from_pixel(6, 6, image::Rgba([255, 255, 255, 255]));
+        let off = crate::decoration::cursor_offset(
+            (112, 209),
+            (100, 200),
+            d.total_margin_logical,
+            1.0,
+            (2, 2),
+        );
+        image::imageops::overlay(&mut cur, &sprite, off.0, off.1);
+        assert_eq!(
+            format!(
+                "kept={:016x} black={:016x} behind={:016x} cursor@{:?}={:016x}",
+                hash(&kept),
+                hash(&black),
+                hash(&behind),
+                off,
+                hash(&cur)
+            ),
+            "kept=e850f40ec45b244c black=281144fb32ac210d behind=6ced5cffa67c9e96 \
+             cursor@(18, 15)=32c1d000cf027586"
+        );
+    }
+
+    /// Recorded from the pre-DRAGON-463 assembly, one line per toggle combination.
+    const EXPECTED: &[&str] = &[
+        "s1/keep/noborder/shadow=false/pad=0 40x28 2f4c632f93de8fad margin=0.00 content=40x28 outer_r=12 tl=[0,0,0,0] mid=[182,100,154,255] ring=[63,15,154,255]",
+        "s1/keep/noborder/shadow=false/pad=8 56x44 6f1f922b807d0551 margin=8.00 content=40x28 outer_r=12 tl=[0,0,0,0] mid=[182,100,154,255] ring=[0,0,0,0]",
+        "s1/keep/noborder/shadow=true/pad=0 40x28 bbe2a1abee8a7763 margin=0.00 content=40x28 outer_r=12 tl=[0,0,0,128] mid=[182,100,154,255] ring=[63,15,154,255]",
+        "s1/keep/noborder/shadow=true/pad=8 56x44 034ba3ae96cf9bd7 margin=8.00 content=40x28 outer_r=12 tl=[0,0,0,52] mid=[182,100,154,255] ring=[0,0,0,83]",
+        "s1/keep/border/shadow=false/pad=0 44x32 52eb34169003da6b margin=2.00 content=40x28 outer_r=14 tl=[220,80,40,0] mid=[182,100,154,255] ring=[49,5,154,90]",
+        "s1/keep/border/shadow=false/pad=8 56x44 4f6484231c40f52c margin=8.00 content=40x28 outer_r=14 tl=[0,0,0,0] mid=[182,100,154,255] ring=[0,0,0,0]",
+        "s1/keep/border/shadow=true/pad=0 44x32 acccc5bf5318b270 margin=2.00 content=40x28 outer_r=14 tl=[0,0,0,128] mid=[182,100,154,255] ring=[49,5,154,90]",
+        "s1/keep/border/shadow=true/pad=8 56x44 e850f40ec45b244c margin=8.00 content=40x28 outer_r=14 tl=[0,0,0,65] mid=[182,100,154,255] ring=[0,0,0,97]",
+        "s1/flat/noborder/shadow=false/pad=0 40x28 d1f37a30bd932935 margin=0.00 content=40x28 outer_r=12 tl=[0,0,0,0] mid=[182,100,154,255] ring=[63,15,154,255]",
+        "s1/flat/noborder/shadow=false/pad=8 56x44 7e1c24c2f75f6aae margin=8.00 content=40x28 outer_r=12 tl=[0,0,0,0] mid=[182,100,154,255] ring=[0,0,0,0]",
+        "s1/flat/noborder/shadow=true/pad=0 40x28 11ef13a338b33573 margin=0.00 content=40x28 outer_r=12 tl=[0,0,0,128] mid=[182,100,154,255] ring=[63,15,154,255]",
+        "s1/flat/noborder/shadow=true/pad=8 56x44 e9aac286a56a4f09 margin=8.00 content=40x28 outer_r=12 tl=[0,0,0,52] mid=[182,100,154,255] ring=[0,0,0,83]",
+        "s1/flat/border/shadow=false/pad=0 44x32 cfe18a805e2f6487 margin=2.00 content=40x28 outer_r=14 tl=[220,80,40,0] mid=[182,100,154,255] ring=[49,5,154,255]",
+        "s1/flat/border/shadow=false/pad=8 56x44 aee3f42ad1c5af66 margin=8.00 content=40x28 outer_r=14 tl=[0,0,0,0] mid=[182,100,154,255] ring=[0,0,0,0]",
+        "s1/flat/border/shadow=true/pad=0 44x32 b757aa9bd4d0faa6 margin=2.00 content=40x28 outer_r=14 tl=[0,0,0,128] mid=[182,100,154,255] ring=[49,5,154,255]",
+        "s1/flat/border/shadow=true/pad=8 56x44 42dad427f88eec42 margin=8.00 content=40x28 outer_r=14 tl=[0,0,0,65] mid=[182,100,154,255] ring=[0,0,0,97]",
+        "s1.5/keep/noborder/shadow=false/pad=0 40x28 4706d71eda7cf1ac margin=0.00 content=40x28 outer_r=18 tl=[0,0,0,0] mid=[182,100,154,255] ring=[63,15,154,255]",
+        "s1.5/keep/noborder/shadow=false/pad=8 64x52 e7d15427c3c58723 margin=8.00 content=40x28 outer_r=18 tl=[0,0,0,0] mid=[182,100,154,255] ring=[0,0,0,0]",
+        "s1.5/keep/noborder/shadow=true/pad=0 40x28 d9daa8b85e3afc28 margin=0.00 content=40x28 outer_r=18 tl=[0,0,0,128] mid=[182,100,154,255] ring=[63,15,154,255]",
+        "s1.5/keep/noborder/shadow=true/pad=8 64x52 a384f6fcbccd08c4 margin=8.00 content=40x28 outer_r=18 tl=[0,0,0,50] mid=[182,100,154,255] ring=[0,0,0,71]",
+        "s1.5/keep/border/shadow=false/pad=0 46x34 9bca73d59cdddf46 margin=2.00 content=40x28 outer_r=21 tl=[220,80,40,0] mid=[182,100,154,255] ring=[42,0,153,253]",
+        "s1.5/keep/border/shadow=false/pad=8 64x52 87a1a7a2f67baf0e margin=8.00 content=40x28 outer_r=21 tl=[0,0,0,0] mid=[182,100,154,255] ring=[0,0,0,0]",
+        "s1.5/keep/border/shadow=true/pad=0 46x34 4e6899e24979b81e margin=2.00 content=40x28 outer_r=21 tl=[0,0,0,128] mid=[182,100,154,255] ring=[42,0,153,253]",
+        "s1.5/keep/border/shadow=true/pad=8 64x52 0440e4cf5a8517f2 margin=8.00 content=40x28 outer_r=21 tl=[0,0,0,66] mid=[182,100,154,255] ring=[0,0,0,88]",
+        "s1.5/flat/noborder/shadow=false/pad=0 40x28 6496df78eb44c485 margin=0.00 content=40x28 outer_r=18 tl=[0,0,0,0] mid=[182,100,154,255] ring=[63,15,154,255]",
+        "s1.5/flat/noborder/shadow=false/pad=8 64x52 345e9f9146345d9e margin=8.00 content=40x28 outer_r=18 tl=[0,0,0,0] mid=[182,100,154,255] ring=[0,0,0,0]",
+        "s1.5/flat/noborder/shadow=true/pad=0 40x28 14c12d545a70aacd margin=0.00 content=40x28 outer_r=18 tl=[0,0,0,128] mid=[182,100,154,255] ring=[63,15,154,255]",
+        "s1.5/flat/noborder/shadow=true/pad=8 64x52 c051ad7bdb4db7d8 margin=8.00 content=40x28 outer_r=18 tl=[0,0,0,50] mid=[182,100,154,255] ring=[0,0,0,71]",
+        "s1.5/flat/border/shadow=false/pad=0 46x34 5a958e9c3a6a6aa4 margin=2.00 content=40x28 outer_r=21 tl=[220,80,40,0] mid=[182,100,154,255] ring=[42,0,153,253]",
+        "s1.5/flat/border/shadow=false/pad=8 64x52 4abaea8ed99f4e6f margin=8.00 content=40x28 outer_r=21 tl=[0,0,0,0] mid=[182,100,154,255] ring=[0,0,0,0]",
+        "s1.5/flat/border/shadow=true/pad=0 46x34 26a6cfa52d45792b margin=2.00 content=40x28 outer_r=21 tl=[0,0,0,128] mid=[182,100,154,255] ring=[42,0,153,253]",
+        "s1.5/flat/border/shadow=true/pad=8 64x52 6bb8a1e307d0a213 margin=8.00 content=40x28 outer_r=21 tl=[0,0,0,66] mid=[182,100,154,255] ring=[0,0,0,88]",
+        "light/noborder 56x44 4a50d9b4dd16b2b6 margin=8.00 content=40x28 outer_r=12 tl=[0,0,0,41] mid=[182,100,154,255] ring=[0,0,0,66]",
+        "light/border 56x44 d1b7be6c522d7978 margin=8.00 content=40x28 outer_r=14 tl=[0,0,0,52] mid=[182,100,154,255] ring=[0,0,0,78]",
+    ];
+}
+
 #[cfg(test)]
 mod cursor_overlay_tests {
-    use super::cursor_over_window;
     use crate::selection::Selection;
 
     fn sel(x: i32, y: i32, w: u32, h: u32) -> Selection {
         Selection { x, y, width: w, height: h, output: None, window_id: None }
+    }
+
+    // The gate moved to the shared seam in DRAGON-463; this reads it the way the Linux
+    // job does (from the picked window's selection rect), so the cases below keep
+    // covering what the Linux capture actually asks.
+    fn cursor_over_window(gx: i32, gy: i32, s: &Selection) -> bool {
+        crate::decoration::cursor_over_window(gx, gy, s.x, s.y, s.width, s.height)
     }
 
     // The DRAGON-213 gate: the pointer must be INSIDE the window rect for the

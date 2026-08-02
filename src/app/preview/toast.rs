@@ -115,6 +115,12 @@ impl Toasts {
     /// Re-posting an IDENTICAL notice (same severity, same text) does not stack a
     /// duplicate: the existing one is refreshed and moved to the newest slot. Mashing Copy
     /// should re-assure, not wallpaper the editor.
+    ///
+    /// The explicit `now` + `ttl` is what makes the queue's expiry, dedupe and overflow rules
+    /// testable without sleeping, which is the whole reason this and `push_full` are separate
+    /// (DRAGON-467: every PRODUCTION caller carries an icon now, so the tests below are its
+    /// only other users — hence the allow).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn push_at(
         &mut self,
         kind: ToastKind,
@@ -150,13 +156,12 @@ impl Toasts {
         }
     }
 
-    /// [`Self::push_at`] at the current instant with the standard TTL — what every caller
-    /// outside the tests uses.
-    pub(super) fn push(&mut self, kind: ToastKind, text: impl Into<String>) {
-        self.push_at(kind, text, Instant::now(), TOAST_TTL);
-    }
+    // DRAGON-467: `push` (the icon-less "now, standard TTL" wrapper) lived here. Its last
+    // caller was the delete's partial-failure toast, which went with the delete feature, so
+    // every notice the editor posts now names its own glyph through `push_icon`.
 
-    /// [`Self::push`] with an explicit per-toast icon (DRAGON-357).
+    /// [`Self::push_at`] at the current instant with the standard TTL, carrying an explicit
+    /// per-toast icon (DRAGON-357) — what every production caller uses.
     pub(super) fn push_icon(&mut self, kind: ToastKind, text: impl Into<String>, icon: &'static str) {
         self.push_full(kind, text, Some(icon), Instant::now(), TOAST_TTL);
     }

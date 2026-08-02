@@ -212,8 +212,16 @@ impl App {
                     // (On macOS the extra argument is inert: the bare check ignores it
                     // and the launch still early-branches to the daemon.) Its own
                     // single-instance lock makes a redundant spawn a harmless no-op.
+                    // DRAGON-465: the token is `instance::RESIDENT_ARG`, the same constant
+                    // `main` reads through `instance::daemon_intent_from_args`. It was a raw
+                    // literal here, which is exactly how the post-update relaunch came to be
+                    // spawned bare: an argv-building launcher that owns its own copy of the
+                    // rule can silently stop agreeing with the one that reads it.
                     if let Ok(exe) = std::env::current_exe() {
-                        match std::process::Command::new(&exe).arg("resident").spawn() {
+                        match std::process::Command::new(&exe)
+                            .arg(crate::instance::RESIDENT_ARG)
+                            .spawn()
+                        {
                             Ok(child) => log::info!("resident on: spawned resident (pid {})", child.id()),
                             Err(e) => log::warn!("resident on: resident spawn failed: {e}"),
                         }
@@ -399,6 +407,15 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            // DRAGON-478. Nothing to re-lay-out by hand: the next view build reads the flag
+            // through `Tb`, and every sizing consumer reads it through
+            // `PreviewSurface::chrome_h`, so an editor already open picks up the new bar
+            // height on its own.
+            SettingsMsg::SetPreviewToolbarLabels(b) => {
+                self.preview_toolbar_labels = b;
+                self.save_state();
+                Task::none()
+            }
             // DRAGON-419. `set_enabled` FIRST, so the "turned on" session header lands before
             // the config write it causes — the file then shows its own enabling as the first
             // thing that happened, which is what makes a mid-session toggle readable.
@@ -408,35 +425,35 @@ impl App {
                 self.save_state();
                 Task::none()
             }
-            SettingsMsg::SetPreviewSaveOnCopy(b) => {
-                self.preview_save_on_copy = b;
+            SettingsMsg::SetPreviewCopyOnExit(b) => {
+                self.preview_copy_on_exit = b;
                 self.save_state();
                 Task::none()
             }
-            SettingsMsg::SetPreviewCloseOnCopy(b) => {
-                self.preview_close_on_copy = b;
+            SettingsMsg::SetPreviewSaveOriginals(b) => {
+                self.preview_save_originals = b;
                 self.save_state();
                 Task::none()
             }
-            SettingsMsg::SetPreviewCopyOnDelete(b) => {
-                self.preview_copy_on_delete = b;
+            SettingsMsg::SetPreviewAskToSave(b) => {
+                self.preview_ask_to_save = b;
                 self.save_state();
                 Task::none()
             }
             // DRAGON-420: the Video Editor group's three. Each writes its OWN field — never
             // the image one beside it — which is exactly what the independence tests pin.
-            SettingsMsg::SetPreviewVideoSaveOnCopy(b) => {
-                self.preview_video_save_on_copy = b;
+            SettingsMsg::SetPreviewVideoCopyOnExit(b) => {
+                self.preview_video_copy_on_exit = b;
                 self.save_state();
                 Task::none()
             }
-            SettingsMsg::SetPreviewVideoCloseOnCopy(b) => {
-                self.preview_video_close_on_copy = b;
+            SettingsMsg::SetPreviewVideoSaveOriginals(b) => {
+                self.preview_video_save_originals = b;
                 self.save_state();
                 Task::none()
             }
-            SettingsMsg::SetPreviewVideoCopyOnDelete(b) => {
-                self.preview_video_copy_on_delete = b;
+            SettingsMsg::SetPreviewVideoAskToSave(b) => {
+                self.preview_video_ask_to_save = b;
                 self.save_state();
                 Task::none()
             }

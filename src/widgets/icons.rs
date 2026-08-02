@@ -162,7 +162,9 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         // active kind, where a press re-reads the screen instead of switching kind. The
         // COUNTER-clockwise arrows, deliberately distinct from `view-refresh-symbolic`'s
         // clockwise `refresh-cw` (a general "reload"): this one means "read it again".
-        "scan-refresh-symbolic" => "refresh-ccw",
+        // DRAGON-460: the CLOCKWISE glyph, because the button spins it clockwise. A
+        // counter-clockwise arrowhead turning clockwise reads as an animation bug.
+        "scan-refresh-symbolic" => "refresh-cw",
         "preferences-system-symbolic" => "settings",
         "audio-input-microphone-symbolic" => "mic",
         "audio-x-generic-symbolic" => "audio-lines", // Audio settings tab
@@ -175,6 +177,17 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "document-save-symbolic" => "save",
         "document-save-as-symbolic" => "save-all", // save variant
         "edit-copy-symbolic" => "copy",
+        // DRAGON-467's top-right group: the ticket named these three lucide glyphs directly
+        // (`copy`, `share-2`, `upload`), so the mapping is one-to-one rather than
+        // interpretive. `document-copy-symbolic` is the plain sheets-of-paper copy, distinct
+        // from `clipboard-copy-symbolic` (a clipboard with an arrow), which the TOASTS keep.
+        "document-copy-symbolic" => "copy",
+        // DRAGON-478, the owner's picks: `share` (the box-with-an-arrow-out, the OS share
+        // affordance on both mac and Windows) rather than `share-2` (the three-node graph,
+        // which reads as social sharing), and `cloud-upload` rather than plain `upload`,
+        // because the Upload button is the ACCOUNTS feature and the cloud says so.
+        "share-symbolic" => "share",
+        "upload-symbolic" => "cloud-upload",
         "view-fullscreen-symbolic" => "maximize",
         "view-restore-symbolic" => "minimize", // leave fullscreen → windowed
         "edit-undo-symbolic" => "undo-2",
@@ -205,7 +218,10 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         // tool; the badge the tool DRAWS is spelled out separately (disc + numeral + ring), so
         // this is the tray glyph, not the rendered mark.
         "sequence-badge-symbolic" => "circle-star",
-        "pencil-symbolic" => "pencil-line", // freehand pencil tool (DRAGON-338)
+        // The freehand tool (DRAGON-338). `pen-line`, not `pencil-line`, since DRAGON-475
+        // (owner's pick): the same glyph minus the pencil crossbar, which read as clutter
+        // at toolbar size.
+        "pencil-symbolic" => "pen-line",
         "text-tool-symbolic" => "type", // text annotation tool (DRAGON-354 items 6 + 5)
         "clipboard-copy-symbolic" => "clipboard-copy", // Copy-to-clipboard button (DRAGON-357)
         "clipboard-check-symbolic" => "clipboard-check", // "Copied" toast (DRAGON-357)
@@ -287,10 +303,11 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "bell" => svg!("bell"),
         "keyboard" => svg!("keyboard"),
         "refresh-cw" => svg!("refresh-cw"),
-        "refresh-ccw" => svg!("refresh-ccw"), // scanner re-read (DRAGON-456)
         "save" => svg!("save"),
         "save-all" => svg!("save-all"),
         "copy" => svg!("copy"),
+        "share" => svg!("share"),
+        "cloud-upload" => svg!("cloud-upload"),
         "maximize" => svg!("maximize"),
         "minimize" => svg!("minimize"),
         "undo-2" => svg!("undo-2"),
@@ -308,7 +325,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "minus-12" => svg!("minus-12"),
         "highlighter" => svg!("highlighter"),
         "box-highlight" => svg!("box-highlight"),
-        "pencil-line" => svg!("pencil-line"),
+        "pen-line" => svg!("pen-line"),
         "type" => svg!("type"),
         "clipboard-copy" => svg!("clipboard-copy"),
         "clipboard-check" => svg!("clipboard-check"),
@@ -365,6 +382,7 @@ mod tests {
             "audio-volume-high-symbolic", "notification-symbolic", "input-keyboard-symbolic",
             "view-refresh-symbolic", "scan-refresh-symbolic",
             "document-save-symbolic", "document-save-as-symbolic",
+            "document-copy-symbolic", "share-symbolic", "upload-symbolic",
             "edit-copy-symbolic", "view-fullscreen-symbolic", "view-restore-symbolic",
             "edit-undo-symbolic", "edit-redo-symbolic", "crop-symbolic", "crop-accept-symbolic",
             "insert-image-symbolic",
@@ -507,7 +525,7 @@ mod tests {
         assert_eq!(lucide_name("checkbox-symbolic"), Some("square"));
         assert_eq!(lucide_name("box-highlight-symbolic"), Some("box-highlight")); // DRAGON-333
         assert_eq!(lucide_name("sun-dim-symbolic"), Some("sun-dim")); // DRAGON-329
-        assert_eq!(lucide_name("pencil-symbolic"), Some("pencil-line")); // DRAGON-338
+        assert_eq!(lucide_name("pencil-symbolic"), Some("pen-line")); // DRAGON-338 + DRAGON-475
         assert_eq!(lucide_name("eraser-symbolic"), Some("eraser")); // DRAGON-338
         // DRAGON-340: the sequence-badge TOOL wears lucide's circle-star; the badge it draws is
         // its own vector (disc + numeral + ring), not this glyph.
@@ -521,7 +539,7 @@ mod tests {
         // DRAGON-456: the scanner's re-read hover face is the COUNTER-clockwise refresh, and
         // it must stay distinct from the clockwise one every other "reload" control wears —
         // the two are one character apart in lucide's own naming, so pin both.
-        assert_eq!(lucide_name("scan-refresh-symbolic"), Some("refresh-ccw"));
+        assert_eq!(lucide_name("scan-refresh-symbolic"), Some("refresh-cw"));
         assert_eq!(lucide_name("view-refresh-symbolic"), Some("refresh-cw"));
     }
 

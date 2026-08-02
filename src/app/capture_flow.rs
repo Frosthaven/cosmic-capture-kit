@@ -22,6 +22,62 @@ pub(in crate::app) fn recording_save_name(stem: &str) -> String {
     format!("{stem}.{RECORDING_EXT}")
 }
 
+/// The documented fallback when a save-folder setting is blank. Named because two readers
+/// need the same answer and a typo between them would send captures to two places.
+pub(in crate::app) const DEFAULT_CAPTURE_DIR: &str = "~/Capture";
+
+/// WHERE a fresh capture's file is written (DRAGON-467).
+///
+/// `configured` is the user's save folder for this media kind; `transient` is wherever
+/// unsaved captures of that kind live. "Automatically save originals" picks between them, and
+/// that is the whole rule:
+///
+/// * ON (the default, and what every earlier version did unconditionally) writes into the
+///   user's folder, so a capture is a file the moment it is taken.
+/// * OFF writes into the transient location instead. The editor still opens on it and the
+///   clipboard still gets it, but nothing reaches the user's folder until they choose Save.
+///   The Windows 11 Snipping Tool's "Automatically save original screenshots" is the same
+///   toggle over the same two outcomes.
+///
+/// **The transient location differs by MEDIUM**, and the split is not cosmetic (DRAGON-467
+/// review, major 3). Stills go to the session runtime directory, which is a tmpfs and
+/// therefore RAM; a few MB written once is exactly what that is for. Recordings go to a
+/// disk-backed cache folder ([`crate::util::transient_recording_dir`]) because a take buffers
+/// its live `.recording` temp AND its finished file, and filling a RAM-backed
+/// `$XDG_RUNTIME_DIR` (10% of memory by default) would ENOSPC in the middle of the take.
+/// [`transient_dir`] picks the right one; this function only chooses between the two columns.
+///
+/// The transient file is deliberately NOT cleaned up when the editor closes: on Linux the
+/// clipboard worker is a detached process holding a `file://` URI for a recording, so removing
+/// the file would break a paste the user can still perform. Accumulation is bounded by AGE
+/// instead ([`crate::util::sweep_transient_recordings`] at
+/// [`crate::util::TRANSIENT_MAX_AGE`]), and the stills' runtime dir is the OS's to clear at
+/// logout.
+///
+/// Pure; unit-tested in `capture_dir_tests`.
+pub(in crate::app) fn capture_write_dir(
+    save_originals: bool,
+    configured: &std::path::Path,
+    transient: &std::path::Path,
+) -> std::path::PathBuf {
+    if save_originals { configured.to_path_buf() } else { transient.to_path_buf() }
+}
+
+/// The transient location for a capture of this MEDIUM (DRAGON-467 review, major 3): the
+/// disk-backed cache folder for a recording, the session runtime directory for a still.
+///
+/// Falls back to the runtime directory when the OS offers no cache dir at all. That is the
+/// tmpfs risk the split exists to avoid, but it only arises where there is nowhere better,
+/// and a capture that lands somewhere beats one that refuses to start.
+pub(in crate::app) fn transient_dir(is_video: bool) -> std::path::PathBuf {
+    if is_video
+        && let Some(dir) = crate::util::transient_recording_dir()
+    {
+        return dir;
+    }
+    std::path::PathBuf::from(crate::util::runtime_dir())
+}
+
 /// DRAGON-228: whether the capture overlays are in the PICKING phase — the phase
 /// where they should hold EXCLUSIVE keyboard so Escape (and the other overlay
 /// shortcuts) work without a focusing click first. cosmic-comp only ever
@@ -788,6 +844,52 @@ impl App {
         }
     }
 
+    /// The user's CONFIGURED save folder for this media kind, tilde-expanded, with the blank
+    /// setting falling back to [`DEFAULT_CAPTURE_DIR`].
+    ///
+    /// ONE reader for both the capture write and the editor's Save prefill, because
+    /// DRAGON-467 made them two different questions with the same answer: the setting names
+    /// where captures BELONG, whether or not this particular capture was written there.
+    pub(in crate::app) fn capture_save_dir(&self, is_video: bool) -> std::path::PathBuf {
+        let raw = if is_video { self.record_dir.trim() } else { self.screenshot_dir.trim() };
+        let raw = if raw.is_empty() { DEFAULT_CAPTURE_DIR } else { raw };
+        crate::util::expand_tilde(raw)
+    }
+
+    /// The folder this capture is written to, for a message shown to the USER (DRAGON-467
+    /// review, minor 9). The same reader the write itself uses, minus the directory creation,
+    /// so a save-failure alert can never name a folder the save did not touch.
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+    pub(in crate::app) fn capture_write_dir_display(&self, is_video: bool) -> String {
+        let save_originals = if is_video {
+            self.preview_video_save_originals
+        } else {
+            self.preview_save_originals
+        };
+        capture_write_dir(save_originals, &self.capture_save_dir(is_video), &transient_dir(is_video))
+            .display()
+            .to_string()
+    }
+
+    /// WHERE this capture's file is written NOW: the configured folder, or the transient
+    /// location for this medium when "Automatically save originals" is off
+    /// ([`capture_write_dir`], DRAGON-467). Creates the directory, as the write sites always
+    /// did.
+    pub(in crate::app) fn capture_write_dir(&self, is_video: bool) -> std::path::PathBuf {
+        let save_originals = if is_video {
+            self.preview_video_save_originals
+        } else {
+            self.preview_save_originals
+        };
+        let dir = capture_write_dir(
+            save_originals,
+            &self.capture_save_dir(is_video),
+            &transient_dir(is_video),
+        );
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
     /// Finish a capture WITHOUT the preview editor: it's already saved. Copy it to the
     /// clipboard, then post a notification naming what was captured and where it went —
     /// "Region copied to clipboard", or "Region saved" with the reason when the copy did
@@ -1272,14 +1374,11 @@ impl App {
         // self-capture keeps the existing preview open.
         crate::instance::close_other_instances();
 
-        // Destination path (shared by both the screencopy and PipeWire paths).
-        let raw_dir = if self.screenshot_dir.trim().is_empty() {
-            "~/Capture"
-        } else {
-            self.screenshot_dir.trim()
-        };
-        let dir = crate::util::expand_tilde(raw_dir);
-        let _ = std::fs::create_dir_all(&dir);
+        // Destination path (shared by both the screencopy and PipeWire paths). DRAGON-467:
+        // the FOLDER now depends on "Automatically save originals" — the configured one, or
+        // the session runtime directory when the user does not want untouched captures
+        // littering it. The NAME is unchanged either way.
+        let dir = self.capture_write_dir(false);
         let path = dir.join(still_save_name(&self.capture_stem(&sel)));
 
         // PipeWire screenshot: a portal stream was granted at commit. Grab a single
@@ -3241,5 +3340,96 @@ mod picker_keyboard_tests {
         assert!(!picking_phase(true, false, false));
         assert!(!picking_phase(false, true, false));
         assert!(!picking_phase(false, false, true));
+    }
+}
+
+#[cfg(test)]
+mod capture_dir_tests {
+    use super::capture_write_dir;
+    use std::path::{Path, PathBuf};
+
+    /// THE "handled through /tmp" rule (DRAGON-467): "Automatically save originals" picks
+    /// between the user's configured folder and the session runtime directory, and picks
+    /// nothing else. Modelled on the Windows 11 Snipping Tool's toggle of the same name.
+    #[test]
+    fn save_originals_chooses_between_the_save_folder_and_the_runtime_dir() {
+        let configured = Path::new("/home/me/Capture");
+        let transient = Path::new("/run/user/1000");
+        assert_eq!(capture_write_dir(true, configured, transient), PathBuf::from(configured));
+        assert_eq!(capture_write_dir(false, configured, transient), PathBuf::from(transient));
+    }
+
+    /// The NAME never moves — only the folder. This is what keeps a transient capture
+    /// recognisable, and what lets `naming::save_prefill` reunite it with the configured
+    /// folder when the user finally saves.
+    #[test]
+    fn only_the_folder_moves_never_the_file_name() {
+        let configured = Path::new("/home/me/Capture");
+        let transient = Path::new("/run/user/1000");
+        let name = super::still_save_name("Screenshot 2026-07-29");
+        for save_originals in [true, false] {
+            let path = capture_write_dir(save_originals, configured, transient).join(&name);
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some(name.as_str()),
+                "save_originals={save_originals}"
+            );
+        }
+        // And the two really are different places, or the setting would do nothing.
+        assert_ne!(
+            capture_write_dir(true, configured, transient),
+            capture_write_dir(false, configured, transient)
+        );
+    }
+
+    /// Recordings take the same fork against their own container, so a `.mp4` in the
+    /// transient folder is still a `.mp4` when the user saves it out.
+    #[test]
+    fn recordings_take_the_same_fork() {
+        let name = super::recording_save_name("Recording 2026-07-29");
+        let path =
+            capture_write_dir(false, Path::new("/home/me/Videos"), Path::new("/var/cache/cck"))
+                .join(&name);
+        assert_eq!(path, PathBuf::from("/var/cache/cck/Recording 2026-07-29.mp4"));
+    }
+
+    /// THE MEDIUM SPLIT (DRAGON-467 review, major 3): an unsaved RECORDING must not buffer
+    /// into `$XDG_RUNTIME_DIR`, which is a tmpfs sized at ~10% of RAM. A take writes its live
+    /// `.recording` temp AND its finished file there, so a long one could ENOSPC in the
+    /// middle of capturing, losing the take it was recording.
+    ///
+    /// Stills deliberately stay in the runtime dir: a few MB written once is exactly what it
+    /// is for, and its clear-at-logout lifetime is the right one for them.
+    #[test]
+    fn recordings_and_stills_have_different_transient_homes() {
+        let runtime = PathBuf::from(crate::util::runtime_dir());
+        assert_eq!(super::transient_dir(false), runtime, "a still stays in the runtime dir");
+        let video = super::transient_dir(true);
+        assert_ne!(
+            video, runtime,
+            "an unsaved recording must not buffer into the RAM-backed runtime dir"
+        );
+        // Whatever it resolved to, it EXISTS: the write site joins a file name straight onto
+        // it, so a folder that was never created would fail the capture rather than the copy.
+        assert!(video.is_dir(), "the transient recording folder is created on demand");
+    }
+
+    /// The sweep is safe to run against a live folder: it removes nothing that is young, and
+    /// it never touches subdirectories. Driven for real, because the risk here is deleting a
+    /// user's capture, and a value-only test would not exercise the filesystem walk at all.
+    #[test]
+    fn the_transient_sweep_keeps_recent_files() {
+        let Some(dir) = crate::util::transient_recording_dir() else { return };
+        let keep = dir.join("cck-sweep-test-recent.mp4");
+        std::fs::write(&keep, b"x").expect("the transient dir must be writable");
+        crate::util::sweep_transient_recordings();
+        assert!(keep.exists(), "a file written moments ago must survive the sweep");
+        let _ = std::fs::remove_file(&keep);
+        // And the age bound is a WEEK, not something incidental — the constant is the
+        // promise the setting's description makes to the user.
+        assert_eq!(
+            crate::util::TRANSIENT_MAX_AGE,
+            std::time::Duration::from_secs(7 * 24 * 60 * 60)
+        );
     }
 }

@@ -1,30 +1,38 @@
-//! WHERE A SAVE WRITES (DRAGON-353) — the preview editor's save-target rule, as pure
-//! path arithmetic.
+//! WHERE A SAVE WRITES — the preview editor's save-target rule, as pure path arithmetic.
 //!
-//! Two facts drive every decision here:
+//! # The DRAGON-467 model, and why the `-edited` suffix is gone
 //!
-//! * **A capture's own file is never overwritten by an edit.** A fresh capture is
-//!   auto-saved to a path the user did not choose; baking annotations into it in place
-//!   would destroy the untouched original with no way back. So the first dirty Save
-//!   writes a SEPARATE file, `name-edited.ext`.
-//! * **A file the user DID choose is theirs to overwrite.** Once Save As has pointed the
-//!   document at an explicit destination — or once a `-edited` file has been created and
-//!   become the working document — further saves write straight back to it. Otherwise
-//!   every save would spawn `-edited-edited-edited…`, and "save, tweak, save" would leave
-//!   a trail of near-identical files.
+//! Until DRAGON-467 a dirty Save wrote a SEPARATE `name-edited.ext` beside the capture, with
+//! a `-edited-2`, `-edited-3` collision walk behind it, so a fresh capture's auto-saved
+//! original could never be overwritten by an edit. That mechanism is REMOVED. The reason it
+//! could not stay is worth recording, because "protect the original" is a real instinct and
+//! it will be suggested again:
 //!
-//! [`save_target`] is the whole rule; `PreviewState::save_in_place` is the "the user chose
-//! this path" bit it consults. Everything is a pure function over a path plus an
-//! `exists` predicate, so the collision policy is unit-testable with no filesystem.
+//! * **No mainstream capture tool names a derived copy.** Surveyed for this ticket: CleanShot
+//!   X, ShareX, the Windows 11 Snipping Tool, macOS Screenshot/Markup and Preview, Flameshot,
+//!   Greenshot, Snagit. Not one writes `-edited`, `_annotated` or any other semantic suffix.
+//!   Where a tool DOES keep the untouched version it distinguishes it by FORMAT, not by name
+//!   (`.cleanshot`, `.greenshot`, `.snagx` project files), and the flat image is the derived
+//!   artifact. Where a collision suffix exists at all it is the plain OS counter, ShareX's
+//!   `" (2)"`, never a word.
+//! * **A known path means overwrite.** ShareX's editor writes straight over the file it knows
+//!   about (its `SaveImageRequested` handler), macOS Preview overwrites on Cmd+S, and the
+//!   Snipping Tool overwrites a file it opened. Our `-edited` rule was the odd one out.
+//! * **The protection moved somewhere better.** Save is now a Save AS: the picker opens
+//!   pre-filled with the path a plain save would have used, and the NATIVE dialog asks before
+//!   replacing anything. That is the Snipping Tool's flow exactly ("save an additional copy of
+//!   the captured snip by selecting the Save as button"), and it beats a suffix because the
+//!   user sees the name, the folder and the replace prompt, instead of finding out afterwards
+//!   that they have two files.
 //!
-//! [`png_name`] is the other half (DRAGON-455): a still is WRITTEN as PNG, so its name has
-//! to say PNG. It composes over `save_target` at the one call site,
+//! So there is no derivation left to do. [`save_prefill`] answers one question — what path
+//! does the picker open on — and the answer is always a path the user then confirms.
+//!
+//! [`png_name`] is the other half (DRAGON-455): a still is WRITTEN as PNG, so its name has to
+//! say PNG. It composes over [`save_prefill`] at the one call site,
 //! `App::preview_save_target`.
 
 use std::path::{Path, PathBuf};
-
-/// The marker appended to a capture's stem when an EDITED copy is saved beside it.
-pub(super) const EDITED_SUFFIX: &str = "-edited";
 
 /// The one extension a still is ever saved under. See [`png_name`].
 pub(super) const PNG_EXT: &str = "png";
@@ -41,7 +49,7 @@ pub(super) const PNG_EXT: &str = "png";
 ///   not re-case a name the user chose.
 /// * another still-image extension we can open (`.jpg`, `.webp`, … — [`super::is_image_path`])
 ///   is REPLACED. That tail is certainly a format name, so nothing of the user's own name is
-///   lost: an edited `clip.JPG` saves as `clip-edited.png`.
+///   lost: an edited `clip.JPG` saves as `clip.png`.
 /// * anything else — no extension at all, a bare trailing dot, or a dotted NAME like
 ///   `report.v2` — gets `.png` APPENDED, never substituted. `Path::extension` reads `v2`
 ///   there as an extension, and replacing it would silently eat part of a name the user
@@ -77,252 +85,135 @@ pub(super) fn png_name(path: &Path) -> PathBuf {
     }
 }
 
-/// How many `-edited-N` variants to try before giving up and overwriting the plain
-/// `-edited` name. Absurdly high on purpose: the loop exists so a pre-existing
-/// `shot-edited.png` from an earlier session is never silently clobbered, not to model a
-/// realistic count.
-const MAX_VARIANTS: u32 = 999;
-
-/// Whether `stem` already carries the edited marker — `foo-edited` or `foo-edited-7`.
+/// THE save rule (DRAGON-467): the path the Save picker opens PRE-FILLED with, i.e. exactly
+/// what a plain overwrite-save would have written.
 ///
-/// This is what stops the suffix from compounding: once a document IS the `-edited` file,
-/// saving it again writes to itself rather than minting `foo-edited-edited`.
-fn is_edited_stem(stem: &str) -> bool {
-    if stem.ends_with(EDITED_SUFFIX) {
-        return true;
-    }
-    // `…-edited-<digits>`: split the trailing number off and re-check the head.
-    match stem.rsplit_once('-') {
-        Some((head, tail)) => {
-            !tail.is_empty()
-                && tail.chars().all(|c| c.is_ascii_digit())
-                && head.ends_with(EDITED_SUFFIX)
-        }
-        None => false,
-    }
-}
-
-/// Rebuild `src`'s path with a different file STEM, preserving its directory and its
-/// extension (including the extension's original case — a `.JPG` capture stays `.JPG`).
-fn with_stem(src: &Path, stem: &str) -> PathBuf {
-    let name = match src.extension().and_then(|e| e.to_str()) {
-        Some(ext) => format!("{stem}.{ext}"),
-        None => stem.to_string(),
-    };
-    match src.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
-        _ => PathBuf::from(name),
-    }
-}
-
-/// The `-edited` sibling of `src`, guaranteed not to collide with a file `exists` reports.
+/// Three inputs, three arms, in priority order:
 ///
-/// * `shot.png` → `shot-edited.png`
-/// * `shot.png` when `shot-edited.png` is taken → `shot-edited-2.png` (then `-3`, …)
-/// * `shot-edited.png` / `shot-edited-2.png` → ITSELF (the document already IS the edited
-///   copy; saving it again writes in place rather than compounding the suffix)
-/// * `notes` (no extension) → `notes-edited`
+/// 1. **`saved`** — `PreviewState::saved_path`, set once this document has actually written a
+///    file (a Save destination the user picked). That path IS the document now, so a further
+///    save goes straight back to it. This is the "a known path means overwrite" behaviour
+///    every surveyed tool has.
+/// 2. **`default_dir`** — the user's configured save folder (`screenshot_dir` for a still,
+///    `record_dir` for a recording), used with the capture's own FILE NAME. This is what makes
+///    the picker land in the right place for a capture that has not been saved yet, INCLUDING
+///    one that only exists in the session runtime directory because "Automatically save
+///    originals" is off. The setting is the basis for the Save action, so the folder it names
+///    is where the picker opens, never the transient location the bytes happen to be in.
+/// 3. **neither** — an external `--preview` document, which has no configured folder of its
+///    own: it stays exactly where it is, so saving a file the user opened offers to write it
+///    back over itself (again, what Preview and the Snipping Tool do), with the native
+///    dialog's replace prompt as the guard.
 ///
-/// The collision policy is DELIBERATELY non-destructive: a `shot-edited.png` left over from
-/// a previous session is somebody's work, and this editor has no way to know it isn't. The
-/// only overwrite is of a file this same document already created (the second bullet's
-/// exception), which is exactly the "keep saving my edit" case.
-pub(super) fn edited_target(src: &Path, exists: &dyn Fn(&Path) -> bool) -> PathBuf {
-    let stem = src
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if is_edited_stem(&stem) {
-        return src.to_path_buf();
-    }
-    let first = with_stem(src, &format!("{stem}{EDITED_SUFFIX}"));
-    if !exists(&first) {
-        return first;
-    }
-    for n in 2..=MAX_VARIANTS {
-        let candidate = with_stem(src, &format!("{stem}{EDITED_SUFFIX}-{n}"));
-        if !exists(&candidate) {
-            return candidate;
-        }
-    }
-    // A thousand taken variants: saving SOMETHING beats refusing to save, so fall back to
-    // the plain name (which the caller will overwrite).
-    first
-}
-
-/// THE save-target rule. `current` is the document's working path; `explicit` is
-/// `PreviewState::save_in_place` — "the user chose this path" (a Save As destination, or
-/// an `-edited` file this document already minted and adopted).
-///
-/// Explicit ⇒ write straight back. Otherwise ⇒ the collision-safe `-edited` sibling, so a
-/// fresh capture's auto-saved original survives its first edit.
-pub(super) fn save_target(
+/// The result is never uniquified and never suffixed. Collisions are the file chooser's job:
+/// it names the existing file and asks. Pure; unit-tested below.
+pub(super) fn save_prefill(
+    saved: Option<&Path>,
     current: &Path,
-    explicit: bool,
-    exists: &dyn Fn(&Path) -> bool,
+    default_dir: Option<&Path>,
 ) -> PathBuf {
-    if explicit {
-        current.to_path_buf()
-    } else {
-        edited_target(current, exists)
+    if let Some(saved) = saved {
+        return saved.to_path_buf();
     }
-}
-
-/// The real filesystem predicate for [`save_target`] / [`edited_target`]. Split out only
-/// so the tests can substitute a fake set of taken names.
-pub(super) fn on_disk(path: &Path) -> bool {
-    path.exists()
+    match (default_dir, current.file_name()) {
+        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => current.to_path_buf(),
+    }
 }
 
 #[cfg(test)]
-mod tests {
+mod save_prefill_tests {
     use super::*;
-    use std::collections::HashSet;
 
-    /// An `exists` predicate over a fixed set of taken paths.
-    fn taken(names: &[&str]) -> impl Fn(&Path) -> bool + use<> {
-        let set: HashSet<PathBuf> = names.iter().map(PathBuf::from).collect();
-        move |p: &Path| set.contains(p)
+    /// A document that has SAVED once re-opens on its own file, whatever else is configured —
+    /// the overwrite-in-place behaviour, and the reason repeated saves settle on ONE file
+    /// instead of accumulating variants.
+    #[test]
+    fn a_saved_document_prefills_its_own_path() {
+        let saved = Path::new("/home/me/report.png");
+        let capture = Path::new("/run/user/1000/Screenshot 2026.png");
+        let dir = Path::new("/home/me/Capture");
+        assert_eq!(save_prefill(Some(saved), capture, Some(dir)), PathBuf::from("/home/me/report.png"));
+        // Even with no configured folder at all.
+        assert_eq!(save_prefill(Some(saved), capture, None), PathBuf::from("/home/me/report.png"));
     }
 
-    /// The base derivation: `-edited` goes on the STEM, the extension rides along
-    /// unchanged (case included), and the directory is preserved.
+    /// An UNSAVED capture prefills the configured folder plus its own name. This is the case
+    /// the "Automatically save originals" toggle creates: the bytes live in the runtime
+    /// directory, but the picker must still open in the folder the user configured.
     #[test]
-    fn edited_target_appends_to_the_stem_and_keeps_the_extension() {
-        let none = taken(&[]);
-        assert_eq!(
-            edited_target(Path::new("/shots/Screenshot 2026.png"), &none),
-            PathBuf::from("/shots/Screenshot 2026-edited.png")
-        );
-        // A capitalised extension keeps its exact spelling. Shown on a RECORDING since
-        // DRAGON-455: this derivation is format-agnostic (it is the video half's rule too),
-        // and a still never reaches it with a foreign extension any more — `png_name` runs
-        // first, so `clip.JPG` derives from `clip.png`. See
-        // `a_still_target_is_always_png_before_the_edited_derivation`.
-        assert_eq!(
-            edited_target(Path::new("/shots/clip.MOV"), &none),
-            PathBuf::from("/shots/clip-edited.MOV")
-        );
-        // RECORDINGS derive identically (DRAGON-398: the video editor's Save writes the same
-        // `-edited` sibling as an image's, from this same rule — there is no second naming
-        // implementation for video). Every container the recorder can produce:
-        for (src, want) in [
-            ("/rec/take.mp4", "/rec/take-edited.mp4"),
-            ("/rec/take.mkv", "/rec/take-edited.mkv"),
-            ("/rec/take.webm", "/rec/take-edited.webm"),
-            ("/rec/take.mov", "/rec/take-edited.mov"),
-            // A recorder's default name is spaced and dotted; both survive.
-            ("/rec/Recording 2026-07-29 at 10.30.mp4", "/rec/Recording 2026-07-29 at 10.30-edited.mp4"),
+    fn an_unsaved_capture_prefills_the_configured_folder() {
+        let dir = Path::new("/home/me/Capture");
+        for capture in [
+            // Already in the save folder (originals ON).
+            "/home/me/Capture/Screenshot 2026.png",
+            // Only in the runtime dir (originals OFF) — same answer.
+            "/run/user/1000/Screenshot 2026.png",
         ] {
-            assert_eq!(edited_target(Path::new(src), &none), PathBuf::from(want), "{src}");
+            assert_eq!(
+                save_prefill(None, Path::new(capture), Some(dir)),
+                PathBuf::from("/home/me/Capture/Screenshot 2026.png"),
+                "{capture}"
+            );
         }
-        // Only the LAST extension is an extension, so a dotted stem keeps its dots.
+        // Recordings behave identically against their own folder — there is no second
+        // implementation for video, and the container rides along untouched.
         assert_eq!(
-            edited_target(Path::new("/shots/a.b.png"), &none),
-            PathBuf::from("/shots/a.b-edited.png")
+            save_prefill(
+                None,
+                Path::new("/run/user/1000/Recording 2026-07-29 at 10.30.mkv"),
+                Some(Path::new("/home/me/Videos")),
+            ),
+            PathBuf::from("/home/me/Videos/Recording 2026-07-29 at 10.30.mkv")
         );
     }
 
-    /// A file with NO extension still gets the marker (and gains no stray dot).
+    /// An EXTERNAL document (`--preview some/file.png`) has no configured folder, so it stays
+    /// where it is: the save offers to write back over the file the user opened.
     #[test]
-    fn edited_target_handles_a_missing_extension() {
-        let none = taken(&[]);
-        assert_eq!(
-            edited_target(Path::new("/shots/notes"), &none),
-            PathBuf::from("/shots/notes-edited")
-        );
-        // A bare relative name keeps its bare form (no directory invented).
-        assert_eq!(edited_target(Path::new("notes"), &none), PathBuf::from("notes-edited"));
+    fn an_external_document_stays_where_it_is() {
+        let file = Path::new("/home/me/Downloads/holiday.png");
+        assert_eq!(save_prefill(None, file, None), PathBuf::from("/home/me/Downloads/holiday.png"));
+        // An empty configured folder is treated as no folder rather than as the root, so a
+        // blank setting can never relocate a save to `/`.
+        assert_eq!(save_prefill(None, file, Some(Path::new(""))), file.to_path_buf());
     }
 
-    /// THE ANTI-COMPOUNDING RULE: a document that already IS the edited copy saves back to
-    /// ITSELF, so save → edit → save cycles stay on one file instead of growing
-    /// `-edited-edited-edited`. True even when the name is taken (it is taken BY US).
+    /// Degenerate paths: a path with no file name cannot be relocated, so it is returned
+    /// as-is rather than producing the bare directory as a save target.
     #[test]
-    fn an_already_edited_name_saves_in_place() {
-        let all = |_: &Path| true;
-        for name in ["/shots/a-edited.png", "/shots/a-edited-2.png", "/shots/a-edited-17.mp4"] {
-            assert_eq!(edited_target(Path::new(name), &all), PathBuf::from(name), "{name}");
-        }
-        // A stem that merely CONTAINS the word is not the marker.
+    fn a_path_with_no_file_name_is_left_alone() {
         assert_eq!(
-            edited_target(Path::new("/shots/edited-shot.png"), &taken(&[])),
-            PathBuf::from("/shots/edited-shot-edited.png")
-        );
-        // `-edited-` followed by something that isn't a number is not a variant either.
-        assert_eq!(
-            edited_target(Path::new("/shots/a-edited-final.png"), &taken(&[])),
-            PathBuf::from("/shots/a-edited-final-edited.png")
+            save_prefill(None, Path::new("/"), Some(Path::new("/home/me/Capture"))),
+            PathBuf::from("/")
         );
     }
 
-    /// COLLISION POLICY: a pre-existing `-edited` file (somebody else's work, from an
-    /// earlier session) is never silently overwritten — the save steps to `-edited-2`,
-    /// `-edited-3`, … until it finds a free name.
+    /// The full life cycle: capture -> edit -> Save (picker, user confirms) -> edit -> Save.
+    /// After the first save the document adopts the chosen path, so every later save prefills
+    /// THAT, and exactly one edited file exists no matter how many times the user saves.
     #[test]
-    fn a_pre_existing_edited_file_is_never_clobbered() {
-        let one = taken(&["/shots/a-edited.png"]);
-        assert_eq!(
-            edited_target(Path::new("/shots/a.png"), &one),
-            PathBuf::from("/shots/a-edited-2.png")
-        );
-        let several =
-            taken(&["/shots/a-edited.png", "/shots/a-edited-2.png", "/shots/a-edited-3.png"]);
-        assert_eq!(
-            edited_target(Path::new("/shots/a.png"), &several),
-            PathBuf::from("/shots/a-edited-4.png")
-        );
-    }
-
-    /// The whole rule: an implicit target derives `-edited`; an EXPLICIT one (a Save As
-    /// destination, or an adopted `-edited` file) writes straight back — never gaining a
-    /// second marker, and never uniquified away from the path the user picked.
-    #[test]
-    fn save_target_respects_an_explicitly_chosen_path() {
-        // Everything is "taken", so a uniquifying bug would be loud.
-        let all = |_: &Path| true;
-        let chosen = Path::new("/home/me/report.png");
-        assert_eq!(save_target(chosen, true, &all), PathBuf::from("/home/me/report.png"));
-        // The same path WITHOUT the explicit flag is a fresh capture: protect the original.
-        assert_eq!(
-            save_target(chosen, false, &taken(&[])),
-            PathBuf::from("/home/me/report-edited.png")
-        );
-    }
-
-    /// The FULL life cycle the ambiguity is really about: capture → edit → Save →
-    /// edit → Save → Save As → edit → Save. After the first save the document adopts the
-    /// `-edited` file and every later save writes to whatever path is current, so exactly
-    /// TWO files exist at the end (the untouched original and the edit), plus whatever
-    /// Save As put where the user asked.
-    ///
-    /// Run for BOTH media kinds (DRAGON-398): a cut recording follows exactly the same
-    /// life cycle as an annotated screenshot, because the video editor's Save routes through
-    /// this same rule rather than a parallel one.
-    #[test]
-    fn repeated_save_cycles_settle_on_one_file() {
-        let none = taken(&[]);
-        for (capture, first_edit, elsewhere) in [
-            ("/shots/2026.png", "/shots/2026-edited.png", "/home/me/final.png"),
-            ("/rec/2026.mp4", "/rec/2026-edited.mp4", "/home/me/final.mp4"),
+    fn repeated_saves_settle_on_the_chosen_file() {
+        let dir = Path::new("/home/me/Capture");
+        for (capture, chosen) in [
+            ("/run/user/1000/2026.png", "/home/me/Capture/2026.png"),
+            ("/run/user/1000/2026.mp4", "/home/me/Elsewhere/take-final.mp4"),
         ] {
-            // 1. Fresh capture, first dirty save.
-            let capture = Path::new(capture);
-            let first = save_target(capture, false, &none);
-            assert_eq!(first, PathBuf::from(first_edit));
-            // 2. The document adopts it (save_in_place = true) — the next save is in place...
-            assert_eq!(save_target(&first, true, &none), first);
-            // ...and would be even if the flag were somehow lost, because the stem carries the
-            // marker. Belt and braces: the suffix can never compound.
-            assert_eq!(save_target(&first, false, &none), first);
-            // 3. Save As elsewhere; that destination is explicit, so it stays exact.
-            assert_eq!(save_target(Path::new(elsewhere), true, &none), PathBuf::from(elsewhere));
-            // The ORIGINAL capture is never a target after step 1.
-            assert_ne!(first, capture.to_path_buf());
+            // 1. First save: the picker opens on the configured folder + the capture's name.
+            let first = save_prefill(None, Path::new(capture), Some(dir));
+            assert_eq!(first, dir.join(Path::new(capture).file_name().unwrap()));
+            // 2. The user may accept that or pick elsewhere; either way it becomes `saved`...
+            let saved = PathBuf::from(chosen);
+            // ...and every later save prefills exactly it, never a derived variant.
+            assert_eq!(save_prefill(Some(&saved), Path::new(capture), Some(dir)), saved);
+            assert_eq!(save_prefill(Some(&saved), &saved, Some(dir)), saved);
         }
     }
+}
 
-    // ── DRAGON-455: a still's name says PNG, because a still IS a PNG ────────────────
+#[cfg(test)]
+mod png_name_tests {
+    use super::*;
 
     /// The already-PNG arm: nothing moves, and a `.PNG` capture is not re-cased. The name
     /// the user chose is theirs.
@@ -398,22 +289,15 @@ mod tests {
         }
     }
 
-    /// THE COMPOSITION `App::preview_save_target` performs: force PNG FIRST, then derive
-    /// `-edited`. Order matters — deriving first would produce `clip-edited.JPG` and run the
-    /// collision walk against a name nothing will ever be written to.
+    /// THE COMPOSITION `App::preview_save_target` performs: force PNG FIRST, then place the
+    /// name in the configured folder. Order matters — relocating first would carry a `.JPG`
+    /// tail into the save folder and offer the user a name nothing will ever be written to.
     #[test]
-    fn a_still_target_is_always_png_before_the_edited_derivation() {
-        let none = taken(&[]);
+    fn a_still_prefill_is_always_png_in_the_configured_folder() {
         let external = png_name(Path::new("/shots/clip.JPG"));
         assert_eq!(
-            save_target(&external, false, &none),
-            PathBuf::from("/shots/clip-edited.png")
-        );
-        // And the collision walk now checks the name that WILL be written.
-        let clash = taken(&["/shots/clip-edited.png"]);
-        assert_eq!(
-            save_target(&external, false, &clash),
-            PathBuf::from("/shots/clip-edited-2.png")
+            save_prefill(None, &external, Some(Path::new("/home/me/Capture"))),
+            PathBuf::from("/home/me/Capture/clip.png")
         );
     }
 }

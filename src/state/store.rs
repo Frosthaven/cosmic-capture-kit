@@ -72,7 +72,7 @@ fn load_raw() -> Option<Persisted> {
 
 /// Current config schema version. Bump when a stored index changes meaning and
 /// add a guarded step in `migrate`.
-pub const CONFIG_VERSION: u32 = 8;
+pub const CONFIG_VERSION: u32 = 9;
 
 /// One-time migrations for configs saved by older versions, keyed on
 /// `config_version`. Idempotent — running it on an already-current config is a
@@ -170,17 +170,36 @@ fn migrate(p: &mut Persisted) {
             _ => {}
         }
     }
-    if p.config_version < 8 {
-        // v8 (DRAGON-355): the single "Automatically save & close on copy" toggle split into
-        // independent save-on-copy and close-on-copy. BOTH new settings inherit the old
-        // combined value, so on->on/on and off->off/off — the prior behaviour is unchanged
-        // until the user parts the two. The old key is a read-only `skip_serializing` field
-        // (see the schema) purely so its value is still readable here; this is the same
-        // deprecated-field + migrate pattern the v3 capture booleans used. New/absent keys
-        // deserialize to their `default_true`, so a config that predated even the combined
-        // key still lands on on/on.
-        p.preview_save_on_copy = p.preview_save_close_on_copy;
-        p.preview_close_on_copy = p.preview_save_close_on_copy;
+    // v8 (DRAGON-355) fanned the combined "Automatically save & close on copy" key out into
+    // `preview_save_on_copy` + `preview_close_on_copy`. DRAGON-467 deleted all three, so the
+    // hook has nothing left to write and is gone with them. The note stays because the shape
+    // is the lesson: a deprecated `skip_serializing` field plus a guarded hook is how a
+    // SPLIT is done here, and the v3 capture booleans are the other instance.
+    if p.config_version < 9 {
+        // v9 (DRAGON-467): the six share-automation keys retire with NOTHING carried
+        // forward, and that is the deliberate part.
+        //
+        // `preview_save_on_copy` / `preview_close_on_copy` / `preview_copy_on_delete` (and
+        // their three `preview_video_*` twins) each modified an ACTION that no longer behaves
+        // that way: Copy now copies the current state and nothing else, and Delete needs no
+        // courtesy copy because every capture reaches the clipboard the moment it is taken.
+        // There is no successor setting whose meaning is close enough to inherit a value.
+        //
+        // The tempting mapping is `preview_save_on_copy` -> `preview_save_originals`, on the
+        // grounds that both are about "do I want files on disk". It is REFUSED, and the
+        // asymmetry is why: both default ON, so the only value worth carrying is an OFF, and
+        // an OFF there meant "a Copy shouldn't also write the -edited sibling" while an OFF
+        // here means "don't write my captures to my folder at all". Carrying it would turn a
+        // narrow opt-out into captures that live only in the runtime directory — data the
+        // user thought was saved, quietly not. A migration may not invent that risk.
+        //
+        // Nothing to write, then: the old keys are absent from the schema, serde ignores
+        // unknown fields (no `deny_unknown_fields` on `Persisted`), and the three new keys
+        // per media kind take their `default_true`. That default reproduces today's
+        // observable behaviour for everything that survived — captures still auto-save, the
+        // unsaved-changes card still appears — so an upgrading user sees no jump. Same
+        // treatment as `recording_tray` (v5) and `allow_multiple`; pinned by
+        // `old_share_automation_keys_are_ignored_on_load`.
     }
     // Version-independent safety net: an empty id (hand-edited config) falls back
     // to the platform default rather than persisting as unset.
@@ -294,21 +313,24 @@ record_fps = 60\n";
         assert_eq!(d.text_confidence, 20.0);
         assert_eq!(d.region_overlay_opacity, 0.66);
         assert_eq!(d.record_fps, 30);
-        // DRAGON-353's preview-editor convenience toggles default ON (the settings-copy
-        // house style for "Automatically …" rows). DRAGON-355 split save-&-close into two,
-        // both still ON by default.
-        assert!(d.preview_save_on_copy);
-        assert!(d.preview_close_on_copy);
-        assert!(d.preview_copy_on_delete);
-        // DRAGON-420: the Video Editor group's three match the image defaults exactly, so an
-        // untouched install behaves as it did when video borrowed the image settings.
-        assert!(d.preview_video_save_on_copy);
-        assert!(d.preview_video_close_on_copy);
-        assert!(d.preview_video_copy_on_delete);
+        // DRAGON-467's preview-editor convenience toggles default ON (the settings-copy house
+        // style). `preview_save_originals` ON is also what keeps the upgrade invisible: it is
+        // the setting that decides whether a capture reaches the user's folder at all.
+        assert!(d.preview_copy_on_exit);
+        assert!(d.preview_save_originals);
+        assert!(d.preview_ask_to_save);
+        // The Video Editor group's three match the image defaults exactly, so an untouched
+        // install answers the same question the same way for both media kinds.
+        assert!(d.preview_video_copy_on_exit);
+        assert!(d.preview_video_save_originals);
+        assert!(d.preview_video_ask_to_save);
+        // DRAGON-478: the top bar's group captions ship ON — the labels are the point of the
+        // change, and OFF is the opt-out back to the historical chrome height.
+        assert!(d.preview_toolbar_labels);
         assert_eq!(d.record_res_preset, 5); // 2K
         assert_eq!(d.nvenc_preset, "p4");
         assert_eq!(d.x264_preset, "fast");
-        assert_eq!(d.config_version, 8);
+        assert_eq!(d.config_version, 9);
         // DRAGON-174: the new toolbar-hiding setting defaults OFF (do not hide).
         assert!(!d.hide_toolbar_fullscreen);
         // Residency defaults on where the global hotkey needs the daemon (macOS AND Windows,
@@ -669,94 +691,162 @@ record_fps = 60\n";
         assert_eq!(s3.inactive_border_color, [65, 69, 80, 255]);
     }
 
+    /// **ALL SIX preview-editor toggles default ON, on BOTH media kinds** (DRAGON-467, owner's
+    /// requirement). Its own test rather than a line in `fresh_defaults_use_serde`, because
+    /// the three ways a default can be stated have to AGREE and each can regress alone:
+    ///
+    /// 1. the `#[serde(default = …)]` attribute on the field, which is what an absent key
+    ///    deserializes to (an old config, or a hand-trimmed one);
+    /// 2. `defaults()`, which is what a fresh install gets AND what the settings page's
+    ///    per-row "reset to default" writes;
+    /// 3. an EMPTY document, which is the path `defaults()` itself takes.
+    ///
+    /// A regression in any one of them would silently flip a toggle off for some users and
+    /// not others, which is exactly the class of bug a single assertion site would miss.
     #[test]
-    fn migrate_v8_splits_save_close_on_copy_into_two_and_never_writes_the_old_key() {
-        // DRAGON-355: a pre-v8 config carries the combined `preview_save_close_on_copy`;
-        // both new independent settings inherit its value on the one-time migration, and the
-        // old key is never written back.
-        for old in [true, false] {
-            let s = format!("preview_save_close_on_copy = {old}\nconfig_version = 7\n");
-            let mut p: super::Persisted = toml::from_str(&s).expect("parse");
-            migrate(&mut p);
-            assert_eq!(p.config_version, CONFIG_VERSION);
-            assert_eq!(p.preview_save_on_copy, old, "save-on-copy inherits the combined value");
-            assert_eq!(p.preview_close_on_copy, old, "close-on-copy inherits the combined value");
+    fn every_preview_editor_toggle_defaults_on_for_both_media_kinds() {
+        // (2) and (3): the fresh-install path, and the empty document behind it.
+        let from_defaults = defaults();
+        let from_empty: super::Persisted =
+            toml::from_str("").expect("an empty config must parse to defaults");
+        // (1): a config that carries OTHER keys but none of these — an upgrading user.
+        let mut from_old: super::Persisted =
+            toml::from_str("record_fps = 60\nconfig_version = 8\n").expect("parse");
+        migrate(&mut from_old);
+
+        for (label, p) in [
+            ("defaults()", &from_defaults),
+            ("empty document", &from_empty),
+            ("upgraded config", &from_old),
+        ] {
+            // The named rows, image side then video side. Listed one per line on purpose: a
+            // field added to either group should look wrong here until it is answered for.
+            for (row, on) in [
+                ("image: automatically copy changes on exit", p.preview_copy_on_exit),
+                ("image: automatically save originals", p.preview_save_originals),
+                ("image: ask to save edited screenshots", p.preview_ask_to_save),
+                ("video: automatically copy changes on exit", p.preview_video_copy_on_exit),
+                ("video: automatically save originals", p.preview_video_save_originals),
+                ("video: ask to save edited videos", p.preview_video_ask_to_save),
+            ] {
+                assert!(on, "{label}: {row} must default ON");
+            }
         }
-        // A config that predated even the combined key (absent) still lands on on/on — the
-        // deprecated field's `default_true` feeds both.
-        let mut absent: super::Persisted =
-            toml::from_str("config_version = 7\n").expect("parse");
-        migrate(&mut absent);
-        assert!(absent.preview_save_on_copy && absent.preview_close_on_copy);
-        // The retired key must not reappear on disk.
-        let written = toml::to_string(&defaults()).expect("serialize");
-        assert!(!written.contains("preview_save_close_on_copy"), "got: {written}");
-        // A v8+ config is left ALONE — the split step never re-runs and clobbers a parted
-        // choice (save off, close on).
-        let mut current = defaults();
-        current.preview_save_on_copy = false;
-        current.preview_close_on_copy = true;
-        migrate(&mut current);
-        assert!(!current.preview_save_on_copy && current.preview_close_on_copy);
+        // And the three sources agree with each other, not merely with `true` — a future
+        // default that is deliberately changed has to be changed in ONE place.
+        assert_eq!(from_defaults.preview_save_originals, from_empty.preview_save_originals);
+        assert_eq!(
+            from_defaults.preview_video_save_originals,
+            from_empty.preview_video_save_originals
+        );
     }
 
     #[test]
-    fn video_editor_share_settings_are_independent_of_the_image_ones() {
-        // DRAGON-420: six SEPARATE persisted fields, not three shared ones. The regression
-        // this pins is a video row wired to an image field (or vice versa), which would look
-        // right in the settings window and silently move the wrong behaviour.
+    fn old_share_automation_keys_are_ignored_on_load() {
+        // DRAGON-467 v9: the six retired keys (and the pre-v8 combined one that fed two of
+        // them) must load without error and WITHOUT touching anything else. This is the whole
+        // migration story — nothing is carried forward, so the proof obligation is "an old
+        // config still works", not "a value moved".
+        let old = "\
+preview_save_close_on_copy = false\n\
+preview_save_on_copy = false\n\
+preview_close_on_copy = false\n\
+preview_copy_on_delete = false\n\
+preview_video_save_on_copy = false\n\
+preview_video_close_on_copy = false\n\
+preview_video_copy_on_delete = false\n\
+record_fps = 60\n\
+screenshot_dir = \"~/Shots\"\n\
+config_version = 8\n";
+        let mut p: super::Persisted =
+            toml::from_str(old).expect("a config carrying the retired keys must still parse");
+        migrate(&mut p);
+        assert_eq!(p.config_version, CONFIG_VERSION);
+        // Unrelated settings on the same file survive untouched.
+        assert_eq!(p.record_fps, 60);
+        assert_eq!(p.screenshot_dir, "~/Shots");
+        // The successors take their defaults. In particular a `preview_save_on_copy = false`
+        // does NOT become `preview_save_originals = false`: see the v9 note in `migrate` for
+        // why that tempting mapping would silently stop saving the user's captures.
+        assert!(p.preview_save_originals, "an OFF save-on-copy must not disable saving originals");
+        assert!(p.preview_copy_on_exit && p.preview_ask_to_save);
+        assert!(
+            p.preview_video_save_originals
+                && p.preview_video_copy_on_exit
+                && p.preview_video_ask_to_save
+        );
+        // And none of the retired keys comes back on the next write.
+        let written = toml::to_string(&p).expect("serialize");
+        for key in [
+            "preview_save_close_on_copy",
+            "preview_save_on_copy",
+            "preview_close_on_copy",
+            "preview_copy_on_delete",
+            "preview_video_save_on_copy",
+            "preview_video_close_on_copy",
+            "preview_video_copy_on_delete",
+        ] {
+            assert!(!written.contains(key), "retired key {key} reappeared: {written}");
+        }
+    }
+
+    #[test]
+    fn video_editor_preview_settings_are_independent_of_the_image_ones() {
+        // Six SEPARATE persisted fields, not three shared ones (the DRAGON-420 split, carried
+        // into DRAGON-467's rows). The regression this pins is a video row wired to an image
+        // field (or vice versa), which would look right in the settings window and silently
+        // move the wrong behaviour.
         //
-        // 1. An existing config that has never seen the video keys picks them up at their
-        //    defaults WITHOUT disturbing the image choices it does carry — no version bump,
-        //    no migrate hook, so absence has to be enough on its own.
+        // 1. A config that carries only the IMAGE keys picks the video ones up at their
+        //    defaults without disturbing it — absence has to be enough on its own.
         let mut p: super::Persisted = toml::from_str(
-            "preview_save_on_copy = false\npreview_close_on_copy = false\n\
-             preview_copy_on_delete = false\nconfig_version = 8\n",
+            "preview_copy_on_exit = false\npreview_save_originals = false\n\
+             preview_ask_to_save = false\nconfig_version = 9\n",
         )
         .expect("parse");
         migrate(&mut p);
-        assert!(!p.preview_save_on_copy && !p.preview_close_on_copy && !p.preview_copy_on_delete);
+        assert!(!p.preview_copy_on_exit && !p.preview_save_originals && !p.preview_ask_to_save);
         assert!(
-            p.preview_video_save_on_copy
-                && p.preview_video_close_on_copy
-                && p.preview_video_copy_on_delete,
+            p.preview_video_copy_on_exit
+                && p.preview_video_save_originals
+                && p.preview_video_ask_to_save,
             "absent video keys default ON regardless of the image choices"
         );
         // 2. And the reverse: video off, image untouched.
         let mut q: super::Persisted = toml::from_str(
-            "preview_video_save_on_copy = false\npreview_video_close_on_copy = false\n\
-             preview_video_copy_on_delete = false\nconfig_version = 8\n",
+            "preview_video_copy_on_exit = false\npreview_video_save_originals = false\n\
+             preview_video_ask_to_save = false\nconfig_version = 9\n",
         )
         .expect("parse");
         migrate(&mut q);
         assert!(
-            q.preview_save_on_copy && q.preview_close_on_copy && q.preview_copy_on_delete,
+            q.preview_copy_on_exit && q.preview_save_originals && q.preview_ask_to_save,
             "the image settings must not follow the video ones"
         );
         assert!(
-            !q.preview_video_save_on_copy
-                && !q.preview_video_close_on_copy
-                && !q.preview_video_copy_on_delete
+            !q.preview_video_copy_on_exit
+                && !q.preview_video_save_originals
+                && !q.preview_video_ask_to_save
         );
         // 3. A fully parted choice round-trips through the file: every one of the six is its
         //    own key on disk, so nothing collapses into a shared value on the next load.
         let mut parted = defaults();
-        parted.preview_save_on_copy = false;
-        parted.preview_close_on_copy = true;
-        parted.preview_copy_on_delete = false;
-        parted.preview_video_save_on_copy = true;
-        parted.preview_video_close_on_copy = false;
-        parted.preview_video_copy_on_delete = true;
+        parted.preview_copy_on_exit = false;
+        parted.preview_save_originals = true;
+        parted.preview_ask_to_save = false;
+        parted.preview_video_copy_on_exit = true;
+        parted.preview_video_save_originals = false;
+        parted.preview_video_ask_to_save = true;
         let s = toml::to_string(&parted).expect("serialize");
         let back: super::Persisted = toml::from_str(&s).expect("parse back");
         assert_eq!(
             (
-                back.preview_save_on_copy,
-                back.preview_close_on_copy,
-                back.preview_copy_on_delete,
-                back.preview_video_save_on_copy,
-                back.preview_video_close_on_copy,
-                back.preview_video_copy_on_delete,
+                back.preview_copy_on_exit,
+                back.preview_save_originals,
+                back.preview_ask_to_save,
+                back.preview_video_copy_on_exit,
+                back.preview_video_save_originals,
+                back.preview_video_ask_to_save,
             ),
             (false, true, false, true, false, true)
         );

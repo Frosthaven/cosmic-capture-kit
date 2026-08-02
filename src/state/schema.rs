@@ -167,6 +167,17 @@ pub struct Persisted {
     /// users keep whatever they saved; only a fresh install picks up the windowed default.
     #[serde(default = "default_true")]
     pub preview_windowed: bool,
+    /// Preview editor: draw the small CAPTION under each group of the top toolbar
+    /// ("Canvas", "Shape", "Redact", …). Default **on**. Settings → Preview Editor →
+    /// General → "Show toolbar group labels".
+    ///
+    /// It is a LAYOUT setting, not only a cosmetic one: the caption band makes the top bar
+    /// taller, so `PreviewSurface::chrome_h` reads this and answers differently for on and
+    /// off. Off returns the editor's geometry to exactly what it was before DRAGON-478 —
+    /// the open fit, the fit/zoom math and the overlay column all follow from that one
+    /// number, so there is nothing else to switch.
+    #[serde(default = "default_true")]
+    pub preview_toolbar_labels: bool,
     /// DRAGON-419: write the opt-in debug log. Default **OFF** — a support switch, not a
     /// feature. Settings → Health → Debug.
     ///
@@ -177,59 +188,63 @@ pub struct Persisted {
     /// Keep the name in step with the one-field struct in `diag::persisted_setting`.
     #[serde(default)]
     pub debug_logging: bool,
-    /// DEPRECATED (DRAGON-355): the combined "Automatically save & close on copy" toggle,
-    /// split into `preview_save_on_copy` + `preview_close_on_copy`. Kept as a read-only
-    /// field ONLY so `migrate` (config_version < 8) can seed BOTH new settings from its old
-    /// value on the first load of an old config — serde would otherwise drop the unknown key
-    /// and the user's choice with it. `skip_serializing`, so it is never written again; the
-    /// `default_true` matches the old default, so a pre-v8 config that predated even this key
-    /// still fans out to on/on (the historical behaviour). Never read outside `migrate`.
-    #[serde(default = "default_true", skip_serializing)]
-    pub preview_save_close_on_copy: bool,
-    /// Preview editor: a manual **Copy** first SAVES the document (through the normal
-    /// save-target rule — the `-edited` sibling, or an explicitly-chosen path). Default on.
-    /// Settings → Preview Editor → Image Editor. INDEPENDENT of `preview_close_on_copy`
-    /// since DRAGON-355 (the two were one "save & close on copy" toggle before).
+    // DRAGON-467 removed SIX fields from here, plus the deprecated seventh that fed two of
+    // them: `preview_save_on_copy`, `preview_close_on_copy`, `preview_copy_on_delete`, their
+    // three `preview_video_*` twins, and `preview_save_close_on_copy` (the pre-v8 combined
+    // toggle the v8 hook read). All three rules described ACTIONS that no longer work that
+    // way: a Copy no longer saves or closes anything (it copies the current state, full
+    // stop), and a Delete no longer needs a courtesy copy because the capture went on the
+    // clipboard the moment it was taken. The three rows below replace them per media kind.
+    // Removed rather than kept as deprecated read-only fields: there is nothing to translate
+    // into (see `store::migrate`'s v9 note, and `old_share_automation_keys_are_ignored_on_load`
+    // for the proof that an old config still loads with every other setting intact).
+    /// Preview editor: put the EDITED result on the clipboard when the editor closes.
+    /// Default on. Settings → Preview Editor → Image Editor.
     ///
-    /// Only the user's Copy ACTION is affected; the automatic copy the editor performs as
-    /// it OPENS never saves or closes (that would shut the editor the instant it appeared).
+    /// The capture itself already went on the clipboard when it was taken (DRAGON-467 made
+    /// that unconditional), so this is specifically about the EDITS: annotations, a crop, a
+    /// covermark. Without it the clipboard still holds the untouched grab after an edit
+    /// session, which is almost never what the user meant.
+    ///
+    /// Nothing is copied when the scene is clean — there would be no difference to carry.
     #[serde(default = "default_true")]
-    pub preview_save_on_copy: bool,
-    /// Preview editor: a manual **Copy** CLOSES the document once the clipboard has it (held
-    /// briefly so the copy toast can be read, the same hold as copy-on-delete, and aborted if
-    /// the copy fails). Default on. Settings → Preview Editor → Image Editor. INDEPENDENT of
-    /// `preview_save_on_copy` since DRAGON-355. With save OFF and close ON, a close over
-    /// UNSAVED edits raises the unsaved-changes dialog instead of dropping them silently.
+    pub preview_copy_on_exit: bool,
+    /// Write every screenshot into `screenshot_dir` as it is captured. Default on.
+    /// Settings → Preview Editor → Image Editor.
+    ///
+    /// OFF routes the capture through the session runtime directory instead
+    /// (`util::runtime_dir`), so nothing lands in the user's folder until they choose Save.
+    /// The editor still opens on it, the clipboard still gets it, and a Save still offers
+    /// `screenshot_dir` as its destination — the only difference is that an untouched
+    /// capture leaves no file behind.
     #[serde(default = "default_true")]
-    pub preview_close_on_copy: bool,
-    /// Preview editor: **Delete** first copies the media to the clipboard, so the pixels
-    /// survive the file. Default on. Settings → Preview Editor → Image Editor.
+    pub preview_save_originals: bool,
+    /// Ask before closing the image editor with edits that were never saved. Default on.
+    /// Settings → Preview Editor → Image Editor.
+    ///
+    /// This is the gate on the unsaved-changes card (`close_needs_confirmation`). OFF closes
+    /// straight away and the un-baked edits go with it — which is a reasonable choice
+    /// alongside `preview_copy_on_exit`, since the edited result still reaches the clipboard.
     #[serde(default = "default_true")]
-    pub preview_copy_on_delete: bool,
-    // DRAGON-420: the three rows above are the IMAGE editor's; the three below are the VIDEO
-    // editor's own copies of the same rules. They are separate FIELDS rather than one shared
-    // set because that separation is the whole feature — a recording is expensive to re-encode
-    // and slow to re-open, so a user who wants a screenshot to save-and-close on copy may well
-    // want a recording to stay put. `serde(default = "default_true")` throughout, matching the
-    // image defaults exactly (an absent key on an existing config therefore reproduces the
-    // pre-DRAGON-420 behaviour, where video read the image settings), so NO `config_version`
-    // bump and no migrate hook: there is nothing to translate.
-    /// Preview editor, VIDEO documents: a manual **Copy** saves the recording first, through
-    /// the same save-target rule as the image side. Default on. Settings → Preview Editor →
-    /// Video Editor. Independent of every `preview_*` image field (DRAGON-420).
+    pub preview_ask_to_save: bool,
+    // The three above are the IMAGE editor's; the three below are the VIDEO editor's own
+    // copies of the same rules (the DRAGON-420 split, carried forward). Separate FIELDS
+    // rather than one shared set because that separation is the whole feature: a recording is
+    // expensive to re-encode and slow to re-open, so a user may well want different answers
+    // per media kind.
+    /// Preview editor, VIDEO documents: put the edited recording on the clipboard when the
+    /// editor closes. Default on. Settings → Preview Editor → Video Editor.
     #[serde(default = "default_true")]
-    pub preview_video_save_on_copy: bool,
-    /// Preview editor, VIDEO documents: a manual **Copy** closes the recording once the
-    /// clipboard has it. Default on. Settings → Preview Editor → Video Editor. Independent of
-    /// `preview_video_save_on_copy` and of the image fields (DRAGON-420). With save OFF and
-    /// close ON, a close over unsaved edits raises the unsaved-changes dialog, exactly as on
-    /// the image side.
+    pub preview_video_copy_on_exit: bool,
+    /// Write every recording into `record_dir` as it is captured. Default on.
+    /// Settings → Preview Editor → Video Editor. OFF routes it through the session runtime
+    /// directory instead, exactly as `preview_save_originals` does for stills.
     #[serde(default = "default_true")]
-    pub preview_video_close_on_copy: bool,
-    /// Preview editor, VIDEO documents: **Delete** copies the recording to the clipboard
-    /// first. Default on. Settings → Preview Editor → Video Editor (DRAGON-420).
+    pub preview_video_save_originals: bool,
+    /// Ask before closing the video editor with cuts that were never saved. Default on.
+    /// Settings → Preview Editor → Video Editor.
     #[serde(default = "default_true")]
-    pub preview_video_copy_on_delete: bool,
+    pub preview_video_ask_to_save: bool,
     // DRAGON-353: `auto_close_preview` ("Automatically close the preview editor on save or
     // copy") lived here. NO share action closes the editor any more — Save / Save As / Copy
     // all keep the document open — so the setting had no behaviour left to name and a
@@ -547,7 +562,9 @@ pub struct Persisted {
     // save+copy+notify path still exists for a `--no-editor` launch (DRAGON-428, including
     // the daemon's "(no editor)" hotkeys) and for the cases where no editor CAN open (no
     // known output). DRAGON-451 retired the third user of it, the region "Copy selection"
-    // quick-action.
+    // quick-action; DRAGON-479 brought that user back — as a FIXED, non-configurable primary+C
+    // chord with no keymap entry and no settings row, so it is a third caller of the same
+    // preview-less delivery and still not a persisted setting.
     /// Pause other media players (via MPRIS) while a video preview with sound is playing,
     /// resuming them when it closes. Default on.
     #[serde(default = "default_true")]

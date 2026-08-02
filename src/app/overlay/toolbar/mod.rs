@@ -7,6 +7,26 @@ use layout::V_W;
 // (DRAGON-324): every glyph is bundled, so the old per-name "is it in the embedded set?"
 // workaround (`vendored_icon_handle`) is gone and resolution is platform-independent.
 
+/// The ACTIVE Region selector's tooltip (DRAGON-479): what the button does, plus the fixed
+/// region-copy chord that skips the editor entirely. The chord renders per platform —
+/// `"Ctrl+C"` on Linux and Windows, the symbolic `"⌘C"` on macOS — through
+/// [`crate::shortcuts::region_copy_chord_label`], the same `Shortcut` the key handler matches
+/// against, so the tooltip cannot advertise a chord the app does not listen for.
+///
+/// Memoized to a `&'static str` so the `tip` closure keeps its `&'static str` label type and
+/// this bar's other thirteen tooltips stay allocation-free borrows: `capture_button_layer`
+/// rebuilds on every frame.
+fn region_capture_tip() -> &'static str {
+    static TIP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TIP.get_or_init(|| {
+        format!(
+            "Capture this region (or press {} to copy the region without editing)",
+            crate::shortcuts::region_copy_chord_label(),
+        )
+    })
+    .as_str()
+}
+
 /// The timer/record chip's icon+text row — the shared shape behind the recording
 /// elapsed time, the countdown remaining time, and the idle delay readout (each a
 /// slightly different combination of the same pieces, formerly ~20 duplicated lines
@@ -66,6 +86,25 @@ impl App {
             return None;
         }
         let (rect, horizontal) = self.toolbar_layout(o)?;
+        // DRAGON-475: every idle-toolbar option carries a hover tooltip, opened into free
+        // space — the bar hugs different edges depending on anchor and drag, so the side
+        // is computed from the placed rect (`layout::tooltip_side`), never fixed.
+        // Suppressed while the delay menu's popover is open, for the same overlay
+        // layer-batching artifact that makes the preview editor drop tooltips under an
+        // open flyout (a tooltip drawn across the popover splits: text above it,
+        // backdrop below).
+        let tip_pos = {
+            let (ow, oh) = o.point_size();
+            layout::tooltip_side(horizontal, &rect, ow, oh)
+        };
+        let tips_off = self.delay_menu_open;
+        let tip = move |el: Element<'static, Msg>, label: &'static str| -> Element<'static, Msg> {
+            if tips_off {
+                el
+            } else {
+                widget::tooltip(el, widget::text(label).size(12), tip_pos).into()
+            }
+        };
         // During a countdown the chip counts down (cancel on click); during a
         // recording it's a record indicator (stop on click). Either way only the
         // chip group shows.
@@ -134,18 +173,31 @@ impl App {
             } else {
                 Some(Msg::Capture(CaptureMsg::SetMode(m)))
             };
-            // DRAGON-392 correction — the ACTIVE REGION selector is an "accept region" button, so
-            // it wears the SAME look as the preview editor's accept-crop button: the shared
-            // accent-filled segment style with the solid on-accent glyph
+            // DRAGON-392 correction — an ACTIVE selector whose press CAPTURES is an "accept"
+            // button, so it wears the SAME look as the preview editor's accept-crop button: the
+            // shared accent-filled segment style with the solid on-accent glyph
             // (`theme::segment_style`, the one source both go through — never a second copy of
-            // the accent values). Both confirm a rect the user actively dragged out.
+            // the accent values), and (DRAGON-475) the ACCEPT MARK rather than the mode glyph —
+            // lucide `check` (`emblem-ok-symbolic`, the same confirm glyph the countdown chip
+            // leads with). A button whose press means "take it" should not keep advertising the
+            // mode it belongs to; the INACTIVE selectors keep their mode glyphs, so the modes
+            // stay findable when not armed.
             //
-            // Scoped to REGION and only while it is the ACTIVE mode. Window and Monitor keep the
-            // plain selector look: there is no user-authored geometry to accept there — picking
-            // the target IS the action (the active Window selector is a literal no-op) — so
-            // dressing them as an accept would promise a confirmation step that doesn't exist.
-            let accept_region = active && m == Mode::Region;
-            if accept_region {
+            // That is REGION and MONITOR, the two whose active press captures (the region rect,
+            // or the monitor the toolbar sits on). Originally scoped to Region alone on the
+            // theory that only a user-authored rect is "accepted"; the owner overrode that in
+            // the DRAGON-475 review round — what earns the face is that the press CAPTURES, and
+            // an active Monitor press does. WINDOW alone keeps the plain selector look: its
+            // active press is a literal no-op (you capture by clicking a window), so an accept
+            // face there would promise a shutter that does not exist.
+            //
+            // DRAGON-475 review round 3: which left WINDOW with only `.selected(active)` to say
+            // it was armed, and the owner found that backdrop too weak to read. So the two marks
+            // now divide the job cleanly: the ACCEPT FACE means "pressing this captures", and the
+            // 1px ACCENT RING below means "this mode is armed" for the one selector whose active
+            // press does nothing. Nothing wears both, and nothing armed wears neither.
+            let accept = active && matches!(m, Mode::Region | Mode::Monitor);
+            if accept {
                 let seg_style = move |t: &cosmic::Theme, hovered: bool| {
                     // A standalone button, so BOTH outer corners round.
                     crate::app::theme::segment_style(t, true, hovered, true, true)
@@ -154,7 +206,7 @@ impl App {
                 // from the style above) colours the glyph, exactly as the kind pair does. An
                 // `Svg::Custom` accent class here would paint accent-on-accent — invisible.
                 return crate::widgets::arrow_cursor::arrow_cursor(
-                    widget::button::custom(mode_icon(name, false))
+                    widget::button::custom(mode_icon("emblem-ok-symbolic", false))
                         .class(cosmic::theme::Button::Custom {
                             active: Box::new(move |_, t| seg_style(t, false)),
                             disabled: Box::new(move |t| seg_style(t, false)),
@@ -169,14 +221,40 @@ impl App {
             // Natural padding keeps the icon at its proper size (forcing the height
             // scaled/clipped it); the width is fixed horizontally and fills when
             // stacked so the buttons share the group evenly.
-            crate::widgets::arrow_cursor::arrow_cursor(
+            //
+            // The ARMED ring (DRAGON-475 review round 3) is the toggle_btn idiom further down:
+            // the button inside a `widget::container` whose style is nothing but a 1px accent
+            // border at the button's own `xl` rounding, with NO padding — so the border draws
+            // INSIDE the container's bounds and the footprint is unchanged. `btn_width` moves to
+            // the CONTAINER and the button fills it, which keeps both layouts exact: horizontally
+            // that is a Fixed(40) box holding a fill-width button (identical to before), and in
+            // the STACKED layout the container is the `Fill` child the row distributes, so the
+            // three selectors still share the group evenly. (Only WINDOW ever reaches this branch
+            // with `active` true; an inactive Region/Monitor flows through here ring-free.)
+            let btn = crate::widgets::arrow_cursor::arrow_cursor(
                 widget::button::custom(mode_icon(name, true))
                     .selected(active)
                     .class(cosmic::theme::Button::Icon)
                     .on_press_maybe(msg)
-                    .width(btn_width)
+                    .width(if active { Length::Fill } else { btn_width })
                     .padding(BTN_PAD),
-            )
+            );
+            if !active {
+                return btn;
+            }
+            widget::container(btn)
+                .width(btn_width)
+                .class(cosmic::theme::Container::Custom(Box::new(|theme| {
+                    cosmic::iced::widget::container::Style {
+                        border: Border {
+                            radius: crate::app::theme::rounding(theme).xl.into(),
+                            width: 1.0,
+                            color: crate::app::theme::accent(theme),
+                        },
+                        ..Default::default()
+                    }
+                })))
+                .into()
         };
         // Photo/video: a SEGMENTED pair (one control, two joined halves) rather than
         // two free-standing buttons — the active half is filled accent with an
@@ -237,45 +315,59 @@ impl App {
                     .padding(BTN_PAD),
             )
         };
-        // The selector-group shell: background + rounding, shared by the mode group and
-        // (DRAGON-460) the scanner's refresh group that stands in its place. Extracted
-        // rather than copied so the two can never drift into looking different — the
-        // whole point of the refresh group is that it reads as one of these.
-        let group_class = || {
+        // The ONE group shell every toolbar group wears — the mode group, the scanner's
+        // refresh group that stands in its place (DRAGON-460), the kind+timer group, the
+        // audio toggles and the settings/close pair. Extracted rather than copied so they
+        // can never drift into looking different (this fn used to carry a second identical
+        // closure, `group_bg`, for the last three; DRAGON-475 folded them together).
+        //
+        // DRAGON-475: the style is the preview editor's tool-cluster chrome — the component
+        // base under a 1px `cluster_border` hairline — because the two toolbars are the
+        // same class of surface and the preview's is the newer design. Two deliberate
+        // deviations from `Tb::tool_cluster`: no frost (the overlay is a layer-shell /
+        // fullscreen surface, never frosted — DRAGON-217's rule), and the rounding keeps
+        // the overlay's own `GROUP_H_BASE` cap, because the STACKED kind+timer group is
+        // taller than wide and the preview's single-row clusters have no answer for it
+        // (byte-identical to plain `xl` for every short group).
+        let group_shell = || {
             cosmic::theme::Container::Custom(Box::new(|theme| {
                 let c = theme.cosmic();
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(c.background.component.base.into())),
                     border: Border {
-                        // The button token: groups round like the buttons they hold
-                        // (a capsule under the "round" preference). Capped at the group
-                        // half-height so it matches the stacked kind+timer group and
-                        // never over-rounds; byte-identical for this short group.
                         radius: crate::app::theme::rounding(theme)
                             .xl_capped(GROUP_H_BASE / 2.0)
                             .into(),
-                        ..Default::default()
+                        width: 1.0,
+                        color: crate::app::theme::cluster_border(theme),
                     },
                     ..Default::default()
                 }
             }))
         };
+        // Tooltip copy mirrors the shutter semantics `mode_btn` encodes: the ACTIVE Region
+        // and Monitor selectors capture on press, the active Window selector is a no-op
+        // (the windows themselves are the targets), and an inactive selector switches mode.
+        let region_active = self.mode == Mode::Region;
+        let window_active = self.mode == Mode::Window;
+        let monitor_active = self.mode == Mode::Monitor;
         let mode_group = widget::container(
             widget::row(vec![
-                mode_btn(
-                    "screenshot-selection-symbolic",
-                    Mode::Region,
-                    self.mode == Mode::Region,
+                tip(
+                    mode_btn("screenshot-selection-symbolic", Mode::Region, region_active),
+                    if region_active { region_capture_tip() } else { "Select a region" },
                 ),
-                mode_btn(
-                    "screenshot-window-symbolic",
-                    Mode::Window,
-                    self.mode == Mode::Window,
+                tip(
+                    mode_btn("screenshot-window-symbolic", Mode::Window, window_active),
+                    if window_active { "Click a window to capture it" } else { "Pick a window" },
                 ),
-                mode_btn(
-                    "screenshot-screen-symbolic",
-                    Mode::Monitor,
-                    self.mode == Mode::Monitor,
+                tip(
+                    mode_btn("screenshot-screen-symbolic", Mode::Monitor, monitor_active),
+                    if monitor_active {
+                        "Capture this monitor (or click on a monitor)"
+                    } else {
+                        "Pick a monitor"
+                    },
                 ),
             ])
             .spacing(2.0)
@@ -285,7 +377,7 @@ impl App {
         .width(group_width)
         .align_x(Alignment::Center)
         .padding(GROUP_PAD)
-        .class(group_class());
+        .class(group_shell());
 
         // DRAGON-460: the scanner's own selector group — a re-read of the screen, sitting
         // exactly where the region/window/monitor group sits in every other kind and
@@ -345,12 +437,16 @@ impl App {
         } else {
             mode_icon_btn("scan-refresh-symbolic", Msg::Capture(CaptureMsg::SetKind(Kind::Scanner)))
         };
+        // The tooltip stays on the disabled (mid-scan) face deliberately — same rule as the
+        // preview's disabled Share/Upload: a control that will not press is exactly the one
+        // a user hovers to ask why.
+        let refresh_btn = tip(refresh_btn, if scanning { "Scanning" } else { "Scan again" });
         let scan_group = widget::container(
             widget::row(vec![refresh_btn]).spacing(2.0).align_y(Alignment::Center),
         )
         .align_x(Alignment::Center)
         .padding(GROUP_PAD)
-        .class(group_class());
+        .class(group_shell());
 
         // DRAGON-460: the scan segment is a KIND selector again, and only that. It keeps
         // its glyph in every state and carries no hover tracking.
@@ -372,26 +468,34 @@ impl App {
 
         // Kind toggle: camera (image) | video. Recording isn't wired up yet, but
         // the toggle is live (mirrors the bottom toolbar).
+        // DRAGON-322: video is disabled while another instance is recording (only one
+        // recording at a time; still image capture stays available) — and its tooltip
+        // says so, since an inert-looking segment with no explanation reads as broken.
+        let video_allowed = crate::instance::video_capture_allowed(self.external_recording);
         let kind_pair: Element<'_, Msg> = widget::row(vec![
             // Scanner kind: captures as a photo, and the only kind QR/OCR runs in.
-            scan_seg,
-            kind_btn(
-                "camera-photo-symbolic",
-                self.kind == Kind::Image,
-                Msg::Capture(CaptureMsg::SetKind(Kind::Image)),
-                false,
-                false,
-                true,
+            tip(scan_seg, "Scan for codes and text"),
+            tip(
+                kind_btn(
+                    "camera-photo-symbolic",
+                    self.kind == Kind::Image,
+                    Msg::Capture(CaptureMsg::SetKind(Kind::Image)),
+                    false,
+                    false,
+                    true,
+                ),
+                "Photo",
             ),
-            kind_btn(
-                "camera-video-symbolic",
-                self.kind == Kind::Video,
-                Msg::Capture(CaptureMsg::SetKind(Kind::Video)),
-                false,
-                true,
-                // DRAGON-322: disabled while another instance is recording (only one
-                // recording at a time; still image capture stays available).
-                crate::instance::video_capture_allowed(self.external_recording),
+            tip(
+                kind_btn(
+                    "camera-video-symbolic",
+                    self.kind == Kind::Video,
+                    Msg::Capture(CaptureMsg::SetKind(Kind::Video)),
+                    false,
+                    true,
+                    video_allowed,
+                ),
+                if video_allowed { "Video" } else { "Video (another capture is recording)" },
             ),
         ])
         .spacing(0.0)
@@ -579,33 +683,17 @@ impl App {
                 .popup(menu)
                 .on_close(Msg::Capture(CaptureMsg::ToggleDelayMenu))
                 .into()
-        } else {
+        } else if active {
+            // Counting down / recording: the chip is the cancel / stop control and the
+            // idle tooltips are out of scope (DRAGON-475 covers the idle toolbar).
             chip.into()
+        } else {
+            tip(chip.into(), "Capture delay")
         };
 
-        // Shared rounded backdrop for a group of connected buttons — the button
-        // token, so groups round like the buttons they hold.
-        let group_bg = || {
-            cosmic::theme::Container::Custom(Box::new(|theme| {
-                let c = theme.cosmic();
-                cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(c.background.component.base.into())),
-                    border: Border {
-                        // Cap at the standard group half-height so the STACKED
-                        // kind+timer group (taller than wide once the delay chip
-                        // wraps below the kind trio) rounds like the horizontal
-                        // groups instead of ballooning into a blob under the
-                        // "round" preference. Byte-identical for every short group
-                        // (their clamp was already this value); see `xl_capped`.
-                        radius: crate::app::theme::rounding(theme)
-                            .xl_capped(GROUP_H_BASE / 2.0)
-                            .into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            }))
-        };
+        // (The second, identical group backdrop closure that lived here — `group_bg` —
+        // was folded into `group_shell` above in DRAGON-475, when both grew the preview
+        // editor's cluster border.)
 
         // Group 1: kind toggle + delay chip — but just the chip while counting
         // down. While recording, the pause/resume button leads the group, then
@@ -661,13 +749,22 @@ impl App {
         .width(group_width)
         .align_x(Alignment::Center)
         .padding(GROUP_PAD)
-        .class(group_bg());
+        .class(group_shell());
 
         // Group 4: settings + close.
         let util_group = widget::container(
             widget::row(vec![
-                action_btn("emblem-system-symbolic", Msg::WindowChrome(WindowChromeMsg::OpenGear)),
-                action_btn("window-close-symbolic", Msg::WindowChrome(WindowChromeMsg::Quit)),
+                tip(
+                    action_btn(
+                        "emblem-system-symbolic",
+                        Msg::WindowChrome(WindowChromeMsg::OpenGear),
+                    ),
+                    "Settings",
+                ),
+                tip(
+                    action_btn("window-close-symbolic", Msg::WindowChrome(WindowChromeMsg::Quit)),
+                    "Close",
+                ),
             ])
             .spacing(2.0)
             .width(row_width)
@@ -676,7 +773,7 @@ impl App {
         .width(group_width)
         .align_x(Alignment::Center)
         .padding(GROUP_PAD)
-        .class(group_bg());
+        .class(group_shell());
 
         // Toggle group: scanner + mic + system audio, toggleable in EVERY mode. One
         // unified palette carries state: On = accent (or white over the live meter
@@ -753,17 +850,25 @@ impl App {
         // Mic + speaker (the scanner is a kind segment now, not a toggle here). The
         // group only exists in video mode — audio has no effect on a photo/scan.
         let toggle_row: Vec<Element<'_, Msg>> = vec![
-            toggle_btn(
-                "audio-input-microphone-symbolic",
-                mic_on,
-                (!ptt).then(|| Msg::Recording(RecordingMsg::ToggleMic)),
-                mic_level,
+            tip(
+                toggle_btn(
+                    "audio-input-microphone-symbolic",
+                    mic_on,
+                    (!ptt).then(|| Msg::Recording(RecordingMsg::ToggleMic)),
+                    mic_level,
+                ),
+                // Push-to-talk mode makes the button a hold-only indicator, and the
+                // tooltip is where that stops being a mystery (the button takes no click).
+                if ptt { "Microphone (push to talk)" } else { "Microphone" },
             ),
-            toggle_btn(
-                "audio-volume-high-symbolic",
-                self.record_system_audio,
-                Some(Msg::Recording(RecordingMsg::ToggleSystemAudio)),
-                sys_level,
+            tip(
+                toggle_btn(
+                    "audio-volume-high-symbolic",
+                    self.record_system_audio,
+                    Some(Msg::Recording(RecordingMsg::ToggleSystemAudio)),
+                    sys_level,
+                ),
+                "System audio",
             ),
         ];
         let audio_group = widget::container(
@@ -775,7 +880,7 @@ impl App {
         .width(group_width)
         .align_x(Alignment::Center)
         .padding(GROUP_PAD)
-        .class(group_bg());
+        .class(group_shell());
 
         // Kind+timer, mode switcher, audio, [capture], then settings/close. The
         // capture button is only present when anchored to a region; the bottom

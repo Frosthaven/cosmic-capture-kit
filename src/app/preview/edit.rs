@@ -78,104 +78,105 @@ pub struct Covermark {
     pub opacity: f32,
 }
 
-/// What share action to run once a bake finishes.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ShareIntent {
-    /// Commit the edits to the document's save target (DRAGON-353: the `-edited` sibling,
-    /// or the explicitly-chosen path — see [`super::naming::save_target`]).
-    Save,
-    /// Bake to a THROWAWAY temp and put that on the clipboard, leaving the saved file
-    /// untouched (so copying never persists edits).
-    Copy,
-    /// SAVE to the document's save target, put the SAVED file on the clipboard, then close
-    /// the document — save-on-copy AND close-on-copy both on (DRAGON-355; the old combined
-    /// "save & close on copy"). One bake, not two: the clipboard gets the same bytes that
-    /// landed on disk.
-    SaveCopyClose,
-    /// SAVE to the document's save target and put the SAVED file on the clipboard, but do NOT
-    /// close — save-on-copy on, close-on-copy off (DRAGON-355). Like [`Save`](Self::Save)
-    /// followed by a copy of what it wrote; the editor stays open.
-    SaveCopy,
-    /// COPY the (baked) capture and then close the document, WITHOUT saving — close-on-copy
-    /// on, save-on-copy off (DRAGON-355). Bakes to a THROWAWAY temp like [`Copy`](Self::Copy)
-    /// so the saved file is left alone; the close is held (so the copy toast reads) and, over
-    /// UNSAVED edits, asks first rather than dropping them silently.
-    CopyClose,
-    /// Copy, then DELETE the document's file and close it — the "Copy to clipboard on
-    /// delete" setting's path. Always copies from a STAGED temp (see
-    /// `App::stage_clipboard_copy`) so unlinking the original can never strand the
-    /// clipboard worker.
-    CopyThenDelete,
-    /// Delete the document's file and close it, with no clipboard step — Delete with
-    /// "Automatically copy to clipboard on delete" turned off. Never baked: the user is discarding the
-    /// file, so committing edits into it first would be absurd.
-    Delete,
+// DRAGON-467 removed `ShareIntent` from here. It named which of save / copy / delete a
+// share was running, and once carried seven flavours, one per combination of the
+// "Automatically save on copy" / "close on copy" / "copy to clipboard on delete" settings.
+// Those settings went first, then Save moved to the destination picker
+// (`PreviewMsg::SaveAsResult`), then Delete left the editor entirely (user decision: "not
+// needed anymore" — with "Automatically save originals" off an unwanted capture never
+// reaches the user's folder, so closing IS the discard). One action was left, so the enum
+// said nothing and its callers now name the copy directly.
+
+/// What a copy-flavoured share owes the baker, given what the last bake already produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BakeNeed {
+    /// Nothing to render: the document is clean, so the file as it stands IS the answer.
+    None,
+    /// The last bake's artifact is EXACTLY this state — copy that instead of producing it
+    /// again.
+    Reuse,
+    /// Render it.
+    Fresh,
 }
 
-impl ShareIntent {
-    /// Whether this intent's bake targets a throwaway TEMP rather than the document's own
-    /// save path. The copy-only flavours do: the point of copying is to leave the saved
-    /// file alone. [`Self::SaveCopyClose`] does NOT — it is a real save whose result is
-    /// then copied.
-    pub fn bakes_to_temp(self) -> bool {
-        // A copy that does NOT save leaves the saved file alone by baking to a temp.
-        matches!(self, Self::Copy | Self::CopyThenDelete | Self::CopyClose)
+/// THE re-bake gate (DRAGON-467 review, major 4). Pure; unit-tested in `bake_need_tests`.
+///
+/// Without it, "Save, then Escape" ran the whole scene through the encoder a SECOND time
+/// (the exit copy), because `dirty()` stays true after a save by design — it asks "does an
+/// export have to re-encode?", and the answer is still yes for a scene that has annotations
+/// in it. For a still that is a wasted composite; for a recording it is a second full ffmpeg
+/// pass over the whole take, behind a spinner, on the way out of the editor.
+///
+/// `baked_at` is [`EditState::baked`]'s history position. Equal to the current `depth` means
+/// the artifact on disk was rendered from exactly the scene now on screen, so it can be
+/// served directly. Any edit moves `depth`, and [`EditState::push_op`] drops a marker that
+/// ends up on an abandoned redo branch, so a stale artifact can never be reused.
+pub fn bake_need(dirty: bool, depth: usize, baked_at: Option<usize>) -> BakeNeed {
+    if !dirty {
+        BakeNeed::None
+    } else if baked_at == Some(depth) {
+        BakeNeed::Reuse
+    } else {
+        BakeNeed::Fresh
     }
+}
 
-    /// Whether this intent WRITES the document's save target.
-    pub fn saves(self) -> bool {
-        matches!(self, Self::Save | Self::SaveCopyClose | Self::SaveCopy)
-    }
+/// Whether the clipboard ALREADY holds this exact state of the document (DRAGON-467 review,
+/// major 4). Pure; unit-tested in `bake_need_tests`.
+///
+/// The second half of the same economy: an explicit toolbar Copy followed by Escape must not
+/// copy twice. `copied_depth` is [`EditState::copied_depth`], set by every successful copy
+/// (including the automatic one the editor performs as it opens, which lands at depth 0).
+pub fn clipboard_is_current(copied_depth: Option<usize>, depth: usize) -> bool {
+    copied_depth == Some(depth)
+}
 
-    /// Whether this intent puts something on the clipboard.
-    pub fn copies(self) -> bool {
-        matches!(
-            self,
-            Self::Copy | Self::SaveCopyClose | Self::CopyThenDelete | Self::SaveCopy | Self::CopyClose
-        )
+/// What must happen BEFORE a bake whose destination is the document's own bake source
+/// (DRAGON-467 review, blocker 1). Pure; unit-tested in `bake_prep_tests`.
+///
+/// # The invariant this defends
+///
+/// Every bake reads PRISTINE media and composites the whole live scene onto it. That is what
+/// makes the editor non-destructive: `path` stays pinned to the untouched capture, the scene
+/// stays live on top, and the undo history survives a save. It also means a bake that reads
+/// ALREADY-BAKED bytes doubles every annotation, and for a recording re-applies the kept
+/// spans to a file the cut has already been taken out of.
+///
+/// Before DRAGON-467 that could not happen: a dirty Save wrote the `-edited` sibling, so the
+/// destination was never the source. With Save asking for a destination and pre-filling the
+/// overwrite target, saving in place is now the DEFAULT gesture, and the very next bake (an
+/// exit copy, a second save, the ask-card's Copy) would have read its own output.
+///
+/// The two media kinds get different answers because the cost is different:
+///
+/// * A STILL snapshots its pristine bytes into the runtime directory and permanently
+///   repoints the bake source at the snapshot. Cheap (one file copy of a few MB), and the
+///   scene stays fully editable after the save: undo, retouch, save again.
+/// * A RECORDING must not be copied, since a take can be multi-GB. It COMMITS instead: bake
+///   through a temp, rename over the destination, then repoint the document at the result
+///   and RESET the scene, because the file now IS the edit. The undo history goes with it,
+///   which is why the user is told.
+pub fn bake_prep(dest_is_source: bool, is_video: bool) -> BakePrep {
+    if !dest_is_source {
+        BakePrep::Direct
+    } else if is_video {
+        BakePrep::CommitVideo
+    } else {
+        BakePrep::SnapshotStill
     }
+}
 
-    /// Whether this intent DELETES the document's file.
-    pub fn deletes(self) -> bool {
-        matches!(self, Self::CopyThenDelete | Self::Delete)
-    }
-
-    /// Whether this intent owes a BAKE before it can run, given the document's `dirty`
-    /// (any pending scene: covermark / annotations / deleted timeline content) and `unsaved`
-    /// (the history has moved past the last save) state. The pure decision behind
-    /// [`super::super::App::begin_bake`]'s single-flight kickoff:
-    ///
-    /// * A COPY-to-temp flavour (plain [`Copy`](Self::Copy), [`CopyClose`](Self::CopyClose),
-    ///   or [`CopyThenDelete`], all
-    ///   [`bakes_to_temp`](Self::bakes_to_temp)) bakes whenever the document is `dirty` — the
-    ///   throwaway temp does not exist yet, so ANY scene content needs rendering onto it.
-    ///   This is what makes copy-on-delete put the EDITED picture on the clipboard rather
-    ///   than the untouched base (DRAGON-352).
-    /// * A SAVING flavour bakes only when `dirty && unsaved`: standing on its own save point
-    ///   would re-encode identical pixels for nothing (the clean-save no-op).
-    /// * A plain [`Delete`](Self::Delete) NEVER bakes — nobody reads the output and the
-    ///   source is about to be unlinked, so it would be pure waste.
-    pub fn owes_bake(self, dirty: bool, unsaved: bool) -> bool {
-        if self.bakes_to_temp() {
-            dirty
-        } else if self.saves() {
-            dirty && unsaved
-        } else {
-            false
-        }
-    }
-
-    /// Whether the document CLOSES once this intent completes. DRAGON-353 removed every
-    /// unconditional auto-close — a plain Save / Save As / Copy leaves you in the editor —
-    /// so only the SETTINGS-driven flavours close: the close-on-copy ones because the user
-    /// asked for it, delete because there is no file left to edit. [`SaveCopy`](Self::SaveCopy)
-    /// (save-on-copy WITHOUT close-on-copy, DRAGON-355) deliberately does NOT close.
-    pub fn closes_document(self) -> bool {
-        matches!(
-            self,
-            Self::SaveCopyClose | Self::CopyClose | Self::CopyThenDelete | Self::Delete
-        )
-    }
+/// The answers [`bake_prep`] gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BakePrep {
+    /// The destination is a different file: bake straight to it, nothing to protect.
+    Direct,
+    /// A STILL saving over its own source: snapshot the pristine bytes aside first and
+    /// repoint the bake source at the snapshot.
+    SnapshotStill,
+    /// A RECORDING saving over its own source: bake through a temp, rename over the
+    /// destination, then commit-and-reset.
+    CommitVideo,
 }
 
 /// The covermark picker's entries while open (a dropdown under the covermark button). The
@@ -516,11 +517,33 @@ pub struct EditState {
     pub flyout: Option<FlyoutNav>,
     /// A bake (export re-encode) is in flight; share/delete inputs are held off.
     pub baking: bool,
-    /// The share action to run when the in-flight bake completes.
-    pub pending: Option<ShareIntent>,
-    /// The file the in-flight bake writes (the capture itself for Save/SaveAs; a
-    /// throwaway temp for Copy, so copying never persists edits to the saved file).
+    // DRAGON-467: `pending: Option<ShareIntent>` lived here, naming which action the
+    // in-flight bake was for. Copy was the one action left then; the share sheet
+    // (DRAGON-474) made it two again, and `bake_for_share` below is the difference that
+    // remains — a full intent enum is still not warranted for one bit.
+    /// The file the in-flight bake writes (the save destination for a Save; a throwaway temp
+    /// for a Copy, so copying never persists edits to a file on disk).
     pub pending_output: Option<PathBuf>,
+    /// The in-flight bake's artifact is for the SHARE SHEET, not the clipboard
+    /// (DRAGON-474). Set by `run_share_sheet` when its bake starts, taken by `BakeDone` to
+    /// pick the completion seam; meaningless while `baking` is false. Defaults to `false`
+    /// so every historical bake path keeps meaning "copy".
+    pub bake_for_share: bool,
+    /// The LAST completed bake: where it sits in the history, and the file it wrote
+    /// (DRAGON-467 review, major 4). `None` = nothing baked yet, or the artifact ended up on
+    /// an abandoned redo branch.
+    ///
+    /// Read by [`bake_need`] so a share standing on exactly this state serves the artifact
+    /// instead of rendering it again — which is what stops "Save, then Escape" from running
+    /// a second full encode. Maintained beside `saved_depth` in [`Self::push_op`].
+    pub baked: Option<(usize, PathBuf)>,
+    /// Where the bytes currently ON THE CLIPBOARD sit in the history (DRAGON-467 review,
+    /// major 4), or `None` when nothing of this document has been copied.
+    ///
+    /// Set by every successful copy, including the automatic one the editor performs as it
+    /// opens (which lands at depth 0). Read by [`clipboard_is_current`], so an explicit Copy
+    /// followed by Escape does not copy the same bytes twice.
+    pub copied_depth: Option<usize>,
     /// The document was asked to CLOSE with unsaved edits (DRAGON-353): show the modal
     /// "you have unsaved changes" card instead of closing. Cleared by every button on it.
     /// Replaces the old `confirm_overwrite` flag — Save no longer overwrites ANY original
@@ -799,8 +822,53 @@ impl EditState {
         if self.saved_depth.is_some_and(|d| d > self.undo_stack.len()) {
             self.saved_depth = None;
         }
+        // The same treatment for the two DRAGON-467 markers, and for the same reason: a
+        // baked artifact or a clipboard write that lived on the abandoned branch describes a
+        // state no amount of redo can reach again, so reusing either would serve the wrong
+        // pixels. The equality checks in `bake_need` / `clipboard_is_current` handle every
+        // other move on their own, because any push changes the depth.
+        if self.baked.as_ref().is_some_and(|(d, _)| *d > self.undo_stack.len()) {
+            self.baked = None;
+        }
+        if self.copied_depth.is_some_and(|d| d > self.undo_stack.len()) {
+            self.copied_depth = None;
+        }
         self.undo_stack.push(op);
         self.redo_stack.clear();
+    }
+
+    /// Record the artifact a bake just wrote, at the history position it was rendered from.
+    /// Called from the two bake completions (`BakeDone`, `SaveAsBaked`).
+    pub fn mark_baked(&mut self, path: &std::path::Path) {
+        self.baked = Some((self.undo_stack.len(), path.to_path_buf()));
+    }
+
+    /// Record that the CURRENT state reached the clipboard. Called from the one place a copy
+    /// outcome is known to be good, so the open-time auto-copy and the explicit Copy both
+    /// count.
+    pub fn mark_copied(&mut self) {
+        self.copied_depth = Some(self.undo_stack.len());
+    }
+
+    /// Forget the scene entirely, because the FILE now holds it (DRAGON-467 review, blocker
+    /// 1 — the video commit-and-reset). Everything the bake burned in goes: the covermark,
+    /// the annotations, the dim, the crop, and the whole undo/redo history, since none of it
+    /// can be undone out of a file that has already been rewritten.
+    ///
+    /// The document is clean afterwards by construction: an empty history at depth 0 with an
+    /// empty scene. The caller re-probes the committed file (the video timeline lives on
+    /// `VideoPreview`, not here) and tells the user what happened.
+    pub fn reset_after_commit(&mut self) {
+        self.covermark = None;
+        self.annotations.clear();
+        self.dim = 0.0;
+        self.crop = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.saved_depth = Some(0);
+        self.baked = None;
+        self.copied_depth = None;
+        self.sel.clear();
     }
 
     /// The PRIMARY selected annotation (DRAGON-341) — what the single-item operations (resize,
@@ -3336,5 +3404,172 @@ mod tests {
         assert!(!is_png_file(&other.0));
         assert!(save_unedited_still(&other.0, &dst2.0).is_err(), "a mislabeled source must not be copied");
         assert!(!dst2.0.exists(), "a refused save writes nothing");
+    }
+}
+
+#[cfg(test)]
+mod bake_need_tests {
+    use super::{BakeNeed, EditState, bake_need, clipboard_is_current};
+
+    /// The depth a marker records, for readability at the call sites below.
+    fn baked_at(e: &EditState) -> Option<usize> {
+        e.baked.as_ref().map(|(d, _)| *d)
+    }
+
+    /// THE re-bake gate (DRAGON-467 review, major 4). A clean document needs nothing; a dirty
+    /// one standing on its last bake serves that artifact; anything else renders.
+    #[test]
+    fn a_share_standing_on_its_last_bake_reuses_the_artifact() {
+        // Clean: the file as it stands IS the answer, whatever was baked before.
+        for baked in [None, Some(0), Some(3)] {
+            assert_eq!(bake_need(false, 3, baked), BakeNeed::None, "{baked:?}");
+        }
+        // Dirty, and the artifact was rendered from exactly this state.
+        assert_eq!(bake_need(true, 3, Some(3)), BakeNeed::Reuse);
+        // Dirty, and it was not — either nothing has been baked, or the scene moved since.
+        assert_eq!(bake_need(true, 3, None), BakeNeed::Fresh);
+        assert_eq!(bake_need(true, 3, Some(2)), BakeNeed::Fresh, "an edit since the bake");
+        assert_eq!(bake_need(true, 2, Some(3)), BakeNeed::Fresh, "an undo since the bake");
+    }
+
+    /// THE double-copy gate: the clipboard already holding this exact state means the exit
+    /// copy has nothing to add.
+    #[test]
+    fn the_clipboard_is_current_only_at_the_depth_it_was_written_from() {
+        assert!(clipboard_is_current(Some(2), 2));
+        assert!(!clipboard_is_current(Some(2), 3), "an edit since the copy");
+        assert!(!clipboard_is_current(Some(3), 2), "an undo since the copy");
+        assert!(!clipboard_is_current(None, 0), "nothing copied yet is never current");
+    }
+
+    /// THE LIFE CYCLE the two gates exist for, walked end to end on a real `EditState`.
+    ///
+    /// Open (auto-copy at depth 0) -> annotate -> Save -> Escape. The exit copy must REUSE
+    /// the save's own artifact rather than running a second full render, which for a
+    /// recording is a second ffmpeg pass over the whole take.
+    #[test]
+    fn save_then_exit_reuses_the_saves_artifact_instead_of_re_baking() {
+        let mut e = EditState::default();
+        // The editor's open-time automatic copy, of the untouched capture.
+        e.mark_copied();
+        assert!(clipboard_is_current(e.copied_depth, e.undo_stack.len()));
+        // The user annotates. The clipboard is now stale, and nothing is baked.
+        e.push_dim(0.0);
+        e.dim = 0.5;
+        let depth = e.undo_stack.len();
+        assert_eq!(depth, 1, "one edit, one history entry");
+        assert!(!clipboard_is_current(e.copied_depth, depth), "the copy is stale now");
+        assert_eq!(bake_need(true, depth, baked_at(&e)), BakeNeed::Fresh);
+        // Save: the bake writes the destination and the document adopts it.
+        e.mark_baked(std::path::Path::new("/home/me/Capture/shot.png"));
+        e.mark_saved();
+        // Escape, with copy-on-exit ON. The scene is still dirty (that is what `dirty()`
+        // means), but the artifact on disk IS this state, so no second render.
+        assert_eq!(
+            bake_need(true, e.undo_stack.len(), baked_at(&e)),
+            BakeNeed::Reuse,
+            "the exit copy must serve the file the save just wrote"
+        );
+        // And the copy DOES happen, because the clipboard still holds the untouched capture.
+        assert!(!clipboard_is_current(e.copied_depth, e.undo_stack.len()));
+        // Once it lands, a second Escape would add nothing.
+        e.mark_copied();
+        assert!(clipboard_is_current(e.copied_depth, e.undo_stack.len()));
+    }
+
+    /// An explicit toolbar Copy followed by Escape with no edits between must not copy twice.
+    #[test]
+    fn an_explicit_copy_then_exit_does_not_copy_twice() {
+        let mut e = EditState::default();
+        e.push_dim(0.0);
+        e.dim = 0.5;
+        e.mark_baked(std::path::Path::new("/run/user/1000/cck-copy.png"));
+        e.mark_copied();
+        assert!(
+            clipboard_is_current(e.copied_depth, e.undo_stack.len()),
+            "the exit copy has nothing to add"
+        );
+        // One more edit and both gates re-arm.
+        e.push_dim(0.5);
+        e.dim = 0.7;
+        let depth = e.undo_stack.len();
+        assert!(!clipboard_is_current(e.copied_depth, depth));
+        assert_eq!(bake_need(true, depth, baked_at(&e)), BakeNeed::Fresh);
+    }
+
+    /// An artifact (or a clipboard write) stranded on an ABANDONED redo branch is dropped, so
+    /// it can never be served for a state no amount of redo can reach. Same rule, same place
+    /// and same reason as `saved_depth` (see `push_op`).
+    #[test]
+    fn an_abandoned_branch_drops_both_markers() {
+        let mut e = EditState::default();
+        e.push_dim(0.0);
+        e.dim = 0.3;
+        e.push_dim(0.3);
+        e.dim = 0.6;
+        e.mark_baked(std::path::Path::new("/tmp/a.png"));
+        e.mark_copied();
+        assert_eq!(baked_at(&e), Some(2));
+        assert_eq!(e.copied_depth, Some(2));
+        // Undo one, then edit down a DIFFERENT branch: the old depth 2 is unreachable.
+        e.undo(None);
+        e.push_annotations(Vec::new());
+        assert_eq!(e.undo_stack.len(), 2, "back at depth 2, but a different depth 2");
+        assert!(e.baked.is_none(), "the stale artifact must not be reusable");
+        assert!(e.copied_depth.is_none(), "and the clipboard is not current either");
+    }
+
+    /// The video COMMIT (DRAGON-467 review, blocker 1) leaves a genuinely clean document:
+    /// nothing in the scene, no history, and neither marker able to serve stale bytes.
+    #[test]
+    fn a_commit_reset_leaves_nothing_behind() {
+        let mut e = EditState::default();
+        e.push_dim(0.0);
+        e.dim = 0.5;
+        e.mark_baked(std::path::Path::new("/rec/take.mp4"));
+        e.mark_copied();
+
+        e.reset_after_commit();
+        assert_eq!(e.undo_stack.len(), 0);
+        assert!(!e.can_undo() && !e.can_redo(), "the history cannot outlive the file it described");
+        assert!(!e.dirty(), "the file IS the edit now");
+        assert!(e.baked.is_none() && e.copied_depth.is_none());
+        assert_eq!(e.dim, 0.0);
+        assert!(e.covermark.is_none() && e.annotations.is_empty() && e.crop.is_none());
+        // Standing on the save point, so an immediate Escape asks nothing.
+        assert!(!super::unsaved_at(e.saved_depth, e.undo_stack.len(), e.dirty()));
+    }
+}
+
+#[cfg(test)]
+mod bake_prep_tests {
+    use super::{BakePrep, bake_prep};
+
+    /// THE pristine-source invariant (DRAGON-467 review, blocker 1): a bake whose destination
+    /// IS its source has to be prepared for, and the two media kinds are prepared differently
+    /// because copying a multi-GB take is not an option.
+    #[test]
+    fn saving_over_the_source_is_prepared_for_per_media_kind() {
+        // A different destination needs nothing at all, for either kind.
+        for is_video in [true, false] {
+            assert_eq!(bake_prep(false, is_video), BakePrep::Direct, "is_video={is_video}");
+        }
+        // Saving in place: a still snapshots aside, a recording commits and resets.
+        assert_eq!(bake_prep(true, false), BakePrep::SnapshotStill);
+        assert_eq!(bake_prep(true, true), BakePrep::CommitVideo);
+    }
+
+    /// The forbidden outcome, stated as a property: NO combination answers `Direct` when the
+    /// destination is the source. A `Direct` there is a bake reading its own output, which is
+    /// doubled annotations for a still and a re-applied cut for a recording.
+    #[test]
+    fn no_in_place_bake_is_ever_left_unprepared() {
+        for is_video in [true, false] {
+            assert_ne!(
+                bake_prep(true, is_video),
+                BakePrep::Direct,
+                "an in-place bake (is_video={is_video}) must never read its own output"
+            );
+        }
     }
 }

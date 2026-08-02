@@ -46,6 +46,11 @@ mod pen_stroke;
 // renderers role `pen_stroke` plays for the pencil, and for the same reason: the live canvas
 // and the full-resolution bake must build the badge from ONE set of pure functions.
 mod badge;
+// The arrow's curve geometry (DRAGON-470) — the third, bend handle's model plus every quantity
+// derived from it (control point, end tangents, arc length, hit polyline, bounds). Same shared
+// role again: the live canvas and the full-resolution bake must draw ONE parabola, so neither
+// owns the maths.
+mod arrow_curve;
 mod platform;
 mod widgets;
 mod encode;
@@ -140,6 +145,19 @@ mod daemon_ipc;
 // `daemon_ipc`'s sibling, same runtime-dir/plain-words conventions.
 #[path = "platform/preview_ipc.rs"]
 mod preview_ipc;
+// The REGION / MONITOR half of the capture-extras behaviour matrix (DRAGON-463). One
+// shared test module, deliberately not per-platform: `crate::screenshot` is a `#[path]`
+// mount and `region_windows_frozen` has the same signature everywhere, so these rows
+// assert real output PIXELS against whichever implementation the host platform ships.
+// Gated to the three real platforms because the `screenshot` mount only exists there.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+mod region_matrix_tests;
+// The SINGLE-WINDOW half of the same matrix (DRAGON-463). It drives the shared
+// `decoration` seam directly (decorate / backdrop_for / apply_backdrop / cursor_offset),
+// which every platform now assembles its window capture from, so one module covers all of
+// them and a new compositor RUNS these rows rather than rewriting them.
+#[cfg(test)]
+mod decoration_matrix_tests;
 
 /// Install a macOS crash logger: chain a panic hook that appends the panic
 /// message + a backtrace to `~/Library/Logs/cosmic-capture-kit/panic.log`
@@ -904,7 +922,9 @@ fn main() -> cosmic::iced::Result {
             // with a literal `resident` argument (daemon-intent: keep the restart-
             // handoff lock retry); a truly bare launch is the global hotkey asking
             // to capture (single lock attempt, signal the live daemon immediately).
-            let daemon_intent = args.iter().any(|a| a == "resident");
+            // DRAGON-465 moved the rule itself into `instance` so every launcher that
+            // spawns this binary reads the same one; the answer here is unchanged.
+            let daemon_intent = instance::daemon_intent_from_args(&args);
             // DRAGON-419: re-tag this pid's lines as the resident (see the mac branch).
             diag::mark_component(diag::Component::Daemon);
             daemon_linux::run(daemon_intent); // never returns — runs the tray loop or exits
@@ -952,7 +972,10 @@ fn main() -> cosmic::iced::Result {
             // argument (daemon-intent — keep the restart-handoff lock retry); a truly bare
             // launch is the user asking to CAPTURE (one lock attempt, then hand the request
             // to the live daemon).
-            let daemon_intent = args.iter().any(|a| a == "resident");
+            // DRAGON-465: the rule now lives in `instance`, because a launcher that gets it
+            // wrong asks for a capture without meaning to — which is exactly what the
+            // post-update relaunch was doing (see `update::post_update_relaunch_args`).
+            let daemon_intent = instance::daemon_intent_from_args(&args);
             // DRAGON-438: THE choke point. Either we become the daemon, or a live daemon
             // acknowledged taking this capture (and `claim_or_signal` exited), or we fall
             // through below to a one-shot capture. What used to happen instead was a silent

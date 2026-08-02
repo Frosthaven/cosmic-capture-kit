@@ -195,7 +195,7 @@ impl App {
     /// Sharing the exact chrome with [`windowed_fit_size`] is what lets a windowed
     /// preview open media-tight with no dead bands above/below the picture.
     pub(super) fn preview_content_height(&self, preview: &PreviewState) -> f32 {
-        (preview.monitor.1 as f32 - preview.surface.chrome_h()).max(1.0)
+        (preview.monitor.1 as f32 - preview.surface.chrome_h(self.preview_toolbar_labels)).max(1.0)
     }
 
     /// The fraction of native (PHYSICAL-pixel) size the picture is displayed at when FIT
