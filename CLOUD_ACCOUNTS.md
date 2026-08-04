@@ -86,8 +86,8 @@ appears after you connect an account, and the gear button on the account's row
 afterwards, is a small folder manager for it:
 
 - **Where you are is where your captures go.** The path above the list names the
-  folder you are looking inside, and the tick beside it means this account
-  uploads there. There is nothing separate to select.
+  folder you are looking inside, and that is where this account uploads. There
+  is nothing separate to select.
 - The list shows what is inside that folder. Click a folder to go into it, which
   also makes it the destination, and click any part of the path to come back out,
   which moves the destination back out with you.

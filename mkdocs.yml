@@ -28,6 +28,16 @@ edit_uri: "edit/main/site-src/"
 
 docs_dir: "site-src"
 
+# MkDocs drops dot-paths from the output by default, which is right for the
+# `.pages` nav files but wrong for `.well-known/`: Microsoft's publisher-domain
+# check needs `/.well-known/microsoft-identity-association.json` served at the
+# site root. Keep the default dot exclusion, then re-include exactly that
+# directory (gitignore semantics: the negation unignores the directory, and its
+# contents carry no leading dot, so nothing else about the default changes).
+exclude_docs: |
+  .*
+  !.well-known
+
 # `mkdocs serve` only watches docs_dir, so the two included root files are
 # added by hand. Without this, editing CLI.md during a local preview would not
 # reload the page that includes it.
@@ -86,6 +96,11 @@ theme:
   features:
     - content.code.copy
     - content.code.select
+    # navigation.instant works WITH the chrome-less splash only because the
+    # splash keeps the header/tabs/footer in its DOM and hides them with the
+    # `body:has(.cck-space)` rules in custom.css. If the splash template ever
+    # goes back to EMPTYING those blocks, the instant swap will carry the
+    # chrome-less DOM into every docs page again; see site-overrides/home.html.
     - navigation.instant
     - navigation.instant.progress
     - navigation.tracking

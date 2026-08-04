@@ -1062,6 +1062,9 @@ struct TokenResponse {
     scope: Option<String>,
     token_type: Option<String>,
     error: Option<String>,
+    /// The provider's own text for the failure. Never shown to the user (see
+    /// [`token_error_message`]); read only by [`oauth_error_fields`] for the debug log.
+    error_description: Option<String>,
 }
 
 /// Turn a token endpoint body into a [`TokenSet`]. Pure; unit-tested.
@@ -1128,7 +1131,42 @@ pub fn token_error_message(error: &str) -> String {
         "unauthorized_client" => {
             "The cloud service will not allow this app to sign in this way.".to_string()
         }
+        // The last two of RFC 6749 section 5.2's token-endpoint error set. Both mean the
+        // REQUEST was wrong, not the account, so reconnecting cannot fix them: they point at
+        // an app bug (a malformed body, or asking for a grant type the endpoint does not
+        // serve), which is why neither is a reconnect.
+        "invalid_request" => {
+            "This app sent a sign-in request the cloud service could not accept.".to_string()
+        }
+        "unsupported_grant_type" => {
+            "The cloud service does not support the sign-in method this app used.".to_string()
+        }
+        // Google-specific, not in RFC 6749: its OAuth servers return HTTP 403 with this code
+        // when an app exceeds its authorization or token grant rate limits (see Google's
+        // "OAuth Application Rate Limits", support.google.com/cloud/answer/9028764). It is
+        // transient, so the user can retry, and it is NOT a reconnect.
+        "rate_limit_exceeded" => {
+            "The cloud service is receiving too many sign-in attempts. Wait a little while, then \
+             try again."
+                .to_string()
+        }
         _ => "The cloud service refused the sign-in.".to_string(),
+    }
+}
+
+/// The `error` and `error_description` fields of a failed token response, for the debug log.
+/// Pure; unit-tested.
+///
+/// Both are PROTOCOL detail, never user content: the code names WHY the provider refused
+/// (`invalid_grant`, `rate_limit_exceeded`, ...) and the description is the provider's own
+/// developer-facing text about THIS app's OAuth request. Neither says anything about what the
+/// user captured, so both are safe for the debug log (the description is still never shown to
+/// the USER; see [`token_error_message`]). A body that is not JSON, or carries no `error`,
+/// yields `(None, None)`.
+pub fn oauth_error_fields(body: &str) -> (Option<String>, Option<String>) {
+    match serde_json::from_str::<TokenResponse>(body) {
+        Ok(parsed) => (parsed.error, parsed.error_description),
+        Err(_) => (None, None),
     }
 }
 
@@ -1146,12 +1184,29 @@ fn post_token(token_url: &str, form: &[(&str, &str)]) -> Result<super::http::Cur
     req.send()
 }
 
+/// Append a `client_secret` form field only when there is one to send. Pure; unit-tested.
+///
+/// Shared by every token-endpoint call that needs it: [`exchange_code`] (the initial
+/// authorization_code exchange) and [`ensure_fresh`]'s refresh call. Google's "Desktop app"
+/// client type requires `client_secret` on EVERY call for that client, not only the initial
+/// exchange; the refresh call went without it for a while, which made every refresh fail with
+/// `invalid_request` the first time an access token actually expired (about an hour in). A
+/// provider with no `client_secret_env` (Microsoft, Dropbox) passes `None` here and the form
+/// is unchanged, which is what keeps their requests byte-identical.
+fn with_client_secret<'a>(
+    mut form: Vec<(&'a str, &'a str)>,
+    secret: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    if let Some(secret) = secret {
+        form.push(("client_secret", secret));
+    }
+    form
+}
+
 /// Exchange an authorization code for tokens.
 ///
 /// `client_secret` is `Some` only for a provider whose native client type issues one
-/// (Google's "Desktop app" type; see [`AuthKind::OAuthPkce::client_secret_env`]'s doc). `None`
-/// sends the request exactly as before this parameter existed: no `client_secret` field at
-/// all, which is what keeps Microsoft's and Dropbox's public-client exchange byte-identical.
+/// (Google's "Desktop app" type; see [`AuthKind::OAuthPkce::client_secret_env`]'s doc).
 fn exchange_code(
     token_url: &str,
     client_id: &str,
@@ -1160,16 +1215,16 @@ fn exchange_code(
     verifier: &str,
     redirect_uri: &str,
 ) -> Result<TokenSet, String> {
-    let mut form = vec![
-        ("grant_type", "authorization_code"),
-        ("client_id", client_id),
-        ("code", code),
-        ("code_verifier", verifier),
-        ("redirect_uri", redirect_uri),
-    ];
-    if let Some(secret) = client_secret {
-        form.push(("client_secret", secret));
-    }
+    let form = with_client_secret(
+        vec![
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
+        ],
+        client_secret,
+    );
     let response = post_token(token_url, &form)?;
     let body = response.text();
     if !response.is_success() {
@@ -1425,21 +1480,44 @@ pub fn ensure_fresh(account_id: &str) -> Result<String, String> {
         )));
     };
     let client_id = ends.client_id()?;
-
-    let response = post_token(
-        ends.token_url,
-        &[
+    // See `with_client_secret`'s doc: this call needs the same secret the initial exchange
+    // does, and used to go without it.
+    let client_secret = ends.client_secret();
+    let form = with_client_secret(
+        vec![
             ("grant_type", "refresh_token"),
-            ("client_id", &client_id),
-            ("refresh_token", &refresh_token),
+            ("client_id", client_id.as_str()),
+            ("refresh_token", refresh_token.as_str()),
         ],
-    )?;
+        client_secret.as_deref(),
+    );
+    let response = post_token(ends.token_url, &form)?;
     let body = response.text();
     if !response.is_success() {
         let message = response_error(&body, "This cloud account's sign-in could not be renewed.");
-        log::warn!(
-            "cloud oauth: renewing {account_id} failed with {} (reconnect needed: {})",
+        // Log the raw OAuth error code (and the provider's description), which is what tells us
+        // WHICH refusal this is: the derived `needs_reconnect` boolean collapses every
+        // unmapped code into the same catch-all, so without the code a multi-device or
+        // rate-limit refusal is indistinguishable from any other. Both fields are protocol
+        // detail, not user content (see `oauth_error_fields`).
+        //
+        // `debug!`, not `warn!`, on purpose: `warn!`/`error!` print to STDERR on every run
+        // regardless of `CCK_DEBUG_LOG` (diag.rs's module doc: "Stderr behaviour is
+        // UNCHANGED"), and a token refresh failing is an ORDINARY, routine event, not a
+        // defect, the same classification `oauth.rs`'s `the sign-in was refused (...)` line
+        // already gives a user declining consent. It still happens on every account that
+        // idles long enough for Google to expire or revoke its token, so at `warn!` it would
+        // print for a completely healthy install the first ordinary time that happens. `debug!`
+        // keeps it silent everywhere by default and still lands in the shared file the moment
+        // `CCK_DEBUG_LOG=1` is set (`diag::FILE_LEVEL` is `Debug` for our own records), which is
+        // exactly the "silent unless asked for" shape this diagnostic needs.
+        let (oauth_error, oauth_desc) = oauth_error_fields(&body);
+        log::debug!(
+            "cloud oauth: renewing {account_id} failed with HTTP {} (oauth error: {}, \
+             description: {}, reconnect needed: {})",
             response.status,
+            oauth_error.as_deref().unwrap_or("<none>"),
+            oauth_desc.as_deref().unwrap_or("<none>"),
             needs_reconnect(&message)
         );
         return Err(message);
@@ -1942,7 +2020,16 @@ mod token_parse_tests {
     fn only_a_dead_authorization_asks_for_a_reconnect() {
         let err = token_error_message("invalid_grant");
         assert!(needs_reconnect(&err), "invalid_grant must be a reconnect: {err}");
-        for other in ["invalid_scope", "invalid_client", "unauthorized_client", "server_error", ""] {
+        for other in [
+            "invalid_scope",
+            "invalid_client",
+            "unauthorized_client",
+            "invalid_request",
+            "unsupported_grant_type",
+            "rate_limit_exceeded",
+            "server_error",
+            "",
+        ] {
             assert!(!needs_reconnect(&token_error_message(other)), "{other} must not be");
         }
         // And it survives the whole parse path, which is how a caller actually meets it.
@@ -1952,6 +2039,41 @@ mod token_parse_tests {
         assert!(needs_reconnect(&err));
         // The provider's own description is never shown.
         assert!(!err.contains("revoked."));
+    }
+
+    /// **The nameable refusals get their own copy.** Each of the newly mapped codes must give a
+    /// specific sentence, not fall through to the generic catch-all, and none may masquerade as
+    /// a reconnect (only `invalid_grant` earns that).
+    #[test]
+    fn the_named_refusals_have_specific_copy() {
+        let generic = token_error_message("something_unmapped");
+        for code in ["invalid_request", "unsupported_grant_type", "rate_limit_exceeded"] {
+            let msg = token_error_message(code);
+            assert_ne!(msg, generic, "{code} must not use the catch-all copy");
+            assert!(!needs_reconnect(&msg), "{code} is not a reconnect: {msg}");
+            assert!(!msg.contains('\u{2014}'), "no em-dash in {code}: {msg}");
+        }
+        // The rate-limit case tells the user to wait and retry, since it is transient.
+        assert!(token_error_message("rate_limit_exceeded").contains("try again"));
+        // An unmapped code still lands on the generic sentence.
+        assert_eq!(generic, "The cloud service refused the sign-in.");
+    }
+
+    /// **The diagnostic seam.** `oauth_error_fields` pulls the raw code and description out of a
+    /// failure body for the debug log, and yields nothing for a body that is not a JSON error.
+    #[test]
+    fn oauth_error_fields_reads_the_code_and_description() {
+        let body = r#"{"error":"rate_limit_exceeded","error_description":"Rate limit exceeded."}"#;
+        let (code, desc) = oauth_error_fields(body);
+        assert_eq!(code.as_deref(), Some("rate_limit_exceeded"));
+        assert_eq!(desc.as_deref(), Some("Rate limit exceeded."));
+        // A code with no description is fine; only the code is required.
+        let (code, desc) = oauth_error_fields(r#"{"error":"invalid_request"}"#);
+        assert_eq!(code.as_deref(), Some("invalid_request"));
+        assert_eq!(desc, None);
+        // A non-error body (a success reply, or not JSON at all) carries neither.
+        assert_eq!(oauth_error_fields(r#"{"access_token":"a"}"#), (None, None));
+        assert_eq!(oauth_error_fields("<html>502</html>"), (None, None));
     }
 
     /// A non-JSON failure body (an HTML error page, a proxy notice) never becomes user copy.
@@ -2232,6 +2354,22 @@ mod client_secret_tests {
             };
             assert_eq!(client_secret_env, None, "{id} must not declare a client secret");
         }
+    }
+
+    /// **The regression this whole file exists for.** `with_client_secret` is what both
+    /// `exchange_code` and `ensure_fresh`'s refresh call build their form through: a `None`
+    /// must leave the form untouched (Microsoft, Dropbox), and a `Some` must add exactly one
+    /// `client_secret` field (Google), on EVERY call, refresh included. The refresh call once
+    /// skipped this, which surfaced as `invalid_request` the first time a token actually
+    /// needed renewing.
+    #[test]
+    fn with_client_secret_appends_only_when_present() {
+        let base = vec![("grant_type", "refresh_token"), ("client_id", "abc")];
+        assert_eq!(with_client_secret(base.clone(), None), base, "no secret, no new field");
+        assert_eq!(
+            with_client_secret(base.clone(), Some("shh")),
+            vec![("grant_type", "refresh_token"), ("client_id", "abc"), ("client_secret", "shh")],
+        );
     }
 }
 

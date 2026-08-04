@@ -58,10 +58,21 @@ pub fn copied_recently(at: Option<Instant>) -> bool {
 ///
 /// `copied` is [`copied_recently`]'s answer, `halo` the padding around the 16px glyph (0 where
 /// the button rides inside something whose height it must not drive, such as the upload meter's
-/// pill), and `press` the message to send. The glyph size is libcosmic's own default for a
-/// symbolic icon button, 16px, which is what both call sites want and neither should restate.
-pub fn copy_button<M: Clone + 'static>(copied: bool, halo: u16, press: M) -> Element<'static, M> {
-    crate::widgets::arrow_cursor::arrow_cursor(
+/// pill), `tip_pos` where the "Copied!" / "Copy URL" tooltip drops (Bottom for the titlebar meter,
+/// so it clears the icons beside it; Top for the cloud sign-in row, so it clears the QR code below
+/// it), and `press` the message to send. The glyph size is libcosmic's own default for a symbolic
+/// icon button, 16px, which is what both call sites want and neither should restate.
+///
+/// The tooltip is the explicit `widget::tooltip(button, text, pos)` wrapper the rest of the app
+/// uses, NOT the `.tooltip(&str)` shorthand: the shorthand has no position control, so it dropped
+/// its card wherever it liked and, in the titlebar meter, on top of the icon it was describing.
+pub fn copy_button<M: Clone + 'static>(
+    copied: bool,
+    halo: u16,
+    tip_pos: widget::tooltip::Position,
+    press: M,
+) -> Element<'static, M> {
+    let button = crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::icon(crate::widgets::icons::handle(if copied {
             // The same tick the folder list's chosen level wears, so "this worked" looks the
             // same everywhere in the app.
@@ -71,9 +82,14 @@ pub fn copy_button<M: Clone + 'static>(copied: bool, halo: u16, press: M) -> Ele
         }))
         .class(accent_icon_button_class(copied))
         .padding(halo)
-        .tooltip(if copied { "Copied!" } else { "Copy URL" })
         .on_press(press),
+    );
+    widget::tooltip(
+        button,
+        widget::text(if copied { "Copied!" } else { "Copy URL" }).size(12),
+        tip_pos,
     )
+    .into()
 }
 
 /// The style an accent icon button carries (DRAGON-489): a steady accent tint with a faint hover

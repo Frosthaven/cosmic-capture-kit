@@ -23,16 +23,18 @@ impl crate::app::App {
             Severity::Error => "A required dependency is missing. Application may not work as expected.",
         };
 
-        let mut secs = vec![SectionSpec {
+        // Application Management (+ its Application Permissions row) is the very FIRST
+        // section on the page, above even Status (owner request, superseding DRAGON-491's
+        // "right after the status banner" placement, which itself had superseded
+        // DRAGON-419's original bottom-of-page placement).
+        let mut secs = vec![self.debug_section()];
+
+        secs.push(SectionSpec {
             title: "Status",
             items: vec![
                 Item::new("Overall health", summary, status_icon(overall)).status(overall),
             ],
-        }];
-
-        // DRAGON-491: Debug (+ its Application Permissions row) right after the
-        // overall status banner, not at the bottom of the page.
-        secs.push(self.debug_section());
+        });
 
         // Group required capabilities (red when missing) before optional features (amber).
         let (required, optional): (Vec<Dep>, Vec<Dep>) =
@@ -54,8 +56,11 @@ impl crate::app::App {
         secs
     }
 
-    /// DRAGON-419: the Debug group. Moved to the TOP of the Health page (DRAGON-491,
-    /// owner's spec superseding DRAGON-419's original bottom placement).
+    /// DRAGON-419: the Debug group, displayed as "Application Management" (owner rename;
+    /// the underlying debug-logging feature, its env var and its log target keep the
+    /// `debug`/`diag` names throughout the code, this is a display title only). Now the
+    /// very first section on the Health page, above even Status (owner's spec, superseding
+    /// DRAGON-491's "right after the status banner" placement).
     ///
     /// First row's description is JUST the resolved log folder — deliberately no prose: a
     /// support reply says "turn this on, do it again, send me the file", and the only thing
@@ -94,7 +99,7 @@ impl crate::app::App {
             action_button("Manage permissions", Msg::Settings(SettingsMsg::OpenPermissionsWindow)),
         ));
         SectionSpec {
-            title: "Debug",
+            title: "Application Management",
             items,
         }
     }

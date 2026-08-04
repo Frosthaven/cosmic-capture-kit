@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.27.0"
+version = "0.27.1"
 edition = "2024"
 description = "Cross-platform screen region, window, and monitor capture with support for translucent windows, image, video, voice, QR, barcodes, OCR text and more."
 license = "GPL-3.0-only"

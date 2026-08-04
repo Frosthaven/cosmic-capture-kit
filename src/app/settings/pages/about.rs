@@ -8,19 +8,22 @@ use super::super::row::{Item, SectionSpec};
 const APP_ICON: &[u8] =
     include_bytes!("../../../../res/icons/dev.frosthaven.CosmicCaptureKit.svg");
 
-/// The Linux "Get Update" target (releases page); the About page no longer shows a
-/// source-code row (DRAGON-226). macOS/Windows use the one-click install button
-/// instead, so it's consumed only on the Linux arm of `update_action_button`.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const REPO_URL: &str = "https://github.com/Frosthaven/cosmic-capture-kit";
+/// The docs site's own rendered patch-notes history page. The Version row's description
+/// links here ("View All Patch Notes") on every platform. This is text only, no download
+/// assets; see [`GITHUB_RELEASES_URL`] for the actual GitHub releases page a download
+/// comes from.
+const PATCH_NOTES_URL: &str = "https://cck.thedragon.dev/releases/";
+/// The GitHub releases page itself, where the downloadable assets live. Used by the Linux
+/// "Get" button (no one-click install there yet, so it opens this to fetch the file by
+/// hand) rather than [`PATCH_NOTES_URL`], since the docs site's page has no download links
+/// of its own, only patch-notes text. Dead on macOS/Windows: those platforms one-click
+/// install instead of opening this page at all.
+#[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+const GITHUB_RELEASES_URL: &str = "https://github.com/Frosthaven/cosmic-capture-kit/releases";
 const ICON_ARTIST_URL: &str = "https://ashleythedesigner.com/";
 /// Donations (DRAGON-226): PayPal is THE donation channel — no other sponsor
 /// platforms. The same URL feeds `.github/FUNDING.yml`.
 const DONATE_URL: &str = "https://paypal.me/Frosthaven";
-
-/// The maximum height of the scrollable release-notes block: long notes never
-/// stretch the About page, they scroll within this box (DRAGON-177).
-const NOTES_MAX_HEIGHT: f32 = 280.0;
 
 /// Right padding applied to the notes content so its right edge lines up with the
 /// right edge of the toggles on the same page (DRAGON-187). Every settings row
@@ -43,31 +46,43 @@ const NOTES_TOGGLE_EDGE_GAP: f32 = {
 
 impl crate::app::App {
     pub(in crate::app::settings) fn about_sections(&self) -> Vec<SectionSpec<'_>> {
-        // The Version row (DRAGON-177 polish, DRAGON-187): the installed version stays
-        // visible. EVERY state carries the status caption under the version - including
-        // Available, where it names the new version (the button is now a short, generic
-        // action label with no version number). Available also shows the scrollable
-        // markdown notes below.
+        // The Version row: its NAME reads "Version <installed>" in a mixed-weight title
+        // (bold label, regular version number), and its description is a "View All Patch
+        // Notes" link to the releases history. The available-update version, when there is
+        // one, reads in the action button's label ("Get <version>"), not here. Available
+        // also shows the scrollable markdown notes below.
+        // `.flush()` (DRAGON-495, first used by the Cloud Accounts page): none of these
+        // three rows ever gets a reset-to-default action, so the fixed unit/reset slots
+        // every other settings row reserves would just be dead space here.
         let version_row = Item::new("Version", "", self.version_row_control())
-            .desc_el(self.version_status_caption());
-        let mut items = vec![Item::note(hero()), version_row];
+            .title_el(version_title())
+            .desc_el(view_patch_notes_link())
+            .flush();
+        // Donations lead the section (owner request): a deliberate support ask sits right
+        // below the app hero, above the version information. The update-notify toggle sits
+        // right below Version (owner request), so the order is hero, donate, version,
+        // notify, then the changelog. Donate shares its width with the Version row's
+        // action button (owner request, see shared_button_width), so both are computed
+        // from the SAME update-status read.
+        use crate::update::UpdateStatus;
+        let available_version =
+            if let UpdateStatus::Available(info) = &self.update_status { Some(info.version.as_str()) } else { None };
+        let donations = Item::new(
+            "Supporting this project",
+            "Like the software? Buy me a drink!",
+            donate_button(shared_button_width(available_version)),
+        )
+        .flush();
+        let mut items = vec![Item::note(hero()), donations, version_row];
+        items.extend(self.update_items());
         // The changelog stays visible in the UpToDate state too (the manifest's
         // notes ARE the installed version's), so users can always read what is
         // in their version; notes_element carries its own "What's new" heading.
         if let Some(notes) = self.notes_element() {
             items.push(Item::note(notes));
         }
-        items.extend(self.update_items());
-        // Donations live in their own section (DRAGON-226) so support reads as a
-        // deliberate ask, not another row of app metadata.
-        let support = vec![Item::new(
-            "Donations",
-            "Free forever. Donations help keep development going.",
-            donate_button(),
-        )];
         let sections = vec![
             SectionSpec { title: "About This Software", items },
-            SectionSpec { title: "Supporting This Project", items: support },
         ];
         // DRAGON-407 removed the Windows-only "Troubleshooting" section that named the
         // DRAGON-406 report folder and opened it. That instrument is gone; the Health page's
@@ -76,80 +91,43 @@ impl crate::app::App {
         sections
     }
 
-    /// The Version row's right-hand control. Always shows the installed version,
-    /// paired with the ONE update action: the platform install/get button when an
-    /// update is Available, the "Check for updates" button otherwise (no
-    /// standalone check row).
+    /// The Version row's right-hand control: the ONE update action. When an update is
+    /// Available it's the platform install/get button ("Get <version>"); otherwise it's
+    /// the "Check for updates" button (no standalone check row). The installed version is
+    /// no longer shown here (it reads in the row's title now), so the button stands alone,
+    /// right-aligned, sharing [`shared_button_width`] with the Donate button.
     fn version_row_control(&self) -> Element<'_, Msg> {
         use crate::update::UpdateStatus;
-        let version = widget::text::body(env!("CARGO_PKG_VERSION"));
-        // The action slot swaps between several buttons (check / checking / install /
-        // installing / get) as the state changes. Size them all to ONE shared width -
-        // the widest label any of them can ever show - so the button never changes
-        // size when its text swaps (DRAGON-187).
-        let action_w = action_button_width();
-        let action = if let UpdateStatus::Available(info) = &self.update_status {
+        if let UpdateStatus::Available(info) = &self.update_status {
+            let action_w = shared_button_width(Some(&info.version));
             update_action_button(info, self.update_installing, action_w)
         } else {
+            let action_w = shared_button_width(None);
             check_button(matches!(self.update_status, UpdateStatus::Checking), action_w)
-        };
-        widget::row(vec![version.into(), action])
-            .spacing(12.0)
-            .align_y(Alignment::Center)
-            .into()
-    }
-
-    /// The version row's description caption: the update status as a colored caption
-    /// (subdued when unchecked/checking, success when current, warning on a failed
-    /// check). In the Available state it names the NEW version here (DRAGON-187), so
-    /// the action button can stay a short, generic label without the version number.
-    fn version_status_caption(&self) -> Element<'_, Msg> {
-        use crate::update::UpdateStatus;
-        match &self.update_status {
-            UpdateStatus::Unknown => {
-                super::super::row::subdued_caption("Update status not checked yet.")
-            }
-            UpdateStatus::Checking => {
-                super::super::row::subdued_caption("Checking for updates...")
-            }
-            UpdateStatus::UpToDate { .. } => {
-                super::super::row::success_caption("You have the latest version.")
-            }
-            UpdateStatus::Failed(reason) => super::super::row::warning_caption(reason.clone()),
-            UpdateStatus::Available(info) => {
-                super::super::row::success_caption(format!("Version {} is available.", info.version))
-            }
         }
     }
 
     /// The parsed release notes: a "What's new in <version>" heading (styled like
-    /// the other option titles) above the scrollable markdown block, capped at
-    /// [`NOTES_MAX_HEIGHT`]. `None` when there are no notes to show. Link clicks
-    /// route through the existing URL-open mechanism.
+    /// the other option titles) above the markdown block. `None` when there are no
+    /// notes to show. Link clicks route through the existing URL-open mechanism.
+    ///
+    /// Unconstrained height (DRAGON-187 originally capped this at a fixed height in its
+    /// own inner scrollable, back when it sat mid-page with rows below it; now that the
+    /// donation/notify/version cards all lead the page and this is the last thing on it,
+    /// nothing below it to protect, and the page itself scrolls as a whole).
     fn notes_element(&self) -> Option<Element<'_, Msg>> {
         let (version, content) = self.update_notes.as_ref()?;
         let rendered = widget::markdown::view(content.items(), notes_markdown_settings())
             .map(|url| Msg::WindowChrome(WindowChromeMsg::OpenUrlOwned(url)));
         let heading = widget::text::body(format!("What's new in {version}"))
             .font(cosmic::font::bold());
-        let block: Element<'_, Msg> = widget::container(
-            // The inner container's right padding lines the wrapped markdown's
-            // right edge up with the toggles' right edge on the same page
-            // (DRAGON-187), and keeps it clear of the scrollbar gutter. The
-            // container is width-constrained (Fill), so the markdown word-wraps
-            // within it and never extends past that edge (top/left/bottom stay
-            // flush). The scrollbar stays put in the outer container's gutter.
-            widget::scrollable(
-                widget::container(rendered)
-                    .width(Length::Fill)
-                    .padding(cosmic::iced::Padding::default().right(NOTES_TOGGLE_EDGE_GAP)),
-            )
-            .height(Length::Shrink),
-        )
-        .max_height(NOTES_MAX_HEIGHT)
-        .width(Length::Fill)
-        .padding([4.0, 0.0])
-        .into();
+        // The right padding lines the wrapped markdown's right edge up with the toggles'
+        // right edge on the same page (DRAGON-187). The container is width-constrained
+        // (Fill), so the markdown word-wraps within it rather than extending past that edge.
+        let block: Element<'_, Msg> = widget::container(rendered)
+            .width(Length::Fill)
+            .padding(cosmic::iced::Padding::default().right(NOTES_TOGGLE_EDGE_GAP).top(4.0))
+            .into();
         Some(widget::column(vec![heading.into(), block]).spacing(4.0).into())
     }
 
@@ -164,17 +142,18 @@ impl crate::app::App {
                 super::super::row::toggle(self.notify_updates, |on| {
                     Msg::Settings(SettingsMsg::SetNotifyUpdates(on))
                 }),
-            ),
+            )
+            .flush(),
         ]
     }
 }
 
-/// The Version row's action button for an available update. macOS/Windows: a suggested
-/// "Install Update" (one-click install, or a plain "Update Available" label if no
-/// artifact is attached). Linux: "Get Update" opening the releases page (no
-/// one-click there yet, so "Install" would be a lie). The version number is NOT in
-/// the button (DRAGON-187): it reads in the row's description caption instead, so
-/// the button stays a short, fixed action label.
+/// The Version row's action button for an available update. Its label carries the NEW
+/// version ("Get <version>"): macOS/Windows one-click install it (swapping to
+/// "Installing..." mid-install, or a plain disabled "Update Available" if no artifact is
+/// attached yet); Linux opens the releases page to download it (no one-click there yet).
+/// The label is centered within the fixed action width on every platform.
+// `installing` is only consumed on the one-click platforms; Linux opens the releases page.
 #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_variables))]
 fn update_action_button<'a>(
     info: &crate::update::UpdateInfo,
@@ -184,21 +163,30 @@ fn update_action_button<'a>(
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         if info.artifact.is_some() {
-            install_button(installing, width)
+            install_button(&info.version, installing, width)
         } else {
-            // No platform artifact attached to this release yet: an honest disabled label.
-            crate::widgets::arrow_cursor::arrow_cursor(
-                widget::button::suggested(UPDATE_AVAILABLE_LABEL).width(Length::Fixed(width)),
+            // No platform artifact attached to this release yet: an honest disabled label,
+            // centered in the shared action width like the other states.
+            crate::app::settings::row::centered_button(
+                None,
+                UPDATE_AVAILABLE_LABEL,
+                Length::Fixed(width),
+                cosmic::theme::Button::Suggested,
+                None,
             )
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        // Linux: no one-click install yet, so open the releases page. Honest label.
-        widget::button::suggested(GET_UPDATE_LABEL)
-            .width(Length::Fixed(width))
-            .on_press(Msg::WindowChrome(WindowChromeMsg::OpenUrl(REPO_URL)))
-            .into()
+        // Linux: no one-click install yet, so open the releases page to fetch it. The
+        // version rides in the label; centered in the shared action width.
+        crate::app::settings::row::centered_button(
+            None,
+            format!("Get {}", info.version),
+            Length::Fixed(width),
+            cosmic::theme::Button::Suggested,
+            Some(Msg::WindowChrome(WindowChromeMsg::OpenUrl(GITHUB_RELEASES_URL))),
+        )
     }
 }
 
@@ -220,40 +208,40 @@ fn notes_markdown_settings() -> widget::markdown::Settings {
     widget::markdown::Settings::with_text_size(14.0, style)
 }
 
-// Every label the Version row's action button (check / checking / install /
-// installing / get / update-available) can ever display. They all SWAP in and out
-// of the same slot, so they share ONE width - the widest of them all - and the
-// button never changes size as its text changes (DRAGON-187): no reflow, no jump.
-// None of these carry the version number (that reads in the row's description
-// caption instead), so they stay short, fixed action labels.
+// The static labels the Version row's action button can display. The check/checking pair
+// swaps in place, and (macOS/Windows) install swaps to "Installing..."; each such swap
+// shares ONE width so the button never reflows mid-swap (DRAGON-187). The available-update
+// button now BAKES the new version into its label ("Get <version>", built at runtime,
+// reversing DRAGON-187's no-version-in-label rule on purpose), so its width is sized per
+// version rather than from a static constant.
 const CHECK_LABEL: &str = "Check for updates";
 const CHECKING_LABEL: &str = "Checking...";
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-const INSTALL_LABEL: &str = "Install Update";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const INSTALLING_LABEL: &str = "Installing...";
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const UPDATE_AVAILABLE_LABEL: &str = "Update Available";
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-const GET_UPDATE_LABEL: &str = "Get Update";
+const DONATE_LABEL: &str = "Donate";
 
-/// The shared fixed width for the Version row's action button, sized to the widest
-/// label it can EVER show. Every button in that slot uses this one width so
-/// swapping labels never reflows it. Pure logic (see [`fixed_button_width`]) -
-/// unit-tested below. The labels are static now (no version number), so the width
-/// is the same in every state.
-fn action_button_width() -> f32 {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    let labels: &[&str] = &[
-        CHECK_LABEL,
-        CHECKING_LABEL,
-        INSTALL_LABEL,
-        INSTALLING_LABEL,
-        UPDATE_AVAILABLE_LABEL,
-    ];
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let labels: &[&str] = &[CHECK_LABEL, CHECKING_LABEL, GET_UPDATE_LABEL];
-    fixed_button_width(labels)
+/// The ONE fixed width shared by every button in this section (owner request): Donate,
+/// Check for updates / Checking, and (when an update IS available) Get <version> /
+/// Installing / Update Available. `version` is the available update's version string when
+/// there is one (folded into "Get <version>", which is why the width depends on it); pass
+/// `None` when there is no update available so the slot is sized from the check-state
+/// labels alone. Donate is ALWAYS a candidate, since it is always on screen regardless of
+/// update state, so the shared width never shrinks smaller than what its own label needs.
+/// Pure logic (see [`fixed_button_width`]), unit-tested below.
+fn shared_button_width(version: Option<&str>) -> f32 {
+    let get = version.map(|v| format!("Get {v}"));
+    let mut labels: Vec<&str> = vec![DONATE_LABEL];
+    match &get {
+        Some(get) => {
+            labels.push(get.as_str());
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            labels.extend([INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);
+        }
+        None => labels.extend([CHECK_LABEL, CHECKING_LABEL]),
+    }
+    fixed_button_width(&labels)
 }
 
 /// Estimate a fixed button width that fits the widest of `labels`. Body text is
@@ -288,17 +276,22 @@ fn check_button<'a>(checking: bool, width: f32) -> Element<'a, Msg> {
     )
 }
 
-/// The one-click "Install Update" button (macOS + Windows), disabled and reading
-/// "Installing..." while an install is running. The version reads in the row's
-/// description caption, not the button (DRAGON-187). Fixed to the shared action-slot
-/// width so it never reflows as the label swaps.
+/// The one-click install button (macOS + Windows) for an available update: reads
+/// "Get <version>" (the NEW version), disabled and reading "Installing..." while an
+/// install is running. Centred within the shared action width so the label swap never
+/// reflows it.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn install_button<'a>(installing: bool, width: f32) -> Element<'a, Msg> {
+fn install_button<'a>(version: &str, installing: bool, width: f32) -> Element<'a, Msg> {
     // Centred within the fixed action width (DRAGON-268 follow-up), matching the
     // Check button; the fixed width still prevents any reflow as the label swaps.
+    let label = if installing {
+        INSTALLING_LABEL.to_string()
+    } else {
+        format!("Get {version}")
+    };
     crate::app::settings::row::centered_button(
         None,
-        if installing { INSTALLING_LABEL } else { INSTALL_LABEL },
+        label,
         Length::Fixed(width),
         cosmic::theme::Button::Suggested,
         (!installing).then_some(Msg::Settings(SettingsMsg::InstallUpdate)),
@@ -384,14 +377,44 @@ fn badge_class() -> cosmic::theme::Button {
     }
 }
 
+/// The Version row's title element: the word "Version" in bold, then a space, then the
+/// CURRENTLY INSTALLED version number (`CARGO_PKG_VERSION`) in regular weight, e.g.
+/// "Version 0.27.0". Inline weight-mixing is a small row of two body-size texts, the way
+/// the app mixes weights inline elsewhere (`cosmic::font::bold()` on a `widget::text`); the
+/// 6px spacing reads as the space between the two words.
+fn version_title() -> Element<'static, Msg> {
+    widget::row(vec![
+        widget::text::body("Version").font(cosmic::font::bold()).into(),
+        widget::text::body(env!("CARGO_PKG_VERSION")).into(),
+    ])
+    .spacing(6.0)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The Version row's description: a "View All Patch Notes" link to the releases history,
+/// styled as an inline accent link (the `Button::Link` idiom, so it gets the pointer
+/// cursor), replacing the old dynamic update-status caption.
+fn view_patch_notes_link() -> Element<'static, Msg> {
+    widget::button::custom(widget::text::caption("View All Patch Notes"))
+        .class(cosmic::theme::Button::Link)
+        .padding(0)
+        .on_press(Msg::WindowChrome(WindowChromeMsg::OpenUrl(PATCH_NOTES_URL)))
+        .into()
+}
 
 /// PayPal donation button (DRAGON-226): the accent-filled (trim-colored) suggested
-/// button, opening the PayPal page. No PayPal trademark art.
-fn donate_button() -> Element<'static, Msg> {
-    widget::button::suggested("Donate")
-        .leading_icon(crate::widgets::icons::handle("donate-symbolic"))
-        .on_press(Msg::WindowChrome(WindowChromeMsg::OpenUrl(DONATE_URL)))
-        .into()
+/// button, opening the PayPal page. No PayPal trademark art. Centred within `width`,
+/// [`shared_button_width`], the same fixed width the Version row's action button uses,
+/// so every button in this section reads as one family (owner request).
+fn donate_button(width: f32) -> Element<'static, Msg> {
+    crate::app::settings::row::centered_button(
+        Some("donate-symbolic"),
+        DONATE_LABEL,
+        Length::Fixed(width),
+        cosmic::theme::Button::Suggested,
+        Some(Msg::WindowChrome(WindowChromeMsg::OpenUrl(DONATE_URL))),
+    )
 }
 
 #[cfg(test)]
@@ -417,23 +440,46 @@ mod tests {
     }
 
     #[test]
-    fn action_width_is_one_shared_max_across_all_labels() {
-        // Every button in the action slot (check / checking / install / installing /
-        // update-available / get) uses this ONE width, so swapping between them never
-        // reflows. The labels are static (no version number now, DRAGON-187), so the
-        // width is state-independent and must cover each candidate label.
-        let width = action_button_width();
-        let mut candidates = vec![CHECK_LABEL, CHECKING_LABEL];
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        candidates.extend([INSTALL_LABEL, INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        candidates.push(GET_UPDATE_LABEL);
-        for label in candidates {
-            assert!(
-                width >= fixed_button_width(&[label]),
-                "shared width must cover {label:?}"
-            );
+    fn check_width_covers_donate_and_both_check_labels() {
+        // The check-state width must cover Donate (always on screen) as well as both
+        // labels the check button itself swaps between, so nothing in the section reflows.
+        let width = shared_button_width(None);
+        for label in [DONATE_LABEL, CHECK_LABEL, CHECKING_LABEL] {
+            assert!(width >= fixed_button_width(&[label]), "shared width must cover {label:?}");
         }
+    }
+
+    #[test]
+    fn available_width_covers_donate_and_get_and_swap_labels() {
+        // The available-update button bakes the new version into a "Get <version>" label;
+        // the shared width must cover that label, Donate, and (macOS/Windows) the
+        // "Installing..." / "Update Available" states it swaps through.
+        let version = "0.27.0";
+        let width = shared_button_width(Some(version));
+        let get = format!("Get {version}");
+        let mut candidates = vec![DONATE_LABEL, get.as_str()];
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        candidates.extend([INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);
+        for label in candidates {
+            assert!(width >= fixed_button_width(&[label]), "shared width must cover {label:?}");
+        }
+    }
+
+    #[test]
+    fn available_width_tracks_version_length() {
+        // The version now rides in the label (reversing DRAGON-187 on purpose), so a
+        // longer version string can only widen the button, never shrink it.
+        let short = shared_button_width(Some("1.0.0"));
+        let long = shared_button_width(Some("10.20.30-rc1"));
+        assert!(long >= short, "a longer version must not shrink the button");
+    }
+
+    #[test]
+    fn no_available_update_still_covers_donate() {
+        // Even with no update in play, the shared width must be at least as wide as Donate,
+        // since Donate is always on screen regardless of update state.
+        let width = shared_button_width(None);
+        assert!(width >= fixed_button_width(&[DONATE_LABEL]));
     }
 
     #[test]

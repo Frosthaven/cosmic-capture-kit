@@ -1607,29 +1607,35 @@ impl App {
                             .into()
                     } else if let Some(de) = it.desc_el {
                         // Rich helper line (e.g. "Provided by <links>") under the title.
-                        widget::column(vec![
-                            widget::text::body(it.title).font(cosmic::font::bold()).into(),
-                            de,
-                        ])
+                        // A rich `title_el` (e.g. mixed-weight "Version 0.27.0") takes
+                        // precedence over the plain bold title, mirroring desc_el/desc.
+                        let title: Element<'_, Msg> = it.title_el.unwrap_or_else(|| {
+                            widget::text::body(it.title).font(cosmic::font::bold()).into()
+                        });
+                        widget::column(vec![title, de])
                         .spacing(2.0)
                         .width(Length::Fill)
                         .into()
                     } else if it.desc.is_empty() {
-                        widget::text::body(it.title)
-                            .font(cosmic::font::bold())
-                            .width(Length::Fill)
-                            .into()
+                        match it.title_el {
+                            Some(te) => widget::container(te).width(Length::Fill).into(),
+                            None => widget::text::body(it.title)
+                                .font(cosmic::font::bold())
+                                .width(Length::Fill)
+                                .into(),
+                        }
                     } else {
                         // Option name in bold; description in the normal text colour
-                        // (the secondary tone failed contrast/accessibility).
+                        // (the secondary tone failed contrast/accessibility). A rich
+                        // `title_el` takes precedence over the plain bold title.
                         let helper: Element<'_, Msg> = match it.severity {
                             Some(sev) => severity_caption(sev, it.desc),
                             None => widget::text::caption(it.desc).into(),
                         };
-                        widget::column(vec![
-                            widget::text::body(it.title).font(cosmic::font::bold()).into(),
-                            helper,
-                        ])
+                        let title: Element<'_, Msg> = it.title_el.unwrap_or_else(|| {
+                            widget::text::body(it.title).font(cosmic::font::bold()).into()
+                        });
+                        widget::column(vec![title, helper])
                         .spacing(2.0)
                         .width(Length::Fill)
                         .into()

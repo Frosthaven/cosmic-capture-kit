@@ -733,10 +733,11 @@ pub fn folder_path_segments<'a>(stored: Option<&'a str>, leaf: &str) -> Vec<&'a 
 /// What this provider CALLS the folder our uploads land in: the LEAF of
 /// [`ProviderSpec::app_folder_path`]. Pure; unit-tested.
 ///
-/// Separate from [`save_path`] because the two answer different questions. A sentence names the
-/// folder ("land in your Cosmic Capture Kit folder"), where a row names the place to go and find
-/// it ("/Apps/Cosmic Capture Kit"). Both read the same registry field, so neither can name a
-/// folder the other does not.
+/// Separate from [`save_path`] because the two answer different questions. A row names the place
+/// to go and find the folder ("/Apps/Cosmic Capture Kit"), reading this field directly. The
+/// post-connect step's body sentence used to read this field too, through its own private
+/// wrapper, but the owner's latest wording for that sentence is a fixed, generic phrase with no
+/// per-provider name in it at all.
 ///
 /// `None` for a provider with no folder at all.
 pub fn app_folder_name(provider_id: &str) -> Option<&'static str> {

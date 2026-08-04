@@ -206,10 +206,14 @@
 }
 
 /*
- * The landing page carries no site chrome at all: `site-overrides/home.html`
- * empties the theme's header, tabs and footer blocks, so the splash is the
- * background and the card and nothing else. Documentation pages are untouched,
- * because they never load that template.
+ * The landing page SHOWS no site chrome, but the chrome stays in its DOM:
+ * `site-overrides/home.html` renders the theme's header, tabs and footer
+ * normally and the rules below hide them. It used to empty those template
+ * blocks instead, which broke `navigation.instant`: the instant swap keeps
+ * the current document's chrome, so entering the docs from a chrome-less
+ * splash left every page without a header or footer until a hard refresh.
+ * Hidden-not-absent means leaving the splash removes `.cck-space` from the
+ * DOM, these selectors stop matching, and the chrome reappears on its own.
  *
  * Everything in this group is scoped with `:has(.cck-space)`, which matches
  * ONLY the landing page, since that element exists nowhere else. There is no
@@ -218,6 +222,12 @@
  * already how this file scopes landing-only styling, so it stays the one
  * mechanism rather than adding a second.
  */
+body:has(.cck-space) .md-header,
+body:has(.cck-space) .md-tabs,
+body:has(.cck-space) .md-footer {
+  display: none;
+}
+
 body:has(.cck-space) .md-main,
 body:has(.cck-space) .md-container {
   background-color: transparent;
@@ -401,6 +411,19 @@ body:has(.cck-space) .md-content__inner::before {
   margin: 0 auto clamp(0.7rem, 3vmin, 1.6rem);
   max-width: 22rem;
   color: rgba(255, 255, 255, 0.78);
+}
+
+/*
+ * The platform-availability line: a secondary note beneath the description, so it
+ * reads a step smaller and dimmer than `.cck-glass__desc`. Placeholder copy for
+ * now; it sits between the description and the download button.
+ */
+.md-typeset .cck-glass__platforms {
+  font-size: clamp(0.55rem, 1.6vmin, 0.68rem);
+  line-height: 1.5;
+  margin: 0 auto clamp(0.55rem, 2.2vmin, 1.1rem);
+  max-width: 22rem;
+  color: rgba(255, 255, 255, 0.58);
 }
 
 .md-typeset .cck-glass__cta {

@@ -57,6 +57,10 @@ pub(super) struct Item<'a> {
     pub(super) severity: Option<Severity>,
     /// A rich helper line (e.g. with inline links) shown instead of `desc`.
     pub(super) desc_el: Option<Element<'a, Msg>>,
+    /// A rich TITLE (e.g. mixed font weights, inline links) shown instead of the plain
+    /// `title` string. Mirrors `desc_el`: when set it takes precedence over `title` at
+    /// render time, while `title` stays populated so the settings search still finds the row.
+    pub(super) title_el: Option<Element<'a, Msg>>,
     /// Render `desc_el` as the WHOLE row (full width, no title, no control) - used for
     /// inline status notes like "[ok] ffmpeg: screen recording is available."
     pub(super) note: bool,
@@ -83,6 +87,7 @@ impl<'a> Item<'a> {
             suffix: None,
             severity: None,
             desc_el: None,
+            title_el: None,
             note: false,
             gated: None,
             flush: false,
@@ -118,6 +123,14 @@ impl<'a> Item<'a> {
     /// Attach a rich helper line (with inline links etc.) shown instead of `desc`.
     pub(super) fn desc_el(mut self, el: impl Into<Element<'a, Msg>>) -> Self {
         self.desc_el = Some(el.into());
+        self
+    }
+
+    /// Attach a rich TITLE (mixed weights, inline links etc.) shown instead of the plain
+    /// `title` string. Mirrors [`Item::desc_el`]: it takes precedence at render time while
+    /// the plain `title` still feeds the settings search.
+    pub(super) fn title_el(mut self, el: impl Into<Element<'a, Msg>>) -> Self {
+        self.title_el = Some(el.into());
         self
     }
 

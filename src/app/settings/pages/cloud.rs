@@ -250,12 +250,32 @@ pub struct CloudAdd {
     pub folder_note: Option<String>,
     /// The folder listing is in flight.
     pub folder_loading: bool,
+    /// Whether ANY folder listing has landed yet THIS DIALOG SESSION, success or failure
+    /// (owner report, live testing). Starts `false` in every constructor and flips to `true`
+    /// for good the moment [`CloudSettingsMsg::FoldersLoaded`] or
+    /// [`CloudSettingsMsg::FolderViewRestored`] lands, whichever the fetch was.
+    ///
+    /// The one thing [`breadcrumb_first_load`] reads besides [`Self::folder_loading`]: while
+    /// this is still `false` AND a listing is in flight, the dialog just opened and has never
+    /// shown a real breadcrumb, so `breadcrumb_row` shows "Loading..." instead. Every later
+    /// fetch (a refresh press, a descent, an ascent) also sets `folder_loading`, but by then
+    /// this is already `true`, so those read as the ordinary case: the real path, with just the
+    /// refresh icon spinning.
+    ///
+    /// **Never reset in place.** It does not need to be: `add` itself is torn down and rebuilt
+    /// fresh (`CloudAdd::new`/`reconnecting`/`edit_account`) on every open of this dialog
+    /// (`AddOpen`, `Reconnect`, `EditAccount`) and dropped on every way it closes (`SetupDone`,
+    /// `CancelSetupStep`, `AddClose`), so "first load this session" is already bounded by the
+    /// struct's own lifetime; a stale `true` surviving a close would need this field to outlive
+    /// its own `CloudAdd`, which nothing here does.
+    pub has_loaded_once: bool,
     /// The path row's refresh glyph's rotation, in radians (DRAGON-514).
     ///
     /// Advanced by [`CloudSettingsMsg::FolderSpinTick`] and read by `folder_refresh_button`,
     /// which spins the icon while (and only while) [`Self::folder_loading`] is set. That spin is
-    /// the ONLY indication a listing is running: there is no loading text anywhere in this
-    /// browser any more.
+    /// the ONLY indication an ORDINARY (not first-ever) listing is running: `breadcrumb_row`'s
+    /// "Loading..." text is the one exception, gated on [`Self::has_loaded_once`] rather than
+    /// living here.
     ///
     /// An angle rather than a start-instant, mirroring the app's other spinning glyph
     /// (`App::scan_spin`, the scanner's re-read button): it needs no reset when a listing
@@ -301,6 +321,7 @@ impl CloudAdd {
             browsed: false,
             folder_note: None,
             folder_loading: false,
+            has_loaded_once: false,
             folder_spin: 0.0,
             reconnect_of: None,
             browser_started: None,
@@ -726,11 +747,12 @@ pub fn commit_label(typed: &str, default: &str) -> String {
 /// The post-connect step's heading. Pure; unit-tested.
 ///
 /// The step asks two things at most, and only one of them is universal, so the heading names
-/// whichever the provider actually has. "Where should uploads go?" on a YouTube step (which has
-/// no folder to choose) would be a question the dialog cannot answer.
+/// whichever the provider actually has. "Configure your cloud storage" on a YouTube step (which
+/// has no folder to choose) would promise a folder-configuration screen the dialog cannot
+/// deliver.
 pub fn setup_title(chooses_folder: bool) -> &'static str {
     if chooses_folder {
-        "Where should uploads go?"
+        "Configure your cloud storage"
     } else {
         "Name this account"
     }
@@ -746,24 +768,17 @@ pub fn setup_title(chooses_folder: bool) -> &'static str {
 /// see from the list alone: the choice is not "anywhere in my drive", it is "the Cosmic Capture
 /// Kit folder, or something inside it", and this app cannot reach past it on any provider.
 ///
-/// **The owner's wording, verbatim** (DRAGON-503). It replaced a sentence that named the real
-/// save PATH (DRAGON-501's own edit to this function, one commit earlier) and one that told the
-/// user to "pick it, or a folder inside it": a step whose first entry is already ticked should
-/// ask them to CONFIRM a selection, not to make one, and the path belongs on the row that has no
-/// list beside it to explain itself. The folder's NAME still comes from provider metadata
-/// ([`crate::cloud::app_folder_name`]), not from a literal, so the sentence follows a renamed app
-/// registration exactly as the row does.
+/// **The owner's wording, verbatim**, latest revision. Earlier revisions named the real save
+/// PATH (DRAGON-501), then named the folder via provider metadata (DRAGON-503, one commit
+/// earlier than this one). This one is a fixed, generic phrase, "the App's Folder", with no
+/// per-provider interpolation at all: [`crate::cloud::app_folder_name`] still exists and still
+/// backs the folder ROW and the sandbox note below, it just no longer feeds this sentence.
 ///
 /// The sandbox half of the old sentence moved out to [`setup_sandbox_note`], which is a
 /// different KIND of statement (a limit, not an instruction) and now wears a different tone.
 pub fn setup_body(spec: &ProviderSpec, chooses_folder: bool) -> String {
     if chooses_folder {
-        return format!(
-            "Captures uploaded to this {} account land in your {} folder. Ensure it is selected \
-             below and name your account.",
-            spec.display_name,
-            app_folder_name(spec)
-        );
+        return "Captures uploaded to this account are placed in the App's Folder.".to_string();
     }
     format!(
         "This {} account is connected. Give it a name you will recognise when you pick where \
@@ -772,12 +787,16 @@ pub fn setup_body(spec: &ProviderSpec, chooses_folder: bool) -> String {
     )
 }
 
-/// What this provider calls the folder this app writes to, for a sentence. Pure; unit-tested.
+/// What this provider calls the folder this app writes to. Pure; unit-tested.
 ///
 /// Straight from [`crate::cloud::app_folder_name`], with the app's own constant as the fallback
-/// for a provider that has no folder at all. The fallback is never reached by a caller that
-/// checked [`chooses_folder`] first (the registry pins the two to agree), and exists so the
-/// sentence can never come out with a hole in it.
+/// for a provider that has no folder at all. [`setup_body`] used to call this for its folder
+/// sentence; the owner's latest copy for that sentence is a fixed generic phrase with no
+/// per-provider interpolation, so the only caller left is the test module's assertion that this
+/// still agrees with [`crate::cloud::APP_FOLDER`] for every registry provider today. Kept (not
+/// deleted) so that assertion, and any sentence that wants a real per-provider folder name again,
+/// still has a single place to read it from.
+#[cfg_attr(not(test), allow(dead_code))]
 fn app_folder_name(spec: &ProviderSpec) -> &'static str {
     crate::cloud::app_folder_name(spec.id).unwrap_or(crate::cloud::APP_FOLDER)
 }
@@ -850,6 +869,19 @@ pub fn folder_slot(chooses_folder: bool, folder_loading: bool, failed: bool) -> 
     })
 }
 
+/// Whether [`breadcrumb_row`] is in its FIRST-EVER-load state for this dialog session: the
+/// dialog (or reconnect, or edit) just opened and no listing has landed yet, success or
+/// failure. Pure; unit-tested.
+///
+/// True for exactly the one fetch [`CloudAdd::has_loaded_once`]'s doc names, never a later one:
+/// that flag flips permanently the moment any fetch lands, so a refresh press or a descent into
+/// a subfolder, both of which also set [`CloudAdd::folder_loading`], read as an ORDINARY
+/// loading state (the real breadcrumb path, spinning refresh icon) rather than this one (owner
+/// report, live testing: only the very first load should replace the path with "Loading...").
+pub fn breadcrumb_first_load(folder_loading: bool, has_loaded_once: bool) -> bool {
+    folder_loading && !has_loaded_once
+}
+
 // ── Tombstone: `level_is_chosen(level_id, root_id, chosen)` (DRAGON-517) ─────────────────────
 //
 // It answered "is the level the browser is inside the account's chosen destination?", so the path
@@ -858,11 +890,13 @@ pub fn folder_slot(chooses_folder: bool, folder_loading: bool, failed: bool) -> 
 // (DRAGON-517), so the answer was always about to become a constant `true`, and a derived
 // predicate that can only ever say one thing is a facade over state that no longer exists.
 //
-// The tick it drew is KEPT and is now unconditional: `level_control` marks the level because the
-// level is where uploads land, not because a separate pick happened to name it. What used to be
-// the SELECTION half of that rule (Drive stores the app folder's real id, the other two store
-// nothing) survives whole in [`viewed_destination`], which is the one place a destination is now
-// built.
+// The tick it drew was KEPT at the time, unconditional: `level_control` marked the level because
+// the level is where uploads land, not because a separate pick happened to name it. The tick
+// itself is gone now too (owner report, live testing): the label alone already states the fact,
+// and DRAGON-517's "no per-row selection" model left no obvious second place to put a mark
+// instead (see [`level_control`]). What used to be the SELECTION half of the retired rule (Drive
+// stores the app folder's real id, the other two store nothing) survives whole in
+// [`viewed_destination`], which is the one place a destination is now built.
 
 /// The destination the browser's current level names: the folder's provider-side id, and the
 /// path stored for it. Pure; unit-tested.
@@ -928,6 +962,17 @@ pub fn adopts_app_folder(stored_id: Option<&str>, stored_name: Option<&str>) -> 
 /// SPINNER is not a `button::icon` (it cannot be: rotation lives on iced's `svg` widget), so
 /// the two faces would otherwise be sized by two different rules and the row would resize
 /// every time a listing started.
+///
+/// **Re-checked directly against libcosmic's own layout code** (owner report, live testing: the
+/// breadcrumb row's height was visibly shifting). This specific pairing is NOT what was wrong:
+/// `Length::Fixed` ignores a rotated SVG's own intrinsic size (`iced::widget::Svg::layout`, the
+/// `Length::Fixed` arm of `Limits::resolve` never reads the `rotated_size` it is handed), and
+/// `button::icon`'s inner content is the identical `iced::widget::Svg` type at the identical
+/// `Length::Fixed(16)`, wrapped in the same padding a bare `container` applies (`Padding::fit`
+/// only ever SHRINKS a padding to fit, never grows one, so a zero outer padding stays zero).
+/// The two faces really do land on the same 20x20 box. The actual bug was one level up, the
+/// crumb-vs-icon-button height mismatch [`row_control_h`]'s doc and [`folder_refresh_button`]'s
+/// now cover.
 const PATH_ICON: f32 = 16.0;
 
 /// The gap inside the path row's trailing PAIR: refresh, then create (DRAGON-514).
@@ -1045,9 +1090,15 @@ pub fn crumb_target(crumb: Crumb, depth: usize) -> Option<usize> {
     (target < depth).then_some(target)
 }
 
-/// The line the folder list shows when the level a user is standing in has nothing in it
-/// (DRAGON-520). Centred and subtle, so it reads as the absence of rows rather than as one.
-pub const EMPTY_LEVEL_NOTE: &str = "No subfolders in this view. You can click the + icon to add one.";
+/// The two lines the folder list shows when the level a user is standing in has nothing in it
+/// (DRAGON-520, a second line added on the owner's later request). Subtle, and centred on BOTH
+/// axes in the well's own space, so it reads as the absence of rows rather than as one: see the
+/// render site (search `EMPTY_LEVEL_NOTE`) for why that means the note replaces the scrollable
+/// rather than riding inside it.
+pub const EMPTY_LEVEL_NOTE: [&str; 2] = [
+    "No subfolders in this view.",
+    "Add a folder with + or select done to use this folder.",
+];
 
 /// Whether the folder list shows [`EMPTY_LEVEL_NOTE`]. Pure; unit-tested.
 ///
@@ -1756,7 +1807,9 @@ const GEAR_GLYPH: f32 = 20.0;
 /// derived from [`row_control_h`] so the glyph centres in the shared height.
 const GEAR_PAD_X: f32 = 8.0;
 
-/// **The height every control in a connected account's row shares** (DRAGON-514).
+/// **The height every control in a connected account's row shares** (DRAGON-514), and, since,
+/// the SAME height [`breadcrumb_row`] pins every crumb-ish child to (owner report, live
+/// testing: that row's height was visibly shifting).
 ///
 /// Not a number of ours, and that is the point. libcosmic's `button::text` builder declares
 /// `height: Length::Fixed(theme.space_l())` (`widget/button/text.rs`), and `button::standard`
@@ -1768,6 +1821,19 @@ const GEAR_PAD_X: f32 = 8.0;
 /// never disagreeing about icon size; they were being sized by two different rules, one of
 /// which follows the theme's spacing and one of which does not. Shrinking the glyph would have
 /// matched them at ONE spacing setting and broken them at the other two.
+///
+/// `breadcrumb_row` hit the identical shape of bug, one call deeper: its pressable crumbs are
+/// `widget::button::text` (this same `space_l`-by-construction builder), while its unpressable
+/// crumb ([`level_control`], a plain `container`), its elided crumb (bare text, no button at
+/// all) and its trailing refresh/create icon buttons are all `Length::Shrink`. A trail with
+/// nothing below the app folder has NO pressable crumb (the sole, last crumb always routes to
+/// `level_control`), so the row sat at its shorter Shrink height; opening any subfolder turned
+/// the app-folder crumb into a pressable `button::text` and jumped the row to `space_l`. That
+/// read as "the row's height shifts when the folder list refreshes/populates", because opening
+/// a folder is exactly what starts its listing AND exactly what adds a pressable crumb. See
+/// `folder_refresh_button`'s and `PATH_ICON`'s docs for the DIFFERENT (and, checked directly
+/// against libcosmic's layout code, not actually buggy) risk this is not: the loading spinner
+/// agreeing in SIZE with the settled refresh/create buttons.
 ///
 /// Reading the token here means the row has one sizing source. Anything else added to these
 /// rows should take its height from this rather than from its own padding.
@@ -1855,7 +1921,13 @@ fn cloud_browser_step<'a>(
         // The app's ONE copy control (`widgets::copy_button`, shared with the upload meter since
         // DRAGON-520): while `copied` its glyph becomes a success-green tick and its tooltip
         // reads "Copied!", reverting on its own once the flash window passes.
-        let copy = copy_button(copied, 2, cm(CloudSettingsMsg::CopyBrowserUrl(url.to_string())));
+        // ABOVE the QR code, so the tooltip drops UPWARD and never lands on the QR image below it.
+        let copy = copy_button(
+            copied,
+            2,
+            widget::tooltip::Position::Top,
+            cm(CloudSettingsMsg::CopyBrowserUrl(url.to_string())),
+        );
         content = content.push(
             widget::row::with_capacity(3)
                 .push(click_link)
@@ -1965,29 +2037,38 @@ fn cloud_setup_step<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> widge
                 cm(CloudSettingsMsg::FolderCrumbIn(index)),
             ));
         }
-        // The settled-empty level says so, in the well's own space (DRAGON-520). See
-        // `shows_empty_level_note` for the three states that keep it quiet instead.
-        if shows_empty_level_note(
-            add.folders.len(),
-            add.folder_loading,
-            add.creating.is_some(),
-            add.pending_delete.is_some() || add.delete_busy,
-        ) {
-            list = list.push(
-                widget::container(subtle_caption(EMPTY_LEVEL_NOTE))
-                    .width(Length::Fill)
-                    .padding([12.0, FOLDER_ROW_PAD[1]])
-                    .align_x(Alignment::Center),
-            );
-        }
         // A "Reading your folders..." line USED to sit here, directly above the list, in the
         // SUBDUED tone (DRAGON-489); it then moved to the dialog's footer as a
         // `tertiary_action` (DRAGON-495) because it pushed the list down as it came and went.
         // DRAGON-514 deleted it outright, in both places: there is no loading TEXT anywhere in
         // this browser now, and the refresh icon in the path row spins instead.
-        control = control.push(folder_list_well(
-            widget::scrollable(list).height(Length::Fixed(FOLDER_LIST_H)).width(Length::Fill),
-        ));
+        //
+        // The settled-empty level says so, in the well's own space (DRAGON-520). See
+        // `shows_empty_level_note` for the three states that keep it quiet instead. The note
+        // REPLACES the scrollable rather than riding inside it (as it used to as an extra row):
+        // a scrollable lays its content out with an unbounded height budget, so it can overflow
+        // and scroll, which leaves nothing for `align_y` to centre a row against. The note's own
+        // container is pinned to the well's exact height instead, which is what gives centering
+        // on both axes real room to apply.
+        let well_content: Element<'_, Msg> = if shows_empty_level_note(
+            add.folders.len(),
+            add.folder_loading,
+            add.creating.is_some(),
+            add.pending_delete.is_some() || add.delete_busy,
+        ) {
+            let lines: Vec<Element<'_, Msg>> =
+                EMPTY_LEVEL_NOTE.iter().map(|line| subtle_caption(*line)).collect();
+            widget::container(widget::column(lines).spacing(2.0).align_x(Alignment::Center))
+                .width(Length::Fill)
+                .height(Length::Fixed(FOLDER_LIST_H))
+                .padding([0.0, FOLDER_ROW_PAD[1]])
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .into()
+        } else {
+            widget::scrollable(list).height(Length::Fixed(FOLDER_LIST_H)).width(Length::Fill).into()
+        };
+        control = control.push(folder_list_well(well_content));
     }
     // A TYPED-PATH field used to follow the list here, for Dropbox alone, with a sentence
     // explaining that typing one overrode whatever had been picked. Both are gone with the axis
@@ -2028,8 +2109,17 @@ fn cloud_setup_step<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> widge
         .secondary_action(crate::widgets::arrow_cursor::arrow_cursor(
             widget::button::text("Cancel").on_press(cm(CloudSettingsMsg::CancelSetupStep)),
         ))
+        // `on_press_maybe`, not a wired `on_press` plus a colour change (owner report, live
+        // testing): while `add.folder_loading` is up (the same flag `folder_slot` and
+        // `folder_refresh_button` key off, the refresh icon spinning), Done writes the account
+        // against whatever the LAST listing landed, which is exactly the folder the browser is
+        // about to move out from under it. Withholding the message is what actually stops the
+        // press, not merely tints the button; the library already renders a `None` `on_press`
+        // in its own disabled style, the same "no handler wired" idiom this file already uses
+        // elsewhere (`app/preview/chrome.rs`'s `.on_press_maybe(enabled.then_some(..))`).
         .primary_action(crate::widgets::arrow_cursor::arrow_cursor(
-            widget::button::suggested("Done").on_press(cm(CloudSettingsMsg::SetupDone)),
+            widget::button::suggested("Done")
+                .on_press_maybe((!add.folder_loading).then_some(cm(CloudSettingsMsg::SetupDone))),
         ))
     // DRAGON-503 put a footer slot here (`tertiary_action`), carrying either the
     // "Reading your folders..." status or the refresh button. DRAGON-514 emptied it: the status
@@ -2066,27 +2156,48 @@ fn cloud_setup_step<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> widge
 ///
 /// `Failed` swaps only the tooltip: after a failure there is no list on screen to refresh, and
 /// "Try again" is what the button actually does then.
-fn folder_refresh_button<'a>(slot: FolderSlot, spin: f32) -> Element<'a, Msg> {
+///
+/// **`height` is [`row_control_h`]**, the same shared height every crumb-ish child in
+/// [`breadcrumb_row`] carries, for a REAL guarantee rather than a trusted-to-agree one. The
+/// glyph box itself was already sound before this (`PATH_ICON`'s doc has the full account: a
+/// `Length::Fixed` size ignores a rotated SVG's own intrinsic size, and `button::icon`'s inner
+/// content is the identical `iced::widget::Svg` type at the identical `Length::Fixed`, so the
+/// bare `container` here and the pressable `button::icon` below it were never actually
+/// disagreeing). What COULD disagree, and is now pinned shut too, is this control's footprint
+/// against the REST of the row: a bare `container`/a `button::icon` are both `Length::Shrink`
+/// by default, sized to `PATH_ICON` plus its own padding, a few px shorter than a pressable
+/// crumb's `button::text` (`space_l` by construction, see [`row_control_h`]'s doc). Explicit
+/// `height` on every face removes any dependency on those two rules coincidentally landing on
+/// the same number.
+/// The SUBTLE tone, for an SVG glyph rather than text: the spinning refresh icon's own tint, and
+/// (owner report, the FIRST-EVER-load state) the leading folder icon's while [`breadcrumb_row`]
+/// is showing "Loading..." in its place. One closure so the two cannot drift to two different
+/// subtle greys.
+fn subtle_svg_class() -> cosmic::theme::Svg {
+    cosmic::theme::Svg::custom(|theme| cosmic::widget::svg::Style { color: Some(theme::subtle(theme)) })
+}
+
+fn folder_refresh_button<'a>(slot: FolderSlot, spin: f32, height: f32) -> Element<'a, Msg> {
     if slot == FolderSlot::Loading {
         // Sized to the glyph the pressable faces wear, so the row's height and the control's
         // footprint are identical in all three states and the spin cannot nudge the `+` beside
         // it sideways.
-        let glyph = crate::widgets::icons::sized_rotated(
-            "view-refresh-symbolic",
-            PATH_ICON,
-            spin,
-            cosmic::theme::Svg::custom(|theme| cosmic::widget::svg::Style {
-                color: Some(theme::subtle(theme)),
-            }),
-        );
+        let glyph =
+            crate::widgets::icons::sized_rotated("view-refresh-symbolic", PATH_ICON, spin, subtle_svg_class());
         // The same padding the pressable faces carry, applied to the bare glyph: a container,
-        // not a button, because there is nothing to press while this is up.
-        return widget::container(glyph).padding(2).into();
+        // not a button, because there is nothing to press while this is up. `height` (not left
+        // to `Length::Shrink`) is the shared row height; see this function's doc.
+        return widget::container(glyph)
+            .padding(2)
+            .height(Length::Fixed(height))
+            .align_y(Alignment::Center)
+            .into();
     }
     crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::icon(crate::widgets::icons::handle("view-refresh-symbolic"))
             .class(accent_icon_button_class(false))
             .padding(2)
+            .height(Length::Fixed(height))
             .tooltip(if slot == FolderSlot::Failed { "Try again" } else { "Refresh folder list" })
             .on_press(cm(CloudSettingsMsg::FolderRefresh)),
     )
@@ -2281,16 +2392,39 @@ fn folder_row_actions<'a>(deletable: Option<usize>) -> Element<'a, Msg> {
 /// # The header IS the level, and the level IS the destination (DRAGON-514, DRAGON-517)
 ///
 /// The LAST crumb is the level being looked at ([`breadcrumb`] guarantees it ends there), and it
-/// carries a folder mark, the level's name and a tick. DRAGON-514 made it the control that CHOSE
-/// that level; DRAGON-517 removed the choosing, because the level shown is the destination by
-/// definition. So the crumb is no longer pressable and the tick is no longer conditional: it
-/// states where this account's captures go, which is a fact about the view and not about a stored
-/// pick. See [`level_control`].
+/// carries the level's name alone now: no folder mark (that leads the whole trail instead,
+/// DRAGON-520) and no tick (owner report; see [`level_control`] for why it left with no
+/// replacement). DRAGON-514 made this crumb the control that CHOSE that level; DRAGON-517 removed
+/// the choosing, because the level shown is the destination by definition. So the crumb is no
+/// longer pressable, and its name alone states where this account's captures go, a fact about the
+/// view and not about a stored pick.
 ///
 /// The crumbs BEFORE it keep their old job of navigating up, and under this model that is also
 /// how the destination moves back OUT: a press on the app folder's crumb both lists it and makes
 /// it where uploads land. The elision keeps its plain text, because it names no single level
 /// ([`crumb_target`]).
+///
+/// # Every crumb-ish child shares [`row_control_h`] (owner report: the row's height visibly
+/// shifted)
+///
+/// A pressable crumb ([`widget::button::text`]) is `space_l` tall by construction; the
+/// unpressable level ([`level_control`]), the elided crumb and the trailing refresh/create pair
+/// are all `Length::Shrink`, naturally shorter. Left alone, a trail with no pressable crumb
+/// (nothing below the app folder) sat at the shorter height, and opening any subfolder jumped it
+/// to `space_l` the moment a pressable crumb appeared. `row_control_h`'s own doc has the full
+/// account, including the DIFFERENT risk this is not (the loading spinner vs the settled refresh
+/// button, [`folder_refresh_button`]'s doc and [`PATH_ICON`]'s: those already agree, checked
+/// directly against libcosmic's layout code).
+///
+/// # The FIRST-EVER load, and only that one, says "Loading..." (owner report, live testing)
+///
+/// [`breadcrumb_first_load`] is the whole decision: while it is true (nothing has landed yet
+/// this dialog session AND a fetch is in flight) the crumb trail is replaced by one subtle
+/// "Loading..." caption and the leading folder icon is tinted subtle too, rather than drawing a
+/// path built from data that does not exist yet. Every LATER fetch this session (a refresh
+/// press, a descent, an ascent) still sets [`CloudAdd::folder_loading`], but by then
+/// [`CloudAdd::has_loaded_once`] is already `true`, so those keep the ordinary look: the real
+/// path, with just the trailing refresh icon spinning.
 fn breadcrumb_row<'a>(add: &'a CloudAdd, slot: Option<FolderSlot>) -> Element<'a, Msg> {
     let depth = add.trail.len();
     let names = add.level_names();
@@ -2298,42 +2432,73 @@ fn breadcrumb_row<'a>(add: &'a CloudAdd, slot: Option<FolderSlot>) -> Element<'a
     // The level's own crumb. `breadcrumb` always ends at the level being looked at, which is what
     // makes "the last one" the right test rather than a second depth calculation here.
     let last = crumbs.len().saturating_sub(1);
+    // Every crumb-ish child (pressable crumbs, the level, the elided crumb, refresh/create) is
+    // pinned to this ONE height below; see the doc above for why.
+    let control_h = row_control_h();
+    // The FIRST-EVER-load state for this dialog session (owner report, live testing): see this
+    // function's doc and [`CloudAdd::has_loaded_once`]'s.
+    let first_load = breadcrumb_first_load(add.folder_loading, add.has_loaded_once);
     let mut row = widget::row::with_capacity(depth * 2 + 5).spacing(4.0).align_y(Alignment::Center);
     // **The folder mark leads the whole trail** (DRAGON-520, owner request). It used to ride
     // inside [`level_control`], attached to the LAST crumb, which read as "this one is a folder"
     // rather than as "the row below is a folder path": the glyph moved along the row as the user
     // descended, and on a deep trail it sat behind the elision. Anchored at the start it names the
-    // whole crumb trail once and never moves. The TICK stays where the level is, because that one
-    // really is about a single crumb: this account's captures land in THAT folder.
-    row = row.push(crate::widgets::icons::sized("folder-open-symbolic", FOLDER_ROW_ICON));
-    for (position, crumb) in crumbs.into_iter().enumerate() {
-        if position > 0 {
-            row = row.push(subtle_caption("/"));
-        }
-        let label = match crumb {
-            Crumb::Root => ROOT_DESTINATION,
-            // Not "..." typed as three dots: one ellipsis character is one glyph to lay out and
-            // reads as an elision rather than as a pause.
-            Crumb::Elided => "\u{2026}",
-            Crumb::Level(index) => names.get(index).copied().unwrap_or_default(),
-        };
-        // Shortened so a long folder name cannot push the row past the card's edge; the
-        // elision above bounds how MANY crumbs there are, and this bounds how wide one is.
-        let label = crumb_label(label);
-        // The level itself: the destination mark, not a navigation crumb.
-        if position == last {
-            row = row.push(level_control(label));
-            continue;
-        }
-        match crumb_target(crumb, depth) {
-            Some(target) => {
-                row = row.push(crate::widgets::arrow_cursor::arrow_cursor(
-                    widget::button::text(label)
-                        .padding([2.0, 6.0])
-                        .on_press(cm(CloudSettingsMsg::FolderCrumbTo(target))),
-                ));
+    // whole crumb trail once and never moves. [`level_control`] itself now carries no glyph at
+    // all, folder mark or tick: the tick it used to wear is gone on the owner's own report.
+    //
+    // Tinted SUBTLE during the first-ever load too (owner report, live testing): the icon leads
+    // whatever is shown in its place, the real path or "Loading...".
+    let folder_glyph = crate::widgets::icons::sized("folder-open-symbolic", FOLDER_ROW_ICON);
+    row = row.push(if first_load { folder_glyph.class(subtle_svg_class()) } else { folder_glyph });
+    if first_load {
+        // Nothing has EVER been shown yet this session, so there is no real path to draw: one
+        // subtle status word takes the whole crumb trail's place, rather than a breadcrumb built
+        // from data that was never fetched. `folder_refresh_button`'s own Loading face already
+        // renders subtle (see its doc), so nothing in the trailing pair needs touching here.
+        row = row.push(subtle_caption("Loading..."));
+    } else {
+        for (position, crumb) in crumbs.into_iter().enumerate() {
+            if position > 0 {
+                row = row.push(subtle_caption("/"));
             }
-            None => row = row.push(widget::text::body(label)),
+            let label = match crumb {
+                Crumb::Root => ROOT_DESTINATION,
+                // Not "..." typed as three dots: one ellipsis character is one glyph to lay out
+                // and reads as an elision rather than as a pause.
+                Crumb::Elided => "\u{2026}",
+                Crumb::Level(index) => names.get(index).copied().unwrap_or_default(),
+            };
+            // Shortened so a long folder name cannot push the row past the card's edge; the
+            // elision above bounds how MANY crumbs there are, and this bounds how wide one is.
+            let label = crumb_label(label);
+            // The level itself: the destination mark, not a navigation crumb.
+            if position == last {
+                row = row.push(level_control(label, control_h));
+                continue;
+            }
+            match crumb_target(crumb, depth) {
+                Some(target) => {
+                    row = row.push(crate::widgets::arrow_cursor::arrow_cursor(
+                        widget::button::text(label)
+                            .padding([2.0, 6.0])
+                            // Overrides `button::text`'s own `Length::Fixed(space_l)` default
+                            // (see this function's doc): every crumb-ish child reads the SAME
+                            // height.
+                            .height(Length::Fixed(control_h))
+                            .on_press(cm(CloudSettingsMsg::FolderCrumbTo(target))),
+                    ));
+                }
+                // The elided crumb: no press, so no button, but the SAME box every other crumb
+                // wears, for the same reason (see this function's doc).
+                None => {
+                    row = row.push(
+                        widget::container(widget::text::body(label))
+                            .padding([2.0, 6.0])
+                            .height(Length::Fixed(control_h))
+                            .align_y(Alignment::Center),
+                    );
+                }
+            }
         }
     }
     row = row.push(widget::Space::new().width(Length::Fill));
@@ -2355,6 +2520,10 @@ fn breadcrumb_row<'a>(add: &'a CloudAdd, slot: Option<FolderSlot>) -> Element<'a
             widget::button::icon(crate::widgets::icons::handle("list-add-symbolic"))
                 .class(accent_icon_button_class(false))
                 .padding(2)
+                // Same shared height as every crumb-ish child (see this function's doc); a bare
+                // `button::icon` is `Length::Shrink` otherwise, a few px shorter than a pressable
+                // crumb.
+                .height(Length::Fixed(control_h))
                 .on_press(cm(CloudSettingsMsg::FolderCreateOpen)),
         ),
         widget::text("New folder here").size(12),
@@ -2362,46 +2531,53 @@ fn breadcrumb_row<'a>(add: &'a CloudAdd, slot: Option<FolderSlot>) -> Element<'a
     );
     let mut actions = widget::row::with_capacity(2).spacing(PATH_ACTION_GAP).align_y(Alignment::Center);
     if let Some(slot) = slot {
-        actions = actions.push(folder_refresh_button(slot, add.folder_spin));
+        actions = actions.push(folder_refresh_button(slot, add.folder_spin, control_h));
     }
     row.push(actions.push(create)).into()
 }
 
-/// The path row's LEVEL mark (DRAGON-514, made a statement rather than a control by DRAGON-517):
-/// the folder the browser is inside, and the tick saying this account's captures land in it.
+/// The path row's LEVEL mark (DRAGON-514, made a statement rather than a control by DRAGON-517,
+/// then stripped of its own tick on the owner's later report): the name of the folder the
+/// browser is inside, this account's destination by definition.
 ///
-/// Shaped like the list row it replaced, deliberately: the level's own name and the accent tick. A
-/// user who read the old first-row-of-the-list as "this folder" reads this the same way, one line
-/// higher and without a duplicate of itself underneath.
+/// Shaped like the list row it replaced, deliberately: the level's own name, at the same padding
+/// as the navigation crumbs beside it. A user who read the old first-row-of-the-list as "this
+/// folder" reads this the same way, one line higher and without a duplicate of itself underneath.
 ///
 /// **The folder glyph is no longer part of it** (DRAGON-520, owner request): it leads the whole
 /// breadcrumb from the row's start now, where it names the trail rather than one crumb of it. See
 /// [`breadcrumb_row`].
 ///
-/// **It is not pressable, and the tick is not conditional.** DRAGON-514 made this the control that
-/// selected the level, which was the best available answer while a selection could sit somewhere
-/// the browser was not. DRAGON-517 removed that possibility: the level shown IS the destination,
-/// so pressing "you are here" would do nothing and a tick that could be off would be describing a
-/// state that cannot happen. What is left is a label, which is what it was before DRAGON-514, plus
-/// the mark that makes the sentence above the list ("ensure it is selected below") true at a
-/// glance.
+/// **The tick is gone too** (owner report, live testing). DRAGON-517 had already made it
+/// unconditional, since the level shown always IS the destination, which left it only confirming
+/// a fact the label beside it already states. The owner's ask was for a mark that makes it
+/// obvious you're inside a folder while browsing subfolders, ideally on the folder LIST rather
+/// than here; there is no row in that list to put one on without relitigating a decision this
+/// file already settled twice, DRAGON-514 removed the one row that used to repeat the current
+/// level (it read as "a child of itself") and DRAGON-517 removed the per-row selection state a
+/// mark would otherwise need to read. So the checkmark is simply gone, and "where you are" is
+/// left to the label here, which was always legible on its own before DRAGON-514 first put a
+/// control on it.
+///
+/// **It is not pressable.** DRAGON-514 made this the control that selected the level, which was
+/// the best available answer while a selection could sit somewhere the browser was not.
+/// DRAGON-517 removed that possibility: the level shown IS the destination, so pressing "you are
+/// here" would do nothing.
 ///
 /// A plain container rather than a `button::custom` for exactly that reason: a control with no
 /// press is a thing users click at. The padding matches the navigation crumbs beside it so the
 /// row's baseline does not step.
-fn level_control<'a>(label: String) -> Element<'a, Msg> {
-    let row = widget::row::with_capacity(2)
-        .push(widget::text::body(label))
-        .push(
-            crate::widgets::icons::sized("emblem-ok-symbolic", FOLDER_ACTION_ICON).class(
-                cosmic::theme::Svg::Custom(std::rc::Rc::new(|t: &cosmic::Theme| {
-                    cosmic::widget::svg::Style { color: Some(theme::accent(t)) }
-                })),
-            ),
-        )
-        .spacing(8.0)
-        .align_y(Alignment::Center);
-    widget::container(row).padding([2.0, 6.0]).into()
+///
+/// **`height` is [`row_control_h`], not left to `Length::Shrink`** (owner report, live testing:
+/// see [`breadcrumb_row`]'s doc). A plain `container` shrinks to its own text, a few px shorter
+/// than a pressable crumb's `button::text` (`space_l` by construction), so the row's height used
+/// to depend on whether the level being shown happened to be the trail's only crumb.
+fn level_control<'a>(label: String, height: f32) -> Element<'a, Msg> {
+    widget::container(widget::text::body(label))
+        .padding([2.0, 6.0])
+        .height(Length::Fixed(height))
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// The inline "new folder" row (DRAGON-506): the name field, a tick that creates it, and an x
@@ -2565,6 +2741,11 @@ impl crate::app::App {
                     return Task::none();
                 };
                 add.folder_loading = false;
+                // A fetch COMPLETED, whichever branch below it lands in, including the
+                // ascend-and-retry one: `breadcrumb_first_load` only cares whether the FIRST
+                // one has landed, not whether it succeeded (owner report, live testing; see
+                // `CloudAdd::has_loaded_once`'s doc).
+                add.has_loaded_once = true;
                 let setup = match result {
                     // Not fatal: the account is already saved and already has a destination
                     // (its app folder), so the listing failing costs the user a choice, not an
@@ -2615,6 +2796,8 @@ impl crate::app::App {
                     return Task::none();
                 };
                 add.folder_loading = false;
+                // Same reasoning as `FoldersLoaded`: a fetch completed, success or failure.
+                add.has_loaded_once = true;
                 let view = match result {
                     // Not one level came back, so there is nothing to show and nothing to save.
                     // The account keeps whatever destination it already had (`CloudAdd::browsed`
@@ -3563,6 +3746,11 @@ mod provider_list_tests {
         assert_eq!(add.account.as_ref().map(|a| a.id.as_str()), Some(account.id.as_str()));
         // gdrive browses, so the dialog opens already listing its folders.
         assert!(add.folder_loading, "a browsable provider starts loading its folder list");
+        // Nothing has landed yet, so this opening fetch is the FIRST-EVER load
+        // (`breadcrumb_first_load`): the breadcrumb shows "Loading..." right when the dialog
+        // opens, not the real path.
+        assert!(!add.has_loaded_once, "a fresh edit-account dialog has never loaded a listing");
+        assert!(breadcrumb_first_load(add.folder_loading, add.has_loaded_once));
         assert_eq!(add.account.and_then(|a| a.folder_id), Some("folder-1".to_string()));
     }
 }
@@ -3770,13 +3958,13 @@ mod step_tests {
         }
     }
 
-    /// The step says what it can actually deliver: a folder question only where there are
-    /// folders, and a naming step everywhere else (DRAGON-495). "Where should uploads go?" on
-    /// a YouTube step would be a question the dialog cannot answer.
+    /// The step says what it can actually deliver: a folder-configuring heading only where there
+    /// are folders, and a naming step everywhere else (DRAGON-495). "Configure your cloud
+    /// storage" on a YouTube step would promise a folder screen the dialog cannot deliver.
     #[rstest::rstest]
-    #[case("gdrive", "Where should uploads go?")]
-    #[case("dropbox", "Where should uploads go?")]
-    #[case("onedrive", "Where should uploads go?")]
+    #[case("gdrive", "Configure your cloud storage")]
+    #[case("dropbox", "Configure your cloud storage")]
+    #[case("onedrive", "Configure your cloud storage")]
     #[case("youtube", "Name this account")]
     fn the_setup_step_asks_only_what_the_provider_can_answer(
         #[case] id: &str,
@@ -3785,26 +3973,34 @@ mod step_tests {
         let browse = chooses_folder(spec(id));
         assert_eq!(setup_title(browse), expected);
         let body = setup_body(spec(id), browse);
-        assert!(body.contains(spec(id).display_name), "the sentence names the provider: {body}");
+        // The folderless body still names the provider; the folder body no longer does (the owner's
+        // newer copy speaks only of "this account", the destination is the same one folder however
+        // the account was reached).
+        if !browse {
+            assert!(body.contains(spec(id).display_name), "the sentence names the provider: {body}");
+        }
         assert_eq!(
-            body.contains("folder"),
+            body.to_lowercase().contains("folder"),
             browse,
             "the sentence mentions folders exactly when there are folders: {body}"
         );
         // **The sandbox is stated, not implied** (DRAGON-498): a folder step that only said
         // "the folder you choose here" left a user with no way to know the choice is confined
         // to one folder, which is the whole shape of the feature. The LIMIT half of that moved
-        // to its own line in DRAGON-503; the body still names the folder.
+        // to its own line in DRAGON-503; the body still names the folder, though the owner's
+        // latest copy names it generically ("the App's Folder") rather than by the registry's
+        // per-provider literal.
         if browse {
-            assert!(body.contains(crate::cloud::APP_FOLDER), "the app folder is named: {body}");
+            assert!(body.contains("App's Folder"), "the app folder is named: {body}");
         }
         assert!(!body.contains('—'), "house style: no em-dashes in user copy");
     }
 
-    /// **The owner's wording, verbatim** (DRAGON-503), for every provider that has a folder: the
-    /// body confirms a selection rather than asking for one, and the limit is its own line. Pinned
-    /// as whole sentences, because this copy was supplied word for word and a later edit that
-    /// "improves" it should have to say so here.
+    /// **The owner's wording, verbatim**, latest revision, for every provider that has a folder:
+    /// the body states where captures land, as a fixed generic phrase ("the App's Folder", no
+    /// per-provider name), and the limit is its own line. Pinned as whole sentences, because this
+    /// copy was supplied word for word and a later edit that "improves" it should have to say so
+    /// here.
     #[rstest::rstest]
     #[case("gdrive", "Google Drive")]
     #[case("onedrive", "OneDrive")]
@@ -3813,10 +4009,7 @@ mod step_tests {
         let spec = spec(id);
         assert_eq!(
             setup_body(spec, true),
-            format!(
-                "Captures uploaded to this {name} account land in your Cosmic Capture Kit \
-                 folder. Ensure it is selected below and name your account."
-            )
+            "Captures uploaded to this account are placed in the App's Folder."
         );
         assert_eq!(
             setup_sandbox_note(spec, true),
@@ -3825,8 +4018,9 @@ mod step_tests {
         for line in [setup_body(spec, true), setup_sandbox_note(spec, true).unwrap()] {
             assert!(!line.contains('—'), "house style: no em-dashes in user copy: {line}");
         }
-        // The folder's name comes from the registry, not from a literal in the sentence, so a
-        // renamed app registration renames it here too (DRAGON-501's metadata).
+        // `app_folder_name` no longer feeds the body sentence (it went generic), but it still
+        // agrees with the app-wide constant for every provider today, which is what keeps it
+        // worth keeping around rather than deleting.
         assert_eq!(app_folder_name(spec), crate::cloud::APP_FOLDER);
     }
 
@@ -3886,6 +4080,24 @@ mod step_tests {
         #[case] expected: Option<FolderSlot>,
     ) {
         assert_eq!(folder_slot(chooses_folder(spec(id)), loading, failed), expected);
+    }
+
+    /// **Only the very first fetch this dialog session says "Loading..."** (owner report, live
+    /// testing). `folder_loading` alone cannot tell a first load from a refresh or a descent,
+    /// since all three set it; `has_loaded_once` is the tiebreaker, and it must win in both
+    /// directions: a fetch in flight before anything has landed says so, and one in flight
+    /// AFTER something already landed (a refresh, a descent, an ascent) does not.
+    #[rstest::rstest]
+    #[case(true, false, true)] // in flight, nothing has ever landed: the first load
+    #[case(true, true, false)] // in flight, something already landed: an ordinary reload
+    #[case(false, false, false)] // idle, nothing has landed: not loading at all
+    #[case(false, true, false)] // idle, already landed: the ordinary settled state
+    fn only_the_first_ever_fetch_reads_as_the_first_load(
+        #[case] folder_loading: bool,
+        #[case] has_loaded_once: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(breadcrumb_first_load(folder_loading, has_loaded_once), expected);
     }
 
     /// **A listing in flight is a SPIN and nothing else** (DRAGON-514). The one state that used
@@ -4352,18 +4564,19 @@ mod breadcrumb_tests {
         }
     }
 
-    /// **The tick follows the VIEW** (DRAGON-517), which is what replaced `level_is_chosen`, the
+    /// **The mark follows the VIEW** (DRAGON-517), which is what replaced `level_is_chosen`, the
     /// per-provider rule that used to decide whether the path row's level was the account's pick.
     ///
     /// There is no pick left to disagree with: the level the browser is showing IS where uploads
-    /// land, so the mark on the last crumb is a statement rather than a state, and the thing that
-    /// still differs per provider is what that level SAVES ([`viewed_destination`], below).
+    /// land, so the mark on the last crumb (a plain label now; the tick it used to carry is gone
+    /// on the owner's report) is a statement rather than a state, and the thing that still differs
+    /// per provider is what that level SAVES ([`viewed_destination`], below).
     ///
-    /// What this pins is that the two really are the same level. `level_control` marks whichever
+    /// What this pins is that the two really are the same level. `level_control` labels whichever
     /// crumb `breadcrumb` ends on, and `viewed_destination` reads whichever level `trail` ends on;
-    /// if those two could ever be different levels the tick would be a lie.
+    /// if those two could ever be different levels the label would be naming the wrong folder.
     #[test]
-    fn the_level_is_ticked_when_it_is_where_uploads_land() {
+    fn the_marked_level_is_where_uploads_land() {
         let root = ("root-id".to_string(), crate::cloud::APP_FOLDER.to_string());
         for depth in 0..8 {
             let trail: Vec<(String, String)> =
@@ -4676,12 +4889,19 @@ mod empty_level_tests {
         assert_eq!(shows_empty_level_note(folders, loading, creating, deleting), shown);
     }
 
-    /// The copy itself: a sentence, and one that points at the control that fixes it. It carries
-    /// no folder name, because this line can reach a log and names are the user's content.
+    /// The copy itself: two lines, the first naming what's true and the second what to do about
+    /// it. Neither carries a folder name, because this line can reach a log and names are the
+    /// user's content.
     #[test]
     fn the_empty_line_says_what_to_do_and_names_nothing() {
-        assert!(EMPTY_LEVEL_NOTE.ends_with('.'), "{EMPTY_LEVEL_NOTE}");
-        assert!(EMPTY_LEVEL_NOTE.contains('+'), "it must point at the create control");
+        for line in EMPTY_LEVEL_NOTE {
+            assert!(line.ends_with('.'), "{line}");
+            assert!(!line.contains('—'), "house style: no em-dashes in user copy: {line}");
+        }
+        assert!(
+            EMPTY_LEVEL_NOTE.iter().any(|line| line.contains('+')),
+            "it must point at the create control: {EMPTY_LEVEL_NOTE:?}"
+        );
     }
 }
 

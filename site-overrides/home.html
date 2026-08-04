@@ -101,17 +101,26 @@
 {% endblock %}
 
 {#
-  No site chrome on the splash. The card IS the page.
+  No VISIBLE site chrome on the splash. The card IS the page.
 
-  Documentation pages are untouched by this: they never load this template, so
-  they keep the theme's header, tabs and footer exactly as before. The
-  sidebars are already gone here through `index.md`'s `hide: [navigation, toc]`
-  front matter.
+  The header, tabs and footer blocks are deliberately NOT emptied here, even
+  though the splash shows none of them. They render into the DOM and
+  `custom.css` hides them with `body:has(.cck-space)` rules, the same
+  mechanism every other splash-only style in this site uses.
+
+  WHY the chrome must stay in the DOM: Material's `navigation.instant` swaps
+  page CONTENT in place and keeps the current document's chrome elements.
+  When these blocks were emptied (the first version of this template), any
+  navigation that STARTED on the splash carried the chrome-less DOM into
+  every documentation page, so the header and footer were invisible until a
+  hard refresh. With the chrome present-but-hidden, leaving the splash makes
+  the `.cck-space` element vanish from the DOM, the `:has()` selectors stop
+  matching, and the chrome shows itself again, in both directions, with
+  instant navigation on.
+
+  Documentation pages are untouched by all of it: they never load this
+  template and never contain `.cck-space`.
 #}
-{% block header %}{% endblock %}
-{% block tabs %}{% endblock %}
-{% block footer %}{% endblock %}
-
 {% block content %}
   {#
     The background. Purely decorative, so it is hidden from screen readers.
@@ -147,6 +156,11 @@
       />
       <h1 class="cck-glass__title">Cosmic Capture Kit</h1>
       <p class="cck-glass__desc">{{ cck_description }}</p>
+      {#
+        A secondary availability line under the description. Placeholder copy for
+        now (the platforms and their versions), to be revisited later.
+      #}
+      <p class="cck-glass__platforms">Available for Windows 11, macOS 14, and COSMIC.</p>
       {#
         One download link for every platform. The release page always lists the
         newest assets, and the per-platform story (which file, which OS

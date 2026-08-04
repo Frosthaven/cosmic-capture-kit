@@ -1563,6 +1563,9 @@ fn upload_meter(pid: window::Id, watch: &super::edit::UploadWatch) -> Element<'s
         items.push(crate::widgets::copy_button::copy_button(
             crate::widgets::copy_button::copied_recently(watch.copied_at),
             0,
+            // Below the pill, the same "below the button" position every other titlebar control
+            // here uses, so the card clears the icon it describes instead of covering it.
+            widget::tooltip::Position::Bottom,
             Msg::Preview(pid, PreviewMsg::UploadCopyLink(watch.session_id.clone())),
         ));
     }
