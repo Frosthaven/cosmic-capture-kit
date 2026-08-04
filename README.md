@@ -8,8 +8,8 @@
 
 ![The preview editor annotating a captured settings window — step markers, a highlighted row, an arrow, text and freehand notes, with the annotation toolbar and zoom controls visible](res/readme/annotations.png)
 
-Cross-platform screen region, window, and monitor capture with support for glass
-windows, image, video, voice, QR, barcodes, OCR text and more. 
+Cross-platform screen region, window, and monitor capture with support for
+translucent windows, image, video, voice, QR, barcodes, OCR text and more.
 
 ## Current Support Status
 
@@ -24,12 +24,19 @@ windows, image, video, voice, QR, barcodes, OCR text and more.
 These are the platforms currently planned for support, along with their current
 status.
 
+Each shipping platform is one architecture today: the macOS build is Apple
+Silicon (aarch64), the Windows build is x86_64, and Linux is x86_64 built from
+source. There is no Intel Mac build, no ARM Windows build, and no packaged
+Linux download yet. Every release names its architecture in the file itself,
+`CosmicCaptureKit-<version>-aarch64.dmg` and
+`CosmicCaptureKit-<version>-x86_64.msi`.
+
 | Platform                                                 | Capture backend                     | Status  | Notes                                                     |
 | -------------------------------------------------------- | ----------------------------------- | ------- | --------------------------------------------------------- |
-| macOS 13+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      |                                                             |
-| Windows 11                                               | Windows Capture                     | ✅      |                                                           |
-| Windows 10                                               | Windows Capture                     | ✅      | Reported working, but we do not provide official support. |
-| Linux (Wayland): COSMIC                                  | Cosmic Compositor / PipeWire Portal | ✅      |                                                           |
+| macOS 13+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      | aarch64 only. Intel Macs are not supported.                |
+| Windows 11                                               | Windows Capture                     | ✅      | x86_64 only.                                              |
+| Windows 10                                               | Windows Capture                     | ✅      | x86_64. Reported working, but we do not provide official support. |
+| Linux (Wayland): COSMIC                                  | Cosmic Compositor / PipeWire Portal | ✅      | x86_64, built from source for now.                        |
 | Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | ❓                                  | 📅      |                                                           |
 | Linux (Wayland): KDE Plasma                              | ❓                                  | 📅      |                                                           |
 | Linux (Wayland): GNOME                                   | ❓                                  | 📅      |                                                           |
@@ -70,7 +77,7 @@ along with their statuses.
 | Preview editor (shared): Copy                       | ✅      |
 | Preview editor (shared): Share sheet (Windows)      | ✅      |
 | Preview editor (shared): Share sheet (macOS)        | ✅      |
-| Preview editor (shared): Upload to an account       | 📅      |
+| Preview editor (shared): Upload to an account       | ✅      |
 | Preview editor (images): Covermarks                 | ✅      |
 | Preview editor (images): Color selector             | ✅      |
 | Preview editor (images): Arrows                     | ✅      |
@@ -80,7 +87,8 @@ along with their statuses.
 | Preview editor (images): Dim/spotlight              | ✅      |
 | Preview editor (images): Destructive pixelate       | ✅      |
 | Preview editor (images): Destructive blur           | ✅      |
-| Preview editor (images): Box fill/outline           | ✅      |
+| Preview editor (images): Box outline                | ✅      |
+| Preview editor (images): Box fill                   | 📅      |
 | Preview editor (images): Box highlight              | ✅      |
 | Preview editor (images): Pencil w/line widths       | ✅      |
 | Preview editor (images): Sticker tool               | 📅      |
@@ -88,7 +96,7 @@ along with their statuses.
 | Preview editor (images): Select/multi-select tool   | ✅      |
 | Preview editor (images): Crop tool                  | ✅      |
 | Preview editor (videos): Simple cutting tool        | ✅      |
-| Preview editor (videos): Simple transition dropdown | ✅      |
+| Preview editor (videos): Simple transition dropdown | 📅      |
 | Recording controls: Toggle mic                      | ✅      |
 | Recording controls: Toggle speaker                  | ✅      |
 | Recording controls: Pause recording                 | ✅      |
@@ -97,26 +105,28 @@ along with their statuses.
 | Recording controls: Keypress overlay                | ❓      |
 | Recording controls: Live annotation tools           | ❓      |
 | Cloud account support: Proton Drive                 | 📅      |
-| Cloud account support: OneDrive                     | 📅      |
-| Cloud account support: Google Drive                 | 📅      |
-| Cloud account support: Dropbox                      | 📅      |
+| Cloud account support: OneDrive                     | ✅      |
+| Cloud account support: Google Drive                 | ✅      |
+| Cloud account support: Dropbox                      | ✅      |
+| Cloud account support: YouTube                      | ✅      |
+| Cloud account support: iCloud Drive                 | 📅      |
 | Cloud account support: SFTP                         | 📅      |
 
 ## Installation
 
 ### macOS
 
-1. Download the latest `.dmg` from
+1. Download the latest `CosmicCaptureKit-<version>-aarch64.dmg` from
    [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases) and
-   drag the app to Applications.
+   drag the app to Applications. Apple Silicon only.
 2. First launch: grant Screen Recording (System Settings > Privacy &
    Security), then relaunch. Microphone is optional (for recordings with mic).
 
 ### Windows 11
 
-1. Download the latest `.msi` from
+1. Download the latest `CosmicCaptureKit-<version>-x86_64.msi` from
    [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases) and run
-   it. It installs per-user (no admin prompt) to
+   it (x86_64 only). It installs per-user (no admin prompt) to
    `%LOCALAPPDATA%\Programs\cosmic-capture-kit`, bundles ffmpeg, and adds Start
    Menu shortcuts (Cosmic Capture Kit, and Cosmic Capture Kit Settings), so
    there is nothing else to install.
@@ -166,6 +176,12 @@ otherwise stops inside `ffmpeg-sys-next`. The only thing dropped is the
 in-process GPU zero-copy encoding path. Recording still works through the
 `ffmpeg` binary.
 
+With [`just`](https://github.com/casey/just) installed, `just build`
+does the same build (and, on Linux, automatically retries with
+`--no-default-features` if the first attempt fails). The same command also
+works on macOS and Windows, each building that platform's own local
+packaged artifact.
+
 #### Run it
 
 The build puts the binary at `target/release/cosmic-capture-kit`, inside the
@@ -184,6 +200,11 @@ immediately dims the screen for a region selection, which is surprising the
 first time if you were expecting a normal application window.
 
 See [CLI.md](CLI.md) for the full flag list.
+
+Want to upload captures straight to Google Drive, OneDrive, Dropbox or
+YouTube? A build made from source needs one extra, one-time setup step per
+provider. See [CLOUD_ACCOUNTS.md](CLOUD_ACCOUNTS.md) for plain, step-by-step
+instructions.
 
 #### Install from source
 

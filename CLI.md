@@ -57,6 +57,9 @@ because it goes on the clipboard as a file reference rather than as pixels.)
 | `--make-sync-clip [path]` | Write the A/V-sync reference clip (black with four flash + beep events) and exit. Default: `cck-sync-reference.mp4` in the recordings folder |
 | `--calibrate-sync <file> [--apply]` | Verify end-to-end A/V sync from a recording of the reference clip and print the measured offset (positive = audio leads video); `--apply` stores a manual override. Recordings already compensate for device latency automatically, so this is normally just a check |
 | `--settings` | Open the settings window only (no capture overlay) |
+| `--cloud-upload <path>` | Upload a capture to a connected cloud account. Needs `--account`. Runs as a detached helper (no window): the transfer happens in the background and a desktop notification reports how it went |
+| `--account <id>` | With `--cloud-upload`: which connected account to use. The id is the one in `cloud_accounts.toml`, minted when the account was connected in Settings |
+| `--auto-share` | With `--cloud-upload`: also ask the provider for a share link and copy it. Ignored for a provider that cannot make one |
 | `--permissions` | **macOS only** — open the permission-checker window (Screen Recording / Microphone / Notifications) with live status and Request / Open System Settings / Relaunch actions. On other platforms the flag is inert (there are no TCC grants) and falls through to a normal launch |
 | `-h`, `--help` | Show the usage summary |
 
@@ -98,11 +101,16 @@ cosmic-capture-kit --scan
 
 # Re-open the last capture in the preview overlay
 cosmic-capture-kit --preview ~/Capture/latest.png
+
+# Upload a capture to a connected cloud account, and copy a share link for it
+cosmic-capture-kit --cloud-upload ~/Capture/latest.png \
+  --account 0123456789abcdef --auto-share
 ```
 
 ## Binding to keys
 
 Point separate desktop shortcuts at different flag sets to get one-press capture
 flows (region screenshot on one key, window recording on another, and so on). See
-the "Launching with a keyboard shortcut" section of the [README](README.md) for the
+the "Launching with a keyboard shortcut" section of the
+[README](https://github.com/Frosthaven/cosmic-capture-kit#readme) for the
 per-desktop setup.

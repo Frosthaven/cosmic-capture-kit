@@ -1,0 +1,24 @@
+# Top-level navigation for the documentation site.
+#
+# The order here is the order a new user should meet the app in: what it is,
+# then the capture overlay, then the editor the capture lands in, then the
+# settings that change both, then the reference material.
+#
+# `cli.md`, `cloud-accounts.md`, `releases.md` and `privacy.md` stay at the top
+# level (and so keep their URLs). Each guide section is a folder with its own
+# `.pages`.
+#
+# `releases.md` is generated at deploy time (scripts/gen-releases-page.py); the
+# committed copy is a placeholder. It is listed here like any other page, so
+# the nav entry is the same whichever copy is being built.
+nav:
+  - Home: index.md
+  - getting-started.md
+  - capture
+  - editor
+  - settings
+  - Command line: cli.md
+  - Cloud accounts: cloud-accounts.md
+  - releases.md
+  - privacy.md
+  - terms.md

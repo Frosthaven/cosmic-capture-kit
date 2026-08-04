@@ -65,6 +65,7 @@ absent.
 |---|---|---|---|
 | **ffmpeg** | `ffmpeg` | Screen recording. Raw frames are piped to ffmpeg (`-f rawvideo`) and encoded. | The Recordings feature is disabled and the UI warns. |
 | **tesseract** | `tesseract` + a language pack (e.g. `tesseract-data-eng`) | OCR text detection ("Scan text (OCR) in region mode"). The region is handed to `tesseract … tsv`. | The toggle shows a "tesseract not found" hint and no-ops. |
+| **curl** | `curl` | **Two features.** (1) The in-app **update check** (`src/update.rs`): one `curl -fsSL --max-time 10` per settings launch to fetch `update.json`. (2) **Cloud accounts** (`src/cloud/http.rs`, DRAGON-482): every request to a connected drive, with the credentials fed through a stdin `--config -` rather than argv. | The update check reports "Could not run curl to check for updates."; connecting or uploading to a cloud account fails with a named reason. Capture, recording and OCR are unaffected. |
 
 > URL opening and the file-manager reveal fallback go through the portal
 > `OpenURI` D-Bus call (see §2), so **no `xdg-utils` / `xdg-open` is needed**. The

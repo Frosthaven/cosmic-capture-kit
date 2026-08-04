@@ -1,6 +1,11 @@
 /target
 # Vendored static ffmpeg/ffprobe for the mac build — never committed (huge binaries).
 /vendor/
+# `mkdocs build` output for the documentation site (mkdocs.yml + site-src/).
+# The built site is published by CI, never committed.
+/site/
+# A local virtualenv for previewing the docs site (`just docs`).
+/.venv-docs/
 **/*.rs.bk
 Cargo.lock.bak
 dependencies.pdf

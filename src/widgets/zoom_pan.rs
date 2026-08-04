@@ -6,9 +6,16 @@
 //!
 //! Input (only while the cursor is over the viewport):
 //! - Ctrl + wheel  → zoom  (`on_zoom(delta)`, +up = in)
-//! - Alt + wheel   → pan vertically   (`on_pan(0, dy)`)
-//! - Alt+Shift+wheel → pan horizontally (`on_pan(dx, 0)`)
+//! - Shift + wheel → pan horizontally (`on_pan(dx, 0)`)
+//! - plain wheel   → pan, both axes   (`on_pan(dx, dy)`; a trackpad gives both)
 //! - Alt + drag    → pan               (`on_pan(dx, dy)` in screen px)
+//! - middle drag   → pan, no modifier needed
+//!
+//! **There is no Alt+wheel.** This list said there was, for both the vertical and the
+//! Alt+Shift horizontal pan, and the wheel handler has never consulted Alt at all:
+//! panning is what a bare wheel does here, which is why no modifier was needed for it.
+//! Alt is a DRAG modifier only. Corrected in DRAGON-508 after a doc audit; the comment
+//! follows the code.
 //!
 //! `zoom`/`pan` are owned by the app (PreviewState) and passed in each build, so this
 //! widget is stateless about the transform — it only tracks live modifiers + the drag.
@@ -22,7 +29,8 @@ use cosmic::iced::core::{
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::widget::Widget;
 
-/// Screen px panned per wheel notch (line delta) for alt+scroll.
+/// Screen px panned per wheel notch (line delta). Used by every wheel pan, plain or
+/// Shift-held; nothing here is gated on Alt (see the module doc).
 const WHEEL_PAN_STEP: f32 = 48.0;
 
 #[derive(Default)]

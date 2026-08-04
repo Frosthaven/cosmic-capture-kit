@@ -1,0 +1,115 @@
+# MkDocs config for the public documentation site at
+# https://cck.thedragon.dev
+#
+# docs_dir is `site-src/`, NOT `docs/`. `docs/` in this repo is the developer
+# doc set (ARCHITECTURE.md, MACOS.md, RELEASING.md, archive/), and part of it is
+# stripped from the public export on purpose. Keeping the website's pages in
+# their own folder means the site can never accidentally publish a private
+# process doc, and the two sets never have to share a naming scheme.
+#
+# The page sources are `site-src/*.md`, the landing-page template override is
+# `site-overrides/`, and the pinned build requirements are `docs-requirements.txt`.
+# Build it with `just docs` (local preview) or `mkdocs build --strict`.
+#
+# Two pages carry no copy of their own: `cli.md` and `cloud-accounts.md` pull
+# the repo-root `CLI.md` and `CLOUD_ACCOUNTS.md` in with a pymdownx.snippets
+# include. Those root files stay the single source of truth, so a person
+# reading them on GitHub and a person reading the site always see the same
+# words. `check_paths: true` below turns a missing or moved include into a
+# build failure instead of a page that quietly prints the raw include marker.
+
+site_name: "Cosmic Capture Kit"
+site_url: "https://cck.thedragon.dev/"
+site_description: "Screenshots, screen recordings and an on-screen QR / barcode / OCR scanner for COSMIC Linux, macOS and Windows."
+copyright: "© 2026 Frosthaven"
+repo_url: "https://github.com/Frosthaven/cosmic-capture-kit"
+repo_name: "Frosthaven/cosmic-capture-kit"
+edit_uri: "edit/main/site-src/"
+
+docs_dir: "site-src"
+
+# `mkdocs serve` only watches docs_dir, so the two included root files are
+# added by hand. Without this, editing CLI.md during a local preview would not
+# reload the page that includes it.
+watch:
+  - "CLI.md"
+  - "CLOUD_ACCOUNTS.md"
+  - "site-overrides"
+
+plugins:
+  - search
+  - awesome-pages
+
+extra_css:
+  - "assets/custom.css"
+
+markdown_extensions:
+  - admonition
+  - toc:
+      toc_depth: 3
+  - attr_list
+  # The settings pages describe one control per entry: a name, then its
+  # description and its default. That is a definition list, and without this
+  # extension the `: ` lines render as literal colons in the prose. Bundled with
+  # Python-Markdown itself, so it adds no dependency, and it only ever activates
+  # on that syntax, so no existing page changes.
+  - def_list
+  - md_in_html
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.details
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      # Repo root, so `--8<-- "CLI.md"` reaches the canonical file. Every
+      # supported way of building (just docs, mkdocs build, the CI job) runs
+      # from the repo root.
+      base_path: ["."]
+      check_paths: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+theme:
+  name: material
+  # The landing page template. `site-src/index.md` selects it with
+  # `template: home.html` front matter; every other page uses the theme's own.
+  custom_dir: "site-overrides"
+  logo: "assets/logo.svg"
+  favicon: "assets/favicon.png"
+  font:
+    text: "Roboto"
+    code: "Roboto Mono"
+  palette:
+    scheme: slate
+  features:
+    - content.code.copy
+    - content.code.select
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - navigation.sections
+    - navigation.footer
+
+extra:
+  # Google Analytics (DRAGON-511). Material injects the tag on every page,
+  # the landing override included, and defers loading until the consent
+  # banner below is accepted. The measurement id is a public identifier.
+  analytics:
+    provider: google
+    property: G-GFF8C5BGTC
+  # The consent banner gates analytics: nothing loads until the visitor
+  # accepts, and rejecting keeps the site fully functional with no tracking.
+  consent:
+    title: Cookie consent
+    description: >-
+      This site uses Google Analytics to count visits and see which pages
+      help people. Analytics only runs if you accept. Rejecting changes
+      nothing about how the site works.
+    actions:
+      - accept
+      - reject
+  social:
+    - icon: fontawesome/brands/github
+      link: "https://github.com/Frosthaven/cosmic-capture-kit"

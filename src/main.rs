@@ -93,6 +93,14 @@ mod util;
 // Read its module doc before adding a log line anywhere.
 mod diag;
 mod cli;
+// Cloud accounts (DRAGON-482): the provider registry, the account store, the platform
+// keyring seam, and the curl transport that keeps every token out of
+// argv. Portable and always compiled: the accounts a user connects
+// belong to the app rather than to any one OS, and only the KEYRING body
+// behind `cloud::secrets` is per-platform. Its own module doc explains the staging (this is
+// the foundation; the OAuth, provider and upload modules are the mount points later stages
+// fill), so no shared file has to change again as the feature lands.
+mod cloud;
 // In-app update channel (DRAGON-175): the manifest fetch/parse, semver compare,
 // and (macOS) the one-click download+verify+swap install flow. The channel is a
 // SEPARATE public Pages repo because the source repo is private (Pages needs a
@@ -749,6 +757,49 @@ fn main() -> cosmic::iced::Result {
         share::run_reveal(&p);
         return Ok(());
     }
+    // Cloud upload (DRAGON-482): `--cloud-upload <file> --account <id> [--auto-share]
+    // [--session <id>]`. A detached single-threaded child, exactly like the helpers above,
+    // because an upload can run for minutes and this app's model is one-shot: the editor
+    // must be free to close while the transfer finishes.
+    //
+    // It sits HERE, with the other helpers, and returns either way, so it is already gone
+    // before the three resident-daemon `bare` checks further down, and none of them needs
+    // to learn this flag. Nothing is logged about the file beyond `diag::path_shape`, and
+    // the account id and the session id (DRAGON-490) are both random hex that identifies
+    // nothing about the user.
+    if let Some(p) = after(share::reexec::CLOUD_UPLOAD) {
+        let account = args
+            .iter()
+            .position(|a| a == share::reexec::CLOUD_ACCOUNT)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+            .unwrap_or("");
+        let auto_share = args.iter().any(|a| a == share::reexec::CLOUD_AUTO_SHARE);
+        // DRAGON-490: the session id the editor minted, so this child can be watched
+        // cross-process. Optional (a bare `--cloud-upload` still runs, just unwatched), and
+        // validated before it becomes part of any filename (`cloud::session::state_path`).
+        let session = args
+            .iter()
+            .position(|a| a == share::reexec::CLOUD_SESSION)
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+            .filter(|s| cloud::session::is_valid_session_id(s))
+            .unwrap_or("");
+        if let Err(e) = cloud::child::run_cloud_upload(&p, account, auto_share, session) {
+            // Both channels on purpose: a terminal run gets the reason on stderr, and a
+            // detached child (the normal case, with no terminal at all) gets it in the
+            // debug log. The message is user-facing copy and names no file.
+            //
+            // Through `redact_oauth` on BOTH (DRAGON-482): most of these reasons are ours,
+            // but one is the provider's own text passed straight through, and stderr is not
+            // a safer place for a credential than the log is. A stderr line lands in a
+            // journal, a terminal's scrollback, or a screenshot of the terminal.
+            let safe = diag::redact_oauth(&e);
+            eprintln!("--cloud-upload: {safe}");
+            log::warn!("cloud upload: {safe}");
+        }
+        return Ok(());
+    }
     // DRAGON-450 (Windows): clicking a capture toast activates us through our OWN URI
     // scheme (`activationType="protocol"` — no COM activator), so the click arrives as a
     // bare URI argument rather than a flag. It is the same helper job as `--reveal` above
@@ -1204,6 +1255,9 @@ Other:\n\
     --preview <file>        Open an existing image/video in the preview (windowed)\n\
     --overlay               With --preview: use the fullscreen overlay, not a window\n\
                             (ignored on Windows 10, which has no overlay editor)\n\
+    --cloud-upload <file>   Upload a capture to a connected cloud account\n\
+    --account <id>          With --cloud-upload: which connected account to use\n\
+    --auto-share            With --cloud-upload: also copy a share link\n\
     --inspect <file>        Print a capture's embedded metadata and exit\n\
     --make-sync-clip [path] Write the A/V-sync reference clip (flash + beep) and exit\n\
     --calibrate-sync <file> Measure a recording of the reference clip; --apply stores it\n\

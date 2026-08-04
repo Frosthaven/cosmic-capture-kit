@@ -101,6 +101,72 @@ points to.
   Linux desktop profiles in fixed ladder order).
 - `src/share/` — post-capture actions, run via a re-exec of this binary
   (`reexec.rs`): `clipboard.rs`, `notify.rs`, `open.rs`, `wifi.rs`.
+- `src/cloud/` — cloud accounts (DRAGON-482): connect a drive, upload a capture
+  to it, optionally copy a share link back. Read `mod.rs` first, it holds the
+  shape everything else reads.
+  - `mod.rs` — the REGISTRY (`registry()`), a compile-time table of
+    `ProviderSpec`s: id, display name, icon, `ProviderCaps`, `AuthKind`, and the
+    host lists a provider's URLs are checked against. **Screens read the CAPS,
+    never the provider id**: the five drives disagree about almost everything
+    (two have no public API at all, one can expire a link, one takes a
+    visibility choice), and stating that once is what keeps the disagreement out
+    of every UI. Also the derived transport allowlist (`registry_hosts`), the two
+    provider-URL validators (`device_url_allowed` / `web_url_allowed`), and the
+    cross-process file lock the oauth gate takes.
+
+    A cloud AUTO-DELETE feature lived here from DRAGON-482 until DRAGON-505: a
+    per-account "delete uploads after N hours" window, a `ledger.rs` recording
+    each upload's deadline, and a six-hourly sweep thread in all three resident
+    daemons. It is gone because no provider offers server-side file TTL, so what
+    shipped was a client-side substitute that only deleted while our own daemon
+    happened to be running, which is too weak a guarantee to promise in settings
+    copy. `providers::delete_file` deliberately stayed: the cancel-after-commit
+    path (DRAGON-496) and the undo-during-hold path (DRAGON-507) both need it,
+    and both delete with the user watching. See `cloud/mod.rs`'s tombstone.
+  - `oauth.rs` — authorization-code-with-PKCE and device-code flows: the
+    loopback redirect catcher, `TokenSet`, and `ensure_fresh`, the ONE place a
+    live access token comes from. Single-flight per account across threads AND
+    processes (this app's model is short-lived processes, so an editor and a
+    detached upload child refreshing at once is the ordinary case, and a
+    provider that ROTATES refresh tokens turns that race into a permanently
+    disconnected account). The loopback listener answers and IGNORES anything
+    that cannot echo the `state` we minted, so a local process cannot end a
+    connect the user is still working through.
+  - `providers/` — one file per drive (`gdrive`, `onedrive`, `dropbox`) behind
+    the `ProviderOps` trait, plus `mod.rs`'s five public functions and the ONE
+    dispatch point (`ops`) that matches on a provider id. Each public function
+    calls `oauth::ensure_fresh` once and hands the token down, so no provider
+    file touches `oauth` or `secrets`. Shared plumbing lives beside them:
+    chunk spans, `Content-Range`, the size-scaled `upload_budget`, and
+    `TempChunk` (a 0600 byte range on disk, removed on drop).
+  - `http.rs` — the transport: `curl` with a stdin config. **Every header, every
+    form field AND the URL ride that config**, because argv is world-readable on
+    Linux and two of these URLs are capabilities (Google's `upload_id`,
+    Microsoft's `tempauth`). https only, only to a host the registry names, no
+    redirects, an explicit budget per request with no default, and a bounded reap
+    so a wedged curl is killed rather than waited on.
+  - `secrets.rs` — the token store seam: `store`/`load`/`delete` over the
+    platform keyring, with a 0600 file fallback that is a real configuration (a
+    Linux box with no Secret Service) rather than an error path. **Decision here,
+    syscall in the plugin**: the item naming, the account-id validation and the
+    file name are pure and unit-tested on every host; `platform/*/secrets.rs`
+    only calls its OS.
+  - `child.rs` — the `--cloud-upload` helper's whole life. An upload runs in a
+    DETACHED re-exec (the same technique every other post-capture action uses),
+    because a transfer can take minutes and this app's model is one-shot. One
+    outer budget, `UPLOAD_BUDGET`, armed before anything else. It records no
+    `diag::Failure`: this is not a capture session, the capture was delivered to
+    the editor long before an upload was asked for, and adding an upload code to
+    that closed vocabulary would be the second failure vocabulary CLAUDE.md
+    forbids.
+  - `upload.rs` — staging (a copy of the capture the child owns, so the editor
+    can close) and the child spawn. `tray.rs` is mounted under it.
+  - `tray.rs` — the upload progress counter's portable model: the `Face` a tray
+    item shows (a bucketed percentage, then a tick or a cross held for
+    `FINISH_HOLD`), the tooltip wording, and the seven-segment SVG the two
+    rastering platforms draw. The three surfaces are
+    `platform/{linux,mac,windows}/upload_tray.rs`; a platform with no tray gets
+    an honest no-op and the upload is unaffected.
 - `src/media/` — PNG `tEXt` metadata chunk read/write.
 - `src/geometry.rs`, `src/selection.rs`, `src/shortcuts.rs`,
   `src/platform/linux/tray.rs`, `src/platform/tray_stub.rs`, `src/util.rs` —

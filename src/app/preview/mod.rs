@@ -22,7 +22,11 @@ mod annotate;
 mod chrome;
 mod covermark;
 mod crop;
-mod edit;
+// `pub(crate)` for ONE caller outside this module: `subscriptions::sub_upload_poll` reads
+// `edit::upload_needs_poll` to decide whether a document still needs its 500ms upload tick
+// (DRAGON-514). The alternative was re-implementing that predicate in the subscription, which
+// is exactly the drift the pure decision exists to prevent.
+pub(crate) mod edit;
 mod image;
 mod layers;
 mod naming;
@@ -789,24 +793,71 @@ pub(in crate::app) fn toggled_preview_windowed(open: PreviewSurface) -> bool {
     !open.is_window()
 }
 
-/// Pure, unit-tested: must an appearance toggle heading for the fullscreen OVERLAY be
-/// REFUSED because the settings pane is open (DRAGON-469)?
+// DRAGON-469 put an `overlay_promotion_blocked(to_overlay, settings_open)` refusal here: the
+// appearance toggle would not promote a document back to the fullscreen overlay while a
+// settings pane was open, and toasted "Close the settings window to go fullscreen" instead.
+// DRAGON-488 DELETED it, on the owner's report. The premise was that the two cannot coexist,
+// and that is only half true: they coexist fine, the overlay simply sits ON TOP (and, on
+// Linux, holds the keyboard — the DRAGON-109 `Exclusive` hazard). What actually matters is
+// that nobody gets LOCKED OUT of settings, and that is guaranteed from the other side: every
+// route to settings from the editor demotes the document off the overlay first (see
+// [`settings_activation`] and [`App::open_settings_from_preview`]). So the way back to a
+// buried pane is the same gear that opened it, and a refusal buys nothing but a red toast on
+// a button the user just pressed on purpose. Do not re-add it; fix the demotion instead if
+// this ever regresses.
+
+/// Pure, unit-tested: is this document ACTUALLY sitting on the fullscreen overlay, so
+/// bringing it down to a window is a real teardown-and-re-mint rather than a no-op?
 ///
-/// The fullscreen preview overlay and the settings window cannot coexist. That is not a new
-/// opinion: it is why [`App::open_settings_from_preview`] demotes an overlay document to a
-/// window before spawning the pane at all. On Linux the preview overlay is an `Exclusive`
-/// layer surface, so it holds the keyboard hostage from every other window (the DRAGON-109
-/// hazard) as well as covering the screen, and the pane is a SEPARATE process with no way to
-/// defend itself. Fixing the toggle's DIRECTION made the promotion newly reachable from that
-/// exact state (demote for settings, then press the button), so the rule that demoted the
-/// document has to hold for the trip back.
+/// ONE expression behind every reader of that rule: [`overlay_siblings`]'s selection (the
+/// DRAGON-336 second-document sweep) and [`App::demote_preview_to_window`]'s own guard, which
+/// is what the settings path ([`App::open_settings_from_preview`]) leans on. They each spelt
+/// it out separately, which is one edit away from disagreeing about what "on the overlay"
+/// means.
 ///
-/// Only the overlay direction is blocked. Going the other way, from the overlay to a window,
-/// is the direction settings WANTS and is never refused. The caller keeps the persisted
-/// appearance untouched on a refusal and mints nothing, so a refusal can never reintroduce
-/// the close-and-remint it replaced.
-pub(in crate::app) fn overlay_promotion_blocked(to_overlay: bool, settings_open: bool) -> bool {
-    to_overlay && settings_open
+/// `surface_open` is load-bearing, not defensive: a document whose surface was torn down
+/// while it stays loaded (a background bake, the overlay's Save-As chooser) has NOTHING on
+/// screen to demote, and minting a window for it would resurrect a surface that was closed on
+/// purpose. It comes back as a window later through [`App::reopen_preview_surface`], which
+/// consults [`overlay_taken`].
+pub(super) fn overlay_demotion_needed(surface: PreviewSurface, surface_open: bool) -> bool {
+    !surface.is_window() && surface_open
+}
+
+/// What activating Settings from the preview editor must do about the PANE itself: DRAGON-353's
+/// three cases, named as a type in DRAGON-488 so the demotion could be lifted out of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::app) enum SettingsActivation {
+    /// THIS process already owns a pane: focus that window and spawn nothing.
+    FocusOwn,
+    /// A pane is open in ANOTHER instance: spawn the `--focus-settings` helper, so the
+    /// activation outlives our own spawn.
+    FocusOther,
+    /// No pane anywhere: spawn a `--settings` child.
+    Spawn,
+}
+
+/// Pure, unit-tested: which of the three [`SettingsActivation`] cases a Settings press in the
+/// preview editor lands in. `own_pane` DOMINATES: a pane we own would also answer the
+/// cross-process probe (a `flock` is not re-takeable from a second descriptor in the same
+/// process), and focusing the window we already have beats spawning a helper to poke it.
+///
+/// **The DEMOTION is deliberately NOT part of this answer (DRAGON-488).** Every arm demotes,
+/// so the caller issues it once, unconditionally, before it looks at the pane at all. Folding
+/// it in as a `bool` would invite an arm that quietly skips it, and skipping it is exactly the
+/// bug this ticket closed: the `FocusOwn` arm used to return early, leaving a same-process
+/// pane focused UNDERNEATH a fullscreen overlay that owns the keyboard. Demoting first is also
+/// what lets the promotion the other way be allowed at all (see the deleted-refusal note
+/// above): the gear is always a way back out of fullscreen, so fullscreen is never a trap.
+pub(in crate::app) fn settings_activation(
+    own_pane: bool,
+    pane_elsewhere: bool,
+) -> SettingsActivation {
+    match (own_pane, pane_elsewhere) {
+        (true, _) => SettingsActivation::FocusOwn,
+        (false, true) => SettingsActivation::FocusOther,
+        (false, false) => SettingsActivation::Spawn,
+    }
 }
 
 /// The open documents that must come DOWN from the fullscreen overlay because a preview is
@@ -827,7 +878,9 @@ pub(super) fn overlay_siblings(
 ) -> Vec<window::Id> {
     previews
         .iter()
-        .filter(|p| !p.surface.is_window() && p.surface_open && Some(p.window) != minting)
+        .filter(|p| {
+            overlay_demotion_needed(p.surface, p.surface_open) && Some(p.window) != minting
+        })
         .map(|p| p.window)
         .collect()
 }
@@ -843,6 +896,21 @@ impl App {
     /// Mutable [`Self::preview_for`].
     pub(in crate::app) fn preview_for_mut(&mut self, id: window::Id) -> Option<&mut PreviewState> {
         index_of(&self.previews, id).map(|i| &mut self.previews[i])
+    }
+
+    /// The account id the Upload flyout's current highlight names, for this document
+    /// (DRAGON-493): the panel's own keyboard highlight when the flyout is open, falling back
+    /// to the SAME preselection rule the flyout opened with. Shared by [`PreviewMsg::UploadStart`]
+    /// and the visibility handler, so both panel actions can never disagree
+    /// about which account they are acting on.
+    fn upload_selected_account_id(&self, id: window::Id) -> Option<String> {
+        let p = self.preview_for(id)?;
+        let by_highlight =
+            p.edit.flyout.filter(|f| f.kind == edit::FlyoutKind::Upload).and_then(|f| f.selected);
+        let idx = by_highlight.or_else(|| {
+            edit::upload_preselect(&p.edit.cloud_accounts, self.cloud_last_account.as_deref())
+        })?;
+        p.edit.cloud_accounts.get(idx).map(|a| a.id.clone())
     }
 
     /// The preview keyboard input belongs to when the event carries no usable window id
@@ -889,6 +957,32 @@ impl App {
     pub(in crate::app) fn note_preview_focus(&mut self, id: window::Id) {
         if self.preview_for(id).is_some() {
             self.focused_preview = Some(id);
+        }
+    }
+
+    /// A window took focus: if it is a preview, re-read the connected cloud accounts into
+    /// its snapshot (DRAGON-482).
+    ///
+    /// This is what un-greys the toolbar's Upload button after the user connects an account
+    /// in Settings. The button reads `EditState::cloud_accounts`, a snapshot, because the
+    /// toolbar is rebuilt every frame and `accounts::list` is a file read plus a TOML parse.
+    /// Coming BACK to the editor is the moment the answer can have changed and the only one
+    /// the app can see without polling, so it joins the document's open and the Upload
+    /// flyout's toggle as the third (and last) refresh point.
+    ///
+    /// Cheap by construction: it does nothing at all for the settings window, an overlay, or
+    /// any other surface, and a preview is focused a handful of times in a session.
+    pub(in crate::app) fn refresh_preview_cloud_accounts(&mut self, id: window::Id) {
+        let Some(is_video) = self.preview_for(id).map(|p| matches!(p.kind, PreviewKind::Video(_)))
+        else {
+            return;
+        };
+        self.note_preview_focus(id);
+        // Filtered to this document's own media kind (DRAGON-493): a video-only provider
+        // (YouTube) has no business in an image session's list, and vice versa.
+        let accounts = edit::accounts_for_kind(crate::cloud::accounts::list(), is_video);
+        if let Some(preview) = self.preview_for_mut(id) {
+            preview.edit.cloud_accounts = accounts;
         }
     }
 
@@ -1174,6 +1268,20 @@ impl App {
                             text_annot::TextFont::Clean
                         };
                         self.update_preview(id, PreviewMsg::SetTextFont(f))
+                    }
+                    // DRAGON-482: Enter PICKS the highlighted account, exactly as it picks a
+                    // covermark or a text size. It deliberately does not start the upload:
+                    // see `FlyoutKind::Upload`; the panel's own button is the commit.
+                    Some(edit::FlyoutNav { kind: edit::FlyoutKind::Upload, selected: Some(i), .. }) => {
+                        match self
+                            .preview_for(id)
+                            .and_then(|p| p.edit.cloud_accounts.get(i).map(|a| a.id.clone()))
+                        {
+                            Some(account) => {
+                                self.update_preview(id, PreviewMsg::UploadAccountSelected(account))
+                            }
+                            None => Task::none(),
+                        }
                     }
                     _ => Task::none(),
                 }
@@ -1835,10 +1943,10 @@ impl App {
                 // document would otherwise linger as a zombie.
                 let deferred_close = std::mem::take(&mut p.edit.close_after_bake);
                 let output = p.edit.pending_output.take();
-                // Which completion this bake feeds (DRAGON-474): the clipboard, or the
-                // share sheet. Taken unconditionally so a failed share bake cannot leave
-                // the flag armed for an unrelated later copy.
-                let for_share = std::mem::take(&mut p.edit.bake_for_share);
+                // Which completion this bake feeds (DRAGON-474, DRAGON-482): the clipboard,
+                // the share sheet, or a cloud upload. Taken unconditionally so a failed share
+                // or upload bake cannot leave the intent armed for an unrelated later copy.
+                let intent = std::mem::take(&mut p.edit.bake_intent);
                 if deferred_close
                     && let Some(p) = self.preview_for_mut(id)
                 {
@@ -1855,17 +1963,30 @@ impl App {
                         }
                         // `pending_output` is where the bake wrote; the size it reported is
                         // re-read from disk by the completion seam.
-                        if for_share {
+                        match intent {
+                            edit::BakeIntent::Copy => self.finish_copy(id, output),
                             // A share bake whose surface died mid-flight has no window to
                             // anchor a sheet to — honour the deferred close instead of
                             // flashing a failure toast at a dead document.
-                            if deferred_close {
+                            edit::BakeIntent::ShareSheet if deferred_close => {
                                 self.close_preview(id)
-                            } else {
-                                self.finish_share_sheet(id, output)
                             }
-                        } else {
-                            self.finish_copy(id, output)
+                            edit::BakeIntent::ShareSheet => self.finish_share_sheet(id, output),
+                            // An UPLOAD is not anchored to the surface at all: it stages the
+                            // artifact and hands it to a detached child, so a document whose
+                            // surface died mid-bake still delivers, and only then closes. That
+                            // is the whole point of the detached design: the user asked for
+                            // this capture to reach their account, and losing the window is
+                            // not them changing their mind. The toast it posts lands on a
+                            // document that is about to go, which costs nothing.
+                            edit::BakeIntent::Upload { account, auto_share } => {
+                                let task = self.finish_upload(id, output, &account, auto_share);
+                                if deferred_close {
+                                    Task::batch(vec![task, self.close_preview(id)])
+                                } else {
+                                    task
+                                }
+                            }
                         }
                     }
                     None => {
@@ -2088,11 +2209,353 @@ impl App {
                 }
                 Task::none()
             }
-            PreviewMsg::Upload => {
-                // DRAGON-467: the accounts feature does not exist yet, so the toolbar button
-                // ships DISABLED and never emits this. The arm exists so the enum is handled
-                // and the wiring is already in place for the account work.
-                log::debug!("preview: upload pressed with no accounts feature to run");
+            // ── Upload (DRAGON-482) ──────────────────────────────────────────────────────
+            PreviewMsg::UploadFlyoutToggle => {
+                // The accounts are RE-READ here: the settings window is a separate document
+                // (and, when it is a detached `--settings` child, a separate process), so an
+                // account connected since this editor opened has to appear the first time the
+                // user asks to see the list. This is the only refresh point besides the
+                // document's own open; the toolbar reads the snapshot every frame. Filtered to
+                // this document's media kind (DRAGON-493) BEFORE the count below decides
+                // whether Upload has anything to offer, so a doc with only wrong-kind accounts
+                // connected is treated the same as having none.
+                let is_video =
+                    self.preview_for(id).is_some_and(|p| matches!(p.kind, PreviewKind::Video(_)));
+                let accounts = edit::accounts_for_kind(crate::cloud::accounts::list(), is_video);
+                let open_now = self
+                    .preview_for(id)
+                    .is_some_and(|p| p.edit.flyout_kind() == Some(edit::FlyoutKind::Upload));
+                // Both routes here (the toolbar button and primary+U) go through ONE decision,
+                // so a key press can never do something the button would have refused. That
+                // now includes the one-at-a-time rule (DRAGON-514): the button draws itself
+                // disabled off `edit::upload_in_flight`, and this is where the keybind meets
+                // the same answer.
+                let busy = self
+                    .preview_for(id)
+                    .is_some_and(|p| edit::upload_in_flight(&p.edit.uploads));
+                let action = edit::upload_toggle(open_now, accounts.len(), busy);
+                let selected = edit::upload_preselect(&accounts, self.cloud_last_account.as_deref());
+                let len = accounts.len();
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.cloud_accounts = accounts;
+                    match action {
+                        edit::UploadToggle::Close => p.edit.close_flyout(),
+                        // The keyboard highlight opens ON the preselected account, so arrows
+                        // move from where the user left off and Enter re-picks it harmlessly.
+                        edit::UploadToggle::Open => {
+                            if let Some(sel) = selected {
+                                p.edit.open_flyout(edit::FlyoutKind::Upload, Some(sel), len);
+                            }
+                        }
+                        edit::UploadToggle::Refuse | edit::UploadToggle::Busy => {}
+                    }
+                }
+                // Only the keybinding can arrive at either of these: the toolbar button is not
+                // pressable in either state. Say why rather than swallowing the press, because
+                // the disabled button's tooltip is the only other place that answer lives and a
+                // keystroke never shows a tooltip.
+                if action == edit::UploadToggle::Refuse {
+                    log::debug!("preview: upload asked for with no connected accounts");
+                    self.preview_toast_icon(
+                        id,
+                        ToastKind::Error,
+                        "No cloud accounts yet. Connect one in Settings.",
+                        "upload-symbolic",
+                    );
+                }
+                if action == edit::UploadToggle::Busy {
+                    // DRAGON-514. Not an error: the user asked for something reasonable at a
+                    // moment it cannot happen, and the meter beside them is already showing
+                    // why.
+                    log::debug!("preview: upload asked for while one is already running");
+                    self.preview_toast_icon(
+                        id,
+                        ToastKind::Success,
+                        "An upload is already running.",
+                        "upload-symbolic",
+                    );
+                }
+                Task::none()
+            }
+            PreviewMsg::UploadFlyoutClose => {
+                // The popover's outside-click dismiss. Escape reaches `FlyoutClose` instead
+                // (the shared modal-key lane), and both mean the same thing here: close it,
+                // upload nothing, keep the account choice for next time.
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.close_flyout();
+                }
+                Task::none()
+            }
+            PreviewMsg::UploadAccountSelected(account) => {
+                // Remembered immediately, not at upload time: picking a destination is itself
+                // a preference, and it should survive an editor closed without uploading.
+                let moved = self
+                    .preview_for(id)
+                    .map(|p| p.edit.cloud_accounts.iter().position(|a| a.id == account));
+                self.cloud_last_account = Some(account);
+                if let (Some(p), Some(Some(i))) = (self.preview_for_mut(id), moved) {
+                    // Keep the keyboard highlight on the row the pointer just picked, so the
+                    // two ways of choosing cannot leave the panel showing two answers.
+                    if let Some(f) = &mut p.edit.flyout {
+                        f.selected = Some(i);
+                    }
+                }
+                // A pick collapses the nested picker back to its chip (DRAGON-489 follow-up),
+                // the same "pick closes the dropdown" behaviour `SetTextSize`/`SetTextFont`
+                // already have.
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.upload_account_menu_open = false;
+                }
+                self.save_state();
+                Task::none()
+            }
+            PreviewMsg::UploadAccountMenu(open) => {
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.upload_account_menu_open = open;
+                }
+                Task::none()
+            }
+            PreviewMsg::UploadAutoShareToggled(on) => {
+                self.cloud_auto_share = on;
+                self.save_state();
+                Task::none()
+            }
+            // ── Visibility (DRAGON-493) ─────────────────────────────────────────────────
+            //
+            // It applies to whichever account the panel currently highlights (the same
+            // resolution `UploadStart` uses, [`Self::upload_selected_account_id`]), and
+            // persists straight onto that `CloudAccount`, the same way `UploadAccountSelected`
+            // persists a folder choice: a preference set here must survive an editor closed
+            // without uploading. It never reaches the network: this is a local TOML write via
+            // `cloud::accounts::upsert`.
+            PreviewMsg::UploadVisibilityMenu(open) => {
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.upload_visibility_menu_open = open;
+                }
+                Task::none()
+            }
+            PreviewMsg::UploadVisibilitySelected(visibility) => {
+                let Some(account_id) = self.upload_selected_account_id(id) else {
+                    return Task::none();
+                };
+                let Some(p) = self.preview_for_mut(id) else {
+                    return Task::none();
+                };
+                let Some(account) = p.edit.cloud_accounts.iter_mut().find(|a| a.id == account_id)
+                else {
+                    return Task::none();
+                };
+                account.visibility = Some(visibility);
+                let saved = account.clone();
+                // A pick collapses the nested menu (DRAGON-489 follow-up's own pattern), the
+                // same "pick closes the dropdown" behaviour the account picker has.
+                p.edit.upload_visibility_menu_open = false;
+                if let Err(e) = crate::cloud::accounts::upsert(saved) {
+                    self.preview_toast_icon(id, ToastKind::Error, e, "upload-symbolic");
+                }
+                Task::none()
+            }
+            PreviewMsg::UploadStart => {
+                // The DESTINATION is resolved through the same pure rule the flyout opened
+                // with, against this document's snapshot, so a remembered account that has
+                // been disconnected since falls back to the first one rather than uploading
+                // into a hole, and the panel's highlighted row is what actually receives it.
+                let account = self.upload_selected_account_id(id);
+                let Some(account) = account else {
+                    log::warn!("preview: upload started with no account to send it to");
+                    self.preview_toast_icon(
+                        id,
+                        ToastKind::Error,
+                        "No cloud accounts yet. Connect one in Settings.",
+                        "upload-symbolic",
+                    );
+                    return Task::none();
+                };
+                let auto_share = self.cloud_auto_share;
+                // Persist the effective choice: the account may never have been CLICKED (the
+                // flyout opened on it), and that is still the one the user is uploading to.
+                self.cloud_last_account = Some(account.clone());
+                self.save_state();
+                // The flyout closes BEFORE the work starts, so the bake's processing spinner
+                // is not drawn under a panel that has nothing left to offer.
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.close_flyout();
+                }
+                self.run_upload(id, account, auto_share)
+            }
+            PreviewMsg::UploadPoll => {
+                // Drain terminal outcomes into `finished` under a SHORT borrow of `p`, then
+                // act on them with `self` free again: `preview_toast_icon` re-borrows `self`,
+                // which cannot overlap a `p` still held from `preview_for_mut` above.
+                let mut finished: Vec<(edit::UploadWatch, crate::cloud::session::UploadState)> =
+                    Vec::new();
+                if let Some(p) = self.preview_for_mut(id) {
+                    // `retain_mut` (not `retain`): a non-terminal read updates the titlebar's
+                    // own tracked percentage in place, which is why this needs `&mut` on the
+                    // entry rather than just deciding whether to keep it.
+                    p.edit.uploads.retain_mut(|w| {
+                        // ENDING (DRAGON-507): the user pressed the X. This entry is on a
+                        // half-second timer of its own and nothing can change its face any
+                        // more, so it is neither read nor reported — a late `Canceled` from
+                        // the child must not resurrect a meter that is already leaving.
+                        if w.ending.is_some() {
+                            return !edit::upload_ending_over(w.ending_for());
+                        }
+                        // Already finished: this entry is now the meter's PERSISTENT readout
+                        // (DRAGON-495 for the outcome, DRAGON-514 for the persistence). Its
+                        // session is cleared and its toast is out, so it must NOT be read or
+                        // reported again, and it is no longer retired on a timer either: it
+                        // stays until this document starts another upload
+                        // (`UploadWatch::in_flight`, applied at the push in `run_upload`) or
+                        // the editor closes with it. The poll keeps ticking only until it
+                        // settles (`edit::upload_needs_poll`), so a meter that never leaves
+                        // does not mean a timer that never stops.
+                        if w.finished.is_some() {
+                            return true;
+                        }
+                        match crate::cloud::session::read_state(&w.session_id) {
+                            // Seeing a `Percent` state at ALL is proof the child has already
+                            // switched to determinate (DRAGON-490 dynamic follow-up: the child
+                            // only ever writes one once `tray::still_indeterminate` says a
+                            // genuine value arrived), so this arm clears the spinner flag
+                            // explicitly rather than leaving it at whatever an earlier poll
+                            // set — the ONE place this document's watch ever un-sets it.
+                            Some(crate::cloud::session::UploadState::Percent(n)) => {
+                                w.last_percent = Some(n);
+                                w.indeterminate = false;
+                                true
+                            }
+                            // Still nothing genuine (every upload starts here, and most polls
+                            // while true just re-confirm it): keep watching, spinner showing.
+                            Some(crate::cloud::session::UploadState::Indeterminate) => {
+                                w.indeterminate = true;
+                                true
+                            }
+                            // Every OTHER `UploadState` variant is terminal by construction
+                            // (`Percent`/`Indeterminate` are the non-terminal cases, matched
+                            // above), so this arm covers Done/Failed/Canceled without needing
+                            // `is_terminal` to tell them apart.
+                            Some(state) => {
+                                // DRAGON-507: keep the file id BEFORE the state is handed on,
+                                // so the finish-hold's undo has something to name. An old
+                                // build's done state carries none, and the X is then not drawn
+                                // at all (`UploadWatch::undoable`).
+                                // DRAGON-520: the share LINK is kept the same way and at the
+                                // same moment, so the meter's copy control has something to
+                                // put back on the clipboard. An upload that made no link
+                                // (the option was off, or the provider cannot) leaves this
+                                // `None` and draws no copy control at all
+                                // (`UploadWatch::copyable`).
+                                if let crate::cloud::session::UploadState::Done {
+                                    file_id,
+                                    url,
+                                    ..
+                                } = &state
+                                {
+                                    if let Some(fid) = file_id {
+                                        w.file_id = Some(fid.clone());
+                                    }
+                                    if let Some(link) = url {
+                                        w.share_url = Some(link.clone());
+                                    }
+                                }
+                                finished.push((w.clone(), state.clone()));
+                                // The outcome is reported exactly once, here. Whether the
+                                // entry then STAYS is `upload_outcome`'s decision
+                                // (DRAGON-495): a Done or a Failed enters a finished HOLD so
+                                // the meter can show what happened for a few seconds instead
+                                // of vanishing mid-transfer, while a CANCEL clears at once,
+                                // because the user already knows. The `finished.is_some()`
+                                // guard at the top of this closure is what stops the next poll
+                                // reporting a held entry a second time.
+                                let Some(outcome) = edit::upload_outcome(&state) else {
+                                    return false; // canceled: the meter clears now
+                                };
+                                w.finished = Some(outcome);
+                                w.finished_at = Some(std::time::Instant::now());
+                                // A completed upload reads 100%: the child's own progress
+                                // states stop at 99 (`cloud::tray::counter`), so without this
+                                // the success meter would hold at whatever the last bucket was.
+                                if outcome == edit::UploadOutcome::Done {
+                                    w.last_percent = Some(100);
+                                    w.indeterminate = false;
+                                }
+                                true
+                            }
+                            // Nothing new to report yet (a torn read, or the child has not
+                            // written anything since the last poll): keep watching, unchanged.
+                            None => true,
+                        }
+                    });
+                }
+                for (watch, state) in finished {
+                    // `retain_mut` above only ever pushes a non-`Percent` state; state as an
+                    // invariant here rather than leaving the reasoning implicit.
+                    debug_assert!(crate::cloud::session::is_terminal(&state));
+                    // The sidecars have done their job; nothing else will ever read this
+                    // session again once this document has acted on its outcome.
+                    crate::cloud::session::clear_session(&watch.session_id);
+                    match state {
+                        crate::cloud::session::UploadState::Done { shared, .. } => {
+                            self.preview_toast_icon(
+                                id,
+                                ToastKind::Success,
+                                format!("Uploaded to {}", watch.label),
+                                "upload-symbolic",
+                            );
+                            if shared {
+                                self.preview_toast_icon(
+                                    id,
+                                    ToastKind::Success,
+                                    "Copied to clipboard",
+                                    "clipboard-check-symbolic",
+                                );
+                            }
+                        }
+                        crate::cloud::session::UploadState::Failed => {
+                            self.preview_toast_icon(
+                                id,
+                                ToastKind::Error,
+                                format!("Upload to {} failed", watch.label),
+                                "upload-symbolic",
+                            );
+                        }
+                        crate::cloud::session::UploadState::Canceled => {
+                            // Not an error: the user asked for this, from the tray or this
+                            // very document's own titlebar Cancel.
+                            self.preview_toast_icon(
+                                id,
+                                ToastKind::Success,
+                                "Upload canceled",
+                                "upload-symbolic",
+                            );
+                        }
+                        // `is_terminal` filtered these out above; `retain_mut` never pushes
+                        // either one into `finished`.
+                        crate::cloud::session::UploadState::Percent(_)
+                        | crate::cloud::session::UploadState::Indeterminate => unreachable!(),
+                    }
+                }
+                Task::none()
+            }
+            PreviewMsg::UploadCancel(session_id) => {
+                // Fire-and-forget: the child's own poll thread notices the marker and stops
+                // the transfer between chunks.
+                crate::cloud::session::request_cancel(&session_id);
+                // DRAGON-507: the meter answers the CLICK, not the child. Red and X-less now,
+                // gone in `UPLOAD_ENDING_HOLD`. Before this, the whole visible response to a
+                // cancel was however long the child took to notice the marker and write
+                // `Canceled` — a control that looked untouched while the user waited to find
+                // out whether their press had registered.
+                self.begin_upload_ending(id, &session_id, edit::MeterAction::Cancel);
+                Task::none()
+            }
+            PreviewMsg::UploadUndo(session_id) => {
+                self.undo_upload(id, &session_id);
+                Task::none()
+            }
+            PreviewMsg::UploadCopyLink(session_id) => {
+                self.copy_upload_link(id, &session_id);
                 Task::none()
             }
             PreviewMsg::LoadFailed => {
@@ -3227,30 +3690,142 @@ mod leaving_the_overlay_tests {
         assert_eq!(surface_closed(p.surface_open, p.edit.baking), SurfaceClosed::Ours);
     }
 
-    /// DRAGON-469 follow-up: promotion to the fullscreen overlay is refused while the settings
-    /// pane is open, because the overlay would take the keyboard (Linux `Exclusive`) and the
-    /// screen from a window in ANOTHER process. Only that direction is blocked.
+    /// DRAGON-488: the appearance toggle's direction is decided by the OPEN SURFACE and
+    /// nothing else. DRAGON-469 briefly ANDed a second input into it, "is a settings pane
+    /// open", and refused the overlay direction when it was; that refusal is gone, so the
+    /// press on a window always heads for the overlay whatever else is on screen. This is the
+    /// model-level statement of "settings never blocks fullscreen".
+    #[test]
+    fn the_direction_depends_on_the_open_surface_alone() {
+        assert!(!toggled_preview_windowed(PreviewSurface::Window), "window ⇒ heading to overlay");
+        assert!(toggled_preview_windowed(PreviewSurface::Overlay), "overlay ⇒ heading to window");
+        // The state the ticket was filed from: demoted for settings (a WINDOW is open, the
+        // setting still says overlay), pane still up. The answer is the overlay, and there is
+        // no second input that could turn it into a refusal.
+        let after_settings_demotion = PreviewSurface::Window;
+        assert!(
+            !toggled_preview_windowed(after_settings_demotion),
+            "pressing fullscreen with settings open must still ask for the overlay"
+        );
+    }
+}
+
+/// DRAGON-488: the Settings press from the preview editor. The demotion is unconditional and
+/// the pane decision is a closed three-case table, so no branch can quietly skip the way back
+/// out of fullscreen.
+#[cfg(test)]
+mod settings_activation_tests {
+    use super::*;
+
+    /// The three cases, plus the domination rule: a pane we OWN wins over the cross-process
+    /// probe, which would answer `true` for our own lock anyway.
     #[rstest::rstest]
-    #[case::to_overlay_with_settings_open(true, true, true)]
-    #[case::to_overlay_with_no_settings(true, false, false)]
-    #[case::to_window_with_settings_open(false, true, false)]
-    #[case::to_window_with_no_settings(false, false, false)]
-    fn only_the_overlay_direction_is_refused_while_settings_is_open(
-        #[case] to_overlay: bool,
-        #[case] settings_open: bool,
-        #[case] want: bool,
+    #[case::own_pane_only(true, false, SettingsActivation::FocusOwn)]
+    #[case::own_pane_beats_the_probe(true, true, SettingsActivation::FocusOwn)]
+    #[case::pane_in_another_instance(false, true, SettingsActivation::FocusOther)]
+    #[case::no_pane_anywhere(false, false, SettingsActivation::Spawn)]
+    fn the_three_cases(
+        #[case] own_pane: bool,
+        #[case] pane_elsewhere: bool,
+        #[case] want: SettingsActivation,
     ) {
-        assert_eq!(overlay_promotion_blocked(to_overlay, settings_open), want);
+        assert_eq!(settings_activation(own_pane, pane_elsewhere), want);
     }
 
-    /// The refusal reads the same `toggled_preview_windowed` the mint does, so the two can
-    /// never disagree about which direction the press is heading: pressing the button on a
-    /// WINDOW is the overlay direction, pressing it on the overlay is not.
+    /// Exactly one case focuses a window WE own; the other two spawn a child. The distinction
+    /// is what the caller matches on, and folding two of them together would either spawn a
+    /// second pane or try to focus a window id we do not have.
     #[test]
-    fn the_refusal_and_the_mint_agree_on_the_direction() {
-        assert!(!toggled_preview_windowed(PreviewSurface::Window), "window ⇒ heading to overlay");
-        assert!(overlay_promotion_blocked(!toggled_preview_windowed(PreviewSurface::Window), true));
-        assert!(toggled_preview_windowed(PreviewSurface::Overlay), "overlay ⇒ heading to window");
-        assert!(!overlay_promotion_blocked(!toggled_preview_windowed(PreviewSurface::Overlay), true));
+    fn only_the_own_pane_case_focuses_in_process() {
+        let all = [
+            settings_activation(true, true),
+            settings_activation(true, false),
+            settings_activation(false, true),
+            settings_activation(false, false),
+        ];
+        assert_eq!(all.iter().filter(|a| **a == SettingsActivation::FocusOwn).count(), 2);
+        // ...and every case is reachable, so none of them is dead code.
+        for want in [
+            SettingsActivation::FocusOwn,
+            SettingsActivation::FocusOther,
+            SettingsActivation::Spawn,
+        ] {
+            assert!(all.contains(&want), "{want:?} is unreachable");
+        }
+    }
+
+    /// THE ticket's invariant, stated where it can be read: NO case of the table carries a
+    /// "skip the demotion" answer, because the demotion is not in the table at all. The
+    /// `FocusOwn` branch is the one that used to return early and leave a same-process pane
+    /// focused under a keyboard-owning overlay. If someone ever adds a `demote: bool` here,
+    /// this test is the note explaining why they should not.
+    #[test]
+    fn the_demotion_is_not_one_of_the_cases() {
+        // A document ON the overlay needs the demotion, whatever the pane situation is...
+        for (own, elsewhere) in [(true, true), (true, false), (false, true), (false, false)] {
+            let _ = settings_activation(own, elsewhere);
+            assert!(
+                overlay_demotion_needed(PreviewSurface::Overlay, true),
+                "every settings case demotes an open overlay document"
+            );
+        }
+        // ...and for a document already in a window the demotion is a no-op, which is why the
+        // caller can issue it unconditionally instead of branching on the surface.
+        assert!(!overlay_demotion_needed(PreviewSurface::Window, true));
+    }
+}
+
+/// DRAGON-488: the one "is this document actually on the fullscreen overlay" expression,
+/// shared by the sibling sweep and the demotion.
+#[cfg(test)]
+mod overlay_demotion_tests {
+    use super::*;
+
+    /// Only a LIVE overlay surface can be demoted. A document already in a window has nothing
+    /// to bring down, and one whose surface is torn down while it stays loaded (a background
+    /// bake, the overlay's Save-As chooser) must not have a window minted for it — that would
+    /// resurrect a surface closed on purpose.
+    #[rstest::rstest]
+    #[case::live_overlay(PreviewSurface::Overlay, true, true)]
+    #[case::overlay_with_no_surface(PreviewSurface::Overlay, false, false)]
+    #[case::live_window(PreviewSurface::Window, true, false)]
+    #[case::window_with_no_surface(PreviewSurface::Window, false, false)]
+    fn only_a_live_overlay_is_demotable(
+        #[case] surface: PreviewSurface,
+        #[case] surface_open: bool,
+        #[case] want: bool,
+    ) {
+        assert_eq!(overlay_demotion_needed(surface, surface_open), want);
+    }
+
+    /// BYTE-IDENTITY PIN for the two callers that used to spell the rule out inline (the
+    /// DRAGON-336 sibling sweep and `demote_preview_to_window`'s guard): the shared predicate
+    /// is the same expression they each carried.
+    #[test]
+    fn it_is_the_historical_expression_both_callers_carried() {
+        for surface in [PreviewSurface::Overlay, PreviewSurface::Window] {
+            for surface_open in [true, false] {
+                assert_eq!(
+                    overlay_demotion_needed(surface, surface_open),
+                    !surface.is_window() && surface_open,
+                );
+            }
+        }
+    }
+
+    /// The sibling sweep reads it through `overlay_siblings`, so a document with no live
+    /// surface is never selected there either — the selection and the guard agree by
+    /// construction now, rather than by two authors writing the same `&&`.
+    #[test]
+    fn the_sibling_sweep_selects_exactly_the_demotable_documents() {
+        // `doc` mints a unique surface id per document.
+        let live = tests::doc(PreviewSurface::Overlay);
+        let mut torn_down = tests::doc(PreviewSurface::Overlay);
+        torn_down.mark_surface_torn_down();
+        let windowed = tests::doc(PreviewSurface::Window);
+        let previews = vec![live, torn_down, windowed];
+        assert_eq!(overlay_siblings(&previews, None), vec![previews[0].window]);
+        // ...and a document never sweeps itself, however demotable it looks.
+        assert!(overlay_siblings(&previews, Some(previews[0].window)).is_empty());
     }
 }

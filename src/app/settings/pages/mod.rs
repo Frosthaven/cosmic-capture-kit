@@ -1,6 +1,7 @@
 pub(super) mod about;
 pub(super) mod audio;
 pub(super) mod capture;
+pub(super) mod cloud;
 pub(super) mod general;
 pub(super) mod health;
 pub(super) mod keyboard;

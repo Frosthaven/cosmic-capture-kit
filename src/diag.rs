@@ -1083,7 +1083,14 @@ pub fn redact_args<S: AsRef<str>>(args: &[S]) -> String {
             _ => out.push(if arg_is_safe(a) { a.to_string() } else { "<value>".into() }),
         }
     }
-    if out.is_empty() { "(none)".into() } else { out.join(" ") }
+    if out.is_empty() {
+        return "(none)".into();
+    }
+    // A last pass for credentials (DRAGON-482). `arg_is_safe` already collapses anything
+    // long or path-shaped, so this is belt and braces rather than the primary defence: a
+    // SHORT token, or a future flag whose value is a credential, would otherwise survive as
+    // a "safe bare word". Costs one scan of a line we were about to log anyway.
+    redact_oauth(&out.join(" "))
 }
 
 /// The SHAPE of a path, for the cases where a failure genuinely cannot be diagnosed without
@@ -1142,6 +1149,12 @@ pub fn path_shape(path: &Path) -> String {
 /// * A BARE relative filename with no separator (`clip.mp4`) is not recognised. Nothing on
 ///   the record path hands ffmpeg one — every output path we build is absolute.
 pub fn redact_paths(text: &str) -> String {
+    // Credentials FIRST (DRAGON-482), then paths. This order matters: a base64url token can
+    // legitimately contain `/`, and a value that begins with one would otherwise be read as
+    // a path and reshaped into a `path(…)` blob mid-credential, leaving the rest of the
+    // token in the line. Masking the credential first removes it from the text entirely, and
+    // `<redacted>` has no path shape for the second pass to find.
+    let text = &redact_oauth(text);
     // Line by line, so a terminator can be "the end of this line" rather than "the end of the
     // whole block".
     let mut out = String::with_capacity(text.len());
@@ -1222,9 +1235,191 @@ fn looks_like_a_path(s: &str) -> bool {
     false
 }
 
+/// What a redacted credential is replaced with. One string, so a reader learns to
+/// recognise it and a test can count occurrences.
+const REDACTED: &str = "<redacted>";
+
+/// The key names whose VALUE is a credential (DRAGON-482).
+///
+/// Ordered longest-prefix-first where one name is a prefix of another: `code_verifier`
+/// must be tried before `code`, or the shorter match would leave `_verifier=…` behind and
+/// redact nothing useful.
+const OAUTH_SECRET_KEYS: [&str; 10] = [
+    "refresh_token",
+    "access_token",
+    "client_secret",
+    "code_verifier",
+    "device_code",
+    "id_token",
+    "token",
+    "code",
+    // The two UPLOAD-SESSION capabilities (DRAGON-482). Neither is an OAuth token, and both
+    // are credentials: Google's resumable session URI carries `upload_id`, Microsoft's carries
+    // `tempauth`, and either one authorizes writing to the user's drive for the life of the
+    // session. They appear in this list rather than a second one because they arrive in the
+    // same shapes (a query string, a JSON reply) and every redactor already walks those.
+    "upload_id",
+    "tempauth",
+];
+
+/// Mask OAuth credentials in FREE-FORM text (DRAGON-482).
+///
+/// The third redactor, beside [`redact_args`] (argv) and [`redact_paths`] (paths in text),
+/// and the newest because the cloud-accounts feature is the first thing this app has ever
+/// held a credential for. A token in the debug log is worse than a path: a path tells us
+/// about the user's machine, a token IS access to their drive, and the log is a file
+/// customers are asked to mail to us.
+///
+/// What it masks, wherever it appears in a line:
+///
+/// * an `Authorization` header value, in any casing, whether the header stands alone
+///   (`Authorization: Bearer …`) or sits inside a quoted string (curl's
+///   `header = "Authorization: Bearer …"`);
+/// * `key=value` for any key in [`OAUTH_SECRET_KEYS`], as it appears in a query string, a
+///   form body or a curl `data-urlencode` line;
+/// * `"key": "value"` for the same keys, as it appears in a JSON token response.
+///
+/// The KEY is always kept and only the VALUE is replaced, because which credential a line
+/// was about is exactly the diagnostic value the line has: "the refresh failed" and "the
+/// authorization code was rejected" are different bugs.
+///
+/// A key must sit on a token boundary, so `barcode=1234` is left alone. Everything that is
+/// not a credential comes back byte-identical, for the same reason [`redact_paths`] leaves
+/// prose alone: a redactor that mangles the surrounding text trades one useless log for
+/// another.
+///
+/// Pure + unit-tested.
+pub fn redact_oauth(text: &str) -> String {
+    // ASCII-lowercasing preserves byte length, so indices into `lower` are valid in `text`.
+    let lower = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < text.len() {
+        if let Some((keep_to, resume)) = oauth_secret_at(text, &lower, i) {
+            out.push_str(&text[i..keep_to]);
+            out.push_str(REDACTED);
+            i = resume;
+            continue;
+        }
+        let Some(ch) = text[i..].chars().next() else { break };
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Whether byte `i` starts a new token (so a key name cannot match inside a longer word).
+///
+/// A HYPHEN counts as a boundary, deliberately: `--code=…` (a CLI flag) and
+/// `X-Authorization: …` (a vendor header) are both real credential carriers, and the cost
+/// of the choice is that a hyphenated word ending in a key name over-redacts. That is the
+/// safe direction, and it is the same trade [`redact_paths`] documents.
+fn at_token_boundary(text: &str, i: usize) -> bool {
+    if i == 0 {
+        return true;
+    }
+    let prev = text.as_bytes()[i - 1];
+    !(prev.is_ascii_alphanumeric() || prev == b'_')
+}
+
+/// Where the credential VALUE starting at `from` ends.
+///
+/// Stops at anything that can only be a delimiter: a quote (the value was inside a JSON or
+/// config string), an ampersand or comma (a form body or JSON object), a brace or bracket,
+/// whitespace, or the end of the line. A credential itself contains none of these.
+fn oauth_value_end(text: &str, from: usize) -> usize {
+    text[from..]
+        .find(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '&' | ',' | '}' | ']' | ')' | ';' | '\\')
+        })
+        .map(|rel| from + rel)
+        .unwrap_or(text.len())
+}
+
+/// If a credential starts at byte `i`, return `(end of the part to KEEP, index to resume
+/// at)`. The kept part is the key and its separator; everything between the two indices is
+/// the value being replaced.
+fn oauth_secret_at(text: &str, lower: &str, i: usize) -> Option<(usize, usize)> {
+    if !at_token_boundary(text, i) {
+        return None;
+    }
+    // 1) An Authorization header, standing alone or inside a quoted string.
+    if lower[i..].starts_with("authorization") {
+        let after_name = i + "authorization".len();
+        let rest = &lower[after_name..];
+        let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let colon_at = after_name + ws;
+        if lower.as_bytes().get(colon_at) == Some(&b':') {
+            let mut value_at = colon_at + 1;
+            // Keep one separating space so the line still reads as a header.
+            while matches!(text.as_bytes().get(value_at), Some(b' ')) {
+                value_at += 1;
+            }
+            // The value runs to the end of the line, or to the quote that closes the string
+            // it sits in (curl's `header = "Authorization: …"`).
+            let end = text[value_at..]
+                .find(['"', '\'', '\n', '\r'])
+                .map(|rel| value_at + rel)
+                .unwrap_or(text.len());
+            if end > value_at {
+                return Some((value_at, end));
+            }
+        }
+    }
+    // 2) A JSON member: `"key": "value"`. The opening quote of the value is kept, so the
+    //    document still parses as JSON after redaction.
+    if text.as_bytes()[i] == b'"' {
+        for key in OAUTH_SECRET_KEYS {
+            let opened = i + 1;
+            if !lower[opened..].starts_with(key) {
+                continue;
+            }
+            let after_key = opened + key.len();
+            if lower.as_bytes().get(after_key) != Some(&b'"') {
+                continue;
+            }
+            let rest = &lower[after_key + 1..];
+            let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+            let colon_at = after_key + 1 + ws;
+            if lower.as_bytes().get(colon_at) != Some(&b':') {
+                continue;
+            }
+            let rest = &lower[colon_at + 1..];
+            let ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+            let value_quote = colon_at + 1 + ws;
+            if lower.as_bytes().get(value_quote) != Some(&b'"') {
+                continue;
+            }
+            let value_at = value_quote + 1;
+            let end = text[value_at..]
+                .find('"')
+                .map(|rel| value_at + rel)
+                .unwrap_or(text.len());
+            return Some((value_at, end));
+        }
+    }
+    // 3) A form field or query parameter: `key=value`.
+    for key in OAUTH_SECRET_KEYS {
+        if !lower[i..].starts_with(key) {
+            continue;
+        }
+        let after_key = i + key.len();
+        if lower.as_bytes().get(after_key) != Some(&b'=') {
+            continue;
+        }
+        let value_at = after_key + 1;
+        let end = oauth_value_end(text, value_at);
+        if end > value_at {
+            return Some((value_at, end));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     /// DRAGON-421. The file sink takes THIS crate at `debug` and dependencies only when they
     /// complain. Enabling the log raises `log::max_level()` to `Debug` process-wide, which
@@ -1359,6 +1554,109 @@ mod tests {
             }
             assert!(out.contains("path("), "nothing was redacted in {line:?} -> {out:?}");
         }
+    }
+
+    /// **THE PRIVACY TEST for credentials** (DRAGON-482). These are the real shapes an
+    /// OAuth flow produces: the header on every API call, the token endpoint's JSON reply,
+    /// the form body that redeems a code, the browser redirect that carries it, and the
+    /// curl config line this app writes. A token in the debug log is not a privacy slip, it
+    /// is a working key to the user's drive in a file we ask customers to mail us.
+    ///
+    /// One `rstest` case per shape rather than one loop, so a regression names the shape it
+    /// broke instead of failing on "one of twelve".
+    #[rstest]
+    #[case::header("GET /v3/files with header Authorization: Bearer ya29.SECRETVALUE")]
+    #[case::header_lowercase("authorization: bearer ya29.SECRETVALUE")]
+    #[case::curl_config("header = \"Authorization: Bearer ya29.SECRETVALUE\"")]
+    #[case::token_reply("{\"access_token\":\"ya29.SECRETVALUE\",\"expires_in\":3599}")]
+    #[case::refresh_reply("{\"refresh_token\": \"ya29.SECRETVALUE\", \"scope\": \"drive.file\"}")]
+    #[case::id_token("{\"id_token\":\"ya29.SECRETVALUE\"}")]
+    #[case::form_body("posted grant_type=authorization_code&code=ya29.SECRETVALUE&client_id=1234")]
+    #[case::verifier("code_verifier=ya29.SECRETVALUE")]
+    #[case::curl_form("data-urlencode = \"refresh_token=ya29.SECRETVALUE\"")]
+    #[case::redirect("https://accounts.example.com/cb?code=ya29.SECRETVALUE&state=xyz")]
+    #[case::client_secret("client_secret=ya29.SECRETVALUE")]
+    #[case::device_code("device_code=ya29.SECRETVALUE")]
+    // The two upload-session capabilities. Not OAuth tokens, and every bit as much a key to
+    // the user's drive: these URLs are what a chunked upload PUTs to.
+    #[case::gdrive_session(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&upload_id=ya29.SECRETVALUE"
+    )]
+    #[case::onedrive_session(
+        "https://sn3302.up.1drv.com/up/abc?tempauth=ya29.SECRETVALUE&guid=1234"
+    )]
+    #[case::session_json("{\"uploadUrl\":\"https://x.example/up?tempauth=ya29.SECRETVALUE\"}")]
+    fn redact_oauth_removes_every_credential_an_oauth_flow_produces(#[case] line: &str) {
+        let out = redact_oauth(line);
+        assert!(!out.contains("SECRETVALUE"), "leaked a credential from {line:?} -> {out:?}");
+        assert!(out.contains(REDACTED), "nothing was redacted in {line:?} -> {out:?}");
+    }
+
+    /// The key SURVIVES and only the value goes. Which credential a line was about is the
+    /// diagnostic value it has: a failed refresh and a rejected authorization code are
+    /// different bugs, and a log that redacted both to the same blob could not tell them
+    /// apart. The non-secret company (`state`, `expires_in`, `scope`, `grant_type`) stays
+    /// too, for the same reason.
+    #[test]
+    fn redact_oauth_keeps_the_key_and_the_line_around_it() {
+        assert_eq!(
+            redact_oauth("code=abc123&state=xyz789&grant_type=authorization_code"),
+            "code=<redacted>&state=xyz789&grant_type=authorization_code"
+        );
+        assert_eq!(
+            redact_oauth("{\"access_token\":\"abc\",\"expires_in\":3599,\"scope\":\"drive.file\"}"),
+            "{\"access_token\":\"<redacted>\",\"expires_in\":3599,\"scope\":\"drive.file\"}"
+        );
+        assert_eq!(
+            redact_oauth("Authorization: Bearer abc\nContent-Type: application/json"),
+            "Authorization: <redacted>\nContent-Type: application/json"
+        );
+        // `code_verifier` must win over `code`: the shorter key would leave `_verifier=…`
+        // dangling and redact nothing that matters.
+        assert_eq!(redact_oauth("code_verifier=abc"), "code_verifier=<redacted>");
+    }
+
+    /// The other half of the bargain, the same one [`redact_paths`] keeps: text with no
+    /// credential in it comes back byte-identical. A key name inside a longer word is not a
+    /// key, which is what stops this from mangling ordinary output.
+    #[test]
+    fn redact_oauth_leaves_everything_else_alone() {
+        for line in [
+            "ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers",
+            "barcode=1234567890",         // `code=` inside a word is not a key
+            "the exit code was 1",        // no `=`, no value
+            "unicode=yes",                // ends with `code` but is not one
+            "authorization is required",  // the word, with no header colon
+            "Authorization:",             // a header with no value
+            "access_token=",              // a key with an empty value
+            "he said 1/2 and 3 / 4",
+            "",
+        ] {
+            assert_eq!(redact_oauth(line), line, "{line:?} was altered");
+        }
+    }
+
+    /// The two redactors compose, in the order [`redact_paths`] applies them. A base64url
+    /// token can contain `/`, so a value beginning with one would be read as a path and
+    /// reshaped mid-credential, leaving the rest of the token in the line. Credentials go
+    /// first for exactly that reason, and this pins it.
+    #[test]
+    fn a_credential_that_looks_like_a_path_is_still_a_credential() {
+        let out = redact_paths("refresh_token=/SECRETVALUE/more and file /home/jane/x.mp4 failed");
+        assert!(!out.contains("SECRETVALUE"), "the token survived: {out}");
+        assert!(!out.contains("jane"), "the path survived: {out}");
+        assert!(out.contains("<redacted>") && out.contains("path("), "both passes ran: {out}");
+    }
+
+    /// argv gets the credential pass too. `arg_is_safe` already collapses long or
+    /// path-shaped values, so this covers the gap it leaves: a SHORT credential that reads
+    /// as an ordinary bare word.
+    #[test]
+    fn redact_args_masks_a_credential_short_enough_to_look_safe() {
+        let args = ["cck".to_string(), "--code=abc123".to_string()];
+        let out = redact_args(&args);
+        assert!(!out.contains("abc123"), "a short credential survived argv redaction: {out}");
+        assert!(out.contains("<redacted>"));
     }
 
     /// The other half of the bargain: a line with no path in it must come back untouched, or

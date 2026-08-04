@@ -121,6 +121,8 @@
 //! | `platform::mac::notify` | `services/notify.rs` | `mac/mod.rs` | macos | closed-split (DRAGON-230) |
 //! | `platform::mac::open` | `services/open.rs` | `mac/mod.rs` | macos | closed-split (DRAGON-230) |
 //! | `platform::mac::sck_stream` | `screencapturekit/sck_stream.rs` | `mac/mod.rs` | macos | facet-sort |
+//! | `platform::mac::secrets` | `services/secrets.rs` | `mac/mod.rs` | macos | closed-split (DRAGON-482) |
+//! | `platform::mac::upload_tray` | `services/upload_tray.rs` | `mac/mod.rs` | macos | closed-split (DRAGON-482) |
 //! | `record::sck` | `mac/screencapturekit/record_worker.rs` | `record/mod.rs` | macos | closed-split |
 //! | `record::sck_live_tests` | `mac/screencapturekit/record_worker_live_tests.rs` | `record/mod.rs` | test+macos | closed-split |
 //! | `audio::ducking::duck_mac` | `mac/services/duck_mac/mod.rs` | `audio/ducking.rs` | macos | closed-split |
@@ -129,6 +131,14 @@
 //! `closed-split` (DRAGON-226): whole mac-native files homed under `platform/mac/` so
 //! `scripts/publish-public.sh` can strip the closed platform plugins from the public
 //! Linux tree in one directory cut. Shared-core `#[cfg]` glue stays public by design.
+//!
+//! Not every plugin file is a MOUNT. `linux::upload_tray` and `windows::upload_tray`
+//! (DRAGON-482's cloud upload counter, the third tray-family surface after the recording
+//! tray and the resident) are plain `pub mod` declarations in their plugin's own `mod.rs`,
+//! because they are NEW paths rather than legacy ones being preserved; only the mac file
+//! needs a `#[path]`, and only because the mac plugin sorts its bodies into facet folders.
+//! The seam all three fill is `cloud::upload::tray`, which owns the number, the glyph and
+//! the wording, so those three files paint and nothing else.
 //!
 //! ## Recipes
 //!

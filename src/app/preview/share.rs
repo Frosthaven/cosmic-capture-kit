@@ -20,10 +20,16 @@
 //!   [`App::finish_share_sheet`] — the same refuse / reuse / bake fork as Copy, delivering
 //!   to the system share sheet instead of the clipboard.
 //!
-//! There is no fourth. DELETE used to be here, with its own `ShareIntent` flavour, its
+//! * **Upload** (DRAGON-482) runs through [`App::run_upload`] → [`App::finish_upload`]: the
+//!   same fork again, delivering to a connected cloud account by STAGING the artifact and
+//!   handing it to a detached child. It is the one delivery this process does not see the end
+//!   of, and the editor is free to close the moment the child is spawned.
+//!
+//! There is no fifth. DELETE used to be here, with its own `ShareIntent` flavour, its
 //! file-unlink step and a copy-first setting; the editor stopped deleting anything in
-//! DRAGON-467, so the intent enum, the delete step and the tracked `written` set all went
-//! (the share sheet brought back exactly one bit of it, `bake_for_share`).
+//! DRAGON-467, so the intent enum, the delete step and the tracked `written` set all went.
+//! The share sheet brought back exactly one bit of it (`bake_for_share`), and the upload
+//! made it three destinations, which is where `edit::BakeIntent` came from.
 //!
 //! Rules this file enforces that used to be scattered:
 //!
@@ -534,13 +540,315 @@ impl App {
                 // The bake is in flight — tell `BakeDone` its artifact is for the share
                 // sheet, not the clipboard.
                 if let Some(p) = self.preview_for_mut(id) {
-                    p.edit.bake_for_share = true;
+                    p.edit.bake_intent = edit::BakeIntent::ShareSheet;
                 }
                 task
             }
             // Nothing to render — the file on disk IS the current state; share it.
             None => self.finish_share_sheet(id, None),
         }
+    }
+
+    /// THE cloud-upload entry point (DRAGON-482): hand `id`'s current state to a detached
+    /// upload child bound for `account`, baking first when there are edits to render.
+    ///
+    /// It is the same refuse / reuse / bake fork as [`Self::run_copy`] and
+    /// [`Self::run_share_sheet`], deliberately and literally: an upload is one more way of
+    /// saying "take what I am looking at", so it must mean exactly what Copy and Share mean by
+    /// "the current state": the pristine media with the live scene rendered onto it, never
+    /// the base file and never the last save. DRAGON-398's rule reaches here unchanged: an
+    /// upload that OWES a bake the media cannot produce is refused whole, with the editor up
+    /// and the reason on it, rather than quietly uploading the unedited capture.
+    ///
+    /// The bake artifact is SHARED with the other two actions, so a Copy followed by an Upload
+    /// of the same state uploads the copy's artifact instead of running the encoder again.
+    pub(super) fn run_upload(
+        &mut self,
+        id: window::Id,
+        account: String,
+        auto_share: bool,
+    ) -> Task<cosmic::Action<Msg>> {
+        let owed = self.preview_for(id).is_some_and(|p| p.dirty());
+        if self.refuse_unbakeable(id, owed) {
+            return Task::none();
+        }
+        let reuse = self.preview_for(id).and_then(|p| {
+            match edit::bake_need(
+                p.dirty(),
+                p.edit.undo_stack.len(),
+                p.edit.baked.as_ref().map(|(d, _)| *d),
+            ) {
+                edit::BakeNeed::Reuse => {
+                    p.edit.baked.as_ref().map(|(_, f)| f.clone()).filter(|f| f.exists())
+                }
+                _ => None,
+            }
+        });
+        if let Some(artifact) = reuse {
+            log::debug!("preview: uploading the last bake instead of rendering it again");
+            return self.finish_upload(id, Some(artifact), &account, auto_share);
+        }
+        match self.begin_bake(id) {
+            Some(task) => {
+                // The destination rides WITH the intent, so the completion never has to ask
+                // "which account was that again" against a file the settings window shares.
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.bake_intent = edit::BakeIntent::Upload { account, auto_share };
+                }
+                task
+            }
+            // Nothing to render: the file on disk IS the current state; upload it.
+            None => self.finish_upload(id, None, &account, auto_share),
+        }
+    }
+
+    /// THE completion seam an upload lands on: after a bake (`baked` = the temp it wrote), on
+    /// a reused artifact, or straight away for a clean document (`baked` = `None`).
+    ///
+    /// Two steps, and the ORDER is the whole design (DRAGON-482): STAGE a copy of the file,
+    /// then spawn a DETACHED child to transfer it. Staging is what makes the editor free to
+    /// close immediately afterwards; the bytes the child sends belong to the staging copy, not
+    /// to a throwaway bake temp this document owns or to a file the user may move next. Nothing
+    /// here waits for the transfer: what this side can honestly report is "handed off", and the
+    /// outcome reaches the user through the child's own tray counter and notification.
+    ///
+    /// Like [`Self::finish_share_sheet`] there is no close step. An upload is not an "I'm done
+    /// here" signal, and no exit-card button arms a close behind it.
+    pub(super) fn finish_upload(
+        &mut self,
+        id: window::Id,
+        baked: Option<PathBuf>,
+        account: &str,
+        auto_share: bool,
+    ) -> Task<cosmic::Action<Msg>> {
+        let Some(path) = baked.or_else(|| self.preview_current_file(id)) else {
+            self.preview_toast_icon(
+                id,
+                ToastKind::Error,
+                "Nothing to upload yet",
+                "upload-symbolic",
+            );
+            return Task::none();
+        };
+        // The account's own name for the toast. Read from the document's snapshot rather than
+        // the file, so the notice names what the user just picked in the flyout even if the
+        // settings window has since renamed or removed it.
+        let chosen = self
+            .preview_for(id)
+            .and_then(|p| p.edit.cloud_accounts.iter().find(|a| a.id == account))
+            .cloned();
+        let label = chosen
+            .as_ref()
+            .map(crate::cloud::accounts::CloudAccount::display_label)
+            .unwrap_or_else(|| "the cloud".to_string());
+        // Snapshotted beside the label, and for the same reason: the meter draws this
+        // provider's brand mark (DRAGON-495), and it must keep drawing the one the upload was
+        // started against however the settings window edits the account meanwhile.
+        let provider = chosen.map(|a| a.provider).unwrap_or_default();
+        let staged = match crate::cloud::upload::stage_for_upload(&path) {
+            Ok(staged) => staged,
+            Err(reason) => {
+                // `stage_for_upload`'s message is already written for a human and names no
+                // path (the privacy rule), so it is shown as it stands.
+                self.preview_toast_icon(id, ToastKind::Error, reason, "upload-symbolic");
+                return Task::none();
+            }
+        };
+        // DRAGON-490: mint a session id BEFORE spawning, so it can ride in the child's own
+        // argv (the same reason the account id already does) and this document can start
+        // watching it the instant the child exists. An empty id (the OS random source is
+        // unavailable, vanishingly rare) degrades to exactly the pre-DRAGON-490 behaviour:
+        // the upload still runs, just with no titlebar indicator and no cross-process Cancel.
+        let session_id = crate::cloud::session::new_session_id();
+        if crate::cloud::upload::spawn_upload_child(&staged, account, auto_share, &session_id) {
+            if !session_id.is_empty()
+                && let Some(p) = self.preview_for_mut(id)
+            {
+                // DRAGON-514: the new upload REPLACES whatever the meter was showing. A
+                // finished watch now persists (`UploadWatch::finished`), and the meter draws
+                // `uploads.first()`, so without this the bar for the upload that just started
+                // would sit behind the settled one from the last. Ending watches go for the
+                // same reason: they are already leaving.
+                p.edit.uploads.retain(edit::UploadWatch::in_flight);
+                p.edit.uploads.push(edit::UploadWatch {
+                    session_id,
+                    label: label.clone(),
+                    // DRAGON-507: kept so an UNDO during the finish-hold can name the account
+                    // to delete from. The provider id below cannot: two accounts can share a
+                    // provider, and the delete has to go to the right one.
+                    account_id: account.to_string(),
+                    last_percent: None,
+                    // Every upload starts as the spinner, unconditionally (DRAGON-490 dynamic
+                    // follow-up) — the same assumption the child's `UploadTray`/session marker
+                    // both start with, so the titlebar shows the spinner from this document's
+                    // very first render rather than a misleading empty 0% bar for the moment
+                    // before the first poll confirms it.
+                    indeterminate: true,
+                    provider,
+                    // Running, so it has no outcome and no hold yet; `UploadPoll` sets both
+                    // together when one arrives (DRAGON-495).
+                    finished: None,
+                    finished_at: None,
+                    // No file yet, and nobody has pressed anything (DRAGON-507).
+                    file_id: None,
+                    ending: None,
+                    ending_at: None,
+                    // No link until the child reports one, and nothing copied from this meter
+                    // yet (DRAGON-520). The child's own automatic copy is not this stamp: that
+                    // one is announced by the "Copied to clipboard" toast, and this control's
+                    // tick means "the button you just pressed worked".
+                    share_url: None,
+                    copied_at: None,
+                });
+            }
+            self.preview_toast_icon(
+                id,
+                ToastKind::Success,
+                format!("Uploading to {label}"),
+                "upload-symbolic",
+            );
+        } else {
+            self.preview_toast_icon(
+                id,
+                ToastKind::Error,
+                "Couldn't start the upload",
+                "upload-symbolic",
+            );
+        }
+        Task::none()
+    }
+
+    /// Put an upload's meter into its ENDING state (DRAGON-507): red, no X, and gone in
+    /// [`edit::UPLOAD_ENDING_HOLD`]. The one place either action starts, so a cancel and an
+    /// undo cannot drift into looking different from each other.
+    ///
+    /// Idempotent by construction: a watch that is already ending keeps its ORIGINAL instant,
+    /// so a second click (or a click that arrives while the first is still on screen) cannot
+    /// keep pushing the disappearance further out.
+    pub(super) fn begin_upload_ending(
+        &mut self,
+        id: window::Id,
+        session_id: &str,
+        action: edit::MeterAction,
+    ) {
+        let Some(p) = self.preview_for_mut(id) else { return };
+        let Some(watch) = p.edit.uploads.iter_mut().find(|w| w.session_id == session_id) else {
+            return;
+        };
+        if watch.ending.is_some() {
+            return;
+        }
+        watch.ending = Some(action);
+        watch.ending_at = Some(std::time::Instant::now());
+    }
+
+    /// UNDO a finished upload during its meter's finish-hold (DRAGON-507): delete the file the
+    /// upload put at the provider.
+    ///
+    /// **The EDITOR does this, not the child.** By the time this can be pressed the upload
+    /// child has written its terminal state and exited, so there is no process left to ask.
+    /// The delete therefore runs here, on a DETACHED worker ([`crate::app::off_thread`], the
+    /// house rule for background work a window close can outrun), with the account and the
+    /// file id copied out of the watch first so the worker holds no borrow of the app.
+    ///
+    /// **Best effort, bounded, and silent about content.** One retry, matching the child's own
+    /// `delete_remote_best_effort` for the cancel-after-upload race, because this runs while
+    /// the user is watching a half-second animation and a longer ladder would buy a marginal
+    /// chance at the cost of a visible wait. The provider's message goes through
+    /// `redact_oauth` like every other provider string, and the FILE ID is never logged: it is
+    /// an opaque handle, and on at least one provider it is the file's path.
+    ///
+    /// # What this deliberately does NOT undo
+    ///
+    /// Accepted consequences, decided with the ticket rather than discovered later:
+    ///
+    /// * **The completion notification has already fired.** Desktop notifications cannot be
+    ///   recalled on any of the three platforms, and a second "actually, never mind" banner
+    ///   would be noise for something the user just did on purpose and watched happen.
+    /// * **An auto-shared URL is already on the clipboard, and goes stale.** The clipboard
+    ///   belongs to the user, not to us: overwriting it would destroy whatever they copied
+    ///   since, to fix a link they are about to stop using anyway. The link stops working
+    ///   when the file goes, which is the honest outcome.
+    /// * **The tray counter is untouched.** Its item is long gone by hold time (the child owns
+    ///   it and the child has exited), so this is editor-only by construction.
+    pub(super) fn undo_upload(&mut self, id: window::Id, session_id: &str) {
+        let found = self.preview_for(id).and_then(|p| {
+            p.edit
+                .uploads
+                .iter()
+                .find(|w| w.session_id == session_id)
+                .and_then(|w| w.file_id.clone().map(|f| (w.account_id.clone(), f, w.label.clone())))
+        });
+        // The meter goes red on the CLICK either way — including in the impossible case below,
+        // where the affordance should never have been drawn (`meter_cancel_action` gates it on
+        // the same `file_id`). A press that visibly does nothing would be worse.
+        self.begin_upload_ending(id, session_id, edit::MeterAction::Undo);
+        let Some((account_id, file_id, label)) = found else {
+            log::warn!("preview: an upload undo had no file to remove; nothing was deleted");
+            return;
+        };
+        self.preview_toast_icon(
+            id,
+            ToastKind::Success,
+            format!("Removing from {label}"),
+            "user-trash-symbolic",
+        );
+        // Detached: the answer changes nothing on screen (the meter is already leaving), so
+        // there is no completion to route back into the UI, and this must not outlive-block a
+        // document the user closes a moment later.
+        std::mem::drop(crate::app::off_thread(move || {
+            let Some(acct) = crate::cloud::accounts::list().into_iter().find(|a| a.id == account_id)
+            else {
+                log::warn!("preview: the account an upload undo names is no longer connected");
+                return;
+            };
+            /// One retry, no more: the same bound and the same reasoning as the child's own
+            /// post-cancel delete (`cloud::child::CANCEL_DELETE_ATTEMPTS`).
+            const ATTEMPTS: u32 = 2;
+            for attempt in 1..=ATTEMPTS {
+                match crate::cloud::providers::delete_file(&acct, &file_id) {
+                    Ok(()) => {
+                        log::debug!("preview: an uploaded file was removed again (attempt {attempt})");
+                        return;
+                    }
+                    Err(e) => log::debug!(
+                        "preview: could not remove an uploaded file (attempt {attempt}/{ATTEMPTS}): {}",
+                        crate::diag::redact_oauth(&e)
+                    ),
+                }
+            }
+            log::debug!("preview: an uploaded file is still at the provider after {ATTEMPTS} attempts");
+        }));
+    }
+
+    /// Put a finished upload's share link back on the clipboard (DRAGON-520).
+    ///
+    /// The BACKUP copy, for the user who copied something else after the upload's own automatic
+    /// one. Everything about it is deliberately small: the link is already in this document's
+    /// watch, the copy goes through `share::copy_text` exactly as every other copy in this app
+    /// does, and nothing else changes. The meter's own tick is the whole acknowledgement, and it
+    /// is stamped here rather than after the copy so a press is answered at once.
+    ///
+    /// No toast. The tick appears in the control the user just pressed, which is where they are
+    /// looking; a "Copied to clipboard" banner would be the third time this session has said so.
+    ///
+    /// **The link is never logged**, not even to say a copy happened with it in hand: it opens
+    /// the capture for anyone holding it. The line below reports the BEHAVIOUR.
+    pub(super) fn copy_upload_link(&mut self, id: window::Id, session_id: &str) {
+        let Some(preview) = self.preview_for_mut(id) else { return };
+        let Some(watch) = preview.edit.uploads.iter_mut().find(|w| w.session_id == session_id)
+        else {
+            return;
+        };
+        // `copyable` is the same gate the control is drawn behind, asked again here: a press
+        // that arrived by some other route must not put an empty string on the clipboard.
+        let Some(url) = watch.copyable().map(str::to_string) else {
+            log::warn!("preview: an upload had no link to copy again; the clipboard was untouched");
+            return;
+        };
+        watch.copied_at = Some(std::time::Instant::now());
+        crate::share::copy_text(&url);
+        log::debug!("preview: an upload's share link was copied again");
     }
 
     /// THE completion seam a share lands on — after a bake (`baked` = the temp it wrote), on
@@ -619,9 +927,9 @@ impl App {
     /// span the re-encode with a desktop "Processing capture" notification; instead the editor
     /// draws its own processing overlay (the same spinner the load state uses) while
     /// `edit.baking` holds every input. The output is always a throwaway TEMP, because the
-    /// things that bake here — a COPY, or a SHARE (DRAGON-474) — must both leave whatever
-    /// is on disk alone. (A SAVE bakes too, but straight to the destination the user
-    /// picked, in `PreviewMsg::SaveAsResult`.)
+    /// things that bake here, a COPY, a SHARE (DRAGON-474) or an UPLOAD (DRAGON-482), must
+    /// all leave whatever is on disk alone. (A SAVE bakes too, but straight to the destination
+    /// the user picked, in `PreviewMsg::SaveAsResult`.)
     pub(super) fn begin_bake(&mut self, id: window::Id) -> Option<Task<cosmic::Action<Msg>>> {
         let processing_msg = random_processing_msg();
         let p = self.preview_for_mut(id)?;

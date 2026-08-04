@@ -66,8 +66,8 @@ impl crate::app::App {
             donate_button(),
         )];
         let sections = vec![
-            SectionSpec { title: "About this software", items },
-            SectionSpec { title: "Supporting this project", items: support },
+            SectionSpec { title: "About This Software", items },
+            SectionSpec { title: "Supporting This Project", items: support },
         ];
         // DRAGON-407 removed the Windows-only "Troubleshooting" section that named the
         // DRAGON-406 report folder and opened it. That instrument is gone; the Health page's

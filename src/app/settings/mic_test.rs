@@ -538,32 +538,9 @@ impl App {
             }
         }));
 
-        // The backdrop swallows clicks (so the settings page behind stays inert) but
-        // does NOT dismiss — only the Close button closes the test, so it can't be lost
-        // with a stray click.
-        let backdrop: Element<'_, Msg> = widget::mouse_area(
-            widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .class(cosmic::theme::Container::custom(|_t| {
-                    cosmic::iced::widget::container::Style {
-                        background: Some(Background::Color(crate::app::theme::SCRIM)),
-                        ..Default::default()
-                    }
-                })),
-        )
-        .on_press(Msg::WindowChrome(WindowChromeMsg::Ignore))
-        // Report a cursor interaction over the whole backdrop so the stack
-        // levitates the pointer away from the settings page beneath it —
-        // otherwise dropdowns and rows below the modal still light up on hover.
-        .interaction(cosmic::iced::mouse::Interaction::Idle)
-        .into();
-        let centered: Element<'_, Msg> = widget::container(card)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-        cosmic::iced::widget::stack(vec![window, backdrop, centered]).into()
+        // The backdrop swallows clicks (so the settings page behind stays inert) but does
+        // NOT dismiss: only the Close button closes the test, so it can't be lost with a
+        // stray click.
+        stack_dialog(window, card.into(), None)
     }
 }

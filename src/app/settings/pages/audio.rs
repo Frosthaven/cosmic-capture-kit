@@ -206,7 +206,7 @@ impl crate::app::App {
                 Item::new(
                     "Audio sync offset",
                     "+ms delays audio (if sound is ahead of video), −ms advances it.",
-                    num_input("0", &self.audio_sync_offset_ms.text, Some(|a0| Msg::Recording(RecordingMsg::SetAudioSyncOffset(a0)))),
+                    num_input("0", &self.audio_sync_offset_ms.text, |a0| Msg::Recording(RecordingMsg::SetAudioSyncOffset(a0))),
                 )
                 .suffix("ms")
                 .reset_with(

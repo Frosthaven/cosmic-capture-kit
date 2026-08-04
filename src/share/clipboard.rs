@@ -205,6 +205,14 @@ pub fn run_copy(_path: &Path, _is_video: bool) {
 pub fn run_copy(path: &Path, is_video: bool) {
     use wl_clipboard_rs::copy::{MimeType, Options, Source};
 
+    // **Say we are here before we start serving** (DRAGON-519). This process is a detached
+    // re-exec of the app's own binary, so a sibling committing a capture matches it by exe
+    // path in `instance::close_other_instances` and, until this marker existed, SIGTERMed it.
+    // On Wayland that is not a lost helper, it is a lost CLIPBOARD: the block below owns the
+    // selection, so killing it takes the user's copied capture away. First statement, so the
+    // unspared window is only this process's own startup. See `instance::SHARE_MARKER`.
+    let _serving = crate::instance::ShareMarker::new();
+
     let (data, mime) = if is_video {
         (
             format!("{}\r\n", crate::util::path_to_file_uri(path)).into_bytes(),
@@ -238,6 +246,13 @@ pub fn run_copy_text(_path: &Path) {
 #[cfg(target_os = "linux")]
 pub fn run_copy_text(path: &Path) {
     use wl_clipboard_rs::copy::{MimeType, Options, Source};
+    // DRAGON-519, exactly as in `run_copy` above: this worker OWNS the selection while it
+    // blocks, so a sibling's capture-commit sweep must spare it or the copied text is gone.
+    // The text path is where that is easiest to see, because nothing re-copies it by
+    // accident: a scanned QR code's contents, a Wi-Fi password, or an upload's share link
+    // (`cloud::child` copies through this same helper) is on the clipboard because the user
+    // asked for it and nothing else is going to put it back.
+    let _serving = crate::instance::ShareMarker::new();
     let Ok(bytes) = std::fs::read(path) else {
         return;
     };

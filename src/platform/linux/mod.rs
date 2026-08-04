@@ -28,6 +28,15 @@ pub mod cosmic;
 pub mod gnome;
 pub mod kde;
 pub mod wlroots;
+/// The Secret Service keyring backend behind `cloud::secrets` (DRAGON-482). Not a
+/// `DesktopProfile` axis member: the secrets bus is protocol-keyed like capture is, so a
+/// GNOME box and a COSMIC box reach the same `org.freedesktop.secrets` and neither profile
+/// owns it.
+pub mod secrets;
+/// The `ksni` upload-progress counter behind `cloud::upload::tray` (DRAGON-482). Not a
+/// profile member either, for the same reason `tray.rs` is not: StatusNotifierItem is a
+/// panel protocol every desktop here speaks, so no desktop owns it.
+pub mod upload_tray;
 
 /// One Linux desktop's profile: its stable id and how it locates the wallpaper
 /// file. Extended per-desktop concern (theme readers, tiling quirks) live in the

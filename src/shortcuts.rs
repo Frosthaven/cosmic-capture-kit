@@ -56,6 +56,13 @@ pub enum Action {
     PreviewSave,
     /// Preview: copy the capture to the clipboard (default Ctrl+C).
     PreviewCopy,
+    /// Preview: open the Upload flyout, which picks a connected cloud account and starts an
+    /// upload (default Ctrl+U). DRAGON-482.
+    ///
+    /// `U` for Upload, and it is free in this context: the preview's other `primary+`
+    /// bindings are S, C, Z, Shift+Z, A and D. It opens the FLYOUT rather than uploading
+    /// straight away, because an upload picks a destination account and is not undoable.
+    PreviewUpload,
     /// Preview: close without deleting (default Esc).
     PreviewCancel,
     // DRAGON-467: `PreviewDelete` (Ctrl+Shift+X, "delete the file and close") lived here,
@@ -202,12 +209,16 @@ impl Action {
     /// [`Keymap::apply_overrides`] — which does not de-duplicate against changed defaults —
     /// a no-op for anyone who had rebound a tool, and it gives the third member of a slot a
     /// first-class escape hatch. Keep the ordering when adding tools.
-    pub const ALL: [Action; 38] = [
+    pub const ALL: [Action; 39] = [
         Action::SelectAllText,
         Action::DeselectText,
         Action::CopyText,
         Action::PreviewSave,
         Action::PreviewCopy,
+        // Straight after Copy, matching the editor's own toolbar order (Save, Copy, Share,
+        // Upload) and keeping the "Action Shortcuts" group contiguous, which `group()`
+        // requires.
+        Action::PreviewUpload,
         Action::PreviewCancel,
         Action::PreviewCovermark,
         Action::PreviewUndo,
@@ -255,6 +266,7 @@ impl Action {
             Action::DeselectText => "Deselect all text",
             Action::PreviewSave => "Save",
             Action::PreviewCopy => "Copy to clipboard",
+            Action::PreviewUpload => "Upload",
             Action::PreviewPlay => "Play",
             Action::PreviewFramePrev => "Previous frame",
             Action::PreviewFrameNext => "Next frame",
@@ -301,6 +313,7 @@ impl Action {
             // Action Shortcuts group: descriptions removed per DRAGON-158.
             Action::PreviewSave => "",
             Action::PreviewCopy => "",
+            Action::PreviewUpload => "Upload to a connected cloud account.",
             Action::PreviewCancel => "",
             Action::PreviewCovermark => "",
             Action::PreviewUndo => "",
@@ -360,6 +373,7 @@ impl Action {
             }
             Action::PreviewSave
             | Action::PreviewCopy
+            | Action::PreviewUpload
             | Action::PreviewCancel
             | Action::PreviewCovermark
             | Action::PreviewUndo
@@ -404,6 +418,7 @@ impl Action {
             | Action::DeselectText => Context::Overlay,
             Action::PreviewSave
             | Action::PreviewCopy
+            | Action::PreviewUpload
             | Action::PreviewPlay
             | Action::PreviewFramePrev
             | Action::PreviewFrameNext
@@ -455,6 +470,7 @@ impl Action {
             Action::DeselectText => Shortcut::primary_char('d'),
             Action::PreviewSave => Shortcut::primary_char('s'),
             Action::PreviewCopy => Shortcut::primary_char('c'),
+            Action::PreviewUpload => Shortcut::primary_char('u'),
             Action::PreviewPlay => Shortcut::char('p'),
             Action::PreviewFramePrev => Shortcut::char(','),
             Action::PreviewFrameNext => Shortcut::char('.'),
@@ -1549,6 +1565,40 @@ mod tests {
         }
     }
 
+    /// Upload is primary+U in the preview, and only in the preview (DRAGON-482).
+    ///
+    /// The point of the test is not the letter, it is that the new action goes through the
+    /// SAME machinery every other one does: the platform primary modifier resolves itself
+    /// (Ctrl off macOS, Cmd on it, asserted by `primary_defaults_are_*`), the per-OS label
+    /// rendering falls out of `Shortcut::label` with nothing added for it, and `Keymap::set`
+    /// de-duplicates within the context so the key cannot be double-booked.
+    #[test]
+    fn upload_is_primary_u_in_the_preview() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            km.action_for(Context::Preview, PRIMARY, &ch("u")),
+            Some(Action::PreviewUpload)
+        );
+        // Not a key the capture overlay or a recording answers: the editor owns it.
+        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("u")), None);
+        assert_eq!(km.action_for(Context::Recording, PRIMARY, &ch("u")), None);
+        // BARE U keeps the shape-tool slot it has held since DRAGON-369: adding a primary+U
+        // chord stole nothing. This is the assertion worth having, because `Keymap::set`
+        // de-duplicates within a context and a careless default could have taken the tool key.
+        assert_eq!(
+            km.action_for(Context::Preview, Modifiers::empty(), &ch("u")),
+            Some(Action::PreviewAnnotShapeCycle)
+        );
+        // It renders through the existing per-OS label machinery with no special case.
+        let label = def(Action::PreviewUpload).label();
+        assert!(label.ends_with('U'), "the label should name the key: {label}");
+        assert!(!label.is_empty());
+        // And it sits in the same settings group as the other committing actions, which is
+        // what puts its row beside Save and Copy.
+        assert_eq!(Action::PreviewUpload.group(), Action::PreviewCopy.group());
+        assert!(!Action::PreviewUpload.label().is_empty());
+    }
+
     // ── DRAGON-369: the Photoshop-parity preview keymap ──────────────────────────────
 
     /// THE tool map: ten keys, twelve tools, every letter a real Photoshop key or an
@@ -1716,6 +1766,7 @@ mod tests {
         assert_eq!(def(Action::CopyText).label(), "Ctrl+C");
         assert_eq!(def(Action::DeselectText).label(), "Ctrl+D");
         assert_eq!(def(Action::PreviewCancel).label(), "Esc");
+        assert_eq!(def(Action::PreviewUpload).label(), "Ctrl+U");
     }
 
     /// Linux/Windows defaults use Ctrl (the primary command modifier), never logo,
@@ -1729,6 +1780,7 @@ mod tests {
             Action::DeselectText,
             Action::PreviewSave,
             Action::PreviewCopy,
+            Action::PreviewUpload,
             Action::PreviewUndo,
             Action::PreviewRedo,
         ] {
@@ -1749,6 +1801,7 @@ mod tests {
             Action::DeselectText,
             Action::PreviewSave,
             Action::PreviewCopy,
+            Action::PreviewUpload,
             Action::PreviewUndo,
             Action::PreviewRedo,
         ] {
@@ -1764,6 +1817,7 @@ mod tests {
         // macOS labels render the ⌘ glyph.
         assert_eq!(def(Action::CopyText).label(), "⌘C");
         assert_eq!(def(Action::PreviewSave).label(), "⌘S");
+        assert_eq!(def(Action::PreviewUpload).label(), "⌘U");
     }
 
     /// A persisted override (e.g. a Linux config carried to a Mac) is applied

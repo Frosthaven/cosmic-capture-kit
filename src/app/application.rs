@@ -664,6 +664,8 @@ impl cosmic::Application for App {
                 update_status: crate::update::UpdateStatus::Unknown,
                 update_installing: false,
                 notify_updates: persisted.notify_updates,
+                cloud_last_account: persisted.cloud_last_account.clone(),
+                cloud_auto_share: persisted.cloud_auto_share,
                 update_dialog: None,
                 update_dialog_decided: false,
                 update_notes: None,

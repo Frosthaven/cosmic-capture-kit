@@ -174,7 +174,7 @@ impl crate::app::App {
                         num_input(
                             "32",
                             &self.window_padding_px.text,
-                            Some(|a0| Msg::Settings(SettingsMsg::SetWindowPaddingPx(a0))),
+                            |a0| Msg::Settings(SettingsMsg::SetWindowPaddingPx(a0)),
                         ),
                     )
                     .suffix("px")

@@ -618,6 +618,20 @@ pub struct Persisted {
     /// (absent key ⇒ `true`), so it needs no config migration.
     #[serde(default = "default_true")]
     pub notify_updates: bool,
+    /// Cloud accounts (DRAGON-482): the account the preview editor's Upload flyout offers
+    /// first, by `cloud::accounts::CloudAccount::id`. `None` until one is chosen; an id
+    /// naming an account that has since been disconnected is ignored at use, so nothing
+    /// has to clean it up. NOT a credential and NOT the account list: both of those live
+    /// outside `config.toml` (see `cloud::accounts` for why), and this is only a memory of
+    /// the last pick. Omitted from disk when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_last_account: Option<String>,
+    /// Cloud accounts (DRAGON-482): create a share link for an upload and put it on the
+    /// clipboard, without a second click. Default ON, per the settings-copy convention
+    /// that a convenience toggle ships on. A defaulted new field (absent key yields
+    /// `true`), so it needs no config migration of its own.
+    #[serde(default = "default_true")]
+    pub cloud_auto_share: bool,
 }
 
 fn default_input_sensitivity() -> f32 {

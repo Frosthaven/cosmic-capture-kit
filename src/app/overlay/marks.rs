@@ -65,9 +65,16 @@ impl App {
     }
 
     /// Overlay drawn over the region on a canvas. QR/barcode marks get an orientation-
-    /// following orange outline (skewed codes → skewed quad) plus a hover wash + a
-    /// tooltip. OCR words get only a translucent cyan wash — no outline — on the
-    /// hovered word and the active selection span, with slightly padded, rounded boxes.
+    /// following ACCENT outline (skewed codes → skewed quad) plus a hover wash + a
+    /// tooltip. OCR words get only a translucent ACCENT wash, no outline, in slightly
+    /// padded rounded boxes: EVERY word carries a faint one so the selectable text is
+    /// visible at all, and hovering or selecting only raises its alpha.
+    ///
+    /// (This block used to say "orange" and "cyan", and used to say the wash appeared
+    /// only on the hovered word and the selection. All three were wrong. `MarkShapes::draw`
+    /// fills and strokes every shape with `crate::app::theme::accent`, so the colour
+    /// follows the user's Appearance setting, and the per-word alphas below are
+    /// unconditional. Comments follow the code, never the other way round.)
     /// Drawing only — hover / click / drag-select are owned by the region widget so
     /// they never intercept a region drag.
     pub(super) fn marks_layer(&self, o: &OutputState) -> Option<Element<'_, Msg>> {
@@ -82,9 +89,10 @@ impl App {
         let mut shapes: Vec<MarkShape> = Vec::new();
         let mut tooltip: Option<Element<'_, Msg>> = None;
 
-        // OCR words: every word always carries a faint cyan wash (so the selectable
+        // OCR words: every word always carries a faint ACCENT wash (so the selectable
         // text is visible); the hovered word is a touch stronger and selected words
-        // are more opaque still.
+        // are more opaque still. Only the ALPHA changes here; the colour itself is the
+        // theme accent for every shape this layer draws.
         for (idx, poly) in words {
             let alpha = if self.text_sel.contains(&idx) {
                 0.40

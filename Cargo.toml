@@ -1,8 +1,8 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.26.0"
+version = "0.27.0"
 edition = "2024"
-description = "Cross-platform screen region, window, and monitor capture with support for glass windows, image, video, voice, QR, barcodes, OCR text and more."
+description = "Cross-platform screen region, window, and monitor capture with support for translucent windows, image, video, voice, QR, barcodes, OCR text and more."
 license = "GPL-3.0-only"
 repository = "https://github.com/Frosthaven/cosmic-capture-kit"
 
@@ -91,6 +91,31 @@ ttf-parser = "0.25"
 # hazard, since the whole point is to shape identically to the renderer. usvg does not
 # re-export it, hence the direct entry. It re-exports the same ttf-parser 0.25 pinned above.
 rustybuzz = "0.20"
+# JSON for the cloud-accounts feature (DRAGON-482). Every provider API and every OAuth
+# token endpoint speaks JSON, and unlike `update.rs`'s manifest (one fixed shape we
+# publish ourselves, parsed by a hand parser on purpose) these are documents someone else
+# defines, nest, and extend: a hand parser there would be a correctness bug waiting to
+# happen. Already in Cargo.lock at this version as a transitive dependency, so this adds a
+# dependency EDGE, not a package (verified: the lock is byte-identical after the change).
+serde_json = "1"
+# The OS CSPRNG, for cloud-account ids (DRAGON-482, `cloud::accounts::new_id`). An id names
+# a keyring item, so two of them colliding would mean one account silently reading
+# another's tokens, which rules out a timestamp or a counter. `getrandom` is the smallest
+# thing that asks the OS directly (getrandom(2) / BCryptGenRandom / SecRandomCopyBytes) and
+# is ALREADY in Cargo.lock at this version via the wgpu/rand stack, so this adds a
+# dependency EDGE, not a package (verified: the lock is byte-identical after the change).
+getrandom = "0.3"
+# SHA-256, for the OAuth PKCE code challenge (DRAGON-482, `cloud::oauth::pkce_challenge`).
+# The S256 challenge is `BASE64URL(SHA256(verifier))`, and PKCE is the ONLY thing protecting
+# a desktop app's authorization code, since a desktop client has no secret to prove with. So
+# the hash has to be right, which is the argument against hand-rolling one here: a SHA-256
+# written for a single call site is a SHA-256 nobody reviews. The base64url half IS
+# hand-written (twenty lines, pinned against RFC 4648's vectors) because it has no such
+# failure mode. Already in Cargo.lock at this version as a transitive dependency, so this
+# adds a dependency EDGE, not a package (verified: the only lock change is the single line
+# adding `sha2` to this package's own dependency list; no package was added and no version
+# moved).
+sha2 = "0.10"
 # Grapheme segmentation for the text-annotation editor (DRAGON-354): caret movement,
 # backspace/delete and selection boundaries snap to whole GRAPHEME clusters (emoji ZWJ
 # sequences, skin tones, flags, combining accents) so an edit never splits a user-visible
@@ -387,6 +412,18 @@ objc2-service-management = { version = "0.3", default-features = false, features
 # build is unaffected (target-gated deps enter Cargo.lock but never build off-target;
 # Linux keeps the xdg-portal GlobalShortcuts path in platform/global_shortcuts.rs).
 global-hotkey = "0.7"
+# DRAGON-482 cloud accounts: the login Keychain backend behind `cloud::secrets`
+# (`platform/mac/services/secrets.rs`). Only its `passwords` module is used: three
+# generic-password calls, each one line, where the hand-rolled SecItem equivalent would be
+# ~40 lines of CFDictionary building whose only reviewer is a machine nobody here develops
+# on. DEFAULT features deliberately (the crate's own `default = ["OSX_10_12"]`): its
+# modules are not feature-gated per API, so trimming features here would only risk an
+# unbuildable combination on the one platform this repo cannot compile-check from Linux,
+# for no code we ship. TWO new lock packages (security-framework + security-framework-sys);
+# core-foundation was already in the lockfile before this, pulled in by the existing macOS
+# stack, so it is not a cost of this dependency. Both are macOS-target-only, so the Linux and
+# Windows `--locked` builds resolve them but never compile them.
+security-framework = "3"
 
 # libcosmic on macOS: winit backend, no wayland, no `desktop` (freedesktop
 # .desktop-file integration is Linux-only). The Xwayland experiment already proved
@@ -486,6 +523,12 @@ features = [
     "Win32_UI_Input_KeyboardAndMouse", # RegisterHotKey/UnregisterHotKey + VIRTUAL_KEY/HOT_KEY_MODIFIERS (the global capture hotkey)
     "Win32_System_LibraryLoader",      # GetModuleHandleW (the message-window class hInstance)
     "Win32_System_Registry",           # HKCU\...\Run launch-at-login (autostart.rs)
+    # DRAGON-482 cloud accounts: CredWriteW/CredReadW/CredDeleteW/CredFree + CREDENTIALW,
+    # the Credential Manager keyring backend behind `cloud::secrets`
+    # (`platform/windows/secrets.rs`). A compile-time-only feature flag on the SAME
+    # already-resolved `windows 0.62`, so no new Cargo.lock package lands (verified
+    # byte-identical, like M2/M3).
+    "Win32_Security_Credentials",
     # DRAGON-283 "pause other media during preview": the GSMTC ducker child enumerates
     # System Media Transport Controls sessions and pauses/resumes the Playing ones.
     # Compile-time-only flags on the SAME already-resolved `windows 0.62` — no new

@@ -86,25 +86,6 @@ impl App {
             return None;
         }
         let (rect, horizontal) = self.toolbar_layout(o)?;
-        // DRAGON-475: every idle-toolbar option carries a hover tooltip, opened into free
-        // space — the bar hugs different edges depending on anchor and drag, so the side
-        // is computed from the placed rect (`layout::tooltip_side`), never fixed.
-        // Suppressed while the delay menu's popover is open, for the same overlay
-        // layer-batching artifact that makes the preview editor drop tooltips under an
-        // open flyout (a tooltip drawn across the popover splits: text above it,
-        // backdrop below).
-        let tip_pos = {
-            let (ow, oh) = o.point_size();
-            layout::tooltip_side(horizontal, &rect, ow, oh)
-        };
-        let tips_off = self.delay_menu_open;
-        let tip = move |el: Element<'static, Msg>, label: &'static str| -> Element<'static, Msg> {
-            if tips_off {
-                el
-            } else {
-                widget::tooltip(el, widget::text(label).size(12), tip_pos).into()
-            }
-        };
         // During a countdown the chip counts down (cancel on click); during a
         // recording it's a record indicator (stop on click). Either way only the
         // chip group shows.
@@ -112,6 +93,26 @@ impl App {
         let recording = self.recording.is_some();
         let rec_paused = self.recording_paused();
         let active = counting || recording;
+
+        // DRAGON-475: every idle-toolbar option carries a hover tooltip, opened into free
+        // space — the bar hugs different edges depending on anchor and drag, so the side
+        // is computed from the placed rect (`layout::tooltip_side`), never fixed.
+        // WHETHER one opens at all is `layout::toolbar_tooltips_enabled`: the delay
+        // popover's layer-batching artifact, and (DRAGON-483) a live recording, which
+        // renders this bar into the video. EVERY tooltip on the toolbar is built through
+        // `tip`, so that one predicate covers the whole bar rather than a button at a time.
+        let tip_pos = {
+            let (ow, oh) = o.point_size();
+            layout::tooltip_side(horizontal, &rect, ow, oh)
+        };
+        let tips_on = layout::toolbar_tooltips_enabled(recording, self.delay_menu_open);
+        let tip = move |el: Element<'static, Msg>, label: &'static str| -> Element<'static, Msg> {
+            if tips_on {
+                widget::tooltip(el, widget::text(label).size(12), tip_pos).into()
+            } else {
+                el
+            }
+        };
 
         // Group/button geometry is module-level (ICON_BOX, BTN_PAD, GROUP_PAD) so
         // `toolbar_layout`'s placement + input zone derive from the exact same

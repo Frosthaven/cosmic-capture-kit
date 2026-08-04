@@ -1,0 +1,529 @@
+/*
+ * Site styles for cck.thedragon.dev.
+ *
+ * Three parts, in this order:
+ *   1. the landing page background (`.cck-space*`)
+ *   2. the landing page card (`.cck-home`, `.cck-glass*`)
+ *   3. small readability tweaks shared by every documentation page
+ *
+ * Parts 1 and 2 are used ONLY by site-overrides/home.html.
+ *
+ * Documentation pages read their colours from Material's own CSS variables, so
+ * they still look right if the scheme is ever changed. The landing CARD does
+ * NOT: it always sits on a dark space background, so its colours are pinned
+ * light on purpose and stay readable whichever colour scheme the reader is in.
+ */
+
+/* ------------------------------------------------------------------ */
+/* 1. Landing page: the space background                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Fixed to the viewport rather than to the page, so it covers on any screen
+ * size and does not move while the page scrolls. `z-index: 0` with the card at
+ * `z-index: 1` keeps it behind the content while staying in front of nothing
+ * else; the theme's header and footer paint over it normally.
+ */
+.cck-space {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  overflow: hidden;
+
+  /*
+   * The nebula. Four layers, painted top to bottom in this list:
+   * a violet bloom at the upper left, a teal one at the upper right, an indigo
+   * one low and central, then the near-black base everything sits on. The
+   * hues are chosen to sit with Material's slate scheme rather than fight it.
+   */
+  background-color: #06040f;
+  background-image:
+    radial-gradient(
+      ellipse 70% 55% at 18% 22%,
+      rgba(124, 58, 237, 0.34),
+      rgba(124, 58, 237, 0) 60%
+    ),
+    radial-gradient(
+      ellipse 55% 45% at 82% 26%,
+      rgba(45, 212, 191, 0.16),
+      rgba(45, 212, 191, 0) 60%
+    ),
+    radial-gradient(
+      ellipse 85% 60% at 58% 88%,
+      rgba(67, 56, 202, 0.32),
+      rgba(67, 56, 202, 0) 62%
+    ),
+    linear-gradient(160deg, #0a0718 0%, #06040f 55%, #050a14 100%);
+}
+
+/*
+ * The starfield.
+ *
+ * Three tiles of stars rather than a long list of hand-placed dots, so the
+ * field scales to any viewport and costs one element. The tile sizes are
+ * deliberately awkward numbers with no common factor, so the three patterns
+ * only line up again far outside any real screen and the eye reads the result
+ * as random rather than as a grid.
+ */
+.cck-space__stars {
+  position: absolute;
+  inset: 0;
+  background-image:
+    /* fine, dim */
+    radial-gradient(1px 1px at 17px 23px, rgba(255, 255, 255, 0.75), transparent),
+    radial-gradient(1px 1px at 143px 61px, rgba(255, 255, 255, 0.55), transparent),
+    radial-gradient(1px 1px at 71px 129px, rgba(255, 255, 255, 0.65), transparent),
+    radial-gradient(1px 1px at 199px 167px, rgba(255, 255, 255, 0.45), transparent),
+    /* mid, brighter, faintly warm and cool */
+    radial-gradient(1.4px 1.4px at 53px 41px, rgba(214, 226, 255, 0.85), transparent),
+    radial-gradient(1.4px 1.4px at 251px 197px, rgba(255, 241, 224, 0.7), transparent),
+    radial-gradient(1.4px 1.4px at 157px 283px, rgba(255, 255, 255, 0.8), transparent),
+    /* sparse and large */
+    radial-gradient(2px 2px at 89px 97px, rgba(255, 255, 255, 0.95), transparent),
+    radial-gradient(2px 2px at 331px 271px, rgba(196, 214, 255, 0.8), transparent);
+  background-size:
+    227px 191px,
+    227px 191px,
+    227px 191px,
+    227px 191px,
+    313px 271px,
+    313px 271px,
+    313px 271px,
+    419px 383px,
+    419px 383px;
+}
+
+/*
+ * The twinkle.
+ *
+ * The field above never moves and never changes. These are three SEPARATE
+ * layers laid over it, and only their opacity animates: each breathes from
+ * full brightness down to almost nothing and back.
+ *
+ * Calibration, which took two passes to get right. The first attempt used two
+ * layers of a dozen 1px stars on 13 and 19 second cycles, and it was
+ * imperceptible: a star that small, that dim, changing that slowly, is not
+ * something an eye catches. These stars are therefore BIGGER and BRIGHTER than
+ * the steady field, there are enough of them that several are always mid
+ * breath, and the cycles are short enough (7 to 11.5 seconds) that watching
+ * any part of the sky for a few seconds shows something happening.
+ *
+ * Three layers rather than one, on periods that share no neat ratio and with
+ * offset starts, so the dips never line up. That is what keeps it reading as
+ * individual stars breathing in their own time rather than the whole sky
+ * blinking at once, which one layer on its own always looks like.
+ *
+ * Opacity is the only property that changes, so this stays on the compositor:
+ * no layout, no reflow, and nothing that could disturb the overflow guards
+ * further down.
+ */
+.cck-space__twinkle {
+  position: absolute;
+  inset: 0;
+  animation: cck-twinkle 7s ease-in-out infinite;
+}
+
+/*
+ * Each star is a SOLID disc with a short fade, not a plain soft gradient. That
+ * detail is what made the difference: `radial-gradient(2px 2px at .., #fff,
+ * transparent)` fades from the centre out, so a "2px" star is really one dim
+ * pixel with a halo, and fading it in and out changes almost nothing on
+ * screen. Giving the white a hard stop first (`#fff 0 1.4px`) and only then
+ * fading produces a star with actual area, which is what an eye can follow.
+ */
+.cck-space__twinkle--a {
+  background-image:
+    radial-gradient(circle 3px at 121px 87px, #ffffff 0 1.4px, rgba(255, 255, 255, 0) 3px),
+    radial-gradient(circle 3px at 308px 331px, #d6e2ff 0 1.2px, rgba(214, 226, 255, 0) 3px),
+    radial-gradient(circle 4px at 231px 412px, #ffffff 0 1.6px, rgba(255, 255, 255, 0) 4px),
+    radial-gradient(circle 3px at 44px 233px, #fff1e0 0 1.3px, rgba(255, 241, 224, 0) 3px);
+  background-size: 367px 449px;
+}
+
+.cck-space__twinkle--b {
+  background-image:
+    radial-gradient(circle 3px at 89px 301px, #fff1e0 0 1.3px, rgba(255, 241, 224, 0) 3px),
+    radial-gradient(circle 4px at 341px 122px, #ffffff 0 1.7px, rgba(255, 255, 255, 0) 4px),
+    radial-gradient(circle 3px at 202px 246px, #c4d6ff 0 1.2px, rgba(196, 214, 255, 0) 3px),
+    radial-gradient(circle 3px at 388px 338px, #ffffff 0 1.4px, rgba(255, 255, 255, 0) 3px);
+  background-size: 431px 389px;
+  animation-duration: 9.5s;
+  animation-delay: -3.5s;
+}
+
+.cck-space__twinkle--c {
+  background-image:
+    radial-gradient(circle 4px at 411px 96px, #ffffff 0 1.6px, rgba(255, 255, 255, 0) 4px),
+    radial-gradient(circle 3px at 168px 377px, #d6e2ff 0 1.3px, rgba(214, 226, 255, 0) 3px),
+    radial-gradient(circle 3px at 297px 468px, #fff1e0 0 1.4px, rgba(255, 241, 224, 0) 3px);
+  background-size: 503px 521px;
+  animation-duration: 11.5s;
+  animation-delay: -7s;
+}
+
+@keyframes cck-twinkle {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.04;
+  }
+}
+
+/* A reader who has asked for less motion gets a completely still sky. */
+@media (prefers-reduced-motion: reduce) {
+  .cck-space__twinkle {
+    animation: none;
+  }
+}
+
+/*
+ * ============================ THE IMAGE SLOT ============================
+ *
+ * Empty by default, so the procedural nebula and starfield above show through.
+ *
+ * To use a real picture instead, put the file in `site-src/assets/` and give
+ * THIS ONE RULE a value:
+ *
+ *     background-image: url("space.jpg");
+ *
+ * That is the whole change. This layer sits on top of both procedural layers
+ * and covers them, so nothing above needs deleting, and removing the url again
+ * restores the procedural sky. Keep the file self-contained (in `assets/`);
+ * the site loads nothing from another host.
+ *
+ * ========================================================================
+ */
+.cck-space__photo {
+  position: absolute;
+  inset: 0;
+  background-image: none;
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+}
+
+/*
+ * The landing page carries no site chrome at all: `site-overrides/home.html`
+ * empties the theme's header, tabs and footer blocks, so the splash is the
+ * background and the card and nothing else. Documentation pages are untouched,
+ * because they never load that template.
+ *
+ * Everything in this group is scoped with `:has(.cck-space)`, which matches
+ * ONLY the landing page, since that element exists nowhere else. There is no
+ * global rule here: a documentation page is never affected by any of it. The
+ * theme gives no block around `<body>` to hang a class on, and `:has()` is
+ * already how this file scopes landing-only styling, so it stays the one
+ * mechanism rather than adding a second.
+ */
+body:has(.cck-space) .md-main,
+body:has(.cck-space) .md-container {
+  background-color: transparent;
+}
+
+/*
+ * Drop the navigation sidebars from the splash outright.
+ *
+ * `index.md`'s `hide: [navigation, toc]` front matter only adds the `hidden`
+ * ATTRIBUTE, and Material's own `.md-sidebar` rules outrank the browser's
+ * default `[hidden] { display: none }` at mobile widths, where the primary
+ * sidebar becomes an off-canvas drawer. So the markup is still there, still
+ * laid out, and its nav lists still count as scrollable containers.
+ *
+ * Nothing on this page can open that drawer, since the header and its
+ * hamburger are gone, so it is dead weight with a latent ability to paint over
+ * the card. Removing it is also what guarantees the sidebars can never
+ * reserve layout width and push the card off centre.
+ */
+body:has(.cck-space) .md-sidebar {
+  display: none;
+}
+
+/*
+ * NO SCROLLBAR ON THE SPLASH, in either axis. It is one card in one viewport,
+ * so a scrollbar would be a bug rather than a way to see more.
+ *
+ * The horizontal half is belt and braces: `.cck-space` is fixed and already
+ * clips its own children (`overflow: hidden` above), so the starfield, which
+ * is deliberately wider and taller than the viewport, can never widen the
+ * layout. This says so explicitly at the page level too, so a future
+ * background layer cannot quietly reintroduce it.
+ */
+html:has(.cck-space),
+html:has(.cck-space) body {
+  overflow: hidden;
+}
+
+/*
+ * The theme's article wrappers are built for PROSE: a fixed-width reading
+ * column (`.md-grid`, 61rem) centred with `margin: 0 auto`, plus vertical
+ * padding and a spacer. The splash is full-bleed and centres its own card, so
+ * the column is removed here and the vertical spacing zeroed.
+ *
+ * Zero the VERTICAL spacing only. Writing `margin: 0` also overrides the
+ * `auto` horizontal margins that CENTRE the reading column, and because the
+ * column keeps its 61rem max-width, it then sits flush left and drags the card
+ * with it: a measured 51px left bias at a 1322px viewport, widening as the
+ * viewport grows. `max-width: none` is what actually makes this full-bleed;
+ * the auto margins are then free to do nothing.
+ */
+body:has(.cck-space) .md-main__inner,
+body:has(.cck-space) .md-content__inner {
+  max-width: none;
+  margin-top: 0;
+  margin-bottom: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+body:has(.cck-space) .md-content__inner::before {
+  display: none;
+}
+
+/* ------------------------------------------------------------------ */
+/* 2. Landing page: the card                                           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * THE CENTRING CONTAINER.
+ *
+ * This is the whole viewport and nothing else: `position: fixed; inset: 0`
+ * makes it exactly the viewport box, so its geometry cannot be influenced by
+ * any Material wrapper above it. That matters, because the wrappers are the
+ * thing that went wrong. In flow, this element inherited the width of the
+ * theme's `.md-grid` reading column and of whatever space the sidebars
+ * reserved, so the card tracked THAT box's centre rather than the screen's,
+ * and the offset changed with the window: left-biased at some widths,
+ * pushed the other way and clipped at others. Sizing to the viewport directly
+ * removes the whole class of bug rather than correcting one instance of it.
+ *
+ * The card is then centred with `margin: auto` on the grid item, rather than
+ * with `place-items: center`. To be clear about what that is: auto margins are
+ * INTRINSIC centring, the browser dividing the leftover space evenly. It is
+ * not a nudge, and there is no measured value anywhere in it.
+ *
+ * It is preferred over `place-items: center` for one reason. The two are
+ * identical until the card is TALLER than its container, at which point
+ * `place-items: center` overflows in BOTH directions and puts the top of the
+ * card above the scroll origin, where no scrollbar can reach it. Auto margins
+ * collapse to zero when the free space runs out, so the card starts at the top
+ * edge and every part of it stays reachable. That is what makes the
+ * `overflow: auto` below a real escape rather than a decoration.
+ *
+ * `overflow: auto` is also why there is no hand-picked "too short" breakpoint
+ * any more: the container scrolls exactly when the card does not fit, at
+ * whatever size that turns out to be, and never when it does.
+ *
+ * There are NO margin nudges and no absolute offsets anywhere in this file.
+ */
+.cck-home {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  display: grid;
+  overflow: auto;
+  padding: clamp(0.6rem, 2.5vmin, 1.5rem) clamp(0.6rem, 2.5vmin, 0.8rem);
+}
+
+/*
+ * The card scales fluidly rather than in fixed steps, and it scales on
+ * `vmin`, which is the SMALLER of the two viewport axes. That single choice is
+ * what makes it responsive to a short screen and a narrow one with the same
+ * rule: a 1280x600 laptop shrinks because the height is tight, a 390x844
+ * phone because the width is, and a 500x400 window because both are. A
+ * width-only breakpoint ladder cannot express that.
+ *
+ * Every `clamp()` below reads min, preferred, max: the max is the comfortable
+ * desktop size, the min is the smallest size still worth reading, and the
+ * middle term is what actually tracks the viewport between them.
+ */
+.cck-glass {
+  width: min(27rem, 100%);
+  box-sizing: border-box;
+  /* The centring itself: auto margins on the grid item centre it on both axes
+     and, unlike `place-items: center`, never push its top edge out of reach
+     when it is taller than the container. See `.cck-home` above. */
+  margin: auto;
+  text-align: center;
+  padding: clamp(1rem, 3.5vmin, 2.4rem) clamp(1rem, 4vmin, 2rem)
+    clamp(0.9rem, 3vmin, 2rem);
+  border-radius: 1.1rem;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  /* The glass itself: a light film over the nebula, blurred and lifted. */
+  background-color: rgba(255, 255, 255, 0.07);
+  -webkit-backdrop-filter: blur(22px) saturate(150%);
+  backdrop-filter: blur(22px) saturate(150%);
+  box-shadow:
+    0 1.4rem 3.2rem rgba(0, 0, 0, 0.45),
+    inset 0 1px 0 rgba(255, 255, 255, 0.14);
+}
+
+/*
+ * A browser with no backdrop-filter would show the card as a barely-there
+ * film over a busy background, which is where text stops being readable. Give
+ * that case a solid-enough panel instead.
+ */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .cck-glass {
+    background-color: rgba(12, 9, 28, 0.82);
+  }
+}
+
+.cck-glass__logo {
+  width: clamp(2.8rem, 13vmin, 6.2rem);
+  max-width: 45vw;
+  height: auto;
+  display: block;
+  margin: 0 auto clamp(0.4rem, 1.6vmin, 1rem);
+  /* A soft glow so the icon does not float unanchored. */
+  filter: drop-shadow(0 0.3rem 1.2rem rgba(151, 125, 236, 0.45));
+}
+
+/*
+ * The card's text colours are pinned rather than inherited. The backdrop is
+ * always the dark space image, in either colour scheme, so the theme's own
+ * foreground colour would be unreadable here under a light scheme.
+ */
+.md-typeset .cck-glass__title {
+  font-size: clamp(1.1rem, 4vmin, 1.85rem);
+  line-height: 1.15;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0 0 clamp(0.35rem, 1.4vmin, 0.7rem);
+  color: #ffffff;
+}
+
+.md-typeset .cck-glass__desc {
+  font-size: clamp(0.6rem, 1.9vmin, 0.76rem);
+  line-height: 1.6;
+  margin: 0 auto clamp(0.7rem, 3vmin, 1.6rem);
+  max-width: 22rem;
+  color: rgba(255, 255, 255, 0.78);
+}
+
+.md-typeset .cck-glass__cta {
+  margin: 0 0 clamp(0.45rem, 1.8vmin, 0.9rem);
+}
+
+/*
+ * The download button is styled here rather than left to `.md-button--primary`
+ * for the same reason as the text above: the theme's primary colour tracks the
+ * colour scheme, and this button always sits on the dark card.
+ */
+.md-typeset .cck-glass__download.md-button {
+  display: inline-block;
+  min-width: clamp(8rem, 30vmin, 12rem);
+  padding: clamp(0.4rem, 1.5vmin, 0.62rem) clamp(1rem, 4vmin, 1.6rem);
+  font-size: clamp(0.68rem, 2vmin, 0.8rem);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  border-radius: 2rem;
+  color: #14092b;
+  background-color: #cbb8ff;
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0.5rem 1.4rem rgba(124, 58, 237, 0.45);
+  transition:
+    transform 120ms ease,
+    background-color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.md-typeset .cck-glass__download.md-button:hover,
+.md-typeset .cck-glass__download.md-button:focus-visible {
+  color: #14092b;
+  background-color: #e2d7ff;
+  box-shadow: 0 0.6rem 1.8rem rgba(124, 58, 237, 0.6);
+  transform: translateY(-1px);
+}
+
+.md-typeset .cck-glass__docs {
+  margin: 0;
+  font-size: 0.68rem;
+  letter-spacing: 0.02em;
+}
+
+.md-typeset .cck-glass__docs a {
+  color: rgba(255, 255, 255, 0.68);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+  text-decoration-color: rgba(255, 255, 255, 0.3);
+}
+
+.md-typeset .cck-glass__docs a:hover,
+.md-typeset .cck-glass__docs a:focus-visible {
+  color: #ffffff;
+  text-decoration-color: rgba(255, 255, 255, 0.75);
+}
+
+/*
+ * The separator between the two links in that row. Dimmer than the links
+ * themselves so it reads as punctuation rather than as a third thing to click,
+ * and it wraps with them on a narrow card because the row is ordinary inline
+ * text (DRAGON-515).
+ */
+.md-typeset .cck-glass__dot {
+  margin: 0 0.45em;
+  color: rgba(255, 255, 255, 0.38);
+}
+
+/*
+ * Small screens: give the card back its margins by trimming the wrapper's own
+ * padding, on EITHER axis being tight. The card's internals are already
+ * fluid above, so this is only about the gap between the card and the screen
+ * edge.
+ */
+@media screen and (max-width: 30em), screen and (max-height: 34em) {
+  .cck-home {
+    padding: 0.8rem 0.6rem;
+  }
+
+  .cck-glass {
+    border-radius: 0.9rem;
+  }
+}
+
+/*
+ * Genuinely short viewports. The logo is the single most expensive element
+ * vertically and the only one that is not load-bearing, since the name right
+ * under it carries the identity on its own. Dropping it buys roughly a
+ * quarter of the card's height and keeps everything else at a readable size.
+ *
+ * Keyed on height AND on the awkward short-and-wide shape, which is what a
+ * phone in landscape actually is.
+ */
+@media screen and (max-height: 23em) {
+  .cck-glass__logo {
+    display: none;
+  }
+
+  .md-typeset .cck-glass__desc {
+    margin-bottom: 0.6rem;
+  }
+}
+
+/*
+ * There is deliberately NO "the viewport is too short" breakpoint here.
+ *
+ * An earlier version guessed a height at which the card could no longer fit
+ * and turned scrolling on below it. A guess like that is wrong twice: it
+ * scrolls at sizes where the card still fits, and it clips at sizes where the
+ * guess was too generous, because the real answer depends on how many lines
+ * the description wraps to, which depends on the width.
+ *
+ * `.cck-home` is `overflow: auto`, so the browser answers it exactly: a
+ * scrollbar appears if and only if the card does not fit, at any combination
+ * of width and height, and the auto margins keep every edge reachable when it
+ * does appear.
+ */
+
+/* ------------------------------------------------------------------ */
+/* 3. Documentation pages                                              */
+/* ------------------------------------------------------------------ */
+
+/* The flag and provider tables on the CLI and cloud pages are wide. Let them
+   scroll inside their own box instead of stretching the page. */
+.md-typeset table:not([class]) {
+  font-size: 0.68rem;
+}

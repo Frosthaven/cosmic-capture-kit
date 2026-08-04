@@ -465,7 +465,8 @@ impl Tb {
     /// flyout), a 1px divider outline, PANEL (`s`) rounding, and a small inset. Every editor
     /// dropdown menu (the text SIZE list, the text FONT list, the bottom-bar Fit/scale list)
     /// wears this ONE look so they read as a single control family. `width` fixes the menu
-    /// width so it never resizes as its rows change.
+    /// width so it never resizes as its rows change, and it is the CARD's outer width: what a
+    /// row inside actually gets is that minus [`MENU_CARD_PAD`] on each side.
     pub(super) fn menu_container<'a>(
         self,
         content: impl Into<Element<'a, Msg>>,
@@ -473,7 +474,7 @@ impl Tb {
     ) -> Element<'a, Msg> {
         widget::container(content)
             .width(Length::Fixed(width))
-            .padding(4.0)
+            .padding(MENU_CARD_PAD)
             .class(cosmic::theme::Container::custom(move |theme| {
                 let c = theme.cosmic();
                 cosmic::iced::widget::container::Style {
@@ -510,9 +511,12 @@ impl Tb {
     ///   while Share is a capability of the MACHINE, and a permanently dead control on a
     ///   desktop that will never have one is just noise.
     /// * **Upload** (`cloud-upload` since DRAGON-478 — the cloud is what says "account", where
-    ///   plain `upload` was one arrow away from Save) is the accounts feature, which does not
-    ///   exist yet, so it ships
-    ///   permanently disabled (the ticket says so outright).
+    ///   plain `upload` was one arrow away from Save) sends the capture to a connected cloud
+    ///   account. DRAGON-467 shipped it permanently disabled because the accounts feature did
+    ///   not exist; DRAGON-482 built it, so the button is now live whenever at least ONE
+    ///   account is connected and still disabled (with a tooltip saying why) when none is. It
+    ///   opens a flyout rather than acting: an upload needs a destination, and unlike every
+    ///   other button in this group it cannot be taken back.
     ///
     /// **Delete is GONE** (user decision after testing DRAGON-467: "remove delete from the
     /// preview editor, not needed anymore"). It made sense when every capture was written to
@@ -531,11 +535,18 @@ impl Tb {
     /// eye to it while work is unsaved would be a trap. A DISABLED button never takes it
     /// either: it already has a tone that says "not now", and two states on one glyph is one
     /// too many.
-    pub(super) fn share_group(
+    ///
+    /// `auto_share` is the persisted "also copy a share link" preference, threaded in because
+    /// the Upload flyout binds a checkbox to it and the toolbar has no other reason to know
+    /// the App's settings. Everything else the flyout draws (the accounts, the highlighted
+    /// row) is on `preview` already.
+    pub(super) fn share_group<'a>(
         self,
+        preview: &'a PreviewState,
         dirty: bool,
         km: &crate::shortcuts::Keymap,
-    ) -> Element<'static, Msg> {
+        auto_share: bool,
+    ) -> Element<'a, Msg> {
         use crate::shortcuts::Action;
         // Top toolbar → tooltips drop below.
         let pos = widget::tooltip::Position::Bottom;
@@ -545,7 +556,45 @@ impl Tb {
         let tint: Option<fn(&cosmic::Theme) -> cosmic::iced::Color> =
             dirty.then_some(super::annotate::companion as fn(&cosmic::Theme) -> cosmic::iced::Color);
         let can_share = crate::platform::services::share_available();
-        let mut buttons = vec![
+        // DRAGON-482: the document's own accounts SNAPSHOT decides whether Upload is live.
+        // Never `accounts::list()` from here: this runs on every frame, and that reads and
+        // parses a file (see `EditState::cloud_accounts`).
+        let accounts = &preview.edit.cloud_accounts;
+        let upload_key = km.get(Action::PreviewUpload).map(|sc| sc.label());
+        // DRAGON-514: one upload at a time. The predicate is shared with the handler the
+        // keybind arrives through, so the button and Ctrl+U cannot disagree about whether an
+        // upload may start; here it only decides how the button DRAWS.
+        let busy = super::edit::upload_in_flight(&preview.edit.uploads);
+        let upload_btn = self.tool_button_gated(
+            "upload-symbolic",
+            upload_tip(!accounts.is_empty(), busy, upload_key.as_deref()),
+            PreviewMsg::UploadFlyoutToggle,
+            pos,
+            !accounts.is_empty() && !busy,
+            tint,
+        );
+        // The flyout hangs off the button itself, so it is anchored to the control that
+        // opened it in both surface kinds. `Down` because this is the TOP bar (the covermark
+        // picker's `Up` is for the bottom one), and it needs no hand-guessed panel height.
+        let upload_btn: Element<'a, Msg> =
+            if preview.edit.flyout_kind() == Some(super::edit::FlyoutKind::Upload) {
+                flyout(
+                    upload_btn,
+                    upload_panel(
+                        accounts,
+                        preview.edit.flyout_selected(),
+                        preview.edit.upload_account_menu_open,
+                        auto_share,
+                        preview.edit.upload_visibility_menu_open,
+                        self,
+                    ),
+                    FlyoutDir::Down,
+                    Msg::Preview(self.pid, PreviewMsg::UploadFlyoutClose),
+                )
+            } else {
+                upload_btn
+            };
+        let mut buttons: Vec<Element<'a, Msg>> = vec![
             self.tool_button_tinted(
                 "document-save-symbolic",
                 action_tip("Save", Action::PreviewSave, km),
@@ -560,14 +609,7 @@ impl Tb {
                 pos,
                 tint,
             ),
-            self.tool_button_gated(
-                "upload-symbolic",
-                "Upload  (accounts are not available yet)".to_string(),
-                PreviewMsg::Upload,
-                pos,
-                false,
-                tint,
-            ),
+            upload_btn,
         ];
         if can_share {
             // Between Copy and Upload, so the group reads share-with-this-machine then
@@ -1427,6 +1469,364 @@ impl App {
         }));
         items
     }
+
+    /// The windowed preview's titlebar upload indicator + Cancel (DRAGON-490): a small,
+    /// FIXED-SIZE progress track (no numeric percentage, per the owner's request) plus a
+    /// Cancel control, shown only while this document has an upload it started still in
+    /// flight ([`EditState::uploads`]). Empty when there is none, so the caller's `.end(...)`
+    /// fold is simply a no-op then.
+    ///
+    /// Meant to be folded onto the header bar's `.end(...)` slot BEFORE the platform's own
+    /// caption-button tail (`preview_view`'s call site), so it always sits to their LEFT on
+    /// every platform — "before any caption buttons", per the owner's own wording. The header
+    /// bar's row height is fixed regardless of its content (`HeaderBarWidget`), so nothing
+    /// pushed here can ever grow the titlebar.
+    ///
+    /// Returns AT MOST ONE element, not one per control (DRAGON-490 follow-up, owner
+    /// live-test): Cancel and the indicator were built through unrelated helpers with no reason
+    /// to agree on a rendered height, so pushing them as two SEPARATE `.end(...)` items left
+    /// them centred independently rather than centred RELATIVE TO EACH OTHER. Bundling them
+    /// into one `Alignment::Center` row, before either ever reaches `.end(...)`, is what
+    /// actually pins their shared centreline — a fixed padding nudge on one side would only
+    /// re-drift the moment either control's own size changes. DRAGON-500 took that further and
+    /// moved Cancel INSIDE [`upload_meter`] at the meter's own glyph box, so the two no longer
+    /// have separate sizes to reconcile at all; this method now just names the upload.
+    ///
+    /// The OLDEST tracked upload (first-started) is what the bar and the Cancel button both
+    /// act on. Several uploads from the same document at once is a real but rare state
+    /// (nothing stops pressing Upload again before the first finishes); showing and
+    /// cancelling them one at a time keeps this from growing into a list inside the
+    /// titlebar. The tooltip names the count when there is more than one.
+    pub(super) fn preview_upload_titlebar(&self, preview: &PreviewState) -> Vec<Element<'static, Msg>> {
+        let Some(watch) = preview.edit.uploads.first() else {
+            return Vec::new();
+        };
+        vec![upload_meter(preview.window, watch)]
+    }
+}
+
+/// The upload METER, as both preview surfaces draw it (DRAGON-490, restyled DRAGON-495): the
+/// account's brand mark, the Cancel control, and the progress track, in one bordered pill.
+///
+/// **One builder, two surfaces.** The windowed editor folds it onto the header bar
+/// ([`App::preview_upload_titlebar`]) and the overlay puts it in its own header row
+/// ([`App::overlay_header_row`]), which used to have no upload readout at all: an upload
+/// started from the fullscreen editor showed nothing anywhere in the app (the owner's report).
+/// EVERYTHING is shared now, Cancel included (DRAGON-500, see [`meter_cancel`]), so the meter
+/// cannot drift between the two; only `pid` differs, and that is the same window either way.
+///
+/// **The container is the toolbar-group treatment** at a LOWER profile (owner's ask): the
+/// component-base fill, hairline [`cluster_border`] outline and capsule rounding
+/// [`Tb::tool_cluster`] wears, but with its own small padding rather than a group's, since this
+/// rides inside a header row whose height it must not drive. The padding is what keeps the
+/// brand mark and the track off the border.
+///
+/// **The brand mark leads it** so a glance says WHERE the capture is going, which the tooltip
+/// otherwise has to be hovered for. Drawn through the un-tinted `brand()` handle (see
+/// `widgets::icons::brand`: a brand mark keeps the provider's own colours and must never take a
+/// colouring class), from the provider snapshotted on the watch. An account whose provider this
+/// build does not know simply has no mark, and the meter starts with the track.
+///
+/// **Cancel sits BETWEEN the mark and the track** (owner's ordering feedback): "cancel the
+/// thing" reads left-to-right before "here's how far along it is". What it offers is
+/// [`super::edit::meter_cancel_action`]'s answer (DRAGON-500, and the stale link to a
+/// `meter_cancelable` that has not existed since is fixed in DRAGON-514).
+///
+/// **The meter PERSISTS after the upload ends** (DRAGON-514): it announces the outcome, settles
+/// (`super::edit::MeterFace::Settled`), and then stays until this document starts another
+/// upload or the editor closes. It used to retire itself a few seconds after finishing, which
+/// took the undo with it.
+///
+/// **The meter itself carries NO tooltip** (DRAGON-514, owner's call). DRAGON-500 had narrowed
+/// it from the whole row to the TRACK alone, so hovering the brand mark or the X no longer
+/// raised "42% uploaded to …" on top of the X's own tip. The remaining one is gone outright:
+/// the meter is a readout the user is already looking at, in a header they are moving the
+/// pointer across on the way to Save and Close, and a hover card explaining a bar that is
+/// visibly filling was noise on the path to every other control. Nothing replaces it, in any
+/// state. The X keeps its own tip, which names the action and the account
+/// ([`meter_cancel`]) and is the one thing on this pill a press can be wrong about.
+fn upload_meter(pid: window::Id, watch: &super::edit::UploadWatch) -> Element<'static, Msg> {
+    let face = super::edit::meter_face(watch);
+    let mut items: Vec<Element<'static, Msg>> = Vec::with_capacity(4);
+    if let Some(spec) = crate::cloud::provider(&watch.provider) {
+        // The meter's own glyph box, the one the X wears too, not the meter's height: a brand
+        // mark scaled up to a container's full height reads as a logo, not as a label.
+        items.push(crate::widgets::icons::sized(spec.icon, METER_ICON).into());
+    }
+    // **Copy, then the X** (DRAGON-520, owner's call: "just before the trash icon"). Offered
+    // only by an upload that finished, succeeded and actually made a share link
+    // (`UploadWatch::copyable`), which is the same upload whose "Copied to clipboard" toast the
+    // user already saw. It re-copies that link, for the very ordinary case of having copied
+    // something else since. `METER_ICON` with no halo, the square the brand mark and the X wear,
+    // so the pill's height is still `METER_PILL_H` and the asserts below still describe it.
+    if watch.copyable().is_some() {
+        items.push(crate::widgets::copy_button::copy_button(
+            crate::widgets::copy_button::copied_recently(watch.copied_at),
+            0,
+            Msg::Preview(pid, PreviewMsg::UploadCopyLink(watch.session_id.clone())),
+        ));
+    }
+    if let Some(action) = super::edit::meter_cancel_action(face, watch.undoable()) {
+        items.push(meter_cancel(pid, watch.session_id.clone(), action, &watch.label));
+    }
+    // Bare, with no tooltip wrapper of any kind: see the note above.
+    items.push(upload_progress_track(face));
+    let row = widget::row(items).spacing(6.0).align_y(Alignment::Center);
+    widget::container(row)
+        .padding(METER_PAD)
+        .align_y(Alignment::Center)
+        .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
+            cosmic::iced::widget::container::Style {
+                background: Some(Background::Color(
+                    theme.cosmic().background.component.base.into(),
+                )),
+                border: Border {
+                    radius: crate::app::theme::rounding(theme).xl.into(),
+                    width: METER_BORDER,
+                    color: cluster_border(theme),
+                },
+                ..Default::default()
+            }
+        })))
+        .into()
+}
+
+/// The meter's own CANCEL control (DRAGON-500): the stop glyph at exactly [`METER_ICON`], the
+/// SAME square the brand mark beside it occupies, with NO halo of its own.
+///
+/// **This is the clipping fix.** Cancel used to be built by the CALLER, each surface handing in
+/// its own standard header control: the windowed titlebar's [`titlebar_button`] (a 16px glyph in
+/// an 8px halo) and the overlay's [`Tb::header_button`] (an 18px glyph in a 6.56px halo). Both
+/// are, by construction, exactly as tall as their row — libcosmic's `HeaderBarWidget` content
+/// row is a fixed 32px and the overlay's is `icon_box + 2 × btn_pad` = 31.12px, and each of
+/// those buttons is that same number. Put one inside this pill and it has to fit the row MINUS
+/// the pill's `2 × METER_PAD.vertical` = 6px, which it cannot, so iced clamps it: a button
+/// resolves its size around its content, so the 6px comes off the GLYPH box, not off the halo.
+/// The titlebar's 16px X was drawn into 10px and the overlay's 18px one into 12px, roughly
+/// two thirds of their height in a row of full-height siblings — the X "cut in half". On macOS
+/// it was worse again, since `titlebar_button` also TOP-pins there, so the squashed glyph sat
+/// against the pill's top edge instead of centred in it.
+///
+/// Nothing was wrong with the pill's padding (DRAGON-495 shrank it deliberately, and this rides
+/// in a row whose height it must never drive). The X was simply carrying a full-size button's
+/// footprint into a container that has to fit INSIDE one. At [`METER_ICON`] with no halo it
+/// needs 16px of the 26px the pill has, and the compile-time asserts below keep the pill itself
+/// inside both rows. ONE constant does both squares, so the X and the brand mark beside it
+/// cannot drift apart again.
+///
+/// Never TOP-pinned, unlike the mac arm of [`titlebar_button`]: this control is centred in a
+/// pill, not aligned to the traffic lights, and the meter rides in the header's TRAILING slot
+/// where there are none. It keeps its own tooltip, which is the only tip a hover over it raises.
+///
+/// **One control, two jobs** (DRAGON-507). `action` is [`super::edit::meter_cancel_action`]'s
+/// answer, never a guess made here: while the transfer runs the X CANCELS it, and once a
+/// successful upload has landed the same square UNDOES it by deleting the file. The glyph and
+/// the wording change with the job, because "stop this" and "take that back" are different
+/// promises; the position, size and colour do not, because it is still the one control the
+/// meter has.
+///
+/// The undo is available for as long as the meter is (DRAGON-514), which is now until the next
+/// upload or the editor's close, rather than the few seconds the old finish-hold allowed.
+fn meter_cancel(
+    pid: window::Id,
+    session: String,
+    action: super::edit::MeterAction,
+    label: &str,
+) -> Element<'static, Msg> {
+    use super::edit::MeterAction;
+    let (glyph, tip, msg) = match action {
+        MeterAction::Cancel => (
+            "process-stop-symbolic",
+            "Cancel upload".to_string(),
+            PreviewMsg::UploadCancel(session),
+        ),
+        // The trash glyph, not an undo arrow: what this does is DELETE the uploaded file, and
+        // the tooltip names the account so nobody presses it thinking it undoes the edit.
+        // DRAGON-514: `user-trash-symbolic` is now MAPPED in `widgets::icons` (to lucide
+        // `trash-2`, the can the folder browser's own delete already wears), so this square is
+        // the app's trash rather than whatever the system icon theme happened to supply next to
+        // lucide glyphs on either side of it.
+        MeterAction::Undo => (
+            "user-trash-symbolic",
+            format!("Remove from {label}"),
+            PreviewMsg::UploadUndo(session),
+        ),
+    };
+    flat_icon_button(pid, glyph, tip, msg, crate::app::theme::accent, METER_ICON as u16, 0, false)
+}
+
+/// The glyph box for BOTH of the meter's square marks: the leading brand mark and the Cancel X
+/// ([`meter_cancel`]). One constant on purpose (DRAGON-500) — two equal literals would drift the
+/// first time either was tuned, and the X being a different square from the mark beside it is
+/// exactly what the pill is too small to absorb.
+const METER_ICON: f32 = 16.0;
+
+/// The meter pill's inner padding: `[vertical, horizontal]`. Deliberately SMALLER than a
+/// toolbar group's (`Tb::grp_pad`), which is what makes this a lower-profile version of the
+/// same treatment rather than a second toolbar inside the header; enough that neither the
+/// brand mark nor the track's rounded ends touch the border.
+const METER_PAD: [f32; 2] = [3.0, 8.0];
+
+/// The pill's hairline outline, in the [`cluster_border`] colour a toolbar group wears.
+const METER_BORDER: f32 = 1.0;
+
+/// What the meter pill asks for vertically: its tallest content (the two [`METER_ICON`]
+/// squares; the track is far shorter) plus its padding and its outline on both edges. The
+/// outline is drawn INSIDE the bounds and so costs no layout space; counting it anyway is
+/// deliberate slack, so the check below also guarantees the hairline never lands on a glyph.
+const METER_PILL_H: f32 = METER_ICON + 2.0 * METER_PAD[0] + 2.0 * METER_BORDER;
+
+/// The windowed preview's titlebar content height. Not ours: libcosmic's `header_bar` fixes its
+/// `HeaderBarWidget` row at a flat 32px and adds its padding OUTSIDE that. Mirrored here only so
+/// the assert below can see it, which is the whole point — the meter has to fit in a number it
+/// cannot change.
+const TITLEBAR_CONTENT_H: f32 = 32.0;
+
+// DRAGON-500: the meter is a passenger in two FIXED-height rows and can never make either
+// taller, so a pill that wants more than the row has is not a layout that stretches, it is a
+// control that gets clamped and drawn cut in half. Both bounds are checked here rather than
+// discovered on screen. (The overlay row is laid out at `icon_box + 2 × btn_pad`, whose
+// `box_px` rounding is not const-evaluable; `OVERLAY_HEADER_H` is the same expression without
+// the rounding, and the ~7px of slack below swallows the difference many times over.)
+const _: () = assert!(
+    METER_PILL_H <= TITLEBAR_CONTENT_H,
+    "the upload meter must fit inside libcosmic's fixed titlebar row, or its contents get clamped"
+);
+const _: () = assert!(
+    METER_PILL_H <= super::surface::OVERLAY_HEADER_H,
+    "the upload meter must fit inside the overlay's fixed header row, or its contents get clamped"
+);
+
+/// The upload progress track (DRAGON-490, DRAGON-495): a small rounded, subdued-background bar
+/// with a FILL proportional to the transfer's progress, or a plain spinner while no genuine
+/// percentage has arrived yet (`MeterFace::Spinner` — every upload starts there, DYNAMICALLY
+/// switching per transfer the moment the child observes a real interim value,
+/// `cloud::tray::still_indeterminate`; it is never predicted from the file's size). Same "no
+/// numbers, no lies" rule either way: a static bar frozen on one value reads as broken, not as
+/// "there is nothing to show yet".
+///
+/// **The fill's colour is the outcome** (DRAGON-495): the accent while it runs, the theme's
+/// SUCCESS colour once it completes, the danger colour if it stopped. The success state is only
+/// reachable because the watch is now HELD past completion (`UploadWatch::finished`); before
+/// that the meter simply vanished when the upload ended. Both end colours come from the theme
+/// tokens every other success/failure in the app uses (`app::theme::success` / `danger`), never
+/// a literal green or red.
+///
+/// **A finished upload keeps its colour until the next one starts** (DRAGON-516, owner's call,
+/// REVERSING DRAGON-514). DRAGON-514 made the meter persistent and then, reasoning that
+/// "full-strength success green held indefinitely is a notification that never stops
+/// notifying", dropped `MeterFace::Settled(Done)` to `app::theme::subdued` once the
+/// announcement ran out. Seen on screen the owner read that as the upload having been
+/// forgotten rather than as it having quietly succeeded: the whole point of keeping the meter
+/// is that a glance at the header says "that capture is in the cloud", and a faded bar does not
+/// say it. So the two finished faces now draw IDENTICALLY, and settling is no longer visible at
+/// all. It still does real work — it is what stops the 500ms poll
+/// (`super::edit::upload_needs_poll`) — it simply no longer changes the picture.
+fn upload_progress_track(face: super::edit::MeterFace) -> Element<'static, Msg> {
+    use super::edit::MeterFace;
+    if matches!(face, MeterFace::Spinner) {
+        // Sized to the meter's own glyph box (`METER_ICON`, what the brand mark and the Cancel
+        // X both wear) rather than the widget's 40px default — the loading view's own use,
+        // `preview_loading_view`, wants that larger size; a header row does not.
+        // Self-animating (`Circular`'s own `update` requests a redraw on every frame), so
+        // nothing here has to drive a tick for it.
+        return widget::indeterminate_circular().size(METER_ICON).bar_height(2.0).into();
+    }
+    upload_track_bar(super::edit::meter_fill(face), meter_tint(face))
+}
+
+/// Which theme colour a face's FILL is drawn in. Pure; unit-tested.
+///
+/// Split out of [`upload_progress_track`] (DRAGON-516) for the usual reason: the track builds
+/// an `Element`, which nothing headless can look at, while this is the whole decision and is
+/// three theme lookups. The rows are argued for in [`upload_progress_track`]'s own doc.
+fn meter_tint(face: super::edit::MeterFace) -> fn(&cosmic::Theme) -> cosmic::iced::Color {
+    use super::edit::{MeterFace, UploadOutcome};
+    match face {
+        // DRAGON-516: the announced and the SETTLED success are one colour. A completed upload
+        // holds its green until another upload replaces the meter or the editor closes, which
+        // is what makes a glance at the header answer "did that capture go up?".
+        MeterFace::Finished(UploadOutcome::Done) | MeterFace::Settled(UploadOutcome::Done) => {
+            crate::app::theme::success
+        }
+        // DRAGON-507: a pressed X turns the bar red AT ONCE, on the same token a genuine stop
+        // uses. The press is the event; nothing waits for the provider to agree. A failure was
+        // never faded even under DRAGON-514, for the reason that still holds: it is not
+        // resolved by time passing, it is still a file that did not arrive.
+        MeterFace::Finished(UploadOutcome::Stopped)
+        | MeterFace::Settled(UploadOutcome::Stopped)
+        | MeterFace::Ending(_) => crate::app::theme::danger,
+        // Running: the spinner never reaches here (it returns above), so this is a percentage.
+        MeterFace::Spinner | MeterFace::Progress(_) => crate::app::theme::accent,
+    }
+}
+
+/// The drawn bar: a `fraction`-wide `tint` fill inside the track.
+///
+/// The TRACK behind the fill is [`cluster_border`] — the theme's `background.divider`, already
+/// flattened to an opaque colour — which is the same hairline the meter pill draws its own
+/// outline in. So the empty part of the bar reads as a channel cut into the pill's chrome,
+/// while the FILL keeps every colour that carries meaning (running / succeeded / stopped).
+///
+/// **`app::theme::subtle` was the wrong kind of token, and this is the second time the track
+/// has been retuned** (DRAGON-516). DRAGON-514 moved it there from a raw `palette.neutral_5`,
+/// wanting a meter that stays on screen to recede into the header. `subtle` cannot do that job:
+/// it is a TEXT token, built by blending the ON-BACKGROUND colour 39% toward the background, so
+/// in a dark theme it lands near 60% white. That is correct for a line of secondary copy and
+/// wrong for 5px of unfilled background, which is why the owner reported the track reading as a
+/// bright grey bar. A background token cannot make that mistake, because it is derived from the
+/// background rather than from the foreground.
+///
+/// `cluster_border` in particular, over a low-alpha neutral, because its own doc carries
+/// MEASURED numbers in both directions — dark `0.266` against a `0.182` fill, light `0.689`
+/// against `0.960` — which is exactly the property this needs and the one `subtle` failed: it
+/// recedes in the light theme too, and it is documented as never invisible, which guards
+/// against re-earning the earlier "the track is barely visible" report from the other side.
+/// It is also opaque, so it composites the same on the windowed titlebar and on the overlay's
+/// header, which sit on different surfaces.
+fn upload_track_bar(
+    fraction: f32,
+    tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
+) -> Element<'static, Msg> {
+    /// The track's own footprint: small enough to sit comfortably in a titlebar row without
+    /// crowding the controls beside it, and fixed regardless of state so the indicator
+    /// appearing/disappearing never nudges anything else in the row sideways by a variable
+    /// amount — only the FILL inside it moves. Doubled from an original 40px (DRAGON-490
+    /// follow-up, owner live-test): the narrower track read as barely visible next to the
+    /// Cancel button.
+    const TRACK_W: f32 = 40.0 * 2.0;
+    const TRACK_H: f32 = 5.0;
+    let fill_w = TRACK_W * fraction.clamp(0.0, 1.0);
+    let fill: Element<'static, Msg> =
+        widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
+            .width(Length::Fixed(fill_w))
+            .height(Length::Fill)
+            .class(cosmic::theme::Container::custom(move |theme| {
+                cosmic::iced::widget::container::Style {
+                    background: Some(Background::Color(tint(theme))),
+                    border: Border { radius: (TRACK_H / 2.0).into(), ..Default::default() },
+                    ..Default::default()
+                }
+            }))
+            .into();
+    widget::container(fill)
+        .width(Length::Fixed(TRACK_W))
+        .height(Length::Fixed(TRACK_H))
+        .class(cosmic::theme::Container::custom(|theme| cosmic::iced::widget::container::Style {
+            background: Some(Background::Color(upload_track_tone(theme))),
+            border: Border { radius: (TRACK_H / 2.0).into(), ..Default::default() },
+            ..Default::default()
+        }))
+        .into()
+}
+
+/// The unfilled part of the upload meter's track (DRAGON-516). See [`upload_track_bar`] for
+/// why it is this token and not a text one.
+///
+/// A named function rather than an inline call so the test below can assert on the SAME thing
+/// the widget draws, instead of re-stating the choice and then agreeing with itself.
+fn upload_track_tone(theme: &cosmic::Theme) -> cosmic::iced::Color {
+    cluster_border(theme)
 }
 
 impl Tb {
@@ -1731,6 +2131,23 @@ impl App {
             PreviewMsg::Cancel,
             crate::app::theme::accent,
         );
+        // DRAGON-495: the upload meter, in the overlay's counterpart of the windowed
+        // titlebar's `.end(...)` slot — the RIGHT-hand group, immediately before Close, which
+        // is where the windowed arm puts it relative to its own caption buttons. It had no
+        // home here at all until now: an upload started from the fullscreen editor showed
+        // nothing anywhere in the app. Same builder, so the meter, its brand mark, its Cancel
+        // control and its tooltip are all identical in both surfaces (DRAGON-500 moved Cancel
+        // in there too: at this row's own button metrics it did not fit the pill).
+        //
+        // The mac arm below puts Close on the LEFT (DRAGON-357), and the meter does NOT follow
+        // it there: it is a status readout, not a window control, so it stays with the trailing
+        // group on every platform.
+        let meter: Vec<Element<'static, Msg>> = match preview.edit.uploads.first() {
+            Some(watch) => {
+                vec![upload_meter(tb.pid, watch)]
+            }
+            None => Vec::new(),
+        };
         // DRAGON-357: on the macOS OVERLAY, Close sits to the LEFT of the Windowed toggle
         // (mac close-on-left convention) — scoped to this per-platform arm so every other OS
         // keeps Close on the right, byte-identical. The windowed preview gets Close from the
@@ -1740,11 +2157,13 @@ impl App {
             let mut row = Vec::with_capacity(left.len() + 1);
             row.push(close);
             row.extend(left);
-            toolbar_row(row, Vec::new(), Vec::new())
+            toolbar_row(row, Vec::new(), meter)
         }
         #[cfg(not(target_os = "macos"))]
         {
-            toolbar_row(left, Vec::new(), vec![close])
+            let mut right = meter;
+            right.push(close);
+            toolbar_row(left, Vec::new(), right)
         }
     }
 
@@ -1784,7 +2203,10 @@ impl App {
         if top_bar_item_state(TopBarItem::Share, cropping) != TrayItemState::Hidden {
             // DRAGON-478: captioned like every tray cluster, and on the SAME presence condition,
             // so a crop session (which hides this group whole) hides its caption with it.
-            right.push(tb.captioned(tb.share_group(preview.unsaved(), km), SHARE_GROUP_CAPTION));
+            right.push(tb.captioned(
+                tb.share_group(preview, preview.unsaved(), km, self.cloud_auto_share),
+                SHARE_GROUP_CAPTION,
+            ));
         }
         // The Close (x) button normally lives elsewhere: the OVERLAY draws it on its header
         // row, the WINDOWED preview gets it from the native window chrome. DRAGON-268
@@ -2419,6 +2841,102 @@ fn annotation_tools<'a>(
 /// 8) / the font labels plus the row padding.
 const TEXT_DROPDOWN_MENU_W: f32 = 96.0;
 
+/// The shared menu CARD's own inner padding ([`Tb::menu_container`]): the inset between the
+/// card's outline and whatever it holds, on all four sides.
+///
+/// Named in DRAGON-500 (it was a literal in the builder). A width handed to `menu_container` is
+/// the OUTER card, so anything that has to line its edges up with a card's contents has to
+/// subtract this twice, and the subtraction must not be a hand-copied number.
+pub(super) const MENU_CARD_PAD: f32 = 4.0;
+
+/// The fixed menu width (px) of the UPLOAD flyout (DRAGON-482). Wider than the text dropdowns
+/// because its widest line is not a list entry but the "Automatically Share & Copy URL"
+/// checkbox; the account rows (a brand mark plus a user-chosen label) sit comfortably inside
+/// it, and a long label ellipsizes ([`upload_account_face`]) rather than stretching the panel
+/// per document.
+///
+/// Doubled from its original 232px (DRAGON-490 follow-up): the owner found the narrower panel
+/// cramped once real account labels (a user-typed name, not the short placeholder) were in
+/// play. Written as the doubling itself, not the resulting number, so the relationship to the
+/// original size stays visible at the definition.
+///
+/// Then cut by a QUARTER (DRAGON-495, owner's live review): the doubling overshot, and a
+/// 464px panel hanging off a toolbar icon read as a window rather than a flyout. 348px still
+/// clears every row in it — the checkbox line is the widest at roughly 250px of text, the
+/// account rows are a 20px mark plus an ellipsizing label, and the visibility row is a short
+/// label plus a 92px chip ([`UPLOAD_VISIBILITY_CHIP_W`]) — so nothing here clips; a long
+/// account name ellipsizes as it always has.
+const UPLOAD_MENU_W: f32 = 232.0 * 2.0 * 0.75;
+
+/// The Upload panel's own extra inset INSIDE the shared menu card ([`MENU_CARD_PAD`]).
+///
+/// More breathing room than the card alone gives (DRAGON-489 follow-up, the owner's report that
+/// the panel read as cramped), scoped to THIS panel rather than to `menu_container`, which the
+/// plainer text-size / font dropdowns also wear and were not reported as cramped. Named in
+/// DRAGON-500 because the account chip's width is now DERIVED from it: the two must move
+/// together or the chip stops lining up with the rows under it.
+const UPLOAD_PANEL_PAD: f32 = 6.0;
+
+/// The width every item inside the Upload flyout gets: the card, less the card's own padding
+/// and this panel's inset, on both sides. This is what a `Length::Fill` row (the checkbox, the
+/// Upload button) actually measures, so anything given this width lines its edges up with them
+/// and leaves ONE margin, `MENU_CARD_PAD + UPLOAD_PANEL_PAD`, against the flyout's edge on each
+/// side (DRAGON-500).
+const UPLOAD_CONTENT_W: f32 = UPLOAD_MENU_W - 2.0 * (MENU_CARD_PAD + UPLOAD_PANEL_PAD);
+
+/// The fixed CLOSED-control width (px) of the Upload flyout's own NESTED account-picker chip
+/// (DRAGON-489 follow-up), AND of the popup menu it opens (DRAGON-500).
+///
+/// It is exactly [`UPLOAD_CONTENT_W`]. It used to be `UPLOAD_MENU_W - 24`, four pixels short of
+/// its column, so the chip's right edge stopped short of the Upload button's below it; and the
+/// popup was sized to the full [`UPLOAD_MENU_W`], twenty pixels WIDER than the chip that opened
+/// it. Both are the owner's DRAGON-500 report: the control did not sit on the panel's margins,
+/// and its menu did not sit on the control.
+///
+/// **One constant for the control and the menu is also what aligns them.** The picker opens with
+/// [`FlyoutDir::Down`], libcosmic's `popover::Position::Bottom`, which anchors the popup at the
+/// control's bottom-CENTRE and then places it at `centre_x - popup_width / 2`. Equal widths make
+/// that arithmetic the identity: the popup's left edge lands on the control's left edge and its
+/// right on the right, with no offset to zero out and nothing to drift. (The popover clamps the
+/// result into the viewport, which can still shift a menu opened hard against a screen edge —
+/// that clamp is the one thing keeping a menu on screen at all, and it applies to the control's
+/// own flyout equally.)
+const UPLOAD_ACCOUNT_CHIP_W: f32 = UPLOAD_CONTENT_W;
+
+// The popover ROUNDS the anchor's bottom-centre to a whole pixel before subtracting half the
+// popup's width, so an odd or fractional width would re-introduce the half-pixel offset this
+// pairing exists to remove. Pinned rather than left to whoever next retunes `UPLOAD_MENU_W`.
+const _: () = assert!(
+    UPLOAD_ACCOUNT_CHIP_W == (UPLOAD_ACCOUNT_CHIP_W as u32) as f32
+        && (UPLOAD_ACCOUNT_CHIP_W as u32).is_multiple_of(2),
+    "the account chip's width must be an even whole number of pixels, or its menu opens half a pixel off it"
+);
+
+/// The CLOSED account chip's height (px): roughly twice what its content asks for
+/// (DRAGON-500, the owner's ask). Its natural height is about 22 — a 16px brand mark or a
+/// 13px label's ~17px line, whichever is taller, plus the shared chip padding on each side —
+/// which reads as a thin strip against the flyout's other rows now that it spans the full
+/// column. The contents are CENTRED in the extra space rather than sitting at the top, which
+/// is where a plain fixed height would leave them: a cosmic button lays its content out from
+/// its padding, not from its middle.
+///
+/// The chip is the only control here that gets this. The visibility picker beside its own row
+/// label ([`UPLOAD_VISIBILITY_CHIP_W`]) keeps the standard chip height, so the family a chip
+/// belongs to is still recognisable.
+const UPLOAD_ACCOUNT_CHIP_H: f32 = 44.0;
+
+/// The fixed CLOSED-control width (px) of the Upload flyout's NESTED visibility-picker chip
+/// (DRAGON-493). Unlike the account picker's chip, this one does not need to span the panel:
+/// its labels are short ("Public" / "Unlisted" / "Private") and it sits beside its own
+/// "Visibility" row label, the same shape [`TEXT_SIZE_CTRL_W`] gives the text-size chip beside
+/// the text tool's own controls.
+const UPLOAD_VISIBILITY_CHIP_W: f32 = 92.0;
+
+/// The fixed menu width (px) of that same nested visibility picker's OPEN list: a small,
+/// dedicated constant rather than reusing [`TEXT_DROPDOWN_MENU_W`], so retuning one dropdown's
+/// size can never silently move the other's.
+const UPLOAD_VISIBILITY_MENU_W: f32 = 110.0;
+
 /// The fixed CLOSED-control width (px) of the text SIZE dropdown chip, sized for the widest
 /// "128px" label (item 8) plus the chevron so the control never resizes as the selection changes
 /// (DRAGON-357 item 3). The font chip's width is MEASURED from its own faces (see
@@ -2605,6 +3123,25 @@ pub(super) fn dropdown_chip<'a>(
     toggle: PreviewMsg,
     enabled: bool,
 ) -> Element<'a, Msg> {
+    dropdown_chip_tall(pid, label, width, None, toggle, enabled)
+}
+
+/// [`dropdown_chip`] with an optional FIXED height (DRAGON-500), for a chip that has to stand
+/// up to the rows around it — today only the Upload flyout's account picker
+/// ([`UPLOAD_ACCOUNT_CHIP_H`]). `None` is the natural height every other chip has always had,
+/// byte-identical.
+///
+/// The height is applied to the button AND the content is wrapped to fill it, because a cosmic
+/// button positions its content at its padding rather than centring it: setting the height
+/// alone would give a tall chip with its mark and label stuck along the top edge.
+pub(super) fn dropdown_chip_tall<'a>(
+    pid: window::Id,
+    label: Element<'a, Msg>,
+    width: f32,
+    height: Option<f32>,
+    toggle: PreviewMsg,
+    enabled: bool,
+) -> Element<'a, Msg> {
     let caret = widget::icon::icon(crate::widgets::icons::handle("pan-down-symbolic")).size(10);
     // Enabled: the chip's own default caret colour (unchanged). Disabled: the shared quiet tone,
     // in lockstep with the label.
@@ -2615,20 +3152,30 @@ pub(super) fn dropdown_chip<'a>(
             cosmic::widget::svg::Style { color: Some(disabled_label_tone(t)) }
         })))
     };
-    crate::widgets::arrow_cursor::arrow_cursor(
-        widget::button::custom(
-            widget::row(vec![
-                widget::container(label).width(Length::Fill).into(),
-                caret.into(),
-            ])
-            .spacing(3.0)
-            .align_y(Alignment::Center),
-        )
+    let row = widget::row(vec![
+        widget::container(label).width(Length::Fill).into(),
+        caret.into(),
+    ])
+    .spacing(3.0)
+    .align_y(Alignment::Center);
+    // A fixed height gets the centring wrapper; the natural chip is left exactly as it was.
+    let body: Element<'a, Msg> = match height {
+        Some(_) => widget::container(row)
+            .height(Length::Fill)
+            .align_y(Alignment::Center)
+            .into(),
+        None => row.into(),
+    };
+    let btn = widget::button::custom(body)
         .class(cosmic::theme::Button::Text)
         .padding([2.0, 6.0])
         .width(Length::Fixed(width))
-        .on_press_maybe(enabled.then_some(Msg::Preview(pid, toggle))),
-    )
+        .on_press_maybe(enabled.then_some(Msg::Preview(pid, toggle)));
+    let btn = match height {
+        Some(h) => btn.height(Length::Fixed(h)),
+        None => btn,
+    };
+    crate::widgets::arrow_cursor::arrow_cursor(btn)
 }
 
 /// THE tone a DISABLED control's text/glyphs wear inside a toolbar cluster — one function so a
@@ -2798,6 +3345,259 @@ fn text_font_panel(
         })
         .collect();
     tb.menu_container(widget::column(rows).spacing(2.0), TEXT_DROPDOWN_MENU_W)
+}
+
+/// The Upload button's tooltip (DRAGON-482, third state DRAGON-514). Pure; unit-tested.
+///
+/// Three states, and the tooltip is the ONLY place a disabled one can explain itself. A
+/// gated button in this group keeps its tip for exactly that reason (see
+/// [`Tb::tool_button_gated`]). The shape matches [`action_tip`]'s in all three: name, two
+/// spaces, a parenthetical. So a disabled tip reads as the same control wearing a different
+/// answer, not as a different kind of label.
+///
+/// `busy` is an upload this document already has in flight (`edit::upload_in_flight`): the
+/// trigger is one-at-a-time, and a button that simply went dead with no explanation would look
+/// like the same "no accounts" dead as the state below it. It is checked SECOND because a
+/// missing account is the more fundamental answer, and an account disconnected mid-transfer can
+/// genuinely be in both.
+///
+/// `keybind` is the live keymap label for `PreviewUpload` (`None` when the user has unbound
+/// it), so an enabled Upload advertises its key exactly like Save and Copy beside it. An
+/// unbound action drops the parenthetical rather than showing an empty one, which is
+/// [`action_tip`]'s rule too.
+pub(super) fn upload_tip(has_accounts: bool, busy: bool, keybind: Option<&str>) -> String {
+    if !has_accounts {
+        // Says what is MISSING, not that the feature is missing: DRAGON-467's wording
+        // ("accounts are not available yet") was true when there was no feature at all, and
+        // would now send a user looking for a build that has one instead of into Settings.
+        return "Upload  (no cloud accounts yet)".to_string();
+    }
+    if busy {
+        return "Upload  (an upload is already running)".to_string();
+    }
+    match keybind {
+        Some(key) => format!("Upload  ({key})"),
+        None => "Upload".to_string(),
+    }
+}
+
+/// One row's content (icon + label, the label tinted accent when `hot`) shared by the
+/// account picker's CLOSED chip (whichever account is currently chosen) and its expanded
+/// popup's row list (DRAGON-489 follow-up), so the two can never draw an account
+/// differently. The provider's own mark makes the list scannable by brand rather than by
+/// reading every label; an account whose provider THIS build does not know still gets a row
+/// (`accounts::list` keeps it) and falls back to the generic cloud glyph.
+///
+/// The label is `Length::Fill` plus a single-line `Ellipsize::End` (DRAGON-490 follow-up): a
+/// user-typed account name has no length limit, and before this it just overflowed the fixed
+/// chip / menu width instead of stopping at it. `Length::Fill` on THIS row too, not just the
+/// label, is what lets the fill actually reach the label: a row that stayed `Shrink` would
+/// still size itself to the label's full natural width before the label's own fill had
+/// anything to divide.
+fn upload_account_face<'a>(acct: &'a crate::cloud::accounts::CloudAccount, hot: bool) -> Element<'a, Msg> {
+    use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
+    let icon =
+        crate::widgets::icons::sized(acct.spec().map_or("cloud-symbolic", |p| p.icon), 16.0);
+    let mut label = widget::text(acct.display_label())
+        .size(TEXT_MENU_LABEL_SIZE)
+        .width(Length::Fill)
+        .wrapping(Wrapping::None)
+        .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
+    if hot {
+        label = label.class(cosmic::theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+            color: Some(crate::app::theme::accent(t)),
+            ..Default::default()
+        }));
+    }
+    widget::row(vec![icon.into(), label.into()])
+        .width(Length::Fill)
+        .spacing(8.0)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+/// The Upload flyout's PANEL (DRAGON-482): the account picker, the per-account visibility
+/// control (DRAGON-493), the share-link checkbox, and the button that starts the
+/// transfer: the whole "where is this going, and how" question in one place, on the shared
+/// opaque menu surface every editor dropdown wears.
+///
+/// The account picker is a NESTED `dropdown_chip` (DRAGON-489 follow-up), closed by default
+/// and showing whichever account is currently chosen, matching the top bar's other dropdowns
+/// (the text size / font chips) instead of the flat always-expanded list this used to be.
+/// `menu_open` is that inner picker's own open state (`EditState::upload_account_menu_open`);
+/// `selected` is the keyboard highlight, seeded to the preselected account when the OUTER
+/// Upload flyout opens (see `edit::upload_preselect`), so the highlighted row IS the
+/// destination and there is no second notion of "chosen" to fall out of step with it.
+///
+/// The visibility row is CAPABILITY-GATED on the SELECTED account's own provider
+/// (`ProviderCaps::visibility`), never on its id: a future provider that adds the capability
+/// gets the row for free, and switching the account picker to a provider without it hides the
+/// row immediately, since it is recomputed from `selected` on every build of this panel.
+///
+/// A second, "Delete after N hours" row sat beside it from DRAGON-493 until DRAGON-505
+/// removed the auto-delete feature; see `cloud/mod.rs`'s tombstone for why.
+fn upload_panel<'a>(
+    accounts: &'a [crate::cloud::accounts::CloudAccount],
+    selected: Option<usize>,
+    menu_open: bool,
+    auto_share: bool,
+    visibility_menu_open: bool,
+    tb: Tb,
+) -> Element<'a, Msg> {
+    let pid = tb.pid;
+    let selected_account = selected.and_then(|i| accounts.get(i));
+    // The chip's face: whichever account is currently chosen. `selected` is `None` only when
+    // there are no accounts, which is also the state where the Upload button itself is not
+    // pressable (this panel is never reached), so the placeholder below is only ever a
+    // defensive fallback, never a state a user can actually see.
+    let chip_label: Element<'a, Msg> = match selected_account {
+        Some(acct) => upload_account_face(acct, false),
+        None => widget::text("Choose an account").size(TEXT_MENU_LABEL_SIZE).into(),
+    };
+    let chip = dropdown_chip_tall(
+        pid,
+        chip_label,
+        UPLOAD_ACCOUNT_CHIP_W,
+        Some(UPLOAD_ACCOUNT_CHIP_H),
+        PreviewMsg::UploadAccountMenu(!menu_open),
+        true,
+    );
+    let account_picker: Element<'a, Msg> = if menu_open {
+        let rows: Vec<Element<'a, Msg>> = accounts
+            .iter()
+            .enumerate()
+            .map(|(i, acct)| {
+                crate::widgets::arrow_cursor::arrow_cursor(
+                    widget::button::custom(upload_account_face(acct, selected == Some(i)))
+                        .width(Length::Fill)
+                        .class(cosmic::theme::Button::Text)
+                        .on_press(Msg::Preview(
+                            pid,
+                            PreviewMsg::UploadAccountSelected(acct.id.clone()),
+                        )),
+                )
+            })
+            .collect();
+        flyout(
+            chip,
+            // DRAGON-500: the menu is the CHIP's width, not the panel's, so the two read as one
+            // column — see [`UPLOAD_ACCOUNT_CHIP_W`] for why equal widths are also what aligns
+            // them under `Position::Bottom`. A long account label ellipsizes at the narrower
+            // width exactly as it already did at the wider one (`upload_account_face`).
+            tb.menu_container(widget::column(rows).spacing(2.0), UPLOAD_ACCOUNT_CHIP_W),
+            FlyoutDir::Down,
+            Msg::Preview(pid, PreviewMsg::UploadAccountMenu(false)),
+        )
+    } else {
+        chip
+    };
+    let caps = selected_account.and_then(|a| a.spec()).map(|s| s.caps);
+    let visibility_row = caps
+        .is_some_and(|c| c.visibility)
+        .then(|| upload_visibility_row(selected_account, visibility_menu_open, tb));
+    // "Share & Copy URL" rather than "share link": what the option actually does on this side
+    // is put the URL on the clipboard, and the upload child is what makes the link.
+    let auto = crate::widgets::arrow_cursor::arrow_cursor(
+        widget::checkbox(auto_share)
+            .label("Automatically Share & Copy URL")
+            .text_size(TEXT_MENU_LABEL_SIZE)
+            .on_toggle(move |on| Msg::Preview(pid, PreviewMsg::UploadAutoShareToggled(on))),
+    );
+    let start = crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::custom(
+            widget::container(widget::text("Upload").size(TEXT_MENU_LABEL_SIZE))
+                .width(Length::Fill)
+                .align_x(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .class(cosmic::theme::Button::Suggested)
+        .padding([8.0, 10.0])
+        .on_press(Msg::Preview(pid, PreviewMsg::UploadStart)),
+    );
+    // More breathing room than the SHARED `menu_container`'s own `MENU_CARD_PAD` gives
+    // (DRAGON-489 follow-up, owner's report the panel read as cramped): an extra inset plus
+    // wider inter-item spacing, scoped to THIS panel alone rather than to `menu_container`
+    // itself, which the plainer text-size/font dropdowns also wear and were not reported as
+    // cramped. Every item here is then `UPLOAD_CONTENT_W` wide, the account chip included.
+    let mut items: Vec<Element<'a, Msg>> =
+        vec![account_picker, widget::divider::horizontal::default().into()];
+    items.extend(visibility_row);
+    items.push(auto);
+    items.push(start);
+    tb.menu_container(
+        widget::column(items).spacing(10.0).padding(UPLOAD_PANEL_PAD),
+        UPLOAD_MENU_W,
+    )
+}
+
+/// The visibility PICKER row (DRAGON-493): a "Visibility" label plus a NESTED `dropdown_chip`
+/// of Public / Unlisted / Private, the same nested-picker shape [`upload_panel`]'s own account
+/// picker uses. Shown only for a provider whose `ProviderCaps::visibility` is true (today:
+/// YouTube); `upload_panel` is what decides that, so this always has SOMETHING to draw.
+fn upload_visibility_row<'a>(
+    account: Option<&'a crate::cloud::accounts::CloudAccount>,
+    menu_open: bool,
+    tb: Tb,
+) -> Element<'a, Msg> {
+    use crate::cloud::accounts::Visibility;
+    let pid = tb.pid;
+    let current = account.and_then(|a| a.visibility).unwrap_or_else(Visibility::default_choice);
+    let chip_label: Element<'a, Msg> =
+        widget::text(visibility_label(current)).size(TEXT_MENU_LABEL_SIZE).into();
+    let chip = dropdown_chip(
+        pid,
+        chip_label,
+        UPLOAD_VISIBILITY_CHIP_W,
+        PreviewMsg::UploadVisibilityMenu(!menu_open),
+        true,
+    );
+    let picker: Element<'a, Msg> = if menu_open {
+        let rows: Vec<Element<'a, Msg>> = [Visibility::Public, Visibility::Unlisted, Visibility::Private]
+            .into_iter()
+            .map(|v| {
+                let hot = v == current;
+                let mut label = widget::text(visibility_label(v)).size(TEXT_MENU_LABEL_SIZE);
+                if hot {
+                    label = label.class(cosmic::theme::Text::Custom(|t| {
+                        cosmic::iced::widget::text::Style {
+                            color: Some(crate::app::theme::accent(t)),
+                            ..Default::default()
+                        }
+                    }));
+                }
+                crate::widgets::arrow_cursor::arrow_cursor(
+                    widget::button::custom(label)
+                        .width(Length::Fill)
+                        .class(cosmic::theme::Button::Text)
+                        .on_press(Msg::Preview(pid, PreviewMsg::UploadVisibilitySelected(v))),
+                )
+            })
+            .collect();
+        flyout(
+            chip,
+            tb.menu_container(widget::column(rows).spacing(2.0), UPLOAD_VISIBILITY_MENU_W),
+            FlyoutDir::Down,
+            Msg::Preview(pid, PreviewMsg::UploadVisibilityMenu(false)),
+        )
+    } else {
+        chip
+    };
+    widget::row(vec![
+        widget::text("Visibility").size(TEXT_MENU_LABEL_SIZE).width(Length::Fill).into(),
+        picker,
+    ])
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// [`crate::cloud::accounts::Visibility`]'s label in the picker. Pure.
+fn visibility_label(v: crate::cloud::accounts::Visibility) -> &'static str {
+    use crate::cloud::accounts::Visibility;
+    match v {
+        Visibility::Public => "Public",
+        Visibility::Unlisted => "Unlisted",
+        Visibility::Private => "Private",
+    }
 }
 
 /// The BOTTOM-bar color swatch with its upward flyout (the palette grid, or — once the "+"
@@ -3514,6 +4314,116 @@ mod tests {
         }
     }
 
+    /// **DRAGON-516: the upload track must RECEDE, in both themes.**
+    ///
+    /// The owner's report was that the track read as a bright grey bar. The cause was a
+    /// category error rather than a bad shade: DRAGON-514 painted it with `theme::subtle`,
+    /// which is built by blending the ON-BACKGROUND colour toward the background, so in a dark
+    /// theme it lands NEAR THE FOREGROUND. A 5px unfilled bar wants the opposite.
+    ///
+    /// So this asserts the property, not the token: the track must sit nearer the surface it is
+    /// drawn on than to that surface's text colour, in dark AND in light. The second assertion
+    /// is what makes this a regression test rather than a restatement — it fails for `subtle`,
+    /// the exact value that shipped.
+    #[test]
+    fn the_upload_track_recedes_into_the_header_in_both_themes() {
+        let lum = |c: cosmic::iced::Color| 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+        for (name, theme) in
+            [("dark", cosmic::theme::Theme::dark()), ("light", cosmic::theme::Theme::light())]
+        {
+            let track = upload_track_tone(&theme);
+            // The meter pill's own fill: the surface this bar is drawn on.
+            let surface: cosmic::iced::Color = theme.cosmic().background.component.base.into();
+            let text = crate::app::theme::foreground(&theme);
+            let to_surface = (lum(track) - lum(surface)).abs();
+            let to_text = (lum(track) - lum(text)).abs();
+            assert!(
+                to_surface < to_text,
+                "{name}: the track sits closer to the text colour than to its own background \
+                 ({to_surface} vs {to_text}) — it will read as a bright bar, not as a channel"
+            );
+            // The token that shipped and was reported: it fails the rule above in the dark
+            // theme, which is what this test exists to keep out.
+            let subtle = crate::app::theme::subtle(&theme);
+            assert!(
+                to_surface < (lum(subtle) - lum(surface)).abs(),
+                "{name}: the track must recede further than `subtle`, the text token it replaced"
+            );
+            // Still VISIBLE, so this does not fix "too bright" by producing "invisible" — the
+            // narrow track was already reported as barely there once (DRAGON-490 follow-up).
+            assert!(to_surface > 0.02, "{name}: the track vanished into the pill ({to_surface})");
+            // Opaque, so the windowed titlebar and the overlay header (different surfaces
+            // underneath) composite it identically.
+            assert!((track.a - 1.0).abs() < f32::EPSILON, "{name}: the track must be opaque");
+        }
+    }
+
+    /// **DRAGON-516: a finished upload keeps its colour until the next one starts.**
+    ///
+    /// The whole tint table in one place. The row that changed is the settled success: DRAGON-514
+    /// faded it to `theme::subdued` so a persistent meter would stop "notifying", and the owner
+    /// overruled that after seeing it — a faded bar reads as the upload having been forgotten,
+    /// not as it having quietly succeeded.
+    ///
+    /// Asserted on the RESOLVED colours under both real themes rather than on the function
+    /// pointers, which Rust does not promise to compare meaningfully and which would also say
+    /// nothing about what a viewer actually sees.
+    #[test]
+    fn a_settled_upload_keeps_the_face_it_announced() {
+        use super::edit::{MeterAction, MeterFace, UploadOutcome};
+        let rgb = |c: cosmic::iced::Color| (c.r, c.g, c.b, c.a);
+        for (name, theme) in
+            [("dark", cosmic::theme::Theme::dark()), ("light", cosmic::theme::Theme::light())]
+        {
+            let tint = |face| rgb(meter_tint(face)(&theme));
+            let (success, danger, accent, subdued) = (
+                rgb(crate::app::theme::success(&theme)),
+                rgb(crate::app::theme::danger(&theme)),
+                rgb(crate::app::theme::accent(&theme)),
+                rgb(crate::app::theme::subdued(&theme)),
+            );
+            // Success: green while announcing AND after settling, the same colour for both.
+            assert_eq!(tint(MeterFace::Finished(UploadOutcome::Done)), success, "{name}");
+            assert_eq!(
+                tint(MeterFace::Settled(UploadOutcome::Done)),
+                success,
+                "{name}: a settled success must stay green (DRAGON-516)"
+            );
+            assert_ne!(
+                tint(MeterFace::Settled(UploadOutcome::Done)),
+                subdued,
+                "{name}: the DRAGON-514 fade is what the owner overruled"
+            );
+            // Failure: danger in both, which DRAGON-514 already had right.
+            for stopped in [
+                MeterFace::Finished(UploadOutcome::Stopped),
+                MeterFace::Settled(UploadOutcome::Stopped),
+            ] {
+                assert_eq!(tint(stopped), danger, "{name} {stopped:?}");
+            }
+            // A pressed X is red at once, whichever action it was.
+            for action in [MeterAction::Cancel, MeterAction::Undo] {
+                assert_eq!(tint(MeterFace::Ending(action)), danger, "{name} {action:?}");
+            }
+            // Running is the accent.
+            for running in [MeterFace::Progress(0), MeterFace::Progress(99)] {
+                assert_eq!(tint(running), accent, "{name} {running:?}");
+            }
+            // The three states really are three different colours, so this is not passing by
+            // everything collapsing to one token.
+            assert_ne!(success, danger, "{name}");
+            assert_ne!(success, accent, "{name}");
+        }
+        // And the LENGTH does not change either: a settled bar stays full, so the meter is a
+        // finished bar in the outcome's colour and nothing about it decays.
+        for outcome in [UploadOutcome::Done, UploadOutcome::Stopped] {
+            let announced = super::edit::meter_fill(MeterFace::Finished(outcome));
+            let settled = super::edit::meter_fill(MeterFace::Settled(outcome));
+            assert!((settled - 1.0).abs() < f32::EPSILON, "{outcome:?} settled at {settled}");
+            assert!((settled - announced).abs() < f32::EPSILON);
+        }
+    }
+
     /// DRAGON-467: the Share BUTTON and the Share ACTION read ONE capability, so the group can
     /// never offer something the platform will refuse.
     ///
@@ -4142,5 +5052,131 @@ mod caption_tests {
                 "scale {scale}: the line box no longer clears the floored glyph size"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod upload_tip_tests {
+    use super::*;
+    use rstest::rstest;
+
+    /// Every state the Upload tooltip has, one case each: with and without accounts, bound
+    /// and unbound, and (DRAGON-514) already busy. A table because they are one rule seen from
+    /// several sides, and a loop would report "one of six" instead of naming the state that
+    /// broke.
+    #[rstest]
+    #[case::live_and_bound(true, false, Some("Ctrl+U"), "Upload  (Ctrl+U)")]
+    // Unbound drops the parenthetical rather than showing an empty one.
+    #[case::live_and_unbound(true, false, None, "Upload")]
+    // With NO accounts the tip is the only explanation the disabled button has, so it names
+    // what is MISSING rather than declaring the feature unavailable, and it never advertises
+    // a key that would do nothing.
+    #[case::gated_and_bound(false, false, Some("Ctrl+U"), "Upload  (no cloud accounts yet)")]
+    #[case::gated_and_unbound(false, false, None, "Upload  (no cloud accounts yet)")]
+    // DRAGON-514: one upload at a time. The busy tip must not advertise the key either, for
+    // the same reason the account-less one does not: pressing it does nothing.
+    #[case::busy(true, true, Some("Ctrl+U"), "Upload  (an upload is already running)")]
+    // No accounts AND busy: the account answer wins, matching `edit::upload_toggle`'s order.
+    #[case::busy_without_accounts(false, true, None, "Upload  (no cloud accounts yet)")]
+    fn the_upload_tip_says_what_the_button_will_do(
+        #[case] has_accounts: bool,
+        #[case] busy: bool,
+        #[case] keybind: Option<&str>,
+        #[case] expected: &str,
+    ) {
+        let tip = upload_tip(has_accounts, busy, keybind);
+        assert_eq!(tip, expected);
+        if busy && has_accounts {
+            assert!(!tip.contains("Ctrl"), "a dead button must not advertise a key: {tip}");
+        }
+        if !has_accounts {
+            assert!(!tip.contains("Ctrl"), "a dead button must not advertise a key: {tip}");
+        }
+        // The house separator: a name, TWO spaces, one parenthetical. Only checked where
+        // there IS a parenthetical, which is what the previous version of this test got
+        // wrong: it asserted the shape over a list that included the bare "Upload" and
+        // happened never to reach it.
+        if tip.contains('(') {
+            assert!(tip.starts_with("Upload  ("), "{tip} broke the tip shape");
+            assert!(tip.ends_with(')'), "{tip} broke the tip shape");
+        }
+        assert!(!tip.contains('\u{2014}'), "{tip} must stay em-dash free");
+    }
+
+    /// The live tip is the SAME shape `action_tip` gives Save and Copy beside it, proven
+    /// against it rather than asserted, so the three read as one control family.
+    #[test]
+    fn a_live_upload_advertises_its_key_like_its_neighbours() {
+        use crate::shortcuts::{Action, Keymap};
+        let km = Keymap::defaults();
+        let key = km.get(Action::PreviewUpload).unwrap().label();
+        assert_eq!(
+            upload_tip(true, false, Some(&key)),
+            action_tip("Upload", Action::PreviewUpload, &km)
+        );
+    }
+}
+
+#[cfg(test)]
+mod upload_flyout_geometry_tests {
+    use super::*;
+
+    /// Where libcosmic puts a popup opened with `popover::Position::Bottom`, given the anchor's
+    /// left edge and width and the popup's width (`widget/popover.rs`: the anchor point is
+    /// `bounds.x + bounds.width / 2`, ROUNDED, and the overlay is then laid out at
+    /// `position.x - width / 2`, clamped into the viewport). Reproduced here because it is the
+    /// premise the account picker's sizing rests on, and GUI placement cannot be observed in
+    /// this environment. The viewport clamp is left out: it only ever moves a menu that would
+    /// leave the screen, which is not what alignment is about.
+    fn popup_left(anchor_x: f32, anchor_w: f32, popup_w: f32) -> f32 {
+        (anchor_x + anchor_w / 2.0).round() - popup_w / 2.0
+    }
+
+    /// DRAGON-500: the account chip spans its column, so it starts and ends exactly where the
+    /// checkbox and the Upload button under it do, leaving ONE margin against the flyout's edge
+    /// on each side.
+    #[test]
+    fn the_account_chip_sits_on_the_flyouts_content_margins() {
+        let margin = MENU_CARD_PAD + UPLOAD_PANEL_PAD;
+        assert!((UPLOAD_ACCOUNT_CHIP_W - (UPLOAD_MENU_W - 2.0 * margin)).abs() < f32::EPSILON);
+        // Stated as the picture: left margin, control, right margin, and nothing left over.
+        assert!(
+            (margin + UPLOAD_ACCOUNT_CHIP_W + margin - UPLOAD_MENU_W).abs() < f32::EPSILON,
+            "the chip plus its two margins must be the whole flyout"
+        );
+        // And the margins really are the same on both sides, which is the owner's actual ask.
+        let (left, right) = (margin, UPLOAD_MENU_W - (margin + UPLOAD_ACCOUNT_CHIP_W));
+        assert!((left - right).abs() < f32::EPSILON, "{left} left vs {right} right");
+    }
+
+    /// The menu opens FLUSH with the control it belongs to: same width, so the popover's
+    /// centre-anchored placement resolves to the control's own left edge, at every anchor
+    /// position and with no offset applied anywhere. The old pairing (a 348px menu under a
+    /// 324px chip) is pinned as the thing that drifted, so the two can never quietly diverge
+    /// again without this failing.
+    #[test]
+    fn the_account_menu_opens_flush_with_its_control() {
+        for anchor_x in [0.0, 1.0, 37.0, 640.0, 1913.0] {
+            let left = popup_left(anchor_x, UPLOAD_ACCOUNT_CHIP_W, UPLOAD_ACCOUNT_CHIP_W);
+            assert!((left - anchor_x).abs() < f32::EPSILON, "the menu opened {left} not {anchor_x}");
+            let right = left + UPLOAD_ACCOUNT_CHIP_W;
+            assert!(
+                (right - (anchor_x + UPLOAD_ACCOUNT_CHIP_W)).abs() < f32::EPSILON,
+                "the menu's right edge must land on the control's"
+            );
+        }
+        // What it used to do: a menu wider than its control hangs off BOTH sides of it.
+        let drifted = popup_left(100.0, UPLOAD_MENU_W - 24.0, UPLOAD_MENU_W);
+        assert!(drifted < 100.0, "the historical pairing really did open left of its control");
+    }
+
+    /// The chip stands up to the rows around it: about twice its own content height, and
+    /// distinctly taller than the standard chip a natural-height picker draws.
+    #[test]
+    fn the_account_chip_is_about_twice_its_content_height() {
+        // A 16px brand mark or a 13px label's line, plus the shared chip padding either side.
+        let natural = TEXT_MENU_LABEL_SIZE.max(16.0) + 2.0 * 2.0;
+        let ratio = UPLOAD_ACCOUNT_CHIP_H / natural;
+        assert!((1.8..=2.4).contains(&ratio), "{UPLOAD_ACCOUNT_CHIP_H} is {ratio}x the natural height");
     }
 }

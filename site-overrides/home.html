@@ -1,0 +1,185 @@
+{#
+  The landing page template.
+
+  `site-src/index.md` selects it with `template: home.html` front matter and
+  hides the navigation and table of contents, so the site root reads as a real
+  landing page instead of a documentation page with no content.
+
+  It extends the theme's own `main.html`. Unlike every documentation page, the
+  splash shows NO site chrome at all: the `header`, `tabs` and `footer` blocks
+  below are deliberately emptied, so the page is the space background and the
+  card, and nothing else. The card's own documentation link is the only way
+  into the site from here.
+
+  Blanking those three blocks is safe for everything in `<head>`. Material
+  declares `extrahead` and `analytics` INSIDE `<head>`, while `header`, `tabs`
+  and `footer` are separate blocks in the body. So the SEO block below, and any
+  analytics added later, are unaffected by the chrome being gone.
+
+  The background is built procedurally in CSS (no image file, no external
+  request); see `site-src/assets/custom.css`, which also carries the one-rule
+  slot for dropping a real photograph in later.
+
+  Everything here is self-contained. No external assets, no scripts, no fonts
+  beyond what Material already ships. The styling lives in
+  `site-src/assets/custom.css` under the `.cck-` prefix.
+#}
+{% extends "main.html" %}
+
+{#
+  ONE canonical description sentence, reused by the card, the meta preview tags
+  and the structured data below, so the four can never drift apart.
+#}
+{% set cck_description = "Cross-platform screen region, window, and monitor capture with support for translucent windows, image, video, voice, QR, barcodes, OCR text and more." %}
+{% set cck_og_image = config.site_url ~ "assets/og-card.png" %}
+{% set cck_download = config.repo_url ~ "/releases/latest" %}
+{% set cck_author_url = "https://github.com/Frosthaven" %}
+
+{#
+  Social previews and structured data.
+
+  `extrahead` is Material's own extension point inside `<head>`, so this rides
+  along with the theme's `<title>` and its canonical link (emitted from
+  `site_url`) instead of replacing them. `super()` keeps whatever the theme
+  itself puts there.
+
+  The meta DESCRIPTION is deliberately NOT here: it comes from `index.md`'s
+  front matter, which Material prefers over `site_description`, so the page
+  carries exactly one description rather than two competing ones.
+#}
+{% block extrahead %}
+  {{ super() }}
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="{{ config.site_name }}">
+  <meta property="og:title" content="Cosmic Capture Kit">
+  <meta property="og:description" content="{{ cck_description }}">
+  <meta property="og:url" content="{{ config.site_url }}">
+  <meta property="og:image" content="{{ cck_og_image }}">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="The Cosmic Capture Kit logo and name over a dark starfield">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Cosmic Capture Kit">
+  <meta name="twitter:description" content="{{ cck_description }}">
+  <meta name="twitter:image" content="{{ cck_og_image }}">
+  <meta name="twitter:image:alt" content="The Cosmic Capture Kit logo and name over a dark starfield">
+  {#
+    Structured data. It says only what is true of every build, on purpose:
+
+    * no `softwareVersion`, because a static page would let it go stale the
+      moment a release ships;
+    * no `offers`, because the app is free on Linux and paid on macOS and
+      Windows, so any single price mark would be wrong. A missing price is
+      better than a wrong one.
+  #}
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Cosmic Capture Kit",
+      "description": {{ cck_description | tojson }},
+      "applicationCategory": "MultimediaApplication",
+      "operatingSystem": "Linux, macOS, Windows",
+      "url": {{ config.site_url | tojson }},
+      "downloadUrl": {{ cck_download | tojson }},
+      "image": {{ cck_og_image | tojson }},
+      "sameAs": {{ config.repo_url | tojson }},
+      "author": {
+        "@type": "Person",
+        "name": "Frosthaven",
+        "url": {{ cck_author_url | tojson }},
+        "sameAs": {{ cck_author_url | tojson }}
+      },
+      "publisher": {
+        "@type": "Person",
+        "name": "Frosthaven",
+        "url": {{ cck_author_url | tojson }},
+        "sameAs": {{ cck_author_url | tojson }}
+      }
+    }
+  </script>
+{% endblock %}
+
+{#
+  No site chrome on the splash. The card IS the page.
+
+  Documentation pages are untouched by this: they never load this template, so
+  they keep the theme's header, tabs and footer exactly as before. The
+  sidebars are already gone here through `index.md`'s `hide: [navigation, toc]`
+  front matter.
+#}
+{% block header %}{% endblock %}
+{% block tabs %}{% endblock %}
+{% block footer %}{% endblock %}
+
+{% block content %}
+  {#
+    The background. Purely decorative, so it is hidden from screen readers.
+    The layers are painted back to front:
+      1. `.cck-space`          the nebula, as layered CSS gradients
+      2. `.cck-space__stars`   the starfield, as repeating gradient tiles.
+                               Completely static.
+      3. `.cck-space__twinkle` three sparser layers over the top, and the only
+                               thing on the page that moves: their opacity
+                               breathes on short, offset cycles, so stars pulse
+                               in their own time rather than together. All
+                               three are needed; each carries its own stars.
+      4. `.cck-space__photo`   empty by default. THE IMAGE SLOT: give this one
+                               rule a `background-image` in custom.css and it
+                               covers every procedural layer.
+  #}
+  <div class="cck-space" aria-hidden="true">
+    <span class="cck-space__stars"></span>
+    <span class="cck-space__twinkle cck-space__twinkle--a"></span>
+    <span class="cck-space__twinkle cck-space__twinkle--b"></span>
+    <span class="cck-space__twinkle cck-space__twinkle--c"></span>
+    <span class="cck-space__photo"></span>
+  </div>
+
+  <div class="cck-home">
+    <section class="cck-glass">
+      <img
+        class="cck-glass__logo"
+        src="{{ 'assets/logo.svg' | url }}"
+        alt="Cosmic Capture Kit logo"
+        width="201"
+        height="201"
+      />
+      <h1 class="cck-glass__title">Cosmic Capture Kit</h1>
+      <p class="cck-glass__desc">{{ cck_description }}</p>
+      {#
+        One download link for every platform. The release page always lists the
+        newest assets, and the per-platform story (which file, which OS
+        versions) lives in the release notes' own download table, so it is not
+        repeated here.
+      #}
+      <p class="cck-glass__cta">
+        <a
+          href="{{ cck_download }}"
+          class="md-button md-button--primary cck-glass__download"
+        >
+          Download
+        </a>
+      </p>
+      {#
+        The ONLY navigation off this page, now that the header is gone.
+        `getting-started/` is the first page of the user guide and the page the
+        guide's own "where to next" links fan out from, so a reader who follows
+        it lands at the start rather than in the middle of the reference.
+        `releases/` sits beside it because the question right after "what is
+        this" is usually "what changed", and the Download button above says
+        nothing about that (DRAGON-515).
+
+        One row, two links, separated by a dot the screen reader skips. Keeping
+        both inside the SAME paragraph is deliberate: the card's centring is a
+        fixed full-viewport grid with an auto-margin card, so every extra block
+        costs height that the short-viewport rules then have to claw back.
+      #}
+      <p class="cck-glass__docs">
+        <a href="{{ 'getting-started/' | url }}">Read the documentation</a>
+        <span class="cck-glass__dot" aria-hidden="true">&middot;</span>
+        <a href="{{ 'releases/' | url }}">Release notes</a>
+      </p>
+    </section>
+  </div>
+{% endblock %}

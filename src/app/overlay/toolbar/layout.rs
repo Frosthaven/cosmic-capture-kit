@@ -183,6 +183,57 @@ pub(super) fn tooltip_side(
     }
 }
 
+/// Whether the capture toolbar offers hover tooltips at all (DRAGON-483). Pure decision
+/// over the two states that suppress them, unit-tested below.
+///
+/// `recording` is the hard one: this toolbar sits IN the recorded frame, so a tooltip that
+/// opens while a recording runs is baked into the video. It was reported on the mic and
+/// system-audio toggles (today the only tipped buttons the recording bar still shows), but
+/// the rule is the WHOLE bar, so adding a tooltip to the pause or cancel button later
+/// cannot quietly reintroduce it. A live recording is also the one phase where the labels
+/// buy nothing: the user already chose every control on that bar to get here.
+///
+/// `delay_menu_open` is the older DRAGON-475 rule, folded in here so the bar has ONE answer
+/// to "tooltips?". A tooltip drawn across the delay popover splits (text above it, backdrop
+/// below), the same overlay layer-batching artifact the preview editor suppresses its own
+/// tooltips under an open flyout for.
+///
+/// A COUNTDOWN is deliberately not suppressed. Nothing it draws reaches a file: a still is
+/// reconstructed from the scene frozen at launch, and a video countdown's tooltip is gone
+/// the moment `recording` flips true and the toolbar rebuilds through this predicate.
+pub(super) fn toolbar_tooltips_enabled(recording: bool, delay_menu_open: bool) -> bool {
+    !recording && !delay_menu_open
+}
+
+#[cfg(test)]
+mod toolbar_tooltips_enabled_tests {
+    use super::*;
+
+    /// The idle toolbar is the case DRAGON-475 added tooltips for.
+    #[test]
+    fn the_idle_toolbar_shows_its_tooltips() {
+        assert!(toolbar_tooltips_enabled(false, false));
+    }
+
+    /// DRAGON-483: a live recording captures this bar, so no tooltip may open over it.
+    #[test]
+    fn a_live_recording_suppresses_every_tooltip() {
+        assert!(!toolbar_tooltips_enabled(true, false));
+    }
+
+    /// The DRAGON-475 flyout rule still holds on its own.
+    #[test]
+    fn an_open_delay_menu_suppresses_every_tooltip() {
+        assert!(!toolbar_tooltips_enabled(false, true));
+    }
+
+    /// Either reason alone is enough, so both together stay suppressed.
+    #[test]
+    fn both_reasons_at_once_stay_suppressed() {
+        assert!(!toolbar_tooltips_enabled(true, true));
+    }
+}
+
 #[cfg(test)]
 mod tooltip_side_tests {
     use super::*;

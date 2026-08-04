@@ -136,6 +136,108 @@ pub fn notification_text(
     (title, body)
 }
 
+/// What became of an upload to a connected cloud account (DRAGON-482).
+///
+/// A separate vocabulary from [`CopyOutcome`] on purpose: the two banners answer different
+/// questions ("is my capture on the clipboard" vs "did my capture reach my drive"), and
+/// folding them together would mean one builder with two unrelated halves. The honesty rule
+/// is the same one though, see [`upload_notification_text`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UploadOutcome<'a> {
+    /// It landed, and there is a share link for it. Carries the link, which the banner's
+    /// CLICK opens (it is never logged, and never printed into the banner text).
+    Shared(&'a str),
+    /// It landed, with no SHARE link: either the provider makes none, the user did not ask
+    /// for one, or the request for one failed.
+    ///
+    /// Carries the provider's own WEB VIEW url for the uploaded file when it reported one
+    /// (`RemoteFile::web_url`, already checked against that provider's hosts by
+    /// `cloud::child`). It is not a share link, so it opens only for the user who uploaded
+    /// it, which is exactly right for a click on their own banner: it lands them on the file
+    /// in their drive instead of on a folder in their file manager. `None` when the provider
+    /// reported none, or reported one this app would not open.
+    Delivered(Option<&'a str>),
+    /// It did not land. Carries the reason, already written as user-facing copy by whoever
+    /// failed (the provider call, or the account lookup).
+    Failed(&'a str),
+}
+
+/// Where a click on a banner goes. Both arms already exist as behaviours; this only names
+/// the choice so one `post` can serve the capture banner (always a reveal) and the upload
+/// banner (a link when there is one).
+enum Click<'a> {
+    /// Show the file in the desktop's file manager, the historical capture-banner click.
+    Reveal(&'a Path),
+    /// Hand a URI to the desktop's default handler: the share link, in a browser.
+    Open(&'a str),
+}
+
+/// The upload banner's two lines. Pure; unit-tested.
+///
+/// The rules, which are the DRAGON-450 honesty rule applied to a different action:
+///
+/// * The title names the ACCOUNT, because a user with several connected drives needs to
+///   know which one this was, and because "Uploaded" alone says nothing they did not
+///   already ask for.
+/// * A failure never says "uploaded". It says the upload failed, and the body is the
+///   reason, so a user is not left comparing a banner against their drive.
+/// * Nothing here claims the link is on the CLIPBOARD. The copy is done by a detached
+///   worker on Linux and cannot be confirmed from this process, and a banner that asserts
+///   an unverified copy is exactly what DRAGON-450 removed. What it says instead is true
+///   everywhere: the link is ready, and clicking opens it.
+pub fn upload_notification_text(label: &str, outcome: UploadOutcome<'_>) -> (String, String) {
+    let who = if label.trim().is_empty() { "your cloud account" } else { label.trim() };
+    match outcome {
+        UploadOutcome::Shared(_) => (
+            format!("Uploaded to {who}"),
+            "The share link is ready. Click to open it.".to_string(),
+        ),
+        UploadOutcome::Delivered(Some(_)) => (
+            format!("Uploaded to {who}"),
+            format!("Your capture is in {who}. Click to open it."),
+        ),
+        UploadOutcome::Delivered(None) => {
+            (format!("Uploaded to {who}"), format!("Your capture is in {who}."))
+        }
+        UploadOutcome::Failed(reason) => (format!("Upload to {who} failed"), reason.to_string()),
+    }
+}
+
+/// Where the upload banner's click goes, best destination first. Pure; unit-tested.
+///
+/// The ladder, and each rung is better than the one under it:
+///
+/// 1. The SHARE link, when one was made. It is what the user asked for and what they would
+///    paste to somebody else.
+/// 2. The provider's WEB VIEW url for the file. Not shareable, but it opens the capture in
+///    the user's own drive, which is where "uploaded" says it went. This rung is what makes a
+///    failed share-link request still land somewhere useful rather than dropping to the local
+///    file: the upload itself worked, so sending the user to their file manager would
+///    understate what happened.
+/// 3. The LOCAL copy. A user who reads "uploaded" and clicks wants to end up somewhere, and
+///    with neither url this is the only place we can send them. `local` is the STAGED copy
+///    (`cloud::upload::stage_for_upload`), which is why that copy is kept rather than deleted
+///    at the end of the transfer, and why its name carries the process and a sequence number:
+///    the file this reveals is always the one this banner is about.
+fn upload_click<'a>(outcome: UploadOutcome<'a>, local: &'a Path) -> Click<'a> {
+    match outcome {
+        UploadOutcome::Shared(url) => Click::Open(url),
+        UploadOutcome::Delivered(Some(url)) => Click::Open(url),
+        UploadOutcome::Delivered(None) | UploadOutcome::Failed(_) => Click::Reveal(local),
+    }
+}
+
+/// Post the upload banner. Runs IN the detached upload child (`cloud::child`), which is
+/// already a short-lived process of its own, so there is no second re-exec: the process
+/// that did the upload owns the banner and its click, exactly as the `--notify-*` helper
+/// does for a capture.
+///
+/// Nothing logged here carries the link, the label or the path.
+pub fn run_upload_notify(label: &str, outcome: UploadOutcome<'_>, local: &Path) {
+    let (title, body) = upload_notification_text(label, outcome);
+    post(&title, &body, upload_click(outcome, local));
+}
+
 /// Post the capture notification, whose click reveals the file. Detached: a short-lived
 /// re-exec of ourselves owns the banner (and the click), so the capture process can exit.
 ///
@@ -209,39 +311,57 @@ fn notification_icon() -> &'static str {
 /// The notification helper's whole job: build the banner, hand it to the OS. Runs in the
 /// short-lived `--notify-*` re-exec child, which also owns the click.
 pub fn run_notify(path: &Path, kind: Option<NotifyKind>, outcome: CopyOutcome) {
+    // DRAGON-519: this helper is a detached re-exec of our own binary, so a sibling
+    // committing a capture matched it by exe path and SIGTERMed it. The banner belongs to the
+    // notification service and survives that, but the CLICK is handled HERE, in `post`'s
+    // signal loop (Linux) or its delegate (macOS), so a killed helper turns "click to reveal
+    // your capture" into nothing happening. For a "(no editor)" capture (DRAGON-428) that
+    // click is the entire delivery. The guard's scope is exactly `post`'s: about 20s on
+    // Linux, 5 minutes on macOS, and instant on Windows, where the toast's click re-enters us
+    // through the URI scheme rather than through this process. See `instance::SHARE_MARKER`.
+    let _lingering = crate::instance::ShareMarker::new();
     let (title, body) = notification_text(kind, outcome, path);
-    post(&title, &body, path);
+    post(&title, &body, Click::Reveal(path));
 }
 
 /// Windows (DRAGON-229): dispatch to the WinRT toast body under `platform/windows/`
-/// (closed split). `path` rides along for the toast's protocol-activation launch URI,
-/// which is what routes a click back into the reveal service (DRAGON-450).
+/// (closed split). The click target rides along as the toast's protocol-activation launch
+/// URI: our own `cosmic-capture-kit:reveal?path=` scheme for a file (DRAGON-450), or the
+/// share link itself for an upload (DRAGON-482), which the shell hands to the browser. Both
+/// are `activationType="protocol"`, so neither needs a COM activator.
 #[cfg(target_os = "windows")]
-fn post(title: &str, body: &str, path: &Path) {
-    crate::platform::windows::services::run_notify(title, body, path);
+fn post(title: &str, body: &str, click: Click<'_>) {
+    match click {
+        Click::Reveal(path) => crate::platform::windows::services::run_notify(title, body, path),
+        Click::Open(uri) => crate::platform::windows::services::run_notify_uri(title, body, uri),
+    }
 }
 
 /// Any other (non-Linux/macOS/Windows) target: no notification path.
 #[cfg(all(not(target_os = "linux"), not(target_os = "macos"), not(target_os = "windows")))]
-fn post(_title: &str, _body: &str, _path: &Path) {
+fn post(_title: &str, _body: &str, _click: Click<'_>) {
     log::debug!("desktop notification is not implemented on this platform");
 }
 
 /// macOS (DRAGON-230): dispatch to the notification body under `platform/mac/`
 /// (closed split). A bundled `.app` posts a UNUserNotificationCenter banner whose
-/// click reveals the file; an unbundled dev binary degrades to a click-less
-/// `osascript` banner.
+/// click reveals the file (or opens the share link, DRAGON-482); an unbundled dev binary
+/// degrades to a click-less `osascript` banner.
 #[cfg(target_os = "macos")]
-fn post(title: &str, body: &str, path: &Path) {
-    crate::platform::mac::notify::run_notify(title, body, path);
+fn post(title: &str, body: &str, click: Click<'_>) {
+    match click {
+        Click::Reveal(path) => crate::platform::mac::notify::run_notify(title, body, path),
+        Click::Open(uri) => crate::platform::mac::notify::run_notify_uri(title, body, uri),
+    }
 }
 
 /// Post a desktop notification (no `transient` hint, so it stays in the drawer)
-/// and stay alive only long enough to catch a click on it — then reveal the
-/// file. Exits as soon as the notification is closed (popup dismissed/expired)
-/// or after a short backstop, so we don't linger like a daemon.
+/// and stay alive only long enough to catch a click on it, then act on `click`
+/// (reveal the file, or open the share link). Exits as soon as the notification is
+/// closed (popup dismissed/expired) or after a short backstop, so we don't linger
+/// like a daemon.
 #[cfg(target_os = "linux")]
-fn post(summary: &str, body: &str, path: &Path) {
+fn post(summary: &str, body: &str, click: Click<'_>) {
     let Ok(conn) = zbus::blocking::Connection::session() else {
         return;
     };
@@ -297,7 +417,12 @@ fn post(summary: &str, body: &str, path: &Path) {
                 if let Ok((sig_id, _key)) = msg.body().deserialize::<(u32, String)>()
                     && sig_id == id
                 {
-                    run_reveal(path);
+                    match click {
+                        Click::Reveal(path) => run_reveal(path),
+                        // A real URL, so the portal's OpenURI is the right handler for it
+                        // (the folder special-case in `run_open_uri` only touches `file://`).
+                        Click::Open(uri) => super::open::run_open_uri(uri),
+                    }
                     return;
                 }
             }
@@ -409,6 +534,112 @@ mod tests {
         // And a flag with nothing after it must not panic or read the wrong argument.
         let truncated = ["cck".to_string(), NOTIFY_SAVED.to_string(), NOTIFY_KIND.to_string()];
         assert_eq!(notify_from_argv(&truncated, false), (None, CopyOutcome::NotCopied));
+    }
+
+    /// The upload banner names the ACCOUNT in every line it can, and a failure never reads
+    /// as a success. This is the table to argue with if the upload wording changes.
+    #[test]
+    fn the_upload_banner_names_the_account_and_never_overclaims() {
+        let text = |o| upload_notification_text("Work Drive", o);
+
+        assert_eq!(
+            text(UploadOutcome::Shared("https://example.test/x")),
+            (
+                "Uploaded to Work Drive".to_string(),
+                "The share link is ready. Click to open it.".to_string()
+            )
+        );
+        assert_eq!(
+            text(UploadOutcome::Delivered(None)),
+            ("Uploaded to Work Drive".to_string(), "Your capture is in Work Drive.".to_string())
+        );
+        // With a view url there IS somewhere to click, and the body says so rather than
+        // leaving the user to guess whether the banner is inert.
+        assert_eq!(
+            text(UploadOutcome::Delivered(Some("https://drive.example.test/file/abc"))),
+            (
+                "Uploaded to Work Drive".to_string(),
+                "Your capture is in Work Drive. Click to open it.".to_string()
+            )
+        );
+        // A failure says so, and the reason rides through verbatim (it is already copy).
+        let (title, body) = text(UploadOutcome::Failed("The account is no longer connected."));
+        assert_eq!(title, "Upload to Work Drive failed");
+        assert_eq!(body, "The account is no longer connected.");
+        assert!(!title.contains("Uploaded to"), "a failure must not read as a success");
+
+        // The LINK never appears in the text: it is what the click opens, not what the
+        // banner says, and a banner is read by anyone looking at the screen.
+        let secret = "https://drive.example.test/file/abc123";
+        let (t, b) = text(UploadOutcome::Shared(secret));
+        assert!(!t.contains(secret) && !b.contains(secret));
+
+        // Nothing claims the clipboard, which this process cannot verify (DRAGON-450).
+        for o in [
+            UploadOutcome::Shared(secret),
+            UploadOutcome::Delivered(None),
+            UploadOutcome::Delivered(Some(secret)),
+        ] {
+            assert!(!text(o).1.contains("clipboard"), "{o:?} claims an unverified copy");
+            // …and the view url is no more printable than the share link is.
+            let (t, b) = text(o);
+            assert!(!t.contains(secret) && !b.contains(secret), "{o:?} printed a url");
+        }
+    }
+
+    /// An account with no label still produces a sentence, not a blank. The same fallback
+    /// the tray tooltip uses, so the two surfaces name a nameless account identically.
+    #[test]
+    fn an_unlabelled_account_still_reads_as_a_sentence() {
+        for label in ["", "   "] {
+            let (title, body) = upload_notification_text(label, UploadOutcome::Delivered(None));
+            assert_eq!(title, "Uploaded to your cloud account");
+            assert_eq!(body, "Your capture is in your cloud account.");
+        }
+        // A real label is trimmed rather than rendered with its whitespace.
+        assert_eq!(
+            upload_notification_text("  Work  ", UploadOutcome::Delivered(None)).0,
+            "Uploaded to Work"
+        );
+        // House rule: no em/en-dashes in user-facing copy.
+        for o in [
+            UploadOutcome::Shared("https://x.test"),
+            UploadOutcome::Delivered(None),
+            UploadOutcome::Delivered(Some("https://x.test")),
+        ] {
+            let (t, b) = upload_notification_text("Work", o);
+            for s in [t, b] {
+                assert!(!s.contains('\u{2014}') && !s.contains('\u{2013}'), "dash in {s:?}");
+            }
+        }
+    }
+
+    /// The click ladder: share link, then the provider's view url, then the local copy.
+    /// The middle rung is what keeps an upload that LANDED from sending the user to their
+    /// file manager just because the share-link request failed.
+    #[test]
+    fn the_upload_click_prefers_the_link_then_the_view_url_then_the_file() {
+        let local = PathBuf::from("/run/user/1000/cck-upload-42-0.png");
+        let url = "https://drive.example.test/file/abc123";
+        let view = "https://drive.example.test/file/abc123/view";
+        assert!(matches!(
+            upload_click(UploadOutcome::Shared(url), &local),
+            Click::Open(u) if u == url
+        ));
+        assert!(matches!(
+            upload_click(UploadOutcome::Delivered(Some(view)), &local),
+            Click::Open(u) if u == view
+        ));
+        assert!(matches!(
+            upload_click(UploadOutcome::Delivered(None), &local),
+            Click::Reveal(p) if p == local
+        ));
+        // A FAILURE never opens a url, even if one is somehow to hand: the capture is not
+        // there, and sending the user to the provider would say it was.
+        assert!(matches!(
+            upload_click(UploadOutcome::Failed("nope"), &local),
+            Click::Reveal(p) if p == local
+        ));
     }
 
     /// Only `Copied` rides the copied flag; only the two explainable failures carry a

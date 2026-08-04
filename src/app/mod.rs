@@ -34,6 +34,9 @@ pub(crate) type OutputHandle = String;
 // Implementation split across submodules (all operate on `App`); each does
 // `use super::*;` to share these imports and the types/helpers defined here.
 mod application;
+// How the app starts background work (DRAGON-497, shared here in DRAGON-499). Read its
+// module doc before writing a `tokio::task::spawn_blocking` anywhere in `app`.
+mod background;
 mod update;
 mod subscriptions;
 mod keyboard;
@@ -90,6 +93,10 @@ pub(super) use layout::{
 // The numeric value+text-buffer pair behind every settings num-input row.
 // Available unqualified in the submodules via their `use super::*;`.
 pub(crate) use num_field::NumField;
+
+// The detached-worker seam. Re-exported so every `use super::*;` submodule reaches it
+// unqualified, the way the Cloud Accounts page and the update handlers both call it.
+pub(crate) use background::off_thread;
 
 pub use settings::SettingsState;
 pub(crate) use settings::{ConfigTab, ResetScope};
@@ -2110,6 +2117,14 @@ pub struct App {
     /// toggle "Notify me when an update is available" and the dialog's "Don't remind
     /// me again" checkbox are two views of this one setting.
     notify_updates: bool,
+    /// Cloud accounts (DRAGON-482): the connected account the preview editor's Upload
+    /// flyout offers first, by id. `None` until one is picked. Only a memory of the last
+    /// choice: the account LIST lives in `cloud::accounts` and the tokens in
+    /// `cloud::secrets`, neither of which is app state.
+    cloud_last_account: Option<String>,
+    /// Cloud accounts (DRAGON-482): create and copy a share link as part of an upload.
+    /// Default on. Mirrors the flyout's checkbox and the persisted setting.
+    cloud_auto_share: bool,
     /// Every OPEN post-capture preview editor, in OPEN ORDER — one entry per previewed
     /// document (DRAGON-336 phase 2: one process can host several preview windows and
     /// exits when the LAST one closes; see [`App::close_preview`]). Empty while no
@@ -2845,8 +2860,8 @@ struct HeldStream {
 
 mod message;
 pub use message::{
-    BorderColorTarget, CaptureMsg, RecordingMsg, DetectMsg, SettingsMsg, PermissionsMsg,
-    WindowChromeMsg, PreviewMsg, VideoMeta,
+    BorderColorTarget, CaptureMsg, CloudSettingsMsg, RecordingMsg, DetectMsg, SettingsMsg,
+    PermissionsMsg, WindowChromeMsg, PreviewMsg, VideoMeta,
 };
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use message::CaptureHotkeySlot;

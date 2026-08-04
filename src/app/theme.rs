@@ -974,6 +974,15 @@ pub(crate) fn subdued(theme: &Theme) -> Color {
     toward_bg(theme, 0.78)
 }
 
+/// Half of [`subdued`]'s dimming: text that should read as secondary/quiet but still
+/// comfortably readable, not near-invisible. `subdued` itself was reported unreadable for a
+/// sentence someone actually has to read (several places in `settings::pages::cloud` moved off
+/// it for exactly that reason, to plain body text); `subtle` is the middle ground for text that
+/// wants to read as secondary WITHOUT going all the way to full-strength body copy.
+pub(crate) fn subtle(theme: &Theme) -> Color {
+    toward_bg(theme, 0.39)
+}
+
 /// The FULL-strength foreground on the plain background — white in the dark themes,
 /// near-black in the light ones. The un-blended end of the very ramp [`subdued`] sits on,
 /// so a control that flips between "active" and "dimmed" (the preview editor's undo / redo,

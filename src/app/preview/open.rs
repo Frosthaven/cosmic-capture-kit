@@ -116,7 +116,7 @@ impl App {
     /// (`App::remember_badge_size`). Two documents open at once may therefore briefly disagree
     /// — deliberately: last write wins on disk, and the next document opened takes it up. No
     /// cross-document sync.
-    pub(super) fn new_edit_state(&self) -> EditState {
+    pub(super) fn new_edit_state(&self, is_video: bool) -> EditState {
         EditState {
             annot_color: self.annot_color,
             tool: self.annot_tool,
@@ -124,6 +124,15 @@ impl App {
             annot_badge_size: self.annot_badge_size,
             annot_text_size: self.annot_text_size,
             annot_text_font: self.annot_text_font,
+            // DRAGON-482: the connected accounts, read ONCE here. This is what decides whether
+            // the toolbar's Upload button is pressable, and the toolbar is rebuilt on every
+            // frame, so it is a snapshot, refreshed when the Upload flyout is opened rather
+            // than re-read from disk continuously. This is THE document-open seam, so every
+            // way a preview can be opened takes the same reading. Filtered to `is_video`
+            // (DRAGON-493) the same way every later refresh point is, so a video-only
+            // provider (YouTube) never shows up as pressable on a freshly-opened image
+            // document, even for the one frame before a refresh point could otherwise fix it.
+            cloud_accounts: edit::accounts_for_kind(crate::cloud::accounts::list(), is_video),
             ..EditState::default()
         }
     }
@@ -151,6 +160,8 @@ impl App {
         // compositor honours the initial size — a post-open resize gets overridden.
         let extra_h = transport_h_for(&kind, PreviewSurface::Window);
         let source_scale = self.preview_source_scale(Some(&output));
+        // Computed before `kind` moves into the struct literal below.
+        let is_video = matches!(kind, PreviewKind::Video(_));
         let (id, open_task, monitor, surface) =
             self.preview_surface_for(None, Some(output), monitor, dims, extra_h);
         self.previews.push(PreviewState {
@@ -165,7 +176,7 @@ impl App {
             source_scale,
             loading_msg: random_loading_msg(),
             kind,
-            edit: self.new_edit_state(),
+            edit: self.new_edit_state(is_video),
             view: Viewport::default(),
             ducking: false,
             surface_open: true,
@@ -463,30 +474,6 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// DEMOTE one open document out of the fullscreen overlay into a normal window,
-    /// preserving it completely: same [`PreviewState`] (pending covermark/annotation
-    /// edits, the shared undo/redo history, the zoom/pan viewport, video playback position
-    /// and timeline edits), re-pointed onto the fresh surface by [`Self::repoint_preview`]
-    /// — which also carries the focus/capture cursors and this document's audio-duck hold.
-    /// The window is minted through [`Self::mint_preview_window`], the SAME open-fit path
-    /// (`windowed_fit_size` + the transient `max_size` hint) a normally-opened window
-    /// takes, so it lands at a sane size instead of cosmic-comp's 2/3 reshape.
-    ///
-    /// ONCE DEMOTED, THE DOCUMENT STAYS WINDOWED for the rest of the session (the sticky
-    /// [`PreviewState::demoted`] pin, read by [`overlay_taken`]): it is NOT promoted back
-    /// to the overlay when its siblings close, because silently re-entering fullscreen as
-    /// windows disappear would be jarring. The user's own appearance toggle still clears
-    /// the pin — an explicit choice is not a silent one.
-    ///
-    /// The appearance SETTING is deliberately untouched: a demotion is forced by the
-    /// second document, not chosen, so it must not become the default for the next
-    /// capture (unlike [`Self::toggle_preview_appearance`], which persists its flip).
-    ///
-    /// No-op for a document that is already a window, or one whose surface was torn down
-    /// while it stays loaded (a background bake, or the overlay's Save-As dialog): there
-    /// is nothing on screen to demote, and re-minting a window for it would resurrect a
-    /// surface that was closed on purpose. Such a document re-opens through
-    /// [`Self::reopen_preview_surface`], which consults the same rule and gets a window.
     /// Tear ONE preview surface down while the document stays loaded, and hand back the close
     /// task — the ONE seam every such teardown goes through (DRAGON-469).
     ///
@@ -519,11 +506,38 @@ impl App {
         surface.close(window)
     }
 
+    /// DEMOTE one open document out of the fullscreen overlay into a normal window,
+    /// preserving it completely: same [`PreviewState`] (pending covermark/annotation
+    /// edits, the shared undo/redo history, the zoom/pan viewport, video playback position
+    /// and timeline edits), re-pointed onto the fresh surface by [`Self::repoint_preview`]
+    /// — which also carries the focus/capture cursors and this document's audio-duck hold.
+    /// The window is minted through [`Self::mint_preview_window`], the SAME open-fit path
+    /// (`windowed_fit_size` + the transient `max_size` hint) a normally-opened window
+    /// takes, so it lands at a sane size instead of cosmic-comp's 2/3 reshape.
+    ///
+    /// ONCE DEMOTED, THE DOCUMENT STAYS WINDOWED for the rest of the session (the sticky
+    /// [`PreviewState::demoted`] pin, read by [`overlay_taken`]): it is NOT promoted back
+    /// to the overlay when its siblings close, because silently re-entering fullscreen as
+    /// windows disappear would be jarring. The user's own appearance toggle still clears
+    /// the pin — an explicit choice is not a silent one.
+    ///
+    /// The appearance SETTING is deliberately untouched: a demotion is forced (by a second
+    /// document, or by [`Self::open_settings_from_preview`] needing the screen and the
+    /// keyboard), not chosen, so it must not become the default for the next capture
+    /// (unlike [`Self::toggle_preview_appearance`], which persists its flip).
+    ///
+    /// No-op for a document that is already a window, or one whose surface was torn down
+    /// while it stays loaded (a background bake, or the overlay's Save-As dialog): there
+    /// is nothing on screen to demote, and re-minting a window for it would resurrect a
+    /// surface that was closed on purpose. Such a document re-opens through
+    /// [`Self::reopen_preview_surface`], which consults the same rule and gets a window.
+    /// That guard is [`overlay_demotion_needed`], the one expression the sibling sweep reads
+    /// too, so "is this on the overlay" cannot come apart between the two callers.
     pub(super) fn demote_preview_to_window(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
         let Some(p) = self.preview_for(id) else {
             return Task::none();
         };
-        if p.surface.is_window() || !p.surface_open {
+        if !overlay_demotion_needed(p.surface, p.surface_open) {
             return Task::none();
         }
         let old_id = p.window;
@@ -681,35 +695,22 @@ impl App {
         if old_surface.is_window() && self.previews.iter().any(|p| p.window != old_id) {
             return Task::none();
         }
-        // NOT WHILE THE SETTINGS PANE IS UP (DRAGON-469). Promoting back to the fullscreen
-        // overlay would undo, on purpose, the very thing
-        // [`Self::open_settings_from_preview`] demoted this document for: on Linux the
-        // preview overlay is an `Exclusive` layer surface, so it takes the keyboard away from
-        // the settings window AND covers it, and the pane is a SEPARATE process that cannot
-        // defend itself. Fixing the toggle's direction made that newly reachable, so it is
-        // refused rather than shipped as a trap. The refusal leaves the persisted appearance
-        // alone and mints nothing, so it cannot reintroduce the reload it replaced; the toast
-        // is there because a button that silently does nothing is the complaint this ticket
-        // opened with.
+        // AN OPEN SETTINGS PANE DOES NOT BLOCK THIS (DRAGON-488). DRAGON-469 refused the
+        // promotion here while a pane was open, with a red "Close the settings window to go
+        // fullscreen" toast, and the owner's report is that refusing is the wrong trade: the
+        // user pressed a fullscreen button and got told no. The promotion is allowed, and the
+        // pane simply sits behind the overlay.
         //
-        // Honest platform note: `settings_pane_is_open` answers `false` on Windows BY DESIGN
-        // (a named mutex with no non-retaining probe — see its doc), so this refusal cannot
-        // fire there and a Windows user can still cover their settings window with the
-        // overlay. That is acceptable where it would not be on Linux: the Windows overlay is
-        // an ordinary topmost window with no keyboard grab, so the pane stays alt-tabbable and
-        // fully usable underneath. Not worth a named-event probe of its own.
-        if overlay_promotion_blocked(
-            !toggled_preview_windowed(old_surface),
-            self.settings.window.is_some() || crate::instance::settings_pane_is_open(),
-        ) {
-            self.preview_toast_icon(
-                id,
-                ToastKind::Error,
-                "Close the settings window to go fullscreen",
-                "emblem-system-symbolic",
-            );
-            return Task::none();
-        }
+        // WHY THAT IS SAFE, and it is not because the DRAGON-109 hazard went away — it did
+        // not. On Linux the preview overlay is an `Exclusive` layer surface (`shell.rs`), so
+        // while it is mapped it covers the screen AND holds the keyboard away from every
+        // toplevel, including a settings pane that is usually a SEPARATE process. What makes
+        // that survivable is the way BACK: every route from this editor to settings demotes
+        // this document to a window FIRST ([`Self::open_settings_from_preview`], now on every
+        // branch), so the gear in the overlay header is a one-press exit from fullscreen that
+        // also raises the pane. Nobody is locked out of settings, and settings never blocks
+        // fullscreen. If that demotion is ever weakened, THIS is the promotion it strands —
+        // fix the demotion, do not re-add a refusal here.
 
         // An explicit appearance choice clears a forced demotion's sticky pin (see
         // [`Self::demote_preview_to_window`]) — the "stays windowed" rule is about never
@@ -797,50 +798,71 @@ impl App {
     ///
     /// # Open vs. refocus
     ///
-    /// Only one settings pane may exist across all instances, so the decision is:
-    ///
-    /// * this process already HAS a pane → focus it and do nothing else. Unreachable in
-    ///   practice (a `--settings` launch never opens a preview, and the gear that converts
-    ///   a capture into a pane runs before any preview exists), but cheap and honest to
-    ///   handle rather than assume;
-    /// * a pane is open ELSEWHERE ([`crate::instance::settings_pane_is_open`], a probe that
-    ///   does not retain the lock) → spawn the `--focus-settings` helper, exactly as the
-    ///   capture gear does, so the activation outlives the spawn;
-    /// * otherwise → spawn a `--settings` child.
+    /// Only one settings pane may exist across all instances, so the decision is
+    /// [`settings_activation`]'s three cases: focus the pane THIS process owns, spawn
+    /// `--focus-settings` for one owned ELSEWHERE ([`crate::instance::settings_pane_is_open`],
+    /// a probe that does not retain the lock), or spawn a `--settings` child.
     ///
     /// The probe is TOCTOU-racy by nature and deliberately tolerated: if a pane appears in
     /// the gap, our `--settings` child finds the lock taken and (macOS/Windows) pokes the
     /// holder or (Linux) returns quietly — the same outcome the other branch aimed for.
     ///
-    /// # The fullscreen overlay must come down first
+    /// # The fullscreen overlay comes down first, on EVERY branch
     ///
     /// An `Exclusive` layer surface owns the keyboard and covers the display, so a settings
-    /// window would open behind it and be unreachable. A document on the overlay is
-    /// therefore DEMOTED to a window first, through the very same
-    /// [`Self::demote_preview_to_window`] the second-document rule uses — which means it
-    /// takes the sticky `demoted` pin too. That is the behaviour we want: the conversion is
-    /// FORCED (by needing the screen), not chosen, so it must neither flip the persisted
-    /// appearance nor let the document silently jump back to fullscreen while settings is
-    /// up. The user's own appearance toggle still clears the pin, as always.
+    /// window would sit behind it and be unreachable. A document on the overlay is therefore
+    /// DEMOTED to a window first, through the very same [`Self::demote_preview_to_window`]
+    /// the second-document rule uses — which means it takes the sticky `demoted` pin too.
+    /// That is the behaviour we want: the conversion is FORCED (by needing the screen), not
+    /// chosen, so it must neither flip the persisted appearance nor let the document silently
+    /// jump back to fullscreen while settings is up. The user's own appearance toggle still
+    /// clears the pin, as always.
     ///
-    /// The demotion task is batched FIRST so the exclusive surface is on its way out before
-    /// the child is spawned.
+    /// DRAGON-488 made that unconditional. The `FocusOwn` branch used to return early with
+    /// just a `gain_focus`, which focuses a window UNDER a fullscreen overlay that holds the
+    /// keyboard: the pane would be raised into a place the user cannot see or type into.
+    /// Rare (a `--settings` launch never opens a preview), but it was the one branch where
+    /// the promise "the gear always gets you to settings" was false — and that promise is
+    /// what earns the right to allow the promotion in [`Self::toggle_preview_appearance`].
+    /// The demotion is issued ONCE, before the pane decision is even read, so a future fourth
+    /// case inherits it instead of having to remember it. It is also batched FIRST so the
+    /// exclusive surface is on its way out before the child is spawned.
+    ///
+    /// One user action, no intermediate clicks: pressing the gear on a fullscreen editor
+    /// leaves a windowed editor plus a focused settings pane.
+    ///
+    /// This is the ONLY route: both gears (`chrome.rs` — the overlay header row and the
+    /// windowed titlebar) send `PreviewMsg::OpenSettings`, and no keymap
+    /// [`crate::shortcuts::Action`] binds settings from the editor. So the demotion is
+    /// structurally on every path rather than repeated per caller, and a keyboard binding
+    /// added later inherits it by sending the same message.
     pub(super) fn open_settings_from_preview(
         &mut self,
         id: window::Id,
     ) -> Task<cosmic::Action<Msg>> {
-        // Same-process pane (see above): just focus it, and leave the surfaces alone.
-        if let Some(settings) = self.settings.window {
-            return window::gain_focus(settings);
-        }
+        // FIRST, and for every case below: get this document off the fullscreen overlay.
+        // No-op when it is already a window (`overlay_demotion_needed`).
         let demote = self.demote_preview_to_window(id);
-        let flag = if crate::instance::settings_pane_is_open() {
-            "--focus-settings"
-        } else {
-            "--settings"
+        let own_pane = self.settings.window;
+        // The cross-process probe is skipped entirely when we own a pane (the `&&`
+        // short-circuits): it opens a lock file, and the only lock it could find is ours.
+        let pane = settings_activation(
+            own_pane.is_some(),
+            own_pane.is_none() && crate::instance::settings_pane_is_open(),
+        );
+        let show = match pane {
+            // `own_pane` is Some by construction here; `Task::none()` is the unreachable arm.
+            SettingsActivation::FocusOwn => own_pane.map_or_else(Task::none, window::gain_focus),
+            SettingsActivation::FocusOther => {
+                crate::recording_ui::spawn_capture_child("--focus-settings");
+                Task::none()
+            }
+            SettingsActivation::Spawn => {
+                crate::recording_ui::spawn_capture_child("--settings");
+                Task::none()
+            }
         };
-        crate::recording_ui::spawn_capture_child(flag);
-        demote
+        Task::batch([demote, show])
     }
 
     /// Pause OTHER apps' media the instant a preview overlay opens — not when its asset finishes
@@ -934,7 +956,7 @@ impl App {
             source_scale,
             loading_msg: random_loading_msg(),
             kind,
-            edit: self.new_edit_state(),
+            edit: self.new_edit_state(is_video),
             view: Viewport::default(),
             ducking: false,
             surface_open: true,
@@ -1006,7 +1028,7 @@ impl App {
             source_scale: 1.0,
             loading_msg: random_loading_msg(),
             kind,
-            edit: self.new_edit_state(),
+            edit: self.new_edit_state(is_video),
             view: Viewport::default(),
             ducking: false,
             surface_open: true,
@@ -1146,7 +1168,7 @@ impl App {
             source_scale: req.source_scale,
             loading_msg: random_loading_msg(),
             kind,
-            edit: self.new_edit_state(),
+            edit: self.new_edit_state(req.video),
             view: Viewport::default(),
             ducking: false,
             surface_open: true,
@@ -1691,6 +1713,17 @@ impl App {
                 .preview_header_controls(preview)
                 .into_iter()
                 .fold(header, |h, control| h.start(control));
+            // DRAGON-490: the upload progress indicator + Cancel, folded onto `.end(...)`
+            // BEFORE the platform caption-button tail below, so it always renders to their
+            // LEFT — "before any caption buttons", the owner's own wording — on every
+            // platform: `HeaderBarWidget::view` appends the min/max/close cluster (or, on
+            // Windows with native DWM buttons, the reserved inset below) to whatever is
+            // already in `end` at that point. Empty (a no-op fold) whenever this document
+            // has no upload in flight.
+            let header = self
+                .preview_upload_titlebar(preview)
+                .into_iter()
+                .fold(header, |h, control| h.end(control));
             // macOS (DRAGON-146): native traffic lights own close/min/zoom (kept +
             // centred in `finalize_preview_window`), so no CSD window buttons here;
             // native close routes through WindowCloseRequested → preview Cancel.

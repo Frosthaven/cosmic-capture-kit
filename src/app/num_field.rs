@@ -7,6 +7,10 @@
 use std::ops::RangeBounds;
 use std::str::FromStr;
 
+/// `Debug` is derived so a page that holds one inside its own `#[derive(Debug)]` state does
+/// not have to hand-write an impl. Neither field is a secret: a numeric setting and the text
+/// of it.
+#[derive(Debug)]
 pub(crate) struct NumField<T> {
     pub value: T,
     pub text: String,

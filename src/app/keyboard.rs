@@ -21,6 +21,9 @@ impl App {
             Action::DeselectText => Msg::Detect(DetectMsg::TextDeselect),
             Action::PreviewSave => return pv(PreviewMsg::Save),
             Action::PreviewCopy => return pv(PreviewMsg::Copy),
+            // DRAGON-482: the key opens the FLYOUT, not an upload. An upload picks a
+            // destination account and cannot be undone, so a keystroke must not commit one.
+            Action::PreviewUpload => return pv(PreviewMsg::UploadFlyoutToggle),
             Action::PreviewPlay => return pv(PreviewMsg::Play),
             Action::PreviewFramePrev => return pv(PreviewMsg::FrameStep(-1)),
             Action::PreviewFrameNext => return pv(PreviewMsg::FrameStep(1)),

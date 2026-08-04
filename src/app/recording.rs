@@ -183,13 +183,18 @@ impl App {
         if !self.encoders.begin_probe() {
             return Task::none();
         }
+        // DRAGON-499: detached, not `spawn_blocking`. This is the OTHER background job a
+        // settings window starts, and the probe runs `ffmpeg -encoders` plus real hardware
+        // probe-encodes, so it is seconds long; on the blocking pool those seconds are added
+        // to closing the window (see `app::background`). A probe nobody is waiting for any
+        // more is simply abandoned.
         Task::perform(
-            async {
-                tokio::task::spawn_blocking(crate::app::EncoderResolve::probe_list)
-                    .await
-                    .unwrap_or_default()
+            off_thread(crate::app::EncoderResolve::probe_list),
+            |list| {
+                cosmic::Action::App(Msg::Settings(SettingsMsg::EncodersProbed(
+                    list.unwrap_or_default(),
+                )))
             },
-            |list| cosmic::Action::App(Msg::Settings(SettingsMsg::EncodersProbed(list))),
         )
     }
 

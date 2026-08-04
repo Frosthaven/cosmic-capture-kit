@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- Proton Drive. The official mark lifted whole out of the Proton Drive lockup. -->
+  <!-- Source: https://upload.wikimedia.org/wikipedia/commons/3/3a/Proton_Drive_Logo.svg -->
+  <defs>
+    <radialGradient id="pd-a" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(197.794,0,0,180.137,114.878,-34.7674)">
+      <stop offset=".5561" stop-color="#6d4aff"/>
+      <stop offset="1" stop-color="#ff50c3"/>
+    </radialGradient>
+    <linearGradient id="pd-b" x1="-1.3974" y1="-20.4032" x2="129.901" y2="125.087" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7341ff"/>
+      <stop offset=".3593" stop-color="#b487ff"/>
+      <stop offset="1" stop-color="#ffc8ff"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(1.44 -1.6483) scale(0.1992)">
+    <path d="m74.8827 46.7999-41.5196.2327c-1.7877.0111-3.5307-.532-4.9944-1.5627L19.1173 38.9532C17.676 37.9336 15.9441 37.3906 14.1788 37.3906H0v63.7374C0 107.135 4.90503 112 10.9609 112H83.4637V55.256c0-4.688-3.8436-8.4894-8.581-8.4561z" fill="url(#pd-a)"/>
+    <path fill-rule="evenodd" clip-rule="evenodd" d="m49.9553 33.7554h45.0838c6.0559 0 10.9609 4.8654 10.9609 10.8722v56.4894c0 6.007-4.905 10.872-10.9609 10.872H83.4637V55.256c0-4.688-3.8436-8.4894-8.581-8.4561l-41.5196.2327c-1.7877.0111-3.5307-.532-4.9944-1.5627L19.1173 38.9532C17.676 37.9336 15.9441 37.3906 14.1788 37.3906H0v-1.5184C0 29.8654 4.90503 25 10.9609 25h20.5698c2.0782 0 4.1006.6539 5.7654 1.873l6.8827 5.0094c1.6759 1.2191 3.6983 1.873 5.7765 1.873z" fill="url(#pd-b)"/>
+  </g>
+</svg>

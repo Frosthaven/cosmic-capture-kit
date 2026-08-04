@@ -680,6 +680,79 @@ const PREVIEW_MARKER: &str = "preview";
 /// cross-process marker each would put up its own dialog. The first one to fail speaks;
 /// the rest find this marker and exit quietly (they were about to exit anyway).
 const ALERT_MARKER: &str = "alert";
+/// Marker suffix: this pid is a `--cloud-upload` child with a transfer in flight (DRAGON-516).
+///
+/// **The bug this exists for.** The upload child is a detached re-exec of THIS binary
+/// (`share::reexec::spawn_self`), so `/proc/<pid>/exe` matches ours and
+/// [`close_other_instances`] found it as an ordinary capture sibling. It held none of the
+/// markers above, is not a settings window and is not the resident, so committing a screenshot
+/// SIGTERMed it (`TerminateProcess` on Windows) mid-transfer. Nothing in `cloud::child`
+/// installs a SIGTERM handler, so the child simply died: the tray counter froze on its last
+/// bucket, the editor's meter froze with it (the child never got to write a terminal state into
+/// its session sidecar), and the OneDrive transfer stopped where it stood. The owner saw it as
+/// "the upload progress stalled the moment I took a screenshot".
+///
+/// It is a MARKER rather than an argv check on purpose. Two of the three sweeps read argv
+/// (`/proc/<pid>/cmdline`, `mac_argv`) but the Windows one does not, and reading another
+/// process's command line there means `NtQueryInformationProcess` plus a PEB read. The per-pid
+/// marker namespace is already portable `std::fs` and already wired into all three sweeps
+/// ([`marker_flags`] on Windows), so one suffix covers every platform with no new syscall.
+///
+/// The child owns it through [`UploadMarker`], created before the transfer starts and removed
+/// on every exit path. A child killed with SIGKILL (or ended by its own backstop's
+/// `process::exit`) leaves it behind; [`sweep_when_owner_is_dead`] covers that like every other
+/// marker here.
+const UPLOAD_MARKER: &str = "upload";
+/// Marker suffix: this pid is a detached `share::` helper still doing its job (DRAGON-519).
+///
+/// **What the sweep was killing.** The post-capture helpers are detached re-execs of this
+/// binary (`share::reexec::spawn_self`), so the exe-path match in [`close_other_instances`]
+/// finds them exactly the way DRAGON-516 found the upload child. They hold none of the
+/// markers above, are not a settings window and are not the resident, so every capture
+/// commit SIGTERMed whichever ones were still alive. Two of them are really alive:
+///
+/// * `--copy-image` / `--copy-file` / `--copy-text`, on LINUX. This is the severe one,
+///   because Wayland has no clipboard STORE: the selection is served live by the process
+///   that owns it, which is why `share::clipboard::run_copy` asks `wl_clipboard_rs` for
+///   `Options::foreground(true)` and blocks there until something else is copied. Our own
+///   process IS the clipboard. Killing it does not break a click or freeze a counter, it
+///   takes the user's copied capture off their clipboard. Scan a QR code and copy its text,
+///   or let an upload copy its share link (`cloud::child` copies through this same helper),
+///   then take a screenshot with automatic copying off: the paste is empty.
+/// * `--notify-copied` / `--notify-saved`, on LINUX and macOS. The banner itself belongs to
+///   the notification service and survives, but the CLICK is handled inside the helper, so
+///   killing it turns "click to reveal your capture" into nothing happening. The helper
+///   lingers about 20s on Linux and 5 minutes on macOS (`platform::mac::notify`'s
+///   `CLICK_WINDOW`), and a "(no editor)" capture (DRAGON-428) gets no other feedback at
+///   all, so that click is the whole delivery.
+///
+/// **How long the clipboard helper is spared: for as long as it runs, with no limit.** That
+/// is the right answer and not a generous one. The helper is not idling, it is serving the
+/// selection, and the moment it stops mattering is the moment something else is copied,
+/// which is exactly when `foreground(true)` returns and the process exits by itself. A
+/// budget here could only ever end a copy the user still wanted. It also means the timing
+/// window is not a race: a copy worker is still alive at the NEXT capture as a matter of
+/// course, which is why this went unnoticed as a "sometimes" bug for so long.
+///
+/// WINDOWS has no exposure and gets the marker for free. Its clipboard write is inline and
+/// concrete (CF_DIBV5 / CF_HDROP persist in the OS clipboard with no owner process), and its
+/// toast returns as soon as `Show()` does, with the click re-entering us through the
+/// `cosmic-capture-kit:` URI scheme instead of through the helper. Nothing there is resident
+/// to kill. The marker still rides all three sweeps because the namespace is portable
+/// `std::fs` and one suffix costs less than a per-platform rule.
+///
+/// ONE suffix for both helper shapes, because the sweep asks them ONE question and gets the
+/// same answer: this is work the user asked for that has not finished, and it has no
+/// selector overlay to collapse. Splitting it would put two flags in
+/// [`should_spare_sibling`] that nothing could ever read apart.
+///
+/// Not given to `--open-uri` or `--reveal`. Those hand a URI or a path to a D-Bus service
+/// and return, so they are gone in milliseconds and there is nothing for the sweep to
+/// interrupt. A marker they do not need would claim a protection they do not have.
+///
+/// Held by [`ShareMarker`], and swept by [`sweep_when_owner_is_dead`] when a helper is
+/// killed outright or ends through the notifier's own `process::exit` backstop.
+const SHARE_MARKER: &str = "share";
 /// Marker suffix: this pid is LISTENING for preview handoffs (DRAGON-336) — the
 /// unix-socket sibling of its [`PREVIEW_MARKER`]. Sits in the same per-pid namespace so
 /// the stale sweep below clears a SIGKILLed host's socket file for free; the transport
@@ -741,8 +814,20 @@ fn sweep_when_owner_is_dead(suffix: &str) -> bool {
     // DRAGON-336: the preview-handoff SOCKET rides the same per-pid namespace, so a
     // host killed with SIGKILL (which leaves its socket file behind) is cleaned up
     // here too — otherwise a recycled pid would inherit a socket nothing listens on.
-    matches!(suffix, RECORDING_MARKER | PREVIEW_MARKER | PREVIEW_SOCKET_MARKER | ALERT_MARKER)
-        || is_audio_fifo_suffix(suffix)
+    // DRAGON-516: the upload child's marker rides the same rule. Its own `UploadMarker` guard
+    // removes it on every ordinary exit path, so this only ever sees one left by a child that
+    // was killed outright or ended by its own backstop's `process::exit`.
+    // DRAGON-519: and the share helpers' marker, on the same terms. The notifier's 20s/5min
+    // backstop ends it with `process::exit`, which runs no destructor.
+    matches!(
+        suffix,
+        RECORDING_MARKER
+            | PREVIEW_MARKER
+            | PREVIEW_SOCKET_MARKER
+            | ALERT_MARKER
+            | UPLOAD_MARKER
+            | SHARE_MARKER
+    ) || is_audio_fifo_suffix(suffix)
 }
 
 /// Whether a marker suffix names one of the recorder's audio FIFOs — the `<token>` in
@@ -836,6 +921,63 @@ pub(crate) fn any_other_alert() -> bool {
     any_other_marker_in(&crate::util::runtime_dir(), std::process::id(), ALERT_MARKER)
 }
 
+/// This process's in-flight-upload marker, held for as long as the transfer is (DRAGON-516).
+///
+/// An RAII guard rather than a `set_upload_marker(bool)` pair, because
+/// `cloud::child::run_cloud_upload` returns from six places (the account is gone, the transfer
+/// failed, the cancel cleanup, the ordinary end) and a marker left behind by ONE missed path
+/// would spare a dead pid's sibling slot until the next sweep noticed. The guard cannot miss a
+/// path; `Drop` is the only removal there is.
+///
+/// It does NOT cover `std::process::exit` (the child's own 30-minute backstop) or a SIGKILL.
+/// Neither runs destructors, and both are covered by [`sweep_when_owner_is_dead`] instead: the
+/// pid is dead, so the next launch that sweeps drops the file.
+pub(crate) struct UploadMarker;
+
+impl UploadMarker {
+    /// Advertise that this process is uploading, so a sibling's capture-commit sweep spares it.
+    pub(crate) fn new() -> Self {
+        set_self_marker(UPLOAD_MARKER, true);
+        UploadMarker
+    }
+}
+
+impl Drop for UploadMarker {
+    fn drop(&mut self) {
+        set_self_marker(UPLOAD_MARKER, false);
+    }
+}
+
+/// This process's share-helper marker, held for as long as the helper is working
+/// (DRAGON-519). See [`SHARE_MARKER`] for what each helper was losing when the sweep
+/// reached it.
+///
+/// The same RAII shape as [`UploadMarker`], for the same reason: the guard cannot miss an
+/// exit path, because `Drop` is the only removal there is. It earns that shape here too.
+/// The clipboard worker's ordinary ending is a return from deep inside `wl_clipboard_rs`
+/// after the selection changes hands, and the notifier's is a `return` out of a signal loop
+/// with several arms, so neither has one tidy place to clear a flag by hand.
+///
+/// It does NOT cover the notifier's `process::exit` backstop or a SIGKILL. Neither runs
+/// destructors, and [`sweep_when_owner_is_dead`] covers both: the pid is dead, so the next
+/// launch that sweeps drops the file.
+pub(crate) struct ShareMarker;
+
+impl ShareMarker {
+    /// Advertise that this process is a share helper still at work, so a sibling's
+    /// capture-commit sweep spares it.
+    pub(crate) fn new() -> Self {
+        set_self_marker(SHARE_MARKER, true);
+        ShareMarker
+    }
+}
+
+impl Drop for ShareMarker {
+    fn drop(&mut self) {
+        set_self_marker(SHARE_MARKER, false);
+    }
+}
+
 fn set_self_marker(suffix: &str, active: bool) {
     let path = state_marker_path(std::process::id(), suffix);
     if active {
@@ -877,8 +1019,34 @@ fn set_self_marker(suffix: &str, active: bool) {
 ///   is live the moment the two merge rather than needing a follow-up.
 /// * Linux writes no alert marker (its failures reach a terminal), so the flag is always
 ///   false there and the sweep is byte-identical.
-pub fn should_spare_sibling(recording: bool, preview: bool, alert: bool) -> bool {
-    recording || preview || alert
+///
+/// DRAGON-516 added `upload`, and it is the one input whose sibling is not a WINDOW at all. The
+/// `--cloud-upload` child is a detached re-exec of this binary with no UI of its own, so the
+/// exe-path match found it and the sweep killed it: a screenshot taken during an upload ended
+/// that upload. It has exactly the property the other three share, which is why it belongs in
+/// the same predicate rather than in a check of its own: it is work the user asked for that is
+/// still going, and collapsing a selector overlay must never take it with them. See
+/// [`UPLOAD_MARKER`] for the whole failure and why the answer is a marker.
+///
+/// Note what this predicate is NOT about. The resident's "capture NOW" SIGUSR1
+/// ([`signal_existing_capture`]) cannot reach an upload child at all: it is sent to the
+/// daemon-lock pid and to nothing else, and an upload child never holds that lock. The sweep
+/// below is the only thing that was ever signalling these processes.
+///
+/// DRAGON-519 added `share`, the detached `share::` clipboard and notification helpers, on
+/// the same reasoning as `upload` beside it and found while fixing that one. See
+/// [`SHARE_MARKER`] for what each was losing. The clipboard helper is what makes this
+/// predicate about the user's DATA and not only about their windows: on Wayland that worker
+/// is not reporting on work it did, it IS the clipboard, so sweeping it deletes something
+/// the user has.
+pub fn should_spare_sibling(
+    recording: bool,
+    preview: bool,
+    alert: bool,
+    upload: bool,
+    share: bool,
+) -> bool {
+    recording || preview || alert || upload || share
 }
 
 /// Whether the VIDEO capture kind should be offered. Disabled while another instance is
@@ -1080,9 +1248,15 @@ pub fn close_other_instances() {
         let preview = std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists();
         // DRAGON-438: and a sibling mid-failure-dialog.
         let alert = std::path::Path::new(&state_marker_path(pid, ALERT_MARKER)).exists();
-        if should_spare_sibling(recording, preview, alert) {
+        // DRAGON-516: and a detached upload child with a transfer in flight.
+        let upload = std::path::Path::new(&state_marker_path(pid, UPLOAD_MARKER)).exists();
+        // DRAGON-519: and a detached share helper, either the one serving the Wayland
+        // clipboard selection or the one holding a banner's click open.
+        let share = std::path::Path::new(&state_marker_path(pid, SHARE_MARKER)).exists();
+        if should_spare_sibling(recording, preview, alert, upload, share) {
             log::info!(
-                "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview} alert={alert})"
+                "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview} \
+                 alert={alert} upload={upload} share={share})"
             );
             continue;
         }
@@ -1262,9 +1436,15 @@ pub fn close_other_instances() {
         let preview = std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists();
         // DRAGON-438: and a sibling mid-failure-dialog.
         let alert = std::path::Path::new(&state_marker_path(pid, ALERT_MARKER)).exists();
-        if should_spare_sibling(recording, preview, alert) {
+        // DRAGON-516: and a detached upload child with a transfer in flight.
+        let upload = std::path::Path::new(&state_marker_path(pid, UPLOAD_MARKER)).exists();
+        // DRAGON-519: and a detached share helper, either the one serving the Wayland
+        // clipboard selection or the one holding a banner's click open.
+        let share = std::path::Path::new(&state_marker_path(pid, SHARE_MARKER)).exists();
+        if should_spare_sibling(recording, preview, alert, upload, share) {
             log::info!(
-                "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview} alert={alert})"
+                "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview} \
+                 alert={alert} upload={upload} share={share})"
             );
             continue;
         }
@@ -1293,19 +1473,30 @@ pub fn close_other_instances() {
     crate::platform::windows::instance::close_other_instances();
 }
 
-/// DRAGON-322: whether `pid`'s per-pid RECORDING / PREVIEW / ALERT marker exists. The
-/// predicate the Windows sibling sweep uses (its pids come from a live Toolhelp snapshot,
-/// so no liveness probe is needed here). Windows-only — the unix sweep inlines the same
-/// three `Path::exists` checks against [`state_marker_path`].
+/// DRAGON-322: whether `pid`'s per-pid RECORDING / PREVIEW / ALERT / UPLOAD / SHARE marker
+/// exists. The predicate the Windows sibling sweep uses (its pids come from a live Toolhelp
+/// snapshot, so no liveness probe is needed here). Windows-only — the unix sweep inlines the
+/// same five `Path::exists` checks against [`state_marker_path`].
 ///
-/// The ALERT flag is DRAGON-438: see [`should_spare_sibling`] for why a child showing the
-/// failure dialog must survive the next capture's sweep.
+/// The ALERT flag is DRAGON-438 and the UPLOAD flag DRAGON-516: see [`should_spare_sibling`]
+/// for why a child showing the failure dialog, and one still uploading, must survive the next
+/// capture's sweep. The upload one matters on Windows for exactly the reason the marker exists
+/// at all: this sweep reads no argv, so a marker file is the only thing it can ask.
+///
+/// The SHARE flag is DRAGON-519, and it is the one flag Windows reads that no Windows process
+/// currently sets. Its clipboard write is inline and its toast helper is gone as soon as the
+/// toast is shown, so nothing there is resident for this sweep to interrupt (the whole reason
+/// is in [`SHARE_MARKER`]). It is asked for anyway so this tuple stays the same shape as the
+/// unix bodies: a flag missing HERE and present there is how the two drift, and a Windows
+/// helper that ever does start lingering would be protected already.
 #[cfg(windows)]
-pub(crate) fn marker_flags(pid: u32) -> (bool, bool, bool) {
+pub(crate) fn marker_flags(pid: u32) -> (bool, bool, bool, bool, bool) {
     (
         std::path::Path::new(&state_marker_path(pid, RECORDING_MARKER)).exists(),
         std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists(),
         std::path::Path::new(&state_marker_path(pid, ALERT_MARKER)).exists(),
+        std::path::Path::new(&state_marker_path(pid, UPLOAD_MARKER)).exists(),
+        std::path::Path::new(&state_marker_path(pid, SHARE_MARKER)).exists(),
     )
 }
 
@@ -1367,10 +1558,10 @@ mod tests {
     /// predicate survives the setting's removal instead of becoming `true`.
     #[test]
     fn spare_recording_and_preview_siblings_but_never_a_bare_selector() {
-        assert!(!should_spare_sibling(false, false, false)); // bare selector overlay -> collapse
-        assert!(should_spare_sibling(true, false, false)); // recording session
-        assert!(should_spare_sibling(false, true, false)); // open preview (self-capture)
-        assert!(should_spare_sibling(true, true, false)); // recording WITH a preview open
+        assert!(!should_spare_sibling(false, false, false, false, false)); // bare -> collapse
+        assert!(should_spare_sibling(true, false, false, false, false)); // recording session
+        assert!(should_spare_sibling(false, true, false, false, false)); // preview (self-capture)
+        assert!(should_spare_sibling(true, true, false, false, false)); // recording + a preview
     }
 
     /// DRAGON-438: a sibling showing the capture-failure dialog is spared.
@@ -1385,7 +1576,7 @@ mod tests {
     fn spare_a_sibling_that_is_showing_the_failure_dialog() {
         // A child doing nothing but showing the dialog — no recording, no preview — is
         // exactly the shape the sweep used to kill, and is spared on the alert flag alone.
-        assert!(should_spare_sibling(false, false, true));
+        assert!(should_spare_sibling(false, false, true, false, false));
         // Sparing is additive: adding the dialog to an already-spared sibling cannot make it
         // collapsible, and the bare selector (nothing at all) is still the ONLY case that
         // collapses. That last assertion is the one worth keeping — the rule is "spare every
@@ -1393,15 +1584,183 @@ mod tests {
         for recording in [false, true] {
             for preview in [false, true] {
                 assert!(
-                    should_spare_sibling(recording, preview, true),
+                    should_spare_sibling(recording, preview, true, false, false),
                     "an alert must survive whatever else the sibling is doing \
                      (recording={recording} preview={preview})"
                 );
             }
         }
         assert!(
-            !should_spare_sibling(false, false, false),
+            !should_spare_sibling(false, false, false, false, false),
             "a sibling showing nothing the user must act on still collapses"
+        );
+    }
+
+    /// **DRAGON-516, the reported bug.** An in-flight upload child is spared.
+    ///
+    /// The scenario, end to end: the editor asks for an upload, which runs in a DETACHED
+    /// re-exec of this binary; the user takes another screenshot while it transfers; that
+    /// capture commits and runs this sweep. The upload child is the same executable, so the
+    /// exe-path match finds it, and it holds none of the other three flags — so it was
+    /// SIGTERMed (`TerminateProcess` on Windows) mid-upload, with no handler to catch it. The
+    /// owner saw the tray counter and the editor's meter both freeze, because the child died
+    /// before it could write either one a terminal state.
+    ///
+    /// It is spared on the upload flag ALONE, because that is the shape it really has: no
+    /// window, no recording, no dialog, just work the user asked for that is still going.
+    #[test]
+    fn spare_a_sibling_that_is_still_uploading() {
+        assert!(should_spare_sibling(false, false, false, true, false));
+        // Additive with every other flag, like the alert one: a process can legitimately be
+        // uploading AND showing a preview (the editor that started the upload is a preview),
+        // and no combination may turn sparing back off.
+        for recording in [false, true] {
+            for preview in [false, true] {
+                for alert in [false, true] {
+                    assert!(
+                        should_spare_sibling(recording, preview, alert, true, false),
+                        "an in-flight upload must survive whatever else the sibling is doing \
+                         (recording={recording} preview={preview} alert={alert})"
+                    );
+                }
+            }
+        }
+        // And the rule stays "spare what the user is waiting on", not "spare everything":
+        // the bare selector overlay is still the one shape that collapses.
+        assert!(!should_spare_sibling(false, false, false, false, false));
+    }
+
+    /// **DRAGON-519, the sibling of the bug above.** A working share helper is spared.
+    ///
+    /// Found while fixing DRAGON-516: the upload child was not the only thing that sweep was
+    /// killing. The `--copy-*` and `--notify-*` helpers are detached re-execs of this binary
+    /// too, so the exe-path match finds them the same way and they held none of the four
+    /// flags. Two different losses, one predicate:
+    ///
+    /// * The clipboard worker OWNS the Wayland selection while it blocks
+    ///   (`wl_clipboard_rs`'s `foreground(true)`), so killing it empties the user's clipboard.
+    ///   Nothing about that is a race: the worker lives until something else is copied, which
+    ///   means it is still there at the next capture as a matter of course.
+    /// * The notification helper owns its banner's CLICK, so killing it makes "click to reveal
+    ///   your capture" do nothing. For a "(no editor)" capture that click is the whole
+    ///   delivery.
+    ///
+    /// Spared on the share flag ALONE, because that is the shape both really have: no window,
+    /// no recording, no dialog, just work the user asked for that has not finished.
+    #[test]
+    fn spare_a_sibling_that_is_serving_the_clipboard_or_a_banner() {
+        assert!(should_spare_sibling(false, false, false, false, true));
+        // Additive with every other flag, like the two before it. No process holds two of
+        // these markers today (a share helper does one job and nothing else), so the table
+        // below is not describing a combination that occurs. It pins the SHAPE of the rule:
+        // sparing is a union, and a flag added later must not be able to turn it back off.
+        for recording in [false, true] {
+            for preview in [false, true] {
+                for alert in [false, true] {
+                    for upload in [false, true] {
+                        assert!(
+                            should_spare_sibling(recording, preview, alert, upload, true),
+                            "a working share helper must survive whatever else the sibling is \
+                             doing (recording={recording} preview={preview} alert={alert} \
+                             upload={upload})"
+                        );
+                    }
+                }
+            }
+        }
+        // The rule is still "spare what the user is waiting on". A bare selector overlay,
+        // which is what this sweep exists to collapse, is the one shape that collapses.
+        assert!(!should_spare_sibling(false, false, false, false, false));
+    }
+
+    /// DRAGON-519: the share marker rides the SAME stale-sweep rule as every other per-pid
+    /// sidecar. It has to: the notifier's backstop ends the helper with `process::exit`, which
+    /// runs no destructor, so a marker left behind is the NORMAL ending of an unclicked
+    /// banner, not a crash. Without this it would spare a recycled pid indefinitely.
+    #[test]
+    fn a_dead_share_helpers_marker_is_swept_like_every_other_one() {
+        assert!(sweep_when_owner_is_dead(SHARE_MARKER));
+        // The suffix is a plain word, so it round-trips through the per-pid marker naming all
+        // three sweeps parse. A suffix with a dot in it would split wrong.
+        let name = format!("cosmic-capture-kit.4242.{SHARE_MARKER}");
+        assert_eq!(parse_marker_name(&name), Some((4242, SHARE_MARKER)));
+        // And it is its own suffix, distinct from every other one in the namespace: two
+        // markers sharing a name would make one helper's exit clear another's protection.
+        for other in [
+            RECORDING_MARKER,
+            PREVIEW_MARKER,
+            PREVIEW_SOCKET_MARKER,
+            ALERT_MARKER,
+            UPLOAD_MARKER,
+            SESSION_MARKER,
+        ] {
+            assert_ne!(SHARE_MARKER, other);
+        }
+    }
+
+    /// DRAGON-519: the guard really creates and removes the file, and it is keyed to THIS pid,
+    /// so two concurrent share helpers never share one marker.
+    ///
+    /// It writes into the live runtime dir, which is safe here for the reason the upload twin
+    /// gives: a cargo run is a dev process, so `util::runtime_dir` is already sandboxed away
+    /// from the developer's real session.
+    #[test]
+    fn the_share_marker_guard_covers_exactly_its_own_scope() {
+        let path = state_marker_path(std::process::id(), SHARE_MARKER);
+        let _ = std::fs::remove_file(&path);
+        assert!(!std::path::Path::new(&path).exists());
+        {
+            let _guard = ShareMarker::new();
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "the marker must exist while the helper is working"
+            );
+        }
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "dropping the guard must take the marker away, on every return path there is"
+        );
+    }
+
+    /// DRAGON-516: the upload marker rides the SAME stale-sweep rule as every other per-pid
+    /// sidecar, so a child killed outright (or ended by its own backstop's `process::exit`,
+    /// which runs no destructor) cannot leave a marker that spares a recycled pid forever.
+    ///
+    /// The session LEDGER stays excluded, which is the one exception this set has always had.
+    #[test]
+    fn a_dead_upload_childs_marker_is_swept_like_every_other_one() {
+        assert!(sweep_when_owner_is_dead(UPLOAD_MARKER));
+        for suffix in [RECORDING_MARKER, PREVIEW_MARKER, PREVIEW_SOCKET_MARKER, ALERT_MARKER] {
+            assert!(sweep_when_owner_is_dead(suffix), "{suffix}");
+        }
+        assert!(
+            !sweep_when_owner_is_dead(SESSION_MARKER),
+            "the recording ledger is evidence `record::recover` consumes, never swept here"
+        );
+        // The suffix is a plain word, so it round-trips through the per-pid marker naming the
+        // three sweeps parse. A suffix with a dot in it would split wrong.
+        let name = format!("cosmic-capture-kit.4242.{UPLOAD_MARKER}");
+        assert_eq!(parse_marker_name(&name), Some((4242, UPLOAD_MARKER)));
+    }
+
+    /// DRAGON-516: the guard really creates and removes the file, and it is keyed to THIS pid
+    /// so two concurrent upload children never share one marker.
+    ///
+    /// It writes into the live runtime dir, which is safe here: a cargo run is a dev process,
+    /// so `util::runtime_dir` is already sandboxed away from the developer's real session
+    /// (`diag::resolve_path` / `util::is_dev_process`, proven by `tests/log_isolation.rs`).
+    #[test]
+    fn the_upload_marker_guard_covers_exactly_its_own_scope() {
+        let path = state_marker_path(std::process::id(), UPLOAD_MARKER);
+        let _ = std::fs::remove_file(&path);
+        assert!(!std::path::Path::new(&path).exists());
+        {
+            let _guard = UploadMarker::new();
+            assert!(std::path::Path::new(&path).exists(), "the marker must exist while uploading");
+        }
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "dropping the guard must take the marker away, on every return path there is"
         );
     }
 

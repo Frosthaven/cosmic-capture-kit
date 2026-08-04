@@ -425,6 +425,16 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            #[cfg(target_os = "macos")]
+            SettingsMsg::OpenPermissionsWindow => {
+                if let Some(id) = self.permissions.window {
+                    return window::gain_focus(id);
+                }
+                self.permissions.probe = permissions::probe_now();
+                let (id, task) = permissions::open_permissions_window();
+                self.permissions.window = Some(id);
+                task
+            }
             SettingsMsg::SetPreviewCopyOnExit(b) => {
                 self.preview_copy_on_exit = b;
                 self.save_state();
@@ -871,40 +881,44 @@ impl App {
                 Task::none()
             }
             SettingsMsg::CheckForUpdates => {
-                // Non-blocking: the curl fetch runs on a blocking pool; the result
+                // Non-blocking: the curl fetch runs on a detached worker; the result
                 // lands back as `UpdateChecked`. Mark "Checking" so the About page
                 // shows progress and a repeat click is a no-op while in flight.
                 if matches!(self.update_status, crate::update::UpdateStatus::Checking) {
                     return Task::none();
                 }
                 self.update_status = crate::update::UpdateStatus::Checking;
+                // DRAGON-499: ONE detached worker for the whole job, off the executor's
+                // blocking pool. Every settings mint fires this check (see
+                // `window_chrome`), so it is the likeliest job to still be running when
+                // the window closes, and a `spawn_blocking` one pins the runtime's drop
+                // on the main thread until it finishes: a slow network turned closing
+                // settings into waiting for curl. See `app::background`.
                 Task::perform(
-                    async {
+                    off_thread(|| {
                         // Run the fetch, then hold "Checking..." until the interactive
                         // floor (DRAGON-177) so an instant result doesn't flip back and
-                        // read as broken. The floor sleep runs on the blocking pool, so
-                        // it never touches the UI thread; the fetch itself is unslowed.
+                        // read as broken. Both halves on this one thread, so neither
+                        // touches the UI thread; the fetch itself is unslowed.
                         let started = std::time::Instant::now();
-                        let status = tokio::task::spawn_blocking(crate::update::check_now)
-                            .await
-                            .unwrap_or_else(|_| {
-                                crate::update::UpdateStatus::Failed(
-                                    "The update check could not run.".to_string(),
-                                )
-                            });
+                        let status = crate::update::check_now();
                         let remainder = crate::update::check_floor_remainder(
                             started.elapsed(),
                             crate::update::INTERACTIVE_CHECK_FLOOR,
                         );
                         if !remainder.is_zero() {
-                            let _ = tokio::task::spawn_blocking(move || {
-                                std::thread::sleep(remainder)
-                            })
-                            .await;
+                            std::thread::sleep(remainder);
                         }
                         status
-                    },
+                    }),
                     |status| {
+                        // A worker that died without answering reads exactly as the
+                        // `JoinError` arm it replaces.
+                        let status = status.unwrap_or_else(|| {
+                            crate::update::UpdateStatus::Failed(
+                                "The update check could not run.".to_string(),
+                            )
+                        });
                         cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateChecked(status)))
                     },
                 )
@@ -1001,19 +1015,15 @@ impl App {
                         return Task::none();
                     }
                     self.update_installing = true;
+                    // DRAGON-499: detached, like every other background job in the app.
                     return Task::perform(
-                        async move {
-                            tokio::task::spawn_blocking(move || {
-                                crate::update::install_macos(&info)
-                            })
-                            .await
-                            .unwrap_or_else(|_| {
+                        off_thread(move || crate::update::install_macos(&info)),
+                        |outcome| {
+                            let outcome = outcome.unwrap_or_else(|| {
                                 crate::update::InstallOutcome::Failed(
                                     "The update install could not run.".to_string(),
                                 )
-                            })
-                        },
-                        |outcome| {
+                            });
                             cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
                                 outcome,
                             )))
@@ -1030,19 +1040,15 @@ impl App {
                         return Task::none();
                     }
                     self.update_installing = true;
+                    // DRAGON-499: detached, like every other background job in the app.
                     return Task::perform(
-                        async move {
-                            tokio::task::spawn_blocking(move || {
-                                crate::update::install_windows(&info)
-                            })
-                            .await
-                            .unwrap_or_else(|_| {
+                        off_thread(move || crate::update::install_windows(&info)),
+                        |outcome| {
+                            let outcome = outcome.unwrap_or_else(|| {
                                 crate::update::InstallOutcome::Failed(
                                     "The update install could not run.".to_string(),
                                 )
-                            })
-                        },
-                        |outcome| {
+                            });
                             cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
                                 outcome,
                             )))
@@ -1063,6 +1069,11 @@ impl App {
                 let _ = self.dismiss_update_dialog();
                 Task::none()
             }
+            // DRAGON-482: the Cloud Accounts page owns its own update body, next to the
+            // state machine it drives and the pure decisions those transitions are made of
+            // (`settings::pages::cloud`). The same split `update_preview` has, and for the
+            // same reason: every one of these arms is a step of ONE flow.
+            SettingsMsg::Cloud(msg) => self.update_cloud(msg),
             // The macOS block ends in `return`, but the `#[cfg(not)]` tail after it
             // makes the block a statement (not the arm's tail expr), so the return is
             // required there; Linux compiles only the tail. Mirrors `seed_outputs_mac`.
@@ -1080,19 +1091,15 @@ impl App {
                         return Task::none();
                     }
                     self.update_installing = true;
+                    // DRAGON-499: detached, like every other background job in the app.
                     return Task::perform(
-                        async move {
-                            tokio::task::spawn_blocking(move || {
-                                crate::update::install_macos(&info)
-                            })
-                            .await
-                            .unwrap_or_else(|_| {
+                        off_thread(move || crate::update::install_macos(&info)),
+                        |outcome| {
+                            let outcome = outcome.unwrap_or_else(|| {
                                 crate::update::InstallOutcome::Failed(
                                     "The update install could not run.".to_string(),
                                 )
-                            })
-                        },
-                        |outcome| {
+                            });
                             cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
                                 outcome,
                             )))
@@ -1109,19 +1116,15 @@ impl App {
                         return Task::none();
                     }
                     self.update_installing = true;
+                    // DRAGON-499: detached, like every other background job in the app.
                     return Task::perform(
-                        async move {
-                            tokio::task::spawn_blocking(move || {
-                                crate::update::install_windows(&info)
-                            })
-                            .await
-                            .unwrap_or_else(|_| {
+                        off_thread(move || crate::update::install_windows(&info)),
+                        |outcome| {
+                            let outcome = outcome.unwrap_or_else(|| {
                                 crate::update::InstallOutcome::Failed(
                                     "The update install could not run.".to_string(),
                                 )
-                            })
-                        },
-                        |outcome| {
+                            });
                             cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
                                 outcome,
                             )))

@@ -249,25 +249,63 @@ fn capture_group_items(recording: bool) -> Vec<ksni::MenuItem<RecordingTray>> {
 /// three-state icon through the SAME rasterizer, keeping the two Linux surfaces pixel-
 /// identical.
 pub(crate) fn render_icon(svg_black: &str, color: [u8; 3]) -> Option<ksni::Icon> {
-    let hex = format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]);
-    // Recolour both the stroked brackets and the filled centre glyph to the accent.
-    let svg_tmpl = svg_black.replace("#000", &hex);
-    render_icon_hex(&svg_tmpl)
+    render_hex(&recolour(svg_black, color), false)
 }
 
-/// Rasterize an already-coloured SVG into the ARGB32 tray icon pixmap.
-fn render_icon_hex(svg: &str) -> Option<ksni::Icon> {
+/// [`render_icon`], but fitting the glyph's INK to the pixmap instead of its viewBox
+/// (DRAGON-500). For the upload counter (`platform/linux/upload_tray.rs`), whose faces do not
+/// all use the same amount of the shared 24-unit box.
+///
+/// The recording icon deliberately does NOT come through here. Its bracket glyph carries a
+/// ~13% margin of its own and has looked that way on the COSMIC panel since DRAGON-173; the
+/// icon nobody complained about stays byte-identical. Passing it through this instead would
+/// grow it by about a quarter, which is what Windows chose for the same glyph and the same
+/// reason (DRAGON-249) — a one-line swap here if the owner ever wants the two to match.
+pub(crate) fn render_icon_fitted(svg_black: &str, color: [u8; 3]) -> Option<ksni::Icon> {
+    render_hex(&recolour(svg_black, color), true)
+}
+
+/// Recolour a `#000` template SVG to `color`, the one substitution both rasterizers share.
+fn recolour(svg_black: &str, color: [u8; 3]) -> String {
+    let hex = format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]);
+    // Recolour both the stroked brackets and the filled centre glyph to the accent.
+    svg_black.replace("#000", &hex)
+}
+
+/// Rasterize an already-coloured SVG into the ARGB32 tray icon pixmap. `fit_ink` scales the
+/// glyph's own ink box up to the cell rather than mapping the viewBox 1:1; see
+/// [`render_icon_fitted`] for who wants which.
+fn render_hex(svg: &str, fit_ink: bool) -> Option<ksni::Icon> {
     // 64px source: comfortably above typical panel icon sizes (22-48) so the host
     // downscales (crisp) rather than upscales (blurry).
     const S: u32 = 64;
+    /// The viewBox edge every glyph this renders is drawn in (`cloud::tray`, `recording_ui`).
+    const BOX: f32 = 24.0;
     let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).ok()?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(S, S)?;
-    let scale = S as f32 / 24.0;
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
+    let transform = if fit_ink {
+        // usvg measures the ink for us, so no face has to hand-declare its own bounds the way
+        // the Windows daemon's rasterizer does; a redrawn glyph is re-fitted automatically.
+        //
+        // The STROKE box, not the plain one (DRAGON-516). usvg's `abs_bounding_box` is the
+        // geometry alone, so a stroked glyph — which is what `Face::Indeterminate` became when
+        // it took lucide's `cloud-upload` outline — would be fitted as if its outline had no
+        // width, and half a stroke width would land outside the cell: on a 64px pixmap that is
+        // about 3px, against a 1.9px margin, so the round caps came back shaved. A FILLED face
+        // measures the same either way, so the digits, tick and cross are untouched.
+        let ink = tree.root().abs_stroke_bounding_box();
+        let (scale, dx, dy) = crate::cloud::upload::tray::icon_ink_fit(
+            (ink.x(), ink.y(), ink.width(), ink.height()),
+            BOX,
+            S as f32,
+            crate::cloud::upload::tray::ICON_INK_MARGIN,
+        );
+        resvg::tiny_skia::Transform::from_row(scale, 0.0, 0.0, scale, dx, dy)
+    } else {
+        let scale = S as f32 / BOX;
+        resvg::tiny_skia::Transform::from_scale(scale, scale)
+    };
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
     // tiny-skia is premultiplied; emit straight-alpha ARGB32 in network (big-endian)
     // byte order: [A, R, G, B] per pixel, which SNI hosts expect.
     let mut data = Vec::with_capacity((S * S * 4) as usize);

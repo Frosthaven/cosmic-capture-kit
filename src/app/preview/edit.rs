@@ -201,6 +201,15 @@ pub enum FlyoutKind {
     TextSize,
     /// The TEXT-font dropdown (top bar, DRAGON-357 item 16): Hand / Clean.
     TextFont,
+    /// The UPLOAD destination picker (top bar, DRAGON-482): which connected cloud account
+    /// this capture goes to, whether to copy a share link, and the button that starts it.
+    ///
+    /// Its entry list is [`EditState::cloud_accounts`], so the arrow keys walk the accounts
+    /// and Enter ([`FlyoutKind`]'s shared apply) picks the highlighted one. Enter deliberately
+    /// does NOT start the upload: an upload is not undoable, and every other flyout's Enter
+    /// means "take the highlighted entry", so making this one commit a transfer would be the
+    /// odd one out in exactly the direction that costs something.
+    Upload,
 }
 
 /// The shared open/nav state of a toolbar flyout: which one is open, the highlighted entry
@@ -210,6 +219,572 @@ pub struct FlyoutNav {
     pub kind: FlyoutKind,
     pub selected: Option<usize>,
     pub len: usize,
+}
+
+/// Which completion an in-flight bake's artifact feeds (see [`EditState::bake_intent`]).
+///
+/// It replaced a `bake_for_share: bool` when DRAGON-482 added a third destination. A second
+/// boolean beside the first would have made "both set" representable and meaningless, and the
+/// bake path has exactly one destination by construction; the enum is that fact written down.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum BakeIntent {
+    /// The clipboard. Every bake meant this before DRAGON-474, which is why it is the
+    /// default: a path that forgets to state its intent keeps the historical behaviour.
+    #[default]
+    Copy,
+    /// The system share sheet (DRAGON-474).
+    ShareSheet,
+    /// A detached cloud-upload child (DRAGON-482): stage the artifact, hand it to `account`,
+    /// and ask for a share link when `auto_share`.
+    ///
+    /// The choice rides HERE rather than being re-read at completion on purpose. The flyout
+    /// is closed by the time the bake lands, and the accounts file is shared with the
+    /// settings window, so re-resolving "the current account" afterwards could send the
+    /// capture somewhere the user never picked.
+    Upload { account: String, auto_share: bool },
+}
+
+/// One upload this document has started and is still watching (DRAGON-490): a session id
+/// (`cloud::session::new_session_id`'s output, minted before the detached child was even
+/// spawned) plus the account label the toasts and the titlebar's tooltip name it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadWatch {
+    /// Keys the cross-process sidecars in `cloud::session` (`state_path`/`cancel_path`).
+    pub session_id: String,
+    /// The account this upload is going to, for the toast/tooltip wording. Snapshotted at
+    /// spawn time, the same way `finish_upload`'s own "Uploading to {label}" toast is, so a
+    /// settings-window rename mid-transfer cannot make the completion toast disagree with
+    /// the one that started it.
+    pub label: String,
+    /// The last percentage `UploadPoll` read for this session, if any yet. `None` for the
+    /// first tick or two, before the child's first bucketed progress write lands; the
+    /// titlebar indicator reads this to size its fill, and draws an EMPTY bar rather than
+    /// guessing while it is `None`.
+    pub last_percent: Option<u8>,
+    /// Whether the titlebar should draw a plain spinner instead of [`Self::last_percent`]'s
+    /// fill (DRAGON-490 follow-up, dynamic detection). Every upload starts `true` — set at
+    /// construction, mirroring the child's own `UploadTray`/session marker, both of which also
+    /// start this way unconditionally — and `UploadPoll` flips it to `false` the moment it
+    /// reads a real `Percent` state, which only ever happens once the child has observed a
+    /// genuine interim value for itself (`cloud::tray::still_indeterminate`). Never goes back
+    /// to `true`: a transfer that has shown a real percentage never reverts to a spinner.
+    pub indeterminate: bool,
+    /// The provider this account belongs to (`cloud::ProviderSpec::id`), snapshotted beside
+    /// [`Self::label`] for the same reason: the meter draws the provider's BRAND MARK
+    /// (DRAGON-495), and reading it live would mean a disconnect mid-transfer changing the
+    /// logo on an upload that is still running.
+    pub provider: String,
+    /// When this upload REACHED a terminal state, if it has (DRAGON-495).
+    ///
+    /// `None` while the transfer is running, which is every state the meter animates.
+    /// `Some(..)` means the outcome has already been reported (its toast is out, its session
+    /// cleared) and the watch is now the meter's PERSISTENT readout: it announces the outcome
+    /// for [`UPLOAD_FINISH_HOLD`] and then settles, and it stays until this document starts
+    /// another upload or the editor closes (DRAGON-514). Before DRAGON-495 the meter simply
+    /// vanished at 90-something percent, which reads as an upload that stopped rather than one
+    /// that finished; before DRAGON-514 it then vanished a few seconds later, taking the undo
+    /// with it while the user was still deciding.
+    pub finished: Option<UploadOutcome>,
+    /// WHICH account this upload went to (DRAGON-507), so an undo can delete from it. The
+    /// provider id below is not enough: two connected accounts can share one provider, and a
+    /// delete sent to the wrong one either fails or, worse, succeeds against a file that
+    /// happens to share an id.
+    pub account_id: String,
+    /// The provider's own id for the file this upload created, once the child has reported a
+    /// done state carrying one (DRAGON-507). `None` while the upload runs, and `None` forever
+    /// for a done state written by a build before DRAGON-507 — which is exactly the condition
+    /// under which the finish-hold offers no undo, because there is nothing to name.
+    ///
+    /// Never logged; see [`crate::cloud::session::UploadState::Done`].
+    pub file_id: Option<String>,
+    /// The SHARE LINK this upload put on the clipboard, when it made one (DRAGON-520), so the
+    /// meter can offer to copy it again once the user has copied something else.
+    ///
+    /// `None` while the upload runs, `None` for an upload that was not asked to share (or whose
+    /// provider cannot), and `None` forever for a done state written by a build before
+    /// DRAGON-520. That is exactly the condition under which no copy control is drawn, because
+    /// there would be nothing to put on the clipboard. See [`UploadWatch::copyable`].
+    ///
+    /// **Never logged.** It opens the capture for anyone holding it; see
+    /// [`crate::cloud::session::UploadState::Done`].
+    pub share_url: Option<String>,
+    /// When this meter's copy control was last pressed (DRAGON-520), so it can flash its
+    /// "Copied!" tick and revert on its own. `None` until the first press.
+    ///
+    /// The same shape the settings page's sign-in link uses for the same control
+    /// (`CloudAdd::copied_at`), read back through `widgets::copy_button::copied_recently`. An
+    /// instant rather than a flag, so nothing has to remember to clear it; what keeps the view
+    /// redrawing while it is up is [`upload_needs_poll`].
+    pub copied_at: Option<std::time::Instant>,
+    /// The X has been CLICKED and this meter is on its way out (DRAGON-507): which action it
+    /// was, for the wording, and so a test can tell a cancel from an undo.
+    ///
+    /// This is the INSTANT-feedback state. It is set the moment the click is handled, before
+    /// anything has actually happened at the provider, because the alternative is a control
+    /// that swallows a press and looks unchanged for as long as a round trip takes. What
+    /// follows it is fixed either way: red, no X, gone in [`UPLOAD_ENDING_HOLD`].
+    pub ending: Option<MeterAction>,
+    /// When [`Self::ending`] was set, so the poll can drop the entry once the window is up.
+    /// Split from `ending` for the same reason `finished_at` is split from `finished`.
+    pub ending_at: Option<std::time::Instant>,
+    /// When [`Self::finished`] was set, so the poll can drop the entry once the hold is over.
+    ///
+    /// A separate field rather than an `Instant` inside [`UploadOutcome`], because
+    /// `UploadWatch` derives `PartialEq` (the toast/■ tests compare whole watches) and an
+    /// instant is not a meaningful thing to compare two watches by. `None` whenever
+    /// `finished` is, and both are set together in the one place that ends a watch.
+    pub finished_at: Option<std::time::Instant>,
+}
+
+impl UploadWatch {
+    /// How long this watch has been in its finished HOLD, or `None` while it is still
+    /// running.
+    pub fn held_for(&self) -> Option<std::time::Duration> {
+        self.finished_at.map(|at| at.elapsed())
+    }
+
+    /// How long this watch has been ENDING (DRAGON-507), or `None` if nobody has pressed its
+    /// X.
+    pub fn ending_for(&self) -> Option<std::time::Duration> {
+        self.ending_at.map(|at| at.elapsed())
+    }
+
+    /// Whether this watch's finish-hold can be UNDONE (DRAGON-507): it finished, it SUCCEEDED,
+    /// and the child named the file that landed. Pure; unit-tested.
+    ///
+    /// A failure has nothing to take back, a cancel already took it back, and a done state
+    /// with no id (an older build's) names nothing — all three answer `false`, and the X
+    /// simply is not drawn.
+    pub fn undoable(&self) -> bool {
+        self.finished == Some(UploadOutcome::Done) && self.file_id.is_some()
+    }
+
+    /// The link this meter's copy control would put on the clipboard, or `None` when it draws no
+    /// copy control at all (DRAGON-520). Pure; unit-tested.
+    ///
+    /// Three conditions, and each rules out a state where the control would be a lie:
+    ///
+    /// * It FINISHED, and successfully. An upload still running has no link yet, and a failed or
+    ///   cancelled one never will.
+    /// * It was asked to share and the child managed it ([`Self::share_url`] is `Some`). An
+    ///   upload with the copy-link option off never made a link, so there is nothing to re-copy;
+    ///   its capture is in the drive and that is the whole of what happened.
+    /// * The link is not blank, which an odd state file could otherwise make it.
+    ///
+    /// The link comes back rather than a `bool`, because every caller that wants to know whether
+    /// to draw the control also wants the value it would copy, and asking twice is how the two
+    /// answers drift apart.
+    pub fn copyable(&self) -> Option<&str> {
+        if self.finished != Some(UploadOutcome::Done) {
+            return None;
+        }
+        self.share_url.as_deref().map(str::trim).filter(|url| !url.is_empty())
+    }
+
+    /// Whether this upload is still GOING: not finished, and nobody has pressed its X. Pure;
+    /// unit-tested.
+    ///
+    /// What "a new upload replaces the persistent meter" is decided by (DRAGON-514). The meter
+    /// draws `uploads.first()`, so a settled watch left at the head of the list would hide the
+    /// transfer that just started behind the one before it; starting an upload therefore drops
+    /// every watch that is no longer in flight. An ENDING watch goes too: it is already on its
+    /// way out, and half a second of a leaving red bar is not worth hiding a live transfer for.
+    pub fn in_flight(&self) -> bool {
+        self.finished.is_none() && self.ending.is_none()
+    }
+}
+
+/// How an upload ENDED, for the brief hold the meter shows before it disappears
+/// (DRAGON-495). A two-state summary of `cloud::session::UploadState`'s terminal variants,
+/// not a copy of them: the meter only ever draws "it worked" or "it did not", and the toast
+/// beside it is what carries the detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadOutcome {
+    /// The upload completed. The meter fills and turns the theme's success colour.
+    Done,
+    /// It failed, or the user cancelled it. The meter stops where it was, in the danger
+    /// colour: a cancel is not a fault, but it is equally not a delivered file, and the
+    /// success colour is the one thing it must not claim.
+    Stopped,
+}
+
+/// How long a finished upload's meter ANNOUNCES its outcome before settling (DRAGON-495,
+/// re-aimed by DRAGON-514).
+///
+/// It used to be how long the meter stayed before the watch was dropped. It is now the
+/// transition INTO the persistent state instead of the transition out of existence: the bar
+/// holds its outcome colour for this long ([`MeterFace::Finished`]), then settles
+/// ([`MeterFace::Settled`]) and stays put until another upload starts or the editor closes.
+/// The value is unchanged, and still the tray's own
+/// [`crate::cloud::upload::tray::FINISH_HOLD`], so the two readouts of one upload announce for
+/// the same span. They no longer END together, and that asymmetry is deliberate: the tray is a
+/// system-wide counter that must not accumulate finished items, while the editor's meter
+/// belongs to ONE document the user is looking at, and it is the only place the undo lives.
+pub const UPLOAD_FINISH_HOLD: std::time::Duration = crate::cloud::upload::tray::FINISH_HOLD;
+
+/// How a terminal upload state reads on the METER, or `None` to clear it at once. Pure;
+/// unit-tested.
+///
+/// **A cancel clears immediately** (DRAGON-495), matching the tray, which likewise shows no
+/// mark for one (`cloud::upload::tray::finish_face`): the hold exists so an upload does not
+/// vanish without saying how it went, and a user who just pressed Cancel already knows how it
+/// went. Holding a red bar there would answer their own question back at them, and would read
+/// as a failure for something they asked for. The "Upload canceled" toast is the confirmation.
+///
+/// Only `Done` earns the success colour. A FAILURE holds in the danger colour, because that is
+/// news the user did not ask for and did not otherwise see.
+///
+/// The two non-terminal states cannot reach here (`UploadPoll` matches them first) and clear
+/// rather than panicking: an unreachable arm that ends a live upload's meter early is a smaller
+/// failure than one that ends the process.
+pub fn upload_outcome(state: &crate::cloud::session::UploadState) -> Option<UploadOutcome> {
+    match state {
+        crate::cloud::session::UploadState::Done { .. } => Some(UploadOutcome::Done),
+        crate::cloud::session::UploadState::Failed => Some(UploadOutcome::Stopped),
+        // Canceled, and the two non-terminal states: nothing to hold.
+        _ => None,
+    }
+}
+
+/// Whether a finished upload has stopped ANNOUNCING and settled (DRAGON-514). Pure;
+/// unit-tested.
+///
+/// The same question `upload_hold_over` used to ask, with a different answer attached: this no
+/// longer retires the watch, it only says which of the two finished faces the meter wears.
+///
+/// `None` (still running) has never settled: only a FINISHED watch has an announcement to run
+/// out of.
+pub fn upload_settled(held_for: Option<std::time::Duration>) -> bool {
+    held_for.is_some_and(|held| held >= UPLOAD_FINISH_HOLD)
+}
+
+/// Whether this document has an upload actually GOING right now (DRAGON-514). Pure;
+/// unit-tested.
+///
+/// **The one predicate the upload trigger is gated on**, consulted by both paths so they cannot
+/// drift: the toolbar button reads it to draw itself disabled (`chrome::share_group`), and the
+/// `UploadFlyoutToggle` handler reads it to refuse, which is the seam the Ctrl+U / Cmd+U
+/// keybind arrives through (`keyboard::action_msg` maps the key to that same message). The
+/// handler is the ENFORCEMENT and the button is the affordance; a guard in the view alone would
+/// leave the keybind able to do what the button will not.
+///
+/// A FINISHED upload does not count, settled or still announcing: its meter persists, but the
+/// transfer is over and the next one may start immediately. That is the whole distinction
+/// [`UploadWatch::in_flight`] draws.
+pub fn upload_in_flight(uploads: &[UploadWatch]) -> bool {
+    uploads.iter().any(UploadWatch::in_flight)
+}
+
+/// Whether a watch still needs the upload poll to tick for it (DRAGON-514). Pure; unit-tested.
+///
+/// The gate on `subscriptions::sub_upload_poll`, and the reason a persistent meter costs
+/// nothing. Before this, "the document is watching an upload" and "the document has a meter on
+/// screen" were the same condition, so a meter that never leaves would have meant a 500ms
+/// timer, and a sidecar read off disk with it, for as long as the editor stayed open.
+///
+/// Three rows:
+///
+/// * **In flight** — yes. The poll is what reads the child's progress at all.
+/// * **Ending** — yes. The poll is also what retires a dismissed meter
+///   ([`upload_ending_over`]).
+/// * **Finished** — only until it has [`upload_settled`]. One more tick after the
+///   announcement is what re-renders the bar into its settled face; after that the watch is a
+///   fixed picture that nothing can change, and it is drawn from state the view already holds.
+/// * **Flashing "Copied!"**: yes, until the flash window passes (DRAGON-520). A settled meter
+///   is a fixed picture UNLESS its copy control has just been pressed: that tick expires by the
+///   clock rather than by a message, so something has to redraw the view for it to revert, and
+///   this poll is the tick the meter already has. It costs one extra sidecar read per 500ms for
+///   [`crate::widgets::copy_button::COPIED_FLASH`], four ticks, and only after a press.
+pub fn upload_needs_poll(watch: &UploadWatch) -> bool {
+    if watch.ending.is_some() || watch.finished.is_none() {
+        return true;
+    }
+    if crate::widgets::copy_button::copied_recently(watch.copied_at) {
+        return true;
+    }
+    !upload_settled(watch.held_for())
+}
+
+/// What the upload meter draws. Pure; unit-tested.
+///
+/// One decision for both preview surfaces (the windowed titlebar and the overlay's header
+/// row, DRAGON-495), so the same upload cannot look different in the two editors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeterFace {
+    /// No genuine percentage yet: a spinner, because a bar frozen at 0 reads as broken.
+    Spinner,
+    /// A real percentage, in the accent colour.
+    Progress(u8),
+    /// The upload just finished: full and green, or stopped where it was and red. The
+    /// ANNOUNCEMENT, for [`UPLOAD_FINISH_HOLD`].
+    Finished(UploadOutcome),
+    /// The announcement is over and the meter has SETTLED (DRAGON-514). Same bar, same undo:
+    /// it stays until another upload starts or the editor closes.
+    ///
+    /// **It no longer draws differently from `Finished`** (DRAGON-516, owner's call). DRAGON-514
+    /// gave this face a quieter tint, reasoning that "a full-strength success green held
+    /// indefinitely is a notification that never stops notifying". On screen the owner read the
+    /// fade as the upload having been forgotten rather than as it having quietly succeeded, and
+    /// asked for the meter to stay full and green until the next upload begins. So
+    /// `chrome::meter_tint` maps the two success faces to one token, and the two failure faces
+    /// to another, and settling is invisible.
+    ///
+    /// Which leaves the question of why the variant survives at all, since its own justification
+    /// ("it is the only difference between the two that anything DRAWS") is now false. Because
+    /// the STATE is still real and still has a consumer: [`upload_settled`] is what stops the
+    /// 500ms upload poll ([`upload_needs_poll`]) once the picture can no longer change, and
+    /// [`meter_face`] is the one place time enters this model. Folding the two faces together
+    /// would not delete that decision, it would only stop `meter_face` being able to report it,
+    /// and any later difference (a different tooltip, a meter that eventually hides itself)
+    /// would have to re-derive what is already computed here.
+    Settled(UploadOutcome),
+    /// The X has been pressed and this meter is going away (DRAGON-507): full and RED, at
+    /// once, whichever action it was. The alternative was a control that looks the same after
+    /// a press as before it, for as long as a provider takes to answer.
+    ///
+    /// It outranks every other face, including `Finished`: an undo pressed during the success
+    /// hold must turn that green bar red immediately, not wait for the hold to run out.
+    Ending(MeterAction),
+}
+
+/// What the meter's X does when pressed (DRAGON-507). Two actions, one control: which one is
+/// offered depends entirely on whether the transfer is still running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeterAction {
+    /// STOP a transfer that is still going. The DRAGON-496/497 semantics, untouched: the
+    /// child notices the cancel marker between chunks and takes back anything it has already
+    /// put at the provider.
+    Cancel,
+    /// UNDO one that already finished, during its finish-hold: delete the file the upload
+    /// created. The child has exited by then, so the EDITOR does this one itself.
+    Undo,
+}
+
+/// Which face the meter shows for `watch`. Pure; unit-tested.
+///
+/// The finished state WINS over the spinner: an upload that never reported a percentage
+/// (single-request, so it stayed indeterminate to the end) still finished, and must show that
+/// rather than spinning on after it is over.
+///
+/// Time enters here through [`UploadWatch::held_for`] (DRAGON-514), which is what splits the
+/// announcement from the settled state. It stays testable because the instant lives on the
+/// watch: a test builds one whose `finished_at` is as old as it likes.
+pub fn meter_face(watch: &UploadWatch) -> MeterFace {
+    // DRAGON-507: a pressed X outranks everything. It is the only face the user just asked
+    // for, and the whole point of it is that it appears with the click rather than after it.
+    if let Some(action) = watch.ending {
+        return MeterFace::Ending(action);
+    }
+    if let Some(outcome) = watch.finished {
+        return match upload_settled(watch.held_for()) {
+            true => MeterFace::Settled(outcome),
+            false => MeterFace::Finished(outcome),
+        };
+    }
+    if watch.indeterminate {
+        return MeterFace::Spinner;
+    }
+    MeterFace::Progress(watch.last_percent.unwrap_or(0))
+}
+
+/// How full the meter's track is drawn, 0.0 to 1.0. Pure; unit-tested.
+///
+/// A finished upload is FULL whatever it last reported: `Done` because it is, and `Stopped`
+/// because a bar that is part-full in the danger colour reads as "still going, badly". The
+/// colour is what says which happened.
+pub fn meter_fill(face: MeterFace) -> f32 {
+    match face {
+        MeterFace::Spinner => 0.0,
+        MeterFace::Progress(percent) => f32::from(percent.min(100)) / 100.0,
+        // An ENDING meter is full for the same reason a stopped one is: a part-full bar in the
+        // danger colour reads as "still going, badly", which is the one thing a press of the X
+        // must not look like. A SETTLED one is full because it is the same bar, just quieter.
+        MeterFace::Finished(_) | MeterFace::Settled(_) | MeterFace::Ending(_) => 1.0,
+    }
+}
+
+/// How long the meter stays on screen, red and X-less, after its X is pressed (DRAGON-507).
+///
+/// Half a second: long enough that the red is SEEN, so a click has a visible consequence and
+/// the meter is not simply yanked out from under the pointer, and short enough that it is not
+/// a wait. Much shorter than the finish hold ([`UPLOAD_FINISH_HOLD`]) on purpose: that one
+/// exists to REPORT an outcome the user did not ask for, while this one only acknowledges an
+/// action they just took and already know about.
+pub const UPLOAD_ENDING_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
+
+// The poll is what actually retires the watch, so the meter leaves on the first tick at or
+// after the window: between `UPLOAD_ENDING_HOLD` and one interval past it. Anything SHORTER
+// than the interval here would be a number the app cannot keep, so it is pinned rather than
+// left as a comment nobody re-checks when either value is retuned.
+const _: () = assert!(
+    UPLOAD_ENDING_HOLD.as_millis() >= crate::app::subscriptions::UPLOAD_POLL_INTERVAL.as_millis(),
+    "DRAGON-507: the ending window cannot be finer than the poll that ends it"
+);
+
+const _: () = assert!(
+    UPLOAD_ENDING_HOLD.as_millis() < UPLOAD_FINISH_HOLD.as_millis(),
+    "DRAGON-507: acknowledging a press must be briefer than reporting an outcome, or an undo \
+     during the hold would outlast the hold it interrupted"
+);
+
+/// Whether an ending meter's window has run out, so the watch can be dropped. Pure;
+/// unit-tested. `None` (nobody pressed anything) is never over.
+pub fn upload_ending_over(ending_for: Option<std::time::Duration>) -> bool {
+    ending_for.is_some_and(|held| held >= UPLOAD_ENDING_HOLD)
+}
+
+/// What the meter's X offers, or `None` to hide it entirely. Pure; unit-tested.
+///
+/// ONE decision for the whole control: whether it is drawn, which glyph and wording it wears,
+/// and which message it sends. Keyed off [`MeterFace`] so the decision that says what the meter
+/// DRAWS also says what it OFFERS, plus `undoable` for the one thing a face cannot know
+/// (whether the finished upload named the file it created — see [`UploadWatch::undoable`]).
+///
+/// The truth table, and why each row is what it is:
+///
+/// * **In flight** (spinner or a percentage) — [`MeterAction::Cancel`]. The original
+///   affordance, DRAGON-496/497 semantics untouched.
+/// * **A success that named its file, announced OR settled** — [`MeterAction::Undo`]
+///   (DRAGON-507, extended by DRAGON-514). The upload is over, but the user can still change
+///   their mind, and an X that vanishes the instant an upload completes is the one moment they
+///   are most likely to want it. This partially REVERSES DRAGON-500, which hid the X at every
+///   terminal state: that was right for the states below and wrong for this one. The settled
+///   row is the whole point of the meter persisting: a four-second window to notice a file went
+///   to the wrong account is not a window, it is a reflex test.
+/// * **Success, no file id** — `None`. An older build's done state names nothing, so there is
+///   nothing to delete and the affordance would be a lie.
+/// * **Failure** — `None`. Nothing landed; there is nothing to take back.
+/// * **After a cancel** — `None`. Cancel already took it back, and its watch is dropped
+///   outright anyway ([`upload_outcome`]).
+/// * **Ending** — `None`. The X has just been pressed; showing it again would invite a second
+///   press at the one moment nothing can come of it.
+pub fn meter_cancel_action(face: MeterFace, undoable: bool) -> Option<MeterAction> {
+    match face {
+        MeterFace::Spinner | MeterFace::Progress(_) => Some(MeterAction::Cancel),
+        MeterFace::Finished(UploadOutcome::Done) | MeterFace::Settled(UploadOutcome::Done)
+            if undoable =>
+        {
+            Some(MeterAction::Undo)
+        }
+        MeterFace::Finished(_) | MeterFace::Settled(_) | MeterFace::Ending(_) => None,
+    }
+}
+
+// DRAGON-514: `meter_tooltip` lived here — the meter's hover copy, "<percent>% uploaded to
+// <account>", plus a "(+N more)" tail naming this document's other uploads. The meter carries
+// NO tooltip in any state now (owner's call): it is a readout in a header the pointer crosses
+// on the way to Save and Close, and a hover card explaining a bar that is visibly filling was
+// noise on the path to every other control. Nothing replaced it, and the "(+N more)" count went
+// with it, which is why `upload_meter` no longer takes an `extra`. The X keeps its own tip: it
+// names an ACTION, and a press can be wrong about that.
+//
+// If a readout for several concurrent uploads is ever wanted again, it belongs in the meter
+// itself rather than behind a hover; the trigger is one-at-a-time as of this same ticket
+// (`upload_toggle`), so a document reaching that state at all now takes deliberate effort.
+
+/// What a press of the Upload control does to the flyout (DRAGON-482).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UploadToggle {
+    /// It is open: close it. Nothing else about the press matters, not even whether the
+    /// accounts have since gone away: a control that opened a panel has to be able to shut
+    /// it again.
+    Close,
+    /// It is closed and there is somewhere to upload to: open it.
+    Open,
+    /// It is closed and NO account is connected, so there is nothing to open onto. The
+    /// toolbar button is not pressable in this state, so only the keybinding reaches it; the
+    /// caller says why instead of flashing an empty panel.
+    Refuse,
+    /// It is closed and this document already has an upload IN FLIGHT (DRAGON-514). One at a
+    /// time: a second upload started from the same editor would fight the first for the one
+    /// meter the header has room for, and the account picker would be offering a choice the
+    /// user cannot see the consequence of. Like [`Self::Refuse`], the button is not pressable
+    /// here and only the keybinding reaches it, so the caller says why.
+    Busy,
+}
+
+/// What the Upload button (and primary+U) does, given whether the flyout is already open, how
+/// many accounts are connected, and whether an upload is already running. Pure; unit-tested.
+///
+/// Split out because it is the ONE place the button and the keybinding can disagree, and they
+/// arrive by different routes: the button is gated by the same conditions in the view, while
+/// the key press is not gated at all. Deciding here means both routes get the same answer, and
+/// the answer is provable without a compositor.
+///
+/// `busy` is checked AFTER the account count, matching the tooltip's order
+/// (`chrome::upload_tip`): a user with no accounts connected needs to hear that first, and a
+/// mid-transfer disconnect can put a document in both states at once.
+///
+/// CLOSING still wins over everything, `busy` included: an upload that starts while the flyout
+/// is somehow still open must not trap the panel on screen.
+pub fn upload_toggle(open: bool, accounts: usize, busy: bool) -> UploadToggle {
+    match (open, accounts, busy) {
+        (true, _, _) => UploadToggle::Close,
+        (false, 0, _) => UploadToggle::Refuse,
+        (false, _, true) => UploadToggle::Busy,
+        (false, _, false) => UploadToggle::Open,
+    }
+}
+
+/// Which account the Upload flyout opens on: the last one uploaded to while it is still
+/// connected, otherwise the first in the list. `None` only when there are no accounts, which
+/// is also the state where the Upload button is not pressable at all.
+///
+/// Pure; unit-tested. It is the ONE preselection rule, consulted both when the flyout opens
+/// and when [`crate::app::message::PreviewMsg::UploadStart`] resolves where the capture
+/// actually goes, so a `cloud_last_account` naming an account removed in settings since can
+/// never send a capture into a hole. Order is [`accounts_for_kind`]'s, which is
+/// [`crate::cloud::accounts::compare`]'s display order (brand, then account name) since
+/// DRAGON-495; "the first in the list" therefore means the first one a user actually sees.
+pub fn upload_preselect(
+    accounts: &[crate::cloud::accounts::CloudAccount],
+    last: Option<&str>,
+) -> Option<usize> {
+    if accounts.is_empty() {
+        return None;
+    }
+    // A `last` that names nothing in the list (removed since, or never set) falls back to the
+    // first account rather than to "nothing selected": a flyout that opens with no destination
+    // would need a second click before the Upload button meant anything.
+    Some(last.and_then(|id| accounts.iter().position(|a| a.id == id)).unwrap_or(0))
+}
+
+/// Keep only the accounts whose provider is a sensible destination for THIS document's media
+/// kind (DRAGON-493): an image editor's Upload list should not offer YouTube, and a video
+/// editor's should not offer a provider that only takes stills, if one is ever added.
+///
+/// Pure; unit-tested. Applied at every point [`super::mod`]'s `cloud_accounts` snapshot is
+/// filled (the document's own open, the flyout's own toggle, and a window regaining focus), so
+/// the toolbar's account count and preselection always agree with what the panel actually
+/// lists.
+///
+/// An account whose provider this build does not know (`spec()` is `None`, see
+/// [`crate::cloud::accounts::CloudAccount`]'s own module doc on why an unknown provider is kept
+/// rather than dropped) is KEPT here too: nothing claims a capability for it either way, and
+/// this filter's job is to hide a KNOWN mismatch, not to guess at an unknown one.
+pub fn accounts_for_kind(
+    accounts: Vec<crate::cloud::accounts::CloudAccount>,
+    is_video: bool,
+) -> Vec<crate::cloud::accounts::CloudAccount> {
+    let kept = accounts
+        .into_iter()
+        .filter(|a| match a.spec() {
+            Some(spec) => {
+                if is_video {
+                    spec.caps.accepts_videos
+                } else {
+                    spec.caps.accepts_images
+                }
+            }
+            None => true,
+        })
+        .collect();
+    // Ordered here, at the one funnel every Upload list comes through (DRAGON-495), by the
+    // same comparator the settings page's list uses. Doing it here rather than at the three
+    // call sites is what keeps the toolbar's preselection, the flyout's list and the upload
+    // itself looking at ONE order; `upload_preselect` returns an INDEX into this vec, so two
+    // orders would mean uploading to a different account than the one highlighted.
+    crate::cloud::accounts::sorted(kept)
 }
 
 impl FlyoutNav {
@@ -518,17 +1093,46 @@ pub struct EditState {
     /// A bake (export re-encode) is in flight; share/delete inputs are held off.
     pub baking: bool,
     // DRAGON-467: `pending: Option<ShareIntent>` lived here, naming which action the
-    // in-flight bake was for. Copy was the one action left then; the share sheet
-    // (DRAGON-474) made it two again, and `bake_for_share` below is the difference that
-    // remains — a full intent enum is still not warranted for one bit.
+    // in-flight bake was for. Copy was the one action left then, so it went; the share sheet
+    // (DRAGON-474) made it two and brought back a single `bake_for_share: bool`, with a note
+    // saying an enum was not warranted for one bit. DRAGON-482 made it three, and
+    // `bake_intent` below is that note expiring; see [`BakeIntent`].
     /// The file the in-flight bake writes (the save destination for a Save; a throwaway temp
     /// for a Copy, so copying never persists edits to a file on disk).
     pub pending_output: Option<PathBuf>,
-    /// The in-flight bake's artifact is for the SHARE SHEET, not the clipboard
-    /// (DRAGON-474). Set by `run_share_sheet` when its bake starts, taken by `BakeDone` to
-    /// pick the completion seam; meaningless while `baking` is false. Defaults to `false`
-    /// so every historical bake path keeps meaning "copy".
-    pub bake_for_share: bool,
+    /// WHICH completion the in-flight bake's artifact feeds. Set by the action that starts
+    /// the bake, taken by `BakeDone` to pick the completion seam; meaningless while `baking`
+    /// is false.
+    pub bake_intent: BakeIntent,
+    /// The connected cloud accounts, as of this document's OPEN, refreshed each time the
+    /// Upload flyout is opened (DRAGON-482).
+    ///
+    /// A snapshot rather than a live read because the toolbar consults it on EVERY frame (it
+    /// is what makes the Upload button pressable or not), and `accounts::list()` reads and
+    /// parses a file. The two refresh points are the two moments the answer can matter: the
+    /// document opening, and the user asking to see the list.
+    pub cloud_accounts: Vec<crate::cloud::accounts::CloudAccount>,
+    /// Whether the Upload flyout's NESTED account picker is open (DRAGON-489 follow-up): the
+    /// account choice sits behind a closed-by-default `dropdown_chip`, matching the top bar's
+    /// other dropdowns, rather than the flat always-expanded list it used to be. A separate
+    /// bool rather than a second [`FlyoutKind`], because the OUTER Upload flyout already
+    /// occupies that single slot for the whole time this inner one can be open. Reset to
+    /// closed by [`Self::open_flyout`]/[`Self::close_flyout`], so it never opens already
+    /// expanded on the NEXT Upload flyout session and can never outlive the flyout closing.
+    pub upload_account_menu_open: bool,
+    /// Whether the Upload flyout's NESTED visibility picker is open (DRAGON-493), shown only
+    /// for a provider whose `ProviderCaps::visibility` is true (today: YouTube). Same shape and
+    /// same reset contract as [`Self::upload_account_menu_open`]: a separate bool rather than a
+    /// second [`FlyoutKind`], reset closed by [`Self::open_flyout`]/[`Self::close_flyout`].
+    pub upload_visibility_menu_open: bool,
+    /// Every upload this document has STARTED and is still watching (DRAGON-490): one entry
+    /// per detached child whose outcome has not yet been reported (or whose cancel is still
+    /// pending). Several at once is a real state — nothing stops a user pressing Upload again
+    /// before the first finishes, and each is its own detached child with its own tray
+    /// counter, so the editor watches them the same way: independently. Polled by
+    /// `sub_upload_poll` while non-empty; an entry is removed the moment its terminal state
+    /// (done/failed/canceled) is read and turned into a toast.
+    pub uploads: Vec<UploadWatch>,
     /// The LAST completed bake: where it sits in the history, and the file it wrote
     /// (DRAGON-467 review, major 4). `None` = nothing baked yet, or the artifact ended up on
     /// an abandoned redo branch.
@@ -902,12 +1506,20 @@ impl EditState {
     /// Open a flyout of `kind`, highlighting `selected`, over `len` entries.
     pub fn open_flyout(&mut self, kind: FlyoutKind, selected: Option<usize>, len: usize) {
         self.flyout = Some(FlyoutNav { kind, selected, len });
+        // Every flyout starts with the Upload one's nested account picker collapsed
+        // (DRAGON-489 follow-up), so a PRIOR Upload session left expanded can never leak into
+        // this one; harmless for every other kind, which never reads this bit.
+        self.upload_account_menu_open = false;
+        // Same reasoning, same harmlessness for every other kind (DRAGON-493).
+        self.upload_visibility_menu_open = false;
     }
 
     /// Close any open flyout (covermark picker or color palette) + drop covermark entries.
     pub fn close_flyout(&mut self) {
         self.flyout = None;
         self.picker = None;
+        self.upload_account_menu_open = false;
+        self.upload_visibility_menu_open = false;
     }
 
     /// The SHARED stroke width for new annotations in logical POINTS (DRAGON-383), falling back
@@ -3571,5 +4183,575 @@ mod bake_prep_tests {
                 "an in-place bake (is_video={is_video}) must never read its own output"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod upload_toggle_tests {
+    use super::*;
+    // The meter module's fixtures: one definition of "an upload that is running" and "one that
+    // finished", shared so the trigger's rule is tested against the same shapes the meter's is
+    // (DRAGON-514).
+    use super::upload_meter_tests::{held_success, watch};
+
+    /// A closed flyout with somewhere to send the capture opens; with nowhere it refuses. The
+    /// refusal is the state the toolbar renders as a disabled button, so the two agree by
+    /// construction rather than by two copies of the same `if`.
+    #[test]
+    fn a_closed_flyout_opens_only_when_an_account_exists() {
+        assert_eq!(upload_toggle(false, 0, false), UploadToggle::Refuse);
+        for n in 1..5 {
+            assert_eq!(upload_toggle(false, n, false), UploadToggle::Open, "{n} accounts");
+        }
+    }
+
+    /// **One upload at a time** (DRAGON-514). A closed flyout refuses to open while this
+    /// document already has a transfer going, whichever route the press arrived by: this is the
+    /// decision the toolbar button draws itself disabled from AND the one the keybind meets, so
+    /// the two cannot drift into a key that starts what the button will not.
+    #[test]
+    fn a_busy_document_refuses_to_open_the_flyout_again() {
+        for n in 1..5 {
+            assert_eq!(upload_toggle(false, n, true), UploadToggle::Busy, "{n} accounts");
+        }
+        // The account answer outranks it, matching `chrome::upload_tip`'s order.
+        assert_eq!(upload_toggle(false, 0, true), UploadToggle::Refuse);
+    }
+
+    /// Busy is a state the document LEAVES: the moment the transfer reaches a terminal state
+    /// the trigger is live again, even though the meter is still on screen showing how it went
+    /// (DRAGON-514). The persistent meter and the disabled trigger are deliberately NOT the
+    /// same condition.
+    #[test]
+    fn the_trigger_comes_back_the_moment_the_upload_ends() {
+        let running = [watch()];
+        assert!(upload_in_flight(&running));
+        assert_eq!(upload_toggle(false, 1, upload_in_flight(&running)), UploadToggle::Busy);
+        // Finished, meter still up, hold not even over yet.
+        let done = [held_success()];
+        assert!(!upload_in_flight(&done), "a finished upload is not in flight");
+        assert_eq!(upload_toggle(false, 1, upload_in_flight(&done)), UploadToggle::Open);
+        // And once it has settled, still open.
+        let mut settled = held_success();
+        settled.finished_at = Some(std::time::Instant::now() - UPLOAD_FINISH_HOLD * 4);
+        assert!(!upload_in_flight(std::slice::from_ref(&settled)));
+        // An ENDING watch is not in flight either: it is already leaving.
+        let mut ending = watch();
+        ending.ending = Some(MeterAction::Cancel);
+        ending.ending_at = Some(std::time::Instant::now());
+        assert!(!upload_in_flight(std::slice::from_ref(&ending)));
+        // Several watches: ONE running is enough to block.
+        let mixed = [held_success(), watch()];
+        assert!(upload_in_flight(&mixed));
+    }
+
+    /// An OPEN flyout always closes, whatever the account count says. The count can go to zero
+    /// underneath an open panel (the settings window disconnects the last account while the
+    /// editor is up), and a control that could then neither close nor act would trap the user
+    /// behind a panel with no way out but Escape.
+    #[test]
+    fn an_open_flyout_always_closes_even_with_no_accounts_left() {
+        for n in 0..5 {
+            assert_eq!(upload_toggle(true, n, false), UploadToggle::Close, "{n} accounts");
+            // Busy included: an upload starting must never trap an open panel on screen.
+            assert_eq!(upload_toggle(true, n, true), UploadToggle::Close, "{n} accounts, busy");
+        }
+    }
+
+    /// Pressing twice returns to where it started: open then close, refuse then refuse. No
+    /// press sequence can leave the flyout open with nothing in it, which is the state the
+    /// panel has no meaningful way to draw.
+    #[test]
+    fn pressing_twice_is_a_round_trip_and_never_strands_an_empty_panel() {
+        // With accounts: closed → Open → (now open) → Close → back to closed.
+        assert_eq!(upload_toggle(false, 2, false), UploadToggle::Open);
+        assert_eq!(upload_toggle(true, 2, false), UploadToggle::Close);
+        // With none: refused both times, so `open` is never reached with a zero count.
+        assert_eq!(upload_toggle(false, 0, false), UploadToggle::Refuse);
+        assert_eq!(upload_toggle(false, 0, false), UploadToggle::Refuse);
+    }
+}
+
+#[cfg(test)]
+mod upload_preselect_tests {
+    use super::*;
+    use crate::cloud::accounts::CloudAccount;
+
+    /// A bare account carrying only what the preselection rule reads.
+    fn acct(id: &str) -> CloudAccount {
+        CloudAccount {
+            id: id.to_string(),
+            provider: "gdrive".to_string(),
+            label: String::new(),
+            folder_id: None,
+            folder_name: None,
+            added_at: String::new(),
+            visibility: None,
+        }
+    }
+
+    /// The remembered account wins whenever it is still connected. That is the whole point of
+    /// persisting it, and it must hold wherever the account sits in the list.
+    #[test]
+    fn the_last_used_account_is_preselected_while_it_still_exists() {
+        let accounts = [acct("aa"), acct("bb"), acct("cc")];
+        assert_eq!(upload_preselect(&accounts, Some("aa")), Some(0));
+        assert_eq!(upload_preselect(&accounts, Some("bb")), Some(1));
+        assert_eq!(upload_preselect(&accounts, Some("cc")), Some(2));
+    }
+
+    /// A remembered id naming nothing (removed in settings since, or a hand-edited config)
+    /// falls back to the FIRST account, never to "nothing selected". This is the case the rule
+    /// exists for: a stale id must not leave the flyout with no destination, and must not send
+    /// the capture at an account that is gone.
+    #[test]
+    fn a_stale_or_missing_memory_falls_back_to_the_first_account() {
+        let accounts = [acct("aa"), acct("bb")];
+        assert_eq!(upload_preselect(&accounts, Some("gone")), Some(0));
+        assert_eq!(upload_preselect(&accounts, Some("")), Some(0));
+        assert_eq!(upload_preselect(&accounts, None), Some(0));
+    }
+
+    /// No accounts is the ONE `None`, and it is the same emptiness the toolbar reads to keep
+    /// the Upload button unpressable, so the button and the destination cannot disagree.
+    #[test]
+    fn no_accounts_preselects_nothing_whatever_is_remembered() {
+        assert_eq!(upload_preselect(&[], None), None);
+        assert_eq!(upload_preselect(&[], Some("aa")), None);
+    }
+}
+
+#[cfg(test)]
+mod accounts_for_kind_tests {
+    use super::*;
+    use crate::cloud::accounts::CloudAccount;
+
+    fn acct(id: &str, provider: &str) -> CloudAccount {
+        CloudAccount {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            label: String::new(),
+            folder_id: None,
+            folder_name: None,
+            added_at: String::new(),
+            visibility: None,
+        }
+    }
+
+    /// **The whole feature.** A video-hosting provider (YouTube) is offered in a video
+    /// session's list and hidden from an image session's; a file-storage drive is offered in
+    /// both.
+    #[test]
+    fn a_video_only_provider_is_offered_only_to_a_video_session() {
+        let accounts = vec![acct("a", "gdrive"), acct("b", "youtube")];
+        let for_image = accounts_for_kind(accounts.clone(), false);
+        assert_eq!(for_image.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+        let for_video = accounts_for_kind(accounts, true);
+        assert_eq!(for_video.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(), vec!["a", "b"]);
+    }
+
+    /// An account whose provider this build does not know is kept for BOTH kinds: nothing
+    /// claims a capability for it either way, and hiding it would be one more way to lose it
+    /// on top of not being usable.
+    #[test]
+    fn an_unknown_provider_is_kept_for_either_kind() {
+        let accounts = vec![acct("a", "a-drive-from-the-future")];
+        assert_eq!(accounts_for_kind(accounts.clone(), false).len(), 1);
+        assert_eq!(accounts_for_kind(accounts, true).len(), 1);
+    }
+
+    /// An empty list stays empty either way.
+    #[test]
+    fn an_empty_list_stays_empty() {
+        assert!(accounts_for_kind(Vec::new(), false).is_empty());
+        assert!(accounts_for_kind(Vec::new(), true).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod upload_meter_tests {
+    use super::*;
+
+    // `pub(super)`: `upload_toggle_tests` builds the same watches to prove the one-at-a-time
+    // trigger reads the same lifecycle this module pins (DRAGON-514). One set of fixtures, so
+    // the two modules cannot disagree about what "running" and "finished" look like.
+    pub(super) fn watch() -> UploadWatch {
+        UploadWatch {
+            session_id: "abc".to_string(),
+            label: "Work Drive".to_string(),
+            account_id: "acct-1".to_string(),
+            last_percent: None,
+            indeterminate: true,
+            provider: "gdrive".to_string(),
+            finished: None,
+            finished_at: None,
+            file_id: None,
+            ending: None,
+            ending_at: None,
+            share_url: None,
+            copied_at: None,
+        }
+    }
+
+    /// A watch in its SUCCESS hold with a file id: what an upload finished by a DRAGON-507
+    /// build looks like, and the one state that offers an undo.
+    pub(super) fn held_success() -> UploadWatch {
+        UploadWatch {
+            indeterminate: false,
+            last_percent: Some(100),
+            finished: Some(UploadOutcome::Done),
+            finished_at: Some(std::time::Instant::now()),
+            file_id: Some("remote-file-1".to_string()),
+            ..watch()
+        }
+    }
+
+    /// The same, plus the share link a copy-link upload reports (DRAGON-520): the one state
+    /// that offers the re-copy control.
+    pub(super) fn held_shared() -> UploadWatch {
+        UploadWatch {
+            share_url: Some("https://example.test/s/abc".to_string()),
+            ..held_success()
+        }
+    }
+
+    /// The three faces, in the order one upload passes through them: a spinner while nothing
+    /// genuine has been reported, a real percentage once one has, and the finished state after
+    /// that. The finished state WINS over the spinner, because an upload that never reported a
+    /// percentage still finished and must not spin on forever.
+    #[test]
+    fn the_face_follows_the_transfer() {
+        assert_eq!(meter_face(&watch()), MeterFace::Spinner);
+        let running = UploadWatch { indeterminate: false, last_percent: Some(42), ..watch() };
+        assert_eq!(meter_face(&running), MeterFace::Progress(42));
+        // No percentage yet but no longer indeterminate: an honest zero, not a guess.
+        let started = UploadWatch { indeterminate: false, ..watch() };
+        assert_eq!(meter_face(&started), MeterFace::Progress(0));
+        let done = UploadWatch { finished: Some(UploadOutcome::Done), ..running.clone() };
+        assert_eq!(meter_face(&done), MeterFace::Finished(UploadOutcome::Done));
+        // Finished while STILL indeterminate (a single-request upload): finished wins.
+        let done_fast = UploadWatch { finished: Some(UploadOutcome::Done), ..watch() };
+        assert_eq!(meter_face(&done_fast), MeterFace::Finished(UploadOutcome::Done));
+    }
+
+    /// Only a completed upload is a success, and only news the user did NOT ask for is worth
+    /// holding the meter for: a cancel clears at once (DRAGON-495), exactly as the tray shows
+    /// no mark for one.
+    #[rstest::rstest]
+    #[case(crate::cloud::session::UploadState::Done { shared: true, file_id: None, url: None }, Some(UploadOutcome::Done))]
+    #[case(crate::cloud::session::UploadState::Done { shared: false, file_id: Some("f1".to_string()), url: None }, Some(UploadOutcome::Done))]
+    #[case(crate::cloud::session::UploadState::Failed, Some(UploadOutcome::Stopped))]
+    #[case(crate::cloud::session::UploadState::Canceled, None)]
+    fn only_unasked_for_news_holds_the_meter(
+        #[case] state: crate::cloud::session::UploadState,
+        #[case] expected: Option<UploadOutcome>,
+    ) {
+        assert_eq!(upload_outcome(&state), expected);
+    }
+
+    /// The bar's fill: proportional while it runs, FULL once it ends whichever way. A
+    /// part-full bar in the danger colour would read as "still going, badly".
+    #[test]
+    fn the_fill_is_proportional_while_running_and_full_when_over() {
+        assert!((meter_fill(MeterFace::Spinner) - 0.0).abs() < f32::EPSILON);
+        assert!((meter_fill(MeterFace::Progress(0)) - 0.0).abs() < f32::EPSILON);
+        assert!((meter_fill(MeterFace::Progress(50)) - 0.5).abs() < 0.001);
+        assert!((meter_fill(MeterFace::Progress(100)) - 1.0).abs() < f32::EPSILON);
+        // A percentage past 100 (nothing writes one, but the type allows it) never overfills.
+        assert!((meter_fill(MeterFace::Progress(255)) - 1.0).abs() < f32::EPSILON);
+        for outcome in [UploadOutcome::Done, UploadOutcome::Stopped] {
+            assert!((meter_fill(MeterFace::Finished(outcome)) - 1.0).abs() < f32::EPSILON);
+            // DRAGON-514 pinned that settling never changes the bar's LENGTH; DRAGON-516 took
+            // away the loudness change too, so a settled meter is simply the finished one,
+            // still full, still in the outcome's colour, until the next upload replaces it.
+            assert!((meter_fill(MeterFace::Settled(outcome)) - 1.0).abs() < f32::EPSILON);
+        }
+    }
+
+    /// The X's whole truth table (DRAGON-500 as amended by DRAGON-507), row by row, in one
+    /// place: what the meter offers is a function of the face plus whether there is a file to
+    /// take back, and nothing else.
+    #[test]
+    fn the_x_offers_cancel_while_running_and_undo_only_during_a_success_it_can_reverse() {
+        // In flight: cancel, whether or not a percentage has arrived. `undoable` is irrelevant
+        // here and both values are checked, because a running upload has no file id yet and a
+        // future one that did must not change what this row offers.
+        for undoable in [false, true] {
+            for face in [MeterFace::Spinner, MeterFace::Progress(0), MeterFace::Progress(99)] {
+                assert_eq!(meter_cancel_action(face, undoable), Some(MeterAction::Cancel), "{face:?}");
+            }
+        }
+        // DRAGON-514: the undo is offered by BOTH success faces, announced and settled. The
+        // settled row is the point of the persistence: the window to notice a capture went to
+        // the wrong account has to outlast the four seconds the old hold gave it.
+        for done in
+            [MeterFace::Finished(UploadOutcome::Done), MeterFace::Settled(UploadOutcome::Done)]
+        {
+            assert_eq!(meter_cancel_action(done, true), Some(MeterAction::Undo), "{done:?}");
+            // The same face with no file named: an older build's done state, nothing to delete.
+            assert_eq!(meter_cancel_action(done, false), None, "an old-format done state");
+        }
+        // A failure has nothing to take back, and a cancel already took it back.
+        for stopped in
+            [MeterFace::Finished(UploadOutcome::Stopped), MeterFace::Settled(UploadOutcome::Stopped)]
+        {
+            assert_eq!(meter_cancel_action(stopped, true), None, "failed, or already cancelled");
+            assert_eq!(meter_cancel_action(stopped, false), None);
+        }
+        // And once pressed, the control is gone: no second press at the one moment nothing can
+        // come of it.
+        for action in [MeterAction::Cancel, MeterAction::Undo] {
+            assert_eq!(meter_cancel_action(MeterFace::Ending(action), true), None);
+        }
+    }
+
+    /// DRAGON-507, transition one: RUNNING to canceling-red to gone. The face turns the moment
+    /// `ending` is set, without waiting for the child, and the watch retires on its own timer.
+    #[test]
+    fn a_cancel_goes_running_then_red_then_away() {
+        let running = UploadWatch { indeterminate: false, last_percent: Some(42), ..watch() };
+        assert_eq!(meter_face(&running), MeterFace::Progress(42));
+        assert_eq!(meter_cancel_action(meter_face(&running), running.undoable()), Some(MeterAction::Cancel));
+        // The click.
+        let ending = UploadWatch {
+            ending: Some(MeterAction::Cancel),
+            ending_at: Some(std::time::Instant::now()),
+            ..running
+        };
+        assert_eq!(meter_face(&ending), MeterFace::Ending(MeterAction::Cancel));
+        assert!((meter_fill(meter_face(&ending)) - 1.0).abs() < f32::EPSILON, "full, not 42%");
+        assert_eq!(meter_cancel_action(meter_face(&ending), false), None, "the X is gone");
+        // Gone: not yet, then once the window is up.
+        assert!(!upload_ending_over(ending.ending_for()));
+        assert!(!upload_ending_over(Some(UPLOAD_ENDING_HOLD - std::time::Duration::from_millis(1))));
+        assert!(upload_ending_over(Some(UPLOAD_ENDING_HOLD)));
+        assert!(upload_ending_over(Some(UPLOAD_ENDING_HOLD * 3)));
+        assert!(!upload_ending_over(None), "nobody pressed anything");
+    }
+
+    /// DRAGON-507, transition two: held-SUCCESS to undoing-red to gone. The success hold is the
+    /// one terminal state that still offers the X, and pressing it must turn the GREEN bar red
+    /// at once rather than leaving it green until the hold runs out.
+    #[test]
+    fn an_undo_goes_held_success_then_red_then_away() {
+        let held = held_success();
+        assert_eq!(meter_face(&held), MeterFace::Finished(UploadOutcome::Done));
+        assert!(held.undoable(), "it succeeded and the child named the file");
+        assert_eq!(meter_cancel_action(meter_face(&held), held.undoable()), Some(MeterAction::Undo));
+        let undoing = UploadWatch {
+            ending: Some(MeterAction::Undo),
+            ending_at: Some(std::time::Instant::now()),
+            ..held
+        };
+        // ENDING outranks the finished face: this is the whole point of the ordering.
+        assert_eq!(meter_face(&undoing), MeterFace::Ending(MeterAction::Undo));
+        assert_eq!(meter_cancel_action(meter_face(&undoing), true), None);
+        assert!(!upload_ending_over(undoing.ending_for()), "red for its window first");
+        // It leaves on the ENDING timer, not the finish hold it interrupted: the whole reason
+        // the two constants are asserted against each other.
+        assert!(UPLOAD_ENDING_HOLD < UPLOAD_FINISH_HOLD);
+    }
+
+    /// Which finished states can be undone at all. The affordance needs BOTH a success and a
+    /// file id, so a failure, a stopped transfer and an old build's id-less done state all
+    /// answer no, and only the state a DRAGON-507 child writes answers yes.
+    #[test]
+    fn only_a_success_that_named_its_file_can_be_undone() {
+        assert!(held_success().undoable());
+        assert!(!UploadWatch { file_id: None, ..held_success() }.undoable(), "no file named");
+        assert!(
+            !UploadWatch { finished: Some(UploadOutcome::Stopped), ..held_success() }.undoable(),
+            "a failure has nothing to take back"
+        );
+        assert!(!watch().undoable(), "a running upload has not created anything yet");
+    }
+
+    /// The finished HOLD still hides the X for every state it should: DRAGON-507 reversed
+    /// exactly one row of DRAGON-500's rule, not the rule.
+    #[test]
+    fn the_finished_hold_offers_no_cancel_except_the_undoable_success() {
+        for outcome in [UploadOutcome::Done, UploadOutcome::Stopped] {
+            let held = UploadWatch {
+                indeterminate: false,
+                last_percent: Some(88),
+                finished: Some(outcome),
+                finished_at: Some(std::time::Instant::now()),
+                ..watch()
+            };
+            assert!(!upload_settled(held.held_for()), "the announcement has only just started");
+            // No file id on this one, so not even the success row offers anything.
+            assert_eq!(meter_cancel_action(meter_face(&held), held.undoable()), None);
+        }
+        // A user's own CANCEL never reaches a held face at all: its watch is dropped the moment
+        // the outcome is read, so the meter and its X go together and neither is left behind.
+        assert_eq!(upload_outcome(&crate::cloud::session::UploadState::Canceled), None);
+    }
+
+    // DRAGON-514: `the_ending_tooltips_name_the_action_and_the_account` and
+    // `the_tooltip_names_the_percentage_and_the_account` lived here, pinning the copy of a
+    // meter tooltip that no longer exists (owner's call; see the note where `meter_tooltip`
+    // was). They are not replaced: there is no hover string left to pin. The X's OWN tip is
+    // still built in `chrome::meter_cancel` and still names the account.
+
+    /// The finish hold is what lets the meter be SEEN finishing: a running upload has never
+    /// settled, and a finished one settles once the announcement has run out. What it no longer
+    /// does is retire the watch (DRAGON-514) or change the bar's appearance (DRAGON-516) — its
+    /// one remaining job is stopping the poll, pinned by
+    /// [`the_poll_stops_once_there_is_nothing_left_to_watch`].
+    #[test]
+    fn only_a_finished_upload_can_settle() {
+        assert!(!upload_settled(None), "a running upload has nothing to settle");
+        assert!(!upload_settled(Some(std::time::Duration::ZERO)));
+        assert!(!upload_settled(Some(UPLOAD_FINISH_HOLD - std::time::Duration::from_millis(1))));
+        assert!(upload_settled(Some(UPLOAD_FINISH_HOLD)));
+        assert!(upload_settled(Some(UPLOAD_FINISH_HOLD * 2)));
+        // A watch that has not finished has no hold to measure at all.
+        assert_eq!(watch().held_for(), None);
+    }
+
+    /// **The persistent meter** (DRAGON-514). A finished upload announces its outcome, settles,
+    /// and then STAYS: the face changes once and never again, and the undo it carries is
+    /// available in both states. This is the test that would have failed under the old
+    /// behaviour, where the watch was retired at exactly the moment `Settled` now begins.
+    ///
+    /// DRAGON-516: what settling no longer does is change how the bar LOOKS. That is asserted
+    /// where the colour lives (`chrome::a_settled_upload_keeps_the_face_it_announced`); this
+    /// test still pins the state machine underneath it, which is unchanged.
+    #[test]
+    fn a_finished_meter_announces_then_settles_and_keeps_its_undo() {
+        let announcing = held_success();
+        assert_eq!(meter_face(&announcing), MeterFace::Finished(UploadOutcome::Done));
+        assert_eq!(
+            meter_cancel_action(meter_face(&announcing), announcing.undoable()),
+            Some(MeterAction::Undo)
+        );
+        // The same watch, once its announcement has run out.
+        let settled = UploadWatch {
+            finished_at: Some(std::time::Instant::now() - UPLOAD_FINISH_HOLD),
+            ..held_success()
+        };
+        assert_eq!(meter_face(&settled), MeterFace::Settled(UploadOutcome::Done));
+        assert_eq!(
+            meter_cancel_action(meter_face(&settled), settled.undoable()),
+            Some(MeterAction::Undo),
+            "the undo survives the settle: it is the reason the meter stays"
+        );
+        // Long after, unchanged. Nothing retires it but a new upload or the editor closing.
+        let old = UploadWatch {
+            finished_at: Some(std::time::Instant::now() - UPLOAD_FINISH_HOLD * 100),
+            ..held_success()
+        };
+        assert_eq!(meter_face(&old), MeterFace::Settled(UploadOutcome::Done));
+        // A FAILURE settles too, and still offers nothing to press.
+        let failed = UploadWatch {
+            finished: Some(UploadOutcome::Stopped),
+            finished_at: Some(std::time::Instant::now() - UPLOAD_FINISH_HOLD),
+            ..held_success()
+        };
+        assert_eq!(meter_face(&failed), MeterFace::Settled(UploadOutcome::Stopped));
+        assert_eq!(meter_cancel_action(meter_face(&failed), failed.undoable()), None);
+        // Pressing the X still outranks a settled face, exactly as it outranks an announcing
+        // one: the bar goes red on the click, whenever the click happens.
+        let undoing = UploadWatch {
+            ending: Some(MeterAction::Undo),
+            ending_at: Some(std::time::Instant::now()),
+            ..old
+        };
+        assert_eq!(meter_face(&undoing), MeterFace::Ending(MeterAction::Undo));
+    }
+
+    /// **A persistent meter must not mean a permanent timer** (DRAGON-514). The poll is what
+    /// costs something (a 500ms tick and a sidecar read per document), so it has to stop when
+    /// the meter stops changing, and keep running for every state that still can change.
+    #[test]
+    fn the_poll_stops_once_there_is_nothing_left_to_watch() {
+        assert!(upload_needs_poll(&watch()), "a running upload is the whole reason to poll");
+        assert!(
+            upload_needs_poll(&held_success()),
+            "still announcing: one more tick renders the settle"
+        );
+        let settled = UploadWatch {
+            finished_at: Some(std::time::Instant::now() - UPLOAD_FINISH_HOLD),
+            ..held_success()
+        };
+        assert!(!upload_needs_poll(&settled), "a settled meter is a fixed picture");
+        // An ENDING watch always needs the tick that retires it, settled or not.
+        let ending = UploadWatch {
+            ending: Some(MeterAction::Undo),
+            ending_at: Some(std::time::Instant::now()),
+            ..settled.clone()
+        };
+        assert!(upload_needs_poll(&ending));
+        // A settled meter whose copy control has just been pressed needs the tick BACK, for
+        // the length of the flash (DRAGON-520): the tick expires by the clock, so something has
+        // to redraw the view or it never reverts.
+        let flashing = UploadWatch { copied_at: Some(std::time::Instant::now()), ..settled.clone() };
+        assert!(upload_needs_poll(&flashing), "the Copied! tick has to be able to revert");
+        let flashed = UploadWatch {
+            copied_at: Some(
+                std::time::Instant::now() - crate::widgets::copy_button::COPIED_FLASH * 2,
+            ),
+            ..settled.clone()
+        };
+        assert!(!upload_needs_poll(&flashed), "an expired flash costs no more ticks");
+        // The subscription's own rule: ANY watch needing a tick keeps the document ticking.
+        assert!([settled.clone(), watch()].iter().any(upload_needs_poll));
+        assert!(![settled].iter().any(upload_needs_poll));
+    }
+
+    /// **The re-copy control is offered by exactly one kind of upload** (DRAGON-520): one that
+    /// finished, succeeded, and actually made a share link. Everything else would be a control
+    /// with nothing to put on the clipboard.
+    #[test]
+    fn only_a_finished_upload_that_made_a_link_offers_to_copy_it() {
+        assert_eq!(held_shared().copyable(), Some("https://example.test/s/abc"));
+        // The copy-link option was off, or the provider cannot make one: no link, no control.
+        assert_eq!(held_success().copyable(), None);
+        // Still running, with the link somehow already set: it has not finished, so no.
+        let running = UploadWatch { share_url: held_shared().share_url, ..watch() };
+        assert_eq!(running.copyable(), None);
+        // It FAILED. Nothing landed, so the link is meaningless even if one were recorded.
+        let failed = UploadWatch {
+            finished: Some(UploadOutcome::Stopped),
+            ..held_shared()
+        };
+        assert_eq!(failed.copyable(), None);
+        // A blank or whitespace link is no link: an odd state file must not put "" on the
+        // clipboard.
+        for blank in ["", "   "] {
+            let odd = UploadWatch { share_url: Some(blank.to_string()), ..held_shared() };
+            assert_eq!(odd.copyable(), None, "{blank:?}");
+        }
+        // The undo and the re-copy are INDEPENDENT: a done state with a link and no file id
+        // offers the copy and no undo, which is what an older child's state can look like.
+        let no_id = UploadWatch { file_id: None, ..held_shared() };
+        assert!(no_id.copyable().is_some());
+        assert!(!no_id.undoable());
+    }
+
+    /// **A new upload replaces the persistent one** (DRAGON-514). The meter draws the FIRST
+    /// watch, so the retention rule `run_upload` applies at the push has to leave a settled
+    /// meter behind rather than in front of the transfer that just started.
+    #[test]
+    fn starting_an_upload_clears_the_meter_the_last_one_left() {
+        let settled = UploadWatch {
+            finished_at: Some(std::time::Instant::now() - UPLOAD_FINISH_HOLD),
+            ..held_success()
+        };
+        let ending = UploadWatch {
+            ending: Some(MeterAction::Cancel),
+            ending_at: Some(std::time::Instant::now()),
+            ..watch()
+        };
+        let mut uploads = vec![settled, ending, held_success()];
+        // What `run_upload` does immediately before pushing the new watch.
+        uploads.retain(UploadWatch::in_flight);
+        assert!(uploads.is_empty(), "nothing that had stopped survives a new upload");
+        // A still-RUNNING one would survive, which is the state the one-at-a-time trigger
+        // (`upload_toggle`) makes unreachable from the UI but the retention must not corrupt.
+        let mut with_live = vec![held_success(), watch()];
+        with_live.retain(UploadWatch::in_flight);
+        assert_eq!(with_live.len(), 1);
+        assert!(with_live[0].in_flight());
     }
 }

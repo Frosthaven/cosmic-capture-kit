@@ -162,6 +162,20 @@ impl App {
                 tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
                     SettingsMsg::CheckForUpdates,
                 ))));
+                // DRAGON-482: fill the Cloud Accounts page from disk, exactly as
+                // `settings::open_settings` does for the in-process convert path.
+                //
+                // BOTH mints need it, and only that one had it. This is the OTHER way a
+                // settings window is born: a standalone `--settings` process. On macOS that
+                // is the ONLY way (the convert path re-execs unconditionally), so the Cloud
+                // page there listed no accounts at all until something else happened to
+                // reload it; on Windows 10 and after an update install, every platform took
+                // this path and got the same empty page. Found by cross-checking the macOS
+                // target from Linux, where `CloudSettingsMsg::Reload` showed up as a variant
+                // nothing constructs.
+                tasks.push(Task::done(cosmic::Action::App(Msg::Settings(SettingsMsg::Cloud(
+                    crate::app::CloudSettingsMsg::Reload,
+                )))));
                 if about {
                     tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
                         SettingsMsg::ShowAboutPage,
@@ -536,6 +550,10 @@ impl App {
                         WindowChromeMsg::WindowClosed(id),
                     )));
                 }
+                Task::none()
+            }
+            WindowChromeMsg::WindowFocused(id) => {
+                self.refresh_preview_cloud_accounts(id);
                 Task::none()
             }
             WindowChromeMsg::ConfigWindowResized(id, w, h) => {

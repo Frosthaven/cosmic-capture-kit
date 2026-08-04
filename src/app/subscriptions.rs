@@ -1,5 +1,14 @@
 use super::*;
 
+/// How often a document with a live upload asks its session sidecar what happened
+/// (`App::sub_upload_poll`).
+///
+/// Named in DRAGON-507 because a second duration now depends on it: this tick is what retires
+/// a meter whose X has been pressed, so `preview::edit::UPLOAD_ENDING_HOLD` can never be
+/// honoured more finely than this, and a compile-time assert beside that constant keeps the
+/// two in a relationship somebody can read.
+pub(crate) const UPLOAD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
 // Each tick lives behind its own named, documented trigger condition; `subscriptions`
 // composes them into the one `Subscription` the `cosmic::Application::subscription`
 // trait method returns (application.rs). Every condition/interval is unchanged from
@@ -20,6 +29,7 @@ impl App {
                 self.sub_loading_tick(),
                 self.sub_playback_poll(),
                 self.sub_preview_toasts(),
+                self.sub_upload_poll(),
                 self.sub_text_caret_blink(),
                 self.sub_tray_poll(),
                 self.sub_preview_handoff(),
@@ -29,6 +39,8 @@ impl App {
                 self.sub_bench(),
                 self.sub_scan_poll(),
                 self.sub_permission_poll(),
+                self.sub_cloud_browser_countdown(),
+                self.sub_cloud_folder_spin(),
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.sub_hotkey_suspend_ping(),
                 #[cfg(windows)]
@@ -79,6 +91,15 @@ impl App {
             }
             Event::Window(window::Event::Resized(size)) => {
                 Some(Msg::WindowChrome(WindowChromeMsg::ConfigWindowResized(id, size.width, size.height)))
+            }
+            // DRAGON-482: a window taking keyboard focus. The preview editor's Upload button
+            // is gated on a SNAPSHOT of the connected accounts, and Settings is a separate
+            // document (often a separate process), so connecting an account there left the
+            // button greyed until the editor was reopened. Coming back to the editor is
+            // exactly the moment to re-read, and it is also the only moment the app can
+            // observe without polling. Ignored for every window that is not a preview.
+            Event::Window(window::Event::Focused) => {
+                Some(Msg::WindowChrome(WindowChromeMsg::WindowFocused(id)))
             }
             // Wayland output hotplug → per-monitor overlays. Linux-only (cctk);
             // macOS derives outputs from NSScreen/SCK (DRAGON-94 phase 2).
@@ -257,6 +278,39 @@ impl App {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_secs(1))
                     .map(|_| Msg::Capture(CaptureMsg::Tick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// While the cloud-accounts add flow is waiting on the browser (DRAGON-489 follow-up):
+    /// tick once a second so `pages::cloud::cloud_browser_step`'s countdown (read against
+    /// `CloudAdd::browser_started` and `Instant::now()` at render time) stays live.
+    fn sub_cloud_browser_countdown(&self) -> Option<Subscription<Msg>> {
+        if self.settings.cloud.waiting_on_browser() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_secs(1))
+                    .map(|_| Msg::Settings(SettingsMsg::Cloud(CloudSettingsMsg::CloudBrowserTick))),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// While a cloud folder LISTING is in flight (DRAGON-514): tick ~30fps so the path row's
+    /// refresh glyph spins. That spin is the browser's only loading indication, the
+    /// "Reading your folders..." line having been deleted with this ticket.
+    ///
+    /// The scanner's `sub_scan_spin` in every respect, including the rule that matters: gated on
+    /// the listing, so an idle dialog (and a settings window with no dialog open) ticks nothing.
+    /// It stops on its own when the listing lands, which is also when the button becomes
+    /// pressable again, so the animation and the affordance cannot disagree.
+    fn sub_cloud_folder_spin(&self) -> Option<Subscription<Msg>> {
+        if self.settings.cloud.listing_folders() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(33))
+                    .map(|_| Msg::Settings(SettingsMsg::Cloud(CloudSettingsMsg::FolderSpinTick))),
             )
         } else {
             None
@@ -452,6 +506,37 @@ impl App {
                 cosmic::iced::time::every(std::time::Duration::from_millis(250))
                     .with(id)
                     .map(|(id, _)| Msg::Preview(id, PreviewMsg::ToastTick))
+            })
+            .collect();
+        if ticks.is_empty() {
+            return None;
+        }
+        Some(Subscription::batch(ticks))
+    }
+
+    /// While a document has an upload it started still in flight, poll its progress/outcome
+    /// (DRAGON-490): one tick PER document that actually HAS an entry in `EditState::uploads`,
+    /// the same per-document shape `sub_preview_toasts` and `sub_playback_poll` use (a distinct
+    /// hash id via `with(window_id)`, so iced does not collapse same-interval timers into one).
+    /// Vanishes the instant every upload a document is watching reaches a terminal state, the
+    /// same "nothing left to poll, no tick at all" rule every gated subscription here follows.
+    ///
+    /// [`UPLOAD_POLL_INTERVAL`]: coarse enough that this never competes with the transfer
+    /// itself for anything, fine enough that a completion toast or the titlebar indicator
+    /// clearing reads as prompt. The child's own tray counter is the fine-grained readout;
+    /// this is only for a document that may not even be visible in the same moment the upload
+    /// finishes. It is ALSO what retires a meter the user has dismissed (DRAGON-507), which is
+    /// why the two durations are pinned against each other where the shorter one is defined.
+    fn sub_upload_poll(&self) -> Option<Subscription<Msg>> {
+        let ticks: Vec<_> = self
+            .previews
+            .iter()
+            .filter(|p| p.edit.uploads.iter().any(crate::app::preview::edit::upload_needs_poll))
+            .map(|p| {
+                let id = p.window;
+                cosmic::iced::time::every(UPLOAD_POLL_INTERVAL)
+                    .with(id)
+                    .map(|(id, _)| Msg::Preview(id, PreviewMsg::UploadPoll))
             })
             .collect();
         if ticks.is_empty() {

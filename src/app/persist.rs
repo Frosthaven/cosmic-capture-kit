@@ -149,6 +149,8 @@ impl App {
             appearance_contrast_boost: self.appearance_contrast_boost,
             selection_box_thickness: self.selection_box_thickness,
             notify_updates: self.notify_updates,
+            cloud_last_account: self.cloud_last_account.clone(),
+            cloud_auto_share: self.cloud_auto_share,
         }
     }
 
@@ -264,6 +266,13 @@ impl App {
             .unwrap_or_default();
         self.annot_recent_colors = p.annot_recent_colors;
         self.notify_updates = p.notify_updates;
+        // DRAGON-482: the remembered account is NOT validated against the live account list
+        // here. A reset applies a snapshot, and the accounts file it would be checked
+        // against can change under any process; the flyout resolves the id when it opens and
+        // silently ignores one that no longer names an account, which is the one place that
+        // check can be current.
+        self.cloud_last_account = p.cloud_last_account.clone();
+        self.cloud_auto_share = p.cloud_auto_share;
     }
 
     /// Reset everything to defaults (factory reset). Also drops cached/saved state
@@ -424,6 +433,13 @@ impl App {
             ConfigTab::Health => {
                 p.debug_logging = d.debug_logging;
             }
+            // DRAGON-482: nothing to reset. The page's content is the connected accounts,
+            // which are not `Persisted` settings (they live in `cloud_accounts.toml`, with
+            // their tokens in the keyring), and neither is something a "restore defaults"
+            // button may quietly disconnect. The two keys this feature DOES persist
+            // (`cloud_last_account`, `cloud_auto_share`) belong to the editor's upload
+            // flyout, not to this page, so they reset with it. Read-only here, like About.
+            ConfigTab::CloudAccounts => {}
             ConfigTab::About => {}
         }
         self.apply_persisted(p);

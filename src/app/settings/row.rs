@@ -63,6 +63,9 @@ pub(super) struct Item<'a> {
     /// This row's control is gated by a missing dependency: tint the title to this
     /// severity (the page supplies an inert, subdued value via `gated_row`).
     pub(super) gated: Option<Severity>,
+    /// Drop the fixed trailing slots so this row's control sits FLUSH with the section's
+    /// right edge. See [`Item::flush`].
+    pub(super) flush: bool,
 }
 
 impl<'a> Item<'a> {
@@ -82,6 +85,7 @@ impl<'a> Item<'a> {
             desc_el: None,
             note: false,
             gated: None,
+            flush: false,
         }
     }
 
@@ -132,6 +136,22 @@ impl<'a> Item<'a> {
     /// Mark this row as gated by a missing dependency: tint the title to `sev`.
     pub(super) fn gated(mut self, sev: Severity) -> Self {
         self.gated = Some(sev);
+        self
+    }
+
+    /// Put this row's control FLUSH with the section's right edge, dropping the fixed unit
+    /// and reset slots every other row reserves (DRAGON-495).
+    ///
+    /// Those two slots (24px + 28px, plus their spacing) are reserved even when empty so that
+    /// every control on a page shares one right edge, which is right for a page of toggles and
+    /// numbers. It is wrong for a row whose control is a lone BUTTON that can never gain a unit
+    /// label or a reset: it reads as a button that failed to align, especially next to
+    /// full-width rows (`Item::full_width`), which never reserved the slots in the first place.
+    /// The Cloud Accounts page is exactly that mix, and the owner reported it.
+    ///
+    /// Opt-IN, so every existing page keeps its shared right edge untouched.
+    pub(super) fn flush(mut self) -> Self {
+        self.flush = true;
         self
     }
 
@@ -479,6 +499,16 @@ pub(super) fn subdued_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a
         .into()
 }
 
+/// Caption text in the subtle tone - half of `subdued`'s dimming, for secondary text that
+/// should still read comfortably, not the near-invisible inert-value tone.
+pub(super) fn subtle_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Msg> {
+    widget::text::caption(s)
+        .class(cosmic::theme::Text::Custom(|t| {
+            cosmic::iced::widget::text::Style { color: Some(theme::subtle(t)), ..Default::default() }
+        }))
+        .into()
+}
+
 /// A setting row whose control is unavailable because a dependency is missing: the
 /// title is tinted to `sev`, and `value` is shown as inert, subdued text in place of
 /// the real control (no interaction, no pointer cursor).
@@ -491,16 +521,27 @@ pub(super) fn gated_row<'a>(
 }
 
 /// A fixed-width numeric input (the unit label, if any, is added by the row via
-/// `Item::suffix`). `on_input` is `None` for a read-only field.
+/// `Item::suffix`).
+///
+/// `on_input` is `impl Fn` rather than a `fn` pointer (DRAGON-482), so a page can pass a
+/// CLOSURE that captures. The cloud page needs exactly that: its numeric field edits one
+/// account out of a list, so the message has to carry that account's id, and a `fn` pointer
+/// cannot hold one. Before this it hand-rolled its own copy of this widget to get around the
+/// restriction, which is how the two drifted.
+///
+/// The `Option` wrapper went with the same change. It was documented as "`None` for a
+/// read-only field" and no caller had ever passed `None`, so it was one unbuildable state and
+/// a `Some(...)` at every call site for nothing.
+///
+/// `value` takes anything `text_input` itself takes, an OWNED `String` included, so a page
+/// that renders its value per row does not have to find somewhere for that string to live.
 pub(super) fn num_input<'a>(
     placeholder: &'a str,
-    value: &'a str,
-    on_input: Option<fn(String) -> Msg>,
+    value: impl Into<std::borrow::Cow<'a, str>>,
+    on_input: impl Fn(String) -> Msg + 'a,
 ) -> Element<'a, Msg> {
-    let mut input = widget::text_input(placeholder, value).width(Length::Fixed(80.0));
-    if let Some(f) = on_input {
-        input = input.on_input(f);
-    }
+    let input =
+        widget::text_input(placeholder, value).width(Length::Fixed(80.0)).on_input(on_input);
     // Hide the input's glyphs cleanly when it scrolls under the pinned tab strip
     // (text_input leaks its value text past the scroll clip; see the wrapper doc).
     crate::widgets::hide_when_clipped(input)

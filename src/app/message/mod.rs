@@ -11,7 +11,7 @@ mod preview;
 pub use capture::CaptureMsg;
 pub use recording::RecordingMsg;
 pub use detect::DetectMsg;
-pub use settings::{BorderColorTarget, SettingsMsg};
+pub use settings::{BorderColorTarget, CloudSettingsMsg, SettingsMsg};
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub use settings::CaptureHotkeySlot;
 pub use permissions::PermissionsMsg;

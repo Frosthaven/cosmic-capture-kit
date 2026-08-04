@@ -18,7 +18,7 @@ impl crate::app::App {
                     Item::new(
                         "Frame rate",
                         "",
-                        num_input("30", &self.record_fps.text, Some(|a0| Msg::Settings(SettingsMsg::SetRecordFps(a0)))),
+                        num_input("30", &self.record_fps.text, |a0| Msg::Settings(SettingsMsg::SetRecordFps(a0))),
                     )
                     .suffix("fps")
                     .reset_with(
@@ -29,7 +29,7 @@ impl crate::app::App {
                     Item::new(
                         "Max bitrate",
                         "",
-                        num_input("8000", &self.record_bitrate_kbps.text, Some(|a0| Msg::Settings(SettingsMsg::SetRecordBitrate(a0)))),
+                        num_input("8000", &self.record_bitrate_kbps.text, |a0| Msg::Settings(SettingsMsg::SetRecordBitrate(a0))),
                     )
                     .suffix("Kbps")
                     .reset_with(
@@ -60,7 +60,7 @@ impl crate::app::App {
                             num_input(
                                 "1920",
                                 &self.record_max_width.text,
-                                Some(|a0| Msg::Settings(SettingsMsg::SetRecordMaxWidth(a0))),
+                                |a0| Msg::Settings(SettingsMsg::SetRecordMaxWidth(a0)),
                             ),
                         )
                         .suffix("px")
@@ -77,7 +77,7 @@ impl crate::app::App {
                             num_input(
                                 "1080",
                                 &self.record_max_height.text,
-                                Some(|a0| Msg::Settings(SettingsMsg::SetRecordMaxHeight(a0))),
+                                |a0| Msg::Settings(SettingsMsg::SetRecordMaxHeight(a0)),
                             ),
                         )
                         .suffix("px")

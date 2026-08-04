@@ -644,22 +644,202 @@ fn parse_version(v: &str) -> Option<Vec<u64>> {
     }
 }
 
-/// The canonical artifact filename for a version on the update channel.
+/// The canonical macOS artifact filename for a version on the update channel.
 /// Kept in ONE place so the workflow (which names the file) and any app-side
-/// expectation agree. Matches `mac-package.sh`'s `CosmicCaptureKit-<version>.dmg`.
+/// expectation agree. Matches `mac-package.sh`'s
+/// `CosmicCaptureKit-<version>-aarch64.dmg` (arch-suffixed since DRAGON-508).
 /// In the binary only the macOS install flow consumes it (Linux has no published
 /// artifact yet); the tests cover it everywhere.
+///
+/// **Not how the download is ADDRESSED.** The URL always comes from the manifest
+/// ([`Artifact::url`]), so a renamed asset needs no app change and an old install
+/// keeps updating. This is only what the downloaded file is called in the private
+/// temp dir on the way to `hdiutil`, and it stays in step with the packaging name
+/// so a log line or a stray temp file still reads as the thing it is.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn artifact_name(version: &str) -> String {
-    format!("CosmicCaptureKit-{version}.dmg")
+    format!("CosmicCaptureKit-{version}-aarch64.dmg")
 }
 
 // ---------------------------------------------------------------------------
 // I/O: fetch + verify + install (not unit-tested — the repo's rule).
+//
+// Every child spawned below is reaped against a deadline (DRAGON-499). The rule is the
+// record path's (DRAGON-118) and it holds here for the same reason: a tool's own
+// `--max-time` is the tool policing ITSELF, which is worth nothing when the tool is wedged,
+// is the wrong tool (a `PATH` shim), or is stuck below its own clock in a resolver or a TLS
+// handshake. The update check runs on EVERY settings mint, so an unbounded one is a hang the
+// user never asked for.
 // ---------------------------------------------------------------------------
 
+/// How long `curl` gets to fetch the manifest, and the `--max-time` it is handed.
+///
+/// ONE constant for both, so the tool's own policing and the Rust-side deadline cannot drift
+/// apart: see [`fetch_argv`], which is where the two meet.
+const FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long `curl` gets to download a release artifact, and the `--max-time` it is handed.
+///
+/// Shared by both install flows (`platform::windows::update_install` reads it too), so the
+/// download's budget is named once rather than repeated as a literal per platform.
+// Dead on Linux: no published artifact there, so nothing downloads one (the tests still
+// pin its relation to the reap deadline on every platform).
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub(crate) const DOWNLOAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How long the checksum tool (`shasum` on mac, `certutil` on Windows) gets.
+///
+/// It has no clock of its own, so this is the whole bound. It is an OUTER ring rather than an
+/// expectation: hashing a file we just finished writing is seconds of local disk read, and a
+/// tool still going after two minutes is stuck, not slow.
+// Dead on Linux for the same reason: only the two install flows verify a download.
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+pub(crate) const HASH_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long `hdiutil` gets to attach or detach the downloaded image (macOS).
+///
+/// Generous because an attach can checksum the whole image on the way in; still a bound,
+/// because a `hdiutil` waiting on a dialog or a stuck volume never returns at all.
+#[cfg(target_os = "macos")]
+const IMAGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// How long `cp -R` gets to copy the new `.app` out of the mounted image (macOS).
+///
+/// The bundle is a few hundred megabytes off a just-mounted local image, so this is minutes
+/// of headroom on a job that takes seconds.
+#[cfg(target_os = "macos")]
+const COPY_BUDGET: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The extra time a child gets to EXIT after its own budget should have ended its work.
+///
+/// A transfer that hits `--max-time` still has to wind down and flush, so the reap must not
+/// race the tool's own timeout; anything still alive after the budget PLUS this grace is
+/// wedged. The same shape as `cloud::http`'s `REAP_GRACE`, smaller because nothing here
+/// uploads.
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the reap loop wakes to check whether the child has exited.
+const REAP_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The wall time a child of budget `budget` is given before it is killed.
+///
+/// Pure; unit-tested. Kept as its own function so every call site's deadline is built the one
+/// way, and so the relation "the deadline is strictly outside the tool's own timeout" is a
+/// property a test can state rather than a habit.
+fn reap_deadline(budget: std::time::Duration) -> std::time::Duration {
+    budget.saturating_add(REAP_GRACE)
+}
+
+/// What a bounded run produced.
+pub(crate) struct Reaped {
+    /// The child exited ON ITS OWN with a success status. A killed child is never a success,
+    /// so a call site that only cares whether the job worked can read this alone.
+    pub success: bool,
+    /// The deadline expired and the child was killed. A killed child is a named failure at
+    /// the call site, never a hang and never a partial answer treated as an answer. Read it
+    /// where the DISTINCTION is worth a different sentence to the user.
+    pub killed: bool,
+    /// Whatever the child wrote to stdout, when the caller PIPED stdout. Empty otherwise.
+    pub stdout: Vec<u8>,
+}
+
+/// Run `cmd` to completion, reaping it against [`reap_deadline`] and killing one that
+/// outlives it (DRAGON-499).
+///
+/// Modelled on [`crate::record::wait_or_kill`] and on `cloud::http`'s `run_bounded`, and here
+/// for the reason DRAGON-118 put the first one there: nothing may wait unboundedly. It is a
+/// third copy rather than a call into either, because those two carry their domains with them
+/// (ffmpeg's stderr ring, curl's stdin config and host allowlist) and this one has to reap
+/// whatever tool the platform hands the update flow.
+///
+/// The call site owns the child's stdio, and this function drains only what was PIPED: a
+/// child that has filled its stdout pipe blocks in `write` and never exits, so an undrained
+/// pipe would turn every deadline into the full grace period and then a kill. `Stdio::null`
+/// and inherited stdio are left exactly as the call site set them, which is what keeps the
+/// success path byte-identical to the `.output()` / `.status()` calls this replaced.
+///
+/// `what` names the job for the log line and nothing else; it never carries a path.
+pub(crate) fn run_bounded(
+    cmd: &mut std::process::Command,
+    budget: std::time::Duration,
+    what: &str,
+) -> std::io::Result<Reaped> {
+    run_bounded_within(cmd, reap_deadline(budget), what)
+}
+
+/// [`run_bounded`] with the allowance INJECTED rather than derived, the repo's `foo_with`
+/// seam: the kill path is then something a test can reach in milliseconds instead of waiting
+/// out a real budget plus [`REAP_GRACE`].
+fn run_bounded_within(
+    cmd: &mut std::process::Command,
+    allowance: std::time::Duration,
+    what: &str,
+) -> std::io::Result<Reaped> {
+    use std::io::Read as _;
+
+    let mut child = cmd.spawn()?;
+    let stdout_reader = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    });
+    // Drained and DROPPED, exactly as `.output()` did with the stderr nothing here reads.
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = pipe.read_to_end(&mut sink);
+        })
+    });
+
+    let deadline = std::time::Instant::now() + allowance;
+    let mut killed = false;
+    let mut success = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                success = status.success();
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(e),
+        }
+        if std::time::Instant::now() >= deadline {
+            log::warn!(
+                "update: {what} was still running {}s after it started, so it was stopped",
+                allowance.as_secs()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            killed = true;
+            break;
+        }
+        std::thread::sleep(REAP_POLL);
+    }
+    // Joined AFTER the child is gone, so every read has hit EOF and no join can block.
+    let stdout = stdout_reader.and_then(|h| h.join().ok()).unwrap_or_default();
+    if let Some(h) = stderr_reader {
+        let _ = h.join();
+    }
+    Ok(Reaped { success, killed, stdout })
+}
+
+/// The argv `curl` gets for a manifest fetch.
+///
+/// Pure; unit-tested, which is the point: the `--max-time` it carries and the deadline
+/// [`run_bounded`] reaps against are built from the SAME [`FETCH_BUDGET`], and a test says so.
+fn fetch_argv(url: &str) -> Vec<String> {
+    vec![
+        "-fsSL".to_string(),
+        "--max-time".to_string(),
+        FETCH_BUDGET.as_secs().to_string(),
+        url.to_string(),
+    ]
+}
+
 /// Fetch the manifest and decide the status. Blocking; call from a background
-/// task (`Task::perform(async { spawn_blocking(check) })`). Degrades to
+/// task (`Task::perform(app::off_thread(check))`). Degrades to
 /// [`UpdateStatus::Failed`] with a short reason on any error.
 pub fn check_now() -> UpdateStatus {
     let url = manifest_url();
@@ -678,17 +858,32 @@ pub fn check_now() -> UpdateStatus {
     }
 }
 
-/// `curl -fsSL --max-time 10 <url>` -> body, or a short error reason.
+/// `curl -fsSL --max-time <FETCH_BUDGET> <url>` -> body, or a short error reason.
 fn fetch_text(url: &str) -> Result<String, String> {
     // Quiet spawn (DRAGON-236): `curl` (present on Windows 10+) is console-subsystem and
     // this fires on every settings launch (the auto update check) — a bare spawn flashes a
     // console before the settings window. Route through the console-free seam. Byte-identical
     // off Windows.
-    let out = crate::util::quiet_command("curl")
-        .args(["-fsSL", "--max-time", "10", url])
-        .output()
-        .map_err(|_| "Could not run curl to check for updates.".to_string())?;
-    if !out.status.success() {
+    //
+    // The stdio is what `.output()` used to set for us (both pipes captured, stdin closed);
+    // it is spelled out now because the reap is ours (DRAGON-499) and `run_bounded` drains
+    // exactly what the call site pipes.
+    let out = run_bounded(
+        crate::util::quiet_command("curl")
+            .args(fetch_argv(url))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+        FETCH_BUDGET,
+        "the update check",
+    )
+    .map_err(|_| "Could not run curl to check for updates.".to_string())?;
+    if out.killed {
+        // Not "could not reach": we reached something, and it would not let go. Named, so the
+        // About page says what happened instead of showing "Checking..." forever.
+        return Err("The update server stopped answering, so the check was ended.".to_string());
+    }
+    if !out.success {
         return Err("Could not reach the update server.".to_string());
     }
     String::from_utf8(out.stdout).map_err(|_| "Update information was not valid text.".to_string())
@@ -698,13 +893,22 @@ fn fetch_text(url: &str) -> Result<String, String> {
 /// macOS install flow verifies a download today, so the fn is macOS-gated.
 #[cfg(target_os = "macos")]
 fn file_sha256(path: &std::path::Path) -> Result<String, String> {
-    let out = std::process::Command::new("shasum")
-        .arg("-a")
-        .arg("256")
-        .arg(path)
-        .output()
-        .map_err(|_| "Could not run shasum to verify the download.".to_string())?;
-    if !out.status.success() {
+    // Bounded reap (DRAGON-499): the stdio is what `.output()` set, the deadline is ours.
+    let out = run_bounded(
+        std::process::Command::new("shasum")
+            .arg("-a")
+            .arg("256")
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped()),
+        HASH_BUDGET,
+        "the download checksum",
+    )
+    .map_err(|_| "Could not run shasum to verify the download.".to_string())?;
+    // A killed `shasum` lands here too: it is not a success, and its partial stdout must
+    // never be read as a hash.
+    if !out.success {
         return Err("Could not verify the download checksum.".to_string());
     }
     let text = String::from_utf8_lossy(&out.stdout);
@@ -768,15 +972,22 @@ fn install_macos_inner(info: &UpdateInfo) -> Result<(), String> {
     std::fs::create_dir_all(&work).map_err(|_| "Could not create a temp folder.".to_string())?;
     let dmg_path = work.join(artifact_name(&info.version));
 
-    // 1) Download.
-    let ok = std::process::Command::new("curl")
-        .args(["-fsSL", "--max-time", "600", "-o"])
-        .arg(&dmg_path)
-        .arg(&artifact.url)
-        .status()
-        .map_err(|_| "Could not run curl to download the update.".to_string())?
-        .success();
-    if !ok {
+    // 1) Download. Bounded reap (DRAGON-499); the stdio is left inherited, as `.status()` had
+    //    it, so nothing about a successful download changes.
+    let max_time = DOWNLOAD_BUDGET.as_secs().to_string();
+    let out = run_bounded(
+        std::process::Command::new("curl")
+            .args(["-fsSL", "--max-time", max_time.as_str(), "-o"])
+            .arg(&dmg_path)
+            .arg(&artifact.url),
+        DOWNLOAD_BUDGET,
+        "the update download",
+    )
+    .map_err(|_| "Could not run curl to download the update.".to_string())?;
+    if out.killed {
+        return Err("The update download stopped responding, so it was ended.".to_string());
+    }
+    if !out.success {
         return Err("The update download failed.".to_string());
     }
 
@@ -791,13 +1002,18 @@ fn install_macos_inner(info: &UpdateInfo) -> Result<(), String> {
     // 3) Mount read-only, no Finder window.
     let mount = work.join("mnt");
     std::fs::create_dir_all(&mount).map_err(|_| "Could not create a mount point.".to_string())?;
-    let attach = std::process::Command::new("hdiutil")
-        .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
-        .arg(&mount)
-        .arg(&dmg_path)
-        .status()
-        .map_err(|_| "Could not run hdiutil to mount the update.".to_string())?;
-    if !attach.success() {
+    let attach = run_bounded(
+        std::process::Command::new("hdiutil")
+            .args(["attach", "-nobrowse", "-readonly", "-mountpoint"])
+            .arg(&mount)
+            .arg(&dmg_path),
+        IMAGE_BUDGET,
+        "the update image mount",
+    )
+    .map_err(|_| "Could not run hdiutil to mount the update.".to_string())?;
+    if !attach.success {
+        // Covers the killed case too: a killed `hdiutil` mounted nothing, and the next step
+        // would look for an app bundle in an empty directory.
         return Err("Could not mount the update image.".to_string());
     }
 
@@ -816,24 +1032,33 @@ fn install_macos_inner(info: &UpdateInfo) -> Result<(), String> {
                 .ok_or_else(|| "The app bundle name was unreadable.".to_string())?,
         );
         // cp -R preserves the bundle (symlinks, resource forks) faithfully.
-        let ok = std::process::Command::new("cp")
-            .arg("-R")
-            .arg(&app_in_dmg)
-            .arg(&staged_app)
-            .status()
-            .map_err(|_| "Could not copy the new app.".to_string())?
-            .success();
-        if !ok {
+        let out = run_bounded(
+            std::process::Command::new("cp")
+                .arg("-R")
+                .arg(&app_in_dmg)
+                .arg(&staged_app),
+            COPY_BUDGET,
+            "the update staging copy",
+        )
+        .map_err(|_| "Could not copy the new app.".to_string())?;
+        if !out.success {
+            // A killed `cp` leaves a half-copied bundle, which must never be staged; the
+            // caller's error path detaches the image and the temp dir goes with the session.
             return Err("Could not copy the new app from the update image.".to_string());
         }
         Ok(staged_app)
     })();
 
-    // Always detach, whether staging succeeded or not.
-    let _ = std::process::Command::new("hdiutil")
-        .args(["detach", "-quiet"])
-        .arg(&mount)
-        .status();
+    // Always detach, whether staging succeeded or not. Best effort, but still bounded: this
+    // runs on the install worker, and a `hdiutil detach` that never returns would strand it
+    // (DRAGON-499).
+    let _ = run_bounded(
+        std::process::Command::new("hdiutil")
+            .args(["detach", "-quiet"])
+            .arg(&mount),
+        IMAGE_BUDGET,
+        "the update image detach",
+    );
 
     let staged_app = stage_result?;
 
@@ -860,7 +1085,9 @@ fn install_macos_inner(info: &UpdateInfo) -> Result<(), String> {
     }
 
     // Detach fully: nohup + setsid-equivalent via `open`-free `sh` in its own
-    // session so it survives this process's exit.
+    // session so it survives this process's exit. The ONE child here that is deliberately
+    // never reaped: it is spawned to OUTLIVE us (it waits for this process to be gone before
+    // it swaps), so there is nothing to bound. Its own wait loop is bounded, in the script.
     std::process::Command::new("/bin/sh")
         .arg(&script_path)
         .stdin(std::process::Stdio::null())
@@ -1413,9 +1640,12 @@ mod tests {
         assert!(UpdateStatus::Available(info).is_available());
     }
 
+    /// The name has to match what `scripts/mac-package.sh` writes, including the architecture
+    /// suffix DRAGON-508 added. Pinned as a literal rather than rebuilt from parts, because
+    /// this string's whole job is to be the same string the packaging script produces.
     #[test]
     fn artifact_name_matches_packaging() {
-        assert_eq!(artifact_name("0.3.0"), "CosmicCaptureKit-0.3.0.dmg");
+        assert_eq!(artifact_name("0.3.0"), "CosmicCaptureKit-0.3.0-aarch64.dmg");
     }
 
     // DRAGON-177: the launch dialog's show/don't-show decision, the full matrix of
@@ -1578,5 +1808,99 @@ mod tests {
     fn shell_single_quote_escapes() {
         assert_eq!(shell_single_quote("a'b"), r"a'\''b");
         assert_eq!(shell_single_quote("plain"), "plain");
+    }
+}
+
+/// DRAGON-499: every child on the update path is reaped against a deadline, and the deadline
+/// is built from the same constant the tool is told to police itself with.
+#[cfg(test)]
+mod reap_bounds_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The relation the whole ticket rests on: the Rust-side deadline is strictly OUTSIDE the
+    /// budget the tool was given, so a tool that honours its own timeout is never killed for
+    /// winding down, and one that ignores it always is.
+    #[test]
+    fn every_deadline_sits_outside_the_budget_it_belongs_to() {
+        for budget in [FETCH_BUDGET, DOWNLOAD_BUDGET, HASH_BUDGET] {
+            assert!(
+                reap_deadline(budget) > budget,
+                "a {budget:?} budget must be reaped LATER than it, not at it"
+            );
+            assert_eq!(reap_deadline(budget), budget + REAP_GRACE);
+        }
+        // A zero budget (nobody passes one, but the arithmetic must not underflow into an
+        // instant kill) still gets the grace.
+        assert_eq!(reap_deadline(Duration::ZERO), REAP_GRACE);
+        // And the grace is a real one: a zero grace would race every healthy tool.
+        assert!(!REAP_GRACE.is_zero());
+    }
+
+    /// The check runs on every settings mint, so its two clocks (curl's `--max-time` and our
+    /// reap) must come from ONE number. This is what stops a later edit from changing the
+    /// argv and leaving the deadline behind, which would silently restore the unbounded wait
+    /// for anything slower than the old literal.
+    #[test]
+    fn the_fetch_argv_carries_the_budget_the_reap_is_built_from() {
+        let argv = fetch_argv("https://example.invalid/update.json");
+        let at = argv
+            .iter()
+            .position(|a| a == "--max-time")
+            .expect("the manifest fetch must police itself as well as being reaped");
+        assert_eq!(argv[at + 1], FETCH_BUDGET.as_secs().to_string());
+        assert_eq!(
+            argv.last().map(String::as_str),
+            Some("https://example.invalid/update.json")
+        );
+        // Nothing else: -f (fail on HTTP error), -s -S (quiet but keep errors), -L (follow).
+        assert_eq!(argv[0], "-fsSL");
+        assert_eq!(argv.len(), 4);
+    }
+
+    /// A wedged child is KILLED, not waited on. The allowance is injected so this costs the
+    /// suite milliseconds; the real path derives it from [`reap_deadline`].
+    ///
+    /// This is the DRAGON-118 property, stated for the update path: the failure mode it
+    /// exists to prevent is not a slow update check, it is a settings window that never
+    /// closes because a `curl` (or a `PATH` shim pretending to be one) never exits.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_will_not_exit_is_killed_rather_than_waited_on() {
+        let began = std::time::Instant::now();
+        let out = run_bounded_within(
+            std::process::Command::new("sleep").arg("30"),
+            Duration::from_millis(200),
+            "a test child",
+        )
+        .expect("spawning `sleep` must work on any unix");
+        assert!(out.killed, "the child outlived its allowance, so it had to be killed");
+        assert!(!out.success, "a killed child is a failure, never a partial answer");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the reap took {:?}, so it waited on the child instead of killing it",
+            began.elapsed()
+        );
+    }
+
+    /// And the success path is untouched: a child that finishes on its own reports its own
+    /// status and hands back everything it wrote, which is what `fetch_text` reads as the
+    /// manifest body.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_finishes_keeps_its_status_and_its_output() {
+        let out = run_bounded(
+            std::process::Command::new("echo")
+                .arg("hello")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped()),
+            FETCH_BUDGET,
+            "a test child",
+        )
+        .expect("spawning `echo` must work on any unix");
+        assert!(out.success);
+        assert!(!out.killed);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
     }
 }

@@ -3,6 +3,7 @@
 pub mod annotation_canvas;
 pub mod annotation_fx;
 pub mod arrow_cursor;
+pub mod copy_button;
 pub mod crop_canvas;
 pub mod crop_window;
 pub mod drag_area;

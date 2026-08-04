@@ -566,6 +566,26 @@ pub fn run(daemon_intent: bool) -> ! {
         })
         .expect("spawn resident update-notice thread");
 
+    // ── Tombstone: the cloud auto-delete sweep (DRAGON-505) ─────────────────────────────
+    //
+    // A `cck-resident-cloud-ledger` thread ran here from DRAGON-482 until DRAGON-505,
+    // calling `cloud::ledger::sweep_forever`: at start and every six hours it deleted the
+    // uploads whose "delete after N hours" window had passed. The mac and Windows daemons
+    // each carried the identical thread, which is the shape any replacement should keep.
+    //
+    // It is gone because the FEATURE is gone, not because the daemon was the wrong owner.
+    // No provider offers server-side file TTL (Google Drive, Dropbox and OneDrive were each
+    // re-checked on 2026-08-03), so this sweep was the whole implementation, and its
+    // guarantee was too weak to ship: files were only ever removed while this daemon
+    // happened to be running, so an uninstall or a machine left off meant "delete after 24
+    // hours" silently never happened. Removed at the owner's direction; DRAGON-505 has the
+    // history, and `cloud/mod.rs` carries the fuller tombstone beside the deleted module.
+    //
+    // If a scheduled delete is ever revisited, note what has NOT changed: a resident is
+    // still the only process of ours that runs long enough to afford network I/O, and a
+    // CAPTURE child must still never do this work (a capture owes the user an overlay in
+    // the time they notice, and a sweep is requests to however many providers are named).
+
     // 5. Trigger loop: drain SIGUSR1 (→ default capture) and SIGTERM (→ clean shutdown).
     //    A short sleep keeps the loop cheap; the ksni item + IPC live on their own threads.
     let mut last_accent = accent;

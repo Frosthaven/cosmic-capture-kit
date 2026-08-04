@@ -149,6 +149,13 @@ pub enum WindowChromeMsg {
     PreviewFinalizeTick,
     /// A window was resized (logical w, h) — used to remember the settings size.
     ConfigWindowResized(window::Id, f32, f32),
+    /// A window took keyboard focus (DRAGON-482).
+    ///
+    /// Handled ONLY for a preview document, where it re-reads the connected cloud accounts so
+    /// the Upload button reflects an account connected in Settings while the editor was open.
+    /// Deliberately not a general focus hook: this app has no other state that goes stale on
+    /// focus, and a message every window reacts to is a message that grows arms.
+    WindowFocused(window::Id),
     /// Close the settings window (header ✕ / Done). On macOS the native traffic
     /// lights (DRAGON-135) and on Windows the native DWM caption buttons (DRAGON-284)
     /// own close/minimize, so these two CSD variants are only constructed on Linux;

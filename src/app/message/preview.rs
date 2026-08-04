@@ -46,14 +46,103 @@ pub enum PreviewMsg {
     /// since DRAGON-480). See `share::share_sheet`'s module doc for where the other
     /// platforms stand.
     Share,
-    /// The share sheet finished presenting (DRAGON-480, macOS only — Windows and Linux share
+    /// The share sheet finished presenting (DRAGON-480, macOS only: Windows and Linux share
     /// synchronously and never produce this). `Err` shows a toast; `Ok` is silent, exactly
     /// like the synchronous platforms' success case.
+    ///
+    /// Constructed only in the macOS arm of `share::share_sheet`, so it is honestly dead
+    /// everywhere else and gated as such rather than deleted: the arm that sends it is one
+    /// `cfg` away, and its `update` arm is compiled on every platform.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ShareDone(Result<(), String>),
-    /// Upload the capture to a configured account (DRAGON-467). The accounts feature does not
-    /// exist yet, so the toolbar button ships DISABLED and never emits this; the variant is
-    /// the wiring that account work will land on.
-    Upload,
+    // DRAGON-467 declared a bare `Upload` here, for a toolbar button that shipped permanently
+    // disabled because the accounts feature did not exist. DRAGON-482 built the feature and
+    // the button reaches `UploadFlyoutToggle` instead: an upload needs a DESTINATION, so
+    // there is no such thing as "just upload" to send. The variant went with its last
+    // producer rather than living on behind an `expect(dead_code)` for a future that had
+    // already arrived.
+    /// Open or close the Upload FLYOUT (DRAGON-482): the small panel that picks which
+    /// connected account to upload to and whether to copy a share link. What the toolbar's
+    /// Upload button and the primary+U shortcut both reach.
+    ///
+    /// With no accounts connected the button is not pressable at all, so only the keybinding
+    /// can arrive here in that state; it says why instead of opening an empty panel.
+    UploadFlyoutToggle,
+    /// Close the Upload flyout without uploading (DRAGON-482): a click outside it. (Escape
+    /// reaches the shared [`Self::FlyoutClose`] instead, through the modal-key lane every
+    /// flyout uses; both do the same thing here.)
+    UploadFlyoutClose,
+    /// Choose which connected account the upload goes to (DRAGON-482), by
+    /// `cloud::accounts::CloudAccount::id`. Persisted as `cloud_last_account`, so the next
+    /// capture opens on the same one. Also closes [`Self::UploadAccountMenu`]'s picker, the
+    /// same "pick collapses the dropdown" behaviour `SetTextSize`/`SetTextFont` already have.
+    UploadAccountSelected(String),
+    /// Open (`true`) or close (`false`) the Upload flyout's own NESTED account picker
+    /// (DRAGON-489 follow-up): the account choice now sits behind a closed-by-default
+    /// `dropdown_chip` (`app::preview::chrome`), matching the top bar's other dropdowns,
+    /// instead of the flat always-expanded list it used to be. A separate bool rather than a
+    /// second `FlyoutKind` (`app::preview::edit`), because the OUTER Upload flyout already
+    /// occupies that single slot for the whole time this inner one can be open.
+    UploadAccountMenu(bool),
+    /// Toggle "also copy a share link" in the flyout (DRAGON-482). Persisted as
+    /// `cloud_auto_share`; ships ON.
+    UploadAutoShareToggled(bool),
+    /// Open (`true`) or close (`false`) the Upload flyout's own NESTED visibility picker
+    /// (DRAGON-493), shown only for the selected account's provider having
+    /// `ProviderCaps::visibility` (today: YouTube). A separate bool rather than a second
+    /// `FlyoutKind`, the same reasoning [`Self::UploadAccountMenu`] documents: the OUTER
+    /// Upload flyout already occupies that one slot.
+    UploadVisibilityMenu(bool),
+    /// Choose a visibility (Public/Unlisted/Private) for the currently selected account
+    /// (DRAGON-493). Persisted straight onto that `CloudAccount`, the same way
+    /// [`Self::UploadAccountSelected`] persists a folder choice: a preference set here must
+    /// survive an editor closed without uploading, and recall the next time this account is
+    /// picked in ANY document's Upload flyout. Also closes the nested menu, the same "pick
+    /// collapses the dropdown" behaviour every other dropdown here has.
+    UploadVisibilitySelected(crate::cloud::accounts::Visibility),
+    /// Start the upload with the flyout's current choices (DRAGON-482). Bakes the current
+    /// state exactly as Copy and Share do, then hands the artifact to a detached
+    /// `--cloud-upload` child, so the editor stays usable and can close.
+    UploadStart,
+    /// Poll every upload this document is still watching (DRAGON-490):
+    /// `cloud::session::read_state` on each `EditState::uploads` entry. A percentage moves the
+    /// titlebar indicator (no number shown there, per the owner's ask); a TERMINAL state
+    /// (done/failed/canceled) fires the matching toast — "Copied to clipboard" too, when
+    /// `Done { shared: true }` — clears the session's sidecars, and drops that entry from
+    /// `uploads`. Driven by `sub_upload_poll`, which exists only while `uploads` is non-empty.
+    UploadPoll,
+    /// Cancel an upload this document is watching, by its session id (`edit::UploadWatch`'s
+    /// own field, DRAGON-490): the titlebar's own Cancel control, next to the progress
+    /// indicator. Creates that session's cancel-request sidecar
+    /// (`cloud::session::request_cancel`); the child's own poll thread notices it and stops
+    /// the transfer between chunks.
+    ///
+    /// DRAGON-507: this ALSO puts the watch into its ending state at once
+    /// (`edit::UploadWatch::ending`), so the bar goes red and the X goes away with the click
+    /// rather than whenever the child gets round to writing `Canceled`. The watch is then
+    /// dropped on its own timer (`edit::UPLOAD_ENDING_HOLD`), not on that terminal state,
+    /// which is why a cancel no longer depends on the child answering at all.
+    UploadCancel(String),
+    /// UNDO a finished upload during its meter's finish-hold (DRAGON-507), by session id:
+    /// delete the file the upload created at the provider.
+    ///
+    /// The EDITOR does this one itself, on a detached worker, because the child that did the
+    /// upload has already exited by the time this can be pressed — see
+    /// `App::undo_upload`, which also records what this deliberately does NOT undo.
+    UploadUndo(String),
+    /// RE-COPY a finished upload's share link (DRAGON-520), by session id: put the link the
+    /// child already made and copied back on the clipboard.
+    ///
+    /// A backup, not the first copy. The child copies the link the moment it has one, and the
+    /// editor toasts "Copied to clipboard" to say so; this is for the user who copied something
+    /// else in between and wants the link back without re-uploading. Offered only where there is
+    /// a link to give (`edit::UploadWatch::copyable`), and it goes through the same
+    /// `share::copy_text` every other copy in the app uses.
+    ///
+    /// The session ID, not the URL: the meter's own watch holds the link, and a message carrying
+    /// it would be a second copy of a value that must not spread (it opens the capture for
+    /// anyone holding it, and messages are the one thing in this app that get `Debug`-printed).
+    UploadCopyLink(String),
     /// Open the SETTINGS pane from the preview editor's chrome. A fullscreen-overlay
     /// document converts itself to a window first (an exclusive layer surface would sit
     /// over the settings window); the pane itself is a detached `--settings` child, or a
@@ -440,7 +529,20 @@ mod tests {
             PreviewMsg::Save,
             PreviewMsg::Copy,
             PreviewMsg::Share,
-            PreviewMsg::Upload,
+            // DRAGON-482: opening a flyout and picking an account are chrome, not hands on
+            // the document, and the upload posts a toast of its own.
+            PreviewMsg::UploadFlyoutToggle,
+            PreviewMsg::UploadAccountSelected("aa".to_string()),
+            PreviewMsg::UploadAccountMenu(true),
+            PreviewMsg::UploadAutoShareToggled(true),
+            // DRAGON-493: the same reasoning as the account picker above: a visibility pick
+            // is chrome, not hands on the document.
+            PreviewMsg::UploadVisibilityMenu(true),
+            PreviewMsg::UploadVisibilitySelected(crate::cloud::accounts::Visibility::Unlisted),
+            PreviewMsg::UploadStart,
+            // DRAGON-490: watching an upload's progress and cancelling one are chrome too.
+            PreviewMsg::UploadPoll,
+            PreviewMsg::UploadCancel("abc123".to_string()),
             PreviewMsg::SaveAndClose,
             PreviewMsg::KeepEditing,
             PreviewMsg::DiscardAndClose,

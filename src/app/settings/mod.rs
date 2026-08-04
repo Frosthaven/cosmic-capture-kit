@@ -11,14 +11,29 @@
 
 use super::*;
 
+mod dialog;
 mod mic_test;
 mod row;
 mod deps;
 mod pages;
 
+// THE dialog composition (DRAGON-502), re-exported at the `settings::` level so every page
+// and sub-module reaches it through the same `use super::*` glob they already carry. One
+// helper, because the drag strip it stacks has to be on EVERY dialog's scrim or the window
+// stays pinned behind whichever one still hand-rolled its own.
+pub(in crate::app::settings) use dialog::stack_dialog;
+
 // Re-export at the settings:: level so `super::settings::MIC_WAVE_COLUMNS` in
 // actions.rs keeps resolving without any path change.
 pub(super) use mic_test::MIC_WAVE_COLUMNS;
+
+// The Cloud Accounts page's state (DRAGON-482). `pages` is private to this module, so the
+// one type `SettingsState` holds is re-exported here, at exactly the visibility its field
+// carries, `pub(in crate::app)`, so no public interface leaks a type nobody outside `app`
+// can name. The page's own vocabulary (its steps, its pure decisions) stays inside
+// `pages::cloud`, which also owns the `update_cloud` body, the way `preview/mod.rs` owns
+// `update_preview`.
+pub(in crate::app) use pages::cloud::CloudPageState;
 
 // Bring row helpers into this module's scope for rendered_sections.
 use self::row::{reset_button, severity_caption, severity_title, Severity, SectionSpec};
@@ -104,9 +119,18 @@ pub enum ConfigTab {
     /// see [`AudioVideoTab`]).
     AudioVideo,
     Shortcuts,
+    /// Connected cloud drives and what an upload does with them (DRAGON-482). Sits before
+    /// Health because it is a place a user CONFIGURES something; Health and About are the
+    /// two read-mostly pages and stay last.
+    CloudAccounts,
     Health,
     About,
 }
+
+/// THE Cloud Accounts page's glyph (DRAGON-482): the plain cloud, deliberately NOT the
+/// `cloud-upload` the preview editor's Upload button wears. The page is where accounts
+/// live; the button is the action.
+pub(super) const CLOUD_ACCOUNTS_ICON: &str = "cloud-symbolic";
 
 /// THE preview editor's glyph in settings (DRAGON-353). Shared by the Preview Editor nav
 /// page and the Keyboard Shortcuts page's "Preview Editor" tab, so the editor reads as one
@@ -117,12 +141,13 @@ impl ConfigTab {
     /// Every settings page, in NAV ORDER (DRAGON-353). The global SEARCH sweeps this, so a
     /// page added to the enum and the nav but forgotten here would be silently unsearchable
     /// — which is exactly what `every_page_is_named_iconed_and_searchable` guards.
-    pub(crate) const ALL: [ConfigTab; 7] = [
+    pub(crate) const ALL: [ConfigTab; 8] = [
         ConfigTab::General,
         ConfigTab::CaptureModes,
         ConfigTab::PreviewEditor,
         ConfigTab::AudioVideo,
         ConfigTab::Shortcuts,
+        ConfigTab::CloudAccounts,
         ConfigTab::Health,
         ConfigTab::About,
     ];
@@ -277,6 +302,10 @@ pub struct SettingsState {
     pub search_id: widget::Id,
     /// A reset-to-defaults action awaiting confirmation (shows the dialog).
     pub pending_reset: Option<ResetScope>,
+    /// The Cloud Accounts page's own state (DRAGON-482): the cached account list, the add /
+    /// reconnect dialog and the disconnect confirmation. All of it lives here rather than on
+    /// `App`, because none of it outlives the settings window.
+    pub(in crate::app) cloud: CloudPageState,
     /// The keyboard-shortcut action currently capturing a new binding on the Keyboard
     /// Shortcuts page, if any — the next key press becomes its shortcut.
     pub rebinding: Option<crate::shortcuts::Action>,
@@ -339,6 +368,10 @@ impl SettingsState {
             .text("Keyboard Shortcuts")
             .icon(crate::widgets::icons::handle("input-keyboard-symbolic").icon())
             .data(ConfigTab::Shortcuts);
+        nav.insert()
+            .text("Cloud Accounts")
+            .icon(crate::widgets::icons::handle(CLOUD_ACCOUNTS_ICON).icon())
+            .data(ConfigTab::CloudAccounts);
         // The icon here is a placeholder; `update_health_nav_icon` replaces it with a
         // severity-tinted glyph before the nav is ever shown.
         let health = nav
@@ -452,6 +485,11 @@ impl SettingsState {
             search: String::new(),
             search_id: widget::Id::unique(),
             pending_reset: None,
+            // Empty until `CloudSettingsMsg::Reload` fills it (batched when the window
+            // opens). Deliberately NOT read from disk here: `SettingsState::new` runs on
+            // every launch, including a capture that never opens a settings window, and a
+            // file read on that path buys nothing.
+            cloud: CloudPageState::default(),
             rebinding: None,
             accent_picker: widget::ColorPickerModel::new("Hex", "RGB", None, None),
             accent_editor_open: false,
@@ -790,7 +828,11 @@ impl App {
             #[cfg(windows)]
             let _ = self.set_window_title(WINDOW_TITLE.to_string(), id);
             let check = self.update_settings(SettingsMsg::CheckForUpdates);
-            Task::batch([task, self.hide_overlays(), check])
+            // DRAGON-482: fill the Cloud Accounts page from disk, and probe the stored
+            // sign-ins on a background task. Batched at open, like the update check, so the
+            // page is ready whenever the user reaches it and the window is never delayed.
+            let cloud = self.update_settings(SettingsMsg::Cloud(CloudSettingsMsg::Reload));
+            Task::batch([task, self.hide_overlays(), check, cloud])
         }
     }
 
@@ -1081,7 +1123,14 @@ impl App {
             }
             // A standalone "Reset to defaults" (this page) below the groups. The
             // About and Health pages are read-only, so they get no reset button.
-            if active != ConfigTab::About && active != ConfigTab::Health {
+            // DRAGON-482: Cloud Accounts joins About and Health in having no chip. It has
+            // no `Persisted` settings of its own to restore (an account is connected or it
+            // is not, and its tokens are not settings), so a "Reset to defaults" button
+            // there could only ever do nothing.
+            if active != ConfigTab::About
+                && active != ConfigTab::Health
+                && active != ConfigTab::CloudAccounts
+            {
                 // A content-sized "Reset to defaults" chip at the column's leading edge
                 // (NOT centred in the column, per the user). Its icon + label are centred
                 // WITHIN the chip via the helper, which for a Shrink width just hugs the
@@ -1379,6 +1428,16 @@ impl App {
             return self.update_dialog_modal(window);
         }
 
+        // Cloud Accounts (DRAGON-482): the add / reconnect flow, then the disconnect
+        // confirmation. The add dialog's backdrop is INERT and the disconnect's dismisses;
+        // both live in `pages::cloud`, which owns the reason for the difference.
+        if self.settings.cloud.add.is_some() {
+            return self.cloud_add_modal(window);
+        }
+        if self.settings.cloud.pending_disconnect.is_some() {
+            return self.cloud_disconnect_modal(window);
+        }
+
         // Reset confirmation modal, stacked over the window when pending.
         let Some(scope) = self.settings.pending_reset else {
             return window;
@@ -1393,32 +1452,17 @@ impl App {
                 "This restores the settings on this page to their defaults. This cannot be undone.",
             ),
         };
-        let backdrop: Element<'_, Msg> = widget::mouse_area(
-            widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .class(cosmic::theme::Container::custom(|_t| {
-                    cosmic::iced::widget::container::Style {
-                        background: Some(Background::Color(theme::SCRIM)),
-                        ..Default::default()
-                    }
-                })),
-        )
-        .on_press(Msg::WindowChrome(WindowChromeMsg::CancelReset))
-        .interaction(cosmic::iced::mouse::Interaction::Idle)
-        .into();
-        let dialog = widget::dialog()
+        let card = widget::dialog()
             .title(title)
             .body(body)
             .primary_action(crate::widgets::arrow_cursor::arrow_cursor(widget::button::destructive("Reset").on_press(Msg::WindowChrome(WindowChromeMsg::ConfirmReset))))
             .secondary_action(crate::widgets::arrow_cursor::arrow_cursor(widget::button::text("Cancel").on_press(Msg::WindowChrome(WindowChromeMsg::CancelReset))));
-        let centered: Element<'_, Msg> = widget::container(dialog)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-        cosmic::iced::widget::stack(vec![window, backdrop, centered]).into()
+        // A DISMISSING backdrop: backing out of a destructive question is always safe.
+        stack_dialog(
+            window,
+            card.into(),
+            Some(Msg::WindowChrome(WindowChromeMsg::CancelReset)),
+        )
     }
 
     /// The launch-time update dialog (DRAGON-177), stacked over the settings window.
@@ -1454,30 +1498,9 @@ impl App {
                 widget::button::text("Update Later")
                     .on_press(Msg::Settings(SettingsMsg::UpdateDialogLater)),
             ));
-        // A click-absorbing scrim behind the card. Unlike the reset modal, an
-        // outside click does NOT dismiss (the user must choose an explicit action so
-        // the checkbox decision is deliberate), so the backdrop is inert.
-        let backdrop: Element<'_, Msg> = widget::mouse_area(
-            widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .class(cosmic::theme::Container::custom(|_t| {
-                    cosmic::iced::widget::container::Style {
-                        background: Some(Background::Color(theme::SCRIM)),
-                        ..Default::default()
-                    }
-                })),
-        )
-        .on_press(Msg::WindowChrome(WindowChromeMsg::Ignore))
-        .interaction(cosmic::iced::mouse::Interaction::Idle)
-        .into();
-        let centered: Element<'_, Msg> = widget::container(card)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into();
-        cosmic::iced::widget::stack(vec![window, backdrop, centered]).into()
+        // Unlike the reset modal, an outside click does NOT dismiss (the user must choose an
+        // explicit action so the checkbox decision is deliberate), so the backdrop is inert.
+        stack_dialog(window, card.into(), None)
     }
 
     /// Render a page's sections to elements, dropping items (and then empty
@@ -1548,9 +1571,16 @@ impl App {
                             .width(Length::Fixed(28.0))
                             .into(),
                     };
-                    let control = widget::row(vec![it.control, suffix_slot, reset_slot])
-                        .spacing(8.0)
-                        .align_y(Alignment::Center);
+                    // A `flush` row keeps neither slot: its control IS the last thing in the
+                    // row, so the reserved space reads as a misalignment rather than as an
+                    // alignment (DRAGON-495). Everything else keeps the shared right edge.
+                    let control = if it.flush {
+                        widget::row(vec![it.control]).align_y(Alignment::Center)
+                    } else {
+                        widget::row(vec![it.control, suffix_slot, reset_slot])
+                            .spacing(8.0)
+                            .align_y(Alignment::Center)
+                    };
                     // Build the row ourselves (vs `item::builder`) so the helper
                     // text uses our secondary tone; `item_row` is the same layout
                     // primitive the builder uses internally.
@@ -1695,6 +1725,7 @@ impl App {
             ConfigTab::PreviewEditor => "Preview Editor",
             ConfigTab::AudioVideo => "Audio & Video",
             ConfigTab::Shortcuts => "Keyboard Shortcuts",
+            ConfigTab::CloudAccounts => "Cloud Accounts",
             ConfigTab::Health => "Health",
             ConfigTab::About => "About",
         }
@@ -1707,6 +1738,7 @@ impl App {
             ConfigTab::PreviewEditor => PREVIEW_EDITOR_ICON,
             ConfigTab::AudioVideo => "applications-multimedia-symbolic",
             ConfigTab::Shortcuts => "input-keyboard-symbolic",
+            ConfigTab::CloudAccounts => CLOUD_ACCOUNTS_ICON,
             ConfigTab::Health => "utilities-system-monitor-symbolic",
             ConfigTab::About => "help-about-symbolic",
         }
@@ -1847,6 +1879,7 @@ impl App {
             // All shortcut sections, regardless of the active in-page tab (DRAGON-142)
             // — the global search surfaces every binding under one header.
             ConfigTab::Shortcuts => self.keyboard_sections(),
+            ConfigTab::CloudAccounts => self.cloud_sections(),
             ConfigTab::Health => self.health_sections(),
             ConfigTab::About => self.about_sections(),
         }

@@ -72,7 +72,7 @@ fn load_raw() -> Option<Persisted> {
 
 /// Current config schema version. Bump when a stored index changes meaning and
 /// add a guarded step in `migrate`.
-pub const CONFIG_VERSION: u32 = 9;
+pub const CONFIG_VERSION: u32 = 10;
 
 /// One-time migrations for configs saved by older versions, keyed on
 /// `config_version`. Idempotent — running it on an already-current config is a
@@ -200,6 +200,21 @@ fn migrate(p: &mut Persisted) {
         // unsaved-changes card still appears — so an upgrading user sees no jump. Same
         // treatment as `recording_tray` (v5) and `allow_multiple`; pinned by
         // `old_share_automation_keys_are_ignored_on_load`.
+    }
+    if p.config_version < 10 {
+        // v10 (DRAGON-482): the two cloud-accounts keys arrive, and there is nothing to
+        // carry forward because there was no such feature before.
+        //
+        // The version still bumps, and the hook still exists, because BOTH keys are
+        // additive with serde defaults (`cloud_last_account` absent means "no account
+        // picked yet", `cloud_auto_share` absent means its `default_true`), which is
+        // exactly the state an upgrading config should land in. Writing anything here
+        // would be inventing a preference the user never expressed.
+        //
+        // The version number earns its keep as a MARKER rather than as a migration: it
+        // records which builds could have written the keys at all, which is what a later
+        // change to their meaning would need. Same shape as the v5 and v9 entries above,
+        // both of which also carry nothing.
     }
     // Version-independent safety net: an empty id (hand-edited config) falls back
     // to the platform default rather than persisting as unset.
@@ -330,7 +345,14 @@ record_fps = 60\n";
         assert_eq!(d.record_res_preset, 5); // 2K
         assert_eq!(d.nvenc_preset, "p4");
         assert_eq!(d.x264_preset, "fast");
-        assert_eq!(d.config_version, 9);
+        // Pinned to the constant, not a literal: a version bump is a routine, guarded event
+        // (DRAGON-482 took it to 10), and a test that has to be hand-edited for each one adds
+        // nothing the `migrate` steps do not already say.
+        assert_eq!(d.config_version, CONFIG_VERSION);
+        // DRAGON-482: a fresh install has no cloud account picked, and the share-link
+        // convenience ships ON (the settings-copy convention for a convenience toggle).
+        assert_eq!(d.cloud_last_account, None);
+        assert!(d.cloud_auto_share);
         // DRAGON-174: the new toolbar-hiding setting defaults OFF (do not hide).
         assert!(!d.hide_toolbar_fullscreen);
         // Residency defaults on where the global hotkey needs the daemon (macOS AND Windows,

@@ -52,7 +52,7 @@ impl App {
 
 /// The permission window title — also the handle used to find/focus an already-open
 /// permissions window in another instance.
-pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit: Permissions";
+pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Permissions";
 
 /// Open a permission-checker toplevel and a Task reporting its id once mapped.
 /// Mirrors `settings::open_config_window`'s window recipe (CSD, transparent

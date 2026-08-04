@@ -13,17 +13,81 @@
 //!
 //! Every Lucide SVG strokes with `currentColor`, so `.symbolic(true)` lets the widget tint
 //! it with the active fg/accent color exactly like a COSMIC symbolic icon.
+//!
+//! # The second directory: `res/icons/brands/` (DRAGON-482)
+//!
+//! Lucide has no cloud-provider marks, so the ones the cloud-accounts feature needs are the
+//! providers' OWN official marks: sanitized copies of the vector each brand publishes, with
+//! the source URL recorded in a comment at the top of every file. Nothing is restyled. Each
+//! sits in a square 24x24 viewBox with the mark centred, which is the only change made to any
+//! of them: the geometry and the colours are the brand's.
+//!
+//! **They are the one exception to this set's tint rule, and it is the whole point.** A brand
+//! mark is recognised BY its colours, and a Google Drive triangle flattened to the theme's
+//! foreground is not a Google Drive triangle; the first build shipped them as hand-drawn
+//! monochrome glyphs and the owner's answer on seeing them was that they had to be the real
+//! marks. So [`brand`] is the ONE resolution path that does not mark its handle symbolic, and
+//! the SVG's own fills and gradients reach the screen. [`handle`] routes every brand name
+//! through it, so no call site has to remember which names are brands.
+//!
+//! Using an unmodified mark to say which service an account connects to is the case every one
+//! of these brands' guidelines sanctions. Keep it that way: do not recolour one, do not
+//! restyle one, and do not put one on anything but the provider it belongs to.
+//!
+//! They live in their OWN directory rather than in `lucide/`, and that is deliberate:
+//! `res/icons/lucide/` is a vendored MIT-licensed upstream set, and mixing files of different
+//! provenance into it would make its licensing a guess. [`lucide_bytes`] embeds from both.
+//!
+//! The two providers with no official API (Proton Drive, iCloud Drive) keep their real marks
+//! too, although nothing draws them today: DRAGON-498 stopped listing those providers in the
+//! add-account picker, and their rows (with the "Not available yet" caption the marks used to
+//! sit beside) went with it. The glyphs stay because the REGISTRY still carries both providers,
+//! so anything that names one, now or later, has its mark ready and does not have to invent a
+//! downgraded stand-in.
 
 use cosmic::widget::icon::{self, Handle};
 
-/// Resolve an app icon NAME to a bundled Lucide glyph handle. A mapped name embeds its
-/// Lucide SVG (marked symbolic so the widget tint applies); an UNMAPPED name falls back to
-/// the system/embedded theme (`from_name`), a safety net that preserves prior behavior.
+/// Resolve an app icon NAME to a bundled glyph handle.
+///
+/// A brand name resolves through [`brand`], in the brand's own colours. Any other mapped name
+/// embeds its Lucide SVG marked symbolic, so the widget tint applies. An UNMAPPED name falls
+/// back to the system/embedded theme (`from_name`), a safety net that preserves prior
+/// behavior.
+///
+/// The brand branch lives HERE rather than at the four call sites that draw a provider mark,
+/// because two of them pass a name they did not choose (an account whose provider this build
+/// does not know falls back to `cloud-symbolic`) and none of them should have to know which
+/// names are brands. One decision, one place.
 pub fn handle(name: &str) -> Handle {
+    if let Some(mark) = brand(name) {
+        return mark;
+    }
     match lucide_name(name) {
         Some(file) => icon::from_svg_bytes(lucide_bytes(file)).symbolic(true),
         None => icon::from_name(name).handle(),
     }
+}
+
+/// The handle for a BRAND mark, in the brand's own colours (DRAGON-482). Pure; unit-tested.
+///
+/// `None` for every other name, which is what lets a caller hand over a name it did not pick
+/// without deciding anything itself.
+///
+/// The handle is deliberately NOT `.symbolic(true)`. libcosmic substitutes the theme's icon
+/// colour only when the handle says symbolic AND the widget's class leaves the colour unset
+/// (`iced/widget/src/svg.rs`), so an unmarked handle renders the file's own fills and
+/// gradients. That also means a brand icon must not be given a colouring `.class(..)`: the
+/// class wins over the file either way round.
+pub fn brand(name: &str) -> Option<Handle> {
+    brand_file(name).map(|file| icon::from_svg_bytes(lucide_bytes(file)))
+}
+
+/// The bundled file `name` resolves to WHEN it is one of the brand marks. Pure; unit-tested.
+///
+/// Keyed on the `brand-` stem prefix rather than a second list of names, so adding a provider
+/// mark is one row in [`lucide_name`] plus one in [`lucide_bytes`] and nothing else.
+fn brand_file(name: &str) -> Option<&'static str> {
+    lucide_name(name).filter(|file| file.starts_with("brand-"))
 }
 
 /// **THE icon-size seam (DRAGON-399): snap a glyph's logical box to a WHOLE pixel.**
@@ -155,7 +219,22 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         // stay stair-stepped. Only more pixels help that — no asset change will.
         "crop-accept-symbolic" => "check-split",
         "edit-delete-symbolic" => "trash-2",
+        // The SAME trash can, under freedesktop's name for "delete this thing that already
+        // exists somewhere else" (DRAGON-514: the upload meter's undo, and the toast that
+        // follows it). Its own entry rather than a call-site swap to `edit-delete-symbolic`,
+        // for the reason `process-stop-symbolic` keeps its own below: removing a file from a
+        // cloud account and deleting a local one are different promises, and a redesign of one
+        // must not silently move the other. Unmapped until now, so both call sites were falling
+        // back to whatever trash the system theme had, next to lucide glyphs everywhere else.
+        "user-trash-symbolic" => "trash-2",
         "window-close-symbolic" => "x",
+        // The same plain X glyph, under freedesktop's name for "cancel an in-progress
+        // action" (DRAGON-490's titlebar upload Cancel), kept as its OWN entry rather than
+        // reusing `window-close-symbolic` directly at the call site: the two names mean
+        // different things (dismiss this control vs. close the whole window) even though
+        // they render identically today, and a future redesign of one must not silently
+        // move the other.
+        "process-stop-symbolic" => "x",
         "emblem-system-symbolic" => "settings", // gear
         "document-properties-symbolic" => "view", // scanner kind (QR/OCR "look")
         // DRAGON-456: the scan kind button's HOVER face while the scanner is ALREADY the
@@ -251,6 +330,19 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "image-x-generic-symbolic" => "image",
         "video-display-symbolic" => "monitor",
         "utilities-system-monitor-symbolic" => "activity", // Health tab
+        // Cloud accounts (DRAGON-482). `cloud` is the settings PAGE's glyph, deliberately
+        // the plain cloud rather than `cloud-upload` (which the preview editor's Upload
+        // BUTTON already wears): the page is where accounts live, not an action.
+        "cloud-symbolic" => "cloud",
+        // The provider marks, from `res/icons/brands/` (see the module doc).
+        "brand-gdrive-symbolic" => "brand-gdrive",
+        "brand-onedrive-symbolic" => "brand-onedrive",
+        "brand-dropbox-symbolic" => "brand-dropbox",
+        "brand-proton-drive-symbolic" => "brand-proton-drive",
+        "brand-icloud-symbolic" => "brand-icloud",
+        // YouTube (DRAGON-493): the first video-hosting provider, alongside the four
+        // file-storage marks above.
+        "brand-youtube-symbolic" => "brand-youtube",
         "speedometer-symbolic" => "gauge", // Run benchmark button
         "donate-symbolic" => "hand-coins", // About-page donate button
         "help-about-symbolic" => "info",
@@ -265,16 +357,32 @@ fn lucide_name(name: &str) -> Option<&'static str> {
 // though no name maps to them anymore (scanner → `view`, covermark → `flag`, DRAGON-324).
 // Kept as ready-to-use glyphs; harmless.
 
-/// The bytes of a bundled Lucide SVG by its file stem. Exhaustive over every file
-/// [`lucide_name`] can return; an unbundled stem is a programmer error (the two lists must
-/// stay in sync — the `every_mapped_name_embeds` test enforces it).
+/// The bytes of a bundled SVG by its file stem. Exhaustive over every file [`lucide_name`]
+/// can return; an unbundled stem is a programmer error (the two lists must stay in sync,
+/// and the `every_mapped_name_embeds` test enforces it).
+///
+/// Two sources, one lookup: `svg!` embeds from the vendored Lucide set, `brand!` from our
+/// own `res/icons/brands/` (see the module doc for why they are separate directories). A
+/// `brand-` stem is the only thing that comes from the second one.
 fn lucide_bytes(file: &str) -> &'static [u8] {
     macro_rules! svg {
         ($f:literal) => {
             include_bytes!(concat!("../../res/icons/lucide/", $f, ".svg")).as_slice()
         };
     }
+    macro_rules! brand {
+        ($f:literal) => {
+            include_bytes!(concat!("../../res/icons/brands/", $f, ".svg")).as_slice()
+        };
+    }
     match file {
+        "cloud" => svg!("cloud"),
+        "brand-gdrive" => brand!("gdrive"),
+        "brand-onedrive" => brand!("onedrive"),
+        "brand-dropbox" => brand!("dropbox"),
+        "brand-proton-drive" => brand!("proton-drive"),
+        "brand-icloud" => brand!("icloud"),
+        "brand-youtube" => brand!("youtube"),
         "crop" => svg!("crop"),
         "arrow-left-right" => svg!("arrow-left-right"),
         "app-window" => svg!("app-window"),
@@ -376,7 +484,8 @@ mod tests {
             "camera-photo-symbolic", "camera-video-symbolic", "media-record-symbolic",
             "media-playback-start-symbolic", "media-playback-pause-symbolic",
             "media-playback-stop-symbolic", "emblem-ok-symbolic", "edit-delete-symbolic",
-            "window-close-symbolic", "emblem-system-symbolic", "document-properties-symbolic",
+            "user-trash-symbolic",
+            "window-close-symbolic", "process-stop-symbolic", "emblem-system-symbolic", "document-properties-symbolic",
             "preferences-system-symbolic", "audio-input-microphone-symbolic",
             "audio-x-generic-symbolic", "object-merge-symbolic",
             "audio-volume-high-symbolic", "notification-symbolic", "input-keyboard-symbolic",
@@ -405,12 +514,76 @@ mod tests {
             "help-about-symbolic",
             "software-update-available-symbolic", "dialog-warning-symbolic",
             "dialog-error-symbolic",
+            // Cloud accounts (DRAGON-482, plus YouTube DRAGON-493): the settings page's glyph
+            // plus every provider mark. The provider ones also have to embed, or a provider row
+            // renders blank off Linux. `cloud::registry_tests::every_provider_is_named_and_iconed`
+            // asserts the registry side of the same pairing.
+            "cloud-symbolic", "brand-gdrive-symbolic", "brand-onedrive-symbolic",
+            "brand-dropbox-symbolic", "brand-proton-drive-symbolic", "brand-icloud-symbolic",
+            "brand-youtube-symbolic",
         ];
         for n in names {
             let file = lucide_name(n).unwrap_or_else(|| panic!("`{n}` is unmapped"));
             assert!(!lucide_bytes(file).is_empty(), "`{file}` embeds no bytes");
             assert!(lucide_bytes(file).starts_with(b"<svg"), "`{file}` is not an SVG");
         }
+    }
+
+    /// **Every brand mark embeds, and embeds IN COLOUR** (DRAGON-482, plus YouTube DRAGON-493).
+    ///
+    /// The sibling of [`every_mapped_name_embeds`], for the half of the bundle that must NOT
+    /// go through the symbolic path. It pins the three things that would each silently undo
+    /// the marks: a brand name resolving to a tinted handle, a brand file drawn in
+    /// `currentColor` (which has no colour of its own to render), and a file arriving with no
+    /// record of where it came from.
+    ///
+    /// It also pins the NEGATIVE side. `cloud-symbolic` is the fallback two of the call sites
+    /// pass for an account whose provider this build does not know, and it is a Lucide glyph:
+    /// if it ever started resolving as a brand it would lose its tint and go invisible against
+    /// a matching theme.
+    #[test]
+    fn brand_marks_resolve_to_their_own_colours() {
+        let brands = [
+            ("brand-gdrive-symbolic", "brand-gdrive"),
+            ("brand-onedrive-symbolic", "brand-onedrive"),
+            ("brand-dropbox-symbolic", "brand-dropbox"),
+            ("brand-proton-drive-symbolic", "brand-proton-drive"),
+            ("brand-icloud-symbolic", "brand-icloud"),
+            ("brand-youtube-symbolic", "brand-youtube"),
+        ];
+        for (name, file) in brands {
+            assert_eq!(brand_file(name), Some(file), "`{name}` must map to `{file}`");
+            assert!(brand(name).is_some(), "`{name}` must resolve as a brand");
+            assert!(
+                !handle(name).symbolic,
+                "`{name}` renders symbolic — the theme tint would flatten the brand's colours"
+            );
+            let svg = std::str::from_utf8(lucide_bytes(file)).expect("a UTF-8 SVG");
+            assert!(svg.starts_with("<svg"), "`{file}` is not an SVG");
+            assert!(
+                !svg.contains("currentColor"),
+                "`{file}` paints with currentColor, which has no colour of its own on the \
+                 un-tinted path"
+            );
+            assert!(
+                svg.contains("fill=\"#") || svg.contains("stop-color=\"#"),
+                "`{file}` names no colour at all"
+            );
+            assert!(
+                svg.contains("Source: https://"),
+                "`{file}` must record where the official mark came from"
+            );
+            assert!(
+                svg.contains("viewBox=\"0 0 24 24\""),
+                "`{file}` must be a square 24x24 box, like every other bundled glyph"
+            );
+        }
+        // A Lucide glyph is not a brand and must keep its tint.
+        assert_eq!(brand_file("cloud-symbolic"), None);
+        assert!(handle("cloud-symbolic").symbolic, "a Lucide glyph must stay symbolic");
+        assert!(brand("emblem-ok-symbolic").is_none());
+        // An unmapped name is not a brand either (it falls through to the system theme).
+        assert!(brand("definitely-not-an-icon").is_none());
     }
 
     /// **One stroke weight across the toolbar set** (DRAGON-392): the bundled glyphs stroke at 2
