@@ -29,9 +29,11 @@
 //!   CSPRNG. Without it, any local process that can win the race to the loopback port has an
 //!   authorization code it can redeem, because a desktop app has no client secret to prove
 //!   with.
-//! * **The redirect listener binds `127.0.0.1:0`.** Loopback only, so nothing off this
-//!   machine can reach it, and a kernel-assigned port so two connects (or two copies of the
-//!   app) cannot collide.
+//! * **The redirect catcher binds LOOPBACK interfaces only** — `127.0.0.1:0` (a
+//!   kernel-assigned port, so two connects or two copies of the app cannot collide), plus
+//!   `[::1]` on the same port for the one provider whose URI is hosted `localhost`
+//!   (DRAGON-525: Windows resolves `localhost` to `::1` first). Nothing off this machine
+//!   can reach either socket.
 //! * **`state` is random and checked** ([`check_state`]). A request arriving at our port
 //!   with someone else's code is refused rather than exchanged.
 //! * **Only the first request LINE is read**, bounded at [`MAX_REQUEST_LINE`] bytes, with a
@@ -79,7 +81,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read as _, Write as _};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -703,19 +705,43 @@ pub fn redirect_policy(provider_id: &str) -> RedirectPolicy {
     }
 }
 
-/// A bound loopback listener plus the redirect URI that names it.
+/// Whether `policy` needs the redirect port bound on BOTH loopback families. Pure;
+/// unit-tested.
+///
+/// A URI hosted `localhost` reaches us over WHICHEVER loopback family the browser picks,
+/// and Windows resolves `localhost` to `::1` FIRST — Edge then shows "can't reach this
+/// page" rather than falling back to IPv4, which is exactly how the Dropbox connect died
+/// on Windows (DRAGON-525). An IP-LITERAL host can only ever arrive over IPv4, so those
+/// policies keep the single socket.
+fn binds_both_loopback_families(policy: RedirectPolicy) -> bool {
+    policy.host == "localhost"
+}
+
+/// A bound loopback catcher plus the redirect URI that names it.
 struct Redirect {
-    listener: TcpListener,
+    /// One listener per loopback FAMILY the browser might arrive over: `127.0.0.1` always,
+    /// plus `[::1]` on the SAME port where [`binds_both_loopback_families`] says the URI's
+    /// host demands it. See [`Redirect::bind`].
+    listeners: Vec<TcpListener>,
     uri: String,
 }
 
 impl Redirect {
     /// Bind a loopback port per `policy` and derive the redirect URI from it.
     ///
-    /// Always binds the loopback INTERFACE (`127.0.0.1`), whatever the policy's host spells:
-    /// the host is what the provider matches the URI against, and the interface is what the
-    /// socket listens on. Binding anything routable would expose the catcher to the network.
-    /// IPv4 only, because Microsoft states `[::1]` is not supported.
+    /// Always binds loopback INTERFACES, whatever the policy's host spells: the host is
+    /// what the provider matches the URI against, and the interface is what the socket
+    /// listens on. Binding anything routable would expose the catcher to the network.
+    ///
+    /// `127.0.0.1` is the primary bind and decides the port. For a `localhost`-hosted URI
+    /// the SAME port is also bound on `[::1]`, BEST-EFFORT (DRAGON-525): Windows resolves
+    /// `localhost` to `::1` first and Edge does not fall back to IPv4, so without the v6
+    /// socket the Dropbox redirect landed on a browser error page and the flow waited out
+    /// its deadline. Best-effort because IPv6 can be administratively disabled, and a
+    /// v4-only bind is exactly what shipped before — degrading beats refusing the flow.
+    /// Microsoft's "`[::1]` is not supported" statement is about the URI HOST, which this
+    /// does not change; the extra socket only widens what we LISTEN on, and only for the
+    /// provider whose URI names `localhost`.
     fn bind(policy: RedirectPolicy) -> Result<Redirect, String> {
         let listener = if policy.ports.is_empty() {
             TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| {
@@ -746,7 +772,18 @@ impl Redirect {
             .local_addr()
             .map_err(|e| format!("The local sign-in port could not be read back: {e}"))?
             .port();
-        Ok(Redirect { uri: format!("http://{}:{port}{REDIRECT_PATH}", policy.host), listener })
+        let mut listeners = vec![listener];
+        if binds_both_loopback_families(policy) {
+            match TcpListener::bind((Ipv6Addr::LOCALHOST, port)) {
+                Ok(v6) => listeners.push(v6),
+                // Log the SHAPE of the degrade, not a failure: the v4 catcher is up and the
+                // flow proceeds exactly as it did before the v6 socket existed.
+                Err(e) => log::debug!(
+                    "cloud oauth: no [::1] catcher on port {port} ({e}); IPv4 loopback only"
+                ),
+            }
+        }
+        Ok(Redirect { uri: format!("http://{}:{port}{REDIRECT_PATH}", policy.host), listeners })
     }
 
     /// Wait for the one request that matters, or until `deadline`.
@@ -773,56 +810,79 @@ impl Redirect {
     /// RFC by dropping `state` from an error redirect makes the user wait out the deadline
     /// instead of seeing "declined" at once, which is the right way round for the trade.
     fn wait(&self, expected_state: &str, deadline: Instant) -> Result<String, String> {
-        let _ = self.listener.set_nonblocking(true);
+        for listener in &self.listeners {
+            let _ = listener.set_nonblocking(true);
+        }
         while Instant::now() < deadline {
-            match self.listener.accept() {
-                Ok((mut stream, _peer)) => {
-                    // Back to blocking, with a read timeout: the connection is already
-                    // accepted, and a byte-at-a-time bounded read is simplest that way.
-                    let _ = stream.set_nonblocking(false);
-                    let Some(line) = read_request_line(&mut stream, deadline) else {
-                        respond(&mut stream, "400 Bad Request", NOT_FOUND_PAGE);
-                        continue;
-                    };
-                    match parse_redirect_request(&line) {
-                        RedirectRequest::Code { code, state } => {
-                            if check_state(expected_state, state.as_deref()).is_err() {
-                                respond(&mut stream, "400 Bad Request", DENIED_PAGE.as_str());
-                                log::debug!(
-                                    "cloud oauth: ignored a redirect carrying the wrong state"
-                                );
-                                continue;
-                            }
-                            respond(&mut stream, "200 OK", SUCCESS_PAGE.as_str());
-                            return Ok(code);
-                        }
-                        RedirectRequest::Denied { error, state } => {
-                            respond(&mut stream, "200 OK", DENIED_PAGE.as_str());
-                            if check_state(expected_state, state.as_deref()).is_err() {
-                                log::debug!(
-                                    "cloud oauth: ignored a refusal carrying the wrong state"
-                                );
-                                continue;
-                            }
-                            // The CODE is logged, never a description: it is a small closed
-                            // vocabulary and it is the whole diagnosis.
-                            log::debug!("cloud oauth: the sign-in was refused ({error})");
-                            return Err(denied_message(&error));
-                        }
-                        RedirectRequest::Other => {
-                            respond(&mut stream, "404 Not Found", NOT_FOUND_PAGE);
+            // Round-robin over the loopback families (DRAGON-525): the browser arrives on
+            // exactly one of them, and which one is the OS resolver's choice, not ours.
+            let mut accepted_any = false;
+            for listener in &self.listeners {
+                match listener.accept() {
+                    Ok((mut stream, _peer)) => {
+                        accepted_any = true;
+                        if let Some(outcome) =
+                            handle_redirect_connection(&mut stream, expected_state, deadline)
+                        {
+                            return outcome;
                         }
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        return Err(format!("The local sign-in port stopped working: {e}"));
+                    }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(ACCEPT_POLL);
-                }
-                Err(e) => {
-                    return Err(format!("The local sign-in port stopped working: {e}"));
-                }
+            }
+            if !accepted_any {
+                std::thread::sleep(ACCEPT_POLL);
             }
         }
         Err("The sign-in was not completed in time, so nothing was connected.".to_string())
+    }
+}
+
+/// Handle one accepted redirect connection: `Some(outcome)` ends the flow (a code, or a
+/// state-checked refusal), `None` means the connection was answered and the wait goes on.
+/// Split out of [`Redirect::wait`] when the catcher grew a second listener (DRAGON-525), so
+/// both loopback families run the exact same request handling; the state-gating rules are
+/// documented on `wait`.
+fn handle_redirect_connection(
+    stream: &mut TcpStream,
+    expected_state: &str,
+    deadline: Instant,
+) -> Option<Result<String, String>> {
+    // Back to blocking, with a read timeout: the connection is already accepted, and a
+    // byte-at-a-time bounded read is simplest that way.
+    let _ = stream.set_nonblocking(false);
+    let Some(line) = read_request_line(stream, deadline) else {
+        respond(stream, "400 Bad Request", NOT_FOUND_PAGE);
+        return None;
+    };
+    match parse_redirect_request(&line) {
+        RedirectRequest::Code { code, state } => {
+            if check_state(expected_state, state.as_deref()).is_err() {
+                respond(stream, "400 Bad Request", DENIED_PAGE.as_str());
+                log::debug!("cloud oauth: ignored a redirect carrying the wrong state");
+                return None;
+            }
+            respond(stream, "200 OK", SUCCESS_PAGE.as_str());
+            Some(Ok(code))
+        }
+        RedirectRequest::Denied { error, state } => {
+            respond(stream, "200 OK", DENIED_PAGE.as_str());
+            if check_state(expected_state, state.as_deref()).is_err() {
+                log::debug!("cloud oauth: ignored a refusal carrying the wrong state");
+                return None;
+            }
+            // The CODE is logged, never a description: it is a small closed
+            // vocabulary and it is the whole diagnosis.
+            log::debug!("cloud oauth: the sign-in was refused ({error})");
+            Some(Err(denied_message(&error)))
+        }
+        RedirectRequest::Other => {
+            respond(stream, "404 Not Found", NOT_FOUND_PAGE);
+            None
+        }
     }
 }
 
@@ -1793,6 +1853,17 @@ mod redirect_policy_tests {
         }
     }
 
+    /// DRAGON-525: exactly the `localhost`-hosted policy binds both loopback families. The
+    /// IP-literal policies stay single-socket: a URI naming `127.0.0.1` can only ever arrive
+    /// over IPv4, so a `[::1]` catcher there would be a listener nothing can reach.
+    #[test]
+    fn only_a_localhost_host_binds_both_loopback_families() {
+        assert!(binds_both_loopback_families(redirect_policy("dropbox")));
+        for id in ["gdrive", "onedrive"] {
+            assert!(!binds_both_loopback_families(redirect_policy(id)), "{id}");
+        }
+    }
+
     /// The URI a bound listener reports is the shape that has to be registered, ending in the
     /// path the parser insists on. A drift here is `redirect_uri_mismatch` at the provider.
     #[test]
@@ -2405,7 +2476,36 @@ mod loopback_tests {
     }
 
     fn port_of(redirect: &Redirect) -> u16 {
-        redirect.listener.local_addr().expect("a bound address").port()
+        redirect.listeners[0].local_addr().expect("a bound address").port()
+    }
+
+    /// DRAGON-525: a `localhost`-hosted redirect must answer over IPv6 loopback too, because
+    /// that is the family Windows resolves `localhost` to first (and Edge does not fall back).
+    /// A synthetic policy rather than `redirect_policy("dropbox")`, so the test never touches
+    /// the real fixed port pool a running daemon may hold. Skips quietly where the machine
+    /// has no `[::1]` at all — the bind is best-effort by design and the v4 path is covered
+    /// by every other test here.
+    #[test]
+    fn a_localhost_hosted_redirect_answers_over_ipv6_loopback() {
+        let policy = RedirectPolicy { host: "localhost", ports: &[] };
+        let redirect = Redirect::bind(policy).expect("a loopback port");
+        if redirect.listeners.len() < 2 {
+            eprintln!("skipping: no [::1] on this machine, the v6 catcher could not bind");
+            return;
+        }
+        let port = port_of(&redirect);
+        let sender = std::thread::spawn(move || {
+            // The knock arrives over ::1, the exact path the Windows browser takes.
+            let Ok(mut stream) = TcpStream::connect((Ipv6Addr::LOCALHOST, port)) else { return };
+            let _ = stream.write_all(b"GET /?code=V6-CODE&state=the-state HTTP/1.1\r\n\r\n");
+            let _ = stream.flush();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+        });
+        let got = redirect.wait("the-state", Instant::now() + Duration::from_secs(20));
+        sender.join().expect("the sender thread");
+        assert_eq!(got, Ok("V6-CODE".to_string()));
     }
 
     /// **The local denial-of-service this fixes** (DRAGON-482). The redirect port is on

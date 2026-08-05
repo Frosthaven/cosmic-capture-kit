@@ -716,7 +716,7 @@ impl ToolEntry {
     pub fn note(self, tool_name: &str) -> Option<String> {
         match self {
             ToolEntry::Ready => None,
-            ToolEntry::Install => Some(format!("Requires {tool_name} CLI")),
+            ToolEntry::Install => Some(format!("Requires {tool_name} CLI in PATH")),
             ToolEntry::Connected => Some("Already connected".to_string()),
         }
     }
@@ -2212,7 +2212,7 @@ fn provider_picker<'a>(
 ///
 /// Proton Drive is back in this list, and it is back because its answer is now FIXABLE. Its row
 /// wears one of [`ToolEntry`]'s three faces: an ordinary entry when its tool answered the probe,
-/// an entry captioned "Requires proton-drive CLI" whose press opens the download page instead of
+/// an entry captioned "Requires proton-drive CLI in PATH" whose press opens the download page instead of
 /// selecting it, and a captioned, unpressable entry when the provider's one account slot is
 /// already taken.
 ///
@@ -2487,13 +2487,16 @@ fn provider_title_row(spec: &'static ProviderSpec, title: String) -> Element<'st
 /// press did nothing they needed. [`external_browser_line`] replaces it with the two plain
 /// sentences the owner asked for, and the transition point is unchanged.
 ///
-/// **What that costs, stated rather than papered over**: the tool swallows a browser-launch
-/// failure (it spawns the opener detached and discards the error), and in `--json` mode it
-/// prints only the address, no instruction. So on a machine where the browser does not come up,
-/// the printed address was the one recovery, and this arm no longer shows it. The countdown
-/// still runs out and the step still ends with a failure the user can retry. Left as-is on the
-/// owner's call rather than improvised around; if that case is ever reported, the fix is a
-/// fallback affordance on the LATE side of the deadline, not the affordance back at the start.
+/// **The cost that trade named came due** (DRAGON-526). The tool swallows a browser-launch
+/// failure (it spawns the opener detached and discards the error), and on the owner's Windows
+/// machine it failed every time: the step sat on "Please sign in with your browser." over a
+/// browser that never came, the exact dead end the paragraph above this one predicted. The arm
+/// now shows the same [`sign_in_link_row`] the OAuth arm always shows, from the moment the URL
+/// lands, worded for the situation ("if your browser did not open."). The prescription had
+/// reserved this for the LATE side of the deadline, and a grace timer shipped first; the owner
+/// cut it in the same round ("no reason to delay"): what answers DRAGON-522's objection, a row
+/// reading as THE way in beside a browser already open, is the conditional wording, not a
+/// timer.
 fn cloud_browser_step<'a>(
     spec: &'static ProviderSpec,
     url: Option<&'a str>,
@@ -2510,6 +2513,15 @@ fn cloud_browser_step<'a>(
     // providers is dead weight here.
     if spec.auth.is_external_tool() {
         content = content.push(widget::text::body(external_browser_line(url.is_some())));
+        // The fallback DRAGON-522's trade reserved, cashed in by DRAGON-526 (owner report:
+        // on Windows the tool's own browser launch silently fails, and this step sat saying
+        // "sign in with your browser" over a browser that never came). It shows the moment
+        // the URL lands, with no grace delay (owner call, same round: "no reason to delay").
+        // The DRAGON-522 objection was a row that read as THE way in beside a browser
+        // already open; the conditional wording is what answers it now, not a timer.
+        if let Some(url) = url {
+            content = content.push(sign_in_link_row(url, copied, "if your browser did not open."));
+        }
         return browser_dialog(content, remaining_secs);
     }
     if url.is_none() {
@@ -2519,40 +2531,9 @@ fn cloud_browser_step<'a>(
         )));
     }
     if let Some(url) = url {
-        let theme = cosmic::theme::active();
-        let accent = theme::accent(&theme);
-        // "Click here" is the clickable span; the rest of the sentence rides in a separate,
-        // plain-colour `rich_text` span, and the copy icon sits between the two as a sibling
-        // in the row (a `Span` carries no room for an inline widget). This one sentence takes
-        // the place of the generic header sentence above (owner report: showing both read as
-        // a bug).
-        let click_span = cosmic::iced::widget::span("Click here").color(accent).link(());
-        let click_link = {
-            let url = url.to_string();
-            cosmic::iced::widget::rich_text([click_span])
-                .on_link_click(move |()| cm(CloudSettingsMsg::OpenBrowserUrl(url.clone())))
-        };
-        // The app's ONE copy control (`widgets::copy_button`, shared with the upload meter since
-        // DRAGON-520): while `copied` its glyph becomes a success-green tick and its tooltip
-        // reads "Copied!", reverting on its own once the flash window passes.
-        // ABOVE the QR code, so the tooltip drops UPWARD and never lands on the QR image below it.
-        let copy = copy_button(
-            copied,
-            2,
-            widget::tooltip::Position::Top,
-            cm(CloudSettingsMsg::CopyBrowserUrl(url.to_string())),
-        );
-        content = content.push(
-            widget::row::with_capacity(3)
-                .push(click_link)
-                .push(copy)
-                // NOT `subdued_caption`: the same "78%-toward-background, unreadable for real
-                // content" mistake already fixed twice elsewhere in this file (the
-                // app-registration notes, the provider-menu "not available yet" caption).
-                .push(widget::text::body("to sign in with your browser."))
-                .spacing(4.0)
-                .align_y(Alignment::Center),
-        );
+        // This one sentence takes the place of the generic header sentence above (owner
+        // report: showing both read as a bug).
+        content = content.push(sign_in_link_row(url, copied, "to sign in with your browser."));
     }
     // Directly under the link sentence, left-aligned like the rest (owner request), not above,
     // so the step never looks "already finished" before the link even renders (the first frame
@@ -2605,6 +2586,50 @@ fn browser_dialog<'a>(
         ))
 }
 
+/// The Browser step's "Click here" sentence: the clickable accent span that opens the sign-in
+/// page, the app's ONE copy control beside it, then `tail` finishing the sentence. ONE builder
+/// for both arms (DRAGON-526), so the OAuth step's row and the external-tool arm's late
+/// fallback cannot drift apart; only the tail differs ("to sign in with your browser." vs
+/// "if your browser did not open.").
+///
+/// "Click here" is the clickable span; the tail rides in a separate, plain-colour piece, and
+/// the copy icon sits between the two as a sibling in the row (a `Span` carries no room for an
+/// inline widget). The copy control is `widgets::copy_button` (shared with the upload meter
+/// since DRAGON-520): while `copied` its glyph becomes a success-green tick and its tooltip
+/// reads "Copied!", reverting on its own once the flash window passes; tooltip UPWARD, a
+/// leftover from when a QR image sat below (harmless, and still the clearer side). The tail is
+/// NOT `subdued_caption`: the same "78%-toward-background, unreadable for real content"
+/// mistake was already fixed twice elsewhere in this file.
+fn sign_in_link_row<'a>(url: &'a str, copied: bool, tail: &'static str) -> Element<'a, Msg> {
+    let theme = cosmic::theme::active();
+    let accent = theme::accent(&theme);
+    let click_span = cosmic::iced::widget::span("Click here").color(accent).link(());
+    let click_link = {
+        let url = url.to_string();
+        cosmic::iced::widget::rich_text([click_span])
+            .on_link_click(move |()| cm(CloudSettingsMsg::OpenBrowserUrl(url.clone())))
+    };
+    let copy = copy_button(
+        copied,
+        2,
+        widget::tooltip::Position::Top,
+        cm(CloudSettingsMsg::CopyBrowserUrl(url.to_string())),
+    );
+    widget::row::with_capacity(3)
+        .push(click_link)
+        .push(copy)
+        .push(widget::text::body(tail))
+        .spacing(4.0)
+        .align_y(Alignment::Center)
+        .into()
+}
+
+// A grace timer stood here for one commit (DRAGON-526 first shipped the fallback link on the
+// LATE side of the deadline, per the prescription DRAGON-522's doc had reserved). The owner
+// cut it in the same round: "no reason to delay". What answers DRAGON-522's objection (a row
+// reading as THE way in beside a browser already open) is the conditional wording, not a
+// timer, so the link now shows the moment the URL lands.
+
 /// What the Browser step says for a provider whose sign-in is run by an external TOOL. Pure;
 /// unit-tested (DRAGON-522, the owner's exact wording).
 ///
@@ -2613,8 +2638,9 @@ fn browser_dialog<'a>(
 /// moment is also the moment the browser opens, because the tool opens it itself immediately
 /// before printing the address, which is what makes the second sentence true when it appears.
 ///
-/// Neither phase offers a link, a copy control or a QR code. See [`cloud_browser_step`]'s doc for
-/// why, and for what the missing affordance would have been good for.
+/// Neither SENTENCE carries a link, a copy control or a QR code; since DRAGON-526 the link
+/// row joins the step separately, the moment the URL is known. See [`cloud_browser_step`]'s
+/// doc for the whole arc.
 pub fn external_browser_line(url_known: bool) -> &'static str {
     if url_known { EXTERNAL_SIGN_IN_READY } else { EXTERNAL_SIGN_IN_LAUNCHING }
 }
@@ -6733,6 +6759,9 @@ mod external_tool_tests {
         // "Requires", not "Install" (owner wording): the caption states the dependency, and
         // its accent styling plus the press are what say it is the link to go get it.
         assert!(note.starts_with("Requires"), "the caption names the dependency: {note}");
+        // "in PATH" (owner wording, DRAGON-526): WHERE the tool must be is the half a user
+        // who installed the wrong artifact was missing.
+        assert!(note.ends_with("in PATH"), "the caption says where the tool must be: {note}");
         assert_eq!(ToolEntry::Connected.note(tool_name).as_deref(), Some("Already connected"));
         assert_eq!(ToolEntry::Ready.note(tool_name), None, "a working row needs no explanation");
     }

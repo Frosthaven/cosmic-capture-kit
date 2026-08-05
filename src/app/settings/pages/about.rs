@@ -133,8 +133,14 @@ impl crate::app::App {
         // markdown, in the styling it has always had, so "what changed here" flows straight
         // into "everything that ever changed". It lives with the notes rather than the
         // Version row now, and shows exactly when they do.
+        //
+        // The blank line above the link (owner request, DRAGON-526 round): at the column's
+        // own 4px the link read as one more line of the notes; a spacer one text line tall
+        // separates "what changed here" from the link out. A Space rather than a bigger
+        // column spacing, so the heading keeps hugging its markdown.
+        let link_gap = widget::Space::new().height(Length::Fixed(16.0));
         Some(
-            widget::column(vec![heading.into(), block, view_patch_notes_link()])
+            widget::column(vec![heading.into(), block, link_gap.into(), view_patch_notes_link()])
                 .spacing(4.0)
                 .into(),
         )

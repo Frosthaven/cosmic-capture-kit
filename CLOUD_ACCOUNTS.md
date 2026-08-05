@@ -423,6 +423,13 @@ about `proton-drive`.
 
 #### Windows
 
+First, make sure you have the right file. The CLI download is a bare
+`proton-drive.exe`, and running it does nothing visible: it is not an
+installer, it IS the tool. If the file you downloaded is called something like
+`Proton Drive Setup 3.0.4.exe`, that is Proton's desktop sync app, a different
+product from the same site. Installing it will not give you the `proton-drive`
+command this app needs.
+
 Make a folder for it, for example `C:\Tools`, and put `proton-drive.exe` in it.
 Then add that folder to your PATH: open Settings, go to **System > About >
 Advanced system settings > Environment Variables**, select **Path** under **User
@@ -430,6 +437,9 @@ variables**, click **Edit**, click **New**, and type `C:\Tools`.
 
 Close and reopen any terminal you had open. Check it worked by running
 `proton-drive version` in a new one.
+
+If you would rather skip the PATH edit, you can instead drop `proton-drive.exe`
+into the folder this app's own exe lives in; the app checks there first.
 
 ### 3. Connect the account
 

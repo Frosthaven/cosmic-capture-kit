@@ -52,9 +52,18 @@ build:
     echo "==> Built: target/release/bundle/Cosmic Capture Kit.app"
 
 # Windows: build the MSI via scripts/win-package.ps1.
+#
+# Two Windows-only quirks, both hit on first run (DRAGON-524):
+# - `[extension('.ps1')]`: just saves a shebang recipe to an EXTENSIONLESS temp file, and
+#   `pwsh -File` refuses anything not named `*.ps1`. The attribute renames the temp.
+# - `#!pwsh.exe`, not `#!/usr/bin/env pwsh`: a shebang containing `/` makes just translate
+#   the path through `cygpath`, which only exists inside a Git-Bash/Cygwin PATH. A bare
+#   Windows program name skips the translation, so this runs from plain PowerShell too.
+#   This recipe is `[windows]`-gated, so the unix-style shebang buys nothing here.
 [windows]
+[extension('.ps1')]
 build:
-    #!/usr/bin/env pwsh
+    #!pwsh.exe
     # win-package.ps1 does build + bundle in one step, including setting
     # CARGO_TARGET_DIR=target-win itself (the dual-boot rule: never touch
     # target/, that is the shared tree's live Linux build). Ships unsigned,

@@ -524,7 +524,7 @@ pub(super) fn subtle_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a,
 
 /// Caption text in the accent tone, for a caption that IS a link's label: the press it sits
 /// on opens something, and the accent is what tells the eye so (owner call, DRAGON-485: the
-/// provider picker's "Requires proton-drive CLI" line opens Proton's install page).
+/// provider picker's "Requires proton-drive CLI in PATH" line opens Proton's install page).
 pub(super) fn accent_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Msg> {
     widget::text::caption(s)
         .class(cosmic::theme::Text::Custom(|t| {
