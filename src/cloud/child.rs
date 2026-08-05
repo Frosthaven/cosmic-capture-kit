@@ -203,7 +203,21 @@ pub fn run_cloud_upload(
         canceled.load(Ordering::Relaxed) || stopped_itself,
         uploaded.is_ok(),
     );
-    tray.finish(tray_ending(ending));
+    // **The tray does NOT end here** (DRAGON-522). It used to: `tray.finish` was called the
+    // moment the bytes stopped moving, which showed the tick, held it for `FINISH_HOLD` and
+    // removed the item, all BEFORE the share link the upload still owes. On Proton that link is
+    // a second process launch, seconds long, so the tray announced success and went while the
+    // editor's meter was still (correctly) waiting for the done state, and the two readouts of
+    // one upload ended seconds apart. Worse, the hold ran INSIDE that gap, delaying the link by
+    // four seconds for every provider.
+    //
+    // The rule now: the tray's terminal face is set once the session's terminal state is
+    // written, and never before. Every path below therefore ends with exactly one `tray.finish`.
+    //
+    // Nothing is drawn in between, deliberately: the item simply HOLDS whatever it last showed,
+    // which is the spinner for a transfer that never reported a midpoint and the last number for
+    // one that did. `tray::counter` is why that number is never "100" (it caps at 99 and answers
+    // `None` above it), so the tick stays the only thing that means finished, on both surfaces.
 
     if let Some(cleanup) = cancel_cleanup(ending) {
         // The user asked for this, from the tray or the editor: not a failure, and no desktop
@@ -220,6 +234,9 @@ pub fn run_cloud_upload(
             delete_remote_best_effort(&acct, &file.id);
         }
         session::write_state(session_id, &session::UploadState::Canceled);
+        // The state first, the tray second, as on every path below: a cancel holds no face at
+        // all, so this simply takes the item away.
+        tray.finish(tray_ending(ending));
         remove_staged(path);
         return Ok(());
     }
@@ -235,6 +252,10 @@ pub fn run_cloud_upload(
                 crate::diag::redact_oauth(&reason)
             );
             session::write_state(session_id, &session::UploadState::Failed);
+            // The cross, and its hold, AFTER the state the editor is waiting on and BEFORE the
+            // banner: the hold blocks (see `UploadTray::finish`), and neither the meter nor the
+            // notification should wait four seconds to hear how this ended.
+            tray.finish(tray_ending(ending));
             // The RECONNECT prefix comes off before the reason becomes banner copy. It earns
             // its place beside a Reconnect BUTTON, which is the settings page and nowhere
             // else; a banner has no button, so the words would label an affordance that is
@@ -304,6 +325,11 @@ pub fn run_cloud_upload(
             url: link.clone(),
         },
     );
+    // **The tick, at the same moment the meter learns the same thing** (DRAGON-522). This is the
+    // whole point of moving it down here: the tray and the editor now end together, however long
+    // the link above took, and the four-second hold this blocks for happens AFTER both readouts
+    // have their answer rather than in the middle of the upload's own tail.
+    tray.finish(tray_ending(ending));
 
     // The provider's own view url for the file, checked the same way the share link is: it
     // becomes the banner's click target when there is no share link, including when making

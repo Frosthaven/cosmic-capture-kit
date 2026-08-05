@@ -4287,6 +4287,7 @@ mod upload_preselect_tests {
             folder_name: None,
             added_at: String::new(),
             visibility: None,
+            destination: None,
         }
     }
 
@@ -4335,6 +4336,7 @@ mod accounts_for_kind_tests {
             folder_name: None,
             added_at: String::new(),
             visibility: None,
+            destination: None,
         }
     }
 

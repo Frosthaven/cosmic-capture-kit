@@ -33,7 +33,7 @@ Linux download yet. Every release names its architecture in the file itself,
 
 | Platform                                                 | Capture backend                     | Status  | Notes                                                     |
 | -------------------------------------------------------- | ----------------------------------- | ------- | --------------------------------------------------------- |
-| macOS 13+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      | aarch64 only. Intel Macs are not supported.                |
+| macOS 14+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      | aarch64 only. Intel Macs are not supported.                |
 | Windows 11                                               | Windows Capture                     | ✅      | x86_64 only.                                              |
 | Windows 10                                               | Windows Capture                     | ✅      | x86_64. Reported working, but we do not provide official support. |
 | Linux (Wayland): COSMIC                                  | Cosmic Compositor / PipeWire Portal | ✅      | x86_64, built from source for now.                        |
@@ -50,7 +50,7 @@ available APIs - clever recompositing tricks are required.
 
 | Platform                                                 | Freeze Pixels for Region Select | Toggle Mouse Cursor | Toggle Window Transparency | Toggle Wallpaper | Single Window Aesthetics (neon border, etc) |
 | -------------------------------------------------------- | ------------------------------- | ------------------- | -------------------------- | ---------------- | ------------------------------------------- |
-| macOS 13+ (Apple Silicon)                                | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
+| macOS 14+ (Apple Silicon)                                | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
 | Windows 11                                               | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
 | Linux (Wayland): COSMIC                                  | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
 | Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
@@ -104,7 +104,7 @@ along with their statuses.
 | Recording controls: Mouse click effects             | 📅      |
 | Recording controls: Keypress overlay                | ❓      |
 | Recording controls: Live annotation tools           | ❓      |
-| Cloud account support: Proton Drive                 | 📅      |
+| Cloud account support: Proton Drive                 | ✅      |
 | Cloud account support: OneDrive                     | ✅      |
 | Cloud account support: Google Drive                 | ✅      |
 | Cloud account support: Dropbox                      | ✅      |
@@ -201,9 +201,11 @@ first time if you were expecting a normal application window.
 
 See [CLI.md](CLI.md) for the full flag list.
 
-Want to upload captures straight to Google Drive, OneDrive, Dropbox or
-YouTube? A build made from source needs one extra, one-time setup step per
-provider. See [CLOUD_ACCOUNTS.md](CLOUD_ACCOUNTS.md) for plain, step-by-step
+Want to upload captures straight to Google Drive, OneDrive, Dropbox, YouTube or
+Proton Drive? A build made from source needs one extra, one-time setup step per
+provider, and Proton Drive needs one on every build (it connects through
+Proton's own free command-line tool rather than through an app registration).
+See [CLOUD_ACCOUNTS.md](CLOUD_ACCOUNTS.md) for plain, step-by-step
 instructions.
 
 #### Install from source

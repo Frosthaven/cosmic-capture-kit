@@ -29,6 +29,19 @@ build:
     # directly: only Gatekeeper on ANOTHER machine cares about signing, and a
     # locally-copied, non-quarantined .app is not gated by it. Never
     # notarizes here; that needs Apple credentials and is a release-only step.
+    #
+    # Bake the cloud client ids from the same GitHub repository variables
+    # release.yml uses (see the Linux recipe's comment for the full why).
+    # Needs an authenticated `gh`; silently unbaked without one.
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        for v in CCK_BAKED_GDRIVE_CLIENT_ID CCK_BAKED_GDRIVE_CLIENT_SECRET CCK_BAKED_ONEDRIVE_CLIENT_ID CCK_BAKED_DROPBOX_CLIENT_ID; do
+            if [ -z "${!v:-}" ]; then
+                val="$(gh variable get "$v" 2>/dev/null || true)"
+                [ -n "$val" ] && export "$v=$val"
+            fi
+        done
+        echo "==> Baked cloud ids from GitHub repository variables"
+    fi
     if security find-identity -v -p codesigning 2>/dev/null | grep -q "Developer ID Application"; then
         echo "==> Developer ID identity found; building signed."
         ./scripts/mac-package.sh --build --icns --bundle --sign
@@ -41,12 +54,26 @@ build:
 # Windows: build the MSI via scripts/win-package.ps1.
 [windows]
 build:
+    #!/usr/bin/env pwsh
     # win-package.ps1 does build + bundle in one step, including setting
     # CARGO_TARGET_DIR=target-win itself (the dual-boot rule: never touch
     # target/, that is the shared tree's live Linux build). Ships unsigned,
     # same as win-package.ps1 always has, since no code-signing cert exists yet.
+    #
+    # Bake the cloud client ids from the same GitHub repository variables
+    # release.yml uses (see the Linux recipe's comment for the full why).
+    # Needs an authenticated `gh`; silently unbaked without one.
+    if ((Get-Command gh -ErrorAction SilentlyContinue) -and ($(gh auth status 2>$null; $?))) {
+        foreach ($v in @('CCK_BAKED_GDRIVE_CLIENT_ID','CCK_BAKED_GDRIVE_CLIENT_SECRET','CCK_BAKED_ONEDRIVE_CLIENT_ID','CCK_BAKED_DROPBOX_CLIENT_ID')) {
+            if (-not (Get-Item "env:$v" -ErrorAction SilentlyContinue)) {
+                $val = (gh variable get $v 2>$null)
+                if ($val) { Set-Item "env:$v" $val }
+            }
+        }
+        Write-Host '==> Baked cloud ids from GitHub repository variables'
+    }
     pwsh scripts/win-package.ps1
-    @echo "Built: target-win\CosmicCaptureKit-*.msi"
+    Write-Host 'Built: target-win\CosmicCaptureKit-*.msi'
 
 # Linux: plain release build, retrying without zero-copy if the first attempt fails.
 [linux]
@@ -58,6 +85,23 @@ build:
     # headers); on failure, most likely an older distro's ffmpeg, retries
     # with --no-default-features rather than leaving you to guess why it
     # died inside ffmpeg-sys-next.
+    #
+    # Bake the cloud client ids into the binary by reading the SAME GitHub
+    # repository variables release.yml bakes from, so a local `just build` and
+    # an official artifact carry identical credentials and no launch path can
+    # lose them to a stale session environment. Needs an authenticated `gh`;
+    # without one the build proceeds unbaked, exactly as before this existed.
+    # An already-exported CCK_BAKED_* wins over the fetch. YouTube is
+    # deliberately never baked, matching the release policy.
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+        for v in CCK_BAKED_GDRIVE_CLIENT_ID CCK_BAKED_GDRIVE_CLIENT_SECRET CCK_BAKED_ONEDRIVE_CLIENT_ID CCK_BAKED_DROPBOX_CLIENT_ID; do
+            if [ -z "${!v:-}" ]; then
+                val="$(gh variable get "$v" 2>/dev/null || true)"
+                [ -n "$val" ] && export "$v=$val"
+            fi
+        done
+        echo "==> Baked cloud ids from GitHub repository variables"
+    fi
     echo "==> Building (default features)..."
     if cargo build --release; then
         echo "==> Built: target/release/cosmic-capture-kit"

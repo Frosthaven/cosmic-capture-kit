@@ -61,6 +61,20 @@ numbers, so re-verify before relying on one for a release decision.
   and a refused host is logged by name so a new legitimate one is
   self-diagnosing.
 
+## Proton Drive (via the official proton-drive CLI)
+
+- No API registration of ours exists, so no quotas, reviews, or user caps on
+  our side at all: the app drives Proton's own MIT-licensed CLI, and every
+  operation happens as the user's own account under their storage plan.
+- The CLI holds exactly ONE session (a second `auth login` evicts the first),
+  which is why the app caps Proton at one connected account.
+- Upload progress comes from the CLI's `--verbose` line log while piped; the
+  progress sink itself is a no-op without a TTY, so the verbose log is the
+  mechanism, not the drawn progress bar (verified live 2026-08-04).
+- Breakage risk is version-coupled to the CLI, which Proton maintains through
+  their own crypto migrations; the app's probe shows the install-guidance
+  state whenever the tool is missing or broken.
+
 ## Dropbox
 
 - Apps start in development status: at most 500 linked users, and, sharper

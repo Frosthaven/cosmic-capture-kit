@@ -1,4 +1,4 @@
-# Setting up Cloud Accounts (Google Drive, OneDrive, Dropbox, YouTube)
+# Setting up Cloud Accounts (Google Drive, OneDrive, Dropbox, YouTube, Proton Drive)
 
 **Do you need this guide?**
 
@@ -6,6 +6,10 @@
   the box. Open Settings, go to Cloud Accounts, and press Connect.
 - **YouTube, any build**: yes. YouTube needs your own registration even in the
   official app, for a quota reason explained in its section below.
+- **Proton Drive, any build**: yes, but it is a different kind of step. Proton
+  has no app registration to make. Instead you install Proton's own free
+  command-line tool once, and the app uses it. The Proton Drive section below
+  has the download and the steps.
 - **Any provider, a build you made yourself from source**: yes, for each
   provider you want to use.
 
@@ -16,6 +20,13 @@ instead of a list, and each provider appears in the list as soon as its
 environment variable is set and the app is restarted. Nothing is hidden
 permanently, and there is no setting to toggle: a provider is listed exactly
 when it can actually be connected.
+
+Proton Drive is the one exception, and it is listed differently on purpose. It
+is always in the list, whatever your build. If its tool is not installed yet,
+the row says "Install proton-drive CLI" underneath the name, and clicking it
+opens the download page instead of starting a sign-in. Install the tool, open
+the list again, and the row becomes an ordinary one you can connect. Nothing
+about your build decides this, so nothing about it could be hidden from you.
 
 ## Why this extra step exists
 
@@ -52,9 +63,10 @@ For each provider you want to use, you will:
    piece of text your computer can hand to a program when it starts).
 4. Restart the app and try Connect again.
 
-Below are the exact steps for each provider. Proton Drive and iCloud are not
-supported yet (neither offers an official way for outside apps to connect), so
-they are not in this list, and the app does not offer them either.
+Below are the exact steps for each provider. Proton Drive does not work this
+way at all (there is no id to copy and no variable to set), so it has its own
+section further down. iCloud is still not supported: Apple offers no official
+way for outside apps to connect to it, so the app does not offer it either.
 
 ## One folder, on every provider
 
@@ -73,6 +85,9 @@ Each provider enforces that a different way, which is why the steps below differ
   under `Apps/` IS the whole of what its sign-in can reach.
 - **YouTube**: no folders exist there, so there is nothing to sandbox. It has
   its own scope, covered in its section.
+- **Proton Drive**: the app creates the folder itself, in My files, and only
+  ever writes there. Proton Drive also lets you send captures to a photo album
+  instead; see its section below.
 
 Because two of the three name that folder after your app REGISTRATION, name
 your registrations "Cosmic Capture Kit" as you create them if you want the
@@ -335,6 +350,144 @@ put the review turnaround at several weeks. Until your project is reviewed,
 test with Private/Unlisted expectations in mind, or ask a teammate with an
 already-reviewed project to set up the client for you.
 
+## Proton Drive
+
+Proton Drive is the one provider that needs no registration, no id and no
+environment variable. It also does not have a public API for other apps to use.
+What it has instead is an official, free command-line tool that Proton
+publishes and maintains, called `proton-drive`. You install that once, and this
+app talks to it.
+
+That is the whole difference. Once the tool is installed, connecting is the
+same two clicks as any other provider.
+
+### 1. Download the tool
+
+Go to [proton.me/support/drive-cli](https://proton.me/support/drive-cli) and
+download the build for your computer. It is a single file, about 120 MB,
+because everything it needs is inside it.
+
+### 2. Put it somewhere your computer can find it
+
+Your computer finds programs by looking through a list of folders called your
+PATH. The tool has to be in one of them, under the name `proton-drive`, or this
+app cannot start it.
+
+#### Linux
+
+On Arch and Arch-based systems (including CachyOS and EndeavourOS), the easiest
+route is the AUR package `proton-drive-cli-bin`, which installs Proton's own
+official checksummed build for you and puts it on your PATH:
+
+```sh
+yay -S proton-drive-cli-bin
+```
+
+Use whichever AUR helper you have; `paru -S proton-drive-cli-bin` does the same.
+
+Anywhere else, download the Linux build and install it by hand. `~/.local/bin`
+is on the PATH on most modern distributions:
+
+```sh
+mkdir -p ~/.local/bin
+mv ~/Downloads/proton-drive ~/.local/bin/proton-drive
+chmod +x ~/.local/bin/proton-drive
+```
+
+That `chmod +x` line is not optional. A downloaded file arrives without
+permission to run, and without it the app will keep saying the tool is not
+installed. Check it worked by opening a new terminal and running
+`proton-drive version`.
+
+#### macOS
+
+Download the macOS build, then in Terminal:
+
+```sh
+mkdir -p ~/.local/bin
+mv ~/Downloads/proton-drive ~/.local/bin/proton-drive
+chmod +x ~/.local/bin/proton-drive
+```
+
+If `~/.local/bin` is not on your PATH, add it by putting this line in
+`~/.zshrc` and opening a new terminal:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+macOS will refuse to run a downloaded program the first time. If you see a
+warning about an unidentified developer, open **System Settings > Privacy &
+Security**, scroll to the bottom, and click **Open Anyway** next to the message
+about `proton-drive`.
+
+#### Windows
+
+Make a folder for it, for example `C:\Tools`, and put `proton-drive.exe` in it.
+Then add that folder to your PATH: open Settings, go to **System > About >
+Advanced system settings > Environment Variables**, select **Path** under **User
+variables**, click **Edit**, click **New**, and type `C:\Tools`.
+
+Close and reopen any terminal you had open. Check it worked by running
+`proton-drive version` in a new one.
+
+### 3. Connect the account
+
+Open Settings, go to Cloud Accounts, press **Add cloud account**, and choose
+**Proton Drive**. There is no need to restart the app after installing the
+tool: it looks for it each time you open that list, so if the row still says
+"Install proton-drive CLI", close the list and open it again. If it still says
+it, the tool is not on your PATH yet; go back to step 2.
+
+Press **Connect**. The app asks the tool to start a sign-in, and the tool opens
+your browser at Proton's own sign-in page. If no browser appears, the app also
+shows the address as a link you can click or copy. Sign in as you normally
+would, including any two-factor step, then come back to the app. Proton handles
+the whole sign-in itself; this app never sees your password, and nothing about
+your sign-in is stored by this app: the tool keeps it, in your system keyring.
+
+### 4. Choose where captures go
+
+The setup step that follows has two tabs:
+
+- **Files** is the ordinary folder browser, exactly like the other providers.
+  Where you are is where your captures go.
+- **Photos** sends captures to a photo album instead, so screenshots land in
+  Proton Drive's photo section rather than as loose files. Albums do not have
+  folders inside them, so this tab is a flat list: click an album to choose it,
+  and a tick appears on the row. The + button makes a new album.
+
+Whichever tab you are on when you press Done is the one the account uses. An
+album called "Cosmic Capture Kit" is made for you the first time, so there is
+always something chosen. You can come back and change any of this later with
+the gear button on the account's row, which reopens on the tab you were using.
+
+### One Proton account at a time
+
+This app allows one connected Proton Drive account, and that is a limit of the
+tool rather than a choice. The tool stores a single sign-in, so signing in as a
+second account would replace the first one, and the first account would quietly
+stop working with nothing on screen explaining why. So while you have a Proton
+account connected, its row in the Add cloud account list says "Already
+connected" and cannot be picked. Disconnect the one you have if you want to use
+a different account.
+
+Reconnecting an account you already have is unaffected, and is what to press if
+the row ever asks for it.
+
+### Two things worth knowing
+
+**There is no upload percentage.** The tool does not report progress when
+another program is driving it, so the app shows a spinner for a Proton upload
+instead of a bar filling up. Everything else behaves the same: it still tells
+you when it finishes, still copies the link, and the undo still works.
+
+**The tool has crash reporting built in.** Proton's official builds of
+`proton-drive` include Sentry crash reporting, switched off unless telemetry is
+turned on, which the current release never does. That is Proton's own tool
+making its own choice about its own program; this app neither enables nor uses
+it, and sends nothing itself.
+
 ## Setting the environment variable
 
 An environment variable is just a named piece of text your computer keeps
@@ -456,7 +609,22 @@ the app, before the new value is visible.
 - **A provider is missing from the Add cloud account list**: this build has no
   registration for it, which for YouTube is normal and expected on every build.
   Set its variable somewhere permanent (see "Setting the environment variable"
-  above), restart the app, and it appears in the list.
+  above), restart the app, and it appears in the list. Proton Drive is never
+  missing; see the next entry.
+- **Proton Drive says "Install proton-drive CLI"**: the app cannot find the
+  tool. Either it is not installed, or it is not on your PATH under the name
+  `proton-drive`, or (on macOS and Linux) it does not have permission to run.
+  Open a new terminal and run `proton-drive version`: if that fails, the app
+  will fail the same way. Go back to the Proton Drive section, step 2, and
+  check the `chmod +x` line in particular. Open the provider list again
+  afterwards and the app rechecks; you do not have to restart it.
+- **Proton Drive says "Already connected" and cannot be picked**: this is
+  working as intended. The tool holds one sign-in, so a second account would
+  replace the first. Disconnect the account you have if you want a different
+  one, or press Reconnect on its row if that is what you meant.
+- **A Proton upload shows a spinner instead of a percentage**: also working as
+  intended. The tool reports no progress to another program, so a made-up
+  percentage would be worse than an honest spinner.
 - **"No cloud drives are set up" instead of a list**: none of the variables are
   visible to the app, which is the usual state of a build made from source
   before any setup. The dialog links to this guide. If you HAVE set them, they

@@ -90,6 +90,15 @@ pub mod oauth;
 pub mod providers;
 pub mod upload;
 
+/// Proton Drive (DRAGON-485), which connects through Proton's own official `proton-drive`
+/// command-line tool rather than through an API of ours.
+///
+/// It sits beside [`oauth`] for the same reason that does: it is the whole way one provider is
+/// reached, not one provider's REST calls. Where the other four speak OAuth over [`http`], this
+/// one spawns a child process, so this module is the seam that finds the tool, decides whether
+/// it is usable, and turns its exit codes into this app's `Result<T, String>` vocabulary.
+pub mod proton;
+
 /// Cross-process upload progress/cancellation (DRAGON-490): the marker files that let a
 /// detached upload child and the editor that started it exchange progress, outcome and a
 /// cancel request without either one holding a handle to the other.
@@ -302,8 +311,30 @@ pub enum AuthKind {
         /// then nothing extra is sent. Empty for every provider that declares no secret.
         baked_client_secret: &'static str,
     },
-    /// No official API to connect to. The provider is listed and named, and connecting is
-    /// refused with an explanation.
+    /// Connected through an EXTERNAL TOOL the provider itself publishes, rather than through an
+    /// API of ours (DRAGON-485; Proton Drive today).
+    ///
+    /// The provider has no third-party API, so there is no client id to resolve and no browser
+    /// flow for [`oauth`] to run. What there is instead is a first-party command-line tool that
+    /// owns the sign-in, the session and the transfers, which this app finds and spawns.
+    ///
+    /// **Availability is a RUNTIME question here, not a build-time one**, and that is the whole
+    /// reason this is its own variant rather than an `OAuthPkce` with empty endpoints. Every
+    /// other provider either has a registration baked in or does not, decided once at compile
+    /// time by [`provider_available`]. This one depends on whether the user has installed the
+    /// tool, which can change between two openings of the settings page, so the picker probes
+    /// for it and offers install guidance instead of hiding the row.
+    ExternalTool {
+        /// Where the user gets it, opened when the row is selected and the tool is not there.
+        download_url: &'static str,
+        /// What to call it in the "install this" line, spelled as the command a user types.
+        tool_name: &'static str,
+    },
+    /// No official API and no official tool either. The provider is listed and named, and
+    /// connecting is refused with an explanation.
+    ///
+    /// iCloud Drive alone since DRAGON-485. Proton Drive was here until Proton shipped the
+    /// official CLI that [`Self::ExternalTool`] now reaches it through.
     Unofficial,
 }
 
@@ -316,13 +347,25 @@ impl AuthKind {
     /// **Test-only since DRAGON-508**, and kept deliberately rather than deleted. It used to be
     /// the picker's filter; the picker now asks the stronger question ([`provider_available`]:
     /// does a client id resolve), which this no longer adds anything to at a call site. What it
-    /// still states precisely is "this provider has an API at all", which is the invariant
+    /// still states precisely is "this provider can be connected at all", which is the invariant
     /// three test modules pin against the registry (every connectable provider has ops, has
     /// endpoints, claims no capability it cannot reach). Deleting it would leave those tests
-    /// spelling `matches!(spec.auth, AuthKind::OAuthPkce { .. })` in three places.
+    /// spelling the `matches!` in three places.
+    ///
+    /// [`Self::ExternalTool`] counts as connectable, because it can be: the tool signs the user
+    /// in. Whether it is INSTALLED is a different question, asked at runtime; see that variant.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_connectable(&self) -> bool {
-        matches!(self, AuthKind::OAuthPkce { .. })
+        matches!(self, AuthKind::OAuthPkce { .. } | AuthKind::ExternalTool { .. })
+    }
+
+    /// Whether this provider is reached by spawning a tool rather than by calling an API. Pure;
+    /// unit-tested.
+    ///
+    /// Named so the picker and the connect path ask one question instead of each matching the
+    /// variant, and so a second external-tool provider needs no new call sites.
+    pub fn is_external_tool(&self) -> bool {
+        matches!(self, AuthKind::ExternalTool { .. })
     }
 }
 
@@ -357,6 +400,20 @@ pub struct ProviderSpec {
     /// as Drive's today only because `CLOUD_ACCOUNTS.md` asks both registrations to carry this
     /// app's name. Renaming one registration is then an edit to one row here and to nothing else.
     pub app_folder_path: &'static [&'static str],
+    /// Where this provider keeps PHOTO ALBUMS, if it has a second, album-shaped destination
+    /// beside its folders (DRAGON-485). One segment per level, outermost first, exactly like
+    /// [`Self::app_folder_path`].
+    ///
+    /// EMPTY for every provider whose only destination is a folder, which is all of them except
+    /// Proton Drive. That emptiness is the CAPABILITY: a screen asks whether this row has an
+    /// album root, never whether the account's provider happens to be the one that does, so the
+    /// setup step's Files/Photos tabs appear for exactly the providers that have both.
+    ///
+    /// **Albums are FLAT and folders are not**, which is why this is a separate field rather
+    /// than a second entry in the path above: there is nothing to descend into, so the picker
+    /// built on it selects rather than navigates. `cloud::proton`'s [`proton::PHOTOS`] doc
+    /// carries the whole of that reasoning and the instruction not to unify the two models.
+    pub album_root: &'static [&'static str],
     /// The hosts a SHARE or web-view link for an uploaded file may be on (DRAGON-482).
     ///
     /// A share link is provider output, and it becomes a notification's click target and a
@@ -424,6 +481,8 @@ pub fn registry() -> &'static [ProviderSpec] {
             // mechanism a user is meant to find. THE SAME NAME `gdrive::ensure_root_folder`
             // creates, single-sourced through the constant so the row and the folder cannot drift.
             app_folder_path: &[APP_FOLDER],
+            // No album destination: Drive has folders and nothing else.
+            album_root: &[],
             // A Drive `webViewLink` is on `drive.google.com`; a Docs-converted item is on
             // `docs.google.com`. Nothing else is a Drive file view.
             web_hosts: &["drive.google.com", "docs.google.com"],
@@ -482,6 +541,7 @@ pub fn registry() -> &'static [ProviderSpec] {
             // Graph provisions `Apps/<the registration's display name>` and hands it back as
             // `special/approot`. The leaf is the REGISTRATION's, not ours; see the field's doc.
             app_folder_path: &[APPS_CONTAINER, APP_FOLDER],
+            album_root: &[],
             // A personal-account share link is a `1drv.ms` short link or an
             // `onedrive.live.com` view; a work/school one is on the tenant's SharePoint host,
             // hence the leading-dot SUFFIX, which a lookalike `evilsharepoint.com` cannot
@@ -534,6 +594,7 @@ pub fn registry() -> &'static [ProviderSpec] {
             // An App-folder registration's token has that folder as its own root, and Dropbox
             // files it under `Apps/<the app's name>` in the user's account, same as Graph.
             app_folder_path: &[APPS_CONTAINER, APP_FOLDER],
+            album_root: &[],
             // A shared link is on `www.dropbox.com`; `db.tt` is Dropbox's own short-link
             // domain, which older links and some clients still produce.
             web_hosts: &["www.dropbox.com", "dropbox.com", "db.tt"],
@@ -599,6 +660,8 @@ pub fn registry() -> &'static [ProviderSpec] {
             // tree. A row for this account names no destination at all (DRAGON-495/501), rather
             // than inventing a folder that cannot exist.
             app_folder_path: &[],
+            // A channel is not a folder and it is not an album either.
+            album_root: &[],
             // `youtu.be` is YouTube's own short-link domain; `www.youtube.com/watch?v=<id>` is
             // the ordinary long form `providers::youtube::create_share_link` builds. Neither is
             // reported back by the API (there is no `webViewLink`-equivalent field), so both are
@@ -610,24 +673,48 @@ pub fn registry() -> &'static [ProviderSpec] {
             id: "proton",
             display_name: "Proton Drive",
             icon: "brand-proton-drive-symbolic",
-            // Everything false: with no official API there is nothing to claim. The caps
-            // are what the settings page reads to explain the state, so they must not
-            // promise an ability the connect path cannot reach.
+            // Every row here was established by READING the official tool's source rather than
+            // by trying an account (DRAGON-485); `cloud::proton`'s module doc records which
+            // command backs each one.
             caps: ProviderCaps {
-                folder_browse: false,
-                share_links: false,
+                // `filesystem list <path> --json` lists a level, so the ordinary folder step
+                // works with no Proton-shaped special case.
+                folder_browse: true,
+                // `sharing set-url <path> --json` creates or updates a public link.
+                share_links: true,
+                // The tool DOES take an `--expiration`, so this is the one cap here that is
+                // false out of caution rather than out of absence: it could not be confirmed
+                // that Proton offers link expiry on a free plan, and the house rule (see Drive
+                // and Dropbox above, both false for exactly this reason) is that a capability
+                // is not promised until it is known to hold for everyone. Flip it with
+                // evidence, not with the flag's existence.
                 link_expiry: false,
-                delete_recoverable: false,
+                // `filesystem trash` moves an item to Proton's trash and `filesystem restore`
+                // brings it back. Proton is the SECOND provider here that can honestly promise
+                // that, after OneDrive, which is why the delete confirmation's copy keys on
+                // this capability rather than on a provider id.
+                delete_recoverable: true,
                 max_file_bytes: None,
-                accepts_images: false,
-                accepts_videos: false,
+                // A general file-storage drive: either kind of capture belongs here.
+                accepts_images: true,
+                accepts_videos: true,
                 visibility: false,
             },
-            auth: AuthKind::Unofficial,
-            // Nothing to connect, so nothing lands anywhere and there is no path to name.
-            app_folder_path: &[],
-            // Nothing to connect and nothing to link, so nothing is reachable.
-            web_hosts: &[],
+            auth: AuthKind::ExternalTool {
+                download_url: proton::DOWNLOAD_URL,
+                tool_name: proton::TOOL_NAME,
+            },
+            // The tool addresses everything by path, and `/my-files` is the root of a user's own
+            // files; the leaf is an ordinary folder this app creates, exactly as on Google
+            // Drive, since Proton has no app-folder mechanism either.
+            app_folder_path: &[proton::MY_FILES, APP_FOLDER],
+            // **The only non-empty one** (DRAGON-485). A Proton drive keeps its albums in a
+            // top-level section of their own, separate from the photo timeline, and they are
+            // FLAT: the leaf is the album itself, chosen per account, so only the section is
+            // named here.
+            album_root: &[proton::ALBUMS],
+            // A Proton share link is on the Drive web app's own host.
+            web_hosts: &["drive.proton.me"],
         },
         ProviderSpec {
             id: "icloud",
@@ -645,6 +732,7 @@ pub fn registry() -> &'static [ProviderSpec] {
             },
             auth: AuthKind::Unofficial,
             app_folder_path: &[],
+            album_root: &[],
             web_hosts: &[],
         },
     ]
@@ -699,6 +787,80 @@ pub fn save_path(provider_id: &str, subfolder: Option<&str>) -> Option<String> {
         path.push_str(name);
     }
     Some(path)
+}
+
+/// Whether this provider offers an ALBUM destination beside its folders (DRAGON-485). Pure;
+/// unit-tested.
+///
+/// The capability behind [`ProviderSpec::album_root`], named so a screen asks one question
+/// rather than testing a slice for emptiness in four places. `false` for every provider whose
+/// only destination is a folder, which is the setup step's ordinary case: no tabs, one browser.
+pub fn has_albums(spec: &ProviderSpec) -> bool {
+    !spec.album_root.is_empty()
+}
+
+/// Where an ALBUM destination is, written as the path a user could follow. Pure; unit-tested.
+///
+/// [`save_path`]'s sibling for the other kind of destination, and deliberately a separate
+/// function rather than an argument to it: an album is not a level of the file tree, so nothing
+/// about it goes through [`folder_path_segments`], and there is no root-collapse rule to apply
+/// because there is no root. `album` is the account's stored `folder_name`, which in this mode
+/// names the album; a blank or absent one reads as [`APP_FOLDER`], the album this app finds or
+/// creates on first use.
+///
+/// **A DISPLAY path, built from the album's NAME**, which is what a reader can act on. Not to be
+/// confused with `proton::album_path`, which addresses an album by its UID because that is what
+/// the tool needs and what an account stores in its `folder_id`. Two functions because they
+/// answer two questions; the name is what a row shows and the uid is what a command takes.
+///
+/// `None` for a provider with no album root at all, which is every provider but one.
+pub fn album_save_path(provider_id: &str, album: Option<&str>) -> Option<String> {
+    let segments = provider(provider_id)?.album_root;
+    if segments.is_empty() {
+        return None;
+    }
+    let mut path = String::new();
+    for segment in segments {
+        path.push('/');
+        path.push_str(segment);
+    }
+    let leaf = album.map(str::trim).filter(|name| !name.is_empty()).unwrap_or(APP_FOLDER);
+    path.push('/');
+    path.push_str(leaf);
+    Some(path)
+}
+
+/// Where THIS ACCOUNT's uploads land, whichever kind of destination it holds. Pure;
+/// unit-tested.
+///
+/// **The ONE builder every surface that names a destination should call** (DRAGON-485). It was
+/// [`save_path`] until a provider gained a second kind of destination; that function still
+/// answers the folder question and is still what this delegates to, but a screen must not have
+/// to remember that an account can be pointed at an album instead, which is exactly the kind of
+/// per-provider knowledge the capability table exists to keep out of the UI.
+///
+/// `None` for a provider with no destination to name at all (YouTube, and a provider this build
+/// has never heard of), which is [`save_path`]'s own rule unchanged.
+pub fn account_save_path(account: &accounts::CloudAccount) -> Option<String> {
+    if uploads_to_album(account) {
+        return album_save_path(&account.provider, account.folder_name.as_deref());
+    }
+    save_path(&account.provider, account.folder_name.as_deref())
+}
+
+/// Whether this account's uploads go to an ALBUM rather than to a folder. Pure; unit-tested.
+///
+/// **The capability is checked FIRST, and that ordering is the point.** `cloud_accounts.toml`
+/// is ordinary config a user may hand-edit, so `destination = "photos"` can appear on an
+/// account whose provider has no albums at all. That has to read as the folder the account
+/// really still has, not as a destination nothing could deliver to; the stored kind selects
+/// between two real answers, it never invents one.
+///
+/// The one question the upload path and the settings row both ask, so a capture cannot land
+/// somewhere other than where the row says it will.
+pub fn uploads_to_album(account: &accounts::CloudAccount) -> bool {
+    account.destination_kind() == accounts::Destination::Photos
+        && account.spec().is_some_and(has_albums)
 }
 
 /// The levels a stored destination sits BELOW the app folder, outermost first. Pure;
@@ -792,10 +954,19 @@ pub fn registry_display_order() -> Vec<(usize, &'static ProviderSpec)> {
 /// read here (the house `foo_with` seam), so the decision is testable without touching
 /// process-wide state.
 pub fn provider_available(spec: &ProviderSpec, env_value: Option<&str>) -> bool {
-    let AuthKind::OAuthPkce { baked_client_id, .. } = spec.auth else {
-        return false;
-    };
-    oauth::resolved_client_id(env_value, baked_client_id).is_some()
+    match spec.auth {
+        AuthKind::OAuthPkce { baked_client_id, .. } => {
+            oauth::resolved_client_id(env_value, baked_client_id).is_some()
+        }
+        // **Always offered, even with the tool absent** (DRAGON-485). This function answers
+        // "can THIS BUILD connect it", and for an external-tool provider the build always can:
+        // there is no registration to bake, so nothing about the build decides it. What decides
+        // it is whether the user has installed the tool, which is a runtime probe the PICKER
+        // makes so it can offer install guidance on the row. Excluding the row here would hide
+        // the one provider whose missing piece the user can actually go and fix.
+        AuthKind::ExternalTool { .. } => true,
+        AuthKind::Unofficial => false,
+    }
 }
 
 /// Every provider a user can actually CONNECT IN THIS BUILD, in display order.
@@ -826,11 +997,14 @@ pub fn connectable_display_order_with(
 ) -> Vec<(usize, &'static ProviderSpec)> {
     registry_display_order()
         .into_iter()
-        .filter(|(_, spec)| {
-            let AuthKind::OAuthPkce { client_id_env, .. } = spec.auth else {
-                return false;
-            };
-            provider_available(spec, env(client_id_env).as_deref())
+        .filter(|(_, spec)| match spec.auth {
+            AuthKind::OAuthPkce { client_id_env, .. } => {
+                provider_available(spec, env(client_id_env).as_deref())
+            }
+            // No environment variable to consult: an external-tool provider is always listed,
+            // and the row itself says whether the tool is there. See [`provider_available`].
+            AuthKind::ExternalTool { .. } => true,
+            AuthKind::Unofficial => false,
         })
         .collect()
 }
@@ -1038,8 +1212,8 @@ mod registry_tests {
     ///
     /// The environment here supplies three of the four OAuth providers, which is the shape of
     /// an official build: Drive, OneDrive and Dropbox arrive with ids, YouTube does not (its
-    /// quota makes a shared registration useless, see the `BAKED_*` block), and the two
-    /// unofficial providers have no id to resolve at all.
+    /// quota makes a shared registration useless, see the `BAKED_*` block), iCloud has no API
+    /// to resolve an id for, and Proton needs no id at all because its tool owns the sign-in.
     #[test]
     fn the_picker_offers_only_what_this_build_can_connect() {
         let offered = connectable_display_order_with(fake_env(&[
@@ -1048,7 +1222,11 @@ mod registry_tests {
             ("CCK_DROPBOX_CLIENT_ID", "d-id"),
         ]));
         let names: Vec<&str> = offered.iter().map(|(_, spec)| spec.display_name).collect();
-        assert_eq!(names, ["Dropbox", "Google Drive", "OneDrive"], "brand order, resolvable only");
+        assert_eq!(
+            names,
+            ["Dropbox", "Google Drive", "OneDrive", "Proton Drive"],
+            "brand order: everything with an id, plus the external-tool provider"
+        );
         for (index, spec) in &offered {
             assert!(spec.auth.is_connectable(), "{} cannot be connected", spec.id);
             assert_eq!(registry()[*index].id, spec.id, "the registry index no longer matches");
@@ -1056,14 +1234,18 @@ mod registry_tests {
         // YouTube is an ordinary OAuth provider that this build simply has no id for, and it
         // is hidden by the SAME rule that hides the two with no API. One rule, not two.
         assert!(!offered.iter().any(|(_, spec)| spec.id == "youtube"));
-        for hidden in ["proton", "icloud"] {
-            assert!(!offered.iter().any(|(_, spec)| spec.id == hidden));
-            // The registry still knows about them, which is what every prose answer reads.
-            assert!(registry().iter().any(|p| p.id == hidden));
-        }
+        // iCloud has no API and no tool, so nothing can ever offer it.
+        assert!(!offered.iter().any(|(_, spec)| spec.id == "icloud"));
+        assert!(registry().iter().any(|p| p.id == "icloud"));
+        // **Proton is offered whatever the environment says** (DRAGON-485), because no
+        // environment variable decides it: the question is whether the user has installed
+        // Proton's tool, which is a RUNTIME probe the picker makes so the row can carry install
+        // guidance. Hiding it here would hide the one provider whose missing piece is fixable.
+        assert!(offered.iter().any(|(_, spec)| spec.id == "proton"));
     }
 
-    /// **The rule itself**, one provider at a time: resolvable, unresolvable, unofficial.
+    /// **The rule itself**, one provider at a time: resolvable, unresolvable, external-tool,
+    /// and the one with nothing at all.
     #[test]
     fn a_provider_is_available_exactly_when_its_client_id_resolves() {
         let spec = |id: &str| provider(id).expect("a registry provider");
@@ -1075,21 +1257,28 @@ mod registry_tests {
         assert!(!provider_available(spec("youtube"), None));
         // Whitespace is not an id.
         assert!(!provider_available(spec("dropbox"), Some("   ")));
-        // An unofficial provider has no client id to resolve, whatever is in the environment.
-        for id in ["proton", "icloud"] {
-            assert!(!provider_available(spec(id), None), "{id}");
-            assert!(!provider_available(spec(id), Some("an-app-id")), "{id}");
-        }
+        // A provider with no API at all can never be available, whatever is in the environment.
+        assert!(!provider_available(spec("icloud"), None));
+        assert!(!provider_available(spec("icloud"), Some("an-app-id")));
+        // An EXTERNAL-TOOL provider is always available to the build, and no environment value
+        // changes that: what decides it is whether the tool is installed, which is asked at
+        // runtime and not here.
+        assert!(provider_available(spec("proton"), None));
+        assert!(provider_available(spec("proton"), Some("an-app-id")));
     }
 
-    /// **The empty build is a supported state** (DRAGON-508): a build made from source with no
-    /// variables set offers nothing at all, and the add dialog answers with its empty state
-    /// rather than with a list of buttons that can only fail. Pinned so nothing quietly starts
-    /// listing a provider it cannot connect.
+    /// **The registration-less build is a supported state** (DRAGON-508): a build made from
+    /// source with no variables set offers no OAUTH provider at all, and the add dialog answers
+    /// with its empty state rather than with a list of buttons that can only fail. Pinned so
+    /// nothing quietly starts listing a provider it has no registration for.
     #[test]
     fn a_build_with_no_ids_at_all_offers_nothing() {
         let offered = connectable_display_order_with(fake_env(&[]));
-        assert!(offered.is_empty(), "an unconfigured build must offer no provider: {offered:?}");
+        // Everything that needs a REGISTRATION falls out. Proton is the deliberate exception
+        // and the only one left: it needs no registration, so an unconfigured build can still
+        // connect it once the user installs the tool (DRAGON-485).
+        let names: Vec<&str> = offered.iter().map(|(_, spec)| spec.id).collect();
+        assert_eq!(names, ["proton"], "an unconfigured build offers only the external-tool one");
         // And the registry is untouched by any of this.
         assert_eq!(registry_display_order().len(), registry().len());
     }
@@ -1162,7 +1351,7 @@ mod registry_tests {
     fn no_provider_asks_for_more_of_a_drive_than_its_own_folder() {
         let scopes = |id: &str| match provider(id).expect("a known provider").auth {
             AuthKind::OAuthPkce { scopes, .. } => scopes,
-            AuthKind::Unofficial => &[][..],
+            AuthKind::ExternalTool { .. } | AuthKind::Unofficial => &[][..],
         };
         assert_eq!(scopes("onedrive"), ["Files.ReadWrite.AppFolder", "offline_access"]);
         assert_eq!(scopes("gdrive"), ["https://www.googleapis.com/auth/drive.file"]);
@@ -1207,6 +1396,112 @@ mod registry_tests {
         // upload ever went to. The other two take their leaf from the app registration, which is
         // the provider's to decide, so nothing pins those to this constant.
         assert_eq!(provider("gdrive").expect("a known provider").app_folder_path, [APP_FOLDER]);
+    }
+
+    /// **The album axis is a registry row, not a provider id** (DRAGON-485), which is what lets
+    /// the setup step ask one question to decide whether it draws tabs at all.
+    #[test]
+    fn only_one_provider_declares_an_album_root() {
+        let with_albums: Vec<&str> =
+            registry().iter().filter(|p| has_albums(p)).map(|p| p.id).collect();
+        assert_eq!(with_albums, ["proton"], "the album axis is one row, and it says so here");
+        for p in registry() {
+            for segment in p.album_root {
+                assert!(!segment.trim().is_empty(), "{} has a blank album segment", p.id);
+                assert!(!segment.contains('/'), "{}'s album root is one level each", p.id);
+            }
+            // A provider with albums must ALSO have folders: the tabs are a choice between two
+            // destinations, and a step with a Photos tab and no Files tab is not a thing this
+            // page can draw.
+            if has_albums(p) {
+                assert!(p.caps.folder_browse, "{} offers albums but no folders", p.id);
+            }
+        }
+    }
+
+    /// The album path is built from the album's NAME, because that is what a reader can act on;
+    /// the uid-shaped path the tool takes is `proton::album_path`, a different function for a
+    /// different question.
+    #[test]
+    fn an_album_destination_reads_as_a_path_a_user_can_follow() {
+        assert_eq!(album_save_path("proton", Some("Holidays")).as_deref(), Some("/albums/Holidays"));
+        // A blank or absent album is the app's own, which is the one found or created on first
+        // use, so a hand-edited file never renders a nameless destination.
+        for blank in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                album_save_path("proton", blank).as_deref(),
+                Some("/albums/Cosmic Capture Kit"),
+                "{blank:?}"
+            );
+        }
+        // Every other provider has no album root and therefore no album path.
+        for folders_only in ["gdrive", "onedrive", "dropbox", "youtube", "icloud"] {
+            assert_eq!(album_save_path(folders_only, Some("Holidays")), None, "{folders_only}");
+        }
+        assert_eq!(album_save_path("a-drive-from-the-future", None), None);
+    }
+
+    /// **Absent means Files**, which is the whole migration story: every account written before
+    /// the destination field existed keeps naming its folder.
+    #[test]
+    fn an_account_with_no_stored_kind_still_names_its_folder() {
+        let account = accounts::CloudAccount {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            provider: "proton".to_string(),
+            label: String::new(),
+            folder_id: None,
+            folder_name: Some("Shots".to_string()),
+            added_at: String::new(),
+            visibility: None,
+            destination: None,
+        };
+        assert!(!uploads_to_album(&account));
+        assert_eq!(
+            account_save_path(&account).as_deref(),
+            Some("/my-files/Cosmic Capture Kit/Shots")
+        );
+    }
+
+    /// A Photos account names its ALBUM instead, and the row and the upload read the same
+    /// answer.
+    #[test]
+    fn a_photos_account_names_its_album() {
+        let account = accounts::CloudAccount {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            provider: "proton".to_string(),
+            label: String::new(),
+            folder_id: Some("/albums/vol~a".to_string()),
+            folder_name: Some("Holidays".to_string()),
+            added_at: String::new(),
+            visibility: None,
+            destination: Some(accounts::Destination::Photos),
+        };
+        assert!(uploads_to_album(&account));
+        assert_eq!(account_save_path(&account).as_deref(), Some("/albums/Holidays"));
+    }
+
+    /// **The capability is checked FIRST**, and this is the case that proves why:
+    /// `cloud_accounts.toml` is ordinary config a user can hand-edit, so `destination =
+    /// "photos"` can land on a provider that has no albums at all. It has to read as the folder
+    /// the account really still has, never as a destination nothing could deliver to.
+    #[test]
+    fn a_hand_edited_photos_kind_on_a_folders_only_provider_still_names_its_folder() {
+        let account = accounts::CloudAccount {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            provider: "gdrive".to_string(),
+            label: String::new(),
+            folder_id: Some("folder-1".to_string()),
+            folder_name: Some("Shots".to_string()),
+            added_at: String::new(),
+            visibility: None,
+            destination: Some(accounts::Destination::Photos),
+        };
+        assert!(!uploads_to_album(&account), "a provider with no albums can never upload to one");
+        assert_eq!(
+            account_save_path(&account).as_deref(),
+            Some("/Cosmic Capture Kit/Shots"),
+            "the row names the folder the account really has"
+        );
     }
 
     /// Link expiry without share links would be meaningless, and so would a promise about
@@ -1289,8 +1584,11 @@ mod save_path_tests {
     // video on a channel, so there is no path either way.
     #[case("youtube", None, None)]
     #[case("youtube", Some("Screenshots"), None)]
-    // The two with no API, and a provider written by a newer build.
-    #[case("proton", None, None)]
+    // Proton addresses by path from its own files root, so its app folder is a real place
+    // (DRAGON-485), with and without a subfolder below it.
+    #[case("proton", None, Some("/my-files/Cosmic Capture Kit"))]
+    #[case("proton", Some("Screenshots/2026"), Some("/my-files/Cosmic Capture Kit/Screenshots/2026"))]
+    // The one with no API at all, and a provider written by a newer build.
     #[case("icloud", None, None)]
     #[case("a-drive-from-the-future", Some("Screenshots"), None)]
     #[case("", None, None)]

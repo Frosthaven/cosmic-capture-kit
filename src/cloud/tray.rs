@@ -152,11 +152,21 @@ pub const BUCKET_STEP: u8 = 5;
 /// Two rules:
 ///
 /// * **It counts 1 to 99.** A "0" badge reads as broken and a "100" badge is a thing that has
-///   already finished, so the number is clamped into the range that means "working".
+///   already finished, so the number is clamped into the range that means "working". 99 is a
+///   step of its own at the top, not the 95 bucket it would otherwise fall into (DRAGON-522): a
+///   provider that has delivered every byte and is waiting on the outcome should read as
+///   nearly-done, and with real per-block percentages arriving from Proton that is now an
+///   ordinary state rather than a theoretical one.
 /// * **`None` at 100.** Every byte is acknowledged, but the OUTCOME has not arrived: the
 ///   provider still has to commit the upload and answer, and that answer can be a failure.
 ///   So there is nothing to draw, and the item keeps its last face until
 ///   [`UploadTray::finish`] replaces it with the tick or the cross.
+///
+/// **This is the ONE clamp** (DRAGON-522), and both readouts of an upload go through it: the
+/// tray draws what it returns, and `child::run_cloud_upload` writes the same value into the
+/// session marker the editor's meter reads. So neither surface can ever show a "100%" that the
+/// tick is there to mean, and neither can show a number after the transfer while the share link
+/// is still being made: they simply hold the last one.
 ///
 /// It used to mean "take the item away", and that is what changed in the DRAGON-482 fix round
 /// (F7). A counter that silently vanished said nothing about how the upload ENDED: a success
@@ -168,6 +178,9 @@ pub const BUCKET_STEP: u8 = 5;
 pub fn counter(percent: u8) -> Option<u8> {
     if percent >= 100 {
         return None;
+    }
+    if percent >= 99 {
+        return Some(99);
     }
     Some((percent / BUCKET_STEP * BUCKET_STEP).clamp(1, 99))
 }
@@ -819,9 +832,10 @@ mod counter_tests {
         }
     }
 
-    /// It never goes backwards, and it lands on the bucket step. Both matter for the same
-    /// reason: the number is re-drawn only when it CHANGES, so a non-monotonic bucketing
-    /// would flicker between two icons on a steady transfer.
+    /// It never goes backwards, and it lands on the bucket step or on one of the two ENDS.
+    /// Monotonicity matters for the same reason the step does: the number is re-drawn only when
+    /// it CHANGES, so a non-monotonic bucketing would flicker between two icons on a steady
+    /// transfer.
     #[test]
     fn buckets_are_monotonic_and_land_on_the_step() {
         let mut last = 0u8;
@@ -830,16 +844,34 @@ mod counter_tests {
             assert!(n >= last, "{p} went backwards: {last} then {n}");
             last = n;
             assert!(
-                n == 1 || n.is_multiple_of(BUCKET_STEP),
-                "{p} drew {n}, not a step of {BUCKET_STEP}"
+                n == 1 || n == 99 || n.is_multiple_of(BUCKET_STEP),
+                "{p} drew {n}, not a step of {BUCKET_STEP} nor an end of the range"
             );
         }
         // The step really coalesces: a whole bucket of percentages draws one number.
         assert_eq!(counter(45), counter(46));
         assert_eq!(counter(46), counter(49));
         assert_ne!(counter(49), counter(50));
-        // And the top of the range is the last NUMBER shown before the end state.
-        assert_eq!(counter(99), Some(95));
+        // And the top of the range is its own step (DRAGON-522): a provider that has delivered
+        // every byte and is waiting on the outcome reads as nearly-done, not as 95.
+        assert_eq!(counter(98), Some(95));
+        assert_eq!(counter(99), Some(99));
+    }
+
+    /// **The ONE clamp both readouts share** (DRAGON-522). A "100%" is never drawn as a number
+    /// on either surface: the tick is what means finished, and the gap between the last byte and
+    /// the outcome (the share link, on a provider that takes seconds to make one) holds the last
+    /// number rather than claiming completion.
+    #[test]
+    fn a_hundred_is_the_tick_and_never_a_number() {
+        assert_eq!(counter(100), None, "the tray holds its last face instead");
+        assert_eq!(counter(255), None);
+        // The highest number either surface can show, and what a transfer's own fraction reports
+        // once every block has landed: `providers::proton::block_percent` caps at exactly this,
+        // pinned on its own side by `a_many_block_upload_climbs`.
+        assert_eq!(counter(99), Some(99));
+        // The end state is a face, not a number.
+        assert_eq!(finish_face(Ending::Done), Some(Face::Done));
     }
 
     /// The tooltip names the account, because two concurrent uploads are two counters and

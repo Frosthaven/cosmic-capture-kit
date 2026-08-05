@@ -320,6 +320,16 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "pan-down-symbolic" => "chevron-down",
         // Settings + misc.
         "folder-open-symbolic" => "folder-open",
+        // The PHOTO ALBUM mark (DRAGON-485, the owner's pick): lucide `book-image`, a book with
+        // a picture in it. Deliberately NOT `image` and NOT the folder mark: it sits beside both
+        // in the cloud setup step's two tabs, where it has to say "this is an album, and an
+        // album is not a folder" at a glance.
+        "book-image-symbolic" => "book-image",
+        // The MY FILES destination tab (DRAGON-522, the owner's pick): lucide `inbox`, a tray
+        // things arrive in. It sits beside the Photos tab's `image` mark, and the pair reads as
+        // "the file tree" and "the photo library" rather than as two flavours of folder. NOT
+        // `folder-open`, which the rows and the breadcrumb below it already wear.
+        "inbox-symbolic" => "inbox",
         "list-add-symbolic" => "plus",
         "system-search-symbolic" => "search",
         "navbar-open-symbolic" => "panel-left-open",
@@ -450,6 +460,8 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "film" => svg!("film"),
         "chevron-down" => svg!("chevron-down"),
         "folder-open" => svg!("folder-open"),
+        "book-image" => svg!("book-image"),
+        "inbox" => svg!("inbox"),
         "plus" => svg!("plus"),
         "search" => svg!("search"),
         "panel-left-open" => svg!("panel-left-open"),
@@ -506,6 +518,9 @@ mod tests {
             "image-filter-symbolic", "edit-cut-symbolic", "view-timeline-symbolic",
             "minus-1", "minus-2", "minus-4", "minus-6", "minus-8", "minus-10", "minus-12",
             "video-x-generic-symbolic", "pan-down-symbolic", "folder-open-symbolic",
+            // The cloud setup step's two destination tabs and its album rows (DRAGON-485, tab
+            // marks added by DRAGON-522).
+            "book-image-symbolic", "inbox-symbolic",
             "list-add-symbolic", "system-search-symbolic", "navbar-open-symbolic",
             "navbar-closed-symbolic", "accessories-screenshot-symbolic",
             "applications-multimedia-symbolic", "applications-graphics-symbolic",

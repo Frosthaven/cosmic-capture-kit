@@ -47,16 +47,17 @@ const NOTES_TOGGLE_EDGE_GAP: f32 = {
 impl crate::app::App {
     pub(in crate::app::settings) fn about_sections(&self) -> Vec<SectionSpec<'_>> {
         // The Version row: its NAME reads "Version <installed>" in a mixed-weight title
-        // (bold label, regular version number), and its description is a "View All Patch
-        // Notes" link to the releases history. The available-update version, when there is
-        // one, reads in the action button's label ("Get <version>"), not here. Available
-        // also shows the scrollable markdown notes below.
+        // (bold label, regular version number). The "View All Patch Notes" link used to be
+        // this row's description; it now closes the changelog block instead (owner request:
+        // read what changed, then the link to the rest is right there). The
+        // available-update version, when there is one, reads in the action button's label
+        // ("Get <version>"), not here. Available also shows the scrollable markdown notes
+        // below.
         // `.flush()` (DRAGON-495, first used by the Cloud Accounts page): none of these
         // three rows ever gets a reset-to-default action, so the fixed unit/reset slots
         // every other settings row reserves would just be dead space here.
         let version_row = Item::new("Version", "", self.version_row_control())
             .title_el(version_title())
-            .desc_el(view_patch_notes_link())
             .flush();
         // Donations lead the section (owner request): a deliberate support ask sits right
         // below the app hero, above the version information. The update-notify toggle sits
@@ -128,7 +129,15 @@ impl crate::app::App {
             .width(Length::Fill)
             .padding(cosmic::iced::Padding::default().right(NOTES_TOGGLE_EDGE_GAP).top(4.0))
             .into();
-        Some(widget::column(vec![heading.into(), block]).spacing(4.0).into())
+        // The link CLOSES the notes (owner request): left-aligned on its own line under the
+        // markdown, in the styling it has always had, so "what changed here" flows straight
+        // into "everything that ever changed". It lives with the notes rather than the
+        // Version row now, and shows exactly when they do.
+        Some(
+            widget::column(vec![heading.into(), block, view_patch_notes_link()])
+                .spacing(4.0)
+                .into(),
+        )
     }
 
     /// The always-present notify toggle (the check button lives on the Version row).
@@ -457,6 +466,13 @@ mod tests {
         let version = "0.27.0";
         let width = shared_button_width(Some(version));
         let get = format!("Get {version}");
+        // The `mut` is used by the `extend` just below, which only exists on the two platforms
+        // that have the swap states. On Linux nothing extends it, so the binding is honestly
+        // immutable there and the attribute says exactly that rather than blanketing the file.
+        #[cfg_attr(
+            not(any(target_os = "macos", target_os = "windows")),
+            allow(unused_mut)
+        )]
         let mut candidates = vec![DONATE_LABEL, get.as_str()];
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         candidates.extend([INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);

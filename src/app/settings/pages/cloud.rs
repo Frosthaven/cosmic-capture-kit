@@ -22,7 +22,7 @@
 //! Done is what writes the answer. There is no pick control, no per-row tick and no chosen-folder
 //! state to hold, which is what three earlier passes at this step kept trying to reconcile.
 //!
-//! Two consequences worth knowing before editing anything here:
+//! Three consequences worth knowing before editing anything here:
 //!
 //! * Opening the step WALKS back down to the account's saved folder
 //!   (`cloud::providers::restore_browse`), because the browser has to be standing in the right
@@ -30,6 +30,11 @@
 //! * Nothing is written while browsing. Cancel therefore leaves the account exactly as it was
 //!   found, and the one write that does still happen mid-dialog
 //!   ([`crate::app::App::adopt_app_folder`]) is not about the browser at all.
+//! * Creating a folder ENTERS it (DRAGON-523), because making a place and then choosing it are
+//!   one act here. The Photos tab does the same thing in its own model: a new album's row takes
+//!   the check, since a flat list has no inside to stand in. Either way the selection is applied
+//!   by the LISTING the create starts, never by the create's own reply; see [`created_selection`]
+//!   for why, and for what happens when the provider has not caught up with itself yet.
 //!
 //! # What it never shows
 //!
@@ -70,9 +75,9 @@
 use super::super::*;
 use super::super::row::{
     Item, SectionSpec, action_button, danger_caption, standard_button_class,
-    subtle_caption, warning_caption,
+    accent_caption, subtle_caption, warning_caption,
 };
-use crate::cloud::accounts::CloudAccount;
+use crate::cloud::accounts::{CloudAccount, Destination};
 use crate::cloud::oauth::TokenSet;
 use crate::cloud::{AuthKind, ProviderSpec};
 // The browser step's copy button, its "Copied!" flash window and the accent icon-button style it
@@ -150,6 +155,17 @@ pub struct CloudPageState {
     /// with an older value is dropped. See `CloudSettingsMsg`'s doc for why a connect
     /// cannot simply be aborted.
     pub generation: u64,
+    /// What the last probe said about the external tool, or `None` before one has landed
+    /// (DRAGON-485).
+    ///
+    /// **Not cached across dialogs on purpose, and not cleared on close either.** A user can
+    /// install the tool while this app is running, which is why the probe runs whenever the
+    /// picker is opened rather than once at startup; keeping the last answer between opens is
+    /// only so the row has something to draw for the moment before the fresh one lands.
+    pub tool: Option<crate::cloud::proton::Availability>,
+    /// A probe is in flight. One at a time: the probe spawns a process, and opening and closing
+    /// the provider list repeatedly must not queue a pile of them.
+    pub tool_probing: bool,
 }
 
 impl CloudPageState {
@@ -169,6 +185,21 @@ impl CloudPageState {
     /// Whether this account's row should offer Reconnect.
     pub fn warrants_reconnect(&self, id: &str) -> bool {
         self.reconnect.iter().any(|k| k == id)
+    }
+
+    /// The face an EXTERNAL-TOOL provider's picker row wears right now (DRAGON-485).
+    ///
+    /// The effectful half of [`tool_entry`]: it collects the two facts (the last probe's answer
+    /// and how many accounts this provider already has) and the pure function decides. Answers
+    /// [`ToolEntry::Ready`] for a provider that is not reached by a tool at all, which is the
+    /// value [`connect_action`] ignores there anyway; a caller therefore never has to ask which
+    /// kind of provider it is holding.
+    pub fn tool_entry_for(&self, spec: &ProviderSpec, is_reconnect: bool) -> ToolEntry {
+        if !spec.auth.is_external_tool() {
+            return ToolEntry::Ready;
+        }
+        let connected = self.accounts.iter().filter(|a| a.provider == spec.id).count();
+        tool_entry(self.tool, tool_seat_taken(connected, is_reconnect))
     }
 
     /// Whether the add flow is currently waiting on the browser (DRAGON-489 follow-up).
@@ -219,6 +250,21 @@ pub struct CloudAdd {
     pub creating: Option<String>,
     /// A create is in flight, so the row shows it and cannot be submitted twice.
     pub create_busy: bool,
+    /// What the last create made, held until the listing it started comes back (DRAGON-523), or
+    /// `None` when there is nothing waiting to be selected.
+    ///
+    /// **Set by the create's reply and consumed by the next listing that lands.** The item is
+    /// selected by the LISTING rather than by the create, because the create's answer is not a
+    /// row: the provider decides the id, the final name and where it sorts, and the browser only
+    /// has those once it has asked for the level again. See [`created_selection`], which is the
+    /// whole of the decision, and [`CreatedItem`] for what identifies it.
+    ///
+    /// Cleared by a fresh create as well, so this always names the MOST RECENT one. Submitting a
+    /// second folder while the first one's listing is still in flight abandons that listing (the
+    /// generation bumps) and replaces what is held here, so the listing that finally lands enters
+    /// the SECOND folder, never the first one the user has already moved on from. And if that
+    /// second create fails, nothing is held at all, so nothing is selected.
+    pub created: Option<CreatedItem>,
     /// The folder (id, display name) a delete confirmation is open for, or `None`
     /// (DRAGON-506). The folder itself rather than an index into [`Self::folders`], so a listing
     /// that lands while the confirmation is up cannot move the confirmation onto a different
@@ -301,6 +347,26 @@ pub struct CloudAdd {
     /// no explicit clear because the Browser step's once-a-second tick already rebuilds the
     /// view (see `sub_cloud_browser_countdown`).
     pub copied_at: Option<std::time::Instant>,
+    /// Which of the setup step's destination TABS is showing (DRAGON-485).
+    ///
+    /// **The active tab IS what Done persists**, which is why this is the account's own
+    /// `Destination` type rather than a UI-only enum beside it: a mapping between two spellings
+    /// of one choice is a mapping that can be got wrong, and there is nothing here the account
+    /// does not already have a word for.
+    ///
+    /// Always [`Destination::Files`] on a provider with no album root, where the tabs are not
+    /// drawn at all; it is simply never read there.
+    pub tab: Destination,
+    /// The album this account will upload to, as `(id, display name)`, or `None` when none has
+    /// been chosen yet (DRAGON-485).
+    ///
+    /// **The Photos tab's real selection state, and the Files tab has no equivalent.** That
+    /// asymmetry is deliberate and is the thing `cloud::proton::ALBUMS`'s doc says not to
+    /// unify away: a folder is chosen by being the level the browser is INSIDE, and an album,
+    /// being flat, has no inside to stand in, so it is chosen by being clicked.
+    ///
+    /// The id is the album's `/albums/<uid>` path, never its name: see that same doc.
+    pub album: Option<(String, String)>,
 }
 
 impl CloudAdd {
@@ -315,6 +381,7 @@ impl CloudAdd {
             trail: Vec::new(),
             creating: None,
             create_busy: false,
+            created: None,
             pending_delete: None,
             delete_busy: false,
             root: None,
@@ -327,6 +394,10 @@ impl CloudAdd {
             browser_started: None,
             is_fresh_connect: true,
             copied_at: None,
+            // A fresh connect always opens on Files: it is the destination every provider has,
+            // and it is what an account with nothing stored already means (DRAGON-485).
+            tab: Destination::Files,
+            album: None,
         }
     }
 
@@ -363,12 +434,27 @@ impl CloudAdd {
             .position(|p| p.id == account.provider)
             .unwrap_or_else(first_connectable);
         let browse = account.spec().is_some_and(chooses_folder);
+        // **The gear re-opens on the tab the account is actually using** (DRAGON-485), with its
+        // album already selected, so a user who set a Photos destination last time is not
+        // silently shown the Files browser and given a chance to overwrite it by pressing Done.
+        // `uploads_to_album` is the one reader of the stored pair, so this cannot disagree with
+        // the row's own destination line or with where an upload goes.
+        let photos = crate::cloud::uploads_to_album(&account);
+        let album = photos.then(|| {
+            (
+                account.folder_id.clone().unwrap_or_default(),
+                account.folder_name.clone().unwrap_or_else(|| crate::cloud::APP_FOLDER.to_string()),
+            )
+        });
+        let tab = if photos { Destination::Photos } else { Destination::Files };
         Self {
             provider,
             step: CloudAddStep::Setup,
             account: Some(account),
             folder_loading: browse,
             is_fresh_connect: false,
+            tab,
+            album,
             ..Self::new()
         }
     }
@@ -392,6 +478,22 @@ impl CloudAdd {
     /// destination is stored as, and what the delete rules compare paths with.
     pub fn level_names(&self) -> Vec<&str> {
         self.trail.iter().map(|(_, name)| name.as_str()).collect()
+    }
+
+    /// Whether this dialog's browser is showing ALBUMS rather than folders (DRAGON-485).
+    ///
+    /// **The capability is checked here, not at the call sites.** [`Self::tab`] is ordinary
+    /// state and can hold `Photos` for a provider that has no albums (a dialog whose provider
+    /// index moved, a future reorder); asking the registry as well is what makes every reader
+    /// of this safe to write as one `if`. It is also the same order
+    /// [`crate::cloud::uploads_to_album`] checks in, so the dialog and the account agree.
+    pub fn browsing_albums(&self) -> bool {
+        self.tab == Destination::Photos && self.spec().is_some_and(crate::cloud::has_albums)
+    }
+
+    /// The words this browser's controls use, for the thing it is currently listing.
+    pub fn words(&self) -> BrowserWords {
+        browser_words(if self.browsing_albums() { Destination::Photos } else { Destination::Files })
     }
 }
 
@@ -558,10 +660,101 @@ pub fn shows_empty_state(reconnecting: bool, offered: usize) -> bool {
 /// Google's needed a client type this app doesn't register, and Microsoft's was redundant
 /// with the link-based browser flow), so every provider is "browser sign-in only" and the
 /// line would just be noise on every dialog; it stays gone.
-pub fn provider_notes(spec: &ProviderSpec, env_value: Option<&str>) -> Vec<String> {
-    match connect_action(spec, env_value) {
+pub fn provider_notes(
+    spec: &ProviderSpec,
+    env_value: Option<&str>,
+    tool: ToolEntry,
+) -> Vec<String> {
+    match connect_action(spec, env_value, tool) {
         ConnectAction::Refused(message) => vec![message],
         ConnectAction::Run => Vec::new(),
+    }
+}
+
+/// What the add-account picker offers on an EXTERNAL-TOOL provider's row (DRAGON-485).
+///
+/// # Why the row is always LISTED, whatever this says
+///
+/// Every other provider is offered or not by a question about the BUILD (does a client id
+/// resolve, `cloud::provider_available`), which cannot change while the app is running. This one
+/// turns on whether the user has installed a tool, which they can go and do, and which can be
+/// true by the next time they open this dialog. Hiding the row would hide the one provider whose
+/// missing piece is fixable, and leave nothing on screen saying what to fix. So the row stays and
+/// its FACE carries the answer.
+///
+/// Three faces because there are three genuinely different situations, and each one wants a
+/// different press.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEntry {
+    /// The tool answered its probe. An ordinary, connectable row.
+    Ready,
+    /// The tool is absent, or present and unusable. The row explains, and a press opens the
+    /// provider's own download page instead of starting a connect that could only fail.
+    ///
+    /// ONE face for both of `cloud::proton::Availability`'s failing states on purpose: the
+    /// action a user takes is "install it" either way, and the two are already told apart where
+    /// the difference is worth something, in the debug log.
+    Install,
+    /// This provider already has a connected account, and its tool can hold only ONE session:
+    /// a second sign-in REPLACES the first rather than sitting beside it. So the row says so
+    /// instead of offering a connect that would silently evict an account the user still has.
+    Connected,
+}
+
+impl ToolEntry {
+    // A `connects()` predicate stood here briefly: "does a press on this row start a connect".
+    // It was deleted before it ever shipped rather than kept behind an allow. Both readers (the
+    // picker row's press and `connect_action`'s external arm) have to answer all THREE faces,
+    // not two, and a bool derived from a three-way match is a facade over the decision rather
+    // than the decision. Match `ToolEntry` directly.
+
+    /// The small line under the provider's name, or `None` when the row needs no explanation.
+    /// Pure; unit-tested.
+    ///
+    /// `tool_name` is the registry row's own [`crate::cloud::AuthKind::ExternalTool`] spelling,
+    /// so the line names the command a user types and this page invents no second name for it.
+    pub fn note(self, tool_name: &str) -> Option<String> {
+        match self {
+            ToolEntry::Ready => None,
+            ToolEntry::Install => Some(format!("Requires {tool_name} CLI")),
+            ToolEntry::Connected => Some("Already connected".to_string()),
+        }
+    }
+}
+
+/// Whether an external-tool provider's ONE account slot is already taken. Pure; unit-tested.
+///
+/// `connected` is how many accounts this provider already has, and `is_reconnect` says whether
+/// this dialog is fixing one of them rather than adding another.
+///
+/// **A reconnect is never blocked**, and that is the whole reason this takes two arguments. The
+/// cap exists because a second `auth login` replaces the tool's stored session, which would
+/// leave the first account signed out with no sign that anything happened. Signing the SAME
+/// account back in is exactly what a dead session needs, and it evicts nothing, so the one flow
+/// that has to keep working is the one this would otherwise break first.
+pub fn tool_seat_taken(connected: usize, is_reconnect: bool) -> bool {
+    connected > 0 && !is_reconnect
+}
+
+/// The face an external-tool provider's row wears. Pure; unit-tested.
+///
+/// `available` is the last probe's answer, or `None` before one has landed (the dialog's first
+/// frames). An unprobed row reads as [`ToolEntry::Ready`]: the probe is bounded and lands in a
+/// moment, and drawing "install this" at a user who has it installed, for the frame before the
+/// answer arrives, would be a wrong answer confidently given. A press in that window reaches
+/// `connect_action`, which asks this same function again with whatever has landed by then.
+///
+/// **The cap outranks the tool's state.** An account already connected means no second connect
+/// whatever the tool says, and saying "install it" beside a provider the user has plainly
+/// already connected would read as the account being broken. The account's own row is where a
+/// tool that has since gone missing shows up, through the failure its next call reports.
+pub fn tool_entry(available: Option<crate::cloud::proton::Availability>, seat_taken: bool) -> ToolEntry {
+    if seat_taken {
+        return ToolEntry::Connected;
+    }
+    match available {
+        None | Some(crate::cloud::proton::Availability::Ready) => ToolEntry::Ready,
+        Some(_) => ToolEntry::Install,
     }
 }
 
@@ -595,7 +788,32 @@ pub fn connect_pressable(action: &ConnectAction) -> bool {
 /// The id question is asked through the SAME resolution `crate::cloud::provider_available`
 /// asks (`oauth::resolve_client_id`, DRAGON-508), so a provider the picker offers is always one
 /// this can run, and there is no way for the list and the button to disagree.
-pub fn connect_action(spec: &ProviderSpec, env_value: Option<&str>) -> ConnectAction {
+pub fn connect_action(
+    spec: &ProviderSpec,
+    env_value: Option<&str>,
+    tool: ToolEntry,
+) -> ConnectAction {
+    // **An external-tool provider is refused by its TOOL, never by a client id** (DRAGON-485).
+    // No id takes part in its connect at all, so `env_value` says nothing about it; what decides
+    // it is the runtime pair [`ToolEntry`] carries, and the picker has already drawn the row's
+    // own face from the same answer. `tool` is ignored for every other provider, which is why it
+    // is one plain argument rather than an `Option`: the caller always has one to give.
+    if let AuthKind::ExternalTool { tool_name, .. } = spec.auth {
+        return match tool {
+            ToolEntry::Ready => ConnectAction::Run,
+            ToolEntry::Install => ConnectAction::Refused(format!(
+                "{} connects through Proton's own {tool_name} command-line tool, which is not \
+                 installed on this computer yet. Install it, then try again.",
+                spec.display_name
+            )),
+            ToolEntry::Connected => ConnectAction::Refused(format!(
+                "{} can hold one connected account at a time, because signing in again would \
+                 replace the sign-in the account you already have is using. Disconnect that one \
+                 first if you want to connect a different account.",
+                spec.display_name
+            )),
+        };
+    }
     let AuthKind::OAuthPkce { client_id_env, baked_client_id, .. } = spec.auth else {
         return ConnectAction::Refused(format!(
             "{} has no public API for other apps to upload through, so it cannot be \
@@ -611,6 +829,66 @@ pub fn connect_action(spec: &ProviderSpec, env_value: Option<&str>) -> ConnectAc
     ) {
         Ok(_) => ConnectAction::Run,
         Err(message) => ConnectAction::Refused(message),
+    }
+}
+
+/// The words one of the setup step's two tabs uses for the thing it is listing (DRAGON-485).
+///
+/// **The Photos tab reuses the folder browser's chassis, and reusing its COPY would be wrong.**
+/// Every control is the same control ("+", the bin, the refresh, the inline create row), so
+/// every one of them needs a sentence naming an album rather than a folder, and a table is what
+/// keeps those from drifting apart across the five places they appear.
+///
+/// Everything here is `&'static str` because none of it interpolates: the strings differ per
+/// tab, not per provider or per folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserWords {
+    /// The thing a row IS, for the one message that has to be built rather than looked up.
+    pub noun: &'static str,
+    /// The `+` button's tooltip.
+    pub create_tooltip: &'static str,
+    /// The inline create row's tick tooltip.
+    pub create_submit: &'static str,
+    /// The inline create row's text-field placeholder.
+    pub name_placeholder: &'static str,
+    /// The bin's tooltip on a row.
+    pub delete_tooltip: &'static str,
+    /// The refresh button's tooltip once a listing has landed.
+    pub refresh_tooltip: &'static str,
+    /// The name-already-taken refusal.
+    pub taken: &'static str,
+    /// The two lines shown when the list has settled with nothing in it.
+    pub empty: [&'static str; 2],
+}
+
+/// The words for a tab. Pure; unit-tested.
+pub fn browser_words(tab: Destination) -> BrowserWords {
+    match tab {
+        // Byte-for-byte what this browser said before the Photos tab existed, so the Files tab
+        // is unchanged by the tab's arrival.
+        Destination::Files => BrowserWords {
+            noun: "folder",
+            create_tooltip: "New folder here",
+            create_submit: "Create this folder",
+            name_placeholder: "Folder name",
+            delete_tooltip: "Delete this folder",
+            refresh_tooltip: "Refresh folder list",
+            taken: "There is already a folder with that name here.",
+            empty: EMPTY_LEVEL_NOTE,
+        },
+        Destination::Photos => BrowserWords {
+            noun: "album",
+            create_tooltip: "New album",
+            create_submit: "Create this album",
+            name_placeholder: "Album name",
+            delete_tooltip: "Delete this album",
+            refresh_tooltip: "Refresh album list",
+            taken: "There is already an album with that name.",
+            // No "or select done to use this one": there is no album to be standing in, so an
+            // empty list means there is nothing to choose yet, not that the current place will
+            // do. That is the flat model showing through the shared chassis.
+            empty: ["No albums yet.", "Add one with + to choose where photos go."],
+        },
     }
 }
 
@@ -785,6 +1063,26 @@ pub fn setup_body(spec: &ProviderSpec, chooses_folder: bool) -> String {
          to upload.",
         spec.display_name
     )
+}
+
+/// The Photos tab's replacement for [`setup_body`]'s sentence. Pure; unit-tested.
+///
+/// The owner's Files wording is a promise about a FOLDER ("placed in the App's Folder"), and on
+/// a tab whose list is albums it names the wrong place. Same shape and same tone, different
+/// destination, so the two tabs read as two answers to one question rather than as two screens.
+pub const PHOTOS_SETUP_BODY: &str =
+    "Captures uploaded to this account are added to the album you choose.";
+
+/// The sentence under the setup step's heading, for the tab being shown. Pure; unit-tested.
+///
+/// [`setup_body`] answers for the Files tab and for every provider that has only one kind of
+/// destination, unchanged; this is the one place the Photos tab's own sentence takes its place,
+/// so the owner's Files wording cannot drift while the album copy is edited.
+pub fn setup_body_for(spec: &ProviderSpec, chooses_folder: bool, photos: bool) -> String {
+    if photos {
+        return PHOTOS_SETUP_BODY.to_string();
+    }
+    setup_body(spec, chooses_folder)
 }
 
 /// What this provider calls the folder this app writes to. Pure; unit-tested.
@@ -975,6 +1273,16 @@ pub fn adopts_app_folder(stored_id: Option<&str>, stored_name: Option<&str>) -> 
 /// now cover.
 const PATH_ICON: f32 = 16.0;
 
+/// The WELL's waiting glyph (DRAGON-522): the same refresh mark the path row spins, five times
+/// the size.
+///
+/// A multiple of [`PATH_ICON`] rather than a number of its own, because it IS that icon: one
+/// listing, one glyph, two sizes, and the pair cannot drift if the small one is ever retuned.
+/// Five was the owner's call, and it is the point of the face: at 16px the only sign a listing
+/// was running sat three rows above an unchanged list, which read as a dialog that had stopped
+/// responding.
+const WELL_SPINNER_ICON: f32 = 5.0 * PATH_ICON;
+
 /// The gap inside the path row's trailing PAIR: refresh, then create (DRAGON-514).
 ///
 /// Deliberately smaller than the space between the crumbs and the pair (which is a
@@ -1100,26 +1408,44 @@ pub const EMPTY_LEVEL_NOTE: [&str; 2] = [
     "Add a folder with + or select done to use this folder.",
 ];
 
-/// Whether the folder list shows [`EMPTY_LEVEL_NOTE`]. Pure; unit-tested.
+/// What the folder well draws (DRAGON-522).
+///
+/// Three faces, and the WAITING one is what the well was missing: a listing in flight left the
+/// last level's rows on screen, or nothing at all, so a refresh, a create and a delete all looked
+/// like the dialog had stopped responding while the provider thought about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WellFace {
+    /// A listing is running. One big refresh glyph, spinning, centred in the well's own space.
+    Waiting,
+    /// The listing landed and this level really is empty: [`EMPTY_LEVEL_NOTE`].
+    Empty,
+    /// Ordinary: the rows, in their scrollable.
+    Rows,
+}
+
+/// Which face the folder well wears. Pure; unit-tested.
 ///
 /// An empty well is ambiguous: a level with no subfolders, a listing that has not landed yet and a
-/// level whose only row is the one being typed all look the same. So the line appears for exactly
-/// ONE of them, the settled empty level, and every other state keeps the well quiet:
+/// level whose only row is the one being typed all look the same. So the states are separated
+/// here, once, and the order of the arms is the decision:
 ///
-/// * `loading`: the answer is not in yet. The refresh glyph is already spinning, and a line that
-///   said "nothing here" and then filled with folders would have been a wrong answer confidently
-///   given.
+/// * `loading` wins over everything. The answer is not in yet, so neither rows nor a "nothing
+///   here" line can be shown honestly; both would be a wrong answer confidently given, and the
+///   second one has been reported as exactly that. This is also the face a MUTATION shows
+///   (DRAGON-522): pressing delete or confirming a create sets `loading` at the press rather than
+///   at the reply, so the well flips to the spinner in the same frame as the click.
 /// * `creating`: the inline new-folder row is open, so the list is not empty, it is being added
 ///   to. A create in flight keeps that row open, which is why this one flag covers both.
 /// * `deleting`: a confirmation is up or a delete is in flight. The row it names is still on
 ///   screen, and the level's contents are about to change anyway.
-pub fn shows_empty_level_note(
-    folders: usize,
-    loading: bool,
-    creating: bool,
-    deleting: bool,
-) -> bool {
-    folders == 0 && !loading && !creating && !deleting
+pub fn well_face(folders: usize, loading: bool, creating: bool, deleting: bool) -> WellFace {
+    if loading {
+        return WellFace::Waiting;
+    }
+    if folders == 0 && !creating && !deleting {
+        return WellFace::Empty;
+    }
+    WellFace::Rows
 }
 
 /// What a failed folder listing does to the breadcrumb (DRAGON-506).
@@ -1191,15 +1517,128 @@ pub fn destination_path(levels: &[&str], child: Option<&str>) -> Option<String> 
 /// `siblings` are the display names at this level. Compared case-INSENSITIVELY: two of the three
 /// providers treat names that way themselves, and "screenshots" beside "Screenshots" would be
 /// two rows a user cannot tell apart on any of them.
-pub fn create_refusal(typed: &str, siblings: &[&str]) -> Option<String> {
+pub fn create_refusal(typed: &str, siblings: &[&str], words: BrowserWords) -> Option<String> {
     let name = match crate::cloud::providers::remote_folder_name(typed) {
         Ok(name) => name,
-        Err(message) => return Some(message),
+        // The validator speaks about a FOLDER, because a folder is what it validates for every
+        // provider that has only folders. The album tab reuses its rules unchanged (a name is a
+        // path component either way), so the one word is swapped rather than a second validator
+        // written, and the swap is a no-op on the Files tab, where the noun already IS "folder".
+        Err(message) => return Some(message.replace("folder", words.noun)),
     };
     siblings
         .iter()
         .any(|existing| existing.trim().eq_ignore_ascii_case(&name))
-        .then(|| "There is already a folder with that name here.".to_string())
+        .then(|| words.taken.to_string())
+}
+
+/// What a create made, carried from its reply to the listing that will show it (DRAGON-523).
+///
+/// A create and the list are two separate answers from the provider, and the new item exists on
+/// screen only once the second one lands. This is what crosses that gap, so the browser can select
+/// the new item without inventing a row for it or guessing which of the landed rows is new.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatedItem {
+    /// The id the provider gave it.
+    ///
+    /// Every create path on every provider today returns a real one, minted exactly as the
+    /// LISTING's ids are: a Drive file id, a Graph driveItem id, Dropbox's `path_lower`, the
+    /// `<path>/<name>` Proton addresses folders by, an album's `/albums/<uid>`. So the match below
+    /// is an identity, not a lookalike.
+    pub id: String,
+    /// The name the provider settled on, which is not always the name that was typed. Read only as
+    /// the fallback for a create path that has no id to give.
+    pub name: String,
+    /// Which browser it was made in, so a listing that lands on the OTHER tab cannot ACT on it.
+    ///
+    /// That listing still takes it, which is the right end for it: a user who switched tabs
+    /// between the create's reply and its listing has left the browser the new item is in, and
+    /// there is nowhere left to apply it. The narrower case, a switch made while the create is
+    /// still in flight, never reaches here at all, since switching re-lists, a re-list bumps the
+    /// generation, and a bumped generation drops the create's reply. So this is one comparison
+    /// against a rare arrival, and it is what makes [`created_selection`] total.
+    pub tab: Destination,
+}
+
+/// What a landed listing does about a create that has just finished (DRAGON-523).
+///
+/// Two answers rather than one "select it", because the two tabs choose differently and that
+/// difference is deliberate (`cloud::proton::ALBUMS`): naming both here is what stops a later
+/// reader unifying them by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreatedSelection {
+    /// Go INTO the folder at this index. That IS choosing it on the Files tab (DRAGON-517): the
+    /// level the browser is showing is where this account's captures land.
+    Enter(usize),
+    /// Tick the album at this index. Albums are flat, so there is nowhere to go into and the row's
+    /// own check is the selection (DRAGON-485).
+    Select(usize),
+    /// Leave the browser exactly as it is.
+    Nothing,
+}
+
+/// What a landed listing should do about the item a create just made. Pure; unit-tested.
+///
+/// `listed` is the level (or the album set) that has just arrived, as the browser holds it: the
+/// same `(id, display name)` pairs the rows are drawn from. `landed` is which browser it belongs
+/// to, which the caller knows from the message it arrived on.
+///
+/// **Absent means nothing happens.** A provider whose listing has not yet caught up with its own
+/// create hands back a level the new item is not in, and the honest answer there is to leave the
+/// view alone: the user's next refresh finds it. Selecting the row that happens to sit where the
+/// new one should be, or trusting the create's own answer over the listing, would both be guesses,
+/// and a guess here moves where the captures go.
+pub fn created_selection(
+    pending: Option<&CreatedItem>,
+    landed: Destination,
+    listed: &[(String, String)],
+) -> CreatedSelection {
+    let Some(created) = pending.filter(|c| c.tab == landed) else {
+        return CreatedSelection::Nothing;
+    };
+    let id = created.id.trim();
+    let found = if id.is_empty() {
+        // No id to match on, which no provider does today. An EXACT name is the only other thing
+        // that identifies the item, and it is exact on purpose: the trimming and case-folding
+        // `create_refusal` applies to REFUSE a name would, here, be a way to select the wrong row.
+        let name = created.name.trim();
+        match name.is_empty() {
+            true => None,
+            false => listed.iter().position(|(_, row)| row.trim() == name),
+        }
+    } else {
+        listed.iter().position(|(row, _)| row == id)
+    };
+    let Some(index) = found else {
+        return CreatedSelection::Nothing;
+    };
+    match landed {
+        Destination::Files => CreatedSelection::Enter(index),
+        Destination::Photos => CreatedSelection::Select(index),
+    }
+}
+
+/// Why a listed ALBUM cannot be deleted, or `None` when it can. Pure; unit-tested
+/// (DRAGON-485).
+///
+/// **ONE rule where [`delete_refusal`] has two**, and the missing one is missing because albums
+/// are flat: an album cannot CONTAIN this account's destination, so the only thing left to
+/// refuse is the album the account uploads to itself. Deleting that would leave the account
+/// pointed at something that no longer exists and the next capture failing with nothing on
+/// screen explaining why, which is the same harm the folder rule prevents.
+///
+/// Compared by the album's own ID (its `/albums/<uid>` path) rather than by name, because two
+/// albums may share a name and the uid is what every command actually takes. That is also why
+/// this is not [`delete_refusal`] with a shorter body: that one compares PATHS with a prefix
+/// rule, which is meaningless here and would quietly match nothing.
+pub fn album_delete_refusal(candidate: &str, chosen: Option<&str>) -> Option<&'static str> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    let chosen = chosen.map(str::trim).filter(|c| !c.is_empty())?;
+    (chosen == candidate)
+        .then_some("This account uploads here, so choose another album first.")
 }
 
 /// Why a listed folder cannot be deleted, or `None` when it can. Pure; unit-tested.
@@ -1239,7 +1678,40 @@ pub fn delete_refusal(candidate: &str, chosen: Option<&str>) -> Option<&'static 
 
 /// The delete confirmation's heading. One sentence for every provider: what differs is what
 /// deleting DOES, and that belongs in the body where there is room to say it.
+///
+/// Two of them since DRAGON-485, and only because the two tabs delete two different KINDS of
+/// thing; see [`delete_title`].
 pub const DELETE_TITLE: &str = "Delete this folder?";
+
+/// The album tab's delete heading.
+pub const ALBUM_DELETE_TITLE: &str = "Delete this album?";
+
+/// The delete confirmation's heading for the tab being shown. Pure; unit-tested.
+pub fn delete_title(tab: Destination) -> &'static str {
+    match tab {
+        Destination::Files => DELETE_TITLE,
+        Destination::Photos => ALBUM_DELETE_TITLE,
+    }
+}
+
+/// The ALBUM delete confirmation's body. Pure; unit-tested (DRAGON-485).
+///
+/// **It promises the opposite of the folder one, and that is not an inconsistency.** A folder's
+/// contents go with the folder; an album's do NOT, because this app deletes an album with the
+/// tool's own "keep the photos in the timeline" option (see
+/// `providers::proton::Proton::delete_album`). An album is a way of grouping photos a user
+/// already has, so destroying the grouping must not destroy the photos, and the sentence has to
+/// say which of the two is about to happen.
+///
+/// Not keyed on `delete_recoverable` like the folder body is: what that capability describes is
+/// whether a deleted thing can be put back, and here nothing the user would miss is deleted at
+/// all.
+pub fn album_delete_confirm_body(album: &str, provider_name: &str) -> String {
+    format!(
+        "{album} will be removed from your {provider_name}. The photos in it stay in your \
+         photo timeline, so nothing you uploaded is lost."
+    )
+}
 
 /// The delete confirmation's body. Pure; unit-tested.
 ///
@@ -1275,7 +1747,21 @@ pub const CONFIGURE_TOOLTIP: &str = "Configure this account";
 /// or the access token is expiring and there is no refresh token to renew it from. Anything
 /// else is a live account, and a Reconnect offered on one of those would read as a fault the
 /// user has to act on.
-pub fn reconnect_warranted(stored: Option<&TokenSet>, now: chrono::DateTime<chrono::Utc>) -> bool {
+pub fn reconnect_warranted(
+    external_tool: bool,
+    stored: Option<&TokenSet>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    // **An external-tool account has no stored sign-in BY DESIGN** (DRAGON-485), because the
+    // tool holds the session itself, under its own identity, where this app cannot see it.
+    // Without this arm every Proton row would offer Reconnect from the moment it was connected:
+    // the probe would find nothing stored, and "nothing stored" is what the rule below reads as
+    // a dead account. A Proton session that really has ended is reported by the call that hits
+    // it, through `proton::classify_failure`'s reconnect prefix, which is the same signal the
+    // OAuth providers' own failures raise.
+    if external_tool {
+        return false;
+    }
     let Some(tokens) = stored else { return true };
     tokens.refresh_token.is_none()
         && crate::cloud::oauth::needs_refresh(tokens.expires_at.as_deref(), now)
@@ -1398,7 +1884,10 @@ impl crate::app::App {
         // `account_subtitle`), and an unknown provider (no spec) names none either: both fall
         // out of `save_path` answering `None`, which is keyed on the same registry table
         // `chooses_folder` reads and is pinned to agree with it in `cloud::registry_tests`.
-        let destination = crate::cloud::save_path(&account.provider, account.folder_name.as_deref());
+        // `account_save_path`, not `save_path`: an account can be pointed at an ALBUM rather
+        // than a folder (DRAGON-485), and the row must name whichever it actually has. That
+        // function is where the two are told apart, so this line asks one question either way.
+        let destination = crate::cloud::account_save_path(account);
         let icon_name = account.spec().map_or("cloud-symbolic", |s| s.icon);
         let text_block = widget::column::with_capacity(2)
             .push(widget::text::body(label.clone()).font(cosmic::font::bold()))
@@ -1489,9 +1978,21 @@ impl crate::app::App {
         let Some((_, name)) = add.pending_delete.as_ref() else {
             return stacked;
         };
+        // The ALBUM confirmation promises the opposite of the folder one, on purpose: this app
+        // deletes an album with the tool's own "keep the photos" option, so nothing the user
+        // uploaded goes with it. See `album_delete_confirm_body`.
+        let body = if add.browsing_albums() {
+            album_delete_confirm_body(name, spec.display_name)
+        } else {
+            delete_confirm_body(name, spec.display_name, spec.caps.delete_recoverable)
+        };
         let card = widget::dialog()
-            .title(DELETE_TITLE)
-            .body(delete_confirm_body(name, spec.display_name, spec.caps.delete_recoverable))
+            .title(delete_title(if add.browsing_albums() {
+                Destination::Photos
+            } else {
+                Destination::Files
+            }))
+            .body(body)
             .primary_action(crate::widgets::arrow_cursor::arrow_cursor(
                 widget::button::destructive("Delete")
                     .on_press(cm(CloudSettingsMsg::FolderDeleteConfirm)),
@@ -1558,6 +2059,13 @@ impl crate::app::App {
         }
         // A reconnect has nothing to choose: the account already names its provider, and
         // changing it would make the new tokens belong to a different drive.
+        // The SELECTED provider's runtime face (DRAGON-485), for the caption and the Connect
+        // button. The open menu does NOT read this one: it derives a face per row from the
+        // page state, because this value belongs to whichever provider is selected, and the
+        // owner hit exactly that as a bug (DRAGON-514 follow-up): with Google selected, the
+        // Proton row drew plain Ready until Proton was selected, so the install guidance only
+        // appeared AFTER the click it should have replaced.
+        let tool = self.settings.cloud.tool_entry_for(spec, add.reconnect_of.is_some());
         let control: Element<'a, Msg> = if add.reconnect_of.is_some() {
             widget::row::with_capacity(2)
                 .push(crate::widgets::icons::sized(spec.icon, 20.0))
@@ -1566,18 +2074,18 @@ impl crate::app::App {
                 .align_y(Alignment::Center)
                 .into()
         } else {
-            provider_picker(add, spec)
+            provider_picker(add, spec, &self.settings.cloud)
         };
         let env_value = std::env::var(client_id_env(spec)).ok();
         let mut column = widget::column::with_capacity(3).push(control).spacing(8.0);
-        for note in provider_notes(spec, env_value.as_deref()) {
+        for note in provider_notes(spec, env_value.as_deref(), tool) {
             // NOT `subdued_caption`: that tone is a 78%-toward-background wash meant for an
             // inert icon at rest, not a sentence the user has to actually read (the missing
             // app-registration notice and its siblings were unreadably faint on the owner's
             // report). Same caption size, normal readable color.
             column = column.push(widget::text::caption(note));
         }
-        let action = connect_action(spec, env_value.as_deref());
+        let action = connect_action(spec, env_value.as_deref(), tool);
         // Pressable unless the provider has no public API at all; see `connect_pressable` for
         // why a build with no client id gets a LIVE button rather than a dead one.
         let button = widget::button::suggested("Connect");
@@ -1647,7 +2155,9 @@ fn cloud_empty_state<'a>() -> widget::Dialog<'a, Msg> {
 fn client_id_env(spec: &ProviderSpec) -> &'static str {
     match spec.auth {
         AuthKind::OAuthPkce { client_id_env, .. } => client_id_env,
-        AuthKind::Unofficial => "",
+        // Neither has a client id to override: one has no API at all, and the other is reached
+        // through a tool that owns its own sign-in.
+        AuthKind::ExternalTool { .. } | AuthKind::Unofficial => "",
     }
 }
 
@@ -1656,7 +2166,11 @@ fn client_id_env(spec: &ProviderSpec) -> &'static str {
 /// The popover WRAPPER is unconditional and only the POPUP comes and goes, the same shape
 /// the preview editor's menus use: wrapping conditionally changes the widget tag at this
 /// position, and iced answers a tag change by rebuilding the subtree.
-fn provider_picker<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> Element<'a, Msg> {
+fn provider_picker<'a>(
+    add: &'a CloudAdd,
+    spec: &'static ProviderSpec,
+    cloud: &'a CloudPageState,
+) -> Element<'a, Msg> {
     let face = widget::row::with_capacity(3)
         .push(crate::widgets::icons::sized(spec.icon, 20.0))
         .push(widget::text::body(spec.display_name).width(Length::Fill))
@@ -1674,7 +2188,7 @@ fn provider_picker<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> Elemen
     let mut picker = widget::popover(anchor);
     if add.menu_open {
         picker = picker
-            .popup(provider_menu(add.provider))
+            .popup(provider_menu(add.provider, cloud, add.reconnect_of.is_some()))
             .position(widget::popover::Position::Bottom)
             .on_close(cm(CloudSettingsMsg::AddProviderMenu(false)));
     }
@@ -1692,26 +2206,99 @@ fn provider_picker<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> Elemen
 /// **Connectable only since DRAGON-498** ([`crate::cloud::connectable_display_order`]). Proton
 /// Drive and iCloud Drive used to sit here unpressable, each captioned "Not available yet", so
 /// a user could see they had not been forgotten; the owner's call is that a picker should offer
-/// what can be picked. Every row here is therefore pressable, which is why this loop has no
-/// caption line and no selectable guard left in it. The registry still carries both providers
-/// for every prose answer that needs them.
-fn provider_menu<'a>(selected: usize) -> Element<'a, Msg> {
+/// what can be picked. iCloud is still absent for exactly that reason.
+///
+/// # The one row that can carry a caption again (DRAGON-485)
+///
+/// Proton Drive is back in this list, and it is back because its answer is now FIXABLE. Its row
+/// wears one of [`ToolEntry`]'s three faces: an ordinary entry when its tool answered the probe,
+/// an entry captioned "Requires proton-drive CLI" whose press opens the download page instead of
+/// selecting it, and a captioned, unpressable entry when the provider's one account slot is
+/// already taken.
+///
+/// That is not a return to the deleted "Not available yet" caption, and the difference is the
+/// whole point: that one said a provider could never be connected, which is a fact a picker
+/// should act on by not listing it. These say what to DO, and two of the three come with a press
+/// that does it.
+fn provider_menu<'a>(
+    selected: usize,
+    cloud: &CloudPageState,
+    is_reconnect: bool,
+) -> Element<'a, Msg> {
     let offered = crate::cloud::connectable_display_order();
     let mut list = widget::column::with_capacity(offered.len()).spacing(2.0);
     for (index, spec) in offered {
+        // EACH row derives its own face from the page state (owner-reported bug, the
+        // DRAGON-514 follow-up round): threading the SELECTED provider's single entry here
+        // meant the Proton row drew plain Ready until Proton was selected, so the install
+        // guidance only appeared after the click it exists to replace. `tool_entry_for`
+        // answers `Ready` for every provider no tool reaches, so plain rows draw exactly
+        // what they always drew.
+        let face = cloud.tool_entry_for(spec, is_reconnect);
+        let tool_name = match spec.auth {
+            AuthKind::ExternalTool { tool_name, .. } => tool_name,
+            _ => "",
+        };
+        // The name, with the row's own explanation under it when it has one. A column rather
+        // than a second row, so the caption sits below the name at the same inset and the
+        // provider marks stay in one vertical line however many rows carry a note.
+        // In the install state the NAME steps back to SUBTLE (owner call, corrected in
+        // DRAGON-522): the provider is not selectable right now, and the accent caption below is
+        // the live part of the row. Subtle, not `subdued`: half the dim, still comfortably
+        // readable, which is the tone this file has twice been reported for getting wrong.
+        let name_text: Element<'_, Msg> = match face {
+            ToolEntry::Install => widget::text::body(spec.display_name)
+                .class(cosmic::theme::Text::Custom(|t| {
+                    cosmic::iced::widget::text::Style {
+                        color: Some(theme::subtle(t)),
+                        ..Default::default()
+                    }
+                }))
+                .into(),
+            _ => widget::text::body(spec.display_name).into(),
+        };
+        let mut names = widget::column::with_capacity(2)
+            .push(name_text)
+            .spacing(1.0)
+            .width(Length::Fill);
+        if let Some(note) = face.note(tool_name) {
+            // The install note is a LINK LABEL (its press opens the download page), so it
+            // wears the accent like every other link (owner call); the connected note is
+            // information, not a press, and keeps the quiet-but-legible subtle tone.
+            names = names.push(match face {
+                ToolEntry::Install => accent_caption(note),
+                _ => subtle_caption(note),
+            });
+        }
         let content = widget::row::with_capacity(2)
             .push(crate::widgets::icons::sized(spec.icon, 20.0))
-            .push(widget::text::body(spec.display_name).width(Length::Fill))
+            .push(names)
             .spacing(10.0)
             .align_y(Alignment::Center)
             .width(Length::Fill);
+        // **What the press does is the face's answer.** Selecting a provider a connect cannot
+        // start would arm a Connect button that could only explain itself, which is the shape
+        // `connect_pressable`'s doc records as having read to the owner as a broken dialog. So
+        // the install face sends the user where the fix is, and the connected face takes no
+        // press at all, with its caption already saying why.
+        let press = match face {
+            ToolEntry::Ready => Some(cm(CloudSettingsMsg::AddProviderSelected(index))),
+            ToolEntry::Install => Some(cm(CloudSettingsMsg::OpenToolDownload(index))),
+            ToolEntry::Connected => None,
+        };
         let entry = widget::button::custom(content)
             .class(cosmic::theme::Button::MenuItem)
             .selected(index == selected)
             .width(Length::Fill)
             .padding([6.0, 10.0])
-            .on_press(cm(CloudSettingsMsg::AddProviderSelected(index)));
-        list = list.push(crate::widgets::arrow_cursor::arrow_cursor(entry));
+            .on_press_maybe(press);
+        // Cursor tells the truth about the press (owner call): the install row IS a link
+        // (its press opens a browser), so it keeps the pointer every link gets; the other
+        // rows are in-app selections and wear the desktop arrow like the rest of the page.
+        list = list.push(match face {
+            ToolEntry::Install => Element::from(entry),
+            _ => crate::widgets::arrow_cursor::arrow_cursor(entry),
+        });
     }
     menu_surface(list, PROVIDER_MENU_W)
 }
@@ -1887,6 +2474,26 @@ fn provider_title_row(spec: &'static ProviderSpec, title: String) -> Element<'st
 /// **`copied` flashes the copy button** (DRAGON-489 follow-up). For [`COPIED_FLASH`] after a
 /// press it swaps the copy glyph to a success-green tick and its tooltip to "Copied!", then
 /// reverts on its own via the once-a-second tick (no state to clear).
+///
+/// # The EXTERNAL-TOOL arm keeps both phases and neither affordance (DRAGON-522)
+///
+/// The two phases are the same seam for every provider: the URL landing is what swaps the copy.
+/// What that URL MEANS is not the same thing on both sides, and the owner's live test is why
+/// this arm exists. On an OAuth provider the app owns the address and nothing opens it unless
+/// the user presses the link, so the link and its copy icon ARE the way in. Proton's tool opens
+/// the browser ITSELF, from inside `auth login`, and prints the address immediately afterwards;
+/// the app cannot switch that off. So the "Click here" row appeared at the exact moment the
+/// browser was already up, offering a second way into a page the user was looking at, and its
+/// press did nothing they needed. [`external_browser_line`] replaces it with the two plain
+/// sentences the owner asked for, and the transition point is unchanged.
+///
+/// **What that costs, stated rather than papered over**: the tool swallows a browser-launch
+/// failure (it spawns the opener detached and discards the error), and in `--json` mode it
+/// prints only the address, no instruction. So on a machine where the browser does not come up,
+/// the printed address was the one recovery, and this arm no longer shows it. The countdown
+/// still runs out and the step still ends with a failure the user can retry. Left as-is on the
+/// owner's call rather than improvised around; if that case is ever reported, the fix is a
+/// fallback affordance on the LATE side of the deadline, not the affordance back at the start.
 fn cloud_browser_step<'a>(
     spec: &'static ProviderSpec,
     url: Option<&'a str>,
@@ -1898,6 +2505,13 @@ fn cloud_browser_step<'a>(
     // needed centering) is gone.
     let mut content = widget::column::with_capacity(5).spacing(12.0).width(Length::Fill);
     content = content.push(provider_title_row(spec, format!("Signing in to {}", spec.display_name)));
+    // The EXTERNAL-TOOL arm (DRAGON-522): two plain sentences, one per phase, and no link, copy
+    // or QR in either. See this function's doc for why an affordance that works for the OAuth
+    // providers is dead weight here.
+    if spec.auth.is_external_tool() {
+        content = content.push(widget::text::body(external_browser_line(url.is_some())));
+        return browser_dialog(content, remaining_secs);
+    }
     if url.is_none() {
         content = content.push(widget::text::body(format!(
             "Sign in to {} using the link below, then come back to this window.",
@@ -1953,10 +2567,34 @@ fn cloud_browser_step<'a>(
     // rather than the thing to act on, and at the column's own 12px it read as a fourth line of
     // the same block. One more `space_xs`, the SAME token this column spaces by, doubles that gap
     // into a section break without introducing a second spacing value to keep in step.
-    let gap = cosmic::theme::active().cosmic().space_xs() as f32;
-    content = content.push(widget::Space::new().height(Length::Fixed(gap)));
-    content = content.push(subtle_caption(format!("Waiting for the browser ({remaining_secs})...")));
+    browser_dialog(content, remaining_secs)
+}
 
+/// The Browser step's shared tail: the countdown, then the card (DRAGON-522).
+///
+/// Both arms end the same way, so the two cannot drift into different-looking steps. Split out
+/// when the external-tool arm returned early; nothing about what it builds changed.
+///
+/// The countdown sits directly under whatever the arm said, left-aligned like the rest (owner
+/// request), not above, so the step never looks "already finished" before its first line even
+/// renders. It reads against the real `BROWSER_DEADLINE`, via `browser_started` at the call site,
+/// so it is never just a decorative number. `subtle_caption`, not `subdued_caption`: this line is
+/// secondary (a background countdown, not the sentence someone acts on), so it dims, but only
+/// half of `subdued`'s wash, which read as unreadable for real content elsewhere in this file.
+///
+/// A DELIBERATE BREAK above it (DRAGON-503, owner report: the two lines sat too close). The
+/// countdown is a different kind of statement from the sentence over it, a background fact rather
+/// than the thing to act on, and at the column's own 12px it read as a fourth line of the same
+/// block. One more `space_xs`, the SAME token this column spaces by, doubles that gap into a
+/// section break without introducing a second spacing value to keep in step.
+fn browser_dialog<'a>(
+    content: widget::Column<'a, Msg, cosmic::Theme>,
+    remaining_secs: u64,
+) -> widget::Dialog<'a, Msg> {
+    let gap = cosmic::theme::active().cosmic().space_xs() as f32;
+    let content = content
+        .push(widget::Space::new().height(Length::Fixed(gap)))
+        .push(subtle_caption(format!("Waiting for the browser ({remaining_secs})...")));
     widget::dialog()
         // No `.icon()`, no `.title()`, no `.body()`: the whole left-aligned header is fed in as
         // the `.control(...)`, so the content column gets the card's full width (see
@@ -1966,6 +2604,26 @@ fn cloud_browser_step<'a>(
             widget::button::text("Cancel").on_press(cm(CloudSettingsMsg::AddClose)),
         ))
 }
+
+/// What the Browser step says for a provider whose sign-in is run by an external TOOL. Pure;
+/// unit-tested (DRAGON-522, the owner's exact wording).
+///
+/// `url_known` is the same two-phase seam every provider's step turns on: false while the tool is
+/// starting and before it has reported an address, true from the moment it has. On this arm that
+/// moment is also the moment the browser opens, because the tool opens it itself immediately
+/// before printing the address, which is what makes the second sentence true when it appears.
+///
+/// Neither phase offers a link, a copy control or a QR code. See [`cloud_browser_step`]'s doc for
+/// why, and for what the missing affordance would have been good for.
+pub fn external_browser_line(url_known: bool) -> &'static str {
+    if url_known { EXTERNAL_SIGN_IN_READY } else { EXTERNAL_SIGN_IN_LAUNCHING }
+}
+
+/// Phase one: the tool is starting and has not opened anything yet.
+const EXTERNAL_SIGN_IN_LAUNCHING: &str = "Launching authorization...";
+
+/// Phase two: the tool has opened the browser.
+const EXTERNAL_SIGN_IN_READY: &str = "Please sign in with your browser.";
 
 /// The failure step. `retry` decides whether there is a primary action at all: a build with
 /// no sign-in id, and a provider with no API, are not going to behave differently on a
@@ -1999,9 +2657,17 @@ fn cloud_failed_step<'a>(
 /// which is what keeps a folderless step from asking where uploads should go.
 fn cloud_setup_step<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> widget::Dialog<'a, Msg> {
     let browse = chooses_folder(spec);
-    let mut control = widget::column::with_capacity(7).spacing(10.0).width(Length::Fill);
+    // The DESTINATION TABS (DRAGON-485), for the one provider whose drive has two kinds of
+    // place to put a capture. Only where the registry row says there is a second destination,
+    // so every other provider's step is byte-identical to what it was.
+    let tabs = browse && crate::cloud::has_albums(spec);
+    // The ONE reader of "which model is this step in", so nothing below has to re-derive it: a
+    // provider with no album root is always Files, whatever a hand-edited account says.
+    let photos = tabs && add.tab == Destination::Photos;
+    let words = browser_words(if photos { Destination::Photos } else { Destination::Files });
+    let mut control = widget::column::with_capacity(8).spacing(10.0).width(Length::Fill);
     control = control.push(provider_title_row(spec, setup_title(browse).to_string()));
-    control = control.push(widget::text::body(setup_body(spec, browse)));
+    control = control.push(widget::text::body(setup_body_for(spec, browse, photos)));
     if let Some(note) = setup_sandbox_note(spec, browse) {
         // `subtle_caption`, the SAME quiet-but-legible tone as the footer status below
         // (DRAGON-495, owner request: one quiet-text style per dialog). It states a limit rather
@@ -2009,64 +2675,101 @@ fn cloud_setup_step<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> widge
         // the subdued wash this file has been reported for twice.
         control = control.push(subtle_caption(note));
     }
+    if tabs {
+        // Above the browser, because the tab decides what the browser is showing.
+        control = control.push(destination_tabs(add.tab));
+    }
     if browse {
-        // The path row carries the level's own name, mark and tick, and the refresh/create pair
-        // (DRAGON-514). Everything the list used to duplicate at its top lives there now.
-        control = control.push(breadcrumb_row(
-            add,
-            folder_slot(browse, add.folder_loading, add.folder_note.is_some()),
-        ));
+        let slot = folder_slot(browse, add.folder_loading, add.folder_note.is_some());
+        // The header row. On Files it is the breadcrumb: the level's own name plus the
+        // refresh/create pair (DRAGON-514). On Photos it is the chosen ALBUM's name plus the
+        // same pair, because there is no trail to draw. See `album_header_row`.
+        control = control.push(if photos {
+            album_header_row(add, slot)
+        } else {
+            breadcrumb_row(add, slot)
+        });
+        let row_glyph = if photos { ALBUM_ROW_ICON_NAME } else { "folder-open-symbolic" };
         let mut list = widget::column::with_capacity(add.folders.len() + 1).spacing(2.0);
         if let Some(typed) = add.creating.as_deref() {
             // At the TOP of the list, where the folder itself will appear once the level is
             // re-listed, and at the list's own inset. See `new_folder_row`.
-            list = list.push(new_folder_row(typed, add.create_busy));
+            list = list.push(new_folder_row(typed, add.create_busy, row_glyph, words));
         }
         // DRAGON-514: the list's FIRST entry used to be the folder the list is INSIDE, repeated
         // above its own children, and it was the only way to choose that folder. The owner's
         // report was that it reads as a child of itself. It is gone; the path row names the level
         // (`level_control`), and the list is exactly the children of the level named above it.
         //
-        // DRAGON-517: a row carries NO tick and no pick. Going into a folder is what makes it the
-        // destination, so the one press a row has is the one it always had, and the mark that
-        // said "this one is chosen" now sits on the level a user is actually in.
-        for (index, (_, name)) in add.folders.iter().enumerate() {
+        // DRAGON-517: a FOLDER row carries no tick and no pick. Going into a folder is what makes
+        // it the destination, so the one press a row has is the one it always had, and the mark
+        // that said "this one is chosen" now sits on the level a user is actually in.
+        //
+        // DRAGON-485: an ALBUM row is the other model, and it is why the rows below take both a
+        // press and a selected flag. An album is flat, so there is nowhere to descend to: the
+        // press SELECTS, and the row itself takes the mark. `cloud::proton::ALBUMS` is where the
+        // instruction not to unify the two lives.
+        let chosen_album = add.album.as_ref().map(|(id, _)| id.as_str());
+        for (index, (id, name)) in add.folders.iter().enumerate() {
+            let (selected, press) = if photos {
+                (chosen_album == Some(id.as_str()), cm(CloudSettingsMsg::AlbumPicked(index)))
+            } else {
+                (false, cm(CloudSettingsMsg::FolderCrumbIn(index)))
+            };
             list = list.push(folder_entry(
                 name,
+                row_glyph,
+                selected,
                 Some(index),
-                cm(CloudSettingsMsg::FolderCrumbIn(index)),
+                words,
+                press,
             ));
         }
         // A "Reading your folders..." line USED to sit here, directly above the list, in the
         // SUBDUED tone (DRAGON-489); it then moved to the dialog's footer as a
         // `tertiary_action` (DRAGON-495) because it pushed the list down as it came and went.
         // DRAGON-514 deleted it outright, in both places: there is no loading TEXT anywhere in
-        // this browser now, and the refresh icon in the path row spins instead.
+        // this browser now.
         //
-        // The settled-empty level says so, in the well's own space (DRAGON-520). See
-        // `shows_empty_level_note` for the three states that keep it quiet instead. The note
-        // REPLACES the scrollable rather than riding inside it (as it used to as an extra row):
-        // a scrollable lays its content out with an unbounded height budget, so it can overflow
-        // and scroll, which leaves nothing for `align_y` to centre a row against. The note's own
-        // container is pinned to the well's exact height instead, which is what gives centering
-        // on both axes real room to apply.
-        let well_content: Element<'_, Msg> = if shows_empty_level_note(
-            add.folders.len(),
-            add.folder_loading,
-            add.creating.is_some(),
-            add.pending_delete.is_some() || add.delete_busy,
-        ) {
-            let lines: Vec<Element<'_, Msg>> =
-                EMPTY_LEVEL_NOTE.iter().map(|line| subtle_caption(*line)).collect();
-            widget::container(widget::column(lines).spacing(2.0).align_x(Alignment::Center))
+        // What replaced it (DRAGON-522) is a PICTURE, in the well's own space: the same refresh
+        // glyph the path row spins, at [`WELL_SPINNER_ICON`], centred where the empty note would
+        // be. The small one keeps spinning beside the `+` as it always did; this one makes the
+        // wait unmistakable, which the 16px glyph three rows up could not.
+        //
+        // Both non-row faces REPLACE the scrollable rather than riding inside it (as the note
+        // used to, as an extra row): a scrollable lays its content out with an unbounded height
+        // budget, so it can overflow and scroll, which leaves nothing for `align_y` to centre
+        // against. Their container is pinned to the well's exact height instead, which is what
+        // gives centering on both axes real room to apply.
+        fn centred<'a>(content: Element<'a, Msg>) -> Element<'a, Msg> {
+            widget::container(content)
                 .width(Length::Fill)
                 .height(Length::Fixed(FOLDER_LIST_H))
                 .padding([0.0, FOLDER_ROW_PAD[1]])
                 .align_x(Alignment::Center)
                 .align_y(Alignment::Center)
                 .into()
-        } else {
-            widget::scrollable(list).height(Length::Fixed(FOLDER_LIST_H)).width(Length::Fill).into()
+        }
+        let well_content: Element<'_, Msg> = match well_face(
+            add.folders.len(),
+            add.folder_loading,
+            add.creating.is_some(),
+            add.pending_delete.is_some() || add.delete_busy,
+        ) {
+            WellFace::Waiting => centred(crate::widgets::icons::sized_rotated(
+                "view-refresh-symbolic",
+                WELL_SPINNER_ICON,
+                add.folder_spin,
+                subdued_svg_class(),
+            )),
+            WellFace::Empty => {
+                let lines: Vec<Element<'_, Msg>> =
+                    words.empty.iter().map(|line| subtle_caption(*line)).collect();
+                centred(widget::column(lines).spacing(2.0).align_x(Alignment::Center).into())
+            }
+            WellFace::Rows => {
+                widget::scrollable(list).height(Length::Fixed(FOLDER_LIST_H)).width(Length::Fill).into()
+            }
         };
         control = control.push(folder_list_well(well_content));
     }
@@ -2127,6 +2830,75 @@ fn cloud_setup_step<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> widge
     // where both act on the level they are read next to. The footer is Cancel and Done again.
 }
 
+/// The setup step's DESTINATION TABS (DRAGON-485): Files first, Photos second.
+///
+/// **The tab is the choice, not a view of it.** Pressing Done writes whichever tab is showing,
+/// so this control is where a user says "put my captures in an album" as much as the album row
+/// below it is. Files leads because it is the destination every provider has and the one an
+/// account with nothing stored already means.
+///
+/// Two `button::custom`s in a strip rather than `widget::tab_bar`: this row sits INSIDE a dialog
+/// card, above a browser it re-aims, and the tab bar widget is a page-level chrome control with
+/// its own margins and its own divider.
+///
+/// **The active tab is drawn by its MATERIAL, not by `.selected(..)`.** That flag would be a
+/// no-op here, and this file already records why: `cosmic::theme::Button::MenuItem`'s style
+/// function never reads it (see `folder_entry`, where the same discovery retired a tick that had
+/// stopped drawing anything). A tab strip whose active tab looks identical to the inactive one
+/// is not a tab strip, so the two states use two materials that visibly differ on their own: the
+/// filled settings pill this dialog's other controls wear, and the flat text button the app's
+/// menus use.
+fn destination_tabs<'a>(active: Destination) -> Element<'a, Msg> {
+    let mut row = widget::row::with_capacity(2).spacing(4.0).align_y(Alignment::Center);
+    for (tab, label, glyph) in [
+        (Destination::Files, FILES_TAB_LABEL, FILES_TAB_ICON_NAME),
+        (Destination::Photos, PHOTOS_TAB_LABEL, PHOTOS_TAB_ICON_NAME),
+    ] {
+        let face = widget::row::with_capacity(2)
+            .push(crate::widgets::icons::sized(glyph, FOLDER_ROW_ICON))
+            .push(widget::text::body(label))
+            .spacing(6.0)
+            .align_y(Alignment::Center);
+        let class = if tab == active {
+            standard_button_class()
+        } else {
+            cosmic::theme::Button::Text
+        };
+        row = row.push(crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::custom(face)
+                .class(class)
+                // Live even on the tab already showing: a press there is a no-op the handler
+                // absorbs, and an inert control in a two-button strip reads as broken, which is
+                // the lesson `connect_pressable`'s doc records from the owner's own report.
+                .padding(FOLDER_ROW_PAD)
+                .on_press(cm(CloudSettingsMsg::SetupTab(tab))),
+        ));
+    }
+    row.into()
+}
+
+/// The FILES tab's label (DRAGON-522, the owner's wording).
+///
+/// "My files", not "Files": it is what Proton's own drive calls the section this tab browses
+/// (`/my-files`), so the tab and the place it opens are named the same thing. Lowercase `f`,
+/// exactly as written here.
+const FILES_TAB_LABEL: &str = "My files";
+
+/// The PHOTOS tab's label. Unchanged, and named here so both tabs read from one place.
+const PHOTOS_TAB_LABEL: &str = "Photos";
+
+/// The FILES tab's mark: lucide `inbox`, a tray things arrive in (DRAGON-522, the owner's pick).
+///
+/// Deliberately not the folder mark: the rows and the breadcrumb below the tab already wear that,
+/// and a tab wearing its own list's glyph says nothing the list does not.
+const FILES_TAB_ICON_NAME: &str = "inbox-symbolic";
+
+/// The PHOTOS tab's mark: lucide `image` (DRAGON-522, the owner's pick).
+///
+/// The album ROWS keep [`ALBUM_ROW_ICON_NAME`]'s `book-image`: a row is one album, a book of
+/// pictures, while the tab is the photo library as a whole.
+const PHOTOS_TAB_ICON_NAME: &str = "image-x-generic-symbolic";
+
 /// The folder browser's REFRESH control (DRAGON-503, relocated and given a spinning face by
 /// DRAGON-514): re-read this account's folders, for a user who has just made one at the
 /// provider.
@@ -2177,7 +2949,22 @@ fn subtle_svg_class() -> cosmic::theme::Svg {
     cosmic::theme::Svg::custom(|theme| cosmic::widget::svg::Style { color: Some(theme::subtle(theme)) })
 }
 
-fn folder_refresh_button<'a>(slot: FolderSlot, spin: f32, height: f32) -> Element<'a, Msg> {
+/// The SUBDUED tone for an SVG glyph: dimmer than [`subtle_svg_class`], used only by the big
+/// centred listing spinner (owner call): at 5x the glyph has enough area that the subtle tone
+/// read too bright against the well, while the SMALL refresh spinner keeps subtle, where the
+/// dimmer tone would vanish at 16px.
+fn subdued_svg_class() -> cosmic::theme::Svg {
+    cosmic::theme::Svg::custom(|theme| {
+        cosmic::widget::svg::Style { color: Some(theme::subdued(theme)) }
+    })
+}
+
+fn folder_refresh_button<'a>(
+    slot: FolderSlot,
+    spin: f32,
+    height: f32,
+    words: BrowserWords,
+) -> Element<'a, Msg> {
     if slot == FolderSlot::Loading {
         // Sized to the glyph the pressable faces wear, so the row's height and the control's
         // footprint are identical in all three states and the spin cannot nudge the `+` beside
@@ -2198,7 +2985,7 @@ fn folder_refresh_button<'a>(slot: FolderSlot, spin: f32, height: f32) -> Elemen
             .class(accent_icon_button_class(false))
             .padding(2)
             .height(Length::Fixed(height))
-            .tooltip(if slot == FolderSlot::Failed { "Try again" } else { "Refresh folder list" })
+            .tooltip(if slot == FolderSlot::Failed { "Try again" } else { words.refresh_tooltip })
             .on_press(cm(CloudSettingsMsg::FolderRefresh)),
     )
 }
@@ -2241,9 +3028,16 @@ fn folder_refresh_button<'a>(slot: FolderSlot, spin: f32, height: f32) -> Elemen
 /// style function never reads it, unlike `Button::ListItem`'s, which is why the tick existed at
 /// all), and there is no per-row selection left for it to carry even if a future libcosmic
 /// started honouring it.
-fn folder_entry<'a>(name: &str, deletable: Option<usize>, msg: Msg) -> Element<'a, Msg> {
+fn folder_entry<'a>(
+    name: &str,
+    glyph: &'static str,
+    selected: bool,
+    deletable: Option<usize>,
+    words: BrowserWords,
+    msg: Msg,
+) -> Element<'a, Msg> {
     let row = widget::row::with_capacity(2)
-        .push(crate::widgets::icons::sized("folder-open-symbolic", FOLDER_ROW_ICON))
+        .push(crate::widgets::icons::sized(glyph, FOLDER_ROW_ICON))
         .push(widget::text::body(name.to_string()).width(Length::Fill));
     let entry = crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::custom(row.spacing(10.0).align_y(Alignment::Center).width(Length::Fill))
@@ -2254,7 +3048,7 @@ fn folder_entry<'a>(name: &str, deletable: Option<usize>, msg: Msg) -> Element<'
     );
     widget::row::with_capacity(2)
         .push(entry)
-        .push(folder_row_actions(deletable))
+        .push(folder_row_actions(selected, deletable, words))
         .align_y(Alignment::Center)
         .width(Length::Fill)
         .into()
@@ -2276,19 +3070,35 @@ const FOLDER_ACTION_ICON: f32 = 16.0;
 /// outside edge so every row ends at the same place as the text above and below it.
 const FOLDER_ACTION_PAD: f32 = 4.0;
 
+/// **The footprint of ONE trailing slot, filled or empty** (DRAGON-522).
+///
+/// The glyph plus its padding on both sides. It exists as a constant because a slot's width has
+/// to be the same whatever is in it, and it was not: the bin is a `button` carrying
+/// [`FOLDER_ACTION_PAD`], while the tick was a BARE glyph with none, so a slot with a tick in it
+/// was 8px narrower than the `Space` that stands in for an empty one. Nothing showed while the
+/// tick was dead on every row (DRAGON-517), and the Photos tab, which is the first list to draw
+/// one, put the bin 8px further left on a checked row than on an unchecked one. Every slot now
+/// goes through [`action_slot`], so a filled one cannot differ from an empty one again.
+const FOLDER_ACTION_SLOT: f32 = FOLDER_ACTION_ICON + 2.0 * FOLDER_ACTION_PAD;
+
 /// **The fixed width of a folder row's trailing-actions block** (DRAGON-514).
 ///
 /// Two slots, always both reserved, whether or not either is filled. This is the whole
 /// mechanism that keeps a row with a tick, a row with a bin, and a row with both ending at the
 /// same inset from the browser's edge: the block cannot change width, so the name column cannot
 /// change width either, so nothing shifts as a selection moves between rows.
-const FOLDER_ACTIONS_W: f32 =
-    2.0 * (FOLDER_ACTION_ICON + 2.0 * FOLDER_ACTION_PAD) + FOLDER_ROW_PAD[1];
+const FOLDER_ACTIONS_W: f32 = 2.0 * FOLDER_ACTION_SLOT + FOLDER_ROW_PAD[1];
 
 const _: () = assert!(
     FOLDER_ACTIONS_W > 2.0 * FOLDER_ACTION_ICON + FOLDER_ROW_PAD[1],
     "DRAGON-514: the trailing block must reserve BOTH glyphs and their padding, or a row with \
      one action ends at a different inset from a row with two, which is what it was reported for"
+);
+
+const _: () = assert!(
+    FOLDER_ACTION_SLOT > FOLDER_ACTION_ICON,
+    "DRAGON-522: a slot is the glyph PLUS its padding; a slot sized to the bare glyph is the \
+     8px the trash icon shifted left by on a checked album row"
 );
 const _: () = assert!(
     FOLDER_ROW_PAD[1] > 0.0,
@@ -2296,19 +3106,29 @@ const _: () = assert!(
      reported as; the create row shares this constant so the two cannot drift apart again"
 );
 
-/// Which of a folder row's two trailing slots are FILLED. Pure; unit-tested.
+/// Which of a row's two trailing slots are FILLED. Pure; unit-tested.
 ///
-/// `[tick, bin]`, and **the tick is now always empty** (DRAGON-517): selection follows the view,
-/// so a folder in the LIST is by definition not the level the browser is in, and a row has no
-/// pick for a mark to report. The slot is still RESERVED, which is why this answers a pair rather
-/// than a bare bool: the block's width is [`FOLDER_ACTIONS_W`], fixed, and an unfilled slot is
-/// drawn as a `Space` of the same footprint, so a row's name column and its right edge do not
-/// move when the bin is the only thing in it.
+/// `[tick, bin]`. The slot is RESERVED either way, which is why this answers a pair rather than
+/// a bare bool: the block's width is [`FOLDER_ACTIONS_W`], fixed, and an unfilled slot is drawn
+/// as a `Space` of the same footprint, so a row's name column and its right edge do not move
+/// when the bin is the only thing in it.
+///
+/// # The tick, gone and back for two different reasons (DRAGON-517, then DRAGON-485)
+///
+/// DRAGON-517 emptied the tick on the FILES tab and it stays empty there: selection follows the
+/// view, so a folder in the list is by definition not the level the browser is in, and a row has
+/// no pick for a mark to report.
+///
+/// The PHOTOS tab is the case that reasoning does not cover. An album is flat, so there is no
+/// level to be standing in and no view for a selection to follow; the album a user clicked is
+/// the destination, and the only place a mark can say which one that is, is the row itself. So
+/// the slot the folder side reserves and never fills is the slot the album side was already
+/// shaped for.
 ///
 /// The block's WIDTH does not depend on this at all: this decides what is DRAWN, never how much
 /// room it takes.
-fn folder_row_slots(deletable: bool) -> [bool; 2] {
-    [false, deletable]
+fn folder_row_slots(selected: bool, deletable: bool) -> [bool; 2] {
+    [selected, deletable]
 }
 
 /// A folder row's trailing actions: the delete bin, in ONE fixed-width block sized for TWO
@@ -2338,15 +3158,32 @@ fn folder_row_slots(deletable: bool) -> [bool; 2] {
 /// rather than as "not this row", which is the lesson `connect_pressable` records from the
 /// owner's own report of this dialog; pressing one of those puts the REASON on the step's notice
 /// line instead (see [`delete_refusal`] and [`CloudSettingsMsg::FolderDelete`]).
-fn folder_row_actions<'a>(deletable: Option<usize>) -> Element<'a, Msg> {
-    // One slot's footprint, used for both the drawn glyph and the empty placeholders.
-    let slot = FOLDER_ACTION_ICON + 2.0 * FOLDER_ACTION_PAD;
-    let blank = || -> Element<'a, Msg> { widget::Space::new().width(Length::Fixed(slot)).into() };
-    let [_tick_slot, show_bin] = folder_row_slots(deletable.is_some());
-    // The leading slot is the retired selection tick (DRAGON-517). It is RESERVED and never
-    // filled, which is what [`folder_row_slots`] answers and what keeps the bin in the column it
-    // has always been in.
-    let tick: Element<'a, Msg> = blank();
+fn folder_row_actions<'a>(
+    selected: bool,
+    deletable: Option<usize>,
+    words: BrowserWords,
+) -> Element<'a, Msg> {
+    let blank = || -> Element<'a, Msg> { action_slot(widget::Space::new()) };
+    let [show_tick, show_bin] = folder_row_slots(selected, deletable.is_some());
+    // The leading slot: empty on the Files tab, where DRAGON-517 retired it, and the chosen
+    // ALBUM's mark on the Photos tab, where a flat list has nowhere else to carry one. See
+    // [`folder_row_slots`] for why the same reserved slot serves both.
+    //
+    // Drawn in the ACCENT, not the plain foreground the bin wears: it reports a state rather
+    // than offering an action, and it is the one thing on the row a user is scanning for.
+    let tick: Element<'a, Msg> = if show_tick {
+        // Through [`action_slot`] like everything else in this block. The bare glyph used to go
+        // straight in, 8px narrower than the `Space` it replaced, which moved the bin beside it.
+        action_slot(
+            crate::widgets::icons::sized("emblem-ok-symbolic", FOLDER_ACTION_ICON).class(
+                cosmic::theme::Svg::Custom(std::rc::Rc::new(|t: &cosmic::Theme| {
+                    cosmic::widget::svg::Style { color: Some(theme::accent(t)) }
+                })),
+            ),
+        )
+    } else {
+        blank()
+    };
     let bin: Element<'a, Msg> = match deletable.filter(|_| show_bin) {
         Some(index) => widget::tooltip(
             crate::widgets::arrow_cursor::arrow_cursor(
@@ -2364,14 +3201,14 @@ fn folder_row_actions<'a>(deletable: Option<usize>) -> Element<'a, Msg> {
                 .padding(FOLDER_ACTION_PAD)
                 .on_press(cm(CloudSettingsMsg::FolderDelete(index))),
             ),
-            widget::text("Delete this folder").size(12),
+            widget::text(words.delete_tooltip).size(12),
             widget::tooltip::Position::Top,
         )
         .into(),
         None => blank(),
     };
     widget::container(
-        widget::row::with_capacity(2).push(tick).push(bin).align_y(Alignment::Center),
+        widget::row::with_capacity(2).push(tick).push(action_slot(bin)).align_y(Alignment::Center),
     )
     // The row's own horizontal inset on the OUTSIDE edge, so the actions stop where a row's
     // text would (`FOLDER_ROW_PAD`), and the fixed width that makes every row agree.
@@ -2379,6 +3216,22 @@ fn folder_row_actions<'a>(deletable: Option<usize>) -> Element<'a, Msg> {
     .width(Length::Fixed(FOLDER_ACTIONS_W))
     .align_y(Alignment::Center)
     .into()
+}
+
+/// One trailing slot: whatever is in it, centred in exactly [`FOLDER_ACTION_SLOT`]
+/// (DRAGON-522).
+///
+/// **Width, not padding.** The bin already carries [`FOLDER_ACTION_PAD`] inside its own button
+/// and the tick is a bare glyph, so padding here would size the two differently all over again;
+/// a fixed width with the content centred makes all three cases (tick, bin, empty) the same
+/// square by construction, which is the invariant [`FOLDER_ACTIONS_W`] assumes and DRAGON-514
+/// wrote down.
+fn action_slot<'a>(content: impl Into<Element<'a, Msg>>) -> Element<'a, Msg> {
+    widget::container(content)
+        .width(Length::Fixed(FOLDER_ACTION_SLOT))
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// The path row above the folder list (DRAGON-506): where in the app folder the list is, the mark
@@ -2426,6 +3279,7 @@ fn folder_row_actions<'a>(deletable: Option<usize>) -> Element<'a, Msg> {
 /// [`CloudAdd::has_loaded_once`] is already `true`, so those keep the ordinary look: the real
 /// path, with just the trailing refresh icon spinning.
 fn breadcrumb_row<'a>(add: &'a CloudAdd, slot: Option<FolderSlot>) -> Element<'a, Msg> {
+    let words = browser_words(Destination::Files);
     let depth = add.trail.len();
     let names = add.level_names();
     let crumbs = breadcrumb(depth);
@@ -2526,15 +3380,84 @@ fn breadcrumb_row<'a>(add: &'a CloudAdd, slot: Option<FolderSlot>) -> Element<'a
                 .height(Length::Fixed(control_h))
                 .on_press(cm(CloudSettingsMsg::FolderCreateOpen)),
         ),
-        widget::text("New folder here").size(12),
+        widget::text(words.create_tooltip).size(12),
         widget::tooltip::Position::Top,
     );
     let mut actions = widget::row::with_capacity(2).spacing(PATH_ACTION_GAP).align_y(Alignment::Center);
     if let Some(slot) = slot {
-        actions = actions.push(folder_refresh_button(slot, add.folder_spin, control_h));
+        actions = actions.push(folder_refresh_button(slot, add.folder_spin, control_h, words));
     }
     row.push(actions.push(create)).into()
 }
+
+/// The PHOTOS tab's header row: one instruction, and the same refresh/create pair the folder
+/// path row carries (DRAGON-485, emptied of its breadcrumb by DRAGON-522).
+///
+/// **[`breadcrumb_row`]'s counterpart, not a variant of it.** There is no trail, because albums
+/// do not nest, so there is nothing to build crumbs from and nothing to press to go back out. It
+/// is the same ROW (the same shared control height, the same trailing pair at the same gap)
+/// carrying what this tab has instead.
+///
+/// # What it says, and why it stopped naming the album (owner report, live testing)
+///
+/// It used to be a breadcrumb of one: the `book-image` mark plus the chosen album's name, the
+/// Photos-side equivalent of the folder row stating the level you are in. On screen that is one
+/// fact said twice, because the album a user picked already wears the tick in the list below,
+/// and the header's copy of it read as a second, competing selection. The owner's call was to
+/// drop it: [`ALBUM_HEADER_PROMPT`] states what the tab is FOR, the check stays the only place a
+/// selection is reported, and the row loses the glyph with the name it was leading.
+///
+/// The FIRST-EVER load still says "Loading...", exactly as the folder row does and for the same
+/// reason: there is no list yet, so inviting a choice from it would be an instruction with
+/// nothing to act on.
+fn album_header_row<'a>(add: &'a CloudAdd, slot: Option<FolderSlot>) -> Element<'a, Msg> {
+    let words = browser_words(Destination::Photos);
+    let control_h = row_control_h();
+    let first_load = breadcrumb_first_load(add.folder_loading, add.has_loaded_once);
+    let mut row = widget::row::with_capacity(4).spacing(4.0).align_y(Alignment::Center);
+    let label: Element<'a, Msg> = if first_load {
+        subtle_caption("Loading...")
+    } else {
+        // Not `subtle_caption`: this is the row's own instruction, the sentence a user acts on,
+        // and the dimmed tone is for the secondary lines beside it (see `subtle_caption`'s own
+        // note about the two mistakes already fixed in this file).
+        widget::text::body(ALBUM_HEADER_PROMPT).into()
+    };
+    row = row.push(label);
+    row = row.push(widget::Space::new().width(Length::Fill));
+    let create = widget::tooltip(
+        crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::icon(crate::widgets::icons::handle("list-add-symbolic"))
+                .class(accent_icon_button_class(false))
+                .padding(2)
+                .height(Length::Fixed(control_h))
+                .on_press(cm(CloudSettingsMsg::FolderCreateOpen)),
+        ),
+        widget::text(words.create_tooltip).size(12),
+        widget::tooltip::Position::Top,
+    );
+    let mut actions =
+        widget::row::with_capacity(2).spacing(PATH_ACTION_GAP).align_y(Alignment::Center);
+    if let Some(slot) = slot {
+        actions = actions.push(folder_refresh_button(slot, add.folder_spin, control_h, words));
+    }
+    row.push(actions.push(create)).into()
+}
+
+/// The album mark, on the Photos tab's header row and on every album row in its list.
+///
+/// The lucide `book-image` glyph (the owner's pick): a book of pictures, which is what an album
+/// is, and visibly not the folder mark beside it on the other tab.
+const ALBUM_ROW_ICON_NAME: &str = "book-image-symbolic";
+
+/// The Photos header's own line (DRAGON-522, owner's wording).
+///
+/// What the tab is FOR, in one sentence, rather than a readout of what is currently picked. It
+/// replaced a breadcrumb of one (the album mark plus the chosen album's name) and its
+/// "No album chosen yet" empty state, both of which said something the list below already says
+/// with its check. Naming the two things a user can do here, choose one or make one, also names
+/// the `+` beside it.
+const ALBUM_HEADER_PROMPT: &str = "Select or create a photo album";
 
 /// The path row's LEVEL mark (DRAGON-514, made a statement rather than a control by DRAGON-517,
 /// then stripped of its own tick on the owner's later report): the name of the folder the
@@ -2592,9 +3515,14 @@ fn level_control<'a>(label: String, height: f32) -> Element<'a, Msg> {
 /// the marks above and below it. Before this it was a bare full-width bar with no padding of its
 /// own, which made it read as a strip laid across the list rather than as the row the new folder
 /// is about to become, and made the list appear to jump when the real row replaced it.
-fn new_folder_row<'a>(typed: &'a str, busy: bool) -> Element<'a, Msg> {
+fn new_folder_row<'a>(
+    typed: &'a str,
+    busy: bool,
+    glyph: &'static str,
+    words: BrowserWords,
+) -> Element<'a, Msg> {
     let mut row = widget::row::with_capacity(4)
-        .push(crate::widgets::icons::sized("folder-open-symbolic", FOLDER_ROW_ICON))
+        .push(crate::widgets::icons::sized(glyph, FOLDER_ROW_ICON))
         .spacing(6.0)
         .align_y(Alignment::Center)
         .width(Length::Fill);
@@ -2605,13 +3533,13 @@ fn new_folder_row<'a>(typed: &'a str, busy: bool) -> Element<'a, Msg> {
         );
     }
     row = row.push(
-        widget::text_input("Folder name", typed)
+        widget::text_input(words.name_placeholder, typed)
             .on_input(|text| cm(CloudSettingsMsg::FolderCreateInput(text)))
             .on_submit(|_| cm(CloudSettingsMsg::FolderCreateSubmit))
             .width(Length::Fill),
     );
     for (icon, tooltip, message) in [
-        ("emblem-ok-symbolic", "Create this folder", CloudSettingsMsg::FolderCreateSubmit),
+        ("emblem-ok-symbolic", words.create_submit, CloudSettingsMsg::FolderCreateSubmit),
         ("window-close-symbolic", "Cancel", CloudSettingsMsg::FolderCreateCancel),
     ] {
         row = row.push(widget::tooltip(
@@ -2662,7 +3590,11 @@ impl crate::app::App {
             CloudSettingsMsg::AddOpen => {
                 self.settings.cloud.notice = None;
                 self.settings.cloud.add = Some(CloudAdd::new());
-                Task::none()
+                // The picker is opening, so ask the external tool whether it is there
+                // (DRAGON-485). Unlike every other provider's availability this can change
+                // between two opens of this dialog, which is the whole reason it is a probe
+                // rather than a build-time fact.
+                self.probe_external_tool()
             }
             CloudSettingsMsg::AddClose => {
                 // A connect already in flight CANNOT be aborted: the loopback listener owns
@@ -2689,6 +3621,14 @@ impl crate::app::App {
             CloudSettingsMsg::AddProviderMenu(open) => {
                 if let Some(add) = self.settings.cloud.add.as_mut() {
                     add.menu_open = open;
+                }
+                // Re-probe every time the LIST is opened (DRAGON-485), not only when the dialog
+                // is: a user sent to the download page by the install row comes back to this
+                // same dialog, and opening the list again is how they ask whether it took.
+                // `probe_external_tool` refuses to start a second one on top of an in-flight
+                // probe, so repeatedly toggling the list costs one process, not a pile.
+                if open {
+                    return self.probe_external_tool();
                 }
                 Task::none()
             }
@@ -2728,6 +3668,24 @@ impl crate::app::App {
                 // A compile-time constant, never a value that travelled through a message or
                 // came back from a provider, so there is nothing here to check.
                 crate::platform::services::open_uri(CLOUD_GUIDE_URL);
+                Task::none()
+            }
+            CloudSettingsMsg::ToolProbed(availability) => {
+                self.settings.cloud.tool_probing = false;
+                self.settings.cloud.tool = Some(availability);
+                Task::none()
+            }
+            CloudSettingsMsg::OpenToolDownload(index) => {
+                // The address is read out of the REGISTRY ROW, which is a compile-time
+                // constant, so the message's payload only ever picks a row: nothing a provider
+                // or a message supplied can reach the OS opener this way. Same reasoning as
+                // `OpenGuide`, which carries no payload at all because it has only one row to
+                // pick from.
+                if let Some(AuthKind::ExternalTool { download_url, .. }) =
+                    crate::cloud::registry().get(index).map(|spec| spec.auth)
+                {
+                    crate::platform::services::open_uri(download_url);
+                }
                 Task::none()
             }
             CloudSettingsMsg::Connected(generation, result) => {
@@ -2786,6 +3744,42 @@ impl crate::app::App {
                 // a refresh incapable of losing where the captures go, which is what
                 // `surviving_selection` used to have to work for.
                 add.browsed = true;
+                // **A folder just created ENTERS itself** (DRAGON-523), which under the DRAGON-517
+                // model is exactly what selecting it means: the level being shown is the
+                // destination, so a user who makes "2026" and presses Done gets 2026.
+                //
+                // TAKEN rather than read, so exactly one landed listing can act on it. This is also
+                // the arm that answers a provider still catching up with its own create: the item
+                // is simply not in `add.folders`, `created_selection` says `Nothing`, and the
+                // browser stays where it is with the new folder one refresh away.
+                let created = add.created.take();
+                let landed = created_selection(created.as_ref(), Destination::Files, &add.folders);
+                let entered = match landed {
+                    CreatedSelection::Enter(index) => add.folders.get(index).cloned(),
+                    // `Select` is the album side's answer and cannot arrive on a FOLDER listing.
+                    CreatedSelection::Select(_) | CreatedSelection::Nothing => None,
+                };
+                if let Some(folder) = entered {
+                    // Byte for byte what a crumb press does (`FolderCrumbIn`), for the same
+                    // reasons: the old level's rows go NOW rather than when the new ones land, the
+                    // inline create row goes with them because a level change closes it, and the
+                    // descent's own listing is what fills the level again.
+                    //
+                    // The create row is worth spelling out, because one really can be open here:
+                    // the create's own reply closed it, but the + on the breadcrumb stays live
+                    // while the re-list runs, so a second press re-opens one aimed at the level
+                    // being left. Descending with it open would hand the next name typed there to
+                    // the folder that was just made, instead of putting it beside it.
+                    add.trail.push(folder);
+                    add.folders.clear();
+                    add.creating = None;
+                    // The adoption still runs, and runs FIRST: this listing is what taught the
+                    // dialog the app folder's id, and that is a fact about the account whether or
+                    // not the view then moves off it (see `adopt_app_folder`). It writes a file and
+                    // returns no task of its own, so the batch is really just the descent.
+                    let adopt = self.adopt_app_folder();
+                    return Task::batch([adopt, self.relist_current_level()]);
+                }
                 self.adopt_app_folder()
             }
             CloudSettingsMsg::FolderViewRestored(generation, result) => {
@@ -2825,6 +3819,105 @@ impl crate::app::App {
                 self.adopt_app_folder()
             }
             CloudSettingsMsg::FolderRefresh => self.relist_current_level(),
+            CloudSettingsMsg::SetupTab(tab) => {
+                let Some(add) = self.settings.cloud.add.as_mut() else {
+                    return Task::none();
+                };
+                if add.tab == tab {
+                    // The tab already showing. Absorbed rather than re-listed: the strip keeps
+                    // both buttons live (a dead control in a two-button strip reads as broken),
+                    // so a press here is ordinary and must not cost a provider round trip.
+                    return Task::none();
+                }
+                add.tab = tab;
+                // The other tab's rows go NOW rather than when the new ones land: folders left
+                // under an album header would say this account has albums it does not.
+                add.folders.clear();
+                add.creating = None;
+                add.pending_delete = None;
+                add.folder_note = None;
+                // The FILES side keeps its trail. A user who browsed three levels down, looked
+                // at Photos and came back should be where they left off, and the trail is the
+                // only record of that; the album side has nothing equivalent to keep, because a
+                // flat list has no position.
+                self.relist_current_level()
+            }
+            CloudSettingsMsg::AlbumPicked(index) => {
+                // **The whole of choosing, on this tab.** Nothing is written here, exactly as
+                // nothing is written when the Files browser descends (DRAGON-517):
+                // `SetupDone` commits, and Cancel therefore leaves the account as it was found.
+                if let Some(add) = self.settings.cloud.add.as_mut()
+                    && let Some(album) = add.folders.get(index).cloned()
+                {
+                    add.album = Some(album);
+                    add.folder_note = None;
+                }
+                Task::none()
+            }
+            CloudSettingsMsg::AlbumsLoaded(generation, result) => {
+                if generation != self.settings.cloud.generation {
+                    return Task::none();
+                }
+                let Some(add) = self.settings.cloud.add.as_mut() else {
+                    return Task::none();
+                };
+                add.folder_loading = false;
+                // A fetch COMPLETED, exactly as in `FoldersLoaded`: what
+                // `breadcrumb_first_load` reads is whether the first one has landed, not
+                // whether it succeeded.
+                add.has_loaded_once = true;
+                let setup = match result {
+                    // Not fatal, and there is no ascend-and-retry arm here: a flat list has no
+                    // level to step out to, so every failure is a note. That absence is the
+                    // model showing through, not a case left unhandled.
+                    Err(message) => {
+                        add.folder_note = Some(classify_failure(&message).message().to_string());
+                        return Task::none();
+                    }
+                    Ok(setup) => setup,
+                };
+                add.folder_note = None;
+                add.folders = setup.folders.into_iter().map(|f| (f.id, f.name)).collect();
+                let default = setup.root.map(|r| (r.id, r.name));
+                // **An album just created takes the check** (DRAGON-523), which is the whole of
+                // choosing on this tab: albums are flat, so there is nowhere to descend to and no
+                // view to move. TAKEN rather than read, exactly as on the Files side, so one
+                // landing acts on it and a provider that has not caught up with its own create
+                // selects nothing.
+                //
+                // Applied BEFORE the reconciliation below rather than after it, so the new album
+                // passes the same "is it really in this listing" gate every other selection does.
+                // An id matched against these very rows cannot fail that gate, which is the point:
+                // there is one rule for what may be selected, not two.
+                let created = add.created.take();
+                if let CreatedSelection::Select(index) =
+                    created_selection(created.as_ref(), Destination::Photos, &add.folders)
+                    && let Some(album) = add.folders.get(index).cloned()
+                {
+                    add.album = Some(album);
+                }
+                // **The selection is reconciled against what actually came back**, which is the
+                // album side's counterpart to the Files side's ascend-when-the-level-is-gone
+                // rule (`listing_failure`). Two cases reach the app's own album: nothing chosen
+                // yet, and a chosen album that has been deleted somewhere else since. Leaving a
+                // stale name on the header would let Done write a destination the provider no
+                // longer has.
+                let still_there = add
+                    .album
+                    .as_ref()
+                    .is_some_and(|(id, _)| add.folders.iter().any(|(listed, _)| listed == id));
+                if !still_there {
+                    // The app's own album if the listing had one, and NOTHING otherwise
+                    // (DRAGON-522). It used to fall back to the first album in the list, which
+                    // was invisible while the default was always provisioned by the listing
+                    // itself; with provisioning lazy, that fallback would quietly pre-select
+                    // whichever album happened to sort first and let Done save it. Nothing
+                    // selected is the honest state: the header asks for a choice, and Done with
+                    // no choice makes the app's own album (`needs_default_album_first`).
+                    add.album = default;
+                }
+                Task::none()
+            }
             CloudSettingsMsg::FolderCrumbIn(index) => {
                 let Some(add) = self.settings.cloud.add.as_mut() else {
                     return Task::none();
@@ -2891,17 +3984,36 @@ impl crate::app::App {
                     return Task::none();
                 };
                 match result {
-                    Ok(_) => {
+                    Ok(made) => {
                         // The row closes and the LEVEL is re-listed rather than the new folder
                         // being pushed onto the list here: the provider decides the id, the
                         // final name and the sort position, and a locally invented row would be
                         // a second, possibly-disagreeing copy of all three.
                         add.creating = None;
+                        // **What that re-listing will select** (DRAGON-523): the new item's
+                        // IDENTITY, not a row. The listing is what turns it into one, and until it
+                        // lands there is nothing on screen to select. See `created_selection`.
+                        //
+                        // The tab is read here, at the reply, because the generation guard above
+                        // has already ruled out a switch since the create was submitted: switching
+                        // tabs re-lists, a re-list bumps the generation, and a bumped generation
+                        // drops this message. So this is the tab the create was made on.
+                        let tab = match add.browsing_albums() {
+                            true => Destination::Photos,
+                            false => Destination::Files,
+                        };
+                        add.created = Some(CreatedItem { id: made.id, name: made.name, tab });
                         self.relist_current_level()
                     }
                     Err(message) => {
                         // The typed name STAYS, so a name that was refused can be edited rather
                         // than retyped from nothing.
+                        //
+                        // **And the spinner stops HERE** (DRAGON-522). This is the one arm that
+                        // starts no listing, so it is the one arm that has to end the refreshing
+                        // state the press turned on; without this the well would spin forever
+                        // over a create that already failed, with Done disabled behind it.
+                        add.folder_loading = false;
                         add.folder_note = Some(classify_failure(&message).message().to_string());
                         Task::none()
                     }
@@ -2918,20 +4030,29 @@ impl crate::app::App {
                 // the step's own notice line, which is why the trash stays a live button on
                 // every row (see `folder_entry`). The candidate is compared as a PATH, since a
                 // destination further down is inside this folder and would go with it.
-                let levels = add.level_names();
-                let candidate = destination_path(&levels, Some(&name));
-                let leaf = add
-                    .spec()
-                    .and_then(|spec| crate::cloud::app_folder_name(spec.id))
-                    .unwrap_or(ROOT_DESTINATION);
-                let chosen = add
-                    .account
-                    .as_ref()
-                    .and_then(|a| a.folder_name.clone())
-                    .map(|stored| crate::cloud::folder_path_segments(Some(&stored), leaf).join("/"));
-                if let Some(reason) =
+                // The ALBUM rule is its own (DRAGON-485), and it is shorter for a reason albums
+                // cannot help: they do not nest, so the "this folder CONTAINS the destination"
+                // half has nothing to match. It also compares the album's ID rather than a path,
+                // since two albums may share a name. See `album_delete_refusal`.
+                let refusal = if add.browsing_albums() {
+                    album_delete_refusal(&id, add.album.as_ref().map(|(id, _)| id.as_str()))
+                } else {
+                    let levels = add.level_names();
+                    let candidate = destination_path(&levels, Some(&name));
+                    let leaf = add
+                        .spec()
+                        .and_then(|spec| crate::cloud::app_folder_name(spec.id))
+                        .unwrap_or(ROOT_DESTINATION);
+                    let chosen = add
+                        .account
+                        .as_ref()
+                        .and_then(|a| a.folder_name.clone())
+                        .map(|stored| {
+                            crate::cloud::folder_path_segments(Some(&stored), leaf).join("/")
+                        });
                     delete_refusal(candidate.as_deref().unwrap_or_default(), chosen.as_deref())
-                {
+                };
+                if let Some(reason) = refusal {
                     add.folder_note = Some(reason.to_string());
                     return Task::none();
                 }
@@ -2980,6 +4101,14 @@ impl crate::app::App {
                 Task::none()
             }
             CloudSettingsMsg::SetupDone => {
+                // **Confirming Photos with nothing chosen is what provisions the default album**
+                // (DRAGON-522). Listing no longer does, so this is the one press that can need an
+                // album that is not there yet: the user has said "put my captures in an album"
+                // and named none. The dialog stays open, spinning, until the create answers; its
+                // reply (`DefaultAlbumMade`) finishes this Done.
+                if self.needs_default_album_first() {
+                    return self.make_default_album();
+                }
                 // **This is where a destination is written** (DRAGON-517). It used to be written
                 // the moment a folder was picked, because picking was a separate act from
                 // browsing; with the level itself as the destination, every crumb press would
@@ -2988,6 +4117,32 @@ impl crate::app::App {
                 self.settings.cloud.generation += 1;
                 self.settings.cloud.add = None;
                 save
+            }
+            CloudSettingsMsg::DefaultAlbumMade(generation, result) => {
+                if generation != self.settings.cloud.generation {
+                    return Task::none();
+                }
+                let Some(add) = self.settings.cloud.add.as_mut() else {
+                    return Task::none();
+                };
+                add.folder_loading = false;
+                match result {
+                    Ok(album) => {
+                        add.album = Some((album.id, album.name));
+                        // Straight on into the Done the user already pressed. Re-entering the
+                        // message rather than duplicating its body keeps ONE ending for both
+                        // routes through it, and it cannot loop: the album is set above, so the
+                        // guard that sent us here is false now.
+                        self.update_cloud(CloudSettingsMsg::SetupDone)
+                    }
+                    Err(message) => {
+                        // The dialog stays open with the reason on its notice line: the account
+                        // keeps whatever destination it already had, and pressing Done again is
+                        // a real retry rather than a second identical failure.
+                        add.folder_note = Some(classify_failure(&message).message().to_string());
+                        Task::none()
+                    }
+                }
             }
             CloudSettingsMsg::Reload => {
                 self.settings.cloud.notice = None;
@@ -3073,8 +4228,16 @@ impl crate::app::App {
         else {
             return Task::none();
         };
-        let refusal = match connect_action(spec, std::env::var(client_id_env(spec)).ok().as_deref())
-        {
+        // The SAME face the picker drew (DRAGON-485), so a row the list offered is a row this
+        // can start, and a row it refused refuses here too rather than opening a flow the tool
+        // cannot finish.
+        let is_reconnect = existing.is_some();
+        let tool = self.settings.cloud.tool_entry_for(spec, is_reconnect);
+        let refusal = match connect_action(
+            spec,
+            std::env::var(client_id_env(spec)).ok().as_deref(),
+            tool,
+        ) {
             ConnectAction::Refused(message) => Some(message),
             ConnectAction::Run => None,
         };
@@ -3200,6 +4363,13 @@ impl crate::app::App {
         if !browse {
             return Task::none();
         }
+        // An account already pointed at an ALBUM re-opens on the Photos tab (DRAGON-485), so
+        // what it fetches is that tab's list. There is no WALK to do here, which is the whole
+        // difference: a folder destination is a path whose every level needs an id the account
+        // does not store, and a flat album is already fully addressed by the one id it does.
+        if crate::cloud::uploads_to_album(&account) {
+            return album_list_task(account, generation);
+        }
         folder_restore_task(account, generation)
     }
 
@@ -3234,10 +4404,19 @@ impl crate::app::App {
         self.settings.cloud.generation += 1;
         let generation = self.settings.cloud.generation;
         let mut parent = None;
+        let mut photos = false;
         if let Some(add) = self.settings.cloud.add.as_mut() {
             add.folder_loading = true;
             add.folder_note = None;
             parent = add.level_parent();
+            photos = add.browsing_albums();
+        }
+        // The ALBUM side lists through its own call and lands on its own message (DRAGON-485):
+        // `album list` is a different command from `filesystem list`, takes no level, and its
+        // answer moves a SELECTION rather than filling a level. Everything before this line is
+        // shared, because starting a listing is the same act either way.
+        if photos {
+            return album_list_task(account, generation);
         }
         folder_level_task(account, parent, generation)
     }
@@ -3259,8 +4438,9 @@ impl crate::app::App {
         if add.create_busy {
             return Task::none();
         }
+        let photos = add.browsing_albums();
         let siblings: Vec<&str> = add.folders.iter().map(|(_, name)| name.as_str()).collect();
-        if let Some(reason) = create_refusal(&typed, &siblings) {
+        if let Some(reason) = create_refusal(&typed, &siblings, add.words()) {
             if let Some(add) = self.settings.cloud.add.as_mut() {
                 add.folder_note = Some(reason);
             }
@@ -3272,19 +4452,82 @@ impl crate::app::App {
         if let Some(add) = self.settings.cloud.add.as_mut() {
             add.create_busy = true;
             add.folder_note = None;
-            // The generation bump above has ABANDONED any listing in flight, so the footer must
-            // stop claiming to be reading one; the create's own reply re-lists the level. Same
-            // reasoning in `delete_cloud_folder`.
-            add.folder_loading = false;
+            // Any earlier create's pending selection goes now (DRAGON-523), so what is waiting is
+            // always the most recent one. A create that FAILS therefore leaves nothing to select,
+            // which is the whole of that case: its arm of `FolderCreated` starts no listing, so
+            // there is no landing for a stale identity to ride in on either.
+            add.created = None;
+            // **Refreshing from the PRESS, not from the reply** (DRAGON-522, owner report). This
+            // used to clear the flag, on the reasoning that the generation bump above had
+            // abandoned any listing in flight and nothing was being read any more. True, and it
+            // left the dialog looking inert for as long as the provider took: on Proton a create
+            // is a process launch, several seconds, with nothing on screen saying so. A mutation
+            // IS the start of the level changing, so the well spins from here until the re-list
+            // its reply starts finally lands. Same reasoning in `delete_cloud_folder`.
+            add.folder_loading = true;
+        }
+        Task::perform(
+            off_thread(move || match photos {
+                // `album create` takes a NAME and no parent: there is nowhere for an album to be
+                // created inside.
+                true => crate::cloud::providers::create_album(&account, &typed),
+                false => {
+                    crate::cloud::providers::create_folder(&account, parent.as_deref(), &typed)
+                }
+            }),
+            move |result| {
+                let result = result.unwrap_or_else(|| {
+                    Err(match photos {
+                        true => "The album could not be created.".to_string(),
+                        false => "The folder could not be created.".to_string(),
+                    })
+                });
+                cosmic::Action::App(cm(CloudSettingsMsg::FolderCreated(generation, result)))
+            },
+        )
+    }
+
+    /// Whether pressing Done has to make the app's own album before it can save (DRAGON-522).
+    ///
+    /// The dialog-side half of the lazy rule (`cloud::providers::needs_default_album` is the
+    /// account-side one): the user is confirming the Photos tab and no album is selected, which
+    /// only happens when the account has none saved AND the listing offered no default to fall
+    /// back on. Every other Done saves straight away, including one on an account whose album is
+    /// simply something else.
+    fn needs_default_album_first(&self) -> bool {
+        self.settings
+            .cloud
+            .add
+            .as_ref()
+            .is_some_and(|add| add.browsing_albums() && add.album.is_none() && add.account.is_some())
+    }
+
+    /// Make the app's own album, for the Done that needs one (DRAGON-522).
+    ///
+    /// Off the UI thread like every other job this page starts, and stamped with a fresh
+    /// generation so a reply from a dialog the user has since closed cannot finish a Done nobody
+    /// asked for. `folder_loading` is set for the same reason a mutation sets it (DRAGON-522,
+    /// item 9): the well spins from the press, and Done is disabled while it does, so the button
+    /// cannot be pressed twice into two albums.
+    fn make_default_album(&mut self) -> Task<cosmic::Action<Msg>> {
+        let Some(account) = self.settings.cloud.add.as_ref().and_then(|add| add.account.clone())
+        else {
+            return Task::none();
+        };
+        self.settings.cloud.generation += 1;
+        let generation = self.settings.cloud.generation;
+        if let Some(add) = self.settings.cloud.add.as_mut() {
+            add.folder_loading = true;
+            add.folder_note = None;
         }
         Task::perform(
             off_thread(move || {
-                crate::cloud::providers::create_folder(&account, parent.as_deref(), &typed)
+                crate::cloud::providers::create_album(&account, crate::cloud::APP_FOLDER)
             }),
             move |result| {
                 let result =
-                    result.unwrap_or_else(|| Err("The folder could not be created.".to_string()));
-                cosmic::Action::App(cm(CloudSettingsMsg::FolderCreated(generation, result)))
+                    result.unwrap_or_else(|| Err("The album could not be created.".to_string()));
+                cosmic::Action::App(cm(CloudSettingsMsg::DefaultAlbumMade(generation, result)))
             },
         )
     }
@@ -3305,19 +4548,31 @@ impl crate::app::App {
         if add.delete_busy {
             return Task::none();
         }
+        let photos = add.browsing_albums();
         self.settings.cloud.generation += 1;
         let generation = self.settings.cloud.generation;
         if let Some(add) = self.settings.cloud.add.as_mut() {
             add.pending_delete = None;
             add.delete_busy = true;
             add.folder_note = None;
-            add.folder_loading = false;
+            // Refreshing from the press (DRAGON-522): see `create_cloud_folder` for why this is
+            // set rather than cleared. It matters more here, because the confirmation card
+            // closing is the only other thing that happens when Delete is pressed, so without it
+            // the well simply sat there with the doomed row still in it.
+            add.folder_loading = true;
         }
         Task::perform(
-            off_thread(move || crate::cloud::providers::delete_folder(&account, &folder)),
+            off_thread(move || match photos {
+                true => crate::cloud::providers::delete_album(&account, &folder),
+                false => crate::cloud::providers::delete_folder(&account, &folder),
+            }),
             move |result| {
-                let result =
-                    result.unwrap_or_else(|| Err("The folder could not be deleted.".to_string()));
+                let result = result.unwrap_or_else(|| {
+                    Err(match photos {
+                        true => "The album could not be deleted.".to_string(),
+                        false => "The folder could not be deleted.".to_string(),
+                    })
+                });
                 cosmic::Action::App(cm(CloudSettingsMsg::FolderDeleted(generation, result)))
             },
         )
@@ -3377,10 +4632,29 @@ impl crate::app::App {
         let Some(mut account) = add.account.clone() else {
             return Task::none();
         };
-        if add.browsed && account.spec().is_some_and(chooses_folder) {
+        // **The ACTIVE TAB is the destination** (DRAGON-485). On Photos that is the album a row
+        // was clicked on; on Files it is the level the browser is showing, unchanged. The KIND
+        // is written beside the pair, and only where the provider actually has two, so an
+        // account on a folders-only provider never gains the key at all.
+        if add.browsing_albums() {
+            if let Some((id, name)) = add.album.clone() {
+                account.destination = Some(Destination::Photos);
+                account.folder_id = Some(id);
+                account.folder_name = Some(name);
+            }
+            // No album chosen (an empty list, a listing that failed): the account keeps whatever
+            // it already had, exactly as `browsed` keeps the Files side from writing a
+            // destination it never learned.
+        } else if add.browsed && account.spec().is_some_and(chooses_folder) {
             let (folder_id, folder_name) = viewed_destination(&add.trail, add.root.as_ref());
             account.folder_id = folder_id;
             account.folder_name = folder_name;
+            // Written explicitly rather than left alone, because this is also how an account
+            // moves BACK from Photos to Files: clearing the kind is what makes the folder pair
+            // above mean a folder again.
+            if account.spec().is_some_and(crate::cloud::has_albums) {
+                account.destination = Some(Destination::Files);
+            }
         }
         if let Err(e) = crate::cloud::accounts::upsert(saved_account(&account)) {
             self.settings.cloud.notice = Some(e);
@@ -3416,12 +4690,46 @@ impl crate::app::App {
         self.set_cloud_destination(Some(id), Some(name))
     }
 
+    /// Ask the external tool whether it is installed and can run (DRAGON-485).
+    ///
+    /// Off the UI thread because it STARTS A PROCESS, and bounded inside
+    /// `cloud::proton::probe` by its own budget, per the house rule that nothing waits
+    /// unboundedly: a tool wedged on a locked keyring must not hold the settings window.
+    ///
+    /// **One at a time.** The probe runs whenever the picker or its list is opened, which a
+    /// user can do repeatedly; without this guard, toggling the list would queue one child per
+    /// press. A probe already in flight is the answer that is about to land anyway.
+    ///
+    /// A probe that could not be run at all reports [`crate::cloud::proton::Availability::Missing`],
+    /// which is what a tool nobody can start means, and is the same answer `probe` itself gives
+    /// for an executable that will not spawn.
+    fn probe_external_tool(&mut self) -> Task<cosmic::Action<Msg>> {
+        if self.settings.cloud.tool_probing {
+            return Task::none();
+        }
+        self.settings.cloud.tool_probing = true;
+        Task::perform(off_thread(crate::cloud::proton::probe), |availability| {
+            let availability =
+                availability.unwrap_or(crate::cloud::proton::Availability::Missing);
+            cosmic::Action::App(cm(CloudSettingsMsg::ToolProbed(availability)))
+        })
+    }
+
     /// Re-read every account's stored sign-in on the blocking pool, and report which ones
     /// warrant a Reconnect. Off the UI thread because a keyring read is a D-Bus round trip
     /// on Linux, and there is one per account.
     fn probe_cloud_signins(&self) -> Task<cosmic::Action<Msg>> {
-        let ids: Vec<String> =
-            self.settings.cloud.accounts.iter().map(|a| a.id.clone()).collect();
+        // The external-tool flag rides along, because the probe runs off the UI thread and the
+        // registry lookup that answers it belongs with the account it describes.
+        let ids: Vec<(String, bool)> = self
+            .settings
+            .cloud
+            .accounts
+            .iter()
+            .map(|a| {
+                (a.id.clone(), a.spec().is_some_and(|spec| spec.auth.is_external_tool()))
+            })
+            .collect();
         if ids.is_empty() {
             return Task::none();
         }
@@ -3429,13 +4737,15 @@ impl crate::app::App {
             off_thread(move || {
                 let now = chrono::Utc::now();
                 ids.into_iter()
-                    .filter(|id| {
+                    .filter(|(_, external)| !external)
+                    .filter(|(id, external)| {
                         let stored = crate::cloud::secrets::load(id)
                             .ok()
                             .flatten()
                             .and_then(|json| TokenSet::from_json(&json).ok());
-                        reconnect_warranted(stored.as_ref(), now)
+                        reconnect_warranted(*external, stored.as_ref(), now)
                     })
+                    .map(|(id, _)| id)
                     .collect::<Vec<String>>()
             }),
             |ids| cosmic::Action::App(cm(CloudSettingsMsg::HealthLoaded(ids.unwrap_or_default()))),
@@ -3526,6 +4836,26 @@ fn folder_restore_task(account: CloudAccount, generation: u64) -> Task<cosmic::A
 /// a refresh, a descent, a walk back up the breadcrumb, a create that landed and a delete that
 /// finished. Opening the dialog is the one thing that does NOT come here, because it may have
 /// several levels to walk; see [`folder_restore_task`].
+/// List an account's ALBUMS off the UI thread (DRAGON-485).
+///
+/// [`folder_level_task`]'s counterpart, and deliberately its own function rather than a flag on
+/// it: it calls a different provider entry point, takes no level (albums are flat, so there is
+/// nothing to pass), and lands on its own message because its answer moves a selection rather
+/// than filling a level.
+fn album_list_task(
+    account: CloudAccount,
+    generation: u64,
+) -> Task<cosmic::Action<Msg>> {
+    Task::perform(
+        off_thread(move || crate::cloud::providers::browse_albums(&account)),
+        move |result| {
+            let result =
+                result.unwrap_or_else(|| Err("Your albums could not be read.".to_string()));
+            cosmic::Action::App(cm(CloudSettingsMsg::AlbumsLoaded(generation, result)))
+        },
+    )
+}
+
 fn folder_level_task(
     account: CloudAccount,
     parent: Option<String>,
@@ -3555,19 +4885,33 @@ fn connect_and_save(
     existing: Option<CloudAccount>,
     on_browser_url: &mut dyn FnMut(&str),
 ) -> Result<CloudAccount, String> {
+    // **An external-tool provider signs in through its own tool, and holds no token at all**
+    // (DRAGON-485). Both flows report the sign-in address the same way and reach the same
+    // account record; what differs is that one comes back with tokens to store and the other
+    // comes back with nothing, because the tool owns the session under its own identity.
+    let external = crate::cloud::provider(provider_id)
+        .is_some_and(|spec| spec.auth.is_external_tool());
     // Report the sign-in URL back to the UI rather than opening it (DRAGON-489 follow-up): the
     // browser step shows it as a clickable link, and the user opens it
     // themselves. An earlier pass opened it automatically here too, but an automatic launch can
     // fail silently (no default browser set, the wrong browser opens, a headless/remote
     // session) with nothing else on screen to fall back to, so the decision is now the user's,
-    // not this closure's.
-    let connected = crate::cloud::oauth::connect_interactive_with(
-        provider_id,
-        crate::cloud::oauth::BROWSER_DEADLINE,
-        &mut |url| on_browser_url(url),
-    )?;
-    // The ONE place this page holds a secret, and it holds it only as far as the store.
-    let secret = connected.tokens.to_json()?;
+    // not this closure's. (The external tool opens one ANYWAY, which this app cannot switch
+    // off; the link is what makes the step recoverable when that fails.)
+    let secret = if external {
+        crate::cloud::proton::sign_in(crate::cloud::oauth::BROWSER_DEADLINE, &mut |url| {
+            on_browser_url(url);
+        })?;
+        None
+    } else {
+        let connected = crate::cloud::oauth::connect_interactive_with(
+            provider_id,
+            crate::cloud::oauth::BROWSER_DEADLINE,
+            &mut |url| on_browser_url(url),
+        )?;
+        // The ONE place this page holds a secret, and it holds it only as far as the store.
+        Some(connected.tokens.to_json()?)
+    };
     let account = match existing {
         Some(account) => account,
         None => {
@@ -3579,7 +4923,7 @@ fn connect_and_save(
             }
             CloudAccount {
                 id,
-                provider: connected.provider.clone(),
+                provider: provider_id.to_string(),
                 // The token exchange reports no identity (see `derive_label`), so this is
                 // the fallback until one is available.
                 label: derive_label(
@@ -3591,10 +4935,16 @@ fn connect_and_save(
                 folder_name: None,
                 added_at: chrono::Utc::now().to_rfc3339(),
                 visibility: None,
+            destination: None,
             }
         }
     };
-    crate::cloud::secrets::store(&account.id, &secret)?;
+    // Nothing to store for an external-tool account, and storing an empty string would be
+    // worse than storing nothing: `reconnect_warranted` reads the presence of a stored sign-in,
+    // and a placeholder would make a healthy account look like one with unusable tokens.
+    if let Some(secret) = secret {
+        crate::cloud::secrets::store(&account.id, &secret)?;
+    }
     crate::cloud::accounts::upsert(account.clone())?;
     log::debug!("cloud accounts: connected a {} account", account.provider);
     Ok(account)
@@ -3631,9 +4981,10 @@ mod provider_list_tests {
     }
 
     /// **The picker lists what can be picked, and nothing else** (DRAGON-498, one rule since
-    /// DRAGON-508). Every row it offers is a provider a press of Connect can actually START,
-    /// which now means one whose client id resolves. The registry still knows all six, which is
-    /// what the coverage answers elsewhere read.
+    /// DRAGON-508). Every row it offers is a provider a press of Connect can actually START:
+    /// one whose client id resolves, or the external-tool one, whose connect needs no id at all
+    /// (DRAGON-485). The registry still knows all six, which is what the coverage answers
+    /// elsewhere read.
     #[test]
     fn the_picker_lists_only_providers_this_build_can_connect() {
         assert_eq!(crate::cloud::registry().len(), 6);
@@ -3642,7 +4993,11 @@ mod provider_list_tests {
             ("CCK_DROPBOX_CLIENT_ID", "d-id"),
         ]));
         let ids: Vec<&str> = offered.iter().map(|(_, spec)| spec.id).collect();
-        assert_eq!(ids, ["dropbox", "gdrive"], "only the two with ids, in brand order");
+        assert_eq!(
+            ids,
+            ["dropbox", "gdrive", "proton"],
+            "the two with ids plus the external-tool one, in brand order"
+        );
         for (index, spec) in &offered {
             assert_ne!(spec.auth, AuthKind::Unofficial, "{} cannot be connected", spec.id);
             // Every row carries its REGISTRY index, which is what `AddProviderSelected` sends
@@ -3651,13 +5006,13 @@ mod provider_list_tests {
             // And a row that is offered is one Connect can press: the list and the button ask
             // the same question, so they cannot drift.
             assert_eq!(
-                connect_action(spec, Some("an-app-id")),
+                connect_action(spec, Some("an-app-id"), ToolEntry::Ready),
                 ConnectAction::Run,
                 "{} is offered but refuses",
                 spec.id
             );
         }
-        for hidden in ["proton", "icloud", "onedrive", "youtube"] {
+        for hidden in ["icloud", "onedrive", "youtube"] {
             assert!(
                 !offered.iter().any(|(_, spec)| spec.id == hidden),
                 "{hidden} has no client id here and must not be offered"
@@ -3717,6 +5072,7 @@ mod provider_list_tests {
             folder_name: None,
             added_at: String::new(),
             visibility: None,
+            destination: None,
         };
         let add = CloudAdd::reconnecting(account);
         assert_eq!(add.spec().map(|s| s.id), Some("dropbox"));
@@ -3738,6 +5094,7 @@ mod provider_list_tests {
             folder_name: Some("Screenshots".to_string()),
             added_at: String::new(),
             visibility: None,
+            destination: None,
         };
         let add = CloudAdd::edit_account(account.clone());
         assert_eq!(add.step, CloudAddStep::Setup);
@@ -3763,14 +5120,18 @@ mod connect_action_tests {
         crate::cloud::provider(id).expect("a registry provider")
     }
 
-    /// An unofficial provider is refused before anything is opened, and the sentence names
-    /// it rather than dumping an error.
+    /// A provider with no API at all is refused before anything is opened, and the sentence
+    /// names it rather than dumping an error.
+    ///
+    /// iCloud is the only one left: Proton moved to `AuthKind::ExternalTool` in DRAGON-485 and
+    /// now RUNS, because its own tool performs the sign-in.
     #[test]
     fn an_unofficial_provider_is_refused_by_name() {
-        let ConnectAction::Refused(message) = connect_action(spec("proton"), None) else {
-            panic!("proton must be refused");
+        let ConnectAction::Refused(message) = connect_action(spec("icloud"), None, ToolEntry::Ready) else {
+            panic!("icloud must be refused");
         };
-        assert!(message.contains("Proton Drive"), "{message}");
+        assert!(message.contains("iCloud Drive"), "{message}");
+        assert_eq!(connect_action(spec("proton"), None, ToolEntry::Ready), ConnectAction::Run);
     }
 
     /// With no client id anywhere, the message names the provider AND the variable that
@@ -3779,7 +5140,7 @@ mod connect_action_tests {
     /// so the one way here is a reconnect on an account whose variable is no longer set.
     #[test]
     fn a_missing_client_id_names_the_variable() {
-        let ConnectAction::Refused(message) = connect_action(spec("gdrive"), None) else {
+        let ConnectAction::Refused(message) = connect_action(spec("gdrive"), None, ToolEntry::Ready) else {
             panic!("a build with no client id must not start a flow");
         };
         assert!(message.contains("Google Drive"), "{message}");
@@ -3790,16 +5151,16 @@ mod connect_action_tests {
     /// has to reach `Run`.
     #[test]
     fn an_environment_client_id_lets_the_flow_run() {
-        assert_eq!(connect_action(spec("dropbox"), Some("an-app-id")), ConnectAction::Run);
+        assert_eq!(connect_action(spec("dropbox"), Some("an-app-id"), ToolEntry::Ready), ConnectAction::Run);
         // Whitespace is not an id.
-        assert!(matches!(connect_action(spec("dropbox"), Some("   ")), ConnectAction::Refused(_)));
+        assert!(matches!(connect_action(spec("dropbox"), Some("   "), ToolEntry::Ready), ConnectAction::Refused(_)));
     }
 
     /// The refusal has to be GUIDANCE. It is the only thing a user sees when a connect cannot
     /// start, so it names the provider, names the exact variable, and says what to do with it.
     #[test]
     fn the_refusal_tells_the_user_what_to_do() {
-        let ConnectAction::Refused(message) = connect_action(spec("dropbox"), None) else {
+        let ConnectAction::Refused(message) = connect_action(spec("dropbox"), None, ToolEntry::Ready) else {
             panic!("a build with no client id must refuse");
         };
         assert!(message.contains("Dropbox"), "{message}");
@@ -3821,18 +5182,22 @@ mod connect_action_tests {
         assert!(connect_pressable(&ConnectAction::Run));
         assert!(!connect_pressable(&ConnectAction::Refused("no api".to_string())));
         // …and through the real registry: with an id supplied, every OAuth provider is
-        // pressable, and neither unofficial one ever is.
+        // pressable, the external-tool one always is (no id is involved at all), and the one
+        // with no API never is.
         for provider in crate::cloud::registry() {
             assert_eq!(
-                connect_pressable(&connect_action(provider, Some("an-app-id"))),
+                connect_pressable(&connect_action(provider, Some("an-app-id"), ToolEntry::Ready)),
                 provider.auth.is_connectable(),
                 "`{}` disagrees about being pressable",
                 provider.id
             );
-            // With NO id, nothing is pressable, which is the state the picker now hides.
-            assert!(
-                !connect_pressable(&connect_action(provider, None)),
-                "`{}` offers a press that cannot run",
+            // With NO id, nothing that NEEDS one is pressable, which is the state the picker
+            // hides. The external-tool provider is the exception by construction: no client id
+            // takes part in its connect at all (DRAGON-485).
+            assert_eq!(
+                connect_pressable(&connect_action(provider, None, ToolEntry::Ready)),
+                provider.auth.is_external_tool(),
+                "`{}` offers the wrong press with no id",
                 provider.id
             );
         }
@@ -3845,19 +5210,19 @@ mod connect_action_tests {
     #[test]
     fn a_note_appears_only_where_a_connect_would_refuse() {
         // Dropbox with no id: one line, and it is the guidance sentence.
-        let dropbox = provider_notes(spec("dropbox"), None);
+        let dropbox = provider_notes(spec("dropbox"), None, ToolEntry::Ready);
         assert_eq!(dropbox.len(), 1, "{dropbox:?}");
         assert!(dropbox[0].contains("Dropbox"), "{dropbox:?}");
         assert!(dropbox[0].contains("CCK_DROPBOX_CLIENT_ID"), "{dropbox:?}");
 
         // Google, same shape.
-        let google = provider_notes(spec("gdrive"), None);
+        let google = provider_notes(spec("gdrive"), None, ToolEntry::Ready);
         assert_eq!(google.len(), 1, "{google:?}");
         assert!(google[0].contains("Google Drive"), "{google:?}");
 
         // With an id supplied, either provider says nothing at all.
-        assert!(provider_notes(spec("gdrive"), Some("an-app-id")).is_empty());
-        assert!(provider_notes(spec("dropbox"), Some("an-app-id")).is_empty());
+        assert!(provider_notes(spec("gdrive"), Some("an-app-id"), ToolEntry::Ready).is_empty());
+        assert!(provider_notes(spec("dropbox"), Some("an-app-id"), ToolEntry::Ready).is_empty());
     }
 
     /// An unconnectable provider says ONE thing, and it is that it cannot be connected. The
@@ -3865,18 +5230,17 @@ mod connect_action_tests {
     ///
     /// Unreachable from the picker since DRAGON-498 (it lists connectable providers only), so
     /// this pins the guard rather than a screen: the one way in is a hand-edited accounts file
-    /// naming `proton`, whose row's Reconnect would open the dialog on that spec.
+    /// naming `icloud`, whose row's Reconnect would open the dialog on that spec.
     #[test]
     fn an_unofficial_provider_says_only_that_it_cannot_be_connected() {
-        for id in ["proton", "icloud"] {
-            let notes = provider_notes(spec(id), None);
-            assert_eq!(notes.len(), 1, "{notes:?}");
-            assert!(notes[0].contains("no public API"), "{notes:?}");
-            assert!(notes[0].contains(spec(id).display_name), "{notes:?}");
-            assert!(!notes[0].contains("app registration"), "{notes:?}");
-            // An id in the environment changes nothing: there is nothing to connect to.
-            assert_eq!(provider_notes(spec(id), Some("an-app-id")), notes);
-        }
+        let icloud = spec("icloud");
+        let notes = provider_notes(icloud, None, ToolEntry::Ready);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("no public API"), "{notes:?}");
+        assert!(notes[0].contains(icloud.display_name), "{notes:?}");
+        assert!(!notes[0].contains("app registration"), "{notes:?}");
+        // An id in the environment changes nothing: there is nothing to connect to.
+        assert_eq!(provider_notes(icloud, Some("an-app-id"), ToolEntry::Ready), notes);
     }
 
     /// The caption and the button cannot drift apart: a note under the control means the
@@ -3887,8 +5251,8 @@ mod connect_action_tests {
     fn a_note_and_an_inert_connect_always_travel_together() {
         for provider in crate::cloud::registry() {
             for env_value in [None, Some("an-app-id")] {
-                let notes = provider_notes(provider, env_value);
-                let pressable = connect_pressable(&connect_action(provider, env_value));
+                let notes = provider_notes(provider, env_value, ToolEntry::Ready);
+                let pressable = connect_pressable(&connect_action(provider, env_value, ToolEntry::Ready));
                 assert_eq!(
                     notes.is_empty(),
                     pressable,
@@ -3941,14 +5305,15 @@ mod step_tests {
     /// The folder step's shape per provider, which since DRAGON-498 is the capability table and
     /// nothing else: every file-storage drive lists the folders inside its app folder, and
     /// YouTube has no folder concept at all (a video upload has no destination FOLDER to
-    /// choose), the same non-shape Proton and iCloud have for the unrelated reason of having no
-    /// API at all.
+    /// choose), the same non-shape iCloud has for the unrelated reason of having no API at all.
+    /// Proton JOINED the folder-listing group in DRAGON-485: its tool lists a level like any
+    /// other drive.
     #[test]
     fn the_folder_step_follows_the_capability_table_alone() {
-        for id in ["gdrive", "onedrive", "dropbox"] {
+        for id in ["gdrive", "onedrive", "dropbox", "proton"] {
             assert!(chooses_folder(spec(id)), "{id} lists folders");
         }
-        for id in ["youtube", "proton", "icloud"] {
+        for id in ["youtube", "icloud"] {
             assert!(!chooses_folder(spec(id)), "{id} has no folder to choose");
         }
         // **Nothing is keyed on a provider id any more.** Dropbox used to be the one arm that
@@ -4232,6 +5597,7 @@ mod step_tests {
             folder_name: None,
             added_at: "2026-08-02T10:00:00+00:00".to_string(),
             visibility: None,
+            destination: None,
         }
     }
 
@@ -4295,6 +5661,7 @@ mod account_row_tests {
             folder_name: Some("Screenshots".to_string()),
             added_at: "2026-08-02T10:00:00+00:00".to_string(),
             visibility: None,
+            destination: None,
         }
     }
 
@@ -4397,6 +5764,7 @@ mod account_name_tests {
             folder_name: None,
             added_at: added_at.to_string(),
             visibility: None,
+            destination: None,
         }
     }
 
@@ -4477,9 +5845,18 @@ mod stored_signin_tests {
     }
 
     /// Missing tokens always warrant a reconnect: there is nothing left to sign in with.
+    /// **An external-tool account never warrants one from the STORE**, because it deliberately
+    /// has nothing there: the tool holds the session under its own identity. Without this arm
+    /// every Proton row would offer Reconnect from the moment it was connected, which is the
+    /// same "nothing stored means dead" rule that is correct for every other provider.
+    #[test]
+    fn an_external_tool_account_is_not_judged_by_a_store_it_never_uses() {
+        assert!(!reconnect_warranted(true, None, chrono::Utc::now()));
+    }
+
     #[test]
     fn missing_tokens_warrant_a_reconnect() {
-        assert!(reconnect_warranted(None, chrono::Utc::now()));
+        assert!(reconnect_warranted(false, None, chrono::Utc::now()));
     }
 
     /// A refresh token means the account can renew itself, whatever the access token's
@@ -4493,7 +5870,7 @@ mod stored_signin_tests {
             scopes: Vec::new(),
             token_type: "Bearer".to_string(),
         };
-        assert!(!reconnect_warranted(Some(&tokens), chrono::Utc::now()));
+        assert!(!reconnect_warranted(false, Some(&tokens), chrono::Utc::now()));
     }
 
     /// No refresh token AND an expiring access token is the one state a user has to act on.
@@ -4508,9 +5885,9 @@ mod stored_signin_tests {
             scopes: Vec::new(),
             token_type: "Bearer".to_string(),
         };
-        assert!(reconnect_warranted(Some(&expiring), chrono::Utc::now()));
+        assert!(reconnect_warranted(false, Some(&expiring), chrono::Utc::now()));
         let live = TokenSet { expires_at: Some(at(7200)), ..expiring };
-        assert!(!reconnect_warranted(Some(&live), chrono::Utc::now()));
+        assert!(!reconnect_warranted(false, Some(&live), chrono::Utc::now()));
     }
 }
 
@@ -4609,19 +5986,45 @@ mod breadcrumb_tests {
     /// footprint, so the bin sits in one column and every row ends at one inset.
     #[test]
     fn a_rows_trailing_actions_are_drawn_by_state_and_sized_by_neither() {
-        assert_eq!(folder_row_slots(false), [false, false], "a folder that cannot be deleted");
-        assert_eq!(folder_row_slots(true), [false, true], "an ordinary child");
+        assert_eq!(folder_row_slots(false, false), [false, false], "a folder that cannot be deleted");
+        assert_eq!(folder_row_slots(false, true), [false, true], "an ordinary child");
         // The tick slot is dead on EVERY row, which is the DRAGON-517 half: there is no argument
         // that can light it, because there is no per-row selection left to report.
         for deletable in [false, true] {
-            let [tick, _] = folder_row_slots(deletable);
+            let [tick, _] = folder_row_slots(false, deletable);
             assert!(!tick, "a listed folder must never mark itself");
         }
         // Both slots occupy the SAME square, the other half of the original report: a tick and a
-        // bin at two different sizes, on two different backgrounds, in one column.
-        let slot = FOLDER_ACTION_ICON + 2.0 * FOLDER_ACTION_PAD;
-        assert!(slot > FOLDER_ACTION_ICON, "a slot is the glyph plus its padding");
-        assert!((FOLDER_ACTIONS_W - (2.0 * slot + FOLDER_ROW_PAD[1])).abs() < f32::EPSILON);
+        // bin at two different sizes, on two different backgrounds, in one column. That a slot is
+        // the glyph PLUS its padding is pinned at the constants themselves, by the compile-time
+        // assert beside `FOLDER_ACTION_SLOT`.
+        assert!(
+            (FOLDER_ACTIONS_W - (2.0 * FOLDER_ACTION_SLOT + FOLDER_ROW_PAD[1])).abs()
+                < f32::EPSILON
+        );
+    }
+
+    /// **The DRAGON-522 report, as the arithmetic that caused it.** On a CHECKED album row the
+    /// trash sat 8px left of where it sat on an unchecked one, because the drawn tick was a bare
+    /// 16px glyph while the empty slot beside it was a 24px `Space`: the filled slot was narrower
+    /// than the reserved one, so everything after it moved.
+    ///
+    /// The fix is structural (both go through `action_slot`, one fixed width, content centred),
+    /// so what is left to pin is the number that made the two disagree: a slot is the glyph PLUS
+    /// its padding, and the bin's own button padding is exactly what fills the difference.
+    #[test]
+    fn a_filled_slot_is_the_same_width_as_an_empty_one() {
+        assert!((FOLDER_ACTION_SLOT - (FOLDER_ACTION_ICON + 2.0 * FOLDER_ACTION_PAD)).abs() < f32::EPSILON);
+        // The bin builds its own square out of the same two numbers (a `button::icon` with
+        // `FOLDER_ACTION_PAD` around a `FOLDER_ACTION_ICON` glyph), so it fits its slot exactly
+        // rather than being centred inside a wider one.
+        assert!((FOLDER_ACTION_ICON + 2.0 * FOLDER_ACTION_PAD - FOLDER_ACTION_SLOT).abs() < f32::EPSILON);
+        // And the block that holds two of them cannot end anywhere but one inset.
+        assert!(
+            (FOLDER_ACTIONS_W - (2.0 * FOLDER_ACTION_SLOT + FOLDER_ROW_PAD[1])).abs()
+                < f32::EPSILON,
+            "the trailing block must be exactly two slots plus the row's inset"
+        );
     }
 
     /// The row always says two things: what this app is confined to, and where the user is now.
@@ -4788,6 +6191,14 @@ mod folder_navigation_tests {
 mod folder_create_tests {
     use super::*;
 
+    /// The FILES tab's copy, read from the one table rather than typed out again: a second
+    /// copy here would let this module keep passing while the real browser said something else.
+    /// That the words themselves are still the ones this page shipped with is pinned separately,
+    /// in `album_tests`.
+    fn files_words() -> BrowserWords {
+        browser_words(Destination::Files)
+    }
+
     /// A typed name is held to the provider rules first, and then to the one this level knows:
     /// a name already on screen. Two folders of one name is a picker nobody can use, and Drive
     /// would happily make one, so refusing here is what keeps the three providers behaving the
@@ -4795,21 +6206,21 @@ mod folder_create_tests {
     #[test]
     fn a_new_folder_name_is_refused_before_anything_is_asked() {
         let siblings = ["Screenshots", "Recordings"];
-        assert_eq!(create_refusal("Notes", &siblings), None);
-        assert_eq!(create_refusal("  Notes  ", &siblings), None, "trimmed, then judged");
+        assert_eq!(create_refusal("Notes", &siblings, files_words()), None);
+        assert_eq!(create_refusal("  Notes  ", &siblings, files_words()), None, "trimmed, then judged");
         // The provider rules, borrowed whole rather than restated.
-        assert!(create_refusal("", &siblings).is_some());
-        assert!(create_refusal("   ", &siblings).is_some());
-        assert!(create_refusal("a/b", &siblings).is_some());
-        assert!(create_refusal("..", &siblings).is_some());
+        assert!(create_refusal("", &siblings, files_words()).is_some());
+        assert!(create_refusal("   ", &siblings, files_words()).is_some());
+        assert!(create_refusal("a/b", &siblings, files_words()).is_some());
+        assert!(create_refusal("..", &siblings, files_words()).is_some());
         // The duplicate rule, case-insensitively: two of the three providers treat names that
         // way themselves, and two rows a user cannot tell apart is the same problem on all three.
         for taken in ["Screenshots", "screenshots", "  SCREENSHOTS "] {
-            let refusal = create_refusal(taken, &siblings).expect("taken");
+            let refusal = create_refusal(taken, &siblings, files_words()).expect("taken");
             assert!(refusal.contains("already a folder"), "{refusal}");
         }
         // An empty level takes any legal name.
-        assert_eq!(create_refusal("Screenshots", &[]), None);
+        assert_eq!(create_refusal("Screenshots", &[], files_words()), None);
     }
 
     /// Every refusal is a sentence a dialog can show, and none of them quotes the name back:
@@ -4817,7 +6228,7 @@ mod folder_create_tests {
     #[test]
     fn a_create_refusal_is_a_sentence_that_quotes_nothing() {
         for typed in ["", "secret/plan", "Screenshots"] {
-            let Some(refusal) = create_refusal(typed, &["Screenshots"]) else { continue };
+            let Some(refusal) = create_refusal(typed, &["Screenshots"], files_words()) else { continue };
             assert!(refusal.ends_with('.'), "{refusal}");
             assert!(!refusal.contains("secret"), "{refusal}");
         }
@@ -4859,6 +6270,207 @@ mod folder_create_tests {
 }
 
 #[cfg(test)]
+mod created_selection_tests {
+    use super::*;
+
+    /// A landed level, as the browser holds one: `(id, display name)` pairs.
+    fn listed(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+        rows.iter().map(|(id, name)| ((*id).to_string(), (*name).to_string())).collect()
+    }
+
+    fn made(id: &str, name: &str, tab: Destination) -> CreatedItem {
+        CreatedItem { id: id.to_string(), name: name.to_string(), tab }
+    }
+
+    /// **A new folder is ENTERED, because entering it is what choosing it means** (DRAGON-523 on
+    /// DRAGON-517's model): the level the browser stands in is where the captures go, so a user
+    /// who makes "2026" and presses Done gets 2026 rather than its parent.
+    #[test]
+    fn a_created_folder_is_entered_when_the_listing_brings_it_back() {
+        let level = listed(&[("id-shots", "Screenshots"), ("id-2026", "2026")]);
+        let created = made("id-2026", "2026", Destination::Files);
+        assert_eq!(
+            created_selection(Some(&created), Destination::Files, &level),
+            CreatedSelection::Enter(1)
+        );
+        // The ID decides, never the position and never the name: a provider is free to sort the
+        // new folder anywhere, and two folders may read alike to a human.
+        let renamed = made("id-2026", "2026 (1)", Destination::Files);
+        assert_eq!(
+            created_selection(Some(&renamed), Destination::Files, &level),
+            CreatedSelection::Enter(1),
+            "the provider's own final name is not what identifies the folder"
+        );
+        // At any depth, since a level is a level: nothing here knows how deep this one is.
+        let deep = listed(&[("id-acme", "Acme")]);
+        let acme = made("id-acme", "Acme", Destination::Files);
+        assert_eq!(
+            created_selection(Some(&acme), Destination::Files, &deep),
+            CreatedSelection::Enter(0)
+        );
+    }
+
+    /// **A new album gets the CHECK**, because albums are flat and a click is the whole of
+    /// choosing one (DRAGON-485). No navigation: there is nowhere to go.
+    #[test]
+    fn a_created_album_is_checked_when_the_listing_brings_it_back() {
+        let albums = listed(&[
+            ("/albums/vol~app", crate::cloud::APP_FOLDER),
+            ("/albums/vol~trips", "Trips"),
+        ]);
+        let created = made("/albums/vol~trips", "Trips", Destination::Photos);
+        assert_eq!(
+            created_selection(Some(&created), Destination::Photos, &albums),
+            CreatedSelection::Select(1)
+        );
+        // The two tabs answer differently on purpose, and the answer follows the LISTING that
+        // landed: a folder listing can only ever enter, an album listing can only ever select.
+        assert!(matches!(
+            created_selection(
+                Some(&made("id-x", "X", Destination::Files)),
+                Destination::Files,
+                &listed(&[("id-x", "X")])
+            ),
+            CreatedSelection::Enter(_)
+        ));
+    }
+
+    /// **A provider that has not caught up with its own create selects NOTHING** and leaves the
+    /// view where it is. Eventual consistency is a real answer, not a broken one: the next refresh
+    /// finds the item. Guessing instead would move where an account's captures go.
+    #[test]
+    fn an_item_the_listing_did_not_bring_back_selects_nothing() {
+        let level = listed(&[("id-shots", "Screenshots"), ("id-old", "2025")]);
+        let created = made("id-2026", "2026", Destination::Files);
+        assert_eq!(
+            created_selection(Some(&created), Destination::Files, &level),
+            CreatedSelection::Nothing
+        );
+        // Not even when a row carries the same NAME: the id is the identity, and a same-named row
+        // is a different folder (the create would have been refused otherwise).
+        let twin = listed(&[("id-other", "2026")]);
+        assert_eq!(
+            created_selection(Some(&created), Destination::Files, &twin),
+            CreatedSelection::Nothing,
+            "a lookalike name is not the folder that was just made"
+        );
+        // An empty level is the same answer, and so is the album side's version of it.
+        assert_eq!(
+            created_selection(Some(&created), Destination::Files, &[]),
+            CreatedSelection::Nothing
+        );
+        let album = made("/albums/vol~new", "Trips", Destination::Photos);
+        let without_it = listed(&[("/albums/vol~app", crate::cloud::APP_FOLDER)]);
+        assert_eq!(
+            created_selection(Some(&album), Destination::Photos, &without_it),
+            CreatedSelection::Nothing
+        );
+    }
+
+    /// **A create that FAILED selects nothing**, because it leaves nothing pending: its arm of
+    /// `FolderCreated` starts no listing at all (DRAGON-522 ends the refreshing state there
+    /// instead), and a fresh create clears any older identity on the way out, so `None` is the
+    /// state every failed create leaves behind.
+    #[test]
+    fn a_create_that_failed_leaves_nothing_to_select() {
+        let level = listed(&[("id-shots", "Screenshots")]);
+        assert_eq!(created_selection(None, Destination::Files, &level), CreatedSelection::Nothing);
+        assert_eq!(created_selection(None, Destination::Photos, &level), CreatedSelection::Nothing);
+        assert_eq!(created_selection(None, Destination::Files, &[]), CreatedSelection::Nothing);
+    }
+
+    /// **A second create supersedes the first**, so a landing acts on the MOST RECENT identity and
+    /// has no memory of any older one.
+    ///
+    /// The state half is two writes: `create_cloud_folder` clears `CloudAdd::created` at the
+    /// press, and `FolderCreated` writes the new identity over whatever was there. This pins the
+    /// half that decides on arrival, and it is the half that could go wrong quietly: the first
+    /// folder is still IN the level that lands, so a rule with any memory of it would enter the
+    /// wrong folder and move where the account's captures go.
+    #[test]
+    fn a_second_create_supersedes_the_first() {
+        let level = listed(&[
+            ("id-shots", "Screenshots"),
+            ("id-first", "First"),
+            ("id-second", "Second"),
+        ]);
+        // Both creates landed in this level. The second one is what is pending, so the second one
+        // is what is entered, even though the first sorts above it and is right there.
+        let second = made("id-second", "Second", Destination::Files);
+        assert_eq!(
+            created_selection(Some(&second), Destination::Files, &level),
+            CreatedSelection::Enter(2)
+        );
+        // What a superseding create that then FAILED leaves behind: nothing pending, and so
+        // nothing selected, rather than the first folder being entered a create later.
+        assert_eq!(created_selection(None, Destination::Files, &level), CreatedSelection::Nothing);
+        // Albums supersede the same way, in their own tab's model.
+        let albums = listed(&[("/albums/vol~one", "One"), ("/albums/vol~two", "Two")]);
+        let newer = made("/albums/vol~two", "Two", Destination::Photos);
+        assert_eq!(
+            created_selection(Some(&newer), Destination::Photos, &albums),
+            CreatedSelection::Select(1)
+        );
+    }
+
+    /// A listing that landed on the OTHER tab cannot act on the identity, though it does take it:
+    /// a user who switched tabs in between has left the browser the new item is in. Rare (a switch
+    /// made while the create is still in flight re-lists, which bumps the generation, which drops
+    /// the create's reply before anything is pending), and it is what makes the decision total: an
+    /// album id and a folder id come from different namespaces, so a cross-tab match would be a
+    /// coincidence acted on.
+    #[test]
+    fn the_other_tabs_listing_cannot_act_on_the_identity() {
+        let rows = listed(&[("shared-id", "Holidays")]);
+        let folder = made("shared-id", "Holidays", Destination::Files);
+        let album = made("shared-id", "Holidays", Destination::Photos);
+        assert_eq!(
+            created_selection(Some(&folder), Destination::Photos, &rows),
+            CreatedSelection::Nothing
+        );
+        assert_eq!(
+            created_selection(Some(&album), Destination::Files, &rows),
+            CreatedSelection::Nothing
+        );
+        // On their own tabs, the same two rows are found.
+        assert_eq!(
+            created_selection(Some(&folder), Destination::Files, &rows),
+            CreatedSelection::Enter(0)
+        );
+        assert_eq!(
+            created_selection(Some(&album), Destination::Photos, &rows),
+            CreatedSelection::Select(0)
+        );
+    }
+
+    /// The name fallback exists for a create path with no id to give, which no provider is today.
+    /// It is EXACT: the trimming and case-folding `create_refusal` uses to REFUSE a name would,
+    /// here, be a way to select the wrong row.
+    #[test]
+    fn a_create_with_no_id_falls_back_to_an_exact_name_and_nothing_looser() {
+        let level = listed(&[("id-shots", "Screenshots"), ("id-2026", "2026")]);
+        assert_eq!(
+            created_selection(Some(&made("", "2026", Destination::Files)), Destination::Files, &level),
+            CreatedSelection::Enter(1)
+        );
+        // Case is not the same name here, however the provider treats it elsewhere.
+        assert_eq!(
+            created_selection(
+                Some(&made("", "screenshots", Destination::Files)),
+                Destination::Files,
+                &level
+            ),
+            CreatedSelection::Nothing
+        );
+        // Nothing identifying at all identifies nothing.
+        assert_eq!(
+            created_selection(Some(&made("  ", "  ", Destination::Files)), Destination::Files, &level),
+            CreatedSelection::Nothing
+        );
+    }
+}
+
+#[cfg(test)]
 mod empty_level_tests {
     use super::*;
 
@@ -4867,26 +6479,42 @@ mod empty_level_tests {
     /// a line saying "nothing here" beside one of those is simply wrong.
     #[rstest::rstest]
     // folders, loading, creating, deleting
-    #[case(0, false, false, false, true)]
+    #[case(0, false, false, false, WellFace::Empty)]
     // Rows on screen: never.
-    #[case(1, false, false, false, false)]
-    #[case(9, false, false, false, false)]
-    // A listing in flight has not answered yet.
-    #[case(0, true, false, false, false)]
+    #[case(1, false, false, false, WellFace::Rows)]
+    #[case(9, false, false, false, WellFace::Rows)]
+    // A listing in flight has not answered yet: the well WAITS, whatever else is true.
+    #[case(0, true, false, false, WellFace::Waiting)]
+    #[case(9, true, false, false, WellFace::Waiting)]
     // The inline create row IS the list's content while it is open, in flight or not.
-    #[case(0, false, true, false, false)]
-    // A delete confirmation is up, or one is running.
-    #[case(0, false, false, true, false)]
-    // Two at once still keeps it quiet.
-    #[case(0, true, true, true, false)]
-    fn the_empty_line_is_shown_only_for_a_settled_empty_level(
+    #[case(0, false, true, false, WellFace::Rows)]
+    // A delete confirmation is up.
+    #[case(0, false, false, true, WellFace::Rows)]
+    // Two at once, with a listing running, still waits.
+    #[case(0, true, true, true, WellFace::Waiting)]
+    fn the_well_wears_one_face_per_state(
         #[case] folders: usize,
         #[case] loading: bool,
         #[case] creating: bool,
         #[case] deleting: bool,
-        #[case] shown: bool,
+        #[case] face: WellFace,
     ) {
-        assert_eq!(shows_empty_level_note(folders, loading, creating, deleting), shown);
+        assert_eq!(well_face(folders, loading, creating, deleting), face);
+    }
+
+    /// **The mutation state machine** (DRAGON-522): a press flips the well to its spinner in the
+    /// same frame, the reply's re-list keeps it there, and only a LANDED listing gets to draw
+    /// rows or the empty note. The empty line can therefore never appear mid-flight, which is
+    /// what it was reported for on a provider whose creates take seconds.
+    #[test]
+    fn a_mutation_shows_the_spinner_until_its_listing_lands() {
+        // Pressed: `create_cloud_folder` / `delete_cloud_folder` set `folder_loading` at the
+        // press, so whatever is in the list at that moment is replaced by the spinner.
+        assert_eq!(well_face(4, true, true, false), WellFace::Waiting, "a create just pressed");
+        assert_eq!(well_face(4, true, false, true), WellFace::Waiting, "a delete just confirmed");
+        // Landed, on a level that now has rows, and on one that ended up empty.
+        assert_eq!(well_face(5, false, false, false), WellFace::Rows);
+        assert_eq!(well_face(0, false, false, false), WellFace::Empty);
     }
 
     /// The copy itself: two lines, the first naming what's true and the second what to do about
@@ -5000,5 +6628,395 @@ mod folder_delete_tests {
         assert!(body("gdrive").contains("permanently deleted from your Google Drive"));
         assert!(body("dropbox").contains("permanently deleted from your Dropbox"));
         assert!(body("onedrive").contains("moved to your OneDrive recycle bin"));
+    }
+}
+
+#[cfg(test)]
+mod external_tool_tests {
+    use super::*;
+    use crate::cloud::proton::Availability;
+
+    fn spec(id: &str) -> &'static ProviderSpec {
+        crate::cloud::provider(id).expect("a registry provider")
+    }
+
+    /// **The row is LISTED whatever the probe said** (DRAGON-485), which is the whole reason
+    /// this three-state exists. Every other provider is offered or not by a question about the
+    /// build; this one turns on something the user can go and fix, so hiding it would hide the
+    /// fix.
+    #[test]
+    fn the_external_tool_provider_is_always_offered() {
+        let offered = crate::cloud::connectable_display_order_with(|_| None);
+        assert!(
+            offered.iter().any(|(_, spec)| spec.auth.is_external_tool()),
+            "a build with no client id anywhere still offers the external-tool provider"
+        );
+    }
+
+    /// The three faces, from the two facts that decide them.
+    #[test]
+    fn the_row_face_follows_the_probe() {
+        assert_eq!(tool_entry(Some(Availability::Ready), false), ToolEntry::Ready);
+        assert_eq!(tool_entry(Some(Availability::Missing), false), ToolEntry::Install);
+        // A tool that is THERE but will not run offers the same action as one that is absent,
+        // because "reinstall it" is what fixes either.
+        assert_eq!(tool_entry(Some(Availability::Broken), false), ToolEntry::Install);
+    }
+
+    /// **An unprobed row reads as Ready**, not as "install this". The probe is bounded and
+    /// lands in a moment; telling a user with the tool installed to install it, for the frame
+    /// before the answer arrives, would be a wrong answer confidently given.
+    #[test]
+    fn a_row_with_no_probe_yet_is_not_accused_of_being_uninstalled() {
+        assert_eq!(tool_entry(None, false), ToolEntry::Ready);
+    }
+
+    /// The cap OUTRANKS the tool's state: an account already connected means no second connect
+    /// whatever the probe said, and "install this" beside a provider the user has plainly
+    /// already connected would read as the account being broken.
+    #[test]
+    fn the_seat_cap_outranks_the_probe() {
+        for probe in [None, Some(Availability::Ready), Some(Availability::Missing)] {
+            assert_eq!(tool_entry(probe, true), ToolEntry::Connected, "{probe:?}");
+        }
+    }
+
+    /// **The browser step's two phases, in plain words** (DRAGON-522, the owner's exact copy).
+    /// The transition is the same one every provider's step turns on, the sign-in address
+    /// landing; what differs is that on this arm that instant is also the instant the TOOL opens
+    /// the browser, so the second sentence is true the moment it appears.
+    #[test]
+    fn the_external_tool_step_says_one_plain_sentence_per_phase() {
+        assert_eq!(external_browser_line(false), "Launching authorization...");
+        assert_eq!(external_browser_line(true), "Please sign in with your browser.");
+        // Neither is the OAuth arm's affordance, which is the whole report: no link to press, no
+        // copy control, and nothing that reads as one.
+        for phase in [external_browser_line(false), external_browser_line(true)] {
+            assert!(!phase.contains("Click"), "{phase}");
+            assert!(!phase.contains("link"), "{phase}");
+            assert!(!phase.contains('\u{2014}'), "house style: no em-dashes in user copy");
+        }
+        // The two phases really are different states, or the transition would be invisible.
+        assert_ne!(external_browser_line(false), external_browser_line(true));
+    }
+
+    /// The arm is chosen by the AUTH KIND, never by a provider id, so a second external-tool
+    /// provider gets it with no new branch, and no OAuth provider can fall into it.
+    #[test]
+    fn only_an_external_tool_provider_takes_the_plain_step() {
+        assert!(spec("proton").auth.is_external_tool());
+        for id in ["gdrive", "onedrive", "dropbox", "youtube"] {
+            assert!(!spec(id).auth.is_external_tool(), "{id} keeps its click-here step");
+        }
+    }
+
+    /// **A reconnect is never capped**, which is the one flow the cap would otherwise break
+    /// first: signing the SAME account back in evicts nothing, and a dead session is exactly
+    /// what needs it.
+    #[test]
+    fn a_reconnect_is_never_blocked_by_the_one_account_cap() {
+        assert!(!tool_seat_taken(0, false), "nothing connected, nothing to cap");
+        assert!(tool_seat_taken(1, false), "a second connect would evict the first");
+        assert!(!tool_seat_taken(1, true), "reconnecting the one account must keep working");
+        assert!(!tool_seat_taken(0, true));
+    }
+
+    /// The caption names the COMMAND a user types, from the registry row's own spelling, so
+    /// this page invents no second name for the tool.
+    #[test]
+    fn the_install_caption_names_the_tool_from_the_registry() {
+        let AuthKind::ExternalTool { tool_name, .. } = spec("proton").auth else {
+            panic!("proton must be an external-tool provider");
+        };
+        let note = ToolEntry::Install.note(tool_name).expect("the install row explains itself");
+        assert!(note.contains(tool_name), "{note}");
+        // "Requires", not "Install" (owner wording): the caption states the dependency, and
+        // its accent styling plus the press are what say it is the link to go get it.
+        assert!(note.starts_with("Requires"), "the caption names the dependency: {note}");
+        assert_eq!(ToolEntry::Connected.note(tool_name).as_deref(), Some("Already connected"));
+        assert_eq!(ToolEntry::Ready.note(tool_name), None, "a working row needs no explanation");
+    }
+
+    /// The button and the row cannot drift: the face the picker drew is the face the connect
+    /// path reads, so a row that offers a press is a row a press can start.
+    #[test]
+    fn the_connect_button_agrees_with_the_row_it_was_pressed_from() {
+        let proton = spec("proton");
+        assert_eq!(connect_action(proton, None, ToolEntry::Ready), ConnectAction::Run);
+        for refused in [ToolEntry::Install, ToolEntry::Connected] {
+            let action = connect_action(proton, None, refused);
+            assert!(matches!(action, ConnectAction::Refused(_)), "{refused:?}");
+            assert!(!connect_pressable(&action), "{refused:?}");
+            // And the caption under the control says the same thing the button will not do.
+            assert_eq!(provider_notes(proton, None, refused).len(), 1, "{refused:?}");
+        }
+    }
+
+    /// The two refusals say DIFFERENT things, because they are different situations with
+    /// different fixes, and neither may read as the other.
+    #[test]
+    fn the_two_refusals_name_their_own_fix() {
+        let proton = spec("proton");
+        let ConnectAction::Refused(missing) = connect_action(proton, None, ToolEntry::Install)
+        else {
+            panic!("a missing tool must refuse");
+        };
+        assert!(missing.contains("proton-drive"), "{missing}");
+        assert!(missing.contains("Install"), "{missing}");
+        let ConnectAction::Refused(taken) = connect_action(proton, None, ToolEntry::Connected)
+        else {
+            panic!("a taken seat must refuse");
+        };
+        assert!(taken.contains("one connected account"), "{taken}");
+        assert!(taken.contains("Disconnect"), "the way out is named: {taken}");
+        assert_ne!(missing, taken);
+        for message in [&missing, &taken] {
+            assert!(!message.contains('\u{2014}'), "house style: no em-dashes in user copy");
+        }
+    }
+
+    /// A client id has nothing to do with this provider, so setting or not setting one must not
+    /// change a single answer here.
+    #[test]
+    fn no_client_id_takes_part_in_an_external_tool_connect() {
+        let proton = spec("proton");
+        for env_value in [None, Some("an-app-id"), Some("   ")] {
+            assert_eq!(connect_action(proton, env_value, ToolEntry::Ready), ConnectAction::Run);
+        }
+    }
+}
+
+#[cfg(test)]
+mod album_tests {
+    use super::*;
+
+    fn spec(id: &str) -> &'static ProviderSpec {
+        crate::cloud::provider(id).expect("a registry provider")
+    }
+
+    /// **The tabs appear for exactly the providers that have two destinations**, asked of the
+    /// registry rather than of a provider id, which is what stops this page growing a
+    /// per-provider branch again.
+    #[test]
+    fn only_a_provider_with_an_album_root_gets_tabs() {
+        assert!(crate::cloud::has_albums(spec("proton")));
+        for folders_only in ["gdrive", "onedrive", "dropbox", "youtube", "icloud"] {
+            assert!(!crate::cloud::has_albums(spec(folders_only)), "{folders_only}");
+        }
+    }
+
+    /// **The Files tab's copy is byte-for-byte what this browser shipped with.** The Photos tab
+    /// reuses its chassis, and the one thing that must not happen is the shared chassis quietly
+    /// renaming the folder browser's own controls.
+    #[test]
+    fn the_files_words_are_unchanged_by_the_photos_tab_existing() {
+        let words = browser_words(Destination::Files);
+        assert_eq!(words.noun, "folder");
+        assert_eq!(words.create_tooltip, "New folder here");
+        assert_eq!(words.create_submit, "Create this folder");
+        assert_eq!(words.name_placeholder, "Folder name");
+        assert_eq!(words.delete_tooltip, "Delete this folder");
+        assert_eq!(words.refresh_tooltip, "Refresh folder list");
+        assert_eq!(words.taken, "There is already a folder with that name here.");
+        assert_eq!(words.empty, EMPTY_LEVEL_NOTE);
+    }
+
+    /// Every control on the Photos tab names an ALBUM. A shared chassis wearing the folder
+    /// browser's sentences would tell a user the + makes a folder in a list of albums.
+    #[test]
+    fn every_photos_control_names_an_album() {
+        let words = browser_words(Destination::Photos);
+        assert_eq!(words.noun, "album");
+        for line in [
+            words.create_tooltip,
+            words.create_submit,
+            words.name_placeholder,
+            words.delete_tooltip,
+            words.refresh_tooltip,
+            words.taken,
+            words.empty[0],
+        ] {
+            assert!(
+                line.to_lowercase().contains("album"),
+                "the Photos tab must not say `folder`: {line}"
+            );
+            assert!(!line.to_lowercase().contains("folder"), "{line}");
+        }
+    }
+
+    /// The name rules are the SAME rules, under the tab's own noun: a picker that accepts a
+    /// name for an album and refuses it for a folder is a picker with two rule sets nobody can
+    /// learn.
+    #[test]
+    fn an_album_name_is_held_to_the_folder_rules_under_its_own_noun() {
+        let words = browser_words(Destination::Photos);
+        assert_eq!(create_refusal("Holidays", &["Trips"], words), None);
+        // Taken, case-insensitively, with the album wording.
+        assert_eq!(
+            create_refusal("holidays", &["Holidays"], words).as_deref(),
+            Some("There is already an album with that name.")
+        );
+        // And the shared validator's own sentences arrive naming an album, not a folder.
+        for bad in ["", "   ", "a/b", ".."] {
+            let refusal = create_refusal(bad, &[], words).expect("refused");
+            assert!(!refusal.contains("folder"), "{bad:?}: {refusal}");
+            assert!(refusal.contains("album"), "{bad:?}: {refusal}");
+        }
+    }
+
+    /// The Files tab's refusals are untouched by that swap, which is what makes it safe: with
+    /// the noun already "folder", the substitution is a no-op.
+    #[test]
+    fn the_files_refusals_are_unchanged_by_the_noun_swap() {
+        let words = browser_words(Destination::Files);
+        assert_eq!(
+            create_refusal("Notes", &["Notes"], words).as_deref(),
+            Some("There is already a folder with that name here.")
+        );
+        let empty = create_refusal("", &[], words).expect("refused");
+        assert!(empty.contains("folder"), "{empty}");
+    }
+
+    /// **One rule where the folder side has two**, and it compares IDS: two albums may share a
+    /// name, and the uid is what every command actually takes.
+    #[test]
+    fn only_the_album_this_account_uploads_to_is_undeletable() {
+        let chosen = "/albums/vol~chosen";
+        assert!(album_delete_refusal(chosen, Some(chosen)).is_some());
+        assert_eq!(album_delete_refusal("/albums/vol~other", Some(chosen)), None);
+        // Nothing chosen yet: nothing to protect.
+        assert_eq!(album_delete_refusal(chosen, None), None);
+        // Two albums with the same NAME are two albums: only the id decides.
+        assert_eq!(album_delete_refusal("/albums/vol~twin", Some("/albums/vol~chosen")), None);
+    }
+
+    /// A blank candidate is not the app folder's "you cannot delete this" case: an album row
+    /// always carries an id, so a blank one is a row that should never have been drawn, and
+    /// refusing it with a sentence about uploads would be a wrong explanation.
+    #[test]
+    fn a_blank_album_candidate_is_not_refused_with_the_wrong_reason() {
+        assert_eq!(album_delete_refusal("", Some("/albums/x")), None);
+        assert_eq!(album_delete_refusal("   ", Some("/albums/x")), None);
+    }
+
+    /// **The app's OWN album is deletable like any other** (DRAGON-522). The protection is about
+    /// SELECTION and nothing else: the album this account uploads to cannot go, because deleting
+    /// it would point the account at something that is not there. An album that merely happens to
+    /// carry the app's name, while the user is sending captures somewhere else, is just an album.
+    ///
+    /// This composes with the lazy provisioning beside it
+    /// (`cloud::providers::needs_default_album`): delete the default while another album is
+    /// selected and nothing puts it back, because no listing provisions and the destination does
+    /// not resolve to it.
+    #[test]
+    fn the_default_album_is_deletable_when_it_is_not_the_one_selected() {
+        let default = "/albums/vol~app";
+        let other = "/albums/vol~other";
+        assert_eq!(
+            album_delete_refusal(default, Some(other)),
+            None,
+            "the app's own album is not special; only the SELECTED one is protected"
+        );
+        // And it is protected the moment it IS the selection, exactly like any other album.
+        assert!(album_delete_refusal(default, Some(default)).is_some());
+        assert!(album_delete_refusal(other, Some(other)).is_some());
+        // The refusal's copy names the reason, which is the upload destination and not the name.
+        let refusal = album_delete_refusal(default, Some(default)).expect("refused");
+        assert!(refusal.contains("uploads here"), "{refusal}");
+        assert!(!refusal.contains(crate::cloud::APP_FOLDER), "{refusal}");
+    }
+
+    /// **The album confirmation promises the opposite of the folder one, and it has to.** This
+    /// app deletes an album with the tool's own keep-the-photos option, so telling a user their
+    /// pictures are going with it would be the worst copy on this page.
+    #[test]
+    fn the_album_confirmation_promises_the_photos_survive() {
+        let body = album_delete_confirm_body("Holidays", "Proton Drive");
+        assert!(body.contains("Holidays"), "{body}");
+        assert!(body.contains("Proton Drive"), "{body}");
+        assert!(body.contains("stay in your photo timeline"), "{body}");
+        assert!(!body.contains("everything inside it"), "that is the FOLDER promise: {body}");
+        assert!(!body.contains('\u{2014}'), "house style: no em-dashes in user copy");
+        // The heading says which kind of thing is going.
+        assert_eq!(delete_title(Destination::Photos), ALBUM_DELETE_TITLE);
+        assert_eq!(delete_title(Destination::Files), DELETE_TITLE);
+        assert_ne!(delete_title(Destination::Files), delete_title(Destination::Photos));
+    }
+
+    /// **The tick slot the Files tab reserves and never fills is the slot the album side needed**
+    /// (DRAGON-517 then DRAGON-485). A folder row still never carries one, because selection
+    /// there follows the view.
+    #[test]
+    fn only_an_album_row_can_carry_the_selection_mark() {
+        assert_eq!(folder_row_slots(false, true), [false, true], "a folder row: bin only");
+        assert_eq!(folder_row_slots(true, true), [true, true], "the chosen album: both");
+        assert_eq!(folder_row_slots(true, false), [true, false]);
+        assert_eq!(folder_row_slots(false, false), [false, false]);
+    }
+
+    /// **The Photos header states what the tab is for, and reports nothing** (DRAGON-522, owner
+    /// request). It carried the chosen album's name, which the row's own check already says; the
+    /// header's copy of it read as a second selection competing with the first.
+    #[test]
+    fn the_photos_header_prompts_instead_of_naming_the_chosen_album() {
+        assert_eq!(ALBUM_HEADER_PROMPT, "Select or create a photo album");
+        // It names both things the row offers, which is also what the `+` beside it does.
+        assert!(ALBUM_HEADER_PROMPT.contains("Select"));
+        assert!(ALBUM_HEADER_PROMPT.contains("create"));
+        // House style, and the rule for every string in this file that reaches a user.
+        assert!(!ALBUM_HEADER_PROMPT.contains('\u{2014}'), "no em-dashes in user copy");
+        assert!(!ALBUM_HEADER_PROMPT.ends_with('.'), "a prompt above a control, not a sentence");
+    }
+
+    /// The two destination tabs, named and marked (DRAGON-522, the owner's wording and picks).
+    /// The labels are exact, including the lowercase `f` in "My files", and both marks have to
+    /// EMBED or a tab renders with a blank square where its glyph should be.
+    #[test]
+    fn the_destination_tabs_are_named_and_marked() {
+        assert_eq!(FILES_TAB_LABEL, "My files");
+        assert_eq!(PHOTOS_TAB_LABEL, "Photos");
+        for name in [FILES_TAB_ICON_NAME, PHOTOS_TAB_ICON_NAME, ALBUM_ROW_ICON_NAME] {
+            assert!(crate::widgets::icons::is_bundled(name), "{name} does not ship");
+        }
+        // The tab marks are their own, and neither is the folder glyph the rows below wear.
+        assert_ne!(FILES_TAB_ICON_NAME, PHOTOS_TAB_ICON_NAME);
+        assert_ne!(FILES_TAB_ICON_NAME, "folder-open-symbolic");
+        // A row is one album (a book of pictures); the tab is the library.
+        assert_ne!(PHOTOS_TAB_ICON_NAME, ALBUM_ROW_ICON_NAME);
+    }
+}
+
+#[cfg(test)]
+mod setup_body_tests {
+    use super::*;
+
+    fn spec(id: &str) -> &'static ProviderSpec {
+        crate::cloud::provider(id).expect("a registry provider")
+    }
+
+    /// **The owner's Files wording is untouched** by the Photos tab existing, on every provider
+    /// including the one that grew the tabs.
+    #[test]
+    fn the_files_sentence_is_the_owners_wording_unchanged() {
+        for id in ["gdrive", "onedrive", "dropbox", "proton"] {
+            assert_eq!(
+                setup_body_for(spec(id), true, false),
+                setup_body(spec(id), true),
+                "{id}"
+            );
+        }
+        // And a provider with no folders at all is unaffected either way.
+        assert_eq!(setup_body_for(spec("youtube"), false, false), setup_body(spec("youtube"), false));
+    }
+
+    /// The Photos tab names the ALBUM, because "placed in the App's Folder" is a promise about a
+    /// folder and there is no folder on that tab.
+    #[test]
+    fn the_photos_sentence_names_the_album_instead_of_a_folder() {
+        let body = setup_body_for(spec("proton"), true, true);
+        assert_eq!(body, PHOTOS_SETUP_BODY);
+        assert!(body.contains("album"), "{body}");
+        assert!(!body.to_lowercase().contains("folder"), "{body}");
+        assert!(!body.contains('\u{2014}'), "house style: no em-dashes in user copy");
     }
 }

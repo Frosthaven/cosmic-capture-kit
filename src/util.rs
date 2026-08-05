@@ -301,6 +301,19 @@ pub fn ffplay_path() -> PathBuf {
     locate_tool("ffplay", "CCK_FFPLAY")
 }
 
+/// Locate the `proton-drive` binary, Proton's own official Drive command-line tool
+/// (DRAGON-485), with the same resolution order as [`ffmpeg_path`]: the `CCK_PROTON_DRIVE`
+/// override, then a sidecar next to our executable, then `PATH`.
+///
+/// **Optional at runtime and never bundled**, exactly like `ffmpeg` and `tesseract`. It is a
+/// ~118 MB standalone binary the user downloads from Proton, and shipping a copy of someone
+/// else's signed application inside ours would be both enormous and wrong. The Proton provider
+/// probes for it and, when it is absent, says so and offers the download page rather than
+/// failing a connect halfway through. See `cloud::proton`.
+pub fn proton_drive_path() -> PathBuf {
+    locate_tool("proton-drive", "CCK_PROTON_DRIVE")
+}
+
 /// Build a [`std::process::Command`] that never pops a console window on Windows
 /// (DRAGON-236). A GUI-subsystem process (DRAGON-233) that spawns a CONSOLE-subsystem
 /// child — ffmpeg, ffprobe, tesseract, curl, netsh, cmd, … — makes Windows allocate a

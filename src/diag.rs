@@ -1,4 +1,4 @@
-//! DRAGON-419: the opt-in debug log — ONE cross-platform file that can name a customer's
+//! DRAGON-419: the debug log, ON BY DEFAULT since v0.28.0 — ONE cross-platform file that can name a customer's
 //! failure without asking them anything.
 //!
 //! # Why this exists
@@ -787,14 +787,21 @@ fn resolve_enabled() -> bool {
 /// the daemon branch. A one-field struct plus serde's ignore-unknown-fields default gets the
 /// one bit for one `read_to_string` and one parse, with no side effects at all.
 fn persisted_setting() -> bool {
-    #[derive(serde::Deserialize, Default)]
+    // `true` everywhere a value is missing, matching `state::schema`'s `default_true` on the
+    // same field (v0.28.0, logging on by default): no config file, an unreadable one, or one
+    // predating the key all mean ON, and only an explicit `debug_logging = false` (the Health
+    // page's toggle) turns it off.
+    #[derive(serde::Deserialize)]
     struct Flag {
-        #[serde(default)]
+        #[serde(default = "flag_default")]
         debug_logging: bool,
     }
-    let Some(path) = crate::state::config_path() else { return false };
-    let Ok(text) = std::fs::read_to_string(path) else { return false };
-    toml::from_str::<Flag>(&text).map(|f| f.debug_logging).unwrap_or(false)
+    fn flag_default() -> bool {
+        true
+    }
+    let Some(path) = crate::state::config_path() else { return true };
+    let Ok(text) = std::fs::read_to_string(path) else { return true };
+    toml::from_str::<Flag>(&text).map(|f| f.debug_logging).unwrap_or(true)
 }
 
 // ── The logger ───────────────────────────────────────────────────────────────

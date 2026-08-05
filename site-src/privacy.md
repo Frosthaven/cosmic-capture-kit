@@ -4,7 +4,7 @@ title: Privacy
 
 # Privacy
 
-**Effective 3 August 2026.**
+**Effective 5 August 2026.**
 
 Cosmic Capture Kit is a screen capture tool that runs on your computer. It has
 no accounts, no sign-up, and no servers of ours behind it. This page says
@@ -63,11 +63,12 @@ where other programs on the machine could see them.
 
 ## The debug log
 
-The app can write a debug log, for when something goes wrong and you want to
-send us something useful. It is **off by default** and you turn it on yourself
-in Settings, under Health.
+The app writes a small debug log, for when something goes wrong and you want
+to send us something useful. It is **on by default** and you can turn it off
+any time in Settings, under Health. It stays small on purpose: the log rolls
+over at a few megabytes and never grows past that.
 
-When it is on, it records what the app did, never what you captured. It does
+It records what the app did, never what you captured. It does
 not write file paths, file names, window titles, clipboard contents, scanned or
 recognized text, audio, pixels, user names, host names, or network names. Where
 a path matters for diagnosis, the log records its shape instead of the path: the

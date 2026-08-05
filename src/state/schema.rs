@@ -185,8 +185,16 @@ pub struct Persisted {
     /// straight out of the TOML as the first statement of `main` (before any subcommand or
     /// the daemon branch, so a launch that never reaches `App::init` is still covered), and
     /// the App mirrors it like every other setting so the toggle can take effect immediately.
-    /// Keep the name in step with the one-field struct in `diag::persisted_setting`.
-    #[serde(default)]
+    /// Keep the name in step with the one-field struct in `diag::persisted_setting`,
+    /// INCLUDING the default: both must say `default_true` or a capture child launched
+    /// before settings ever saved would disagree with the settings window about whether
+    /// logging is on.
+    ///
+    /// Default **ON** since v0.28.0 (owner decision): the log records what the app DID and
+    /// never what was captured (the diag privacy rules), it is bounded under ~5 MiB total by
+    /// rotation, and a support conversation that starts with "turn on logging and reproduce
+    /// it" loses the one run that mattered. The Health page toggle turns it off.
+    #[serde(default = "default_true")]
     pub debug_logging: bool,
     // DRAGON-467 removed SIX fields from here, plus the deprecated seventh that fed two of
     // them: `preview_save_on_copy`, `preview_close_on_copy`, `preview_copy_on_delete`, their

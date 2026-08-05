@@ -522,6 +522,17 @@ pub(super) fn subtle_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a,
         .into()
 }
 
+/// Caption text in the accent tone, for a caption that IS a link's label: the press it sits
+/// on opens something, and the accent is what tells the eye so (owner call, DRAGON-485: the
+/// provider picker's "Requires proton-drive CLI" line opens Proton's install page).
+pub(super) fn accent_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Msg> {
+    widget::text::caption(s)
+        .class(cosmic::theme::Text::Custom(|t| {
+            cosmic::iced::widget::text::Style { color: Some(theme::accent(t)), ..Default::default() }
+        }))
+        .into()
+}
+
 /// A setting row whose control is unavailable because a dependency is missing: the
 /// title is tinted to `sev`, and `value` is shown as inert, subdued text in place of
 /// the real control (no interaction, no pointer cursor).

@@ -133,6 +133,24 @@ pub enum CloudSettingsMsg {
     /// per-provider `auth_url` constant (see `cloud::AuthKind::OAuthPkce`), so it is already
     /// trusted before it ever reaches the UI, unlike provider-supplied network input.
     OpenBrowserUrl(String),
+    /// The external-tool probe finished (DRAGON-485): whether Proton's own `proton-drive`
+    /// command-line tool is installed and can run.
+    ///
+    /// A RUNTIME answer, unlike every other provider's availability, which is decided once at
+    /// compile time by whether a client id was baked in. The user can install the tool while
+    /// this app is running, so the probe runs whenever the add dialog or its provider list is
+    /// opened, and the picker's row draws whatever the latest answer is (see
+    /// `pages::cloud::tool_entry`). Bounded by `cloud::proton::PROBE_BUDGET` and run off the
+    /// UI thread, because it starts a process.
+    ToolProbed(crate::cloud::proton::Availability),
+    /// Open an external-tool provider's DOWNLOAD page, by index into `cloud::registry()`
+    /// (DRAGON-485): what a press on a picker row does while the tool is not installed.
+    ///
+    /// An index rather than a URL, for the same reason [`Self::OpenGuide`] carries nothing at
+    /// all: the handler reads the address out of the registry row's own
+    /// `AuthKind::ExternalTool { download_url, .. }`, a compile-time constant, so no URL from a
+    /// message or from a provider can ever ride this path to the OS opener.
+    OpenToolDownload(usize),
     /// Open the cloud accounts setup guide in the user's browser (DRAGON-508): the add
     /// dialog's empty-state link, shown when this build has no provider configured at all.
     ///
@@ -166,6 +184,46 @@ pub enum CloudSettingsMsg {
     /// path a failed listing takes. A walk that got partway carries its reason INSIDE the view
     /// instead, because there is still something to show.
     FolderViewRestored(u64, Result<crate::cloud::providers::RestoredBrowse, String>),
+    /// Switch the setup step's destination TAB (DRAGON-485), for the one provider that has two
+    /// kinds of destination.
+    ///
+    /// **The tab IS the destination**: pressing Done writes whichever one is showing, so this
+    /// is not a view toggle over one answer, it is the choice itself. Nothing is written here,
+    /// exactly as browsing writes nothing (DRAGON-517); switching tabs starts that tab's own
+    /// listing and Cancel still leaves the account as it was found.
+    ///
+    /// Carries the account's own `Destination` rather than a UI-only enum, so there is no
+    /// mapping between two spellings of one choice for anything to get wrong.
+    SetupTab(crate::cloud::accounts::Destination),
+    /// Choose one of the listed ALBUMS as this account's destination, by index (DRAGON-485).
+    ///
+    /// The Photos tab's answer to [`Self::FolderCrumbIn`], and deliberately a different
+    /// message: a folder is chosen by being descended INTO, and an album, being flat, has
+    /// nowhere to descend to, so a press selects instead of navigating. See
+    /// `cloud::proton::ALBUMS` for why the two models stay apart.
+    ///
+    /// Nothing is written here either; [`Self::SetupDone`] is what commits it.
+    AlbumPicked(usize),
+    /// The account's ALBUMS landed (DRAGON-485): the generation, and either the app's own
+    /// album plus every album this account has (`cloud::providers::FolderSetup`, whose `root`
+    /// carries the default) or a message.
+    ///
+    /// Separate from [`Self::FoldersLoaded`] because the two answers are consumed differently:
+    /// a folder listing fills a level and may walk the breadcrumb up when the level has gone,
+    /// and an album listing fills a flat set and may move the SELECTION when the chosen album
+    /// has gone. Folding them together would mean one handler doing both under a flag.
+    AlbumsLoaded(u64, Result<crate::cloud::providers::FolderSetup, String>),
+    /// The app's own album was provisioned on the way to saving a Photos destination
+    /// (DRAGON-522): the generation, and either the album or a message.
+    ///
+    /// **The one path that CREATES a default album.** Listing no longer does
+    /// (`cloud::providers::needs_default_album`): opening the Photos tab, refreshing it, or
+    /// editing an account whose album is something else all used to leave a "Cosmic Capture Kit"
+    /// album behind, which was the report. Provisioning is now what happens when the destination
+    /// genuinely resolves to the default and the default is not there, and confirming Photos with
+    /// nothing chosen is exactly that case: this message is its reply, and its handler finishes
+    /// the Done that started it.
+    DefaultAlbumMade(u64, Result<crate::cloud::providers::RemoteFolder, String>),
     /// Re-run the folder listing for the account the setup step is configuring (DRAGON-503).
     ///
     /// The refresh button that replaces the "Reading your folders" line once a listing has

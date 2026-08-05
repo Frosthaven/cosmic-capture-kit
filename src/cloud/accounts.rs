@@ -80,6 +80,40 @@ mod visibility_tests {
     }
 }
 
+/// WHICH KIND of place an account uploads to (DRAGON-485).
+///
+/// Almost every provider has exactly one: a folder. Proton Drive has two, because a Proton
+/// drive keeps photos in a section of its own whose containers are flat ALBUMS rather than
+/// nested folders, and an album is not a folder that happens to hold pictures. So an account
+/// records which of the two it was pointed at, and [`CloudAccount::folder_id`] /
+/// [`CloudAccount::folder_name`] then name whichever one that is.
+///
+/// **One pair of fields, not two.** An account has exactly one destination at a time, so
+/// storing a folder AND an album would be storing one answer plus a stale one; this enum is
+/// what says which of them the pair currently means.
+///
+/// The capability is a registry row ([`super::ProviderSpec::album_root`]), never a provider id,
+/// so a screen asks the table whether this axis exists at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Destination {
+    /// The ordinary file tree: the app folder, or a folder inside it.
+    Files,
+    /// A photo album.
+    Photos,
+}
+
+impl Destination {
+    /// What an account uses when it has never chosen one. Pure; unit-tested.
+    ///
+    /// Files, and it is the whole migration story: every account written before this field
+    /// existed has no value here, and every provider that has only folders can never have
+    /// another, so "absent" and "files" have to be the same thing.
+    pub fn default_choice() -> Destination {
+        Destination::Files
+    }
+}
+
 /// One connected account, as stored on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CloudAccount {
@@ -120,12 +154,27 @@ pub struct CloudAccount {
     /// read) for every provider without the capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<Visibility>,
+    /// Which KIND of destination [`Self::folder_id`] / [`Self::folder_name`] name
+    /// (DRAGON-485), for the one provider that has two of them. `None` means
+    /// [`Destination::Files`], which is what every account written before this field existed
+    /// holds and the only thing a folders-only provider can mean; read it through
+    /// [`Self::destination_kind`] rather than matching the `Option` at a call site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<Destination>,
 }
 
 impl CloudAccount {
     /// The provider this account belongs to, if this build knows it.
     pub fn spec(&self) -> Option<&'static super::ProviderSpec> {
         super::provider(&self.provider)
+    }
+
+    /// Which kind of destination this account uploads to. Pure; unit-tested.
+    ///
+    /// The ONE reader of [`Self::destination`], so "absent means files" is decided once rather
+    /// than at every call site that has to know where an upload goes.
+    pub fn destination_kind(&self) -> Destination {
+        self.destination.unwrap_or_else(Destination::default_choice)
     }
 
     /// The name to show for this account: the user's label, or a fallback that still says
@@ -306,6 +355,7 @@ mod account_file_tests {
             folder_name: Some("Screenshots".to_string()),
             added_at: "2026-08-02T10:00:00+00:00".to_string(),
             visibility: None,
+            destination: None,
         }
     }
 
@@ -382,6 +432,55 @@ added_at = \"2026-08-02T10:00:00+00:00\"
         // And writing it back drops the retired key rather than preserving it forever.
         let written = toml::to_string(&parsed).expect("serialize");
         assert!(!written.contains("auto_delete_hours"), "the key is not written back: {written}");
+    }
+
+    /// The destination KIND round-trips the way `visibility` already does: `Some` survives, and
+    /// `None` is omitted rather than written, so an account connected before this field existed
+    /// parses unchanged and one on a folders-only provider never gains the key at all.
+    #[test]
+    fn the_destination_kind_round_trips_and_is_omitted_when_unset() {
+        let photos = CloudAccount { destination: Some(Destination::Photos), ..sample() };
+        let text = toml::to_string(&AccountFile { accounts: vec![photos.clone()] }).expect("ser");
+        assert!(text.contains("destination = \"photos\""), "{text}");
+        let back: AccountFile = toml::from_str(&text).expect("parse");
+        assert_eq!(back.accounts, vec![photos]);
+
+        let unset = CloudAccount { destination: None, ..sample() };
+        let text = toml::to_string(&AccountFile { accounts: vec![unset.clone()] }).expect("ser");
+        assert!(!text.contains("destination"), "an unset kind must not be written: {text}");
+        assert_eq!(toml::from_str::<AccountFile>(&text).expect("parse").accounts, vec![unset]);
+    }
+
+    /// **An account written before the destination field existed still loads, and still uploads
+    /// to its folder.** This is the whole migration story: there is no rewrite, no default
+    /// written on read, and no way for an existing account to be quietly re-pointed.
+    #[test]
+    fn an_account_written_before_the_destination_field_still_uploads_to_its_folder() {
+        let text = "\
+[[accounts]]
+id = \"dddddddddddddddddddddddddddddddd\"
+provider = \"proton\"
+label = \"Personal\"
+folder_name = \"Shots\"
+added_at = \"2026-08-02T10:00:00+00:00\"
+";
+        let parsed: AccountFile = toml::from_str(text).expect("an absent kind still parses");
+        assert_eq!(parsed.accounts.len(), 1);
+        assert_eq!(parsed.accounts[0].destination, None);
+        assert_eq!(parsed.accounts[0].destination_kind(), Destination::Files);
+        assert_eq!(Destination::default_choice(), Destination::Files);
+    }
+
+    /// The on-disk spelling is lowercase and stable, for the same reason `visibility`'s is: a
+    /// rename here would silently move every Photos account back to its folder.
+    #[test]
+    fn the_destination_wire_spelling_is_lowercase_and_stable() {
+        #[derive(Serialize)]
+        struct Wrapper {
+            d: Destination,
+        }
+        assert_eq!(toml::to_string(&Wrapper { d: Destination::Files }).unwrap().trim(), "d = \"files\"");
+        assert_eq!(toml::to_string(&Wrapper { d: Destination::Photos }).unwrap().trim(), "d = \"photos\"");
     }
 
     /// An account naming a provider this build does not know must LOAD, not vanish. This
@@ -468,6 +567,7 @@ mod ordering_tests {
             folder_name: None,
             added_at: "2026-08-02T10:00:00+00:00".to_string(),
             visibility: None,
+            destination: None,
         }
     }
 

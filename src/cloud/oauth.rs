@@ -920,6 +920,14 @@ fn endpoints(provider_id: &str) -> Result<Endpoints, String> {
             client_secret_env,
             baked_client_secret,
         }),
+        // Reached by spawning the provider's own tool, which owns the sign-in end to end. There
+        // are no OAuth endpoints to hand back and nothing in this file ever runs for it; a
+        // caller that arrives here has routed an external-tool provider through the browser flow
+        // by mistake, so the message says that rather than blaming the provider.
+        AuthKind::ExternalTool { tool_name, .. } => Err(format!(
+            "{} signs in through the {tool_name} tool, not through this app's browser sign-in.",
+            spec.display_name
+        )),
         AuthKind::Unofficial => Err(format!(
             "{} has no public API for other apps to upload through, so it cannot be connected.",
             spec.display_name
@@ -1655,8 +1663,15 @@ mod authorize_url_tests {
             let extras = authorize_extras(spec.id);
             let scopes = match spec.auth {
                 AuthKind::OAuthPkce { scopes, .. } => scopes,
-                AuthKind::Unofficial => &[],
+                // Neither requests OAuth scopes: one has no API, the other signs in through
+                // its own tool.
+                AuthKind::ExternalTool { .. } | AuthKind::Unofficial => &[],
             };
+            // A provider with no OAuth flow at all has no refresh token to ask for: iCloud
+            // cannot be connected, and Proton's own tool owns its session (DRAGON-485).
+            if !matches!(spec.auth, AuthKind::OAuthPkce { .. }) {
+                continue;
+            }
             let offline = extras.iter().any(|(k, v)| {
                 (*k == "access_type" && *v == "offline")
                     || (*k == "token_access_type" && *v == "offline")

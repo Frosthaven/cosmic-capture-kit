@@ -59,6 +59,7 @@
 mod dropbox;
 mod gdrive;
 mod onedrive;
+mod proton;
 mod youtube;
 
 use std::path::{Path, PathBuf};
@@ -145,7 +146,7 @@ pub fn upload(
     should_cancel: &dyn Fn() -> bool,
 ) -> Result<RemoteFile, String> {
     let ops = ops(acct)?;
-    let token = super::oauth::ensure_fresh(&acct.id)?;
+    let token = access_token(acct)?;
     on_progress(0);
     ops.upload(acct, &token, file, on_progress, should_cancel)
 }
@@ -173,7 +174,7 @@ fn canceled_err() -> String {
 /// Create (or fetch the existing) shared link for an uploaded file.
 pub fn create_share_link(acct: &CloudAccount, file_id: &str) -> Result<String, String> {
     let ops = ops(acct)?;
-    let token = super::oauth::ensure_fresh(&acct.id)?;
+    let token = access_token(acct)?;
     ops.create_share_link(&token, file_id)
 }
 
@@ -203,7 +204,7 @@ pub fn create_share_link(acct: &CloudAccount, file_id: &str) -> Result<String, S
 /// setup step answers by walking its breadcrumb up one level rather than failing the dialog.
 pub fn browse_folders(acct: &CloudAccount, parent: Option<&str>) -> Result<FolderSetup, String> {
     let ops = ops(acct)?;
-    let token = super::oauth::ensure_fresh(&acct.id)?;
+    let token = access_token(acct)?;
     let root = match parent {
         None => ops.ensure_root_folder(&token)?,
         Some(_) => None,
@@ -361,7 +362,7 @@ pub fn create_folder(
 ) -> Result<RemoteFolder, String> {
     let ops = ops(acct)?;
     let name = remote_folder_name(name)?;
-    let token = super::oauth::ensure_fresh(&acct.id)?;
+    let token = access_token(acct)?;
     let folder = ops.create_folder(&token, parent, &name)?;
     log::debug!("cloud {}: created a folder", acct.provider);
     Ok(folder)
@@ -422,7 +423,7 @@ fn create_parent_with(
 /// should be able to talk a user into.
 pub fn delete_folder(acct: &CloudAccount, folder: &str) -> Result<(), String> {
     let ops = ops(acct)?;
-    let token = super::oauth::ensure_fresh(&acct.id)?;
+    let token = access_token(acct)?;
     ops.delete_folder(&token, folder)?;
     log::debug!("cloud {}: deleted a folder", acct.provider);
     Ok(())
@@ -437,8 +438,116 @@ pub fn delete_folder(acct: &CloudAccount, folder: &str) -> Result<(), String> {
 /// capability flag; every connectable provider implements this.
 pub fn delete_file(acct: &CloudAccount, file_id: &str) -> Result<(), String> {
     let ops = ops(acct)?;
-    let token = super::oauth::ensure_fresh(&acct.id)?;
+    let token = access_token(acct)?;
     ops.delete_file(&token, file_id)
+}
+
+/// Every photo ALBUM this account has, with the app's own album found or created first
+/// (DRAGON-485).
+///
+/// The album axis's [`browse_folders`], and it is deliberately the same SHAPE: one call that
+/// provisions and then lists, so the Photos tab cannot show a list from one place and save a
+/// destination in another, and so an account that has never chosen an album still has one to
+/// fall back to. [`FolderSetup::root`] carries that default album, exactly as it carries the app
+/// folder on the files side; there is no level below it, so there is no `parent` argument and
+/// no descent.
+pub fn browse_albums(acct: &CloudAccount) -> Result<FolderSetup, String> {
+    let ops = ops(acct)?;
+    let token = access_token(acct)?;
+    // **ONE listing, and what to do about the default is decided from it.** The obvious shape
+    // (ask the provider to ensure the album, then list) costs a SECOND listing, because finding
+    // an album by name is itself a listing; and this provider's tool is a ~118 MB binary whose
+    // start-up dominates a small call, so a redundant one is a visible pause on a dialog someone
+    // is looking at. The decision is [`app_album`], in the shared tree and unit-tested; the only
+    // thing left for the provider is the create.
+    let mut albums = ops.list_albums(&token)?;
+    let found = app_album(&albums, super::APP_FOLDER).map(|index| albums[index].clone());
+    let root = match found {
+        Some(album) => Some(album),
+        // **Listing does not provision** (DRAGON-522). This used to create the app's own album
+        // whenever it was absent, which meant opening the Photos tab, refreshing it, or editing
+        // an account whose album is something else all made one, on a tab the user may have been
+        // only looking at. Browsing writes nothing, the same rule DRAGON-517 settled for the
+        // folder side. The one case that still provisions HERE is an account that already
+        // uploads to albums and names none, because that account's destination genuinely
+        // resolves to the default and its next capture needs it to exist.
+        None if needs_default_album(crate::cloud::uploads_to_album(acct), acct.folder_id.as_deref()) => {
+            let made = ops.create_album(&token, super::APP_FOLDER)?;
+            // Pushed onto the list rather than left for the next refresh: the album the caller
+            // is about to select has to be IN the set it selects from, or the reconciliation
+            // that checks a chosen album still exists would drop it on the spot.
+            albums.push(made.clone());
+            Some(made)
+        }
+        // No default, and no reason to make one. The picker shows what is there, and its empty
+        // state already says to add one with `+`.
+        None => None,
+    };
+    log::debug!("cloud {}: listed {} albums", acct.provider, albums.len());
+    Ok(FolderSetup { root, folders: albums })
+}
+
+/// Whether LISTING an account's albums should also provision the app's own. Pure; unit-tested
+/// (DRAGON-522).
+///
+/// The lazy rule, in one predicate: provision only when the account's destination genuinely
+/// RESOLVES to the default album. That is true for an account already set to Photos with no album
+/// recorded, whose uploads fall back to the app's own album by name
+/// (`providers::proton::account_album`), and false for everything else, including every account
+/// that is merely being browsed.
+///
+/// `photos` is whether the stored destination is the album axis, `saved` the album id the account
+/// carries. A blank id is no id: a hand-edited accounts file, or a destination cleared by a
+/// migration, both mean "wherever the default is".
+///
+/// **Not a question about the DIALOG.** The tab a user happens to be looking at is not a
+/// destination until Done writes it, which is why the tab is not an argument here: confirming
+/// Photos with nothing chosen provisions through its own path
+/// (`CloudSettingsMsg::DefaultAlbumMade`), where a user has actually asked for it.
+pub fn needs_default_album(photos: bool, saved: Option<&str>) -> bool {
+    photos && saved.is_none_or(|id| id.trim().is_empty())
+}
+
+/// Which listed album is the app's own, by name. Pure; unit-tested.
+///
+/// The album side's find-half of find-or-create. Matched by NAME, and only here: everything
+/// downstream addresses an album by its id, but a name is all this app knows about an album it
+/// may have created on a previous run, and there is nowhere else to look it up.
+///
+/// Case-INSENSITIVE and trimmed, the same rule [`restore_step`] matches folder names by, so a
+/// user who renamed the album's case in Proton's own app does not get a second one made beside
+/// it on the next open.
+fn app_album(albums: &[RemoteFolder], name: &str) -> Option<usize> {
+    let want = name.trim();
+    albums.iter().position(|album| album.name.trim().eq_ignore_ascii_case(want))
+}
+
+/// Make a new album called `name` (DRAGON-485).
+///
+/// [`create_folder`]'s sibling, and it applies the SAME name rules
+/// ([`remote_folder_name`]) before any request: a picker that accepts a name for an album and
+/// refuses it for a folder is a picker with two rule sets nobody can learn. There is no parent
+/// to resolve, which is the one thing [`create_folder`] does that this does not have to.
+pub fn create_album(acct: &CloudAccount, name: &str) -> Result<RemoteFolder, String> {
+    let ops = ops(acct)?;
+    let name = remote_folder_name(name)?;
+    let token = access_token(acct)?;
+    let album = ops.create_album(&token, &name)?;
+    log::debug!("cloud {}: created an album", acct.provider);
+    Ok(album)
+}
+
+/// Delete an album (DRAGON-485).
+///
+/// The album this account uploads to is refused in the UI, before this is reached, for the same
+/// reason [`delete_folder`]'s app folder is: "delete the place this app uploads to" is a
+/// decision no confirmation should be able to talk a user into.
+pub fn delete_album(acct: &CloudAccount, album: &str) -> Result<(), String> {
+    let ops = ops(acct)?;
+    let token = access_token(acct)?;
+    ops.delete_album(&token, album)?;
+    log::debug!("cloud {}: deleted an album", acct.provider);
+    Ok(())
 }
 
 /// Revoke the account's tokens at the provider, best effort, before local deletion.
@@ -449,7 +558,13 @@ pub fn delete_file(acct: &CloudAccount, file_id: &str) -> Result<(), String> {
 /// account, which is the one account a user most wants to remove.
 pub fn revoke(acct: &CloudAccount) -> Result<(), String> {
     let ops = ops(acct)?;
-    match super::oauth::ensure_fresh(&acct.id) {
+    // **`access_token`, not `ensure_fresh`** (DRAGON-485), which is the same swap the other five
+    // entry points made and matters MOST here. An external-tool account has no stored token, so
+    // `ensure_fresh` fails with a reconnect-shaped message, which the arm below reads as "already
+    // revoked" and returns success from without ever calling the provider. The tool would then
+    // stay signed in after a disconnect, and the next account connected would silently inherit
+    // that session, which is exactly the eviction the one-account cap exists to prevent.
+    match access_token(acct) {
         Ok(token) => ops.revoke(&token),
         Err(e) if super::oauth::needs_reconnect(&e) => {
             log::debug!("cloud {}: nothing to revoke, the authorization is already gone", acct.provider);
@@ -520,6 +635,70 @@ trait ProviderOps {
     fn delete_file(&self, token: &str, file_id: &str) -> Result<(), String>;
 
     fn revoke(&self, token: &str) -> Result<(), String>;
+
+    /// Every photo ALBUM this account has (DRAGON-485).
+    ///
+    /// The album axis's answer to [`Self::list_folders`], and it takes no parent, because that
+    /// is the whole difference between the two: albums do not nest, so there is no level to
+    /// list the inside of. See `cloud::proton::ALBUMS` for the model and for the instruction
+    /// not to fold the two together.
+    ///
+    /// The default `Err` is the right answer for every provider whose only destination is a
+    /// folder, and it is unreachable from the UI: [`super::has_albums`] is what decides whether
+    /// the Photos tab exists at all, and it reads the same registry row this refusal describes.
+    fn list_albums(&self, _token: &str) -> Result<Vec<RemoteFolder>, String> {
+        Err(NO_ALBUMS.to_string())
+    }
+
+    /// Make a new album called `name`. `name` has already been through
+    /// [`remote_folder_name`].
+    ///
+    /// There is deliberately no `ensure_album` beside this, unlike the folder side's
+    /// [`Self::ensure_root_folder`]: finding an album by name is just a listing, so the
+    /// find-or-create is decided in [`browse_albums`] from the listing it was going to make
+    /// anyway, and a provider that implemented its own would be paying for a second one.
+    fn create_album(&self, _token: &str, _name: &str) -> Result<RemoteFolder, String> {
+        Err(NO_ALBUMS.to_string())
+    }
+
+    /// Delete an album, by its [`RemoteFolder::id`].
+    ///
+    /// Separate from [`Self::delete_folder`] for the same reason that one is separate from
+    /// [`Self::delete_file`]: the operation's NAME reaches the user in a failure message, and
+    /// the two are not the same act. What happens to the PHOTOS in a deleted album is the
+    /// provider's decision and belongs in the confirmation's copy; see
+    /// `pages::cloud::delete_confirm_body`.
+    fn delete_album(&self, _token: &str, _album_id: &str) -> Result<(), String> {
+        Err(NO_ALBUMS.to_string())
+    }
+}
+
+/// What a provider with no album axis says when asked about one (DRAGON-485).
+///
+/// One sentence rather than four, because it describes a state no screen can reach: the Photos
+/// tab is drawn only where [`super::has_albums`] is true. It exists so the trait's defaults are
+/// honest rather than silently answering "no albums" with an empty list, which would draw an
+/// empty picker on a provider that has no albums to draw.
+const NO_ALBUMS: &str = "This cloud service does not keep photo albums.";
+
+/// The access token to hand a provider's ops, or an empty one for a provider that has none.
+///
+/// **Why this is not just [`super::oauth::ensure_fresh`] any more** (DRAGON-485). Four of the
+/// five providers keep OAuth tokens in [`super::secrets`], and refreshing them in ONE place is
+/// what stops any provider forgetting to. The fifth, Proton, keeps no token at all: its session
+/// lives inside Proton's own CLI, in the OS secret store under the tool's identity, and this app
+/// never sees or holds it. Asking `ensure_fresh` for a token that was never stored would fail
+/// every Proton call before it started.
+///
+/// So the token is fetched exactly when there is one to fetch, decided from the registry rather
+/// than from a provider id, and an external-tool provider's ops receive an empty string they
+/// are documented to ignore.
+fn access_token(acct: &CloudAccount) -> Result<String, String> {
+    let external = acct.spec().is_some_and(|spec| spec.auth.is_external_tool());
+    if external {
+        return Ok(String::new());
+    }
+    super::oauth::ensure_fresh(&acct.id)
 }
 
 /// **THE dispatch point.** The only place in the app that matches on a provider id.
@@ -529,6 +708,7 @@ fn ops(acct: &CloudAccount) -> Result<&'static dyn ProviderOps, String> {
         "onedrive" => Ok(&onedrive::OneDrive),
         "dropbox" => Ok(&dropbox::Dropbox),
         "youtube" => Ok(&youtube::YouTube),
+        "proton" => Ok(&proton::Proton),
         // Either an account written by a newer build, or one of the two providers with no
         // public API. The message distinguishes them, because "we cannot" and "nobody can"
         // are different answers.
@@ -919,6 +1099,101 @@ fn json_field(body: &str, field: &str, what: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
+mod album_tests {
+    use super::*;
+
+    fn album(name: &str, uid: &str) -> RemoteFolder {
+        RemoteFolder { id: format!("/albums/{uid}"), name: name.to_string() }
+    }
+
+    /// The find half of find-or-create: the app's own album is recognised so a second one is
+    /// never made beside it.
+    #[test]
+    fn the_apps_own_album_is_found_by_name() {
+        let albums = [album("Holidays", "a"), album("Cosmic Capture Kit", "b")];
+        assert_eq!(app_album(&albums, "Cosmic Capture Kit"), Some(1));
+    }
+
+    /// Case and surrounding space never make it a different album: a user who renamed its case
+    /// in Proton's own app must not get a duplicate on the next open.
+    #[test]
+    fn the_match_ignores_case_and_surrounding_space() {
+        let albums = [album("  cosmic capture kit  ", "b")];
+        assert_eq!(app_album(&albums, "Cosmic Capture Kit"), Some(0));
+        assert_eq!(app_album(&albums, "  Cosmic Capture Kit"), Some(0));
+    }
+
+    /// Nothing matching means there is something to create, which is the other half.
+    #[test]
+    fn an_absent_album_reports_nothing_to_find() {
+        assert_eq!(app_album(&[], "Cosmic Capture Kit"), None);
+        assert_eq!(app_album(&[album("Holidays", "a")], "Cosmic Capture Kit"), None);
+        // A name that merely CONTAINS ours is a different album; this is not a prefix match.
+        assert_eq!(app_album(&[album("Cosmic Capture Kit 2", "a")], "Cosmic Capture Kit"), None);
+    }
+
+    /// **The DRAGON-522 report: listing must not create.** Opening the Photos tab, refreshing it
+    /// or editing an account whose album is something else all list, and a listing that
+    /// provisioned left a "Cosmic Capture Kit" album behind every time. The one case that still
+    /// provisions on a listing is the account whose destination genuinely resolves to the
+    /// default: Photos, with no album of its own, which is what an upload would fall back to.
+    #[test]
+    fn only_an_account_that_resolves_to_the_default_provisions_on_a_listing() {
+        // The account the report was about: on Photos, with a different album saved.
+        assert!(!needs_default_album(true, Some("/albums/vol~something-else")));
+        // Browsing an account that uploads to FILES, whichever tab is on screen: the tab is not
+        // a destination until Done writes it.
+        assert!(!needs_default_album(false, None));
+        assert!(!needs_default_album(false, Some("/albums/vol~a")));
+        // The one that does: already on the album axis, naming no album.
+        assert!(needs_default_album(true, None));
+        // A blank id is no id: a hand-edited file, or one a migration cleared.
+        for blank in ["", "   ", "\n"] {
+            assert!(needs_default_album(true, Some(blank)), "{blank:?}");
+        }
+    }
+
+    /// A provider with no album axis refuses rather than answering "no albums" with an empty
+    /// list, which would draw an empty picker on a provider that has none to draw.
+    #[test]
+    fn a_folders_only_provider_refuses_the_album_calls() {
+        let ops: &dyn ProviderOps = &gdrive::GDrive;
+        assert!(ops.list_albums("t").is_err());
+        assert!(ops.create_album("t", "Holidays").is_err());
+        assert!(ops.delete_album("t", "/albums/a").is_err());
+        // And the refusal is the same sentence wherever it comes from.
+        assert_eq!(ops.list_albums("t").unwrap_err(), NO_ALBUMS);
+    }
+
+    /// The registry and the implementations agree: the provider that declares an album root is
+    /// the provider whose ops answer album calls, and no other. A row added with one and not the
+    /// other would draw a Photos tab whose every control failed.
+    #[test]
+    fn only_the_provider_with_an_album_root_implements_the_album_calls() {
+        for spec in super::super::registry() {
+            let account = CloudAccount {
+                id: "0123456789abcdef0123456789abcdef".to_string(),
+                provider: spec.id.to_string(),
+                label: String::new(),
+                folder_id: None,
+                folder_name: None,
+                added_at: String::new(),
+                visibility: None,
+                destination: None,
+            };
+            let Ok(ops) = ops(&account) else { continue };
+            let refuses = ops.list_albums("t").as_ref().err().map(String::as_str) == Some(NO_ALBUMS);
+            assert_eq!(
+                super::super::has_albums(spec),
+                !refuses,
+                "`{}`'s album root and its ops disagree",
+                spec.id
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod dispatch_tests {
     use super::*;
 
@@ -931,6 +1206,7 @@ mod dispatch_tests {
             folder_name: None,
             added_at: String::new(),
             visibility: None,
+            destination: None,
         }
     }
 
@@ -955,8 +1231,11 @@ mod dispatch_tests {
     #[test]
     fn an_unusable_provider_says_which_kind_it_is() {
         // `.map(drop)` because a `&dyn ProviderOps` has no `Debug` for `expect_err` to print.
-        let unofficial = ops(&account("proton")).map(drop).expect_err("proton has no API");
-        assert!(unofficial.contains("Proton Drive"), "{unofficial}");
+        let unofficial = ops(&account("icloud")).map(drop).expect_err("icloud has no API");
+        assert!(unofficial.contains("iCloud Drive"), "{unofficial}");
+        // Proton moved OUT of that group in DRAGON-485: it has ops now, reached through
+        // Proton's own tool rather than through an API of ours.
+        assert!(ops(&account("proton")).is_ok(), "proton must dispatch to its own ops");
         let unknown = ops(&account("a-drive-from-the-future")).map(drop).expect_err("unknown");
         assert!(unknown.contains("does not know"), "{unknown}");
     }
