@@ -4,117 +4,177 @@
 > Cosmic Capture Kit is currently in the alpha stages. You are free to test this
 > software as-is, and scroll below to find planned features and support.
 
-![Cosmic Capture Kit capturing its own settings window](res/readme/hero.png)
+![The capture toolbar: scan, image and video modes with a countdown, then the region, window and monitor targets, captioned "Scan/capture/record a region, window, or monitor..."](site-src/assets/hero.png)
 
-![The preview editor annotating a captured settings window — step markers, a highlighted row, an arrow, text and freehand notes, with the annotation toolbar and zoom controls visible](res/readme/annotations.png)
+![The preview editor's annotation tools, with numbered callouts on the toolbar's shape, redaction, highlight, text and draw groups, the save, copy and upload file actions, a spotlight dimming everything but one strip, freehand writing with an emoji, and the zoom control](site-src/assets/annotations.png)
 
 Cross-platform screen region, window, and monitor capture with support for
-translucent windows, image, video, voice, QR, barcodes, OCR text and more.
+translucent windows, image, video, voice, QR, barcodes, OCR text, and
+annotation.
 
 ## Current Support Status
 
-| Legend | Meaning          |
-| ------ | ---------------- |
-| ✅     | Completed        |
-| 📅     | Planned          |
-| ❓     | To be determined |
+### Supported Platforms
 
-### Supported Operating Systems
+**Legend:** ✅ supported · 🟡 partial · ❌ not supported · 📅 planned · ❓ unknown until built
 
-These are the platforms currently planned for support, along with their current
-status.
+| Platform                  | Compositor                                  | Common distros                       | Capture method           | Core features | Capture extras | Window aesthetics |
+| ------------------------- | ------------------------------------------- | ------------------------------------ | ------------------------ | ------------- | -------------- | ----------------- |
+| macOS 14+ (Apple Silicon) | Quartz Compositor                           | macOS                                | ScreenCaptureKit         | ✅            | ✅             | ✅                |
+| Windows 10, 11 (x86_64)   | Desktop Window Manager                      | Windows                              | Windows Graphics Capture | ✅            | ✅             | ✅                |
+| Linux, Wayland            | cosmic-comp (COSMIC)                        | Pop!_OS                              | screencopy / portal      | ✅            | ✅             | ✅                |
+| Linux, Wayland            | KWin 6.6+ (KDE Plasma)                      | Kubuntu, Fedora KDE, SteamOS Desktop | screencopy / portal      | 📅            | ❓             | ❓                |
+| Linux, Wayland            | Mutter 49.2+ (GNOME)                        | Ubuntu, Fedora, Debian               | screencopy / portal      | 📅            | ❓             | ❓                |
+| Linux, Wayland            | Muffin 6.6+ (Cinnamon)                      | Linux Mint                           | screencopy / portal      | 📅            | ❓             | ❓                |
+| Linux, Wayland            | Hyprland 0.52+                              | *user installed*                     | screencopy / portal      | 📅            | ❓             | ❓                |
+| Linux, Wayland            | niri 25.11+                                 | *user installed*                     | screencopy / portal      | 📅            | ❓             | ❓                |
+| Linux, Wayland            | wlroots 0.19+ (Sway, river, Wayfire, labwc) | *user installed*                     | screencopy / portal      | 📅            | ❓             | ❓                |
+| Linux, X11                | any window manager                          | Mint MATE / Xfce, older releases     | X11 XShm                 | 📅            | ❓             | ❓                |
 
-Each shipping platform is one architecture today: the macOS build is Apple
-Silicon (aarch64), the Windows build is x86_64, and Linux is x86_64 built from
-source. There is no Intel Mac build, no ARM Windows build, and no packaged
-Linux download yet. Every release names its architecture in the file itself,
-`CosmicCaptureKit-<version>-aarch64.dmg` and
-`CosmicCaptureKit-<version>-x86_64.msi`.
+<details>
+<summary>What these columns mean, and what's required</summary>
 
-| Platform                                                 | Capture backend                     | Status  | Notes                                                     |
-| -------------------------------------------------------- | ----------------------------------- | ------- | --------------------------------------------------------- |
-| macOS 14+ (Apple Silicon)                                | ScreenCaptureKit                    | ✅      | aarch64 only. Intel Macs are not supported.                |
-| Windows 11                                               | Windows Capture                     | ✅      | x86_64 only.                                              |
-| Windows 10                                               | Windows Capture                     | ✅      | x86_64. Reported working, but we do not provide official support. |
-| Linux (Wayland): COSMIC                                  | Cosmic Compositor / PipeWire Portal | ✅      | x86_64, built from source for now.                        |
-| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | ❓                                  | 📅      |                                                           |
-| Linux (Wayland): KDE Plasma                              | ❓                                  | 📅      |                                                           |
-| Linux (Wayland): GNOME                                   | ❓                                  | 📅      |                                                           |
-| Linux (X11)                                              | ❓                                  | 📅      |                                                           |
+Sway, river, Wayfire and labwc share a row because they are all built on
+wlroots, which implements these protocols on their behalf. Each version above is
+simply that compositor's first release carrying wlroots 0.19 or newer, which is
+where the capture protocols landed. Hyprland and niri implement their own
+protocol support (on Aquamarine and Smithay respectively), so they get their own
+rows.
 
-### Supported Compositor Extras
+**Capture extras** are the four capture-time options: freeze pixels during
+selection, preserve mouse cursor, preserve window transparency, and preserve
+wallpaper. Some of them need platform-specific functionality: on macOS, for
+example, capturing windows with their glass effects is not possible through the
+available APIs, so clever recompositing is required.
 
-These features require platform-specific functionality. One example is on macOS,
-where capturing windows with their glass effects is not possible using the
-available APIs - clever recompositing tricks are required.
+**Window aesthetics** is the border, shadow, rounding and padding applied to a
+captured single window.
 
-| Platform                                                 | Freeze Pixels for Region Select | Toggle Mouse Cursor | Toggle Window Transparency | Toggle Wallpaper | Single Window Aesthetics (neon border, etc) |
-| -------------------------------------------------------- | ------------------------------- | ------------------- | -------------------------- | ---------------- | ------------------------------------------- |
-| macOS 14+ (Apple Silicon)                                | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
-| Windows 11                                               | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
-| Linux (Wayland): COSMIC                                  | ✅                              | ✅                  | ✅                         | ✅               | ✅                                          |
-| Linux (Wayland): Sway 1.10+ / Hyprland / River (wlroots) | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
-| Linux (Wayland): KDE Plasma                              | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
-| Linux (Wayland): GNOME                                   | 📅                              | 📅                  | 📅                         | 📅               | 📅                                          |
+Whatever your own system supports is reported under Settings -> Health.
+
+On Linux the two capture methods are **Compositor screencopy**, which reads
+frames straight from the compositor, and the **PipeWire portal**, which asks
+permission through a system dialog. Both appear in Settings under Capture
+method; the version floors above are where each compositor gained the protocols
+screencopy needs.
+
+On X11 there is no single capture API. A backend there would combine XShm for
+full-screen grabs, XComposite for per-window pixels, XFixes for the cursor,
+EWMH window properties for the window list, and ffmpeg's x11grab for recording.
+
+X11 applications running inside a Wayland session capture normally: they are
+ordinary windows to the compositor.
+
+Recording needs ffmpeg, and audio capture on Linux needs a Pulse-compatible
+server. See [dependencies.md](dependencies.md) for the full list and what
+happens when a piece is missing.
+
+</details>
 
 ### Supported Features
 
 These are cross-platform features that are currently planned for the project
 along with their statuses.
 
-| Feature                                             | Status  |
-| --------------------------------------------------- | ------- |
-| Core: Image capture                                 | ✅      |
-| Core: Video capture                                 | ✅      |
-| Core: Audio capture                                 | ✅      |
-| Core: Audio cleanup & mixing pipeline               | ✅      |
-| Core: Encoder setup & configuration                 | ✅      |
-| Core: Preview editor (windowed)                     | ✅      |
-| Core: Preview editor (overlay)                      | ✅      |
-| Core: System tray daemon                            | ✅      |
-| Preview editor (shared): Clipboard toggle           | ✅      |
-| Preview editor (shared): Save (choose where)        | ✅      |
-| Preview editor (shared): Copy                       | ✅      |
-| Preview editor (shared): Share sheet (Windows)      | ✅      |
-| Preview editor (shared): Share sheet (macOS)        | ✅      |
-| Preview editor (shared): Upload to an account       | ✅      |
-| Preview editor (images): Covermarks                 | ✅      |
-| Preview editor (images): Color selector             | ✅      |
-| Preview editor (images): Arrows                     | ✅      |
-| Preview editor (images): Highlighter                | ✅      |
-| Preview editor (images): Text w/size                | ✅      |
-| Preview editor (images): Step markers               | ✅      |
-| Preview editor (images): Dim/spotlight              | ✅      |
-| Preview editor (images): Destructive pixelate       | ✅      |
-| Preview editor (images): Destructive blur           | ✅      |
-| Preview editor (images): Box outline                | ✅      |
-| Preview editor (images): Box fill                   | 📅      |
-| Preview editor (images): Box highlight              | ✅      |
-| Preview editor (images): Pencil w/line widths       | ✅      |
-| Preview editor (images): Sticker tool               | 📅      |
-| Preview editor (images): Eraser tool                | ✅      |
-| Preview editor (images): Select/multi-select tool   | ✅      |
-| Preview editor (images): Crop tool                  | ✅      |
-| Preview editor (videos): Simple cutting tool        | ✅      |
-| Preview editor (videos): Simple transition dropdown | 📅      |
-| Recording controls: Toggle mic                      | ✅      |
-| Recording controls: Toggle speaker                  | ✅      |
-| Recording controls: Pause recording                 | ✅      |
-| Recording controls: Delete/cancel recording         | ✅      |
-| Recording controls: Mouse click effects             | 📅      |
-| Recording controls: Keypress overlay                | ❓      |
-| Recording controls: Live annotation tools           | ❓      |
-| Cloud account support: Proton Drive                 | ✅      |
-| Cloud account support: OneDrive                     | ✅      |
-| Cloud account support: Google Drive                 | ✅      |
-| Cloud account support: Dropbox                      | ✅      |
-| Cloud account support: YouTube                      | ✅      |
-| Cloud account support: iCloud Drive                 | 📅      |
-| Cloud account support: SFTP                         | 📅      |
+**Legend:** ✅ done · 📅 planned · ❓ under consideration
+
+<details>
+<summary><b>Core</b></summary>
+
+| Feature                         | Status |
+| ------------------------------- | ------ |
+| Image capture                   | ✅     |
+| Video capture                   | ✅     |
+| Audio capture                   | ✅     |
+| Audio cleanup & mixing pipeline | ✅     |
+| Encoder setup & configuration   | ✅     |
+| Preview editor (windowed)       | ✅     |
+| Preview editor (overlay)        | ✅     |
+| System tray daemon              | ✅     |
+
+</details>
+
+<details>
+<summary><b>Image Preview Editor</b></summary>
+
+| Feature                   | Status |
+| ------------------------- | ------ |
+| Covermarks                | ✅     |
+| Color selector            | ✅     |
+| Arrows                    | ✅     |
+| Highlighter               | ✅     |
+| Text w/size               | ✅     |
+| Step markers              | ✅     |
+| Dim/spotlight             | ✅     |
+| Destructive pixelate      | ✅     |
+| Destructive blur          | ✅     |
+| Box outline               | ✅     |
+| Box fill                  | 📅     |
+| Box highlight             | ✅     |
+| Pencil w/line widths      | ✅     |
+| Sticker tool              | 📅     |
+| Eraser tool               | ✅     |
+| Select/multi-select tool  | ✅     |
+| Crop tool                 | ✅     |
+| Automatic clipboard copy  | ✅     |
+| Save (choose where)       | ✅     |
+| Copy to clipboard         | ✅     |
+| Share sheet (Windows)     | ✅     |
+| Share sheet (macOS)       | ✅     |
+| Upload to a cloud account | ✅     |
+
+</details>
+
+<details>
+<summary><b>Video Preview Editor</b></summary>
+
+| Feature                    | Status |
+| -------------------------- | ------ |
+| Simple cutting tool        | ✅     |
+| Simple transition dropdown | 📅     |
+| Automatic clipboard copy   | ✅     |
+| Save (choose where)        | ✅     |
+| Copy to clipboard          | ✅     |
+| Share sheet (Windows)      | ✅     |
+| Share sheet (macOS)        | ✅     |
+| Upload to a cloud account  | ✅     |
+
+</details>
+
+<details>
+<summary><b>Recording Controls</b></summary>
+
+| Feature                 | Status |
+| ----------------------- | ------ |
+| Toggle mic              | ✅     |
+| Toggle speaker          | ✅     |
+| Pause recording         | ✅     |
+| Delete/cancel recording | ✅     |
+| Mouse click effects     | 📅     |
+| Keypress overlay        | ❓     |
+| Live annotation tools   | ❓     |
+
+</details>
+
+<details>
+<summary><b>Cloud Accounts</b></summary>
+
+| Feature      | Status |
+| ------------ | ------ |
+| Dropbox      | ✅     |
+| Google Drive | ✅     |
+| iCloud Drive | 📅     |
+| OneDrive     | ✅     |
+| Proton Drive | ✅     |
+| SFTP         | 📅     |
+| YouTube      | ✅     |
+
+</details>
 
 ## Installation
 
-### macOS
+<details>
+<summary><b>macOS</b></summary>
 
 1. Download the latest `CosmicCaptureKit-<version>-aarch64.dmg` from
    [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases) and
@@ -122,7 +182,10 @@ along with their statuses.
 2. First launch: grant Screen Recording (System Settings > Privacy &
    Security), then relaunch. Microphone is optional (for recordings with mic).
 
-### Windows 11
+</details>
+
+<details>
+<summary><b>Windows 11</b></summary>
 
 1. Download the latest `CosmicCaptureKit-<version>-x86_64.msi` from
    [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases) and run
@@ -133,9 +196,44 @@ along with their statuses.
 2. The installer is not code-signed yet, so on first run SmartScreen may show
    "Windows protected your PC". Click More info, then Run anyway.
 
-### Linux (Wayland): COSMIC
+</details>
 
-Build from source for now (packaged channels are on the way).
+<details>
+<summary><b>Linux (Wayland): COSMIC</b></summary>
+
+There are two routes: download the release build, which is the quickest, or
+build from source, which works on any distro and is the only route on
+architectures other than x86_64.
+
+#### Download the release build
+
+1. Download `CosmicCaptureKit-<version>-x86_64-COSMIC.zip` from
+   [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases).
+2. Unzip it and put the binary on your `PATH`:
+
+   ```sh
+   unzip CosmicCaptureKit-*-x86_64-COSMIC.zip
+   chmod +x cosmic-capture-kit
+   mkdir -p ~/.local/bin && mv cosmic-capture-kit ~/.local/bin/
+   ```
+
+   If your shell cannot find it afterwards, `~/.local/bin` is not on your
+   `PATH` yet.
+3. Run `cosmic-capture-kit --settings` to look around and set your save
+   folders, then bind the [shortcuts](#shortcuts) below.
+
+The zip holds one binary and nothing else. It is x86_64 only and needs glibc
+2.39 or newer, so Arch, CachyOS, Fedora 40+, Ubuntu 24.04+, Pop!_OS 24.04 and
+Debian 13 all run it, while Ubuntu 22.04, Mint 21 and Debian 12 do not. It also
+links libxkbcommon, libpulse and libpipewire, which a COSMIC desktop already
+has. On an older distro, build from source instead.
+
+Cloud uploads need no setup in this build: the provider registrations are
+already compiled in. A build from source does not have them, and needs one
+one-time step per provider.
+
+To get an entry in the application menu, install the shipped desktop file as
+described under [Install from source](#install-from-source).
 
 #### Build dependencies
 
@@ -242,26 +340,47 @@ xdg-desktop-portal show the app's real name instead of a generic fallback.
 
 #### Shortcuts
 
-Cosmic Capture Kit ships with no keybindings of its own — add your own in
-**Settings → Keyboard → Shortcuts → Custom shortcuts**, pointing each at one of
-these commands:
+Cosmic Capture Kit ships with no keybindings of its own. Add your own in
+**Settings → Keyboard → Shortcuts → Custom shortcuts**.
 
-| Command                               | Suggested keys           |
-| ------------------------------------- | ------------------------ |
-| `cosmic-capture-kit --region`         | `Alt+Shift+1`            |
-| `cosmic-capture-kit --active-window`  | `Alt+Shift+2`            |
-| `cosmic-capture-kit --active-monitor` | `Alt+Shift+3`            |
+**One key is enough.** A bare launch opens the capture overlay, and the overlay
+is the whole tool. Its toolbar switches between region, window and monitor
+without relaunching, and it also carries the screenshot / recording / scan
+choice, the countdown, and the capture toggles. Pressing the active selector is
+what takes the capture.
 
-Add `--no-editor` to any of these for a variant that skips the preview editor — the
-capture is saved, copied to the clipboard and notified, with no editor to dismiss. The
-notification names what it captured and clicking it opens the folder with the file
-selected. Bind both variants of a mode and pick per keypress:
+| Command              | Suggested keys |
+| -------------------- | -------------- |
+| `cosmic-capture-kit` | `Print`        |
 
-| Command                                             | Suggested keys           |
-| --------------------------------------------------- | ------------------------ |
-| `cosmic-capture-kit --region --no-editor`           | `Alt+Shift+4`            |
-| `cosmic-capture-kit --active-window --no-editor`    | `Alt+Shift+5`            |
-| `cosmic-capture-kit --active-monitor --no-editor`   | `Alt+Shift+6`            |
+With a region drawn, `Ctrl+C` copies it to the clipboard without opening the
+editor.
+
+The rest are for landing somewhere directly, if you would rather skip the
+toolbar for a mode you use constantly:
+
+| Command                               | What it does                                    | Suggested keys |
+| ------------------------------------- | ----------------------------------------------- | -------------- |
+| `cosmic-capture-kit --region`         | The overlay, region selected (same as bare)      | `Alt+Shift+1`  |
+| `cosmic-capture-kit --window`         | The overlay, window selected                     | `Alt+Shift+2`  |
+| `cosmic-capture-kit --monitor`        | The overlay, monitor selected                    | `Alt+Shift+3`  |
+| `cosmic-capture-kit --active-window`  | Captures the active window at once, no overlay   | `Alt+Shift+4`  |
+| `cosmic-capture-kit --active-monitor` | Captures the monitor under the cursor, no overlay | `Alt+Shift+5` |
+
+Add `--no-editor` to any of these for a variant that skips the preview editor:
+the capture is saved, copied to the clipboard and notified, with no editor to
+dismiss. The notification names what it captured, and clicking it opens the
+folder with the file selected. Bind both variants of a mode and pick per
+keypress:
+
+| Command                                           | Suggested keys |
+| ------------------------------------------------- | -------------- |
+| `cosmic-capture-kit --no-editor`                  | `Alt+Shift+6`  |
+| `cosmic-capture-kit --active-window --no-editor`  | `Alt+Shift+7`  |
+| `cosmic-capture-kit --active-monitor --no-editor` | `Alt+Shift+8`  |
+
+See [CLI.md](CLI.md) for every flag, including `--video`, `--scan` and
+`--countdown`.
 
 #### Dependencies
 
@@ -269,6 +388,8 @@ selected. Bind both variants of a mode and pick per keypress:
 | ----------- | -------- | ------------------------------------------------------------------------------- |
 | `ffmpeg`    | Yes      | If you have `ffmpeg` 8 headers, you can take advantage of zero-copy recordings. |
 | `tesseract` | No       | Enables OCR support in the scanner (don't forget to install a language pack).   |
+
+</details>
 
 ---
 
@@ -353,5 +474,7 @@ contents.).
 
 ## Contributions & Credits
 
-- Icon by [Ashley Ball](https://ashleythedesigner.com/);
-- Embedded icon licensing lives in [res/icons/ATTRIBUTION.md](res/icons/ATTRIBUTION.md).
+- Brand icon by [Ashley Ball](https://ashleythedesigner.com/).
+- UI icons from [Lucide](https://lucide.dev) (ISC). The cloud provider marks are
+  each provider's own. Details in
+  [res/icons/ATTRIBUTION.md](res/icons/ATTRIBUTION.md).

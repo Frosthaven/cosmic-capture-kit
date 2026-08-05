@@ -7,7 +7,7 @@ template: home.html
 # what the landing page's single `<meta name="description">` carries. It is the
 # same sentence the card, the social previews and the structured data show; the
 # template holds the copy those three share.
-description: "Cross-platform screen region, window, and monitor capture with support for translucent windows, image, video, voice, QR, barcodes, OCR text and more."
+description: "Cross-platform screen region, window, and monitor capture with support for translucent windows, image, video, voice, QR, barcodes, OCR text, and annotation."
 hide:
   - navigation
   - toc

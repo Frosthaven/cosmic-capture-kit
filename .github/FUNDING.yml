@@ -1,3 +1,13 @@
-# Donations go through PayPal (DRAGON-226) — the same link the in-app About
-# page shows. GitHub renders this as the repo's Sponsor button.
+# The repo's Sponsor button (DRAGON-226). GitHub renders the `github` entry as
+# a native sponsor tier list and the `custom` entries as plain links, so the
+# Sponsors listing leads and PayPal stands beside it for anyone who would rather
+# not use it. The PayPal link is the same one the in-app About page shows; keep
+# the two in step.
+#
+# This file survives the closed-platform export on purpose: the public repo is
+# where donations are actually asked for, since the Linux app is the free one.
+#
+# The Sponsor button only appears if Sponsorships is also ticked under the
+# repo's Settings > General > Features. The file alone is not enough.
+github: [Frosthaven]
 custom: ["https://paypal.me/Frosthaven"]

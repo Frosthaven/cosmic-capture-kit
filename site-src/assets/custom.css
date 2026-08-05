@@ -350,15 +350,37 @@ body:has(.cck-space) .md-content__inner::before {
  * middle term is what actually tracks the viewport between them.
  */
 .cck-glass {
-  width: min(27rem, 100%);
+  /* THREE limits, smallest wins. The third is the one that keeps the shot
+     whole on a short screen: the card's height is set by the shot, which is
+     `image share of the width / its aspect` tall, so the width that fits a
+     given height is that height times ~2.08 (0.59 share, 1.231 aspect). Give
+     the wrapper's padding back before multiplying. Without it a short viewport
+     grows the card past the fold instead of scaling it down. */
+  width: min(58rem, 100%, calc((100vh - 2rem) * 2.08));
   box-sizing: border-box;
   /* The centring itself: auto margins on the grid item centre it on both axes
      and, unlike `place-items: center`, never push its top edge out of reach
      when it is taller than the container. See `.cck-home` above. */
   margin: auto;
   text-align: center;
-  padding: clamp(1rem, 3.5vmin, 2.4rem) clamp(1rem, 4vmin, 2rem)
-    clamp(0.9rem, 3vmin, 2rem);
+  /* Two columns: the product shot bleeds to the card's left edge and the body
+     carries the padding the card used to have itself. `overflow: hidden` is
+     what makes the corner radius clip the shot, rather than the shot squaring
+     off the card's corners. The width breakpoint further down collapses this
+     to one column, and it is the one place in this file where width alone is
+     the right question, because it is literally about room for a column. */
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(0, 1fr);
+  align-items: stretch;
+  /* The card's OWN ratio, derived from the shot's: the shot takes 1.45/2.45 of
+     the width and is 1024/832 itself, so the height that exactly fits it is
+     width / 2.08. Pinning it here is what stops the shot being squashed. Without
+     it the row grows to whatever the text column needs, and a `height: auto`
+     image under `align-items: stretch` is stretched to match, distorting it at
+     every width where the text is the taller of the two. */
+  aspect-ratio: 2.08;
+  overflow: hidden;
+  padding: 0;
   border-radius: 1.1rem;
   border: 1px solid rgba(255, 255, 255, 0.16);
   /* The glass itself: a light film over the nebula, blurred and lifted. */
@@ -381,8 +403,135 @@ body:has(.cck-space) .md-content__inner::before {
   }
 }
 
+/*
+ * The product shot, the same file the README embeds. It is a link to its own
+ * full-size file (new tab); the anchor is what the grid sizes, so it carries
+ * the height and the shot fills it. `object-fit: contain` keeps the picture
+ * whole (the card's pinned aspect ratio is what stops that leaving gaps), and
+ * the hairline divides the halves without a hard edge.
+ */
+.cck-glass__shotlink {
+  position: relative;
+  display: block;
+  height: 100%;
+  min-width: 0;
+  /* Material styles links inside typeset content; this one is a picture. */
+  color: inherit;
+  text-decoration: none;
+}
+
+/*
+ * The hover veil: black glass over the shot with a zoom glyph, so it reads as
+ * openable rather than decorative. Only opacity animates, so it stays off the
+ * layout path, and focus-visible gets the same treatment for keyboard users.
+ */
+.cck-glass__zoom {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  opacity: 0;
+  transition: opacity 0.18s ease;
+  background-color: rgba(0, 0, 0, 0.45);
+  -webkit-backdrop-filter: blur(6px) saturate(80%);
+  backdrop-filter: blur(6px) saturate(80%);
+  color: #fff;
+}
+
+.cck-glass__zoom svg {
+  width: clamp(1.6rem, 9vmin, 2.6rem);
+  height: auto;
+  filter: drop-shadow(0 0.15rem 0.6rem rgba(0, 0, 0, 0.5));
+}
+
+.cck-glass__shotlink:hover .cck-glass__zoom,
+.cck-glass__shotlink:focus-visible .cck-glass__zoom {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cck-glass__zoom {
+    transition: none;
+  }
+}
+
+.cck-glass__shot {
+  /* NEVER cropped: the shot fills its column's width and takes whatever height
+     its own aspect gives, so all of it is always visible. That is also why
+     there is no `object-fit` here, `cover` would crop and `contain` would
+     letterbox inside a stretched box; a natural-aspect image needs neither. */
+  width: 100%;
+  height: 100%;
+  /* `contain` rather than `cover`: the box above is built to the shot's own
+     ratio, so this fills it exactly, and if the two ever drift apart the shot
+     letterboxes by a hairline instead of cropping or distorting. */
+  object-fit: contain;
+  display: block;
+}
+
+/* The body column carries the padding the card itself used to have, and the
+   divider rides on IT rather than the shot: the shot is only as tall as its
+   aspect allows, so a border on it would stop short of the card's edges. */
+.cck-glass__body {
+  /* A query container, so the logo and title below can shrink with THIS column
+     rather than only with the viewport: in the two-column range the column
+     narrows while `vmin` may be pinned by the viewport's height, which left
+     both at full size exactly where the room ran out. */
+  container-type: inline-size;
+  padding: clamp(1rem, 3.5vmin, 2.4rem) clamp(1rem, 4vmin, 2rem)
+    clamp(0.9rem, 3vmin, 2rem);
+  border-left: 1px solid rgba(255, 255, 255, 0.12);
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  /* The card's height is the shot's now, so the text lives within it: `min-height: 0`
+     lets this column be shorter than its content and `overflow: auto` gives that
+     content somewhere to go on the narrow end of the two-column range. */
+  min-height: 0;
+  overflow: auto;
+}
+
+
+/*
+ * One column below 1024px. NOTE the unit: in a MEDIA QUERY `em` is always the
+ * initial 16px, never the root's font-size, so 1024px is 64em here even though
+ * Material sets the root to 20px and 1rem is 20px everywhere else in this file.
+ * Getting that wrong put the breakpoint at 819px and left the two-column layout
+ * running at widths where the text column could not fit, which showed up as the
+ * body overflowing into a scrollbar.
+ *
+ * Stacked, the body leads and the shot follows as a full-width banner, whole.
+ */
+@media screen and (max-width: 64em) {
+  .cck-glass {
+    width: min(27rem, 100%);
+    display: flex;
+    flex-direction: column;
+    /* The two-column ratio must NOT survive here: stacked, the card's height is
+       the body plus the banner, not the shot's aspect. */
+    aspect-ratio: auto;
+  }
+
+  .cck-glass__shotlink,
+  .cck-glass__shot {
+    /* Natural height again, so the banner shows whole under the body. */
+    height: auto;
+  }
+
+  /* Stacked, the BODY leads: on a phone the name and the download button are
+     what the visitor came for, and a screenshot above them would push both
+     under the fold. Source order keeps the shot first for the two-column
+     layout, so `order` does the swap rather than a second markup path. */
+  .cck-glass__body {
+    order: -1;
+    border-left: 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  }
+}
+
 .cck-glass__logo {
-  width: clamp(2.8rem, 13vmin, 6.2rem);
+  width: clamp(2.8rem, min(13vmin, 26cqw), 6.2rem);
   max-width: 45vw;
   height: auto;
   display: block;
@@ -397,7 +546,7 @@ body:has(.cck-space) .md-content__inner::before {
  * foreground colour would be unreadable here under a light scheme.
  */
 .md-typeset .cck-glass__title {
-  font-size: clamp(1.1rem, 4vmin, 1.85rem);
+  font-size: clamp(1.1rem, min(4vmin, 8cqw), 1.85rem);
   line-height: 1.15;
   font-weight: 700;
   letter-spacing: -0.02em;

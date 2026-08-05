@@ -223,8 +223,10 @@ pub trait CaptureBackend {
 
 /// What the Wayland compositor actually advertises, by PROTOCOL — not by desktop
 /// name. Today's capture stack speaks the upstream `ext-image-copy-capture-v1`
-/// family, so any compositor implementing these globals (COSMIC, wlroots ≥0.18 —
-/// Sway 1.10+, Hyprland, …) runs the native backend unchanged.
+/// family, so any compositor implementing these globals (COSMIC, wlroots ≥0.19 —
+/// Sway 1.11+, Hyprland 0.52+, niri, KWin 6.6+, Mutter 49.2+, …) runs the native
+/// backend unchanged. The protocols landed in wlroots 0.19, not 0.18: Sway 1.11
+/// is the first release carrying them.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WaylandProtocols {

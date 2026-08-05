@@ -16,8 +16,19 @@ default:
 
 # Documentation site: serve it locally with live reload, on every platform.
 docs:
-    # Needs the pinned tools once: `pip install -r docs-requirements.txt` (a virtualenv is fine).
-    mkdocs serve
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Serve the site locally with live reload, on the PINNED toolchain rather
+    # than whatever `mkdocs` happens to be on PATH (a global install may lack
+    # the plugins mkdocs.yml requires). The venv is created on first run, so a
+    # fresh clone needs nothing but python3.
+    if [ ! -x .venv-docs/bin/mkdocs ]; then
+        echo "==> Creating .venv-docs from docs-requirements.txt (first run)..."
+        python3 -m venv .venv-docs
+        .venv-docs/bin/pip install -q -r docs-requirements.txt
+    fi
+    echo "==> Serving on http://127.0.0.1:8000 (Ctrl-C to stop)"
+    .venv-docs/bin/mkdocs serve
 
 # macOS: build + bundle the .app (signed if a Developer ID identity is available).
 [macos]
@@ -121,3 +132,60 @@ build:
         cargo build --release --no-default-features
         echo "==> Built: target/release/cosmic-capture-kit (--no-default-features)"
     fi
+
+# Update the RUNNING resident daemon to the freshly built binary, on any
+# platform: build, stop the old daemon, start the new one, and print the
+# binary's full path (paste it into a system-level hotkey, e.g. COSMIC's
+# custom shortcut, and it survives rebuilds because the path never changes).
+[linux]
+dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just build
+    pkill -f 'cosmic-capture-kit resident' 2>/dev/null || true
+    setsid -f target/release/cosmic-capture-kit resident >/dev/null 2>&1
+    sleep 1
+    pgrep -f 'target/release/cosmic-capture-kit resident' >/dev/null \
+        && echo "==> Daemon restarted on the fresh binary" \
+        || { echo "==> ERROR: daemon did not come up"; exit 1; }
+    echo "==> Hotkey binary path: $(realpath target/release/cosmic-capture-kit)"
+
+[macos]
+dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just build
+    pkill -f 'cosmic-capture-kit resident' 2>/dev/null || true
+    # No setsid on stock macOS; nohup + disown detaches the same way.
+    nohup target/release/cosmic-capture-kit resident >/dev/null 2>&1 &
+    disown
+    sleep 1
+    pgrep -f 'cosmic-capture-kit resident' >/dev/null \
+        && echo "==> Daemon restarted on the fresh binary" \
+        || { echo "==> ERROR: daemon did not come up"; exit 1; }
+    echo "==> Hotkey binary path: $(cd target/release && pwd)/cosmic-capture-kit"
+
+[windows]
+dev:
+    #!/usr/bin/env pwsh
+    $ErrorActionPreference = 'Stop'
+    # A dev-loop build, NOT the msi packaging: plain release into target-win
+    # (the dual-boot rule: never touch target/, that is the Linux boot's live
+    # build), with the same baked-id fetch the packaged build performs.
+    if ((Get-Command gh -ErrorAction SilentlyContinue) -and ($(gh auth status 2>$null; $?))) {
+        foreach ($v in @('CCK_BAKED_GDRIVE_CLIENT_ID','CCK_BAKED_GDRIVE_CLIENT_SECRET','CCK_BAKED_ONEDRIVE_CLIENT_ID','CCK_BAKED_DROPBOX_CLIENT_ID')) {
+            if (-not (Get-Item "env:$v" -ErrorAction SilentlyContinue)) {
+                $val = (gh variable get $v 2>$null)
+                if ($val) { Set-Item "env:$v" $val }
+            }
+        }
+        Write-Host '==> Baked cloud ids from GitHub repository variables'
+    }
+    $env:CARGO_TARGET_DIR = 'target-win'
+    cargo build --release --no-default-features
+    Get-CimInstance Win32_Process -Filter "Name='cosmic-capture-kit.exe'" |
+        Where-Object { $_.CommandLine -match 'resident' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+    Start-Process -FilePath 'target-win\release\cosmic-capture-kit.exe' -ArgumentList 'resident' -WindowStyle Hidden
+    Write-Host '==> Daemon restarted on the fresh binary'
+    Write-Host "==> Hotkey binary path: $(Resolve-Path 'target-win\release\cosmic-capture-kit.exe')"
