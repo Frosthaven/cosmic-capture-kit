@@ -12,7 +12,7 @@ Cross-platform screen region, window, and monitor capture with support for
 translucent windows, image, video, voice, QR, barcodes, OCR text, and
 annotation.
 
-## Current Support Status
+## 📊 Current Support Status
 
 ### Supported Platforms
 
@@ -171,7 +171,7 @@ along with their statuses.
 
 </details>
 
-## Installation
+## 📦 Installation
 
 <details>
 <summary><b>macOS</b></summary>
@@ -393,19 +393,24 @@ See [CLI.md](CLI.md) for every flag, including `--video`, `--scan` and
 
 ---
 
-## Tiling window managers
+## 🧩 Tiling window managers
 
-Cosmic Capture Kit makes an effort to play nicely with a few popular tiling
-window managers. The overlay tools will bypass tiling, while the preview editor
-and the settings window will not by default. You can change the behavior of the
-settings window and the preview editor by using the information below.
+Cosmic Capture Kit makes an effort to play nicely with popular tiling window
+managers. The overlay tools will bypass tiling, while the preview editor and the
+settings window will not by default. You can change the behavior of the settings
+window and the preview editor by using the information below.
 
 * Settings window: title `Cosmic Capture Kit - Settings`
 * Preview editor window: title `Cosmic Capture Kit - Preview Editor`
 * Both share application id `dev.frosthaven.CosmicCaptureKit`
 
+Each snippet below is an addition to your existing config, not a replacement
+for it.
+
+### macOS
+
 <details>
-<summary><b>AeroSpace (macOS)</b></summary>
+<summary><b>AeroSpace</b></summary>
 
 ```
 ~/.config/aerospace/aerospace.toml
@@ -421,14 +426,61 @@ if.window-title-regex-substring = 'Cosmic Capture Kit - Preview Editor'
 run = ['layout floating']
 ```
 
+Reload with `aerospace reload-config`. The match is an unanchored, case
+insensitive substring.
+
 </details>
 
 <details>
-<summary><b>komorebi (Windows)</b></summary>
+<summary><b>yabai</b></summary>
+
+```
+~/.config/yabai/yabairc
+```
+
+```sh
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Settings$" manage=off
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Preview Editor$" manage=off
+```
+
+The regex is POSIX extended and unanchored, hence the `^` and `$`. `app` matches
+the application name, not the bundle id. Rules apply to windows opened
+afterwards, so run `yabai -m rule --apply` to catch windows that are already
+open. `manage` needs no SIP changes.
+
+</details>
+
+### Windows
+
+<details>
+<summary><b>GlazeWM</b></summary>
+
+```
+%USERPROFILE%\.glzr\glazewm\config.yaml
+```
+
+```yaml
+window_rules:
+  - commands: ["set-floating"]
+    match:
+      - window_title: { equals: "Cosmic Capture Kit - Settings" }
+      - window_title: { equals: "Cosmic Capture Kit - Preview Editor" }
+```
+
+This is the v3 config format. Reload with `wm-reload-config` (`alt+shift+r` by
+default). Each `- ` entry under `match` is an alternative, so the two titles are
+an either/or.
+
+</details>
+
+<details>
+<summary><b>komorebi</b></summary>
 
 ```
 %USERPROFILE%\komorebi.json
 ```
+
+Merge this key into your existing `komorebi.json`; it is not the whole file:
 
 ```json
 {
@@ -439,10 +491,16 @@ run = ['layout floating']
 }
 ```
 
+Apply it with `komorebic replace-configuration <path>`. Note that
+`komorebic reload-configuration` is for the legacy `komorebi.ahk` and
+`komorebi.ps1` configs and will not pick this up.
+
 </details>
 
+### Linux
+
 <details>
-<summary><b>COSMIC desktop (Linux)</b></summary>
+<summary><b>COSMIC desktop</b></summary>
 
 ```
 ~/.config/cosmic/com.system76.CosmicSettings.WindowRules/v1/tiling_exception_custom
@@ -455,11 +513,134 @@ run = ['layout floating']
 ]
 ```
 
+All three fields are required. No compositor restart is needed, but the rule is
+read when a window opens, so reopen the window rather than restarting. Do not
+hand-edit this file while the Settings app is open, since it will write over you.
+
+</details>
+
+<details>
+<summary><b>Hyprland</b></summary>
+
+Hyprland changed its config language in 0.55, so which snippet you want depends
+on your version. Check with `hyprctl version`.
+
+**0.55 and newer**, `~/.config/hypr/hyprland.lua`:
+
+```lua
+hl.window_rule({
+  match = { title = "Cosmic Capture Kit - Settings" },
+  float = true,
+})
+
+hl.window_rule({
+  match = { title = "Cosmic Capture Kit - Preview Editor" },
+  float = true,
+})
+```
+
+**0.52 and older**, `~/.config/hypr/hyprland.conf`:
+
+```
+windowrule = float, title:Cosmic Capture Kit - Settings
+windowrule = float, title:Cosmic Capture Kit - Preview Editor
+```
+
+0.53 and 0.54 use an intermediate form; the 0.54 wiki has it. Matching is RE2
+whole-string, so these patterns are already exact and a substring match would
+need explicit `.*` at both ends. One caveat worth knowing: `float` is applied
+when the window opens and reads its INITIAL title, so if a rule ever stops
+firing, match `class:dev\.frosthaven\.CosmicCaptureKit` instead.
+
+</details>
+
+<details>
+<summary><b>niri</b></summary>
+
+```
+~/.config/niri/config.kdl
+```
+
+```kdl
+window-rule {
+    match title=r#"^Cosmic Capture Kit - Settings$"#
+    match title=r#"^Cosmic Capture Kit - Preview Editor$"#
+    open-floating true
+}
+```
+
+`open-floating` needs niri 25.01 or newer. Multiple `match` directives are an
+either/or. Matching is unanchored, hence the `^` and `$`, and the KDL raw string
+(`r#"..."#`) is what keeps a backslash intact if you add one. The config
+live-reloads on save.
+
+</details>
+
+<details>
+<summary><b>river</b></summary>
+
+river 0.4 removed its built-in window manager, so there is no rule to write in
+river itself any more: floating behavior belongs to whichever third-party window
+manager you run on top of it, and each has its own config.
+
+On **river-classic** (the maintained 0.3.x line), in `~/.config/river/init`,
+which must be executable:
+
+```sh
+riverctl rule-add -title 'Cosmic Capture Kit - Settings' float
+riverctl rule-add -title 'Cosmic Capture Kit - Preview Editor' float
+```
+
+Matching here is glob, not regex, so there is no alternation and each title needs
+its own rule. The rules apply to windows opened after they are added, and
+`riverctl list-rules float` prints what is active.
+
+</details>
+
+<details>
+<summary><b>Sway</b></summary>
+
+```
+~/.config/sway/config
+```
+
+```
+for_window [title="^Cosmic Capture Kit - Settings$"] floating enable
+for_window [title="^Cosmic Capture Kit - Preview Editor$"] floating enable
+```
+
+Criteria are PCRE2 and unanchored, so the `^` and `$` are doing real work.
+`for_window` only affects windows opened after the rule exists, so reload with
+`swaymsg reload` and reopen the window.
+
+</details>
+
+<details>
+<summary><b>Wayfire</b></summary>
+
+```
+~/.config/wayfire.ini
+```
+
+Wayfire stacks by default and only tiles if the `simple-tile` plugin is enabled,
+so if you are not running that plugin there is nothing to do. If you are, the
+opt-out goes through the plugin rather than through `window-rules`, which has no
+float action at all:
+
+```ini
+[simple-tile]
+tile_by_default = !((title is "Cosmic Capture Kit - Settings") | (title is "Cosmic Capture Kit - Preview Editor"))
+```
+
+Criteria here are not regex: `is` is exact and `contains` is a substring.
+Combining more than two needs explicit parentheses, since the operators have no
+precedence order.
+
 </details>
 
 ---
 
-## License
+## ⚖️ License
 
 The source code in this repository is licensed under [GPL-3.0-only](LICENSE).
 The Linux app is free software: use it, build it, share it (it's free forever).
@@ -472,7 +653,7 @@ and additionally licenses their own code to themselves for those proprietary
 builds; the GPL grant above applies to everyone else and to this repository's
 contents.).
 
-## Contributions & Credits
+## 🙏 Contributions & Credits
 
 - Brand icon by [Ashley Ball](https://ashleythedesigner.com/).
 - UI icons from [Lucide](https://lucide.dev) (ISC). The cloud provider marks are
