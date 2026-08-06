@@ -306,6 +306,15 @@ pub struct SettingsState {
     /// reconnect dialog and the disconnect confirmation. All of it lives here rather than on
     /// `App`, because none of it outlives the settings window.
     pub(in crate::app) cloud: CloudPageState,
+    /// Which tool location the Health page last copied, and when, so its copy button can
+    /// flash a "Copied!" tick for `widgets::copy_button::COPIED_FLASH` and revert on its own.
+    /// `None` until the first copy.
+    ///
+    /// Keyed by the copied TEXT rather than by a row id, because that text is what the press
+    /// carried and no two rows can name the same binary. It lives here and not on `Dep`
+    /// because the Health page rebuilds every `Dep` from scratch on each render, so nothing
+    /// on one survives a frame.
+    pub(in crate::app) health_copied: Option<(String, std::time::Instant)>,
     /// The keyboard-shortcut action currently capturing a new binding on the Keyboard
     /// Shortcuts page, if any — the next key press becomes its shortcut.
     pub rebinding: Option<crate::shortcuts::Action>,
@@ -490,6 +499,7 @@ impl SettingsState {
             // every launch, including a capture that never opens a settings window, and a
             // file read on that path buys nothing.
             cloud: CloudPageState::default(),
+            health_copied: None,
             rebinding: None,
             accent_picker: widget::ColorPickerModel::new("Hex", "RGB", None, None),
             accent_editor_open: false,
@@ -786,7 +796,9 @@ impl App {
             // instance already has it open, focus that window (via a detached helper
             // so the activation outlives us) and end this capture attempt.
             if !crate::instance::acquire_settings_lock() {
-                if let Ok(exe) = std::env::current_exe() {
+                // Detached and outliving us (that is the point of the helper), so
+                // `self_exe` rather than `current_exe` (DRAGON-510).
+                if let Ok(exe) = crate::util::self_exe() {
                     let _ = std::process::Command::new(exe).arg("--focus-settings").spawn();
                 }
                 return self.teardown();

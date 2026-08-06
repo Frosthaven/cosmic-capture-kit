@@ -121,20 +121,47 @@ impl App {
             .width(Length::Fill)
             .height(Length::Fill);
 
-        // Opaque rounded window background + hairline border (matches the settings
-        // window's outer container), so the transparent surface only shows through
-        // outside the rounded corners.
+        // Frosted glass (DRAGON-217/533): window background paints translucent
+        // (`theme::frost_color`) so the compositor blur / masked NSVisualEffectView
+        // vibrancy enrolled on this surface (`open_permissions_window`'s `blur`,
+        // `enable_window_vibrancy`'s reparenting) actually shows through. This
+        // container's own comment used to claim it "matches the settings window's
+        // outer container", but painted a hardcoded opaque `cosmic.background.base`
+        // instead of settings' `frost_color(.., glass)`, so the window-level
+        // vibrancy was set up correctly and then completely hidden behind this
+        // view's own opaque paint. `glass` is captured by value (`Option<GlassConfig>`
+        // is `Copy`) so the closure needs no lifetime tied to `self`.
+        let glass = self.glass;
         widget::container(stacked)
             .padding(1)
             .width(Length::Fill)
             .height(Length::Fill)
-            .class(cosmic::theme::Container::custom(|theme| {
+            .class(cosmic::theme::Container::custom(move |theme| {
                 let cosmic = theme.cosmic();
+                // macOS (matches settings::open_config_window's outer container): this
+                // toplevel is NATIVE-decorated, so the window server already draws +
+                // rounds the frame and clips content to it. Rounding this container TOO
+                // paints a second, slightly-mismatched corner inside the OS frame's, a
+                // "double corner" fringe. Fill SQUARE and let the window server do the
+                // one rounding; Linux keeps the app-drawn radius since its window edge
+                // IS the app's.
+                #[cfg(target_os = "linux")]
                 let radius = theme::rounding(theme).window();
+                #[cfg(target_os = "macos")]
+                let radius = [0.0f32; 4];
                 cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(cosmic.background.base.into())),
+                    background: Some(Background::Color(theme::frost_color(
+                        cosmic.background.base.into(),
+                        glass,
+                    ))),
                     border: Border {
                         color: cosmic.bg_divider().into(),
+                        // macOS: NO app border, matching the settings window's own
+                        // reasoning (the OS-drawn native frame is the border; a 1px app
+                        // stroke traces a bright fringe just inside the OS corner round).
+                        #[cfg(target_os = "macos")]
+                        width: 0.0,
+                        #[cfg(not(target_os = "macos"))]
                         width: 1.0,
                         radius: radius.into(),
                     },

@@ -2383,6 +2383,16 @@ impl App {
                 }
                 self.run_upload(id, account, auto_share)
             }
+            PreviewMsg::UploadAnimTick => {
+                // One step of the finalize stripe sweep (DRAGON-537). The advance wraps at
+                // the stripe pitch inside `upload_stripes::advance`, and the re-render this
+                // message causes is the whole animation; the meter reads the phase in
+                // `chrome::upload_progress_track`.
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.edit.upload_anim = crate::widgets::upload_stripes::advance(p.edit.upload_anim);
+                }
+                Task::none()
+            }
             PreviewMsg::UploadPoll => {
                 // Drain terminal outcomes into `finished` under a SHORT borrow of `p`, then
                 // act on them with `self` free again: `preview_toast_icon` re-borrows `self`,

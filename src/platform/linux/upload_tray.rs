@@ -40,7 +40,16 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::cloud::upload::tray::{CANCEL_LABEL, Face, face_svg, tooltip};
+use crate::cloud::upload::tray::{
+    CANCEL_LABEL, Face, FaceArt, cancel_offered, counter_pixel_svg, face_art, tooltip,
+};
+
+/// The cells a digit face is pre-rendered at (DRAGON-539): the panel sizes seen in the
+/// wild (COSMIC 22/24, GNOME 16/22, taskbar variants 20/32, HiDPI 48). An SNI host picks
+/// the nearest and shows it 1:1, which is what keeps the blocks on the pixel grid; the old
+/// single fitted 64px source left the HOST to downscale, which re-blurred exactly the
+/// edges the pixel font exists to keep hard.
+const DIGIT_SIZES: [u32; 6] = [16, 20, 22, 24, 32, 48];
 
 /// The `ksni` item: the account label and the number it is drawing, plus the accent it is
 /// tinted with, a one-entry icon cache, and the cancel flag its one menu entry sets.
@@ -92,19 +101,37 @@ impl ksni::Tray for CounterTray {
         {
             return icons.clone();
         }
-        // FITTED (DRAGON-500): each face's own ink fills the panel's cell. See the module doc
-        // for why the counter needs this and the recording icon does not.
-        let icons = crate::tray::render_icon_fitted(&face_svg(self.face), self.accent)
-            .map(|i| vec![i])
-            .unwrap_or_default();
+        // The DIGIT faces are pixel art (DRAGON-539): one exact-size pixmap per cell in
+        // [`DIGIT_SIZES`], each rendered 1:1 so the blocks stay on the pixel grid, and the
+        // host picks its nearest instead of scaling one source. The GLYPH faces keep the
+        // DRAGON-500 ink-fitted 64px pixmap; see the module doc for why the counter needs
+        // the fit and the recording icon does not.
+        let icons: Vec<ksni::Icon> = match face_art(self.face) {
+            FaceArt::PixelDigits(n) => DIGIT_SIZES
+                .iter()
+                .filter_map(|&px| {
+                    crate::tray::render_icon_exact(&counter_pixel_svg(n, px), self.accent, px)
+                })
+                .collect(),
+            FaceArt::Fitted(svg) => crate::tray::render_icon_fitted(&svg, self.accent)
+                .map(|i| vec![i])
+                .unwrap_or_default(),
+        };
         *self.icon_cache.borrow_mut() = Some((self.face, icons.clone()));
         icons
     }
 
-    /// One entry: Cancel. The same `StandardItem` + `activate` shape the recording tray's own
-    /// `menu()` uses; the closure only sets the flag, never touches the transfer itself.
+    /// One entry: Cancel, and only while the shared decision says a cancel can still do
+    /// something ([`cancel_offered`], DRAGON-537): at the finalize wait and the end states
+    /// the flag it sets has nothing left to read, so the menu is empty rather than offering
+    /// an entry that does nothing. The entry itself is the same `StandardItem` + `activate`
+    /// shape the recording tray's own `menu()` uses; the closure only sets the flag, never
+    /// touches the transfer itself.
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
+        if !cancel_offered(self.face) {
+            return Vec::new();
+        }
         vec![
             StandardItem {
                 label: CANCEL_LABEL.to_string(),
@@ -248,6 +275,19 @@ mod tests {
         assert!(t.canceled.load(Ordering::Relaxed), "activating Cancel must set the flag");
     }
 
+    /// **No Cancel where it can do nothing** (DRAGON-537): the finalize wait and the end
+    /// states offer an empty menu, from the ONE shared decision, so this arm cannot drift
+    /// from the other two platforms or from the editor meter's X.
+    #[test]
+    fn the_menu_is_empty_once_cancel_could_only_pretend() {
+        for face in [Face::Finalizing, Face::Done, Face::Failed] {
+            assert!(tray("Work Drive", face).menu().is_empty(), "{face:?} still offers Cancel");
+        }
+        for face in [Face::Percent(40), Face::Indeterminate] {
+            assert_eq!(tray("Work Drive", face).menu().len(), 1, "{face:?} lost its Cancel");
+        }
+    }
+
     /// Two uploads at once are two processes, so the id must not be the same string in both
     /// or a de-duplicating host shows one counter for two transfers.
     ///
@@ -299,15 +339,15 @@ mod tests {
         (iw.max(ih) / w as f32, off / w as f32)
     }
 
-    /// DRAGON-500, the owner's report: EVERY face has to fill the cell the panel gives it.
-    /// Rendered 1:1 from the shared 24-unit viewBox, `Face::Indeterminate`'s lone cloud mark
-    /// covered 42% of the pixmap and sat 7% off-centre, which on a ~22px panel slot is a
-    /// glyph roughly nine pixels across — "really small" — while the digit faces beside it
-    /// covered 92%, so the item also changed size as the upload ran. Fitted, every face
-    /// spans essentially the whole cell and is centred in it.
+    /// DRAGON-500, the owner's report: every GLYPH face has to fill the cell the panel
+    /// gives it. Rendered 1:1 from the shared 24-unit viewBox, `Face::Indeterminate`'s lone
+    /// cloud mark covered 42% of the pixmap and sat 7% off-centre, which on a ~22px panel
+    /// slot is a glyph roughly nine pixels across — "really small". Fitted, every glyph
+    /// spans essentially the whole cell and is centred in it. The DIGIT faces left this
+    /// test in DRAGON-539: they are pixel art with their own coverage rule, below.
     #[test]
-    fn every_face_fills_the_panel_cell_and_is_centred() {
-        for face in [Face::Percent(7), Face::Percent(95), Face::Indeterminate, Face::Done, Face::Failed] {
+    fn every_glyph_face_fills_the_panel_cell_and_is_centred() {
+        for face in [Face::Indeterminate, Face::Finalizing, Face::Done, Face::Failed] {
             let t = tray("Work Drive", face);
             let icons = t.icon_pixmap();
             assert_eq!(icons.len(), 1, "{face:?} rendered no pixmap");
@@ -317,13 +357,32 @@ mod tests {
         }
     }
 
+    /// The digit faces are pixel art at several EXACT sizes (DRAGON-539): one pixmap per
+    /// advertised cell, each its own width, so the host shows its nearest 1:1 instead of
+    /// scaling one fitted source (the scaling is what blurred the digits). The ink is the
+    /// 7x5 block grid at that cell's integer scale, centred.
+    #[test]
+    fn the_digit_faces_come_in_exact_pixel_sizes() {
+        let t = tray("Work Drive", Face::Percent(45));
+        let icons = t.icon_pixmap();
+        let sizes: Vec<i32> = icons.iter().map(|i| i.width).collect();
+        assert_eq!(sizes, DIGIT_SIZES.map(|s| s as i32).to_vec(), "one pixmap per cell size");
+        for icon in &icons {
+            assert_eq!(icon.data.len(), (icon.width * icon.height * 4) as usize);
+            let (span, off_centre) = ink_span(icon);
+            // 7 columns at the biggest integer scale: at least half the cell, never past it.
+            assert!(span > 0.5 && span <= 1.0, "{}px spans {:.0}%", icon.width, span * 100.0);
+            assert!(off_centre < 0.07, "{}px sits {:.0}% off-centre", icon.width, off_centre * 100.0);
+        }
+    }
+
     /// The icon really rasterizes on this machine, and the cache answers the second call
     /// with the same pixels (a host may ask on every redraw).
     #[test]
     fn the_icon_renders_and_is_cached_per_number() {
         let t = tray("Work Drive", Face::Percent(40));
         let first = t.icon_pixmap();
-        assert_eq!(first.len(), 1, "the counter renders one pixmap");
+        assert!(!first.is_empty(), "the counter renders pixmaps");
         assert!(first[0].width > 0 && !first[0].data.is_empty());
         assert_eq!(t.icon_pixmap()[0].data, first[0].data, "the cache must not re-render");
         // A different number is a different picture, and so is each end state.

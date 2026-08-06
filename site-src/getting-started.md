@@ -39,7 +39,16 @@ The installer is not code-signed yet. On the first run Windows may show
 
 ### Linux
 
-The Linux app is free software and you build it yourself. The
+The Linux app is free software. Download the latest `.AppImage` from the
+[releases page](https://github.com/Frosthaven/cosmic-capture-kit/releases),
+`chmod +x` it and run it. It carries its own ffmpeg and tesseract, so recording
+and text detection work with nothing else installed, and it runs on glibc 2.34
+or newer (Ubuntu 22.04, Mint 21, Pop!_OS 22.04, Debian 12 and anything newer).
+There is a plain zip beside it if you would rather use your distribution's own
+ffmpeg and tesseract.
+
+You can also build it yourself, which is the route on architectures other than
+x86_64. The
 [README](https://github.com/Frosthaven/cosmic-capture-kit#build-from-source)
 has the exact commands for your distribution, including the packages to install
 first. COSMIC is the supported desktop today.

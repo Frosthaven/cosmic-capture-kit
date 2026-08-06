@@ -101,6 +101,13 @@ points to.
   Linux desktop profiles in fixed ladder order).
 - `src/share/` — post-capture actions, run via a re-exec of this binary
   (`reexec.rs`): `clipboard.rs`, `notify.rs`, `open.rs`, `wifi.rs`.
+  - **Every re-exec goes through `util::self_exe`, never `current_exe`**
+    (DRAGON-510). It answers `$APPIMAGE` when the app is running from one, and
+    `current_exe()` otherwise. Inside an AppImage, `current_exe()` is a FUSE
+    mount that dies with the process holding it, and these children are detached
+    on purpose and outlive their parent, so the mount path is exactly the wrong
+    thing to hand them. `util::locate_tool` is the deliberate exception: it wants
+    the mount path, because the bundled ffmpeg/tesseract sidecars live there.
 - `src/cloud/` — cloud accounts (DRAGON-482): connect a drive, upload a capture
   to it, optionally copy a share link back. Read `mod.rs` first, it holds the
   shape everything else reads.

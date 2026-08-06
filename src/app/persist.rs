@@ -94,6 +94,7 @@ impl App {
             scan_codes: self.scan_codes,
             scan_text: self.scan_text,
             text_confidence: self.text_confidence,
+            ocr_language: self.ocr_language.clone(),
             record_dir: self.record_dir.clone(),
             record_hardware: true, // deprecated (removed toggle); kept for back-compat read
             screenshot_dir: self.screenshot_dir.clone(),
@@ -213,6 +214,7 @@ impl App {
         self.scan_codes = p.scan_codes;
         self.scan_text = p.scan_text;
         self.text_confidence = p.text_confidence.clamp(0.0, 60.0);
+        self.ocr_language = p.ocr_language;
         self.screenshot_dir = p.screenshot_dir;
         self.record_mic = p.record_mic;
         self.record_system_audio = p.record_system_audio;

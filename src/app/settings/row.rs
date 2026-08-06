@@ -515,11 +515,24 @@ pub(super) fn subdued_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a
 /// Caption text in the subtle tone - half of `subdued`'s dimming, for secondary text that
 /// should still read comfortably, not the near-invisible inert-value tone.
 pub(super) fn subtle_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a, Msg> {
-    widget::text::caption(s)
-        .class(cosmic::theme::Text::Custom(|t| {
-            cosmic::iced::widget::text::Style { color: Some(theme::subtle(t)), ..Default::default() }
-        }))
-        .into()
+    subtle_caption_text(s).into()
+}
+
+/// [`subtle_caption`] BEFORE it is boxed into an `Element`, for a caller that has to give it a
+/// width. Same tone, same size; an `Element` can no longer be sized, which is the only reason
+/// this is separate.
+///
+/// One caller today (DRAGON-540): the Health page's tool-location line, which sits in a row
+/// beside a copy button and takes `Length::Fill` so it WRAPS. A caption at its natural
+/// `Shrink` width wraps against whatever space it is handed, so on its own it is fine; in a
+/// row it is handed everything and leaves nothing, which pushed the button beside it off the
+/// visible edge of the pane.
+pub(super) fn subtle_caption_text<'a>(
+    s: impl Into<Cow<'a, str>> + 'a,
+) -> widget::Text<'a, cosmic::Theme> {
+    widget::text::caption(s).class(cosmic::theme::Text::Custom(|t| {
+        cosmic::iced::widget::text::Style { color: Some(theme::subtle(t)), ..Default::default() }
+    }))
 }
 
 /// Caption text in the accent tone, for a caption that IS a link's label: the press it sits

@@ -15,6 +15,7 @@ pub(super) fn run_ocr(
     region: (i32, i32, u32, u32),
     skew: f32,
     conf_thresh: f32,
+    lang: &str,
 ) -> Vec<TextWord> {
     let mut ocr = render(gray, iw, ih, invert);
     let center = (ocr.width() as f32 / 2.0, ocr.height() as f32 / 2.0);
@@ -34,11 +35,16 @@ pub(super) fn run_ocr(
     }
     // psm 11 (sparse text) suits UI screenshots far better than psm 3's page-layout
     // analysis, which mis-segments icon-interspersed / multi-column UI and garbles text.
-    let out = crate::util::quiet_command("tesseract")
-        .arg(&path)
-        .arg("stdout")
-        .args(["--psm", "11", "--dpi", "300", "tsv"])
-        .output();
+    //
+    // The language comes from Settings (DRAGON-527). An empty string means "say nothing",
+    // which leaves tesseract on its own `eng` default, the behaviour every build had
+    // before the setting existed, so an unset config changes nothing.
+    let mut cmd = super::tesseract_cmd();
+    cmd.arg(&path).arg("stdout");
+    if !lang.is_empty() {
+        cmd.arg("-l").arg(lang);
+    }
+    let out = cmd.args(["--psm", "11", "--dpi", "300", "tsv"]).output();
     let _ = std::fs::remove_file(&path);
     let Ok(out) = out else {
         return Vec::new();

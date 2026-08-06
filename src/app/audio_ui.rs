@@ -335,3 +335,98 @@ mod speaker_label_tests {
         assert!(long.starts_with(&out[..out.len() - '…'.len_utf8()]), "keeps the name's prefix");
     }
 }
+
+impl crate::app::App {
+    /// Re-probe the installed tesseract language packs and rebuild the dropdown labels.
+    ///
+    /// Called when the Settings window opens rather than at launch: it spawns tesseract,
+    /// which a capture launch has no reason to pay for, and a user who has just dropped a
+    /// new `.traineddata` into the folder expects reopening Settings to show it.
+    pub(super) fn refresh_ocr_langs(&mut self) {
+        let (langs, dir) = crate::detect::lang_list();
+        self.ocr_langs = langs;
+        self.ocr_lang_dir = dir;
+        self.ocr_lang_labels = self
+            .ocr_langs
+            .iter()
+            .map(|c| crate::detect::lang_label(c))
+            .collect();
+    }
+
+    /// Which dropdown row is selected.
+    ///
+    /// An EMPTY `ocr_language` means "pass no `-l`", which lands on tesseract's own `eng`
+    /// default, so it selects `eng` here rather than a separate "Default" row. It used to
+    /// have one, and the result was a dropdown offering "Default (English)" and
+    /// "English (eng)" as two entries that did exactly the same thing.
+    ///
+    /// A persisted language that is no longer installed falls back to the first row, so
+    /// deleting a pack degrades to something selectable instead of showing a choice that
+    /// cannot be honoured.
+    pub(super) fn ocr_lang_index(&self) -> usize {
+        let wanted = if self.ocr_language.is_empty() { "eng" } else { &self.ocr_language };
+        self.ocr_langs.iter().position(|c| c == wanted).unwrap_or(0)
+    }
+}
+
+impl crate::app::App {
+    /// The "Tesseract language pack" row's description: one sentence, then the REAL
+    /// directory tesseract is reading packs from.
+    ///
+    /// It names BOTH routes because both are real depending on where you are. A distro
+    /// tesseract is fed by the package manager (`tesseract-data-deu`) and its folder is
+    /// root-owned; a bundled one has no package manager behind it and its folder is
+    /// user-writable. One sentence covers both without the row reading differently per
+    /// platform, which is what it used to do.
+    ///
+    /// The path is asked of tesseract (`--list-langs` names it in its header) rather than
+    /// derived here. That is the only answer correct in both cases without duplicating
+    /// tesseract's own search rules: a bundled build reports the folder we seed, a distro
+    /// build reports its own `/usr/share/tessdata`. An earlier version hardcoded the
+    /// bundled path on every platform, which read as an instruction to put packs somewhere
+    /// that Linux does not look.
+    ///
+    /// Falls back to naming no directory at all if the probe could not report one, since a
+    /// sentence ending in an empty line is worse than a shorter sentence.
+    pub(in crate::app) fn ocr_lang_desc(&self) -> String {
+        match &self.ocr_lang_dir {
+            Some(dir) => {
+                format!("Install more language packs from your package manager, or place them in:\n{dir}")
+            }
+            None => "Install more language packs from your package manager.".to_string(),
+        }
+    }
+}
+
+/// DRAGON-527: the OCR language dropdown selection.
+#[cfg(test)]
+mod ocr_lang_index_tests {
+    /// The selection rule, extracted so it is testable without building a whole `App`.
+    /// Mirrors `App::ocr_lang_index`.
+    fn index_of(langs: &[&str], persisted: &str) -> usize {
+        let wanted = if persisted.is_empty() { "eng" } else { persisted };
+        langs.iter().position(|c| *c == wanted).unwrap_or(0)
+    }
+
+    /// An unset config selects `eng` rather than a separate "Default" row. There used to
+    /// be one, and it showed "Default (English)" and "English (eng)" as two entries doing
+    /// exactly the same thing, since passing no `-l` IS tesseract's `eng` default.
+    #[test]
+    fn an_unset_language_selects_english() {
+        assert_eq!(index_of(&["deu", "eng", "fra"], ""), 1);
+    }
+
+    #[test]
+    fn a_set_language_selects_itself() {
+        assert_eq!(index_of(&["deu", "eng", "fra"], "fra"), 2);
+    }
+
+    /// Deleting a pack must leave a selectable row rather than an index pointing at
+    /// nothing, so an unknown code falls back to the first entry.
+    #[test]
+    fn an_uninstalled_language_falls_back_to_the_first_row() {
+        assert_eq!(index_of(&["deu", "fra"], "spa"), 0);
+        // Also covers "unset, but eng is not installed either".
+        assert_eq!(index_of(&["deu", "fra"], ""), 0);
+    }
+}

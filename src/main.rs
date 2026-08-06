@@ -1055,6 +1055,18 @@ fn main() -> cosmic::iced::Result {
     // `pin_vulkan_icd` for the six conditions it insists on before touching anything.
     #[cfg(target_os = "linux")]
     pin_vulkan_icd();
+    // DRAGON-527: seed the OCR language directory from the bundled `eng.traineddata`.
+    //
+    // Here, sharing the anchor above, for the same reason: every remaining path is a GUI
+    // launch, so this runs exactly once per such process and never for a helper subcommand
+    // or for the long-lived resident daemon (both already returned / never return above).
+    //
+    // Synchronous on purpose, not on a thread: this app is one-shot and can exit within a
+    // second of launch, and a copy interrupted halfway would leave a half-written pack that
+    // the "never overwrite" rule then keeps forever. It is also not a launch cost worth
+    // deferring: with a distro tesseract it returns after a couple of `stat`s (the packs
+    // are the distro's), and with a bundled one it copies only on the very first run.
+    util::seed_tessdata();
     // DRAGON-427 (Windows 10): this process IS the preview EDITOR for a capture another
     // process just took. The argument is one `preview_ipc::OpenRequest` line — the very same
     // wire format the unix socket handoff sends — so the document opens with the capture's

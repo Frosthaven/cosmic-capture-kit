@@ -111,6 +111,12 @@ pub enum PreviewMsg {
     /// `Done { shared: true }` — clears the session's sidecars, and drops that entry from
     /// `uploads`. Driven by `sub_upload_poll`, which exists only while `uploads` is non-empty.
     UploadPoll,
+    /// Advance the finalize stripe sweep one step (DRAGON-537):
+    /// `widgets::upload_stripes::advance` on `EditState::upload_anim`. Driven by
+    /// `sub_upload_finalize_anim`, which exists only while one of this document's meters is
+    /// in its finalize wait (`edit::MeterFace::Finalizing`); the redraw the message causes
+    /// is the animation.
+    UploadAnimTick,
     /// Cancel an upload this document is watching, by its session id (`edit::UploadWatch`'s
     /// own field, DRAGON-490): the titlebar's own Cancel control, next to the progress
     /// indicator. Creates that session's cancel-request sidecar
@@ -542,6 +548,9 @@ mod tests {
             PreviewMsg::UploadStart,
             // DRAGON-490: watching an upload's progress and cancelling one are chrome too.
             PreviewMsg::UploadPoll,
+            // DRAGON-537: so is the finalize sweep's own tick, arriving thirty times a
+            // second while the meter animates.
+            PreviewMsg::UploadAnimTick,
             PreviewMsg::UploadCancel("abc123".to_string()),
             PreviewMsg::SaveAndClose,
             PreviewMsg::KeepEditing,

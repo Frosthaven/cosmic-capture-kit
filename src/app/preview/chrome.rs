@@ -1501,7 +1501,7 @@ impl App {
         let Some(watch) = preview.edit.uploads.first() else {
             return Vec::new();
         };
-        vec![upload_meter(preview.window, watch)]
+        vec![upload_meter(preview.window, watch, preview.edit.upload_anim)]
     }
 }
 
@@ -1545,7 +1545,11 @@ impl App {
 /// visibly filling was noise on the path to every other control. Nothing replaces it, in any
 /// state. The X keeps its own tip, which names the action and the account
 /// ([`meter_cancel`]) and is the one thing on this pill a press can be wrong about.
-fn upload_meter(pid: window::Id, watch: &super::edit::UploadWatch) -> Element<'static, Msg> {
+fn upload_meter(
+    pid: window::Id,
+    watch: &super::edit::UploadWatch,
+    anim: f32,
+) -> Element<'static, Msg> {
     let face = super::edit::meter_face(watch);
     let mut items: Vec<Element<'static, Msg>> = Vec::with_capacity(4);
     if let Some(spec) = crate::cloud::provider(&watch.provider) {
@@ -1573,7 +1577,7 @@ fn upload_meter(pid: window::Id, watch: &super::edit::UploadWatch) -> Element<'s
         items.push(meter_cancel(pid, watch.session_id.clone(), action, &watch.label));
     }
     // Bare, with no tooltip wrapper of any kind: see the note above.
-    items.push(upload_progress_track(face));
+    items.push(upload_progress_track(face, anim));
     let row = widget::row(items).spacing(6.0).align_y(Alignment::Center);
     widget::container(row)
         .padding(METER_PAD)
@@ -1725,7 +1729,7 @@ const _: () = assert!(
 /// say it. So the two finished faces now draw IDENTICALLY, and settling is no longer visible at
 /// all. It still does real work — it is what stops the 500ms poll
 /// (`super::edit::upload_needs_poll`) — it simply no longer changes the picture.
-fn upload_progress_track(face: super::edit::MeterFace) -> Element<'static, Msg> {
+fn upload_progress_track(face: super::edit::MeterFace, anim: f32) -> Element<'static, Msg> {
     use super::edit::MeterFace;
     if matches!(face, MeterFace::Spinner) {
         // Sized to the meter's own glyph box (`METER_ICON`, what the brand mark and the Cancel
@@ -1734,6 +1738,19 @@ fn upload_progress_track(face: super::edit::MeterFace) -> Element<'static, Msg> 
         // Self-animating (`Circular`'s own `update` requests a redraw on every frame), so
         // nothing here has to drive a tick for it.
         return widget::indeterminate_circular().size(METER_ICON).bar_height(2.0).into();
+    }
+    if matches!(face, MeterFace::Finalizing) {
+        // The finalize wait (DRAGON-537): full in the accent, with the darker block sweep
+        // saying "still working" where a motionless full bar read as done or stuck. `anim`
+        // is `EditState::upload_anim`, advanced by `sub_upload_finalize_anim` while any
+        // meter is in this state; unlike the spinner above, this widget does not drive its
+        // own redraws, so the tick is what animates it.
+        return upload_track_shell(crate::widgets::upload_stripes::upload_stripes(
+            TRACK_W,
+            TRACK_H,
+            anim,
+            meter_tint(face),
+        ));
     }
     upload_track_bar(super::edit::meter_fill(face), meter_tint(face))
 }
@@ -1752,6 +1769,10 @@ fn meter_tint(face: super::edit::MeterFace) -> fn(&cosmic::Theme) -> cosmic::ice
         MeterFace::Finished(UploadOutcome::Done) | MeterFace::Settled(UploadOutcome::Done) => {
             crate::app::theme::success
         }
+        // DRAGON-537: the finalize wait KEEPS the running colour (owner's call). The colour
+        // says "still working"; the stripe sweep, not a colour change, is what marks the
+        // state. Success green here would claim an outcome that has not arrived.
+        MeterFace::Finalizing => crate::app::theme::accent,
         // DRAGON-507: a pressed X turns the bar red AT ONCE, on the same token a genuine stop
         // uses. The press is the event; nothing waits for the provider to agree. A failure was
         // never faded even under DRAGON-514, for the reason that still holds: it is not
@@ -1787,18 +1808,20 @@ fn meter_tint(face: super::edit::MeterFace) -> fn(&cosmic::Theme) -> cosmic::ice
 /// against re-earning the earlier "the track is barely visible" report from the other side.
 /// It is also opaque, so it composites the same on the windowed titlebar and on the overlay's
 /// header, which sit on different surfaces.
+/// The track's own footprint: small enough to sit comfortably in a titlebar row without
+/// crowding the controls beside it, and fixed regardless of state so the indicator
+/// appearing/disappearing never nudges anything else in the row sideways by a variable
+/// amount — only the FILL inside it moves. Doubled from an original 40px (DRAGON-490
+/// follow-up, owner live-test): the narrower track read as barely visible next to the
+/// Cancel button. Module-level since DRAGON-537, because the finalize arm sizes its
+/// animated fill to the same numbers.
+const TRACK_W: f32 = 40.0 * 2.0;
+const TRACK_H: f32 = 5.0;
+
 fn upload_track_bar(
     fraction: f32,
     tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
 ) -> Element<'static, Msg> {
-    /// The track's own footprint: small enough to sit comfortably in a titlebar row without
-    /// crowding the controls beside it, and fixed regardless of state so the indicator
-    /// appearing/disappearing never nudges anything else in the row sideways by a variable
-    /// amount — only the FILL inside it moves. Doubled from an original 40px (DRAGON-490
-    /// follow-up, owner live-test): the narrower track read as barely visible next to the
-    /// Cancel button.
-    const TRACK_W: f32 = 40.0 * 2.0;
-    const TRACK_H: f32 = 5.0;
     let fill_w = TRACK_W * fraction.clamp(0.0, 1.0);
     let fill: Element<'static, Msg> =
         widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
@@ -1812,6 +1835,14 @@ fn upload_track_bar(
                 }
             }))
             .into();
+    upload_track_shell(fill)
+}
+
+/// The track's outer shell: the fixed footprint and the channel-toned rounded background
+/// every state's fill sits in. Split out of [`upload_track_bar`] by DRAGON-537, so the
+/// finalize arm's animated fill and the plain fills share one footprint and one tone and
+/// cannot drift.
+fn upload_track_shell(fill: Element<'static, Msg>) -> Element<'static, Msg> {
     widget::container(fill)
         .width(Length::Fixed(TRACK_W))
         .height(Length::Fixed(TRACK_H))
@@ -2147,7 +2178,7 @@ impl App {
         // group on every platform.
         let meter: Vec<Element<'static, Msg>> = match preview.edit.uploads.first() {
             Some(watch) => {
-                vec![upload_meter(tb.pid, watch)]
+                vec![upload_meter(tb.pid, watch, preview.edit.upload_anim)]
             }
             None => Vec::new(),
         };

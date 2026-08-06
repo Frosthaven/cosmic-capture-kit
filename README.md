@@ -201,18 +201,71 @@ along with their statuses.
 <details>
 <summary><b>Linux (Wayland): COSMIC</b></summary>
 
-There are two routes: download the release build, which is the quickest, or
-build from source, which works on any distro and is the only route on
-architectures other than x86_64.
+There are three routes: the AppImage, which is the quickest and the one to take
+unless you have a reason not to; the plain zip, if you would rather have a bare
+binary and use your distro's own ffmpeg and tesseract; or building from source,
+which works on any distro and on any architecture.
 
-#### Download the release build
+The downloads come in **x86_64** and **aarch64** builds. Take the one matching
+`uname -m`; the filenames carry it. aarch64 covers Asahi on Apple Silicon,
+Raspberry Pi 5 desktops and ARM laptops.
 
-1. Download `CosmicCaptureKit-<version>-x86_64-COSMIC.zip` from
-   [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases).
+#### Download the AppImage
+
+1. Download `CosmicCaptureKit-<arch>.AppImage` from
+   [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases), where
+   `<arch>` is what `uname -m` prints (`x86_64` or `aarch64`).
+2. Make it executable and, if you like, put it on your `PATH`:
+
+   ```sh
+   chmod +x CosmicCaptureKit-*.AppImage
+   mkdir -p ~/.local/bin && mv CosmicCaptureKit-*.AppImage ~/.local/bin/
+   ```
+
+   Every command below works the same way, so `cosmic-capture-kit --settings`
+   becomes `CosmicCaptureKit-<arch>.AppImage --settings`. A symlink named
+   `cosmic-capture-kit` pointing at it keeps the shorter form.
+
+   The filename carries no version on purpose: this file updates itself in
+   place, so a version in the name would be wrong as soon as the first update
+   landed. Check the version in Settings, under About. Whatever path you bind a
+   shortcut to keeps working forever, because updates never rename it.
+3. Run it with `--settings` to look around and set your save folders, then bind
+   the [shortcuts](#shortcuts) below.
+
+The AppImage carries its own **ffmpeg 8.1.2 and tesseract**, so recording and
+OCR work with nothing else installed, and it carries ffmpeg's libraries too, so
+GPU zero-copy recording is available even on a distro whose own ffmpeg is older.
+Graphics, audio and GPU drivers deliberately come from your system, since a
+bundled copy could not match your driver. It needs glibc 2.34 or newer (Ubuntu
+22.04, Mint 21, Pop!_OS 22.04, Debian 12 and anything newer) and, for zero-copy
+recording, Mesa 21.1 or newer.
+
+If it refuses to start with **"No suitable fusermount binary found on the
+$PATH"**, install `fuse3` (that package name is the same on Arch, Debian,
+Ubuntu, Fedora and openSUSE). An AppImage mounts itself to run, and while this
+one carries its own copy of the FUSE library, the small `fusermount3` helper it
+needs has to come from your distribution, because it must be installed with
+elevated privileges. Any normal desktop already has it, pulled in by things like
+your file manager or the desktop portals, so this only tends to come up on a
+minimal or server install.
+
+It is also the only Linux download that **updates itself**. Settings > About
+checks for new releases and installs one in place, keeping the filename and
+location you chose, so a shortcut, symlink or autostart entry pointing at it
+keeps working afterwards. Put it somewhere you own, such as `~/.local/bin` or
+`~/Applications`; an AppImage in a system folder like `/opt` cannot be replaced
+without root, and the update will say so rather than fail quietly.
+
+#### Download the plain zip
+
+1. Download `CosmicCaptureKit-<version>-<arch>.zip` from
+   [Releases](https://github.com/Frosthaven/cosmic-capture-kit/releases), where
+   `<arch>` is what `uname -m` prints (`x86_64` or `aarch64`).
 2. Unzip it and put the binary on your `PATH`:
 
    ```sh
-   unzip CosmicCaptureKit-*-x86_64-COSMIC.zip
+   unzip CosmicCaptureKit-*.zip
    chmod +x cosmic-capture-kit
    mkdir -p ~/.local/bin && mv cosmic-capture-kit ~/.local/bin/
    ```
@@ -222,11 +275,15 @@ architectures other than x86_64.
 3. Run `cosmic-capture-kit --settings` to look around and set your save
    folders, then bind the [shortcuts](#shortcuts) below.
 
-The zip holds one binary and nothing else. It is x86_64 only and needs glibc
-2.39 or newer, so Arch, CachyOS, Fedora 40+, Ubuntu 24.04+, Pop!_OS 24.04 and
-Debian 13 all run it, while Ubuntu 22.04, Mint 21 and Debian 12 do not. It also
-links libxkbcommon, libpulse and libpipewire, which a COSMIC desktop already
-has. On an older distro, build from source instead.
+The zip holds one binary and nothing else, so recording and OCR use your
+distro's `ffmpeg` and `tesseract` packages (see
+[dependencies.md](dependencies.md)). It needs glibc 2.34 or newer, the same
+floor as the AppImage. It also links libxkbcommon, libpulse and libpipewire,
+which a COSMIC desktop already has.
+
+This route tells you when an update is out but does not install it: you unpacked
+the binary wherever you liked, so there is no install location to replace safely.
+Settings > About opens the releases page instead, and you repeat the steps above.
 
 Cloud uploads need no setup in this build: the provider registrations are
 already compiled in. A build from source does not have them, and needs one
@@ -349,6 +406,27 @@ without relaunching, and it also carries the screenshot / recording / scan
 choice, the countdown, and the capture toggles. Pressing the active selector is
 what takes the capture.
 
+**`cosmic-capture-kit` below means whichever file you installed.** The tables use
+the zip's binary name, but the AppImage takes exactly the same flags. Substitute
+its filename and everything works identically:
+
+```sh
+cosmic-capture-kit --region                 # the zip's binary
+CosmicCaptureKit-x86_64.AppImage --region   # the AppImage, same flags
+```
+
+A custom shortcut runs a command directly instead of searching your `PATH` the
+way a shell does, so give the **full path** unless the file sits somewhere
+already on it:
+
+```
+/home/you/.local/bin/CosmicCaptureKit-x86_64.AppImage --region
+```
+
+A symlink named `cosmic-capture-kit` pointing at the AppImage keeps the short
+form in every command below, and keeps working across updates, since an update
+replaces the file without renaming it.
+
 | Command              | Suggested keys |
 | -------------------- | -------------- |
 | `cosmic-capture-kit` | `Print`        |
@@ -396,13 +474,14 @@ See [CLI.md](CLI.md) for every flag, including `--video`, `--scan` and
 ## 🧩 Tiling window managers
 
 Cosmic Capture Kit makes an effort to play nicely with popular tiling window
-managers. The overlay tools will bypass tiling, while the preview editor and the
-settings window will not by default. You can change the behavior of the settings
-window and the preview editor by using the information below.
+managers. The overlay tools will bypass tiling, while the preview editor, the
+settings window, and (macOS only) the permission checker window will not by
+default. You can change this behavior using the information below.
 
 * Settings window: title `Cosmic Capture Kit - Settings`
 * Preview editor window: title `Cosmic Capture Kit - Preview Editor`
-* Both share application id `dev.frosthaven.CosmicCaptureKit`
+* Permission checker window (macOS only): title `Cosmic Capture Kit - Permissions`
+* All three share application id `dev.frosthaven.CosmicCaptureKit`
 
 Each snippet below is an addition to your existing config, not a replacement
 for it.
@@ -424,6 +503,10 @@ run = ['layout floating']
 [[on-window-detected]]
 if.window-title-regex-substring = 'Cosmic Capture Kit - Preview Editor'
 run = ['layout floating']
+
+[[on-window-detected]]
+if.window-title-regex-substring = 'Cosmic Capture Kit - Permissions'
+run = ['layout floating']
 ```
 
 Reload with `aerospace reload-config`. The match is an unanchored, case
@@ -441,6 +524,7 @@ insensitive substring.
 ```sh
 yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Settings$" manage=off
 yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Preview Editor$" manage=off
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Permissions$" manage=off
 ```
 
 The regex is POSIX extended and unanchored, hence the `^` and `$`. `app` matches
@@ -652,6 +736,9 @@ copyright holder. (The author holds the copyright to all code in this repository
 and additionally licenses their own code to themselves for those proprietary
 builds; the GPL grant above applies to everyone else and to this repository's
 contents.).
+
+Building from source or hacking on it? [DEVELOPERS.md](DEVELOPERS.md) covers the
+`just` commands and the things that will bite you.
 
 ## 🙏 Contributions & Credits
 

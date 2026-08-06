@@ -361,10 +361,13 @@ pub fn spawn_capture_child_with_env(flag: &str, envs: &[(&str, &str)]) -> bool {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn spawn_capture_child_args(args: &[&str], envs: &[(&str, &str)]) -> bool {
     let flag = args.first().copied().unwrap_or("");
-    let exe = match std::env::current_exe() {
+    // `self_exe`, not `current_exe` (DRAGON-510): a capture child is detached and unreaped
+    // and long outlives the daemon call that started it, so under an AppImage it must be
+    // launched from the `.AppImage` file rather than from a mount that can disappear.
+    let exe = match crate::util::self_exe() {
         Ok(p) => p,
         Err(e) => {
-            log::warn!("spawn_capture_child: current_exe failed, cannot spawn {flag}: {e}");
+            log::warn!("spawn_capture_child: self_exe failed, cannot spawn {flag}: {e}");
             return false;
         }
     };

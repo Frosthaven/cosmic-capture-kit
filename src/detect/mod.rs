@@ -13,7 +13,10 @@ mod luma;
 mod text;
 
 pub use codes::{Mark, MarkAction, scan_codes};
-pub use text::{TextWord, join_words, scan_text, tesseract_available, tesseract_langs_available};
+pub use text::{
+    TextWord, join_words, lang_list, lang_label, scan_text, tesseract_available,
+    tesseract_langs_available,
+};
 
 /// Buffer px → logical px (the snapshot is at buffer resolution). Shared by both
 /// scanners to map detection boxes back to screen coords.

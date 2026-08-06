@@ -8,6 +8,9 @@ pub enum DetectMsg {
     SetScanText(bool),
     /// Screenshots: minimum OCR word confidence (0–100).
     SetTextConfidence(f32),
+    /// OCR language dropdown: the selected ROW index (0 = the default entry, which
+    /// clears `ocr_language` back to empty). DRAGON-527.
+    SetOcrLanguage(usize),
     /// Screenshots: toggle dropping OCR'd UI symbols/icons.
     /// Poll the background scans (load results, re-OCR a changed region).
     MarksPoll,

@@ -291,6 +291,227 @@ pub fn ffprobe_path() -> PathBuf {
     locate_tool("ffprobe", "CCK_FFPROBE")
 }
 
+/// Locate the `tesseract` binary (same resolution order as [`ffmpeg_path`]:
+/// `CCK_TESSERACT` override → mac `.app` `Resources/` → exe-adjacent sidecar → PATH).
+///
+/// It went through [`locate_tool`] late (DRAGON-527). The three OCR call sites used a
+/// BARE NAME, so tesseract could only ever be found on `PATH`, fine for Linux, where
+/// the distro packages it, and silently broken for a packaged mac/Windows build, which
+/// has no Homebrew and nothing on `PATH`. OCR was therefore absent for exactly the
+/// users who paid for the app. Routing it here lets the packaged builds ship a sidecar
+/// beside the binary, the same way they already ship ffmpeg.
+pub fn tesseract_path() -> PathBuf {
+    locate_tool("tesseract", "CCK_TESSERACT")
+}
+
+/// Where tesseract should look for `*.traineddata`, given the binary that [`tesseract_path`]
+/// actually resolved. **Pure**, unit-tested: the effectful half is [`tessdata_dir`].
+///
+/// The distinction is the whole point, and getting it backwards would be a regression the
+/// user sees as "my language packs disappeared":
+///
+/// * A **bundled** tesseract (an absolute path: the mac `Resources/` sidecar, the
+///   exe-adjacent Windows/AppImage sidecar, or a `CCK_TESSERACT` override) ships with only
+///   `eng`. It has no system tessdata to fall back on, so we own the directory and hand it
+///   a writable one the user can drop more languages into.
+/// * A **PATH** tesseract (the bare name, i.e. the distro's own package) already knows
+///   where its data lives, and the user's `tesseract-data-deu` sits there. Pointing it
+///   somewhere else would HIDE every language pack they installed. So: leave it alone.
+fn tessdata_dir_for(resolved: &Path, writable: Option<PathBuf>) -> Option<PathBuf> {
+    // `locate_tool` returns the bare name when nothing on disk matched, which is the
+    // signal that the OS will resolve it on PATH.
+    if resolved.parent().is_none_or(|p| p.as_os_str().is_empty()) {
+        return None;
+    }
+    writable
+}
+
+/// [`tessdata_dir_for`] with the real writable location filled in: `<app config dir>/tessdata`,
+/// which is sandboxed away from a developer's real directory like every other config-adjacent
+/// path (see [`app_config_dir`]). `None` means "say nothing to tesseract and let it use its
+/// own data", which is what a distro install wants.
+pub fn tessdata_dir() -> Option<PathBuf> {
+    tessdata_dir_for(&tesseract_path(), app_config_dir().map(|d| d.join("tessdata")))
+}
+
+/// Seed the writable tessdata dir from the bundled `eng.traineddata` on first run, so a
+/// packaged build has a language to work with and a folder the user can add to.
+///
+/// Best-effort and idempotent: an existing file is never overwritten (the user may have
+/// replaced `eng` with `tessdata_best`), and every failure is a warning rather than an
+/// error, because OCR is an optional feature and a read-only install must not break launch.
+pub fn seed_tessdata() {
+    let Some(dir) = tessdata_dir() else {
+        return; // PATH tesseract: the distro owns the data.
+    };
+    let tool = tesseract_path();
+    let Some(bundled) = tool.parent().map(|d| d.join("tessdata")) else {
+        return;
+    };
+    if !bundled.is_dir() {
+        return; // No sidecar data shipped (a dev build pointing at a system tesseract).
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("tessdata: could not create the language dir: {e}");
+        return;
+    }
+    // What we last seeded, so a shipped update can replace OUR copy without ever
+    // touching the user's. See `seed_verdict`.
+    let ledger = dir.join(".seeded");
+    let mut seeded = read_seed_ledger(&ledger);
+    let mut ledger_dirty = false;
+
+    // Mirror the WHOLE bundled tree, not just `*.traineddata`.
+    //
+    // This filtered on that extension once, and the result was that bundled OCR
+    // returned nothing at all, silently. The scan runs `tesseract … tsv`, where `tsv`
+    // is not an output flag: it is a CONFIG FILE (`configs/tsv`, containing
+    // `tessedit_create_tsv 1`) that tesseract loads from the tessdata directory. With
+    // the language pack present but no `configs/`, tesseract prints
+    // `read_params_file: Can't open tsv` to stderr, quietly falls back to PLAIN TEXT,
+    // and exits 0. `parse_tsv_words` then finds no columns and returns an empty list,
+    // so the feature looks broken with no error anywhere. Verified both ways.
+    for (rel, src, src_len) in collect_files(&bundled) {
+        let dest = dir.join(&rel);
+        let dest_len = std::fs::metadata(&dest).map(|m| m.len()).ok();
+        match seed_verdict(dest_len, src_len, seeded.get(&rel).copied()) {
+            SeedVerdict::UpToDate => continue,
+            SeedVerdict::UserOwned => {
+                log::debug!("tessdata: leaving the user's own {rel} alone");
+                continue;
+            }
+            SeedVerdict::Write => {}
+        }
+        if let Some(parent) = dest.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("tessdata: could not create {}: {e}", parent.display());
+            continue;
+        }
+        // Copy aside, then RENAME into place. A language pack is tens of megabytes and
+        // this app is one-shot: a process that exits mid-copy would otherwise leave a
+        // truncated file that the ownership rule then preserves forever, so OCR would
+        // fail on every later run with no way back short of deleting the folder by hand.
+        // The rename is atomic within the directory, so the name only ever appears
+        // complete. A `.part` left by an interrupted run is overwritten by the next one.
+        let part = dest.with_extension("cck-part");
+        if let Err(e) = std::fs::copy(&src, &part) {
+            log::warn!("tessdata: could not seed {rel}: {e}");
+            continue;
+        }
+        if let Err(e) = std::fs::rename(&part, &dest) {
+            log::warn!("tessdata: could not publish {rel}: {e}");
+            let _ = std::fs::remove_file(&part);
+            continue;
+        }
+        seeded.insert(rel, src_len);
+        ledger_dirty = true;
+    }
+    if ledger_dirty {
+        write_seed_ledger(&ledger, &seeded);
+    }
+}
+
+/// Every file under `root`, as `(path relative to root, absolute path, length)`.
+///
+/// Hand-rolled rather than pulling in `walkdir`: the tree is a language directory a
+/// handful of levels deep, and this is the only place in the crate that needs a walk.
+/// Depth-limited so a symlink loop in a user-writable directory cannot hang a capture
+/// launch.
+fn collect_files(root: &Path) -> Vec<(String, PathBuf, u64)> {
+    fn walk(dir: &Path, prefix: &str, depth: u32, out: &mut Vec<(String, PathBuf, u64)>) {
+        if depth > 4 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => walk(&entry.path(), &rel, depth + 1, out),
+                Ok(t) if t.is_file() => {
+                    let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    out.push((rel, entry.path(), len));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, "", 0, &mut out);
+    out
+}
+
+/// What [`seed_tessdata`] should do with one language file.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedVerdict {
+    /// The user put this here, or replaced ours. Never touch it.
+    UserOwned,
+    /// Already ours and already current.
+    UpToDate,
+    /// Missing, or ours and stale.
+    Write,
+}
+
+/// **Pure**, unit-tested: decide whether to write a bundled language pack over what is
+/// already on disk.
+///
+/// The rule the user asked for: **a pack the user installed always wins**, but a pack WE
+/// seeded must still be replaceable when a release ships a newer one. Before this, the
+/// rule was simply "never overwrite", which protected the user's file correctly and also
+/// meant an updated `eng.traineddata` could never reach anyone who had already launched
+/// the old build.
+///
+/// Ownership is decided by SIZE against a ledger of what we last wrote, rather than by
+/// hashing: these files are tens of megabytes and this runs on a one-shot launch path, so
+/// reading them fully on every capture would be absurd. A size match is not proof of
+/// identity, but the failure it risks is "we overwrite our own copy with an identical
+/// one", which costs nothing. The case that MATTERS, a user dropping in `tessdata_best`
+/// or another language's file, changes the size in practice.
+fn seed_verdict(dest_len: Option<u64>, src_len: u64, seeded_len: Option<u64>) -> SeedVerdict {
+    let Some(dest_len) = dest_len else {
+        return SeedVerdict::Write; // nothing there yet
+    };
+    match seeded_len {
+        // We have no record of writing this, so the user put it there.
+        None => SeedVerdict::UserOwned,
+        // On disk no longer matches what we wrote: the user replaced it.
+        Some(recorded) if recorded != dest_len => SeedVerdict::UserOwned,
+        // Still ours. Write only when the bundled pack has actually changed.
+        Some(_) if dest_len == src_len => SeedVerdict::UpToDate,
+        Some(_) => SeedVerdict::Write,
+    }
+}
+
+/// Read the seed ledger: one `<size> <name>` line per file we wrote. A missing or
+/// unreadable ledger reads as empty, which makes every existing file user-owned, the
+/// safe direction.
+fn read_seed_ledger(path: &Path) -> std::collections::HashMap<String, u64> {
+    let mut out = std::collections::HashMap::new();
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    for line in text.lines() {
+        if let Some((len, name)) = line.split_once(' ')
+            && let Ok(len) = len.parse::<u64>()
+        {
+            out.insert(name.to_string(), len);
+        }
+    }
+    out
+}
+
+/// Write the seed ledger. Best-effort: losing it only makes the next run treat our own
+/// files as the user's, which is the conservative direction.
+fn write_seed_ledger(path: &Path, seeded: &std::collections::HashMap<String, u64>) {
+    let body: String = seeded.iter().map(|(n, l)| format!("{l} {n}\n")).collect();
+    if let Err(e) = std::fs::write(path, body) {
+        log::warn!("tessdata: could not record what was seeded: {e}");
+    }
+}
+
 /// Locate the `ffplay` binary (`CCK_FFPLAY` override → exe-adjacent sidecar → PATH, the
 /// same resolution order as [`ffmpeg_path`]). Windows-only: the preview soundtrack renders
 /// through ffplay (SDL2 → default output endpoint) because the bundled Windows ffmpeg has
@@ -423,6 +644,151 @@ pub fn ffprobe_command() -> std::process::Command {
     quiet_command(ffprobe_path())
 }
 
+/// Which `vendor/<dir>/macos-arm64/` directory a tool is vendored into.
+///
+/// **Pure**, unit-tested. Not simply `name`, because ffprobe ships alongside ffmpeg from
+/// the same upstream archive and so shares its directory; everything else vendors under
+/// its own name.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn vendor_subdir(name: &str) -> &str {
+    match name {
+        "ffprobe" | "ffplay" => "ffmpeg",
+        other => other,
+    }
+}
+
+// ── Re-executing ourselves (DRAGON-510) ──────────────────────────────────────
+
+/// Set by the AppImage runtime to the `.AppImage` FILE it is running, which is the only
+/// path to this program that outlives the mount. Not a `CCK_` name because it is not ours:
+/// the runtime defines it, and it is absent from every other kind of launch.
+const APPIMAGE_ENV: &str = "APPIMAGE";
+
+/// The path to spawn when this process re-executes ITSELF.
+///
+/// **Why this is not just `current_exe()`.** Inside an AppImage, `current_exe()` is
+/// `/tmp/.mount_XXXXXX/usr/bin/cosmic-capture-kit`, and that mount exists only while the
+/// process that created it is alive. This app deliberately spawns children that OUTLIVE
+/// their parent (the clipboard / notify / upload helpers, [`crate::share::reexec`], and the
+/// resident daemon's capture children), and `App::finish_session` always exits. A child
+/// holding the mount path can therefore lose its own executable mid-run, and anything that
+/// RECORDS the path for later (the autostart `.desktop` entry) records one that is
+/// guaranteed to be gone by the next login. `$APPIMAGE` is the AppImage file itself, which
+/// mounts afresh on every invocation.
+///
+/// Byte-identical off an AppImage: the variable is absent, so this is `current_exe()`.
+///
+/// **Not for [`locate_tool`]**, which keeps `current_exe()` on purpose. That one wants the
+/// MOUNT path, because the bundled `ffmpeg` / `tesseract` sidecars live next to the
+/// extracted binary and are not reachable through the `.AppImage` file.
+pub fn self_exe() -> std::io::Result<PathBuf> {
+    let current = std::env::current_exe()?;
+    Ok(re_exec_path(std::env::var_os(APPIMAGE_ENV).as_deref(), &current))
+}
+
+/// **Pure**, unit-tested: [`self_exe`]'s decision, with the environment injected.
+fn re_exec_path(appimage: Option<&std::ffi::OsStr>, current: &Path) -> PathBuf {
+    appimage_from(appimage).unwrap_or_else(|| current.to_path_buf())
+}
+
+/// The `.AppImage` FILE this process is running from, or `None` on every other kind of
+/// launch (a source build, the release binary, the `.app`, the MSI install).
+///
+/// The honest answer to "which file IS this program", which is a different question from
+/// [`self_exe`]'s "what should I spawn": they agree inside an AppImage and diverge outside
+/// it, where `self_exe` still has an answer and this has none. The in-place self-update
+/// (DRAGON-532) needs the file, and needs `None` to mean "there is nothing here we own,
+/// so do not offer to replace it".
+///
+/// Linux-only, and honestly dead elsewhere: AppImage is a Linux format, so no macOS or
+/// Windows build has a caller. The pure [`appimage_from`] underneath stays ungated, because
+/// [`re_exec_path`] uses it on every platform.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn appimage_path() -> Option<PathBuf> {
+    appimage_from(std::env::var_os(APPIMAGE_ENV).as_deref())
+}
+
+/// **Pure**, unit-tested: [`appimage_path`]'s decision, with the environment injected, and
+/// the ONE place the "what counts as running from an AppImage" rule is written.
+///
+/// An EMPTY `$APPIMAGE` is treated as absent rather than as a path of `""`. As a spawn
+/// target that would fail with a bare `No such file or directory` and no hint of where the
+/// path came from; as an update target it would be far worse, since the installer's
+/// swap would aim at a file the user never named.
+fn appimage_from(appimage: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    match appimage {
+        Some(p) if !p.is_empty() => Some(PathBuf::from(p)),
+        _ => None,
+    }
+}
+
+/// Set by the AppImage runtime to the directory it MOUNTED the bundle at, the root the
+/// bundle's own `usr/bin`, `usr/lib` and `usr/share` hang off. Like [`APPIMAGE_ENV`] it is
+/// the runtime's name, not ours, and it is absent from every other kind of launch.
+const APPDIR_ENV: &str = "APPDIR";
+
+/// The directory this process's AppImage bundle is mounted at, or `None` on every other kind
+/// of launch. The ONE place the app asks that question, so the Health page and the debug log
+/// can never disagree about it.
+///
+/// The mount point is a fresh random path (`/tmp/.mount_CosmicXXXXXX`) on every launch, so it
+/// is only ever useful as something to measure another path AGAINST: see [`appimage_label`].
+///
+/// Not gated to Linux even though AppImage is a Linux format. It is two environment reads
+/// that no macOS or Windows launch can satisfy (nothing there sets the runtime's variables),
+/// its `$APPIMAGE` half is already portable for [`re_exec_path`], and keeping it portable is
+/// what lets [`tool_location_label`] stay free of platform branches.
+pub fn appimage_dir() -> Option<PathBuf> {
+    appimage_dir_from(
+        std::env::var_os(APPIMAGE_ENV).as_deref(),
+        std::env::var_os(APPDIR_ENV).as_deref(),
+    )
+}
+
+/// **Pure**, unit-tested: [`appimage_dir`]'s decision, with the environment injected.
+///
+/// BOTH variables are required. `$APPIMAGE` is the "this really is an AppImage launch" marker
+/// ([`appimage_from`], the same rule the re-exec path uses), and `$APPDIR` alone is a name
+/// generic enough that something else could have exported it; claiming "AppImage" over
+/// somebody else's variable would mislabel a path rather than explain it. Empty values are
+/// treated as absent, exactly as [`appimage_from`] treats them.
+fn appimage_dir_from(
+    appimage: Option<&std::ffi::OsStr>,
+    appdir: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    appimage_from(appimage)?;
+    match appdir {
+        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
+        _ => None,
+    }
+}
+
+/// Whether this launch is running from a mounted AppImage bundle rather than a plain binary
+/// (a distro build, the `.app`, an MSI install, a `cargo` build). Always false off Linux.
+pub fn running_from_appimage() -> bool {
+    appimage_dir().is_some()
+}
+
+/// A resolved tool path as a human should read it, given the AppImage mount root (if any).
+/// **Pure**, unit-tested.
+///
+/// A path INSIDE the bundle is reported relative to the bundle, prefixed `AppImage:`. Showing
+/// the real one would be worse than useless: the mount point is a different random path on
+/// every launch, so the interesting half (`usr/bin/ffmpeg`, i.e. "the copy we shipped") is
+/// buried under noise that changes each time the user looks. Everything else is shown as it
+/// is, because for a plain install the full path IS the answer.
+fn appimage_label(path: &Path, mount: Option<&Path>) -> String {
+    if let Some(root) = mount
+        && let Ok(rel) = path.strip_prefix(root)
+        && !rel.as_os_str().is_empty()
+    {
+        return format!("AppImage: {}", rel.display());
+    }
+    path.display().to_string()
+}
+
 fn locate_tool(name: &str, env_override: &str) -> PathBuf {
     // An explicit override is taken verbatim (user intent, even if the file is
     // missing — a broken override should fail loudly, not silently fall back).
@@ -447,12 +813,22 @@ fn locate_tool(name: &str, env_override: &str) -> PathBuf {
         if let Some(dir) = exe_dir {
             candidates.push(dir.join("..").join("Resources").join(name));
         }
-        // Dev vendor dir: the checked-out repo's vendored static arm64 ffmpeg.
-        // `CARGO_MANIFEST_DIR` is baked at compile time — it points at the repo for a
+        // Dev vendor dir: the checked-out repo's vendored arm64 sidecars.
+        // `CARGO_MANIFEST_DIR` is baked at compile time, so it points at the repo for a
         // dev build and simply doesn't exist in a shipped bundle (harmless fall-through).
+        //
+        // The subdirectory is PER TOOL, and that is the fix for a real bug: this used to
+        // be hardcoded to `vendor/ffmpeg/macos-arm64`, so `tesseract_path()` looked for
+        // `vendor/ffmpeg/macos-arm64/tesseract`, never matched, and fell through to PATH.
+        // A mac dev build therefore took ffmpeg from the pinned vendor dir but tesseract
+        // from Homebrew, which is precisely the "different on the build machine" mismatch
+        // the vendoring exists to remove, and it would have hidden a broken vendored
+        // tesseract until someone opened a packaged build.
         candidates.push(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("vendor/ffmpeg/macos-arm64")
+                .join("vendor")
+                .join(vendor_subdir(name))
+                .join("macos-arm64")
                 .join(name),
         );
     }
@@ -478,31 +854,102 @@ fn first_existing_or_bare(name: &str, candidates: &[PathBuf]) -> PathBuf {
 /// Whether a tool resolved by [`ffmpeg_path`]-style lookup is actually runnable:
 /// an absolute path must exist; a bare name is scanned for on PATH.
 pub fn tool_available(tool: &Path) -> bool {
-    if tool.is_absolute() {
-        return tool.is_file();
-    }
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|d| dir_has_tool(&d, tool)))
-        .unwrap_or(false)
+    tool_location(tool).is_some()
 }
 
-/// Whether directory `d` contains the bare tool `tool` as a file. On Windows the on-disk
-/// file carries `EXE_SUFFIX` (`ffmpeg.exe`) even though `Command::new("ffmpeg")` resolves it
-/// without — so the bare `d/ffmpeg` never exists and a PATH-only ffmpeg would wrongly read as
-/// "missing" (gating recording). Also probe `d/ffmpeg{EXE_SUFFIX}` to match the runtime spawn
-/// (DRAGON-229). On Linux/macOS `EXE_SUFFIX` is empty, so this is byte-identical to the plain
-/// `d.join(tool).is_file()`.
-fn dir_has_tool(d: &Path, tool: &Path) -> bool {
-    if d.join(tool).is_file() {
-        return true;
+/// WHERE a tool resolved by [`ffmpeg_path`]-style lookup actually sits on disk, or `None`
+/// when it is nowhere: an absolute path is itself (when the file is there), a bare name is
+/// the first `PATH` entry that has it. [`tool_available`] is written in terms of this, so
+/// "it is available" and "here is the one we will run" can never disagree.
+///
+/// The result is deliberately NOT canonicalised. What the user needs to see is the binary
+/// this app will actually spawn, symlinks and all: `/usr/bin/ffmpeg` is the honest answer
+/// even when it points at `ffmpeg-7`. Resolving links would also break the AppImage prefix
+/// match in [`appimage_label`] on any system that reaches its mount point through one.
+pub fn tool_location(tool: &Path) -> Option<PathBuf> {
+    if tool.is_absolute() {
+        return tool.is_file().then(|| tool.to_path_buf());
+    }
+    tool_on_path(tool)
+}
+
+/// The full path to the bare tool `tool` in the first `PATH` directory that holds it, or
+/// `None` when no entry does. The path-returning half of the `PATH` scan
+/// [`tool_available`] has always done.
+pub fn tool_on_path(tool: &Path) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|d| tool_in_dir(&d, tool))
+}
+
+/// The bare tool `tool` inside directory `d`, as the full path to it, if it is there. On
+/// Windows the on-disk file carries `EXE_SUFFIX` (`ffmpeg.exe`) even though
+/// `Command::new("ffmpeg")` resolves it without — so the bare `d/ffmpeg` never exists and a
+/// PATH-only ffmpeg would wrongly read as "missing" (gating recording). Also probe
+/// `d/ffmpeg{EXE_SUFFIX}` to match the runtime spawn (DRAGON-229). On Linux/macOS
+/// `EXE_SUFFIX` is empty, so this is byte-identical to the plain `d.join(tool)`.
+fn tool_in_dir(d: &Path, tool: &Path) -> Option<PathBuf> {
+    let plain = d.join(tool);
+    if plain.is_file() {
+        return Some(plain);
     }
     let suffix = std::env::consts::EXE_SUFFIX;
     if !suffix.is_empty() {
         let mut name = tool.as_os_str().to_os_string();
         name.push(suffix);
-        return d.join(name).is_file();
+        let suffixed = d.join(name);
+        if suffixed.is_file() {
+            return Some(suffixed);
+        }
     }
-    false
+    None
+}
+
+/// Where an external tool ACTUALLY resolved, written for a human to read, or `None` when the
+/// tool is not on this machine at all. Takes whatever [`ffmpeg_path`] and friends returned
+/// (an absolute path or a bare name) and reports the file that will really be spawned, with
+/// a path inside an AppImage bundle named relative to the bundle (see [`appimage_label`]).
+pub fn tool_location_label(tool: &Path) -> Option<String> {
+    Some(appimage_label(&tool_location(tool)?, appimage_dir().as_deref()))
+}
+
+/// One external tool and where it resolved: `location` is `None` when it is not installed.
+pub struct ToolLocation {
+    /// The tool as the user knows it, which is also the name of its Health-page row.
+    pub name: &'static str,
+    /// Its [`tool_location_label`], or `None` when nothing on this machine matched.
+    pub location: Option<String>,
+}
+
+/// Every external binary this app can run, with where each one resolved. ONE producer for
+/// both surfaces that report this (the Health page's rows and the debug log's session
+/// header), so the two can never tell a customer different stories.
+///
+/// Resolved once per process and cached: each entry costs a handful of `stat`s and, for a
+/// tool that is not a bundled sidecar, a `PATH` scan, while the Health page re-derives its
+/// rows on every frame that draws the nav health icon. Nothing here can change under a
+/// running process anyway.
+pub fn tool_locations() -> &'static [ToolLocation] {
+    static CACHE: std::sync::OnceLock<Vec<ToolLocation>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        // `mut` only where something is pushed below: pactl is a Linux row, so mac and
+        // Windows build this list once and never add to it.
+        #[cfg_attr(any(target_os = "macos", windows), allow(unused_mut))]
+        let mut tools = vec![
+            ToolLocation { name: "ffmpeg", location: tool_location_label(&ffmpeg_path()) },
+            ToolLocation { name: "ffprobe", location: tool_location_label(&ffprobe_path()) },
+            ToolLocation { name: "tesseract", location: tool_location_label(&tesseract_path()) },
+        ];
+        // Linux only: there is no pactl on macOS or Windows, where audio devices come from
+        // avfoundation / DirectShow through ffmpeg, which is already the first row here.
+        #[cfg(not(any(target_os = "macos", windows)))]
+        tools.push(ToolLocation {
+            name: "pactl",
+            location: crate::audio::devices::pactl_path()
+                .as_deref()
+                .and_then(tool_location_label),
+        });
+        tools
+    })
 }
 
 /// Expand a leading `~/` to the user's home directory; every other path passes through.
@@ -971,22 +1418,45 @@ mod tests {
         );
     }
 
-    /// `dir_has_tool` must find a bare tool name whose on-disk file carries the platform
+    /// `tool_in_dir` must find a bare tool name whose on-disk file carries the platform
     /// `EXE_SUFFIX` — on Windows the file is `ffmpeg.exe` but `Command::new("ffmpeg")`
     /// resolves it without, so a bare-only check wrongly reports it missing and gates
     /// recording (DRAGON-229). On Linux/macOS (empty suffix) this is the plain bare match.
+    /// It also returns the file it matched, which is what the Health page reports.
     #[test]
-    fn dir_has_tool_matches_exe_suffixed_bare_name() {
+    fn tool_in_dir_matches_exe_suffixed_bare_name() {
         let dir = std::env::temp_dir().join(format!("cck-toolcheck-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("mk temp dir");
         // The on-disk file as the OS ships it (bare on unix, `.exe` on windows).
         let disk = dir.join(format!("cck-fake-tool{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&disk, b"x").expect("write fake tool");
-        assert!(
-            dir_has_tool(&dir, Path::new("cck-fake-tool")),
+        assert_eq!(
+            tool_in_dir(&dir, Path::new("cck-fake-tool")),
+            Some(disk.clone()),
             "the bare tool name must resolve to its EXE_SUFFIX file on disk"
         );
-        assert!(!dir_has_tool(&dir, Path::new("cck-absent-tool")), "an absent tool is not found");
+        assert_eq!(
+            tool_in_dir(&dir, Path::new("cck-absent-tool")),
+            None,
+            "an absent tool is not found"
+        );
+        let _ = std::fs::remove_file(&disk);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// An absolute tool path reports itself when the file is there, and nothing when it is
+    /// not: the Health page must never claim a location for a binary that has been removed.
+    #[test]
+    fn tool_location_answers_for_an_absolute_path() {
+        let dir = std::env::temp_dir().join(format!("cck-toolloc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk temp dir");
+        let disk = dir.join("cck-fake-tool");
+        std::fs::write(&disk, b"x").expect("write fake tool");
+        assert_eq!(tool_location(&disk), Some(disk.clone()));
+        assert!(tool_available(&disk));
+        let gone = dir.join("cck-absent-tool");
+        assert_eq!(tool_location(&gone), None);
+        assert!(!tool_available(&gone));
         let _ = std::fs::remove_file(&disk);
         let _ = std::fs::remove_dir(&dir);
     }
@@ -1064,5 +1534,352 @@ mod tests {
         let key = sandbox_key();
         assert!(cfg.to_string_lossy().ends_with(&key), "{cfg:?}");
         assert!(logs.to_string_lossy().ends_with(&key), "{logs:?}");
+    }
+}
+
+/// How a resolved tool path is reported to a human (the Health page's rows, the debug log's
+/// session header). The AppImage arm can only ever run on Linux, but the rule is pure and is
+/// pinned here on every platform, because it is the half that cannot be checked by running
+/// the app on the machine you are developing on.
+#[cfg(test)]
+mod tool_location_label_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    /// Off an AppImage the full path IS the answer, and it is passed through untouched: no
+    /// tilde, no shortening, no canonicalising away the symlink the user's distro installed.
+    #[test]
+    fn a_plain_path_is_shown_as_it_is() {
+        for p in [
+            "/usr/bin/ffmpeg",
+            "/opt/homebrew/bin/tesseract",
+            "/Applications/Cosmic Capture Kit.app/Contents/Resources/ffprobe",
+        ] {
+            assert_eq!(appimage_label(Path::new(p), None), p);
+        }
+    }
+
+    /// A tool INSIDE the running bundle is named relative to the bundle. The mount root is a
+    /// fresh random directory every launch, so the raw path would be different noise each
+    /// time the user opened the page; `usr/bin/ffmpeg` is the durable fact.
+    #[test]
+    fn a_tool_inside_the_bundle_is_named_relative_to_it() {
+        let mount = Path::new("/tmp/.mount_Cosmic7fA2xQ");
+        assert_eq!(
+            appimage_label(Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/ffmpeg"), Some(mount)),
+            "AppImage: usr/bin/ffmpeg"
+        );
+        assert_eq!(
+            appimage_label(Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/tesseract"), Some(mount)),
+            "AppImage: usr/bin/tesseract"
+        );
+    }
+
+    /// A tool OUTSIDE the bundle keeps its real path even while running from an AppImage.
+    /// That is the interesting case: it is how the user sees that the distro's ffmpeg is in
+    /// use rather than the one we shipped.
+    #[test]
+    fn a_system_tool_keeps_its_path_inside_an_appimage() {
+        let mount = Path::new("/tmp/.mount_Cosmic7fA2xQ");
+        assert_eq!(appimage_label(Path::new("/usr/bin/ffmpeg"), Some(mount)), "/usr/bin/ffmpeg");
+        // The mount root itself has no relative part to show, so it stays a path rather than
+        // becoming a bare "AppImage: ".
+        assert_eq!(appimage_label(mount, Some(mount)), "/tmp/.mount_Cosmic7fA2xQ");
+    }
+
+    /// Both runtime variables are required, and empty counts as absent. `$APPDIR` alone is a
+    /// generic enough name that something else could have exported it, and labelling a path
+    /// "AppImage" over it would mislead rather than explain.
+    #[test]
+    fn the_mount_root_needs_both_runtime_variables() {
+        let img = OsStr::new("/home/u/Apps/CosmicCaptureKit.AppImage");
+        let dir = OsStr::new("/tmp/.mount_Cosmic7fA2xQ");
+        assert_eq!(
+            appimage_dir_from(Some(img), Some(dir)),
+            Some(PathBuf::from("/tmp/.mount_Cosmic7fA2xQ"))
+        );
+        assert_eq!(appimage_dir_from(None, Some(dir)), None, "$APPDIR alone proves nothing");
+        assert_eq!(appimage_dir_from(Some(img), None), None, "no mount root to measure against");
+        assert_eq!(appimage_dir_from(Some(OsStr::new("")), Some(dir)), None, "empty is absent");
+        assert_eq!(appimage_dir_from(Some(img), Some(OsStr::new(""))), None, "empty is absent");
+        assert_eq!(appimage_dir_from(None, None), None, "every other kind of launch");
+    }
+
+    /// The end-to-end label for a tool this machine really has. Nothing here can assert a
+    /// specific path (it differs per machine), so it pins the contract: a tool that resolves
+    /// gets a non-empty label, one that does not gets nothing at all.
+    #[test]
+    fn a_missing_tool_has_no_location_at_all() {
+        assert_eq!(tool_location_label(Path::new("cck-tool-that-does-not-exist")), None);
+        assert_eq!(tool_location_label(Path::new("/nonexistent/cck-tool")), None);
+        let me = std::env::current_exe().expect("test exe path");
+        assert_eq!(tool_location_label(&me), Some(me.display().to_string()));
+    }
+
+    /// The list both surfaces read is the same list, and every entry is named after the
+    /// binary it describes (which is what lets the Health page look one up by row name).
+    #[test]
+    fn the_shared_tool_list_names_every_binary_we_report() {
+        let names: Vec<&str> = tool_locations().iter().map(|t| t.name).collect();
+        assert!(names.contains(&"ffmpeg"), "{names:?}");
+        assert!(names.contains(&"ffprobe"), "{names:?}");
+        assert!(names.contains(&"tesseract"), "{names:?}");
+        #[cfg(not(any(target_os = "macos", windows)))]
+        assert!(names.contains(&"pactl"), "{names:?}");
+        // Cached: the same slice comes back, so a per-frame Health page pays once.
+        assert_eq!(tool_locations().as_ptr(), tool_locations().as_ptr());
+    }
+}
+
+/// DRAGON-527: where OCR language data comes from, which depends on WHICH tesseract
+/// we resolved. Getting this backwards is a regression the user experiences as "all my
+/// language packs vanished", so both directions are pinned.
+#[cfg(test)]
+mod tessdata_dir_tests {
+    use super::*;
+
+    /// A bundled tesseract (an absolute path: the mac `Resources/` sidecar, the
+    /// exe-adjacent Windows/AppImage sidecar) ships only `eng` and has no system data to
+    /// fall back on, so it gets our writable directory.
+    #[test]
+    fn a_bundled_tesseract_gets_the_writable_dir() {
+        let writable = PathBuf::from("/home/u/.config/cosmic-capture-kit/tessdata");
+        for bundled in [
+            "/Applications/Cosmic Capture Kit.app/Contents/Resources/tesseract",
+            "/opt/cck/tesseract",
+            "/tmp/.mount_abc/usr/bin/tesseract",
+        ] {
+            assert_eq!(
+                tessdata_dir_for(Path::new(bundled), Some(writable.clone())),
+                Some(writable.clone()),
+                "{bundled} is a sidecar and should use our own language dir"
+            );
+        }
+    }
+
+    /// The bare name is `locate_tool`'s "nothing on disk matched, let the OS resolve it on
+    /// PATH" signal, i.e. the distro's own tesseract. Its packs live in `/usr/share/tessdata`
+    /// and `tesseract-data-deu` put them there, so we must say NOTHING and leave them visible.
+    #[test]
+    fn a_path_tesseract_is_left_alone() {
+        let writable = PathBuf::from("/home/u/.config/cosmic-capture-kit/tessdata");
+        assert_eq!(tessdata_dir_for(Path::new("tesseract"), Some(writable)), None);
+        assert_eq!(tessdata_dir_for(Path::new("tesseract.exe"), None), None);
+    }
+
+    /// No writable location resolved (no home dir) degrades to "say nothing" rather than
+    /// inventing a path. Tesseract's own default is a better answer than a broken flag.
+    #[test]
+    fn no_writable_dir_means_no_flag() {
+        assert_eq!(tessdata_dir_for(Path::new("/opt/cck/tesseract"), None), None);
+    }
+}
+
+/// DRAGON-531: seeding must be able to ship an updated language pack WITHOUT ever
+/// overwriting one the user installed themselves.
+#[cfg(test)]
+mod seed_verdict_tests {
+    use super::{SeedVerdict, seed_verdict};
+
+    /// Nothing on disk yet: the first launch of a packaged build.
+    #[test]
+    fn a_missing_file_is_written() {
+        assert_eq!(seed_verdict(None, 4_000_000, None), SeedVerdict::Write);
+    }
+
+    /// A file we have no record of writing belongs to the user. This is the case that
+    /// protects someone who dropped a pack in before ever running a bundled build.
+    #[test]
+    fn an_unrecorded_file_belongs_to_the_user() {
+        assert_eq!(
+            seed_verdict(Some(15_000_000), 4_000_000, None),
+            SeedVerdict::UserOwned
+        );
+    }
+
+    /// The user swapped our tessdata_fast eng for tessdata_best. On disk no longer
+    /// matches what we recorded writing, so it is theirs now and stays.
+    #[test]
+    fn a_replaced_file_belongs_to_the_user() {
+        assert_eq!(
+            seed_verdict(Some(15_000_000), 4_000_000, Some(4_000_000)),
+            SeedVerdict::UserOwned
+        );
+    }
+
+    /// Ours, and the bundled pack has not changed: the common path, and it must not
+    /// rewrite tens of megabytes on every one-shot launch.
+    #[test]
+    fn our_own_current_file_is_left_alone() {
+        assert_eq!(
+            seed_verdict(Some(4_000_000), 4_000_000, Some(4_000_000)),
+            SeedVerdict::UpToDate
+        );
+    }
+
+    /// THE BUG THIS FIXES: still ours, but the release ships a newer pack. The old rule
+    /// was "never overwrite", so an updated eng.traineddata could never reach anyone who
+    /// had already launched the previous build.
+    #[test]
+    fn our_own_stale_file_is_updated() {
+        assert_eq!(
+            seed_verdict(Some(4_000_000), 4_200_000, Some(4_000_000)),
+            SeedVerdict::Write
+        );
+    }
+}
+
+/// DRAGON-510: which path this process re-executes ITSELF from.
+#[cfg(test)]
+mod re_exec_path_tests {
+    use super::re_exec_path;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    /// The ordinary launch: no AppImage, so the answer is exactly `current_exe()` and
+    /// every existing spawn site behaves as it always has.
+    #[test]
+    fn without_an_appimage_it_is_the_running_binary() {
+        assert_eq!(
+            re_exec_path(None, Path::new("/home/u/repo/target/release/cosmic-capture-kit")),
+            PathBuf::from("/home/u/repo/target/release/cosmic-capture-kit")
+        );
+    }
+
+    /// THE CASE THIS EXISTS FOR: `current_exe()` is a FUSE mount that dies with the
+    /// process holding it, and this app detaches children that outlive their parent. The
+    /// `.AppImage` file is the only path that is still there afterwards.
+    #[test]
+    fn inside_an_appimage_it_is_the_appimage_file() {
+        assert_eq!(
+            re_exec_path(
+                Some(OsStr::new("/home/u/Apps/CosmicCaptureKit-0.28.1-x86_64.AppImage")),
+                Path::new("/tmp/.mount_Cosmic1a2b3c/usr/bin/cosmic-capture-kit"),
+            ),
+            PathBuf::from("/home/u/Apps/CosmicCaptureKit-0.28.1-x86_64.AppImage")
+        );
+    }
+
+    /// An empty value is treated as absent. Spawning `""` would fail with a bare
+    /// "No such file or directory" that names nothing and points nowhere.
+    #[test]
+    fn an_empty_appimage_variable_falls_back() {
+        assert_eq!(
+            re_exec_path(Some(OsStr::new("")), Path::new("/usr/bin/cosmic-capture-kit")),
+            PathBuf::from("/usr/bin/cosmic-capture-kit")
+        );
+    }
+}
+
+/// DRAGON-532: whether this launch has an `.AppImage` file behind it, which is what decides
+/// both the manifest key it reads and whether a one-click update is offered at all.
+#[cfg(test)]
+mod appimage_from_tests {
+    use super::appimage_from;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    /// Every launch that is not an AppImage: a source build, the release binary, the `.app`,
+    /// the MSI install. There is no file we own, so the updater must not offer to swap one.
+    #[test]
+    fn without_the_variable_there_is_no_appimage() {
+        assert_eq!(appimage_from(None), None);
+    }
+
+    #[test]
+    fn with_the_variable_it_is_the_appimage_file() {
+        assert_eq!(
+            appimage_from(Some(OsStr::new(
+                "/home/u/Apps/CosmicCaptureKit-0.28.1-x86_64.AppImage"
+            ))),
+            Some(PathBuf::from(
+                "/home/u/Apps/CosmicCaptureKit-0.28.1-x86_64.AppImage"
+            ))
+        );
+    }
+
+    /// The name is NOT parsed, anywhere. A user who renamed the download still gets updates,
+    /// and the installer writes back to whatever they called it (DRAGON-532: the swap keeps
+    /// the filename so autostart entries and capture shortcuts survive it).
+    #[test]
+    fn a_renamed_appimage_is_still_an_appimage() {
+        assert_eq!(
+            appimage_from(Some(OsStr::new("/home/u/bin/screenshot-tool"))),
+            Some(PathBuf::from("/home/u/bin/screenshot-tool"))
+        );
+    }
+
+    /// Empty means absent, and here that is load-bearing beyond the spawn case: an installer
+    /// that took `""` as its target would swap a file the user never named.
+    #[test]
+    fn an_empty_variable_is_absent() {
+        assert_eq!(appimage_from(Some(OsStr::new(""))), None);
+    }
+}
+
+/// DRAGON-531: which vendor directory each macOS sidecar comes from.
+#[cfg(test)]
+mod vendor_subdir_tests {
+    use super::vendor_subdir;
+
+    /// ffprobe and ffplay ship inside the ffmpeg archive, so they share its directory.
+    /// Giving them their own would send the lookup somewhere nothing is ever vendored.
+    #[test]
+    fn the_ffmpeg_family_shares_one_directory() {
+        assert_eq!(vendor_subdir("ffmpeg"), "ffmpeg");
+        assert_eq!(vendor_subdir("ffprobe"), "ffmpeg");
+        assert_eq!(vendor_subdir("ffplay"), "ffmpeg");
+    }
+
+    /// THE BUG THIS FIXES: the directory was hardcoded to ffmpeg's, so a mac dev build
+    /// looked for `vendor/ffmpeg/macos-arm64/tesseract`, never found it, and silently
+    /// used Homebrew's tesseract while taking ffmpeg from the pinned vendor dir.
+    #[test]
+    fn tesseract_has_its_own_directory() {
+        assert_eq!(vendor_subdir("tesseract"), "tesseract");
+    }
+
+    /// A tool nobody has vendored yet resolves to its own name rather than to ffmpeg's
+    /// directory, so adding one needs no change here.
+    #[test]
+    fn an_unknown_tool_uses_its_own_name() {
+        assert_eq!(vendor_subdir("magick"), "magick");
+    }
+}
+
+/// DRAGON-531: seeding must mirror the WHOLE tessdata tree.
+#[cfg(test)]
+mod collect_files_tests {
+    use super::collect_files;
+
+    /// The case that was broken: `configs/tsv` is a real file tesseract loads, and a
+    /// walk that only saw the top level would miss it, leaving OCR silently empty.
+    #[test]
+    fn it_finds_files_in_subdirectories() {
+        let root = std::env::temp_dir().join(format!("cck-collect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("configs")).expect("mk configs");
+        std::fs::write(root.join("eng.traineddata"), b"lang").expect("write lang");
+        std::fs::write(root.join("configs/tsv"), b"tessedit_create_tsv 1").expect("write cfg");
+
+        let mut got: Vec<String> = collect_files(&root).into_iter().map(|(r, _, _)| r).collect();
+        got.sort();
+        assert_eq!(got, vec!["configs/tsv".to_string(), "eng.traineddata".to_string()]);
+
+        // The length travels with it, since the ownership rule compares on size.
+        let cfg = collect_files(&root)
+            .into_iter()
+            .find(|(r, _, _)| r == "configs/tsv")
+            .expect("configs/tsv present");
+        assert_eq!(cfg.2, 21);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A missing directory is not an error: a dev build pointing at a system tesseract
+    /// has no bundled tessdata at all, and that must not be noisy.
+    #[test]
+    fn a_missing_root_yields_nothing() {
+        assert!(collect_files(std::path::Path::new("/nonexistent-cck-tessdata")).is_empty());
     }
 }

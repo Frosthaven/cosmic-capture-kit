@@ -930,7 +930,80 @@ fn session_header(reason: &str) {
         cfg!(feature = "zero-copy"),
         std::env::consts::ARCH,
     ));
+    // How the program was DELIVERED, which decides where its own files are: an AppImage
+    // self-mounts at a fresh random directory every launch and carries its ffmpeg/tesseract
+    // sidecars inside that bundle, where a distro build, the `.app` and an MSI install do
+    // not. It is the first thing to know when a report says a bundled tool went missing.
+    write_line(&format!(
+        "package: {}",
+        if crate::util::running_from_appimage() { "AppImage" } else { "plain binary" },
+    ));
+    log_tool_locations();
     announce_sandbox();
+}
+
+/// The external binaries this launch would run, and where each one resolved: one line per
+/// tool, `not found` when it is absent. Part of the session header, so it is written once per
+/// process and never repeated.
+///
+/// It answers the question a support thread otherwise spends a day on: WHICH ffmpeg. A
+/// bundled sidecar, the distro's, a `CCK_FFMPEG` override and a stale copy earlier on `PATH`
+/// all report as "ffmpeg is available" while behaving differently, and the same list is what
+/// the Health page shows the user, so the two describe one machine.
+fn log_tool_locations() {
+    if !logs_tool_locations(component()) {
+        return;
+    }
+    for tool in crate::util::tool_locations() {
+        let location = tool
+            .location
+            .as_deref()
+            .map(tool_location_for_log)
+            .unwrap_or_else(|| "not found".to_string());
+        write_line(&format!("tool: {}={}", tool.name, location));
+    }
+}
+
+/// Which processes write the tool block. **Pure**, unit-tested.
+///
+/// Everything except the two that can never run one of these tools: the detached share
+/// helpers (clipboard, notify, reveal, upload) and the tray daemon, which spawns capture
+/// children but encodes nothing itself. They are also the launches that happen most often, so
+/// skipping them keeps a resolution costing several `stat`s and a `PATH` scan off the paths
+/// that gain nothing from it. Everything else, capture children included, can reach for
+/// ffmpeg, ffprobe or tesseract, and those are the sessions worth explaining.
+fn logs_tool_locations(c: Component) -> bool {
+    !matches!(c, Component::Helper | Component::Daemon)
+}
+
+/// A resolved tool location, made safe to write to the log.
+///
+/// The narrow, deliberate exception to "never log a path". The rule exists because a path in
+/// this app is normally the user's: their capture folder, their filename, the thing they
+/// photographed. A tool location is not that. It is a fact about the machine's software, it
+/// is the whole point of the line, and [`path_shape`] would reduce it to `ext=none,
+/// name_len=6`, which answers nothing.
+///
+/// The one part that CAN identify somebody is the home directory (`/home/jane/.local/bin`,
+/// `/Users/jane/…`), so that prefix collapses to `~`. `/usr/bin/ffmpeg`,
+/// `/opt/homebrew/bin/ffmpeg` and an `AppImage: usr/bin/ffmpeg` are untouched, because there
+/// is nothing in them to protect.
+fn tool_location_for_log(label: &str) -> String {
+    home_collapsed(label, dirs::home_dir().as_deref())
+}
+
+/// **Pure**, unit-tested: [`tool_location_for_log`]'s rule with the home directory injected.
+fn home_collapsed(label: &str, home: Option<&Path>) -> String {
+    let Some(home) = home else { return label.to_string() };
+    let home = home.to_string_lossy();
+    let home = home.trim_end_matches(['/', '\\']);
+    if home.is_empty() {
+        return label.to_string();
+    }
+    match label.strip_prefix(home) {
+        Some(rest) => format!("~{rest}"),
+        None => label.to_string(),
+    }
 }
 
 /// Say, once per session and in both places a human might look, that this is NOT a user's log.
@@ -1695,6 +1768,53 @@ mod tests {
         let block = redact_paths("first\n/home/jane/x.mp4: denied\nlast");
         assert_eq!(block.lines().count(), 3);
         assert!(block.starts_with("first\n") && block.ends_with("\nlast"), "{block}");
+    }
+
+    /// The tool block's privacy rule: a system location is written in full (it is the whole
+    /// value of the line), and the one part that could identify a person, their home
+    /// directory, collapses to `~`.
+    #[test]
+    fn a_tool_location_keeps_the_machine_and_drops_the_person() {
+        let home = Path::new("/home/jane");
+        assert_eq!(home_collapsed("/home/jane/.local/bin/ffmpeg", Some(home)), "~/.local/bin/ffmpeg");
+        // A trailing separator on the home dir must not leave a doubled one behind.
+        assert_eq!(
+            home_collapsed("/home/jane/bin/ffmpeg", Some(Path::new("/home/jane/"))),
+            "~/bin/ffmpeg"
+        );
+        for line in ["/usr/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg", "AppImage: usr/bin/ffmpeg"] {
+            assert_eq!(home_collapsed(line, Some(home)), line, "{line} was altered");
+        }
+        // A machine with no home directory resolves nothing away rather than guessing.
+        assert_eq!(home_collapsed("/home/jane/bin/ffmpeg", None), "/home/jane/bin/ffmpeg");
+        assert_eq!(
+            home_collapsed("/home/jane/bin/ffmpeg", Some(Path::new(""))),
+            "/home/jane/bin/ffmpeg"
+        );
+        // Windows shapes, where the same prefix rule applies with the other separator.
+        assert_eq!(
+            home_collapsed("C:\\Users\\jane\\bin\\ffmpeg.exe", Some(Path::new("C:\\Users\\jane"))),
+            "~\\bin\\ffmpeg.exe"
+        );
+    }
+
+    /// Which processes pay for the tool block. The two that can never run one of these tools
+    /// skip it; everything that can, including a one-shot capture child, writes it.
+    #[test]
+    fn only_processes_that_can_run_a_tool_log_where_it_is() {
+        for c in [Component::Helper, Component::Daemon] {
+            assert!(!logs_tool_locations(c), "{} should skip the tool block", c.tag());
+        }
+        for c in [
+            Component::App,
+            Component::Capture,
+            Component::Settings,
+            Component::Preview,
+            Component::Permissions,
+            Component::Cli,
+        ] {
+            assert!(logs_tool_locations(c), "{} should write the tool block", c.tag());
+        }
     }
 
     #[test]

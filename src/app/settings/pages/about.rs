@@ -164,43 +164,41 @@ impl crate::app::App {
 }
 
 /// The Version row's action button for an available update. Its label carries the NEW
-/// version ("Get <version>"): macOS/Windows one-click install it (swapping to
-/// "Installing..." mid-install, or a plain disabled "Update Available" if no artifact is
-/// attached yet); Linux opens the releases page to download it (no one-click there yet).
-/// The label is centered within the fixed action width on every platform.
-// `installing` is only consumed on the one-click platforms; Linux opens the releases page.
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(unused_variables))]
+/// version ("Get <version>"). A build that can install itself does so in one click (swapping
+/// to "Installing..." mid-install, or a plain disabled "Update Available" if no artifact is
+/// attached to the release yet); one that cannot opens the releases page instead. The label
+/// is centered within the fixed action width in every state.
+///
+/// The split is [`crate::update::one_click_install_available`], and since DRAGON-532 it is a
+/// RUNTIME question rather than a `cfg`: on Linux the AppImage can replace itself and the
+/// ZIP (BIN) build cannot, yet both are the same compiled binary.
 fn update_action_button<'a>(
     info: &crate::update::UpdateInfo,
     installing: bool,
     width: f32,
 ) -> Element<'a, Msg> {
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    {
-        if info.artifact.is_some() {
-            install_button(&info.version, installing, width)
-        } else {
-            // No platform artifact attached to this release yet: an honest disabled label,
-            // centered in the shared action width like the other states.
-            crate::app::settings::row::centered_button(
-                None,
-                UPDATE_AVAILABLE_LABEL,
-                Length::Fixed(width),
-                cosmic::theme::Button::Suggested,
-                None,
-            )
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        // Linux: no one-click install yet, so open the releases page to fetch it. The
-        // version rides in the label; centered in the shared action width.
-        crate::app::settings::row::centered_button(
+    if !crate::update::one_click_install_available() {
+        // No install location we own, so the honest offer is the download page. The version
+        // rides in the label; centered in the shared action width.
+        return crate::app::settings::row::centered_button(
             None,
             format!("Get {}", info.version),
             Length::Fixed(width),
             cosmic::theme::Button::Suggested,
             Some(Msg::WindowChrome(WindowChromeMsg::OpenUrl(GITHUB_RELEASES_URL))),
+        );
+    }
+    if info.artifact.is_some() {
+        install_button(&info.version, installing, width)
+    } else {
+        // No platform artifact attached to this release yet: an honest disabled label,
+        // centered in the shared action width like the other states.
+        crate::app::settings::row::centered_button(
+            None,
+            UPDATE_AVAILABLE_LABEL,
+            Length::Fixed(width),
+            cosmic::theme::Button::Suggested,
+            None,
         )
     }
 }
@@ -231,9 +229,9 @@ fn notes_markdown_settings() -> widget::markdown::Settings {
 // version rather than from a static constant.
 const CHECK_LABEL: &str = "Check for updates";
 const CHECKING_LABEL: &str = "Checking...";
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+// Ungated since DRAGON-532: whether these states can appear is a RUNTIME question, so the
+// labels are compiled everywhere and `one_click_install_available` decides at draw time.
 const INSTALLING_LABEL: &str = "Installing...";
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 const UPDATE_AVAILABLE_LABEL: &str = "Update Available";
 const DONATE_LABEL: &str = "Donate";
 
@@ -251,8 +249,13 @@ fn shared_button_width(version: Option<&str>) -> f32 {
     match &get {
         Some(get) => {
             labels.push(get.as_str());
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            labels.extend([INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);
+            // Only the one-click states can appear, so only they can widen the slot. Matches
+            // `update_action_button`'s own branch, which since DRAGON-532 is a runtime
+            // question on Linux: an AppImage swaps its label to "Installing...", the
+            // ZIP (BIN) build never does and keeps the width it always had.
+            if crate::update::one_click_install_available() {
+                labels.extend([INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);
+            }
         }
         None => labels.extend([CHECK_LABEL, CHECKING_LABEL]),
     }
@@ -291,11 +294,10 @@ fn check_button<'a>(checking: bool, width: f32) -> Element<'a, Msg> {
     )
 }
 
-/// The one-click install button (macOS + Windows) for an available update: reads
-/// "Get <version>" (the NEW version), disabled and reading "Installing..." while an
-/// install is running. Centred within the shared action width so the label swap never
-/// reflows it.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// The one-click install button for an available update on a build that can install itself
+/// (macOS, Windows, and since DRAGON-532 a Linux AppImage): reads "Get <version>" (the NEW
+/// version), disabled and reading "Installing..." while an install is running. Centred
+/// within the shared action width so the label swap never reflows it.
 fn install_button<'a>(version: &str, installing: bool, width: f32) -> Element<'a, Msg> {
     // Centred within the fixed action width (DRAGON-268 follow-up), matching the
     // Check button; the fixed width still prevents any reflow as the label swaps.
@@ -467,21 +469,18 @@ mod tests {
     #[test]
     fn available_width_covers_donate_and_get_and_swap_labels() {
         // The available-update button bakes the new version into a "Get <version>" label;
-        // the shared width must cover that label, Donate, and (macOS/Windows) the
-        // "Installing..." / "Update Available" states it swaps through.
+        // the shared width must cover that label, Donate, and, on a build that installs
+        // itself, the "Installing..." / "Update Available" states it swaps through.
         let version = "0.27.0";
         let width = shared_button_width(Some(version));
         let get = format!("Get {version}");
-        // The `mut` is used by the `extend` just below, which only exists on the two platforms
-        // that have the swap states. On Linux nothing extends it, so the binding is honestly
-        // immutable there and the attribute says exactly that rather than blanketing the file.
-        #[cfg_attr(
-            not(any(target_os = "macos", target_os = "windows")),
-            allow(unused_mut)
-        )]
         let mut candidates = vec![DONATE_LABEL, get.as_str()];
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
-        candidates.extend([INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);
+        // The SAME runtime condition `shared_button_width` uses, not a `cfg`: since
+        // DRAGON-532 a Linux AppImage has the swap states and the ZIP (BIN) build does not,
+        // and asking the question the same way is what keeps the two from drifting.
+        if crate::update::one_click_install_available() {
+            candidates.extend([INSTALLING_LABEL, UPDATE_AVAILABLE_LABEL]);
+        }
         for label in candidates {
             assert!(width >= fixed_button_width(&[label]), "shared width must cover {label:?}");
         }

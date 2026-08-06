@@ -30,7 +30,8 @@ fn portal_open_uri(uri: &str) -> bool {
 /// Open a URI (a URL decoded from a QR code, or a `file://` folder) with the
 /// desktop's default handler, detached, so the overlay can exit immediately.
 pub fn open_uri(uri: &str) {
-    if let Ok(exe) = std::env::current_exe() {
+    // Detached and outliving us, so `self_exe` rather than `current_exe` (DRAGON-510).
+    if let Ok(exe) = crate::util::self_exe() {
         let _ = Command::new(exe).arg(OPEN_URI).arg(uri).spawn();
     }
 }

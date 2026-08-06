@@ -70,8 +70,13 @@ pub(crate) const REVEAL_URI_PREFIX: &str = "cosmic-capture-kit:reveal?path=";
 /// `pub(crate)` rather than `pub(super)` since DRAGON-482: `cloud::upload::spawn_upload_child`
 /// is the one caller outside `share`, and it spawns through THIS function on purpose, so the
 /// upload child is launched exactly the way every other detached helper is.
+///
+/// Spawns [`crate::util::self_exe`] rather than `current_exe()` (DRAGON-510). These children
+/// are the exact case that distinction exists for: they are detached on purpose and outlive
+/// the process that started them, so under an AppImage a `current_exe()` mount path can be
+/// gone before the worker has finished with it.
 pub(crate) fn spawn_self(flag: &str, path: &Path, extra: &[&str]) -> bool {
-    match std::env::current_exe() {
+    match crate::util::self_exe() {
         Ok(exe) => match Command::new(exe).arg(flag).arg(path).args(extra).spawn() {
             Ok(_) => true,
             Err(e) => {
@@ -80,7 +85,7 @@ pub(crate) fn spawn_self(flag: &str, path: &Path, extra: &[&str]) -> bool {
             }
         },
         Err(e) => {
-            log::warn!("spawn_self: current_exe failed, cannot launch the {flag} worker: {e}");
+            log::warn!("spawn_self: self_exe failed, cannot launch the {flag} worker: {e}");
             false
         }
     }

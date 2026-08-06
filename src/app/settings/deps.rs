@@ -17,7 +17,7 @@
 //! Required-but-missing is red, optional-but-missing is amber, present is green.
 
 use super::*;
-use super::row::{action_button, severity_caption, status_icon, Item, Severity};
+use super::row::{action_button, severity_caption, status_icon, subtle_caption_text, Item, Severity};
 #[cfg(target_os = "macos")]
 use crate::platform::mac::tcc::TccStatus;
 use std::borrow::Cow;
@@ -77,6 +77,15 @@ pub(in crate::app::settings) struct Dep {
     /// "Request". `(label, message)`. `None` (the norm, and always on Linux) keeps
     /// the historical status-icon control.
     action: Option<(&'static str, Msg)>,
+    /// For a requirement that IS an external binary, where that binary actually resolved
+    /// (see [`tool_location`]). `None` for every requirement with no file behind it (a TCC
+    /// grant, a capability, language data) and for one that is missing, since there is no
+    /// location to name. Shown on the Health row only.
+    location: Option<String>,
+    /// Whether this row's location was JUST copied, so its copy button shows the "Copied!"
+    /// tick. Read from `SettingsState::health_copied` when the `Dep` is built, because a
+    /// `Dep` is rebuilt from scratch on every render and can hold no state of its own.
+    location_copied: bool,
 }
 
 impl Dep {
@@ -128,14 +137,90 @@ impl Dep {
     /// Health-page row: the name as the title, the message as the helper line, and —
     /// on the right — a remediation action button when the row carries one (a missing
     /// TCC grant), otherwise the severity status icon.
+    ///
+    /// A row that IS an external binary gets a SECOND helper line naming where that binary
+    /// was found, led by a copy button. "ffmpeg is available" is a claim the user cannot
+    /// check; the path is the evidence, and it is the difference between the ffmpeg they
+    /// installed, the one we bundled, and one an override points at. It sits under the status
+    /// line in the subtle tone (secondary but still readable) rather than inside the status
+    /// sentence, so the functional answer stays one short line and the path never has to be
+    /// hunted for.
+    ///
+    /// The copy control is the app's shared `widgets::copy_button`, in its subtle tint so it
+    /// belongs to the line of text it leads rather than competing with it, and it copies the
+    /// location EXACTLY as shown. For a real path that is what a terminal wants. Inside an
+    /// AppImage the shown form ("AppImage: usr/bin/ffmpeg") is the better thing to paste
+    /// anyway: the mount root it stands in for is a different random directory on every
+    /// launch, so it tells a support thread nothing it can use.
+    ///
+    /// **The button LEADS the line and the path FILLS the rest** (DRAGON-540, owner's call
+    /// after seeing it). Both halves of that are load-bearing, and the first shipped
+    /// arrangement had them the other way round with the icon clipped off the pane's edge for
+    /// it. A row lays its fixed-size children out first, handing each the space still
+    /// unclaimed, and only then divides what is left among the `Fill` ones. A long path at its
+    /// natural width is a fixed-size child that claims the WHOLE row, so anything after it
+    /// starts past the visible edge. Leading with the button (fixed, tiny) and giving the text
+    /// `Length::Fill` inverts that: the text is measured against the space that survives the
+    /// button, which is also the boundary it wraps at, so a path too long for one line becomes
+    /// two lines inside the pane instead of one line outside it. `Alignment::Start` then keeps
+    /// the button level with the FIRST line rather than floating in the middle of a wrapped
+    /// block.
     pub(in crate::app::settings) fn row<'a>(&self) -> Item<'a> {
         let sev = self.severity();
         let control = match &self.action {
             Some((label, msg)) => action_button(label, msg.clone()),
             None => status_icon(sev),
         };
-        Item::new(self.name, self.message(), control).status(sev)
+        let item = Item::new(self.name, self.message(), control).status(sev);
+        match &self.location {
+            Some(loc) => {
+                let copy = crate::widgets::copy_button::subtle_copy_button(
+                    self.location_copied,
+                    2,
+                    widget::tooltip::Position::Top,
+                    "Copy path",
+                    Msg::Settings(SettingsMsg::CopyHealthLocation(loc.clone())),
+                );
+                let line = widget::row(vec![
+                    copy,
+                    subtle_caption_text(loc.clone()).width(Length::Fill).into(),
+                ])
+                .spacing(4.0)
+                .width(Length::Fill)
+                .align_y(Alignment::Start);
+                item.desc_el(
+                    widget::column(vec![severity_caption(sev, self.message()), line.into()])
+                        .spacing(2.0)
+                        .width(Length::Fill),
+                )
+            }
+            None => item,
+        }
     }
+}
+
+/// Where the binary behind a requirement actually resolved, for the four requirements that
+/// ARE a binary. `None` for everything else: a TCC grant, a capability satisfied by a capture
+/// backend, and OCR language data have no single file to point at, so there is nothing
+/// honest to show.
+///
+/// The lookup goes through [`crate::util::tool_locations`], the same cached list the debug
+/// log's session header prints, so a customer's Health page and their log can never name
+/// different binaries. macOS and Windows have no pactl (their audio-device row is about
+/// ffmpeg, whose own row already names it), so that entry is Linux-only on both sides.
+fn tool_location(id: DepId) -> Option<String> {
+    let name = match id {
+        DepId::Ffmpeg => "ffmpeg",
+        DepId::Ffprobe => "ffprobe",
+        DepId::Tesseract => "tesseract",
+        #[cfg(not(any(target_os = "macos", windows)))]
+        DepId::Pactl => "pactl",
+        _ => return None,
+    };
+    crate::util::tool_locations()
+        .iter()
+        .find(|t| t.name == name)
+        .and_then(|t| t.location.clone())
 }
 
 impl crate::app::App {
@@ -387,7 +472,19 @@ impl crate::app::App {
         let action = self.tcc_row_action(id, present);
         #[cfg(not(target_os = "macos"))]
         let action: Option<(&'static str, Msg)> = None;
-        Dep { name, present, requirement, ok, missing, action }
+        // Where this row's binary is, for the rows that have one. Only while it is present:
+        // a missing tool has no location, and a row forced missing by a CCK_HEALTH_FORCE_*
+        // review flag must read exactly like the real thing.
+        let location = present.then(|| tool_location(id)).flatten();
+        // Whether THIS row's copy button is inside its flash window. Keyed by the copied text,
+        // which is what the press carried; two rows can never name the same binary.
+        let location_copied = match (&location, &self.settings.health_copied) {
+            (Some(loc), Some((copied, at))) => {
+                loc == copied && crate::widgets::copy_button::copied_recently(Some(*at))
+            }
+            _ => false,
+        };
+        Dep { name, present, requirement, ok, missing, action, location, location_copied }
     }
 
     /// The remediation action for a macOS TCC health row, given its resolved presence.

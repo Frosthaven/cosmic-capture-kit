@@ -38,6 +38,17 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            DetectMsg::SetOcrLanguage(idx) => {
+                // Every row is a real installed language now, so the index maps straight
+                // across. An out-of-range index (a stale view against a refreshed list)
+                // clears to empty, which is the pass-no-`-l` default.
+                self.ocr_language = self.ocr_langs.get(idx).cloned().unwrap_or_default();
+                // Re-OCR the current region so the new language takes effect immediately,
+                // exactly as the confidence slider does.
+                self.last_ocr_region = None;
+                self.save_state();
+                Task::none()
+            }
             DetectMsg::MarksPoll => {
                 use std::sync::atomic::Ordering::Relaxed;
                 let mut changed = false;

@@ -364,6 +364,11 @@ impl App {
             }
             WindowChromeMsg::ConfigWindowOpened(id) => {
                 self.refresh_audio_devices();
+                // DRAGON-527: the OCR language list, probed HERE and not at launch, for the
+                // same reason the audio devices are: it spawns tesseract, which a capture
+                // launch has no reason to pay for, and a user who just dropped a new
+                // `.traineddata` into the folder expects reopening this window to show it.
+                self.refresh_ocr_langs();
                 self.sync_mic_input(); // live sensitivity bar if opened to the Audio page (manual)
                 if std::env::var_os("CCK_MIC_TEST").is_some() {
                     self.mic_test_modal_open = true;

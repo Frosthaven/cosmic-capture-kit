@@ -444,6 +444,15 @@ pub struct Persisted {
     /// to ~0.4× this. Default 20.
     #[serde(default = "default_text_confidence")]
     pub text_confidence: f32,
+    /// Which tesseract language pack OCR runs with, as its short code (`eng`, `deu`, …),
+    /// or several joined by `+` (`eng+deu`), which is tesseract's own `-l` syntax.
+    ///
+    /// **Empty means "don't pass `-l` at all"**, leaving tesseract on its built-in `eng`
+    /// default. That is deliberately the default here: every build before DRAGON-527 passed
+    /// no language, so an existing config that has never seen this field behaves exactly as
+    /// it always did rather than silently changing what OCR recognises.
+    #[serde(default)]
+    pub ocr_language: String,
     /// Directory recordings are saved to (`~` is expanded). Default
     /// `~/Capture`.
     #[serde(default = "default_record_dir")]

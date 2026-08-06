@@ -174,6 +174,93 @@ pub fn pipe_name() -> &'static str {
     r"\\.\pipe\cosmic-capture-kit-recording"
 }
 
+/// Accumulate raw pipe bytes into complete newline-terminated lines. Pure; unit-tested
+/// (DRAGON-538).
+///
+/// Both Windows ends of the recording pipe used `BufReader::lines()`, whose blocking read
+/// PARKS in `ReadFile`, and a synchronous pipe serializes its I/O on the FILE OBJECT: a
+/// parked read holds the object, and every later `WriteFile` on the same connection queues
+/// behind it forever. That is how a stop's final `state 0 ...` line never left the child
+/// (the tray stayed on the recording state), and how a daemon menu command could wedge the
+/// daemon's own main thread. Both ends now PEEK for available bytes and only then read,
+/// so no read ever parks; this buffer is the line assembly those bounded reads need,
+/// portable and pure so the rule is tested on every host.
+///
+/// Bounded: a stream that never sends a newline cannot grow this without limit. Past
+/// [`Self::MAX_PENDING`] the pending fragment is discarded (the wire only ever carries our
+/// own short lines, so an overlong fragment is garbage, and dropping it mirrors how
+/// `RecordingState::parse` ignores a malformed line rather than misapplying it).
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Default)]
+pub struct LineBuf {
+    pending: Vec<u8>,
+}
+
+// The struct-level `allow(dead_code)` above doesn't reach these: rustc checks an inherent
+// impl's associated items independently of the type they're on, so the same gate has to be
+// repeated here or `MAX_PENDING`/`push` warn on their own on non-Windows builds.
+#[cfg_attr(not(windows), allow(dead_code))]
+impl LineBuf {
+    /// The most of an unterminated fragment worth keeping. A real wire line is under 32
+    /// bytes; this is generous headroom, not a protocol limit.
+    pub const MAX_PENDING: usize = 4096;
+
+    /// Feed freshly-read bytes; get back every line they complete, oldest first, with the
+    /// terminator (and a `\r`, should one ever appear) stripped.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<String> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=pos).collect();
+            out.push(String::from_utf8_lossy(&line[..pos]).trim_end_matches('\r').to_string());
+        }
+        if self.pending.len() > Self::MAX_PENDING {
+            self.pending.clear();
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod line_buf_tests {
+    use super::*;
+
+    /// The shapes a pipe read actually delivers: whole lines, several at once, and split
+    /// fragments. Every complete line comes out exactly once, oldest first, terminator
+    /// stripped.
+    #[test]
+    fn fragments_reassemble_and_batches_split() {
+        let mut b = LineBuf::default();
+        assert_eq!(b.push(b"state 1 0 1 1\n"), vec!["state 1 0 1 1"]);
+        assert_eq!(b.push(b"state 0"), Vec::<String>::new());
+        assert_eq!(b.push(b" 0 1 1\n"), vec!["state 0 0 1 1"]);
+        assert_eq!(b.push(b"pause\nstop\n"), vec!["pause", "stop"]);
+        // A trailing fragment waits for its terminator without disturbing later lines.
+        assert_eq!(b.push(b"can"), Vec::<String>::new());
+        assert_eq!(b.push(b"cel\nmic"), vec!["cancel"]);
+        assert_eq!(b.push(b"\n"), vec!["mic"]);
+    }
+
+    /// A `\r` is stripped like the `\n`, so a future writer that emits CRLF cannot make
+    /// `Command::parse` miss.
+    #[test]
+    fn a_carriage_return_does_not_reach_the_parser() {
+        let mut b = LineBuf::default();
+        assert_eq!(b.push(b"stop\r\n"), vec!["stop"]);
+    }
+
+    /// The bound: an unterminated stream is discarded past MAX_PENDING rather than growing
+    /// forever, and the buffer keeps working afterwards.
+    #[test]
+    fn garbage_without_a_newline_is_bounded() {
+        let mut b = LineBuf::default();
+        let junk = vec![b'x'; LineBuf::MAX_PENDING + 1];
+        assert_eq!(b.push(&junk), Vec::<String>::new());
+        // The over-limit fragment was dropped; a fresh real line still comes through.
+        assert_eq!(b.push(b"stop\n"), vec!["stop"]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

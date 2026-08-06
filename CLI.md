@@ -9,6 +9,12 @@ into a specific capture flow instead of the default region screenshot. Run
 cosmic-capture-kit [FLAGS]
 ```
 
+`cosmic-capture-kit` here means whichever file you installed. The Linux AppImage
+takes exactly the same flags, so substitute its filename
+(`CosmicCaptureKit-x86_64.AppImage --region`) and everything below applies
+unchanged. The AppImage runtime reserves its own `--appimage-*` flags, which
+collide with none of ours.
+
 ## Launch flags
 
 These open the capture overlay. With no flags it opens in region-select mode for a

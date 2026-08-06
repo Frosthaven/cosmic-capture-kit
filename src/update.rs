@@ -1,12 +1,23 @@
 //! In-app update channel (DRAGON-175; channel consolidated in DRAGON-226).
 //!
-//! The channel is the PUBLIC repo's GitHub Releases: `scripts/mirror-release.sh`
-//! attaches a manifest (`update.json`) next to the macOS `.dmg` on each public
-//! release, and the app polls the stable `releases/latest/download/update.json`
-//! URL, compares its `version` against `CARGO_PKG_VERSION`, and can install in one
-//! click: macOS downloads/verifies/swaps the `.app`; Windows downloads/verifies then
-//! runs a silent per-user `.msi` install (DRAGON-287; the Windows body lives in
-//! `crate::platform::windows::update_install`).
+//! The channel is the PUBLIC repo's GitHub Releases: `publish-release.yml` (or
+//! `scripts/mirror-release.sh`, its manual fallback) attaches a manifest
+//! (`update.json`) next to the release's artifacts, and the app polls the stable
+//! `releases/latest/download/update.json` URL, compares its `version` against
+//! `CARGO_PKG_VERSION`, and where it can, installs in one click: macOS
+//! downloads/verifies/swaps the `.app`; Windows downloads/verifies then runs a silent
+//! per-user `.msi` install (DRAGON-287; the Windows body lives in
+//! `crate::platform::windows::update_install`); a Linux AppImage downloads/verifies
+//! then renames the new file over `$APPIMAGE` (DRAGON-532).
+//!
+//! **[`platform_key`] is a function, not a constant, and that is the load-bearing
+//! detail.** Linux ships TWO artifacts from ONE compiled binary, the AppImage and the
+//! ZIP (BIN) build, so no `cfg` can tell them apart; only the running process knows,
+//! from `$APPIMAGE`. They read SEPARATE manifest entries (`appimage` vs `linux`)
+//! because the entry carries the download URL, and a shared key would hand one
+//! artifact the other's download. Only the AppImage can install itself
+//! ([`one_click_install_available`]); the zip was unpacked wherever the user chose, so
+//! there is no location we own to replace and it stays a link to the releases page.
 //!
 //! HISTORY: while the source repo was fully private the channel was a separate
 //! Pages repo (`cosmic-capture-kit-updates`), and `publish-release.yml` shipped to
@@ -21,7 +32,8 @@
 //!   * fetch is a `curl` shell-out (present on macOS and virtually every Linux),
 //!   * the manifest is parsed by a tiny hand parser for its FIXED shape (no
 //!     `serde_json` in the tree — see CLAUDE.md's "don't add deps lightly"),
-//!   * sha256 is `shasum -a 256` (no hashing crate in the tree).
+//!   * sha256 is the platform's own tool, `shasum -a 256` / `sha256sum` (no hashing
+//!     crate in the tree).
 //!
 //! The pure islands — [`compare_versions`], [`Manifest::parse`],
 //! [`UpdateStatus::from_manifest`], [`artifact_name`] — are unit-tested at the
@@ -38,10 +50,10 @@ pub const DEFAULT_MANIFEST_URL: &str =
 /// Environment override for the manifest URL (dev/testing).
 pub const MANIFEST_URL_ENV: &str = "CCK_UPDATE_URL";
 
-/// The project page the "Update Now" launch dialog opens on Linux (no one-click
-/// install there yet), matching the About page's "Open releases" link destination.
-/// Only the Linux launch-dialog path consumes it; macOS/Windows use the one-click
-/// flow instead, so it's dead there (compiled everywhere so the plumbing can't drift).
+/// The project page the "Update Now" launch dialog opens on a build with no one-click
+/// install, matching the About page's "Open releases" link destination. Since DRAGON-532
+/// that is the Linux ZIP (BIN) build specifically, not all of Linux: an AppImage takes the
+/// one-click path like macOS and Windows. Compiled everywhere so the plumbing can't drift.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const RELEASES_URL: &str = "https://github.com/Frosthaven/cosmic-capture-kit";
 
@@ -126,7 +138,10 @@ pub enum PostUpdateMarker {
 /// for that invariant.
 ///
 /// Compiled (and type-checked) everywhere on purpose.
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), expect(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    expect(dead_code)
+)]
 pub(crate) fn write_post_update_marker() {
     if let Some(path) = state_file("post-update") {
         if let Some(dir) = path.parent() {
@@ -208,15 +223,56 @@ pub fn take_post_update_marker() -> bool {
 /// anyway because the rule belongs to the update channel, not to one platform's installer,
 /// and because Linux would inherit the exact Windows defect the day it gains an in-app
 /// install flow.
-// Consumed by the Windows swap helper (`platform::windows::update_install::run_swap`) and by
-// the tests below; honestly dead on the platforms whose installers do not (yet) call it.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+///
+/// **That day arrived** (DRAGON-532): Linux now has one, and it relaunches through here.
+// Consumed by the Windows swap helper (`platform::windows::update_install::run_swap`), the
+// Linux AppImage installer's relaunch helper, and the tests below.
+#[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
 pub fn post_update_relaunch_args(resident: bool) -> &'static [&'static str] {
     if resident {
         &[crate::instance::RESIDENT_ARG]
     } else {
         &[]
     }
+}
+
+/// Is a post-update marker waiting, WITHOUT consuming it?
+///
+/// A PEEK, deliberately, and the distinction matters. [`take_post_update_marker`] is
+/// single-shot precisely so two launches cannot both act on one update, so a caller that
+/// only needs to know "did an update just happen" must not take it: the launch that goes on
+/// to become the resident is the one that has to consume it and open About.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn post_update_marker_pending() -> bool {
+    state_file("post-update").is_some_and(|p| p.exists())
+}
+
+/// **Pure**, unit-tested: should a launch that could NOT take the daemon lock ask the
+/// running daemon to capture?
+///
+/// Losing that lock means a resident is already up, and normally the right reading is
+/// "capture NOW": the user launched this binary a second time, and a second launch is how
+/// both the global hotkey and a manual re-run ask for an overlay.
+///
+/// A post-update RELAUNCH is the exception, because no user asked for anything. The
+/// installer started it, to restore the shape the app was in before the update. If it loses
+/// the lock it has simply been beaten to the job, and the correct move is to exit quietly
+/// and let the winner consume the marker and show About. Signalling a capture there puts an
+/// overlay on screen that nobody requested, seconds after an update.
+///
+/// This is the same defect DRAGON-465 fixed on Windows, reached by a different route.
+/// There it was the relaunch's ARGV being read as capture intent, fixed by
+/// [`post_update_relaunch_args`]. Here the argv is already right and the launch still ends
+/// up asking for a capture, because losing the lock is itself read as intent. Observed for
+/// real on 2026-08-05, in a local test of the AppImage self-update.
+///
+/// Only `daemon_intent` launches are spared. A BARE launch is the capture hotkey, and the
+/// user pressing it during the seconds after an update still deserves their overlay.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn signal_capture_after_lost_lock(daemon_intent: bool, post_update_pending: bool) -> bool {
+    !(daemon_intent && post_update_pending)
 }
 
 /// What a launch that has just become the resident must do, given the post-update marker it
@@ -345,15 +401,127 @@ pub fn check_floor_remainder(
 /// the JSON object key under `"platforms"` (see [`platform_object`]): the Windows
 /// `.msi` artifact lands at `platforms.windows.{url,sha256,size}` (DRAGON-287),
 /// exactly the shape [`Manifest::parse_platform`] slices for `macos`/`linux`.
-pub const PLATFORM_KEY: &str = if cfg!(target_os = "macos") {
-    "macos"
-} else if cfg!(target_os = "linux") {
-    "linux"
-} else if cfg!(target_os = "windows") {
-    "windows"
-} else {
-    "unknown"
-};
+///
+/// A FUNCTION, not a constant, because Linux ships TWO artifacts from one binary
+/// (DRAGON-532). The AppImage and the plain ZIP (BIN) build are the same compiled code, so
+/// no `cfg` can tell them apart; only the running process knows, from `$APPIMAGE`. They
+/// must not share a key: the entry carries the download URL, and handing an AppImage the
+/// zip's URL (or the reverse) would install the wrong artifact the moment either side gains
+/// a one-click install.
+pub fn platform_key() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macos"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "windows"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Two axes, deliberately read differently: the artifact KIND is a runtime fact (both
+        // kinds are this same binary), the ARCH is a compile-time one.
+        linux_platform_key(
+            crate::util::appimage_path().is_some(),
+            cfg!(target_arch = "aarch64"),
+        )
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        "unknown"
+    }
+}
+
+/// Whether THIS build can install an update itself, or can only point the user at the
+/// releases page to download one by hand.
+///
+/// macOS and Windows always can: both install into a layout their packaging defined, so
+/// there is a known thing to replace. Linux depends on WHICH artifact is running, which is
+/// not a `cfg` (both are the same compiled binary). An AppImage is one file we can rename
+/// over. The ZIP (BIN) build was unpacked wherever the user chose, possibly onto a read-only
+/// mount, possibly renamed, with its own sidecars beside it; there is no install location we
+/// own, so there is nothing safe to swap and the honest answer is a download link.
+pub fn one_click_install_available() -> bool {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        true
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Expressed through `platform_key` on purpose: "can install itself" and "reads an
+        // appimage manifest entry" are the same fact, and deriving one from the other means
+        // the button and the download URL can never disagree about which artifact this is.
+        // Any architecture's AppImage qualifies, which is what `is_appimage_key` centralises.
+        is_appimage_key(platform_key())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// The four Linux manifest keys, one per (artifact kind x architecture) pair. Named rather
+/// than spelled inline so the reader here and the publisher's writer cannot drift apart on a
+/// typo, which would silently look like "no update available" rather than like an error.
+///
+/// **The unsuffixed pair means x86_64, and must stay that way.** They were the only Linux
+/// keys when they shipped (`linux` in DRAGON-521, `appimage` in DRAGON-532), so every
+/// installed build already looks for exactly those strings. A published manifest is read by
+/// versions we can no longer change; renaming a live key to `linux-x86_64` would stop
+/// updates dead for everyone already on it, while adding a suffixed sibling cannot.
+///
+/// All four are Linux-only, and honestly dead elsewhere: no macOS or Windows build ever
+/// looks at them. `test` is in each gate so the tests that pin the strings still run on
+/// every host, which is where a typo would otherwise reach a release unnoticed.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const APPIMAGE_PLATFORM_KEY: &str = "appimage";
+/// The aarch64 AppImage (DRAGON-529). See [`APPIMAGE_PLATFORM_KEY`] for why this one carries
+/// the suffix and the x86_64 one does not.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const APPIMAGE_AARCH64_PLATFORM_KEY: &str = "appimage-aarch64";
+/// The x86_64 ZIP (BIN) build (DRAGON-521).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_PLATFORM_KEY: &str = "linux";
+/// The aarch64 ZIP (BIN) build (DRAGON-529).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_AARCH64_PLATFORM_KEY: &str = "linux-aarch64";
+
+/// **Pure**, unit-tested: [`platform_key`]'s Linux decision, with both inputs injected.
+///
+/// The two axes are genuinely different in kind, which is why they are separate parameters
+/// rather than one. `is_appimage` is a RUNTIME fact, read from `$APPIMAGE` at the edge by
+/// [`crate::util::appimage_path`], because the AppImage and the zip are the same compiled
+/// binary. `is_aarch64` is a COMPILE-TIME fact, a `cfg!(target_arch)`, because an x86_64
+/// build simply cannot run on aarch64. Both must reach the key: getting the arch wrong is
+/// worse than getting the kind wrong, since the download would not even execute.
+///
+/// Kept OUT of any platform module so it is compiled and tested on every host, per the
+/// repo's decision-in-the-shared-tree rule.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_platform_key(is_appimage: bool, is_aarch64: bool) -> &'static str {
+    match (is_appimage, is_aarch64) {
+        (true, false) => APPIMAGE_PLATFORM_KEY,
+        (true, true) => APPIMAGE_AARCH64_PLATFORM_KEY,
+        (false, false) => LINUX_PLATFORM_KEY,
+        (false, true) => LINUX_AARCH64_PLATFORM_KEY,
+    }
+}
+
+/// **Pure**, unit-tested: whether `key` names an AppImage, for ANY architecture.
+///
+/// ONE place knows the answer. The install button and the manifest reader must agree about
+/// what this build is, and a second architecture is exactly the kind of addition that
+/// otherwise updates one of them and forgets the other.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_appimage_key(key: &str) -> bool {
+    key == APPIMAGE_PLATFORM_KEY || key == APPIMAGE_AARCH64_PLATFORM_KEY
+}
 
 /// Resolve the manifest URL: the `CCK_UPDATE_URL` override if set, else the
 /// baked-in default.
@@ -399,7 +567,7 @@ impl Manifest {
     /// It is NOT a general JSON parser; it tolerates whitespace and key order,
     /// and unescapes the handful of JSON string escapes the publisher emits.
     pub fn parse(json: &str) -> Option<Manifest> {
-        Manifest::parse_platform(json, PLATFORM_KEY)
+        Manifest::parse_platform(json, platform_key())
     }
 
     /// Same as [`parse`](Manifest::parse) but for an explicit platform key
@@ -684,7 +852,10 @@ const FETCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 /// download's budget is named once rather than repeated as a literal per platform.
 // Dead on Linux: no published artifact there, so nothing downloads one (the tests still
 // pin its relation to the reap deadline on every platform).
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(crate) const DOWNLOAD_BUDGET: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the checksum tool (`shasum` on mac, `certutil` on Windows) gets.
@@ -693,7 +864,10 @@ pub(crate) const DOWNLOAD_BUDGET: std::time::Duration = std::time::Duration::fro
 /// expectation: hashing a file we just finished writing is seconds of local disk read, and a
 /// tool still going after two minutes is stuck, not slow.
 // Dead on Linux for the same reason: only the two install flows verify a download.
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
 pub(crate) const HASH_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long `hdiutil` gets to attach or detach the downloaded image (macOS).
@@ -889,15 +1063,30 @@ fn fetch_text(url: &str) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|_| "Update information was not valid text.".to_string())
 }
 
-/// Compute the lowercase-hex sha256 of a file via `shasum -a 256`. Only the
-/// macOS install flow verifies a download today, so the fn is macOS-gated.
-#[cfg(target_os = "macos")]
+/// The checksum tool for this platform, as a ready `Command`: `shasum -a 256` on macOS
+/// (perl, in the base system), `sha256sum` on Linux (coreutils, on every distro we target).
+/// Both print `<hash>  <path>`, which is why [`file_sha256`]'s parse is shared.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sha256_command() -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = std::process::Command::new("shasum");
+        cmd.arg("-a").arg("256");
+        cmd
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("sha256sum")
+    }
+}
+
+/// Compute the lowercase-hex sha256 of a file. Used by every install flow that verifies a
+/// download before running it: macOS (DRAGON-175) and the Linux AppImage (DRAGON-532).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn file_sha256(path: &std::path::Path) -> Result<String, String> {
     // Bounded reap (DRAGON-499): the stdio is what `.output()` set, the deadline is ours.
     let out = run_bounded(
-        std::process::Command::new("shasum")
-            .arg("-a")
-            .arg("256")
+        sha256_command()
             .arg(path)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -905,7 +1094,7 @@ fn file_sha256(path: &std::path::Path) -> Result<String, String> {
         HASH_BUDGET,
         "the download checksum",
     )
-    .map_err(|_| "Could not run shasum to verify the download.".to_string())?;
+    .map_err(|_| "Could not run the checksum tool to verify the download.".to_string())?;
     // A killed `shasum` lands here too: it is not a success, and its partial stdout must
     // never be read as a hash.
     if !out.success {
@@ -924,7 +1113,10 @@ fn file_sha256(path: &std::path::Path) -> Result<String, String> {
 /// (DRAGON-287); the type (and its Linux match in `update_settings`) is compiled
 /// everywhere so the message plumbing can't drift.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+#[cfg_attr(
+    not(any(target_os = "macos", target_os = "windows", target_os = "linux")),
+    allow(dead_code)
+)]
 pub enum InstallOutcome {
     /// The new `.app` is staged and a detached helper is armed to swap + relaunch
     /// once this process (and the daemon) exit. The caller must now quit.
@@ -933,12 +1125,43 @@ pub enum InstallOutcome {
     Failed(String),
 }
 
+/// Run this platform's one-click install for `info`, BLOCKING.
+///
+/// The portable seam the UI calls, so no call site carries a `cfg` (the repo's shape: a
+/// portable `fn` whose body branches, not a branching caller). Both entry points, the About
+/// page's install button and the launch dialog's "Install now", go through here, which is
+/// what keeps them from drifting on which platforms install and which only link out.
+///
+/// Only reachable when [`one_click_install_available`] is true; the UI does not offer the
+/// button otherwise. The Linux arm re-checks anyway and fails with a readable message,
+/// because the alternative is a button that silently does nothing.
+pub fn install(info: &UpdateInfo) -> InstallOutcome {
+    #[cfg(target_os = "macos")]
+    {
+        install_macos(info)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        install_windows(info)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        install_linux_appimage(info)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = info;
+        InstallOutcome::Failed("This platform has no in-app installer.".to_string())
+    }
+}
+
 /// Run the full macOS one-click install for `info`, BLOCKING. Downloads the dmg
 /// to a temp dir, verifies its sha256, mounts + stages the `.app`, writes a
 /// detached swap helper, and returns [`InstallOutcome::Staged`] (the caller then
 /// quits: the helper waits for full exit, swaps `/Applications`, and relaunches).
 ///
-/// Not available on Linux (no published Linux artifact yet).
+/// Reached through [`install`]; see [`install_linux_appimage`] for the Linux counterpart,
+/// which is much shorter because an AppImage is one file and installing it is a rename.
 #[cfg(target_os = "macos")]
 pub fn install_macos(info: &UpdateInfo) -> InstallOutcome {
     match install_macos_inner(info) {
@@ -955,6 +1178,258 @@ pub fn install_macos(info: &UpdateInfo) -> InstallOutcome {
 #[cfg(target_os = "windows")]
 pub fn install_windows(info: &UpdateInfo) -> InstallOutcome {
     crate::platform::windows::update_install::install(info)
+}
+
+/// Run the full Linux AppImage one-click install for `info`, BLOCKING (DRAGON-532).
+/// Downloads the new `.AppImage` beside the running one, verifies its sha256, renames it
+/// over `$APPIMAGE`, and arms a detached helper to relaunch once this process exits.
+///
+/// **Only for a build launched from an `.AppImage`.** The plain ZIP (BIN) Linux build was
+/// unpacked wherever the user chose, under no install layout we defined, so there is nothing
+/// here we can safely replace; it stays notify-only and the About page keeps sending it to
+/// the releases page. [`crate::util::appimage_path`] returning `None` is that case, and it
+/// is an error rather than a silent no-op because reaching here at all means the UI offered
+/// a button it should not have.
+///
+/// **Why this is so much smaller than the macOS flow.** There is no image to mount, nothing
+/// to stage, and no waiting for the old process to exit first: an AppImage is ONE file, so
+/// installing it is a rename. `rename(2)` is atomic and is safe while the old version runs,
+/// because the running instance's FUSE mount pins the old inode until it exits. What we must
+/// NOT do is write to `$APPIMAGE` in place, which fails `ETXTBSY` (Text file busy) against
+/// the running program. The same lesson landed in the AppImage build script, which assembles
+/// aside and renames for exactly this reason.
+///
+/// **The filename is never parsed and never changed.** The user's autostart entry
+/// (`platform::linux::autostart` writes `Exec=$APPIMAGE resident`) and whatever capture
+/// shortcut they bound both name this exact path, so a version-stamped rename would leave
+/// them pointing at a file that no longer exists. The release asset stays versioned for the
+/// download page; the installed file keeps whatever the user called it, with new contents
+/// underneath. This mirrors macOS shipping a versioned dmg into a fixed `.app`.
+#[cfg(target_os = "linux")]
+pub fn install_linux_appimage(info: &UpdateInfo) -> InstallOutcome {
+    match install_linux_appimage_inner(info) {
+        Ok(()) => InstallOutcome::Staged,
+        Err(e) => InstallOutcome::Failed(e),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_appimage_inner(info: &UpdateInfo) -> Result<(), String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let artifact = info
+        .artifact
+        .as_ref()
+        .ok_or_else(|| "This update has no AppImage download.".to_string())?;
+
+    let target = crate::util::appimage_path().ok_or_else(|| {
+        "This build is not an AppImage, so it cannot replace itself. Download the new version \
+         from the releases page."
+            .to_string()
+    })?;
+    // Resolve symlinks before swapping. `$APPIMAGE` is normally already the real path (the
+    // runtime derives it from `/proc/self/exe`, which the kernel resolves), but the README
+    // tells users they can keep a short-named symlink pointing at the versioned file, so
+    // being explicit costs one syscall and removes an assumption. It matters because
+    // `rename` over a SYMLINK replaces the LINK with a regular file: the user's tidy setup
+    // would quietly become two copies, the newer one wearing the symlink's name. Falling
+    // back to the unresolved path keeps a build with an odd `$APPIMAGE` working as before.
+    let target = std::fs::canonicalize(&target).unwrap_or(target);
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| "Could not find the folder the AppImage is in.".to_string())?;
+
+    // Stage BESIDE the target, never in a temp dir. The install is a rename, and a rename
+    // across filesystems fails with EXDEV; `/tmp` is a tmpfs on most desktops, so staging
+    // there would work right up until the swap and then fail on every real machine. Leading
+    // dot so a file manager open on the folder does not flash it at the user mid-download.
+    let staged = parent.join(format!(".cck-update-{}.AppImage.part", std::process::id()));
+
+    // Creating the staging file IS the writability probe, and doing it FIRST is the point:
+    // an AppImage in /opt or /usr/local/bin belongs to root, and telling the user that after
+    // a 30MB download rather than before it is a worse experience for no benefit.
+    std::fs::File::create(&staged).map_err(|_| {
+        "Could not save the update next to the AppImage. Move the AppImage somewhere you own, \
+         such as ~/Applications, then try again."
+            .to_string()
+    })?;
+
+    // Everything that can leave a partial file behind runs inside here, so ONE cleanup
+    // covers every failure. After a successful rename there is nothing left to remove.
+    let staged_ok = (|| -> Result<(), String> {
+        // 1) Download. Bounded reap (DRAGON-499), stdio inherited as elsewhere.
+        let max_time = DOWNLOAD_BUDGET.as_secs().to_string();
+        let out = run_bounded(
+            std::process::Command::new("curl")
+                .args(["-fsSL", "--max-time", max_time.as_str(), "-o"])
+                .arg(&staged)
+                .arg(&artifact.url),
+            DOWNLOAD_BUDGET,
+            "the update download",
+        )
+        .map_err(|_| "Could not run curl to download the update.".to_string())?;
+        if out.killed {
+            return Err("The update download stopped responding, so it was ended.".to_string());
+        }
+        if !out.success {
+            return Err("The update download failed.".to_string());
+        }
+
+        // 2) Verify sha256. Skipped only if the manifest omitted one, matching macOS; the
+        //    publisher always writes it (`publish-release.yml`).
+        if !artifact.sha256.trim().is_empty() {
+            let got = file_sha256(&staged)?;
+            if got != artifact.sha256.to_lowercase() {
+                return Err("The download failed its integrity check.".to_string());
+            }
+        }
+
+        // 3) Carry the old file's mode across before the swap, so a user who tightened it
+        //    keeps their choice, and guarantee execute: a fresh download is 0644, and a
+        //    non-executable AppImage is just a file the desktop cannot open.
+        let existing = std::fs::metadata(&target).ok().map(|m| m.permissions().mode());
+        std::fs::set_permissions(
+            &staged,
+            std::fs::Permissions::from_mode(installed_appimage_mode(existing)),
+        )
+        .map_err(|_| "Could not make the downloaded AppImage executable.".to_string())?;
+
+        // 4) The install itself. Atomic, and safe against the running copy (see the doc).
+        std::fs::rename(&staged, &target)
+            .map_err(|_| "Could not replace the AppImage with the new version.".to_string())
+    })();
+    if staged_ok.is_err() {
+        // A dotfile left next to the user's AppImage is litter they would have to find
+        // themselves, so clear it on every failure path.
+        let _ = std::fs::remove_file(&staged);
+    }
+    staged_ok?;
+
+    // The new version is on disk from here on. Anything below can only affect whether the
+    // app comes BACK by itself, never whether the update landed, and the messages say so.
+
+    // The relaunched app consumes this to land on Settings > About with the freshly
+    // installed version's notes.
+    write_post_update_marker();
+
+    // Relaunch as whatever the user actually runs: `resident` brings the tray daemon back,
+    // a bare launch does not start one they never asked for. The rule already existed for
+    // the Windows installer and belongs to the update channel, not to one platform.
+    let resident = crate::state::load().resident;
+    let work = std::env::temp_dir().join(format!("cck-update-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&work);
+    let script_path = work.join("relaunch.sh");
+    let log_path = work.join("relaunch.log");
+    let script = appimage_relaunch_script(
+        &target.to_string_lossy(),
+        post_update_relaunch_args(resident),
+        std::process::id(),
+        &log_path.to_string_lossy(),
+    );
+    let wrote = std::fs::File::create(&script_path)
+        .and_then(|mut f| f.write_all(script.as_bytes()))
+        .is_ok();
+    // Deliberately never reaped: spawned to OUTLIVE us, since its whole job is to wait until
+    // we are gone. Its own wait loop is bounded, in the script.
+    let spawned = wrote
+        && std::process::Command::new("/bin/sh")
+            .arg(&script_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok();
+    if !spawned {
+        // Report it honestly rather than as a failed install: the swap already happened, so
+        // claiming failure here would send the user to re-download what they already have.
+        // `Failed` also means the caller does NOT quit, so this message stays on screen.
+        return Err("The update was installed, but this app could not restart itself. \
+                    Quit and start Cosmic Capture Kit again to finish."
+            .to_string());
+    }
+    Ok(())
+}
+
+/// **Pure**, unit-tested: the file mode a freshly downloaded AppImage should carry.
+///
+/// Preserve what the replaced file had, so a user who tightened permissions keeps that, and
+/// force owner-execute regardless: `curl -o` writes 0644, and an AppImage without the
+/// execute bit cannot be launched by the desktop, the autostart entry, or us. `None` (the
+/// old file's mode was unreadable) falls back to the mode a downloaded AppImage is normally
+/// given by hand.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn installed_appimage_mode(existing: Option<u32>) -> u32 {
+    existing.unwrap_or(0o755) | 0o100
+}
+
+/// Build the detached relaunch helper for the AppImage install. Pure string builder so its
+/// shape (quoting, the bounded wait, the relaunch arguments) is unit-testable.
+///
+/// Far smaller than the macOS [`swap_helper_script`], and deliberately so: the swap has
+/// ALREADY happened by the time this runs, because replacing an AppImage is a rename that is
+/// safe against the running copy. There is no install left to do. The only job is to wait
+/// out the old processes so the relaunch does not race the single-instance lock, then start
+/// the new file.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn appimage_relaunch_script(appimage: &str, args: &[&str], caller_pid: u32, log: &str) -> String {
+    // Each argument single-quoted separately, so the command line is safe even though these
+    // are our own constants today. `shell_single_quote` escapes the INSIDE of a literal; the
+    // surrounding quotes are the caller's, exactly as in the macOS helper's template.
+    let args = args
+        .iter()
+        .map(|a| format!(" '{}'", shell_single_quote(a)))
+        .collect::<String>();
+    format!(
+        r#"#!/bin/sh
+set -u
+LOG='{log}'
+APPIMAGE='{appimage}'
+CALLER={caller_pid}
+exec >>"$LOG" 2>&1
+echo "[cck-update] helper started $(date)"
+
+# Two waits, both bounded (~30s each), because the relaunch must not race the
+# single-instance lock and leave the user with nothing running.
+#
+# First the process that spawned us, BY PID. Exact, and immune to the AppImage living at a
+# path containing regex characters, which the pgrep below is not: `pgrep -f` takes an ERE, so
+# a `+` or `(` in the user's folder name could make it match nothing and fall straight
+# through. The pid check is the one that must not fail.
+i=0
+while [ $i -lt 60 ]; do
+  kill -0 "$CALLER" 2>/dev/null || break
+  i=$((i + 1))
+  sleep 0.5
+done
+echo "[cck-update] caller gone after ${{i}} polls"
+
+# Then any SIBLING still holding the lock: the resident daemon, a preview editor, a settings
+# window. Best effort by path, since their pids are not ours to know. This helper cannot
+# match itself, its own argv being `/bin/sh <script>`.
+j=0
+while [ $j -lt 60 ]; do
+  pgrep -f "$APPIMAGE" >/dev/null 2>&1 || break
+  j=$((j + 1))
+  sleep 0.5
+done
+echo "[cck-update] siblings clear after ${{j}} polls"
+
+# A short settle so the flock released at exit is really gone before we contend for it.
+sleep 1
+
+# setsid so the new process outlives this helper rather than dying with it.
+setsid "$APPIMAGE"{args} >/dev/null 2>&1 &
+echo "[cck-update] relaunched"
+"#,
+        log = shell_single_quote(log),
+        appimage = shell_single_quote(appimage),
+        caller_pid = caller_pid,
+        args = args,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1162,8 +1637,14 @@ fi
     )
 }
 
-/// Escape a string for safe embedding inside a single-quoted `sh` literal.
-#[cfg(target_os = "macos")]
+/// Escape a string for safe embedding inside a single-quoted `sh` literal. Shared by the
+/// macOS swap helper and the Linux AppImage relaunch helper, both of which interpolate
+/// user-controlled paths into a script.
+///
+/// `test` is in the gate so the script builders that call it stay testable on Windows too
+/// (they are compiled there under `cfg(test)` for exactly that reason).
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 fn shell_single_quote(s: &str) -> String {
     // A single quote inside single quotes is written as: '\''
     s.replace('\'', r"'\''")
@@ -1754,24 +2235,25 @@ mod tests {
         );
     }
 
-    // DRAGON-241: PLATFORM_KEY must be the JSON object key under `platforms` for THIS
+    // DRAGON-241: the platform key must be the JSON object key under `platforms` for THIS
     // build (what `platform_object` slices), so an artifact can resolve. Windows used to
     // fall through to "unknown" and could never match one.
     #[test]
     fn platform_key_is_the_manifest_json_key() {
         #[cfg(target_os = "windows")]
-        assert_eq!(PLATFORM_KEY, "windows");
+        assert_eq!(platform_key(), "windows");
         #[cfg(target_os = "macos")]
-        assert_eq!(PLATFORM_KEY, "macos");
-        #[cfg(target_os = "linux")]
-        assert_eq!(PLATFORM_KEY, "linux");
+        assert_eq!(platform_key(), "macos");
+        // Linux is asserted by `linux_platform_key_tests` instead: the answer depends on
+        // `$APPIMAGE`, and `cargo test` must not care whether the runner happens to have it.
         // Whatever the key is, a manifest carrying an artifact under it must parse for
         // this platform (proves the value is a usable `platforms.<key>` selector).
+        let key = platform_key();
         let json = format!(
-            r#"{{"version":"9.9.9","notes":"","published":"","platforms":{{"{PLATFORM_KEY}":{{"url":"https://example.com/a","sha256":"","size":1}}}}}}"#
+            r#"{{"version":"9.9.9","notes":"","published":"","platforms":{{"{key}":{{"url":"https://example.com/a","sha256":"","size":1}}}}}}"#
         );
         let m = Manifest::parse(&json).expect("parse for this platform's key");
-        assert!(m.artifact.is_some(), "artifact under PLATFORM_KEY must resolve");
+        assert!(m.artifact.is_some(), "artifact under the platform key must resolve");
     }
 
     #[test]
@@ -1803,7 +2285,9 @@ mod tests {
         assert!(s.contains("open \"$INSTALLED\""));
     }
 
-    #[cfg(target_os = "macos")]
+    // Compiled wherever the helper is (DRAGON-532 added the Linux relaunch script as a
+    // second consumer), so the escaping stays covered on both.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn shell_single_quote_escapes() {
         assert_eq!(shell_single_quote("a'b"), r"a'\''b");
@@ -1902,5 +2386,368 @@ mod reap_bounds_tests {
         assert!(out.success);
         assert!(!out.killed);
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    }
+}
+
+/// DRAGON-532: what a launch that lost the daemon lock does about it.
+#[cfg(test)]
+mod signal_capture_after_lost_lock_tests {
+    use super::signal_capture_after_lost_lock;
+
+    /// The ordinary second launch: a resident is up and the user wants a shot. Unchanged,
+    /// and the case the "capture NOW" UX exists for.
+    #[test]
+    fn a_normal_second_launch_still_asks_for_a_capture() {
+        assert!(signal_capture_after_lost_lock(false, false), "bare launch = the hotkey");
+        assert!(signal_capture_after_lost_lock(true, false), "manual `resident` re-run");
+    }
+
+    /// THE CASE THIS EXISTS FOR, observed for real on 2026-08-05 while testing the AppImage
+    /// self-update: the installer's relaunch lost the lock and put an unrequested capture
+    /// overlay on screen seconds after the update. Nobody asked for it.
+    #[test]
+    fn a_post_update_relaunch_that_lost_the_lock_stays_quiet() {
+        assert!(!signal_capture_after_lost_lock(true, true));
+    }
+
+    /// The hotkey still wins. A user pressing capture during the seconds after an update
+    /// gets their overlay: that IS a request, and a pending marker must not swallow it.
+    /// Only the installer's own `resident` relaunch is spared.
+    #[test]
+    fn a_pending_marker_never_suppresses_the_capture_hotkey() {
+        assert!(signal_capture_after_lost_lock(false, true));
+    }
+
+    /// Both inputs are load-bearing: neither alone suppresses anything.
+    #[test]
+    fn suppression_needs_both_conditions() {
+        let suppressed: Vec<_> = [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter()
+            .filter(|(d, p)| !signal_capture_after_lost_lock(*d, *p))
+            .collect();
+        assert_eq!(suppressed, vec![(true, true)], "exactly one cell suppresses");
+    }
+}
+
+/// DRAGON-532: the file mode a freshly downloaded AppImage is given before it replaces the
+/// running one.
+#[cfg(test)]
+mod installed_appimage_mode_tests {
+    use super::installed_appimage_mode;
+
+    /// The ordinary case: the file we are replacing was 0755, so the new one is too.
+    #[test]
+    fn it_preserves_the_replaced_files_mode() {
+        assert_eq!(installed_appimage_mode(Some(0o755)), 0o755);
+    }
+
+    /// THE CASE THIS EXISTS FOR. `curl -o` writes 0644, and an AppImage without the execute
+    /// bit cannot be launched by the desktop, the autostart entry, or the relaunch helper.
+    /// A swap that dropped it would leave the user with an app that will not start.
+    #[test]
+    fn it_always_grants_owner_execute() {
+        assert_eq!(installed_appimage_mode(Some(0o644)) & 0o100, 0o100);
+        assert_eq!(installed_appimage_mode(None) & 0o100, 0o100);
+    }
+
+    /// A user who tightened permissions (no group/other access) keeps that choice; we add
+    /// execute, never breadth.
+    #[test]
+    fn it_never_widens_access() {
+        let out = installed_appimage_mode(Some(0o700));
+        assert_eq!(out, 0o700, "0700 already has owner execute, so nothing changes");
+        assert_eq!(installed_appimage_mode(Some(0o600)) & 0o077, 0, "group/other stay closed");
+    }
+
+    /// An unreadable old mode falls back to what a hand-downloaded AppImage is normally
+    /// given, rather than to something the desktop cannot launch.
+    #[test]
+    fn an_unknown_previous_mode_falls_back_to_executable() {
+        assert_eq!(installed_appimage_mode(None), 0o755);
+    }
+}
+
+/// DRAGON-532: the detached helper that relaunches after the AppImage swap.
+#[cfg(test)]
+mod appimage_relaunch_script_tests {
+    use super::{appimage_relaunch_script, post_update_relaunch_args};
+
+    fn script(resident: bool) -> String {
+        appimage_relaunch_script(
+            "/home/u/Apps/Cosmic.AppImage",
+            post_update_relaunch_args(resident),
+            4242,
+            "/tmp/cck-update-1/relaunch.log",
+        )
+    }
+
+    /// The resident user gets their tray daemon back; a non-resident user gets a plain
+    /// launch and NOT a daemon they never asked for.
+    #[test]
+    fn the_relaunch_matches_how_the_user_runs_the_app() {
+        assert!(script(true).contains(r#"setsid "$APPIMAGE" 'resident'"#));
+        assert!(script(false).contains(r#"setsid "$APPIMAGE" >"#));
+    }
+
+    /// The helper waits for the old processes so the relaunch does not race the
+    /// single-instance lock, and EVERY wait is BOUNDED (DRAGON-118 applies to every wait we
+    /// write): a wedged old process must not strand the helper forever.
+    #[test]
+    fn every_wait_for_the_old_processes_is_bounded() {
+        let s = script(true);
+        assert!(s.contains("while [ $i -lt 60 ]"), "the caller wait has a fixed ceiling");
+        assert!(s.contains("while [ $j -lt 60 ]"), "the sibling wait has a fixed ceiling");
+        assert_eq!(s.matches("while ").count(), 2, "no unbounded loop crept in");
+    }
+
+    /// The caller is waited on BY PID, not by path. `pgrep -f` takes an ERE, so an AppImage
+    /// living under a folder with a `+` or `(` in its name could match nothing and fall
+    /// straight through to a relaunch that races the still-running old process for the lock.
+    /// The pid check cannot fail that way, which is why it is the primary signal and the
+    /// path-based sweep only mops up siblings afterwards.
+    #[test]
+    fn the_caller_is_waited_on_by_pid_not_by_path() {
+        let s = script(true);
+        assert!(s.contains("CALLER=4242"), "the caller's pid is baked in");
+        assert!(s.contains(r#"kill -0 "$CALLER""#), "and waited on exactly");
+        // Ordering matters: the exact wait must come first, so a broken pattern in the
+        // best-effort one cannot skip it. Matched on the CODE, not the prose (the comment
+        // above the pid loop names `pgrep -f` too).
+        let by_pid = s.find(r#"kill -0 "$CALLER""#).expect("pid wait present");
+        let by_path = s.find(r#"pgrep -f "$APPIMAGE""#).expect("sibling wait present");
+        assert!(by_pid < by_path, "the exact wait runs before the best-effort one");
+    }
+
+    /// Paths are interpolated into a shell script, so they are single-quoted. A path with a
+    /// quote in it must not be able to end the literal and run anything.
+    #[test]
+    fn paths_are_quoted_against_breaking_out() {
+        let s = appimage_relaunch_script(
+            "/home/u/it's here/Cosmic.AppImage",
+            &[],
+            4242,
+            "/tmp/cck-update-1/relaunch.log",
+        );
+        // The sh idiom for a quote inside a single-quoted literal: close, escaped quote,
+        // reopen.
+        assert!(s.contains(r#"APPIMAGE='/home/u/it'\''s here/Cosmic.AppImage'"#));
+        // And the raw quote never survives unescaped, which is what would end the literal
+        // early and hand the rest of the path to the shell as code.
+        assert!(!s.contains("it's here"), "no unescaped quote reaches the script");
+    }
+
+    /// We GENERATE this script and never parse it at build time, so a syntax error would
+    /// first surface on a user's machine, mid-update, with the app already swapped and
+    /// exiting. `sh -n` parses without executing, which is the cheapest possible guard.
+    /// (`reap_bounds_tests` sets the precedent for shelling out in a unit test here.)
+    #[cfg(unix)]
+    #[test]
+    fn the_generated_script_is_valid_sh() {
+        use std::io::Write as _;
+        for (label, s) in [("resident", script(true)), ("bare", script(false))] {
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg("-n")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawning `/bin/sh` must work on any unix");
+            child
+                .stdin
+                .take()
+                .expect("stdin is piped")
+                .write_all(s.as_bytes())
+                .expect("writing the script must succeed");
+            let out = child.wait_with_output().expect("reaping `sh -n` must succeed");
+            assert!(
+                out.status.success(),
+                "sh -n rejected the {label} script: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// It does NOT swap anything. The rename happened before this helper was spawned,
+    /// because replacing an AppImage is safe against the running copy; a helper that also
+    /// tried to install would be a second, racing writer.
+    #[test]
+    fn it_only_relaunches_and_never_installs() {
+        let s = script(true);
+        assert!(!s.contains("mv "), "no move");
+        assert!(!s.contains("cp "), "no copy");
+        assert!(!s.contains("rm "), "nothing removed");
+    }
+}
+
+/// DRAGON-532: which manifest entry a Linux build reads. Compiled and run on EVERY host,
+/// because the two Linux artifacts are one binary and the rule is not a `cfg`.
+#[cfg(test)]
+mod linux_platform_key_tests {
+    use super::{
+        APPIMAGE_AARCH64_PLATFORM_KEY, APPIMAGE_PLATFORM_KEY, LINUX_AARCH64_PLATFORM_KEY,
+        LINUX_PLATFORM_KEY, is_appimage_key, linux_platform_key,
+    };
+
+    /// The ZIP (BIN) build, and every source build: `platforms.linux`, unchanged since
+    /// DRAGON-521.
+    #[test]
+    fn a_plain_binary_reads_the_linux_entry() {
+        assert_eq!(linux_platform_key(false, false), "linux");
+    }
+
+    #[test]
+    fn an_appimage_reads_its_own_entry() {
+        assert_eq!(linux_platform_key(true, false), APPIMAGE_PLATFORM_KEY);
+    }
+
+    /// THE POINT OF THE KIND SPLIT. Both artifacts are the same compiled code, so if these
+    /// two ever collapsed to one key the manifest entry (which carries the DOWNLOAD URL)
+    /// would hand an AppImage the zip's URL, or the reverse, and the installer would replace
+    /// the running program with a different artifact kind.
+    #[test]
+    fn the_two_linux_artifacts_never_share_a_key() {
+        assert_ne!(linux_platform_key(true, false), linux_platform_key(false, false));
+        assert_ne!(linux_platform_key(true, true), linux_platform_key(false, true));
+    }
+
+    /// THE POINT OF THE ARCH SPLIT, and the worse of the two failures (DRAGON-529). A wrong
+    /// KIND at least still executes; a wrong ARCH downloads a binary this CPU cannot run and
+    /// renames it over the working one, leaving nothing that starts.
+    #[test]
+    fn the_two_architectures_never_share_a_key() {
+        assert_ne!(linux_platform_key(true, false), linux_platform_key(true, true));
+        assert_ne!(linux_platform_key(false, false), linux_platform_key(false, true));
+    }
+
+    /// All four combinations are distinct. Stated once over the whole matrix, so neither
+    /// axis can be added to in future without this failing.
+    #[test]
+    fn all_four_linux_keys_are_distinct() {
+        let keys = [
+            linux_platform_key(false, false),
+            linux_platform_key(false, true),
+            linux_platform_key(true, false),
+            linux_platform_key(true, true),
+        ];
+        let unique: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "every (kind, arch) pair needs its own key: {keys:?}");
+    }
+
+    /// The publisher writes these literals into `update.json`, so a typo on either side
+    /// reads as "no update available" rather than as an error. Pin all four.
+    ///
+    /// The UNSUFFIXED two mean x86_64 and must never gain a suffix: they are what every
+    /// already-installed build looks for, and a published manifest is read by versions we
+    /// can no longer change. Renaming one stops updates dead for everyone on it.
+    #[test]
+    fn the_key_strings_are_stable() {
+        assert_eq!(LINUX_PLATFORM_KEY, "linux");
+        assert_eq!(APPIMAGE_PLATFORM_KEY, "appimage");
+        assert_eq!(LINUX_AARCH64_PLATFORM_KEY, "linux-aarch64");
+        assert_eq!(APPIMAGE_AARCH64_PLATFORM_KEY, "appimage-aarch64");
+    }
+
+    /// One-click install follows the KIND, across every architecture. If this only knew
+    /// about x86_64, an aarch64 AppImage would silently fall back to "open the releases
+    /// page" despite being perfectly able to replace itself.
+    #[test]
+    fn every_appimage_key_is_recognised_as_an_appimage() {
+        assert!(is_appimage_key(APPIMAGE_PLATFORM_KEY));
+        assert!(is_appimage_key(APPIMAGE_AARCH64_PLATFORM_KEY));
+        assert!(!is_appimage_key(LINUX_PLATFORM_KEY));
+        assert!(!is_appimage_key(LINUX_AARCH64_PLATFORM_KEY));
+        // And nothing else is, including the other platforms' keys.
+        assert!(!is_appimage_key("macos"));
+        assert!(!is_appimage_key("windows"));
+    }
+
+    /// A real published manifest carries ALL FOUR keys at once (`publish-release.yml` emits
+    /// every artifact attached to the release), so each build must slice out its OWN entry.
+    ///
+    /// This is the failure the split exists to prevent, and it is not hypothetical: the
+    /// entry carries the download URL, so an AppImage that resolved the `linux` entry would
+    /// fetch the unpacked zip and rename THAT over itself. The keys share a prefix-free
+    /// substring search, and the AppImage's own URL ends in `.AppImage`, one case-fold away
+    /// from the key it must not match.
+    #[test]
+    fn every_platform_slices_its_own_artifact_out_of_one_manifest() {
+        const PUBLISHED: &str = r#"
+        {
+          "version": "0.29.0",
+          "notes": "",
+          "published": "2026-08-06T00:00:00Z",
+          "platforms": {
+            "macos":    { "url": "https://e.com/CosmicCaptureKit-0.29.0-aarch64.dmg",       "sha256": "aa", "size": 1 },
+            "windows":  { "url": "https://e.com/CosmicCaptureKit-0.29.0-x86_64.msi",        "sha256": "bb", "size": 2 },
+            "linux":    { "url": "https://e.com/CosmicCaptureKit-0.29.0-x86_64.zip",        "sha256": "cc", "size": 3 },
+            "appimage": { "url": "https://e.com/CosmicCaptureKit-0.29.0-x86_64.AppImage",   "sha256": "dd", "size": 4 }
+          }
+        }
+        "#;
+        for (key, want_url, want_sha) in [
+            ("macos", "https://e.com/CosmicCaptureKit-0.29.0-aarch64.dmg", "aa"),
+            ("windows", "https://e.com/CosmicCaptureKit-0.29.0-x86_64.msi", "bb"),
+            ("linux", "https://e.com/CosmicCaptureKit-0.29.0-x86_64.zip", "cc"),
+            ("appimage", "https://e.com/CosmicCaptureKit-0.29.0-x86_64.AppImage", "dd"),
+        ] {
+            let m = super::Manifest::parse_platform(PUBLISHED, key)
+                .unwrap_or_else(|| panic!("{key} must parse"));
+            let a = m
+                .artifact
+                .unwrap_or_else(|| panic!("{key} must resolve an artifact"));
+            assert_eq!(a.url, want_url, "{key} resolved another platform's download");
+            assert_eq!(a.sha256, want_sha, "{key} resolved another platform's checksum");
+        }
+    }
+
+    /// THE BACKWARD-COMPATIBILITY TEST, and the reason the unsuffixed keys may never be
+    /// renamed (DRAGON-529).
+    ///
+    /// Every already-installed build looks for the literal `linux`, `macos` or `windows`,
+    /// and a published manifest is read by versions we can no longer change. Adding the
+    /// suffixed siblings must therefore be INVISIBLE to them. The risk is real rather than
+    /// theoretical, because [`platform_object`] resolves a key by substring search: if
+    /// `"linux"` could match inside `"linux-aarch64"`, an existing x86_64 install would
+    /// start downloading the ARM zip, which its CPU cannot run.
+    ///
+    /// It cannot, because the search includes BOTH quotes, and `"linux-aarch64"` has a
+    /// hyphen where the closing quote would be. Pinned here in the worst arrangement: the
+    /// suffixed key placed FIRST, so a prefix match would be found before the real one.
+    #[test]
+    fn adding_the_aarch64_keys_does_not_disturb_the_existing_ones() {
+        // Suffixed keys deliberately BEFORE their unsuffixed counterparts.
+        const NEW: &str = r#"{"version":"0.30.0","notes":"","published":"","platforms":{
+            "linux-aarch64":    {"url":"https://e.com/arm.zip",      "sha256":"aa","size":1},
+            "appimage-aarch64": {"url":"https://e.com/arm.AppImage", "sha256":"bb","size":2},
+            "linux":            {"url":"https://e.com/x86.zip",      "sha256":"cc","size":3},
+            "appimage":         {"url":"https://e.com/x86.AppImage", "sha256":"dd","size":4},
+            "macos":            {"url":"https://e.com/a.dmg",        "sha256":"ee","size":5},
+            "windows":          {"url":"https://e.com/a.msi",        "sha256":"ff","size":6}}}"#;
+        for (key, want) in [
+            ("linux", "https://e.com/x86.zip"),
+            ("appimage", "https://e.com/x86.AppImage"),
+            ("linux-aarch64", "https://e.com/arm.zip"),
+            ("appimage-aarch64", "https://e.com/arm.AppImage"),
+        ] {
+            let a = super::Manifest::parse_platform(NEW, key)
+                .unwrap_or_else(|| panic!("{key} must parse"))
+                .artifact
+                .unwrap_or_else(|| panic!("{key} must resolve"));
+            assert_eq!(a.url, want, "{key} resolved the wrong architecture's artifact");
+        }
+    }
+
+    /// A manifest published BEFORE this key existed (every release up to 0.28.x) must leave
+    /// an AppImage with no artifact rather than falling back to the zip. No artifact means
+    /// the About page shows "Update Available" without an install button, which is the
+    /// honest state; falling back would install the wrong thing.
+    #[test]
+    fn an_older_manifest_gives_the_appimage_no_artifact() {
+        const OLD: &str = r#"{"version":"0.28.0","notes":"","published":"","platforms":{
+            "macos":{"url":"https://e.com/a.dmg","sha256":"aa","size":1},
+            "linux":{"url":"https://e.com/a.zip","sha256":"cc","size":3}}}"#;
+        let m = super::Manifest::parse_platform(OLD, APPIMAGE_PLATFORM_KEY).expect("parse");
+        assert_eq!(m.version, "0.28.0", "the version still reads, so the check still works");
+        assert!(m.artifact.is_none(), "no appimage entry must not fall back to the zip");
     }
 }

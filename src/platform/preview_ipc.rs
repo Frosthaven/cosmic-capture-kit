@@ -815,6 +815,13 @@ mod tests {
     fn paths_with_spaces_newlines_and_non_utf8_survive() {
         // The exact reason `path` is hex: none of these survive whitespace splitting,
         // and the last one isn't even a `String`.
+        //
+        // The `mut` is used by the `cases.push` below, which is `cfg(unix)` only (a
+        // non-UTF-8 path cannot be built from bytes on Windows). So off unix the binding
+        // is honestly immutable, and the attribute says exactly where rather than
+        // blanketing the file. Windows holds a ZERO-warning clippy bar under
+        // `--all-targets`, which is where this surfaced.
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut cases = vec![
             PathBuf::from("/home/u/My Pictures/shot 1.png"),
             PathBuf::from("/tmp/we\nird.png"),

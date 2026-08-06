@@ -59,11 +59,31 @@ pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Permissions";
 /// surface, resize border) at a smaller onboarding size. A fixed, compact size —
 /// nothing here scrolls at the default height, and it isn't a size worth persisting.
 pub(super) fn open_permissions_window() -> (window::Id, Task<cosmic::Action<Msg>>) {
-    const W: f32 = 520.0;
-    const H: f32 = 560.0;
+    // DRAGON-533: the old 520x560 read as too short (some cards' content clipped/scrolled
+    // more than felt right). Owner resized their live window to a comfortable 629x707 and
+    // asked for that to become the new default AND the floor.
+    const W: f32 = 629.0;
+    const H: f32 = 707.0;
+    // Frosted glass (DRAGON-217/533): this window's own doc claims to mirror
+    // `settings::open_config_window`'s recipe, but was missing the one field that
+    // actually enrolls it in the compositor's backdrop blur. `MacCenterTitlebar`
+    // (dispatched below, in `PermissionsWindowOpened`) already calls
+    // `enable_window_vibrancy` for this window's title exactly like it does for
+    // Settings; without `blur: true` at creation there is nothing for that call to
+    // reveal, so the window opened opaque with no visible vibrancy regardless. See
+    // `settings::open_config_window`'s own comment for the Windows Mica caveat this
+    // mirrors too.
+    #[cfg(not(windows))]
+    let blur = crate::app::theme::glass_windows_enabled();
+    #[cfg(windows)]
+    let blur = false;
     let (id, task) = window::open(window::Settings {
         size: cosmic::iced::Size::new(W, H),
-        min_size: Some(cosmic::iced::Size::new(460.0, 460.0)),
+        blur,
+        // The opening size IS the floor (owner report: the window read as too short at
+        // the old 460x460 minimum). Was smaller than the default, so shrinking it ever
+        // clipped content the default size was chosen to fit.
+        min_size: Some(cosmic::iced::Size::new(W, H)),
         resizable: true,
         resize_border: 8,
         // macOS (DRAGON-135): native decorations with a hidden/transparent titlebar —

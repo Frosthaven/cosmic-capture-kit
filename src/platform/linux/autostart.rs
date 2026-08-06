@@ -15,10 +15,15 @@
 //! ## Why the current exe, not a fixed path
 //!
 //! The user's PrintScreen shortcut already launches `target/release/cosmic-capture-kit`
-//! directly (nothing is installed on PATH). We write `Exec=<current_exe> resident`, the
+//! directly (nothing is installed on PATH). We write `Exec=<util::self_exe> resident`, the
 //! SAME binary the resident/daemon spawn uses, so the autostart entry launches exactly
 //! what the running app is — a dev build autostarts the dev build, an installed build the
 //! installed one. The bare `resident` argument is the token `main()` early-branches on.
+//!
+//! `util::self_exe`, NOT `current_exe` (DRAGON-510). This entry is read at the NEXT login,
+//! and inside an AppImage `current_exe()` names a FUSE mount that stops existing the moment
+//! this process ends. Writing it here would produce an autostart entry that is dead before
+//! it is ever used; `$APPIMAGE` is the file, which is still there tomorrow.
 
 #![cfg(target_os = "linux")]
 
@@ -66,14 +71,14 @@ pub fn is_enabled() -> bool {
 }
 
 /// Create (`on`) or remove (`off`) the autostart entry. On create, writes the `.desktop`
-/// file with `Exec=<current_exe> resident` (creating `~/.config/autostart` if needed); on
+/// file with `Exec=<util::self_exe> resident` (creating `~/.config/autostart` if needed); on
 /// remove, deletes it (a missing file is success — the desired state is "absent"). Returns
 /// an honest error string on an I/O failure so the settings UI can surface it. Mirrors
 /// `login_item::set`.
 pub fn set(on: bool) -> Result<(), String> {
     let path = desktop_path().ok_or_else(|| "could not resolve the autostart directory".to_string())?;
     if on {
-        let exe = std::env::current_exe()
+        let exe = crate::util::self_exe()
             .map_err(|e| format!("could not resolve the current executable: {e}"))?;
         let exe = exe.to_string_lossy().into_owned();
         if let Some(dir) = path.parent() {

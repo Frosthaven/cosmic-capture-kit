@@ -15,6 +15,7 @@ pub mod icons;
 pub mod notched_slider;
 pub mod output_selection;
 pub mod region_selection;
+pub mod upload_stripes;
 pub mod zoom_pan;
 
 pub use drag_area::DragArea;

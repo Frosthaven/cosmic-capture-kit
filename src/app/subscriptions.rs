@@ -30,6 +30,7 @@ impl App {
                 self.sub_playback_poll(),
                 self.sub_preview_toasts(),
                 self.sub_upload_poll(),
+                self.sub_upload_finalize_anim(),
                 self.sub_text_caret_blink(),
                 self.sub_tray_poll(),
                 self.sub_preview_handoff(),
@@ -41,6 +42,7 @@ impl App {
                 self.sub_permission_poll(),
                 self.sub_cloud_browser_countdown(),
                 self.sub_cloud_folder_spin(),
+                self.sub_health_copy_flash(),
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.sub_hotkey_suspend_ping(),
                 #[cfg(windows)]
@@ -298,6 +300,25 @@ impl App {
         }
     }
 
+    /// While a Health-page location copy is still flashing (DRAGON-540): tick once a second so
+    /// the copy button's "Copied!" tick reverts on its own.
+    ///
+    /// `sub_cloud_browser_countdown` in every respect, including the rule that matters: the
+    /// flash is a WINDOW read against `Instant::now()` at render time, so the view has to be
+    /// rebuilt once more after it closes or the tick stays up until something else redraws.
+    /// It gates itself off with the flash, so an idle Health page ticks nothing.
+    fn sub_health_copy_flash(&self) -> Option<Subscription<Msg>> {
+        let (_, at) = self.settings.health_copied.as_ref()?;
+        if crate::widgets::copy_button::copied_recently(Some(*at)) {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_secs(1))
+                    .map(|_| Msg::Settings(SettingsMsg::HealthCopyTick)),
+            )
+        } else {
+            None
+        }
+    }
+
     /// While a cloud folder LISTING is in flight (DRAGON-514): tick ~30fps so the path row's
     /// refresh glyph spins. That spin is the browser's only loading indication, the
     /// "Reading your folders..." line having been deleted with this ticket.
@@ -537,6 +558,38 @@ impl App {
                 cosmic::iced::time::every(UPLOAD_POLL_INTERVAL)
                     .with(id)
                     .map(|(id, _)| Msg::Preview(id, PreviewMsg::UploadPoll))
+            })
+            .collect();
+        if ticks.is_empty() {
+            return None;
+        }
+        Some(Subscription::batch(ticks))
+    }
+
+    /// Drive the upload meter's finalize stripe sweep (DRAGON-537): while any of a
+    /// document's meters sits in its finalize wait (`MeterFace::Finalizing`, the 99 hold
+    /// while the provider commits), tick ~30fps to advance the phase, the same cadence and
+    /// shape as the folder refresh glyph's spin (`FolderSpinTick`). Per-document like
+    /// `sub_upload_poll`, and gone the instant no meter is finalizing, so the fast tick
+    /// exists only for the few seconds it is actually animating something.
+    fn sub_upload_finalize_anim(&self) -> Option<Subscription<Msg>> {
+        const UPLOAD_ANIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(33);
+        let ticks: Vec<_> = self
+            .previews
+            .iter()
+            .filter(|p| {
+                p.edit.uploads.iter().any(|w| {
+                    matches!(
+                        crate::app::preview::edit::meter_face(w),
+                        crate::app::preview::edit::MeterFace::Finalizing
+                    )
+                })
+            })
+            .map(|p| {
+                let id = p.window;
+                cosmic::iced::time::every(UPLOAD_ANIM_INTERVAL)
+                    .with(id)
+                    .map(|(id, _)| Msg::Preview(id, PreviewMsg::UploadAnimTick))
             })
             .collect();
         if ticks.is_empty() {

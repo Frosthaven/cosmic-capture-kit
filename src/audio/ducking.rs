@@ -89,7 +89,9 @@ impl OtherAudioDuck {
 impl OtherAudioDuck {
     /// Spawn the babysitter. It pauses the other players and holds them until we let go.
     pub(crate) fn engage() -> Self {
-        let child = std::env::current_exe().ok().and_then(|exe| {
+        // `self_exe` (DRAGON-510): the babysitter is held for the whole recording and the
+        // AppImage mount path is not a durable way to name ourselves.
+        let child = crate::util::self_exe().ok().and_then(|exe| {
             Command::new(exe)
                 .arg(DUCK_FLAG)
                 // Our keepalive: the child blocks on this pipe and resumes when we close it.

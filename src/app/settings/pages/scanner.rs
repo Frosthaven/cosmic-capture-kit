@@ -37,6 +37,22 @@ impl crate::app::App {
             ocr_items.push(note);
         }
         if tess && self.scan_text {
+            // DRAGON-527: which language pack OCR runs with. Row 0 is the default entry,
+            // which passes no `-l` and leaves tesseract on its own `eng`, so a config that
+            // has never touched this reads exactly what it always did. The list comes from
+            // `tesseract --list-langs`, re-probed each time this window opens.
+            ocr_items.push(
+                Item::new(
+                    "Tesseract language pack",
+                    self.ocr_lang_desc(),
+                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
+                        &self.ocr_lang_labels,
+                        Some(self.ocr_lang_index()),
+                        |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0)),
+                    )),
+                )
+                .reset_with(self.ocr_lang_index(), 0usize, |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0))),
+            );
             ocr_items.push(
                 Item::new(
                     "Text matching strictness",
@@ -84,3 +100,4 @@ impl crate::app::App {
         ]
     }
 }
+

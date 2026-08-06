@@ -66,7 +66,7 @@
 //! # Decision here, syscall in the plugin
 //!
 //! The house split (CLAUDE.md). The BUCKETING ([`counter`]), the glyph geometry
-//! ([`counter_svg`]) and the tooltip wording ([`tooltip`]) are pure and unit-tested on
+//! ([`counter_pixel_svg`]) and the tooltip wording ([`tooltip`]) are pure and unit-tested on
 //! every host, so the number the three platforms draw is decided ONCE and cannot drift.
 //! Since DRAGON-495 all THREE platforms rasterize that same geometry: macOS used to set its
 //! button's title to the number as text, which made it the one platform showing something
@@ -231,6 +231,16 @@ pub enum Face {
     /// the owner noticed it was the one glyph in the app that was a filled blob rather than a
     /// lucide outline.
     Indeterminate,
+    /// The FINALIZE wait (DRAGON-537): every byte is delivered and acknowledged, the counter
+    /// is parked at [`counter`]'s dedicated 99 step, and the outcome has not arrived (the
+    /// provider is committing the transfer, and the child may still be making the share
+    /// link). Drawn as lucide's `hourglass` outline: the number had stopped moving, and a
+    /// parked "99" read as stuck rather than as nearly-done. The Cancel entry is NOT offered
+    /// here ([`cancel_offered`]): the flag it sets is read between chunks, and there are
+    /// none left. Only a transfer that reported a GENUINE percentage ever reaches this face;
+    /// one that stayed [`Self::Indeterminate`] to the end keeps its spinner, since it never
+    /// had a number to park.
+    Finalizing,
     /// The upload finished and the provider confirmed it: a tick.
     Done,
     /// The upload did not finish: a cross.
@@ -266,15 +276,23 @@ pub const FACE_FAILED_CODE: u8 = 101;
 #[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
 pub const FACE_INDETERMINATE_CODE: u8 = 102;
 
-// The three non-percentage codes have to sit above every percentage `counter` can produce,
+/// The wire form of [`Face::Finalizing`] (DRAGON-537). See [`FACE_DONE_CODE`].
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+pub const FACE_FINALIZING_CODE: u8 = 103;
+
+// The non-percentage codes have to sit above every percentage `counter` can produce,
 // and stay distinct from each other, or two faces would decode to each other across the seam.
 const _: () = assert!(
     FACE_DONE_CODE > 99
         && FACE_FAILED_CODE > 99
         && FACE_INDETERMINATE_CODE > 99
+        && FACE_FINALIZING_CODE > 99
         && FACE_DONE_CODE != FACE_FAILED_CODE
         && FACE_DONE_CODE != FACE_INDETERMINATE_CODE
-        && FACE_FAILED_CODE != FACE_INDETERMINATE_CODE,
+        && FACE_DONE_CODE != FACE_FINALIZING_CODE
+        && FACE_FAILED_CODE != FACE_INDETERMINATE_CODE
+        && FACE_FAILED_CODE != FACE_FINALIZING_CODE
+        && FACE_INDETERMINATE_CODE != FACE_FINALIZING_CODE,
     "DRAGON-482: a non-percentage face's wire code must not collide with a percentage or \
      another face"
 );
@@ -285,6 +303,7 @@ pub fn face_code(face: Face) -> u8 {
     match face {
         Face::Percent(n) => n.min(99),
         Face::Indeterminate => FACE_INDETERMINATE_CODE,
+        Face::Finalizing => FACE_FINALIZING_CODE,
         Face::Done => FACE_DONE_CODE,
         Face::Failed => FACE_FAILED_CODE,
     }
@@ -299,9 +318,23 @@ pub fn face_from_code(code: u8) -> Face {
     match code {
         FACE_DONE_CODE => Face::Done,
         FACE_INDETERMINATE_CODE => Face::Indeterminate,
+        FACE_FINALIZING_CODE => Face::Finalizing,
         FACE_FAILED_CODE => Face::Failed,
         n => Face::Percent(n.clamp(1, 99)),
     }
+}
+
+/// Whether the tray's "Cancel upload" entry should be offered at `face`. Pure; unit-tested
+/// (DRAGON-537).
+///
+/// The flag Cancel sets is read between chunks, so it can only stop a transfer that still
+/// has chunks left: a percentage or the spinner. At [`Face::Finalizing`] every byte is
+/// already at the provider, and at the end faces the transfer is over, so in all of those
+/// the entry would be an affordance that does nothing. The same rule the editor meter's X
+/// follows (`preview::edit::meter_cancel_action`); each platform's menu builder consults
+/// THIS answer rather than restating it, so the three arms cannot drift.
+pub fn cancel_offered(face: Face) -> bool {
+    matches!(face, Face::Percent(_) | Face::Indeterminate)
 }
 
 /// The counter's tooltip: which account this upload is going to, and where it has got to.
@@ -316,6 +349,9 @@ pub fn tooltip(label: &str, face: Face) -> String {
         Face::Percent(n) => format!("Uploading to {who} ({n}%)"),
         // No number: there is nothing honest to put after it (DRAGON-490 follow-up).
         Face::Indeterminate => format!("Uploading to {who}"),
+        // Every byte is delivered; the provider is committing (DRAGON-537). Not a
+        // percentage, because there is no number left that would be true.
+        Face::Finalizing => format!("Finishing upload to {who}"),
         Face::Done => format!("Uploaded to {who}"),
         Face::Failed => format!("Upload to {who} failed"),
     }
@@ -334,6 +370,9 @@ pub fn face_title(face: Face) -> String {
         // No digits to show (DRAGON-490 follow-up): a plain ellipsis reads as "working" in a
         // menu-bar title the same way it does anywhere else, without claiming a number.
         Face::Indeterminate => "\u{2026}".to_string(),
+        // U+29D7 BLACK HOURGLASS (DRAGON-537): the text-presentation hourglass, so a font
+        // renders it at menu-bar size and colour rather than swapping in the U+231B emoji.
+        Face::Finalizing => "\u{29D7}".to_string(),
         Face::Done => "\u{2713}".to_string(),
         Face::Failed => "\u{2715}".to_string(),
     }
@@ -341,43 +380,46 @@ pub fn face_title(face: Face) -> String {
 
 // ── The counter glyph (Linux + Windows raster it; macOS draws text) ───────────
 
-/// The icon for a face, as a 24x24 SVG in `#000`. Pure; unit-tested.
+/// The icon for a face, as an SVG in `#000`. Pure; unit-tested.
 ///
-/// One glyph per face, each owning the whole box: the seven-segment number
-/// ([`counter_svg`]), the tick or the cross ([`mark_svg`]), or lucide's `cloud-upload`
-/// outline ([`glyph_svg`]) while there is no honest percentage to show. They stopped
-/// SHARING the box in DRAGON-495; this doc said "an upload cloud with the number under it"
-/// until DRAGON-516, describing a layout two tickets dead.
+/// One glyph per face, each owning the whole box: the tick or the cross ([`mark_svg`]),
+/// lucide's `cloud-upload` outline or `hourglass` ([`glyph_svg`]) — all in the shared
+/// 24-unit box the ink-fit renderers expect. They stopped SHARING the box in DRAGON-495;
+/// this doc said "an upload cloud with the number under it" until DRAGON-516, describing a
+/// layout two tickets dead.
 ///
-/// `#000` throughout because that is the contract the two rasterizers already share: the
-/// Linux tray's `render_icon` recolours `#000` to the app accent, and the Windows daemon's
-/// tray SVG does the same substitution. So this glyph tints itself the same way the
-/// recording icon does, with no second colour rule.
+/// **Backends should not call this directly any more** (DRAGON-539): [`face_art`] is the
+/// seam, because the DIGIT faces are pixel art sized to the backend's own cell and rendered
+/// 1:1, never ink-fitted. The `Percent` arm here serves only the uniform-signature callers
+/// (tests, comparisons) with the 24px form of the same generator; nothing renders it.
 ///
-/// **The digits are SEGMENTS, not text.** `<text>` would need a font database loaded into
-/// usvg, which means a system font scan in a process whose whole job is one upload, and it
-/// would render NOTHING if the scan came back empty. Seven-segment digits are geometry: they
-/// need no fonts, they are identical on every machine, and they stay legible at the 22-ish
-/// pixels a panel actually gives an icon.
+/// `#000` throughout because that is the contract the rasterizers already share: the Linux
+/// tray's `render_icon` recolours `#000` to the app accent, and the Windows arm does the
+/// same substitution. So every face tints itself the same way the recording icon does, with
+/// no second colour rule. No `<text>` anywhere, in any face: a font database is exactly
+/// what a one-upload process must not need, and both the blocks and the glyphs are plain
+/// geometry.
 pub fn face_svg(face: Face) -> String {
     match face {
-        Face::Percent(n) => counter_svg(n),
-        Face::Indeterminate => glyph_svg(),
+        Face::Percent(n) => counter_pixel_svg(n, 24),
+        Face::Indeterminate => glyph_svg(cloud_mark()),
+        Face::Finalizing => glyph_svg(hourglass_mark()),
         Face::Done => mark_svg(TICK),
         Face::Failed => mark_svg(CROSS),
     }
 }
 
-/// The plain upload glyph alone, with no number/tick/cross under it (DRAGON-490 follow-up):
-/// [`Face::Indeterminate`]'s icon, for a transfer with no real percentage to show. Since
-/// DRAGON-516 it is the lucide `cloud-upload` mark ([`cloud_mark`]), drawn at the size of the
-/// whole box.
+/// A lucide outline alone in the box: [`Face::Indeterminate`]'s `cloud-upload` (DRAGON-516)
+/// or [`Face::Finalizing`]'s `hourglass` (DRAGON-537), whichever `mark` the caller hands in.
+/// Both wear lucide's own stroke attributes and are ink-fitted by the rasterizers exactly
+/// like every other face, which is what keeps the hourglass the same visual weight as the
+/// digits it replaces.
 ///
 /// The stroke attributes live on the GROUP rather than on each path, which is both how lucide
 /// ships its own icons and what keeps ONE `#000` in the file for the accent substitution to
 /// find (`platform/linux/tray.rs`'s `recolour`, and the identical `replace` in the Windows
 /// arm).
-fn glyph_svg() -> String {
+fn glyph_svg(mark: &str) -> String {
     let mut out = String::with_capacity(512);
     out.push_str(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">"#,
@@ -385,7 +427,7 @@ fn glyph_svg() -> String {
     out.push_str(
         r##"<g fill="none" stroke="#000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">"##,
     );
-    out.push_str(cloud_mark());
+    out.push_str(mark);
     out.push_str("</g></svg>");
     out
 }
@@ -472,96 +514,134 @@ fn cloud_mark() -> &'static str {
     )
 }
 
-/// The digit face for `n`: the NUMBER ALONE, filling the box. See [`face_svg`], which is the
-/// entry point every backend uses.
+/// The finalize mark: lucide's `hourglass`, path data verbatim (DRAGON-537), in the same
+/// group-stroke shape as [`cloud_mark`]. The vendored copy is `res/icons/lucide/hourglass.svg`
+/// (fetched from lucide upstream, attribution in `res/icons/ATTRIBUTION.md`); the paths here
+/// must stay byte-identical to that file's.
+fn hourglass_mark() -> &'static str {
+    concat!(
+        // The two caps.
+        r#"<path d="M5 22h14"/>"#,
+        r#"<path d="M5 2h14"/>"#,
+        // The lower bulb, waist at the centre.
+        r#"<path d="M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22"/>"#,
+        // The upper bulb, mirrored.
+        r#"<path d="M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2"/>"#,
+    )
+}
+
+/// The digit faces' pixel font: 3x5 blocks, one entry per digit, 3 bits per row, top to
+/// bottom (DRAGON-539, the owner-approved shapes from the side-by-side preview).
 ///
-/// **No cloud mark** (DRAGON-495, owner report). The number used to share the box with the
-/// upload glyph above it, which left it half-height: at the ~22 physical pixels a panel gives a
-/// tray item, two digits in the bottom half are around 8px tall, and the owner could not read
-/// them. The glyph was saying what the tooltip already says and what a counter appearing in the
-/// tray at all implies, so the digits took the space.
+/// 3x5 and nothing finer, because the whole tray cell can be 16 pixels: two digits plus
+/// their gap are 7 columns, which still leaves an INTEGER block scale of 2 at 16px, and an
+/// integer scale is the entire point (see [`counter_pixel_svg`]).
+const DIGIT_FONT: [[u8; 5]; 10] = [
+    [0b111, 0b101, 0b101, 0b101, 0b111], // 0
+    [0b010, 0b110, 0b010, 0b010, 0b111], // 1
+    [0b111, 0b001, 0b111, 0b100, 0b111], // 2
+    [0b111, 0b001, 0b111, 0b001, 0b111], // 3
+    [0b101, 0b101, 0b111, 0b001, 0b001], // 4
+    [0b111, 0b100, 0b111, 0b001, 0b111], // 5
+    [0b111, 0b100, 0b111, 0b101, 0b111], // 6
+    [0b111, 0b001, 0b001, 0b001, 0b001], // 7
+    [0b111, 0b101, 0b111, 0b101, 0b111], // 8
+    [0b111, 0b101, 0b111, 0b001, 0b111], // 9
+];
+
+/// The two-digit grid: 3 columns per digit plus a 1-column gap, 5 rows.
+const DIGIT_COLS: u32 = 7;
+const DIGIT_ROWS: u32 = 5;
+
+/// The pixel layout for a `px` cell: the integer block scale and the centred origin.
+/// Pure; unit-tested (DRAGON-539).
 ///
-/// The geometry below is the whole of that change: [`Y`]/[`H`] span the box top to bottom
-/// instead of its lower half, and the digit boxes are as wide as two of them fit.
-pub fn counter_svg(n: u8) -> String {
+/// The scale is the LARGEST integer that fits the 7x5 grid inside the cell with a pixel of
+/// margin, floored at 1 so a degenerate cell still draws something. Integer, always: a
+/// fractional scale is precisely the anti-aliased blur this replaced.
+fn pixel_layout(px: u32) -> (u32, u32, u32) {
+    let room = px.saturating_sub(2);
+    let s = (room / DIGIT_COLS).min(room / DIGIT_ROWS).max(1);
+    let x0 = px.saturating_sub(DIGIT_COLS * s) / 2;
+    let y0 = px.saturating_sub(DIGIT_ROWS * s) / 2;
+    (s, x0, y0)
+}
+
+/// The digit face for `n` at a `px` cell: ALWAYS two digits, zero-padded, as pixel blocks
+/// on the integer grid. Pure; unit-tested (DRAGON-539).
+///
+/// **Rendered 1:1, never fitted.** The viewBox IS the target cell, and every rect edge
+/// lands on an integer pixel boundary, so the rasterizer's anti-aliasing has nothing to
+/// soften: absolute flat pixels, which is the owner's ask. The seven-segment predecessor
+/// drew in a 24-unit box and was ink-fitted by a FRACTIONAL scale into the cell, which
+/// smeared every edge grey at the 16px a tray actually gives an icon.
+///
+/// **Two digits always** (owner refinement): 7 draws as `07`. One 7x5 grid at one integer
+/// scale means every digit is the identical size and the icon never re-layouts as a
+/// transfer crosses 9 to 10. Still no `<text>` anywhere: a font database is exactly what
+/// this icon must not need (the rule since the seven-segment days), and blocks need none.
+///
+/// One `#000` group, so the accent substitution the rasterizing platforms share reaches
+/// the whole number in one replace, unchanged.
+pub fn counter_pixel_svg(n: u8, px: u32) -> String {
+    use std::fmt::Write as _;
+    let n = n.min(99);
+    let (s, x0, y0) = pixel_layout(px);
     let mut out = String::with_capacity(1024);
-    out.push_str(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">"#,
+    let _ = write!(
+        out,
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {px} {px}" width="{px}" height="{px}">"#
     );
     out.push_str(r##"<g fill="#000">"##);
-    // The number, across the WHOLE box. One digit is centred and wider; two are spread to
-    // the full width with a gap between them.
-    //
-    // A 1-unit margin all round rather than a flush 0..24: a tray rasterizer scales this into
-    // a box it chooses, and a glyph whose ink touches the viewBox edge is the one that comes
-    // back clipped on the platform that rounds down.
-    const Y: f32 = 1.0;
-    const H: f32 = 22.0;
-    // Thicker with the digits (the old 1.9 was sized for an 11-unit digit); still under a
-    // quarter of the height, which is what keeps a `0` from closing up into a filled block.
-    const T: f32 = 3.2;
-    // One digit's width when there are two, and the gap between them. The two digits plus the
-    // gap plus a 1-unit margin each side are the whole 24, which the assert below pins: a
-    // change to either width that stops filling the box is the bug this whole edit was.
-    const W2: f32 = 10.4;
-    const GAP: f32 = 1.2;
-    const _: () = assert!(
-        2.0 + W2 + GAP + W2 <= 24.0 && 2.0 + W2 + GAP + W2 > 23.9,
-        "two digits plus their gap and margins must fill the 24-unit icon box"
-    );
-    // A lone digit is wider (there is room) but not full width: a seven-segment glyph much
-    // past this reads as a rectangle rather than as a number.
-    const W1: f32 = 13.0;
-    let n = n.min(99);
-    if n >= 10 {
-        digit_rects(n / 10, 1.0, Y, W2, H, T, &mut out);
-        digit_rects(n % 10, 1.0 + W2 + GAP, Y, W2, H, T, &mut out);
-    } else {
-        digit_rects(n, (24.0 - W1) / 2.0, Y, W1, H, T, &mut out);
+    for (slot, digit) in [n / 10, n % 10].into_iter().enumerate() {
+        // Digit 0 at column 0, digit 1 past the 3 columns plus the 1-column gap.
+        let col0 = slot as u32 * 4;
+        for (row, bits) in DIGIT_FONT[digit as usize].iter().enumerate() {
+            // Consecutive lit cells merge into one rect per run: fewer rects, same pixels.
+            let mut col = 0u32;
+            while col < 3 {
+                if bits & (0b100 >> col) == 0 {
+                    col += 1;
+                    continue;
+                }
+                let start = col;
+                while col < 3 && bits & (0b100 >> col) != 0 {
+                    col += 1;
+                }
+                let _ = write!(
+                    out,
+                    r#"<rect x="{}" y="{}" width="{}" height="{}"/>"#,
+                    x0 + (col0 + start) * s,
+                    y0 + row as u32 * s,
+                    (col - start) * s,
+                    s
+                );
+            }
+        }
     }
     out.push_str("</g></svg>");
     out
 }
 
-/// Which of the seven segments each digit lights, in the classic `a b c d e f g` order
-/// (top, top-right, bottom-right, bottom, bottom-left, top-left, middle).
-const SEGMENTS: [[bool; 7]; 10] = [
-    [true, true, true, true, true, true, false],    // 0
-    [false, true, true, false, false, false, false], // 1
-    [true, true, false, true, true, false, true],   // 2
-    [true, true, true, true, false, false, true],   // 3
-    [false, true, true, false, false, true, true],  // 4
-    [true, false, true, true, false, true, true],   // 5
-    [true, false, true, true, true, true, true],    // 6
-    [true, true, true, false, false, false, false], // 7
-    [true, true, true, true, true, true, true],     // 8
-    [true, true, true, true, false, true, true],    // 9
-];
+/// What a backend should DRAW for a face, and crucially HOW (DRAGON-539). Pure; unit-tested.
+///
+/// The digit faces are pixel art: the backend asks [`counter_pixel_svg`] for its own native
+/// cell size and renders it 1:1, so the blocks stay on the pixel grid. Every other face is
+/// a glyph in the shared 24-unit box, rendered through the DRAGON-500 ink-fit exactly as
+/// before. This enum is what keeps "which faces are pixel digits" decided once, here, while
+/// each platform keeps the one thing that is legitimately its own: its native cell size.
+pub enum FaceArt {
+    /// Render [`counter_pixel_svg`] of this value at the backend's native cell size, 1:1.
+    PixelDigits(u8),
+    /// Render this 24-unit-box SVG through the ink-fit path, anti-aliased as ever.
+    Fitted(String),
+}
 
-/// Append one seven-segment digit's rects to `out`, in a `w` by `h` box at (`x`, `y`) with
-/// stroke thickness `t`. Pure geometry; the caller owns placement.
-fn digit_rects(d: u8, x: f32, y: f32, w: f32, h: f32, t: f32, out: &mut String) {
-    let lit = SEGMENTS[(d % 10) as usize];
-    let half = (h + t) / 2.0;
-    let mid = y + (h - t) / 2.0;
-    // (x, y, w, h) per segment, in the a b c d e f g order of `SEGMENTS`.
-    let boxes = [
-        (x, y, w, t),                  // a: top
-        (x + w - t, y, t, half),       // b: top-right
-        (x + w - t, mid, t, half),     // c: bottom-right
-        (x, y + h - t, w, t),          // d: bottom
-        (x, mid, t, half),             // e: bottom-left
-        (x, y, t, half),               // f: top-left
-        (x, mid, w, t),                // g: middle
-    ];
-    for (on, (bx, by, bw, bh)) in lit.into_iter().zip(boxes) {
-        if on {
-            use std::fmt::Write as _;
-            let _ = write!(
-                out,
-                r#"<rect x="{bx:.2}" y="{by:.2}" width="{bw:.2}" height="{bh:.2}"/>"#
-            );
-        }
+/// The [`FaceArt`] for a face. Pure; unit-tested.
+pub fn face_art(face: Face) -> FaceArt {
+    match face {
+        Face::Percent(n) => FaceArt::PixelDigits(n),
+        other => FaceArt::Fitted(face_svg(other)),
     }
 }
 
@@ -691,7 +771,7 @@ impl UploadTray {
             return;
         }
         if let Some(item) = &self.backing {
-            item.set(&self.label, Face::Percent(next));
+            item.set(&self.label, tray_face(next));
         }
         self.shown = Some(next);
     }
@@ -734,6 +814,16 @@ pub enum Ending {
     Failed,
     /// The user cancelled it, from this tray's own menu or from the editor.
     Canceled,
+}
+
+/// The face a BUCKETED counter value wears in the tray. Pure; unit-tested (DRAGON-537).
+///
+/// [`counter`]'s 99 step means "every byte is delivered, the outcome is pending"
+/// (DRAGON-522 made it a step of its own for exactly that reason), and a number that has
+/// stopped moving reads as stuck, so that step wears the hourglass rather than digits.
+/// Every lower bucket is an ordinary percentage.
+pub fn tray_face(bucket: u8) -> Face {
+    if bucket >= 99 { Face::Finalizing } else { Face::Percent(bucket) }
 }
 
 /// The face the tray holds after an upload ends, or `None` to take the item away at once.
@@ -943,6 +1033,7 @@ mod counter_tests {
             Face::Percent(40),
             Face::Percent(99),
             Face::Indeterminate,
+            Face::Finalizing,
             Face::Done,
             Face::Failed,
         ] {
@@ -955,21 +1046,102 @@ mod counter_tests {
 }
 
 #[cfg(test)]
+mod finalize_tests {
+    use super::*;
+
+    /// **The 99 step wears the hourglass** (DRAGON-537). The one clamp made 99 mean "every
+    /// byte is delivered, the outcome is pending" (DRAGON-522); a number that has stopped
+    /// moving read as stuck, so that step is a glyph, not digits. Every lower bucket stays
+    /// a percentage.
+    #[test]
+    fn the_ninety_nine_step_is_the_hourglass_and_lower_buckets_are_digits() {
+        assert_eq!(tray_face(99), Face::Finalizing);
+        for bucket in [1u8, 5, 40, 95] {
+            assert_eq!(tray_face(bucket), Face::Percent(bucket), "{bucket}");
+        }
+    }
+
+    /// **Cancel is only offered while it can still do something** (DRAGON-537). The flag it
+    /// sets is read between chunks; at Finalizing there are none left, and at the end faces
+    /// the transfer is over. The same truth the editor meter's X follows.
+    #[test]
+    fn cancel_is_offered_exactly_while_chunks_remain() {
+        assert!(cancel_offered(Face::Percent(1)));
+        assert!(cancel_offered(Face::Percent(95)));
+        assert!(cancel_offered(Face::Indeterminate));
+        assert!(!cancel_offered(Face::Finalizing));
+        assert!(!cancel_offered(Face::Done));
+        assert!(!cancel_offered(Face::Failed));
+    }
+
+    /// The finalize face says "finishing", never a number: there is no number left that
+    /// would be true, and the title is the text hourglass rather than the emoji one.
+    #[test]
+    fn the_finalize_face_claims_no_percentage() {
+        assert_eq!(tooltip("Work Drive", Face::Finalizing), "Finishing upload to Work Drive");
+        assert_eq!(tooltip("", Face::Finalizing), "Finishing upload to your cloud account");
+        let title = face_title(Face::Finalizing);
+        assert!(!title.contains('%') && !title.chars().any(|c| c.is_ascii_digit()), "{title}");
+        assert_eq!(title, "\u{29D7}");
+        for t in [tooltip("W", Face::Finalizing), title] {
+            assert!(!t.contains('\u{2014}') && !t.contains('\u{2013}'), "dash in {t:?}");
+        }
+    }
+
+    /// The hourglass glyph is a standalone lucide mark like every other face's icon: it
+    /// parses, needs no font, recolours through the one `#000`, and is not any other face's
+    /// picture.
+    #[test]
+    fn the_hourglass_glyph_parses_and_recolours() {
+        let svg = face_svg(Face::Finalizing);
+        assert!(
+            resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).is_ok(),
+            "the hourglass glyph does not parse: {svg}"
+        );
+        assert!(!svg.contains("<text") && !svg.contains("font"));
+        assert_eq!(svg.matches("#000").count(), 1, "one substitution recolours the whole mark");
+        assert!(svg.contains(r#"viewBox="0 0 24 24""#), "the shared 24-unit icon box");
+        for other in [Face::Indeterminate, Face::Percent(99), Face::Done, Face::Failed] {
+            assert_ne!(svg, face_svg(other), "{other:?} draws the same picture");
+        }
+    }
+
+    /// The vendored `res/icons/lucide/hourglass.svg` and [`hourglass_mark`] must carry the
+    /// SAME path data: the vendored file is the attribution-bearing source of truth, and a
+    /// drift here would ship a glyph the attribution no longer describes.
+    #[test]
+    fn the_hourglass_mark_matches_the_vendored_icon() {
+        let vendored = include_str!("../../res/icons/lucide/hourglass.svg");
+        for d in [
+            "M5 22h14",
+            "M5 2h14",
+            "M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22",
+            "M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2",
+        ] {
+            assert!(hourglass_mark().contains(d), "mark lost {d}");
+            assert!(vendored.contains(d), "vendored icon lost {d}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod glyph_tests {
     use super::*;
 
-    /// **The one that matters**: every number the counter can show must PARSE as SVG. The
-    /// two rasterizing platforms hand this straight to usvg, and a glyph that fails to parse
-    /// is an upload with no visible progress at all.
+    /// **The one that matters**: every number the counter can show must PARSE as SVG, at
+    /// the real cell sizes the three platforms render. A glyph that fails to parse is an
+    /// upload with no visible progress at all.
     #[test]
     fn every_counter_value_parses_as_an_svg() {
         for n in 1..=99u8 {
-            let svg = counter_svg(n);
-            assert!(
-                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
-                    .is_ok(),
-                "the glyph for {n} does not parse: {svg}"
-            );
+            for px in [16u32, 24, 36] {
+                let svg = counter_pixel_svg(n, px);
+                assert!(
+                    resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
+                        .is_ok(),
+                    "the glyph for {n} at {px}px does not parse: {svg}"
+                );
+            }
         }
     }
 
@@ -977,7 +1149,7 @@ mod glyph_tests {
     /// exactly what this icon must not need.
     #[test]
     fn the_glyph_needs_no_font() {
-        let svg = counter_svg(42);
+        let svg = counter_pixel_svg(42, 16);
         assert!(!svg.contains("<text"), "the counter must not depend on a font stack");
         assert!(!svg.contains("font"), "the counter must not depend on a font stack");
     }
@@ -1082,7 +1254,7 @@ mod glyph_tests {
     /// This is what makes that a safe edit to three platform files at once.
     #[test]
     fn a_filled_face_measures_the_same_either_way() {
-        for face in [Face::Percent(7), Face::Percent(88), Face::Done, Face::Failed] {
+        for face in [Face::Done, Face::Failed] {
             let svg = face_svg(face);
             let tree =
                 resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
@@ -1095,81 +1267,6 @@ mod glyph_tests {
                 "{face:?} is filled, so counting a stroke it does not have must change nothing"
             );
         }
-    }
-
-    /// Recolouring is what tints the icon to the app accent on both rasterizing platforms,
-    /// and it works by replacing `#000`. A glyph that named its colour any other way would
-    /// come out black on a dark panel.
-    #[test]
-    fn the_glyph_is_black_so_the_accent_substitution_reaches_it() {
-        let svg = counter_svg(7);
-        assert!(svg.contains("#000"), "the accent substitution keys on #000");
-        assert_eq!(svg.matches("#000").count(), 1, "one fill for the whole mark");
-        assert!(svg.contains(r#"viewBox="0 0 24 24""#), "the shared 24-unit icon box");
-    }
-
-    /// One digit versus two is a layout difference, so the two must really differ, and a
-    /// two-digit number must place its digits apart rather than on top of each other.
-    #[test]
-    fn one_and_two_digit_numbers_are_laid_out_differently() {
-        let one = counter_svg(7);
-        let two = counter_svg(70);
-        assert_ne!(one, two);
-        // 8 lights every segment, so a two-digit 88 has exactly seven rects more than a
-        // single 8 (nothing else contributes a rect since DRAGON-495 took the cloud away).
-        let rects = |s: &str| s.matches("<rect").count();
-        assert_eq!(rects(&counter_svg(88)) - rects(&counter_svg(8)), 7);
-        // 1 lights two segments, 8 lights seven: the map is really being read.
-        assert_eq!(rects(&counter_svg(8)) - rects(&counter_svg(1)), 5);
-    }
-
-    /// The bounding box of every `<rect>` in `svg`, as `(x0, y0, x1, y1)`.
-    ///
-    /// Only meaningful for the DIGIT faces, whose rects are axis-aligned and untransformed;
-    /// the tick and the cross rotate theirs about their own start points, so their drawn
-    /// extent is not the rect's own extent.
-    fn ink_bounds(svg: &str) -> (f32, f32, f32, f32) {
-        let attr = |tag: &str, name: &str| -> f32 {
-            let key = format!("{name}=\"");
-            let start = tag.find(&key).map(|i| i + key.len()).expect("the attribute is present");
-            let rest = &tag[start..];
-            let end = rest.find('"').expect("the attribute is closed");
-            rest[..end].parse::<f32>().expect("a number")
-        };
-        let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-        for chunk in svg.split("<rect").skip(1) {
-            let tag = &chunk[..chunk.find("/>").expect("the rect is closed")];
-            let (x, y) = (attr(tag, "x"), attr(tag, "y"));
-            x0 = x0.min(x);
-            y0 = y0.min(y);
-            x1 = x1.max(x + attr(tag, "width"));
-            y1 = y1.max(y + attr(tag, "height"));
-        }
-        (x0, y0, x1, y1)
-    }
-
-    /// **DRAGON-495: the number owns the whole icon.** It used to share the box with the upload
-    /// cloud, which left two digits about eight physical pixels tall in a panel and, as the
-    /// owner reported, unreadable. The cloud's own shapes must be gone from the counter, and the
-    /// digits' ink must reach every edge of the 24-unit box (bar the 1-unit safety margin).
-    #[test]
-    fn the_counter_is_digits_alone_filling_the_box() {
-        let svg = counter_svg(88);
-        assert!(!svg.contains("<circle"), "the cloud mark survives in the counter");
-        assert!(!svg.contains("<polygon"), "the cloud's arrow survives in the counter");
-        let (x0, y0, x1, y1) = ink_bounds(&svg);
-        assert!(x0 <= 1.0 && x1 >= 23.0, "the digits do not span the box across: {x0}..{x1}");
-        assert!(y0 <= 1.0 && y1 >= 23.0, "the digits do not span the box down: {y0}..{y1}");
-        // A single digit is centred, and just as tall: an upload must not appear to change
-        // size as it crosses 10%.
-        let (sx0, sy0, sx1, sy1) = ink_bounds(&counter_svg(8));
-        assert!(sy0 <= 1.0 && sy1 >= 23.0, "a lone digit is not full height: {sy0}..{sy1}");
-        assert!(sx0 > x0 && sx1 < x1, "a lone digit is not narrower than two");
-        assert!(
-            (sx0 - (24.0 - sx1)).abs() < 0.05,
-            "a lone digit is not centred: {sx0} left, {} right",
-            24.0 - sx1
-        );
     }
 
     /// The end states lost the cloud with the digits (DRAGON-495), so the tick and the cross
@@ -1189,18 +1286,125 @@ mod glyph_tests {
             );
         }
     }
+}
 
-    /// Every digit has its own shape. A copy-paste slip in the segment table would show as
-    /// two numbers rendering identically, which nothing else would catch.
+#[cfg(test)]
+mod pixel_digit_tests {
+    use super::*;
+
+    /// Every `<rect>`'s `(x, y, w, h)` in `svg`, parsed as INTEGERS: a fractional attribute
+    /// fails the parse, which is itself the flat-pixel assertion (DRAGON-539).
+    fn rects(svg: &str) -> Vec<(u32, u32, u32, u32)> {
+        let attr = |tag: &str, name: &str| -> u32 {
+            let key = format!("{name}=\"");
+            let start = tag.find(&key).map(|i| i + key.len()).expect("the attribute is present");
+            let rest = &tag[start..];
+            let end = rest.find('"').expect("the attribute is closed");
+            rest[..end].parse::<u32>().expect("an integer pixel coordinate")
+        };
+        svg.split("<rect")
+            .skip(1)
+            .map(|chunk| {
+                let tag = &chunk[..chunk.find("/>").expect("the rect is closed")];
+                (attr(tag, "x"), attr(tag, "y"), attr(tag, "width"), attr(tag, "height"))
+            })
+            .collect()
+    }
+
+    /// The overall ink box of the digit blocks.
+    fn ink(svg: &str) -> (u32, u32, u32, u32) {
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for (x, y, w, h) in rects(svg) {
+            x0 = x0.min(x);
+            y0 = y0.min(y);
+            x1 = x1.max(x + w);
+            y1 = y1.max(y + h);
+        }
+        (x0, y0, x1, y1)
+    }
+
+    /// **Flat pixels** (DRAGON-539): every block coordinate is an integer on the cell's own
+    /// grid and stays inside the cell, at every tray size the platforms render. The `rects`
+    /// helper's integer parse IS the assertion; this pins the bounds on top of it.
+    #[test]
+    fn every_block_sits_on_the_pixel_grid_inside_the_cell() {
+        for n in [0u8, 7, 45, 88, 99] {
+            for px in [16u32, 20, 22, 24, 32, 36, 48] {
+                let svg = counter_pixel_svg(n, px);
+                assert!(!rects(&svg).is_empty(), "{n} at {px}px drew nothing");
+                for (x, y, w, h) in rects(&svg) {
+                    assert!(x + w <= px && y + h <= px, "{n} at {px}px: block leaves the cell");
+                    assert!(w > 0 && h > 0, "{n} at {px}px: an empty block");
+                }
+            }
+        }
+    }
+
+    /// **Always two digits, always one size** (owner refinement): 7 draws as `07`, and the
+    /// ink box is the same 7x5 block grid for EVERY value, so no digit is ever a different
+    /// size and the icon never re-layouts crossing 9 to 10.
+    #[test]
+    fn every_value_is_two_digits_on_one_grid() {
+        for px in [16u32, 24, 36] {
+            let (s, _, _) = super::pixel_layout(px);
+            let reference = ink(&counter_pixel_svg(45, px));
+            assert_eq!(
+                (reference.2 - reference.0, reference.3 - reference.1),
+                (7 * s, 5 * s),
+                "the ink box is not the 7x5 grid at {px}px"
+            );
+            for n in [0u8, 1, 7, 9, 10, 50, 99] {
+                assert_eq!(ink(&counter_pixel_svg(n, px)), reference, "{n} at {px}px moved");
+            }
+        }
+        // The pad is real: a bare 7 and a 70 differ (the zero leads, not trails).
+        assert_ne!(counter_pixel_svg(7, 16), counter_pixel_svg(70, 16));
+    }
+
+    /// The scale is the LARGEST integer fit: 2 at the 16px tray cell, 3 at 24, 4 at 36.
+    /// Integer, always, because a fractional scale is the anti-aliased blur this replaced.
+    #[test]
+    fn the_scale_is_the_biggest_integer_that_fits() {
+        for (px, s) in [(16u32, 2u32), (20, 2), (24, 3), (32, 4), (36, 4), (48, 6), (64, 8)] {
+            assert_eq!(super::pixel_layout(px).0, s, "wrong scale at {px}px");
+        }
+        // Degenerate cells still draw at scale 1 rather than 0.
+        assert_eq!(super::pixel_layout(8).0, 1);
+    }
+
+    /// Recolouring is what tints the icon on the rasterizing platforms, by replacing `#000`:
+    /// one colour for the whole number, one substitution.
+    #[test]
+    fn the_digits_are_black_so_the_accent_substitution_reaches_them() {
+        let svg = counter_pixel_svg(7, 16);
+        assert_eq!(svg.matches("#000").count(), 1, "one fill for the whole number");
+        assert!(svg.contains(r#"viewBox="0 0 16 16""#), "the viewBox IS the cell");
+    }
+
+    /// Every digit has its own shape. A copy-paste slip in the font table would show as two
+    /// numbers rendering identically, which nothing else would catch.
     #[test]
     fn each_digit_draws_something_different() {
         let mut seen: Vec<String> = Vec::new();
         for d in 0..10u8 {
-            let mut svg = String::new();
-            digit_rects(d, 0.0, 0.0, 9.0, 11.0, 1.9, &mut svg);
-            assert!(!svg.is_empty(), "digit {d} drew nothing");
+            // `dd` puts the digit in both slots, so the comparison is the digit alone.
+            let svg = counter_pixel_svg(d * 11, 24);
             assert!(!seen.contains(&svg), "digit {d} draws the same as an earlier one");
             seen.push(svg);
+        }
+    }
+
+    /// The seam (DRAGON-539): digits are pixel art at the backend's own size, everything
+    /// else is the ink-fitted glyph it always was.
+    #[test]
+    fn only_the_digit_faces_are_pixel_art() {
+        assert!(matches!(face_art(Face::Percent(40)), FaceArt::PixelDigits(40)));
+        assert!(matches!(face_art(Face::Percent(99)), FaceArt::PixelDigits(99)));
+        for face in [Face::Indeterminate, Face::Finalizing, Face::Done, Face::Failed] {
+            match face_art(face) {
+                FaceArt::Fitted(svg) => assert_eq!(svg, face_svg(face), "{face:?}"),
+                FaceArt::PixelDigits(_) => panic!("{face:?} must stay an ink-fitted glyph"),
+            }
         }
     }
 }

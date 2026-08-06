@@ -64,9 +64,10 @@ absent.
 | Binary | Package (Arch) | Feature | Without it |
 |---|---|---|---|
 | **ffmpeg** | `ffmpeg` | Screen recording. Raw frames are piped to ffmpeg (`-f rawvideo`) and encoded. | The Recordings feature is disabled and the UI warns. |
-| **tesseract** | `tesseract` + a language pack (e.g. `tesseract-data-eng`) | OCR text detection ("Scan text (OCR) in region mode"). The region is handed to `tesseract … tsv`. | The toggle shows a "tesseract not found" hint and no-ops. |
+| **tesseract** | `tesseract` + a language pack (e.g. `tesseract-data-eng`) | OCR text detection ("Scan text (OCR) in region mode"). The region is handed to `tesseract … tsv`. Found via `CCK_TESSERACT`, then a sidecar beside our binary, then `PATH` (DRAGON-527), so a packaged build can carry its own. **The macOS and Windows packages now DO** (DRAGON-531): they ship tesseract plus `tessdata/eng.traineddata` beside the binary, and the Settings language dropdown lists whatever is in that folder, so a user can drop more `.traineddata` files in. Linux keeps using the distro's tesseract and its own `/usr/share/tessdata`, deliberately: pointing it elsewhere would HIDE every `tesseract-data-*` pack the user installed.
 | **proton-drive** | none in any distro's own repos; download the standalone binary from [proton.me/support/drive-cli](https://proton.me/support/drive-cli), or on Arch the AUR package `proton-drive-cli-bin` (Proton's official checksummed build). Linux also needs `libsecret` and a running keyring (GNOME Keyring, KWallet). | **Proton Drive cloud accounts only** (DRAGON-485). Proton has no third-party API, so this provider goes through Proton's own official CLI: sign-in (`auth login`, which opens your browser), uploads, folder listing and share links. Found via `CCK_PROTON_DRIVE`, then a sidecar beside our binary, then `PATH`. It is a ~118 MB self-contained binary and is deliberately **not bundled**. | The Proton Drive entry stays visible in the add-account picker with an "Install proton-drive CLI" line, and selecting it opens Proton's download page instead of starting a sign-in. Every other cloud provider, and all capture, recording and OCR, are unaffected. |
-| **curl** | `curl` | **Two features.** (1) The in-app **update check** (`src/update.rs`): one `curl -fsSL --max-time 10` per settings launch to fetch `update.json`. (2) **Cloud accounts** (`src/cloud/http.rs`, DRAGON-482): every request to a connected drive, with the credentials fed through a stdin `--config -` rather than argv. | The update check reports "Could not run curl to check for updates."; connecting or uploading to a cloud account fails with a named reason. Capture, recording and OCR are unaffected. |
+| **curl** | `curl` | **Two features.** (1) The in-app **update check and install** (`src/update.rs`): one `curl -fsSL --max-time 10` per settings launch to fetch `update.json`, plus, when running as an **AppImage**, the download of the new `.AppImage` itself (DRAGON-532). (2) **Cloud accounts** (`src/cloud/http.rs`, DRAGON-482): every request to a connected drive, with the credentials fed through a stdin `--config -` rather than argv. | The update check reports "Could not run curl to check for updates."; a one-click update reports "Could not run curl to download the update." and changes nothing on disk; connecting or uploading to a cloud account fails with a named reason. Capture, recording and OCR are unaffected. |
+| **sha256sum** | `coreutils` (already on every distro) | Verifying a downloaded update before it replaces the running program (`update::file_sha256`, the AppImage install path only). macOS uses `shasum` from its base system for the same step. | A one-click AppImage update stops with "Could not run the checksum tool to verify the download." and leaves the existing file untouched. An unverified update is never installed. Nothing else uses it. |
 
 > URL opening and the file-manager reveal fallback go through the portal
 > `OpenURI` D-Bus call (see §2), so **no `xdg-utils` / `xdg-open` is needed**. The
@@ -235,6 +236,145 @@ Two things to know about that flag:
 
 Nothing is lost but the in-process GPU zero-copy path (§5). Recording still
 works through the external `ffmpeg` binary, which is fine on ffmpeg 5+.
+
+---
+
+## 8. Pinned third-party artifacts (release builds)
+
+Everything in this section is about what the RELEASE PIPELINE downloads, not
+about what you need installed to run the app. A build from source, and the plain
+Linux zip, still resolve `ffmpeg` and `tesseract` from the distro exactly as §3
+describes.
+
+The macOS `.app`, the Windows MSI and the Linux **AppImage** cannot do that: the
+user's machine may have neither tool, so those packages **ship their own copies
+beside the app binary**, which `util::locate_tool` finds before `PATH`. The Linux
+zip build downloads one thing too, an ffmpeg source tarball, built inside its
+container purely to supply the headers the zero-copy encoder compiles against
+(§7).
+
+### What the AppImage bundles, and what it deliberately does not
+
+| Bundled | Why |
+|---|---|
+| `ffmpeg`, `ffprobe` | recording and probing, on a machine that may have no ffmpeg at all, or one older than 8 |
+| `libavcodec`, `libavdevice`, `libavfilter`, `libavformat`, `libavutil`, `libswresample`, `libswscale`, `libx264` | the in-process **GPU zero-copy** encoder `dlopen`s the libav trio (§5). Bundling them is what gives zero-copy to Debian-family users, who cannot have it from their own repositories |
+| `tesseract` + `tessdata` (`eng` plus tesseract's own `configs/`) | OCR. Statically linked against leptonica and libpng, so it needs nothing bundled beside it |
+
+Everything else comes from the host, and that is a decision rather than an
+omission. **Mesa, libgbm, libdrm, libva and the Vulkan loader must match the
+user's GPU driver**; a bundled copy breaks rendering wherever the driver differs
+from the build machine. libpulse and libpipewire are clients of host daemons and
+are left to the host for the same family of reason. The app already hard-links
+libpulse, libgbm and libpipewire (§1), so a machine that can start the app
+demonstrably has them.
+
+Two consequences worth knowing:
+
+* The AppImage's glibc floor is **whatever its build base has**, and an AppImage
+  does not fix that for itself. It is built on Rocky 9, so the floor is
+  `GLIBC_2.34`, reaching Ubuntu 22.04, Mint 21, Pop!_OS 22.04, Debian 12 and
+  everything newer. The build prints the measured floor so a base-image change
+  cannot raise it quietly.
+* The bundled ffmpeg has **no libx265**, so software HEVC encoding is
+  unavailable there (the UI hides it). Hardware HEVC through VAAPI or NVENC is
+  present, and H.264 software encoding through libx264 is present, so the
+  fallback tier every machine relies on is intact.
+
+The AppImage carries a **static-FUSE runtime** rather than the classic one.
+Debian 12 and Ubuntu 24.04 dropped libfuse2, and the usual workaround
+(`--appimage-extract-and-run`) unpacks the whole payload on every launch, which
+for a one-shot tool bound to PrintScreen would mean an extraction per screenshot.
+The runtime still needs the host's `fusermount3` helper and `/dev/fuse` to mount
+itself, which the `fuse3` package provides and every current desktop already
+has; `--appimage-extract-and-run` remains the escape hatch on a system without
+it.
+
+Every one of those artifacts is **pinned to an exact version and verified before
+use**. Nothing follows a "latest" pointer, so a release built today and the same
+release rebuilt later contain byte-identical third-party parts.
+
+**`scripts/pins.env` is the single source of truth**: one plain `KEY=value`
+manifest that every fetcher reads, so "the same ffmpeg and tesseract everywhere"
+is true by construction rather than by vigilance. It exists because the pins
+previously lived in each fetcher and drifted immediately: the Linux container
+built ffmpeg 8.0 while the macOS package bundled 8.1.2, and nothing caught it but
+a human reading both files. Its readers are:
+
+| Reads `pins.env` | For |
+|---|---|
+| `scripts/fetch-mac-vendor.sh` | the macOS `.app` sidecars |
+| `scripts/fetch-win-vendor.ps1` | the Windows MSI sidecars |
+| `.github/workflows/release.yml` (`build-linux`) | the container's ffmpeg headers |
+| `justfile` (the linux `dist` recipe) | the same container build |
+| `scripts/appimage/Dockerfile` | everything the AppImage bundles |
+
+The two fetch scripts populate the git-ignored `vendor/` directory, and both the
+release workflow and `just build` call them, so a local package and a shipped one
+cannot differ. They are idempotent: each vendor dir carries a `.pinned` stamp,
+and a matching stamp skips the work. Change a pin in the manifest and the stamp
+changes with it, which is what forces the re-fetch.
+
+### What is pinned
+
+| Component | Version | Where it comes from | Verified by |
+|---|---|---|---|
+| ffmpeg + ffprobe (macOS arm64) | **8.1.2** | martin-riedl.de, a permanent per-build URL with a published `.sha256` | SHA-256 |
+| ffmpeg + ffprobe + ffplay (Windows x86_64) | **8.1.2** | BtbN/FFmpeg-Builds, the `win64-gpl` static build from a month-end `autobuild-*` tag | SHA-256 |
+| tesseract (macOS arm64) | **5.5.3** | built from source, with leptonica **1.87.0** and libpng **1.6.50** | SHA-256 |
+| tesseract (Windows x86_64) | **5.5.3** | the official installer published as a GitHub release asset by the tesseract project, unpacked with 7-Zip (never executed) | SHA-256 |
+| `eng.traineddata` | `tessdata_fast` tag **4.1.0** | the same file and hash on both platforms, so OCR results match | SHA-256 |
+| ffmpeg **source** (Linux artifact) | **8.1.2** | ffmpeg.org, built inside the Rocky 9 container only to supply the headers `ffmpeg-sys-next` compiles against | **GPG signature** + SHA-256 |
+| ffmpeg **source** (Linux AppImage) | **8.1.2** | the same tarball, built wider (x264, pulse, VAAPI, NVENC) because the AppImage *ships* the binary and its libraries rather than just compiling against the headers | **GPG signature** + SHA-256 |
+| x264 (Linux AppImage) | git **0480cb0** (2025-09-10) | Debian's immutable pool tarball. x264 publishes no releases and no tags, videolan's snapshot directory stopped in 2019, and GitLab's `/-/archive/` tarballs are generated per request so their bytes can change under a hash | SHA-256 |
+| nv-codec-headers (Linux AppImage) | **13.0.19.1** | header-only NVENC interface; links nothing, and decides only whether the bundled ffmpeg has `h264_nvenc` at all | SHA-256 |
+| tesseract + leptonica + libpng (Linux AppImage) | **5.5.3** / **1.87.0** / **1.6.50** | the same sources and the same static-link recipe the macOS package uses | SHA-256 |
+| AppImage runtime | tag **20251108** | AppImage/type2-runtime, the **dated** release rather than the moving `continuous` tag, which cannot carry a checksum that stays true | SHA-256 |
+
+The Linux row is the odd one out in two ways, both deliberate. It is a *source*
+tarball rather than a shipped binary, and it is the only artifact any upstream
+here signs, so it is verified by **FFmpeg's detached GPG signature** with the
+release key fingerprint `FCF986EA15E6E293A5644F10B4322F04D67658D8` pinned in the
+build recipe and independently published on ffmpeg.org/download.html. That is
+strictly stronger than a checksum: a hash we carry only proves the bytes still
+match what we saw when the pin was made, while the signature proves the FFmpeg
+project produced them. The build imports the key into a throwaway keyring and
+requires the signature to be made by that exact fingerprint, so a compromised key
+URL supplying both a key and a matching signature still fails.
+
+None of the other upstreams publish signatures (probed 2026-08: martin-riedl.de
+offers `.sha256` only, BtbN only a `checksums.sha256` asset, and the libpng,
+leptonica, tesseract and tessdata downloads none at all), so for those a pinned
+hash is the honest best available rather than an equivalent guarantee.
+
+**ffmpeg is held at 8.x deliberately.** The recording pipeline is written against
+ffmpeg 8's observed behaviour, including workarounds for it (the `MuxerWatchdog`
+exists because ffmpeg 8 can wedge on a session's first video write; a live
+`-itsoffset` is banned because ≥ ~200 ms deterministically stalls ffmpeg 8's
+scheduler). Both upstreams now serve 9.x as their current build, so moving up is
+a real change that needs a recording test pass behind it, not something a version
+bump does quietly.
+
+**Why macOS builds tesseract from source.** There is no self-contained arm64
+macOS tesseract to download. Homebrew's links leptonica out of `/opt/homebrew`,
+so copying it yields an app that runs on the build machine and dies everywhere
+else. Building leptonica and libpng as static libraries and linking them into the
+tesseract CLI leaves a single binary whose only dynamic dependencies are `/usr/lib`
+system libraries, which is what `mac-package.sh`'s `_check_relocatable` guard
+demands. It costs roughly two minutes on a hosted runner, once per pin change.
+
+Windows takes the prebuilt official installer instead, and ships the DLLs beside
+`tesseract.exe`.
+
+### Licensing
+
+The bundled ffmpeg is a GPL build. The app **spawns** it as a separate process
+rather than linking it, which is the arm's-length case the GPL treats as mere
+aggregation, so the obligation attaches to the bundled binary rather than to the
+application. `mac-package.sh` therefore ships the GPLv3 text plus a `NOTICE`
+naming the exact build and offering its source. Tesseract is Apache-2.0 and
+leptonica BSD-2-Clause; both permit binary redistribution inside a proprietary
+build as long as the notice travels with it, which `TESSERACT-LICENSE` does.
 
 ---
 

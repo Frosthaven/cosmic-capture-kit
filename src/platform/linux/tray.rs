@@ -265,6 +265,20 @@ pub(crate) fn render_icon_fitted(svg_black: &str, color: [u8; 3]) -> Option<ksni
     render_hex(&recolour(svg_black, color), true)
 }
 
+/// Rasterize an already PIXEL-GRID SVG 1:1 at its own `px` cell (DRAGON-539): identity
+/// transform, so every integer-aligned block edge stays a hard pixel. For the upload
+/// counter's digit faces, which `cloud::tray::counter_pixel_svg` generates at exactly this
+/// size; the glyph faces keep the ink-fitted 64px path above, and the recording icon keeps
+/// [`render_icon`].
+pub(crate) fn render_icon_exact(svg_black: &str, color: [u8; 3], px: u32) -> Option<ksni::Icon> {
+    let svg = recolour(svg_black, color);
+    let tree =
+        resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(px, px)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::identity(), &mut pixmap.as_mut());
+    Some(pack_argb(&pixmap))
+}
+
 /// Recolour a `#000` template SVG to `color`, the one substitution both rasterizers share.
 fn recolour(svg_black: &str, color: [u8; 3]) -> String {
     let hex = format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2]);
@@ -306,14 +320,20 @@ fn render_hex(svg: &str, fit_ink: bool) -> Option<ksni::Icon> {
         resvg::tiny_skia::Transform::from_scale(scale, scale)
     };
     resvg::render(&tree, transform, &mut pixmap.as_mut());
-    // tiny-skia is premultiplied; emit straight-alpha ARGB32 in network (big-endian)
-    // byte order: [A, R, G, B] per pixel, which SNI hosts expect.
-    let mut data = Vec::with_capacity((S * S * 4) as usize);
+    Some(pack_argb(&pixmap))
+}
+
+/// Pack a rendered pixmap as the icon an SNI host expects: tiny-skia is premultiplied, so
+/// emit straight-alpha ARGB32 in network (big-endian) byte order, [A, R, G, B] per pixel.
+/// Shared by the fitted and the exact rasterizers (DRAGON-539), so the packing cannot
+/// drift between them.
+fn pack_argb(pixmap: &resvg::tiny_skia::Pixmap) -> ksni::Icon {
+    let mut data = Vec::with_capacity((pixmap.width() * pixmap.height() * 4) as usize);
     for px in pixmap.pixels() {
         let c = px.demultiply();
         data.extend_from_slice(&[c.alpha(), c.red(), c.green(), c.blue()]);
     }
-    Some(ksni::Icon { width: S as i32, height: S as i32, data })
+    ksni::Icon { width: pixmap.width() as i32, height: pixmap.height() as i32, data }
 }
 
 /// A live recording control surface. Two backings share the seam the app calls

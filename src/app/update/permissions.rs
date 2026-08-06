@@ -16,7 +16,9 @@ impl App {
             // this instance — the honest recovery for Screen Recording, which macOS
             // only applies to a NEW launch.
             PermissionsMsg::Relaunch => {
-                if let Ok(exe) = std::env::current_exe() {
+                // `self_exe` (DRAGON-510): this instance ends immediately below, so the
+                // child must not be tied to a path only this process keeps alive.
+                if let Ok(exe) = crate::util::self_exe() {
                     let mut cmd = std::process::Command::new(exe);
                     // Reopen straight back into the permission window so the user sees
                     // the (now-applied) grant land green, and can grant the rest.

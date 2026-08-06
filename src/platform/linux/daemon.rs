@@ -488,6 +488,27 @@ pub fn run(daemon_intent: bool) -> ! {
         crate::instance::try_acquire_daemon_lock()
     };
     if !acquired {
+        // ...UNLESS this is a post-update relaunch (DRAGON-532). Nobody asked for a
+        // capture: the installer started us to restore the shape the app was in before
+        // the update, and losing the lock only means something else got there first. The
+        // winner consumes the marker and opens About, so the right move here is to leave
+        // quietly rather than drop an unrequested overlay on screen seconds after an
+        // update. The marker is PEEKED, never taken, so the winner still finds it.
+        //
+        // Same defect DRAGON-465 fixed on Windows, reached differently: there the
+        // relaunch's ARGV was read as capture intent (fixed by
+        // `update::post_update_relaunch_args`, which this flow already uses); here the
+        // argv is right and losing the lock is itself read as intent. Seen for real while
+        // testing the AppImage self-update.
+        if !crate::update::signal_capture_after_lost_lock(
+            daemon_intent,
+            crate::update::post_update_marker_pending(),
+        ) {
+            log::info!(
+                "resident: post-update relaunch found a live resident; exiting without capturing"
+            );
+            std::process::exit(0);
+        }
         if crate::instance::signal_existing_capture() {
             log::info!("resident: another instance is up; asked it to capture");
         } else {
@@ -505,11 +526,18 @@ pub fn run(daemon_intent: bool) -> ! {
     //
     // DRAGON-465 (Windows) was this exact rule firing for nobody: an installer relaunched
     // the app BARE, `main` read that as capture intent, and a finished update came back with
-    // an overlay over the release notes. Linux cannot hit it — there is no in-app install
-    // flow here, so the post-update marker is never written and the marker check further
-    // down is a no-op. If one is ever added, relaunch through
-    // `update::post_update_relaunch_args` and gate this spawn with
-    // `update::owes_capture_on_start`, both of which are shared and already tested.
+    // an overlay over the release notes.
+    //
+    // Linux DOES have an in-app install flow now (DRAGON-532, the AppImage self-update), so
+    // the "Linux cannot hit it" this comment used to claim is no longer true, and
+    // `owes_capture_on_start` (which it told a future reader to use) was never written.
+    // What actually keeps this spawn safe is `update::post_update_relaunch_args`: a
+    // post-update relaunch with `resident` on arrives WITH the resident argument, so
+    // `daemon_intent` is true and this branch is skipped; with `resident` off it never
+    // reaches this file at all, because `main` only routes a bare launch here when the
+    // persisted `resident` setting is on, and `app::run`'s marker check turns it into a
+    // settings window on About. The remaining hole was the LOST-LOCK path above, which is
+    // now closed by `update::signal_capture_after_lost_lock`.
     if !daemon_intent {
         log::info!("resident: capture-intent launch became the resident; spawning the capture");
         spawn_child(REGION_FLAG);

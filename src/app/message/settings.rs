@@ -505,6 +505,14 @@ pub enum SettingsMsg {
     /// immediately, with no restart — a customer turns it on, reproduces the failure once,
     /// and mails the file.
     SetDebugLogging(bool),
+    /// Settings → Health: copy one dependency row's resolved tool location to the clipboard
+    /// (DRAGON-540), carrying the text to copy, exactly as it is shown. The handler stamps
+    /// `SettingsState::health_copied` so the row's copy button flashes its "Copied!" tick.
+    CopyHealthLocation(String),
+    /// Settings → Health: a tick while a location copy is still inside its flash window.
+    /// Nothing in state changes here. Like `CloudSettingsMsg::CloudBrowserTick`, it exists
+    /// purely to rebuild the view so the tick reverts by the clock, with no explicit clear.
+    HealthCopyTick,
     /// Settings → Health → Debug: open the macOS permission-checker window
     /// (`app::permissions`) from within Settings, rather than only via `--permissions`
     /// or missing-grant routing. Focuses it if already open. macOS-only, mirroring

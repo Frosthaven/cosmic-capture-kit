@@ -2448,7 +2448,7 @@ fn provider_title_row(spec: &'static ProviderSpec, title: String) -> Element<'st
 }
 
 /// Waiting for the user to sign in. A Cancel is always offered: the flow's own deadline is
-/// two minutes, and a user who has changed their mind must not have to wait it out.
+/// five minutes, and a user who has changed their mind must not have to wait it out.
 ///
 /// **The header is `provider_title_row`** (the provider's own icon + "Signing in to X"), the
 /// SAME header the provider-choice and folder steps use. An earlier pass swapped this for the
@@ -2464,39 +2464,35 @@ fn provider_title_row(spec: &'static ProviderSpec, title: String) -> Element<'st
 /// itself, where nothing is listening. Signing in from another device would need a
 /// publicly-reachable relay, which is out of scope; the link is the one honest way in.
 ///
-/// **Two-phase, on `url`** (DRAGON-489). The step opens with `url` = `None`, for the frame or
-/// two before the background task reports the sign-in page's own address back; all it can
-/// show then is that it is waiting. Once the URL arrives (`Some`), it adds the "Click here"
-/// sentence with a clickable accent link (opening the page) plus a copy icon: the way in,
-/// since the page is no longer opened automatically (an automatic launch can fail silently: no
-/// default browser set, the wrong browser opens, a headless/remote session).
+/// **Two-phase, on `url`, for EVERY provider** (DRAGON-536). Phase one, `url` = `None`:
+/// "Launching authorization...", while the address is still being produced (an external tool
+/// starting up, or the frame or two before the OAuth flow's background task reports back).
+/// Phase two, from the moment the URL lands: "Please sign in with your browser." plus the
+/// [`sign_in_link_row`] fallback. The second sentence is true the moment it appears on BOTH
+/// arms, because the URL landing is also the launch: Proton's tool opens the browser itself
+/// right before printing the address, and for an OAuth provider the app now opens the page in
+/// the `BrowserUrl` handler, in the same instant it stores the URL.
 ///
 /// **`copied` flashes the copy button** (DRAGON-489 follow-up). For [`COPIED_FLASH`] after a
 /// press it swaps the copy glyph to a success-green tick and its tooltip to "Copied!", then
 /// reverts on its own via the once-a-second tick (no state to clear).
 ///
-/// # The EXTERNAL-TOOL arm keeps both phases and neither affordance (DRAGON-522)
+/// # How the two arms converged (DRAGON-489, 522, 526, 536)
 ///
-/// The two phases are the same seam for every provider: the URL landing is what swaps the copy.
-/// What that URL MEANS is not the same thing on both sides, and the owner's live test is why
-/// this arm exists. On an OAuth provider the app owns the address and nothing opens it unless
-/// the user presses the link, so the link and its copy icon ARE the way in. Proton's tool opens
-/// the browser ITSELF, from inside `auth login`, and prints the address immediately afterwards;
-/// the app cannot switch that off. So the "Click here" row appeared at the exact moment the
-/// browser was already up, offering a second way into a page the user was looking at, and its
-/// press did nothing they needed. [`external_browser_line`] replaces it with the two plain
-/// sentences the owner asked for, and the transition point is unchanged.
-///
-/// **The cost that trade named came due** (DRAGON-526). The tool swallows a browser-launch
-/// failure (it spawns the opener detached and discards the error), and on the owner's Windows
-/// machine it failed every time: the step sat on "Please sign in with your browser." over a
-/// browser that never came, the exact dead end the paragraph above this one predicted. The arm
-/// now shows the same [`sign_in_link_row`] the OAuth arm always shows, from the moment the URL
-/// lands, worded for the situation ("if your browser did not open."). The prescription had
-/// reserved this for the LATE side of the deadline, and a grace timer shipped first; the owner
-/// cut it in the same round ("no reason to delay"): what answers DRAGON-522's objection, a row
-/// reading as THE way in beside a browser already open, is the conditional wording, not a
-/// timer.
+/// DRAGON-489 made the OAuth arm deliberately passive: the app did NOT open the page, because
+/// an automatic launch can fail silently (no default browser, the wrong browser, a remote
+/// session) and back then a failed launch left NOTHING on screen to fall back to; the "Click
+/// here" link was the one way in. DRAGON-522 gave the external-tool arm its own two plain
+/// sentences instead of that link, since Proton's tool opens the browser itself and a link
+/// beside an already-open browser read as a second way into a page the user was looking at.
+/// DRAGON-526 collected the cost that trade named: the tool SWALLOWS a launch failure, and on
+/// the owner's Windows machine the step sat over a browser that never came, so the link row
+/// returned to that arm as a fallback, worded "if your browser did not open.", shown the
+/// moment the URL lands (owner call: "no reason to delay", the conditional wording is the
+/// answer, not a grace timer). DRAGON-536 closed the loop in the other direction: with the
+/// fallback row always present, DRAGON-489's objection to auto-launching is answered, so the
+/// OAuth arm now launches too and both arms share one copy sequence. The ONLY remaining
+/// difference is who opens the browser, and that lives in the `BrowserUrl` handler, not here.
 fn cloud_browser_step<'a>(
     spec: &'static ProviderSpec,
     url: Option<&'a str>,
@@ -2508,46 +2504,14 @@ fn cloud_browser_step<'a>(
     // needed centering) is gone.
     let mut content = widget::column::with_capacity(5).spacing(12.0).width(Length::Fill);
     content = content.push(provider_title_row(spec, format!("Signing in to {}", spec.display_name)));
-    // The EXTERNAL-TOOL arm (DRAGON-522): two plain sentences, one per phase, and no link, copy
-    // or QR in either. See this function's doc for why an affordance that works for the OAuth
-    // providers is dead weight here.
-    if spec.auth.is_external_tool() {
-        content = content.push(widget::text::body(external_browser_line(url.is_some())));
-        // The fallback DRAGON-522's trade reserved, cashed in by DRAGON-526 (owner report:
-        // on Windows the tool's own browser launch silently fails, and this step sat saying
-        // "sign in with your browser" over a browser that never came). It shows the moment
-        // the URL lands, with no grace delay (owner call, same round: "no reason to delay").
-        // The DRAGON-522 objection was a row that read as THE way in beside a browser
-        // already open; the conditional wording is what answers it now, not a timer.
-        if let Some(url) = url {
-            content = content.push(sign_in_link_row(url, copied, "if your browser did not open."));
-        }
-        return browser_dialog(content, remaining_secs);
-    }
-    if url.is_none() {
-        content = content.push(widget::text::body(format!(
-            "Sign in to {} using the link below, then come back to this window.",
-            spec.display_name
-        )));
-    }
+    // ONE sequence for every provider (DRAGON-536): the phase sentence, then, once the URL
+    // has landed (which is also the moment a browser was opened, by the tool or by the
+    // `BrowserUrl` handler), the fallback link row. See this function's doc for the arc that
+    // ended with the two arms identical here.
+    content = content.push(widget::text::body(browser_step_line(url.is_some())));
     if let Some(url) = url {
-        // This one sentence takes the place of the generic header sentence above (owner
-        // report: showing both read as a bug).
-        content = content.push(sign_in_link_row(url, copied, "to sign in with your browser."));
+        content = content.push(sign_in_link_row(url, copied));
     }
-    // Directly under the link sentence, left-aligned like the rest (owner request), not above,
-    // so the step never looks "already finished" before the link even renders (the first frame
-    // or two, while `url` is still `None`). The countdown reads against the real
-    // `BROWSER_DEADLINE`, via `browser_started` at the call site, so it's never just a
-    // decorative number. `subtle_caption`, not `subdued_caption`: this line is secondary (a
-    // background countdown, not the sentence someone actually acts on), so it dims, but only
-    // half of `subdued`'s wash, which read as unreadable for real content elsewhere in this file.
-    //
-    // A DELIBERATE BREAK above it (DRAGON-503, owner report: the two lines sat too close). The
-    // countdown is a different kind of statement from the sign-in link over it, a background fact
-    // rather than the thing to act on, and at the column's own 12px it read as a fourth line of
-    // the same block. One more `space_xs`, the SAME token this column spaces by, doubles that gap
-    // into a section break without introducing a second spacing value to keep in step.
     browser_dialog(content, remaining_secs)
 }
 
@@ -2587,10 +2551,11 @@ fn browser_dialog<'a>(
 }
 
 /// The Browser step's "Click here" sentence: the clickable accent span that opens the sign-in
-/// page, the app's ONE copy control beside it, then `tail` finishing the sentence. ONE builder
-/// for both arms (DRAGON-526), so the OAuth step's row and the external-tool arm's late
-/// fallback cannot drift apart; only the tail differs ("to sign in with your browser." vs
-/// "if your browser did not open.").
+/// page, the app's ONE copy control beside it, then the tail finishing the sentence. ONE
+/// builder for both arms (DRAGON-526), so the arms cannot drift apart; since DRAGON-536 even
+/// the tail is shared ("if your browser did not open."), because a browser was launched on
+/// BOTH arms by the time this row appears, so the row is always the fallback, never the way
+/// in.
 ///
 /// "Click here" is the clickable span; the tail rides in a separate, plain-colour piece, and
 /// the copy icon sits between the two as a sibling in the row (a `Span` carries no room for an
@@ -2600,7 +2565,8 @@ fn browser_dialog<'a>(
 /// leftover from when a QR image sat below (harmless, and still the clearer side). The tail is
 /// NOT `subdued_caption`: the same "78%-toward-background, unreadable for real content"
 /// mistake was already fixed twice elsewhere in this file.
-fn sign_in_link_row<'a>(url: &'a str, copied: bool, tail: &'static str) -> Element<'a, Msg> {
+fn sign_in_link_row<'a>(url: &'a str, copied: bool) -> Element<'a, Msg> {
+    let tail = "if your browser did not open.";
     let theme = cosmic::theme::active();
     let accent = theme::accent(&theme);
     let click_span = cosmic::iced::widget::span("Click here").color(accent).link(());
@@ -2630,26 +2596,27 @@ fn sign_in_link_row<'a>(url: &'a str, copied: bool, tail: &'static str) -> Eleme
 // reading as THE way in beside a browser already open) is the conditional wording, not a
 // timer, so the link now shows the moment the URL lands.
 
-/// What the Browser step says for a provider whose sign-in is run by an external TOOL. Pure;
-/// unit-tested (DRAGON-522, the owner's exact wording).
+/// What the Browser step says, for EVERY provider (DRAGON-536; the wording is DRAGON-522's,
+/// written for the external-tool arm and adopted by all of them when the arms converged).
+/// Pure; unit-tested.
 ///
-/// `url_known` is the same two-phase seam every provider's step turns on: false while the tool is
-/// starting and before it has reported an address, true from the moment it has. On this arm that
-/// moment is also the moment the browser opens, because the tool opens it itself immediately
-/// before printing the address, which is what makes the second sentence true when it appears.
+/// `url_known` is the two-phase seam every provider's step turns on: false while the sign-in
+/// address is still being produced, true from the moment it has landed. That moment is also
+/// the moment a browser was opened, by the external tool itself or by the `BrowserUrl`
+/// handler, which is what makes the second sentence true when it appears.
 ///
-/// Neither SENTENCE carries a link, a copy control or a QR code; since DRAGON-526 the link
-/// row joins the step separately, the moment the URL is known. See [`cloud_browser_step`]'s
-/// doc for the whole arc.
-pub fn external_browser_line(url_known: bool) -> &'static str {
-    if url_known { EXTERNAL_SIGN_IN_READY } else { EXTERNAL_SIGN_IN_LAUNCHING }
+/// Neither SENTENCE carries a link, a copy control or a QR code; the link row joins the step
+/// separately, the moment the URL is known. See [`cloud_browser_step`]'s doc for the whole
+/// arc.
+pub fn browser_step_line(url_known: bool) -> &'static str {
+    if url_known { SIGN_IN_READY } else { SIGN_IN_LAUNCHING }
 }
 
-/// Phase one: the tool is starting and has not opened anything yet.
-const EXTERNAL_SIGN_IN_LAUNCHING: &str = "Launching authorization...";
+/// Phase one: nothing has been opened yet.
+const SIGN_IN_LAUNCHING: &str = "Launching authorization...";
 
-/// Phase two: the tool has opened the browser.
-const EXTERNAL_SIGN_IN_READY: &str = "Please sign in with your browser.";
+/// Phase two: a browser has been opened, by the external tool or by the `BrowserUrl` handler.
+const SIGN_IN_READY: &str = "Please sign in with your browser.";
 
 /// The failure step. `retry` decides whether there is a primary action at all: a build with
 /// no sign-in id, and a provider with no API, are not going to behave differently on a
@@ -3669,6 +3636,17 @@ impl crate::app::App {
                     && let Some(add) = self.settings.cloud.add.as_mut()
                     && matches!(add.step, CloudAddStep::Browser { .. })
                 {
+                    // Open the page ourselves (DRAGON-536), in the same instant the URL is
+                    // stored, so the step's "Please sign in with your browser." is true when
+                    // it renders. Behind the generation guard on purpose: a late reply must
+                    // not pop a browser over a flow that has moved on. NOT on the
+                    // external-tool arm, whose tool already opened one from inside its own
+                    // sign-in; a second window over it would be DRAGON-522's complaint again.
+                    // A silent launch failure is answered by the fallback link row this step
+                    // always shows (the DRAGON-526 answer to the DRAGON-489 objection).
+                    if !add.spec().is_some_and(|spec| spec.auth.is_external_tool()) {
+                        crate::platform::services::open_uri(&url);
+                    }
                     add.step = CloudAddStep::Browser { url: Some(url) };
                 }
                 Task::none()
@@ -4917,13 +4895,13 @@ fn connect_and_save(
     // comes back with nothing, because the tool owns the session under its own identity.
     let external = crate::cloud::provider(provider_id)
         .is_some_and(|spec| spec.auth.is_external_tool());
-    // Report the sign-in URL back to the UI rather than opening it (DRAGON-489 follow-up): the
-    // browser step shows it as a clickable link, and the user opens it
-    // themselves. An earlier pass opened it automatically here too, but an automatic launch can
-    // fail silently (no default browser set, the wrong browser opens, a headless/remote
-    // session) with nothing else on screen to fall back to, so the decision is now the user's,
-    // not this closure's. (The external tool opens one ANYWAY, which this app cannot switch
-    // off; the link is what makes the step recoverable when that fails.)
+    // Report the sign-in URL back to the UI rather than opening it HERE. The launch decision
+    // lives in the `BrowserUrl` handler (DRAGON-536), behind the generation guard, where a
+    // late reply cannot pop a browser over a flow that has moved on: the UI opens the page
+    // for an OAuth provider the instant the URL lands, and leaves the external tool's own
+    // launch alone. DRAGON-489 had removed automatic launching entirely, because a silent
+    // launch failure left nothing on screen to fall back to; the ever-present fallback link
+    // row (DRAGON-526) is what answered that and made launching safe to restore.
     let secret = if external {
         crate::cloud::proton::sign_in(crate::cloud::oauth::BROWSER_DEADLINE, &mut |url| {
             on_browser_url(url);
@@ -6707,32 +6685,35 @@ mod external_tool_tests {
         }
     }
 
-    /// **The browser step's two phases, in plain words** (DRAGON-522, the owner's exact copy).
-    /// The transition is the same one every provider's step turns on, the sign-in address
-    /// landing; what differs is that on this arm that instant is also the instant the TOOL opens
-    /// the browser, so the second sentence is true the moment it appears.
+    /// **The browser step's two phases, in plain words** (DRAGON-522's exact copy, the
+    /// owner's wording, adopted by EVERY provider when the arms converged in DRAGON-536).
+    /// The transition is the sign-in address landing, which is also the instant a browser was
+    /// opened (by the external tool, or by the `BrowserUrl` handler), so the second sentence
+    /// is true the moment it appears.
     #[test]
-    fn the_external_tool_step_says_one_plain_sentence_per_phase() {
-        assert_eq!(external_browser_line(false), "Launching authorization...");
-        assert_eq!(external_browser_line(true), "Please sign in with your browser.");
-        // Neither is the OAuth arm's affordance, which is the whole report: no link to press, no
-        // copy control, and nothing that reads as one.
-        for phase in [external_browser_line(false), external_browser_line(true)] {
+    fn the_browser_step_says_one_plain_sentence_per_phase() {
+        assert_eq!(browser_step_line(false), "Launching authorization...");
+        assert_eq!(browser_step_line(true), "Please sign in with your browser.");
+        // Neither sentence reads as an affordance: no link to press, no copy control. The
+        // fallback link row is a separate element that joins in phase two.
+        for phase in [browser_step_line(false), browser_step_line(true)] {
             assert!(!phase.contains("Click"), "{phase}");
             assert!(!phase.contains("link"), "{phase}");
             assert!(!phase.contains('\u{2014}'), "house style: no em-dashes in user copy");
         }
         // The two phases really are different states, or the transition would be invisible.
-        assert_ne!(external_browser_line(false), external_browser_line(true));
+        assert_ne!(browser_step_line(false), browser_step_line(true));
     }
 
-    /// The arm is chosen by the AUTH KIND, never by a provider id, so a second external-tool
-    /// provider gets it with no new branch, and no OAuth provider can fall into it.
+    /// WHO launches the browser is chosen by the AUTH KIND, never by a provider id
+    /// (DRAGON-536): an external tool opens its own browser and the app must not open a
+    /// second one over it, while every OAuth provider's page is opened by the `BrowserUrl`
+    /// handler. A second external-tool provider gets the right side with no new branch.
     #[test]
-    fn only_an_external_tool_provider_takes_the_plain_step() {
+    fn only_an_external_tool_provider_launches_its_own_browser() {
         assert!(spec("proton").auth.is_external_tool());
         for id in ["gdrive", "onedrive", "dropbox", "youtube"] {
-            assert!(!spec(id).auth.is_external_tool(), "{id} keeps its click-here step");
+            assert!(!spec(id).auth.is_external_tool(), "{id}: the app opens the page itself");
         }
     }
 

@@ -170,7 +170,14 @@ pub fn corner_radius_from_alpha(img: &image::RgbaImage) -> Option<f32> {
 
 /// How a captured window's corners are already shaped, and therefore what the
 /// decoration must do about them.
+///
+/// This whole seam is called from Linux/Windows production code (`platform/{linux,windows}
+/// /screenshot.rs`) and, on every platform, from `decoration_matrix_tests` (`#[cfg(test)]`,
+/// not platform-gated). macOS's OWN screenshot path does not use it: it is dead ONLY in a
+/// macOS non-test build, which is exactly what `#[cfg_attr(all(target_os = "macos",
+/// not(test)), allow(dead_code))]` says on every item below, rather than a blanket allow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub enum CornerStyle {
     /// The capture has SQUARE corners and must be rounded to this radius in physical
     /// px. Linux and Windows: the compositor hands back the full rectangle.
@@ -188,7 +195,9 @@ pub enum CornerStyle {
 }
 
 /// What sits behind the window in the finished picture. The three arms ARE the
-/// wallpaper/transparency matrix; see [`backdrop_for`].
+/// wallpaper/transparency matrix; see [`backdrop_for`]. Dead on macOS outside test builds;
+/// see [`CornerStyle`]'s doc for why.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub enum Backdrop {
     /// Composite over these pixels. The platform prepares them (Linux re-renders the
     /// wallpaper file as its compositor placed it; macOS and Windows pass their own
@@ -216,8 +225,9 @@ pub enum Backdrop {
 /// keep, so the capture needs an opaque backing and gets black.
 ///
 /// Pure, so the matrix can assert it directly and the pixel tests can assert what each
-/// arm then produces.
+/// arm then produces. Dead on macOS outside test builds; see [`CornerStyle`]'s doc for why.
 #[must_use]
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub fn backdrop_for(wallpaper: bool, transparency: bool) -> BackdropKind {
     if wallpaper {
         BackdropKind::Wallpaper
@@ -228,15 +238,19 @@ pub fn backdrop_for(wallpaper: bool, transparency: bool) -> BackdropKind {
     }
 }
 
-/// [`backdrop_for`]'s answer, before the platform supplies any wallpaper pixels.
+/// [`backdrop_for`]'s answer, before the platform supplies any wallpaper pixels. Dead on
+/// macOS outside test builds; see [`CornerStyle`]'s doc for why.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub enum BackdropKind {
     Wallpaper,
     Black,
     Transparent,
 }
 
-/// Everything the decoration needs that is NOT platform-specific.
+/// Everything the decoration needs that is NOT platform-specific. Dead on macOS outside
+/// test builds; see [`CornerStyle`]'s doc for why.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub struct DecorationOpts {
     /// Keep the window's own alpha. False flattens it to opaque.
     pub keep_transparency: bool,
@@ -263,7 +277,9 @@ pub struct DecorationOpts {
     pub min_border_px: u32,
 }
 
-/// A decorated window plus the measurements its caller still needs.
+/// A decorated window plus the measurements its caller still needs. Dead on macOS outside
+/// test builds; see [`CornerStyle`]'s doc for why.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub struct Decorated {
     pub img: image::RgbaImage,
     /// Border + padding, LOGICAL px: the offset from the canvas edge to the window
@@ -290,7 +306,9 @@ pub struct Decorated {
 /// ([`apply_backdrop`], [`overlay_cursor`]) because both need pixels the platform owns.
 ///
 /// This is the shared half of what were three near-identical bodies. Read the module
-/// note above for what stayed native and why.
+/// note above for what stayed native and why. Dead on macOS outside test builds; see
+/// [`CornerStyle`]'s doc for why.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub fn decorate(img: image::RgbaImage, opts: &DecorationOpts) -> Decorated {
     let (fin, base_radius) = match opts.corners {
         CornerStyle::Rounded(r) => {
@@ -341,7 +359,9 @@ pub fn decorate(img: image::RgbaImage, opts: &DecorationOpts) -> Decorated {
     }
 }
 
-/// Apply the backdrop chosen by [`backdrop_for`].
+/// Apply the backdrop chosen by [`backdrop_for`]. Dead on macOS outside test builds; see
+/// [`CornerStyle`]'s doc for why.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub fn apply_backdrop(img: image::RgbaImage, backdrop: Backdrop) -> image::RgbaImage {
     match backdrop {
         Backdrop::Behind(bg) => crate::compose::over(bg, &img),
@@ -363,8 +383,10 @@ pub fn apply_backdrop(img: image::RgbaImage, backdrop: Backdrop) -> image::RgbaI
 /// already holds them (`CursorSprite` carries `(i32, i32)` hotspots on all three
 /// platforms), so the call site does no unpacking and no casting. Six loose `i32`s also
 /// put this one argument over clippy's limit, which was a fair complaint about a
-/// signature nobody could read.
+/// signature nobody could read. Dead on macOS outside test builds; see [`CornerStyle`]'s
+/// doc for why.
 #[must_use]
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub fn cursor_offset(
     pointer: (i32, i32),
     sel_origin: (i32, i32),
@@ -382,8 +404,10 @@ pub fn cursor_offset(
 ///
 /// The window-capture cursor overlay is gated on this (DRAGON-213): the decorated canvas
 /// extends past the window content, so relying on canvas clipping alone floated a cursor
-/// beside the window whenever the pointer merely happened to be nearby at launch.
+/// beside the window whenever the pointer merely happened to be nearby at launch. Dead on
+/// macOS outside test builds; see [`CornerStyle`]'s doc for why.
 #[must_use]
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
 pub fn cursor_over_window(gx: i32, gy: i32, sel_x: i32, sel_y: i32, w: u32, h: u32) -> bool {
     gx >= sel_x && gx < sel_x + w as i32 && gy >= sel_y && gy < sel_y + h as i32
 }

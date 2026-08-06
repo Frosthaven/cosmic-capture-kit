@@ -72,6 +72,40 @@ pub fn copy_button<M: Clone + 'static>(
     tip_pos: widget::tooltip::Position,
     press: M,
 ) -> Element<'static, M> {
+    copy_button_with(copied, halo, tip_pos, "Copy URL", theme::accent, press)
+}
+
+/// The same control tinted to match SUBTLE text instead of the accent (DRAGON-540): for a copy
+/// icon that sits INSIDE a line of quiet secondary text, such as the Health page's "here is
+/// where ffmpeg actually is" line. The accent tint is right for a control that has to be found
+/// on a page; beside its own text it reads as a second, louder thing to look at, and the owner
+/// asked for it to match the text it follows.
+///
+/// Only the RESTING tint changes. The "Copied!" flash stays success-green, because that green
+/// is the app's one "this worked" colour and an acknowledgement nobody notices is no
+/// acknowledgement. `label` is the resting tooltip ("Copy URL" is [`copy_button`]'s, and is
+/// wrong for anything that is not a link).
+pub fn subtle_copy_button<M: Clone + 'static>(
+    copied: bool,
+    halo: u16,
+    tip_pos: widget::tooltip::Position,
+    label: &'static str,
+    press: M,
+) -> Element<'static, M> {
+    copy_button_with(copied, halo, tip_pos, label, theme::subtle, press)
+}
+
+/// The one body both public copy controls are built from: `tint` is the RESTING glyph colour
+/// and `label` the resting tooltip, and everything else (the glyph pair, the flash, the tick,
+/// the "Copied!" wording, the tooltip mechanics) is shared so the two cannot drift.
+fn copy_button_with<M: Clone + 'static>(
+    copied: bool,
+    halo: u16,
+    tip_pos: widget::tooltip::Position,
+    label: &'static str,
+    tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
+    press: M,
+) -> Element<'static, M> {
     let button = crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::icon(crate::widgets::icons::handle(if copied {
             // The same tick the folder list's chosen level wears, so "this worked" looks the
@@ -80,13 +114,13 @@ pub fn copy_button<M: Clone + 'static>(
         } else {
             "document-copy-symbolic"
         }))
-        .class(accent_icon_button_class(copied))
+        .class(icon_button_class(copied, tint))
         .padding(halo)
         .on_press(press),
     );
     widget::tooltip(
         button,
-        widget::text(if copied { "Copied!" } else { "Copy URL" }).size(12),
+        widget::text(if copied { "Copied!" } else { label }).size(12),
         tip_pos,
     )
     .into()
@@ -102,23 +136,37 @@ pub fn copy_button<M: Clone + 'static>(
 /// browser's create, refresh and delete controls), which is why this is the button STYLE rather
 /// than something private to [`copy_button`].
 pub fn accent_icon_button_class(success: bool) -> cosmic::theme::Button {
+    icon_button_class(success, theme::accent)
+}
+
+/// [`accent_icon_button_class`] with the resting tint chosen by the caller (see
+/// [`subtle_copy_button`]). Private: the accent one is the page-level control style, and a
+/// second public knob for it would invite icon buttons in colours nothing else on the page
+/// uses.
+fn icon_button_class(
+    success: bool,
+    tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
+) -> cosmic::theme::Button {
     cosmic::theme::Button::Custom {
-        active: Box::new(move |_focused, theme| accent_icon_button_style(false, success, theme)),
-        hovered: Box::new(move |_focused, theme| accent_icon_button_style(true, success, theme)),
-        pressed: Box::new(move |_focused, theme| accent_icon_button_style(true, success, theme)),
-        disabled: Box::new(move |theme| accent_icon_button_style(false, success, theme)),
+        active: Box::new(move |_focused, theme| icon_button_style(false, success, tint, theme)),
+        hovered: Box::new(move |_focused, theme| icon_button_style(true, success, tint, theme)),
+        pressed: Box::new(move |_focused, theme| icon_button_style(true, success, tint, theme)),
+        disabled: Box::new(move |theme| icon_button_style(false, success, tint, theme)),
     }
 }
 
-fn accent_icon_button_style(
+fn icon_button_style(
     hovered: bool,
     success: bool,
+    tint: fn(&cosmic::Theme) -> cosmic::iced::Color,
     theme: &cosmic::Theme,
 ) -> cosmic::widget::button::Style {
     let cosmic = theme.cosmic();
     let mut s = cosmic::widget::button::Style::new();
     s.border_radius = theme::rounding(theme).xl.into();
-    s.icon_color = Some(if success { theme::success(theme) } else { theme::accent(theme) });
+    // The flash is success GREEN whatever the resting tint is: one "this worked" colour for
+    // the whole app.
+    s.icon_color = Some(if success { theme::success(theme) } else { tint(theme) });
     if hovered {
         let mut bg: cosmic::iced::Color = cosmic.palette.neutral_5.into();
         bg.a = 0.1;
@@ -139,6 +187,24 @@ mod flash_tests {
         assert!(copied_recently(Some(Instant::now())), "a press just now flashes");
         let stale = Instant::now().checked_sub(COPIED_FLASH * 2).expect("a representable instant");
         assert!(!copied_recently(Some(stale)), "an old copy has stopped flashing");
+    }
+
+    /// The tint is the ONLY thing a caller varies (DRAGON-540): at rest the subtle control
+    /// wears the same colour as the text it sits in, and both controls flash the one success
+    /// green. A tint that leaked into the flash would give the app two "this worked" colours.
+    #[test]
+    fn only_the_resting_tint_varies_and_the_flash_is_always_green() {
+        let t = cosmic::Theme::default();
+        assert_eq!(icon_button_style(false, false, theme::subtle, &t).icon_color, Some(theme::subtle(&t)));
+        assert_eq!(icon_button_style(false, false, theme::accent, &t).icon_color, Some(theme::accent(&t)));
+        assert_ne!(theme::subtle(&t), theme::accent(&t), "the two tints must be distinguishable");
+        for tint in [theme::subtle as fn(&cosmic::Theme) -> cosmic::iced::Color, theme::accent] {
+            assert_eq!(
+                icon_button_style(false, true, tint, &t).icon_color,
+                Some(theme::success(&t)),
+                "the flash must be success green whatever the resting tint is"
+            );
+        }
     }
 
     /// Long enough to be read, short enough that a second copy reads as a second copy. Pinned so

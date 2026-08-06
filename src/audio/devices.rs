@@ -17,15 +17,25 @@ use std::process::Command;
 /// out to it). Without it, only the system-default device is offered in Settings. Always
 /// false on macOS — there is no PulseAudio; device enumeration uses avfoundation instead.
 pub fn pactl_available() -> bool {
+    pactl_path().is_some()
+}
+
+/// WHERE `pactl` is, not just whether it exists: the Health page names the binary it found so
+/// the user can see which one the app will run. `None` when it is not installed, and always
+/// `None` on macOS, which has no PulseAudio.
+///
+/// Unlike ffmpeg / ffprobe / tesseract, pactl is never a bundled sidecar (it belongs to the
+/// user's audio server, not to us), so this is a plain `PATH` lookup rather than a
+/// `util::locate_tool` resolution. It goes through [`crate::util::tool_on_path`] so it is the
+/// same scan, `EXE_SUFFIX` handling included, that every other tool check uses.
+pub fn pactl_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        false
+        None
     }
     #[cfg(not(target_os = "macos"))]
     {
-        std::env::var_os("PATH")
-            .map(|paths| std::env::split_paths(&paths).any(|d| d.join("pactl").is_file()))
-            .unwrap_or(false)
+        crate::util::tool_on_path(std::path::Path::new("pactl"))
     }
 }
 

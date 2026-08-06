@@ -217,7 +217,10 @@ impl App {
                     // literal here, which is exactly how the post-update relaunch came to be
                     // spawned bare: an argv-building launcher that owns its own copy of the
                     // rule can silently stop agreeing with the one that reads it.
-                    if let Ok(exe) = std::env::current_exe() {
+                    // `self_exe` (DRAGON-510): the resident is meant to outlive every
+                    // capture process, including this one, so an AppImage mount path
+                    // would be exactly the wrong thing to hand it.
+                    if let Ok(exe) = crate::util::self_exe() {
                         match std::process::Command::new(&exe)
                             .arg(crate::instance::RESIDENT_ARG)
                             .spawn()
@@ -425,6 +428,14 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            // DRAGON-540. The text is copied exactly as the row shows it, so what the user
+            // reads and what they paste are the same thing.
+            SettingsMsg::CopyHealthLocation(text) => {
+                crate::platform::services::copy_text(&text);
+                self.settings.health_copied = Some((text, std::time::Instant::now()));
+                Task::none()
+            }
+            SettingsMsg::HealthCopyTick => Task::none(),
             #[cfg(target_os = "macos")]
             SettingsMsg::OpenPermissionsWindow => {
                 if let Some(id) = self.permissions.window {
@@ -993,76 +1004,30 @@ impl App {
                 }
                 Task::none()
             }
-            #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(clippy::needless_return))]
             SettingsMsg::UpdateDialogNow => {
                 // Apply the checkbox (Don't remind me again -> notify_updates OFF),
                 // dismiss the dialog, then run the platform update flow using the
-                // dialog's own captured `info`: the macOS/Windows one-click install, or
-                // the Linux release-page link. Same flows the About buttons drive (no drift).
+                // dialog's own captured `info`: the one-click install where this build has
+                // one, the release-page link where it does not. Same flows the About buttons
+                // drive (no drift).
                 let dismissed = self.dismiss_update_dialog();
                 // Land on the About page so the install progress ("Installing...")
                 // and the release notes are in view after the click.
                 self.activate_config_tab(crate::app::ConfigTab::About);
-                #[cfg(target_os = "macos")]
-                {
-                    // Install the update the dialog offered (mirrors `InstallUpdate`,
-                    // but keyed off the dialog's own info so it can't drift from a
-                    // concurrently-cleared status). A no-op without an artifact.
-                    let Some(info) = dismissed.map(|d| d.info) else {
-                        return Task::none();
-                    };
-                    if info.artifact.is_none() || self.update_installing {
-                        return Task::none();
-                    }
-                    self.update_installing = true;
-                    // DRAGON-499: detached, like every other background job in the app.
-                    return Task::perform(
-                        off_thread(move || crate::update::install_macos(&info)),
-                        |outcome| {
-                            let outcome = outcome.unwrap_or_else(|| {
-                                crate::update::InstallOutcome::Failed(
-                                    "The update install could not run.".to_string(),
-                                )
-                            });
-                            cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
-                                outcome,
-                            )))
-                        },
-                    );
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    // Windows one-click install (DRAGON-287), keyed off the dialog's own info.
-                    let Some(info) = dismissed.map(|d| d.info) else {
-                        return Task::none();
-                    };
-                    if info.artifact.is_none() || self.update_installing {
-                        return Task::none();
-                    }
-                    self.update_installing = true;
-                    // DRAGON-499: detached, like every other background job in the app.
-                    return Task::perform(
-                        off_thread(move || crate::update::install_windows(&info)),
-                        |outcome| {
-                            let outcome = outcome.unwrap_or_else(|| {
-                                crate::update::InstallOutcome::Failed(
-                                    "The update install could not run.".to_string(),
-                                )
-                            });
-                            cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
-                                outcome,
-                            )))
-                        },
-                    );
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                {
-                    // Linux has no one-click yet: open the project releases page, the
-                    // exact same destination as the About page's "Open releases" link.
-                    let _ = dismissed;
+                if !crate::update::one_click_install_available() {
+                    // Open the project releases page, the exact same destination as the
+                    // About page's "Open releases" link. On Linux this is the ZIP (BIN)
+                    // build, which has no install location we own (DRAGON-532).
                     crate::platform::services::open_uri(crate::update::RELEASES_URL);
-                    Task::none()
+                    return Task::none();
                 }
+                // Install the update the dialog offered (mirrors `InstallUpdate`, but keyed
+                // off the dialog's own info so it can't drift from a concurrently-cleared
+                // status). A no-op without an artifact.
+                let Some(info) = dismissed.map(|d| d.info) else {
+                    return Task::none();
+                };
+                self.start_update_install(info)
             }
             SettingsMsg::UpdateDialogLater => {
                 // Apply the checkbox and dismiss for this session; no update action.
@@ -1074,75 +1039,26 @@ impl App {
             // (`settings::pages::cloud`). The same split `update_preview` has, and for the
             // same reason: every one of these arms is a step of ONE flow.
             SettingsMsg::Cloud(msg) => self.update_cloud(msg),
-            // The macOS block ends in `return`, but the `#[cfg(not)]` tail after it
-            // makes the block a statement (not the arm's tail expr), so the return is
-            // required there; Linux compiles only the tail. Mirrors `seed_outputs_mac`.
-            #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(clippy::needless_return))]
             SettingsMsg::InstallUpdate => {
-                // One-click install: macOS (dmg swap) + Windows (silent MSI, DRAGON-287).
-                // Linux has no published artifact yet, so it falls through to a no-op.
-                #[cfg(target_os = "macos")]
-                {
-                    let crate::update::UpdateStatus::Available(info) = self.update_status.clone()
-                    else {
-                        return Task::none();
-                    };
-                    if info.artifact.is_none() || self.update_installing {
-                        return Task::none();
-                    }
-                    self.update_installing = true;
-                    // DRAGON-499: detached, like every other background job in the app.
-                    return Task::perform(
-                        off_thread(move || crate::update::install_macos(&info)),
-                        |outcome| {
-                            let outcome = outcome.unwrap_or_else(|| {
-                                crate::update::InstallOutcome::Failed(
-                                    "The update install could not run.".to_string(),
-                                )
-                            });
-                            cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
-                                outcome,
-                            )))
-                        },
-                    );
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    let crate::update::UpdateStatus::Available(info) = self.update_status.clone()
-                    else {
-                        return Task::none();
-                    };
-                    if info.artifact.is_none() || self.update_installing {
-                        return Task::none();
-                    }
-                    self.update_installing = true;
-                    // DRAGON-499: detached, like every other background job in the app.
-                    return Task::perform(
-                        off_thread(move || crate::update::install_windows(&info)),
-                        |outcome| {
-                            let outcome = outcome.unwrap_or_else(|| {
-                                crate::update::InstallOutcome::Failed(
-                                    "The update install could not run.".to_string(),
-                                )
-                            });
-                            cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(
-                                outcome,
-                            )))
-                        },
-                    );
-                }
-                #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-                Task::none()
+                // One-click install: macOS (dmg swap), Windows (silent MSI, DRAGON-287), or
+                // a Linux AppImage (in-place file swap, DRAGON-532). The button that sends
+                // this is only drawn where `one_click_install_available`, so a build without
+                // one never gets here.
+                let crate::update::UpdateStatus::Available(info) = self.update_status.clone()
+                else {
+                    return Task::none();
+                };
+                self.start_update_install(info)
             }
             SettingsMsg::UpdateInstallDone(outcome) => {
                 self.update_installing = false;
                 match outcome {
                     crate::update::InstallOutcome::Staged => {
-                        // The swap helper is armed and waiting for this app AND the
-                        // daemon to fully exit before installing (mac: swap /Applications;
-                        // Windows: msiexec) and relaunching. Signal the daemon to quit (so
-                        // its lock clears and the helper's wait completes), then exit this app.
-                        #[cfg(any(target_os = "macos", target_os = "windows"))]
+                        // A detached helper is armed and waiting for this app AND the daemon
+                        // to fully exit before finishing (mac: swap /Applications; Windows:
+                        // msiexec; Linux: the file is already swapped, so it only relaunches)
+                        // and bringing us back. Signal the daemon to quit, so its lock clears
+                        // and the helper's wait completes, then exit this app.
                         crate::instance::signal_daemon_quit();
                         self.quit_now()
                     }
@@ -1157,6 +1073,35 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Start the platform's one-click install for `info`, off-thread, and mark the UI busy.
+    ///
+    /// ONE body for both entry points, the About page's install button (`InstallUpdate`) and
+    /// the launch dialog's "Install now" (`UpdateDialogNow`), which used to carry a
+    /// per-platform copy each: four near-identical blocks that had to be kept in step by
+    /// hand. Callers do the guarding they need first (this returns a no-op task if there is
+    /// nothing to install or an install is already running).
+    fn start_update_install(
+        &mut self,
+        info: crate::update::UpdateInfo,
+    ) -> Task<cosmic::Action<Msg>> {
+        if info.artifact.is_none() || self.update_installing {
+            return Task::none();
+        }
+        self.update_installing = true;
+        // DRAGON-499: detached, like every other background job in the app.
+        Task::perform(
+            off_thread(move || crate::update::install(&info)),
+            |outcome| {
+                let outcome = outcome.unwrap_or_else(|| {
+                    crate::update::InstallOutcome::Failed(
+                        "The update install could not run.".to_string(),
+                    )
+                });
+                cosmic::Action::App(Msg::Settings(SettingsMsg::UpdateInstallDone(outcome)))
+            },
+        )
     }
 
     /// macOS/Windows (DRAGON-295): the persisted spec string for one of the three global

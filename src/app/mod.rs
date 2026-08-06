@@ -2412,6 +2412,17 @@ pub struct App {
     /// Minimum OCR word confidence (0–100) to keep (persisted; the "Text Confidence
     /// Threshold" slider).
     text_confidence: f32,
+    /// Which tesseract language pack OCR runs with (persisted; the Settings dropdown).
+    /// Empty = pass no `-l`, leaving tesseract on its own `eng` default (DRAGON-527).
+    ocr_language: String,
+    /// Language codes tesseract reported (`--list-langs`), probed once at settings open.
+    ocr_langs: Vec<String>,
+    /// Display labels for [`Self::ocr_langs`], with the "Default (eng)" entry at index 0
+    /// standing for the empty `ocr_language`.
+    ocr_lang_labels: Vec<String>,
+    /// The directory tesseract reported reading language packs from, so the Settings row
+    /// can name the real one rather than a guess. `None` until the probe runs.
+    ocr_lang_dir: Option<String>,
     /// Whether the `tesseract` OCR binary is available (text scanning needs it).
     tesseract_available: bool,
     /// Latest region QR/barcode scan result (re-run when the region changes).

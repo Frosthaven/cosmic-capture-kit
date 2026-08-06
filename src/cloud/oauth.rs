@@ -38,7 +38,10 @@
 //!   with someone else's code is refused rather than exchanged.
 //! * **Only the first request LINE is read**, bounded at [`MAX_REQUEST_LINE`] bytes, with a
 //!   read timeout. This listener is a one-shot redirect catcher, not an HTTP server, and the
-//!   less of an attacker-supplied request it parses the better.
+//!   less of an attacker-supplied request it parses the better. The unread remainder is
+//!   DRAINED (bounded in bytes and time) before the socket closes, because closing with it
+//!   still queued aborts the connection and can destroy the response in flight
+//!   (DRAGON-534; see [`respond`]).
 //! * **The pages it serves are fixed content.** [`SUCCESS_PAGE`], [`DENIED_PAGE`] and
 //!   [`NOT_FOUND_PAGE`] reflect NOTHING from the request: no code, no state, no path, no
 //!   error string. A browser page that echoes its query is a reflected-XSS hole, and the
@@ -119,6 +122,19 @@ const TOKEN_BUDGET: Duration = Duration::from_secs(30);
 
 /// How long a redirect connection has to send its request line before we drop it.
 const REDIRECT_READ_BUDGET: Duration = Duration::from_secs(10);
+
+/// How long [`respond`] keeps a connection open after the response is out, waiting for the
+/// peer to finish sending and close (the graceful-close drain, DRAGON-534). Small on
+/// purpose: a browser closes as soon as it has the page, and while the drain runs the
+/// accept loop is not accepting. A peer still talking at the budget gets the abortive
+/// close it was always going to get.
+const RESPOND_DRAIN_BUDGET: Duration = Duration::from_secs(1);
+
+/// The most request bytes [`respond`]'s drain will discard before giving up on a peer that
+/// will not stop sending. Bounds the drain in SIZE as the budget bounds it in time; a local
+/// process talking fast could otherwise hold the accept loop for the whole budget at full
+/// memory bandwidth for nothing.
+const RESPOND_DRAIN_MAX: usize = 64 * 1024;
 
 /// How often the accept loop wakes to check its deadline.
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
@@ -925,7 +941,19 @@ fn read_request_line(stream: &mut TcpStream, deadline: Instant) -> Option<String
     String::from_utf8(line).ok()
 }
 
-/// Write one of the constant pages back and close.
+/// Write one of the constant pages back, then close WITHOUT aborting the connection.
+///
+/// The close is the load-bearing half (DRAGON-534). Only the request LINE is ever read
+/// (see [`read_request_line`]), so the browser's headers are still unread in the socket
+/// here, and closing a socket with unread received data is an ABORTIVE close: the stack
+/// sends RST instead of FIN, and the RST can destroy the response before the browser has
+/// read it. This used `Shutdown::Both` and lost that race reliably on Windows: Edge showed
+/// a connection error, or retried the GET on a fresh connection that found the port
+/// already closed because the wait had returned, so a sign-in that WORKED ended on
+/// "can't reach this page". Linux and macOS merely kept winning the same race. So the
+/// shutdown is now WRITE-only, which sends FIN with the page in front of it, and the
+/// unread tail is drained, bounded in bytes and time, before the socket drops with an
+/// empty receive side.
 fn respond(stream: &mut TcpStream, status: &str, page: &str) {
     let head = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
@@ -935,7 +963,26 @@ fn respond(stream: &mut TcpStream, status: &str, page: &str) {
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(page.as_bytes());
     let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    // Drain until the peer's own close (`Connection: close` asks for it, and a browser
+    // closes once it has the page), or until the budget says it never will.
+    let deadline = Instant::now() + RESPOND_DRAIN_BUDGET;
+    let mut discard = [0u8; 1024];
+    let mut total = 0usize;
+    while total <= RESPOND_DRAIN_MAX {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            // A zero timeout means "no timeout" to the socket API, so it is checked
+            // here rather than handed on (same rule as `read_request_line`).
+            return;
+        }
+        let _ = stream.set_read_timeout(Some(left));
+        match stream.read(&mut discard) {
+            Ok(0) => return,
+            Ok(n) => total += n,
+            Err(_) => return,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2550,6 +2597,47 @@ mod loopback_tests {
         sender.join().expect("the sender thread");
         let err = got.expect_err("a real denial ends the flow");
         assert!(err.contains("declined"), "{err}");
+    }
+
+    /// **The Windows redirect race** (DRAGON-534). A real browser sends a header block after
+    /// the request line, and the catcher never reads it, so the success page used to go out
+    /// on a socket that was then closed with those bytes still unread: an abortive RST close
+    /// that could destroy the page before the browser read it. Edge showed a connection
+    /// error, or retried onto the already-closed port and showed "refused", for a sign-in
+    /// that had actually WORKED. The client here does what the browser does: full request
+    /// with headers, then read the response to its end. The graceful close must deliver the
+    /// whole page and a clean EOF.
+    #[test]
+    fn the_success_page_survives_unread_request_headers() {
+        let redirect = Redirect::bind(redirect_policy("gdrive")).expect("a loopback port");
+        let port = port_of(&redirect);
+        let browser = std::thread::spawn(move || {
+            let mut stream =
+                TcpStream::connect((Ipv4Addr::LOCALHOST, port)).expect("connect to the catcher");
+            let _ = stream.write_all(
+                b"GET /?code=THE-CODE&state=the-state HTTP/1.1\r\n\
+                  Host: 127.0.0.1\r\n\
+                  User-Agent: a-real-browser/1.0\r\n\
+                  Accept: text/html,application/xhtml+xml\r\n\
+                  Accept-Language: en-US,en\r\n\
+                  Connection: keep-alive\r\n\r\n",
+            );
+            let _ = stream.flush();
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut got = Vec::new();
+            let read = stream.read_to_end(&mut got);
+            (read, got)
+        });
+        let got = redirect.wait("the-state", Instant::now() + Duration::from_secs(20));
+        let (read, response) = browser.join().expect("the browser thread");
+        assert_eq!(got, Ok("THE-CODE".to_string()));
+        read.expect("the response must end in a clean EOF, not a reset");
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.ends_with(SUCCESS_PAGE.as_str()),
+            "the whole success page must arrive; got {} bytes",
+            response.len()
+        );
     }
 
     /// **The slowloris case** (DRAGON-482). One byte every 50ms keeps every individual read

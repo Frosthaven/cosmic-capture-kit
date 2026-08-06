@@ -1236,7 +1236,10 @@ pub fn close_other_instances() {
         if pid == self_pid {
             continue;
         }
-        if std::fs::read_link(format!("/proc/{pid}/exe")).ok().as_ref() != Some(&self_exe) {
+        let Ok(other_exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+            continue;
+        };
+        if !same_program(&self_exe, &other_exe) {
             continue;
         }
         if is_settings_instance(pid) {
@@ -1273,6 +1276,39 @@ pub fn close_other_instances() {
             let _ = rustix::process::kill_process(p, rustix::process::Signal::TERM);
         }
     }
+}
+
+/// **Pure**, unit-tested: whether `/proc/<pid>/exe` belongs to another instance of THIS
+/// program.
+///
+/// Normally that is a plain path comparison, and staying a path comparison is the point: a
+/// name-only match would sweep any unrelated binary that happens to be called
+/// `cosmic-capture-kit`, including one from a different checkout the user is deliberately
+/// running side by side.
+///
+/// The AppImage arm (DRAGON-510) is the exception it has to make. Every AppImage launch
+/// gets its OWN FUSE mount, so two instances of the same `.AppImage` file read as
+/// `/tmp/.mount_AAAAAA/usr/bin/cosmic-capture-kit` and `/tmp/.mount_BBBBBB/usr/…`: never
+/// equal, so the sweep would find no siblings at all and a committed capture would leave
+/// every other overlay on screen. When BOTH paths sit under a `.mount_` directory the
+/// comparison falls back to the file name, which is as precise as the mount namespace
+/// allows. Note this deliberately does not fire when only one side is mounted, so an
+/// AppImage never closes a source build or the other way round.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn same_program(self_exe: &std::path::Path, other_exe: &std::path::Path) -> bool {
+    if self_exe == other_exe {
+        return true;
+    }
+    let mounted = |p: &std::path::Path| {
+        p.components().any(|c| {
+            c.as_os_str().to_str().is_some_and(|s| s.starts_with(".mount_"))
+        })
+    };
+    mounted(self_exe)
+        && mounted(other_exe)
+        && self_exe.file_name().is_some()
+        && self_exe.file_name() == other_exe.file_name()
 }
 
 /// macOS (DRAGON-459): every live pid on the system, via `libproc`'s `proc_listallpids`
@@ -2277,5 +2313,50 @@ mod tests {
         truncated.extend_from_slice(&[0u8]);
         truncated.extend_from_slice(b"only-one\0");
         assert_eq!(parse_procargs2(&truncated), vec!["only-one"]);
+    }
+}
+
+/// DRAGON-510: which `/proc/<pid>/exe` counts as another instance of us.
+#[cfg(test)]
+mod same_program_tests {
+    use super::same_program;
+    use std::path::Path;
+
+    /// The ordinary case, and the one that must not loosen: identical paths only.
+    #[test]
+    fn a_plain_install_matches_on_the_exact_path() {
+        let a = Path::new("/home/u/repo/target/release/cosmic-capture-kit");
+        assert!(same_program(a, a));
+        assert!(!same_program(a, Path::new("/usr/bin/cosmic-capture-kit")));
+    }
+
+    /// THE CASE THE APPIMAGE ARM EXISTS FOR: two launches of the same `.AppImage` mount
+    /// at different paths, so an exact comparison finds no siblings and a committed
+    /// capture leaves every other overlay on screen.
+    #[test]
+    fn two_appimage_mounts_of_the_same_program_match() {
+        assert!(same_program(
+            Path::new("/tmp/.mount_Cosmic1a2b3c/usr/bin/cosmic-capture-kit"),
+            Path::new("/tmp/.mount_CosmicZ9y8x7/usr/bin/cosmic-capture-kit"),
+        ));
+    }
+
+    /// Different programs inside two mounts are still different programs.
+    #[test]
+    fn mounted_but_differently_named_does_not_match() {
+        assert!(!same_program(
+            Path::new("/tmp/.mount_Cosmic1a2b3c/usr/bin/cosmic-capture-kit"),
+            Path::new("/tmp/.mount_Other99999/usr/bin/some-other-app"),
+        ));
+    }
+
+    /// One side mounted and the other not stays a miss, so an AppImage never sweeps a
+    /// source build the user is deliberately running beside it (or the reverse).
+    #[test]
+    fn a_mounted_and_an_unmounted_copy_do_not_match() {
+        assert!(!same_program(
+            Path::new("/tmp/.mount_Cosmic1a2b3c/usr/bin/cosmic-capture-kit"),
+            Path::new("/home/u/repo/target/release/cosmic-capture-kit"),
+        ));
     }
 }

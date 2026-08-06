@@ -515,6 +515,17 @@ pub enum MeterFace {
     Spinner,
     /// A real percentage, in the accent colour.
     Progress(u8),
+    /// The FINALIZE wait (DRAGON-537): every byte is delivered and acknowledged, and the
+    /// outcome has not arrived (the provider is committing the transfer, and the child may
+    /// still be making the share link). The marker parks at the one clamp's dedicated 99
+    /// step for this span (`cloud::tray::counter`, DRAGON-522), which can last several
+    /// seconds. Drawn FULL in the accent with the animated stripe sweep
+    /// (`widgets::upload_stripes`), because a full bar sitting perfectly still is the same
+    /// "frozen reads as broken" problem the spinner rule was written against, at the far end
+    /// of the transfer. Offers NO cancel ([`meter_cancel_action`]): the flag a cancel sets
+    /// is read between chunks, and there are none left. Only a transfer that reported a
+    /// genuine percentage ever gets here; one that stayed indeterminate keeps its spinner.
+    Finalizing,
     /// The upload just finished: full and green, or stopped where it was and red. The
     /// ANNOUNCEMENT, for [`UPLOAD_FINISH_HOLD`].
     Finished(UploadOutcome),
@@ -584,7 +595,16 @@ pub fn meter_face(watch: &UploadWatch) -> MeterFace {
     if watch.indeterminate {
         return MeterFace::Spinner;
     }
-    MeterFace::Progress(watch.last_percent.unwrap_or(0))
+    // 99 is the one clamp's dedicated "all bytes sent, waiting on the outcome" step
+    // (`cloud::tray::counter`, DRAGON-522): the child writes it into the marker and it
+    // holds there through the provider's commit, so it IS the finalize wait (DRAGON-537).
+    // The moment mid-transfer where the bytes are genuinely at 99% wears the same face for
+    // the instant it lasts, which is the honest reading either way: cancelling would not
+    // beat the transfer finishing.
+    match watch.last_percent.unwrap_or(0) {
+        percent if percent >= 99 => MeterFace::Finalizing,
+        percent => MeterFace::Progress(percent),
+    }
 }
 
 /// How full the meter's track is drawn, 0.0 to 1.0. Pure; unit-tested.
@@ -599,7 +619,12 @@ pub fn meter_fill(face: MeterFace) -> f32 {
         // An ENDING meter is full for the same reason a stopped one is: a part-full bar in the
         // danger colour reads as "still going, badly", which is the one thing a press of the X
         // must not look like. A SETTLED one is full because it is the same bar, just quieter.
-        MeterFace::Finished(_) | MeterFace::Settled(_) | MeterFace::Ending(_) => 1.0,
+        // A FINALIZING one is full because every byte really is delivered (DRAGON-537); the
+        // stripe sweep, not the fill level, is what says it is still working.
+        MeterFace::Finalizing
+        | MeterFace::Finished(_)
+        | MeterFace::Settled(_)
+        | MeterFace::Ending(_) => 1.0,
     }
 }
 
@@ -651,6 +676,10 @@ pub fn upload_ending_over(ending_for: Option<std::time::Duration>) -> bool {
 ///   terminal state: that was right for the states below and wrong for this one. The settled
 ///   row is the whole point of the meter persisting: a four-second window to notice a file went
 ///   to the wrong account is not a window, it is a reflex test.
+/// * **Finalizing** — `None` (DRAGON-537). Every byte is already at the provider, and the
+///   cancel flag is only read between chunks, so there is no chunk left for a press to stop:
+///   the X would be an affordance that does nothing. The finished states that follow decide
+///   their own rows; the Undo appears with them if the upload names its file.
 /// * **Success, no file id** — `None`. An older build's done state names nothing, so there is
 ///   nothing to delete and the affordance would be a lie.
 /// * **Failure** — `None`. Nothing landed; there is nothing to take back.
@@ -666,7 +695,10 @@ pub fn meter_cancel_action(face: MeterFace, undoable: bool) -> Option<MeterActio
         {
             Some(MeterAction::Undo)
         }
-        MeterFace::Finished(_) | MeterFace::Settled(_) | MeterFace::Ending(_) => None,
+        MeterFace::Finalizing
+        | MeterFace::Finished(_)
+        | MeterFace::Settled(_)
+        | MeterFace::Ending(_) => None,
     }
 }
 
@@ -1133,6 +1165,13 @@ pub struct EditState {
     /// `sub_upload_poll` while non-empty; an entry is removed the moment its terminal state
     /// (done/failed/canceled) is read and turned into a toast.
     pub uploads: Vec<UploadWatch>,
+    /// The stripe-sweep phase for a meter in its FINALIZE wait (DRAGON-537), in px of
+    /// pattern travel, wrapped at the stripe pitch. Advanced by
+    /// `sub_upload_finalize_anim`'s ~30fps tick (the house animation pattern, same as the
+    /// folder refresh glyph's spin) while any of this document's meters is finalizing, and
+    /// simply left wherever it stopped otherwise: like the spin angle, where the pattern
+    /// happens to stand carries no meaning, so it needs no reset.
+    pub upload_anim: f32,
     /// The LAST completed bake: where it sits in the history, and the file it wrote
     /// (DRAGON-467 review, major 4). `None` = nothing baked yet, or the artifact ended up on
     /// an abandoned redo branch.
@@ -4429,6 +4468,13 @@ mod upload_meter_tests {
         // No percentage yet but no longer indeterminate: an honest zero, not a guess.
         let started = UploadWatch { indeterminate: false, ..watch() };
         assert_eq!(meter_face(&started), MeterFace::Progress(0));
+        // The one clamp's 99 step is the finalize wait (DRAGON-537): every byte delivered,
+        // outcome pending. Never `Progress(99)`; the marker parks here while the provider
+        // commits. The bucket below it is still an ordinary percentage.
+        let finalizing = UploadWatch { indeterminate: false, last_percent: Some(99), ..watch() };
+        assert_eq!(meter_face(&finalizing), MeterFace::Finalizing);
+        let almost = UploadWatch { indeterminate: false, last_percent: Some(95), ..watch() };
+        assert_eq!(meter_face(&almost), MeterFace::Progress(95));
         let done = UploadWatch { finished: Some(UploadOutcome::Done), ..running.clone() };
         assert_eq!(meter_face(&done), MeterFace::Finished(UploadOutcome::Done));
         // Finished while STILL indeterminate (a single-request upload): finished wins.
@@ -4461,6 +4507,9 @@ mod upload_meter_tests {
         assert!((meter_fill(MeterFace::Progress(100)) - 1.0).abs() < f32::EPSILON);
         // A percentage past 100 (nothing writes one, but the type allows it) never overfills.
         assert!((meter_fill(MeterFace::Progress(255)) - 1.0).abs() < f32::EPSILON);
+        // The finalize wait is full (DRAGON-537): every byte really is delivered, and the
+        // stripe sweep, not the fill level, is what says it is still working.
+        assert!((meter_fill(MeterFace::Finalizing) - 1.0).abs() < f32::EPSILON);
         for outcome in [UploadOutcome::Done, UploadOutcome::Stopped] {
             assert!((meter_fill(MeterFace::Finished(outcome)) - 1.0).abs() < f32::EPSILON);
             // DRAGON-514 pinned that settling never changes the bar's LENGTH; DRAGON-516 took
@@ -4479,9 +4528,16 @@ mod upload_meter_tests {
         // here and both values are checked, because a running upload has no file id yet and a
         // future one that did must not change what this row offers.
         for undoable in [false, true] {
-            for face in [MeterFace::Spinner, MeterFace::Progress(0), MeterFace::Progress(99)] {
+            for face in [MeterFace::Spinner, MeterFace::Progress(0), MeterFace::Progress(95)] {
                 assert_eq!(meter_cancel_action(face, undoable), Some(MeterAction::Cancel), "{face:?}");
             }
+        }
+        // The finalize wait (DRAGON-537): every byte is already at the provider and the
+        // cancel flag is only read between chunks, so no X at all, whatever `undoable` says.
+        // (`Progress(95)` above replaced `Progress(99)`, a face `meter_face` no longer
+        // mints: 99 IS this state.)
+        for undoable in [false, true] {
+            assert_eq!(meter_cancel_action(MeterFace::Finalizing, undoable), None);
         }
         // DRAGON-514: the undo is offered by BOTH success faces, announced and settled. The
         // settled row is the point of the persistence: the window to notice a capture went to
