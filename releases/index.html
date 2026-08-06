@@ -1,0 +1,2627 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Screenshots, screen recordings and an on-screen QR / barcode / OCR scanner for COSMIC Linux, macOS and Windows.">
+      
+      
+      
+        <link rel="canonical" href="https://cck.thedragon.dev/releases/">
+      
+      
+        <link rel="prev" href="../cloud-accounts/">
+      
+      
+        <link rel="next" href="../privacy/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Release notes - Cosmic Capture Kit</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/custom.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+  
+
+
+  
+  
+
+<script id="__analytics">function __md_analytics(){function e(){dataLayer.push(arguments)}window.dataLayer=window.dataLayer||[],e("js",new Date),e("config","G-GFF8C5BGTC"),document.addEventListener("DOMContentLoaded",(function(){document.forms.search&&document.forms.search.query.addEventListener("blur",(function(){this.value&&e("event","search",{search_term:this.value})}));document$.subscribe((function(){var t=document.forms.feedback;if(void 0!==t)for(var a of t.querySelectorAll("[type=submit]"))a.addEventListener("click",(function(a){a.preventDefault();var n=document.location.pathname,d=this.getAttribute("data-md-value");e("event","feedback",{page:n,data:d}),t.firstElementChild.disabled=!0;var r=t.querySelector(".md-feedback__note [data-md-value='"+d+"']");r&&(r.hidden=!1)})),t.hidden=!1})),location$.subscribe((function(t){e("config","G-GFF8C5BGTC",{page_path:t.pathname})}))}));var t=document.createElement("script");t.async=!0,t.src="https://www.googletagmanager.com/gtag/js?id=G-GFF8C5BGTC",document.getElementById("__analytics").insertAdjacentElement("afterEnd",t)}</script>
+  
+    <script>if("undefined"!=typeof __md_analytics){var consent=__md_get("__consent");consent&&consent.analytics&&__md_analytics()}</script>
+  
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#release-notes" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Cosmic Capture Kit" class="md-header__button md-logo" aria-label="Cosmic Capture Kit" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Cosmic Capture Kit
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Release notes
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/Frosthaven/cosmic-capture-kit" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Frosthaven/cosmic-capture-kit
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Cosmic Capture Kit" class="md-nav__button md-logo" aria-label="Cosmic Capture Kit" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    Cosmic Capture Kit
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/Frosthaven/cosmic-capture-kit" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Frosthaven/cosmic-capture-kit
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capturing
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Capturing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The capture overlay
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capture modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/screenshots/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Screenshots
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/recording/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Recording
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/scanner/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The scanner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/keyboard/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Keyboard shortcuts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The preview editor
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    The preview editor
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The preview editor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/annotating/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Annotating
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/crop/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Crop and covermark
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/video/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Editing a recording
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/sharing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Saving, copying and uploading
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Settings
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/general/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    General
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/capture-modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capture Modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/preview-editor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Preview Editor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/audio-video/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Audio & Video
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/shortcuts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Keyboard Shortcuts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/cloud/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud Accounts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/health/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Health
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/about/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    About
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Command line
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cloud-accounts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud accounts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release notes
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#v0290" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.29.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0281" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.28.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0280" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.28.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0271" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.27.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0270" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.27.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0260" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.26.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0251" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.25.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0240" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.24.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0230" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.23.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0220" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.22.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0211" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.21.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0200" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.20.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0192" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.19.2
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0180" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.18.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0171" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.17.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0170" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.17.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0161" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.16.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0151" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.15.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0150" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.15.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0140" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.14.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0130" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.13.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0120" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.12.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0110" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.11.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0101" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.10.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v090" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.9.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v060" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.6.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v051" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.5.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v050" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.5.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v047" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.4.7
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../privacy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Privacy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../terms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Terms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#v0290" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.29.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0281" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.28.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0280" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.28.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0271" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.27.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0270" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.27.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0260" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.26.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0251" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.25.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0240" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.24.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0230" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.23.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0220" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.22.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0211" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.21.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0200" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.20.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0192" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.19.2
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0180" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.18.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0171" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.17.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0170" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.17.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0161" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.16.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0151" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.15.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0150" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.15.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0140" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.14.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0130" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.13.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0120" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.12.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0110" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.11.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v0101" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.10.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v090" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.9.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v060" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.6.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v051" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.5.1
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v050" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.5.0
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v047" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v0.4.7
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<!--
+This page is GENERATED. Do not edit it by hand: the docs deploy
+rewrites it from the project's published GitHub releases every time the
+site is built. The copy committed to the repository is a placeholder.
+-->
+
+<h1 id="release-notes">Release notes</h1>
+<p>Every release, newest first. Each entry is the release's own notes, as written when it shipped.</p>
+<p>Downloads live on the <a href="https://github.com/Frosthaven/cosmic-capture-kit/releases">releases page</a>.</p>
+<h2 id="v0290">v0.29.0</h2>
+<p><em>Released 6 August 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>OCR speaks more languages</strong>: text scanning now picks up any language pack
+  installed on your system, and Settings gains a language dropdown to choose
+  between them. The macOS and Windows builds now carry text scanning with
+  English built in, so it works the moment you install.</li>
+<li><strong>The Health page names its tools</strong>: it now shows the resolved path of every
+  external tool it found, each with a copy button, so "which ffmpeg is it
+  actually using" is a glance instead of a guess.</li>
+<li><strong>Cloud sign-in opens by itself</strong>: connecting an account now launches your
+  browser automatically, and the success page is delivered fully before the
+  helper closes, so the tab confirms instead of erroring at the last step.</li>
+<li><strong>Recordings cannot stall on their own plumbing</strong>: an internal wait during
+  recording could, in rare cases, block the write that fed it. It no longer can.</li>
+<li><strong>System tray counter for uploads</strong>: Now has crisper numbers for the
+  percentage of the upload that is completed instead of being a bit blurry.</li>
+<li><strong>Packages list their locations</strong>: In the health panel, found packages now
+  list their locations along with a copy button which can be useful for
+  debugging.</li>
+<li><strong>Preview editor cloud storage UX</strong>: When uploading a file, the preview
+  editor's upload meter and the system tray now keep you more informed. During
+  the final handshake of a file, the meter will animate while the system tray
+  becomes an hourglass. As soon as the cloud service finalizes the transaction,
+  the meter turns green and the system tray becomes a checkmark.</li>
+</ul>
+<p><strong>Linux:</strong></p>
+<ul>
+<li><strong>There is now an AppImage</strong>, and it is the download to take. One file, no
+  install step, and it carries its own ffmpeg and text-scanning engine, so
+  recording and OCR work immediately with nothing else to set up. It also
+  bundles the video libraries, which means GPU-accelerated recording on distros
+  whose own ffmpeg is too old for it.</li>
+<li><strong>The AppImage updates itself</strong>: Settings, then About, checks for new releases
+  and installs one in place. It keeps the filename and location you chose, so
+  your capture shortcut, symlink or autostart entry keeps working afterwards.
+  Put it somewhere you own, such as <code>~/.local/bin</code>.</li>
+<li><strong>ARM builds</strong>: both the AppImage and the plain binary now ship for aarch64
+  alongside x86_64. That covers Asahi on Apple Silicon, Raspberry Pi 5 desktops
+  and ARM laptops, which previously had to build from source.</li>
+<li><strong>The plain binary gained GPU recording and reaches further back</strong>: it now
+  ships with hardware-accelerated recording enabled, and is built against an
+  older system baseline, so it runs on distros it previously refused to start
+  on.</li>
+</ul>
+<p><strong>macOS:</strong></p>
+<ul>
+<li><strong>The permissions window looks like the rest of the app</strong>: it now has the same
+  frosted background as the other windows, and sizes itself correctly.</li>
+</ul>
+<p><strong>Windows:</strong></p>
+<ul>
+<li><strong>A paused recording is easier to spot</strong>: the tray icon's centre now stays red
+  while paused, matching the recording dot, instead of blending into the
+  surrounding brackets. The shape still tells the two apart.</li>
+</ul>
+<h2 id="v0281">v0.28.1</h2>
+<p><em>Released 5 August 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Cloud sign-in is more reliable</strong>: the sign-in helper that catches your
+  browser's redirect now listens on both IPv4 and IPv6, so browsers that
+  resolve localhost to IPv6 complete the connection instead of hanging.</li>
+<li><strong>Proton sign-in fallback</strong>: if your browser does not open on its own during
+  Proton sign-in, the step now shows a link you can click or copy right away.</li>
+</ul>
+<p><strong>Windows:</strong></p>
+<ul>
+<li><strong>Cloud sign-ins open correctly</strong>: sign-in links were being cut short by how
+  the browser was launched, so some connections could never complete. Links
+  now open through the proper system call, intact.</li>
+</ul>
+<h2 id="v0280">v0.28.0</h2>
+<p><em>Released 5 August 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Proton Drive support</strong>: connect a Proton account under <em>Settings -&gt; Cloud
+  Accounts</em> and your captures upload end-to-end encrypted. Proton Drive supports
+  uploading to your "My files" directory or to an album of your choice in the
+  "Photos" section of your drive. This requires the official <a href="https://proton.me/support/drive-cli">proton-drive
+  CLI</a> to be installed on your system.</li>
+<li><strong>Cloud folder browsing feels faster</strong>: The UI now immediately responds to
+  interactions instead of waiting for cloud responses, making things a little
+  snappier. An extra spinner has been placed into the file listing window for UX.</li>
+<li><strong>About page</strong>: the View All Patch Notes link now sits at the end of the
+  patch notes themselves.</li>
+</ul>
+<p><strong>Linux:</strong></p>
+<ul>
+<li><strong>A packaged download</strong>: each release now ships the COSMIC/Wayland binary as
+  a zip, so trying the app no longer requires building from source. It is on
+  the release page's download table; unzip, <code>chmod +x</code> if needed, and run.</li>
+</ul>
+<h2 id="v0271">v0.27.1</h2>
+<p><em>Released 4 August 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Fixed Google Drive accounts</strong> silently breaking after about an hour: renewing
+  the sign-in was missing a required credential, so the very first refresh after
+  connecting always failed.</li>
+<li><strong>Cleaned up the cloud account setup screens</strong> to simplify the experience.</li>
+<li><strong>Redesigned the About page</strong>, which now includes a link to view all
+  historical patch notes.</li>
+</ul>
+<h2 id="v0270">v0.27.0</h2>
+<p><em>Released 4 August 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Cloud accounts</strong>: connect Google Drive, OneDrive, and Dropbox under
+  <em>Settings -&gt; Cloud Accounts</em>. Sign-in happens in your own browser, tokens are
+  kept in your system's keychain, and uploads go straight from your machine to
+  your account. Nothing passes through anyone else's servers.</li>
+<li><strong>Upload from the preview editor</strong>: a new Upload action (Ctrl+U, Cmd+U on
+  macOS) sends the capture to a cloud account and copies a link to it.</li>
+<li><strong>Live upload progress</strong>: a progress meter in the editor titlebar shows the
+  upload as it happens, with cancel a click away. When it finishes, the meter
+  turns success colored and stays until your next upload, and a trash button
+  can take the upload back off the cloud if you change your mind.</li>
+<li><strong>Upload progress in the tray</strong>: while an upload runs, the tray and menu bar
+  icon shows a clear, full-size progress counter.</li>
+<li><strong>YouTube uploads for self-configured setups</strong>: connect a YouTube account and
+  upload videos with a title and visibility of your choice. This one needs your
+  own (free) API credentials; the docs walk you through it step by step.</li>
+<li><strong>A real documentation site</strong>: guides for the capture tool, the preview
+  editor, settings, the CLI, and cloud account setup now live at
+  https://cck.thedragon.dev.</li>
+<li><strong>Recording toolbar stays quiet</strong>: toolbar tooltips no longer pop up over
+  your content while a recording is running.</li>
+</ul>
+<p><strong>Fixes:</strong></p>
+<ul>
+<li><strong>Settings window could hang on close</strong>: closing settings right after cloud
+  account work no longer wedges the window.</li>
+</ul>
+<h2 id="v0260">v0.26.0</h2>
+<p><em>Released 2 August 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Save now works like Save As</strong>: pressing Save opens a picker prefilled with
+  where it would have saved, so you can always confirm or change the destination.</li>
+<li><strong>Better save experience</strong>: Check out the new options under _Settings -&gt;
+  Preview Editor. In the preview editor, you now have Save, Copy, Share, and
+  Upload. Behaviors are intuitive and succinct.</li>
+<li><strong>Native share integration</strong>: On platforms that support it, the preview editor
+  has a new "Share" file action available. This will launch your platform's
+  native share widget.</li>
+<li><strong>Capture toolbar polish</strong>: Every option now has a tooltip, and the button
+  used to capture has been changed to a checkmark to make it more
+  obvious.</li>
+<li><strong>Toolbar group labels</strong>: each group of buttons in the editor's toolbar now
+  has a small label describing what it does (and can be turned off in settings).</li>
+<li><strong>Curved arrows</strong>: arrows now have a third handle in the middle you can drag
+  to bend them.</li>
+<li><strong>The selection tool is easier to use</strong>: selecting no longer looks like
+  drawing, and pressing Escape now clears your selection.</li>
+<li><strong>Scanner can now be refreshed</strong>: The scanner mode now has a refresh button that you can
+  use to freely re-scan what's in the selected region.</li>
+</ul>
+<p><strong>Windows:</strong></p>
+<ul>
+<li><strong>Fixed not being able to open the overlay editor</strong> after opening a
+  dialog like Save/Settings.</li>
+</ul>
+<h2 id="v0251">v0.25.1</h2>
+<p><em>Released 1 August 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Instant capture</strong>: new shortcuts that save and copy without opening the editor.</li>
+<li><strong>Capture notifications</strong>: an editor-less capture says what it copied, and clicking it
+  finds the file.</li>
+<li><strong>Shortcut conflicts</strong>: two capture shortcuts can no longer be given the same keys.</li>
+<li><strong>The editor opens faster</strong>: copying to the clipboard no longer holds up the editor
+  while it opens.</li>
+<li><strong>Window captures are clean</strong>: a window capture can no longer contain a window you did
+  not pick.</li>
+<li><strong>Failed recordings explain themselves</strong>: the reason is shown instead of a generic
+  failure.</li>
+<li><strong>Edited images keep their capture info.</strong></li>
+<li><strong>Scanner improvements</strong>: the scanner now reads what is on your screen right now instead
+  of a copy taken when the capture started, so switching windows no longer gives you the
+  old window's text. Your real screen stays visible while you scan, and a refresh button
+  in the toolbar re-reads it whenever you want.</li>
+</ul>
+<p><strong>Linux (COSMIC):</strong></p>
+<ul>
+<li><strong>Recording starts right away on multi-GPU machines</strong>: it used to pause for several
+  seconds at the start of every take before falling back.</li>
+<li><strong>Audio meters work</strong>: the microphone and system audio level indicators now show up
+  correctly when a recording starts.</li>
+</ul>
+<p><strong>macOS:</strong></p>
+<ul>
+<li><strong>Permission prompts come to the front</strong> instead of opening behind other windows.</li>
+<li><strong>macOS 13 is now fully supported</strong>: screenshots and recordings work, not just an
+  error message.</li>
+<li><strong>Failed captures explain themselves</strong> instead of the app silently closing.</li>
+<li><strong>Pressing a capture shortcut repeatedly no longer leaves old capture windows stuck
+  open.</strong></li>
+</ul>
+<p><strong>Windows:</strong></p>
+<ul>
+<li><strong>Captures work on scaled displays</strong>: above 100% scaling every capture failed
+  instantly and silently. Fixed.</li>
+<li><strong>A failed capture says so</strong> instead of closing with nothing.</li>
+<li><strong>A stuck tray icon no longer swallows captures.</strong></li>
+</ul>
+<h2 id="v0240">v0.24.0</h2>
+<p><em>Released 29 July 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Fixed a recording with no audio at all</strong>: on machines using the software
+  recording path, two parts of the pipeline could collide and leave the
+  recording silent.</li>
+<li><strong>A failed recording no longer breaks the next one</strong>: if a recording session
+  died unexpectedly it could leave a stuck background process holding the file,
+  and every later recording would fail until it was cleared by hand. That can no
+  longer happen, and a session that does die is cleaned up automatically.</li>
+<li><strong>Interrupted recordings are kept, not lost</strong>: a recording cut short by a
+  crash is recovered alongside your other captures instead of being discarded.</li>
+<li><strong>Recordings start faster</strong>: the encoder was being detected twice at the start
+  of every recording, once needlessly.</li>
+<li><strong>More natural voice levels</strong>: the automatic gain now leaves more room above
+  your speaking level, so louder syllables keep their punch instead of being
+  flattened against the ceiling. Your level meter will read a little lower than
+  before, which is the extra headroom.</li>
+<li><strong>Video editor settings</strong>: the Preview Editor settings page has a new Video
+  Editor section, so save-on-copy, close-on-copy and copy-on-delete can differ
+  between images and videos instead of sharing one set.</li>
+<li><strong>Small region selections work</strong>: dragging a very thin selection produced
+  nothing at all, with no error. Fixed.</li>
+<li><strong>Crop button</strong> now reads "Apply Crop".</li>
+</ul>
+<p><strong>Diagnostics:</strong></p>
+<ul>
+<li><strong>Debug logging</strong>: Settings → Health → Debug has an opt-in "Enable Debug
+  Logging" switch, off by default, with a button that opens the log folder. When
+  something goes wrong, the log names it, which makes a bug report a single file
+  instead of a conversation.</li>
+</ul>
+<p><strong>Linux:</strong></p>
+<ul>
+<li><strong>Folder buttons open the file manager</strong>: buttons that open a folder did
+  nothing at all. Fixed.</li>
+</ul>
+<p><strong>macOS:</strong></p>
+<ul>
+<li><strong>Failures explain themselves</strong>: a capture that could not complete used to
+  close with nothing and no message. It now says what happened and, where the
+  fix is known, how to fix it.</li>
+<li><strong>Screen Recording permission</strong>: if the permission is missing or has been
+  invalidated (which macOS often does after a system update), the app now says
+  so and gives the steps to restore it.</li>
+<li><strong>Permissions are clearer</strong>: Accessibility is now labelled Recommended rather
+  than Optional, explains what it is used for, and can be skipped without being
+  asked again on every launch.</li>
+<li><strong>Manage Permissions</strong> has been added to the menu bar item, so the permissions
+  window can be reopened whenever you want.</li>
+<li><strong>Stuck captures clean themselves up</strong>: a capture that never manages to open
+  now exits on its own instead of lingering as an invisible process.</li>
+</ul>
+<p><strong>Windows:</strong></p>
+<ul>
+<li>Nothing new this release.</li>
+</ul>
+<p><strong>Known issues:</strong></p>
+<ul>
+<li>On Windows 10, the shaded overlay shown when selecting a capture area renders
+  solid black instead of see-through, and frosted-glass window effects do not
+  apply. Windows 11 is unaffected. Still under investigation.</li>
+</ul>
+<p><em>Note: Windows 10 is not officially supported, but effort is being made to
+ensure rudimentary compatibility at this time.</em></p>
+<h2 id="v0230">v0.23.0</h2>
+<p><em>Released 29 July 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Hand tool and a reorganized toolbar</strong>: Crop, Select, and Hand now sit
+  together as one group. The hand tool (H, or hold middle click) pans the canvas
+  without touching your annotations. The bottom bar gained a live info block
+  showing the current resolution and original capture file size.</li>
+<li><strong>Zoom range increased</strong>: The preview editor zooms further than before, with
+  the 100% detent still snapping exactly under your cursor.</li>
+<li><strong>Sharper icons everywhere</strong>: Every icon in the app is now drawn on whole
+  pixels instead of being resampled onto a fractional grid. This leads to much
+  cleaner icon display.</li>
+<li><strong>Crop framing</strong>: Entering crop now zooms out to leave a consistent margin
+  around the image on all sides, so the handles are always reachable and there
+  is room to expand the canvas outward.</li>
+<li><strong>Crop UX</strong>: The top toolbar items not related to crop now vanish while in a
+  cropping session.</li>
+<li><strong>Annotations stay visible while cropping</strong>: Marks that fall outside the
+  current crop rectangle are still drawn during a crop session, so you can see
+  what you are about to cut. Covermarks and spotlight dimming are hidden during
+  crop for usability, and return when you accept.</li>
+<li><strong>Live selection preview</strong>: Dragging a selection box in the canvas will now
+  show a border around items that get included in the selection in real time as
+  you continue dragging.</li>
+<li><strong>Covermarks cover expanded canvas</strong>: When you crop past the image bounds, the
+  covermark pattern now fills the expanded area instead of stopping at the
+  original edge.</li>
+<li><strong>Video share parity</strong>: The video editor's share actions now match the image
+  editor's. Copied recordings get a proper name, and a share that cannot be
+  baked is refused with a reason instead of silently producing the wrong file.</li>
+<li><strong>Fixed</strong>: The preview editor no longer crashes when zooming in quickly on a
+  large capture with many annotations.</li>
+</ul>
+<p><strong>Windows:</strong></p>
+<ul>
+<li><strong>Windows 10 window controls</strong>: The minimize, restore, and close buttons now
+  render on Windows 10. They were previously invisible while still being
+  clickable.</li>
+<li><strong>Diagnostics report</strong>: Windows builds now write a small text report to
+  <code>%LOCALAPPDATA%\cosmic-capture-kit\logs</code> describing the graphics adapter and
+  window settings. It exists to track down a Windows 10 display problem and
+  contains no screenshots, file names, or personal data. It will be removed once
+  that issue is resolved.</li>
+</ul>
+<p><strong>Known issues:</strong></p>
+<ul>
+<li>On Windows 10, the shaded overlay shown when selecting a capture area renders
+  solid black instead of see-through, and frosted-glass window effects do not
+  apply. Windows 11 is unaffected. This is under active investigation, and the
+  diagnostics report above is part of tracking it down.</li>
+</ul>
+<p><em>Note: Windows 10 is not officially supported, but effort is being made to
+ensure rudimentary compatibility at this time.</em></p>
+<h2 id="v0220">v0.22.0</h2>
+<p><em>Released 28 July 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Crop tool</strong>: Crop any screenshot from the preview editor (press C or use the toolbar). Classic thirds-grid selection with draggable edges and corners, edge snapping with modifier override, and Enter to apply. Crop past the image bounds to expand the canvas: annotations work on the expanded space, and everything stays non-destructive until you save.</li>
+<li><strong>Companion colors</strong>: Press X to swap the active annotation color with its perfect companion color. Press X again to swap right back.</li>
+<li><strong>Multi-select groups</strong>: Selecting multiple annotations now wraps them in a group box you can drag, scale, and right-click as one. Scaling keeps every item's size, position, and overlap in perfect unison.</li>
+<li><strong>Tool shortcuts</strong>: Spotlight joined the highlighter group on U. The color picker moved to S, freeing C for the crop tool, so Photoshop muscle memory transfers.</li>
+</ul>
+<p><strong>macOS:</strong></p>
+<ul>
+<li><strong>Emoji picker</strong>: Press Ctrl+Cmd+Space while editing a text annotation to open the system emoji picker. Picking an emoji drops it right at your cursor.</li>
+<li><strong>Display consistency</strong>: Annotation strokes, text, and step markers now render at the same visual size on Retina and standard displays.</li>
+</ul>
+<h2 id="v0211">v0.21.1</h2>
+<p><em>Released 28 July 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Text annotations</strong>: Add text to any capture. Click to drop a box that grows as you type, or drag one out to a fixed width and let the text wrap inside it. Pick fonts, sizes, colors and outline weight. Dragged selection boxes match Photoshop's behavior for text vs paragraph bounds.</li>
+<li><strong>Emoji support</strong>: The text annotation tool also supports the full emoji space. </li>
+<li><strong>Save, Save As, Copy, Delete</strong>: Much clearer actions with failure notices when something goes wrong. </li>
+<li><strong>Tool shortcuts changed</strong>: Tool keys now follow Photoshop, so muscle memory transfers. Several tools are now grouped for cycling a single hotkey.</li>
+<li><strong>Multi-select</strong>: Shift-click to build a selection with any tool armed, and duplicate several annotations at once. Ctrl with a drawing tool lays a new shape over the top instead of grabbing what's underneath.</li>
+<li><strong>Step markers</strong> Now remembers the last used size.</li>
+<li><strong>Polish</strong>: Updated preview editor toolbar design.</li>
+</ul>
+<p><strong>macOS:</strong></p>
+<ul>
+<li>Improved Encoder performance for recordings.</li>
+</ul>
+<h2 id="v0200">v0.20.0</h2>
+<p><em>Released 27 July 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Step markers</strong>: Number the steps in your screenshots. Click to drop a numbered circle — markers count 1, 2, 3… and renumber themselves when you delete one from the middle.</li>
+<li><strong>UI Updates</strong>: Reduced clutter in the window preview editor by grouping tools</li>
+<li><strong>Lighter on memory</strong>: Significant reductions across the app — capture sessions, the preview editor, and the tray icon all use less RAM.</li>
+<li><strong>Multiple capture</strong>: Improved support for multiple window preview editors open at once.</li>
+</ul>
+<p><strong>Windows:</strong></p>
+<ul>
+<li>Fixes a bug where automatic update checks don't always trigger</li>
+</ul>
+<h2 id="v0192">v0.19.2</h2>
+<p><em>Released 27 July 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>Pencil</strong>: Freehand drawing arrives to the image editor. Paired with an eraser tool, you can now mark up your images as you see fit!</li>
+<li><strong>Select</strong> with the pointer tool: click, Ctrl/Shift-click, or sweep a band to build a multi-selection, then move it as a group. Ctrl+A selects everything.</li>
+<li><strong>Place instantly</strong>: double-click any shape tool to drop a ready-made, pre-selected item in the center of the shot. Hold Ctrl while a tool is armed to draw on top of existing items instead of moving them.</li>
+</ul>
+<p><strong>macOS &amp; Windows:</strong></p>
+<ul>
+<li>The zoom slider's 100% tick now sits exactly on 100%, matching Linux.</li>
+</ul>
+<h2 id="v0180">v0.18.0</h2>
+<p><em>Released 26 July 2026</em></p>
+<p><strong>All Platforms:</strong></p>
+<ul>
+<li><strong>New</strong>: Image preview editor has been upgraded with the first round of annotation tools.</li>
+<li><strong>Annotate</strong> with arrows, boxes, box-highlights, and a dynamic highlighter that automatically stays readable over both dark and light backgrounds.</li>
+<li><strong>Redact</strong> sensitive details with pixelate or blur. Pixel size is based on what's visible - small text, faces, anything.</li>
+<li><strong>Dim &amp; spotlight</strong> to darken the shot and draw the eye to what matters. Anything you spotlight stays fully visible, even through a pixelate or blur. Other highlight marks will also pierce the dimness.</li>
+<li><strong>Right click</strong> for extended control. Layer controls to bring to front, send to back, or move up/down. Update a selection's color, delete, or duplicate the item.</li>
+</ul>
+<h2 id="v0171">v0.17.1</h2>
+<p><em>Released 25 July 2026</em></p>
+<p><strong>All Platforms:</strong>
+- The region selection box is now sleeker: thinner lines by default, shorter corner arms, and tighter gaps.</p>
+<p><strong>Linux (COSMIC):</strong>
+- The Capture Active Monitor hotkey and <code>--active-monitor</code> CLI flag now capture immediately (as intended) instead of opening the monitor selector.
+- The preview editor now opens on the display you started the capture from, in both windowed and full-screen modes, matching macOS and Windows.
+- Removed deprecated settings to control float status, as this is now controlled through tiling window manager configs.</p>
+<p><strong>Windows:</strong>
+- Recorded system audio now properly retains its loudness.
+- Muting system audio during a recording now properly works as expected instead of allowing light audio bleed through.
+- Overlays no longer flicker when being brought into view.</p>
+<h2 id="v0170">v0.17.0</h2>
+<p><em>Released 22 July 2026</em></p>
+<p><strong>All Platforms:</strong>
+- New capture hotkeys: Capture Active Window and Capture Active Monitor instantly grab the focused window, or the monitor under it, with no picker. The old Start Capture action is now Capture All In One. All three hotkeys ship unbound by default, so you assign the keys you want.
+- The preview editor now opens on the display you started the capture from, even when the captured window is on another monitor. Switching from windowed to full-screen editing follows the monitor the editor is currently on.
+- Capturing a window that lives on another monitor now correctly grabs it in its active state when it is set to active in settings.</p>
+<p><strong>macOS:</strong>
+- The preview editor's keyboard shortcuts (copy, save, save as, delete) now work the moment it opens, with no click needed first.
+- Under the AeroSpace tiling window manager, the preview editor and Settings window stay on the monitor you triggered from instead of being pulled onto another workspace.
+- Fixed the preview editor opening too small when the captured content was on a different-resolution display.
+- Capturing the active window now targets the focused window; onboarding requests the Accessibility permission it needs.</p>
+<p><strong>Windows:</strong>
+- Capturing a glass or acrylic window now shows the desktop wallpaper behind it instead of the other windows that were there, matching macOS.
+- The Settings window now tiles correctly under the komorebi tiling window manager.
+- Restored the Mica material on focused Settings and preview title bars.</p>
+<h2 id="v0161">v0.16.1</h2>
+<p><em>Released 22 July 2026</em></p>
+<p>All Platforms:
+- The capture hotkey is now three separate actions: Capture All In One (the full picker overlay), Capture Active Window, and Capture Active Monitor. The two new ones capture instantly, with no picker. All default to unbound; set them in Settings &gt; Keyboard Shortcuts.
+- Immediate captures follow your delivery settings exactly (copy to clipboard / open the preview editor) and open the editor on the correct monitor.
+- The settings window and preview editor now have proper titles ("Cosmic Capture Kit - Settings" / "Cosmic Capture Kit - Preview Editor"). If you float them in a tiling window manager by title, see the updated README rules; COSMIC float exceptions migrate automatically.
+- The settings window remembers its size between launches.
+- General settings: "Keep system tray icon" (renamed), with a new "Automatically start on login" toggle beneath it.
+- When recording system audio with a mic, ducking responds only to real speech from an enabled mic, never to background noise and never when the mic is off.</p>
+<p>macOS:
+- Keyboard shortcut fields show native modifier symbols (⌃⌥⇧⌘) universally.
+- Capturing a full-screen app window now grabs the window contents instead of the capture loading cover.</p>
+<p>Windows:
+- Windows now live-resizes: the settings window and preview editor re-layout and rescale during a resize drag, matching macOS.
+- Recording system audio keeps the dialog (center) channel on surround and spatial endpoints, and loud surround is smoothly limited instead of clipped.
+- A recording that hits an encoder stall now recovers and saves instead of hanging forever.
+- Single-window captures show the fullscreen loading cover with a cancel button, like macOS.
+- Capture selectors no longer appear in the taskbar; only the editor and settings do.
+- The system tray is on by default (with start-on-login); both can be switched off in General settings.
+- Fixed a crash that could kill the settings window as it opened, and Windows-key chords now display as "Win+...".</p>
+<h2 id="v0151">v0.15.1</h2>
+<p><em>Released 21 July 2026</em></p>
+<p>All Platforms:
+- UX improvements</p>
+<p>macOS:
+- Window capture now does a true recomposite, allowing for the capture of glass effects and translucency/blur. This completely bypasses a mac limitation where even Apple's own capture tools cannot capture glass effects.</p>
+<h2 id="v0150">v0.15.0</h2>
+<p><em>Released 21 July 2026</em></p>
+<p>All Platforms:
+- UX improvements</p>
+<p>macOS:
+- Window capture now does a true recomposite, allowing for the capture of glass effects and translucency/blur. This completely bypasses a mac limitation where even Apple's own capture tools cannot capture glass effects.</p>
+<h2 id="v0140">v0.14.0</h2>
+<p><em>Released 20 July 2026</em></p>
+<p>all platforms:
+- UX and responsive size improvements to the settings window</p>
+<p>macOS:
+- Miscellaneous single window capture improvements
+- Settings window &amp; preview editor now use the glass UI effect, bringing it in line with Cosmic Desktop and Windows.</p>
+<h2 id="v0130">v0.13.0</h2>
+<p><em>Released 20 July 2026</em></p>
+<p><strong>Windows is now supported, including Mica.</strong></p>
+<p>Also in this release:</p>
+<ul>
+<li>New <strong>Automatic Contrast Boost</strong> appearance option: your accent color adapts for legibility across the whole interface. Turn it off to use your exact chosen color everywhere.</li>
+</ul>
+<h2 id="v0120">v0.12.0</h2>
+<p><em>Released 16 July 2026</em></p>
+<ul>
+<li>The preview editor window now opens at the media size: correct aspect ratio, never above 100% scale, and never taller than comfortably fits the monitor.</li>
+<li>Zooming and panning in the preview editor no longer travel past the edges of the media.</li>
+</ul>
+<h2 id="v0110">v0.11.0</h2>
+<p><em>Released 16 July 2026</em></p>
+<p>This release marks a major refactor in preparation for supporting more desktop environments</p>
+<h2 id="v0101">v0.10.1</h2>
+<p><em>Released 16 July 2026</em></p>
+<p>macOS:
+- Loading indicators use a refreshed circular spinner.</p>
+<p>Cosmic Desktop:
+- Loading indicators use a refreshed circular spinner.
+- The settings and preview windows now use frosted glass.
+- Single-window captures now reproduce the frosted glass backdrop, so a captured window matches how it looks on screen.</p>
+<h2 id="v090">v0.9.0</h2>
+<p><em>Released 15 July 2026</em></p>
+<p>Cursor and window picker fixes:
+- The captured cursor is now taken at the right moment and placed correctly, including across multiple monitors.
+- A cursor indicator shows where the pointer is while you select a region or monitor, and the cursor is hidden while picking a window or during the countdown.
+- For a delayed capture, the cursor is captured at the moment the shot is taken.
+- Picking a window no longer briefly freezes the screen.</p>
+<h2 id="v060">v0.6.0</h2>
+<p><em>Released 14 July 2026</em></p>
+<p>Window capture improvements:
+- Captured windows now show as active or inactive to match the look you choose.
+- The window picker shows each display's own wallpaper instead of a gray background.
+- The window picker arranges many open windows in a grid so they stay large and easy to pick.
+- More windows appear in the picker, including System Settings.</p>
+<p>Redesigned window border settings:
+- Separate Active and Inactive borders, each with its own color and width.
+- The active border follows your system accent color by default.
+- A new drop shadow toggle for captured windows.</p>
+<p>Other fixes:
+- Your settings no longer reset when the app updates.</p>
+<h2 id="v051">v0.5.1</h2>
+<p><em>Released 14 July 2026</em></p>
+<p>Fixes for macOS window capture:
+- The single window border now hugs the window's rounded corners.
+- Only the wallpaper shows behind a captured window, with no other windows bleeding through.</p>
+<h2 id="v050">v0.5.0</h2>
+<p><em>Released 13 July 2026</em></p>
+<p>This update brings compositor features to screenshots on macOS:
+- Freeze pixels during selection
+- Preserve mouse cursor
+- Preserve window transparency
+- Preserve wallpaper</p>
+<p>It also brings single window aesthetics to capture compositing:
+- Window border style
+- Padding around the window</p>
+<h2 id="v047">v0.4.7</h2>
+<p><em>Released 12 July 2026</em></p>
+<p>This release brings several features and enhancements to macOS:</p>
+<ul>
+<li>The about page of settings now carries update functionality, with patch notes and a notification toggle.</li>
+<li>Video recording has been optimized at all scales. You can now record even on incredibly large studio displays.</li>
+<li>Editing overlay has been enabled as an option if you prefer that for quick actions instead of opening a new window.</li>
+</ul>
+
+
+
+
+
+
+
+  
+  
+
+
+
+  
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../cloud-accounts/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Cloud accounts">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Cloud accounts
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../privacy/" class="md-footer__link md-footer__link--next" aria-label="Next: Privacy">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Privacy
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      © 2026 Frosthaven
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/Frosthaven/cosmic-capture-kit" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+      <div class="md-consent" data-md-component="consent" id="__consent" hidden>
+        <div class="md-consent__overlay"></div>
+        <aside class="md-consent__inner">
+          <form class="md-consent__form md-grid md-typeset" name="consent">
+            
+
+
+
+  
+
+<h4>Cookie consent</h4>
+<p>This site uses Google Analytics to count visits and see which pages help people. Analytics only runs if you accept. Rejecting changes nothing about how the site works.</p>
+<input class="md-toggle" type="checkbox" id="__settings" checked>
+<div class="md-consent__settings">
+  <ul class="task-list">
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="analytics" checked>
+      <span class="task-list-indicator"></span>
+      Google Analytics
+    </label>
+  </li>
+
+      
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="github" checked>
+      <span class="task-list-indicator"></span>
+      GitHub
+    </label>
+  </li>
+
+      
+    
+    
+  </ul>
+</div>
+<div class="md-consent__controls">
+  
+    
+      <button class="md-button md-button--primary">Accept</button>
+    
+    
+    
+  
+    
+    
+      <button type="reset" class="md-button md-button--primary">Reject</button>
+    
+    
+  
+</div>
+          </form>
+        </aside>
+      </div>
+      <script>var consent=__md_get("__consent");if(consent)for(var input of document.forms.consent.elements)input.name&&(input.checked=consent[input.name]||!1);else"file:"!==location.protocol&&setTimeout((function(){document.querySelector("[data-md-component=consent]").hidden=!1}),250);var form=document.forms.consent;for(var action of["submit","reset"])form.addEventListener(action,(function(e){if(e.preventDefault(),"reset"===e.type)for(var n of document.forms.consent.elements)n.name&&(n.checked=!1);__md_set("__consent",Object.fromEntries(Array.from(new FormData(form).keys()).map((function(e){return[e,!0]})))),location.hash="",location.reload()}))</script>
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.code.select", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.sections", "navigation.footer"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
