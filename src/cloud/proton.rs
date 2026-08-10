@@ -7,8 +7,22 @@
 //! official, MIT-licensed, cross-platform command-line tool, `proton-drive`, built on Proton's
 //! own Drive SDK. So this provider is a CHILD PROCESS seam rather than an HTTP one, and it
 //! follows the pattern this app already uses for `ffmpeg` and `tesseract`: an optional external
-//! tool, found through [`crate::util::proton_drive_path`], never bundled, probed before use, and
-//! explained rather than assumed when it is missing.
+//! tool, found through [`crate::util::proton_drive_path`], probed before use, and explained
+//! rather than assumed when it is missing.
+//!
+//! # "Never bundled" held until DRAGON-566, and only half of it fell
+//!
+//! This doc used to say the tool is never bundled, and for the DIRECT builds that still holds,
+//! for the original reasons: it is a ~118 MB standalone binary of someone else's application,
+//! and a copy inside our artifacts would go stale on OUR update cadence rather than Proton's.
+//! The FLATPAK bundles it (at `/app/bin`, exactly where [`crate::util::proton_drive_path`]'s
+//! exe-adjacent arm looks), because both halves of that reasoning invert inside a sandbox: a
+//! host install is INVISIBLE from in there, so "go install it" is advice the package itself
+//! makes false, and the store is the update channel in a Flatpak, so the bundled copy is
+//! updated the same way the app is. The MIT license is what makes shipping a copy clean.
+//! [`missing_tool_note`] and [`install_refusal`] are where the user-facing guidance splits on
+//! package kind, and [`install_press_downloads`] is why a bundled build never opens
+//! [`DOWNLOAD_URL`].
 //!
 //! **A native reimplementation was built and then retired.** DRAGON-485 first went the other
 //! way: Proton's SRP-6a login and both of its password derivations were implemented and unit
@@ -77,7 +91,64 @@ use std::time::Duration;
 ///
 /// Proton's own support page rather than a direct binary link: the download page names the
 /// per-platform builds and their checksums, and a direct link would rot at the next release.
+///
+/// Never offered by a package that BUNDLES the tool ([`install_press_downloads`]): there a
+/// download could only produce a host install the sandbox cannot see.
 pub const DOWNLOAD_URL: &str = "https://proton.me/support/drive-cli";
+
+/// Whether this package BUNDLES the tool (DRAGON-566). Pure; unit-tested.
+///
+/// The Flatpak ships `proton-drive` at `/app/bin`, beside our own binary, which is exactly
+/// where [`crate::util::proton_drive_path`]'s exe-adjacent arm looks. It is the only package
+/// that does; the module doc carries the whole of why. The package kind is a legitimate axis
+/// here because what changes with it is the ADVICE, not the capture behaviour.
+pub fn bundled_in(kind: crate::util::PackageKind) -> bool {
+    kind == crate::util::PackageKind::Flatpak
+}
+
+/// The install row's caption when the tool cannot be run, keyed on how this app is shipped.
+/// Pure; unit-tested.
+///
+/// A Flatpak user told "put `proton-drive` in `PATH`" would install it on the HOST, where the
+/// sandbox can never see it, chasing a fix that cannot work. The honest sentence there is that
+/// this build includes the tool and its absence is our packaging fault, with reinstalling the
+/// app as the one action that can restore it. Every other package keeps the historical wording
+/// unchanged.
+pub fn missing_tool_note(kind: crate::util::PackageKind, tool_name: &str) -> String {
+    if bundled_in(kind) {
+        format!("This build includes {tool_name}, but it is missing. Reinstall the app.")
+    } else {
+        format!("Requires {tool_name} CLI in PATH")
+    }
+}
+
+/// The Connect refusal when the tool cannot be run, keyed the same way. Pure; unit-tested.
+///
+/// Same split as [`missing_tool_note`], in the longer form the connect dialog speaks:
+/// a bundled build names a packaging fault instead of asking the user to install anything.
+pub fn install_refusal(kind: crate::util::PackageKind, display_name: &str, tool_name: &str) -> String {
+    if bundled_in(kind) {
+        format!(
+            "{display_name} connects through Proton's own {tool_name} command-line tool. This \
+             build includes that tool, so its absence is a packaging fault, not something to \
+             install. Reinstalling this app should restore it."
+        )
+    } else {
+        format!(
+            "{display_name} connects through Proton's own {tool_name} command-line tool, which is not \
+             installed on this computer yet. Install it, then try again."
+        )
+    }
+}
+
+/// Whether the install row's press may open [`DOWNLOAD_URL`]. Pure; unit-tested.
+///
+/// In a package that bundles the tool, the download page IS the host-install advice this
+/// module must never give, so the row's caption explains and the press goes nowhere, the same
+/// shape as the already-connected face.
+pub fn install_press_downloads(kind: crate::util::PackageKind) -> bool {
+    !bundled_in(kind)
+}
 
 /// The tool's name, spelled as the command a user types and as `PATH` must carry it.
 ///
@@ -552,6 +623,91 @@ mod path_shape_tests {
     fn a_photo_is_addressed_by_name_under_the_timeline_root() {
         assert_eq!(photo_path("Screenshot 2026-08-04.png"), "/photos/Screenshot 2026-08-04.png");
         assert_eq!(photo_path("  shot.png "), "/photos/shot.png");
+    }
+}
+
+#[cfg(test)]
+mod install_guidance_tests {
+    use super::*;
+    use crate::util::PackageKind;
+
+    /// The whole point of the split (DRAGON-566): a Flatpak never sends its user to install
+    /// the CLI on the host, because the sandbox could not see that install anyway. It says the
+    /// build includes the tool and a missing one is a packaging fault.
+    #[test]
+    fn a_flatpak_blames_the_package_not_the_user() {
+        let note = missing_tool_note(PackageKind::Flatpak, TOOL_NAME);
+        assert!(note.contains("includes"), "{note}");
+        assert!(note.contains("Reinstall"), "{note}");
+        assert!(!note.contains("PATH"), "a PATH hint is host-install advice: {note}");
+        let refusal = install_refusal(PackageKind::Flatpak, "Proton Drive", TOOL_NAME);
+        assert!(refusal.contains("packaging fault"), "{refusal}");
+        assert!(!refusal.contains("Install it"), "{refusal}");
+    }
+
+    /// The direct builds keep the historical wording BYTE-IDENTICAL: the guidance change is
+    /// package-kind-scoped, and everywhere else nothing moved. macOS and Windows are in the
+    /// list since DRAGON-614 gave them their own kinds, and the point is that the wording they
+    /// get is the same one they got as `Binary`.
+    #[test]
+    fn the_direct_builds_keep_the_historical_wording() {
+        for kind in [
+            PackageKind::Binary,
+            PackageKind::AppImage,
+            PackageKind::MacOs,
+            PackageKind::Windows,
+        ] {
+            assert_eq!(
+                missing_tool_note(kind, TOOL_NAME),
+                "Requires proton-drive CLI in PATH",
+                "{kind:?}"
+            );
+            assert_eq!(
+                install_refusal(kind, "Proton Drive", TOOL_NAME),
+                "Proton Drive connects through Proton's own proton-drive command-line tool, \
+                 which is not installed on this computer yet. Install it, then try again.",
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// The download page opens only where downloading is the fix. A bundled build's install
+    /// row explains instead, so its press must go nowhere.
+    #[test]
+    fn only_an_unbundled_package_offers_the_download_page() {
+        assert!(!install_press_downloads(PackageKind::Flatpak));
+        assert!(install_press_downloads(PackageKind::Binary));
+        assert!(install_press_downloads(PackageKind::AppImage));
+        // DRAGON-614: the two new kinds bundle nothing, so both keep the host-install advice
+        // they already had as `Binary`. Answered here rather than left to the `== Flatpak`
+        // body, because "which packages ship the tool" is a packaging fact and a new package
+        // is exactly when it needs re-asking.
+        assert!(install_press_downloads(PackageKind::MacOs));
+        assert!(install_press_downloads(PackageKind::Windows));
+    }
+
+    /// The three deciders answer from ONE fact, so they can never disagree about which
+    /// package bundles the tool.
+    #[test]
+    fn the_guidance_split_and_the_press_gate_agree() {
+        for kind in [
+            PackageKind::Binary,
+            PackageKind::AppImage,
+            PackageKind::Flatpak,
+            PackageKind::MacOs,
+            PackageKind::Windows,
+        ] {
+            assert_eq!(
+                install_press_downloads(kind),
+                !bundled_in(kind),
+                "{kind:?}: the press offers a download exactly where nothing is bundled"
+            );
+            assert_eq!(
+                missing_tool_note(kind, TOOL_NAME).contains("PATH"),
+                !bundled_in(kind),
+                "{kind:?}: PATH advice belongs only to the unbundled packages"
+            );
+        }
     }
 }
 

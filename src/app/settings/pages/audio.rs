@@ -172,7 +172,12 @@ impl crate::app::App {
     /// sync. The manual offset only applies (and only shows) when auto-sync is off.
     pub(in crate::app::settings) fn mixing_sections(&self) -> Vec<SectionSpec<'_>> {
         let d = crate::state::defaults();
-        let mut mixing = vec![
+        // DRAGON-555: pausing other players goes through their MPRIS bus names, and a session
+        // bus that will not let this process reach them makes the whole feature inert. Gate
+        // the toggle the way a missing `tesseract` gates OCR (inert, tinted, with a note
+        // saying why) rather than leaving a switch that flips and does nothing. On any
+        // ordinary session the capability is present and this row is untouched.
+        let mut mixing = vec![if crate::audio::ducking::media_pause_available() {
             Item::new(
                 "Pause other media during preview editor",
                 "When you capture content that contains audio, this will attempt to pause other \
@@ -183,7 +188,21 @@ impl crate::app::App {
                 self.mute_others_during_preview,
                 d.mute_others_during_preview,
                 |a0| Msg::Settings(SettingsMsg::SetMuteOthersDuringPreview(a0)),
-            ),
+            )
+        } else {
+            gated_row(
+                "Pause other media during preview editor",
+                if self.mute_others_during_preview { "On" } else { "Off" },
+                Severity::Warn,
+            )
+        }];
+        if !crate::audio::ducking::media_pause_available() {
+            mixing.push(Item::note(widget::text::caption(
+                "This build cannot reach other media players over the session bus, so their \
+                 audio keeps playing while you edit.",
+            )));
+        }
+        mixing.extend([
             Item::new(
                 "Automatically duck system audio",
                 "Automatically reduces recorded system volume when speaking.",
@@ -200,7 +219,7 @@ impl crate::app::App {
                 toggle(self.audio_sync_auto, |a0| Msg::Recording(RecordingMsg::SetAudioSyncAuto(a0))),
             )
             .reset_with(self.audio_sync_auto, d.audio_sync_auto, |a0| Msg::Recording(RecordingMsg::SetAudioSyncAuto(a0))),
-        ];
+        ]);
         if !self.audio_sync_auto {
             mixing.push(
                 Item::new(

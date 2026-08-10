@@ -24,6 +24,9 @@ pub(super) const W_KIND: f32 = 188.0;
 pub(super) const W_KIND_SCANNER: f32 = 130.0;
 /// Region/window/monitor mode group width.
 pub(super) const W_MODE: f32 = 130.0;
+/// The scanner's refresh group (DRAGON-460): one 40pt button plus the group padding,
+/// standing in the mode group's slot while the scanner kind is active.
+pub(super) const W_SCAN: f32 = 46.0;
 /// Mic + system audio group width (two buttons; video mode only).
 pub(super) const W_AUDIO: f32 = 88.0;
 /// Settings + close group width.
@@ -93,9 +96,13 @@ impl App {
             if self.kind == Kind::Video {
                 g.push((W_AUDIO, GROUP_H_BASE, GROUP_H_BASE));
             }
-            if !scanner {
-                g.push((W_MODE, GROUP_H_BASE, GROUP_H_BASE));
-            }
+            // DRAGON-576: the selector slot is occupied in EVERY kind (DRAGON-460),
+            // the mode group normally, the scanner's refresh group in scanner kind.
+            // The refresh group used to be missing from this list, so the scanner
+            // toolbar's placed rect was one group short of what was drawn: the
+            // bottom-centred bar sat off centre and its drag clamp let it hang off
+            // the output, and the side-docked stack overflowed its clamped box.
+            g.push((if scanner { W_SCAN } else { W_MODE }, GROUP_H_BASE, GROUP_H_BASE));
             g.push((W_UTIL, GROUP_H_BASE, GROUP_H_BASE));
             g
         };

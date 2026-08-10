@@ -17,6 +17,12 @@ pub enum TrayEvent {
     TogglePause,
     ToggleMic,
     ToggleSystemAudio,
+    /// An "Audio Recording" radio pick's complete arm state (DRAGON-558; see the Linux
+    /// enum). Matched in the shared app handling, never constructed here.
+    AudioArms(crate::recording_ui::AudioArmState),
+    /// A "Countdown Timer" radio pick's preset index (DRAGON-574; see the Linux enum).
+    /// Matched in the shared app handling, never constructed here.
+    CountdownPick(usize),
     Cancel,
     /// Quit the whole capture session/app (DRAGON-174; the idle session icon's Quit).
     Quit,
@@ -29,7 +35,12 @@ pub struct TraySession {}
 
 impl TraySession {
     /// No tray on this platform, so the caller keeps the in-frame toolbar.
-    pub fn start_recording(_mic: bool, _system_audio: bool, _accent: [u8; 3]) -> Option<Self> {
+    pub fn start_recording(
+        _mic: bool,
+        _system_audio: bool,
+        _accent: [u8; 3],
+        _delay_idx: usize,
+    ) -> Option<Self> {
         None
     }
 
@@ -45,4 +56,23 @@ impl TraySession {
     pub fn set_audio(&self, _mic: bool, _system_audio: bool) {}
 
     pub fn set_paused(&self, _paused: bool) {}
+}
+
+/// The countdown digits tray item (DRAGON-563). Never constructed on this platform
+/// (`start` returns `None`, so the countdown simply has no tray digits); the type +
+/// methods exist so the app's `Option<CountdownTraySession>` state and its poll/update
+/// calls compile unchanged, the same shape as [`TraySession`] above.
+pub struct CountdownTraySession {}
+
+impl CountdownTraySession {
+    /// No tray on this platform, so the countdown runs without digits.
+    pub fn start(_remaining: u8) -> Option<Self> {
+        None
+    }
+
+    pub fn set_remaining(&self, _remaining: u8) {}
+
+    pub fn poll(&self) -> Vec<TrayEvent> {
+        Vec::new()
+    }
 }

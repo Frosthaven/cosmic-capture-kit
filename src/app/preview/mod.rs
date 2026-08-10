@@ -275,6 +275,18 @@ pub struct PreviewState {
     /// The path can arrive later than the surface (a pre-opened spinner), so the copy is
     /// attempted at several seams; this makes it happen exactly once.
     pub copied_on_open: bool,
+    /// `lab/flatpak`: the open-time automatic copy is DEFERRED, waiting for this document's
+    /// window to take keyboard focus.
+    ///
+    /// Only ever set on the [`crate::share::CopyRoute::ThisWindow`] route, where the
+    /// selection is served by our own focused surface: the copy is started while the surface
+    /// is still an open task ("surface minted; open task queued, not yet created"), so there
+    /// is no window to write through yet. Cleared by whichever of the two arrivals comes
+    /// first — the focus, which writes and toasts the outcome, or the bounded
+    /// [`AUTO_COPY_FOCUS_BUDGET`], which reports the failure honestly rather than claiming a
+    /// copy that never happened. Always `false` on a data-control session, on macOS and on
+    /// Windows, whose copies do not need us at all.
+    pub auto_copy_waiting: bool,
     /// This document was DEMOTED out of the fullscreen overlay when a second document
     /// opened (DRAGON-336), and stays windowed for the rest of the session — even once
     /// its siblings close and it is alone again. Silently re-entering fullscreen as
@@ -1205,6 +1217,31 @@ impl App {
                 self.toast_copy_outcome(id, ok);
                 Task::none()
             }
+            PreviewMsg::AutoCopyDeadline => {
+                // `lab/flatpak`: the bounded wait for this document's window to take focus
+                // (`AUTO_COPY_FOCUS_BUDGET`). Normally the focus arrives long first and
+                // `flush_deferred_auto_copy` has already cleared the latch, so this is a
+                // no-op — that is the common path, not the exception.
+                let waiting = self.preview_for(id).is_some_and(|p| p.auto_copy_waiting);
+                if !waiting {
+                    return Task::none();
+                }
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.auto_copy_waiting = false;
+                }
+                // Nothing was written. Say so — in the log for us, and in the toast for the
+                // user — rather than claiming a copy that never happened. The capture itself
+                // is on disk; only the courtesy copy is lost, and the Copy button still works
+                // the moment the editor has focus.
+                log::warn!(
+                    "clipboard: the open-time copy waited {}s for the editor window to take \
+                     focus and it never did, so this session's window-served selection could \
+                     not be written",
+                    share::AUTO_COPY_FOCUS_BUDGET.as_secs(),
+                );
+                self.toast_copy_outcome(id, false);
+                Task::none()
+            }
             PreviewMsg::Covermark => {
                 // Toggle the covermark flyout. Open with the APPLIED mark highlighted (its
                 // keyboard index), falling back to the "None" card (index 0).
@@ -1693,6 +1730,14 @@ impl App {
             }
             PreviewMsg::TextDragTo(x, y) => self.text_drag_to(id, x, y),
             PreviewMsg::TextImeCommit(s) => self.text_edit_ime_commit(id, s),
+            // DRAGON-572: the window-route paste's delivery. It inserts through the
+            // IME-commit lane — the same normalize + cap + replace-selection + own-undo-step
+            // the worker-read paste does inline — so the two routes cannot drift. `None`
+            // (no text on the clipboard) inserts nothing, exactly like that path.
+            PreviewMsg::TextPasted(t) => match t {
+                Some(s) => self.text_edit_ime_commit(id, s),
+                None => Task::none(),
+            },
             PreviewMsg::ToggleAnnotPalette => {
                 // Toggle the COLOR palette flyout. Open with the ACTIVE color highlighted
                 // (matched across ALL swatches, incl. the custom MRU); no highlight if the
@@ -1793,23 +1838,13 @@ impl App {
                     });
                 if let Some(p) = self.preview_for_mut(id) {
                     p.edit.annot_picker = None;
-                    if let Some(c) = picked {
-                        p.edit.annot_color = Some(c);
-                        // A custom wheel pick also breaks a pending companion-swap pair
-                        // (DRAGON-386), like a flyout swatch pick.
-                        p.edit.color_swap_back = None;
-                    }
                 }
-                if let Some(c) = picked {
-                    // Applying a custom wheel color also recolors the SELECTED colorable item.
-                    self.recolor_selected_annotation(id, c);
-                    self.annot_color = Some(c);
-                    self.push_recent_color(c);
-                    self.save_state();
+                match picked {
+                    Some(c) => self.apply_custom_annot_color(id, c),
+                    // A recolored highlight re-renders through the GPU shader (DRAGON-330); a
+                    // recolored text box re-renders its raster layer (DRAGON-354).
+                    None => self.refresh_text_display(id),
                 }
-                // A recolored highlight re-renders through the GPU shader (DRAGON-330); a
-                // recolored text box re-renders its raster layer (DRAGON-354).
-                self.refresh_text_display(id)
             }
             PreviewMsg::SelectAnnotation(annot) => {
                 // Clicking AWAY from an edited text box settles it first (DRAGON-354) — unless
@@ -2498,6 +2533,12 @@ impl App {
                         }
                     });
                 }
+                // DRAGON-553: a link the CHILD could not copy (this session serves the
+                // clipboard from a focused window, which a detached child has none of) is
+                // written here instead, through this document's own window. Collected across
+                // the loop below and batched at the end, because the loop is a `for` over
+                // owned values with no task of its own.
+                let mut link_copies: Vec<Task<cosmic::Action<Msg>>> = Vec::new();
                 for (watch, state) in finished {
                     // `retain_mut` above only ever pushes a non-`Percent` state; state as an
                     // invariant here rather than leaving the reasoning implicit.
@@ -2506,7 +2547,7 @@ impl App {
                     // session again once this document has acted on its outcome.
                     crate::cloud::session::clear_session(&watch.session_id);
                     match state {
-                        crate::cloud::session::UploadState::Done { shared, .. } => {
+                        crate::cloud::session::UploadState::Done { shared, url, .. } => {
                             self.preview_toast_icon(
                                 id,
                                 ToastKind::Success,
@@ -2514,12 +2555,20 @@ impl App {
                                 "upload-symbolic",
                             );
                             if shared {
+                                // The child already holds the selection (the standalone
+                                // route). Say so, and nothing more — unchanged behaviour.
                                 self.preview_toast_icon(
                                     id,
                                     ToastKind::Success,
                                     "Copied to clipboard",
                                     "clipboard-check-symbolic",
                                 );
+                            } else if let Some(link) = url.as_deref() {
+                                // DRAGON-553: a link exists but nobody has copied it, which
+                                // on this route is not a failure, it is whose turn it is. The
+                                // editor has the focused window the write needs; it posts its
+                                // own toast so the claim still matches what happened.
+                                link_copies.push(self.copy_upload_link_on_finish(id, link));
                             }
                         }
                         crate::cloud::session::UploadState::Failed => {
@@ -2546,7 +2595,9 @@ impl App {
                         | crate::cloud::session::UploadState::Indeterminate => unreachable!(),
                     }
                 }
-                Task::none()
+                // Empty on every standalone-route session, where `Task::batch([])` is a
+                // `Task::none()` by another name, so nothing about those changes.
+                Task::batch(link_copies)
             }
             PreviewMsg::UploadCancel(session_id) => {
                 // Fire-and-forget: the child's own poll thread notices the marker and stops
@@ -2565,8 +2616,9 @@ impl App {
                 Task::none()
             }
             PreviewMsg::UploadCopyLink(session_id) => {
-                self.copy_upload_link(id, &session_id);
-                Task::none()
+                // DRAGON-553: the write can be a task now (this session may serve the
+                // clipboard from our own window), so it is returned rather than dropped.
+                self.copy_upload_link(id, &session_id)
             }
             PreviewMsg::LoadFailed => {
                 // DRAGON-415: the decode thread died. The capture is SAVED, so this is not a
@@ -2577,7 +2629,7 @@ impl App {
                 // DRAGON-436 round 2 (Windows) / DRAGON-415 (macOS): "say so, THEN close" has
                 // to be sequenced by hand on both platforms — neither may close inline. A
                 // `MessageBox` does not block, and on Windows this close almost always ends
-                // the PROCESS — the preview is single-document there (`preview_host` is
+                // the PROCESS — the preview is single-document there (`handoff_host` is
                 // cfg(unix), and a handoff spawns a fresh process), so `Cancel` reaches
                 // `finish_session` and its 1.5s hard exit within milliseconds, killing the
                 // alert thread before anyone could read a word. `NSAlert::runModal` DOES
@@ -2660,6 +2712,23 @@ impl App {
             }
             PreviewMsg::ToggleAppearance => self.toggle_preview_appearance(id),
             PreviewMsg::OpenSettings => self.open_settings_from_preview(id),
+            PreviewMsg::OpenColorPicker => {
+                // Detached, like every other tool launch. The editor is protected from a
+                // later capture's sibling sweep by its own preview marker, and nothing
+                // here ends this session.
+                //
+                // DRAGON-587: the child is TOLD which editor asked, by pid, so its pick
+                // comes back here and can never land in an unrelated editor. The pid is an
+                // explicit part of the launch rather than something the child infers from
+                // whatever happens to be open. A child that finds this editor gone simply
+                // shows its own result window, so nothing is lost either way.
+                let pid = std::process::id().to_string();
+                crate::recording_ui::spawn_capture_child_args(
+                    &["--color-picker"],
+                    &[(crate::app::color_picker::COLOR_TO_PID_ENV, pid.as_str())],
+                );
+                Task::none()
+            }
             PreviewMsg::WindowDrag => match self.preview_for(id) {
                 Some(p) => window::drag(p.window),
                 None => Task::none(),
@@ -3228,6 +3297,7 @@ mod tests {
             surface_open: true,
             toasts: Toasts::default(),
             copied_on_open: false,
+            auto_copy_waiting: false,
             demoted: false,
             bake_src: None,
             saved_path: None,

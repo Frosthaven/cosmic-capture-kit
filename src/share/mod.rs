@@ -26,8 +26,9 @@ mod share_sheet;
 mod wifi;
 
 pub use clipboard::{
-    AUTO_COPY_MAX_BYTES, auto_copy_limit_label, copy_embeds_bytes, copy_text, copy_to_clipboard,
-    read_text, run_copy, run_copy_text,
+    AUTO_COPY_MAX_BYTES, CopyRoute, CopyStep, WINDOW_COPY_FOCUS_BUDGET, auto_copy_limit_label,
+    copy_embeds_bytes, copy_route, copy_step, copy_text, copy_to_clipboard, copy_text_task,
+    needs_window_clipboard, read_text, run_copy, run_copy_text, window_payload,
 };
 // `UploadOutcome` + `run_upload_notify` are DRAGON-482's additions: the upload child posts
 // its own banner in-process (it is already a detached helper), so unlike the capture banner

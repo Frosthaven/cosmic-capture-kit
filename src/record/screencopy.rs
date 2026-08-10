@@ -35,6 +35,7 @@ pub(crate) fn record_screencopy(
     fps: u32,
     cursor: bool,
     preferred_encoder: &str,
+    encoder_hint: Option<&str>,
     presets: &crate::encode::Presets,
     mic: bool,
     system_audio: bool,
@@ -54,9 +55,9 @@ pub(crate) fn record_screencopy(
         Ok(owned) => {
             log::info!("recording pipeline: media-clock owned path (DRAGON-127)");
             record_screencopy_owned(
-                x, y, w, h, fps, cursor, preferred_encoder, presets, mic, system_audio,
-                bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, out_path,
-                stop, paused, events, dims, metadata, zero_copy, owned,
+                x, y, w, h, fps, cursor, preferred_encoder, encoder_hint, presets, mic,
+                system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res,
+                out_path, stop, paused, events, dims, metadata, zero_copy, owned,
             )
         }
         Err(reason) => {
@@ -84,6 +85,7 @@ fn record_screencopy_owned(
     fps: u32,
     cursor: bool,
     preferred_encoder: &str,
+    encoder_hint: Option<&str>,
     presets: &crate::encode::Presets,
     mic: bool,
     system_audio: bool,
@@ -256,7 +258,7 @@ fn record_screencopy_owned(
     if let Ok(mut g) = dims.lock() {
         *g = Some((bw, bh));
     }
-    let plan = crate::encode::EncodePlan::resolve(preferred_encoder, ew, eh, presets);
+    let plan = super::resolve_session_plan(preferred_encoder, encoder_hint, ew, eh, presets);
     let nv12 = plan.nv12;
     let is_hevc = plan.is_hevc();
     let frame_dur = std::time::Duration::from_secs_f64(1.0 / fps as f64);

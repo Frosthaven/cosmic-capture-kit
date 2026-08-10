@@ -25,6 +25,9 @@ impl App {
                 self.sub_toast(),
                 self.sub_pixel_capture(),
                 self.sub_scan_shot(),
+                self.sub_menu_hold(),
+                self.sub_dim_fade(),
+                self.sub_accept_pending(),
                 self.sub_scan_spin(),
                 self.sub_loading_tick(),
                 self.sub_playback_poll(),
@@ -33,6 +36,7 @@ impl App {
                 self.sub_upload_finalize_anim(),
                 self.sub_text_caret_blink(),
                 self.sub_tray_poll(),
+                self.sub_countdown_tray_poll(),
                 self.sub_preview_handoff(),
                 self.sub_recording_poll(),
                 self.sub_meter_tick(),
@@ -53,6 +57,8 @@ impl App {
                 self.sub_overlay_finalize(),
                 #[cfg(target_os = "macos")]
                 self.sub_preview_pinch(),
+                #[cfg(target_os = "macos")]
+                self.sub_color_picker_pinch(),
                 // DRAGON-212: the frozen-flats grab is deferred on both platforms now.
                 self.sub_frozen_ready(),
                 // DRAGON-213: the launch-locked cursor rides its own launch thread.
@@ -76,7 +82,7 @@ impl App {
     /// Window/keyboard/output events forwarded into `update` — always live (not
     /// conditional on any state).
     fn sub_global_events(&self) -> Option<Subscription<Msg>> {
-        Some(event::listen_with(|e, _, id| match e {
+        Some(event::listen_with(|e, status, id| match e {
             // The settings toplevel can be closed by its ✕ or the WM.
             Event::Window(window::Event::CloseRequested) => {
                 Some(Msg::WindowChrome(WindowChromeMsg::WindowCloseRequested(id)))
@@ -120,19 +126,41 @@ impl App {
             // layer-shell path map `KP_Enter` to the same logical `Key::Named(Named::Enter)`
             // and record the keypad only here. Forwarded verbatim; the live text-annotation
             // editor is its one consumer today.
+            // `repeat` (DRAGON-601) separates a real press from an auto-repeat the compositor
+            // synthesised while the key stayed down. It was destructured away here, so the app
+            // treated a hold as a stream of indistinguishable presses; the nudge lane needs the
+            // difference to spend exactly one pixel per tap.
             Event::Keyboard(cosmic::iced::keyboard::Event::KeyPressed {
-                key, modifiers, location, text, ..
+                key, modifiers, location, text, repeat, ..
             }) => Some(Msg::WindowChrome(WindowChromeMsg::KeyPressed(
                 id,
                 modifiers,
                 key,
                 location,
                 text.map(|t| t.to_string()),
+                repeat,
             ))),
             // Releases matter only for push-to-talk (release → re-mute the mic).
             Event::Keyboard(cosmic::iced::keyboard::Event::KeyReleased {
                 key, modifiers, ..
             }) => Some(Msg::WindowChrome(WindowChromeMsg::KeyReleased(id, modifiers, key))),
+            // DRAGON-599: a right press cancels the capture session, on the surfaces where
+            // that is what it can mean. The rule itself is `right_click_cancels` in
+            // `update::window_chrome`; all this arm does is deliver the press and say which
+            // surface took it.
+            //
+            // `Status::Ignored` is the whole of "no widget claimed it", and it is what keeps
+            // this from stealing a right-click that already has a job: the scanner's OCR word
+            // menu and its QR/barcode contents menu both `capture_event()` in
+            // `widgets::region_selection`, and the preview timeline's context menu does the
+            // same, so those presses never reach here at all. Every other arm in this closure
+            // ignores the status because a key press means the same thing whoever handled it;
+            // a mouse button does not.
+            Event::Mouse(cosmic::iced::mouse::Event::ButtonPressed(
+                cosmic::iced::mouse::Button::Right,
+            )) if status == cosmic::iced::event::Status::Ignored => {
+                Some(Msg::WindowChrome(WindowChromeMsg::RightPressed(id)))
+            }
             _ => None,
         }))
     }
@@ -306,7 +334,14 @@ impl App {
     /// `sub_cloud_browser_countdown` in every respect, including the rule that matters: the
     /// flash is a WINDOW read against `Instant::now()` at render time, so the view has to be
     /// rebuilt once more after it closes or the tick stays up until something else redraws.
-    /// It gates itself off with the flash, so an idle Health page ticks nothing.
+    /// It gates itself off with the flash, so an idle settings window ticks nothing.
+    ///
+    /// Covers every page that renders a path through `settings::row::path_line`, not just
+    /// Health: the flash is keyed on the copied text and stamped in one place, so Scanner's
+    /// language folder and the preview editor's covermark folder need no tick of their own.
+    /// DRAGON-583 put the Keyboard page's recording COMMANDS on the same footing: they are
+    /// not paths, but they flash through the same `path_line_copied` window, so they ride
+    /// this tick too and the name is now the only thing about it that says "Health".
     fn sub_health_copy_flash(&self) -> Option<Subscription<Msg>> {
         let (_, at) = self.settings.health_copied.as_ref()?;
         if crate::widgets::copy_button::copied_recently(Some(*at)) {
@@ -372,6 +407,30 @@ impl App {
         }
     }
 
+    /// DRAGON-612: re-ask a HELD accept while the colour picker is still finding its pixel.
+    ///
+    /// Armed only by a press the gate answered `Wait`, which only a picker launch can produce,
+    /// so an ordinary capture launch never schedules it at all. 16ms to match `sub_dim_fade`,
+    /// because the pick should land on the first frame after the snapshot arrives rather than
+    /// up to a tick later.
+    ///
+    /// It stops on its own the moment the request is resolved. `accept_pending` has exactly
+    /// three writers, and knowing them as a set is the point, because "a 16ms poll that quietly
+    /// stays armed" is the failure mode a conditional subscription exists to prevent: every
+    /// branch of `request_accept` that is not another `Wait` clears it (fired, refused, or out
+    /// of budget), and `destroy_surfaces` clears it too, so a pick or a teardown cannot leave a
+    /// tick running under the result window for the rest of the session.
+    fn sub_accept_pending(&self) -> Option<Subscription<Msg>> {
+        if self.accept_pending.is_some() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Msg::Capture(CaptureMsg::AcceptPending)),
+            )
+        } else {
+            None
+        }
+    }
+
     /// One short tick to let the torn-down overlay clear the screen before we
     /// grab output pixels (window capture is overlay-independent, but a uniform
     /// delay is harmless).
@@ -402,6 +461,44 @@ impl App {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(33))
                     .map(|_| Msg::Capture(CaptureMsg::ScanSpinTick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// DRAGON-600 (Linux, tray-menu launches): poll the HELD frozen-flats grab while the
+    /// tray dropdown is still being retired. One frame's cadence, because the release is a
+    /// short settle after our overlay takes keyboard focus and a coarser tick would spend
+    /// more of the launch waiting than the settle itself costs. Stops for good the moment
+    /// the hold releases, so nothing polls after the grab is running.
+    fn sub_menu_hold(&self) -> Option<Subscription<Msg>> {
+        if self.menu_hold.is_some() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Msg::Capture(CaptureMsg::MenuHoldTick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// DRAGON-606: drive the dim's fade-in, at one frame's cadence, and ONLY while it is
+    /// armed or actually ramping. `Waiting` schedules nothing (the frozen-flats grab may
+    /// still be reading the screen), and `Done` schedules nothing either, so a 200ms
+    /// animation cannot leave a timer running for the rest of the session.
+    ///
+    /// `Armed` DOES tick, and it has to: the state only advances when a frame is built, so
+    /// on a launch where nothing else is asking for redraws this tick is what produces the
+    /// frame that starts the clock. Without it an armed fade could sit unstarted.
+    fn sub_dim_fade(&self) -> Option<Subscription<Msg>> {
+        if matches!(
+            self.dim_fade.get(),
+            crate::app::overlay::DimFade::Armed | crate::app::overlay::DimFade::Running(_)
+        ) {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Msg::Capture(CaptureMsg::DimFadeTick)),
             )
         } else {
             None
@@ -502,6 +599,34 @@ impl App {
                 .with(id)
                 .map(|(id, _)| Msg::Preview(id, PreviewMsg::PinchPoll))
         })))
+    }
+
+    /// macOS: drive trackpad pinch-to-zoom for the colour picker's magnifier, the same way
+    /// [`Self::sub_preview_pinch`] does for the preview editor: drain the gesture recognizer's
+    /// accumulated magnification (`ColorPickerMsg::PinchPoll`) while there is a picker overlay
+    /// to zoom.
+    ///
+    /// ONE poll, not one per output. Unlike a preview, which is several independent DOCUMENTS
+    /// each with their own zoom, the picker's magnification is a SINGLE piece of state
+    /// (`ColorPickerState::zoom`) shared by every per-output overlay a picker launch mints, so
+    /// there is only ever one thing here to drive.
+    ///
+    /// Gated on the OVERLAY being mapped, not on [`Self::color_picking`] alone:
+    /// `color_picker.active` marks this whole PROCESS as a picker launch and stays true for its
+    /// entire life, including after a pick tears the overlay down and opens the small result
+    /// window, where there is no magnifier left to zoom. `self.outputs` is what the overlay
+    /// actually maps to and is cleared the moment it closes (`destroy_surfaces`), so pairing the
+    /// two is exactly "the picker's dimmed overlay is on screen right now".
+    #[cfg(target_os = "macos")]
+    fn sub_color_picker_pinch(&self) -> Option<Subscription<Msg>> {
+        if self.color_picking() && !self.outputs.is_empty() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Msg::ColorPicker(ColorPickerMsg::PinchPoll)),
+            )
+        } else {
+            None
+        }
     }
 
     /// Expire each document's in-editor toasts (DRAGON-353).
@@ -651,8 +776,18 @@ impl App {
 
     /// While the recording controls live in the system tray, drain menu clicks
     /// promptly (a click → action within ~80ms, imperceptible).
+    ///
+    /// DRAGON-583: the same tick also drains the recording-CONTROL inlet, so a global
+    /// hotkey running `--toggle-mic` acts within the same ~80ms. It is a second gate rather
+    /// than a second subscription because both feed the one `TrayPoll` handler, and it has
+    /// to be a gate of its own: a sandboxed child can fail to register a tray item, and
+    /// that is precisely the session where the CLI commands are the only control left.
     fn sub_tray_poll(&self) -> Option<Subscription<Msg>> {
-        if self.tray.is_some() {
+        #[cfg(target_os = "linux")]
+        let listening = self.tray.is_some() || self.record_control.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let listening = self.tray.is_some();
+        if listening {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(80))
                     .map(|_| Msg::Recording(RecordingMsg::TrayPoll)),
@@ -662,15 +797,34 @@ impl App {
         }
     }
 
-    /// DRAGON-336: while this process HOSTS preview handoffs, drain the inbound channel
-    /// promptly — a capture child is blocked waiting for our ack, so this interval is the
-    /// floor on how long its handoff takes (and, on a miss, how long before it gives up and
-    /// opens its own preview). 100ms is imperceptible against a capture's own save, and is
-    /// well inside `preview_ipc::ACK_TIMEOUT`. Gated on the listener existing, exactly like
-    /// `sub_tray_poll` gates on the tray: no preview open ⇒ no host ⇒ no tick.
+    /// DRAGON-563: while the countdown digits live in the tray (any session), drain the
+    /// item's Cancel clicks at the same ~80ms cadence as `sub_tray_poll`. Gated on the
+    /// item existing, so a session with no tray host (and every moment outside a
+    /// countdown) never ticks.
+    fn sub_countdown_tray_poll(&self) -> Option<Subscription<Msg>> {
+        if self.countdown_tray.is_some() {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(80))
+                    .map(|_| Msg::Capture(CaptureMsg::CountdownTrayPoll)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// DRAGON-336: while this process HOSTS handoffs, drain the inbound channel promptly —
+    /// the sibling is blocked waiting for our ack, so this interval is the floor on how long
+    /// its handoff takes (and, on a miss, how long before it gives up and does the job
+    /// itself). 100ms is imperceptible against a capture's own save, and is well inside
+    /// `preview_ipc::ACK_TIMEOUT`. Gated on the listener existing, exactly like
+    /// `sub_tray_poll` gates on the tray: no window open ⇒ no host ⇒ no tick.
+    ///
+    /// DRAGON-613 widened WHAT can be waiting on it (a colour for the picker window as well
+    /// as a capture for a preview) without changing the tick or the gate: one listener, one
+    /// poll, one drain.
     #[cfg(unix)]
     fn sub_preview_handoff(&self) -> Option<Subscription<Msg>> {
-        if self.preview_host.is_some() {
+        if self.handoff_host.is_some() {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(100))
                     .map(|_| Msg::Capture(CaptureMsg::HandoffPoll)),

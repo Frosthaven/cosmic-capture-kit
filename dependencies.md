@@ -15,7 +15,7 @@ UI) when its dependency is missing.
 
 | Dependency | Why | Notes |
 |---|---|---|
-| **Wayland compositor (COSMIC)** | The whole app is a native COSMIC overlay. | See protocols below — capture relies on COSMIC's screencopy, so it does **not** work on non-COSMIC compositors. |
+| **Wayland compositor (COSMIC)** | The whole app is a native COSMIC overlay. | See protocols below. Native capture is keyed on the protocols, not the desktop name, so it runs wherever those globals exist. Where they are missing or hidden (GNOME, sandboxed builds) capture falls back to the xdg-desktop-portal ScreenCast path (§2), with fewer extras. |
 | **Vulkan-capable GPU + driver** | The overlay is rendered with `wgpu` (via libcosmic/iced), whose primary Linux backend is Vulkan. | Needs the Vulkan loader (`libvulkan.so.1`) and an ICD — NVIDIA's driver, or Mesa (RADV/ANV). Loaded at runtime (not shown by `ldd`). |
 | **libxkbcommon** (`libxkbcommon.so.0`) | Keyboard handling (Escape to cancel, etc.). | **Linked** into the binary, so building needs its dev package too. See §7. |
 | **libpulse** (`libpulse.so.0`) | The shared PulseAudio client FFI (`src/audio/pulse_ffi.rs`): the device-latency probe and the system-audio monitor capture. | **Linked** into the binary (`#[link(name = "pulse")]`, not `dlopen`ed), so it is a build requirement of every Linux build, including one that will never record. See §7. |
@@ -31,7 +31,7 @@ Pixels are captured **natively** (no `grim`); each of these is bound directly:
 
 | Protocol | Used for |
 |---|---|
-| **COSMIC screencopy** (`cosmic-protocols`, ext-image-copy-capture) | All pixel capture — monitor, region, and per-window. This is COSMIC-specific; it is why capture only works under COSMIC. |
+| **ext-image-copy-capture** (bound through `cosmic-client-toolkit`) | All native pixel capture: monitor, region, and per-window. The upstream `ext-*` protocol family, so any compositor implementing these globals runs the native backend; a session without them takes the portal ScreenCast fallback (§2) instead. |
 | **wlr-layer-shell** (`zwlr_layer_shell_v1`) | The per-output overlay surfaces (selection UI, toolbar). |
 | **ext-foreign-toplevel-list** + **COSMIC toplevel-info / toplevel-management** | Enumerating windows and capturing a specific (even occluded) window by handle. |
 | **ext-workspace** | Restricting window capture to the active workspace. |
@@ -48,9 +48,9 @@ folder picker.
 | Interface / service | Why | Fallback |
 |---|---|---|
 | `org.freedesktop.Notifications` | "Copied / Saved" toast after a capture. | Silent no-op if unavailable. |
-| `org.freedesktop.FileManager1` (`ShowItems`) | "Show in file manager" reveal. | Falls back to the portal `OpenURI` on the containing directory. |
-| `org.freedesktop.portal.OpenURI` | Opening a URL decoded from a QR code, and the file-manager reveal fallback (replaces shelling out to `xdg-open`). | Provided by the base xdg-desktop-portal; silent no-op if absent. |
-| **xdg-desktop-portal** + a backend (**xdg-desktop-portal-cosmic**) | Folder pickers in Settings (screenshot/recording save dirs) via `org.freedesktop.portal.FileChooser` (the `ashpd` crate). | Picker won't open; the dir can still be typed/edited and is persisted. |
+| `org.freedesktop.FileManager1` (`ShowItems`) | "Show in file manager" reveal. | Falls back to the portal's fd-based `OpenURI.OpenDirectory` on the containing folder, with the entry selected (DRAGON-556). |
+| `org.freedesktop.portal.OpenURI` | Opening a URL decoded from a QR code (`OpenURI`), opening a saved local file with its default app (the fd-based `OpenFile`; `OpenURI` itself rejects `file://` URIs, DRAGON-556), and the file-manager reveal fallback (`OpenDirectory`). Replaces shelling out to `xdg-open`. | Provided by the base xdg-desktop-portal; silent no-op if absent. |
+| **xdg-desktop-portal** + a backend (**xdg-desktop-portal-cosmic**) | Folder pickers in Settings (screenshot/recording save dirs) via `org.freedesktop.portal.FileChooser` (the `ashpd` crate); and, on sessions where the native capture globals are missing or hidden (GNOME, sandboxed builds), all capture via `org.freedesktop.portal.ScreenCast` + PipeWire. | Picker won't open (the dir can still be typed/edited and is persisted); portal-fallback capture is unavailable. |
 
 ---
 
@@ -65,7 +65,7 @@ absent.
 |---|---|---|---|
 | **ffmpeg** | `ffmpeg` | Screen recording. Raw frames are piped to ffmpeg (`-f rawvideo`) and encoded. | The Recordings feature is disabled and the UI warns. |
 | **tesseract** | `tesseract` + a language pack (e.g. `tesseract-data-eng`) | OCR text detection ("Scan text (OCR) in region mode"). The region is handed to `tesseract … tsv`. Found via `CCK_TESSERACT`, then a sidecar beside our binary, then `PATH` (DRAGON-527), so a packaged build can carry its own. **The macOS and Windows packages now DO** (DRAGON-531): they ship tesseract plus `tessdata/eng.traineddata` beside the binary, and the Settings language dropdown lists whatever is in that folder, so a user can drop more `.traineddata` files in. Linux keeps using the distro's tesseract and its own `/usr/share/tessdata`, deliberately: pointing it elsewhere would HIDE every `tesseract-data-*` pack the user installed.
-| **proton-drive** | none in any distro's own repos; download the standalone binary from [proton.me/support/drive-cli](https://proton.me/support/drive-cli), or on Arch the AUR package `proton-drive-cli-bin` (Proton's official checksummed build). Linux also needs `libsecret` and a running keyring (GNOME Keyring, KWallet). | **Proton Drive cloud accounts only** (DRAGON-485). Proton has no third-party API, so this provider goes through Proton's own official CLI: sign-in (`auth login`, which opens your browser), uploads, folder listing and share links. Found via `CCK_PROTON_DRIVE`, then a sidecar beside our binary, then `PATH`. It is a ~118 MB self-contained binary and is deliberately **not bundled**. | The Proton Drive entry stays visible in the add-account picker with an "Install proton-drive CLI" line, and selecting it opens Proton's download page instead of starting a sign-in. Every other cloud provider, and all capture, recording and OCR, are unaffected. |
+| **proton-drive** | none in any distro's own repos; download the standalone binary from [proton.me/support/drive-cli](https://proton.me/support/drive-cli), or on Arch the AUR package `proton-drive-cli-bin` (Proton's official checksummed build). Linux also needs `libsecret` and a running keyring (GNOME Keyring, KWallet). | **Proton Drive cloud accounts only** (DRAGON-485). Proton has no third-party API, so this provider goes through Proton's own official CLI: sign-in (`auth login`, which opens your browser), uploads, folder listing and share links. Found via `CCK_PROTON_DRIVE`, then a sidecar beside our binary, then `PATH`. It is a ~118 MB self-contained binary and is deliberately **not bundled by the direct builds**; the lab Flatpak bundles it at `/app/bin` (DRAGON-566), because a sandboxed app cannot see a host install and the store updates the bundled copy with the app. | The Proton Drive entry stays visible in the add-account picker with an "Install proton-drive CLI" line, and selecting it opens Proton's download page instead of starting a sign-in. Every other cloud provider, and all capture, recording and OCR, are unaffected. |
 | **curl** | `curl` | **Two features.** (1) The in-app **update check and install** (`src/update.rs`): one `curl -fsSL --max-time 10` per settings launch to fetch `update.json`, plus, when running as an **AppImage**, the download of the new `.AppImage` itself (DRAGON-532). (2) **Cloud accounts** (`src/cloud/http.rs`, DRAGON-482): every request to a connected drive, with the credentials fed through a stdin `--config -` rather than argv. | The update check reports "Could not run curl to check for updates."; a one-click update reports "Could not run curl to download the update." and changes nothing on disk; connecting or uploading to a cloud account fails with a named reason. Capture, recording and OCR are unaffected. |
 | **sha256sum** | `coreutils` (already on every distro) | Verifying a downloaded update before it replaces the running program (`update::file_sha256`, the AppImage install path only). macOS uses `shasum` from its base system for the same step. | A one-click AppImage update stops with "Could not run the checksum tool to verify the download." and leaves the existing file untouched. An unverified update is never installed. Nothing else uses it. |
 
@@ -165,9 +165,9 @@ recording uses only the external `ffmpeg` binary (no in-process zero-copy). **Se
 |---|---|
 | **Linux `/proc`** | Single-instance lock and "close other overlays on capture" read `/proc/<pid>/exe`. |
 | **`~/.config/cosmic/`** (theme + background config) | Read to match COSMIC's window corner radius and active-window border on window captures, and to composite the real wallpaper. Falls back to sane defaults when absent. |
-| **XDG base dirs** | `XDG_RUNTIME_DIR` for short-lived handoff files (clipboard payload, OCR temp PNG); `XDG_STATE_HOME`/cache for persisted settings (`state.ron`). |
+| **XDG base dirs** | `XDG_RUNTIME_DIR` for short-lived handoff files (clipboard payload, OCR temp PNG); persisted settings are TOML at `~/.config/cosmic-capture-kit/config.toml` (a legacy `state.ron` under the XDG state dir is still read and migrated). |
 | **System fonts** | UI text rendering (cosmic-text). Uses installed fonts via the system font database. |
-| **`dev.frosthaven.CosmicCaptureKit.desktop`** (desktop entry) | Matches the app's `app_id` so the desktop and xdg-desktop-portal resolve its name (**"Cosmic Capture Kit"**) instead of a generic / wrong fallback in the screencast picker. Shipped in `res/`; install to `~/.local/share/applications/`. |
+| **`dev.thedragon.CosmicCaptureKit.desktop`** (desktop entry) | Matches the app's `app_id` so the desktop and xdg-desktop-portal resolve its name (**"Cosmic Capture Kit"**) instead of a generic / wrong fallback in the screencast picker. Shipped in `res/`; install to `~/.local/share/applications/`. |
 
 ---
 
@@ -235,7 +235,11 @@ Two things to know about that flag:
    crate's only feature, so the two mean the same thing here.
 
 Nothing is lost but the in-process GPU zero-copy path (§5). Recording still
-works through the external `ffmpeg` binary, which is fine on ffmpeg 5+.
+works through the external `ffmpeg` binary, on ffmpeg 5+. That floor is
+measured, not presumed (DRAGON-568): ffmpeg 4.4, 5.1, 6.1 and 7.1 all block a
+raw-PCM FIFO input's open until real audio data arrives, and the shipped probe
+flags plus the audio pump's opening prime bound that hunger to 4096 bytes,
+cleared in about a tenth of a second, ffmpeg 4.4 included.
 
 ---
 

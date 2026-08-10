@@ -4,11 +4,20 @@ use crate::app::DirTarget;
 use crate::shortcuts::{Action, Shortcut};
 use cosmic::widget::color_picker::ColorPickerUpdate;
 
-/// macOS/Windows (DRAGON-295): which of the three resident-daemon global capture hotkeys
-/// a settings row edits. Each is an independent spec string persisted separately (see the
-/// `capture_*_hotkey` fields); the daemon registers each that is set. Gated to the two OSes
-/// with a daemon-owned global hotkey so Linux's `SettingsMsg` stays byte-identical.
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// One GLOBAL capture hotkey this app advertises: what it is called, what it launches, and
+/// (on the two platforms with a resident daemon) which persisted spec string a settings row
+/// edits.
+///
+/// macOS/Windows (DRAGON-295): each slot is an independent spec string persisted separately
+/// (see the `capture_*_hotkey` fields), and the daemon registers each that is set.
+///
+/// **Compiled on EVERY platform since DRAGON-589**, and the widening is the point. Linux
+/// cannot register any of these itself, so its Global tab shows the same seven actions with
+/// the COMMAND that runs each one instead of a chord editor. Both pages need one list, in one
+/// order, under one set of names: a second Linux-only table would be a second vocabulary for
+/// the same seven verbs, and the two would drift the first time a slot was added. What stays
+/// gated to macOS and Windows is the `SettingsMsg` variants that EDIT a slot, so Linux's
+/// message enum is byte-identical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureHotkeySlot {
     /// "Capture All In One" — opens the full region/window/monitor picker overlay
@@ -25,25 +34,34 @@ pub enum CaptureHotkeySlot {
     ActiveWindowNoEditor,
     /// DRAGON-428: "Capture Active Monitor (no editor)".
     ActiveMonitorNoEditor,
+    /// DRAGON-582: "Color Picker" — opens the colour picker tool. LAST in the list, so
+    /// the six capture slots keep their order and their indices (the pure duplicate
+    /// check speaks in indices, and the two daemons' registration tables are zipped
+    /// against the same order).
+    ColorPicker,
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 impl CaptureHotkeySlot {
     /// Every slot, in the order the settings page lists them AND the order both daemons
     /// register them (`load_specs` on Windows, the `Spawn` slot list on macOS). One order,
     /// three consumers: change it here and the rows, the registration and the DRAGON-452
     /// duplicate check move together.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::AllInOne,
         Self::ActiveWindow,
         Self::ActiveMonitor,
         Self::AllInOneNoEditor,
         Self::ActiveWindowNoEditor,
         Self::ActiveMonitorNoEditor,
+        Self::ColorPicker,
     ];
 
     /// This slot's position in [`Self::ALL`] — the index the pure
     /// [`crate::shortcuts::capture_hotkey_conflict`] check speaks in.
+    // Honestly dead on Linux: the duplicate check exists to stop two DAEMON-registered chords
+    // colliding, and Linux registers none (its Global rows are commands, which cannot collide).
+    // The body stays portable because the answer is the same everywhere.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub fn index(self) -> usize {
         match self {
             Self::AllInOne => 0,
@@ -52,6 +70,7 @@ impl CaptureHotkeySlot {
             Self::AllInOneNoEditor => 3,
             Self::ActiveWindowNoEditor => 4,
             Self::ActiveMonitorNoEditor => 5,
+            Self::ColorPicker => 6,
         }
     }
 
@@ -65,6 +84,151 @@ impl CaptureHotkeySlot {
             Self::AllInOneNoEditor => "Capture All In One (no editor)",
             Self::ActiveWindowNoEditor => "Capture Active Window (no editor)",
             Self::ActiveMonitorNoEditor => "Capture Active Monitor (no editor)",
+            Self::ColorPicker => "Color Picker",
+        }
+    }
+
+    /// The argv that PERFORMS this slot's action, which is what a resident daemon spawns and
+    /// what a desktop-level shortcut has to run (DRAGON-589).
+    ///
+    /// The "(no editor)" twins are `<capture flag> --no-editor`: `--no-editor` is a MODIFIER
+    /// rather than a mode, so it composes with the flag its twin uses alone.
+    ///
+    /// Both daemons keep their own copy of this table, because argv is their only channel to
+    /// the child and neither can reach into the settings layer: macOS `Spawn::args`, Windows
+    /// its slot list. Those two must stay word-for-word this, each pinned by its own test.
+    /// This copy is the one a HUMAN is shown, and it is in the shared tree so `cargo test`
+    /// proves the spelling on any host.
+    // Honestly dead on macOS and Windows, and the Windows cross-check is what said so. There
+    // the resident daemon BINDS these keys, so the Global Capture row is a chord editor that
+    // never prints a command, and each daemon spawns from its OWN copy of this table. The body
+    // still stays portable and ungated: it is the copy the tests below check, and those run on
+    // every host, which is the only reason a spelling drift is catchable at all from Linux.
+    #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
+    pub fn flags(self) -> &'static [&'static str] {
+        match self {
+            Self::AllInOne => &["--all-in-one"],
+            Self::ActiveWindow => &["--active-window"],
+            Self::ActiveMonitor => &["--active-monitor"],
+            Self::AllInOneNoEditor => &["--all-in-one", "--no-editor"],
+            Self::ActiveWindowNoEditor => &["--active-window", "--no-editor"],
+            Self::ActiveMonitorNoEditor => &["--active-monitor", "--no-editor"],
+            Self::ColorPicker => &["--color-picker"],
+        }
+    }
+
+    /// Which picker-free IMMEDIATE capture this slot performs, if it performs one at all.
+    ///
+    /// The distinction decides whether a build can offer the action AT ALL (DRAGON-589). An
+    /// immediate capture needs the compositor to say which window or monitor is active and
+    /// then hand over its pixels; a sandboxed session cannot ask, so those actions are absent
+    /// there rather than merely unbindable. `None` means the action needs no such answer:
+    /// All In One opens the ordinary picker overlay and the colour picker samples a snapshot,
+    /// both of which work wherever a capture works.
+    ///
+    /// The availability question itself is `capture_flow::immediate_capture_available`; this
+    /// is only the mapping from a hotkey slot to the capture it asks for.
+    /// Pure, unit-tested: is this one of DRAGON-428's "(no editor)" twins, the slots that
+    /// save, copy and notify without ever opening the preview editor?
+    ///
+    /// It matters because an editor-less capture has NO WINDOW OF OURS to deliver a
+    /// clipboard write through; see `global_capture_items` for what that costs in a
+    /// sandbox.
+    pub fn no_editor(self) -> bool {
+        matches!(
+            self,
+            Self::AllInOneNoEditor | Self::ActiveWindowNoEditor | Self::ActiveMonitorNoEditor
+        )
+    }
+
+    pub fn immediate(self) -> Option<crate::app::ImmediateCapture> {
+        use crate::app::ImmediateCapture;
+        match self {
+            Self::ActiveWindow | Self::ActiveWindowNoEditor => Some(ImmediateCapture::ActiveWindow),
+            Self::ActiveMonitor | Self::ActiveMonitorNoEditor => {
+                Some(ImmediateCapture::ActiveMonitor)
+            }
+            Self::AllInOne | Self::AllInOneNoEditor | Self::ColorPicker => None,
+        }
+    }
+}
+
+/// DRAGON-589: the global capture slots as ONE list, now that Linux reads the same labels,
+/// order and flags the two daemons do.
+#[cfg(test)]
+mod capture_hotkey_slot_tests {
+    use super::*;
+
+    /// Every slot appears in `ALL` exactly once, at the index `index()` claims. The pure
+    /// duplicate check speaks in those indices, and both daemons zip their registration
+    /// tables against this order.
+    #[test]
+    fn every_slot_is_listed_once_at_its_own_index() {
+        assert_eq!(CaptureHotkeySlot::ALL.len(), 7);
+        for (i, slot) in CaptureHotkeySlot::ALL.into_iter().enumerate() {
+            assert_eq!(slot.index(), i, "{slot:?}");
+            assert_eq!(
+                CaptureHotkeySlot::ALL.iter().filter(|s| **s == slot).count(),
+                1,
+                "{slot:?} listed twice"
+            );
+        }
+    }
+
+    /// The flags a desktop shortcut runs, pinned exactly. These are the strings `main` parses,
+    /// so a typo here is a shortcut that opens a capture overlay instead of doing the thing.
+    #[test]
+    fn each_slot_spells_the_flags_main_parses() {
+        use CaptureHotkeySlot as S;
+        assert_eq!(S::AllInOne.flags(), ["--all-in-one"]);
+        assert_eq!(S::ActiveWindow.flags(), ["--active-window"]);
+        assert_eq!(S::ActiveMonitor.flags(), ["--active-monitor"]);
+        assert_eq!(S::ColorPicker.flags(), ["--color-picker"]);
+        // A "(no editor)" twin is its original plus the modifier, in that order, and never
+        // anything else: the daemons spawn exactly this and the two must not drift.
+        for (twin, original) in [
+            (S::AllInOneNoEditor, S::AllInOne),
+            (S::ActiveWindowNoEditor, S::ActiveWindow),
+            (S::ActiveMonitorNoEditor, S::ActiveMonitor),
+        ] {
+            assert_eq!(twin.flags(), [original.flags()[0], "--no-editor"], "{twin:?}");
+            assert_eq!(original.flags().len(), 1, "{original:?}");
+        }
+    }
+
+    /// A slot never has an empty flag list and never a short-form flag: `main` matches these
+    /// by exact token, and an empty argv would launch the bare picker.
+    #[test]
+    fn no_slot_launches_with_nothing() {
+        for slot in CaptureHotkeySlot::ALL {
+            assert!(!slot.flags().is_empty(), "{slot:?}");
+            assert!(!slot.label().is_empty(), "{slot:?}");
+            for f in slot.flags() {
+                assert!(f.starts_with("--"), "{slot:?} flag {f} must be a long flag");
+            }
+        }
+    }
+
+    /// Only the four active-window / active-monitor slots ask the compositor what is active,
+    /// and a twin asks the same question its original does. This is the mapping the
+    /// "absent in this build" rule reads, so a wrong answer either hides a working action or
+    /// advertises one that cannot run.
+    #[test]
+    fn exactly_the_active_target_slots_are_immediate_captures() {
+        use crate::app::ImmediateCapture as I;
+        use CaptureHotkeySlot as S;
+        assert_eq!(S::ActiveWindow.immediate(), Some(I::ActiveWindow));
+        assert_eq!(S::ActiveWindowNoEditor.immediate(), Some(I::ActiveWindow));
+        assert_eq!(S::ActiveMonitor.immediate(), Some(I::ActiveMonitor));
+        assert_eq!(S::ActiveMonitorNoEditor.immediate(), Some(I::ActiveMonitor));
+        assert_eq!(S::AllInOne.immediate(), None);
+        assert_eq!(S::AllInOneNoEditor.immediate(), None);
+        assert_eq!(S::ColorPicker.immediate(), None);
+        // And the two axes agree: a slot is immediate exactly when its capture flag is one of
+        // the two `main` treats as picker-free.
+        for slot in S::ALL {
+            let by_flag = slot.flags()[0] == "--active-window" || slot.flags()[0] == "--active-monitor";
+            assert_eq!(slot.immediate().is_some(), by_flag, "{slot:?}");
         }
     }
 }
@@ -383,6 +547,10 @@ pub enum SettingsMsg {
     /// Settings (DRAGON-191): single-window capture focus appearance (dropdown index
     /// 0 = Active, 1 = Inactive).
     SetWindowFocusAppearance(usize),
+    /// Settings: the MASTER "Enable single window aesthetic effects" toggle. OFF
+    /// delivers the bare captured frame and hides every other single-window aesthetic
+    /// row; the individual preferences stay persisted.
+    SetWindowRecompositing(bool),
     /// Settings (DRAGON-209): the region selection box thickness (slider, 1-8 px).
     SetSelectionBoxThickness(u32),
     /// Settings (DRAGON-191): the ACTIVE window-capture border width (slider, 0-10 px).
@@ -425,8 +593,21 @@ pub enum SettingsMsg {
     /// `SetResident`), so Linux/other `SettingsMsg` shapes stay byte-identical elsewhere.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     SetAutostartOnLogin(bool),
+    /// Settings (DRAGON-618): a Flatpak's Background-portal autostart request has settled.
+    ///
+    /// Linux only, because it is the only platform whose registration is ASYNCHRONOUS. A
+    /// Flatpak cannot write the host's autostart directory, so it asks
+    /// `org.freedesktop.portal.Background` instead, and the portal may put a confirmation
+    /// dialog in front of the user. The payload is what autostart is registered as AFTER the
+    /// request, which is NOT what was asked for when the user declines; `Err` is a request
+    /// that never landed. `autostart::settled_toggle` turns either into the value the toggle
+    /// shows, so it can never claim a registration that did not happen.
+    #[cfg(target_os = "linux")]
+    AutostartPortalSettled(Result<bool, String>),
     /// Settings: region selection overlay dim opacity.
     SetRegionOpacity(f32),
+    /// Settings (DRAGON-582): colour-picker overlay dim opacity.
+    SetColorPickerOpacity(f32),
     /// Settings: active (countdown/recording) overlay dim + line opacity.
     SetActiveOpacity(f32),
     /// Settings: post-capture preview overlay dim opacity.
@@ -458,6 +639,11 @@ pub enum SettingsMsg {
     /// `ffmpeg -encoders` + hardware probe-encodes; fills the process-wide cache.
     #[cfg(windows)]
     EncodersProbed(Vec<crate::encode::EncoderInfo>),
+    /// DRAGON-564: the off-thread tool-version probe finished - store what each
+    /// Health-row binary reported. Kicked when the settings window opens
+    /// (`App::kick_tool_version_probe`) so the Health page never blocks on spawning
+    /// ffmpeg / ffprobe / tesseract / pactl for their version banners.
+    ToolVersionsProbed(Vec<crate::util::ToolVersion>),
     /// Settings: pick which monitor the encoder benchmark tests (index into the
     /// enumerated `bench_monitors`).
     SetBenchMonitor(usize),
@@ -505,11 +691,17 @@ pub enum SettingsMsg {
     /// immediately, with no restart — a customer turns it on, reproduces the failure once,
     /// and mails the file.
     SetDebugLogging(bool),
-    /// Settings → Health: copy one dependency row's resolved tool location to the clipboard
-    /// (DRAGON-540), carrying the text to copy, exactly as it is shown. The handler stamps
-    /// `SettingsState::health_copied` so the row's copy button flashes its "Copied!" tick.
+    /// Copy a PATH shown in a settings row to the clipboard, carrying the text exactly as the
+    /// row shows it. The handler stamps `SettingsState::health_copied`, and the button flashes
+    /// its "Copied!" tick.
+    ///
+    /// Named for Health because that page had the only such line when it landed (DRAGON-540),
+    /// and now shared by every row that renders a path through `settings::row::path_line`:
+    /// Health's tool locations, Scanner's tesseract language folder, and the preview editor's
+    /// covermark folder. The flash is keyed on the copied TEXT rather than on which row asked,
+    /// which is exactly why one message and one stamp serve all three.
     CopyHealthLocation(String),
-    /// Settings → Health: a tick while a location copy is still inside its flash window.
+    /// Settings: a tick while a path copy is still inside its flash window.
     /// Nothing in state changes here. Like `CloudSettingsMsg::CloudBrowserTick`, it exists
     /// purely to rebuild the view so the tick reverts by the clock, with no explicit clear.
     HealthCopyTick,
@@ -657,6 +849,17 @@ pub enum SettingsMsg {
     /// settings child spawned with `CCK_SETTINGS_TAB=about`), so the new
     /// version's "What's new" notes are immediately visible.
     ShowAboutPage,
+    /// About (DRAGON-605): the About page became active on a build whose
+    /// [`crate::update::notes_source`] is `OwnFetch` (a Flatpak), so fetch the release
+    /// notes on their own. A build WITH an update channel already has them from its
+    /// check and the arm is a no-op there. Sent only on About activation, once per
+    /// session; never from a daemon, a capture launch or a settings-window mint.
+    FetchReleaseNotes,
+    /// About (DRAGON-605): the notes-only fetch resolved. `None` covers every failure
+    /// (no network, no curl, malformed manifest, no notes in the release) and leaves the
+    /// page exactly as it was: this build cannot update, so an update error would name a
+    /// feature it does not have.
+    ReleaseNotesFetched(Option<crate::update::ReleaseNotes>),
     /// Launch dialog (DRAGON-177): the "Don't remind me again" checkbox in the
     /// update dialog changed; carries its new state (applied to `notify_updates`
     /// when a dialog button is clicked).

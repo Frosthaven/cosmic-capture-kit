@@ -59,8 +59,23 @@ RUN dnf -y install epel-release dnf-plugins-core \
 # Rust into a SHARED prefix, readable by any uid, so the build can run as the
 # calling user and still not need a writable toolchain (CARGO_HOME is per-run and
 # lives in the mounted work dir).
+#
+# The toolchain is PINNED here and must match the repo's `rust-toolchain.toml`.
+# This image IS rustup-driven, so it reads that file: with `--default-toolchain
+# stable` the build died at `could not create temp file /usr/local/rustup/tmp/...
+# Permission denied`, because rustup tried to DOWNLOAD the pinned version into a
+# prefix deliberately made read-only. Installing the pinned version at image
+# build time means the run finds it already present and never writes.
+#
+# So this version and `rust-toolchain.toml` move together, in the same commit,
+# and both track the Flatpak SDK's rust extension. See CLAUDE.md's toolchain
+# bullet for why one compiler is worth this coupling.
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
-RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path \
+ARG RUST_TOOLCHAIN=1.95.0
+# `--component` matters as much as the version: rust-toolchain.toml also names
+# clippy and rustfmt, and rustup will try to FETCH anything the pin asks for and
+# the image lacks, which fails the same read-only way as a missing toolchain.
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt --no-modify-path \
  && chmod -R a+rX "$RUSTUP_HOME" "$CARGO_HOME"
 ENV PATH=/usr/local/cargo/bin:$PATH
 

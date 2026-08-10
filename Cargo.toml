@@ -1,8 +1,8 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.29.0"
+version = "0.30.0"
 edition = "2024"
-description = "Cross-platform screen region, window, and monitor capture with support for translucent windows, image, video, voice, QR, barcodes, OCR text, and annotation."
+description = "Quickly capture your screen/audio to the clipboard for sharing with others. Supports QR/barcode/OCR scanning, cloud upload with automatic sharing links, and post-capture annotations."
 license = "GPL-3.0-only"
 repository = "https://github.com/Frosthaven/cosmic-capture-kit"
 
@@ -31,6 +31,12 @@ bytes = "1.9"
 # racy destructor phase entirely. Already in the tree (transitive), so it adds no build.
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+# DRAGON-602: libcosmic's `Core::set_auto_blur` takes a `BitFlags<Auto>`, and the
+# one value we ever pass it is the EMPTY set (`app::theme::toolkit_auto_glass`,
+# which stops the toolkit enrolling our capture overlays in the compositor's
+# backdrop blur). Spelling it `BitFlags::EMPTY` needs the crate by name. Same
+# version libcosmic already resolves, so it adds no extra build.
+enumflags2 = "0.7"
 ron = "0.8" # legacy state-file READ only (migration); config is written as TOML
 toml = "0.8"
 dirs = "6"
@@ -179,7 +185,7 @@ ksni = { version = "0.3.5", default-features = false, features = ["tokio", "bloc
 
 [target.'cfg(target_os = "linux")'.dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"
-rev = "4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+rev = "8a017a15ee7753241c0a631b4294a68edf79b13b"
 default-features = false
 # `markdown` (DRAGON-177): renders the About page's release notes via
 # `cosmic::widget::markdown` (forwards to iced's markdown widget + pulldown-cmark).
@@ -364,11 +370,24 @@ dispatch2 = "0.3"
 # `default-features = false` keeps the giant AVFoundation surface out — we enable
 # only AVCaptureDevice (+ AVMediaFormat for the AVMediaTypeAudio constant) and
 # block2 for the async request completion handler.
+# The AVCapture{Session,Input,Output,AudioDataOutput} headers are the NATIVE MIC
+# CAPTURE (`platform::mac::mic_capture`), which replaced the `ffmpeg -f avfoundation`
+# mic child because ffmpeg's indev keeps a single un-queued CMSampleBuffer slot and
+# destroyed ~1 mic buffer in 6; that module's doc carries the measurements. `dispatch2`
+# is what exposes `setSampleBufferDelegate:queue:`, and `objc2-core-media` the
+# CMSampleBuffer the delegate is handed — both already in the lock via SCK.
 objc2-av-foundation = { version = "0.3", default-features = false, features = [
     "std",
+    "AVCaptureAudioDataOutput",
     "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
     "AVMediaFormat",
     "block2",
+    "dispatch2",
+    "objc2-core-media",
 ] }
 # DRAGON-130 bundle-gated services: UNUserNotificationCenter — the sticky,
 # click-actionable capture notification the bundled .app posts (unbundled dev
@@ -431,7 +450,7 @@ security-framework = "3"
 # the compiled shape instead of a runtime fallthrough.
 [target.'cfg(target_os = "macos")'.dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"
-rev = "4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+rev = "8a017a15ee7753241c0a631b4294a68edf79b13b"
 default-features = false
 # `markdown` (DRAGON-177): renders the About page's release notes via
 # `cosmic::widget::markdown` (forwards to iced's markdown widget + pulldown-cmark).
@@ -558,7 +577,7 @@ winres = "0.1"
 # partition, pinned to the SAME git rev so no second libcosmic/iced tree resolves.
 [target.'cfg(windows)'.dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic"
-rev = "4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+rev = "8a017a15ee7753241c0a631b4294a68edf79b13b"
 default-features = false
 # `markdown` (DRAGON-177): renders the About page's release notes via
 # `cosmic::widget::markdown` (forwards to iced's markdown widget + pulldown-cmark).
@@ -576,9 +595,16 @@ zero-copy = ["dep:ffmpeg-next", "dep:gbm"]
 
 # Match xdg-desktop-portal-cosmic: unify every cosmic-protocols dep (incl.
 # libcosmic's own) onto the rev its Cargo.lock resolves to.
+# DRAGON-597 moved this rev from c253ec1 to 32283d7 along with the libcosmic
+# bump below. It is not an independent choice: libcosmic and its iced submodule
+# both pin cctk at 32283d7 now, and two copies of these generated Wayland
+# bindings are two incompatible sets of types. The portal moved to the same rev,
+# so the "match the reference consumer" reason above still holds too. If the
+# libcosmic rev moves again, re-read libcosmic's own cctk pin and move this WITH
+# it.
 [patch."https://github.com/pop-os/cosmic-protocols"]
-cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c253ec1" }
-cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c253ec1" }
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "32283d7" }
+cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "32283d7" }
 
 # DRAGON-293: patch the winit workspace to our fork carrying the WindowDelegate::view() fix
 # (it finds the WinitView even when it's nested inside a masked NSVisualEffectView backdrop),
@@ -593,6 +619,40 @@ winit-core = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-co
 winit-wayland = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
 winit-x11 = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
 winit-win32 = { git = "https://github.com/Frosthaven/winit.git", branch = "cck-corner-fix" }
+
+# DRAGON-597: patch the iced workspace to our fork, which implements
+# `set_cursor_visible` for wayland surfaces. Upstream leaves it a bare TODO, so on a
+# layer surface we can set a cursor ICON but cannot HIDE the pointer, which is what the
+# colour picker's loupe needs. One commit on top of pop-os/iced master.
+#
+# The patched SOURCE is libcosmic, not iced, and that is not a typo. libcosmic vendors
+# iced as a git SUBMODULE and consumes every crate by path (`path = "./iced/core"`), so
+# in our lockfile the iced crates carry libcosmic's git source, and there is no
+# pop-os/iced source at all. Cargo keys `[patch]` on the CANONICAL url, so entries under
+# the libcosmic url do reach them.
+#
+# Every iced workspace member our graph resolves is patched to the SAME fork, for the
+# same reason the winit block above patches all of its members: our fork's `iced_winit`
+# would pull its own path siblings from the fork source while libcosmic's copies stayed
+# on the libcosmic source, and two `iced_core`s are two incompatible sets of types.
+# Verified with `cargo metadata`: patching one member split the graph, patching all
+# thirteen collapsed it onto one source. `iced_highlighter`, `iced_test` and the other
+# members we never resolve are deliberately absent; adding them would only earn an
+# unused-patch warning.
+[patch."https://github.com/pop-os/libcosmic"]
+iced = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_accessibility = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_core = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_debug = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_futures = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_graphics = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_program = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_renderer = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_runtime = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_tiny_skia = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_wgpu = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_widget = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+iced_winit = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
 
 # Optimize dependencies even in dev builds. The capture pipeline leans hard on
 # dependency crates (image/png/miniz_oxide PNG decode+encode, fast_blur for the

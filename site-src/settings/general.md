@@ -57,15 +57,21 @@ Two tabs: **Settings** and **Appearance**. The window opens on Settings.
 
 **Selection box thickness**
 :   How thick the line around your capture region is drawn, from 1 to 8 pixels.
+    It is also the thickness of the ring around
+    [the colour picker's magnifier](../capture/color-picker.md), so the two match.
 :   **2** by default. This one is always available, even with System Default on.
 
 ### Overlay Opacity
 
-Three sliders, each from 0 to 100 percent. They control how much the app dims
-the parts of the screen you are not capturing. Higher means darker.
+Four sliders, each from 0 to 100 percent. They control how much the app dims the
+parts of the screen you are not capturing. Higher means darker.
 
 | Setting | Default | When it applies |
 |---|---|---|
+| During Color Picker | 33% | While the colour picker is up, so you can still read colours through it |
 | During Region Selection | 66% | While you are drawing and adjusting a region |
 | During Countdown & Recording | 33% | Once the timer starts and while recording, so you can still see what is happening |
 | During Preview | 90% | Behind the editor when it opens as an overlay |
+
+The colour picker's dim never changes the colour you get. It reads a picture of
+your screen taken before the dim went on.

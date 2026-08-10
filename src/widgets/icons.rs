@@ -34,16 +34,24 @@
 //! of these brands' guidelines sanctions. Keep it that way: do not recolour one, do not
 //! restyle one, and do not put one on anything but the provider it belongs to.
 //!
+//! **Proton Drive is a real mark again, by owner decision (2026-08-07).** DRAGON-566 had
+//! swapped `proton-drive.svg` for a neutral locked-cloud glyph, because the sanction above
+//! assumes an integration the brand OFFERS and Proton has no third-party API and does not
+//! officially support this one (it runs through Proton's MIT-licensed CLI). The owner
+//! reviewed Proton's third-party branding terms (quoted in DRAGON-566) and accepted the
+//! risk, so the official mark is restored and the neutral glyph and the registry row's
+//! `support_note` disclosure were removed at owner direction, not by oversight. Proton's
+//! stance itself is unchanged; the file's own comment carries the same record.
+//!
 //! They live in their OWN directory rather than in `lucide/`, and that is deliberate:
 //! `res/icons/lucide/` is a vendored MIT-licensed upstream set, and mixing files of different
 //! provenance into it would make its licensing a guess. [`lucide_bytes`] embeds from both.
 //!
-//! The two providers with no official API (Proton Drive, iCloud Drive) keep their real marks
-//! too, although nothing draws them today: DRAGON-498 stopped listing those providers in the
-//! add-account picker, and their rows (with the "Not available yet" caption the marks used to
-//! sit beside) went with it. The glyphs stay because the REGISTRY still carries both providers,
-//! so anything that names one, now or later, has its mark ready and does not have to invent a
-//! downgraded stand-in.
+//! iCloud Drive (no official API, not listed in the add-account picker since DRAGON-498)
+//! keeps its real mark although nothing draws it today: the REGISTRY still carries the
+//! provider, so anything that names it, now or later, has its mark ready and does not have to
+//! invent a downgraded stand-in. Proton Drive sat in that same sentence until DRAGON-485 made
+//! it connectable through its own CLI, and DRAGON-566 then swapped its glyph as above.
 
 use cosmic::widget::icon::{self, Handle};
 
@@ -184,6 +192,17 @@ pub(crate) fn is_bundled(name: &str) -> bool {
 fn lucide_name(name: &str) -> Option<&'static str> {
     Some(match name {
         // Capture modes / overlay.
+        // The About page's release-kind line (Linux Flatpak): lucide `package`, a shipped
+        // box, which is exactly what the line names. Its four siblings are
+        // `application-x-executable-symbolic` / `application-x-appimage-symbolic` below and
+        // `package-macos-symbolic` / `package-windows-symbolic` here.
+        "package-x-generic-symbolic" => "package",
+        // DRAGON-614: the two non-Linux release kinds, the owner's picks. Named as siblings
+        // of `package-x-generic-symbolic` rather than with a `brand-` prefix, which is
+        // reserved for the colour provider marks in `res/icons/brands/`. These two are
+        // ordinary symbolic glyphs and must tint like every other one.
+        "package-macos-symbolic" => "apple",
+        "package-windows-symbolic" => "grid-2x2",
         "screenshot-selection-symbolic" => "crop", // region marquee
         "screenshot-window-symbolic" => "app-window",
         "screenshot-screen-symbolic" => "monitor",
@@ -245,6 +264,10 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         // counter-clockwise arrowhead turning clockwise reads as an animation bug.
         "scan-refresh-symbolic" => "refresh-cw",
         "preferences-system-symbolic" => "settings",
+        // The macOS Health page's "Manage permissions" button (DRAGON-412): the same
+        // Lucide `key` the tray daemon's own "Manage Permissions" menu item uses
+        // (`recording_ui::MenuIcon::Permissions`), so the two affordances read as one.
+        "dialog-password-symbolic" => "key",
         "audio-input-microphone-symbolic" => "mic",
         "audio-x-generic-symbolic" => "audio-lines", // Audio settings tab
         "object-merge-symbolic" => "merge", // Mixing settings tab
@@ -256,6 +279,19 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "document-save-symbolic" => "save",
         "document-save-as-symbolic" => "save-all", // save variant
         "edit-copy-symbolic" => "copy",
+        // DRAGON-582: the colour picker tool, in the preview editor's bottom bar and
+        // named directly by the owner (Lucide `pipette`).
+        "color-select-symbolic" => "pipette",
+        // DRAGON-588: the Keyboard Shortcuts page's Global tab, the OS-owned hotkeys.
+        // Lucide `globe`, the owner's pick: these are the keys that work anywhere on the
+        // system rather than inside one of our windows.
+        "globe-symbolic" => "globe",
+        // DRAGON-591: the About page's release-kind line, one glyph per package kind
+        // (`util::PackageKind`). The owner's picks: lucide `binary` for a bare executable,
+        // `file-archive` for the AppImage (one file carrying a packed filesystem). The
+        // Flatpak keeps `package`, which the owner was happy with.
+        "application-x-executable-symbolic" => "binary",
+        "application-x-appimage-symbolic" => "file-archive",
         // DRAGON-467's top-right group: the ticket named these three lucide glyphs directly
         // (`copy`, `share-2`, `upload`), so the mapping is one-to-one rather than
         // interpretive. `document-copy-symbolic` is the plain sheets-of-paper copy, distinct
@@ -387,6 +423,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
     }
     match file {
         "cloud" => svg!("cloud"),
+        "package" => svg!("package"),
         "brand-gdrive" => brand!("gdrive"),
         "brand-onedrive" => brand!("onedrive"),
         "brand-dropbox" => brand!("dropbox"),
@@ -413,6 +450,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "trash-2" => svg!("trash-2"),
         "x" => svg!("x"),
         "settings" => svg!("settings"),
+        "key" => svg!("key"),
         "sliders-horizontal" => svg!("sliders-horizontal"),
         "mic" => svg!("mic"),
         "audio-lines" => svg!("audio-lines"),
@@ -424,6 +462,12 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "save" => svg!("save"),
         "save-all" => svg!("save-all"),
         "copy" => svg!("copy"),
+        "pipette" => svg!("pipette"),
+        "globe" => svg!("globe"),
+        "binary" => svg!("binary"),
+        "file-archive" => svg!("file-archive"),
+        "apple" => svg!("apple"),
+        "grid-2x2" => svg!("grid-2x2"),
         "share" => svg!("share"),
         "cloud-upload" => svg!("cloud-upload"),
         "maximize" => svg!("maximize"),
@@ -504,7 +548,8 @@ mod tests {
             "view-refresh-symbolic", "scan-refresh-symbolic",
             "document-save-symbolic", "document-save-as-symbolic",
             "document-copy-symbolic", "share-symbolic", "upload-symbolic",
-            "edit-copy-symbolic", "view-fullscreen-symbolic", "view-restore-symbolic",
+            "edit-copy-symbolic", "color-select-symbolic",
+            "view-fullscreen-symbolic", "view-restore-symbolic",
             "edit-undo-symbolic", "edit-redo-symbolic", "crop-symbolic", "crop-accept-symbolic",
             "insert-image-symbolic",
             "zoom-in-symbolic", "display-brightness-symbolic", "mail-forward-symbolic",
@@ -527,6 +572,14 @@ mod tests {
             "image-x-generic-symbolic", "video-display-symbolic",
             "utilities-system-monitor-symbolic", "speedometer-symbolic", "donate-symbolic",
             "help-about-symbolic",
+            // The About page's release-kind line, one glyph per `util::PackageKind`
+            // (DRAGON-591 for the three Linux kinds, DRAGON-614 for macOS and Windows). All
+            // five were missing from this list until DRAGON-614, so a half-vendored icon
+            // would have shipped as a blank badge rather than failing here.
+            // `util::package_kind_tests::each_package_kind_has_its_own_glyph` pins the other
+            // side of the pairing, that each kind names a DIFFERENT one of these.
+            "application-x-executable-symbolic", "application-x-appimage-symbolic",
+            "package-x-generic-symbolic", "package-macos-symbolic", "package-windows-symbolic",
             "software-update-available-symbolic", "dialog-warning-symbolic",
             "dialog-error-symbolic",
             // Cloud accounts (DRAGON-482, plus YouTube DRAGON-493): the settings page's glyph
@@ -584,6 +637,9 @@ mod tests {
                 svg.contains("fill=\"#") || svg.contains("stop-color=\"#"),
                 "`{file}` names no colour at all"
             );
+            // Every entry is an official mark and must record where it came from.
+            // (Proton was the one NEUTRAL exception from DRAGON-566 until the owner's
+            // 2026-08-07 decision restored its official mark; see the module doc.)
             assert!(
                 svg.contains("Source: https://"),
                 "`{file}` must record where the official mark came from"

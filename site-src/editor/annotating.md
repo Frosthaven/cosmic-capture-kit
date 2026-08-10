@@ -135,6 +135,18 @@ thicknesses, and the tooltips name them in plain words from "Thinnest line" to
 "Thickest line" rather than giving you numbers. Like colour, it applies to your
 current selection as well as to the next thing you draw.
 
+### Taking a colour off the screen
+
+**The pipette button sits just before the swatch.** It opens
+[the colour picker](../capture/color-picker.md) over your whole screen, so you can
+draw with a colour from anywhere: a logo, a website, another app's window.
+
+The colour you click becomes the annotation colour straight away. It recolours
+whatever you have selected and joins your recent colours, exactly as choosing one
+from the swatch does. **No extra window opens**, because you asked for a colour to
+draw with and the swatch is already showing it. Press Esc to come back without
+changing anything.
+
 ## Working with what you have drawn
 
 ### Selecting

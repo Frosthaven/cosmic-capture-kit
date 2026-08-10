@@ -528,7 +528,7 @@ impl App {
         .class(cosmic::theme::Container::custom(|theme| {
             let c = theme.cosmic();
             cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background.base.into())),
+                background: Some(Background::Color(c.background(false).base.into())),
                 border: Border {
                     color: c.bg_divider().into(),
                     width: 1.0,

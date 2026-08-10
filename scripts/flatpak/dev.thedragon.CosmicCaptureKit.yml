@@ -1,0 +1,278 @@
+# EXPERIMENTAL Flatpak manifest (lab/flatpak).
+#
+# This is a LAB artifact, not a shippable one, and two choices in here would fail a Flathub
+# review on purpose. They are marked LAB-ONLY below. The point of this manifest is to get a
+# real sandboxed build on a real COSMIC session so the feature losses can be MEASURED rather
+# than predicted; making it submission-clean is a separate job.
+#
+# What the runtime already gives us, verified against org.freedesktop.Platform 25.08 rather
+# than assumed, because each one it provides is a module we do not have to build:
+#
+#   ffmpeg + ffprobe   /usr/bin, so recording and the preview player work with no module
+#   pactl              /usr/bin, so audio device enumeration works
+#   libpulse.so.0      so the linked pulse FFI resolves at runtime
+#   libpipewire-0.3    1.4.9, the portal ScreenCast transport
+#   libxkbcommon       1.11.0
+#   libpng             1.6.58, which leptonica links rather than vendoring
+#
+# What it does NOT give us, and why each costs something:
+#
+#   tesseract          absent entirely, so OCR needs leptonica + tesseract modules below
+#   libavcodec 61      that is ffmpeg 7.1, and our `zero-copy` feature binds the ffmpeg 8.1
+#                      headers through ffmpeg-next. Building ffmpeg 8 as a module would add
+#                      15+ minutes to every build for a feature the sandbox degrades anyway,
+#                      so this build is --no-default-features and loses IN-PROCESS GPU
+#                      encoding. Recording still works through the runtime's ffmpeg binary,
+#                      which is the same path macOS and Windows already ship.
+#   clang              bindgen (pipewire-sys, libspa-sys) needs libclang, hence the llvm21
+#                      SDK extension in sdk-extensions.
+
+app-id: dev.thedragon.CosmicCaptureKit
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  # Rust 1.97.1 on the 25.08 branch.
+  - org.freedesktop.Sdk.Extension.rust-stable
+  # libclang, for the bindgen that pipewire-sys and libspa-sys run. The base SDK ships no
+  # clang at all, so without this the build dies in a build script rather than in our code.
+  - org.freedesktop.Sdk.Extension.llvm21
+command: cosmic-capture-kit
+
+# GLOBAL no-debuginfo, not just the proton-drive module's: flatpak-builder runs a
+# FINALIZE-stage strip over /app that module-level `no-debuginfo: true` does not
+# shield against (measured twice: the module option + an app-module sha guard both
+# passed while the installed binary still came out stripped). The strip severs the
+# Bun single-file proton-drive executable's appended JS bundle, leaving a bare Bun
+# runtime that answers "Script not found". The lab build ships no .Debug worth
+# keeping, so the global switch costs nothing. The justfile verifies the INSTALLED
+# binary's sha after every `just flatpak`, so any future strip regression fails
+# loudly instead of installing a broken provider.
+build-options:
+  no-debuginfo: true
+
+finish-args:
+  - --socket=wayland
+  - --share=ipc
+  # Cloud accounts and the OAuth loopback redirect. The redirect listener works because the
+  # sandbox shares the host network namespace, so 127.0.0.1 is the same 127.0.0.1.
+  - --share=network
+  - --socket=pulseaudio
+  # wgpu/Vulkan, VAAPI, and the NVIDIA nodes. --device=dri covers the NVIDIA ones too, and
+  # org.freedesktop.Platform.GL auto-installs the extension matching the host driver, so
+  # --device=all is unnecessary (and is a review smell).
+  - --device=dri
+  # The portal's PipeWire remote, which is how ScreenCast hands us frames.
+  - --filesystem=xdg-run/pipewire-0
+  # COSMIC's theme, corner radius, accent and background config. Read-only. An accepted
+  # pattern: dev.edfloreshz.Tasks and io.github.cosmic_utils.Examine both hold this grant.
+  - --filesystem=xdg-config/cosmic:ro
+  # LAB-ONLY. The save-directory default is ~/Capture and captures auto-write with no picker
+  # interaction, so honouring the existing setting needs broad home access. A shippable build
+  # would move the default under xdg-pictures and route anything else through the FileChooser
+  # portal, which also earns the document-portal grant for free. Left broad here so the lab
+  # build behaves like the AppImage and the comparison is about CAPTURE, not about paths.
+  - --filesystem=home
+  # Cloud tokens.
+  - --talk-name=org.freedesktop.secrets
+  # The ksni tray. No --own-name: that wildcard form is invalid syntax anyway (only a trailing
+  # `.*` matches), and ksni's disable_dbus_name(true) registers on the connection's unique name
+  # instead, which is documented as the sandboxed path and is what the code now does.
+  #
+  # BOTH watcher names, because a COSMIC session owns both and ksni asks for the KDE one:
+  #   org.kde.StatusNotifierWatcher            what ksni looks up
+  #   com.system76.CosmicStatusNotifierWatcher  COSMIC's own, granted so the item survives if
+  #                                             ksni ever prefers it or the KDE alias goes away
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=com.system76.CosmicStatusNotifierWatcher
+  # Live accent/theme changes without a restart.
+  - --talk-name=com.system76.CosmicSettingsDaemon
+  # "Pause other players while recording" (MPRIS). The trailing `.*` is the one wildcard
+  # form Flatpak accepts, and the same pattern media-controller applets ship on Flathub.
+  # The in-app gate (util::session_bus_talk_allowed) reads the live policy from
+  # /.flatpak-info, so this line alone restores the settings row and the runtime pause
+  # with no code change; remove it and the feature gates itself off again, honestly.
+  - --talk-name=org.mpris.MediaPlayer2.*
+  # Deliberately ABSENT, and each absence is load-bearing:
+  #   org.freedesktop.Notifications  portal names are allowed by default, and adding a
+  #                                  --talk-name for a portal is itself a lint error
+  #   org.freedesktop.FileManager1   OpenURI v5's OpenDirectory falls back to it itself
+  #   org.freedesktop.Flatpak        NOT the portal. That name is the session helper's
+  #                                  Development.HostCommand and grants arbitrary host
+  #                                  execution. We want org.freedesktop.portal.Flatpak,
+  #                                  which needs no finish-arg at all.
+
+modules:
+  # Leptonica, tesseract's image-IO layer. Not in the runtime. Linked against the runtime's
+  # libpng rather than vendoring its own, and with every format we do not use turned off so
+  # the build stays short: OCR here only ever reads an in-memory RGBA capture.
+  - name: leptonica
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --without-jpeg
+      - --without-giflib
+      - --without-libtiff
+      - --without-libwebp
+      - --without-libopenjpeg
+    sources:
+      - type: archive
+        url: https://github.com/DanBloomberg/leptonica/releases/download/1.87.0/leptonica-1.87.0.tar.gz
+        sha256: c73363397f96eb1295602bf44d708a994ad42046c791bf03ea0505d829bdb6a7
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - '*.la'
+
+  # Tesseract 5.5.3, matching scripts/pins.env so the Flatpak and the AppImage run the same
+  # OCR engine. Training tools and the legacy engine are off: we only ever call the binary
+  # with the LSTM engine on a single image.
+  - name: tesseract
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --disable-legacy
+      - --disable-openmp
+      - --disable-doc
+      - --disable-graphics
+    sources:
+      - type: archive
+        url: https://github.com/tesseract-ocr/tesseract/archive/refs/tags/5.5.3.tar.gz
+        sha256: 9218e62793116d42a9f6d14cd9348518b27f382096eea3d0f2d1a24616bb5884
+      # The English language data, same pin as the AppImage. `dest-filename` keeps it out of
+      # the way of the tarball's own tree; post-install puts it where tesseract looks.
+      - type: file
+        url: https://github.com/tesseract-ocr/tessdata_fast/raw/4.1.0/eng.traineddata
+        sha256: 7d4322bd2a7749724879683fc3912cb542f19906c83bcc1a52132556427170b2
+        dest-filename: eng.traineddata
+    post-install:
+      # Beside the BINARY, not in share/, and the whole tree.
+      #
+      # `util::seed_tessdata` reads `<tool dir>/tessdata`, so with tesseract at /app/bin the
+      # only directory it will ever look in is /app/bin/tessdata. Installing to the
+      # conventional /app/share/tessdata left that path empty, the seed silently did nothing,
+      # and the app reported "no usable language data" while the data sat right there. This
+      # mirrors the AppImage exactly, which copies to `$APPDIR/usr/bin/tessdata` for the same
+      # reason.
+      #
+      # The WHOLE tree, not just `*.traineddata`: `configs/` carries the output-mode configs
+      # (`tsv` among them) that the OCR pass names on the command line, and tesseract fails
+      # outright without them. Tesseract's own `make install` put those in share/tessdata, so
+      # the language file joins them there first and the finished tree is copied across.
+      - install -Dm644 eng.traineddata /app/share/tessdata/eng.traineddata
+      - cp -a /app/share/tessdata /app/bin/tessdata
+      # Fail the BUILD rather than ship a package whose OCR is quietly broken, the same two
+      # assertions the AppImage build makes.
+      - test -f /app/bin/tessdata/eng.traineddata
+      - test -f /app/bin/tessdata/configs/tsv
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+      - '*.la'
+
+  # Proton's own official Drive CLI (DRAGON-566), which the Proton cloud provider drives as a
+  # child process (src/cloud/proton.rs). Bundled HERE and only here: inside the sandbox a host
+  # install is invisible, so "put proton-drive on PATH" is advice this package would make
+  # false, the tool is MIT-licensed (the license installs beside it), and the store is the
+  # update channel in a Flatpak, so the bundled copy is updated the same way the app is. The
+  # direct builds keep treating the tool as optional and external.
+  #
+  # Same pins as scripts/pins.env. The OFFICIAL prebuilt x86_64 binary rather than a source
+  # build keeps the lab loop short; building it from the ProtonDriveApps/sdk source is the
+  # Flathub follow-up. A linux-arm64 build exists at the sibling path (linux-arm64/
+  # proton-drive); only x86_64 is pinned because the lab build is x86_64-only.
+  #
+  # /app/bin is where `util::proton_drive_path`'s exe-adjacent arm looks (beside our own
+  # binary), so the app finds this copy with no configuration at all.
+  - name: proton-drive
+    buildsystem: simple
+    build-options:
+      # The tool is a Bun single-file executable: the bun runtime with the CLI's JS bundle
+      # appended to the ELF. flatpak-builder's default debuginfo pass (eu-strip) rewrites
+      # the ELF and severs that bundle, leaving a bare Bun runtime: `--version` then prints
+      # Bun's own version (1.3.14 at this pin) and `version` fails with "Script not found"
+      # (exit 1), which the app's probe rightly reports as Broken. That is exactly what the
+      # fifth live test shipped. Never let anything strip this binary.
+      no-debuginfo: true
+    build-commands:
+      - install -Dm755 proton-drive /app/bin/proton-drive
+      - install -Dm644 LICENSE.md /app/share/doc/proton-drive/LICENSE.md
+      # Fail the BUILD rather than ship a package whose Proton provider reports its own tool
+      # as a packaging fault. Same shape as the tessdata assertions above. This check alone
+      # is NOT enough: the debuginfo pass that broke this binary runs AFTER a module's own
+      # build-commands, so the byte-identity guard lives in the next module down.
+      - test -x /app/bin/proton-drive
+    sources:
+      - type: file
+        url: https://proton.me/download/drive/cli/0.7.0/linux-x64/proton-drive
+        sha256: 4e3c74a7a25da00d7a0ca9ee223a9b7b0b238da357ab6fcfee04a5c313ddf4d1
+        dest-filename: proton-drive
+      - type: file
+        url: https://raw.githubusercontent.com/ProtonDriveApps/sdk/941aafa55fb179c8ee347c9d0b4660a3fc893f09/LICENSE.md
+        sha256: 0ce1c7dc272b2b5f86de58045d87dbfdec582fdce352a4a41cc8c56bff51c6f5
+        dest-filename: LICENSE.md
+
+  # The app itself.
+  - name: cosmic-capture-kit
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm21/bin
+      prepend-ld-library-path: /usr/lib/sdk/llvm21/lib
+      env:
+        CARGO_HOME: /run/build/cosmic-capture-kit/cargo
+        # bindgen finds libclang here rather than in the base SDK, which has none.
+        LIBCLANG_PATH: /usr/lib/sdk/llvm21/lib
+      build-args:
+        # LAB-ONLY, and the single biggest reason this manifest is not submittable.
+        #
+        # Flathub builds offline and requires every cargo dependency to be declared as a
+        # source, generated by flatpak-cargo-generator. That is a solved problem but a fiddly
+        # one for this tree specifically, because we carry git dependencies (cosmic-client-
+        # toolkit, pipewire-rs, and our own winit fork) rather than crates.io-only deps.
+        #
+        # Letting cargo reach the network keeps the lab loop fast and, more importantly,
+        # keeps this manifest HONEST about what it is testing: the sandbox's effect on the
+        # RUNNING app, which is the actual open question. Generating offline sources changes
+        # nothing about runtime behaviour.
+        - --share=network
+    build-commands:
+      # The bundled proton-drive must still be byte-identical to its pin when THIS module
+      # runs, meaning it survived the previous module's post-processing. flatpak-builder
+      # strips and splits debuginfo AFTER a module's own build-commands, so a check inside
+      # the proton-drive module can never see that mutation; this cross-module check is the
+      # earliest place a build can. Keep the hash in lockstep with the source pin above and
+      # with scripts/pins.env.
+      - echo "4e3c74a7a25da00d7a0ca9ee223a9b7b0b238da357ab6fcfee04a5c313ddf4d1  /app/bin/proton-drive"
+        | sha256sum -c -
+      # --no-default-features: the runtime's libavcodec is 61 (ffmpeg 7.1) and `zero-copy`
+      # binds ffmpeg 8.1 headers. See the header comment. Recording still works through the
+      # runtime's ffmpeg BINARY, which is exactly what macOS and Windows ship.
+      - cargo build --release --no-default-features
+      - install -Dm755 target/release/cosmic-capture-kit /app/bin/cosmic-capture-kit
+      - install -Dm644 res/dev.thedragon.CosmicCaptureKit.desktop
+        /app/share/applications/dev.thedragon.CosmicCaptureKit.desktop
+      # The desktop entry's Icon= key names this exact id, and flatpak-builder warns (then
+      # exports an iconless launcher entry) if no matching file is installed. The scalable
+      # hicolor path is where the export step looks.
+      - install -Dm644 res/icons/dev.thedragon.CosmicCaptureKit.svg
+        /app/share/icons/hicolor/scalable/apps/dev.thedragon.CosmicCaptureKit.svg
+    sources:
+      - type: dir
+        path: ../..
+        # The checkout's build dirs are ENORMOUS (target/ alone is well over 100G on a
+        # working machine) and flatpak-builder copies the source dir wholesale. Without
+        # these skips the copy alone would fill the disk long before cargo ran.
+        # `.claude` holds agent worktrees, each a full checkout with its own target/,
+        # so it grows faster than every other skip here combined. On 2026-08-09 it was
+        # 118G across 56 worktrees and the copy filled /home to 99% before cargo ran,
+        # which reads as a build hung at "Building module cosmic-capture-kit" because
+        # flatpak-builder prints nothing while it copies. The skips above are per-NAME,
+        # so `target` does not cover a target/ nested inside a worktree.
+        skip:
+          - target
+          - target-appimage
+          - target-win
+          - target-dist
+          - .git
+          - .flatpak-builder
+          - .claude

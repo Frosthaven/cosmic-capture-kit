@@ -48,8 +48,8 @@ There is a plain zip beside it if you would rather use your distribution's own
 ffmpeg and tesseract.
 
 You can also build it yourself, which is the route on architectures other than
-x86_64. The
-[README](https://github.com/Frosthaven/cosmic-capture-kit#build-from-source)
+x86_64.
+[DEVELOPERS.md](https://github.com/Frosthaven/cosmic-capture-kit/blob/main/DEVELOPERS.md)
 has the exact commands for your distribution, including the packages to install
 first. COSMIC is the supported desktop today.
 
@@ -83,7 +83,7 @@ it is on by default. You can turn it off in
 
 A fresh install ships with **no capture key set**. You choose your own in
 [Settings, under Shortcuts](settings/shortcuts.md), in the section called
-**Global**. There are six of them, and every one is optional:
+**Global**. There are seven of them, and every one is optional:
 
 | Shortcut | What it does |
 |---|---|
@@ -93,6 +93,7 @@ A fresh install ships with **no capture key set**. You choose your own in
 | Capture All In One (no editor) | The same picker, but the result is saved, copied and announced without the editor opening |
 | Capture Active Window (no editor) | The same instant window capture, delivered without the editor |
 | Capture Active Monitor (no editor) | The same instant monitor capture, delivered without the editor |
+| Color Picker | Opens [the colour picker](capture/color-picker.md), which reads a colour off the screen |
 
 ### Linux
 
@@ -105,6 +106,10 @@ Settings, then Keyboard, then Shortcuts, then Custom shortcuts.
 | `cosmic-capture-kit --region` | `Alt+Shift+1` |
 | `cosmic-capture-kit --active-window` | `Alt+Shift+2` |
 | `cosmic-capture-kit --active-monitor` | `Alt+Shift+3` |
+| `cosmic-capture-kit --color-picker` | `Alt+Shift+C` |
+
+The Global tab in Settings shows the same list with the command for each one, so
+you can copy them from there instead of typing them.
 
 Add `--no-editor` to any of them for a variant that skips the editor. The
 capture is still saved, copied to the clipboard and announced by a

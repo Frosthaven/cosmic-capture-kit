@@ -37,7 +37,7 @@
 //! precedent for adding one when this outgrows one screen.
 
 use super::super::*;
-use super::super::row::{gated_row, toggle, Item, SectionSpec, Severity};
+use super::super::row::{toggle, Item, SectionSpec};
 
 /// The "Editor appearance" dropdown options (index 0 = overlay, 1 = windowed — matches
 /// `preview_windowed` as a bool). Moved here from `general.rs` with the row it serves
@@ -60,60 +60,61 @@ impl crate::app::App {
             // ("Preview Editor") and this group now supply for free.
             SectionSpec {
                 title: "General",
-                // DRAGON-427: Windows 10 has no overlay editor to choose, so there is no
-                // choice to offer. The row stays (searchable, and it says what you get)
-                // but goes INERT — a gated row, the same shape the missing-tesseract OCR
-                // toggle uses. Disabling it here is only half the job: `App::preview_windowed`
-                // is forced windowed in `effective_preview_windowed` too, so a config that
-                // already says `preview_windowed = false` lands on the window rather than on
-                // an overlay editor the software rasterizer cannot draw.
-                items: vec![
+                // Where there is no overlay editor there is no choice to offer: Windows 10
+                // (DRAGON-427) and a Linux session with no layer shell (`lab/flatpak`). The
+                // row used to stay visible but INERT (a gated row with a warning saying
+                // why); the owner's third live test overruled that: a setting that cannot
+                // change is noise, not a warning to read, so the row is HIDDEN outright
+                // (and with it its search entry, which could only lead somewhere inert).
+                // Hiding is display-only. Nothing here writes `preview_windowed`, so a
+                // normal session still sees the user's real choice, and the other half of
+                // the job stands unchanged: `App::preview_windowed` is forced windowed in
+                // `effective_preview_windowed`, so a config that already says
+                // `preview_windowed = false` lands on the window rather than on an overlay
+                // editor that cannot draw, or has no surface to draw on. The group keeps
+                // its header either way: the toolbar-labels row below is unconditional.
+                items: {
+                    let mut items = Vec::new();
                     if crate::platform::overlay_preview_available() {
-                        Item::new(
-                            "Editor appearance",
-                            "",
-                            crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                                &PREVIEW_APPEARANCES,
-                                Some(usize::from(self.preview_windowed)),
+                        items.push(
+                            Item::new(
+                                "Editor appearance",
+                                "",
+                                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
+                                    &PREVIEW_APPEARANCES,
+                                    Some(usize::from(self.preview_windowed)),
+                                    |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
+                                )),
+                            )
+                            .reset_with(
+                                usize::from(self.preview_windowed),
+                                usize::from(d.preview_windowed),
                                 |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                            )),
-                        )
-                        .reset_with(
-                            usize::from(self.preview_windowed),
-                            usize::from(d.preview_windowed),
-                            |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                        )
-                    } else {
-                        let mut it = gated_row(
-                            "Editor appearance",
-                            PREVIEW_APPEARANCES[1],
-                            Severity::Warn,
+                            ),
                         );
-                        it.desc = std::borrow::Cow::Borrowed(
-                            "Windows 10 only draws the editor as a window — the overlay editor \
-                             needs a translucent surface this version of Windows cannot give it.",
-                        );
-                        it
-                    },
+                    }
                     // DRAGON-478: the small captions under the top toolbar's groups ("Canvas",
                     // "Shape", "Redact", …). It belongs beside the appearance row because it is
                     // the same kind of choice — what the editor LOOKS like before what it does —
                     // and it is a layout switch as much as a cosmetic one: the caption band
                     // makes the top bar taller, which `PreviewSurface::chrome_h` reads. No
                     // description: the label says the whole of it.
-                    Item::new(
-                        "Show toolbar group labels",
-                        "",
-                        toggle(self.preview_toolbar_labels, |a0| {
-                            Msg::Settings(SettingsMsg::SetPreviewToolbarLabels(a0))
-                        }),
-                    )
-                    .reset_with(
-                        self.preview_toolbar_labels,
-                        d.preview_toolbar_labels,
-                        |a0| Msg::Settings(SettingsMsg::SetPreviewToolbarLabels(a0)),
-                    ),
-                ],
+                    items.push(
+                        Item::new(
+                            "Show toolbar group labels",
+                            "",
+                            toggle(self.preview_toolbar_labels, |a0| {
+                                Msg::Settings(SettingsMsg::SetPreviewToolbarLabels(a0))
+                            }),
+                        )
+                        .reset_with(
+                            self.preview_toolbar_labels,
+                            d.preview_toolbar_labels,
+                            |a0| Msg::Settings(SettingsMsg::SetPreviewToolbarLabels(a0)),
+                        ),
+                    );
+                    items
+                },
             },
             SectionSpec {
                 title: "Image Editor",
@@ -223,7 +224,7 @@ impl crate::app::App {
                 items: vec![
                     Item::new(
                         "Custom overlayed text",
-                        format!("Covermark SVG loaded from:\n{}", covermark_dir_display()),
+                        "Covermark SVG loaded from:",
                         crate::widgets::hide_when_clipped(
                             widget::text_input("CONFIGURE TEXT IN SETTINGS", &self.covermark_text)
                                 .on_input(|a0| Msg::Settings(SettingsMsg::SetCovermarkText(a0)))
@@ -234,7 +235,18 @@ impl crate::app::App {
                         self.covermark_text.clone(),
                         d.covermark_text.clone(),
                         |a0| Msg::Settings(SettingsMsg::SetCovermarkText(a0)),
-                    ),
+                    )
+                    // The folder gets the Health page's treatment: subtle tone, led by a copy
+                    // button, wrapping inside the pane. It was a bare line inside the
+                    // description, which could not be copied and read as ordinary prose.
+                    // Only the PATH is toned down — `path_desc` keeps the sentence above it in
+                    // the ordinary description tone, which the first cut got wrong.
+                    .desc_el({
+                        let dir = covermark_dir_display();
+                        let copied =
+                            super::super::row::path_line_copied(&dir, &self.settings.health_copied);
+                        super::super::row::path_desc("Covermark SVG loaded from:", dir, copied)
+                    }),
                 ],
             },
         ]
@@ -247,10 +259,9 @@ fn covermark_dir_display() -> String {
     let Some(dir) = crate::app::preview::covermark_dir() else {
         return "~/.config/cosmic-capture-kit/covermarks".into();
     };
-    if let Some(home) = dirs::home_dir()
-        && let Ok(rest) = dir.strip_prefix(&home)
-    {
-        return format!("~/{}", rest.display());
-    }
+    // The `~` abbreviation itself is `settings::row::path_line`'s job now, applied to every
+    // path the app shows rather than to this one row. The hand-rolled copy that used to live
+    // here was the only place that did it, which is exactly why the other paths leaked the
+    // account name into screenshots.
     dir.display().to_string()
 }

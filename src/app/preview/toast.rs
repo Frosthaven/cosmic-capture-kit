@@ -327,7 +327,7 @@ fn card(
         .max_width(360.0)
         .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
             let mut bg = crate::app::theme::frost_color(
-                theme.cosmic().background.component.base.into(),
+                theme.cosmic().background(false).component.base.into(),
                 glass,
             );
             // 85% opaque for EVERY toast/surface (DRAGON-357) — a flat readability floor,

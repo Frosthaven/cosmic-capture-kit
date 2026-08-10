@@ -202,6 +202,20 @@ fn bench_cores(stderr: &str) -> Option<f32> {
 /// deterministically stalls on a live `-itsoffset` ≥ ~200ms).
 fn fifo_input_args(path: &std::path::Path, channels: u8) -> Vec<String> {
     vec![
+        // `-probesize 32 -analyzeduration 0` (`lab/flatpak`): this input is a LIVE FIFO of
+        // raw PCM whose every parameter is already on the command line, so there is nothing
+        // for ffmpeg's stream analysis to learn by reading. ffmpeg 8 agrees and returns
+        // without data; ffmpeg 7.x does NOT: with the default probe budgets its
+        // find_stream_info blocks reading the mic FIFO for seconds of real audio BEFORE it
+        // will open the next input, while the pump cannot deliver any audio until its own
+        // sys-FIFO open completes, and the whole session deadlocks into the muxer watchdog
+        // (measured in the Flatpak, whose runtime ships ffmpeg 7.1: with these flags 7.1 is
+        // satisfied by ONE packet, without them 32 KiB was still not enough). The flags
+        // shrink the hunger; the pump's writer-side sys rendezvous (record::pump) delivers
+        // the packet. Applied to every FIFO input on every platform: the analysis is
+        // meaningless for fully-specified raw PCM everywhere.
+        "-probesize".into(), "32".into(),
+        "-analyzeduration".into(), "0".into(),
         "-thread_queue_size".into(), "1024".into(),
         "-f".into(), "f32le".into(),
         "-ar".into(), "48000".into(),
@@ -512,13 +526,19 @@ mod tests {
         let sys = fifo_input_args(std::path::Path::new("/tmp/sys.pcm"), 2);
         assert!(!mic.iter().any(|a| a == "-itsoffset"));
         assert!(!sys.iter().any(|a| a == "-itsoffset"));
+        // `-probesize 32 -analyzeduration 0` lead each FIFO input (`lab/flatpak`): without
+        // them ffmpeg 7.x blocks its stream analysis on real audio data before it will
+        // open the NEXT input, which deadlocks the start against the pump's own FIFO
+        // rendezvous. See `fifo_input_args` for the measurements.
         assert_eq!(
             mic,
-            ["-thread_queue_size", "1024", "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "/tmp/mic.pcm"]
+            ["-probesize", "32", "-analyzeduration", "0", "-thread_queue_size", "1024",
+             "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "/tmp/mic.pcm"]
         );
         assert_eq!(
             sys,
-            ["-thread_queue_size", "1024", "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "/tmp/sys.pcm"]
+            ["-probesize", "32", "-analyzeduration", "0", "-thread_queue_size", "1024",
+             "-f", "f32le", "-ar", "48000", "-ac", "2", "-i", "/tmp/sys.pcm"]
         );
     }
 

@@ -1,7 +1,8 @@
-//! Build script. macOS-only: compile the tiny MediaRemote proxy dylib the
-//! preview media-ducker loads under `/usr/bin/perl` (DRAGON-171). On every other
-//! target this is a no-op — the ducker's mac arm is `#[cfg(target_os = "macos")]`,
-//! and Linux/Windows builds stay byte-identical (no compiler invoked, no output).
+//! Build script, two per-platform jobs. macOS: compile the tiny MediaRemote
+//! proxy dylib the preview media-ducker loads under `/usr/bin/perl`
+//! (DRAGON-171); the ducker's mac arm is `#[cfg(target_os = "macos")]`.
+//! Windows: embed the app icon into the exe (DRAGON-233, cosmetic-only,
+//! warn-never-fail). Linux is a no-op: no compiler invoked, no output.
 //!
 //! The dylib (`src/platform/mac/services/duck_mac/mrduck.m`) is built into `OUT_DIR` and the
 //! ducker embeds it with `include_bytes!(concat!(env!("OUT_DIR"), ...))`, so the
@@ -13,13 +14,22 @@
 fn main() {
     #[cfg(target_os = "macos")]
     {
-        // DRAGON-199: the private SkyLight framework (the CGS window-server client API
-        // used for the active-Space / window-Space queries in src/platform/mac/spaces.rs)
-        // lives in /System/Library/PrivateFrameworks, which is NOT on the default linker
-        // framework search path. Add it so `#[link(name = "SkyLight")]` resolves — the
-        // same path every macOS window manager (yabai, AeroSpace) links SkyLight from.
-        println!("cargo:rustc-link-search=framework=/System/Library/PrivateFrameworks");
-        build_mrduck();
+        // A build script is compiled for the HOST, so `cfg(target_os)` above says where it
+        // is RUNNING, not what it is building for. Gate the macOS jobs on the real target
+        // as well (DRAGON-629): cross-compiling to `x86_64-pc-windows-msvc` from a Mac,
+        // CLAUDE.md's `cargo clippy --target ...` Windows cross-check, otherwise reaches
+        // `build_mrduck` and dies in clang with "-fobjc-arc is not supported on platforms
+        // using the legacy runtime", which reads like a source problem and is not one.
+        // Building FOR macOS is unchanged, so the normal path is byte-identical.
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            // DRAGON-199: the private SkyLight framework (the CGS window-server client API
+            // used for the active-Space / window-Space queries in src/platform/mac/spaces.rs)
+            // lives in /System/Library/PrivateFrameworks, which is NOT on the default linker
+            // framework search path. Add it so `#[link(name = "SkyLight")]` resolves, the
+            // same path every macOS window manager (yabai, AeroSpace) links SkyLight from.
+            println!("cargo:rustc-link-search=framework=/System/Library/PrivateFrameworks");
+            build_mrduck();
+        }
     }
     #[cfg(windows)]
     embed_windows_icon();

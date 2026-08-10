@@ -186,9 +186,12 @@ fn placement_in(
     let (sx, sy, sw, sh) = sel;
     let (ow, oh) = out_pt;
     // The selection is CAPTURE space; the box we are placing is POINTS. Cross once.
+    // On the letterbox fallback bridge (`lab/flatpak`) `to_point` carries the bar
+    // offsets, so the box follows the selection onto the displayed frame, and the
+    // viewport fed in as `out_pt` is the WINDOW's extent, so the bars themselves are
+    // legal toolbar room. Identical arithmetic everywhere else.
     let (lx, ly) = units.to_point((sx, sy));
-    let lw = units.len_to_point(sw as f32);
-    let lh = units.len_to_point(sh as f32);
+    let (lw, lh) = units.size_f_to_point((sw as f32, sh as f32));
     if lx + lw <= 0.0 || ly + lh <= 0.0 || lx >= ow || ly >= oh {
         return None;
     }

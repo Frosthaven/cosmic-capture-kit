@@ -1,16 +1,16 @@
 # Cosmic Capture Kit
 
-> [!NOTE]
-> Cosmic Capture Kit is currently in the alpha stages. You are free to test this
-> software as-is, and scroll below to find planned features and support.
+<!-- cck-disclosure-start -->
+![AI disclosure for Cosmic Capture Kit: share of completed tickets by label, over the project lifetime and the last 30 days, split into bugs caught, features, and tasks](docs/ticket-mix.png)
+<!-- cck-disclosure-end -->
 
-![The capture toolbar: scan, image and video modes with a countdown, then the region, window and monitor targets, captioned "Scan/capture/record a region, window, or monitor..."](site-src/assets/hero.png)
+---
 
 ![The preview editor's annotation tools, with numbered callouts on the toolbar's shape, redaction, highlight, text and draw groups, the save, copy and upload file actions, a spotlight dimming everything but one strip, freehand writing with an emoji, and the zoom control](site-src/assets/annotations.png)
 
-Cross-platform screen region, window, and monitor capture with support for
-translucent windows, image, video, voice, QR, barcodes, OCR text, and
-annotation.
+Quickly capture your screen/audio to the clipboard for sharing with others.
+Supports QR/barcode/OCR scanning, a screen color picker, cloud upload with
+automatic sharing links, and post-capture annotations.
 
 ## 📊 Current Support Status
 
@@ -91,6 +91,7 @@ along with their statuses.
 | Preview editor (windowed)       | ✅     |
 | Preview editor (overlay)        | ✅     |
 | System tray daemon              | ✅     |
+| Color picker tool               | ✅     |
 
 </details>
 
@@ -290,110 +291,25 @@ already compiled in. A build from source does not have them, and needs one
 one-time step per provider.
 
 To get an entry in the application menu, install the shipped desktop file as
-described under [Install from source](#install-from-source).
-
-#### Build dependencies
-
-The binary links libxkbcommon, libpulse and libpipewire, so their development
-packages have to be installed before the first build. A desktop system has the
-runtime libraries already but usually not the dev packages.
-
-```sh
-# Arch / CachyOS
-sudo pacman -S base-devel clang libxkbcommon libpulse libpipewire
-
-# Debian / Ubuntu / Linux Mint / Pop!_OS
-sudo apt install build-essential pkg-config libclang-dev \
-                 libxkbcommon-dev libpulse-dev libpipewire-0.3-dev
-```
-
-See [dependencies.md](dependencies.md) for what each one is for, plus the
-runtime extras (ffmpeg for recording, tesseract for OCR).
+described in [DEVELOPERS.md](DEVELOPERS.md).
 
 #### Build from source
+
+Building works on any distro and any architecture, and it is the route on
+architectures the releases do not cover. With Rust and
+[`just`](https://github.com/casey/just) installed:
 
 ```sh
 git clone https://github.com/Frosthaven/cosmic-capture-kit
 cd cosmic-capture-kit
-cargo build --release
+just build
 ```
 
-**On Debian, Ubuntu, Mint and Pop!_OS, add `--no-default-features` to every
-cargo command**, including `test`, `run` and `install`:
+It prints the path to the binary it made as its last line.
 
-```sh
-cargo build --release --no-default-features
-```
-
-Those distros ship an older ffmpeg (Ubuntu 24.04, and so Mint 22, has 6.1.1),
-while the default `zero-copy` feature needs ffmpeg 8 headers, so the build
-otherwise stops inside `ffmpeg-sys-next`. The only thing dropped is the
-in-process GPU zero-copy encoding path. Recording still works through the
-`ffmpeg` binary.
-
-With [`just`](https://github.com/casey/just) installed, `just build`
-does the same build (and, on Linux, automatically retries with
-`--no-default-features` if the first attempt fails). The same command also
-works on macOS and Windows, each building that platform's own local
-packaged artifact.
-
-#### Run it
-
-The build puts the binary at `target/release/cosmic-capture-kit`, inside the
-folder you cloned into. There is no app window to open and nothing is added to
-your application menu by building: Cosmic Capture Kit is a one-shot tool. It
-launches straight into a capture, does the job, and exits.
-
-```sh
-./target/release/cosmic-capture-kit             # region screenshot (a bare launch)
-./target/release/cosmic-capture-kit --settings  # the settings window, no capture
-./target/release/cosmic-capture-kit --help      # every flag
-```
-
-Start with `--settings` to look around and set your save folders. A bare launch
-immediately dims the screen for a region selection, which is surprising the
-first time if you were expecting a normal application window.
-
-See [CLI.md](CLI.md) for the full flag list.
-
-Want to upload captures straight to Google Drive, OneDrive, Dropbox, YouTube or
-Proton Drive? A build made from source needs one extra, one-time setup step per
-provider, and Proton Drive needs one on every build (it connects through
-Proton's own free command-line tool rather than through an app registration).
-See [CLOUD_ACCOUNTS.md](CLOUD_ACCOUNTS.md) for plain, step-by-step
-instructions.
-
-#### Install from source
-
-Install the built binary onto your `PATH` (`~/.cargo/bin`) so shortcuts and the
-terminal can launch it by name instead of a full path:
-
-```sh
-cargo install --path .
-```
-
-On Debian, Ubuntu, Mint and Pop!_OS this needs the same flag as the build:
-`cargo install --path . --no-default-features`.
-
-Once installed, the commands above become `cosmic-capture-kit`,
-`cosmic-capture-kit --settings`, and so on, from any directory. That is also the
-form the keyboard shortcuts below expect. If your shell cannot find it, make
-sure `~/.cargo/bin` is on your `PATH`.
-
-To get an entry in the application menu, install the shipped desktop file and
-its icon. Do this after `cargo install`, because the entry launches the binary
-by name and so needs it on your `PATH`:
-
-```sh
-install -Dm644 res/dev.frosthaven.CosmicCaptureKit.desktop \
-  ~/.local/share/applications/dev.frosthaven.CosmicCaptureKit.desktop
-install -Dm644 res/icons/dev.frosthaven.CosmicCaptureKit.svg \
-  ~/.local/share/icons/hicolor/scalable/apps/dev.frosthaven.CosmicCaptureKit.svg
-```
-
-Launching from the menu is a bare launch, so it starts a region screenshot.
-Installing the entry is worth doing anyway: it is what makes the desktop and
-xdg-desktop-portal show the app's real name instead of a generic fallback.
+[DEVELOPERS.md](DEVELOPERS.md) is the full guide: the packages to install first,
+the `--no-default-features` rule for distros whose ffmpeg is older than 8, how to
+put the binary on your `PATH`, and what each `just` recipe does.
 
 #### Shortcuts
 
@@ -444,6 +360,10 @@ toolbar for a mode you use constantly:
 | `cosmic-capture-kit --monitor`        | The overlay, monitor selected                    | `Alt+Shift+3`  |
 | `cosmic-capture-kit --active-window`  | Captures the active window at once, no overlay   | `Alt+Shift+4`  |
 | `cosmic-capture-kit --active-monitor` | Captures the monitor under the cursor, no overlay | `Alt+Shift+5` |
+| `cosmic-capture-kit --color-picker`   | Picks a color off the screen (magnifier overlay)  | `Alt+Shift+C` |
+
+The two `--active-*` commands are not available when the app runs as a Flatpak: a
+sandboxed app cannot ask the compositor which window or monitor is active.
 
 Add `--no-editor` to any of these for a variant that skips the preview editor:
 the capture is saved, copied to the clipboard and notified, with no editor to
@@ -457,8 +377,31 @@ keypress:
 | `cosmic-capture-kit --active-window --no-editor`  | `Alt+Shift+7`  |
 | `cosmic-capture-kit --active-monitor --no-editor` | `Alt+Shift+8`  |
 
-See [CLI.md](CLI.md) for every flag, including `--video`, `--scan` and
-`--countdown`.
+**Controlling a recording that is already running.** These are shortcuts too,
+bound the same way, but they do not launch anything: each one reaches the
+recording in progress and acts on it.
+
+| Command                                    | What it does                            | Suggested keys |
+| ------------------------------------------ | --------------------------------------- | -------------- |
+| `cosmic-capture-kit --pause-recording`     | Pauses the recording, or resumes it      | `Alt+Shift+P`  |
+| `cosmic-capture-kit --finish-recording`    | Finishes the recording and saves it      | `Alt+Shift+Enter` |
+| `cosmic-capture-kit --cancel-recording`    | Cancels the recording and deletes it     | `Alt+Shift+Backspace` |
+| `cosmic-capture-kit --toggle-mic`          | Toggles the microphone                   | `Alt+Shift+M`  |
+| `cosmic-capture-kit --toggle-system-audio` | Toggles system audio                     | `Alt+Shift+S`  |
+
+They have to be desktop shortcuts rather than shortcuts inside the app. Once a
+recording starts, the app hands the keyboard back to the window you are
+recording, so that you can keep typing into it, and COSMIC's desktop portal has
+no way to give an app a shortcut that works without focus. A shortcut in your own
+keyboard settings has neither problem. The app's Settings → Keyboard Shortcuts
+page shows these five commands for the same reason, instead of key bindings it
+could not honour.
+
+With no recording in progress, the command prints `no recording is in progress`
+and does nothing.
+
+See [CLI.md](CLI.md) for every flag, including `--video`, `--audio`, `--scan`
+and `--countdown`.
 
 #### Dependencies
 
@@ -475,13 +418,15 @@ See [CLI.md](CLI.md) for every flag, including `--video`, `--scan` and
 
 Cosmic Capture Kit makes an effort to play nicely with popular tiling window
 managers. The overlay tools will bypass tiling, while the preview editor, the
-settings window, and (macOS only) the permission checker window will not by
-default. You can change this behavior using the information below.
+settings window, the color picker's result window, and (macOS only) the
+permission checker window will not by default. You can change this behavior
+using the information below.
 
 * Settings window: title `Cosmic Capture Kit - Settings`
 * Preview editor window: title `Cosmic Capture Kit - Preview Editor`
+* Color picker window: title `Cosmic Capture Kit - Color Picker`
 * Permission checker window (macOS only): title `Cosmic Capture Kit - Permissions`
-* All three share application id `dev.frosthaven.CosmicCaptureKit`
+* All four share application id `dev.thedragon.CosmicCaptureKit`
 
 Each snippet below is an addition to your existing config, not a replacement
 for it.
@@ -505,6 +450,10 @@ if.window-title-regex-substring = 'Cosmic Capture Kit - Preview Editor'
 run = ['layout floating']
 
 [[on-window-detected]]
+if.window-title-regex-substring = 'Cosmic Capture Kit - Color Picker'
+run = ['layout floating']
+
+[[on-window-detected]]
 if.window-title-regex-substring = 'Cosmic Capture Kit - Permissions'
 run = ['layout floating']
 ```
@@ -524,6 +473,7 @@ insensitive substring.
 ```sh
 yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Settings$" manage=off
 yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Preview Editor$" manage=off
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Color Picker$" manage=off
 yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Permissions$" manage=off
 ```
 
@@ -549,10 +499,11 @@ window_rules:
     match:
       - window_title: { equals: "Cosmic Capture Kit - Settings" }
       - window_title: { equals: "Cosmic Capture Kit - Preview Editor" }
+      - window_title: { equals: "Cosmic Capture Kit - Color Picker" }
 ```
 
 This is the v3 config format. Reload with `wm-reload-config` (`alt+shift+r` by
-default). Each `- ` entry under `match` is an alternative, so the two titles are
+default). Each `- ` entry under `match` is an alternative, so the three titles are
 an either/or.
 
 </details>
@@ -570,7 +521,8 @@ Merge this key into your existing `komorebi.json`; it is not the whole file:
 {
   "floating_applications": [
     { "kind": "Title", "id": "Cosmic Capture Kit - Settings", "matching_strategy": "Equals" },
-    { "kind": "Title", "id": "Cosmic Capture Kit - Preview Editor", "matching_strategy": "Equals" }
+    { "kind": "Title", "id": "Cosmic Capture Kit - Preview Editor", "matching_strategy": "Equals" },
+    { "kind": "Title", "id": "Cosmic Capture Kit - Color Picker", "matching_strategy": "Equals" }
   ]
 }
 ```
@@ -592,8 +544,9 @@ Apply it with `komorebic replace-configuration <path>`. Note that
 
 ```
 [
-  (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit - Settings"),
-  (enabled: true, appid: "dev.frosthaven.CosmicCaptureKit", title: "Cosmic Capture Kit - Preview Editor"),
+  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "Cosmic Capture Kit - Settings"),
+  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "Cosmic Capture Kit - Preview Editor"),
+  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "Cosmic Capture Kit - Color Picker"),
 ]
 ```
 
@@ -621,6 +574,11 @@ hl.window_rule({
   match = { title = "Cosmic Capture Kit - Preview Editor" },
   float = true,
 })
+
+hl.window_rule({
+  match = { title = "Cosmic Capture Kit - Color Picker" },
+  float = true,
+})
 ```
 
 **0.52 and older**, `~/.config/hypr/hyprland.conf`:
@@ -628,13 +586,14 @@ hl.window_rule({
 ```
 windowrule = float, title:Cosmic Capture Kit - Settings
 windowrule = float, title:Cosmic Capture Kit - Preview Editor
+windowrule = float, title:Cosmic Capture Kit - Color Picker
 ```
 
 0.53 and 0.54 use an intermediate form; the 0.54 wiki has it. Matching is RE2
 whole-string, so these patterns are already exact and a substring match would
 need explicit `.*` at both ends. One caveat worth knowing: `float` is applied
 when the window opens and reads its INITIAL title, so if a rule ever stops
-firing, match `class:dev\.frosthaven\.CosmicCaptureKit` instead.
+firing, match `class:dev\.thedragon\.CosmicCaptureKit` instead.
 
 </details>
 
@@ -649,6 +608,7 @@ firing, match `class:dev\.frosthaven\.CosmicCaptureKit` instead.
 window-rule {
     match title=r#"^Cosmic Capture Kit - Settings$"#
     match title=r#"^Cosmic Capture Kit - Preview Editor$"#
+    match title=r#"^Cosmic Capture Kit - Color Picker$"#
     open-floating true
 }
 ```
@@ -673,6 +633,7 @@ which must be executable:
 ```sh
 riverctl rule-add -title 'Cosmic Capture Kit - Settings' float
 riverctl rule-add -title 'Cosmic Capture Kit - Preview Editor' float
+riverctl rule-add -title 'Cosmic Capture Kit - Color Picker' float
 ```
 
 Matching here is glob, not regex, so there is no alternation and each title needs
@@ -691,6 +652,7 @@ its own rule. The rules apply to windows opened after they are added, and
 ```
 for_window [title="^Cosmic Capture Kit - Settings$"] floating enable
 for_window [title="^Cosmic Capture Kit - Preview Editor$"] floating enable
+for_window [title="^Cosmic Capture Kit - Color Picker$"] floating enable
 ```
 
 Criteria are PCRE2 and unanchored, so the `^` and `$` are doing real work.
@@ -713,12 +675,18 @@ float action at all:
 
 ```ini
 [simple-tile]
-tile_by_default = !((title is "Cosmic Capture Kit - Settings") | (title is "Cosmic Capture Kit - Preview Editor"))
+tile_by_default = !((title is "Cosmic Capture Kit - Settings") | ((title is "Cosmic Capture Kit - Preview Editor") | (title is "Cosmic Capture Kit - Color Picker")))
 ```
 
 Criteria here are not regex: `is` is exact and `contains` is a substring.
 Combining more than two needs explicit parentheses, since the operators have no
 precedence order.
+
+Unlike the compositors above, Wayfire cannot express these as one rule per
+title: `tile_by_default` is a single option (a second line would silently
+replace the first, floating only one window), and the `window-rules` plugin,
+which does support one rule per line, has no floating action at all. The
+combined expression is the required form.
 
 </details>
 

@@ -181,6 +181,49 @@ const _: () = assert!(
      enough to be saved, and its real audio is discarded as `late_chunks`"
 );
 
+/// How many bytes ffmpeg 7.x reads from EACH f32le FIFO input before it will finish
+/// opening that input and move on to the next (DRAGON-554, measured against the Flatpak
+/// runtime's ffmpeg 7.1.3): EXACTLY 16384. 16320 bytes leave it blocked; 16384 open it.
+/// It is a BYTE threshold, the same for the mono mic and the stereo system FIFO, and it
+/// is avio-level buffering, not stream analysis: `-probesize 32`, `-analyzeduration 0`
+/// and `-avioflags direct` do not lower it. ffmpeg 8 opens with zero bytes.
+///
+/// Why it matters: ffmpeg opens its inputs strictly in order, and while one hangs in
+/// open it reads NOTHING from the video stdin either, so the worker's frame loop parks
+/// in a blocking write. Without the opening prime (see [`OPENING_PRIME_FRAMES`]), the
+/// first FIFO byte only exists once the render horizon reaches media 0 — at wall
+/// [`RENDER_LAG_SECS`] — so every ffmpeg-7.x recording opened with ~1.1s of frozen
+/// video ending in a content jump (the DRAGON-554 evidence file, measured
+/// frame-by-frame: bit-identical frames from media 0.5s to 1.6s, then a jump).
+pub(super) const FFMPEG7_INPUT_OPEN_BYTES: usize = 16384;
+
+/// The opening prime (DRAGON-554): how much of the session's OPENING the control thread
+/// renders IMMEDIATELY after the startup catch-up drain, instead of letting the render
+/// horizon deliver the first byte at wall [`RENDER_LAG_SECS`]. Sized so the MONO mic
+/// track (4 bytes per frame, the smaller stream) emits at least
+/// [`FFMPEG7_INPUT_OPEN_BYTES`] (the stereo system track emits twice that), with a few
+/// frames of slack so `f64` rounding can never come up one byte short of the threshold.
+///
+/// Honesty of the early render: the catch-up drain has ALREADY placed everything the
+/// sources captured during the video-side startup (its whole job, DRAGON-417), so this
+/// emits the same bytes the horizon would have emitted at wall 1.5s — real captured
+/// audio plus each source's own lead-in silence — just early enough for ffmpeg's
+/// input-open to eat them. What it gives up is the horizon's late-arrival protection
+/// for the primed span ONLY: audio whose placement lands inside media [0, ~85ms) but
+/// arrives after this render (a negative sync offset, or a large latched device latency
+/// shifting a chunk earlier) is clipped and counted/logged like any late arrival.
+/// Bounded by this constant, and the trade is deliberate: without it, EVERY ffmpeg-7.x
+/// session (the Flatpak runtime) opens with ~[`RENDER_LAG_SECS`] of frozen video.
+pub(super) const OPENING_PRIME_FRAMES: u64 = (FFMPEG7_INPUT_OPEN_BYTES as u64 / 4) + 8;
+
+const _: () = assert!(
+    (OPENING_PRIME_FRAMES as f64) / (crate::mixer::SAMPLE_RATE as f64) < RENDER_LAG_SECS / 4.0,
+    "the opening prime must stay far under the render horizon (DRAGON-554): every primed \
+     sample gives up the horizon's late-arrival protection at the session's head, and a \
+     prime approaching RENDER_LAG_SECS would simply BE a shorter horizon, which is the \
+     DRAGON-411 regression by another name"
+);
+
 /// MID-STREAM padded silence (seconds, either track) past which
 /// [`MediaClockPump::finish`]'s summary is raised from `info` to `warn`. Lead-in is
 /// excluded at the source (`MixerStats::leading_gap_samples`), so this counts only
@@ -386,23 +429,33 @@ fn open_fifo_write_end(
     budget: Duration,
     stop: &AtomicBool,
 ) -> Option<std::fs::File> {
-    use rustix::fs::{fcntl_getfl, fcntl_setfl, Mode, OFlags};
     let deadline = Instant::now() + budget;
-    let fd = loop {
-        match rustix::fs::open(
-            fifo,
-            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => break fd,
-            Err(_) => {
-                if Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+    loop {
+        if let Some(f) = try_open_fifo_write_end(fifo) {
+            return Some(f);
         }
-    };
+        if Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// ONE non-blocking attempt at a FIFO's write end: `None` while no reader has it
+/// open (ENXIO), the ready-to-write `File` (blocking mode, `O_CLOEXEC`) once one
+/// does. The single step [`open_fifo_write_end`] loops over, split out so the
+/// writer thread's PENDING sys rendezvous (`SysSink::Pending`, the `lab/flatpak`
+/// ffmpeg 7.x deadlock fix) can retry once per render step instead of parking a
+/// whole thread in the bounded sleep loop.
+#[cfg(unix)]
+fn try_open_fifo_write_end(fifo: &std::path::Path) -> Option<std::fs::File> {
+    use rustix::fs::{fcntl_getfl, fcntl_setfl, Mode, OFlags};
+    let fd = rustix::fs::open(
+        fifo,
+        OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
     if let Ok(flags) = fcntl_getfl(&fd) {
         let _ = fcntl_setfl(&fd, flags & !OFlags::NONBLOCK);
     }
@@ -513,21 +566,318 @@ struct PcmStep {
     sys: Vec<f32>,
 }
 
+/// The writer's SYSTEM-track sink: already-open (Windows, whose named-pipe connects
+/// both channels on the control thread exactly as before), or still pending its FIFO
+/// rendezvous (POSIX, `lab/flatpak`).
+///
+/// WHY the POSIX sys rendezvous moved onto the writer: ffmpeg opens its inputs
+/// strictly in order, and ffmpeg 7.x will not OPEN the sys FIFO until the MIC
+/// input's stream analysis has read real audio data (ffmpeg 8 returns without any;
+/// see `encode::command::fifo_input_args` for the measurements). The old shape,
+/// where the control thread blocked opening the sys write end BEFORE any render
+/// could run, therefore deadlocked on 7.x: no mic data until the sys open, no sys
+/// open until mic data. Holding the sys sink PENDING lets renders start and mic
+/// audio flow immediately after the mic rendezvous; ffmpeg eats the packet its
+/// probe wants, opens the sys FIFO, and the writer's bounded retry completes.
+enum SysSink {
+    // POSIX release builds never CONSTRUCT this variant (their sys sink starts
+    // Pending and the writer transitions to a plain boxed writer, not back into
+    // the enum); Windows' spawn arm and the writer unit test do. Honestly dead
+    // there, kept because it IS the type's meaning on the other platform.
+    #[cfg_attr(unix, allow(dead_code))]
+    Open(Box<dyn Write + Send>),
+    #[cfg(unix)]
+    Pending {
+        path: std::path::PathBuf,
+        /// The same [`FIFO_OPEN_BUDGET`] bound the old blocking open carried,
+        /// stamped when the writer was handed the pending sink.
+        deadline: Instant,
+        /// System samples rendered while the open is pending, flushed in order the
+        /// moment it completes. Bounded by construction: renders arrive in real
+        /// time, so this holds at most `FIFO_OPEN_BUDGET` seconds of stereo f32
+        /// (about 6 MB) before the deadline ends the session.
+        buffered: Vec<f32>,
+    },
+}
+
+/// The writer's MIC sink: the write end, plus (POSIX) the raw fd behind it.
+///
+/// The fd exists for ONE reason (DRAGON-629): while the sys sink is still
+/// [`SysSink::Pending`], [`writer_loop`] drives this write end NON-BLOCKING, because on
+/// that path a blocking mic write can deadlock the whole session. See
+/// [`MicNonblocking`]. `fd` is `None` for the unit tests' in-memory fakes, which model a
+/// full pipe themselves by returning [`std::io::ErrorKind::WouldBlock`].
+pub(super) struct MicSink {
+    w: Box<dyn Write + Send>,
+    #[cfg(unix)]
+    fd: Option<std::os::fd::RawFd>,
+}
+
+impl MicSink {
+    /// The real FIFO write end (POSIX): its fd is kept so the pending phase can drive it
+    /// non-blocking.
+    #[cfg(unix)]
+    fn real(w: std::fs::File) -> Self {
+        use std::os::fd::AsRawFd;
+        let fd = w.as_raw_fd();
+        Self { w: Box::new(w), fd: Some(fd) }
+    }
+
+    /// The real named-pipe write end (Windows). No fd and no pending phase: that arm
+    /// connects BOTH pipes on the control thread before the writer starts, so the
+    /// DRAGON-629 ring cannot form there (see [`writer_loop`]).
+    #[cfg(windows)]
+    fn real<W: Write + Send + 'static>(w: W) -> Self {
+        Self { w: Box::new(w) }
+    }
+
+    /// A test fake (or any sink with no fd of its own).
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn boxed(w: Box<dyn Write + Send>) -> Self {
+        #[cfg(unix)]
+        {
+            Self { w, fd: None }
+        }
+        #[cfg(not(unix))]
+        Self { w }
+    }
+}
+
+/// Scoped `O_NONBLOCK` on the mic write end, restored on drop. The same shape as
+/// `record::owned`'s `NonblockingStdin`, for the same reason: a write that cannot park
+/// is the only kind this thread may perform while it still owes somebody else progress.
+///
+/// A `None` fd (a unit-test fake) makes this a no-op guard; the fake supplies the
+/// would-block behaviour directly.
+#[cfg(unix)]
+struct MicNonblocking {
+    raw: Option<std::os::fd::RawFd>,
+    restore: Option<rustix::fs::OFlags>,
+}
+
+#[cfg(unix)]
+impl MicNonblocking {
+    fn new(fd: Option<std::os::fd::RawFd>) -> Self {
+        use rustix::fs::{fcntl_getfl, fcntl_setfl, OFlags};
+        let Some(raw) = fd else {
+            return Self { raw: None, restore: None };
+        };
+        // SAFETY: the fd is owned by the writer's mic sink, which outlives this guard
+        // (the guard is scoped strictly inside the pending phase).
+        let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+        let restore = fcntl_getfl(borrowed).ok();
+        if let Some(flags) = restore {
+            let _ = fcntl_setfl(borrowed, flags | OFlags::NONBLOCK);
+        }
+        Self { raw: Some(raw), restore }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MicNonblocking {
+    fn drop(&mut self) {
+        if let (Some(raw), Some(flags)) = (self.raw, self.restore) {
+            // SAFETY: same validity reasoning as `new`: the owning `MicSink` outlives
+            // this guard.
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+            let _ = rustix::fs::fcntl_setfl(borrowed, flags);
+        }
+    }
+}
+
+/// Push as much of `backlog` into `w` as it will take RIGHT NOW, dropping what was
+/// accepted off the front. Never parks: the caller has set `O_NONBLOCK`, so a full pipe
+/// reports [`std::io::ErrorKind::WouldBlock`] (or a zero-length write) and the remainder
+/// stays queued, in order. `false` only on a REAL write error (ffmpeg gone).
+#[cfg(unix)]
+fn push_nonblocking(w: &mut dyn Write, backlog: &mut Vec<u8>) -> bool {
+    while !backlog.is_empty() {
+        match w.write(backlog) {
+            Ok(0) => return true, // the pipe is full right now; keep the rest queued
+            Ok(n) => {
+                backlog.drain(..n);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Interleaved `samples` → little-endian bytes appended to `out`. The byte-level form of
+/// [`write_pcm`], for the pending phase's backlog (a partial write can land mid-sample,
+/// so the queue has to be bytes, not floats).
+#[cfg(unix)]
+fn append_pcm(out: &mut Vec<u8>, samples: &[f32]) {
+    out.reserve(samples.len() * 4);
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+}
+
 /// The writer half of the pump (see the module doc's threading section): owns both
-/// FIFO write ends and performs EVERY blocking write, so the control thread can
+/// audio sinks and performs EVERY blocking write, so the control thread can
 /// never be stalled by ffmpeg's draining pace. On a failed write (ffmpeg gone) it
 /// warns, trips the shared `stop` (a dead muxer ends the session regardless of what
 /// the app-level flag says), and keeps DRAINING the channel — dropping the data —
 /// so the control thread's sends stay cheap until it notices and finishes. Exit —
 /// the channel hanging up after [`MediaClockPump::finish`]'s final render — is what
 /// closes the FIFOs and delivers ffmpeg's audio EOF.
+///
+/// A [`SysSink::Pending`] sys sink resolves in a dedicated rendezvous phase FIRST:
+/// retry the non-blocking open on the same 20ms cadence the blocking helper used,
+/// draining any steps that arrive meanwhile (mic writes keep flowing, which is what
+/// un-hungers ffmpeg 7.x's mic probe; sys samples buffer in order and flush the
+/// moment the open lands). The retry cadence must NOT wait on steps: the first step
+/// only arrives with the first render, and an ffmpeg that is ALREADY at its sys
+/// open (ffmpeg 8, which probes without data) would sit blocked there for that
+/// whole first-render latency, not consuming video stdin, and the session's opening
+/// frames would land as late duplicates (caught by the E2E flash content checks).
+/// The phase is bounded by its deadline and by `stop`, and a spent budget reports
+/// through the same [`rendezvous_failure`] wording the old control-thread open used.
+///
+/// ## The mic write in that phase MUST NOT be able to park (DRAGON-629)
+///
+/// It used to be a plain blocking `write_all`, and that closed a deadlock ring with
+/// ffmpeg. ffmpeg opens its inputs strictly IN ORDER and reads NOTHING while an open is
+/// outstanding, so once it has the mic FIFO open and is sitting in `open()` on the sys
+/// FIFO it is not draining mic either. Our writer then fills the mic pipe (64KB, ~341ms
+/// of mono f32 at 48kHz), parks in `write_all`, and never returns to the sys-open retry
+/// that ffmpeg is waiting on. Neither side can move: ffmpeg waits for a sys writer, we
+/// wait for a mic reader. Nothing timed out at the right layer either, because both
+/// budgets that could have caught it are LONGER than the muxer watchdog, so what the
+/// user got was the recording failing outright with "ffmpeg accepted frames but never
+/// wrote output" 12s in. Observed live with `sample`: ffmpeg in `avpriv_open`→`open()`
+/// with only the mic fd open, `cck-pump-writer` in `write_pcm`.
+///
+/// So for the duration of the phase the mic end is `O_NONBLOCK` ([`MicNonblocking`]) and
+/// anything the pipe will not take right now queues in `mic_backlog`, in order, exactly
+/// as `buffered` already does for the sys side. Nothing is dropped and nothing is
+/// reordered, so the mic stream's sample count IS still media time; the bytes are only
+/// deferred, and the phase's own [`FIFO_OPEN_BUDGET`] deadline bounds how far (15s of
+/// mono f32 is ~2.9MB, the same order as the sys buffer this phase already tolerates).
+/// The moment the open lands the guard drops, blocking mode returns, and the backlog is
+/// flushed AHEAD of anything later.
+///
+/// The alternative considered and rejected: moving the sys-open retry to the control
+/// thread (it is non-blocking, so it would not violate that thread's no-blocking-I/O
+/// rule) and leaving the mic write blocking. That does break the ring, but it puts a
+/// rendezvous back on the most timing-sensitive loop in the recorder and needs a new
+/// hand-off for the resolved sink, to fix a hazard that lives entirely inside this one
+/// phase. Keeping it here, and making the one write that must not park unable to, is the
+/// smaller and more local guarantee.
+// Windows compiles `SysSink` with only its `Open` variant, making the match below
+// single-armed there; the allow keeps that honest single arm instead of a cfg'd
+// second match shape.
+#[cfg_attr(windows, allow(clippy::infallible_destructuring_match))]
 fn writer_loop(
     rx: Receiver<PcmStep>,
-    mut mic_fifo: Box<dyn Write + Send>,
-    mut sys_fifo: Box<dyn Write + Send>,
+    mic_sink: MicSink,
+    sys: SysSink,
     stop: &AtomicBool,
 ) {
+    // Taken BEFORE the sink is destructured; the fd stays valid because `mic_fifo` (the
+    // same open file) lives for the whole loop.
+    #[cfg(unix)]
+    let mic_raw = mic_sink.fd;
+    let MicSink { w: mut mic_fifo, .. } = mic_sink;
     let mut failed = false;
+    let mut sys_fifo: Box<dyn Write + Send> = match sys {
+        SysSink::Open(w) => w,
+        #[cfg(unix)]
+        SysSink::Pending { path, deadline, mut buffered } => {
+            // Whatever the mic pipe will not take right now, in order. See the fn doc:
+            // this is what makes the phase's mic write unable to park, and with it the
+            // DRAGON-629 deadlock ring impossible to close.
+            let mut mic_backlog: Vec<u8> = Vec::new();
+            let opened = {
+                let _nb = MicNonblocking::new(mic_raw);
+                loop {
+                    // Try FIRST, bail-check second: a reader that shows up right at the
+                    // deadline still rendezvouses instead of being refused on a tie.
+                    if let Some(f) = try_open_fifo_write_end(&path) {
+                        break Some(f);
+                    }
+                    if failed || Instant::now() >= deadline || stop.load(Ordering::Relaxed) {
+                        break None;
+                    }
+                    // The 20ms wait doubles as the retry cadence; a step arriving inside
+                    // it is drained immediately so mic audio never queues behind the
+                    // rendezvous.
+                    match rx.recv_timeout(Duration::from_millis(20)) {
+                        Ok(step) => {
+                            append_pcm(&mut mic_backlog, &step.mic);
+                            buffered.extend_from_slice(&step.sys);
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+                    }
+                    // Feed ffmpeg's mic probe whatever the pipe has room for, and NEVER
+                    // wait on it: a full pipe here means ffmpeg is busy in its sys open,
+                    // which is the very thing the next iteration retries.
+                    if !push_nonblocking(&mut *mic_fifo, &mut mic_backlog) {
+                        failed = true;
+                        log::warn!(
+                            "media-clock pump: FIFO write failed (ffmpeg gone); \
+                             stopping the session"
+                        );
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                }
+            };
+            // Blocking mode is back (the guard dropped with the scope above), so the
+            // deferred mic bytes go out FIRST, ahead of anything the main loop writes.
+            if opened.is_some() && !failed && !mic_backlog.is_empty() {
+                if mic_fifo.write_all(&mic_backlog).is_err() {
+                    failed = true;
+                    log::warn!(
+                        "media-clock pump: FIFO write failed (ffmpeg gone); \
+                         stopping the session"
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                } else {
+                    log::debug!(
+                        "media-clock pump: flushed {} deferred mic bytes after the system \
+                         FIFO rendezvous (DRAGON-629)",
+                        mic_backlog.len()
+                    );
+                }
+            }
+            match opened {
+                Some(mut f) => {
+                    // Flush everything rendered while the open was pending, in
+                    // order, so the stream's sample count stays the media time.
+                    if !failed && !write_pcm(&mut f, &buffered) {
+                        failed = true;
+                        log::warn!(
+                            "media-clock pump: FIFO write failed (ffmpeg gone); \
+                             stopping the session"
+                        );
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    Box::new(f)
+                }
+                None => {
+                    if !failed {
+                        // Read `stop` BEFORE tripping it, so the report says
+                        // "stopped" only when the session really was being torn
+                        // down (DRAGON-422).
+                        log::warn!(
+                            "{}",
+                            rendezvous_failure("system", stop.load(Ordering::Relaxed))
+                        );
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    // Same shape as a failed write: drain the channel (dropping the
+                    // data) until it hangs up, then exit; the mic FIFO drops here
+                    // and delivers its EOF.
+                    while rx.recv().is_ok() {}
+                    return;
+                }
+            }
+        }
+    };
     while let Ok(step) = rx.recv() {
         if failed {
             continue;
@@ -538,7 +888,7 @@ fn writer_loop(
             stop.store(true, Ordering::Relaxed);
         }
     }
-    // FIFOs drop here: EOF for ffmpeg's audio inputs.
+    // Sinks drop here: EOF for ffmpeg's audio inputs.
 }
 
 /// The mixer-integration engine (the CONTROL half — see the module doc's threading
@@ -936,6 +1286,19 @@ fn run(
         }
         std::thread::sleep(Duration::from_millis(2));
     }
+    // DRAGON-554: render the opening slice NOW, not at wall RENDER_LAG_SECS. ffmpeg
+    // 7.x will not finish OPENING an audio input until it has read
+    // FFMPEG7_INPUT_OPEN_BYTES from it, and while an input hangs in open ffmpeg reads
+    // no video from stdin either — the worker's frame loop parks in a blocking write
+    // and the session opens on ~RENDER_LAG_SECS of frozen frames (the DRAGON-554
+    // evidence file). The catch-up drain above already placed everything captured so
+    // far, so this emits the same opening bytes the horizon would have emitted at
+    // wall 1.5s. See OPENING_PRIME_FRAMES' doc for the bounded late-arrival trade.
+    pump.render_to(OPENING_PRIME_FRAMES as f64 / crate::mixer::SAMPLE_RATE as f64);
+    log::debug!(
+        "media-clock pump: opening prime rendered ({OPENING_PRIME_FRAMES} frames per track) \
+         so the muxer's input-open never waits on the render horizon (DRAGON-554)"
+    );
     loop {
         let now = Instant::now();
         drain_external(&mut pump, now);
@@ -1041,14 +1404,17 @@ impl<'scope> PumpHandle<'scope> {
 /// (kept alive across the pre-flight "did the owned path come up" check — see
 /// `record::pipewire`'s runtime fork).
 ///
-/// Returns IMMEDIATELY (the ticker in hand): the FIFO write-end rendezvous happens
+/// Returns IMMEDIATELY (the ticker in hand): the MIC write-end rendezvous happens
 /// ON the spawned thread, not here — load-bearing ordering, learned from a live
 /// wedge (see `open_fifo_write_end`'s doc): ffmpeg only reaches its FIFO read-side
 /// opens after PROBING input 0, which reads real video bytes from stdin — and those
 /// bytes come from the caller's video loop, which can only start once this returns.
 /// Blocking here would deadlock the session start for the FIFO budget, every time.
-/// If either FIFO never opens (bounded), the thread trips `stop`, tears down its
-/// captures, and resolves to an empty [`PumpOut`] — the session's video side then
+/// The SYS rendezvous goes one step further on POSIX (`lab/flatpak`, the ffmpeg 7.x
+/// deadlock): it rides the WRITER thread as a pending sink (see [`SysSink`]),
+/// because ffmpeg 7.x will not even open the sys FIFO until the mic input's probe
+/// has read real audio, which only flows once `run` is rendering. If a rendezvous
+/// never completes (all bounded), the owning thread trips `stop` and the session
 /// winds down through its normal wedge machinery (the muxer-liveness check /
 /// watchdog: an ffmpeg with unopened inputs never writes its header). `Err` here
 /// means only that the THREAD couldn't spawn.
@@ -1111,19 +1477,40 @@ pub(crate) fn spawn<'scope, 'env>(
                 abandon_captures(mic_tap, mic_rx, monitor, sys_rx);
                 return PumpOut::empty();
             };
+            // POSIX: the SYS rendezvous is handed to the WRITER as a pending sink
+            // instead of being blocked on here (`lab/flatpak`, the ffmpeg 7.x
+            // deadlock; see `SysSink`'s doc): renders must start and mic audio must
+            // flow BEFORE ffmpeg will open the sys FIFO at all, so blocking this
+            // thread on it, ahead of `run`, could never complete on 7.x. The budget
+            // is the same [`FIFO_OPEN_BUDGET`], now stamped here; a rendezvous that
+            // spends it trips `stop` from the writer and the session winds down
+            // through the same wedge machinery as before.
             #[cfg(not(windows))]
-            let sys_fifo = open_fifo_write_end(&sys_path, FIFO_OPEN_BUDGET, thread_stop);
-            #[cfg(windows)]
-            let sys_fifo = crate::platform::windows::named_pipe::connect_write_end(
-                sys_pipe, FIFO_OPEN_BUDGET, thread_stop,
-            );
-            let Some(sys_fifo) = sys_fifo else {
-                log::warn!("{}", rendezvous_failure("system", thread_stop.load(Ordering::Relaxed)));
-                thread_stop.store(true, Ordering::Relaxed);
-                abandon_captures(mic_tap, mic_rx, monitor, sys_rx);
-                return PumpOut::empty();
+            let sys_sink = SysSink::Pending {
+                path: sys_path,
+                deadline: Instant::now() + FIFO_OPEN_BUDGET,
+                buffered: Vec::new(),
             };
-            // The writer thread (module doc): owns the freshly-opened FIFOs and
+            // Windows: named pipes have no open-order dependency (the client's
+            // CreateFile connects regardless of ffmpeg's probe order), so the
+            // control-thread connect stays byte-identical.
+            #[cfg(windows)]
+            let sys_sink = {
+                let sys_fifo = crate::platform::windows::named_pipe::connect_write_end(
+                    sys_pipe, FIFO_OPEN_BUDGET, thread_stop,
+                );
+                let Some(sys_fifo) = sys_fifo else {
+                    log::warn!(
+                        "{}",
+                        rendezvous_failure("system", thread_stop.load(Ordering::Relaxed))
+                    );
+                    thread_stop.store(true, Ordering::Relaxed);
+                    abandon_captures(mic_tap, mic_rx, monitor, sys_rx);
+                    return PumpOut::empty();
+                };
+                SysSink::Open(Box::new(sys_fifo))
+            };
+            // The writer thread (module doc): owns the audio sinks and
             // every blocking write, spawned on the same scope (nested scoped
             // spawns are joined at scope exit like any other; see
             // `PumpHandle::join`'s doc for why its exit is guaranteed bounded).
@@ -1131,7 +1518,7 @@ pub(crate) fn spawn<'scope, 'env>(
             let writer_stop = thread_stop;
             let writer = std::thread::Builder::new().name("cck-pump-writer".to_string()).spawn_scoped(
                 scope,
-                move || writer_loop(writer_rx, Box::new(mic_fifo), Box::new(sys_fifo), writer_stop),
+                move || writer_loop(writer_rx, MicSink::real(mic_fifo), sys_sink, writer_stop),
             );
             if let Err(e) = writer {
                 log::warn!("media-clock pump: could not spawn its writer thread: {e}");
@@ -1783,8 +2170,15 @@ mod tests {
 
         // Materialize the queued PCM through the REAL writer loop (`finish`
         // consumed the pump, hanging up the channel — production's EOF cue).
+        // `SysSink::Open` is the Windows-and-rendezvoused shape; the pending-open
+        // variant is exercised by ffmpeg itself in the media-clock E2E sessions.
         let stop = AtomicBool::new(false);
-        writer_loop(writer_rx, Box::new(mic_fifo.clone()), Box::new(sys_fifo.clone()), &stop);
+        writer_loop(
+            writer_rx,
+            MicSink::boxed(Box::new(mic_fifo.clone())),
+            SysSink::Open(Box::new(sys_fifo.clone())),
+            &stop,
+        );
         assert!(!stop.load(Ordering::Relaxed), "healthy fakes: the writer never trips stop");
 
         // PCM spot-check: the mic FIFO carries the pushed 0.5 block at the very
@@ -1843,5 +2237,154 @@ mod tests {
         );
         drop(fifo);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pending_rendezvous_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::sync::mpsc::{channel, RecvTimeoutError};
+
+    /// THE DRAGON-629 regression, with real FIFOs and no ffmpeg.
+    ///
+    /// Reproduces the live deadlock exactly: ffmpeg has our mic FIFO open but is not
+    /// reading it, because it is sitting in `open()` on the SYS FIFO waiting for our
+    /// write end, and our writer is in the pending-sys phase filling the mic pipe. Once
+    /// that pipe is full, the OLD code parked in a blocking `write_all` and never
+    /// returned to the sys-open retry the other side was waiting on. Neither could move
+    /// and the recording died 12s later on the muxer watchdog.
+    ///
+    /// The observation point is the sys reader's own BLOCKING open: on POSIX it returns
+    /// exactly when a writer opens the other end, so it IS the rendezvous, seen from
+    /// ffmpeg's side. Nothing here drains the mic FIFO before that check, which is the
+    /// whole point: draining it would let the parked write finish and would let the
+    /// buggy code pass. Against the old code this times out; against the fix it returns
+    /// in a couple of retry cycles.
+    #[test]
+    fn a_full_mic_pipe_cannot_stall_the_pending_system_rendezvous() {
+        let dir = std::env::temp_dir();
+        let tag = format!("cck-pump-629-{}", std::process::id());
+        let mic_path = dir.join(format!("{tag}.mic"));
+        let sys_path = dir.join(format!("{tag}.sys"));
+        assert!(super::super::owned::mkfifo(&mic_path), "mkfifo mic");
+        assert!(super::super::owned::mkfifo(&sys_path), "mkfifo sys");
+
+        // A mic READER that never reads: the write end can open, and the pipe then fills
+        // and stays full. This is ffmpeg holding the input open while blocked elsewhere.
+        let mic_reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&mic_path)
+            .expect("open the mic read end");
+
+        let mic_w = try_open_fifo_write_end(&mic_path).expect("mic write end");
+        let stop = AtomicBool::new(false);
+        let (tx, rx) = channel::<PcmStep>();
+
+        // 256KB of mono f32, comfortably past any FIFO buffer (64KB on Linux and macOS).
+        let per_step = 4_800usize; // 100ms at 48kHz
+        let steps = 14;
+        for i in 0..steps {
+            tx.send(PcmStep {
+                mic: vec![i as f32; per_step],
+                sys: vec![0.25; per_step * 2],
+            })
+            .expect("queue a step");
+        }
+
+        let (opened_tx, opened_rx) = channel::<()>();
+        let (done_tx, done_rx) = channel::<()>();
+        let sys_for_reader = sys_path.clone();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                writer_loop(
+                    rx,
+                    MicSink::real(mic_w),
+                    SysSink::Pending {
+                        path: sys_path.clone(),
+                        deadline: Instant::now() + Duration::from_secs(10),
+                        buffered: Vec::new(),
+                    },
+                    &stop,
+                );
+                let _ = done_tx.send(());
+            });
+
+            // The "ffmpeg" side: after a beat, block in open() on the sys FIFO. This
+            // returns only once the writer's retry opens the write end.
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                let mut sys_reader = std::fs::File::open(&sys_for_reader).expect("sys read end");
+                let _ = opened_tx.send(());
+                // Then behave like ffmpeg and actually consume it, so the writer's
+                // post-rendezvous flush of `buffered` is not the thing that blocks.
+                let mut buf = [0u8; 64 * 1024];
+                let deadline = Instant::now() + Duration::from_secs(6);
+                while Instant::now() < deadline {
+                    match sys_reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+
+            let rendezvoused = opened_rx.recv_timeout(Duration::from_secs(5));
+
+            // Unstick the writer whatever happened, so neither arm can hang the suite:
+            // drain the mic FIFO to EOF on a helper, and hang the step channel up.
+            let drain = std::thread::spawn(move || {
+                let mut sink = Vec::new();
+                let mut r = mic_reader;
+                let mut buf = [0u8; 64 * 1024];
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    match r.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => sink.extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                sink
+            });
+            drop(tx);
+            let finished = done_rx.recv_timeout(Duration::from_secs(8));
+            let written = drain.join().expect("mic drain thread");
+
+            assert!(
+                rendezvoused.is_ok(),
+                "the system FIFO rendezvous never completed while the mic pipe was full \
+                 (DRAGON-629: the writer parked in a blocking mic write and stopped \
+                 retrying the sys open)"
+            );
+            assert!(
+                !matches!(finished, Err(RecvTimeoutError::Timeout)),
+                "the writer never finished after the channel hung up"
+            );
+            assert!(
+                !stop.load(Ordering::Relaxed),
+                "a healthy rendezvous must not trip the session stop"
+            );
+            // Nothing may be dropped or reordered by the deferral: the mic stream's
+            // sample count IS media time.
+            assert_eq!(
+                written.len(),
+                steps * per_step * 4,
+                "every deferred mic byte must reach the FIFO once the rendezvous lands"
+            );
+            let first = f32::from_le_bytes(written[0..4].try_into().expect("4 bytes"));
+            let last_off = written.len() - 4;
+            let last = f32::from_le_bytes(written[last_off..].try_into().expect("4 bytes"));
+            assert_eq!(first, 0.0, "the backlog must flush in order, oldest first");
+            assert_eq!(last, (steps - 1) as f32, "and end on the newest step");
+        });
+
+        let _ = std::fs::remove_file(&mic_path);
+        let _ = std::fs::remove_file(&sys_path);
     }
 }

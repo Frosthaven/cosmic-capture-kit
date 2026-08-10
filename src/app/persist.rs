@@ -29,6 +29,7 @@ impl App {
             // never serialized (skip_serializing). Carry the schema default; it's dead
             // on disk now (only pre-v7 configs still hold it, for the one-time migration).
             window_border_style: 0,
+            window_recompositing: self.window_recompositing,
             active_border_color: self.active_border_color,
             active_border_width: self.active_border_width,
             inactive_border_color: self.inactive_border_color,
@@ -76,6 +77,7 @@ impl App {
             capture_active_monitor_no_editor_hotkey: self
                 .capture_active_monitor_no_editor_hotkey
                 .clone(),
+            color_picker_hotkey: self.color_picker_hotkey.clone(),
             // Not cached on App (they're one-time lifecycle markers, not live
             // settings): carry whatever's on disk forward so a normal save never
             // clobbers them. Only init's first-run flow / the daemon's login-item
@@ -88,9 +90,35 @@ impl App {
             region_overlay_opacity: self.region_overlay_opacity,
             active_overlay_opacity: self.active_overlay_opacity,
             preview_overlay_opacity: self.preview_overlay_opacity,
+            color_picker_overlay_opacity: self.color_picker_overlay_opacity,
+            // DRAGON-615: the magnifier's zoom rides along on whatever save is already
+            // happening. It gets NO save call of its own, deliberately: the three zoom
+            // routes are a scroll wheel and a held key, so saving per step would rewrite
+            // the whole config file dozens of times during one gesture. The save that
+            // matters is the one a PICK already performs (the same one that writes the
+            // recents), so the zoom a user picked at is the zoom that persists, and a
+            // session they cancelled leaves no trace, exactly like the recents.
+            color_picker_zoom: self.color_picker.zoom,
+            // DRAGON-582: capped on the way OUT as well as on the way in, so a config
+            // hand-edited to hold a hundred entries is trimmed the next time we save
+            // rather than growing forever.
+            recent_colors: self
+                .color_picker
+                .recents
+                .iter()
+                .take(crate::app::color_picker::geom::RECENTS_CAP)
+                .map(|c| c.hex())
+                .collect(),
             record_fps: self.record_fps.value,
             record_bitrate_kbps: self.record_bitrate_kbps.value,
-            preferred_encoder: self.preferred_encoder(),
+            // The INTENT ("auto" or the user's pick), never the display resolution
+            // (DRAGON-571): persisting the resolution is what used to pin one
+            // transient probe failure as "software" forever.
+            preferred_encoder: self.encoder_requested(),
+            // Disk-carried like the lifecycle markers below: the recording workers
+            // write this cache directly (state::note_encoder_auto_hint), so a live
+            // mirror here would let a settings save revert a fresher note.
+            encoder_auto_hint: crate::state::load().encoder_auto_hint,
             scan_codes: self.scan_codes,
             scan_text: self.scan_text,
             text_confidence: self.text_confidence,
@@ -117,7 +145,12 @@ impl App {
             vaapi_compression_level: self.vaapi_compression_level,
             record_zero_copy: self.record_zero_copy,
             record_codec: self.record_codec.clone(),
-            pw_restore_token: self.pw_restore_token.clone(),
+            // The legacy single-token pair is retired (config v11, DRAGON-570):
+            // read only by the one-time migration, never written again.
+            pw_restore_token: None,
+            pw_restore_source: None,
+            pw_restore_token_monitor: self.pw_restore_token.monitor.clone(),
+            pw_restore_token_window: self.pw_restore_token.window.clone(),
             audio_sync_offset_ms: self.audio_sync_offset_ms.value,
             audio_sync_auto: self.audio_sync_auto,
             av_calibration_base_ms: self.av_calibration_base_ms,
@@ -164,6 +197,7 @@ impl App {
         self.capture_cursor = p.capture_cursor;
         self.capture_transparency = p.capture_transparency;
         self.capture_wallpaper = !p.no_wallpaper;
+        self.window_recompositing = p.window_recompositing;
         self.active_border_color = p.active_border_color;
         self.active_border_width = p.active_border_width.min(10);
         self.inactive_border_color = p.inactive_border_color;
@@ -185,9 +219,26 @@ impl App {
             p.capture_active_window_no_editor_hotkey.clone();
         self.capture_active_monitor_no_editor_hotkey =
             p.capture_active_monitor_no_editor_hotkey.clone();
+        self.color_picker_hotkey = p.color_picker_hotkey.clone();
         self.region_overlay_opacity = p.region_overlay_opacity.clamp(0.0, 1.0);
         self.active_overlay_opacity = p.active_overlay_opacity.clamp(0.0, 1.0);
         self.preview_overlay_opacity = p.preview_overlay_opacity.clamp(0.0, 1.0);
+        self.color_picker_overlay_opacity = p.color_picker_overlay_opacity.clamp(0.0, 1.0);
+        // DRAGON-615: clamped into THIS build's bounds rather than applied as stored, since
+        // the ceiling has already moved once and a config from either side is in the wild.
+        // A factory reset routes through here with the default, so it restores the opening
+        // lens like every other setting.
+        self.color_picker.zoom =
+            crate::app::color_picker::geom::zoom_from_persisted(p.color_picker_zoom);
+        // DRAGON-582: a factory reset (which routes through here with the DEFAULTS) must
+        // clear the recents, because they are user content and "reset everything" has to
+        // mean it. Unparseable entries are dropped rather than failing the whole load.
+        self.color_picker.recents = p
+            .recent_colors
+            .iter()
+            .filter_map(|s| crate::color::ColorFormat::Hex.parse(s))
+            .take(crate::app::color_picker::geom::RECENTS_CAP)
+            .collect();
         self.record_fps.set_value(p.record_fps.clamp(1, 240));
         self.record_bitrate_kbps.set_value(p.record_bitrate_kbps.clamp(100, 500_000));
         self.record_res_preset = p.record_res_preset.min(RES_CUSTOM as u8);
@@ -220,14 +271,11 @@ impl App {
         self.record_system_audio = p.record_system_audio;
         self.record_backend = p.record_backend;
         self.screenshot_backend = p.screenshot_backend;
-        // preferred_encoder is the "auto" sentinel in defaults() — resolve it to the
-        // best concrete encoder, like first launch does. Runs only on factory/page
-        // reset (a settings-window action), so the encoder list is already resolved.
-        if self.encoders().iter().any(|e| e.id == p.preferred_encoder) {
-            self.set_preferred_encoder(p.preferred_encoder);
-        } else if let Some(best) = self.encoders().first().map(|e| e.id.clone()) {
-            self.set_preferred_encoder(best);
-        }
+        // DRAGON-571: apply the encoder INTENT verbatim: "auto" stays auto (the
+        // picker's display and each recording resolve it fresh), a concrete id stays
+        // the user's pick. The old code resolved auto to the best probed encoder
+        // here, which is exactly the kind of write-back this ticket removed.
+        self.set_preferred_encoder(p.preferred_encoder);
         // Rebuild the live keymap from the persisted overrides (empty = all defaults).
         let mut keymap = crate::shortcuts::Keymap::defaults();
         keymap.apply_overrides(&p.shortcuts);
@@ -278,12 +326,15 @@ impl App {
     }
 
     /// Reset everything to defaults (factory reset). Also drops cached/saved state
-    /// that isn't a "setting" — the saved region, the PipeWire restore token, and the
-    /// last-scan regions — so nothing lingers after a reset.
+    /// that isn't a "setting" — the saved region, the PipeWire restore tokens (both
+    /// source-type slots), and the last-scan regions — so nothing lingers after a
+    /// reset. Like the settings Forget row, this only clears OUR replay tokens; the
+    /// portal's own permission-store entry outlives the app (see
+    /// `portal::FORGET_SCREEN_ACCESS_NOTE`).
     pub(super) fn factory_reset(&mut self) {
         self.apply_persisted(crate::state::defaults());
         self.region = None;
-        self.pw_restore_token = None;
+        self.pw_restore_token.clear();
         self.last_code_region = None;
         self.last_ocr_region = None;
         // apply_persisted saved defaults already; re-save so the cleared token/region
@@ -309,6 +360,7 @@ impl App {
                         p.region_overlay_opacity = d.region_overlay_opacity;
                         p.active_overlay_opacity = d.active_overlay_opacity;
                         p.preview_overlay_opacity = d.preview_overlay_opacity;
+                        p.color_picker_overlay_opacity = d.color_picker_overlay_opacity;
                         p.appearance_use_system = d.appearance_use_system;
                         p.appearance_mode = d.appearance_mode;
                         p.appearance_accent = d.appearance_accent;
@@ -348,6 +400,7 @@ impl App {
                         p.capture_cursor = d.capture_cursor;
                         p.capture_transparency = d.capture_transparency;
                         p.no_wallpaper = d.no_wallpaper;
+                        p.window_recompositing = d.window_recompositing;
                         p.active_border_color = d.active_border_color;
                         p.active_border_width = d.active_border_width;
                         p.inactive_border_color = d.inactive_border_color;
@@ -414,10 +467,17 @@ impl App {
                 let tab = self.settings.active_shortcuts_tab();
                 p.shortcuts
                     .retain(|(a, _)| settings::ShortcutsTab::for_group(a.group()) != tab);
-                // The macOS/Windows global capture hotkey rows (DRAGON-295: all three) live
-                // on the Capture tab, so a Capture-tab reset restores each to its default
-                // (all UNSET now).
-                if tab == settings::ShortcutsTab::Capture {
+                // The macOS/Windows global capture-hotkey rows (DRAGON-295: all seven) are on
+                // the GLOBAL tab, so a Global-tab reset restores each to its default (all
+                // UNSET).
+                //
+                // This said `Capture` until DRAGON-627, and had been wrong since DRAGON-588
+                // moved the rows to the Global tab: the reset button under the rows did not
+                // reach them, while the button under the OCR rows silently cleared seven
+                // hotkeys nobody could see from there. DRAGON-627 then emptied the Capture tab
+                // outright (`ShortcutsTab::occupied` stops offering it), which would have made
+                // this branch unreachable and the hotkeys unresettable.
+                if tab == settings::ShortcutsTab::Global {
                     p.capture_hotkey = d.capture_hotkey.clone();
                     p.capture_active_window_hotkey = d.capture_active_window_hotkey.clone();
                     p.capture_active_monitor_hotkey = d.capture_active_monitor_hotkey.clone();
@@ -426,6 +486,7 @@ impl App {
                         d.capture_active_window_no_editor_hotkey.clone();
                     p.capture_active_monitor_no_editor_hotkey =
                         d.capture_active_monitor_no_editor_hotkey.clone();
+                    p.color_picker_hotkey = d.color_picker_hotkey.clone();
                 }
             }
             // DRAGON-419: Health gained its one real setting (the Debug group's log toggle),

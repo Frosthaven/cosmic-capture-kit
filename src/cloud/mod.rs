@@ -326,6 +326,9 @@ pub enum AuthKind {
     /// for it and offers install guidance instead of hiding the row.
     ExternalTool {
         /// Where the user gets it, opened when the row is selected and the tool is not there.
+        /// Never opened by a package that BUNDLES the tool (the Flatpak, DRAGON-566): there
+        /// the guidance names a packaging fault instead; see
+        /// `proton::install_press_downloads`.
         download_url: &'static str,
         /// What to call it in the "install this" line, spelled as the command a user types.
         tool_name: &'static str,
@@ -380,6 +383,15 @@ pub struct ProviderSpec {
     pub display_name: &'static str,
     /// The app icon name for the provider's mark (see `widgets::icons`).
     pub icon: &'static str,
+    // `support_note` (DRAGON-566) lived here until the owner's 2026-08-07 decision: a
+    // per-row disclosure line, carried only by Proton ("Not officially supported by
+    // Proton."), because Proton has no third-party API and does not endorse this
+    // integration (it runs through Proton's MIT-licensed CLI). The owner reviewed
+    // Proton's third-party branding terms (quoted in DRAGON-566) and accepted the risk;
+    // the disclosure and the neutral row glyph were removed at owner direction, not by
+    // oversight. Proton's stance itself is unchanged; if a disclosure is ever needed
+    // again, re-add the field here so screens keep reading the table, never a provider
+    // id.
     /// What it can do.
     pub caps: ProviderCaps,
     /// How a user connects it.
@@ -673,6 +685,14 @@ pub fn registry() -> &'static [ProviderSpec] {
             id: "proton",
             display_name: "Proton Drive",
             icon: "brand-proton-drive-symbolic",
+            // The icon above resolves to Proton's OFFICIAL mark again, and this row carries
+            // no disclosure line any more: the owner reviewed Proton's third-party branding
+            // terms (quoted in DRAGON-566) and accepted the risk on 2026-08-07, so the
+            // DRAGON-566 neutral glyph and `support_note` were removed at owner direction,
+            // not by oversight (see the tombstone on `ProviderSpec` and
+            // `res/icons/brands/proton-drive.svg`). Proton still neither offers a
+            // third-party API nor endorses this integration, which runs through their
+            // MIT-licensed CLI.
             // Every row here was established by READING the official tool's source rather than
             // by trying an account (DRAGON-485); `cloud::proton`'s module doc records which
             // command backs each one.
@@ -1076,6 +1096,11 @@ fn lock_file_exclusive(path: &std::path::Path) -> Result<std::fs::File, ()> {
         .read(true)
         .write(true)
         .create(true)
+        // Same reason as the unix arm above, which had said so since it was written while
+        // this one silently left the behaviour undefined: nothing is ever written into a
+        // lock file, and truncating would be one more way for a failed attempt to disturb
+        // the holder. Two arms of one function must not disagree about that.
+        .truncate(false)
         .share_mode(0)
         .open(path)
         .map_err(|_| ())
@@ -1158,6 +1183,12 @@ pub fn web_url_allowed(provider_id: &str, url: &str) -> bool {
 #[cfg(test)]
 mod registry_tests {
     use super::*;
+
+    // `only_proton_carries_the_unofficial_disclosure` pinned the DRAGON-566
+    // `support_note` field until the owner's 2026-08-07 decision removed the field with
+    // the disclosure it carried (Proton's branding terms reviewed, risk accepted; see
+    // the tombstone on `ProviderSpec`). The test went with the field: there is no
+    // disclosure vocabulary left to pin.
 
     /// Ids are the on-disk vocabulary for a connected account, so they must be
     /// unique and stable. The exact list is asserted so a rename fails HERE rather than

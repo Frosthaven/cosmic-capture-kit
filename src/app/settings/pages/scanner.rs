@@ -41,18 +41,31 @@ impl crate::app::App {
             // which passes no `-l` and leaves tesseract on its own `eng`, so a config that
             // has never touched this reads exactly what it always did. The list comes from
             // `tesseract --list-langs`, re-probed each time this window opens.
-            ocr_items.push(
-                Item::new(
-                    "Tesseract language pack",
-                    self.ocr_lang_desc(),
-                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                        &self.ocr_lang_labels,
-                        Some(self.ocr_lang_index()),
-                        |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0)),
-                    )),
-                )
-                .reset_with(self.ocr_lang_index(), 0usize, |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0))),
-            );
+            let lang_item = Item::new(
+                "Tesseract language pack",
+                self.ocr_lang_desc(),
+                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
+                    &self.ocr_lang_labels,
+                    Some(self.ocr_lang_index()),
+                    |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0)),
+                )),
+            )
+            .reset_with(self.ocr_lang_index(), 0usize, |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0)));
+            // The folder gets the Health page's treatment: subtle tone, led by a copy button,
+            // wrapping inside the pane. It used to be a bare line inside the description,
+            // which could not be copied and read as ordinary prose (owner's call).
+            let lang_item = match &self.ocr_lang_dir {
+                Some(dir) => {
+                    let copied = super::super::row::path_line_copied(dir, &self.settings.health_copied);
+                    lang_item.desc_el(super::super::row::path_desc(
+                        self.ocr_lang_desc(),
+                        dir.clone(),
+                        copied,
+                    ))
+                }
+                None => lang_item,
+            };
+            ocr_items.push(lang_item);
             ocr_items.push(
                 Item::new(
                     "Text matching strictness",

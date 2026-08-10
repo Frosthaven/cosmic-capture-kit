@@ -35,14 +35,17 @@ use super::owned::preflights_started;
 use super::{PipewireRecordParams, RecordSettings, start_pipewire_recording};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::Ordering;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// Serializes these tests against each other: they read a PROCESS-GLOBAL pre-flight
-/// counter as a delta and set a process-global env seam.
+/// Serializes these tests against each other AND against `media_clock_e2e_tests`
+/// (DRAGON-554: the crate-wide `super::recording_globals_lock`): the pre-flight
+/// counter delta and the forced-failure env seam are process-global, so a
+/// module-local lock could not stop that module's pre-flights from landing inside
+/// this module's delta window, or this module's forced-failure env from failing
+/// that module's real pre-flight mid-test.
 fn test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    super::recording_globals_lock()
 }
 
 /// Clears the forced-failure seam on drop, including during a panic's unwind.
@@ -67,6 +70,7 @@ fn settings(out: &std::path::Path) -> RecordSettings {
         fps: 30,
         // Anything but "software", or the zero-copy attempt is skipped outright.
         preferred_encoder: "auto".to_string(),
+        encoder_hint: None,
         presets: crate::encode::Presets::default(),
         zero_copy: true,
         mic: true,

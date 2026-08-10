@@ -762,6 +762,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "build_helpers"
+version = "0.14.0"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
+dependencies = [
+ "cfg_aliases",
+]
+
+[[package]]
+name = "build_helpers"
+version = "0.14.0"
+source = "git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b#8a017a15ee7753241c0a631b4294a68edf79b13b"
+dependencies = [
+ "cfg_aliases",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1109,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-capture-kit"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "arboard",
  "ashpd 0.12.3",
@@ -1123,6 +1139,7 @@ dependencies = [
  "dirs",
  "dispatch2",
  "earshot",
+ "enumflags2",
  "env_logger",
  "ffmpeg-next",
  "gbm",
@@ -1178,7 +1195,7 @@ dependencies = [
 [[package]]
 name = "cosmic-client-toolkit"
 version = "0.2.0"
-source = "git+https://github.com/pop-os/cosmic-protocols//?rev=c253ec1#c253ec1d6804afbcdf250f5cc37ae1194bba7bd2"
+source = "git+https://github.com/pop-os/cosmic-protocols//?rev=32283d7#32283d76a8d0342da74c4cc022a533c52dcf378f"
 dependencies = [
  "bitflags 2.13.0",
  "cosmic-protocols",
@@ -1191,14 +1208,14 @@ dependencies = [
 [[package]]
 name = "cosmic-config"
 version = "1.0.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b#8a017a15ee7753241c0a631b4294a68edf79b13b"
 dependencies = [
  "atomicwrites",
- "cosmic-config-derive 1.0.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "cosmic-config-derive 1.0.0 (git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b)",
  "cosmic-settings-daemon",
  "dirs",
  "futures-util",
- "iced_futures 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_futures",
  "known-folders",
  "notify",
  "ron 0.12.2",
@@ -1217,7 +1234,7 @@ dependencies = [
  "atomicwrites",
  "cosmic-config-derive 1.0.0 (git+https://github.com/pop-os/libcosmic)",
  "dirs",
- "iced_futures 0.14.0 (git+https://github.com/pop-os/libcosmic)",
+ "iced_futures",
  "known-folders",
  "notify",
  "ron 0.12.2",
@@ -1229,7 +1246,7 @@ dependencies = [
 [[package]]
 name = "cosmic-config-derive"
 version = "1.0.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b#8a017a15ee7753241c0a631b4294a68edf79b13b"
 dependencies = [
  "quote",
  "syn",
@@ -1261,7 +1278,7 @@ dependencies = [
 [[package]]
 name = "cosmic-protocols"
 version = "0.2.0"
-source = "git+https://github.com/pop-os/cosmic-protocols//?rev=c253ec1#c253ec1d6804afbcdf250f5cc37ae1194bba7bd2"
+source = "git+https://github.com/pop-os/cosmic-protocols//?rev=32283d7#32283d76a8d0342da74c4cc022a533c52dcf378f"
 dependencies = [
  "bitflags 2.13.0",
  "wayland-backend",
@@ -1320,13 +1337,14 @@ dependencies = [
 [[package]]
 name = "cosmic-theme"
 version = "1.0.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b#8a017a15ee7753241c0a631b4294a68edf79b13b"
 dependencies = [
  "almost",
  "configparser",
- "cosmic-config 1.0.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "cosmic-config 1.0.0 (git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b)",
  "csscolorparser",
  "dirs",
+ "hex_color",
  "palette",
  "ron 0.12.2",
  "serde",
@@ -2611,6 +2629,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hex_color"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d37f101bf4c633f7ca2e4b5e136050314503dd198e78e325ea602c327c484ef0"
+dependencies = [
+ "arrayvec",
+ "rand 0.8.6",
+ "serde",
+]
+
+[[package]]
 name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2710,13 +2739,14 @@ dependencies = [
 [[package]]
 name = "iced"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
+ "build_helpers 0.14.0 (git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor)",
  "dnd",
  "iced_accessibility",
- "iced_core 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_core",
  "iced_debug",
- "iced_futures 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_futures",
  "iced_program",
  "iced_renderer",
  "iced_runtime",
@@ -2731,7 +2761,7 @@ dependencies = [
 [[package]]
 name = "iced_accessibility"
 version = "0.1.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -2740,9 +2770,10 @@ dependencies = [
 [[package]]
 name = "iced_core"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
  "bitflags 2.13.0",
+ "build_helpers 0.14.0 (git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor)",
  "bytes",
  "cosmic-client-toolkit",
  "dnd",
@@ -2763,45 +2794,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "iced_core"
-version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic#417923fbafc0f38a63846b307036e4f20fc4960d"
-dependencies = [
- "bitflags 2.13.0",
- "bytes",
- "dnd",
- "glam",
- "lilt",
- "log",
- "mime 0.1.0",
- "num-traits",
- "palette",
- "raw-window-handle",
- "rustc-hash 2.1.2",
- "smol_str",
- "thiserror 2.0.18",
- "unicode-segmentation",
- "web-time",
- "window_clipboard",
-]
-
-[[package]]
 name = "iced_debug"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
- "iced_core 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
- "iced_futures 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_core",
+ "iced_futures",
  "log",
 ]
 
 [[package]]
 name = "iced_futures"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
  "futures",
- "iced_core 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_core",
  "log",
  "rustc-hash 2.1.2",
  "tokio",
@@ -2810,29 +2818,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "iced_futures"
-version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic#417923fbafc0f38a63846b307036e4f20fc4960d"
-dependencies = [
- "futures",
- "iced_core 0.14.0 (git+https://github.com/pop-os/libcosmic)",
- "log",
- "rustc-hash 2.1.2",
- "wasm-bindgen-futures",
- "wasmtimer",
-]
-
-[[package]]
 name = "iced_graphics"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",
  "cosmic-text",
  "half",
- "iced_core 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
- "iced_futures 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_core",
+ "iced_futures",
  "image",
  "kamadak-exif",
  "log",
@@ -2846,7 +2841,7 @@ dependencies = [
 [[package]]
 name = "iced_program"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
  "iced_graphics",
  "iced_runtime",
@@ -2855,7 +2850,7 @@ dependencies = [
 [[package]]
 name = "iced_renderer"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
  "iced_graphics",
  "iced_tiny_skia",
@@ -2867,13 +2862,14 @@ dependencies = [
 [[package]]
 name = "iced_runtime"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
+ "build_helpers 0.14.0 (git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor)",
  "bytes",
  "cosmic-client-toolkit",
  "dnd",
- "iced_core 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
- "iced_futures 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_core",
+ "iced_futures",
  "raw-window-handle",
  "thiserror 2.0.18",
  "window_clipboard",
@@ -2882,7 +2878,7 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
  "bytemuck",
  "cosmic-text",
@@ -2899,10 +2895,11 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
  "as-raw-xcb-connection",
  "bitflags 2.13.0",
+ "build_helpers 0.14.0 (git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor)",
  "bytemuck",
  "cosmic-client-toolkit",
  "cryoglyph",
@@ -2930,8 +2927,9 @@ dependencies = [
 [[package]]
 name = "iced_widget"
 version = "0.14.2"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
+ "build_helpers 0.14.0 (git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor)",
  "cosmic-client-toolkit",
  "dnd",
  "iced_renderer",
@@ -2949,13 +2947,14 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.14.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor#a5787f89bce8281182889f85816301c0df97446e"
 dependencies = [
+ "build_helpers 0.14.0 (git+https://github.com/Frosthaven/iced.git?branch=cck-layer-hide-cursor)",
  "cosmic-client-toolkit",
  "cursor-icon",
  "dnd",
  "iced_debug",
- "iced_futures 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_futures",
  "iced_graphics",
  "iced_program",
  "iced_runtime",
@@ -3458,27 +3457,29 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libcosmic"
 version = "1.0.0"
-source = "git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a#4657b6a7259e6ecdbf0af6f956de163e3d49dc1a"
+source = "git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b#8a017a15ee7753241c0a631b4294a68edf79b13b"
 dependencies = [
  "apply",
  "ashpd 0.12.3",
  "auto_enums",
+ "build_helpers 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b)",
  "cosmic-client-toolkit",
- "cosmic-config 1.0.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "cosmic-config 1.0.0 (git+https://github.com/pop-os/libcosmic?rev=8a017a15ee7753241c0a631b4294a68edf79b13b)",
  "cosmic-freedesktop-icons",
  "cosmic-settings-config",
  "cosmic-settings-daemon",
  "cosmic-theme",
  "css-color",
  "derive_setters",
+ "enumflags2",
  "float-cmp 0.10.0",
  "freedesktop-desktop-entry",
  "futures",
  "i18n-embed",
  "i18n-embed-fl",
  "iced",
- "iced_core 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
- "iced_futures 0.14.0 (git+https://github.com/pop-os/libcosmic?rev=4657b6a7259e6ecdbf0af6f956de163e3d49dc1a)",
+ "iced_core",
+ "iced_futures",
  "iced_renderer",
  "iced_runtime",
  "iced_tiny_skia",
@@ -4122,7 +4123,9 @@ checksum = "478ae33fcac9df0a18db8302387c666b8ef08a3e2d62b510ca4fc278a384b6c0"
 dependencies = [
  "bitflags 2.13.0",
  "block2 0.6.2",
+ "dispatch2",
  "objc2 0.6.4",
+ "objc2-core-media",
  "objc2-foundation 0.3.2",
 ]
 
@@ -4997,6 +5000,8 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
 dependencies = [
+ "libc",
+ "rand_chacha 0.3.1",
  "rand_core 0.6.4",
 ]
 
@@ -5006,8 +5011,18 @@ version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44c5af06bb1b7d3216d91932aed5265164bf384dc89cd6ba05cf59a35f5f76ea"
 dependencies = [
- "rand_chacha",
+ "rand_chacha 0.9.0",
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rand_chacha"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6c10a63a0fa32252be49d21e7709d4d4baf8d231c2dbce1eaa8141b9b127d88"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.6.4",
 ]
 
 [[package]]
@@ -5025,6 +5040,9 @@ name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
+dependencies = [
+ "getrandom 0.2.17",
+]
 
 [[package]]
 name = "rand_core"

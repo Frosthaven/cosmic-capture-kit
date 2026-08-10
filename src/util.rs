@@ -88,6 +88,376 @@ pub(crate) fn is_dev_process() -> bool {
     cfg!(test) || std::env::var_os(CARGO_ENV).is_some()
 }
 
+/// Whether this process is running inside a FLATPAK sandbox (`lab/flatpak`).
+///
+/// Cached: the answer cannot change during a process's life, and several hot-ish paths ask
+/// (the overlay mint, the config readers, the update gate).
+///
+/// See [`flatpak_sandboxed_from`] for why the marker FILE is the test rather than the
+/// environment variable everyone reaches for first.
+pub fn flatpak_sandboxed() -> bool {
+    static SANDBOXED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SANDBOXED.get_or_init(|| flatpak_sandboxed_from(std::path::Path::new("/.flatpak-info").exists()))
+}
+
+/// **Pure**, unit-tested: the sandbox decision, given whether `/.flatpak-info` exists.
+///
+/// **Why the file and not `$FLATPAK_ID`.** Both are set inside a sandbox, and the environment
+/// variable is the more obvious test. It is the wrong one HERE specifically, because this
+/// codebase spawns detached children constantly: every capture child, the upload child, and
+/// the whole `share::reexec` family. A child inherits the parent's environment, so a
+/// `$FLATPAK_ID` test keeps answering "sandboxed" for any process descended from a sandboxed
+/// one even after it has left the sandbox, and it can be set by anyone. `/.flatpak-info` is
+/// placed in the mount namespace by Flatpak itself, so it is present exactly when the calling
+/// process really is inside the sandbox and absent the moment it is not. Flatpak's own
+/// documentation names it as the reliable check for this reason.
+///
+/// Taking the existence check as an argument keeps the decision testable without a sandbox,
+/// which is the only way this is provable on a developer machine or in CI.
+pub fn flatpak_sandboxed_from(marker_exists: bool) -> bool {
+    marker_exists
+}
+
+// ── Session-bus reachability (a CAPABILITY, not a sandbox test) ───────────────
+//
+// A sandboxed process talks to the session bus through a FILTERING PROXY, and the filter is
+// not an error the caller can see: `ListNames` silently omits names the policy does not
+// cover, and a method call to one of them comes back as an ordinary failure. So a feature
+// built on a bus name can be completely dead while every call site reports "nothing was
+// playing" or "the file manager declined". Two of ours were (DRAGON-555, DRAGON-556).
+//
+// The policy that decides this is written where the process can read it: the
+// `[Session Bus Policy]` section of `/.flatpak-info`. Asking THAT is a capability question
+// with the same shape as the Wayland protocol probe: it is true on a normal session (no
+// policy applies), true in a sandbox that was granted the name, and false only where the
+// call really cannot land. It is deliberately not a `flatpak_sandboxed()` test: a grant
+// added to the manifest heals the feature with no code change, which a sandbox test could
+// never do.
+
+/// The contents of `/.flatpak-info`, or `None` when this process is not inside a sandbox
+/// (no bus policy applies to it at all). Read once and cached: the file cannot change under
+/// a running process.
+///
+/// Linux-only, like Flatpak itself and like both callers of the capability below.
+#[cfg(target_os = "linux")]
+fn flatpak_info() -> Option<&'static str> {
+    static INFO: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    INFO.get_or_init(|| std::fs::read_to_string("/.flatpak-info").ok()).as_deref()
+}
+
+/// May this process CALL methods on the session-bus name `want`?
+///
+/// `want` may name one bus name (`org.freedesktop.FileManager1`) or a whole family with a
+/// trailing `.*` (`org.mpris.MediaPlayer2.*`, "any media player"). The answer is the live
+/// session-bus policy, so it is `true` on every unsandboxed session and the callers keep
+/// their existing behaviour byte-identical there.
+///
+/// See [`session_bus_talk_allowed`] for the decision itself.
+#[cfg(target_os = "linux")]
+pub fn bus_name_reachable(want: &str) -> bool {
+    session_bus_talk_allowed(flatpak_info(), want)
+}
+
+/// **Pure**, unit-tested: may a process whose `/.flatpak-info` is `info` call methods on the
+/// session-bus name (or `.*` family) `want`?
+///
+/// `None` means no sandbox policy applies, which is every ordinary launch, and the answer is
+/// unconditionally yes. Inside a sandbox the `[Session Bus Policy]` section lists one
+/// `name=verb` per line, where the verb is `see`, `talk` or `own` and the name may end in
+/// `.*` to cover a family. Only `talk` and `own` let a method call through; `see` allows a
+/// process to observe that a name exists and nothing more, so it is not enough for any of our
+/// callers (pausing a player, showing a folder).
+///
+/// A policy entry and the wanted name are BOTH patterns, so the test is whether the two
+/// overlap: `org.mpris.MediaPlayer2.*=talk` answers the family question, and so does a
+/// single-player grant like `org.mpris.MediaPlayer2.spotify=talk`, because one reachable
+/// player is enough for the feature to do something.
+// Compiled into the TEST build on every host so the parser is proven wherever the suite runs,
+// while staying honestly absent from a mac or Windows release binary, which has no Flatpak,
+// no `/.flatpak-info` and no caller.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn session_bus_talk_allowed(info: Option<&str>, want: &str) -> bool {
+    let Some(info) = info else { return true };
+    let mut in_section = false;
+    for line in info.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_section = line == "[Session Bus Policy]";
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((name, verb)) = line.split_once('=') else { continue };
+        if verb != "talk" && verb != "own" {
+            continue;
+        }
+        if bus_patterns_overlap(name.trim(), want) {
+            return true;
+        }
+    }
+    false
+}
+
+/// **Pure**, unit-tested: do two session-bus name patterns name any bus name in common?
+///
+/// A pattern is either an exact bus name or a prefix with a trailing `.*`, which Flatpak
+/// documents as matching the prefix itself and everything below it. Two exact names overlap
+/// only when equal; a wildcard overlaps anything at or below its prefix, in either direction
+/// (asking about `org.mpris.MediaPlayer2.*` must be answered by a grant of `org.mpris.*` and
+/// by a grant of one single player alike).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn bus_patterns_overlap(a: &str, b: &str) -> bool {
+    /// `(prefix, is_wildcard)` for one pattern.
+    fn parts(p: &str) -> (&str, bool) {
+        match p.strip_suffix(".*") {
+            Some(prefix) => (prefix, true),
+            None => (p, false),
+        }
+    }
+    /// Whether `name` is at or below `prefix`.
+    fn covers(prefix: &str, name: &str) -> bool {
+        name == prefix
+            || (name.len() > prefix.len()
+                && name.starts_with(prefix)
+                && name.as_bytes()[prefix.len()] == b'.')
+    }
+    let (pa, wa) = parts(a);
+    let (pb, wb) = parts(b);
+    match (wa, wb) {
+        (false, false) => pa == pb,
+        (true, false) => covers(pa, pb),
+        (false, true) => covers(pb, pa),
+        // Two families overlap when either prefix is at or below the other.
+        (true, true) => covers(pa, pb) || covers(pb, pa),
+    }
+}
+
+/// How this build was DELIVERED. One vocabulary, so the debug log and the About page can never
+/// disagree about what the user is running.
+///
+/// The distinction is not cosmetic. Each kind answers different questions about where the app's
+/// own files are, whether it can update itself, and which copy of ffmpeg or tesseract is really
+/// being spawned, which is the first thing to establish when a report says a bundled tool went
+/// missing.
+/// **The two axes are read differently, and DRAGON-614 is where that becomes visible.** The
+/// three Linux kinds are a RUNTIME fact: AppImage and the plain binary are the same compiled
+/// code, so no `cfg` can tell them apart and only the running process knows, from `$APPIMAGE`.
+/// macOS and Windows are a COMPILE-TIME fact: a build either targets them or it does not.
+/// [`package_kind`] branches on the second and delegates the first to [`package_kind_from`],
+/// which stays exactly the Linux artifact-kind decision it always was.
+///
+/// This is deliberately NOT the same question [`crate::update::platform_key`] answers, and the
+/// two must not be folded together. That one picks which artifact an UPDATE downloads and reads
+/// `cfg!(target_os)`, `$APPIMAGE` and `cfg!(target_arch)` directly; it has never consulted this
+/// enum and adding cases here cannot change a manifest key.
+/// **Every build constructs only its own subset, so each variant declares where it is dead.**
+/// The vocabulary is deliberately cross-platform (one enum, so the About badge and the debug
+/// log speak the same five names everywhere, and `cargo test` exercises all five on any host),
+/// but a Linux binary never constructs [`Self::MacOs`] and a Mac never constructs
+/// [`Self::Binary`]. The per-variant gates are deliberately NOT one blanket allow on the enum:
+/// this way the compiler still catches a variant that goes dead on its OWN platform, which
+/// would mean `package_kind`'s arm for it had been lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageKind {
+    /// A plain Linux binary: a distro build, a ZIP unpacked by hand, a `cargo` build.
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+    Binary,
+    /// A self-mounting AppImage bundle, carrying its own sidecars.
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+    AppImage,
+    /// A Flatpak sandbox: read-only `/app`, private config, some tools from the runtime.
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+    Flatpak,
+    /// A macOS build: the signed `.app` from the dmg, or a `cargo` build on a Mac.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    MacOs,
+    /// A Windows build: the MSI install, or a `cargo` build on Windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Windows,
+}
+
+impl PackageKind {
+    /// The user-facing name, for the About page.
+    ///
+    /// **The three Linux ones name their platform, and that is a deliberate reversal**
+    /// (DRAGON-614). They read "Binary Release" and so on until macOS and Windows joined
+    /// them, which was right while every case was Linux and wrong the moment the badge
+    /// stopped being Linux-only: an unprefixed "Binary Release" beside "macOS Release" reads
+    /// as a THIRD platform rather than as the Linux plain-binary artifact. Do not simplify
+    /// the prefixes back out.
+    ///
+    /// macOS and Windows take no artifact word because they have no second artifact to be
+    /// distinguished from: each ships one kind, so "macOS Release" is already unambiguous
+    /// where "Linux Release" would not be.
+    pub fn label(self) -> &'static str {
+        match self {
+            PackageKind::Binary => "Linux Binary Release",
+            PackageKind::AppImage => "Linux AppImage Release",
+            PackageKind::Flatpak => "Linux Flatpak Release",
+            PackageKind::MacOs => "macOS Release",
+            PackageKind::Windows => "Windows Release",
+        }
+    }
+
+    /// The glyph the About page's release-kind line shows for this package (DRAGON-591 and
+    /// DRAGON-614, the owner's picks): lucide `binary` for a bare executable, `file-archive`
+    /// for the AppImage (one file carrying a packed filesystem), the general `package` box for
+    /// the Flatpak, `apple` for macOS and `grid-2x2` for Windows. Names are the
+    /// freedesktop-ish keys `widgets::icons::handle` maps into the bundled lucide set, so this
+    /// returns a NAME rather than bytes and the icon plumbing stays the single resolver.
+    pub fn icon_name(self) -> &'static str {
+        match self {
+            PackageKind::Binary => "application-x-executable-symbolic",
+            PackageKind::AppImage => "application-x-appimage-symbolic",
+            PackageKind::Flatpak => "package-x-generic-symbolic",
+            PackageKind::MacOs => "package-macos-symbolic",
+            PackageKind::Windows => "package-windows-symbolic",
+        }
+    }
+
+    /// The debug log's spelling. Deliberately NOT the same string as [`Self::label`]: the log
+    /// says what the thing IS ("plain binary") while the UI names a release channel, and a log
+    /// line reading "Binary Release" would imply a distribution we do not have.
+    ///
+    /// The two non-Linux spellings are COARSER than the Linux three, and that is honest rather
+    /// than lazy: the Linux names distinguish three artifacts that behave differently from each
+    /// other, and neither macOS nor Windows ships a second kind for these to be told apart
+    /// from. There is nothing finer to say.
+    pub fn diag_name(self) -> &'static str {
+        match self {
+            PackageKind::Binary => "plain binary",
+            PackageKind::AppImage => "AppImage",
+            PackageKind::Flatpak => "Flatpak",
+            PackageKind::MacOs => "macOS build",
+            PackageKind::Windows => "Windows build",
+        }
+    }
+}
+
+/// How THIS process was delivered.
+///
+/// macOS and Windows answer from a `cfg`, because on those platforms the question has a
+/// compile-time answer. Only the Linux arm has anything to probe, and it asks
+/// [`package_kind_from`], which is that arm's whole decision.
+pub fn package_kind() -> PackageKind {
+    #[cfg(target_os = "macos")]
+    {
+        PackageKind::MacOs
+    }
+    #[cfg(windows)]
+    {
+        PackageKind::Windows
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        package_kind_from(flatpak_sandboxed(), running_from_appimage())
+    }
+}
+
+/// **Pure**, unit-tested: the LINUX artifact-kind decision, with both probes injected.
+///
+/// Three artifacts, one compiled binary, so this is a runtime question and not a `cfg` one.
+/// It is called only from [`package_kind`]'s Linux arm; macOS and Windows never reach it,
+/// because their kind is settled at compile time and modelling them the same way would invent
+/// a probe for a fact that is already known.
+///
+/// Flatpak is asked FIRST, and the order is load-bearing rather than arbitrary. The two are not
+/// mutually exclusive in principle (nothing stops someone putting an AppImage inside a Flatpak),
+/// and if that ever happened the sandbox is the fact that governs everything a reader cares
+/// about here: the read-only `/app`, the private config, the hidden Wayland globals. Reporting
+/// "AppImage" for it would name the inner packaging and hide the thing actually shaping the
+/// app's behaviour.
+// Its only non-test caller is the Linux arm above, so off Linux it is honestly dead rather
+// than hidden behind a blanket allow. It stays compiled everywhere because the decision is
+// portable and `cargo test` proves it on any host, which is the whole point of the split.
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+pub fn package_kind_from(flatpak: bool, appimage: bool) -> PackageKind {
+    if flatpak {
+        PackageKind::Flatpak
+    } else if appimage {
+        PackageKind::AppImage
+    } else {
+        PackageKind::Binary
+    }
+}
+
+/// The user's REAL config directory, seeing past a Flatpak sandbox (`lab/flatpak`).
+///
+/// Outside a sandbox this is exactly `dirs::config_dir()` and nothing changes.
+///
+/// Inside one it must not be, and the reason is easy to get wrong. Flatpak leaves `$HOME`
+/// pointing at the real home but redirects `$XDG_CONFIG_HOME` to
+/// `~/.var/app/<app-id>/config`, which is the app's PRIVATE store. `dirs::config_dir()` reads
+/// that variable, so every caller silently starts reading a directory the desktop has never
+/// written to. Nothing errors: the reads just miss and fall through to defaults, so the
+/// symptom is a capture with the wrong accent and square corners rather than a failure.
+///
+/// The host's own config is still reachable, because a `--filesystem=xdg-config/cosmic:ro`
+/// grant bind-mounts it at its ordinary path under the real `$HOME`. So the fix is to stop
+/// asking `$XDG_CONFIG_HOME` and ask the host instead. libcosmic's `cosmic-config` solved the
+/// identical problem the same way, which is why the COSMIC readers here can follow it.
+///
+/// **The rule, rather than a caller list that goes stale.** Reading somebody ELSE'S config
+/// (the desktop's, the compositor's, another app's) goes through here. Reading OUR OWN config
+/// keeps using `dirs::config_dir()` via [`app_config_dir`], because inside a sandbox ours
+/// SHOULD be private. So: if the file was written by something other than this app, ask this
+/// function.
+///
+/// Callers today are the COSMIC theme reader (accent, corner radius), the COSMIC wallpaper
+/// readers, the KDE applet reader, the sway/hyprland reader, and the XDG autostart entry,
+/// which the SESSION reads even though we write it.
+///
+/// DRAGON-619 is what turned this from a list into a rule: three readers were added over time
+/// using `dirs::config_dir()` directly, and every one of them silently read the sandbox and
+/// missed. The failure is invisible by construction, since a miss is indistinguishable from a
+/// machine that genuinely has no such config, so nothing logs and nothing fails. DRAGON-618
+/// was the same mistake in the writing direction.
+// Callers are the COSMIC theme and wallpaper readers, all `cfg(target_os = "linux")`, so
+// this is honestly dead off Linux. Kept portable rather than Linux-gated so the pure decision
+// below stays reachable from the tests on every host.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn host_config_dir() -> Option<std::path::PathBuf> {
+    host_config_dir_from(
+        flatpak_sandboxed(),
+        std::env::var_os("HOST_XDG_CONFIG_HOME").map(std::path::PathBuf::from),
+        dirs::home_dir(),
+        dirs::config_dir(),
+    )
+}
+
+/// **Pure**, unit-tested: [`host_config_dir`]'s decision, with every input injected.
+///
+/// The ladder inside a sandbox, in order, and each rung earns its place:
+///
+/// 1. `$HOST_XDG_CONFIG_HOME`, which Flatpak sets when the HOST's own `XDG_CONFIG_HOME` is
+///    non-default. Rare, but when it is set it is the only correct answer, because the user's
+///    config genuinely is not at `~/.config`.
+/// 2. `$HOME/.config`, the ordinary case. `$HOME` is the real home inside the sandbox, so this
+///    resolves to the bind-mounted host directory.
+/// 3. `dirs::config_dir()`, which is the sandboxed path and therefore wrong, kept only so the
+///    function is total. A caller reading it finds nothing and falls back to its own defaults,
+///    which is the same outcome as a machine with no COSMIC config at all.
+// Dead off Linux for the same reason as `host_config_dir`, but compiled everywhere on
+// purpose: it is the pure half, and its tests are what prove the sandbox rule on a machine
+// that has no sandbox.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn host_config_dir_from(
+    sandboxed: bool,
+    host_xdg_config_home: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+    config_dir: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    if !sandboxed {
+        return config_dir;
+    }
+    host_xdg_config_home
+        .or_else(|| home.map(|h| h.join(".config")))
+        .or(config_dir)
+}
+
 /// A short, deterministic key that separates one checkout's sandbox from another's.
 ///
 /// Keyed by the cargo manifest dir so concurrent runs in different worktrees never share a
@@ -526,11 +896,18 @@ pub fn ffplay_path() -> PathBuf {
 /// (DRAGON-485), with the same resolution order as [`ffmpeg_path`]: the `CCK_PROTON_DRIVE`
 /// override, then a sidecar next to our executable, then `PATH`.
 ///
-/// **Optional at runtime and never bundled**, exactly like `ffmpeg` and `tesseract`. It is a
-/// ~118 MB standalone binary the user downloads from Proton, and shipping a copy of someone
-/// else's signed application inside ours would be both enormous and wrong. The Proton provider
-/// probes for it and, when it is absent, says so and offers the download page rather than
-/// failing a connect halfway through. See `cloud::proton`.
+/// **Optional at runtime and never bundled by the DIRECT builds**, exactly like `ffmpeg` and
+/// `tesseract`. It is a ~118 MB standalone binary the user downloads from Proton, and a copy
+/// inside our direct artifacts would be enormous and would go stale on OUR update cadence
+/// rather than Proton's. The Proton provider probes for it and, when it is absent, says so
+/// and (outside a Flatpak) offers the download page rather than failing a connect halfway
+/// through. See `cloud::proton`.
+///
+/// **The FLATPAK bundles it since DRAGON-566**, at `/app/bin/proton-drive`, which is exactly
+/// the exe-adjacent arm of this resolution: inside the sandbox a host install is invisible,
+/// so "download it yourself" is advice that package makes false; the CLI is MIT-licensed, so
+/// redistribution is clean; and the store is the Flatpak's update channel, so the bundled
+/// copy is updated with the app. `cloud::proton`'s module doc carries the whole record.
 pub fn proton_drive_path() -> PathBuf {
     locate_tool("proton-drive", "CCK_PROTON_DRIVE")
 }
@@ -734,57 +1111,248 @@ const APPDIR_ENV: &str = "APPDIR";
 /// can never disagree about it.
 ///
 /// The mount point is a fresh random path (`/tmp/.mount_CosmicXXXXXX`) on every launch, so it
-/// is only ever useful as something to measure another path AGAINST: see [`appimage_label`].
+/// is only ever useful as something to measure another path AGAINST: see [`bundle_label`].
 ///
 /// Not gated to Linux even though AppImage is a Linux format. It is two environment reads
 /// that no macOS or Windows launch can satisfy (nothing there sets the runtime's variables),
 /// its `$APPIMAGE` half is already portable for [`re_exec_path`], and keeping it portable is
 /// what lets [`tool_location_label`] stay free of platform branches.
 pub fn appimage_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok();
     appimage_dir_from(
         std::env::var_os(APPIMAGE_ENV).as_deref(),
         std::env::var_os(APPDIR_ENV).as_deref(),
+        exe.as_deref(),
     )
 }
 
 /// **Pure**, unit-tested: [`appimage_dir`]'s decision, with the environment injected.
 ///
-/// BOTH variables are required. `$APPIMAGE` is the "this really is an AppImage launch" marker
-/// ([`appimage_from`], the same rule the re-exec path uses), and `$APPDIR` alone is a name
-/// generic enough that something else could have exported it; claiming "AppImage" over
-/// somebody else's variable would mislabel a path rather than explain it. Empty values are
-/// treated as absent, exactly as [`appimage_from`] treats them.
+/// `$APPIMAGE` is REQUIRED and is the "this really is an AppImage launch" marker
+/// ([`appimage_from`], the same rule the re-exec path uses). Empty values are treated as
+/// absent, exactly as [`appimage_from`] treats them.
+///
+/// `$APPDIR` is preferred but NO LONGER REQUIRED, and that change is a bug fix rather than a
+/// loosening (owner report: a Linux Mint user's AppImage showed plain paths where a CachyOS one
+/// showed `AppImage://`).
+///
+/// The reason it can go missing is that our `AppRun` is a SYMLINK straight to the binary rather
+/// than a shell script, deliberately, so nothing of ours exports anything. We inherit whatever
+/// the runtime chose to set, and that is not identical everywhere: extract-and-run mode, older
+/// runtimes and some launchers differ. Requiring both variables therefore made a purely
+/// cosmetic label depend on an environment detail the user cannot see or influence, and its
+/// absence looked like "the bundled ffmpeg is not being used" when the bundled ffmpeg was in
+/// fact being used the whole time.
+///
+/// So when `$APPDIR` is absent, derive the root from where WE are, which is ground truth: the
+/// binary lives at `<mount>/usr/bin/<name>`, so three parents up is the mount. `exe` is the
+/// resolved `current_exe`.
+///
+/// The `usr/bin` shape is CHECKED rather than assumed, and that check is what keeps this
+/// honest: without it, any `$APPIMAGE`-carrying launch would claim its grandparent directory as
+/// a bundle root and start labelling ordinary paths. A dev build under `target/release` fails
+/// the check and is left alone.
 fn appimage_dir_from(
     appimage: Option<&std::ffi::OsStr>,
     appdir: Option<&std::ffi::OsStr>,
+    exe: Option<&Path>,
 ) -> Option<PathBuf> {
     appimage_from(appimage)?;
-    match appdir {
-        Some(d) if !d.is_empty() => Some(PathBuf::from(d)),
-        _ => None,
+    if let Some(d) = appdir
+        && !d.is_empty()
+    {
+        return Some(PathBuf::from(d));
     }
+    // `<mount>/usr/bin/<name>` → `<mount>`, but only when the tail really is `usr/bin`.
+    let exe = exe?;
+    let bin = exe.parent()?;
+    let usr = bin.parent()?;
+    if bin.file_name()? != "bin" || usr.file_name()? != "usr" {
+        return None;
+    }
+    let root = usr.parent()?;
+    // A bundle root of `/` is not a bundle root, it is a distro install at
+    // `/usr/bin/cosmic-capture-kit` that happens to match the shape. Accepting it would make
+    // `bundle_label` strip `/` off every system path and report `AppImage://usr/bin/ffmpeg`
+    // for a file we did not ship. Caught by `a_wrong_shaped_exe_path_derives_nothing`.
+    (root != Path::new("/") && root.file_name().is_some()).then(|| root.to_path_buf())
 }
 
 /// Whether this launch is running from a mounted AppImage bundle rather than a plain binary
-/// (a distro build, the `.app`, an MSI install, a `cargo` build). Always false off Linux.
+/// (a distro build, a ZIP unpacked by hand, a `cargo` build). Always false off Linux.
+///
+/// Its one caller is [`package_kind`]'s Linux arm, so DRAGON-614 made it honestly dead on the
+/// other two: those platforms answer their package kind from a `cfg` and have no artifact
+/// kinds to tell apart, which is the whole distinction that commit drew. It stays portable
+/// rather than becoming Linux-only because [`appimage_dir`] beneath it already is (it reads
+/// `$APPIMAGE`, which simply never exists elsewhere), and a `cfg`-gated body here would be a
+/// second statement of the same fact.
+#[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
 pub fn running_from_appimage() -> bool {
     appimage_dir().is_some()
+}
+
+// ── Spelling our own launch, for a human to paste (DRAGON-589) ───────────────
+
+/// The shell command line that starts THIS build with `flags`, for a user who has to bind it
+/// as a shortcut in their own desktop.
+///
+/// [`self_exe`] answers "what path do I spawn"; this answers the neighbouring question "what
+/// does a PERSON type to spawn me". Same subject, different audience, so the answer is a
+/// string rather than a `PathBuf` and it has to survive a paste into a terminal.
+///
+/// The reader collects the two facts and [`launch_command_from`] decides. See that function
+/// for why the three package kinds are spelled differently.
+pub fn launch_command(flags: &[&str]) -> String {
+    let exe = self_exe().ok();
+    launch_command_from(package_kind(), exe.as_deref(), FLATPAK_APP_ID, flags)
+}
+
+/// The Flatpak application id this build ships under, which is also the only handle a Flatpak
+/// launch has: `flatpak run <app-id>`. Inside the sandbox the binary's own path (`/app/bin/…`)
+/// exists only for processes already in that sandbox, so it is useless to the user's desktop
+/// shortcut, which runs on the HOST.
+///
+/// The same string the manifest declares (`scripts/flatpak/dev.thedragon.CosmicCaptureKit.yml`)
+/// and the same one `cosmic::Application::APP_ID` carries.
+pub const FLATPAK_APP_ID: &str = "dev.thedragon.CosmicCaptureKit";
+
+/// **Pure**, unit-tested: [`launch_command`]'s decision, with both probes injected.
+///
+/// One action, three spellings, because how you start this program depends entirely on how it
+/// was delivered:
+///
+/// * **Flatpak**: `flatpak run <app-id> --flag`. The executable path inside the sandbox is not
+///   reachable from the host, and the app id is the only name the host knows us by.
+/// * **AppImage**: the `.AppImage` FILE, which is what [`self_exe`] already resolves inside a
+///   bundle (`$APPIMAGE`). Emphatically NOT `current_exe()`, which names a FUSE mount that
+///   stops existing the moment this process does, so a shortcut recorded against it would
+///   break at the next launch.
+/// * **Plain binary**: the resolved executable path, which for this project is usually a
+///   `target/release` build rather than anything on `PATH`.
+///
+/// `exe` is `None` only when the platform could not report our own path at all, which leaves
+/// nothing honest to print; the command then falls back to the program NAME, which is right
+/// for a distro install on `PATH` and at least tells the reader what to run.
+///
+/// The path is home-collapsed and shell-quoted; see [`shell_word`] for the quoting rule and
+/// [`collapse_home`] for why `~` is a safe default rather than a trade-off.
+pub fn launch_command_from(
+    kind: PackageKind,
+    exe: Option<&Path>,
+    app_id: &str,
+    flags: &[&str],
+) -> String {
+    let head = match kind {
+        PackageKind::Flatpak => format!("flatpak run {app_id}"),
+        // DRAGON-614: macOS and Windows join the executable-path arm, which is where they
+        // already were as `PackageKind::Binary`, so the command they print is unchanged. The
+        // Flatpak is still the only kind whose own path is unreachable from the host.
+        PackageKind::Binary
+        | PackageKind::AppImage
+        | PackageKind::MacOs
+        | PackageKind::Windows => match exe {
+            Some(p) => shell_word(&collapse_home(&p.to_string_lossy())),
+            None => BIN_NAME.to_string(),
+        },
+    };
+    let mut out = head;
+    for f in flags {
+        out.push(' ');
+        out.push_str(&shell_word(f));
+    }
+    out
+}
+
+/// The program's own basename, the last-resort spelling when the platform cannot report where
+/// this executable lives. Matches the `[[bin]]` name in `Cargo.toml`, which is what a distro
+/// package puts on `PATH`.
+///
+/// `pub(crate)` since DRAGON-618: the Flatpak autostart path hands this exact name to the
+/// Background portal as the command to launch inside the sandbox, where `/app/bin` is on
+/// `PATH`. It must be the SAME string the binary is actually installed as, so it defers here
+/// rather than re-spelling it.
+pub(crate) const BIN_NAME: &str = "cosmic-capture-kit";
+
+/// **Pure**, unit-tested: `word` as ONE argument of a shell command line, quoted only if it
+/// has to be.
+///
+/// Quoting only when needed is the point. A command a user is meant to read and paste should
+/// look like the command they would have typed, and `'/usr/bin/cosmic-capture-kit' --region`
+/// reads as a mistake. A path with a space in it, though, silently becomes two arguments, so
+/// that case must be quoted or the pasted line does something else entirely.
+///
+/// The safe set is the characters no POSIX shell treats specially: letters, digits, and
+/// `_ - . / : = + , @ %`. Anything else (a space, a quote, `$`, `&`, a newline, a non-ASCII
+/// byte) sends the word through single quotes, where the shell interprets nothing at all. A
+/// single quote inside is written `'\''`, the same escape `update::shell_single_quote` uses
+/// for the inside of a script literal; that one always sits inside quotes its caller wrote,
+/// while this decides whether there are quotes at all, which is why they are separate.
+///
+/// A LEADING `~/` is kept outside the quotes, because `~` only expands unquoted. `~/'my
+/// folder'/app` is one word to the shell, expands the home directory, and runs.
+pub fn shell_word(word: &str) -> String {
+    fn safe(s: &str) -> bool {
+        !s.is_empty()
+            && s.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '=' | '+' | ',' | '@' | '%')
+            })
+    }
+    fn quoted(s: &str) -> String {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+    if safe(word) {
+        return word.to_string();
+    }
+    // `~` alone, or a home-collapsed path whose tail needs quoting: the tilde stays bare so the
+    // shell still expands it, and only the rest goes inside quotes.
+    if word == "~" {
+        return word.to_string();
+    }
+    match word.strip_prefix("~/") {
+        Some(rest) if safe(rest) => word.to_string(),
+        Some(rest) => format!("~/{}", quoted(rest)),
+        None => quoted(word),
+    }
 }
 
 /// A resolved tool path as a human should read it, given the AppImage mount root (if any).
 /// **Pure**, unit-tested.
 ///
-/// A path INSIDE the bundle is reported relative to the bundle, prefixed `AppImage:`. Showing
-/// the real one would be worse than useless: the mount point is a different random path on
-/// every launch, so the interesting half (`usr/bin/ffmpeg`, i.e. "the copy we shipped") is
-/// buried under noise that changes each time the user looks. Everything else is shown as it
-/// is, because for a plain install the full path IS the answer.
-fn appimage_label(path: &Path, mount: Option<&Path>) -> String {
+/// A path INSIDE the bundle is reported relative to the bundle, written `AppImage://usr/…`.
+/// Showing the real one would be worse than useless: the mount point is a different random
+/// path on every launch, so the interesting half (`usr/bin/ffmpeg`, i.e. "the copy we
+/// shipped") is buried under noise that changes each time the user looks. Everything else is
+/// shown as it is, because for a plain install the full path IS the answer.
+///
+/// The `://` is deliberate, and reads as a scheme rather than a sentence. `AppImage: usr/…`
+/// looked like a label followed by a path, which invites reading the two halves as separate
+/// things and makes the result awkward to quote or paste. `AppImage://usr/bin/ffmpeg` is one
+/// token that says "inside the bundle, at this path", the same way any URI does.
+///
+/// A FLATPAK gets the same treatment for the same reason, written `Flatpak://app/bin/tesseract`
+/// (`lab/flatpak`). The two bundles differ in one detail that matters to the formatting: an
+/// AppImage path is measured against a mount root, so what survives is already relative
+/// (`usr/bin/ffmpeg`), while a Flatpak path is ABSOLUTE inside the sandbox (`/app/bin/…`).
+/// Interpolating that directly would produce `Flatpak:///app/…` with three slashes, which
+/// reads as a malformed URI, so the leading separator is dropped and the scheme keeps exactly
+/// two.
+///
+/// Only paths from the bundle IMAGE are labelled, which on a Flatpak means `/app` (what we
+/// ship) and `/usr` (the runtime we ship against). Anything else the sandbox can see is a real
+/// host path the user recognises, and is shown as it is.
+fn bundle_label(path: &Path, mount: Option<&Path>, flatpak: bool) -> String {
     if let Some(root) = mount
         && let Ok(rel) = path.strip_prefix(root)
         && !rel.as_os_str().is_empty()
     {
-        return format!("AppImage: {}", rel.display());
+        return format!("AppImage://{}", rel.display());
+    }
+    if flatpak {
+        let s = path.to_string_lossy();
+        if s.starts_with("/app/") || s.starts_with("/usr/") {
+            return format!("Flatpak://{}", s.trim_start_matches('/'));
+        }
     }
     path.display().to_string()
 }
@@ -865,7 +1433,7 @@ pub fn tool_available(tool: &Path) -> bool {
 /// The result is deliberately NOT canonicalised. What the user needs to see is the binary
 /// this app will actually spawn, symlinks and all: `/usr/bin/ffmpeg` is the honest answer
 /// even when it points at `ffmpeg-7`. Resolving links would also break the AppImage prefix
-/// match in [`appimage_label`] on any system that reaches its mount point through one.
+/// match in [`bundle_label`] on any system that reaches its mount point through one.
 pub fn tool_location(tool: &Path) -> Option<PathBuf> {
     if tool.is_absolute() {
         return tool.is_file().then(|| tool.to_path_buf());
@@ -907,9 +1475,13 @@ fn tool_in_dir(d: &Path, tool: &Path) -> Option<PathBuf> {
 /// Where an external tool ACTUALLY resolved, written for a human to read, or `None` when the
 /// tool is not on this machine at all. Takes whatever [`ffmpeg_path`] and friends returned
 /// (an absolute path or a bare name) and reports the file that will really be spawned, with
-/// a path inside an AppImage bundle named relative to the bundle (see [`appimage_label`]).
+/// a path inside a bundle named for that bundle (see [`bundle_label`]).
 pub fn tool_location_label(tool: &Path) -> Option<String> {
-    Some(appimage_label(&tool_location(tool)?, appimage_dir().as_deref()))
+    Some(bundle_label(
+        &tool_location(tool)?,
+        appimage_dir().as_deref(),
+        flatpak_sandboxed(),
+    ))
 }
 
 /// One external tool and where it resolved: `location` is `None` when it is not installed.
@@ -952,6 +1524,165 @@ pub fn tool_locations() -> &'static [ToolLocation] {
     })
 }
 
+/// One external tool and the version its binary REPORTS: `version` is `None` when the tool
+/// is missing or its output carried no recognisable version. Same `name` vocabulary as
+/// [`ToolLocation`], so the Health page can join the two by name.
+#[derive(Debug, Clone)]
+pub struct ToolVersion {
+    /// The tool as the user knows it, matching its [`ToolLocation`] entry.
+    pub name: &'static str,
+    /// The bare version its `-version` / `--version` output reported ("8.1.2"), or `None`.
+    pub version: Option<String>,
+}
+
+/// How long one version probe may run before its child is killed. These commands answer in
+/// milliseconds; the bound exists for the wedged case (DRAGON-118: nothing waits unboundedly,
+/// and a hung probe would otherwise leak its detached worker thread for the process lifetime).
+const VERSION_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The version each external binary reports, for the Health page's rows (DRAGON-564). The
+/// same tool set as [`tool_locations`], resolved through the same `*_path()` lookups, so the
+/// version describes the binary the app actually spawns, env overrides included.
+///
+/// BLOCKING: spawns each tool once (bounded, [`VERSION_PROBE_BUDGET`] apiece). Call it off
+/// the UI thread (`app::off_thread`); the settings window kicks it when it opens and the
+/// result arrives as a message. Deliberately NOT cached here: the one caller already caches
+/// the result for the process lifetime, and a second cache could only disagree with it.
+pub fn probe_tool_versions() -> Vec<ToolVersion> {
+    // `mut` only where something is pushed below: pactl is a Linux row, so mac and
+    // Windows build this list once and never add to it (mirrors `tool_locations`).
+    #[cfg_attr(any(target_os = "macos", windows), allow(unused_mut))]
+    let mut tools = vec![
+        ToolVersion {
+            name: "ffmpeg",
+            version: probe_version(&ffmpeg_path(), "-version", ffmpeg_version_line),
+        },
+        ToolVersion {
+            name: "ffprobe",
+            version: probe_version(&ffprobe_path(), "-version", ffmpeg_version_line),
+        },
+        ToolVersion {
+            name: "tesseract",
+            version: probe_version(&tesseract_path(), "--version", name_version_line),
+        },
+    ];
+    #[cfg(not(any(target_os = "macos", windows)))]
+    tools.push(ToolVersion {
+        name: "pactl",
+        version: crate::audio::devices::pactl_path()
+            .and_then(|p| probe_version(&p, "--version", name_version_line)),
+    });
+    tools
+}
+
+/// Spawn `tool <flag>` and parse the version out of the FIRST non-empty line of its output,
+/// stdout first with stderr as the fallback (tesseract releases before 5 print their version
+/// banner to stderr). `None` on any failure: a missing tool, a killed child, a non-zero-exit
+/// crash that printed nothing usable, or output no parser recognises.
+///
+/// BOUNDED, modelled on `update::run_bounded` (DRAGON-118). A separate copy rather than a
+/// call, for the reason that one gives for not calling ffmpeg's: it carries its domain with
+/// it (its kill warning names the update flow) and it DROPS stderr, which this probe needs.
+/// Reader threads drain both pipes while the reap loop polls, so a chatty tool can never
+/// fill a pipe buffer and stall itself into the deadline. Logs at debug only, and never a
+/// path (the diag privacy rules).
+fn probe_version(tool: &Path, flag: &str, parse: fn(&str) -> Option<String>) -> Option<String> {
+    let mut child = quiet_command(tool)
+        .arg(flag)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take().map(drain_thread);
+    let stderr = child.stderr.take().map(drain_thread);
+    let deadline = std::time::Instant::now() + VERSION_PROBE_BUDGET;
+    let exited = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break true,
+            Ok(None) => {}
+            Err(_) => break false,
+        }
+        if std::time::Instant::now() >= deadline {
+            log::debug!(
+                "version probe: a tool outlived its {}s budget and was stopped",
+                VERSION_PROBE_BUDGET.as_secs()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    // Joined AFTER the child is gone, so every read has hit EOF and no join can block.
+    let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+    if !exited {
+        return None;
+    }
+    first_line(&stdout)
+        .and_then(|l| parse(&l))
+        .or_else(|| first_line(&stderr).and_then(|l| parse(&l)))
+}
+
+/// Drain one child pipe to EOF on its own thread (so the reap loop never blocks on I/O and
+/// the child never blocks on a full pipe), handing the bytes back through the join.
+fn drain_thread<R: std::io::Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// Pure: the first non-empty line of a tool's output, trimmed, decoded lossily.
+fn first_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(str::to_string)
+}
+
+/// Pure: the bare version out of an `ffmpeg -version` / `ffprobe -version` first line
+/// ("ffmpeg version 8.1.2 Copyright (c) ..."), or `None` when the line carries none.
+/// The token after the literal `version` is the version; unit-tested
+/// (`ffmpeg_version_line_tests`), including the git-build and garbage lines that must
+/// answer `None` so the Health row shows the name alone.
+fn ffmpeg_version_line(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    tokens.by_ref().find(|t| *t == "version")?;
+    bare_version(tokens.next()?)
+}
+
+/// Pure: the bare version out of a `tesseract --version` / `pactl --version` first line
+/// ("tesseract 5.5.3", "pactl 17.0"): the token after the tool's own name; unit-tested
+/// (`name_version_line_tests`), including garbage lines that must answer `None`.
+fn name_version_line(line: &str) -> Option<String> {
+    let mut tokens = line.split_whitespace();
+    let _name = tokens.next()?;
+    bare_version(tokens.next()?)
+}
+
+/// Pure: reduce one version token to its bare numeric form, or `None` when it has none.
+/// Strips a single packaging prefix ("n8.1.2" on FFmpeg's own release builds, "v5.3.0"
+/// on Windows tesseract packages), then keeps the leading digits-and-dots run, so a
+/// distro suffix ("6.1.1-3ubuntu5") falls away. A token with no leading digit (a git
+/// build's "N-109802-g7c2f9a6c4e", prose) is not a version. Unit-tested through the two
+/// line parsers above.
+fn bare_version(token: &str) -> Option<String> {
+    let t = token
+        .strip_prefix(['n', 'v'])
+        .filter(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+        .unwrap_or(token);
+    let end = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(t.len());
+    let bare = t[..end].trim_end_matches('.');
+    bare.starts_with(|c: char| c.is_ascii_digit())
+        .then(|| bare.to_string())
+}
+
 /// Expand a leading `~/` to the user's home directory; every other path passes through.
 pub fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/")
@@ -960,6 +1691,46 @@ pub fn expand_tilde(path: &str) -> PathBuf {
         return home.join(rest);
     }
     PathBuf::from(path)
+}
+
+/// [`expand_tilde`]'s inverse: collapse a leading home directory back to `~`, for a path we
+/// are about to SHOW.
+///
+/// The reason is privacy rather than tidiness (owner call). Settings screens get screenshotted
+/// into bug reports, pasted into chats, and shared on calls, and a full path leaks the account
+/// name to everyone who sees it. `~/Capture` says everything the reader needs and nothing they
+/// do not.
+///
+/// It stays a valid, pasteable path, which is why this is a safe default rather than a
+/// trade-off: a shell expands `~` itself, so a copied string still works in a terminal, and the
+/// [`expand_tilde`] above is what reads it back if it ever comes to us as input.
+///
+/// Only an exact home PREFIX collapses. A path that merely starts with the same characters
+/// (`/home/frost-backup` beside `/home/frost`) is left alone, because it is a different
+/// directory and rewriting it would be a lie rather than an abbreviation.
+pub fn collapse_home(path: &str) -> String {
+    collapse_home_from(path, dirs::home_dir().as_deref())
+}
+
+/// **Pure**, unit-tested: [`collapse_home`]'s decision, with the home directory injected.
+pub fn collapse_home_from(path: &str, home: Option<&Path>) -> String {
+    let Some(home) = home.map(|h| h.to_string_lossy().into_owned()) else {
+        return path.to_string();
+    };
+    // An empty or root home would match everything; nothing sane to collapse against.
+    if home.is_empty() || home == "/" {
+        return path.to_string();
+    }
+    if path == home {
+        return "~".to_string();
+    }
+    // The separator has to be part of the match, or `/home/frost-backup` would collapse
+    // against `/home/frost` and name a directory the user does not have.
+    let with_sep = format!("{home}/");
+    match path.strip_prefix(&with_sep) {
+        Some(rest) => format!("~/{rest}"),
+        None => path.to_string(),
+    }
 }
 
 /// A `file://` URI for a local path (clipboard file references + opening folders).
@@ -1555,7 +2326,7 @@ mod tool_location_label_tests {
             "/opt/homebrew/bin/tesseract",
             "/Applications/Cosmic Capture Kit.app/Contents/Resources/ffprobe",
         ] {
-            assert_eq!(appimage_label(Path::new(p), None), p);
+            assert_eq!(bundle_label(Path::new(p), None, false), p);
         }
     }
 
@@ -1566,13 +2337,26 @@ mod tool_location_label_tests {
     fn a_tool_inside_the_bundle_is_named_relative_to_it() {
         let mount = Path::new("/tmp/.mount_Cosmic7fA2xQ");
         assert_eq!(
-            appimage_label(Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/ffmpeg"), Some(mount)),
-            "AppImage: usr/bin/ffmpeg"
+            bundle_label(Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/ffmpeg"), Some(mount), false),
+            "AppImage://usr/bin/ffmpeg"
         );
         assert_eq!(
-            appimage_label(Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/tesseract"), Some(mount)),
-            "AppImage: usr/bin/tesseract"
+            bundle_label(Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/tesseract"), Some(mount), false),
+            "AppImage://usr/bin/tesseract"
         );
+    }
+
+    /// The label is written as a SCHEME, `AppImage://usr/…`, not as a sentence. Pinned
+    /// because it is user-visible text that gets pasted into support threads, and because
+    /// the earlier `AppImage: usr/…` form read as a label followed by a separate path.
+    #[test]
+    fn the_bundle_label_reads_as_a_scheme() {
+        let mount = Path::new("/tmp/.mount_Cosmic7fA2xQ");
+        let out = bundle_label(Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/ffmpeg"), Some(mount), false);
+        assert!(out.starts_with("AppImage://"), "must carry the scheme prefix: {out}");
+        assert!(!out.contains("AppImage: "), "the old label-and-path form must not come back");
+        // One token, so a double-click or a shell paste takes the whole thing.
+        assert!(!out.contains(' '), "the label must not contain a space: {out}");
     }
 
     /// A tool OUTSIDE the bundle keeps its real path even while running from an AppImage.
@@ -1581,10 +2365,10 @@ mod tool_location_label_tests {
     #[test]
     fn a_system_tool_keeps_its_path_inside_an_appimage() {
         let mount = Path::new("/tmp/.mount_Cosmic7fA2xQ");
-        assert_eq!(appimage_label(Path::new("/usr/bin/ffmpeg"), Some(mount)), "/usr/bin/ffmpeg");
+        assert_eq!(bundle_label(Path::new("/usr/bin/ffmpeg"), Some(mount), false), "/usr/bin/ffmpeg");
         // The mount root itself has no relative part to show, so it stays a path rather than
-        // becoming a bare "AppImage: ".
-        assert_eq!(appimage_label(mount, Some(mount)), "/tmp/.mount_Cosmic7fA2xQ");
+        // becoming a bare "AppImage://".
+        assert_eq!(bundle_label(mount, Some(mount), false), "/tmp/.mount_Cosmic7fA2xQ");
     }
 
     /// Both runtime variables are required, and empty counts as absent. `$APPDIR` alone is a
@@ -1595,14 +2379,26 @@ mod tool_location_label_tests {
         let img = OsStr::new("/home/u/Apps/CosmicCaptureKit.AppImage");
         let dir = OsStr::new("/tmp/.mount_Cosmic7fA2xQ");
         assert_eq!(
-            appimage_dir_from(Some(img), Some(dir)),
+            appimage_dir_from(Some(img), Some(dir), None),
             Some(PathBuf::from("/tmp/.mount_Cosmic7fA2xQ"))
         );
-        assert_eq!(appimage_dir_from(None, Some(dir)), None, "$APPDIR alone proves nothing");
-        assert_eq!(appimage_dir_from(Some(img), None), None, "no mount root to measure against");
-        assert_eq!(appimage_dir_from(Some(OsStr::new("")), Some(dir)), None, "empty is absent");
-        assert_eq!(appimage_dir_from(Some(img), Some(OsStr::new(""))), None, "empty is absent");
-        assert_eq!(appimage_dir_from(None, None), None, "every other kind of launch");
+        assert_eq!(appimage_dir_from(None, Some(dir), None), None, "$APPDIR alone proves nothing");
+        assert_eq!(
+            appimage_dir_from(Some(img), None, None),
+            None,
+            "no $APPDIR and no exe to derive one from leaves nothing to measure against"
+        );
+        assert_eq!(
+            appimage_dir_from(Some(OsStr::new("")), Some(dir), None),
+            None,
+            "empty is absent"
+        );
+        assert_eq!(
+            appimage_dir_from(Some(img), Some(OsStr::new("")), None),
+            None,
+            "empty is absent"
+        );
+        assert_eq!(appimage_dir_from(None, None, None), None, "every other kind of launch");
     }
 
     /// The end-to-end label for a tool this machine really has. Nothing here can assert a
@@ -1628,6 +2424,113 @@ mod tool_location_label_tests {
         assert!(names.contains(&"pactl"), "{names:?}");
         // Cached: the same slice comes back, so a per-frame Health page pays once.
         assert_eq!(tool_locations().as_ptr(), tool_locations().as_ptr());
+    }
+}
+
+/// DRAGON-564: the `ffmpeg -version` / `ffprobe -version` first-line parser, pinned
+/// against the real formats those builds print. Anything unrecognisable must answer
+/// `None`, because the Health row's fallback is the name alone, never a wrong version.
+#[cfg(test)]
+mod ffmpeg_version_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_release_ffmpeg_line_yields_the_bare_version() {
+        assert_eq!(
+            ffmpeg_version_line(
+                "ffmpeg version 8.1.2 Copyright (c) 2000-2025 the FFmpeg developers"
+            ),
+            Some("8.1.2".to_string())
+        );
+    }
+
+    #[test]
+    fn an_ffprobe_line_parses_the_same_way() {
+        assert_eq!(
+            ffmpeg_version_line(
+                "ffprobe version 8.1.2 Copyright (c) 2007-2025 the FFmpeg developers"
+            ),
+            Some("8.1.2".to_string())
+        );
+    }
+
+    #[test]
+    fn the_n_packaging_prefix_and_git_suffix_fall_away() {
+        // FFmpeg's own release builds tag the version "n8.1.2"; a point build appends
+        // the commit ("-2-g8e14e5cd6a"). Both are packaging, not version.
+        assert_eq!(
+            ffmpeg_version_line(
+                "ffmpeg version n8.1.2-2-g8e14e5cd6a Copyright (c) 2000-2025 the FFmpeg developers"
+            ),
+            Some("8.1.2".to_string())
+        );
+    }
+
+    #[test]
+    fn a_distro_suffix_falls_away() {
+        assert_eq!(
+            ffmpeg_version_line(
+                "ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2024 the FFmpeg developers"
+            ),
+            Some("6.1.1".to_string())
+        );
+    }
+
+    #[test]
+    fn a_git_master_build_has_no_version_to_show() {
+        // "N-<count>-g<hash>" carries no release number; the row shows the name alone.
+        assert_eq!(
+            ffmpeg_version_line(
+                "ffmpeg version N-109802-g7c2f9a6c4e Copyright (c) 2000-2023 the FFmpeg developers"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn garbage_lines_answer_none() {
+        assert_eq!(ffmpeg_version_line("bash: ffmpeg: command not found"), None);
+        assert_eq!(ffmpeg_version_line("ffmpeg version"), None);
+        assert_eq!(ffmpeg_version_line(""), None);
+    }
+}
+
+/// DRAGON-564: the `tesseract --version` / `pactl --version` first-line parser ("name
+/// version"), pinned against the real formats, old-tesseract and Windows shapes included.
+#[cfg(test)]
+mod name_version_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_modern_tesseract_line_yields_the_bare_version() {
+        assert_eq!(name_version_line("tesseract 5.5.3"), Some("5.5.3".to_string()));
+    }
+
+    #[test]
+    fn an_old_tesseract_stderr_banner_parses_too() {
+        // Before 5.0 the banner went to stderr; the probe falls back to it, same shape.
+        assert_eq!(name_version_line("tesseract 4.1.1"), Some("4.1.1".to_string()));
+    }
+
+    #[test]
+    fn the_windows_v_prefix_falls_away() {
+        assert_eq!(
+            name_version_line("tesseract v5.3.0.20221214"),
+            Some("5.3.0.20221214".to_string())
+        );
+    }
+
+    #[test]
+    fn a_pactl_line_yields_the_bare_version() {
+        assert_eq!(name_version_line("pactl 17.0"), Some("17.0".to_string()));
+    }
+
+    #[test]
+    fn garbage_lines_answer_none() {
+        assert_eq!(name_version_line("Usage: tesseract --help | --version"), None);
+        assert_eq!(name_version_line("no such file or directory"), None);
+        assert_eq!(name_version_line("tesseract"), None);
+        assert_eq!(name_version_line(""), None);
     }
 }
 
@@ -1881,5 +2784,628 @@ mod collect_files_tests {
     #[test]
     fn a_missing_root_yields_nothing() {
         assert!(collect_files(std::path::Path::new("/nonexistent-cck-tessdata")).is_empty());
+    }
+}
+
+/// The Flatpak sandbox seam (`lab/flatpak`).
+#[cfg(test)]
+mod flatpak_sandbox_tests {
+    use super::{flatpak_sandboxed_from, host_config_dir_from};
+    use std::path::PathBuf;
+
+    #[test]
+    fn the_marker_file_is_the_sandbox_test() {
+        assert!(flatpak_sandboxed_from(true));
+        assert!(!flatpak_sandboxed_from(false));
+    }
+
+    /// Outside a sandbox the config dir is untouched, whatever else is set. This is the case
+    /// every existing user is in, so it must be exactly the old behaviour.
+    #[test]
+    fn outside_a_sandbox_the_config_dir_is_unchanged() {
+        let got = host_config_dir_from(
+            false,
+            Some(PathBuf::from("/host/xdg")),
+            Some(PathBuf::from("/home/u")),
+            Some(PathBuf::from("/home/u/.config")),
+        );
+        assert_eq!(got, Some(PathBuf::from("/home/u/.config")));
+    }
+
+    /// Inside a sandbox `dirs::config_dir()` points at the app's PRIVATE store, which the
+    /// desktop never writes to, so it must not win. `$HOME/.config` is where the host's config
+    /// is bind-mounted.
+    #[test]
+    fn inside_a_sandbox_home_config_beats_the_private_store() {
+        let got = host_config_dir_from(
+            true,
+            None,
+            Some(PathBuf::from("/home/u")),
+            Some(PathBuf::from("/home/u/.var/app/dev.thedragon.CosmicCaptureKit/config")),
+        );
+        assert_eq!(got, Some(PathBuf::from("/home/u/.config")));
+    }
+
+    /// When the HOST's own XDG_CONFIG_HOME is non-default, Flatpak passes it through and it is
+    /// the only correct answer: the user's config genuinely is not at ~/.config.
+    #[test]
+    fn host_xdg_config_home_wins_when_flatpak_provides_it() {
+        let got = host_config_dir_from(
+            true,
+            Some(PathBuf::from("/host/xdg")),
+            Some(PathBuf::from("/home/u")),
+            Some(PathBuf::from("/home/u/.var/app/x/config")),
+        );
+        assert_eq!(got, Some(PathBuf::from("/host/xdg")));
+    }
+
+    /// Total even with nothing to go on, so a caller falls through to its own defaults rather
+    /// than failing. That is the same outcome as a machine with no COSMIC config at all.
+    #[test]
+    fn it_stays_total_when_nothing_resolves() {
+        assert_eq!(host_config_dir_from(true, None, None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod session_bus_policy_tests {
+    use super::session_bus_talk_allowed;
+
+    /// The real `/.flatpak-info` of the `lab/flatpak` build, trimmed to the sections that
+    /// matter. Copied from a live sandbox, so the parser is proven against the actual format
+    /// rather than an invented one.
+    const LIVE: &str = "\
+[Application]
+name=dev.thedragon.CosmicCaptureKit
+
+[Context]
+shared=ipc;network;
+sockets=pulseaudio;wayland;
+
+[Session Bus Policy]
+org.kde.StatusNotifierWatcher=talk
+com.system76.CosmicStatusNotifierWatcher=talk
+org.freedesktop.secrets=talk
+com.system76.CosmicSettingsDaemon=talk
+
+[Environment]
+ALSA_CONFIG_DIR=/usr/share/alsa
+";
+
+    /// No policy file means no policy applies: an ordinary launch keeps every bus feature,
+    /// which is what makes this safe to gate real features on.
+    #[test]
+    fn no_policy_means_everything_is_reachable() {
+        assert!(session_bus_talk_allowed(None, "org.freedesktop.FileManager1"));
+        assert!(session_bus_talk_allowed(None, "org.mpris.MediaPlayer2.*"));
+    }
+
+    /// The two names DRAGON-555 and DRAGON-556 turn on, against the policy that is really
+    /// shipped: neither is granted, so both features must know they are dead.
+    #[test]
+    fn the_live_policy_grants_neither_mpris_nor_the_file_manager() {
+        assert!(!session_bus_talk_allowed(Some(LIVE), "org.mpris.MediaPlayer2.*"));
+        assert!(!session_bus_talk_allowed(Some(LIVE), "org.freedesktop.FileManager1"));
+    }
+
+    /// What the policy DOES grant still reads as granted, so the parser is not simply
+    /// answering "no" to everything.
+    #[test]
+    fn the_live_policy_grants_the_names_the_manifest_asked_for() {
+        assert!(session_bus_talk_allowed(Some(LIVE), "org.freedesktop.secrets"));
+        assert!(session_bus_talk_allowed(Some(LIVE), "org.kde.StatusNotifierWatcher"));
+    }
+
+    /// A `--talk-name` added to the manifest heals the feature with no code change. This is
+    /// the whole reason the guard reads the POLICY rather than testing for a sandbox.
+    #[test]
+    fn granting_the_family_makes_it_reachable() {
+        let granted = "[Session Bus Policy]\norg.mpris.MediaPlayer2.*=talk\n";
+        assert!(session_bus_talk_allowed(Some(granted), "org.mpris.MediaPlayer2.*"));
+    }
+
+    /// One player granted by name is enough to ask the family question: pausing whatever we
+    /// can reach is the feature, and it can do that.
+    #[test]
+    fn one_named_player_answers_the_family_question() {
+        let granted = "[Session Bus Policy]\norg.mpris.MediaPlayer2.spotify=talk\n";
+        assert!(session_bus_talk_allowed(Some(granted), "org.mpris.MediaPlayer2.*"));
+    }
+
+    /// A wildcard ABOVE the family covers it too.
+    #[test]
+    fn a_broader_wildcard_covers_the_family() {
+        let granted = "[Session Bus Policy]\norg.mpris.*=talk\n";
+        assert!(session_bus_talk_allowed(Some(granted), "org.mpris.MediaPlayer2.*"));
+    }
+
+    /// `see` is not enough: it lets a process observe that a name exists and nothing more,
+    /// while every caller here wants to CALL a method on it.
+    #[test]
+    fn see_is_not_talk() {
+        let seen = "[Session Bus Policy]\norg.freedesktop.FileManager1=see\n";
+        assert!(!session_bus_talk_allowed(Some(seen), "org.freedesktop.FileManager1"));
+        let owned = "[Session Bus Policy]\norg.freedesktop.FileManager1=own\n";
+        assert!(session_bus_talk_allowed(Some(owned), "org.freedesktop.FileManager1"));
+    }
+
+    /// A grant only covers what sits at or below it, so a near-miss prefix is still a no.
+    /// Without the dot boundary `org.mpris.MediaPlayer2Fake` would answer for the real one.
+    #[test]
+    fn a_prefix_only_matches_on_a_dot_boundary() {
+        let granted = "[Session Bus Policy]\norg.mpris.MediaPlayer2Fake.*=talk\n";
+        assert!(!session_bus_talk_allowed(Some(granted), "org.mpris.MediaPlayer2.*"));
+    }
+
+    /// Entries outside the section are not policy, however much they look like it. The
+    /// `[Environment]` block is full of `key=value` lines.
+    #[test]
+    fn only_the_session_bus_policy_section_counts() {
+        let elsewhere = "\
+[System Bus Policy]
+org.freedesktop.FileManager1=talk
+
+[Session Bus Policy]
+org.freedesktop.secrets=talk
+";
+        assert!(!session_bus_talk_allowed(Some(elsewhere), "org.freedesktop.FileManager1"));
+    }
+
+    /// A sandbox with no policy section at all grants nothing, rather than falling back to
+    /// the unsandboxed "yes".
+    #[test]
+    fn a_policy_free_sandbox_grants_nothing() {
+        assert!(!session_bus_talk_allowed(
+            Some("[Application]\nname=x\n"),
+            "org.freedesktop.FileManager1"
+        ));
+    }
+}
+
+/// The FLATPAK half of [`bundle_label`] (`lab/flatpak`).
+#[cfg(test)]
+mod flatpak_label_tests {
+    use super::bundle_label;
+    use std::path::Path;
+
+    /// THE formatting rule the owner asked for: exactly two slashes after the scheme. A Flatpak
+    /// path is absolute inside the sandbox, so interpolating it raw would give `Flatpak:///app/…`
+    /// and read as a malformed URI. AppImage paths never had this problem because they are
+    /// already relative to a mount root by the time they are formatted.
+    #[test]
+    fn the_scheme_keeps_exactly_two_slashes() {
+        let out = bundle_label(Path::new("/app/bin/tesseract"), None, true);
+        assert_eq!(out, "Flatpak://app/bin/tesseract");
+        assert!(!out.contains(":///"), "three slashes reads as a malformed URI: {out}");
+        assert_eq!(out.matches('/').count(), 4, "scheme's two, plus the path's own two");
+    }
+
+    /// Both bundle trees are labelled: `/app` is what we ship, `/usr` is the runtime we ship
+    /// against. Both are the Flatpak image rather than anything on the user's machine.
+    #[test]
+    fn both_app_and_the_runtime_are_bundle_paths() {
+        assert_eq!(bundle_label(Path::new("/app/bin/tesseract"), None, true), "Flatpak://app/bin/tesseract");
+        assert_eq!(bundle_label(Path::new("/usr/bin/ffmpeg"), None, true), "Flatpak://usr/bin/ffmpeg");
+    }
+
+    /// A HOST path the sandbox can see is the user's own file and is shown as it is. Labelling
+    /// it would claim we shipped something we did not.
+    #[test]
+    fn a_host_path_inside_the_sandbox_is_not_relabelled() {
+        for p in ["/home/u/.local/bin/tesseract", "/run/host/usr/bin/ffmpeg", "/var/tmp/ffmpeg"] {
+            assert_eq!(bundle_label(Path::new(p), None, true), p);
+        }
+    }
+
+    /// Not sandboxed: `/app` and `/usr` are ordinary directories and must not be dressed up.
+    /// This is the case every non-Flatpak user is in, so it must be exactly the old behaviour.
+    #[test]
+    fn without_the_sandbox_nothing_is_relabelled() {
+        assert_eq!(bundle_label(Path::new("/usr/bin/ffmpeg"), None, false), "/usr/bin/ffmpeg");
+        assert_eq!(bundle_label(Path::new("/app/bin/tesseract"), None, false), "/app/bin/tesseract");
+    }
+
+    /// An AppImage mount wins if one is somehow present, so the two schemes can never both
+    /// apply to one path and produce a doubled label.
+    #[test]
+    fn the_appimage_mount_takes_precedence() {
+        let mount = Path::new("/tmp/.mount_Cosmic7fA2xQ");
+        let out = bundle_label(Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/ffmpeg"), Some(mount), true);
+        assert_eq!(out, "AppImage://usr/bin/ffmpeg");
+        assert!(!out.contains("Flatpak"));
+    }
+}
+
+/// The `$APPDIR`-less AppImage fallback (owner report: a Linux Mint AppImage showed plain
+/// paths where a CachyOS one showed `AppImage://`).
+#[cfg(test)]
+mod appimage_dir_fallback_tests {
+    use super::appimage_dir_from;
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+
+    const IMG: &str = "/home/u/Apps/CosmicCaptureKit-x86_64.AppImage";
+
+    /// THE CASE THIS FIXES. `$APPIMAGE` is set, `$APPDIR` is not, and the binary is sitting at
+    /// `<mount>/usr/bin/<name>` exactly as our AppImage lays it out. The mount is three parents
+    /// up, so the label works without the runtime having exported anything.
+    #[test]
+    fn the_mount_is_derived_from_the_exe_when_appdir_is_missing() {
+        let exe = Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/cosmic-capture-kit");
+        assert_eq!(
+            appimage_dir_from(Some(OsStr::new(IMG)), None, Some(exe)),
+            Some(PathBuf::from("/tmp/.mount_Cosmic7fA2xQ"))
+        );
+    }
+
+    /// Extract-and-run mounts somewhere else entirely, and the derivation does not care: it is
+    /// keyed on the `usr/bin` SHAPE, not on the mount looking like `/tmp/.mount_*`.
+    #[test]
+    fn an_extracted_run_derives_just_as_well() {
+        let exe = Path::new("/tmp/appimage_extracted_9f2/usr/bin/cosmic-capture-kit");
+        assert_eq!(
+            appimage_dir_from(Some(OsStr::new(IMG)), None, Some(exe)),
+            Some(PathBuf::from("/tmp/appimage_extracted_9f2"))
+        );
+    }
+
+    /// `$APPDIR` still WINS when present, so a runtime that exports it keeps deciding and this
+    /// build behaves exactly as every previous one did on the machines where it already worked.
+    #[test]
+    fn appdir_still_takes_precedence() {
+        let exe = Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/cosmic-capture-kit");
+        assert_eq!(
+            appimage_dir_from(Some(OsStr::new(IMG)), Some(OsStr::new("/tmp/.mount_REAL")), Some(exe)),
+            Some(PathBuf::from("/tmp/.mount_REAL"))
+        );
+    }
+
+    /// The `usr/bin` shape is what keeps the fallback honest. Without that check any
+    /// `$APPIMAGE`-carrying launch would claim its grandparent as a bundle root and start
+    /// labelling ordinary paths as though we had shipped them.
+    #[test]
+    fn a_wrong_shaped_exe_path_derives_nothing() {
+        for exe in [
+            "/home/u/repo/target/release/cosmic-capture-kit", // a dev build
+            "/usr/bin/cosmic-capture-kit",                    // a distro install: no `usr/bin` ABOVE it
+            "/opt/cck/bin/cosmic-capture-kit",                // bin, but not under usr
+            "/cosmic-capture-kit",                            // no parents to speak of
+        ] {
+            assert_eq!(
+                appimage_dir_from(Some(OsStr::new(IMG)), None, Some(Path::new(exe))),
+                None,
+                "{exe} must not be read as a bundle root"
+            );
+        }
+    }
+
+    /// `$APPIMAGE` remains the gate. Without it this is not an AppImage launch at all, and a
+    /// `usr/bin`-shaped path (every distro install) must never be labelled.
+    #[test]
+    fn without_appimage_the_exe_shape_proves_nothing() {
+        let exe = Path::new("/tmp/.mount_Cosmic7fA2xQ/usr/bin/cosmic-capture-kit");
+        assert_eq!(appimage_dir_from(None, None, Some(exe)), None);
+    }
+}
+
+/// The `~` abbreviation shown paths get (owner call: a full path leaks the account name into
+/// every screenshot of a settings screen).
+#[cfg(test)]
+mod collapse_home_tests {
+    use super::collapse_home_from;
+    use std::path::Path;
+
+    const HOME: &str = "/home/frosthaven";
+
+    #[test]
+    fn a_path_under_home_collapses() {
+        assert_eq!(
+            collapse_home_from("/home/frosthaven/Capture", Some(Path::new(HOME))),
+            "~/Capture"
+        );
+        assert_eq!(
+            collapse_home_from("/home/frosthaven/.config/cosmic-capture-kit/tessdata", Some(Path::new(HOME))),
+            "~/.config/cosmic-capture-kit/tessdata"
+        );
+    }
+
+    /// Home itself, with no trailing component, is just `~`.
+    #[test]
+    fn home_itself_is_a_bare_tilde() {
+        assert_eq!(collapse_home_from(HOME, Some(Path::new(HOME))), "~");
+    }
+
+    /// THE case the separator exists for. `/home/frosthaven-backup` shares a prefix with
+    /// `/home/frosthaven` but is a DIFFERENT directory, and rewriting it would name a place
+    /// the user does not have. A plain `strip_prefix` on the string would get this wrong.
+    #[test]
+    fn a_sibling_that_merely_shares_the_prefix_is_left_alone() {
+        for p in ["/home/frosthaven-backup/Capture", "/home/frosthaven2", "/home/frosthavenX/x"] {
+            assert_eq!(collapse_home_from(p, Some(Path::new(HOME))), p);
+        }
+    }
+
+    /// Paths outside home are untouched, including the bundle labels, which must keep their
+    /// scheme rather than acquiring a tilde.
+    #[test]
+    fn paths_outside_home_pass_through() {
+        for p in ["/usr/bin/ffmpeg", "/app/bin/tesseract", "Flatpak://app/bin/tesseract", "AppImage://usr/bin/ffmpeg"] {
+            assert_eq!(collapse_home_from(p, Some(Path::new(HOME))), p);
+        }
+    }
+
+    /// No home, or a degenerate one, changes nothing. A home of `/` would otherwise match
+    /// every absolute path on the machine and turn `/usr/bin/ffmpeg` into `~/usr/bin/ffmpeg`.
+    #[test]
+    fn a_missing_or_degenerate_home_is_a_no_op() {
+        assert_eq!(collapse_home_from("/home/frosthaven/Capture", None), "/home/frosthaven/Capture");
+        assert_eq!(collapse_home_from("/usr/bin/ffmpeg", Some(Path::new("/"))), "/usr/bin/ffmpeg");
+        assert_eq!(collapse_home_from("/usr/bin/ffmpeg", Some(Path::new(""))), "/usr/bin/ffmpeg");
+    }
+
+    /// It round-trips with `expand_tilde`, which is what makes the copied string usable: a
+    /// shell expands `~`, and so do we if it ever comes back as input.
+    #[test]
+    fn it_round_trips_with_expand_tilde() {
+        let collapsed = collapse_home_from("/home/frosthaven/Capture", Some(Path::new(HOME)));
+        assert_eq!(collapsed, "~/Capture");
+        // `expand_tilde` reads the real home, so assert the SHAPE rather than the literal.
+        assert!(super::expand_tilde(&collapsed).ends_with("Capture"));
+    }
+}
+
+/// The delivery-kind vocabulary shared by the About page and the debug log.
+#[cfg(test)]
+mod package_kind_tests {
+    use super::{PackageKind, package_kind_from};
+
+    #[test]
+    fn each_probe_combination_names_one_kind() {
+        assert_eq!(package_kind_from(false, false), PackageKind::Binary);
+        assert_eq!(package_kind_from(false, true), PackageKind::AppImage);
+        assert_eq!(package_kind_from(true, false), PackageKind::Flatpak);
+    }
+
+    /// Flatpak wins when both are somehow true. Nothing stops an AppImage inside a sandbox, and
+    /// if that happened the SANDBOX is the fact that governs everything a reader cares about
+    /// here: read-only /app, private config, hidden Wayland globals. Naming the inner packaging
+    /// would hide the thing actually shaping behaviour.
+    #[test]
+    fn the_sandbox_wins_over_the_inner_packaging() {
+        assert_eq!(package_kind_from(true, true), PackageKind::Flatpak);
+    }
+
+    /// Every kind, so a new variant fails the exhaustive match below and forces a decision
+    /// here rather than falling into whatever a `_` arm happened to say. Mirrors
+    /// `update::notes_source_tests::EVERY_KIND`, which does the same job for the channel and
+    /// notes questions.
+    const EVERY_KIND: [PackageKind; 5] = [
+        PackageKind::Binary,
+        PackageKind::AppImage,
+        PackageKind::Flatpak,
+        PackageKind::MacOs,
+        PackageKind::Windows,
+    ];
+
+    /// The owner asked for these strings exactly, and they are what the About page shows.
+    ///
+    /// **The three Linux prefixes are the DRAGON-614 reversal**, and pinning them literally is
+    /// the point: they were unprefixed while every kind was Linux, and that was right then.
+    /// Once macOS and Windows sit beside them an unprefixed "Binary Release" reads as a third
+    /// platform, so the prefixes must not be simplified back out.
+    #[test]
+    fn the_ui_labels_are_the_requested_wording() {
+        assert_eq!(PackageKind::Binary.label(), "Linux Binary Release");
+        assert_eq!(PackageKind::AppImage.label(), "Linux AppImage Release");
+        assert_eq!(PackageKind::Flatpak.label(), "Linux Flatpak Release");
+        assert_eq!(PackageKind::MacOs.label(), "macOS Release");
+        assert_eq!(PackageKind::Windows.label(), "Windows Release");
+        // Every Linux kind names its platform; neither of the other two borrows the word.
+        for k in EVERY_KIND {
+            let linux = matches!(
+                k,
+                PackageKind::Binary | PackageKind::AppImage | PackageKind::Flatpak
+            );
+            assert_eq!(k.label().starts_with("Linux "), linux, "{k:?}");
+            assert!(k.label().ends_with(" Release"), "{k:?}");
+        }
+    }
+
+    /// DRAGON-591 and DRAGON-614: one glyph per package kind on the About page's release-kind
+    /// line, the owner's picks. Pinned by NAME because the names are what
+    /// `widgets::icons::handle` maps into the bundled lucide set;
+    /// `widgets::icons::tests::every_mapped_name_embeds` lists all five, so these two pins
+    /// together prove the row can actually draw on every kind.
+    #[test]
+    fn each_package_kind_has_its_own_glyph() {
+        assert_eq!(PackageKind::Binary.icon_name(), "application-x-executable-symbolic");
+        assert_eq!(PackageKind::AppImage.icon_name(), "application-x-appimage-symbolic");
+        // The Flatpak keeps the general package box, which the owner was happy with.
+        assert_eq!(PackageKind::Flatpak.icon_name(), "package-x-generic-symbolic");
+        assert_eq!(PackageKind::MacOs.icon_name(), "package-macos-symbolic");
+        assert_eq!(PackageKind::Windows.icon_name(), "package-windows-symbolic");
+        let names: Vec<&str> = EVERY_KIND.iter().map(|k| k.icon_name()).collect();
+        let mut uniq = names.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), names.len(), "each kind is visually distinct");
+    }
+
+    /// The log spells it differently ON PURPOSE: it says what the thing IS, where the UI names a
+    /// release channel. A log line reading "Binary Release" would imply a distribution we do not
+    /// have. Pinned so a later tidy-up does not "unify" them.
+    #[test]
+    fn the_log_names_differ_from_the_ui_labels() {
+        assert_eq!(PackageKind::Binary.diag_name(), "plain binary");
+        assert_eq!(PackageKind::AppImage.diag_name(), "AppImage");
+        assert_eq!(PackageKind::Flatpak.diag_name(), "Flatpak");
+        assert_eq!(PackageKind::MacOs.diag_name(), "macOS build");
+        assert_eq!(PackageKind::Windows.diag_name(), "Windows build");
+        for k in EVERY_KIND {
+            assert_ne!(k.diag_name(), k.label(), "{k:?}");
+        }
+    }
+
+    /// DRAGON-614: the running build's kind agrees with the platform it was compiled for.
+    ///
+    /// The half worth having is the NEGATIVE one. `package_kind_from`'s three answers are
+    /// Linux artifact kinds, and a macOS or Windows build must never reach them: a Mac
+    /// reporting "Linux Binary Release" is exactly the bug the prefixes would otherwise
+    /// introduce, and it is what this build did before the cfg arms existed.
+    #[test]
+    fn the_running_kind_matches_the_target_platform() {
+        let kind = super::package_kind();
+        if cfg!(target_os = "macos") {
+            assert_eq!(kind, PackageKind::MacOs);
+        } else if cfg!(windows) {
+            assert_eq!(kind, PackageKind::Windows);
+        } else {
+            assert!(
+                matches!(
+                    kind,
+                    PackageKind::Binary | PackageKind::AppImage | PackageKind::Flatpak
+                ),
+                "a Linux build must report a Linux artifact kind, got {kind:?}"
+            );
+        }
+    }
+}
+
+/// DRAGON-589: the shell command line that starts THIS build, which the Global tab shows for
+/// every hotkey the app cannot register itself. A user pastes it into their desktop's shortcut
+/// settings, so a wrong spelling is a shortcut that silently does nothing.
+#[cfg(test)]
+mod launch_command_tests {
+    use super::*;
+
+    /// The three package kinds, each spelled the only way that actually starts that build.
+    #[test]
+    fn each_package_kind_gets_its_own_spelling() {
+        let exe = PathBuf::from("/opt/cck/cosmic-capture-kit");
+        assert_eq!(
+            launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &["--region"]),
+            "/opt/cck/cosmic-capture-kit --region"
+        );
+        // An AppImage names the .AppImage FILE, which is what `self_exe` resolves there.
+        let img = PathBuf::from("/opt/CosmicCaptureKit.AppImage");
+        assert_eq!(
+            launch_command_from(PackageKind::AppImage, Some(&img), FLATPAK_APP_ID, &["--region"]),
+            "/opt/CosmicCaptureKit.AppImage --region"
+        );
+        // A Flatpak's own path is unreachable from the host, so the app id is the handle.
+        assert_eq!(
+            launch_command_from(PackageKind::Flatpak, Some(&exe), FLATPAK_APP_ID, &["--region"]),
+            "flatpak run dev.thedragon.CosmicCaptureKit --region"
+        );
+    }
+
+    /// A Flatpak ignores the executable path entirely, present or not: inside the sandbox it
+    /// names a file the host cannot run.
+    #[test]
+    fn a_flatpak_never_prints_its_own_path() {
+        let inside = PathBuf::from("/app/bin/cosmic-capture-kit");
+        for exe in [Some(inside.as_path()), None] {
+            let c = launch_command_from(PackageKind::Flatpak, exe, FLATPAK_APP_ID, &["--scan"]);
+            assert_eq!(c, "flatpak run dev.thedragon.CosmicCaptureKit --scan");
+            assert!(!c.contains("/app/bin"), "{c}");
+        }
+    }
+
+    /// Several flags keep their order and are separated by single spaces, so the no-editor
+    /// twins (`<capture flag> --no-editor`) read exactly as the daemons spawn them.
+    #[test]
+    fn every_flag_survives_in_order() {
+        let exe = PathBuf::from("/opt/cck/cosmic-capture-kit");
+        assert_eq!(
+            launch_command_from(
+                PackageKind::Binary,
+                Some(&exe),
+                FLATPAK_APP_ID,
+                &["--active-window", "--no-editor"]
+            ),
+            "/opt/cck/cosmic-capture-kit --active-window --no-editor"
+        );
+        // No flags at all is a bare launch, and prints as one.
+        assert_eq!(
+            launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &[]),
+            "/opt/cck/cosmic-capture-kit"
+        );
+    }
+
+    /// With no path to report, the command falls back to the program NAME rather than printing
+    /// something empty or misleading. That is the right answer for a distro install on `PATH`.
+    #[test]
+    fn a_missing_exe_falls_back_to_the_program_name() {
+        assert_eq!(
+            launch_command_from(PackageKind::Binary, None, FLATPAK_APP_ID, &["--region"]),
+            "cosmic-capture-kit --region"
+        );
+        assert_eq!(
+            launch_command_from(PackageKind::AppImage, None, FLATPAK_APP_ID, &[]),
+            "cosmic-capture-kit"
+        );
+    }
+
+    /// The whole reason quoting exists here: a path with a SPACE must stay one argument, or the
+    /// pasted line runs a different program with a stray argument.
+    #[test]
+    fn a_path_with_a_space_survives_a_paste() {
+        let exe = PathBuf::from("/somewhere/My Apps/cosmic-capture-kit");
+        let c = launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &["--region"]);
+        assert_eq!(c, "'/somewhere/My Apps/cosmic-capture-kit' --region");
+        // And the flag stays OUTSIDE the quoted word, still its own argument.
+        assert!(c.ends_with(" --region"), "{c}");
+    }
+
+    /// The quoting rule itself, both directions. An ordinary path must come back untouched, so
+    /// the common case reads like something a person would type.
+    #[test]
+    fn only_a_word_that_needs_quoting_gets_quoted() {
+        for plain in [
+            "/opt/cck/cosmic-capture-kit",
+            "cosmic-capture-kit",
+            "--toggle-system-audio",
+            "/home/u/.local/bin/cck-1.2",
+            "~/apps/cck",
+            "~",
+        ] {
+            assert_eq!(shell_word(plain), plain, "{plain} should not be quoted");
+        }
+        assert_eq!(shell_word("/a b/c"), "'/a b/c'");
+        assert_eq!(shell_word("/a$b"), "'/a$b'");
+        assert_eq!(shell_word("/a&b"), "'/a&b'");
+        assert_eq!(shell_word("/a\"b"), "'/a\"b'");
+        assert_eq!(shell_word("/a\nb"), "'/a\nb'");
+        // An empty word still has to BE a word, or it vanishes from argv.
+        assert_eq!(shell_word(""), "''");
+    }
+
+    /// A single quote inside the word is the one escape a single-quoted shell literal needs,
+    /// and it is written the same way `update::shell_single_quote` writes it.
+    #[test]
+    fn a_single_quote_is_escaped_the_posix_way() {
+        assert_eq!(shell_word("/u/it's here/cck"), r"'/u/it'\''s here/cck'");
+    }
+
+    /// A home-collapsed path keeps its `~` OUTSIDE the quotes, because a quoted tilde is a
+    /// literal character and the pasted line would look for a folder actually named `~`.
+    #[test]
+    fn a_collapsed_home_keeps_its_tilde_expandable() {
+        assert_eq!(shell_word("~/My Apps/cck"), "~/'My Apps/cck'");
+        assert!(!shell_word("~/My Apps/cck").starts_with('\''));
+    }
+
+    /// The command SHOWS a home-collapsed path, like every other path this app prints
+    /// (`collapse_home`'s privacy rule), and it still runs: the shell expands `~` itself.
+    #[test]
+    fn the_command_collapses_the_home_directory() {
+        let Some(home) = dirs::home_dir() else {
+            eprintln!("skipping: no home directory on this runner");
+            return;
+        };
+        let exe = home.join("apps/cosmic-capture-kit");
+        let c = launch_command_from(PackageKind::Binary, Some(&exe), FLATPAK_APP_ID, &["--region"]);
+        assert_eq!(c, "~/apps/cosmic-capture-kit --region");
+        assert!(!c.contains(&*home.to_string_lossy()), "{c}");
     }
 }

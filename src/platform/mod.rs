@@ -244,6 +244,12 @@ pub mod windows_autostart;
 // left is the residue of DRAGON-406's diagnostics report after DRAGON-407 deleted that
 // instrument: see the module doc for which three helpers survived and why.
 pub mod win_diag;
+// Portable Windows cursor-capture geometry (DRAGON-567): the pure decision that a captured
+// cursor draws at its bitmap's own physical size (the GetIconInfo bitmap is already
+// display-scaled, so no dpi/96 resample), compiled on EVERY platform so the Linux gate
+// pins it. The GDI reads stay in `windows/cursor.rs`; see the module doc for the
+// double-scale dead end this replaces.
+pub mod win_cursor;
 
 /// Opt OUR-app window titled `title` OUT of automatic tiling by the user's tiling window
 /// manager — AeroSpace on macOS, komorebi on Windows — where possible. This is the single
@@ -579,7 +585,21 @@ pub fn software_overlays() -> bool {
 }
 
 /// Runtime seam: may the preview editor open as the fullscreen overlay on THIS machine?
-/// `true` everywhere except Windows 10 (see [`win_build_has_overlay_preview`]).
+///
+/// Two independent reasons it can be `false`, and every caller wants the same answer for
+/// both — the button that offers the appearance, the settings row behind it, the toggle
+/// handler, and the mint decision itself:
+///
+/// * **Windows 10** (see [`win_build_has_overlay_preview`]): the overlay editor would
+///   inherit the software rasterizer that cannot draw its shader layers.
+/// * **Linux with no `zwlr_layer_shell_v1`** (`lab/flatpak`): the Linux overlay preview IS a
+///   layer surface (`app::shell::preview_surface_on` → `get_layer_surface`), so a session
+///   that cannot see the global has no overlay editor to offer at all. Protocol-keyed for
+///   the same reason [`layer_overlay_available`] is: sandboxed under cosmic-comp's
+///   security-context filter and "mutter never implemented it" are different causes with
+///   one right answer. A session that CAN see the global is byte-identical to before.
+///
+/// macOS, Windows 11 and every layer-shell Linux session answer `true`, as they always have.
 pub fn overlay_preview_available() -> bool {
     #[cfg(windows)]
     {
@@ -589,9 +609,303 @@ pub fn overlay_preview_available() -> bool {
         crate::platform::windows::window::os_build()
             .is_none_or(win_build_has_overlay_preview)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        layer_overlay_available()
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         true
+    }
+}
+
+/// Runtime seam: may the capture overlay be a LAYER-SHELL surface on this machine, or must it
+/// fall back to a plain fullscreen toplevel (`lab/flatpak`)?
+///
+/// Linux answers from the live protocol probe, so this is protocol-keyed rather than
+/// desktop-keyed or sandbox-keyed, exactly like the capture backend selection next to it. That
+/// matters because there are two quite different reasons `zwlr_layer_shell_v1` can be missing
+/// and the overlay code should not care which it is hitting:
+///
+/// * **Sandboxed.** cosmic-comp hides the layer-shell global from clients carrying a
+///   `wp_security_context_v1`, which is every Flatpak. The protocol is there, we are just not
+///   allowed to see it.
+/// * **Never implemented.** mutter has never shipped `wlr-layer-shell` at all, so a GNOME
+///   session has no layer shell for anyone, sandboxed or not.
+///
+/// Either way the registry simply does not advertise it, `probe_globals` records `false`, and
+/// the overlay takes the plain-toplevel path. A launch that CAN see the global is byte-identical
+/// to before this existed, which is what keeps the normal Linux build unaffected.
+///
+/// macOS and Windows return false and always have: they never had layer shell and their
+/// overlays are the PlainWindows path already.
+// Its only caller is `app::shell::overlay_surface_with`, which is `cfg(target_os = "linux")`,
+// so this is honestly dead off Linux. The body stays portable rather than being gated to Linux
+// because the false arm IS the correct answer for mac and Windows, and a caller that ever asks
+// there should get it rather than fail to compile.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn layer_overlay_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::platform::backend::wayland_protocols().layer_shell
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// **Pure**, unit-tested: can an overlay surface of this kind HIDE the pointer sprite
+/// (DRAGON-587, then DRAGON-597)?
+///
+/// **Both kinds can, since DRAGON-597. This answers `true` for every input.** The parameter
+/// stays because it names the axis that USED to decide the answer, and because the tests below
+/// are what pin that the axis is gone.
+///
+/// The colour picker wants the cursor gone while you aim: its magnifier already marks the
+/// sample point, and an arrow would sit on top of the very pixel being read. iced expresses
+/// that as [`cosmic::iced::core::mouse::Interaction::Hidden`].
+///
+/// A **winit toplevel** (every macOS and Windows overlay, and on Linux the whole
+/// portal-fallback path) has always reached `Window::set_cursor_visible(false)`, which is a
+/// real hide. A **layer surface** did not: libcosmic's Wayland backend left
+/// `set_cursor_visible` an unimplemented `// TODO` for the surfaces it manages itself (layer,
+/// popup, lock, subsurface), so asking there hid nothing. That hole is now filled by our iced
+/// fork (see the iced `[patch]` block in `Cargo.toml`), which implements the method as the
+/// canonical `wl_pointer.set_cursor(serial, NULL, 0, 0)`.
+///
+/// # Tombstone: what this predicate was for, and why it stops here (DRAGON-587)
+///
+/// The gap was never COSMIC-specific and this signature said so: it was keyed on the surface
+/// KIND, so it opened wherever our overlay was a layer surface (COSMIC, sway, hyprland, river
+/// alike) and closed wherever it was a plain toplevel (GNOME, since mutter has never shipped
+/// `wlr-layer-shell`; every Flatpak launch, since cosmic-comp hides the global from a
+/// sandboxed client; and the portal-fallback path anywhere). A `false` was not "give up": it
+/// selected the picker's OTHER design, a default ARROW whose hotspot is its tip with the
+/// sample read one point up and left of it, the nearest pixel the arrow did not cover.
+///
+/// Three routes to hiding a layer surface's pointer were searched from inside this app. Two
+/// are still closed and are recorded so nobody repeats the search:
+///
+/// 1. **A CUSTOM (transparent) cursor image.** Blocked twice over. iced's public vocabulary is
+///    `mouse::Interaction`, a closed enum of NAMED shapes, and `conversion::mouse_interaction`
+///    returns `Option<CursorIcon>`, the `cursor-icon` named set: no variant is transparent and
+///    none carries a buffer. Below that, the layer-surface `set_cursor` still handles only the
+///    named arm, with `Cursor::Custom(_) => { /* TODO */ }`. Our fork did not touch this one.
+/// 2. **This repo's own cursor plumbing** (`widgets::cursor_reassert`, DRAGON-331). It does
+///    not reach lower than the enum. It solved a TIMING problem (cosmic-comp drops a
+///    `set_cursor` issued too soon after `wl_pointer.enter`, so the widget re-asserts past
+///    that window) by returning different `Interaction` VALUES at different moments. It never
+///    touches a `wl_pointer`.
+///
+/// The third route is the one taken. `wl_pointer.set_cursor(serial, NULL, 0, 0)` was always
+/// one method call away: iced holds an sctk `ThemedPointer` (`SctkSeat.ptr`) and already calls
+/// `ptr.set_cursor(conn, icon)` on it, and the next method on that object is `hide_cursor()`.
+/// What blocked it from OUR side was purely visibility: the pointer is `pub(crate)` to
+/// iced_winit, the layer backend's only action was `SetCursor(CursorIcon)`, and the public
+/// `iced_runtime::platform_specific::wayland::Action` enum that `send_wayland_action_direct`
+/// forwards has no cursor variant at all. Minting our own `wl_pointer` could never work
+/// either: `set_cursor` needs the serial of a `wl_pointer.enter` for one of the CALLER'S own
+/// surfaces, and a second Wayland connection owns none, which is exactly the
+/// `PointerThemeError::MissingEnterSerial` sctk returns. So the fix had to be a fork, and
+/// DRAGON-597 made it one.
+///
+/// # When to delete this seam
+///
+/// Once the owner has confirmed the hide on a live native COSMIC session (the ONE place a
+/// layer-shell overlay exists, and the one thing no test here can prove), this function and
+/// [`overlay_pointer_hideable`] are both constants and should GO rather than linger as a `fn`
+/// returning `true`. `overlay_pointer_tests` goes with them, and
+/// `app::color_picker::view`'s `.hide_pointer(…)` becomes `.hide_pointer(true)`. Keeping them
+/// until then is deliberate: it is what makes reverting to the arrow fallback a clean revert
+/// if the fork turns out not to work on a real compositor.
+///
+/// Pure so the answer is provable on any host; [`overlay_pointer_hideable`] is the reader.
+pub fn overlay_hides_pointer(_layer_surface: bool) -> bool {
+    true
+}
+
+/// Runtime seam: can THIS session's capture-shaped overlay hide the pointer sprite?
+///
+/// Since DRAGON-597 the answer is yes everywhere, but the shape is kept: Linux still asks
+/// whether the overlay is a layer surface at all, from the same protocol probe
+/// `app::shell::overlay_surface_with` mints them with, so if the fork ever has to be dropped
+/// the answer goes back to tracking what was actually created rather than which desktop is
+/// running. macOS and Windows are PlainWindows toplevels and always could.
+pub fn overlay_pointer_hideable() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        overlay_hides_pointer(layer_overlay_available())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        overlay_hides_pointer(false)
+    }
+}
+
+/// **Pure**, unit-tested: can a shortcut bound in THIS app's own keymap reach a recording
+/// that is ALREADY IN PROGRESS (DRAGON-583)?
+///
+/// There are exactly two ways a keypress gets from the user to `App::handle_key` while a
+/// recording runs, and a session needs only one of them:
+///
+/// * `focus_free_hotkeys`: something binds the chord process-wide, so it arrives whatever
+///   has focus. On Linux that is the xdg-desktop-portal `GlobalShortcuts` interface, and
+///   the input is a REAL probe of the live session
+///   ([`global_shortcuts::interface_available`]), never a cfg and never a Flatpak test: the
+///   interface can be absent because the desktop never shipped it (COSMIC today) or because
+///   a sandbox hid it, and the answer we need is the same either way. On macOS and Windows
+///   it is a constant `false`, and that is a fact about our own code rather than an
+///   assumption: both resident daemons register exactly the seven CAPTURE hotkey slots
+///   (`CaptureHotkeySlot::ALL`) and nothing recording-related, `global_shortcuts::start` is
+///   a do-nothing stub off Linux, and there is no event tap or keyboard hook anywhere in
+///   the tree.
+/// * `keeps_keyboard_focus`: one of OUR surfaces still owns the keyboard while the
+///   recording runs, so ordinary key events reach us. macOS and Windows keep their overlay
+///   windows up at record start (they only turn click-through), and nothing on those
+///   platforms takes the focus away, so the chord can still land. LINUX is the opposite on
+///   BOTH of its paths, deliberately: a native session hands focus straight back to the
+///   window being recorded (`App::start_recording` calls `compositor::activate`, so you can
+///   type into the app you are recording), and the portal-fallback session destroys its one
+///   toplevel outright at record start. Either way nothing of ours is left to press a key
+///   into.
+///
+/// Where this answers `false`, the three Recording rows in Settings → Keyboard Shortcuts
+/// are DEAD controls, and the settled rule for a control that cannot apply is to hide it
+/// and say what does work instead (the DRAGON-551 / 569 / 577 hide-where-dead line). What
+/// works there is the CLI: `--toggle-mic`, `--toggle-system-audio`, `--pause-recording`,
+/// `--finish-recording` and `--cancel-recording` each reach the live recording through the
+/// resident relay's own command words (`crate::daemon_ipc`), so a desktop-level global
+/// hotkey can drive a recording exactly the way one already launches a capture.
+pub fn in_app_recording_shortcut_reachable(
+    focus_free_hotkeys: bool,
+    keeps_keyboard_focus: bool,
+) -> bool {
+    focus_free_hotkeys || keeps_keyboard_focus
+}
+
+/// Runtime seam: [`in_app_recording_shortcut_reachable`] for the session we are actually
+/// running in, so a caller needs no `cfg` of its own.
+///
+/// Linux probes the portal once per process and pins `keeps_keyboard_focus` to `false`;
+/// every other platform is the constant pair the doc above justifies. Read by the settings
+/// page, which must not advertise a chord it knows cannot fire.
+pub fn in_app_recording_shortcuts_work() -> bool {
+    #[cfg(target_os = "linux")]
+    let (focus_free, keeps_focus) = (global_shortcuts::interface_available(), false);
+    #[cfg(not(target_os = "linux"))]
+    let (focus_free, keeps_focus) = (false, true);
+    in_app_recording_shortcut_reachable(focus_free, keeps_focus)
+}
+
+/// Does THIS BUILD register the global CAPTURE hotkeys itself (DRAGON-589)?
+///
+/// Honestly a compile-time fact, and named here once so no caller has to write the `cfg`.
+/// The registration lives in the two resident daemons and nowhere else: macOS
+/// (`platform::mac::daemon`, a Carbon hotkey per `CaptureHotkeySlot`) and Windows
+/// (`platform::windows::daemon`, `RegisterHotKey` per slot). Neither exists in a Linux build.
+/// Linux's capture keys are the DESKTOP's own custom shortcuts, pointing at this binary with
+/// a flag, which is a different mechanism owned by a different program.
+///
+/// This decides which shape a Global Capture row takes: a chord editor where we can bind the
+/// key, otherwise the command a user pastes into their desktop's shortcut settings. It is NOT
+/// the question of whether the action exists at all; that one is
+/// `capture_flow::immediate_capture_available`, and an action missing from the build gets no
+/// row of either shape.
+pub const fn app_registers_capture_hotkeys() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
+// `toplevel_clamped_to_work_area` lived here (DRAGON-549): a desktop-profile seam saying
+// whether the window system clamps an over-large new toplevel to the work area, so the
+// windowed preview could ask COSMIC for the whole output height. DRAGON-579 deleted it
+// with the full-height ask it served: the README-recommended floating exception routes
+// our windows through the placement path that SKIPS cosmic-comp's map-time clamp, native
+// sessions included, so "the compositor source says it clamps" was never a guarantee on
+// the machines that follow our own docs. The height budget is the DRAGON-221 guess again
+// (`sizing::USABLE_H_FRAC`, where the full story lives).
+
+/// Pure, unit-tested: should a LINUX interactive capture launch seed the PORTAL-FROZEN
+/// fallback overlay (`lab/flatpak`) instead of per-output layer surfaces?
+///
+/// The fallback exists for the session where the capture overlay cannot be a layer
+/// surface (`layer_overlay` false: sandboxed under cosmic-comp's security-context filter,
+/// or a compositor that never implemented `wlr-layer-shell`) but the session-clamped
+/// capture choice lands on the portal anyway (`uses_portal`), so a full-monitor frame CAN
+/// be grabbed through ScreenCast and region selection can run over that frozen frame in
+/// one ordinary fullscreen toplevel. Both terms are protocol/caps seams, never a sandbox
+/// probe: a global can be missing because we are refused it OR because the compositor
+/// never shipped it, and the fallback wants the same answer for both.
+///
+/// Deliberately NOT keyed on the async portal reachability probe: at output-seed time
+/// that probe may not have resolved yet, and the seed-time ScreenCast request is its own
+/// proof: an unreachable portal answers `Unavailable`, which the handler turns into a
+/// loud `fail_session`, never a silent exit. A layer-shell session (`layer_overlay`
+/// true) answers `false` unconditionally, which is what keeps a normal COSMIC launch
+/// byte-identical.
+///
+/// This is a LINUX decision only. Its caller (`App::overlay_fallback_active`) returns a
+/// constant `false` on macOS/Windows, whose overlays are the PlainWindows path and where
+/// `uses_portal` is spuriously true (no Wayland screencopy exists to prefer).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn overlay_fallback_seeding(layer_overlay: bool, uses_portal: bool) -> bool {
+    !layer_overlay && uses_portal
+}
+
+/// **Pure**, unit-tested: does a saved capture-method choice, CLAMPED to this session, land
+/// on the portal?
+///
+/// A preference for native screencopy cannot apply on a compositor that does not offer it, so
+/// a session with no native capture is on the portal whatever the config says. This is the
+/// rule `App::screenshot_uses_portal` / `App::recording_uses_portal` apply; it lives out here
+/// as well because the tray DAEMON has to reach the same answer, and it is a separate process
+/// with no `App` at all (DRAGON-555).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn capture_choice_uses_portal(saved_backend_id: &str, native_capture: bool) -> bool {
+    saved_backend_id == backend::PORTAL_ID || !native_capture
+}
+
+/// Runtime seam: is THIS session's interactive capture overlay the PORTAL-FROZEN fallback
+/// rather than a real layer-shell overlay (`lab/flatpak`, DRAGON-555)?
+///
+/// The same question `App::overlay_fallback_active` answers inside a capture process, asked
+/// from OUTSIDE one. The tray daemon needs it to decide which capture entries its menu can
+/// honestly offer, and the daemon is a separate process: no `App`, no GUI stack, nothing to
+/// ask. It has the same two ingredients available anyway, because it is the same binary:
+///
+/// * the Wayland protocol probe (one throwaway registry connection, cached per process), and
+/// * the persisted capture-method choices, which it already re-reads for the tray accent.
+///
+/// Protocol-keyed and preference-keyed, never sandbox-keyed, so a normal COSMIC session
+/// answers false and the menu it renders is byte-identical to before this existed.
+///
+/// macOS and Windows return false and always will: their overlays are the PlainWindows path
+/// and the portal this fallback grabs through does not exist there. Its DRAGON-555 callers
+/// were the two Linux trays, which used it to slim their capture menus; DRAGON-558 reverted
+/// that slimming (the owner moved the audio pre-arm into the tray's persistent Enable
+/// items, so a portal-picker launch no longer skips anything the user cannot set), which
+/// left this with no caller at all. It stays: the QUESTION — "is this session's capture
+/// overlay the portal-frozen fallback, asked from outside a capture process" — remains
+/// real, the ingredients and caching are non-obvious, and the next out-of-process
+/// fallback-shaped decision should find the answer here rather than rebuild it.
+#[allow(dead_code)]
+pub fn portal_fallback_session() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let protocols = backend::wayland_protocols();
+        let native = protocols.image_copy_capture && protocols.output_source;
+        let saved = crate::state::load();
+        // Either capture kind landing on the portal is enough, matching the app's own OR: in
+        // the session this fallback exists for, both are true anyway.
+        let uses_portal = capture_choice_uses_portal(&saved.screenshot_backend, native)
+            || capture_choice_uses_portal(&saved.record_backend, native);
+        overlay_fallback_seeding(protocols.layer_shell, uses_portal)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -744,6 +1058,350 @@ pub fn win_backdrop_seated_below(
     false
 }
 
+// ───────────────────────── Launch at login: what the row may claim ─────────────────────────
+//
+// DRAGON-628. The "Automatically start on login" row rendered the PERSISTED PREFERENCE, which
+// is what the user asked for and not what the system is doing. On the owner's machine the two
+// had been apart for a day: the config said on, the autostart entry named an AppImage that
+// DRAGON-590 relocated, and the session refused it at every login
+// (`systemd-xdg-autostart-generator: not generating unit, executable specified in Exec= does
+// not exist`) while the row kept claiming the feature was on. DRAGON-625 made
+// `linux_autostart::is_enabled` honest about exactly that entry, but nothing on the display
+// path ever asked it.
+//
+// The usual split. The DECISION (what may the row claim, given a preference and whatever
+// reality we could observe) is pure and lives here, so `cargo test` proves it on any host. The
+// READ is per-platform and lives in the plugins.
+//
+// **Reading and repairing are separate occasions, on purpose.** Opening the settings window
+// only READS: it probes, displays reality and logs a disagreement, and writes nothing at all,
+// so a window opening can never issue a portal request, re-create an entry the user removed,
+// or (on an unbundled mac dev build, where `set` always fails) correct a stored preference
+// nobody withdrew. The REPAIR lives in the resident daemon's startup instead, which is the
+// better home for it: the daemon is the thing autostart exists to launch, so if it is running
+// then that is the moment its own registration should be made to match, with nobody opening
+// anything. A login that worked keeps working, and one that did not is fixed the first time
+// the daemon runs by any other route.
+//
+// The rule that is not obvious: reality is not always observable, and a build that cannot
+// observe it must not guess. Two builds cannot:
+//
+//   * A **Flatpak** registers through the Background portal, which writes the entry on the
+//     HOST, where a sandbox with no `--filesystem=home` cannot read it. Nor does the portal
+//     offer a read: `RequestBackground` is a REQUEST, asynchronous and possibly interactive.
+//     Probing by asking would put a dialog on screen every time Settings opened.
+//   * An **unbundled macOS dev binary** has no `SMAppService` to query at all
+//     (`login_item::Availability::Unbundled`), so its `is_enabled()` answers `false` for a
+//     process that could never have registered anything, which is not the same as "off".
+//
+// Both answer `None`, and `None` means "show the stored preference". On the Flatpak that is
+// honest for a second reason: `linux_autostart::settled_preference` already writes the
+// portal's real answer into the preference, so there it IS the last known truth.
+
+/// What the "Automatically start on login" row may claim, given the stored preference and
+/// whatever the OS could be asked.
+///
+/// Three states rather than a bare `bool` because the two ways of arriving at the same
+/// rendered value are not the same event: one is a build that cannot know, the other is a
+/// build that looked and found a contradiction, and only the second is worth telling the
+/// debug log about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutostartRow {
+    /// Reality could not be read (see the note above), so the stored preference is all
+    /// anyone has and the row shows it. This is what every platform used to do
+    /// unconditionally.
+    Unobservable(bool),
+    /// Reality was read and it agrees with the preference. Nothing to say.
+    Agrees(bool),
+    /// Reality was read and it CONTRADICTS the preference. The row shows reality, because
+    /// the row's job is to say what the machine will do at the next login. The preference is
+    /// left exactly as it is: the user asked for it, we simply could not deliver it yet.
+    Disagrees { shown: bool, preference: bool },
+}
+
+impl AutostartRow {
+    /// What the toggle renders.
+    pub fn shown(self) -> bool {
+        match self {
+            AutostartRow::Unobservable(v) | AutostartRow::Agrees(v) => v,
+            AutostartRow::Disagrees { shown, .. } => shown,
+        }
+    }
+}
+
+/// **Pure**, unit-tested: classify the autostart row from the stored preference and the
+/// observed registration (`None` when this build has no read-only way to find out).
+///
+/// Reality wins wherever there is any, in BOTH directions. A preference of "on" against a
+/// dead entry shows off, which is the case that produced this ticket. A preference of "off"
+/// against a live entry shows on, which is the same rule and matters just as much: the row
+/// would otherwise promise the app will stay put while the session is going to launch it.
+pub fn autostart_row(preference: bool, registered: Option<bool>) -> AutostartRow {
+    match registered {
+        None => AutostartRow::Unobservable(preference),
+        Some(actual) if actual == preference => AutostartRow::Agrees(actual),
+        Some(actual) => AutostartRow::Disagrees {
+            shown: actual,
+            preference,
+        },
+    }
+}
+
+/// What the OS has on file for launch-at-login.
+///
+/// Three states rather than a bool because **absent and stale are different events with
+/// different owners**, and only one of them is ours to fix:
+///
+/// * [`Stale`](Self::Stale) is OUR bug. The registration is right there, and it names an
+///   artifact that has moved: the owner's entry pointed at an AppImage DRAGON-590 relocated.
+///   Nobody chose that, and rewriting it with this build's current path is a repair.
+/// * [`Absent`](Self::Absent) is somebody's DECISION. Either the user never turned it on, or
+///   they removed it, possibly through their desktop's own autostart editor. Putting it back
+///   because a window opened would override a choice we have no evidence they withdrew.
+///
+/// Reality is what the row shows in every case ([`is_live`](Self::is_live)); the distinction
+/// governs only whether opening Settings may WRITE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutostartRegistration {
+    /// Nothing is registered.
+    Absent,
+    /// A registration exists but names something that no longer resolves, so the session
+    /// will skip it. Not reachable on macOS: see [`autostart_registration`].
+    Stale,
+    /// A registration exists and will run.
+    Live,
+}
+
+impl AutostartRegistration {
+    /// Will the app actually start at the next login? This is what the row shows.
+    pub fn is_live(self) -> bool {
+        matches!(self, AutostartRegistration::Live)
+    }
+}
+
+/// **Pure**, unit-tested: the login item this build should have.
+///
+/// The ONE expression of the rule, so the settings handler and all three resident daemons
+/// cannot drift: registered iff there is a resident to launch AND the user opted in. It was
+/// inlined in `App::reconcile_login_item`, which was fine while that was the only caller and
+/// stopped being fine when the daemons started asking the same question (DRAGON-628).
+pub fn autostart_wanted(resident: bool, autostart_on_login: bool) -> bool {
+    resident && autostart_on_login
+}
+
+/// **Pure**, unit-tested: may the resident daemon REPAIR the login item at startup?
+///
+/// Exactly one situation earns an unprompted write: a registration that is present and no
+/// longer resolves, on a build that wants one. Everything else is left alone.
+///
+/// * **Absent** never repairs, whatever the preference says. An absent entry is
+///   indistinguishable from one the user deleted, in their desktop's own autostart editor or
+///   by hand, so nothing may re-create it behind them. The row shows off, the preference is
+///   kept, and the click that turns it back on still does exactly what it always did.
+/// * **Live** needs nothing.
+/// * `want == false` never repairs either, so a stale entry is never REMOVED here. Its
+///   absence-in-effect already agrees with the preference, and deleting a file from the
+///   user's home to tidy a setting is the thing `linux_autostart::registration` promises not
+///   to do.
+///
+/// So the only write this can cause is the one that fixes a path we broke.
+pub fn autostart_daemon_repair(registration: Option<AutostartRegistration>, want: bool) -> bool {
+    want && registration == Some(AutostartRegistration::Stale)
+}
+
+/// What the OS has on file for launch-at-login, or `None` when this build has no read-only
+/// way to find out (see the note above this function's neighbours).
+///
+/// **Read only.** It never registers, never unregisters, never writes a file and never issues
+/// a portal request, which is what lets it run every time the settings window opens.
+///
+/// `Some(_)` answers a SECOND question too, and deliberately the same way: it is exactly the
+/// set of builds whose login item can also be WRITTEN here and now, synchronously, without
+/// asking the user anything. A Flatpak's registration is a portal request; an unbundled mac
+/// binary's `set` returns an honest error. So the row's source and the repair's gate are one
+/// value rather than two predicates that could drift.
+///
+/// **macOS can never answer [`AutostartRegistration::Stale`], and that is the honest answer
+/// rather than a gap.** `SMAppService` registers the app's IDENTITY, not a command line, so
+/// there is no recorded path to go stale and nothing for a settings-open repair to fix. It
+/// reports `Live` or `Absent`, both of which leave the login item untouched on open. Linux
+/// and Windows record a path, so both can be stale and both can be repaired.
+pub fn autostart_registration() -> Option<AutostartRegistration> {
+    #[cfg(target_os = "macos")]
+    {
+        // Unbundled reports `false` for a process that never could have registered, so it is
+        // "unknown", not "off". Bundled, `SMAppService.status` is the OS's own answer.
+        use crate::platform::mac::login_item;
+        (login_item::availability() == login_item::Availability::Available).then(|| {
+            if login_item::is_enabled() {
+                AutostartRegistration::Live
+            } else {
+                AutostartRegistration::Absent
+            }
+        })
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use crate::platform::linux_autostart as autostart;
+        match autostart::autostart_mechanism(crate::util::package_kind()) {
+            autostart::Mechanism::DesktopFile => Some(autostart::registration()),
+            autostart::Mechanism::BackgroundPortal => None,
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some(crate::platform::windows_autostart::registration())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Repair a STALE login item, once, at resident-daemon startup (DRAGON-628).
+///
+/// Called by all three residents (`platform/{linux,mac,windows}/daemon.rs`) early in their
+/// startup, after the single-instance lock and before the tray goes up, so exactly one process
+/// per session does it and a duplicate launch that exits does nothing.
+///
+/// Portable on the outside: the body branches by `cfg`, so each daemon's call site is one line
+/// with no `cfg` of its own and the three cannot drift apart.
+///
+/// It writes in exactly ONE case, [`autostart_daemon_repair`]: the registration is present, no
+/// longer resolves, and this build wants one. That is the case that is unambiguously our bug
+/// rather than somebody's decision. Every other case is logged and left alone.
+///
+/// **macOS reaches this and correctly does nothing, which is the honest answer rather than a
+/// gap.** `SMAppService` registers the app's bundle IDENTITY, not a command line, so there is
+/// no recorded path that can go stale: [`autostart_registration`] can only answer `Live` or
+/// `Absent` there and the repair predicate is false for both. The call site exists anyway so
+/// the three daemons read identically, and so that a future mac mechanism which DID record a
+/// path would be covered without anyone remembering to add a hook. Linux and Windows both
+/// record a path, and both really can be stale: Linux in the `.desktop` `Exec=` line, Windows
+/// in the `Run` value's command.
+///
+/// Best effort throughout. A failure is logged and the daemon carries on; launch-at-login is
+/// not worth refusing to start a tray over.
+pub fn autostart_repair_at_daemon_start() {
+    // One config read at daemon startup, on the process that is about to sit resident for the
+    // whole session. The settings handler reads its own copy; there is no shared state to
+    // thread through three separate processes.
+    let p = crate::state::load();
+    let want = autostart_wanted(p.resident, p.autostart_on_login);
+    let registration = autostart_registration();
+    if !autostart_daemon_repair(registration, want) {
+        // Say WHY nothing happened. A silent no-op here is indistinguishable from the hook
+        // never having run, and "autostart is still not working" is a question this log has
+        // to be able to answer.
+        match registration {
+            None => log::debug!(
+                "autostart: this build cannot read its login item, so there is nothing to \
+                 repair at startup"
+            ),
+            Some(AutostartRegistration::Absent) if want => log::info!(
+                "autostart: no login item is registered although the setting asks for one. \
+                 Leaving it alone: an absent registration may have been removed on purpose, \
+                 and only the settings toggle may create one"
+            ),
+            Some(AutostartRegistration::Stale) => log::debug!(
+                "autostart: the login item is stale but this build does not want one, so it \
+                 is left as it is rather than deleted"
+            ),
+            Some(_) => {}
+        }
+        return;
+    }
+    log::info!(
+        "autostart: the login item no longer resolves; rewriting it for this build (the \
+         artifact it named has moved)"
+    );
+    #[cfg(target_os = "macos")]
+    let result = crate::platform::mac::login_item::set(true);
+    #[cfg(target_os = "linux")]
+    let result = crate::platform::linux_autostart::set(true);
+    #[cfg(target_os = "windows")]
+    let result = crate::platform::windows_autostart::set(true);
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let result: Result<(), String> = Ok(());
+    match result {
+        Ok(()) => log::info!("autostart: the login item was rewritten"),
+        Err(e) => log::warn!("autostart: could not rewrite the login item: {e}"),
+    }
+}
+
+/// **Pure**, unit-tested: whether a Windows `Run` value can still LAUNCH anything, given its
+/// data.
+///
+/// The Windows half of the DRAGON-625 lesson, ported by DRAGON-628 because the Windows toggle
+/// could lie in exactly the same way the Linux one did. `is_enabled` there asked only whether
+/// the registry VALUE exists, and the value carries an absolute exe path recorded when the
+/// toggle was flipped. Move the exe (a dev install rebuilt elsewhere, an MSI upgraded into a
+/// different directory) and Windows silently skips the entry at login while the row keeps
+/// saying the feature is on.
+///
+/// Kept in the shared tree rather than in `platform/windows/`, for the same reason as the
+/// `win_build_*` gates above: nobody on the project runs Windows day to day, so the reasoning
+/// has to be provable from the Linux gate. The registry READ stays native.
+///
+/// The rules mirror `linux_autostart::entry_is_live_with` deliberately, so the two platforms
+/// cannot answer the same question differently:
+///
+/// * Our own writer emits `"<exe>" resident`, so a QUOTED first field is the path, spaces and
+///   all. That is the normal case and it is tried first.
+/// * Failing that, the whole command minus a trailing bare `resident`, then the first
+///   whitespace-separated token, which covers an unquoted value someone else wrote.
+/// * A candidate that is not an ABSOLUTE Windows path is a `PATH` lookup we cannot honestly
+///   resolve, so it reads as LIVE. Guessing there would disable a working entry.
+///
+/// So it only ever calls a value dead when it names an absolute path that is not there, which
+/// is precisely the case Windows itself skips. `is_absolute()` is not used, and must not be:
+/// it answers for the HOST target, so `C:\…` is not absolute to a Linux test run and every
+/// case would collapse to "live".
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_run_value_is_live_with(data: &str, exists: impl Fn(&std::path::Path) -> bool) -> bool {
+    /// `X:\…`, `X:/…` or a `\\server\share` UNC. Spelled out rather than asked of
+    /// `Path::is_absolute`, which answers for whatever target the test happens to run on.
+    fn is_windows_absolute(s: &str) -> bool {
+        if s.starts_with(r"\\") {
+            return true;
+        }
+        let mut c = s.chars();
+        matches!(
+            (c.next(), c.next(), c.next()),
+            (Some(d), Some(':'), Some('\\' | '/')) if d.is_ascii_alphabetic()
+        )
+    }
+
+    let data = data.trim();
+    if data.is_empty() {
+        return false;
+    }
+    // A candidate that is not a path at all is a PATH lookup we cannot resolve, so it is
+    // never called dead.
+    let live = |cand: &str| {
+        !cand.is_empty() && (!is_windows_absolute(cand) || exists(std::path::Path::new(cand)))
+    };
+    // The quoted form our own writer produces. When it parses it is the WHOLE answer and the
+    // unquoted candidates below are not tried at all: they would both still carry the quote
+    // characters, which no absolute-path test can match, so a dead exe would read as a PATH
+    // lookup and so as live. An unterminated quote falls through instead.
+    if let Some(exe) = data
+        .strip_prefix('"')
+        .and_then(|rest| rest.split_once('"').map(|(exe, _)| exe))
+    {
+        return live(exe);
+    }
+    // `instance::RESIDENT_ARG`, the token every launcher agrees on, rather than a fourth
+    // private copy of the literal (see its doc). `windows_autostart` keeps its own for the
+    // command it WRITES, pinned to the same string by its own test.
+    let whole = data
+        .strip_suffix(crate::instance::RESIDENT_ARG)
+        .map(str::trim_end)
+        .unwrap_or(data);
+    let first = data.split_whitespace().next().unwrap_or(data);
+    live(whole) || live(first)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +1429,38 @@ mod tests {
     // pinned. `WS_EX_LAYERED` is unconditional on every Windows build again (DRAGON-280's
     // shape), so there is no build-keyed decision left to test — see the note above
     // `WIN10_MIN_BUILD` for why the gate's premise was wrong.
+
+    #[test]
+    fn fallback_seeding_needs_no_layer_shell_and_a_portal_landing() {
+        // The Flatpak / GNOME shape: no layer shell, capture clamped to the portal.
+        assert!(overlay_fallback_seeding(false, true));
+        // A normal COSMIC session keeps its layer surfaces whatever the backend choice
+        // says. This is the term that keeps the unsandboxed build byte-identical.
+        assert!(!overlay_fallback_seeding(true, true));
+        assert!(!overlay_fallback_seeding(true, false));
+        // No layer shell AND no portal landing (native screencopy present, e.g. a
+        // layer-shell-less compositor with ext-image-copy-capture, screencopy chosen):
+        // the fallback has no frame source, so the session keeps today's loud
+        // OverlayNeverShown ending instead of half-seeding.
+        assert!(!overlay_fallback_seeding(false, false));
+    }
+
+    /// The clamp the tray daemon applies to reach the same answer a capture process does
+    /// (DRAGON-555). A saved preference only decides anything where BOTH backends exist.
+    #[test]
+    fn a_capture_choice_lands_on_the_portal_when_it_is_asked_for_or_is_all_there_is() {
+        use backend::{PORTAL_ID, SCREENCOPY_ID};
+        // Asked for, on a session that has both.
+        assert!(capture_choice_uses_portal(PORTAL_ID, true));
+        // Native asked for and native present: the preference stands.
+        assert!(!capture_choice_uses_portal(SCREENCOPY_ID, true));
+        // No native capture at all (the sandbox / GNOME shape): the saved preference cannot
+        // apply, and the session is on the portal whatever the config says. The persisted
+        // value is never rewritten for it, which is what keeps a COSMIC+GNOME dual login
+        // working.
+        assert!(capture_choice_uses_portal(SCREENCOPY_ID, false));
+        assert!(capture_choice_uses_portal(PORTAL_ID, false));
+    }
 
     #[test]
     fn win11_is_always_layered_whatever_the_env_says() {
@@ -1028,5 +1718,349 @@ mod tests {
         assert!(win_rect_contains((0, 0, 100, 100), (0, 0, 100, 100)));
         assert!(win_rect_contains((0, 0, 100, 100), (10, 10, 10, 10)));
         assert!(!win_rect_contains((0, 0, 100, 100), (10, 10, 100, 10)));
+    }
+}
+
+/// DRAGON-583: whether an in-app recording shortcut can reach a live recording, and so
+/// whether the three Recording rows in Settings → Keyboard Shortcuts are honest.
+#[cfg(test)]
+mod recording_shortcut_reach_tests {
+    use super::*;
+
+    /// Either route on its own is enough, and neither is required.
+    #[test]
+    fn either_route_alone_delivers_the_chord() {
+        // A focus-free binding (the portal GlobalShortcuts interface) reaches us whatever
+        // has focus, so our own surfaces are irrelevant.
+        assert!(in_app_recording_shortcut_reachable(true, false));
+        // Our surface still owns the keyboard, so ordinary key events arrive with no
+        // global binding at all.
+        assert!(in_app_recording_shortcut_reachable(false, true));
+        // Both, which nothing ships today but is not a contradiction.
+        assert!(in_app_recording_shortcut_reachable(true, true));
+    }
+
+    /// The whole point of the ticket: with no focus-free binding AND no surface of ours
+    /// holding the keyboard, the chord can never arrive. That is exactly the shape of a
+    /// COSMIC recording, native or portal-fallback, and it is why those rows stop being
+    /// advertised there.
+    #[test]
+    fn no_binding_and_no_focus_can_never_deliver() {
+        assert!(!in_app_recording_shortcut_reachable(false, false));
+    }
+
+    /// The predicate is a plain OR and must stay one: neither term may start implying the
+    /// other. Stated exhaustively so a third term added later cannot quietly widen it.
+    #[test]
+    fn the_matrix_is_exactly_an_or() {
+        for focus_free in [false, true] {
+            for keeps_focus in [false, true] {
+                assert_eq!(
+                    in_app_recording_shortcut_reachable(focus_free, keeps_focus),
+                    focus_free || keeps_focus,
+                    "focus_free={focus_free} keeps_focus={keeps_focus}"
+                );
+            }
+        }
+    }
+
+    /// The LIVE reader's platform inputs, pinned so a cfg edit cannot silently change what
+    /// a session is told.
+    ///
+    /// Linux answers from a real probe of the running desktop, so this cannot assert the
+    /// result; what it CAN assert is that the answer is that probe and nothing else, which
+    /// is the same as pinning the second term to `false` (a native session hands focus to
+    /// the recorded window at record start, and the fallback session destroys its
+    /// toplevel). macOS and Windows answer `true` and must keep doing so: their overlays
+    /// stay up and nothing takes the keyboard away, so their Recording rows are
+    /// byte-identically unchanged by DRAGON-583.
+    #[test]
+    fn the_live_reader_keeps_each_platforms_answer() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            in_app_recording_shortcuts_work(),
+            global_shortcuts::interface_available(),
+            "on Linux the answer must be the portal probe and nothing else"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            in_app_recording_shortcuts_work(),
+            "mac and Windows keep their overlay windows, so their rows stay advertised"
+        );
+    }
+}
+
+/// DRAGON-587, then DRAGON-597: whether an overlay can hide the pointer sprite. The surface
+/// kind used to decide it; the iced fork closed the gap, so now nothing does.
+#[cfg(test)]
+mod overlay_pointer_tests {
+    use super::*;
+
+    /// The axis is GONE. A layer surface used to be the one kind that could not hide, because
+    /// libcosmic's Wayland backend no-oped `set_cursor_visible`; our iced fork implements it
+    /// (the iced `[patch]` block in `Cargo.toml`), so both kinds hide now. This test is the
+    /// thing
+    /// that fails if the `[patch]` is ever dropped without restoring the arrow fallback.
+    #[test]
+    fn every_overlay_kind_can_now_hide_the_pointer() {
+        assert!(overlay_hides_pointer(false), "a plain toplevel reaches winit and hides");
+        assert!(
+            overlay_hides_pointer(true),
+            "a layer surface hides too, via the iced fork's set_cursor_visible"
+        );
+    }
+
+    /// The live reader agrees with the pure predicate on every platform, layer shell or not.
+    #[test]
+    fn the_live_reader_agrees_on_every_platform() {
+        assert!(overlay_pointer_hideable(), "every overlay this app mints can hide");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            overlay_pointer_hideable(),
+            overlay_hides_pointer(layer_overlay_available()),
+            "the reader is the pure predicate fed this session's real surface kind"
+        );
+    }
+}
+
+/// DRAGON-628: what the "Automatically start on login" row is allowed to claim.
+#[cfg(test)]
+mod autostart_row_tests {
+    use super::*;
+
+    /// THE regression. The owner's config said on, the autostart entry named an AppImage
+    /// DRAGON-590 had moved, and the row went on claiming the feature was on. Reality wins.
+    #[test]
+    fn a_dead_registration_reads_off_however_the_preference_was_left() {
+        let row = autostart_row(true, Some(false));
+        assert_eq!(
+            row,
+            AutostartRow::Disagrees {
+                shown: false,
+                preference: true
+            }
+        );
+        assert!(!row.shown(), "the row must say what the next login will do");
+    }
+
+    /// The same rule pointing the other way, which is not symmetry for its own sake: an entry
+    /// that exists while the preference says off WILL launch the app, and a row reading off
+    /// would be exactly as untrue as the case above.
+    #[test]
+    fn a_live_registration_reads_on_even_when_the_preference_says_off() {
+        let row = autostart_row(false, Some(true));
+        assert_eq!(
+            row,
+            AutostartRow::Disagrees {
+                shown: true,
+                preference: false
+            }
+        );
+        assert!(row.shown());
+    }
+
+    /// A build that cannot observe reality (a Flatpak, an unbundled mac dev binary) shows the
+    /// stored preference, which is what every platform did before this ticket. Getting this
+    /// wrong would put a NEW lie in the Flatpak: the portal grants autostart on the host,
+    /// where the sandbox cannot read the entry, so a probe there would answer a confident
+    /// "off" for an app that really does start at login.
+    #[test]
+    fn an_unobservable_build_falls_back_to_the_preference() {
+        for pref in [true, false] {
+            let row = autostart_row(pref, None);
+            assert_eq!(row, AutostartRow::Unobservable(pref));
+            assert_eq!(row.shown(), pref);
+        }
+    }
+
+    /// The ordinary case: reality and the preference agree, so nothing is logged and nothing
+    /// on screen changes from what shipped before.
+    #[test]
+    fn agreement_is_its_own_state_so_the_log_stays_quiet() {
+        for v in [true, false] {
+            let row = autostart_row(v, Some(v));
+            assert_eq!(row, AutostartRow::Agrees(v));
+            assert_eq!(row.shown(), v);
+        }
+    }
+
+    /// Whatever the inputs, the row renders the observation when there is one. Pinned as one
+    /// statement so a future variant cannot quietly start rendering the preference instead.
+    #[test]
+    fn the_row_always_renders_the_observation_when_there_is_one() {
+        for pref in [true, false] {
+            for actual in [true, false] {
+                assert_eq!(
+                    autostart_row(pref, Some(actual)).shown(),
+                    actual,
+                    "preference {pref}, observed {actual}"
+                );
+            }
+        }
+    }
+
+    /// Only a registration that RUNS is live. `Stale` is the state that exists purely to
+    /// separate our bug from the user's choice, and it must never read as on.
+    #[test]
+    fn only_a_runnable_registration_is_live() {
+        assert!(AutostartRegistration::Live.is_live());
+        assert!(!AutostartRegistration::Stale.is_live());
+        assert!(!AutostartRegistration::Absent.is_live());
+    }
+}
+
+/// DRAGON-628: when the resident daemon may write the login item at startup.
+#[cfg(test)]
+mod autostart_daemon_repair_tests {
+    use super::*;
+
+    /// The ONE case that earns an unprompted write: the registration is there and no longer
+    /// resolves, and this build wants one. That is the owner's case, where DRAGON-590 moved
+    /// the AppImage the entry named.
+    #[test]
+    fn only_a_stale_registration_that_is_wanted_is_repaired() {
+        assert!(autostart_daemon_repair(
+            Some(AutostartRegistration::Stale),
+            true
+        ));
+    }
+
+    /// THE refinement. An absent registration is indistinguishable from one the user deleted
+    /// in their desktop's autostart editor, so no daemon may put it back, however loudly the
+    /// stored preference asks for it. The row shows off and the click still works.
+    #[test]
+    fn an_absent_registration_is_never_recreated() {
+        assert!(!autostart_daemon_repair(
+            Some(AutostartRegistration::Absent),
+            true
+        ));
+    }
+
+    /// A live one needs nothing, so the `Exec=` path is never rewritten out from under a
+    /// working entry by whichever build happened to start the daemon.
+    #[test]
+    fn a_live_registration_is_left_exactly_as_it_is() {
+        assert!(!autostart_daemon_repair(
+            Some(AutostartRegistration::Live),
+            true
+        ));
+    }
+
+    /// With no login item wanted, nothing is written at all. In particular a stale entry is
+    /// never DELETED here: it already fails to run, so it agrees with the preference, and
+    /// removing a file from the user's home to tidy a setting is not this hook's job.
+    #[test]
+    fn nothing_is_written_when_no_login_item_is_wanted() {
+        for r in [
+            AutostartRegistration::Absent,
+            AutostartRegistration::Stale,
+            AutostartRegistration::Live,
+        ] {
+            assert!(!autostart_daemon_repair(Some(r), false), "{r:?}");
+        }
+    }
+
+    /// A build that cannot READ its registration cannot repair it either, and must not try.
+    /// On a Flatpak "trying" would mean a Background-portal request from a daemon nobody is
+    /// looking at; on an unbundled mac dev binary it would fail every time.
+    #[test]
+    fn an_unobservable_build_never_writes() {
+        assert!(!autostart_daemon_repair(None, true));
+        assert!(!autostart_daemon_repair(None, false));
+    }
+
+    /// The desired state is ONE expression, shared by the settings handler and all three
+    /// daemons. A login item with no resident to launch is pointless, and one the user opted
+    /// out of is unwanted.
+    #[test]
+    fn a_login_item_is_wanted_only_with_a_resident_and_an_opt_in() {
+        assert!(autostart_wanted(true, true));
+        assert!(!autostart_wanted(true, false));
+        assert!(!autostart_wanted(false, true));
+        assert!(!autostart_wanted(false, false));
+    }
+}
+
+/// DRAGON-628: the Windows `Run` value's liveness, the port of DRAGON-625's Linux rule.
+#[cfg(test)]
+mod win_run_value_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// What our own writer produces, and the lie it could tell. The value exists either way;
+    /// only the exe's presence separates "starts at login" from "silently skipped".
+    #[test]
+    fn a_quoted_exe_decides_the_answer_by_itself() {
+        let v = r#""C:\Program Files\CCK\cosmic-capture-kit.exe" resident"#;
+        assert!(
+            win_run_value_is_live_with(v, |p| p
+                == Path::new(r"C:\Program Files\CCK\cosmic-capture-kit.exe")),
+            "a path with spaces must survive the quotes"
+        );
+        assert!(
+            !win_run_value_is_live_with(v, |_| false),
+            "a value naming a missing exe must read as not registered"
+        );
+    }
+
+    /// The trap this function is written around. Falling back to the unquoted candidates
+    /// after a quoted path misses would hand the absolute-path test a string that still
+    /// begins with `"`, which reads as a PATH lookup, which reads as LIVE. A dead entry
+    /// would then answer true and the row would be lying again, one layer down.
+    #[test]
+    fn a_dead_quoted_path_never_falls_through_to_the_raw_string() {
+        for v in [
+            r#""C:\gone\cosmic-capture-kit.exe" resident"#,
+            r#""C:\gone\cosmic-capture-kit.exe""#,
+            r#""D:/gone/cck.exe" resident"#,
+        ] {
+            assert!(!win_run_value_is_live_with(v, |_| false), "{v}");
+        }
+    }
+
+    /// An unquoted absolute path, which is what a hand-edited value or another writer looks
+    /// like. The trailing resident token is stripped first, then the first token is tried.
+    #[test]
+    fn an_unquoted_value_resolves_through_its_path_or_its_first_token() {
+        let v = r"C:\cck\cosmic-capture-kit.exe resident";
+        assert!(win_run_value_is_live_with(v, |p| p
+            == Path::new(r"C:\cck\cosmic-capture-kit.exe")));
+        assert!(!win_run_value_is_live_with(v, |_| false));
+        // A launcher plus arguments: the whole string is not a path, so the first token is.
+        let w = r"C:\Windows\System32\cmd.exe /c start cck.exe resident";
+        assert!(win_run_value_is_live_with(w, |p| p
+            == Path::new(r"C:\Windows\System32\cmd.exe")));
+    }
+
+    /// A bare command is a `PATH` lookup we cannot honestly reproduce, so it is never called
+    /// dead. Guessing there would disable a working entry, exactly as it would on Linux.
+    #[test]
+    fn a_path_lookup_is_never_called_dead() {
+        assert!(win_run_value_is_live_with("cosmic-capture-kit.exe resident", |_| false));
+        assert!(win_run_value_is_live_with(r#""cck.exe" resident"#, |_| false));
+    }
+
+    /// A UNC path is absolute too, so it is checked rather than waved through.
+    #[test]
+    fn a_unc_path_is_absolute_and_gets_checked() {
+        let v = r#""\\nas\apps\cck.exe" resident"#;
+        assert!(win_run_value_is_live_with(v, |p| p == Path::new(r"\\nas\apps\cck.exe")));
+        assert!(!win_run_value_is_live_with(v, |_| false));
+    }
+
+    /// Nothing to launch is not registered.
+    #[test]
+    fn an_empty_value_is_not_live() {
+        assert!(!win_run_value_is_live_with("", |_| true));
+        assert!(!win_run_value_is_live_with("   ", |_| true));
+        assert!(!win_run_value_is_live_with(r#""" resident"#, |_| true));
+    }
+
+    /// The Linux and Windows readers must answer the same QUESTION, or one platform's toggle
+    /// tells the truth and the other does not. The token they both strip is the one every
+    /// launcher agrees on.
+    #[test]
+    fn both_platforms_strip_the_same_resident_token() {
+        assert_eq!(crate::instance::RESIDENT_ARG, "resident");
     }
 }

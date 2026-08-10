@@ -2,7 +2,7 @@
 //! stream and pipe its frames to ffmpeg.
 
 use super::owned::{
-    make_frame_writer, run_video_stop_tail, try_start_owned_audio, MuteIntervals, OwnedAudioStart,
+    make_frame_writer, run_video_stop_tail, AudioPreflight, MuteIntervals, OwnedAudioStart,
 };
 use super::{ToggleEvent, median_offset_ms, monotonic_ns};
 use crate::audio::capture::MonitorCapture;
@@ -81,14 +81,21 @@ fn latch_freshest(
 // ---------------------------------------------------------------------------
 // Media-clock OWNED path (DRAGON-125 chunk B1; the legacy wallclock+CFR+segments
 // fallback retired in DRAGON-127 — this is now the ONLY recording path):
-// `record_pipewire` (the public entry point) runs a cheap, self-contained
-// pre-flight check of the owned path's audio components FIRST (before touching
-// the portal stream at all — see `try_start_owned_audio`); only if that succeeds
-// does it commit to the single-session owned loop below. Any failure from that
-// point on (no video frames, ffmpeg won't spawn, a wedged muxer) is an ordinary
-// recording failure. If the pre-flight check itself fails, `fd` was never
-// touched, and the recording fails outright with a named, actionable reason
-// (pulse connection / FIFO / mic chain) instead of falling back.
+// `record_pipewire` (the public entry point) starts the PipeWire consumer thread
+// AND the audio pre-flight (`owned::AudioPreflight`) together, in that order and
+// both within a millisecond of the worker starting (DRAGON-554): the stream's
+// connect + format negotiation + first-buffer latency then OVERLAPS the
+// pre-flight's own capture-chain starts and smoke checks instead of following
+// them, which shrinks the opening span the file must cover with copies of the
+// first frame. (It used to run the pre-flight strictly first, "before touching
+// the portal stream at all" — that ordering bought nothing: there is no fallback
+// that needs an untouched fd, a failed pre-flight tears the consumer down
+// explicitly, and the serialization was a straight add to the frozen opening.)
+// The pre-flight result is joined only where it is first needed (the FIFO paths,
+// for the ffmpeg spawn); if it failed, the recording fails outright with its
+// named, actionable reason (pulse connection / FIFO / mic chain). Any failure
+// after that point (no video frames, ffmpeg won't spawn, a wedged muxer) is an
+// ordinary recording failure.
 // ---------------------------------------------------------------------------
 
 /// Fold an owned-session startup failure into a single `Err` message, tearing
@@ -117,8 +124,11 @@ fn owned_start_failure<T>(
 
 /// Record a portal/PipeWire stream through the media-clock OWNED pipeline
 /// (DRAGON-125; the ONLY recording path since DRAGON-127) — the public entry point
-/// `record::mod`'s `start_pipewire_recording` calls. If the audio pre-flight check
-/// can't start, the recording fails outright with a named, actionable reason.
+/// `record::mod`'s `start_pipewire_recording` calls. Starts the PipeWire consumer
+/// thread and the audio pre-flight TOGETHER (DRAGON-554; see the section comment
+/// above): the stream negotiation overlaps the pre-flight instead of waiting on it.
+/// If the pre-flight can't start, the recording fails outright with a named,
+/// actionable reason.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pipewire(
     fd: OwnedFd,
@@ -126,6 +136,7 @@ pub(crate) fn record_pipewire(
     crop: Option<(u32, u32, u32, u32)>,
     fps: u32,
     preferred_encoder: &str,
+    encoder_hint: Option<&str>,
     presets: &crate::encode::Presets,
     mic: bool,
     system_audio: bool,
@@ -141,65 +152,13 @@ pub(crate) fn record_pipewire(
     dims: &Mutex<Option<(u32, u32)>>,
     metadata: &str,
 ) -> Result<PathBuf, String> {
-    match try_start_owned_audio() {
-        Ok(owned) => {
-            log::info!("recording pipeline: media-clock owned path (DRAGON-125)");
-            record_pipewire_owned(
-                fd, node_id, crop, fps, preferred_encoder, presets, mic, system_audio,
-                bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, out_path, stop,
-                paused, events, measured, dims, metadata, owned,
-            )
-        }
-        Err(reason) => {
-            log::error!("recording pipeline: audio pre-flight failed ({reason}); cannot record");
-            Err(format!("could not start recording audio: {reason}"))
-        }
-    }
-}
-
-/// The media-clock owned PipeWire session (DRAGON-125 chunk B1): ONE continuous
-/// ffmpeg for the whole recording — index-stamped video
-/// ([`crate::encode::spawn_ffmpeg_media_clock`]), audio rendered by
-/// [`super::pump`]'s `Mixer`-backed engine — instead of the legacy
-/// wallclock+CFR+per-pause-segment model. Called only once [`try_start_owned_audio`]
-/// has already confirmed both audio sources are alive; `owned` is consumed here
-/// (its FIFOs/tap/monitor become the pump's).
-#[allow(clippy::too_many_arguments)]
-fn record_pipewire_owned(
-    fd: OwnedFd,
-    node_id: u32,
-    crop: Option<(u32, u32, u32, u32)>,
-    fps: u32,
-    preferred_encoder: &str,
-    presets: &crate::encode::Presets,
-    mic: bool,
-    system_audio: bool,
-    bitrate_kbps: u32,
-    audio_offset_ms: i32,
-    auto_device_compensation: bool,
-    max_res: (u32, u32),
-    out_path: &std::path::Path,
-    stop: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    events: &Mutex<Vec<ToggleEvent>>,
-    measured: &Mutex<Option<i32>>,
-    dims: &Mutex<Option<(u32, u32)>>,
-    metadata: &str,
-    owned: OwnedAudioStart,
-) -> Result<PathBuf, String> {
-    if let Some(parent) = out_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let OwnedAudioStart {
-        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
-    } = owned;
-
-    // Same PipeWire consumer shape as the legacy path (untouched): a small
-    // jitter-buffered channel, dropping (never blocking) when the encoder side is
-    // behind, discarding frames while paused — nothing is captured then; the
-    // pump's video ticks independently freeze for the same span (see
-    // `super::pump::VideoTicker`).
-    let (ftx, frx) = std::sync::mpsc::sync_channel::<(u32, u32, Vec<u8>, i64, i64, i64)>(8);
+    // Same PipeWire consumer shape as ever: a small jitter-buffered channel, dropping
+    // (never blocking) when the encoder side is behind, discarding frames while
+    // paused — nothing is captured then; the pump's video ticks independently freeze
+    // for the same span (see `super::pump::VideoTicker`). Spawned BEFORE the
+    // pre-flight is awaited (DRAGON-554) so connect/negotiate/first-buffer run
+    // concurrently with it.
+    let (ftx, frx) = std::sync::mpsc::sync_channel::<Frame>(8);
     let pw_stop = stop.clone();
     let pw_paused = paused.clone();
     let pw = std::thread::spawn(move || {
@@ -219,10 +178,62 @@ fn record_pipewire_owned(
             }
         })
     });
+    let preflight = AudioPreflight::start();
+    record_pipewire_owned(
+        fps, preferred_encoder, encoder_hint, presets, mic, system_audio, bitrate_kbps,
+        audio_offset_ms, auto_device_compensation, max_res, out_path, stop, paused, events,
+        measured, dims, metadata, frx, pw, preflight,
+    )
+}
+
+/// The media-clock owned PipeWire session (DRAGON-125 chunk B1): ONE continuous
+/// ffmpeg for the whole recording — index-stamped video
+/// ([`crate::encode::spawn_ffmpeg_media_clock`]), audio rendered by
+/// [`super::pump`]'s `Mixer`-backed engine — instead of the legacy
+/// wallclock+CFR+per-pause-segment model. The consumer thread (`pw` + `frx`) is
+/// already running and the audio `preflight` already started (DRAGON-554, both by
+/// [`record_pipewire`]); the pre-flight is joined here at the first point its result
+/// is needed — after the first frame fixed the encode size, before the ffmpeg spawn
+/// that consumes its FIFO paths.
+#[allow(clippy::too_many_arguments)]
+fn record_pipewire_owned(
+    fps: u32,
+    preferred_encoder: &str,
+    encoder_hint: Option<&str>,
+    presets: &crate::encode::Presets,
+    mic: bool,
+    system_audio: bool,
+    bitrate_kbps: u32,
+    audio_offset_ms: i32,
+    auto_device_compensation: bool,
+    max_res: (u32, u32),
+    out_path: &std::path::Path,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    events: &Mutex<Vec<ToggleEvent>>,
+    measured: &Mutex<Option<i32>>,
+    dims: &Mutex<Option<(u32, u32)>>,
+    metadata: &str,
+    frx: std::sync::mpsc::Receiver<Frame>,
+    pw: std::thread::JoinHandle<Result<(), String>>,
+    preflight: AudioPreflight,
+) -> Result<PathBuf, String> {
+    if let Some(parent) = out_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
     let mut all_lag_samples: Vec<i64> = Vec::new();
 
     // The first frame fixes the encode size — identical bounded wait to the
-    // legacy path (paused waits don't count against the 10s budget).
+    // legacy path (paused waits don't count against the 10s budget). A failure here
+    // abandons the still-running pre-flight (its captures/FIFOs come down with it).
+    let no_frames = |stop: &Arc<AtomicBool>,
+                     pw: std::thread::JoinHandle<Result<(), String>>,
+                     preflight: AudioPreflight| {
+        stop.store(true, Ordering::Relaxed);
+        let _ = pw.join();
+        preflight.abandon();
+        "no frames from the PipeWire stream".to_string()
+    };
     let (w0, h0, first, _pts0, _delay0, _recv0) = {
         let mut waited_s = 0u32;
         loop {
@@ -233,17 +244,11 @@ fn record_pipewire_owned(
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     waited_s += 1;
                     if waited_s >= 10 || stop.load(Ordering::Relaxed) {
-                        return Err(owned_start_failure(
-                            &stop, pw, mic_tap, monitor, &mic_fifo_path, &sys_fifo_path,
-                            "no frames from the PipeWire stream".to_string(),
-                        ));
+                        return Err(no_frames(&stop, pw, preflight));
                     }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(owned_start_failure(
-                        &stop, pw, mic_tap, monitor, &mic_fifo_path, &sys_fifo_path,
-                        "no frames from the PipeWire stream".to_string(),
-                    ));
+                    return Err(no_frames(&stop, pw, preflight));
                 }
             }
         }
@@ -253,9 +258,27 @@ fn record_pipewire_owned(
     if let Ok(mut g) = dims.lock() {
         *g = Some((w0, h0));
     }
-    let plan = crate::encode::EncodePlan::resolve(preferred_encoder, ew, eh, presets);
+    let plan = super::resolve_session_plan(preferred_encoder, encoder_hint, ew, eh, presets);
     let nv12 = plan.nv12;
     let is_hevc = plan.is_hevc();
+
+    // The pre-flight's result is needed from here on (the FIFO paths feed the ffmpeg
+    // spawn). Joining it is bounded by its own internal budgets (see `AudioPreflight`).
+    let owned = match preflight.join() {
+        Ok(o) => {
+            log::info!("recording pipeline: media-clock owned path (DRAGON-125)");
+            o
+        }
+        Err(reason) => {
+            log::error!("recording pipeline: audio pre-flight failed ({reason}); cannot record");
+            stop.store(true, Ordering::Relaxed);
+            let _ = pw.join();
+            return Err(format!("could not start recording audio: {reason}"));
+        }
+    };
+    let OwnedAudioStart {
+        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } = owned;
 
     let temp = super::recording_temp_path(out_path);
     let mut child = match crate::encode::spawn_ffmpeg_media_clock(

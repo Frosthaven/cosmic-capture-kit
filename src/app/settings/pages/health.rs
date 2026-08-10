@@ -12,7 +12,7 @@ use super::super::deps::Dep;
 use super::super::row::{open_folder_btn, status_icon, toggle, Item, SectionSpec, Severity};
 // The Application Permissions row is macOS-only, and so is the only button on this page.
 #[cfg(target_os = "macos")]
-use super::super::row::action_button;
+use super::super::row::{centered_button, standard_button_class};
 
 impl crate::app::App {
     pub(in crate::app::settings) fn health_sections(&self) -> Vec<SectionSpec<'_>> {
@@ -81,23 +81,44 @@ impl crate::app::App {
         ])
         .spacing(12.0)
         .align_y(Alignment::Center);
+        // The folder gets the same treatment as every other path the app shows (owner report):
+        // subtle tone, led by a copy button, wrapping inside the pane, and `~` for the home
+        // prefix. It was plain description prose, which is the one form a path should never
+        // take here, because the whole job of this row is "which file do I send to support"
+        // and copying it by hand off a wrapped line is exactly the friction the copy button
+        // exists to remove.
+        //
+        // `path_line` alone rather than `path_desc`: this row deliberately carries no
+        // introducing sentence (see the doc above), so there is no prose half to pair with.
+        let log_dir = crate::diag::log_dir_display();
+        let log_dir_copied =
+            super::super::row::path_line_copied(&log_dir, &self.settings.health_copied);
         // `mut` only where something is pushed below: the Application Permissions row is
         // macOS-only, so every other platform builds this list once and never adds to it.
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        let mut items = vec![Item::new(
-            "Enable Debug Logging",
-            crate::diag::log_dir_display(),
-            control,
-        )
-        .reset_with(self.debug_logging, false, |b| {
-            Msg::Settings(SettingsMsg::SetDebugLogging(b))
-        })];
+        let mut items = vec![Item::new("Enable Debug Logging", "", control)
+            .desc_el(super::super::row::path_line(log_dir, log_dir_copied))
+            .reset_with(self.debug_logging, false, |b| {
+                Msg::Settings(SettingsMsg::SetDebugLogging(b))
+            })];
+        // `flush()` (DRAGON-495): this row's control is a lone button with no unit label
+        // or reset, so it drops the fixed trailing slots every other row reserves for
+        // those, matching the same fix the Cloud Accounts page already carries.
         #[cfg(target_os = "macos")]
-        items.push(Item::new(
-            "Application Permissions",
-            "",
-            action_button("Manage permissions", Msg::Settings(SettingsMsg::OpenPermissionsWindow)),
-        ));
+        items.push(
+            Item::new(
+                "Application Permissions",
+                "",
+                centered_button(
+                    Some("dialog-password-symbolic"),
+                    "Manage permissions",
+                    Length::Shrink,
+                    standard_button_class(),
+                    Some(Msg::Settings(SettingsMsg::OpenPermissionsWindow)),
+                ),
+            )
+            .flush(),
+        );
         SectionSpec {
             title: "Application Management",
             items,

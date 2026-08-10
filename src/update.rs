@@ -39,6 +39,60 @@
 //! [`UpdateStatus::from_manifest`], [`artifact_name`] — are unit-tested at the
 //! file bottom. The I/O (curl / hdiutil / the detached swap helper) is not, by
 //! the repo's testing rule.
+//!
+//! **A Flatpak build has no update channel at all** (DRAGON-561). Updates flow through
+//! the Flatpak remote (the store), so a manifest poll would only advertise versions the
+//! store delivers on its own schedule, and the updater could never act on one anyway:
+//! `/app` is read-only inside the sandbox, so there is no install location we own. The
+//! one gate is [`channel_available`] ([`channel_available_for`] over
+//! [`crate::util::package_kind`]), and every trigger consults it: the settings-open
+//! check (both mint paths), the About page's controls, the on-disk cache seed, and the
+//! daemons' startup notice (gated inside [`notify_daemon_startup_if_update_available`],
+//! the shared body every resident daemon calls). A Flatpak therefore never runs an
+//! update check, and [`platform_key`] never grows a `flatpak` key.
+//!
+//! **The notes are a SEPARATE question from the channel** (DRAGON-605). That one gate was
+//! answering two things at once: "can this build install an update itself", which on a
+//! Flatpak is permanently no, and "can this build tell the user what changed", which has
+//! nothing to do with who performs the install. Turning the channel off took the About
+//! page's "What's new" block down with it, so a Flatpak user could see the store card and
+//! nothing about what the store was going to hand them.
+//!
+//! [`notes_source_for`] is the split, and it is total: EVERY package kind shows notes.
+//! What differs is where they come from. A channel build already has them, because
+//! [`check_now`] parses them out of the same manifest it compares versions against
+//! ([`NotesSource::UpdateCheck`]). A Flatpak runs no check, so it fetches the notes on
+//! their own ([`NotesSource::OwnFetch`], [`fetch_release_notes`]). The two predicates are
+//! exact complements and a test says so, which is what keeps the relationship stated in
+//! code rather than implied by a comment.
+//!
+//! **Why fetched and not bundled at build time.** Bundling would need no network at all,
+//! and it would answer the nicer question ("what is new in what I am running"), so it was
+//! the preferred option until the release pipeline was checked. `release.yml` generates
+//! the notes in its FINAL job, after every artifact is already built, and a human then
+//! edits them inside the `cck-notes` markers before clicking Publish. The shipping notes
+//! therefore do not exist when the binary is compiled and change again afterwards, so
+//! baking them in is not a matter of adding a build step: it would need a second build
+//! after the draft exists, or a hand-maintained notes file in the repo, which is exactly
+//! the second source of truth this must not invent.
+//!
+//! **So the shipped UI answers: what is new in the newest PUBLISHED version.** That is the
+//! same question every other build's About page answers. On a channel build that version
+//! is either the one you have or the one you can install in a click; on a Flatpak it is
+//! the one the store will deliver on its own schedule, and the heading naming a version
+//! you do not have yet is the honest signal that it has not arrived.
+//!
+//! **This is not an update check by the back door**, and four things keep it from becoming
+//! one. It runs ONLY when the About page becomes active, once per session, never from a
+//! daemon, a capture launch or a settings-window mint. It returns a [`ReleaseNotes`],
+//! which carries a version string and markdown and NOTHING installable: no URL, no sha,
+//! no size, because [`parse_release_notes`] never reads the manifest's `platforms` object
+//! and [`platform_key`] is still never computed on a Flatpak. It never produces an
+//! [`UpdateStatus`], so it cannot tint the nav rail, raise the DRAGON-177 dialog or put a
+//! button on the Version row. And it never writes the manifest cache, so
+//! [`seeded_status_from_cache`] can never read a file a Flatpak wrote. A failed fetch
+//! degrades to no notes at all: an error banner about updates would be nonsense on a
+//! build that cannot update.
 
 /// The default update channel: the public repo's latest-release `update.json`
 /// asset (GitHub serves `releases/latest/download/<asset>` as a stable URL for
@@ -248,32 +302,27 @@ pub fn post_update_marker_pending() -> bool {
     state_file("post-update").is_some_and(|p| p.exists())
 }
 
-/// **Pure**, unit-tested: should a launch that could NOT take the daemon lock ask the
-/// running daemon to capture?
-///
-/// Losing that lock means a resident is already up, and normally the right reading is
-/// "capture NOW": the user launched this binary a second time, and a second launch is how
-/// both the global hotkey and a manual re-run ask for an overlay.
-///
-/// A post-update RELAUNCH is the exception, because no user asked for anything. The
-/// installer started it, to restore the shape the app was in before the update. If it loses
-/// the lock it has simply been beaten to the job, and the correct move is to exit quietly
-/// and let the winner consume the marker and show About. Signalling a capture there puts an
-/// overlay on screen that nobody requested, seconds after an update.
-///
-/// This is the same defect DRAGON-465 fixed on Windows, reached by a different route.
-/// There it was the relaunch's ARGV being read as capture intent, fixed by
-/// [`post_update_relaunch_args`]. Here the argv is already right and the launch still ends
-/// up asking for a capture, because losing the lock is itself read as intent. Observed for
-/// real on 2026-08-05, in a local test of the AppImage self-update.
-///
-/// Only `daemon_intent` launches are spared. A BARE launch is the capture hotkey, and the
-/// user pressing it during the seconds after an update still deserves their overlay.
-#[cfg(any(target_os = "linux", test))]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn signal_capture_after_lost_lock(daemon_intent: bool, post_update_pending: bool) -> bool {
-    !(daemon_intent && post_update_pending)
-}
+// DRAGON-473 REMOVED `signal_capture_after_lost_lock(daemon_intent, post_update_pending)`, a
+// Linux-only predicate that answered "should a launch which could not take the daemon lock ask
+// the running daemon to capture?" with `!(daemon_intent && post_update_pending)`.
+//
+// Keep the reason, because the deletion looks like a regression from here: it was written
+// (DRAGON-532) to stop a post-update relaunch that lost the lock race from dropping an
+// unrequested overlay on screen seconds after an update, which is a real bug and was observed
+// for real while testing the AppImage self-update. That behaviour is NOT gone. It moved.
+//
+// The predicate's flaw was that it granted the capture to every OTHER daemon-intent launch, so
+// the autostart entry and the settings tray toggle still asked a live resident for a capture
+// when they had only ever wanted a tray (DRAGON-473). Once the general rule is "only capture
+// intent hands over a capture", the post-update case is simply one instance of it and this
+// function has nothing left of its own to say.
+//
+// Its replacement is `instance::held_lock_action`, which all three platforms consult, and which
+// still distinguishes the post-update launch — it returns `RestoreAbout` there, versus
+// `ProbeOnly` for an ordinary `resident` launch, so Linux keeps its distinct log line and
+// Windows keeps delivering the release notes. A second vocabulary for one decision is the thing
+// this codebase most consistently refuses; two of them disagreeing about which launches may ask
+// for a capture is exactly how the DRAGON-473 hole survived DRAGON-471.
 
 /// What a launch that has just become the resident must do, given the post-update marker it
 /// found. Both fields together, because they are one decision: whether to spawn the capture
@@ -408,6 +457,22 @@ pub fn check_floor_remainder(
 /// must not share a key: the entry carries the download URL, and handing an AppImage the
 /// zip's URL (or the reverse) would install the wrong artifact the moment either side gains
 /// a one-click install.
+///
+/// There is deliberately NO `flatpak` key, and a Flatpak build never computes one
+/// (DRAGON-561): every path that reads the manifest is gated off by [`channel_available`]
+/// before it gets here, and [`one_click_install_available`]'s Flatpak arm answers before
+/// its Linux arm would ask. The store owns Flatpak updates, so a key here could only ever
+/// hand the sandbox a download it has no way to install.
+///
+/// **This never reads [`crate::util::PackageKind`], and it must not start** (DRAGON-614).
+/// The two look like the same question and are not. This one picks which ARTIFACT an update
+/// downloads, and it answers from `cfg!(target_os)`, `$APPIMAGE` and `cfg!(target_arch)`
+/// directly. `PackageKind` names how the running build was DELIVERED, for the About badge
+/// and the debug log. Adding cases there (DRAGON-614 added `MacOs` and `Windows`) therefore
+/// cannot merge a key here or change a download URL, which is the property that made that
+/// change safe. Routing this through `PackageKind` would also lose the architecture, which
+/// that enum does not carry and which a wrong answer for would install a binary the CPU
+/// cannot run.
 pub fn platform_key() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -432,6 +497,137 @@ pub fn platform_key() -> &'static str {
     }
 }
 
+/// **Pure**, unit-tested: whether a build of this package kind has an in-app update
+/// channel at all (DRAGON-561).
+///
+/// A Flatpak does not, twice over. Updates flow through the Flatpak remote (the store),
+/// so a manifest poll would only advertise versions the store delivers on its own
+/// schedule, and the updater could never act on one anyway: `/app` is read-only inside
+/// the sandbox, so there is no install location to write over (the same structural fact
+/// [`one_click_install_available`] answers from). Every other kind keeps the channel
+/// exactly as it was. Kept as its own decision, in the shared tree, so every trigger
+/// asks the one question and `cargo test` proves the answer on any host.
+pub fn channel_available_for(kind: crate::util::PackageKind) -> bool {
+    kind != crate::util::PackageKind::Flatpak
+}
+
+/// Whether THIS build has an in-app update channel: [`channel_available_for`] over the
+/// real package kind. The one gate every update-check trigger consults (the
+/// settings-open check on both mint paths, the About page's controls, the on-disk cache
+/// seed, and the daemons' startup notice), so no two of them can disagree about whether
+/// a check may run.
+pub fn channel_available() -> bool {
+    channel_available_for(crate::util::package_kind())
+}
+
+/// Where a build's "What's new" release notes come from (DRAGON-605).
+///
+/// The enum is deliberately total: there is no "no notes" variant, because every package
+/// kind shows them. That is the whole point of the split. [`channel_available_for`] says
+/// who performs an install, and this says who fetches the text; the two used to be one
+/// answer, and a Flatpak lost its changelog to a rule about installing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotesSource {
+    /// The update check already carries them. [`check_now`] parses `notes` out of the
+    /// very manifest it compares versions against, so a build with a channel gets the
+    /// notes for free and must not fetch them a second time.
+    UpdateCheck,
+    /// A notes-only fetch ([`fetch_release_notes`]), because this build runs no update
+    /// check at all and nothing else would ever fill them in.
+    OwnFetch,
+}
+
+/// **Pure**, unit-tested: where a build of this package kind gets its release notes.
+///
+/// The body is one line on purpose. Deriving it FROM [`channel_available_for`], rather
+/// than re-deciding it against `PackageKind`, is what makes the two exact complements by
+/// construction: a future package kind that gains or loses a channel moves both answers
+/// together, and cannot end up checking for updates while fetching notes separately (two
+/// requests for one manifest) or running no check while showing no notes (the DRAGON-605
+/// bug). `notes_source_complements_the_channel_gate` pins it anyway, because a later
+/// "simplification" could easily inline the wrong constant here.
+pub fn notes_source_for(kind: crate::util::PackageKind) -> NotesSource {
+    if channel_available_for(kind) { NotesSource::UpdateCheck } else { NotesSource::OwnFetch }
+}
+
+/// Where THIS build gets its release notes: [`notes_source_for`] over the real package
+/// kind. The About page's one question, asked the same way the update triggers ask
+/// [`channel_available`].
+pub fn notes_source() -> NotesSource {
+    notes_source_for(crate::util::package_kind())
+}
+
+/// The "What's new" text for a published version, with nothing installable attached.
+///
+/// The absence of an artifact is the load-bearing part, not an omission. A
+/// [`PlatformArtifact`] carries a download URL, and a value carrying one is one refactor
+/// away from a button that offers it. This type cannot grow that button because it has
+/// nothing to hand it: see [`parse_release_notes`], which never reads `platforms` at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseNotes {
+    /// The published version the notes describe. On a store-managed build this may be
+    /// AHEAD of `CARGO_PKG_VERSION`, and the About heading says so by naming it.
+    pub version: String,
+    /// The markdown notes, guaranteed non-empty (an empty `notes` field yields `None`
+    /// from the parser rather than an empty block on the page).
+    pub notes: String,
+}
+
+/// **Pure**, unit-tested: read a manifest for its notes and nothing else.
+///
+/// Deliberately NOT [`Manifest::parse`]. That one resolves [`platform_key`] to slice out
+/// this build's artifact, and a Flatpak must never compute a platform key: there is no
+/// `flatpak` entry to find, so it would silently read the `linux` one and hold a download
+/// URL for the ZIP build. Reading only the two text fields means the notes path has no
+/// artifact to leak, whatever anyone does to the UI later.
+///
+/// `None` when the manifest is malformed, when `version` is blank, or when there are no
+/// notes to show. All three are the same outcome for the caller: leave the page as it is.
+pub fn parse_release_notes(json: &str) -> Option<ReleaseNotes> {
+    let version = json_string_field(json, "version")?;
+    if version.trim().is_empty() {
+        return None;
+    }
+    let notes = json_string_field(json, "notes").unwrap_or_default();
+    if notes.trim().is_empty() {
+        return None;
+    }
+    Some(ReleaseNotes { version, notes })
+}
+
+/// Fetch ONLY the release notes from the manifest. Blocking; call from a background task
+/// (`Task::perform(app::off_thread(...))`), exactly as [`check_now`] is called.
+///
+/// The one caller is the About page on a build whose [`notes_source`] is
+/// [`NotesSource::OwnFetch`]. Every failure, a missing `curl`, no network, a timeout, a
+/// malformed manifest, comes back as `None` and shows nothing. There is deliberately no
+/// [`UpdateStatus::Failed`] equivalent here: an "update check failed" notice on a build
+/// that cannot update would be reporting a fault in a feature it does not have.
+///
+/// It does NOT [`write_manifest_cache`]. The cache exists to seed an [`UpdateStatus`] at
+/// the next settings launch, which is precisely the state this build must not have, and a
+/// file written here would be read by [`seeded_status_from_cache`] the moment anyone
+/// relaxed its gate.
+pub fn fetch_release_notes() -> Option<ReleaseNotes> {
+    let url = manifest_url();
+    match fetch_text(&url) {
+        Ok(body) => {
+            let notes = parse_release_notes(&body);
+            if notes.is_none() {
+                log::info!("release notes: the manifest carried none");
+            }
+            notes
+        }
+        Err(reason) => {
+            // Logged, never surfaced: this build cannot update, so a user-facing update
+            // error would name a feature it does not have. The reason is our own short
+            // copy, not the server's, so nothing user-specific reaches the log.
+            log::info!("release notes: not fetched ({reason})");
+            None
+        }
+    }
+}
+
 /// Whether THIS build can install an update itself, or can only point the user at the
 /// releases page to download one by hand.
 ///
@@ -442,6 +638,16 @@ pub fn platform_key() -> &'static str {
 /// mount, possibly renamed, with its own sidecars beside it; there is no install location we
 /// own, so there is nothing safe to swap and the honest answer is a download link.
 pub fn one_click_install_available() -> bool {
+    // A FLATPAK can never install itself, and this is structural rather than a policy we are
+    // choosing to honour (`lab/flatpak`). `/app` and `/usr` are read-only mounts inside the
+    // sandbox, so there is nothing to write over even if we wanted to; the packaging system
+    // owns updates. Checked before the per-OS arms because it is true on every platform a
+    // Flatpak can run on, and because the Linux arm below would otherwise answer from
+    // `$APPIMAGE`, which a Flatpak does not have and would read as the ZIP build: the right
+    // answer for the wrong reason, and one that would break the moment anything else changed.
+    if crate::util::flatpak_sandboxed() {
+        return false;
+    }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         true
@@ -756,6 +962,13 @@ pub fn should_notify_on_daemon_startup(status: &UpdateStatus, notify_updates: bo
 /// and the launch-time check only ever happens when something opens a settings window.
 /// The body is fully portable, so every resident daemon now shares it. Keep it ungated.
 pub fn notify_daemon_startup_if_update_available(spawn_settings: impl FnOnce()) {
+    // DRAGON-561: a Flatpak build has no update channel; the store owns its updates.
+    // Gated HERE, in the shared body every resident daemon calls, rather than in each
+    // daemon, so no platform's daemon can drift back into polling.
+    if !channel_available() {
+        log::info!("daemon: update check skipped (this package kind has no in-app update channel)");
+        return;
+    }
     let notify_updates = crate::state::load().notify_updates;
     if !notify_updates {
         log::info!("daemon: update notice suppressed (notify_updates off)");
@@ -2389,45 +2602,11 @@ mod reap_bounds_tests {
     }
 }
 
-/// DRAGON-532: what a launch that lost the daemon lock does about it.
-#[cfg(test)]
-mod signal_capture_after_lost_lock_tests {
-    use super::signal_capture_after_lost_lock;
-
-    /// The ordinary second launch: a resident is up and the user wants a shot. Unchanged,
-    /// and the case the "capture NOW" UX exists for.
-    #[test]
-    fn a_normal_second_launch_still_asks_for_a_capture() {
-        assert!(signal_capture_after_lost_lock(false, false), "bare launch = the hotkey");
-        assert!(signal_capture_after_lost_lock(true, false), "manual `resident` re-run");
-    }
-
-    /// THE CASE THIS EXISTS FOR, observed for real on 2026-08-05 while testing the AppImage
-    /// self-update: the installer's relaunch lost the lock and put an unrequested capture
-    /// overlay on screen seconds after the update. Nobody asked for it.
-    #[test]
-    fn a_post_update_relaunch_that_lost_the_lock_stays_quiet() {
-        assert!(!signal_capture_after_lost_lock(true, true));
-    }
-
-    /// The hotkey still wins. A user pressing capture during the seconds after an update
-    /// gets their overlay: that IS a request, and a pending marker must not swallow it.
-    /// Only the installer's own `resident` relaunch is spared.
-    #[test]
-    fn a_pending_marker_never_suppresses_the_capture_hotkey() {
-        assert!(signal_capture_after_lost_lock(false, true));
-    }
-
-    /// Both inputs are load-bearing: neither alone suppresses anything.
-    #[test]
-    fn suppression_needs_both_conditions() {
-        let suppressed: Vec<_> = [(false, false), (false, true), (true, false), (true, true)]
-            .into_iter()
-            .filter(|(d, p)| !signal_capture_after_lost_lock(*d, *p))
-            .collect();
-        assert_eq!(suppressed, vec![(true, true)], "exactly one cell suppresses");
-    }
-}
+// DRAGON-473: `signal_capture_after_lost_lock_tests` lived here. The cases it pinned were not
+// dropped — they moved to `instance::held_lock_action`'s test module with the decision itself,
+// including the one this ticket exists for (the post-update relaunch that lost the lock race
+// and must stay quiet). See the tombstone above `post_update_relaunch_args` for why the
+// function went away.
 
 /// DRAGON-532: the file mode a freshly downloaded AppImage is given before it replaces the
 /// running one.
@@ -2749,5 +2928,182 @@ mod linux_platform_key_tests {
         let m = super::Manifest::parse_platform(OLD, APPIMAGE_PLATFORM_KEY).expect("parse");
         assert_eq!(m.version, "0.28.0", "the version still reads, so the check still works");
         assert!(m.artifact.is_none(), "no appimage entry must not fall back to the zip");
+    }
+}
+
+#[cfg(test)]
+mod channel_availability_tests {
+    use super::channel_available_for;
+    use crate::util::PackageKind;
+
+    /// THE DRAGON-561 gate: a Flatpak has no in-app update channel. Updates arrive
+    /// through the store, and /app is read-only, so a poll could only ever advertise
+    /// something this build has no way to install.
+    #[test]
+    fn a_flatpak_has_no_update_channel() {
+        assert!(!channel_available_for(PackageKind::Flatpak));
+    }
+
+    /// Every other package kind keeps the channel exactly as it was: the plain binary
+    /// and the AppImage both still check, and the AppImage still one-click installs.
+    ///
+    /// **macOS and Windows are answered here rather than by default** (DRAGON-614). Both had
+    /// this channel before they were their own `PackageKind`, because both reported
+    /// `Binary`, and both must still have it: the dmg and the MSI install into a layout
+    /// their packaging defined, which is exactly what `one_click_install_available` says
+    /// they can replace. `channel_available_for` gives them `true` through its `!= Flatpak`
+    /// body with nothing added, and this pins that the body keeps doing so.
+    #[test]
+    fn every_other_package_kind_keeps_the_channel() {
+        assert!(channel_available_for(PackageKind::Binary));
+        assert!(channel_available_for(PackageKind::AppImage));
+        assert!(channel_available_for(PackageKind::MacOs));
+        assert!(channel_available_for(PackageKind::Windows));
+    }
+}
+
+// The DRAGON-605 split: the channel gate answers "who installs", this answers "who
+// fetches the text". One gate was answering both, and a Flatpak lost its changelog to a
+// rule about installing.
+#[cfg(test)]
+mod notes_source_tests {
+    use super::{NotesSource, channel_available_for, notes_source_for};
+    use crate::util::PackageKind;
+
+    /// Every kind this app ships as. Spelled out rather than derived so adding a variant
+    /// to `PackageKind` fails the exhaustive match below and forces a decision here.
+    const EVERY_KIND: [PackageKind; 5] = [
+        PackageKind::Binary,
+        PackageKind::AppImage,
+        PackageKind::Flatpak,
+        PackageKind::MacOs,
+        PackageKind::Windows,
+    ];
+
+    /// THE bug. A Flatpak has no update channel and must still show what changed; those
+    /// are different questions and only the first one is impossible in a sandbox.
+    #[test]
+    fn a_flatpak_shows_notes_despite_having_no_channel() {
+        assert!(!channel_available_for(PackageKind::Flatpak), "the DRAGON-561 rule holds");
+        assert_eq!(
+            notes_source_for(PackageKind::Flatpak),
+            NotesSource::OwnFetch,
+            "no check runs, so nothing else would ever fill the notes in"
+        );
+    }
+
+    /// A build WITH a channel must not fetch twice. Its update check already parsed the
+    /// notes out of the same manifest, so a second request would buy nothing.
+    ///
+    /// DRAGON-614's two new kinds are answered explicitly for the same reason the channel
+    /// test answers them: they are channel builds, so they ride the check, exactly as they
+    /// did while they both reported `Binary`.
+    #[test]
+    fn a_channel_build_rides_its_update_check() {
+        assert_eq!(notes_source_for(PackageKind::Binary), NotesSource::UpdateCheck);
+        assert_eq!(notes_source_for(PackageKind::AppImage), NotesSource::UpdateCheck);
+        assert_eq!(notes_source_for(PackageKind::MacOs), NotesSource::UpdateCheck);
+        assert_eq!(notes_source_for(PackageKind::Windows), NotesSource::UpdateCheck);
+    }
+
+    /// The relationship, stated once: the two predicates are exact complements over every
+    /// package kind. A kind that checks for updates never fetches notes separately, and a
+    /// kind that does not check always does. Drift either way is a live defect: two
+    /// requests for one manifest, or the DRAGON-605 blank changelog.
+    #[test]
+    fn notes_source_complements_the_channel_gate() {
+        for kind in EVERY_KIND {
+            let expected = if channel_available_for(kind) {
+                NotesSource::UpdateCheck
+            } else {
+                NotesSource::OwnFetch
+            };
+            assert_eq!(notes_source_for(kind), expected, "{kind:?} must not drift");
+        }
+    }
+
+    /// There is no "no notes" answer, for any kind. The enum is total on purpose: this is
+    /// the guarantee that turning a channel off can never again take the changelog with
+    /// it. Exhaustive, so a new `PackageKind` variant will not compile until it is listed
+    /// in `EVERY_KIND` and answered here.
+    #[test]
+    fn no_package_kind_is_left_without_notes() {
+        for kind in EVERY_KIND {
+            match notes_source_for(kind) {
+                NotesSource::UpdateCheck | NotesSource::OwnFetch => {}
+            }
+        }
+        assert_eq!(EVERY_KIND.len(), 5, "list every PackageKind variant here");
+    }
+}
+
+// `parse_release_notes` reads the two text fields and nothing else, which is what stops
+// the notes path from ever holding something installable (DRAGON-605).
+#[cfg(test)]
+mod release_notes_parse_tests {
+    use super::parse_release_notes;
+
+    /// A real-shaped manifest: the version and the markdown come back intact.
+    #[test]
+    fn it_reads_the_version_and_the_notes() {
+        const JSON: &str = r###"{"version":"0.31.0","notes":"## Fixed\n- a thing\n",
+            "published":"2026-08-09","platforms":{
+            "linux":{"url":"https://e.com/a.zip","sha256":"cc","size":3}}}"###;
+        let n = parse_release_notes(JSON).expect("parse");
+        assert_eq!(n.version, "0.31.0");
+        assert!(n.notes.contains("- a thing"), "the markdown survives: {}", n.notes);
+    }
+
+    /// THE structural guarantee. The parser must not read `platforms`, so no artifact,
+    /// URL, sha or size can reach the notes path and turn into a download button on a
+    /// build that cannot install one. The type has no field for it; this pins that the
+    /// values do not sneak into the two it does have.
+    #[test]
+    fn nothing_installable_comes_back() {
+        const JSON: &str = r#"{"version":"0.31.0","notes":"just text","platforms":{
+            "linux":{"url":"https://e.com/a.zip","sha256":"deadbeef","size":42},
+            "appimage":{"url":"https://e.com/a.AppImage","sha256":"feedface","size":43}}}"#;
+        let n = parse_release_notes(JSON).expect("parse");
+        for leaked in ["https://", "deadbeef", "feedface", ".AppImage", ".zip"] {
+            assert!(!n.notes.contains(leaked), "{leaked} must not reach the notes");
+            assert!(!n.version.contains(leaked), "{leaked} must not reach the version");
+        }
+    }
+
+    /// No notes means no block, not an empty one. A whitespace-only field counts as none.
+    #[test]
+    fn an_empty_notes_field_shows_nothing() {
+        assert!(parse_release_notes(r#"{"version":"0.31.0","notes":""}"#).is_none());
+        assert!(parse_release_notes(r#"{"version":"0.31.0","notes":"  \n "}"#).is_none());
+        assert!(parse_release_notes(r#"{"version":"0.31.0"}"#).is_none());
+    }
+
+    /// A manifest with no usable version is unusable: the heading reads "What's new in
+    /// <version>", so there is nothing honest to render without one.
+    #[test]
+    fn a_missing_or_blank_version_shows_nothing() {
+        assert!(parse_release_notes(r#"{"notes":"text"}"#).is_none());
+        assert!(parse_release_notes(r#"{"version":"  ","notes":"text"}"#).is_none());
+    }
+
+    /// Garbage degrades quietly, like every other read on this path.
+    #[test]
+    fn malformed_input_shows_nothing() {
+        assert!(parse_release_notes("").is_none());
+        assert!(parse_release_notes("<html>404</html>").is_none());
+    }
+
+    /// The notes-only read and the full manifest read must agree about the text, so the
+    /// Flatpak page and every other platform's page show the same changelog for the same
+    /// release. Two parsers over one document is exactly where a drift would hide.
+    #[test]
+    fn it_agrees_with_the_full_manifest_parse() {
+        const JSON: &str = r###"{"version":"0.31.0","notes":"## What\n- one\n- two\n",
+            "published":"2026-08-09","platforms":{
+            "macos":{"url":"https://e.com/a.dmg","sha256":"aa","size":1}}}"###;
+        let full = super::Manifest::parse_platform(JSON, "macos").expect("full parse");
+        let notes = parse_release_notes(JSON).expect("notes parse");
+        assert_eq!(notes.version, full.version);
+        assert_eq!(notes.notes, full.notes);
     }
 }

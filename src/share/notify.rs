@@ -295,7 +295,7 @@ pub fn notify_from_argv<S: AsRef<str>>(
 /// it in hicolor), else a stock camera glyph so dev runs aren't iconless.
 #[cfg(target_os = "linux")]
 fn notification_icon() -> &'static str {
-    const NAME: &str = "dev.frosthaven.CosmicCaptureKit";
+    const NAME: &str = "dev.thedragon.CosmicCaptureKit";
     let installed = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local/share")))

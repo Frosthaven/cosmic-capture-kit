@@ -9,17 +9,36 @@ macOS and Windows. `src/widgets/icons.rs` is the one resolver.
 | --- | --- | --- |
 | `lucide/*.svg` | [lucide-icons/lucide](https://github.com/lucide-icons/lucide) | ISC, plus MIT on 18 of them ([`lucide/LICENSE`](lucide/LICENSE)) |
 | `brands/*.svg` | each provider's own published mark (source URL in every file) | see below |
-| `dev.frosthaven.CosmicCaptureKit*.svg`, `cosmic-capture-kit*.windows.ico` | original project artwork by [Ashley Ball](https://ashleythedesigner.com/) | project license |
+| `dev.thedragon.CosmicCaptureKit*.svg`, `cosmic-capture-kit*.windows.ico` | original project artwork by [Ashley Ball](https://ashleythedesigner.com/) | project license |
 
 ## Lucide (the UI set, DRAGON-324)
 
-85 glyphs, chosen by what each control DOES rather than by an old freedesktop
-name. The SVGs stroke with `currentColor`, so they are marked symbolic and
-tinted with the active foreground or accent color like a native symbolic icon.
+96 glyphs, chosen by what each control DOES rather than by an old freedesktop
+name. (The count is the number of `.svg` files in `lucide/`; it read 90 against
+93 files until DRAGON-614, so re-count rather than trusting the line.) The SVGs
+stroke with `currentColor`, so they are marked symbolic and tinted with the
+active foreground or accent color like a native symbolic icon.
+`timer.svg` (DRAGON-574, the tray menu's Countdown Timer entry), `trash.svg`
+(the tray menu's Cancel & Delete Recording control), `pipette.svg`
+(DRAGON-582, the colour picker tool, the glyph the owner named), `globe.svg`
+(DRAGON-588, the Keyboard Shortcuts page's Global tab), `binary.svg` +
+`file-archive.svg` (DRAGON-591, the About page's release-kind line, one glyph
+per package kind), `apple.svg` + `grid-2x2.svg` (DRAGON-614, the same line's
+macOS and Windows kinds, the glyphs the owner named) and `key.svg` (DRAGON-412,
+the macOS tray menu's Manage Permissions entry, the glyph the owner named) are
+verbatim copies of the official Lucide `timer`, `trash`, `pipette`, `globe`,
+`binary`, `file-archive`, `apple`, `grid-2x2` and `key` icons, fetched from
+upstream and already in the set's house format (24-unit viewBox, `currentColor`
+strokes, stroke-width 2).
+
+`apple.svg` is Lucide's own generic apple-fruit drawing, not Apple Inc's logo
+and not a brand mark. That is why it sits here with the tinted symbolic set
+rather than in `brands/`: nothing about it is a trademark, and it is used to
+name the macOS build the way the `package` box names the Flatpak one.
 
 **This attribution is not optional, and it cannot be dropped while the SVGs are
 here.** ISC grants use "provided that the above copyright notice and this
-permission notice appear in all copies", and we ship 85 copies: in the repo, and
+permission notice appear in all copies", and we ship 95 copies: in the repo, and
 compiled into every binary. Eighteen of them (`check`, `chevron-down`, `circle`,
 `search`, `x`, `zoom-in` and twelve more) are derived from Feather and carry
 Cole Bemis's MIT notice on top, which asks the same thing.
@@ -43,6 +62,15 @@ service an account connects to is the case every one of these brands' guidelines
 sanctions. Keep it that way: do not recolor one, do not restyle one, and do not
 put one on anything but the provider it belongs to. Each remains the trademark
 of its owner, and none of them implies endorsement.
+
+One mark carries an extra record: `proton-drive.svg` is Proton's official mark,
+restored at owner direction. Proton does not sanction this integration (no
+third-party API; it runs through Proton's MIT-licensed CLI), so the sanction
+sentence above does not cover it. DRAGON-566 shipped a neutral locked-cloud
+glyph for that reason; the owner then reviewed Proton's third-party branding
+terms (quoted in DRAGON-566) and accepted the risk on 2026-08-07, so the
+neutral glyph and the app's disclosure line were removed at owner direction,
+not by oversight. The file's own comment carries the same record.
 
 ## Not in this directory
 

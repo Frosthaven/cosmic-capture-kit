@@ -93,43 +93,68 @@ impl EncodePlan {
         }
     }
 
-    /// Resolve the encoder for a recording: software when `hardware` is off; otherwise
-    /// honour the user's `preferred` choice, falling back to the best available
-    /// (GPU → software) when it's "auto" or the preference isn't usable.
+    /// Resolve the encoder for a recording: [`resolve_hinted`](Self::resolve_hinted)
+    /// with no hint. Kept for callers that already hold a concrete id (the benchmark
+    /// fallback, the e2e tests): their probe sequence and log line are unchanged.
     pub fn resolve(preferred: &str, w: u32, h: u32, presets: &Presets) -> EncodePlan {
-        let chosen = match preferred {
-            "nvenc" => nvenc_plan(w, h, &presets.nvenc, &presets.codec),
-            "vaapi" => vaapi_plan(w, h, presets.vaapi_cl, &presets.codec),
-            #[cfg(windows)]
-            "amf" => amf_plan(w, h, &presets.codec),
-            #[cfg(windows)]
-            "qsv" => qsv_plan(w, h, &presets.codec),
-            #[cfg(target_os = "macos")]
-            "videotoolbox" => videotoolbox_plan(w, h, &presets.codec),
-            "software" => Some(software_plan(&presets.x264, &presets.codec, w, h)),
-            _ => None, // "auto" / unknown
+        Self::resolve_hinted(preferred, None, w, h, presets)
+    }
+
+    /// Resolve the encoder for a recording (DRAGON-571): honour a CONCRETE `requested`
+    /// id when its plan builds, falling back down [`AUTO_LADDER`] when it does not:
+    /// the same probe sequence the old hand-chained `or_else` fallback ran, including
+    /// the failing pick being probed once in its own slot and once more in ladder
+    /// position. "auto" (or any unknown id) walks [`auto_probe_order`] instead, which
+    /// hoists the last-known-good `hint` to the front: the happy path pays ONE
+    /// probe-encode, the same single probe a concrete pick pays, and the rest of the
+    /// ladder is only walked when the hinted encoder fails. The winner is never
+    /// persisted as the user's preference; callers may update only the HINT (see
+    /// [`auto_resolution_outcome`], applied by `record::resolve_session_plan`).
+    pub fn resolve_hinted(
+        requested: &str,
+        hint: Option<&str>,
+        w: u32,
+        h: u32,
+        presets: &Presets,
+    ) -> EncodePlan {
+        let build = |id: &str| -> Option<EncodePlan> {
+            match id {
+                "nvenc" => nvenc_plan(w, h, &presets.nvenc, &presets.codec),
+                // vaapi always no-ops on Windows (no /dev/dri) and on mac; keeping it
+                // in every ladder keeps the historical probe sequence byte-identical.
+                "vaapi" => vaapi_plan(w, h, presets.vaapi_cl, &presets.codec),
+                #[cfg(windows)]
+                "amf" => amf_plan(w, h, &presets.codec),
+                #[cfg(windows)]
+                "qsv" => qsv_plan(w, h, &presets.codec),
+                #[cfg(target_os = "macos")]
+                "videotoolbox" => videotoolbox_plan(w, h, &presets.codec),
+                "software" => Some(software_plan(&presets.x264, &presets.codec, w, h)),
+                _ => None,
+            }
         };
-        let chosen = chosen
-            .or_else(|| nvenc_plan(w, h, &presets.nvenc, &presets.codec))
-            .or_else(|| vaapi_plan(w, h, presets.vaapi_cl, &presets.codec));
-        // Windows (DRAGON-238): the hardware tier is NVENC (tried above) > AMF > QSV, all
-        // before the software fallback. vaapi above always no-ops on Windows (no /dev/dri).
-        #[cfg(windows)]
-        let chosen = chosen
-            .or_else(|| amf_plan(w, h, &presets.codec))
-            .or_else(|| qsv_plan(w, h, &presets.codec));
-        // macOS: VideoToolbox is the hardware tier — tried before the software fallback
-        // (nvenc/vaapi above always no-op on mac: no /dev/nvidia0, no /dev/dri).
-        #[cfg(target_os = "macos")]
-        let chosen = chosen.or_else(|| videotoolbox_plan(w, h, &presets.codec));
-        let plan = chosen.unwrap_or_else(|| software_plan(&presets.x264, &presets.codec, w, h));
+        let order: Vec<&str> = if AUTO_LADDER.contains(&requested) {
+            // A concrete pick: try it first, then the ranked ladder.
+            std::iter::once(requested).chain(AUTO_LADDER.iter().copied()).collect()
+        } else {
+            // "auto" / unknown: the hint-first ladder.
+            auto_probe_order(AUTO_LADDER, hint)
+        };
+        let plan = order
+            .into_iter()
+            .find_map(build)
+            // Unreachable (every order ends in "software", which always builds), but a
+            // recording resolver must never panic.
+            .unwrap_or_else(|| software_plan(&presets.x264, &presets.codec, w, h));
         // DRAGON-419: which encoder a session actually got was never recorded anywhere. It is
         // the first question of every recording report — a silent fall-through from the
         // requested hardware tier to software changes CPU load, frame pacing and quality all
         // at once, and "I picked NVENC" and "NVENC was usable" are different facts. One line
-        // per session; no user content in any of it.
+        // per session; no user content in any of it. DRAGON-571 added the hint so the line
+        // shows all three facts: what was asked, what the cache suggested, what won.
         log::info!(
-            "encoder plan: requested={preferred} chosen={} encode_size={w}x{h} hevc={} nv12={}",
+            "encoder plan: requested={requested} hint={} chosen={} encode_size={w}x{h} hevc={} nv12={}",
+            hint.unwrap_or("none"),
             plan.encoder_id(),
             plan.is_hevc(),
             plan.nv12,
@@ -145,11 +170,12 @@ impl EncodePlan {
     /// checks inside each `*_plan` do), so a size-independent probe is exact. A generous
     /// side is passed to the probes so hardware availability, not a size limit, decides.
     ///
-    /// The mac SCK worker (`record::sck`) and the Windows WGC worker (`record::wgc`,
-    /// DRAGON-229) call this (DRAGON-168 encode-size resolution), plus the Windows-gated
-    /// `cli::diagnostics` probe. It is dead on the Linux workers, hence the
-    /// `not(any(macos, windows))` allow — restored here, because DRAGON-419's reason for
-    /// removing it (`resolve` calling it) is exactly what DRAGON-421 undoes.
+    /// The un-hinted wrapper over [`resolve_encoder_id_hinted`]. The mac SCK worker
+    /// (`record::sck`) and the Windows WGC worker (`record::wgc`, DRAGON-229) used to call
+    /// this directly (DRAGON-168 encode-size resolution) but have since moved to calling
+    /// the hinted form themselves, so this wrapper's only remaining caller anywhere is the
+    /// Windows-gated `cli::diagnostics` probe (`windows_record_test`) — dead in its own
+    /// right on every other platform, hence the `not(windows)` gate below.
     ///
     /// **Do not call this when you already hold a plan** — use
     /// [`EncodePlan::encoder_id`], which reads the answer off the plan. Every call here
@@ -157,8 +183,26 @@ impl EncodePlan {
     /// uncached `ffmpeg -encoders`; the Windows tiers each run a probe-encode). DRAGON-419's
     /// session log did exactly that on an already-resolved plan and doubled the encoder-
     /// resolution cost of every recording start (DRAGON-421).
-    #[cfg_attr(not(any(target_os = "macos", windows)), expect(dead_code))]
+    #[cfg_attr(not(windows), expect(dead_code))]
     pub fn resolve_encoder_id<'a>(preferred: &'a str, presets: &Presets) -> &'a str {
+        Self::resolve_encoder_id_hinted(preferred, None, presets)
+    }
+
+    /// [`resolve_encoder_id`](Self::resolve_encoder_id) with the DRAGON-571 auto hint:
+    /// the mac/Windows workers pass the same `(requested, hint)` pair here (to size the
+    /// encode) and to [`resolve_hinted`] (to build the plan), and both walk the same
+    /// hint-first order over the same probes, so the sizing answer and the plan's
+    /// winner cannot drift apart.
+    // `allow`, not `expect`: `record::sck` and `record::wgc` call this DIRECTLY now (see
+    // `resolve_encoder_id`'s doc above), so it is dead only on Linux, where neither worker
+    // exists — a plain per-platform absence, not the chain-propagation case `resolve_encoder_id`
+    // itself is in (see the same note on `permissions::Tier`, DRAGON-625).
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+    pub fn resolve_encoder_id_hinted<'a>(
+        requested: &'a str,
+        hint: Option<&'a str>,
+        presets: &Presets,
+    ) -> &'a str {
         // 1x1 is enough for the availability probes; each `*_plan` returns Some when the
         // hardware + encoder exist (its side checks only matter far above 1px).
         // Windows (DRAGON-238): the hardware tier is NVENC > AMF > QSV — a distinct
@@ -172,7 +216,7 @@ impl EncodePlan {
                 "qsv" => qsv_plan(w, h, &presets.codec).is_some(),
                 _ => false,
             };
-            windows_resolve_encoder_id(preferred, &usable)
+            windows_resolve_encoder_id(requested, hint, &usable)
         }
         #[cfg(not(windows))]
         {
@@ -186,18 +230,18 @@ impl EncodePlan {
                     _ => false,
                 }
             };
-            match preferred {
-                "nvenc" | "vaapi" | "videotoolbox" if usable(preferred) => return preferred,
+            match requested {
+                "nvenc" | "vaapi" | "videotoolbox" if usable(requested) => return requested,
                 "software" => return "software",
                 _ => {}
             }
-            // "auto" / an unavailable preference: the same order `resolve` falls back through.
-            for id in ["nvenc", "vaapi", "videotoolbox"] {
-                if usable(id) {
-                    return id;
-                }
-            }
-            "software"
+            // "auto" / an unavailable preference: the hint-first ladder (DRAGON-571),
+            // the same order `resolve_hinted` falls back through. `usable` answers false
+            // for "software", so the ladder's tail lands on the fallback below.
+            auto_probe_order(AUTO_LADDER, hint)
+                .into_iter()
+                .find(|id| usable(id))
+                .unwrap_or("software")
         }
     }
 }
@@ -669,17 +713,103 @@ fn qsv_plan(w: u32, h: u32, codec_choice: &str) -> Option<EncodePlan> {
     })
 }
 
-/// The Windows hardware-encoder preference order (DRAGON-238): honour the user's
-/// `preferred` when it's usable, else fall back NVENC → AMF → QSV → software. Pure over a
-/// `usable` predicate so the ranking is unit-testable without spawning ffmpeg — the real
-/// [`EncodePlan::resolve_encoder_id`] feeds it the probe-backed predicate.
+/// The ranked auto/fallback encoder ladder for THIS build's platform, best first,
+/// with "software" always last (it cannot fail to build). [`EncodePlan::resolve_hinted`]
+/// walks it for an "auto" request (through [`auto_probe_order`]) and after a concrete
+/// request whose own plan failed; the settings picker's display resolution
+/// (`app::display_encoder_choice`) filters the same order through the probed list, so
+/// what auto shows and what auto records cannot disagree on rank. "vaapi" stays in the
+/// Windows/mac ladders even though it always no-ops there (no /dev/dri): that keeps the
+/// probe sequence identical to the historical hand-chained fallback.
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const AUTO_LADDER: &[&str] = &["nvenc", "vaapi", "software"];
 #[cfg(windows)]
-fn windows_resolve_encoder_id<'a>(preferred: &'a str, usable: &dyn Fn(&str) -> bool) -> &'a str {
+pub const AUTO_LADDER: &[&str] = &["nvenc", "vaapi", "amf", "qsv", "software"];
+#[cfg(target_os = "macos")]
+pub const AUTO_LADDER: &[&str] = &["nvenc", "vaapi", "videotoolbox", "software"];
+
+/// Pure, unit-tested (DRAGON-571). The order an "auto" encoder resolution tries the
+/// ranked `ladder` in: the last-known-good `hint` is hoisted to the front, so the
+/// happy path pays a single probe-encode (exactly what a concrete user pick pays),
+/// and the rest of the ladder keeps its rank for the walk that only happens when the
+/// hinted encoder fails.
+///
+/// A "software" hint is IGNORED on purpose: software is the unconditional tail of
+/// every ladder (it cannot fail), so hoisting it to the front would make auto land on
+/// software forever, re-creating the exact permanent pin DRAGON-571 removes. A hint
+/// naming an id not in `ladder` (foreign config, retired encoder) is ignored the same
+/// way. A hoisted hint is deduplicated out of its ladder slot, so a failing hinted
+/// encoder is probed once, not twice.
+pub fn auto_probe_order<'a>(ladder: &[&'a str], hint: Option<&'a str>) -> Vec<&'a str> {
+    match hint {
+        Some(h) if h != "software" && ladder.contains(&h) => std::iter::once(h)
+            .chain(ladder.iter().copied().filter(|id| *id != h))
+            .collect(),
+        _ => ladder.to_vec(),
+    }
+}
+
+/// What a finished session resolution writes back, decided by
+/// [`auto_resolution_outcome`] and applied by `record::resolve_session_plan`.
+pub struct AutoResolutionOutcome {
+    /// `Some(id)`: update the persisted last-known-good hint to `id` (it changed).
+    /// NEVER the user's `preferred_encoder`: the hint is a cache with its own field,
+    /// and an auto resolution is never written as if the user chose it (DRAGON-571).
+    pub new_hint: Option<String>,
+    /// The stored hint named a hardware encoder (proof it worked before), yet this
+    /// session still landed on software. Worth a loud warn.
+    pub hardware_hint_failed: bool,
+}
+
+/// Pure, unit-tested (DRAGON-571). After a session's encoder resolution: what, if
+/// anything, to write back to the last-known-good AUTO hint, and whether the outcome
+/// deserves a warn.
+///
+/// - A CONCRETE `requested` (a real user pick, including "software") teaches nothing:
+///   the session used the user's choice, not the ladder, so neither the hint nor
+///   `preferred_encoder` is ever written. This is the never-persist-auto rule's
+///   write side, in one place.
+/// - An auto (or unknown) request updates the hint to the winner whenever it changed,
+///   including to "software", which records "nothing hardware worked last time". That
+///   can never re-pin the CPU fallback, because [`auto_probe_order`] ignores software
+///   hints; it only keeps the cache honest.
+/// - `hardware_hint_failed` fires when a HARDWARE hint loses to software now: the
+///   DRAGON-571 regression signature (driver asleep, NVENC sessions held by a game or
+///   overlay, the ffmpeg sidecar missing an encoder). Nothing is pinned either way;
+///   the next session re-probes.
+pub fn auto_resolution_outcome(
+    requested: &str,
+    chosen: &str,
+    stored_hint: Option<&str>,
+) -> AutoResolutionOutcome {
+    if AUTO_LADDER.contains(&requested) {
+        return AutoResolutionOutcome { new_hint: None, hardware_hint_failed: false };
+    }
+    let hardware_hint = stored_hint.is_some_and(|h| h != "software" && AUTO_LADDER.contains(&h));
+    AutoResolutionOutcome {
+        new_hint: (stored_hint != Some(chosen)).then(|| chosen.to_string()),
+        hardware_hint_failed: hardware_hint && chosen == "software",
+    }
+}
+
+/// The Windows hardware-encoder preference order (DRAGON-238): honour the user's
+/// `preferred` when it's usable, else fall back NVENC → AMF → QSV → software, with the
+/// DRAGON-571 auto hint hoisted to the front of that fallback (via [`auto_probe_order`],
+/// so the hoist-and-ignore rules cannot drift from the plan resolver's). Pure over a
+/// `usable` predicate so the ranking is unit-testable without spawning ffmpeg — the real
+/// [`EncodePlan::resolve_encoder_id`] feeds it the probe-backed predicate, which answers
+/// false for "software", landing the ladder's tail on the explicit fallback.
+#[cfg(windows)]
+fn windows_resolve_encoder_id<'a>(
+    preferred: &'a str,
+    hint: Option<&'a str>,
+    usable: &dyn Fn(&str) -> bool,
+) -> &'a str {
     match preferred {
         "nvenc" | "amf" | "qsv" if usable(preferred) => preferred,
         "software" => "software",
-        // "auto" / an unavailable preference: the ranked hardware order, then software.
-        _ => ["nvenc", "amf", "qsv"]
+        // "auto" / an unavailable preference: the hint-first ranked order, then software.
+        _ => auto_probe_order(AUTO_LADDER, hint)
             .into_iter()
             .find(|id| usable(id))
             .unwrap_or("software"),
@@ -813,40 +943,71 @@ mod tests {
         #[test]
         fn honours_a_usable_preference() {
             let u = only(&["nvenc", "amf", "qsv"]);
-            assert_eq!(windows_resolve_encoder_id("amf", &u), "amf");
-            assert_eq!(windows_resolve_encoder_id("qsv", &u), "qsv");
-            assert_eq!(windows_resolve_encoder_id("nvenc", &u), "nvenc");
+            assert_eq!(windows_resolve_encoder_id("amf", None, &u), "amf");
+            assert_eq!(windows_resolve_encoder_id("qsv", None, &u), "qsv");
+            assert_eq!(windows_resolve_encoder_id("nvenc", None, &u), "nvenc");
         }
 
         #[test]
         fn software_preference_is_always_honoured() {
             let u = only(&["nvenc", "amf", "qsv"]);
-            assert_eq!(windows_resolve_encoder_id("software", &u), "software");
+            assert_eq!(windows_resolve_encoder_id("software", None, &u), "software");
         }
 
         #[test]
         fn an_unusable_preference_falls_back_in_rank_order() {
             // Preferred amf but only qsv works -> the fallback picks the best available.
             let u = only(&["qsv"]);
-            assert_eq!(windows_resolve_encoder_id("amf", &u), "qsv");
+            assert_eq!(windows_resolve_encoder_id("amf", None, &u), "qsv");
             // Preferred nvenc, only amf + qsv work -> amf (ranked above qsv).
             let u = only(&["amf", "qsv"]);
-            assert_eq!(windows_resolve_encoder_id("nvenc", &u), "amf");
+            assert_eq!(windows_resolve_encoder_id("nvenc", None, &u), "amf");
         }
 
         #[test]
         fn auto_picks_the_ranked_best_available() {
-            assert_eq!(windows_resolve_encoder_id("auto", &only(&["nvenc", "amf", "qsv"])), "nvenc");
-            assert_eq!(windows_resolve_encoder_id("auto", &only(&["amf", "qsv"])), "amf");
-            assert_eq!(windows_resolve_encoder_id("auto", &only(&["qsv"])), "qsv");
-            assert_eq!(windows_resolve_encoder_id("", &only(&["qsv"])), "qsv");
+            assert_eq!(
+                windows_resolve_encoder_id("auto", None, &only(&["nvenc", "amf", "qsv"])),
+                "nvenc"
+            );
+            assert_eq!(windows_resolve_encoder_id("auto", None, &only(&["amf", "qsv"])), "amf");
+            assert_eq!(windows_resolve_encoder_id("auto", None, &only(&["qsv"])), "qsv");
+            assert_eq!(windows_resolve_encoder_id("", None, &only(&["qsv"])), "qsv");
         }
 
         #[test]
         fn nothing_usable_is_software() {
             let none = only(&[]);
-            assert_eq!(windows_resolve_encoder_id("nvenc", &none), "software");
-            assert_eq!(windows_resolve_encoder_id("auto", &none), "software");
+            assert_eq!(windows_resolve_encoder_id("nvenc", None, &none), "software");
+            assert_eq!(windows_resolve_encoder_id("auto", None, &none), "software");
+        }
+
+        // DRAGON-571: the last-known-good hint leads the auto fallback but never
+        // outranks a usable concrete preference, and a failed hint degrades to the
+        // plain ranked order.
+        #[test]
+        fn auto_probes_a_usable_hint_first() {
+            let u = only(&["nvenc", "qsv"]);
+            assert_eq!(windows_resolve_encoder_id("auto", Some("qsv"), &u), "qsv");
+        }
+
+        #[test]
+        fn auto_with_a_failed_hint_falls_back_in_rank_order() {
+            let u = only(&["nvenc", "amf"]);
+            assert_eq!(windows_resolve_encoder_id("auto", Some("qsv"), &u), "nvenc");
+        }
+
+        #[test]
+        fn auto_ignores_a_software_hint() {
+            // A software hint must never pin the CPU fallback (the DRAGON-571 bug).
+            let u = only(&["nvenc"]);
+            assert_eq!(windows_resolve_encoder_id("auto", Some("software"), &u), "nvenc");
+        }
+
+        #[test]
+        fn a_usable_concrete_preference_beats_the_hint() {
+            let u = only(&["nvenc", "amf", "qsv"]);
+            assert_eq!(windows_resolve_encoder_id("amf", Some("qsv"), &u), "amf");
         }
     }
 
@@ -1036,6 +1197,106 @@ mod tests {
         assert!(
             ffmpeg_encode_ok(&codec, ew, eh),
             "the resolved capped software plan ({codec:?}) must initialize at {ew}x{eh}"
+        );
+    }
+}
+
+// DRAGON-571: the hint-first probe order, pinned as its own island. The ladder is
+// injected so every hoist/ignore rule is provable on any host, on top of a shape
+// check for this platform's real ladder.
+#[cfg(test)]
+mod auto_probe_order_tests {
+    use super::{AUTO_LADDER, auto_probe_order};
+
+    #[test]
+    fn no_hint_keeps_the_ladder_rank() {
+        assert_eq!(auto_probe_order(&["a", "b", "software"], None), ["a", "b", "software"]);
+    }
+
+    #[test]
+    fn a_hardware_hint_is_hoisted_and_deduplicated() {
+        // The hinted encoder moves to the front and vacates its ladder slot, so a
+        // failing hint costs one probe, not two.
+        assert_eq!(auto_probe_order(&["a", "b", "software"], Some("b")), ["b", "a", "software"]);
+    }
+
+    #[test]
+    fn a_software_hint_is_ignored() {
+        // Software always builds, so hoisting it would pin the CPU fallback forever,
+        // the exact DRAGON-571 bug this ordering exists to remove.
+        assert_eq!(
+            auto_probe_order(&["a", "b", "software"], Some("software")),
+            ["a", "b", "software"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_hint_is_ignored() {
+        // A foreign config's id (or a retired encoder) cannot derail the ladder.
+        assert_eq!(auto_probe_order(&["a", "software"], Some("zz")), ["a", "software"]);
+    }
+
+    #[test]
+    fn the_platform_ladder_ends_in_software() {
+        // `resolve_hinted` relies on every order terminating in an encoder that
+        // cannot fail to build.
+        assert_eq!(AUTO_LADDER.last(), Some(&"software"));
+        // And the hoist keeps that true for any non-software hint.
+        for hint in AUTO_LADDER.iter().filter(|id| **id != "software") {
+            assert_eq!(auto_probe_order(AUTO_LADDER, Some(hint)).last(), Some(&"software"));
+        }
+    }
+}
+
+// DRAGON-571: the write-back decision, pinned as its own island. The load-bearing
+// rules: a concrete request writes NOTHING (user intent and the cache never cross),
+// and only a previously-good hardware hint losing to software raises the warn.
+#[cfg(test)]
+mod auto_resolution_outcome_tests {
+    use super::auto_resolution_outcome;
+
+    #[test]
+    fn a_concrete_request_writes_nothing() {
+        // "nvenc" and "software" are concrete on every platform's ladder.
+        for requested in ["nvenc", "software"] {
+            let out = auto_resolution_outcome(requested, "software", Some("nvenc"));
+            assert_eq!(out.new_hint, None, "requested={requested}");
+            assert!(!out.hardware_hint_failed, "requested={requested}");
+        }
+    }
+
+    #[test]
+    fn an_auto_win_updates_a_changed_hint_only() {
+        assert_eq!(
+            auto_resolution_outcome("auto", "nvenc", None).new_hint.as_deref(),
+            Some("nvenc")
+        );
+        assert_eq!(auto_resolution_outcome("auto", "nvenc", Some("nvenc")).new_hint, None);
+    }
+
+    #[test]
+    fn auto_landing_on_software_is_recorded_but_only_a_lost_hardware_hint_warns() {
+        // No hint yet (first run on a software-only box): record it, no warn.
+        let first = auto_resolution_outcome("auto", "software", None);
+        assert_eq!(first.new_hint.as_deref(), Some("software"));
+        assert!(!first.hardware_hint_failed);
+        // Stable software-only box: nothing to write, nothing to warn about.
+        let stable = auto_resolution_outcome("auto", "software", Some("software"));
+        assert_eq!(stable.new_hint, None);
+        assert!(!stable.hardware_hint_failed);
+        // Hardware worked before and lost to software now: the regression signature.
+        let regressed = auto_resolution_outcome("auto", "software", Some("nvenc"));
+        assert_eq!(regressed.new_hint.as_deref(), Some("software"));
+        assert!(regressed.hardware_hint_failed);
+    }
+
+    #[test]
+    fn an_unknown_request_is_treated_as_auto() {
+        // A hand-edited or foreign id resolves through the ladder, so its winner is
+        // cache-worthy exactly like a literal "auto".
+        assert_eq!(
+            auto_resolution_outcome("wxyz", "nvenc", None).new_hint.as_deref(),
+            Some("nvenc")
         );
     }
 }

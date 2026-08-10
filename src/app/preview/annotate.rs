@@ -839,8 +839,9 @@ pub enum EscapeStage {
     /// domain, not a second one grown for the keyboard.
     Deselect,
     /// The editor holds nothing this press can give up, so it falls through: to the live text
-    /// editor while typing (where the key is ordinary input), and otherwise to the preview
-    /// keymap, where Escape is `PreviewCancel` — the window's own close-or-confirm decision.
+    /// editor while typing (where the key is ordinary input), and otherwise to the BAKED Close
+    /// key (`shortcuts::FixedEditorAction::Close`, DRAGON-617), i.e. the window's own
+    /// close-or-confirm decision.
     Pass,
 }
 
@@ -1391,7 +1392,7 @@ fn clamp_text_rect_on_canvas(r: AnnotRect, fw: f32, fh: f32) -> AnnotRect {
     let axis = |v: f32, extent: f32, full: f32| {
         // A degenerate (or NaN) frame leaves the rect alone rather than inventing a position;
         // spelled as a positive comparison so a NaN `full` falls through here too.
-        if !(full.is_finite() && full > 0.0) || !v.is_finite() {
+        if !(full.is_finite() && full > 0.0 && v.is_finite()) {
             return v;
         }
         let keep = TEXT_MIN_ON_CANVAS_PX.min(extent.max(0.0));
@@ -3237,7 +3238,7 @@ pub fn text_layer_region(items: &[AnnotationItem], frame: (u32, u32)) -> Option<
     let x1 = (x1 / g).ceil() * g;
     let y1 = (y1 / g).ceil() * g;
     let (w, h) = (x1 - x0, y1 - y0);
-    if !(w > 0.0 && h > 0.0) || !(x0.is_finite() && y0.is_finite()) {
+    if !(w > 0.0 && h > 0.0 && x0.is_finite() && y0.is_finite()) {
         return None;
     }
     Some(AnnotRect { x: x0, y: y0, w, h })
@@ -3553,9 +3554,10 @@ pub(super) fn placed_text_region(
     xform: TextXform,
     padded: (f32, f32, f32, f32),
 ) -> Option<AnnotRect> {
-    if !(xform.scale.is_finite() && xform.scale >= TEXT_PROXY_MIN_SCALE)
-        || !xform.dx.is_finite()
-        || !xform.dy.is_finite()
+    if !(xform.scale.is_finite()
+        && xform.scale >= TEXT_PROXY_MIN_SCALE
+        && xform.dx.is_finite()
+        && xform.dy.is_finite())
     {
         return None;
     }
@@ -3923,6 +3925,40 @@ impl App {
         if p.edit.text_edit.is_none() {
             p.edit.push_annotations(prev);
         }
+    }
+
+    /// Adopt `color` as this document's CUSTOM annotation colour: the swatch, the active
+    /// colour for new shapes, any selected colourable annotation, the recent-colours MRU, and
+    /// the persisted default.
+    ///
+    /// THE one custom-colour path (DRAGON-587). It was the tail of `PreviewMsg::AnnotColorApply`
+    /// (the wheel's Apply button) until the colour picker needed the same thing: a pick
+    /// launched from the editor's pipette IS a custom colour, arriving from another process
+    /// instead of from the wheel. Two copies of this would be two chances to forget the MRU,
+    /// the swap-back reset or the save.
+    ///
+    /// Returns the same refresh task the wheel path returned: a recoloured highlight
+    /// re-renders through the GPU shader (DRAGON-330), a recoloured text box re-renders its
+    /// raster layer (DRAGON-354).
+    pub(in crate::app) fn apply_custom_annot_color(
+        &mut self,
+        id: window::Id,
+        color: AnnotColor,
+    ) -> Task<cosmic::Action<Msg>> {
+        if let Some(p) = self.preview_for_mut(id) {
+            p.edit.annot_color = Some(color);
+            // A custom pick also breaks a pending companion-swap pair (DRAGON-386), like a
+            // flyout swatch pick.
+            p.edit.color_swap_back = None;
+        } else {
+            return Task::none();
+        }
+        // Applying a custom color also recolors the SELECTED colorable item.
+        self.recolor_selected_annotation(id, color);
+        self.annot_color = Some(color);
+        self.push_recent_color(color);
+        self.save_state();
+        self.refresh_text_display(id)
     }
 
     /// Re-stroke the currently-SELECTED box/arrow to `stroke_w` (SOURCE px), pushing ONE
@@ -4668,8 +4704,8 @@ impl App {
         // next Escape look like it did nothing. `deselect_everything` is the shared action: the
         // annotation deselect (which settles a live edit before it clears) plus the video
         // timeline's, so a caption typed over a recording with a segment selected gives up both.
-        // The press with nothing left to give up is the one that reaches `PreviewCancel` and the
-        // window's close-or-confirm decision.
+        // The press with nothing left to give up is the one that reaches the baked Close key
+        // and the window's close-or-confirm decision.
         let stage = self.preview_for(id).map(|p| {
             escape_stage(
                 &key,
@@ -4743,10 +4779,12 @@ impl App {
                     )
                 }
                 Some(TextEditChord::Copy) => {
-                    if let Some(t) = selected_text(sel) {
-                        crate::share::copy_text(&t);
+                    // Task form: the editor window is focused while typing, and on a compositor
+                    // with no data-control it is the only thing that can hold the selection.
+                    match selected_text(sel) {
+                        Some(t) => crate::share::copy_text_task(&t),
+                        None => Task::none(),
                     }
-                    Task::none()
                 }
                 Some(TextEditChord::Cut) => {
                     let Some((a, b)) = sel else { return Task::none() };
@@ -4757,6 +4795,20 @@ impl App {
                     self.apply_text_edit(id, te_id, size_px, font, rect, constrained, bounds, Some(nt), nc, None, false)
                 }
                 Some(TextEditChord::Paste) => {
+                    // Protocol-keyed like the write side ([`crate::share::CopyRoute`],
+                    // DRAGON-572): without a data-control global the in-process
+                    // `wl_clipboard_rs` read can never see the selection (a Flatpak on
+                    // COSMIC, GNOME, sandboxed niri/Hyprland), and the only clipboard this
+                    // session can read is what its FOCUSED window is offered. The editor
+                    // window IS focused while typing, so read through it; the result
+                    // arrives as [`PreviewMsg::TextPasted`] and inserts through the
+                    // IME-commit lane, which normalizes and caps identically to the
+                    // inline path below.
+                    if crate::share::needs_window_clipboard() {
+                        return cosmic::iced::clipboard::read().map(move |t| {
+                            cosmic::Action::App(Msg::Preview(id, PreviewMsg::TextPasted(t)))
+                        });
+                    }
                     let Some(pasted) = crate::share::read_text() else {
                         return Task::none();
                     };
@@ -4866,6 +4918,13 @@ impl App {
     /// replaces any active selection. Same insertion path as typing a character (through
     /// [`Self::apply_text_edit`]) — capped like a paste so a pathological commit can't stall the
     /// per-keystroke reflow. A no-op unless a text box is actually being edited.
+    ///
+    /// ALSO the delivery lane for the window-route paste ([`PreviewMsg::TextPasted`],
+    /// DRAGON-572): a Cmd/Ctrl+V on a session without data-control reads the clipboard
+    /// asynchronously through the focused window, and by the time the text arrives the edit
+    /// state may have moved, so re-deriving it here — exactly as an IME commit must — is the
+    /// correct shape for both. The normalize + cap + replace-selection + own-undo-step below
+    /// is byte-for-byte what the inline worker-read paste does, so the routes cannot drift.
     pub(crate) fn text_edit_ime_commit(
         &mut self,
         id: window::Id,
@@ -10207,7 +10266,7 @@ mod tests {
 
     /// Escape gives up ONE thing at a time, outside in. The table is the whole rule: with
     /// something held the press is consumed here, and only a press with nothing left to give up
-    /// falls through to the keymap, i.e. to `PreviewCancel` and the window's close-or-confirm
+    /// falls through to the baked Close key (DRAGON-617) and the window's close-or-confirm
     /// decision. Nothing about that decision is restated in `escape_stage`.
     #[test]
     fn escape_deselects_before_it_ever_reaches_the_close_decision() {
@@ -10233,7 +10292,7 @@ mod tests {
         assert_eq!(
             escape_stage(&esc, Location::Standard, false, false, false),
             EscapeStage::Pass,
-            "with nothing selected Escape must reach PreviewCancel, not be eaten",
+            "with nothing selected Escape must reach the Close key, not be eaten",
         );
     }
 

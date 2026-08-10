@@ -23,11 +23,31 @@
 //! 7. pan/scroll clamping (no overscroll past the media edges) lives in
 //!    `widgets::zoom_pan` (`clamp_pan_of`), the one clamp both platforms share.
 
-/// Fraction of the monitor HEIGHT a spawned windowed preview may occupy (rule 3), so
-/// it clears the top/bottom panels, docks, trays and menu bars that are unknowable
-/// client-side. Applied to the fit bound on BOTH platforms — the single knob that
-/// replaced macOS's old `visibleFrame × 0.95` downscale and Linux's reliance on the
-/// compositor's own 2/3 reshape.
+/// Fraction of the monitor HEIGHT a spawned windowed preview may occupy (rule 3), on EVERY
+/// session and platform, so the client leaves room for the top/bottom panels, docks, trays
+/// and menu bars it cannot measure. The single knob that replaced macOS's old
+/// `visibleFrame × 0.95` downscale (DRAGON-221).
+///
+/// # The retired full-height ask (DRAGON-549, taken back by DRAGON-579)
+///
+/// DRAGON-549 briefly made this a decision (`usable_h_frac`): native COSMIC sessions asked
+/// for the WHOLE output height (`CLAMPED_H_FRAC = 1.0`), betting on cosmic-comp's
+/// `FloatingLayout::map_internal`, which ends its sizing with
+/// `win_geo.size = min(win_geo.size, layers.non_exclusive_zone().size)` for every freshly
+/// mapped floating toplevel, so the compositor would apply the exact panel subtraction no
+/// client can compute. The bet was already known to lose on the portal-fallback session
+/// (DRAGON-549 reopened, sixth live test): a COSMIC floating-window EXCEPTION routes a
+/// toplevel through a placement path that skips the map-time clamp, and the full-height
+/// request mapped over the panels.
+///
+/// DRAGON-579 is why the bet is retired EVERYWHERE, not just on the fallback: the tiling
+/// exception is this app's RECOMMENDED configuration on COSMIC (the README documents it so
+/// our windows float), so the exact setups that follow our own docs are the ones where the
+/// clamp never runs, native sessions included. The owner measured it on AppImage and binary
+/// builds: previews mapped past the approved 90 percent allotment. A Wayland client can
+/// read neither the work area nor the exception list, so self-limiting at this guess is the
+/// only honest ceiling on every path. Do not bring the full-height ask back without a way
+/// to KNOW the clamp will run; "the compositor source says it clamps" was not enough.
 pub(crate) const USABLE_H_FRAC: f32 = 0.9;
 
 /// Convert PHYSICAL capture pixels to the LOGICAL points the picture occupied on its
@@ -175,6 +195,78 @@ mod tests {
             assert!((got.0 - native.0).abs() < 2.0, "scale {scale}: w {got:?} vs {native:?}");
             assert!((got.1 - native.1).abs() < 2.0, "scale {scale}: h {got:?} vs {native:?}");
         }
+    }
+
+    /// DRAGON-579: the height budget is the DRAGON-221 guess again, on every path. The
+    /// DRAGON-549 full-height ask is retired (see [`USABLE_H_FRAC`]'s doc for the story);
+    /// this pin exists so it cannot quietly come back without a test saying so.
+    #[test]
+    fn the_height_budget_is_the_guess_everywhere() {
+        assert!((USABLE_H_FRAC - 0.9).abs() < 1e-6, "the DRAGON-221 guess is unchanged");
+    }
+
+    /// DRAGON-579, the owner's regression report as arithmetic: a 5120x1440 monitor grab on
+    /// the 5120x1440 ultrawide (chrome 163) must request inside the 90 percent allotment
+    /// (~4030x1296), never the full 4542x1440 the retired full-height ask produced. The
+    /// floating-window exception the README recommends bypasses cosmic-comp's map-time
+    /// clamp, so nothing else trims an over-large request.
+    #[test]
+    fn a_monitor_grab_stays_inside_the_ninety_percent_allotment() {
+        let chrome = (2.0f32, 163.0f32); // the logged still-window chrome
+        let monitor = Some((5120u32, 1440u32));
+        let media = (5120u32, 1440u32);
+        let fit = spawn_window_size(media, monitor, chrome, MIN, USABLE_H_FRAC);
+        assert!(
+            fit.1 <= 1440.0 * USABLE_H_FRAC + 0.5,
+            "inside the 90 percent allotment: {fit:?}"
+        );
+        assert!((fit.1 - 1296.0).abs() < 0.5, "90 percent of 1440: {fit:?}");
+        assert!((fit.0 - 4030.0).abs() < 1.0, "width follows the same uniform scale: {fit:?}");
+    }
+
+    /// DRAGON-549 reopened, the sixth live test's window capture as arithmetic. The grant
+    /// carried no position (COSMIC's portal sends none for window streams), the origin fell
+    /// to the first-registered output, and a 1360x786 capture was fitted against the 800x480
+    /// side panel: floored at the editor minimums, the five identical logged 924x732
+    /// requests. Resolved to the 5120x1440 ultrawide (the shared synthetic anchor), the same
+    /// capture opens 1:1 at ~1362x949 under the fallback budget. The end-to-end half, with
+    /// the real chrome and floor constants, lives in
+    /// `surface::portal_window_origin_fit_tests`.
+    #[test]
+    fn the_window_capture_opens_one_to_one_on_the_ultrawide() {
+        let chrome = (2.0f32, 163.0f32); // the logged still-window chrome
+        let floor = (924.0f32, 732.0f32); // shell::PREVIEW_MIN_W / PREVIEW_MIN_H
+        let media = (1360u32, 786u32);
+        let frac = USABLE_H_FRAC;
+        // The defect: bounded to the panel, every window capture is the same floored window.
+        let defect = spawn_window_size(media, Some((800, 480)), chrome, floor, frac);
+        assert_eq!(defect, floor, "the logged 924x732 request");
+        // The fix: bounded to the ultrawide, the media opens at its natural size.
+        let fixed = spawn_window_size(media, Some((5120, 1440)), chrome, floor, frac);
+        assert!((fixed.0 - 1362.0).abs() < 0.5, "media width + 2 border: {fixed:?}");
+        assert!((fixed.1 - 949.0).abs() < 0.5, "media height + 163 chrome: {fixed:?}");
+    }
+
+    /// The original DRAGON-549 symptom, as arithmetic, kept as documentation: on a display
+    /// where every capture is taller than the budget, the budget IS the window height, so
+    /// two quite different pictures come out exactly the same height and both best-fit
+    /// scale. DRAGON-579 ACCEPTS this as the cost of the honest ceiling: the full-height
+    /// ask that gave the height back mapped over the panels wherever the recommended
+    /// floating exception voids cosmic-comp's clamp, which the owner rejected twice.
+    #[test]
+    fn a_binding_height_budget_makes_every_capture_the_same_height() {
+        let monitor = Some((5120u32, 1440u32));
+        let chrome = (2.0f32, 163.0f32); // a still window with the toolbar captions on
+        let window = |media: (u32, u32)| {
+            spawn_window_size(media, monitor, chrome, MIN, USABLE_H_FRAC).1
+        };
+        // A window capture and a monitor capture, both taller than the budget.
+        let (win_cap, mon_cap) = (window((2542, 1384)), window((5120, 1440)));
+        assert!(
+            (win_cap - mon_cap).abs() < 0.5,
+            "the bound, not the media, decided both heights: {win_cap} vs {mon_cap}"
+        );
+        assert!((win_cap - 1440.0 * USABLE_H_FRAC).abs() < 0.5);
     }
 
     /// No monitor known → native sized (the compositor clamps any overshoot later).

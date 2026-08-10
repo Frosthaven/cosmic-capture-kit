@@ -23,6 +23,18 @@ use super::pixfmt::drm_fourcc;
 /// Crop in stream pixels: `(x, y, w, h)`. `None` delivers the whole frame.
 pub type Crop = Option<(u32, u32, u32, u32)>;
 
+/// DRAGON-562 alpha probe (`CCK_ALPHA_PROBE=1`), inert unless set: measure
+/// whether a portal stream can deliver real per-pixel alpha, BEFORE
+/// `convert_crop` forces every pixel opaque. Two effects while set: the format
+/// request offers the alpha-carrying formats FIRST (BGRA/RGBA before
+/// BGRx/RGBx), and the first few delivered frames print a raw byte-3 histogram
+/// to stderr (`pixfmt::alpha_histogram`). Run it as
+/// `CCK_ALPHA_PROBE=1 cosmic-capture-kit --test pw window`, picking a
+/// TRANSLUCENT window in the portal dialog. The answer gates flipping the
+/// portal backend's `transparency` capability; an experiment variable is
+/// temporary by contract — delete this hook the moment the answer is measured.
+pub const ALPHA_PROBE_ENV: &str = "CCK_ALPHA_PROBE";
+
 struct UserData<F> {
     format: spa::param::video::VideoInfoRaw,
     crop: Crop,
@@ -32,6 +44,11 @@ struct UserData<F> {
     /// pre-negotiation) — a persistent run of these is a FROZEN recording (video
     /// stops while audio continues), so they must never be silent.
     skips: u64,
+    /// [`ALPHA_PROBE_ENV`]: histogram the raw byte-3 channel of the first few
+    /// frames before conversion. Inert (false) unless the env is set.
+    alpha_probe: bool,
+    /// Frames the probe has reported so far (it stops after a handful).
+    alpha_frames: u32,
 }
 
 impl<F> UserData<F> {
@@ -76,12 +93,15 @@ where
         .connect_fd_rc(fd, None)
         .map_err(|e| format!("pipewire connect_fd: {e}"))?;
 
+    let alpha_probe = std::env::var_os(ALPHA_PROBE_ENV).is_some();
     let data = UserData {
         format: Default::default(),
         crop,
         out: Vec::new(),
         on_frame,
         skips: 0,
+        alpha_probe,
+        alpha_frames: 0,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -180,6 +200,13 @@ where
             let Some(bpp) = bytes_per_pixel(fmt) else {
                 return;
             };
+            // DRAGON-562 alpha probe: read the RAW byte-3 channel BEFORE
+            // convert_crop overwrites it with 255 (first frames only; stderr,
+            // like the dmabuf debug hook above).
+            if ud.alpha_probe && ud.alpha_frames < 5 {
+                ud.alpha_frames += 1;
+                report_alpha_probe(src, stride, fmt, bpp, (cx, cy, cw, ch), ud.alpha_frames);
+            }
             let need = (cw * ch * 4) as usize;
             if ud.out.len() != need {
                 ud.out.resize(need, 0);
@@ -197,6 +224,38 @@ where
 
     // Request a raw-RGB format (we convert to RGBA ourselves); the compositor picks
     // the size/framerate.
+    //
+    // DRAGON-562 alpha probe: while probing, offer the alpha-carrying formats
+    // FIRST so a compositor that CAN hand per-window alpha will; the normal
+    // request keeps BGRx first (what every compositor offers for monitors) and
+    // is byte-identical with the env unset.
+    let fmt_prop = if alpha_probe {
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            spa::param::video::VideoFormat::BGRA,
+            spa::param::video::VideoFormat::BGRA,
+            spa::param::video::VideoFormat::RGBA,
+            spa::param::video::VideoFormat::BGRx,
+            spa::param::video::VideoFormat::RGBx,
+            spa::param::video::VideoFormat::RGB,
+        )
+    } else {
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoFormat,
+            Choice,
+            Enum,
+            Id,
+            spa::param::video::VideoFormat::BGRx,
+            spa::param::video::VideoFormat::BGRx,
+            spa::param::video::VideoFormat::RGBx,
+            spa::param::video::VideoFormat::BGRA,
+            spa::param::video::VideoFormat::RGBA,
+            spa::param::video::VideoFormat::RGB,
+        )
+    };
     let obj = spa::pod::object!(
         spa::utils::SpaTypes::ObjectParamFormat,
         spa::param::ParamType::EnumFormat,
@@ -210,18 +269,7 @@ where
             Id,
             spa::param::format::MediaSubtype::Raw
         ),
-        spa::pod::property!(
-            spa::param::format::FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            spa::param::video::VideoFormat::BGRx,
-            spa::param::video::VideoFormat::BGRx,
-            spa::param::video::VideoFormat::RGBx,
-            spa::param::video::VideoFormat::BGRA,
-            spa::param::video::VideoFormat::RGBA,
-            spa::param::video::VideoFormat::RGB,
-        ),
+        fmt_prop,
         spa::pod::property!(
             spa::param::format::FormatProperties::VideoSize,
             Choice,
@@ -274,6 +322,39 @@ where
 
     mainloop.run();
     Ok(())
+}
+
+/// DRAGON-562 alpha probe: print one frame's raw byte-3 histogram to stderr,
+/// labelled with whether the negotiated format makes that byte REAL alpha
+/// (BGRA/RGBA) or padding (BGRx/RGBx — the structural "no alpha negotiated"
+/// answer). The counting itself is `pixfmt::alpha_histogram` (pure, tested);
+/// this is only the report. Behavior-only output: format, dimensions, counts —
+/// never pixel content.
+fn report_alpha_probe(
+    src: &[u8],
+    stride: usize,
+    fmt: spa::param::video::VideoFormat,
+    bpp: usize,
+    crop: (u32, u32, u32, u32),
+    n: u32,
+) {
+    use spa::param::video::VideoFormat as V;
+    let (cx, cy, cw, ch) = crop;
+    let channel = match fmt {
+        V::BGRA | V::RGBA => "a REAL alpha channel",
+        V::BGRx | V::RGBx => "a PADDING byte (no alpha format negotiated)",
+        _ => {
+            eprintln!("alpha-probe: frame {n}: fmt {fmt:?} carries no fourth byte to read");
+            return;
+        }
+    };
+    match super::pixfmt::alpha_histogram(src, stride, bpp, cx, cy, cw, ch) {
+        Some((zero, partial, opaque)) => eprintln!(
+            "alpha-probe: frame {n}: fmt {fmt:?} (byte 3 is {channel}) {cw}x{ch}px: \
+             alpha==0: {zero}  0<alpha<255: {partial}  alpha==255: {opaque}"
+        ),
+        None => eprintln!("alpha-probe: frame {n}: fmt {fmt:?}: bpp {bpp} != 4, nothing to read"),
+    }
 }
 
 /// DRM_FORMAT_MOD_INVALID — "implicit modifier": ask the compositor for a dmabuf and

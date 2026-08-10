@@ -5,7 +5,7 @@ impl cosmic::Application for App {
     /// How the app was launched (`--settings`, `--preview <file>`, or a normal capture).
     type Flags = super::Startup;
     type Message = Msg;
-    const APP_ID: &'static str = "dev.frosthaven.CosmicCaptureKit";
+    const APP_ID: &'static str = "dev.thedragon.CosmicCaptureKit";
 
     fn core(&self) -> &app::Core {
         &self.core
@@ -14,8 +14,17 @@ impl cosmic::Application for App {
         &mut self.core
     }
 
-    fn init(core: app::Core, startup: super::Startup) -> (Self, Task<cosmic::Action<Msg>>) {
+    fn init(mut core: app::Core, startup: super::Startup) -> (Self, Task<cosmic::Action<Msg>>) {
         crate::util::timing_mark("App::init entry (iced runtime + winit + wgpu preinit done)");
+        // DRAGON-602: opt every surface OUT of the toolkit's AUTOMATIC backdrop blur,
+        // before any surface is created. libcosmic enrolls each new surface from the
+        // user's frosted-windows theme preference alone, which for a capture tool means
+        // the compositor frosts the live desktop behind our fullscreen overlay and the
+        // user is shown a picture of their screen that is not their screen. The rule and
+        // the whole mechanism are documented on `toolkit_auto_glass`. Glass we ask for
+        // ourselves is untouched: the colour picker and permission windows still pass
+        // `window::Settings.blur`, and `crate::glass` still reproduces frost in captures.
+        core.set_auto_blur(crate::app::theme::toolkit_auto_glass());
         // DRAGON-467 review, major 3: bound the disk-backed transient folder by AGE. A
         // recording the user never saved has to outlive this process (the Linux clipboard
         // worker serves it as a `file://` URI), so it cannot be cleaned up on close; a sweep
@@ -45,9 +54,6 @@ impl cosmic::Application for App {
         let preview_mode = startup_preview.is_some() || startup_handoff.is_some();
         let dummy_id = window::Id::unique();
         let dummy = super::shell::bootstrap_surface(dummy_id);
-        // Detect the very first launch (no state file yet) before anything writes
-        // one, so we can choose smart capture-method defaults once.
-        let first_launch = !crate::state::file_exists();
         let persisted = crate::state::load();
         // DRAGON-309: snapshot the TRIGGER display's NAME NOW, at the very top of init — before
         // the picker overlay is shown, before the user moves the cursor to the target monitor to
@@ -195,15 +201,28 @@ impl cosmic::Application for App {
                 _ => startup.mode.unwrap_or(Mode::Region),
             }
         };
+        // DRAGON-336: the launch KIND gates the frozen-flats grab. Bound here rather than
+        // inline in the call because DRAGON-600 needs the same answer twice: once to gate
+        // the grab, once to decide whether a tray-menu launch holds it.
+        let want_flats = launch_flats_needed(
+            scene_active,
+            persisted.freeze,
+            startup.kind.unwrap_or(Kind::Image),
+            startup.color_picker,
+        );
         let (precapture, frozen, frozen_slot, wallpaper_slot, cursor_slot) = acquire_scene(
             scene_active,
             launch_mode,
-            // DRAGON-336: the launch KIND gates the frozen-flats grab too — the QR/OCR
-            // scanners are the only non-freeze reader of the flats, so a `--scan` launch
-            // must grab them even with freeze off (`launch_flats_needed`).
-            startup.kind.unwrap_or(Kind::Image),
-            persisted.capture_cursor,
+            // DRAGON-582: a colour-picker launch draws no captured cursor, so it does not
+            // pay for the launch cursor grab even when "Preserve mouse cursor" is on.
+            launch_cursor_needed(persisted.capture_cursor, startup.color_picker),
             persisted.freeze,
+            // DRAGON-336: the launch KIND gates the frozen-flats grab — the QR/OCR
+            // scanners are a non-freeze reader of the flats, so a `--scan` launch must
+            // grab them even with freeze off. DRAGON-582 added the third reader: the
+            // colour picker samples them for every pointer move, so it always needs them
+            // (`app::color_picker`'s `PixelSource`).
+            want_flats,
             wallpaper_path(),
             radius,
         );
@@ -217,6 +236,15 @@ impl cosmic::Application for App {
         // here); it lands via `FrozenReady`, so mark it pending whenever the scene is active
         // so the drain poll runs.
         let frozen_pending = scene_active;
+        // DRAGON-600 (Linux, tray-menu launches only): the grab above was HELD, because
+        // the dropdown that launched us is still on screen and only this process taking
+        // keyboard focus will retire it. Arm the hold so the overlay paints nothing and
+        // the tick releases the grab once that focus lands (or the budget expires).
+        let menu_hold = menu_flats_held(want_flats).then(|| crate::app::MenuFlatsHold {
+            want_cursor: launch_cursor_needed(persisted.capture_cursor, startup.color_picker),
+            armed: std::time::Instant::now(),
+            focused: None,
+        });
         // macOS defers the per-output picker wallpaper too (DRAGON-200): it lands via
         // `WallpaperReady`, so arm its drain poll. Linux resolves it inline (precapture
         // tuple), so nothing is pending there.
@@ -229,12 +257,13 @@ impl cosmic::Application for App {
         // Encoder probe is DEFERRED (DRAGON-201): resolving the usable encoders spawns
         // `ffmpeg -encoders`, a cost every launch used to pay here synchronously — even a
         // region/window/scan screenshot that never encodes. It now runs lazily the first
-        // time the encoder list / preferred encoder is actually read (entering the
-        // recording UI, the settings video/Health pages, or starting a recording), via
-        // the `EncoderResolve` holder below. The resolution itself (probe the list,
-        // dropping hardware under CCK_HEALTH_FORCE_WARN; keep the saved choice when
-        // available else pick+persist the best; map record_hardware=off to software) is
-        // unchanged — only WHEN it runs moved off the init critical path.
+        // time the encoder list / displayed encoder is actually read (entering the
+        // recording UI or the settings video/Health pages), via the `EncoderResolve`
+        // holder below. Since DRAGON-571 a recording start does not read the list at
+        // all: it carries the persisted intent ("auto" or the user's pick) plus the
+        // last-known-good hint, and the worker's hint-first ladder resolves it. The
+        // display resolution is never persisted; only a real picker click writes
+        // `preferred_encoder` (the legacy record_hardware=off still maps to software).
         let encoders = EncoderResolve::default();
         // The freeze DISPLAY still gates on this persisted flag (the snapshot
         // itself is always grabbed above by `acquire_scene`, so freeze + the
@@ -346,6 +375,14 @@ impl cosmic::Application for App {
             .max_by_key(|(_, m)| m.px_w as u64 * m.px_h as u64)
             .map(|(i, _)| i)
             .unwrap_or(0);
+        // DRAGON-559: the audio arms this launch starts with — a `--audio <channels>`
+        // override when given, else the persisted pair (pure decision, unit-tested in
+        // `recording_ui`). In-memory only: nothing here writes an override back, and only
+        // a user's own later toggle persists, as any toggle does.
+        let launch_arms = crate::recording_ui::launch_audio_arms(
+            startup.audio_arms,
+            (persisted.record_mic, persisted.record_system_audio),
+        );
         crate::util::timing_mark("App::init returning (App struct built, tasks batched)");
         (
             App {
@@ -420,6 +457,24 @@ impl cosmic::Application for App {
                 overlay_finalize_deadline: None,
                 settings,
                 permissions,
+                // DRAGON-582: the colour picker's state. `active` is what makes this
+                // process the picker; the recents come off the persisted list, dropping
+                // any entry that no longer parses rather than failing the whole load.
+                color_picker: color_picker::ColorPickerState {
+                    active: startup.color_picker,
+                    recents: persisted
+                        .recent_colors
+                        .iter()
+                        .filter_map(|s| crate::color::ColorFormat::Hex.parse(s))
+                        .take(color_picker::geom::RECENTS_CAP)
+                        .collect(),
+                    // DRAGON-615: the lens opens where the user last left it, clamped into
+                    // this build's bounds rather than applied as stored. This is the launch
+                    // path a picker actually takes, so the read has to happen HERE and not
+                    // only in `apply_persisted`, which runs for a reset or a reload.
+                    zoom: color_picker::geom::zoom_from_persisted(persisted.color_picker_zoom),
+                    ..Default::default()
+                },
                 keymap,
                 // DRAGON-428: `--no-editor`, carried through from the launch flags.
                 no_editor: startup.no_editor,
@@ -431,6 +486,7 @@ impl cosmic::Application for App {
                     startup.preview_windowed.unwrap_or(persisted.preview_windowed),
                     startup.opens_overlays(),
                     crate::platform::overlay_preview_available(),
+                    crate::platform::software_overlays(),
                 ),
                 preview_toolbar_labels: persisted.preview_toolbar_labels,
                 // DRAGON-419: the mirrored setting only. `diag::init` already resolved the
@@ -453,13 +509,20 @@ impl cosmic::Application for App {
                 selection_box_thickness: persisted.selection_box_thickness.clamp(1, 8),
                 previews: Vec::new(),
                 focused_preview: None,
+                focused_window: None,
+                #[cfg(target_os = "linux")]
+                portal_origin_output: None,
                 capture_preview: None,
                 preview_duck: None,
                 preview_duck_refs: Default::default(),
                 // Bound lazily, at the first preview mint (`preview_surface_for`) — a
                 // capture that never opens a preview never hosts.
                 #[cfg(unix)]
-                preview_host: None,
+                handoff_host: None,
+                // Bound lazily too, at record start (`begin_recording_tray`): a session
+                // that never records is never reachable by a recording command.
+                #[cfg(target_os = "linux")]
+                record_control: None,
                 trigger_display,
                 preview_output: None,
                 #[cfg(target_os = "linux")]
@@ -482,6 +545,7 @@ impl cosmic::Application for App {
                 capture_cursor: persisted.capture_cursor,
                 capture_transparency: persisted.capture_transparency,
                 capture_wallpaper: !persisted.no_wallpaper,
+                window_recompositing: persisted.window_recompositing,
                 active_border_color: persisted.active_border_color,
                 active_border_width: persisted.active_border_width.min(10),
                 inactive_border_color: persisted.inactive_border_color,
@@ -493,6 +557,22 @@ impl cosmic::Application for App {
                 window_padding_px: NumField::new(persisted.window_padding_px),
                 resident: persisted.resident,
                 autostart_on_login: persisted.autostart_on_login,
+                // DRAGON-628: UNOBSERVED, deliberately, rather than probed here. Every launch
+                // is a one-shot capture child and almost none of them ever shows the settings
+                // row, so the probe (a file read, a registry query, an `SMAppService` call)
+                // belongs on the path that can display it. `autostart_settings_opened` takes
+                // it at both settings-window mints, before the window is ever painted, and
+                // until then the row falls back to the preference exactly as it always did.
+                #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                autostart_registered: None,
+                // DRAGON-618: nothing is in flight at launch, and this is never restored from
+                // disk (see the field's doc).
+                #[cfg(target_os = "linux")]
+                autostart_pending: false,
+                // DRAGON-625: no attempt has failed yet this run, and this is never
+                // restored from disk (see the field's doc).
+                #[cfg(target_os = "linux")]
+                autostart_notice: None,
                 capture_hotkey: persisted.capture_hotkey.clone(),
                 capture_active_window_hotkey: persisted.capture_active_window_hotkey.clone(),
                 capture_active_monitor_hotkey: persisted.capture_active_monitor_hotkey.clone(),
@@ -504,6 +584,7 @@ impl cosmic::Application for App {
                 capture_active_monitor_no_editor_hotkey: persisted
                     .capture_active_monitor_no_editor_hotkey
                     .clone(),
+                color_picker_hotkey: persisted.color_picker_hotkey.clone(),
                 #[cfg(target_os = "macos")]
                 aerospace_guard: None,
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -513,6 +594,7 @@ impl cosmic::Application for App {
                 region_overlay_opacity: persisted.region_overlay_opacity,
                 active_overlay_opacity: persisted.active_overlay_opacity,
                 preview_overlay_opacity: persisted.preview_overlay_opacity,
+                color_picker_overlay_opacity: persisted.color_picker_overlay_opacity,
                 record_fps: NumField::new(persisted.record_fps.clamp(1, 240)),
                 record_bitrate_kbps: NumField::new(persisted.record_bitrate_kbps.clamp(100, 500_000)),
                 record_res_preset: persisted.record_res_preset.min(RES_CUSTOM as u8),
@@ -571,13 +653,16 @@ impl cosmic::Application for App {
                 recording_cancelled: false,
                 hide_toolbar_fullscreen: persisted.hide_toolbar_fullscreen,
                 tray: None,
+                countdown_tray: None,
                 tray_hides_toolbar: false,
                 push_to_talk: persisted.push_to_talk,
                 ptt_held: false,
                 hotkeys: None,
                 screenshot_dir: persisted.screenshot_dir,
-                record_mic: persisted.record_mic,
-                record_system_audio: persisted.record_system_audio,
+                // DRAGON-559: `launch_arms` above — the `--audio` override, or the
+                // persisted pair when the flag is absent.
+                record_mic: launch_arms.0,
+                record_system_audio: launch_arms.1,
                 covermark_text: persisted.covermark_text,
                 covermark_zoom: persisted.covermark_zoom,
                 covermark_opacity: persisted.covermark_opacity,
@@ -638,6 +723,15 @@ impl cosmic::Application for App {
                 frozen,
                 frozen_slot,
                 frozen_pending,
+                menu_hold,
+                // DRAGON-606: no dim until the frozen-flats grab has landed. On a launch
+                // that grabs nothing this clears on the first drain tick; on one that does,
+                // it clears when the grab posts, which is the ordering the fade exists to
+                // respect.
+                dim_fade: std::cell::Cell::new(crate::app::overlay::DimFade::Waiting),
+                // DRAGON-601: no directional key is held at launch, so the first press is a
+                // fresh tap and always moves.
+                nudge_hold: None,
                 wallpaper_slot,
                 wallpaper_pending,
                 cursor_slot,
@@ -657,14 +751,33 @@ impl cosmic::Application for App {
                     ffmpeg_available,
                     |c| c.record,
                 ),
-                first_launch,
                 pipewire_available: false,
                 pipewire_source_types: 0,
                 toast: None,
-                pw_restore_token: persisted.pw_restore_token,
+                // DRAGON-612: no accept is being held. Only a colour-picker launch can ever
+                // leave this state, and only for the moment before its first pixel lands.
+                accept_pending: None,
+                pw_restore_token: super::portal::RestoreTokens {
+                    monitor: persisted.pw_restore_token_monitor,
+                    window: persisted.pw_restore_token_window,
+                },
                 pw_pending: None,
                 pw_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 pw_held: None,
+                #[cfg(target_os = "linux")]
+                fallback_seed_kicked: false,
+                // DRAGON-604: no seed frame exists yet, so there is nothing to compare a
+                // kind change against and nothing to replace.
+                #[cfg(target_os = "linux")]
+                fallback_seed_cursor: None,
+                #[cfg(target_os = "linux")]
+                fallback_reseeding: false,
+                #[cfg(target_os = "linux")]
+                fallback_window: None,
+                #[cfg(target_os = "linux")]
+                fallback_grant: None,
+                #[cfg(target_os = "linux")]
+                fallback_frame_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 update_status: crate::update::UpdateStatus::Unknown,
                 update_installing: false,
                 notify_updates: persisted.notify_updates,
@@ -673,6 +786,7 @@ impl cosmic::Application for App {
                 update_dialog: None,
                 update_dialog_decided: false,
                 update_notes: None,
+                release_notes_fetched: false,
             },
             {
                 let mut tasks = vec![
@@ -729,6 +843,16 @@ impl cosmic::Application for App {
                 // `init` races the compositor's lazy creation and is silently dropped (see the
                 // long note in `run`), which is why the font-preview dropdown labels (DRAGON-354
                 // item 19) never resolved. Nothing to do at this seam.
+                // DRAGON-601 launched a pointer probe here to seed the colour picker's loupe,
+                // because on a Wayland layer surface the toolkit reported no cursor until the
+                // pointer moved. DRAGON-609 removed it, and the reason is worth keeping: the
+                // seed never once fired on a clean run. The probe minted a layer surface per
+                // output and waited for a `wl_pointer.enter`, which is the very thing
+                // cosmic-comp fails to terminate with the mandatory `wl_pointer.frame`, so the
+                // probe was defeated by the same bug it existed to work around. It cost ~350ms
+                // of full-screen surfaces mapping over the picker overlay and answered nothing.
+                // The picker now learns its position from the enter itself, earlier and more
+                // accurately, via the dispatch fix in our iced fork.
                 // No per-session idle icon anymore (DRAGON-182): the app's own status
                 // icon exists ONLY while a recording is live (`begin_recording_tray`);
                 // a resident, when enabled, owns the one always-present tray icon.
@@ -750,6 +874,11 @@ impl cosmic::Application for App {
         if Some(id) == self.permissions.window {
             return self.permissions_window_view();
         }
+        // DRAGON-582: the colour picker's result window is its own toplevel, like
+        // settings and the permission checker.
+        if Some(id) == self.color_picker.window {
+            return self.color_picker_window_view();
+        }
         // DRAGON-216 (Linux windowed): the pre-opened neutral overlay whose preview was just
         // swapped to a real window keeps painting its loading cover until its close lands, so
         // the window maps under it with no desktop flash.
@@ -760,6 +889,20 @@ impl cosmic::Application for App {
             return self.preview_view(id);
         }
         if let Some(o) = self.outputs.iter().find(|o| o.id == id) {
+            // DRAGON-600: this overlay exists right now for ONE reason, to take keyboard
+            // focus so the tray dropdown that launched us goes away, and the flats grab
+            // that follows would photograph anything we drew. Paint NOTHING until the
+            // hold releases: the surface is transparent, so it composites to nothing.
+            // Same trick DRAGON-456 used for the scan re-read, and the same reason it is
+            // ONE gate here rather than per layer, so no layer can be forgotten. Nothing
+            // of the user's is hidden by it: at launch there is no selection yet, which
+            // is exactly why the blank DRAGON-460 removed could not live here.
+            if self.menu_hold.is_some() {
+                return widget::space::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+            }
             // DRAGON-456: a scan refresh is re-reading the screen, and our own overlay is
             // part of what a screen grab sees. Paint NOTHING (the surface is transparent,
             // so it composites to nothing) until the new flats land — chrome, marks, dim
@@ -777,7 +920,11 @@ impl cosmic::Application for App {
             //
             // Do not reintroduce a blank here. It was also the mechanism by which a refresh
             // "hid the region selection", which is the behaviour this ticket removes.
-            if self.recording.is_some() {
+            if self.color_picking() {
+                // DRAGON-582: a colour-picker launch mints the SAME per-output overlays
+                // a capture does and only draws something else on them.
+                self.color_picker_view(o)
+            } else if self.recording.is_some() {
                 self.recording_view(o)
             } else if self.countdown.is_some() {
                 self.countdown_view(o)
@@ -800,6 +947,7 @@ impl cosmic::Application for App {
             Msg::Settings(message) => self.update_settings(message),
             Msg::Permissions(message) => self.update_permissions(message),
             Msg::WindowChrome(message) => self.update_window_chrome(message),
+            Msg::ColorPicker(message) => self.update_color_picker(message),
             Msg::Preview(id, message) => self.update_preview(id, message),
         };
         // DRAGON-413: publish what this child currently has on screen to the startup

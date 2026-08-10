@@ -23,8 +23,14 @@ impl DesktopProfile for KdeProfile {
 }
 
 /// KDE Plasma: the desktop applet config's wallpaper `Image=` entries.
+///
+/// `util::host_config_dir()`, NOT `dirs::config_dir()` (DRAGON-619). This reads the DESKTOP's
+/// config, not ours, so it must see past a Flatpak sandbox: inside one `$XDG_CONFIG_HOME` is
+/// our own private store, which Plasma has never written to, and the read would miss in a way
+/// indistinguishable from a machine with no KDE at all. Outside a sandbox the two calls are
+/// identical, so nothing changes for an ordinary build.
 fn kde_wallpaper() -> Option<PathBuf> {
-    let path = dirs::config_dir()?.join("plasma-org.kde.plasma.desktop-appletsrc");
+    let path = crate::util::host_config_dir()?.join("plasma-org.kde.plasma.desktop-appletsrc");
     let text = std::fs::read_to_string(path).ok()?;
     parse_appletsrc(&text)
 }

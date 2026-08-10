@@ -664,8 +664,9 @@ pub fn provider_notes(
     spec: &ProviderSpec,
     env_value: Option<&str>,
     tool: ToolEntry,
+    kind: crate::util::PackageKind,
 ) -> Vec<String> {
-    match connect_action(spec, env_value, tool) {
+    match connect_action(spec, env_value, tool, kind) {
         ConnectAction::Refused(message) => vec![message],
         ConnectAction::Run => Vec::new(),
     }
@@ -713,10 +714,17 @@ impl ToolEntry {
     ///
     /// `tool_name` is the registry row's own [`crate::cloud::AuthKind::ExternalTool`] spelling,
     /// so the line names the command a user types and this page invents no second name for it.
-    pub fn note(self, tool_name: &str) -> Option<String> {
+    ///
+    /// `kind` is injected rather than read here (the house seam), because the INSTALL wording
+    /// splits on it (DRAGON-566): a package that bundles the tool must never hand out
+    /// host-install advice. The wording table itself lives in
+    /// [`crate::cloud::proton::missing_tool_note`], beside the rest of the guidance split.
+    pub fn note(self, tool_name: &str, kind: crate::util::PackageKind) -> Option<String> {
         match self {
             ToolEntry::Ready => None,
-            ToolEntry::Install => Some(format!("Requires {tool_name} CLI in PATH")),
+            ToolEntry::Install => {
+                Some(crate::cloud::proton::missing_tool_note(kind, tool_name))
+            }
             ToolEntry::Connected => Some("Already connected".to_string()),
         }
     }
@@ -788,10 +796,16 @@ pub fn connect_pressable(action: &ConnectAction) -> bool {
 /// The id question is asked through the SAME resolution `crate::cloud::provider_available`
 /// asks (`oauth::resolve_client_id`, DRAGON-508), so a provider the picker offers is always one
 /// this can run, and there is no way for the list and the button to disagree.
+///
+/// `kind` is injected the same way `env_value` is, because the INSTALL refusal's wording
+/// splits on the package (DRAGON-566): a build that bundles the tool names a packaging fault
+/// instead of asking the user to install anything. The table is
+/// [`crate::cloud::proton::install_refusal`].
 pub fn connect_action(
     spec: &ProviderSpec,
     env_value: Option<&str>,
     tool: ToolEntry,
+    kind: crate::util::PackageKind,
 ) -> ConnectAction {
     // **An external-tool provider is refused by its TOOL, never by a client id** (DRAGON-485).
     // No id takes part in its connect at all, so `env_value` says nothing about it; what decides
@@ -801,11 +815,9 @@ pub fn connect_action(
     if let AuthKind::ExternalTool { tool_name, .. } = spec.auth {
         return match tool {
             ToolEntry::Ready => ConnectAction::Run,
-            ToolEntry::Install => ConnectAction::Refused(format!(
-                "{} connects through Proton's own {tool_name} command-line tool, which is not \
-                 installed on this computer yet. Install it, then try again.",
-                spec.display_name
-            )),
+            ToolEntry::Install => ConnectAction::Refused(
+                crate::cloud::proton::install_refusal(kind, spec.display_name, tool_name),
+            ),
             ToolEntry::Connected => ConnectAction::Refused(format!(
                 "{} can hold one connected account at a time, because signing in again would \
                  replace the sign-in the account you already have is using. Disconnect that one \
@@ -2077,15 +2089,16 @@ impl crate::app::App {
             provider_picker(add, spec, &self.settings.cloud)
         };
         let env_value = std::env::var(client_id_env(spec)).ok();
+        let package = crate::util::package_kind();
         let mut column = widget::column::with_capacity(3).push(control).spacing(8.0);
-        for note in provider_notes(spec, env_value.as_deref(), tool) {
+        for note in provider_notes(spec, env_value.as_deref(), tool, package) {
             // NOT `subdued_caption`: that tone is a 78%-toward-background wash meant for an
             // inert icon at rest, not a sentence the user has to actually read (the missing
             // app-registration notice and its siblings were unreadably faint on the owner's
             // report). Same caption size, normal readable color.
             column = column.push(widget::text::caption(note));
         }
-        let action = connect_action(spec, env_value.as_deref(), tool);
+        let action = connect_action(spec, env_value.as_deref(), tool, package);
         // Pressable unless the provider has no public API at all; see `connect_pressable` for
         // why a build with no client id gets a LIVE button rather than a dead one.
         let button = widget::button::suggested("Connect");
@@ -2216,6 +2229,11 @@ fn provider_picker<'a>(
 /// selecting it, and a captioned, unpressable entry when the provider's one account slot is
 /// already taken.
 ///
+/// In a package that BUNDLES the tool (the Flatpak, DRAGON-566) the install face changes shape:
+/// the caption says the build includes the tool and a missing one is a packaging fault, and the
+/// press goes nowhere, because the download page is host-install advice the sandbox makes
+/// useless. `cloud::proton::install_press_downloads` is the gate.
+///
 /// That is not a return to the deleted "Not available yet" caption, and the difference is the
 /// whole point: that one said a provider could never be connected, which is a fact a picker
 /// should act on by not listing it. These say what to DO, and two of the three come with a press
@@ -2226,6 +2244,10 @@ fn provider_menu<'a>(
     is_reconnect: bool,
 ) -> Element<'a, Msg> {
     let offered = crate::cloud::connectable_display_order();
+    // Read once for the whole list: the install face's caption, press and cursor all key on
+    // whether THIS package bundles the tool (DRAGON-566), and asking per row would be three
+    // chances for them to disagree.
+    let package = crate::util::package_kind();
     let mut list = widget::column::with_capacity(offered.len()).spacing(2.0);
     for (index, spec) in offered {
         // EACH row derives its own face from the page state (owner-reported bug, the
@@ -2257,19 +2279,28 @@ fn provider_menu<'a>(
                 .into(),
             _ => widget::text::body(spec.display_name).into(),
         };
-        let mut names = widget::column::with_capacity(2)
+        // Whether this row's install face may act as a download link at all: in a package
+        // that bundles the tool it may not, and the caption, the press and the cursor below
+        // all read this ONE answer (DRAGON-566).
+        let install_downloads = crate::cloud::proton::install_press_downloads(package);
+        let mut names = widget::column::with_capacity(3)
             .push(name_text)
             .spacing(1.0)
             .width(Length::Fill);
-        if let Some(note) = face.note(tool_name) {
+        if let Some(note) = face.note(tool_name, package) {
             // The install note is a LINK LABEL (its press opens the download page), so it
             // wears the accent like every other link (owner call); the connected note is
-            // information, not a press, and keeps the quiet-but-legible subtle tone.
+            // information, not a press, and keeps the quiet-but-legible subtle tone. In a
+            // package that bundles the tool the install note is information too: there is
+            // nothing to download, so it must not dress as a link.
             names = names.push(match face {
-                ToolEntry::Install => accent_caption(note),
+                ToolEntry::Install if install_downloads => accent_caption(note),
                 _ => subtle_caption(note),
             });
         }
+        // The DRAGON-566 `support_note` disclosure line rendered here until the owner's
+        // 2026-08-07 decision removed the field (Proton's branding terms reviewed, risk
+        // accepted; see the tombstone on `ProviderSpec`).
         let content = widget::row::with_capacity(2)
             .push(crate::widgets::icons::sized(spec.icon, 20.0))
             .push(names)
@@ -2280,11 +2311,15 @@ fn provider_menu<'a>(
         // start would arm a Connect button that could only explain itself, which is the shape
         // `connect_pressable`'s doc records as having read to the owner as a broken dialog. So
         // the install face sends the user where the fix is, and the connected face takes no
-        // press at all, with its caption already saying why.
+        // press at all, with its caption already saying why. A BUNDLED build's install face
+        // has no fix to send the user to, so it takes no press either, exactly like the
+        // connected face: its caption already names the packaging fault.
         let press = match face {
             ToolEntry::Ready => Some(cm(CloudSettingsMsg::AddProviderSelected(index))),
-            ToolEntry::Install => Some(cm(CloudSettingsMsg::OpenToolDownload(index))),
-            ToolEntry::Connected => None,
+            ToolEntry::Install if install_downloads => {
+                Some(cm(CloudSettingsMsg::OpenToolDownload(index)))
+            }
+            ToolEntry::Install | ToolEntry::Connected => None,
         };
         let entry = widget::button::custom(content)
             .class(cosmic::theme::Button::MenuItem)
@@ -2295,8 +2330,9 @@ fn provider_menu<'a>(
         // Cursor tells the truth about the press (owner call): the install row IS a link
         // (its press opens a browser), so it keeps the pointer every link gets; the other
         // rows are in-app selections and wear the desktop arrow like the rest of the page.
+        // An install row with no press (the bundled case) is not a link and wears the arrow.
         list = list.push(match face {
-            ToolEntry::Install => Element::from(entry),
+            ToolEntry::Install if install_downloads => Element::from(entry),
             _ => crate::widgets::arrow_cursor::arrow_cursor(entry),
         });
     }
@@ -2313,11 +2349,11 @@ fn menu_surface<'a>(content: impl Into<Element<'a, Msg>>, width: f32) -> Element
         .class(cosmic::theme::Container::custom(move |t| {
             let c = t.cosmic();
             cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background.component.base.into())),
+                background: Some(Background::Color(c.background(false).component.base.into())),
                 border: Border {
                     radius: theme::rounding(t).s.into(),
                     width: 1.0,
-                    color: c.background.divider.into(),
+                    color: c.background(false).divider.into(),
                 },
                 ..Default::default()
             }
@@ -2339,11 +2375,11 @@ fn folder_list_well<'a>(content: impl Into<Element<'a, Msg>>) -> Element<'a, Msg
         .class(cosmic::theme::Container::custom(move |t| {
             let c = t.cosmic();
             cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background.component.base.into())),
+                background: Some(Background::Color(c.background(false).component.base.into())),
                 border: Border {
                     radius: theme::rounding(t).s.into(),
                     width: 1.0,
-                    color: c.background.divider.into(),
+                    color: c.background(false).divider.into(),
                 },
                 ..Default::default()
             }
@@ -4241,6 +4277,7 @@ impl crate::app::App {
             spec,
             std::env::var(client_id_env(spec)).ok().as_deref(),
             tool,
+            crate::util::package_kind(),
         ) {
             ConnectAction::Refused(message) => Some(message),
             ConnectAction::Run => None,
@@ -5010,7 +5047,7 @@ mod provider_list_tests {
             // And a row that is offered is one Connect can press: the list and the button ask
             // the same question, so they cannot drift.
             assert_eq!(
-                connect_action(spec, Some("an-app-id"), ToolEntry::Ready),
+                connect_action(spec, Some("an-app-id"), ToolEntry::Ready, crate::util::PackageKind::Binary),
                 ConnectAction::Run,
                 "{} is offered but refuses",
                 spec.id
@@ -5131,11 +5168,11 @@ mod connect_action_tests {
     /// now RUNS, because its own tool performs the sign-in.
     #[test]
     fn an_unofficial_provider_is_refused_by_name() {
-        let ConnectAction::Refused(message) = connect_action(spec("icloud"), None, ToolEntry::Ready) else {
+        let ConnectAction::Refused(message) = connect_action(spec("icloud"), None, ToolEntry::Ready, crate::util::PackageKind::Binary) else {
             panic!("icloud must be refused");
         };
         assert!(message.contains("iCloud Drive"), "{message}");
-        assert_eq!(connect_action(spec("proton"), None, ToolEntry::Ready), ConnectAction::Run);
+        assert_eq!(connect_action(spec("proton"), None, ToolEntry::Ready, crate::util::PackageKind::Binary), ConnectAction::Run);
     }
 
     /// With no client id anywhere, the message names the provider AND the variable that
@@ -5144,7 +5181,7 @@ mod connect_action_tests {
     /// so the one way here is a reconnect on an account whose variable is no longer set.
     #[test]
     fn a_missing_client_id_names_the_variable() {
-        let ConnectAction::Refused(message) = connect_action(spec("gdrive"), None, ToolEntry::Ready) else {
+        let ConnectAction::Refused(message) = connect_action(spec("gdrive"), None, ToolEntry::Ready, crate::util::PackageKind::Binary) else {
             panic!("a build with no client id must not start a flow");
         };
         assert!(message.contains("Google Drive"), "{message}");
@@ -5155,16 +5192,16 @@ mod connect_action_tests {
     /// has to reach `Run`.
     #[test]
     fn an_environment_client_id_lets_the_flow_run() {
-        assert_eq!(connect_action(spec("dropbox"), Some("an-app-id"), ToolEntry::Ready), ConnectAction::Run);
+        assert_eq!(connect_action(spec("dropbox"), Some("an-app-id"), ToolEntry::Ready, crate::util::PackageKind::Binary), ConnectAction::Run);
         // Whitespace is not an id.
-        assert!(matches!(connect_action(spec("dropbox"), Some("   "), ToolEntry::Ready), ConnectAction::Refused(_)));
+        assert!(matches!(connect_action(spec("dropbox"), Some("   "), ToolEntry::Ready, crate::util::PackageKind::Binary), ConnectAction::Refused(_)));
     }
 
     /// The refusal has to be GUIDANCE. It is the only thing a user sees when a connect cannot
     /// start, so it names the provider, names the exact variable, and says what to do with it.
     #[test]
     fn the_refusal_tells_the_user_what_to_do() {
-        let ConnectAction::Refused(message) = connect_action(spec("dropbox"), None, ToolEntry::Ready) else {
+        let ConnectAction::Refused(message) = connect_action(spec("dropbox"), None, ToolEntry::Ready, crate::util::PackageKind::Binary) else {
             panic!("a build with no client id must refuse");
         };
         assert!(message.contains("Dropbox"), "{message}");
@@ -5190,7 +5227,7 @@ mod connect_action_tests {
         // with no API never is.
         for provider in crate::cloud::registry() {
             assert_eq!(
-                connect_pressable(&connect_action(provider, Some("an-app-id"), ToolEntry::Ready)),
+                connect_pressable(&connect_action(provider, Some("an-app-id"), ToolEntry::Ready, crate::util::PackageKind::Binary)),
                 provider.auth.is_connectable(),
                 "`{}` disagrees about being pressable",
                 provider.id
@@ -5199,7 +5236,7 @@ mod connect_action_tests {
             // hides. The external-tool provider is the exception by construction: no client id
             // takes part in its connect at all (DRAGON-485).
             assert_eq!(
-                connect_pressable(&connect_action(provider, None, ToolEntry::Ready)),
+                connect_pressable(&connect_action(provider, None, ToolEntry::Ready, crate::util::PackageKind::Binary)),
                 provider.auth.is_external_tool(),
                 "`{}` offers the wrong press with no id",
                 provider.id
@@ -5214,19 +5251,19 @@ mod connect_action_tests {
     #[test]
     fn a_note_appears_only_where_a_connect_would_refuse() {
         // Dropbox with no id: one line, and it is the guidance sentence.
-        let dropbox = provider_notes(spec("dropbox"), None, ToolEntry::Ready);
+        let dropbox = provider_notes(spec("dropbox"), None, ToolEntry::Ready, crate::util::PackageKind::Binary);
         assert_eq!(dropbox.len(), 1, "{dropbox:?}");
         assert!(dropbox[0].contains("Dropbox"), "{dropbox:?}");
         assert!(dropbox[0].contains("CCK_DROPBOX_CLIENT_ID"), "{dropbox:?}");
 
         // Google, same shape.
-        let google = provider_notes(spec("gdrive"), None, ToolEntry::Ready);
+        let google = provider_notes(spec("gdrive"), None, ToolEntry::Ready, crate::util::PackageKind::Binary);
         assert_eq!(google.len(), 1, "{google:?}");
         assert!(google[0].contains("Google Drive"), "{google:?}");
 
         // With an id supplied, either provider says nothing at all.
-        assert!(provider_notes(spec("gdrive"), Some("an-app-id"), ToolEntry::Ready).is_empty());
-        assert!(provider_notes(spec("dropbox"), Some("an-app-id"), ToolEntry::Ready).is_empty());
+        assert!(provider_notes(spec("gdrive"), Some("an-app-id"), ToolEntry::Ready, crate::util::PackageKind::Binary).is_empty());
+        assert!(provider_notes(spec("dropbox"), Some("an-app-id"), ToolEntry::Ready, crate::util::PackageKind::Binary).is_empty());
     }
 
     /// An unconnectable provider says ONE thing, and it is that it cannot be connected. The
@@ -5238,13 +5275,13 @@ mod connect_action_tests {
     #[test]
     fn an_unofficial_provider_says_only_that_it_cannot_be_connected() {
         let icloud = spec("icloud");
-        let notes = provider_notes(icloud, None, ToolEntry::Ready);
+        let notes = provider_notes(icloud, None, ToolEntry::Ready, crate::util::PackageKind::Binary);
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("no public API"), "{notes:?}");
         assert!(notes[0].contains(icloud.display_name), "{notes:?}");
         assert!(!notes[0].contains("app registration"), "{notes:?}");
         // An id in the environment changes nothing: there is nothing to connect to.
-        assert_eq!(provider_notes(icloud, Some("an-app-id"), ToolEntry::Ready), notes);
+        assert_eq!(provider_notes(icloud, Some("an-app-id"), ToolEntry::Ready, crate::util::PackageKind::Binary), notes);
     }
 
     /// The caption and the button cannot drift apart: a note under the control means the
@@ -5255,8 +5292,8 @@ mod connect_action_tests {
     fn a_note_and_an_inert_connect_always_travel_together() {
         for provider in crate::cloud::registry() {
             for env_value in [None, Some("an-app-id")] {
-                let notes = provider_notes(provider, env_value, ToolEntry::Ready);
-                let pressable = connect_pressable(&connect_action(provider, env_value, ToolEntry::Ready));
+                let notes = provider_notes(provider, env_value, ToolEntry::Ready, crate::util::PackageKind::Binary);
+                let pressable = connect_pressable(&connect_action(provider, env_value, ToolEntry::Ready, crate::util::PackageKind::Binary));
                 assert_eq!(
                     notes.is_empty(),
                     pressable,
@@ -6735,7 +6772,7 @@ mod external_tool_tests {
         let AuthKind::ExternalTool { tool_name, .. } = spec("proton").auth else {
             panic!("proton must be an external-tool provider");
         };
-        let note = ToolEntry::Install.note(tool_name).expect("the install row explains itself");
+        let note = ToolEntry::Install.note(tool_name, crate::util::PackageKind::Binary).expect("the install row explains itself");
         assert!(note.contains(tool_name), "{note}");
         // "Requires", not "Install" (owner wording): the caption states the dependency, and
         // its accent styling plus the press are what say it is the link to go get it.
@@ -6743,8 +6780,8 @@ mod external_tool_tests {
         // "in PATH" (owner wording, DRAGON-526): WHERE the tool must be is the half a user
         // who installed the wrong artifact was missing.
         assert!(note.ends_with("in PATH"), "the caption says where the tool must be: {note}");
-        assert_eq!(ToolEntry::Connected.note(tool_name).as_deref(), Some("Already connected"));
-        assert_eq!(ToolEntry::Ready.note(tool_name), None, "a working row needs no explanation");
+        assert_eq!(ToolEntry::Connected.note(tool_name, crate::util::PackageKind::Binary).as_deref(), Some("Already connected"));
+        assert_eq!(ToolEntry::Ready.note(tool_name, crate::util::PackageKind::Binary), None, "a working row needs no explanation");
     }
 
     /// The button and the row cannot drift: the face the picker drew is the face the connect
@@ -6752,13 +6789,13 @@ mod external_tool_tests {
     #[test]
     fn the_connect_button_agrees_with_the_row_it_was_pressed_from() {
         let proton = spec("proton");
-        assert_eq!(connect_action(proton, None, ToolEntry::Ready), ConnectAction::Run);
+        assert_eq!(connect_action(proton, None, ToolEntry::Ready, crate::util::PackageKind::Binary), ConnectAction::Run);
         for refused in [ToolEntry::Install, ToolEntry::Connected] {
-            let action = connect_action(proton, None, refused);
+            let action = connect_action(proton, None, refused, crate::util::PackageKind::Binary);
             assert!(matches!(action, ConnectAction::Refused(_)), "{refused:?}");
             assert!(!connect_pressable(&action), "{refused:?}");
             // And the caption under the control says the same thing the button will not do.
-            assert_eq!(provider_notes(proton, None, refused).len(), 1, "{refused:?}");
+            assert_eq!(provider_notes(proton, None, refused, crate::util::PackageKind::Binary).len(), 1, "{refused:?}");
         }
     }
 
@@ -6767,13 +6804,13 @@ mod external_tool_tests {
     #[test]
     fn the_two_refusals_name_their_own_fix() {
         let proton = spec("proton");
-        let ConnectAction::Refused(missing) = connect_action(proton, None, ToolEntry::Install)
+        let ConnectAction::Refused(missing) = connect_action(proton, None, ToolEntry::Install, crate::util::PackageKind::Binary)
         else {
             panic!("a missing tool must refuse");
         };
         assert!(missing.contains("proton-drive"), "{missing}");
         assert!(missing.contains("Install"), "{missing}");
-        let ConnectAction::Refused(taken) = connect_action(proton, None, ToolEntry::Connected)
+        let ConnectAction::Refused(taken) = connect_action(proton, None, ToolEntry::Connected, crate::util::PackageKind::Binary)
         else {
             panic!("a taken seat must refuse");
         };
@@ -6791,7 +6828,7 @@ mod external_tool_tests {
     fn no_client_id_takes_part_in_an_external_tool_connect() {
         let proton = spec("proton");
         for env_value in [None, Some("an-app-id"), Some("   ")] {
-            assert_eq!(connect_action(proton, env_value, ToolEntry::Ready), ConnectAction::Run);
+            assert_eq!(connect_action(proton, env_value, ToolEntry::Ready, crate::util::PackageKind::Binary), ConnectAction::Run);
         }
     }
 }

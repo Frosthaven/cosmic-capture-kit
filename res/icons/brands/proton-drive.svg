@@ -1,6 +1,12 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
   <!-- Proton Drive. The official mark lifted whole out of the Proton Drive lockup. -->
   <!-- Source: https://upload.wikimedia.org/wikipedia/commons/3/3a/Proton_Drive_Logo.svg -->
+  <!-- DRAGON-566 replaced this mark with a neutral locked-cloud glyph because Proton does -->
+  <!-- not sanction this integration (no third-party API; it runs through Proton's        -->
+  <!-- MIT-licensed CLI). RESTORED at owner direction: the owner reviewed Proton's         -->
+  <!-- third-party branding terms (quoted in DRAGON-566) and accepted the risk on          -->
+  <!-- 2026-08-07. The neutral glyph and the row's disclosure line were removed on that    -->
+  <!-- decision, not by oversight. Proton's stance itself is unchanged.                    -->
   <defs>
     <radialGradient id="pd-a" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="matrix(197.794,0,0,180.137,114.878,-34.7674)">
       <stop offset=".5561" stop-color="#6d4aff"/>

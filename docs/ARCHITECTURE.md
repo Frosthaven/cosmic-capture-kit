@@ -7,12 +7,13 @@ points to.
 
 ## Module tree
 
-- `src/main.rs` — argv parsing (mode/kind/countdown/`--preview`/`--inspect`/
-  `--settings`), the settings single-instance lock (`src/instance.rs` — a
-  CAPTURE launch takes no lock at all since DRAGON-351), launches the
-  `cosmic::Application`.
-- `src/cli/` — `diagnostics.rs` (the `--test` harness) and `inspect.rs`
-  (metadata dump). See [`CLI.md`](../CLI.md) for the user-facing flag list.
+- `src/main.rs`: argv parsing (mode/kind/countdown/`--audio`/`--preview`/
+  `--inspect`/`--settings`/`--permissions`), the settings single-instance lock
+  (`src/instance.rs`; a CAPTURE launch takes no lock at all since DRAGON-351),
+  launches the `cosmic::Application`.
+- `src/cli/`: `diagnostics.rs` (the `--test` harness), `inspect.rs`
+  (metadata dump) and `sync.rs` (the A/V-sync reference clip + calibration).
+  See [`CLI.md`](../CLI.md) for the user-facing flag list.
 - `src/app/` — the application; see below.
 - `src/record/`, `src/encode/` — recording + encoding; see "Pipeline" below.
 - `src/audio/` — mic capture/cleanup chain (`input.rs` composes the stages,
@@ -31,8 +32,9 @@ points to.
 - `src/platform/` — the per-platform PLUGIN layer (DRAGON-220). The seam map,
   the `#[path]` mount registry, and the add-a-plugin recipes live in
   `platform/mod.rs`'s module doc; start there. Portable spine: `backend.rs`
-  (the `CaptureBackend` capability trait + `Caps` + the Wayland protocol
-  probe), `compositor.rs` (facade: portable `Toplevel`/`WinRect` plus the
+  (the `CaptureBackend` capability trait + `Caps` + `CursorDelivery` +
+  `Acquisition` + the Wayland protocol probe; see "How the capture backend is
+  chosen" below), `compositor.rs` (facade: portable `Toplevel`/`WinRect` plus the
   mac/fallback arms; Linux re-exports the cosmic plugin's enumeration),
   `services.rs`, `tray_stub.rs`, `daemon_ipc.rs`, `screencast_stub.rs`.
   Physical files sort into plugin folders while every module path stays
@@ -101,6 +103,11 @@ points to.
   Linux desktop profiles in fixed ladder order).
 - `src/share/` — post-capture actions, run via a re-exec of this binary
   (`reexec.rs`): `clipboard.rs`, `notify.rs`, `open.rs`, `wifi.rs`.
+  - `clipboard.rs` also holds **`CopyRoute`** (`copy_route`, DRAGON-553): the
+    ONE copy decision every copy site consults. The detached worker where the
+    compositor offers data-control (that write outlives the process); the
+    focused-window `iced` clipboard write everywhere else (GNOME, sandboxes),
+    deferred to the window's focus event, whose serial the selection needs.
   - **Every re-exec goes through `util::self_exe`, never `current_exe`**
     (DRAGON-510). It answers `$APPIMAGE` when the app is running from one, and
     `current_exe()` otherwise. Inside an AppImage, `current_exe()` is a FUSE
@@ -175,6 +182,16 @@ points to.
     `platform/{linux,mac,windows}/upload_tray.rs`; a platform with no tray gets
     an honest no-op and the upload is unaffected.
 - `src/media/` — PNG `tEXt` metadata chunk read/write.
+- `src/color.rs`: the colour picker's pure colour model (DRAGON-582). `Srgb`, the
+  seven notations (`ColorFormat`: HEX / RGB / HSL / HSV / OKLCH / CMYK / LAB), their
+  formatters and their deliberately TOLERANT parsers, over ONE sRGB / linear /
+  XYZ-D65 stack so no two rows can disagree about the same colour. Three things the
+  module doc states outright and the tests pin: CMYK is the naive device-agnostic
+  separation, not an ICC one; an out-of-gamut LAB / OKLCh value clamps per channel
+  rather than wrapping; and a hue wraps because 400 degrees is unambiguously 40. What
+  the parser refuses is the wrong NUMBER of components, since guessing there is the
+  "reports the wrong colour" failure the whole tool exists to avoid. No `App`, no iced,
+  no platform, so the Linux gate proves all of it.
 - `src/geometry.rs`, `src/selection.rs`, `src/shortcuts.rs`,
   `src/platform/linux/tray.rs`, `src/platform/tray_stub.rs`, `src/util.rs` —
   pure rectangle/quad math, the resolved capture-target type, the keybinding
@@ -221,6 +238,104 @@ points to.
   Recording card carries a **Relaunch** button — macOS only applies that grant
   to a fresh launch, so the button spawns `current_exe --permissions` detached
   and exits.
+- `color_picker/` — the **colour picker tool** (DRAGON-582): a dimmed overlay with a
+  magnifier that follows the pointer, and the result window a pick opens. `mod.rs`
+  holds the state, the `PixelSource` seam and `open_color_picker_window`; `geom.rs`
+  the pure decisions (which source pixel, the magnifier raster, the label-placement
+  ladder, the window size, the recents write rule); `view.rs` both views. A
+  `--color-picker` launch mints the SAME per-output overlays a capture does, through
+  the same `shell` seam, so it inherits layer-shell / portal-fallback / PlainWindows /
+  Windows-10-software routing without a second copy of any of it.
+
+  **Read the module doc before changing where the picked pixel comes from.** It reads
+  the LAUNCH-TIME FROZEN SNAPSHOT on every platform, because the picker's own dimming
+  layer is on screen while it samples, so a live read of the composite would come back
+  dimmed. The doc records what each platform COULD do later (Windows
+  `WDA_EXCLUDEFROMCAPTURE`, an SCK content filter on macOS, nothing on Wayland) and why
+  the xdg portal's own `PickColor` is the honest Linux fallback rather than the default.
+
+  DRAGON-587 added the rest of the behaviour, and each piece has its WHY in the module
+  doc: the pick's hex copy goes through the app's one copy ladder (`share::copy_step`,
+  so it survives a session with no data-control, where it used to be dropped); the
+  pointer sprite is hidden wherever the surface can hide it
+  (`platform::overlay_hides_pointer`, keyed on the SURFACE KIND rather than the OS), which
+  since DRAGON-597 is EVERY surface: a layer surface could not, because libcosmic's Wayland
+  backend left `set_cursor_visible` unimplemented, and our iced fork fills that hole
+  (the iced `[patch]` block in `Cargo.toml`). The arrow fallback that went with it, a
+  default arrow plus a
+  one-point sample shift out from under its tip, is deleted, with tombstones in
+  `color_picker`'s module doc, `color_picker::geom` and `widgets::color_pick`; the
+  magnifier CLIPS at a screen edge instead of being clamped or
+  contain-fitted (`geom::disc_view`, which is also why the accent ring is baked into the
+  raster); it ZOOMS from the trackpad, the wheel and the numpad `+`/`-` through one
+  clamp (`geom::zoom_after_step`, the range being `MAGNIFIER_ZOOM_MIN` 3 to
+  `MAGNIFIER_ZOOM_MAX` 26, opening at `MAGNIFIER_ZOOM_DEFAULT`, which is
+  `MAGNIFIER_CELL` = 12; both ends are stated as the SOURCE PIXELS the fixed-size disc
+  holds edge to edge, `156 / zoom`, so 52 at the floor, 13 at the default and 6 at the
+  ceiling. DRAGON-598 raised the floor off 1:1 and DRAGON-601 raised the ceiling above
+  the default, which used to BE the maximum, and two compile-time asserts now pin the
+  default strictly between the two ends);
+  the result window is a fixed, non-resizable size; and a pick launched from a preview
+  editor's pipette is DELIVERED to that editor over the preview-handoff socket's second
+  verb (`preview_ipc::Request::Color`, addressed by pid from `CCK_COLOR_TO_PID`) and
+  opens no window at all.
+
+  **Four entry points, one argv.** The tray / menu-bar entry
+  (`recording_ui::CaptureAction::ColorPicker`, first in the idle menu, before
+  Scanner), the preview editor's toolbar pipette (`PreviewMsg::OpenColorPicker`,
+  which adds `CCK_COLOR_TO_PID`), the `--color-picker` flag, and the
+  `CaptureHotkeySlot::ColorPicker` global-shortcut slot (index 6, LAST so the six
+  capture slots keep their indices; ships UNBOUND like every slot, and on Linux the
+  Global tab shows the command instead of a chord). Every one of them spawns
+  `--color-picker`; the result window's own pick-again pipette
+  (`ColorPickerMsg::PickAgain`) does the same rather than re-entering the overlay in
+  this process, because a re-entry would have to re-grab the frozen scene and, on the
+  portal fallback, re-request a ScreenCast mid-session.
+
+  **One window, and any new pick updates it** (DRAGON-613). A CROSS-PROCESS rule, not
+  a state update, because every pick is its own one-shot process. A pick about to show
+  a window first looks for a live one (`instance::live_color_picker_windows`) and hands
+  its colour there (`preview_ipc::send_color_to_picker`), becoming that window's current
+  colour and the newest entry in its recents; only if nothing takes it does this process
+  open a window. The fresh LAUNCH stays: it mints overlays for every output, so the next
+  pick can come off a different monitor, and only the DELIVERY is redirected. This is the
+  same shape as the editor handoff above, one verb along, which is why both live on the
+  preview-handoff socket rather than growing a transport of their own.
+
+  **The keyboard lanes** (`app::keyboard.rs`, not this module, because both are shared
+  with the region overlay). The four arrows and the vim letters `h` `j` `k` `l` become a
+  `shortcuts::Direction` and move the SAMPLE while a pick is up, the drawn REGION
+  otherwise (DRAGON-599); `color_picking()` keeps the two exclusive by construction rather
+  than by ordering. Hold-to-move runs on OUR cadence, never the desktop's
+  (`shortcuts::nudge_step_allowed` decides, `nudge_step_due` owns the clock): a press is
+  always exactly one pixel and repeats are ignored until the key clears
+  `NUDGE_HOLD_DELAY`, because the system's repeat cadence is tuned for text entry and
+  would make one deliberate tap cost two or three pixels, differently per machine. Bare
+  Enter and bare Space then ACCEPT (DRAGON-612), routing the same `ColorPickerMsg::Pick`
+  a left click sends, with the same raw pointer point; `picker_sample_state` is the pure
+  three-way classification of whether there is a pixel to hand over yet, since the overlay
+  maps before any pointer enter and the first moments of every launch have none. Both
+  lanes sit in the FALL-THROUGH, after the keymap, so a binding the user configured always
+  wins; neither key collides with any default, which is pinned by tests. A right press on
+  a per-output overlay cancels (`update::window_chrome::right_click_cancels`), routing into
+  the Escape path.
+
+  **What it reads out of settings**, none of it its own: `color_picker_overlay_opacity`
+  (the dim, its own `Persisted` field with its own Settings row, defaulting to the same
+  33% as the active overlay; DRAGON-588 took it to zero and the owner took it back, and
+  the field's doc says why so it is not re-argued), `selection_box_thickness` (the
+  magnifier's accent ring, the same width the region box uses, which is what DRAGON-582
+  asked for), and the theme's rounding token (every swatch in the window, one lookup, so
+  they cannot drift). `recent_colors` is the one field it WRITES: `#RRGGBB` strings,
+  newest first, capped at `geom::RECENTS_CAP` (10). It is persisted because the app is
+  one-shot, so an in-memory list would be empty at every window open and the feature
+  would do nothing. It is also user CONTENT, so it goes to the config and never to the
+  debug log; nothing in the picker logs a colour value, only a `ColorFormat::id`.
+
+  **On the Linux fallback overlay the picker covers ONE output**, the granted one, for
+  the same reason a capture does: only that `OutputState` is backed by a real surface
+  (see "The Linux fallback overlay" below). Nothing in the picker knows that; it is what
+  minting the same overlays a capture mints buys.
 - `preview/` — the post-capture editor. `mod.rs` holds the shared types
   (`PreviewState`/`PreviewKind`) + the `update_preview` dispatch; around it
   (DRAGON-115 split): `surface.rs` (overlay-vs-window + all sizing math),
@@ -237,11 +352,93 @@ points to.
   folder-picker portal call, audio-settings view helpers, capture-flow and
   recording-lifecycle orchestration.
 
+### Photographing our own overlay (DRAGON-608, DRAGON-611)
+
+**A capture excludes our own overlay by TIMING, not by any filter**, and that
+one fact is why photographing the colour picker needs no feature of its own.
+
+Nothing marks our surfaces as un-capturable. What keeps them out of an ordinary
+shot is that `begin_capture` tears the overlay down and waits for the
+`sub_pixel_capture` tick, so a live grab reads a screen we have already left
+(and a frozen grab reads a snapshot taken before we painted, DRAGON-600 and
+DRAGON-606). That exclusion reaches exactly one process: **our own**.
+
+So a region capture started over a live colour picker is a live composite that
+CONTAINS the picker, because the picker is a separate process whose overlay
+nothing tore down. The ordinary keybinds already do the right thing, and no
+second entry point is needed. DRAGON-608 originally shipped one, a
+`primary+Shift+P` chord in its own `self_capture.rs`; it was removed once the
+requirement was corrected, because an undiscoverable binding for a case the
+ordinary path already covers is a maintenance cost with no user.
+
+What DID need fixing is that the teardown DISTURBS the picker underneath. The
+compositor hands the pointer to the newly topmost surface as a
+`wl_pointer.enter`, our iced fork turns that into a `CursorMoved`, and the
+picker's loupe jumps to it just in time to be photographed. The rule that
+separates a revealed pointer from a moved one is
+`widgets::color_pick::pointer_report_moves_sample`; read its doc before
+touching pointer handling in the picker. The same disturbance applies to any of
+our surfaces mapping over a live picker, not just the region path.
+
+## How the capture backend is chosen (DRAGON-595)
+
+Linux is the only platform with TWO runtime backends, native screencopy and the
+xdg-portal ScreenCast path, so it is the only place a compile-time module mount
+cannot answer "who is capturing". `App::active_screenshot_backend` and
+`active_record_backend` (`app/portal.rs`) are the ONE place that resolves it,
+returning a `Box<dyn CaptureBackend>`. Ask them, then ask the backend: that is how
+a capability, a cursor mechanism or a metadata label can never disagree with the
+plugin that implements it.
+
+`App::screenshot_uses_portal` / `recording_uses_portal` survive underneath, and
+their remaining readers are legitimate. They answer SESSION SHAPE questions, not
+capture ones: which selection surface to mint, whose picker presents the target
+choice, which chrome and settings rows render, which preview anchor survives
+teardown. Those really are about the choice rather than about pixels.
+
+**What deliberately did NOT move behind the trait**, so it is not attempted a
+third time (DRAGON-93 promised it; DRAGON-595 measured it and stopped):
+
+- **The pixel branches key on the HELD STREAM, not on identity, and must.**
+  `capture_flow::do_pixel_capture` and `app::recording::start_recording` both fork
+  on `App::pw_held`. A portal grant that fails with `CastError::Unavailable`
+  proceeds with no held stream so the native path serves the capture. Re-keying
+  either fork on "is the portal selected" deletes that fallback.
+- **The portal plugin cannot serve stateless pixel calls.** Its pixels live in a
+  session (an `OwnedFd` plus a node id) negotiated across several iced messages
+  through a permission dialog and owned by `App`; and every native read funnels
+  through `screencopy::connect_raw`, which returns `None` unless the compositor
+  advertises protocols a sandboxed session does not get. Both reasons are
+  independent and either alone is sufficient. It declares this as
+  `Acquisition::Session` rather than leaving callers to infer it from `None`.
+- **The frozen-reconstruction paths are not captures.** `region_windows_frozen`,
+  `crop_frozen` and `stitch_region` are pure `RgbaImage` math over a scene
+  captured at launch and held by `App`.
+
+What DID move is the cursor contract, `CaptureBackend::cursor_delivery`. It is an
+enum (`Sprite` vs `InStream`) because the two mechanisms differ in when the
+pointer is decided and where it comes from: a native backend stamps a sprite it
+locked at launch (DRAGON-214, so the pointer is where it was when the tool opened
+rather than over our own toolbar after teardown), while the portal picks a stream
+cursor mode before any frame exists. No boolean carries both without one backend
+lying. Naming the mechanism separately is what let the "does this capture take the
+pointer at all" rule collapse into one predicate, `app::cursor_wanted`; it used to
+exist twice, once per mechanism, kept in step only by a test.
+
+**One trap worth knowing before you use `cursor_delivery` for anything: the backend
+SELECTED is not always the backend SERVING.** With layer shell present, the portal
+chosen, and the grant failing `CastError::Unavailable`, the capture degrades to
+native screencopy while `active_screenshot_backend` still answers Portal. So it must
+not gate the cursor stamp, and DRAGON-595 backed that change out after finding it
+dropped the pointer from exactly that capture. The question "did the frozen scene
+come from the portal" is `overlay_fallback_active`, not a backend identity.
+
 ## `Msg` dispatch
 
 `Msg` (`app/mod.rs`) is a thin wrapper over per-domain sub-enums —
 `CaptureMsg`, `RecordingMsg`, `DetectMsg`, `SettingsMsg`, `WindowChromeMsg`,
-`PreviewMsg` (all defined under `app/message/`, re-exported from there). Each
+`ColorPickerMsg`, `PreviewMsg` (all defined under `app/message/`, re-exported from
+there). Each
 variant is unwrapped once, in `application.rs`, into a matching `update_*`
 method (bodies under `app/update/`, one file per domain). Keep new messages in
 their domain's sub-enum; view code should not hand-handle another domain's
@@ -288,6 +485,117 @@ mint for the NEXT preview; `PreviewState.surface` records what is actually
 open and drives behavior/chrome/close paths — never resurrect a close path
 that consults the setting instead of the open surface's real kind.
 
+### The Linux fallback overlay: no layer shell, one frozen toplevel (`lab/flatpak`)
+
+cosmic-comp hides `zwlr_layer_shell_v1` from any client carrying a
+`wp_security_context_v1` (every Flatpak), and mutter never implemented it at all,
+so on those sessions the per-output capture overlay cannot exist. There the app
+takes a FALLBACK path: grab a full-monitor frame through the ScreenCast portal
+FIRST, then run region selection over that frozen frame in ONE ordinary
+fullscreen xdg toplevel. Freeze stops being an extra and becomes the only mode.
+
+The gate is `platform::overlay_fallback_seeding(layer_overlay, uses_portal)`, pure
+and unit-tested, wrapped by `App::overlay_fallback_active()`. It is
+PROTOCOL-keyed, never sandbox-keyed: a global can be missing because we are
+refused it or because the compositor never shipped it, and the overlay wants the
+same answer either way. A layer-shell session answers `false` and is
+byte-identical to before the path existed.
+
+The flow, all in `app/portal.rs` unless noted:
+
+1. `on_output` (`app/surfaces.rs`) registers each output's GEOMETRY but mints no
+   layer surface and notes no failure, then kicks ONE seed request
+   (`fallback_seed_kicked`, the `immediate_kicked` shape). The kick honors the
+   LAUNCH MODE: a Window or Monitor launch (the daemon's `--window` /
+   `--monitor`) goes straight to the portal picker of the matching source and
+   delivers through the normal held-stream path, no region overlay at all; only
+   a Region launch takes the frozen-overlay seed below. A dismissed launch
+   dialog ends the session as Cancelled (there is no selector to return to).
+2. `request_fallback_cast` asks the portal for a monitor with the persisted
+   restore token. The portal's own picker IS the monitor selection. Tokens live
+   in one persisted SLOT per source type (`pw_restore_token_monitor` /
+   `pw_restore_token_window`, the `RestoreTokens` pair, DRAGON-570; the legacy
+   `pw_restore_token` + `pw_restore_source` pair migrates once, config v11),
+   and the pure `replayable_restore_token` reads only the requested source's
+   own slot: cosmic's portal restores the stored source ACROSS types, so a
+   window request replaying a monitor token silently re-granted the monitor.
+   Grants PERSIST across one-shot capture children because
+   `platform::screencast` requests `PersistMode::ExplicitlyRevoked` (mode 2),
+   which writes the portal's on-disk permission store; mode-1 grants live in a
+   per-connection table and die with the requesting process, which re-prompted
+   every capture (the DRAGON-552 finding, recorded in `screencast.rs`'s module
+   doc).
+3. `on_fallback_cast_ready` resolves the grant against the registered outputs,
+   keeps it in `fallback_grant`, and pulls ONE frame off-thread
+   (`pipewire::grab_frame`, its own 5s watchdog) into `fallback_frame_slot`.
+4. `on_fallback_frozen_ready` builds the `FrozenOutput` for that monitor and
+   `mint_fallback_window` opens the toplevel (`shell::overlay_fallback_window`),
+   writing the winit id into that output's `OutputState`. The view chain
+   (`view_window` → `overlay_view` → `with_frozen_bg`) is UNCHANGED: it already
+   renders selection over a frozen backdrop.
+
+Three things this path has to get right, and where they live:
+
+* **Failing out loud.** A dismissed portal dialog is the ordinary `Cancelled`
+  ending (the dialog stands in for the overlay). An unreachable portal or an
+  empty grant is `OverlayNeverShown`, a frameless grab `SceneGrabTimeout`, and
+  both go through `fail_session`. No new `diag::Failure` variant.
+* **The monitor mismatch.** Wayland gives a client no say in which monitor a
+  fullscreen toplevel maps on, so the window can land on a different one than the
+  portal granted. The frozen frame keeps its ASPECT there:
+  `geometry::OverlayUnits::letterbox` (pure, unit-tested) computes the one uniform
+  scale that fits the whole frame, capped at 1 so a smaller monitor's capture is
+  never blown up (it renders at native size, bars on all four sides, the owner's
+  call from the third live test), centres it over opaque black bars, and maps
+  window points back onto the frame by subtracting the offsets and dividing by the
+  scale. Bar points clamp to the frame's edge and the selection walls confine to
+  the visible image (`visible_capture_size`), so selection can only ever cover
+  pixels the frame actually has. The backdrop draws the still at the SAME bridge's
+  `letterbox_dest`, one math source for pixels and mapping. Round 1 stretched the
+  still per axis (`ContentFit::Fill` plus a `stretched()` bridge) instead; it
+  mapped correctly but distorted the image, and the owner requires the aspect
+  kept, so the per-axis form is gone. Every uniform bridge is bit-identical to
+  before the fallback existed.
+* **Closing.** `App::close_overlay_surface` routes by id: `window::close` for the
+  fallback toplevel, nothing for the placeholder ids of the other outputs (they
+  never got a surface), the layer destroy otherwise. A WM close or an out-of-band
+  destroy of that window ends the session as a cancel.
+
+Delivery is WYSIWYG: a non-delayed region STILL crops the seed-frozen frame
+(`capture_flow::fallback_still_from_frozen`, pure), and so does the in-overlay
+scanner. A DELAYED still and region VIDEO keep the per-capture portal request,
+because the delay exists to change the screen; the restore token means no second
+prompt. The backdrop itself serves region selection of EVERY kind, video
+included (`capture_flow::fallback_backdrop`, pure, deliberately without a kind
+input): a fullscreen toplevel has no live desktop composited behind it, so the
+seed still is the only honest backdrop there is. Known costs, all consequences
+of a plain toplevel having no input zones: recording tears the window down and
+the tray becomes the control, and a COUNTDOWN does the same (DRAGON-563): the
+fallback window closes at countdown start and the remaining seconds render in
+the tray icon (the upload counter's pixel digits, tinted the recording glyph's
+red, with one "Cancel countdown" menu entry routing to the ordinary Cancelled
+ending). The tray digits themselves are UNGATED, owner's call: every session on
+every platform with a tray/menu-bar presence shows them during a countdown
+(`tray::CountdownTraySession` per platform, decisions in `recording_ui`);
+normal sessions keep their on-screen countdown and get the digits in addition,
+and only the fallback path loses the window. The fallback path never mints the
+window countdown at all, tray or NO tray (DRAGON-563 reopened): the historical
+gray-but-visible failure-safe was removed after the fourth sandbox test, where
+child tray items failed to register while the resident's succeeded, so the
+owner hit the gray sheet on every delayed capture. With no tray host the
+fallback countdown is invisible (a warn names it) and still fires and cancels
+on schedule.
+
+One recording gotcha this path surfaced lives OUTSIDE the overlay: ffmpeg 7.x
+blocks a raw-PCM FIFO input's stream analysis on real audio data before it will
+open the NEXT input, which deadlocked against the pump's own FIFO rendezvous
+order and killed every sandbox recording at the muxer watchdog. The fix is
+two-sided and platform-wide: `-probesize 32 -analyzeduration 0` on the FIFO
+inputs (`encode::command::fifo_input_args`) and the POSIX sys-FIFO rendezvous
+riding the pump's WRITER thread as a pending sink (`record::pump::SysSink`), so
+mic audio flows while ffmpeg is still probing. ffmpeg 8 never needed either,
+and the media-clock E2E content tests pin that its behavior is unchanged.
+
 ## Resident mode (macOS) — the daemon
 
 The app is ALWAYS one-shot: `finish_session` (`app/surfaces.rs`) always calls
@@ -301,9 +609,22 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
   `cfg(macos)`) — a tiny AppKit-only process: an
   `NSApplication` with the Accessory activation policy (LSUIElement in the bundle
   plist; set programmatically so the dev binary also stays out of the Dock), an
-  `NSStatusItem` with the six-item menu (Scanner / Capture Region / Window /
-  Monitor / — / Settings… / Quit), and the process-wide PrintScreen (+ F13)
-  `global-hotkey`. It NEVER touches `app::run`, so the iced/cosmic/wgpu graph is
+  `NSStatusItem` with the capture menu (Scanner / Capture Region / Window /
+  Monitor / — / Record Region / Record Window / Record Monitor / the "Audio
+  Recording: <state>" radio submenu, DRAGON-558, closing the record block since
+  DRAGON-559 / — / Settings… / Manage Permissions / — / Quit), and the
+  process-wide PrintScreen
+  (+ F13) `global-hotkey`. The record entries (DRAGON-559) spawn the capture
+  twins' children plus `--video` (`CaptureAction::spawn_args`), show wherever
+  the capture trio shows, and are idle-only (the recording-time Capture Menu
+  submenu drops them: one recording at a time). The audio submenu is on EVERY
+  tray/menu-bar surface: its title carries the current arm state, one radio pick
+  (Both / Microphone only / System only / None) sets the complete pair, and the
+  pick routes by ONE portable decision (`recording_ui::audio_toggles_are_live`):
+  the live toggle diff to a recording child, the persisted
+  `record_mic`/`record_system_audio` while idle. The in-recording menus are the
+  three-entry group (Pause/Resume, Finish & Save, Cancel & Delete) since the
+  audio toggles moved here. It NEVER touches `app::run`, so the iced/cosmic/wgpu graph is
   never initialized — that is what buys the memory number. `NSApp.run()` blocks
   the main thread for the daemon's life; menu callbacks act DIRECTLY (spawn a
   child / terminate) — no drain queue. A background thread drains the hotkey
@@ -354,6 +675,41 @@ idling just to listen for a hotkey); the daemon idles at ~14MB phys_footprint.
   even across a crash (see `platform::mac::window`). Only engaged when the
   `CCK_AEROSPACE_PAUSE=1` escape hatch actually paused the WM — the DRAGON-154
   default never disables AeroSpace at all.
+
+## Controlling a live recording from another process (DRAGON-583)
+
+Five verbs act on a recording that is already running: pause, finish, cancel,
+toggle mic, toggle system audio. They arrive from three places and converge
+immediately: a resident menu click, a recording-tray click, and the CLI flags
+(`--pause-recording`, `--finish-recording`, `--cancel-recording`,
+`--toggle-mic`, `--toggle-system-audio`). All three become the SAME `TrayEvent`,
+drained by the same `RecordingMsg::TrayPoll`, so there is one code path to
+reason about and no verb can work on one surface but not another.
+
+The transport is `platform/daemon_ipc.rs`'s existing `Command` vocabulary,
+unchanged. What DRAGON-583 added was an ADDRESS, not a protocol: normally the
+resident listens on the one well-known socket and the recording child connects
+to it, so with no resident there is no socket at all. The recording child now
+also listens on its own per-pid socket beside the recording marker
+`instance.rs` already writes, the shape `platform/preview_ipc.rs` established
+for reaching a live preview host. Fire-and-forget, bounded, no reply word, no
+new tokens. The resident's own socket, connection and menu are untouched, which
+is why macOS and Windows saw no behavior change.
+
+The inlet is deliberately INDEPENDENT of the tray. A sandboxed capture child
+often fails to register a ksni item at all (the DRAGON-563 finding), and that is
+precisely the session where these commands are the only control the user has
+left, so `sub_tray_poll` gates on either being alive.
+
+**Why the CLI exists at all on Linux**: `in_app_recording_shortcut_reachable`
+(`platform/mod.rs`, pure, unit-tested) says an in-app recording chord can only
+fire if the session has focus-free hotkeys OR our surface keeps the keyboard.
+Linux has neither: COSMIC ships no `GlobalShortcuts` portal interface (a real
+bounded, memoized probe reads its `version`, so a desktop that DOES ship it
+keeps the ordinary key bindings), and record start hands focus back to the
+recorded window while the fallback path destroys its toplevel outright. macOS
+and Windows pass the second term today, though only incidentally: see
+DRAGON-585 for making that deliberate.
 
 ## Where a capture lives, and what the editor's actions do (DRAGON-467)
 
@@ -513,7 +869,12 @@ default on) is a GPU alternative for both sources: DMA-BUF frames go straight
 into an in-process hardware encoder (`src/encode/gpu.rs`), no CPU readback.
 `src/encode/device.rs` + `plan.rs` + `preset.rs` pick and configure the
 encoder (NVENC/VAAPI/software, and — on macOS — VideoToolbox, tried ahead of
-the software fallback via `videotoolbox_plan`); `src/encode/resolution.rs` and
+the software fallback via `videotoolbox_plan`). An AUTO encoder preference
+stays "auto" (DRAGON-571): the persisted `encoder_auto_hint` caches the
+last-known-good winner, `EncodePlan::resolve_hinted` hoists it to the front of
+the auto ladder (so the happy path pays one probe), and the winner updates only
+the HINT (`state::note_encoder_auto_hint`), never the preference itself.
+`src/encode/resolution.rs` and
 `pixfmt.rs` handle size-fitting and RGBA→NV12 conversion. `src/record/finalize.rs`
 bakes the live mic/system-audio mute timeline into the recorded file at the end.
 
@@ -543,10 +904,20 @@ Unit tests live at the bottom of the file they test (`#[cfg(test)] mod
 tests`), close to pure-logic islands: geometry, parsing, validators, state
 machines, encoder preset/resolution policy, shortcut matching, zoom/pan
 clamping, and so on — anything exercisable without a compositor, D-Bus, or
-`ffmpeg`. `rstest` is available for table-driven cases. The 4 CLI-level tests
+`ffmpeg`. `rstest` is available for table-driven cases. The 5 CLI-level tests
 in `tests/cli.rs` drive the compiled binary (via `assert_cmd`) for
-`--help`/unknown-flag/`--inspect` behavior; `tests/ocr/` holds a small labeled
-image corpus used by the `--ocr-bench` harness, not `cargo test`.
+`--help`/unknown-flag/`--inspect` behavior and for a recording-control flag
+with no recording running; `tests/ocr/` holds a small labeled image corpus used
+by the `--ocr-bench` harness, not `cargo test`.
+
+**Never run the two feature configs at once.** `cargo test` and `cargo test
+--no-default-features` must go SEQUENTIALLY even in separate
+`CARGO_TARGET_DIR`s: separate dirs stop the builds colliding but not the runs,
+and `record::media_clock_e2e_tests` plus `record::wedge_live_tests` drive real
+`ffmpeg` against the live pulse server, so two suites contend for the audio
+server and manufacture failures. A parallel run invented a "2 failed" on
+2026-08-08 that passed clean re-run alone. Clippy legs and the Windows
+cross-check are pure compilation and may run alongside anything.
 
 ## Historical record
 

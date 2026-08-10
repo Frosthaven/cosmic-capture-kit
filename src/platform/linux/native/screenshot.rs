@@ -903,7 +903,7 @@ pub fn bench_window_capture() {
 
 /// First per-output (or `all`) wallpaper path from the cosmic-bg config (bench only).
 fn bench_wallpaper_path() -> Option<std::path::PathBuf> {
-    let dir = dirs::config_dir()?.join("cosmic/com.system76.CosmicBackground/v1");
+    let dir = crate::util::host_config_dir()?.join("cosmic/com.system76.CosmicBackground/v1");
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -1194,7 +1194,7 @@ fn composite_over_wallpaper(
 /// all" is set, falling back to `all`. `scaling_mode: Stretch` distorts to fill; anything
 /// else (Zoom / Fit) cover-fits, which is what `wallpaper_crop` reproduces.
 fn wallpaper_for_output(name: &str) -> Option<(std::path::PathBuf, bool)> {
-    let dir = dirs::config_dir()?.join("cosmic/com.system76.CosmicBackground/v1");
+    let dir = crate::util::host_config_dir()?.join("cosmic/com.system76.CosmicBackground/v1");
     let same = std::fs::read_to_string(dir.join("same-on-all"))
         .map(|s| s.trim() == "true")
         .unwrap_or(true);

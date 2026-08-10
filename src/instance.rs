@@ -196,11 +196,8 @@ pub const RESIDENT_ARG: &str = "resident";
 /// ours is `cosmic-capture-kit`. Do not "fix" this into a skip without checking `main`.
 ///
 /// Pure + unit-tested; the callers in `main` are the only readers.
-// Compiled on Linux + Windows (the two `main` branches that ask) and under `cfg(test)`
-// everywhere so the decision is proven on any host; dead on macOS, whose `daemon::run` takes
-// no intent argument.
-#[cfg(any(target_os = "linux", windows, test))]
-#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+// Compiled everywhere and gate-free since DRAGON-473: all three `main` branches now ask, macOS
+// included, because `daemon::run` there grew the intent argument the other two always had.
 pub fn daemon_intent_from_args<S: AsRef<str>>(args: &[S]) -> bool {
     args.iter().any(|a| a.as_ref() == RESIDENT_ARG)
 }
@@ -223,20 +220,36 @@ pub fn daemon_lock_attempts(daemon_intent: bool) -> u32 {
 }
 
 /// What a launch that found the daemon lock HELD should ASK the running daemon for
-/// (DRAGON-471). This comes BEFORE [`RelaunchAction`], which judges the answer: this decides
-/// whether to put the question at all.
-#[cfg(any(windows, test))]
-#[cfg_attr(not(windows), allow(dead_code))]
+/// (DRAGON-471, third answer added by DRAGON-473). This comes BEFORE [`RelaunchAction`],
+/// which judges the answer: this decides whether to put the question at all.
+///
+/// Consulted on all three platforms since DRAGON-473, which is why it carries no `cfg` gate.
+/// Only Windows acts on all three answers differently; Linux exits on either non-capture
+/// answer (with its own log line for each) and macOS cannot reach `RestoreAbout` at all,
+/// having no post-update marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeldLockAction {
     /// Hand this launch's CAPTURE to the running daemon and judge the two-stage answer.
-    /// Every ordinary launch: the tray menu, the capture hotkey, a plain double-click, and
-    /// a `resident` launch too, whose pulse doubles as the DRAGON-438 wedge probe.
+    /// A launch that wanted a capture: the tray menu, the capture hotkey, a plain
+    /// double-click. Since DRAGON-473 this is CAPTURE INTENT ONLY.
     SignalCapture,
     /// Ask for NOTHING. Deliver the post-update About window from this process and exit,
     /// leaving the running daemon completely alone.
     RestoreAbout,
+    /// Ask only "are you still pumping?" and hand over no work at all (DRAGON-473). A
+    /// `resident` launch that raced a live daemon: it wanted a TRAY, one is already up, and
+    /// the only thing left worth knowing is whether that one is healthy or wedged.
+    ///
+    /// Windows answers it with a liveness ping that spawns nothing
+    /// (`platform::windows::instance::probe_daemon_alive`), so the DRAGON-438 takeover still
+    /// runs. Linux and macOS have no wedge to detect from out here, so they simply exit.
+    ProbeOnly,
 }
+// A `hands_over_capture()` helper briefly lived here for the callers that only care about the
+// capture / no-capture split. It is gone on purpose: every caller matches exhaustively anyway,
+// so its only user would have been macOS, and a method live on ONE target is exactly the shape
+// that needs a `cfg` gate plus a dead-code allowance to stay warning-free on the other two.
+// Not creating the situation beats gating it.
 
 /// Whether a launch that found the daemon lock held should hand over a capture, or restore
 /// the post-update About window instead. Pure + unit-tested.
@@ -259,6 +272,30 @@ pub enum HeldLockAction {
 /// is fine — the marker means the release notes are owed, and a daemon-intent launch is a
 /// launch with no capture to serve, so showing them is the only useful thing it can do.
 ///
+/// ## DRAGON-473: the marker was never what made the capture wrong
+///
+/// The version above still answered `SignalCapture` for daemon intent WITHOUT a marker, and
+/// that was the same bug with the special case filed off. "A launch with no capture to
+/// serve" is true of EVERY `resident` launch, marker or not, so the autostart entry at login
+/// and the settings tray toggle both handed a capture request to a daemon that was already
+/// running and dropped a region overlay on a user who had asked for a tray icon.
+///
+/// So the rule is now stated the way it always meant to be: **capture intent is the only
+/// thing that hands over a capture.** Daemon intent asks for the release notes if they are
+/// owed, and otherwise asks only whether the holder is alive.
+///
+/// This subsumed a second copy of the same decision. `update::signal_capture_after_lost_lock`
+/// (DRAGON-532) was the Linux-only form of "a post-update relaunch must not ask for a
+/// capture", and once daemon intent stops asking in general, it had nothing left to say; it
+/// is gone, and Linux consults this function instead. Two vocabularies for one decision is
+/// exactly what this file exists to prevent.
+///
+/// What `ProbeOnly` costs, stated plainly: the pulse it declines to send was also the
+/// DRAGON-438 wedge probe. On Windows nothing is lost, because the probe is now a separate
+/// ping that spawns no child. On Linux and macOS nothing was there to lose — their
+/// `signal_existing_capture` is a `SIGUSR1` to a pid they already checked for liveness, which
+/// tells them nothing about whether the daemon's loop is running, so those two simply exit.
+///
 /// The transitional cost is narrow and named: an update installed by a pre-DRAGON-465 build
 /// relaunches BARE, which reads as capture intent, so if a daemon also survived the swap that
 /// one update still pulses a capture. The marker survives that path too (nothing on the
@@ -272,13 +309,13 @@ pub enum HeldLockAction {
 /// full DRAGON-438 protocol, so wedge recovery is deferred by one keypress rather than lost.
 /// The caller does re-probe the LOCK once after delivering About, so a holder that died in
 /// the meantime is still taken over rather than leaving the user with no tray at all.
-#[cfg(any(windows, test))]
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn held_lock_action(daemon_intent: bool, post_update: bool) -> HeldLockAction {
-    if daemon_intent && post_update {
+    if !daemon_intent {
+        HeldLockAction::SignalCapture
+    } else if post_update {
         HeldLockAction::RestoreAbout
     } else {
-        HeldLockAction::SignalCapture
+        HeldLockAction::ProbeOnly
     }
 }
 
@@ -429,7 +466,10 @@ fn acquire_daemon_lock_attempts(attempts: u32) -> bool {
                 use std::io::{Seek as _, Write as _};
                 let _ = file.set_len(0);
                 let _ = file.rewind();
-                let _ = write!(file, "{}", std::process::id());
+                // Pid AND the namespace it means something in (`lab/flatpak`). A reader in a
+                // different PID namespace would otherwise take this number literally and
+                // signal its own process of the same id; see `addressable_pid`.
+                let _ = write!(file, "{}", lock_record(std::process::id(), pid_namespace_id()));
                 let _ = file.flush();
                 if let Ok(mut g) = DAEMON_LOCK.lock() {
                     *g = Some(file);
@@ -446,12 +486,87 @@ fn acquire_daemon_lock_attempts(attempts: u32) -> bool {
     false // another daemon still holds it after the handoff window
 }
 
-/// The pid recorded by the running resident daemon (the daemon-lock holder), if any.
+/// The pid recorded by the running resident daemon (the daemon-lock holder), if any, and
+/// `None` when that pid is not addressable from THIS process (see [`addressable_pid`]).
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn daemon_lock_pid() -> Option<u32> {
-    std::fs::read_to_string(daemon_lock_path())
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
+    let raw = std::fs::read_to_string(daemon_lock_path()).ok()?;
+    let (pid, recorded_ns) = parse_lock_record(&raw)?;
+    addressable_pid(pid, recorded_ns, pid_namespace_id())
+}
+
+/// **Pure**, unit-tested: the lock-file body for `pid`, carrying its namespace when known.
+///
+/// A bare pid when the namespace is unknown, which keeps the file byte-identical to every
+/// version before this on macOS and on any Linux where the namespace cannot be read. That
+/// matters for downgrades as much as upgrades: an older build reading this file parses the
+/// first whitespace-separated token and ignores the rest either way.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub fn lock_record(pid: u32, ns: Option<u64>) -> String {
+    match ns {
+        Some(ns) => format!("{pid} {ns}"),
+        None => pid.to_string(),
+    }
+}
+
+/// This process's PID-NAMESPACE identity, as the inode of `/proc/self/ns/pid`.
+///
+/// `None` off Linux (macOS has no such file) and `None` if it cannot be read, both of which
+/// [`addressable_pid`] treats as "no information", preserving the historical behaviour exactly.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn pid_namespace_id() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata("/proc/self/ns/pid").ok().map(|m| m.ino())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// **Pure**, unit-tested: parse the daemon lock file into `(pid, namespace)`.
+///
+/// Two formats, and reading both is what makes this change safe to deploy. The historical one
+/// is a bare pid; the current one appends the writer's PID-namespace id. A file written by an
+/// older build parses as `(pid, None)`, which [`addressable_pid`] then treats exactly as this
+/// code did before the namespace existed.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub fn parse_lock_record(raw: &str) -> Option<(u32, Option<u64>)> {
+    // No `trim()`: `split_whitespace` already skips leading and trailing whitespace, so the
+    // trim would be redundant work on a string we are about to walk anyway.
+    let mut parts = raw.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    Some((pid, parts.next().and_then(|n| n.parse().ok())))
+}
+
+/// **Pure**, unit-tested: is `pid` a number THIS process can meaningfully signal?
+///
+/// **The bug this exists for is silent, which is why it needs a decision of its own**
+/// (`lab/flatpak`). Every `flatpak run` gets its own PID namespace, and inside one the app is
+/// PID 2. Two instances therefore both record "2". A second instance reading that file would
+/// `kill(2, SIGUSR1)` ITSELF and succeed, and would read `/proc/2/exe` as its own binary so the
+/// "is this really one of ours" check would PASS. Nothing fails, nothing logs, and the wrong
+/// process gets the signal. That is worse than a no-op, and it is invisible without this.
+///
+/// The rule: a recorded pid is addressable only when we KNOW it was recorded in the namespace
+/// we are asking from. Concretely, `Some(a)` and `Some(b)` that differ means not addressable;
+/// anything else (either side unknown, or the two equal) keeps the historical answer.
+///
+/// Unknowns deliberately pass rather than fail. Off Linux there is no namespace to read and
+/// there is no problem to solve, and on Linux an older lock file predates the field. Failing
+/// closed there would break the ordinary non-sandboxed second-launch UX to defend against a
+/// case that cannot occur in it.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+pub fn addressable_pid(pid: u32, recorded_ns: Option<u64>, our_ns: Option<u64>) -> Option<u32> {
+    match (recorded_ns, our_ns) {
+        (Some(a), Some(b)) if a != b => None,
+        _ => Some(pid),
+    }
 }
 
 /// Resident "capture NOW" UX (DRAGON-130/173): signal the running resident (macOS
@@ -753,11 +868,41 @@ const UPLOAD_MARKER: &str = "upload";
 /// Held by [`ShareMarker`], and swept by [`sweep_when_owner_is_dead`] when a helper is
 /// killed outright or ends through the notifier's own `process::exit` backstop.
 const SHARE_MARKER: &str = "share";
+/// Marker suffix: this pid has the COLOUR PICKER's result window open (DRAGON-582).
+///
+/// The same reason `PREVIEW_MARKER` exists, one feature later: the picker window is a
+/// workspace the user is reading values out of, and it is a detached sibling of every
+/// capture, so committing a screenshot would SIGTERM it. Picking a colour and then
+/// taking a screenshot to use it in is not an unusual sequence, it is the obvious one,
+/// so the window has to survive the sweep.
+///
+/// Held only while the window is open: set when it opens, cleared at `finish_session`
+/// (closing it ends the process). The OVERLAY phase deliberately has no marker, because
+/// a bare selector overlay is exactly what the sweep exists to collapse.
+const COLOR_PICKER_MARKER: &str = "colorpicker";
+/// Marker suffix: this pid's picker WINDOW is LISTENING for picked colours (DRAGON-613),
+/// the unix-socket sibling of its [`COLOR_PICKER_MARKER`], in exactly the shape
+/// [`PREVIEW_SOCKET_MARKER`] established and [`RECORDING_SOCKET_MARKER`] copied.
+///
+/// This is what makes "at most ONE colour picker window" possible in a one-shot app. Every
+/// pick is its own PROCESS, so a later pick cannot update an existing window by changing
+/// state: it has to find that window's owner and hand the colour over. The marker beside
+/// this socket is the discovery record and the socket is the address, so there is no second
+/// registry. The transport and the verbs are [`crate::preview_ipc`]'s.
+const COLOR_PICKER_SOCKET_MARKER: &str = "colorpicker.sock";
 /// Marker suffix: this pid is LISTENING for preview handoffs (DRAGON-336) — the
 /// unix-socket sibling of its [`PREVIEW_MARKER`]. Sits in the same per-pid namespace so
 /// the stale sweep below clears a SIGKILLed host's socket file for free; the transport
 /// itself lives in [`crate::preview_ipc`].
 const PREVIEW_SOCKET_MARKER: &str = "preview.sock";
+/// Marker suffix: this pid's live recording is LISTENING for control commands
+/// (DRAGON-583), the unix-socket sibling of its [`RECORDING_MARKER`], in exactly the
+/// shape [`PREVIEW_SOCKET_MARKER`] established. The transport and the verbs are the
+/// existing resident relay's ([`crate::daemon_ipc`]); this is the address a process that
+/// is NOT the resident uses to reach the recording, which is what the `--toggle-mic` /
+/// `--finish-recording` family of CLI commands needs on Linux, where no in-app shortcut
+/// can be delivered to a recording that owns no focused surface.
+const RECORDING_SOCKET_MARKER: &str = "recording.sock";
 /// Marker suffix: the recording-session LEDGER (DRAGON-421) — this pid's live recording
 /// names its ffmpeg muxer, its audio FIFOs and its temp file here, so a LATER session can
 /// tell that wreckage apart from a live session's working files. Written and cleared by
@@ -819,14 +964,23 @@ fn sweep_when_owner_is_dead(suffix: &str) -> bool {
     // was killed outright or ended by its own backstop's `process::exit`.
     // DRAGON-519: and the share helpers' marker, on the same terms. The notifier's 20s/5min
     // backstop ends it with `process::exit`, which runs no destructor.
+    // DRAGON-583: the recording-control SOCKET rides the same rule as the preview one, for
+    // the same reason: a recorder killed outright leaves its socket file behind, and a
+    // recycled pid must never inherit a socket nothing listens on.
+    // DRAGON-613: and the colour picker window's SOCKET, on identical terms. A recycled pid
+    // inheriting one would make a later pick address a corpse instead of opening its own
+    // window, which is the one outcome that would lose the colour.
     matches!(
         suffix,
         RECORDING_MARKER
+            | RECORDING_SOCKET_MARKER
             | PREVIEW_MARKER
             | PREVIEW_SOCKET_MARKER
             | ALERT_MARKER
             | UPLOAD_MARKER
             | SHARE_MARKER
+            | COLOR_PICKER_MARKER
+            | COLOR_PICKER_SOCKET_MARKER
     ) || is_audio_fifo_suffix(suffix)
 }
 
@@ -894,6 +1048,12 @@ pub(crate) fn set_recording_marker(active: bool) {
 /// editor opens, cleared at `finish_session` (a preview close ends the process).
 pub(crate) fn set_preview_marker(active: bool) {
     set_self_marker(PREVIEW_MARKER, active);
+}
+
+/// Create (`active`) or remove this instance's COLOUR-PICKER-window marker
+/// (DRAGON-582). Set when the result window opens, cleared at `finish_session`.
+pub(crate) fn set_color_picker_marker(active: bool) {
+    set_self_marker(COLOR_PICKER_MARKER, active);
 }
 
 /// Create (`active`) or remove this instance's failure-ALERT marker (DRAGON-415). Held
@@ -1033,6 +1193,11 @@ fn set_self_marker(suffix: &str, active: bool) {
 /// daemon-lock pid and to nothing else, and an upload child never holds that lock. The sweep
 /// below is the only thing that was ever signalling these processes.
 ///
+/// DRAGON-582 added `color_picker`, the colour picker's RESULT WINDOW, on the same
+/// reasoning as `preview` above: it is a window the user is reading values out of, and the
+/// very next thing they are likely to do is take a screenshot. Its OVERLAY phase is
+/// deliberately NOT spared, because a bare selector overlay is what this sweep is for.
+///
 /// DRAGON-519 added `share`, the detached `share::` clipboard and notification helpers, on
 /// the same reasoning as `upload` beside it and found while fixing that one. See
 /// [`SHARE_MARKER`] for what each was losing. The clipboard helper is what makes this
@@ -1045,8 +1210,9 @@ pub fn should_spare_sibling(
     alert: bool,
     upload: bool,
     share: bool,
+    color_picker: bool,
 ) -> bool {
-    recording || preview || alert || upload || share
+    recording || preview || alert || upload || share || color_picker
 }
 
 /// Whether the VIDEO capture kind should be offered. Disabled while another instance is
@@ -1144,6 +1310,23 @@ pub(crate) fn live_preview_host() -> Option<u32> {
 /// its stale sweep) is testable without touching the live runtime dir.
 #[cfg(unix)]
 fn live_preview_hosts_in(dir: &str, self_pid: u32) -> Vec<u32> {
+    live_marker_hosts_in(dir, self_pid, PREVIEW_MARKER, PREVIEW_SOCKET_MARKER)
+}
+
+/// The body [`live_preview_hosts_in`] has always had, generalised over WHICH marker names
+/// the host and which sidecar is its socket (DRAGON-583 needs the identical question for
+/// the RECORDING marker). The same shape as [`any_other_marker_in`], which was generalised
+/// out of `any_other_recording` for the same reason.
+///
+/// Dead pids are swept as we scan: BOTH the marker and its socket sidecar, so a recycled
+/// pid can never inherit a socket nothing listens on.
+#[cfg(unix)]
+fn live_marker_hosts_in(
+    dir: &str,
+    self_pid: u32,
+    marker: &str,
+    socket_marker: &str,
+) -> Vec<u32> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -1154,19 +1337,93 @@ fn live_preview_hosts_in(dir: &str, self_pid: u32) -> Vec<u32> {
         let Some((pid, suffix)) = parse_marker_name(name) else {
             continue;
         };
-        if suffix != PREVIEW_MARKER || pid == self_pid {
+        if suffix != marker || pid == self_pid {
             continue;
         }
         if !pid_is_live(pid) {
-            // A preview that died without reaching `finish_session`: drop its marker AND
-            // its handoff socket so no child ever tries to hand a capture to a corpse.
+            // A host that died without reaching `finish_session`: drop its marker AND its
+            // socket so no caller ever tries to talk to a corpse.
             let _ = std::fs::remove_file(entry.path());
-            let _ = std::fs::remove_file(state_marker_path_in(dir, pid, PREVIEW_SOCKET_MARKER));
+            let _ = std::fs::remove_file(state_marker_path_in(dir, pid, socket_marker));
             continue;
         }
         found.push((pid, entry.metadata().ok().and_then(|m| m.modified().ok())));
     }
     order_preview_hosts(found)
+}
+
+// ── Live RECORDING discovery (DRAGON-583) ────────────────────────────────────
+//
+// A recording is owned by ONE live process, and something that is not that process (the
+// `--toggle-mic` / `--finish-recording` CLI commands a Linux global hotkey runs) has to
+// find it. There is deliberately no second registry, exactly as with the preview hosts
+// above: a live recording is exactly a pid whose [`RECORDING_MARKER`] exists and is LIVE,
+// the marker `close_other_instances` already spares and `any_other_recording` already
+// reads. Its control socket is that pid's [`RECORDING_SOCKET_MARKER`] sibling, speaking
+// the resident relay's own [`crate::daemon_ipc::Command`] words.
+//
+// LINUX-only, and deliberately narrower than the preview transport's `cfg(unix)`. Linux is
+// the platform where an in-app recording shortcut cannot be delivered at all, so it is the
+// platform that needs a CLI route to the recording. macOS and Windows keep their overlay
+// windows (and their menu-bar / tray controls) through a recording and are left
+// byte-identical by DRAGON-583; widening this to `cfg(unix)` is the whole of what it would
+// take to give macOS the same commands, once someone can test them there.
+
+/// The recording-control socket path for `pid`, the sibling of that pid's recording
+/// marker.
+#[cfg(target_os = "linux")]
+pub(crate) fn recording_socket_path(pid: u32) -> String {
+    state_marker_path(pid, RECORDING_SOCKET_MARKER)
+}
+
+/// Every live recording OTHER than ours, newest first (same ordering rule as the preview
+/// hosts). In practice there is at most one, since a capture overlay disables its video
+/// kind while another instance records; the list shape is kept so a caller never has to
+/// assume that.
+#[cfg(target_os = "linux")]
+pub(crate) fn live_recording_hosts() -> Vec<u32> {
+    live_marker_hosts_in(
+        &crate::util::runtime_dir(),
+        std::process::id(),
+        RECORDING_MARKER,
+        RECORDING_SOCKET_MARKER,
+    )
+}
+
+// ── Colour picker WINDOW discovery (DRAGON-613) ──────────────────────────────
+//
+// "At most one colour picker window at a time" is a CROSS-PROCESS rule, because every pick
+// is its own one-shot process. So a pick that is about to show a window first asks whether
+// some other process already has one, and hands its colour there instead.
+//
+// There is deliberately no second registry, exactly as with the preview hosts and the live
+// recording above: a picker window host is exactly a pid whose [`COLOR_PICKER_MARKER`]
+// exists and is LIVE, the same marker `close_other_instances` already spares so that
+// screenshotting something does not kill the window you are reading a colour out of. Its
+// address is that pid's [`COLOR_PICKER_SOCKET_MARKER`] sibling, speaking
+// [`crate::preview_ipc`]'s `color` verb.
+//
+// Unix-only, like the preview transport and for the same reason: Windows has no unix
+// sockets, so a pick there opens its own window exactly as it does today.
+
+/// The picked-colour socket path for `pid`, the sibling of that pid's picker-window marker.
+#[cfg(unix)]
+pub(crate) fn color_picker_socket_path(pid: u32) -> String {
+    state_marker_path(pid, COLOR_PICKER_SOCKET_MARKER)
+}
+
+/// Every live picker WINDOW other than ours, newest first (the same ordering rule as the
+/// preview hosts, and for the same reason: the most recently opened window is the one the
+/// user is looking at). In practice there is at most one, because this scan is what keeps
+/// it that way; the list shape is kept so no caller has to assume it.
+#[cfg(unix)]
+pub(crate) fn live_color_picker_windows() -> Vec<u32> {
+    live_marker_hosts_in(
+        &crate::util::runtime_dir(),
+        std::process::id(),
+        COLOR_PICKER_MARKER,
+        COLOR_PICKER_SOCKET_MARKER,
+    )
 }
 
 /// Order host candidates for a handoff attempt: newest marker first (the most recently
@@ -1256,10 +1513,13 @@ pub fn close_other_instances() {
         // DRAGON-519: and a detached share helper, either the one serving the Wayland
         // clipboard selection or the one holding a banner's click open.
         let share = std::path::Path::new(&state_marker_path(pid, SHARE_MARKER)).exists();
-        if should_spare_sibling(recording, preview, alert, upload, share) {
+        // DRAGON-582: and a sibling showing the colour picker's result window.
+        let picker =
+            std::path::Path::new(&state_marker_path(pid, COLOR_PICKER_MARKER)).exists();
+        if should_spare_sibling(recording, preview, alert, upload, share, picker) {
             log::info!(
                 "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview} \
-                 alert={alert} upload={upload} share={share})"
+                 alert={alert} upload={upload} share={share} color_picker={picker})"
             );
             continue;
         }
@@ -1477,10 +1737,13 @@ pub fn close_other_instances() {
         // DRAGON-519: and a detached share helper, either the one serving the Wayland
         // clipboard selection or the one holding a banner's click open.
         let share = std::path::Path::new(&state_marker_path(pid, SHARE_MARKER)).exists();
-        if should_spare_sibling(recording, preview, alert, upload, share) {
+        // DRAGON-582: and a sibling showing the colour picker's result window.
+        let picker =
+            std::path::Path::new(&state_marker_path(pid, COLOR_PICKER_MARKER)).exists();
+        if should_spare_sibling(recording, preview, alert, upload, share, picker) {
             log::info!(
                 "DRAGON-322: sparing sibling pid {pid} (recording={recording} preview={preview} \
-                 alert={alert} upload={upload} share={share})"
+                 alert={alert} upload={upload} share={share} color_picker={picker})"
             );
             continue;
         }
@@ -1526,13 +1789,14 @@ pub fn close_other_instances() {
 /// unix bodies: a flag missing HERE and present there is how the two drift, and a Windows
 /// helper that ever does start lingering would be protected already.
 #[cfg(windows)]
-pub(crate) fn marker_flags(pid: u32) -> (bool, bool, bool, bool, bool) {
+pub(crate) fn marker_flags(pid: u32) -> (bool, bool, bool, bool, bool, bool) {
     (
         std::path::Path::new(&state_marker_path(pid, RECORDING_MARKER)).exists(),
         std::path::Path::new(&state_marker_path(pid, PREVIEW_MARKER)).exists(),
         std::path::Path::new(&state_marker_path(pid, ALERT_MARKER)).exists(),
         std::path::Path::new(&state_marker_path(pid, UPLOAD_MARKER)).exists(),
         std::path::Path::new(&state_marker_path(pid, SHARE_MARKER)).exists(),
+        std::path::Path::new(&state_marker_path(pid, COLOR_PICKER_MARKER)).exists(),
     )
 }
 
@@ -1594,10 +1858,10 @@ mod tests {
     /// predicate survives the setting's removal instead of becoming `true`.
     #[test]
     fn spare_recording_and_preview_siblings_but_never_a_bare_selector() {
-        assert!(!should_spare_sibling(false, false, false, false, false)); // bare -> collapse
-        assert!(should_spare_sibling(true, false, false, false, false)); // recording session
-        assert!(should_spare_sibling(false, true, false, false, false)); // preview (self-capture)
-        assert!(should_spare_sibling(true, true, false, false, false)); // recording + a preview
+        assert!(!should_spare_sibling(false, false, false, false, false, false)); // bare -> collapse
+        assert!(should_spare_sibling(true, false, false, false, false, false)); // recording session
+        assert!(should_spare_sibling(false, true, false, false, false, false)); // preview (self-capture)
+        assert!(should_spare_sibling(true, true, false, false, false, false)); // recording + a preview
     }
 
     /// DRAGON-438: a sibling showing the capture-failure dialog is spared.
@@ -1612,7 +1876,7 @@ mod tests {
     fn spare_a_sibling_that_is_showing_the_failure_dialog() {
         // A child doing nothing but showing the dialog — no recording, no preview — is
         // exactly the shape the sweep used to kill, and is spared on the alert flag alone.
-        assert!(should_spare_sibling(false, false, true, false, false));
+        assert!(should_spare_sibling(false, false, true, false, false, false));
         // Sparing is additive: adding the dialog to an already-spared sibling cannot make it
         // collapsible, and the bare selector (nothing at all) is still the ONLY case that
         // collapses. That last assertion is the one worth keeping — the rule is "spare every
@@ -1620,14 +1884,14 @@ mod tests {
         for recording in [false, true] {
             for preview in [false, true] {
                 assert!(
-                    should_spare_sibling(recording, preview, true, false, false),
+                    should_spare_sibling(recording, preview, true, false, false, false),
                     "an alert must survive whatever else the sibling is doing \
                      (recording={recording} preview={preview})"
                 );
             }
         }
         assert!(
-            !should_spare_sibling(false, false, false, false, false),
+            !should_spare_sibling(false, false, false, false, false, false),
             "a sibling showing nothing the user must act on still collapses"
         );
     }
@@ -1646,7 +1910,7 @@ mod tests {
     /// window, no recording, no dialog, just work the user asked for that is still going.
     #[test]
     fn spare_a_sibling_that_is_still_uploading() {
-        assert!(should_spare_sibling(false, false, false, true, false));
+        assert!(should_spare_sibling(false, false, false, true, false, false));
         // Additive with every other flag, like the alert one: a process can legitimately be
         // uploading AND showing a preview (the editor that started the upload is a preview),
         // and no combination may turn sparing back off.
@@ -1654,7 +1918,7 @@ mod tests {
             for preview in [false, true] {
                 for alert in [false, true] {
                     assert!(
-                        should_spare_sibling(recording, preview, alert, true, false),
+                        should_spare_sibling(recording, preview, alert, true, false, false),
                         "an in-flight upload must survive whatever else the sibling is doing \
                          (recording={recording} preview={preview} alert={alert})"
                     );
@@ -1663,7 +1927,7 @@ mod tests {
         }
         // And the rule stays "spare what the user is waiting on", not "spare everything":
         // the bare selector overlay is still the one shape that collapses.
-        assert!(!should_spare_sibling(false, false, false, false, false));
+        assert!(!should_spare_sibling(false, false, false, false, false, false));
     }
 
     /// **DRAGON-519, the sibling of the bug above.** A working share helper is spared.
@@ -1685,7 +1949,7 @@ mod tests {
     /// no recording, no dialog, just work the user asked for that has not finished.
     #[test]
     fn spare_a_sibling_that_is_serving_the_clipboard_or_a_banner() {
-        assert!(should_spare_sibling(false, false, false, false, true));
+        assert!(should_spare_sibling(false, false, false, false, true, false));
         // Additive with every other flag, like the two before it. No process holds two of
         // these markers today (a share helper does one job and nothing else), so the table
         // below is not describing a combination that occurs. It pins the SHAPE of the rule:
@@ -1695,7 +1959,7 @@ mod tests {
                 for alert in [false, true] {
                     for upload in [false, true] {
                         assert!(
-                            should_spare_sibling(recording, preview, alert, upload, true),
+                            should_spare_sibling(recording, preview, alert, upload, true, false),
                             "a working share helper must survive whatever else the sibling is \
                              doing (recording={recording} preview={preview} alert={alert} \
                              upload={upload})"
@@ -1706,7 +1970,36 @@ mod tests {
         }
         // The rule is still "spare what the user is waiting on". A bare selector overlay,
         // which is what this sweep exists to collapse, is the one shape that collapses.
-        assert!(!should_spare_sibling(false, false, false, false, false));
+        assert!(!should_spare_sibling(false, false, false, false, false, false));
+    }
+
+    /// **DRAGON-582.** A sibling showing the colour picker's RESULT WINDOW is spared.
+    ///
+    /// The sequence this exists for is the obvious one, not a corner case: pick a colour,
+    /// then take a screenshot of the thing you want to use it in. That screenshot commits
+    /// and runs this sweep, and without the flag it would SIGTERM the window holding the
+    /// value the user just picked.
+    ///
+    /// Note what is NOT spared: the picker's OVERLAY phase holds no marker, so a picker
+    /// still choosing a colour collapses exactly like a bare capture selector. That is the
+    /// rule this predicate has always encoded, applied to one more window.
+    #[test]
+    fn spare_a_sibling_showing_the_colour_picker_window() {
+        assert!(should_spare_sibling(false, false, false, false, false, true));
+        // Additive, like every other flag: no combination may turn sparing back off.
+        for recording in [false, true] {
+            for preview in [false, true] {
+                for alert in [false, true] {
+                    assert!(
+                        should_spare_sibling(recording, preview, alert, false, false, true),
+                        "the picker window must survive whatever else the sibling is doing \
+                         (recording={recording} preview={preview} alert={alert})"
+                    );
+                }
+            }
+        }
+        // And a picker still on its OVERLAY (no marker) collapses like any selector.
+        assert!(!should_spare_sibling(false, false, false, false, false, false));
     }
 
     /// DRAGON-519: the share marker rides the SAME stale-sweep rule as every other per-pid
@@ -1847,21 +2140,67 @@ mod tests {
         assert!(daemon_intent_from_args(&[String::from(RESIDENT_ARG)]));
     }
 
-    /// DRAGON-471: the held-lock branch used to pulse a capture on the LOCK being held,
-    /// which is not a statement about what the launch wanted. Only the post-update relaunch
-    /// (daemon intent AND a marker) restores About instead; everything else still hands its
-    /// capture over.
+    /// DRAGON-471/473: the held-lock branch used to pulse a capture on the LOCK being held,
+    /// which is not a statement about what the launch wanted. The whole table, since the
+    /// interesting content of this decision is which cells DON'T ask for a capture.
     #[test]
-    fn only_a_post_update_resident_launch_declines_to_ask_for_a_capture() {
+    fn only_a_capture_intent_launch_asks_a_live_daemon_for_a_capture() {
+        // THE DRAGON-473 CELL. A plain `resident` launch — the autostart entry at login, the
+        // settings tray toggle, a manual re-run — wanted a TRAY. One is already up, so the
+        // only question left is whether it is healthy, and asking for a capture put an
+        // unrequested overlay on screen. This cell answered `SignalCapture` until DRAGON-473.
+        assert_eq!(held_lock_action(true, false), HeldLockAction::ProbeOnly);
+        // A post-update relaunch (DRAGON-471) owes the release notes, not a capture.
         assert_eq!(held_lock_action(true, true), HeldLockAction::RestoreAbout);
-        // A plain `resident` launch (autostart, the settings toggle) keeps today's path,
-        // pulse and all: the pulse is also the wedge probe.
-        assert_eq!(held_lock_action(true, false), HeldLockAction::SignalCapture);
         // The safety rule: a capture-intent launch is a person pressing a key. A marker on
         // disk may be stale, and losing a real capture is worse than one extra About window,
         // so intent wins over the marker here.
         assert_eq!(held_lock_action(false, true), HeldLockAction::SignalCapture);
         assert_eq!(held_lock_action(false, false), HeldLockAction::SignalCapture);
+    }
+
+    /// Stated as the invariant rather than as four cells, because this is the rule the ticket
+    /// actually established and the one a future edit is most likely to break: **daemon intent
+    /// never hands over a capture**, whatever else is true. DRAGON-471 got this right for one
+    /// input combination and left the other asking for a capture; pinning the property rather
+    /// than the cells is what stops that from happening a third time.
+    #[test]
+    fn a_daemon_intent_launch_never_asks_for_a_capture() {
+        for post_update in [false, true] {
+            assert_ne!(
+                held_lock_action(true, post_update),
+                HeldLockAction::SignalCapture,
+                "a `resident` launch has no capture to give away (post_update={post_update})"
+            );
+        }
+        // And the converse, so the rule cannot be satisfied by refusing everyone: a launch
+        // that DID want a capture always gets to hand it over.
+        for post_update in [false, true] {
+            assert_eq!(held_lock_action(false, post_update), HeldLockAction::SignalCapture);
+        }
+    }
+
+    /// The cases the deleted `update::signal_capture_after_lost_lock` used to pin (DRAGON-532),
+    /// restated against the decision that replaced it so the coverage moved with the code
+    /// rather than evaporating.
+    ///
+    /// Its own name for the answer was a bool, "may this launch ask for a capture", and the two
+    /// cells that mattered were the post-update relaunch (must stay quiet: observed for real on
+    /// 2026-08-05, when the AppImage self-update's relaunch lost the lock race and dropped an
+    /// unrequested capture overlay on screen seconds after an update) and the capture hotkey
+    /// pressed while a marker happened to be pending (must still work).
+    #[test]
+    fn the_post_update_relaunch_cases_survived_the_move_from_update_rs() {
+        assert_ne!(
+            held_lock_action(true, true),
+            HeldLockAction::SignalCapture,
+            "a post-update relaunch that lost the lock must not ask for a capture"
+        );
+        assert_eq!(
+            held_lock_action(false, true),
+            HeldLockAction::SignalCapture,
+            "a pending marker must never swallow a real capture keypress"
+        );
     }
 
     /// The two DRAGON-465 / DRAGON-471 halves have to agree about one launch: the relaunch
@@ -2201,6 +2540,86 @@ mod tests {
         assert_eq!(parse_marker_name(name), Some((4242, PREVIEW_SOCKET_MARKER)));
     }
 
+    /// DRAGON-613: the picker window's socket is the same shape of sidecar, in the same
+    /// namespace, distinct from the marker beside it, and it must not collide with the
+    /// preview one on the same pid (a process is only ever one of the two, but the paths
+    /// have to be able to coexist for the sweep to reason about them separately).
+    #[cfg(unix)]
+    #[test]
+    fn color_picker_socket_is_a_distinct_per_pid_sidecar() {
+        let sock = color_picker_socket_path(4242);
+        assert!(sock.ends_with("cosmic-capture-kit.4242.colorpicker.sock"), "{sock}");
+        assert_ne!(sock, state_marker_path(4242, COLOR_PICKER_MARKER));
+        assert_ne!(sock, preview_socket_path(4242), "the two transports never share a path");
+        let name = sock.rsplit('/').next().unwrap();
+        assert_eq!(parse_marker_name(name), Some((4242, COLOR_PICKER_SOCKET_MARKER)));
+        // And it is swept when its owner dies, like every other sidecar here. A recycled pid
+        // inheriting one would make a later pick address a corpse instead of opening a window.
+        assert!(sweep_when_owner_is_dead(COLOR_PICKER_SOCKET_MARKER));
+    }
+
+    /// DRAGON-613: picker-window discovery is the SAME marker-driven scan as the preview
+    /// one, over the picker's own marker pair. This is what enforces "at most one window":
+    /// a pick that finds a live one hands its colour over instead of opening a second.
+    #[cfg(unix)]
+    #[test]
+    fn color_picker_window_discovery_skips_self_and_dead_pids() {
+        let dir = std::env::temp_dir().join(format!("cck-pick-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let live = std::process::id();
+        let dead = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
+        let selfish = 999_999_002; // stands in as "us" for this scan
+
+        for pid in [live, dead, selfish] {
+            std::fs::File::create(state_marker_path_in(&dir, pid, COLOR_PICKER_MARKER)).unwrap();
+        }
+        std::fs::File::create(state_marker_path_in(&dir, dead, COLOR_PICKER_SOCKET_MARKER))
+            .unwrap();
+        // A PREVIEW marker is a different window and must never look like a picker window,
+        // or an editor's pick would land in a colour picker that never asked for it.
+        std::fs::File::create(state_marker_path_in(&dir, live, PREVIEW_MARKER)).unwrap();
+
+        let windows =
+            live_marker_hosts_in(&dir, selfish, COLOR_PICKER_MARKER, COLOR_PICKER_SOCKET_MARKER);
+        assert_eq!(windows, vec![live], "only the live, non-self picker window");
+        assert!(
+            !std::path::Path::new(&state_marker_path_in(&dir, dead, COLOR_PICKER_MARKER)).exists(),
+            "a dead pid's picker marker must be swept"
+        );
+        assert!(
+            !std::path::Path::new(&state_marker_path_in(
+                &dir,
+                dead,
+                COLOR_PICKER_SOCKET_MARKER
+            ))
+            .exists(),
+            "a dead pid's picker socket must be swept with it"
+        );
+        // No window open at all is the ordinary first-pick case, and it must answer empty so
+        // the pick opens its own window.
+        let empty = std::env::temp_dir().join(format!("cck-pick-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(
+            live_marker_hosts_in(
+                &empty.to_string_lossy(),
+                selfish,
+                COLOR_PICKER_MARKER,
+                COLOR_PICKER_SOCKET_MARKER
+            )
+            .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
+
     /// Host discovery is marker-driven: live preview pids only, never self, dead pids'
     /// markers (and their sockets) swept as we scan.
     #[cfg(unix)]
@@ -2246,6 +2665,65 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// DRAGON-583: the recording-control SOCKET is the same shape of per-pid sidecar as
+    /// the preview one, distinct from the recording marker it sits beside, and parsed by
+    /// the sweep so a SIGKILLed recorder's socket is cleared.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recording_socket_is_a_distinct_per_pid_sidecar() {
+        let sock = recording_socket_path(4242);
+        assert!(sock.ends_with("cosmic-capture-kit.4242.recording.sock"), "{sock}");
+        assert_ne!(sock, state_marker_path(4242, RECORDING_MARKER));
+        let name = sock.rsplit('/').next().unwrap();
+        assert_eq!(parse_marker_name(name), Some((4242, RECORDING_SOCKET_MARKER)));
+        // Both sidecars are swept when their owner dies; the session LEDGER still is not.
+        assert!(sweep_when_owner_is_dead(RECORDING_SOCKET_MARKER));
+        assert!(!sweep_when_owner_is_dead(SESSION_MARKER));
+    }
+
+    /// DRAGON-583: finding the live recording is the SAME marker-driven scan preview
+    /// handoffs use, over the recording marker instead. Live pids only, never self, and a
+    /// dead recorder's marker AND socket swept as we go, so a CLI command can never be sent
+    /// at a corpse or at a recycled pid.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recording_discovery_skips_self_and_dead_pids() {
+        let dir = std::env::temp_dir().join(format!("cck-rec-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.to_string_lossy().into_owned();
+
+        let live = std::process::id();
+        let dead = {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
+        let selfish = 999_999_002; // stands in as "us" for this scan
+
+        for pid in [live, dead, selfish] {
+            std::fs::File::create(state_marker_path_in(&dir, pid, RECORDING_MARKER)).unwrap();
+        }
+        std::fs::File::create(state_marker_path_in(&dir, dead, RECORDING_SOCKET_MARKER)).unwrap();
+        // A PREVIEW marker is a different state and must never look like a recording.
+        std::fs::File::create(state_marker_path_in(&dir, live, PREVIEW_MARKER)).unwrap();
+
+        let found =
+            live_marker_hosts_in(&dir, selfish, RECORDING_MARKER, RECORDING_SOCKET_MARKER);
+        assert_eq!(found, vec![live], "only the live, non-self recording pid is reachable");
+        assert!(
+            !std::path::Path::new(&state_marker_path_in(&dir, dead, RECORDING_MARKER)).exists(),
+            "a dead recorder's marker must be swept"
+        );
+        assert!(
+            !std::path::Path::new(&state_marker_path_in(&dir, dead, RECORDING_SOCKET_MARKER))
+                .exists(),
+            "a dead recorder's control socket must be swept with it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Candidate order is deterministic: newest marker first, unknown mtimes last, ties
@@ -2358,5 +2836,56 @@ mod same_program_tests {
             Path::new("/tmp/.mount_Cosmic1a2b3c/usr/bin/cosmic-capture-kit"),
             Path::new("/home/u/repo/target/release/cosmic-capture-kit"),
         ));
+    }
+}
+
+/// The PID-NAMESPACE guard (`lab/flatpak`): a recorded pid only means something to a reader in
+/// the namespace that wrote it.
+#[cfg(test)]
+mod pid_namespace_tests {
+    use super::{addressable_pid, lock_record, parse_lock_record};
+
+    /// THE CASE THIS EXISTS FOR. Two Flatpak instances of the same app are both PID 2 in their
+    /// own namespaces, so a naive reader signals ITSELF and succeeds. Different namespace ids
+    /// with the same pid must therefore refuse.
+    #[test]
+    fn the_same_pid_in_a_different_namespace_is_not_addressable() {
+        assert_eq!(addressable_pid(2, Some(4026533392), Some(4026533888)), None);
+    }
+
+    /// The ordinary non-sandboxed case: one namespace, so every recorded pid is addressable and
+    /// the behaviour is exactly what it was before the field existed.
+    #[test]
+    fn the_same_namespace_addresses_normally() {
+        assert_eq!(addressable_pid(1234, Some(4026531836), Some(4026531836)), Some(1234));
+    }
+
+    /// Unknowns pass rather than fail, on both sides independently. macOS can never read a
+    /// namespace, and a lock file written by an older build carries none; failing closed there
+    /// would break the second-launch capture UX on every platform to defend a case that cannot
+    /// arise on them.
+    #[test]
+    fn an_unknown_namespace_on_either_side_keeps_the_old_behaviour() {
+        assert_eq!(addressable_pid(99, None, Some(4026531836)), Some(99));
+        assert_eq!(addressable_pid(99, Some(4026531836), None), Some(99));
+        assert_eq!(addressable_pid(99, None, None), Some(99));
+    }
+
+    /// The file format round-trips, and BOTH directions matter: an older build must be able to
+    /// read what this one writes (it takes the first token and ignores the rest), and this one
+    /// must read what an older build wrote (a bare pid).
+    #[test]
+    fn the_lock_record_round_trips_and_reads_the_legacy_form() {
+        assert_eq!(lock_record(7, Some(4026531836)), "7 4026531836");
+        assert_eq!(lock_record(7, None), "7");
+        assert_eq!(parse_lock_record("7 4026531836"), Some((7, Some(4026531836))));
+        assert_eq!(parse_lock_record("7"), Some((7, None)));
+        // Trailing newline and padding, since the file is written and re-read as text.
+        assert_eq!(parse_lock_record(" 7 4026531836 \n"), Some((7, Some(4026531836))));
+        // Garbage is not a pid.
+        assert_eq!(parse_lock_record(""), None);
+        assert_eq!(parse_lock_record("not-a-pid"), None);
+        // An unparsable namespace degrades to "unknown" rather than discarding the pid.
+        assert_eq!(parse_lock_record("7 xyz"), Some((7, None)));
     }
 }

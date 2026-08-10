@@ -136,7 +136,7 @@ pub const CANCEL_LABEL: &str = "Cancel upload";
 /// their items structurally, for the reasons in the module doc.
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 pub fn item_id(pid: u32) -> String {
-    format!("dev.frosthaven.CosmicCaptureKit.Upload.{pid}")
+    format!("dev.thedragon.CosmicCaptureKit.Upload.{pid}")
 }
 
 /// How coarsely the number moves: it is re-drawn at multiples of this, never per percent.
@@ -854,7 +854,7 @@ mod counter_tests {
         assert_ne!(item_id(1234), item_id(1235), "two children, two items");
         assert_eq!(item_id(1234), item_id(1234), "one child, one item, however often asked");
         assert!(item_id(1234).ends_with(".1234"), "the pid is what makes it per child");
-        assert!(item_id(1).starts_with("dev.frosthaven.CosmicCaptureKit."), "{}", item_id(1));
+        assert!(item_id(1).starts_with("dev.thedragon.CosmicCaptureKit."), "{}", item_id(1));
         // A D-Bus-shaped name: dot-separated elements of `[A-Za-z0-9_]`, nothing that would
         // need escaping in a bus property or a window class name.
         for pid in [0u32, 1, 4242, u32::MAX] {

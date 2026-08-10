@@ -47,6 +47,46 @@ const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 #[cfg(target_os = "linux")]
 const PLAYER_IFACE: &str = "org.mpris.MediaPlayer2.Player";
 
+/// The whole MPRIS name family, as a session-bus policy pattern: "any media player".
+/// Players publish under [`MPRIS_PREFIX`] with their own suffix, so no single name can be
+/// asked about, and reaching ONE of them is enough for this feature to do its job.
+#[cfg(target_os = "linux")]
+const MPRIS_FAMILY: &str = "org.mpris.MediaPlayer2.*";
+
+/// Can this process pause other media players at all (DRAGON-555)?
+///
+/// Linux answers from the session-bus policy, which is a capability and not a sandbox test:
+/// true on every ordinary session, and false only where the bus refuses us the MPRIS family.
+///
+/// That refusal is INVISIBLE from inside the calls this module makes, which is why the
+/// question has to be asked separately. A filtered `ListNames` omits the players instead of
+/// failing, so [`mpris_players`] comes back empty and every layer above reads that as "nothing
+/// was playing". The feature was dead in the `lab/flatpak` build for exactly that reason and
+/// reported success the whole time: the settings toggle sat there switched on, the babysitter
+/// child spawned, found nobody, and exited immediately.
+///
+/// The answer heals itself if the sandbox is ever granted `--talk-name=org.mpris.MediaPlayer2.*`;
+/// nothing here would need changing.
+#[cfg(target_os = "linux")]
+pub(crate) fn media_pause_available() -> bool {
+    crate::util::bus_name_reachable(MPRIS_FAMILY)
+}
+
+/// macOS and Windows reach the system's Now Playing app through a native API
+/// ([`duck_mac`] / [`media_control`]), not a bus name anyone can filter, so the capability is
+/// always there.
+#[cfg(any(target_os = "macos", windows))]
+pub(crate) fn media_pause_available() -> bool {
+    true
+}
+
+/// Other platforms: no public API to pause arbitrary apps, matching the inert
+/// [`OtherAudioDuck::engage`] below.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub(crate) fn media_pause_available() -> bool {
+    false
+}
+
 /// RAII guard the preview holds while a soundtrack is on screen. [`engage`](Self::engage) just
 /// spawns the babysitter child (fast, non-blocking — no D-Bus on our threads); the child does the
 /// pausing and resumes when this guard drops (dropping closes the child's stdin → it reads EOF).
@@ -89,6 +129,17 @@ impl OtherAudioDuck {
 impl OtherAudioDuck {
     /// Spawn the babysitter. It pauses the other players and holds them until we let go.
     pub(crate) fn engage() -> Self {
+        // No route to any player (DRAGON-555): spawning the babysitter would cost a process
+        // to discover that, every time a preview opens, and it would look like the feature
+        // ran. Say so once, in the log, and hand back the inert guard. The settings row is
+        // gated on the same answer, so nothing offered the user this in the first place.
+        if !media_pause_available() {
+            log::info!(
+                "pause other media: the session bus will not let this process reach any \
+                 org.mpris.MediaPlayer2 name, so other players are left alone"
+            );
+            return Self { child: None };
+        }
         // `self_exe` (DRAGON-510): the babysitter is held for the whole recording and the
         // AppImage mount path is not a durable way to name ourselves.
         let child = crate::util::self_exe().ok().and_then(|exe| {

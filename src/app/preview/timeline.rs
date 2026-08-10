@@ -748,7 +748,7 @@ impl cosmic::widget::canvas::Program<Msg, cosmic::Theme, cosmic::Renderer> for T
         // timeline the lanes draw.
         let subdued = crate::app::theme::subdued(theme);
         let label = {
-            let on: Color = c.background.on.into();
+            let on: Color = c.background(false).on.into();
             Color { a: 0.85, ..on }
         };
         frame.fill_rectangle(

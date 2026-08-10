@@ -16,7 +16,7 @@ use crate::app::theme::{
 
 /// Path to the active cosmic theme's `v1/` config dir (Dark or Light).
 pub(crate) fn cosmic_theme_dir() -> Option<std::path::PathBuf> {
-    let base = dirs::config_dir()?.join("cosmic");
+    let base = crate::util::host_config_dir()?.join("cosmic");
     let dark = std::fs::read_to_string(base.join("com.system76.CosmicTheme.Mode/v1/is_dark"))
         .map(|s| s.trim() != "false")
         .unwrap_or(true);
@@ -43,7 +43,7 @@ pub(crate) fn window_radius() -> f32 {
 /// Whether the active cosmic theme is dark — drives the drop-shadow opacity
 /// (cosmic uses 0.45 in dark mode, 0.35 in light).
 pub(crate) fn theme_is_dark() -> bool {
-    dirs::config_dir()
+    crate::util::host_config_dir()
         .and_then(|d| {
             std::fs::read_to_string(
                 d.join("cosmic/com.system76.CosmicTheme.Mode/v1/is_dark"),
@@ -68,7 +68,7 @@ pub(crate) fn theme_is_dark() -> bool {
 /// [`cosmic_theme_dir`] — the `frosted`/`alpha_map`/`frosted_windows` keys moved
 /// to v2 (the schema recently bumped v1→v2). `None` off COSMIC (no config dir).
 fn cosmic_theme_v2_dir() -> Option<std::path::PathBuf> {
-    let base = dirs::config_dir()?.join("cosmic");
+    let base = crate::util::host_config_dir()?.join("cosmic");
     let dark = std::fs::read_to_string(base.join("com.system76.CosmicTheme.Mode/v1/is_dark"))
         .map(|s| s.trim() != "false")
         .unwrap_or(true);

@@ -36,3 +36,15 @@ pub enum CastError {
     Cancelled,
     Unavailable(String),
 }
+
+/// What a ScreenCast request wants done with the pointer (DRAGON-592).
+///
+/// Stubbed here for the same reason the types above are: the DECISION that picks
+/// between these is `app::portal::cursor_request`, which is pure and compiled into
+/// every test build so it is proven on any host (the house pattern). Only the real
+/// module turns it into a portal `CursorMode`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorRequest {
+    Keep,
+    Omit,
+}

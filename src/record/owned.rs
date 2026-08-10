@@ -304,7 +304,7 @@ fn smoke_check<T>(rx: &std::sync::mpsc::Receiver<T>, budget: std::time::Duration
 /// [`try_start_owned_audio`]'s `#[cfg(windows)]` arm via
 /// `crate::platform::windows::named_pipe::create_pipe_server`).
 #[cfg(not(windows))]
-fn mkfifo(path: &std::path::Path) -> bool {
+pub(super) fn mkfifo(path: &std::path::Path) -> bool {
     let _ = std::fs::remove_file(path);
     #[cfg(not(target_os = "macos"))]
     {
@@ -349,10 +349,18 @@ pub(super) struct OwnedAudioStart {
     /// mixer (it lands at a negative media position). Anchoring at the later
     /// video-ready instant is exactly what discarded the opening seconds of a
     /// recording — the user speaks into a live-looking indicator while the pipeline
-    /// quietly drops what it hears. The video side covers the resulting opening span
-    /// with copies of its first frame (`VideoTicker::due_video_ticks` already returns
-    /// however many ticks the span is worth), so the recording is honest in both
-    /// streams: audio complete, video frozen on the first frame it ever got.
+    /// quietly drops what it hears. The video side COVERS the resulting opening span
+    /// instead: `VideoTicker::due_video_ticks` already returns however many ticks the
+    /// span is worth, and the worker writes that many, so the recording is honest in
+    /// both streams.
+    ///
+    /// WHAT those covering ticks show is the worker's own call, and it is not free
+    /// (DRAGON-628). The Linux and Windows workers repeat the first captured frame,
+    /// which reads as a frozen opening; `record::sck` on macOS instead spends them on
+    /// the frames its capture had already delivered and was discarding, which halved
+    /// the measured frozen head. If you touch a worker's covering burst, the rule is
+    /// that the tick COUNT is the contract and the pixels are not: changing the count
+    /// changes media time, changing the pixels does not.
     pub(super) capture_start: std::time::Instant,
     pub(super) mic_fifo_path: PathBuf,
     pub(super) sys_fifo_path: PathBuf,
@@ -430,6 +438,7 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
     // on falling back, `cleanup()` unlinked them. ffmpeg then found no such file and the
     // recording came out silent, with nothing but an "Error opening input" from a child
     // process to show for it (measured live while reproducing DRAGON-417).
+    crate::util::timing_mark("rec/pre: entry (media 0)");
     let token = PREFLIGHTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     log::info!("media-clock pipeline: audio pre-flight #{token} starting");
     if test_force_owned_failure() {
@@ -466,6 +475,7 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
         };
         (m, s, mp, sp)
     };
+    crate::util::timing_mark("rec/pre: fifos made");
     let (cfg, speaker) = crate::audio::config::recording_mic_config();
     // The AEC far-end reference (DRAGON-128): with the default speaker ("System
     // (automatic)"), the recording's OWN system capture below monitors the same
@@ -496,6 +506,7 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
         let _ = std::fs::remove_file(&sys_fifo_path);
         return Err("microphone capture chain failed to start".to_string());
     };
+    crate::util::timing_mark("rec/pre: mic tap up");
     let farend_tee: Option<crate::audio::capture::CaptureTee> = shared_farend.map(|ring| {
         let mut feeder = crate::audio::filters::aec::FarEndFeeder::new(ring);
         Box::new(move |samples: &[f32]| feeder.feed_interleaved_stereo(samples)) as _
@@ -516,6 +527,7 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
         let _ = std::fs::remove_file(&sys_fifo_path);
         return Err("system audio (pulse monitor) connection failed to start".to_string());
     };
+    crate::util::timing_mark("rec/pre: monitor up");
     log::info!(
         "media-clock pipeline: mic cleanup latency {:.1}ms",
         mic_tap.processing_latency_ms()
@@ -537,6 +549,7 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
         started.cleanup();
         return Err("microphone capture produced no audio (mic chain not responding)".to_string());
     }
+    crate::util::timing_mark("rec/pre: mic smoke ok");
     if !smoke_check(&started.sys_rx, OWNED_AUDIO_SMOKE_BUDGET) {
         started.cleanup();
         return Err(
@@ -544,7 +557,86 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
                 .to_string(),
         );
     }
+    crate::util::timing_mark("rec/pre: sys smoke ok (preflight done)");
     Ok(started)
+}
+
+/// The audio pre-flight, STARTED on its own thread (DRAGON-554) so a worker's
+/// video-side bring-up — the PipeWire connect + format negotiation + first frame on
+/// Linux, the SCK target resolution + stream build/start + first frame on macOS —
+/// overlaps it instead of following it. Serialized, those two independent startups
+/// summed into the session's opening span, every millisecond of which the file covers
+/// with copies of the first captured frame; overlapped, the span is their MAX.
+///
+/// The invariant is untouched: media time 0 is still the pre-flight's own entry
+/// instant (`OwnedAudioStart::capture_start`), and `start()` is the FIRST thing a
+/// worker does, so that instant stays within a millisecond of the worker thread's
+/// start and of the app marking itself "recording" (DRAGON-417). Only the point where
+/// the worker WAITS on the result moved.
+///
+/// [`join`](Self::join) adds no unbounded wait (DRAGON-118): the pre-flight is bounded
+/// by construction (FIFO creation, the capture-chain starts, and two
+/// [`OWNED_AUDIO_SMOKE_BUDGET`] smoke checks), so the thread join it performs is
+/// bounded by those same budgets. A worker whose video side failed first calls
+/// [`abandon`](Self::abandon) instead, which joins and tears down whatever the
+/// pre-flight managed to start.
+// Dead on Windows only: the WGC worker still runs its pre-flight inline (its capture
+// bring-up has not shown the multi-second serialized startup this seam exists for);
+// the seam stays portable so wiring it there is a call-site change, not a port.
+#[cfg_attr(windows, allow(dead_code))]
+pub(super) struct AudioPreflight(PreflightState);
+
+// Dead on Windows only — see `AudioPreflight`.
+#[cfg_attr(windows, allow(dead_code))]
+enum PreflightState {
+    Running(std::thread::JoinHandle<Result<OwnedAudioStart, String>>),
+    /// The spawn-failure fallback: the pre-flight already ran inline on the caller's
+    /// thread (an OS that cannot spawn a thread this early is already degraded, but
+    /// the session still gets its ordinary serialized start rather than dying).
+    /// Boxed so this rare arm does not size the whole enum (clippy's
+    /// `large_enum_variant`; `OwnedAudioStart` is ~240 bytes of handles).
+    Done(Box<Result<OwnedAudioStart, String>>),
+}
+
+// Dead on Windows only — see `AudioPreflight`.
+#[cfg_attr(windows, allow(dead_code))]
+impl AudioPreflight {
+    /// Start the pre-flight on its own thread. Call FIRST in a worker, before any
+    /// video-side bring-up, so `capture_start` (media 0) stays within a millisecond
+    /// of the worker's start.
+    pub(super) fn start() -> Self {
+        match std::thread::Builder::new()
+            .name("cck-audio-preflight".to_string())
+            .spawn(try_start_owned_audio)
+        {
+            Ok(thread) => AudioPreflight(PreflightState::Running(thread)),
+            Err(e) => {
+                log::warn!(
+                    "audio pre-flight: could not spawn its thread ({e}); running it inline"
+                );
+                AudioPreflight(PreflightState::Done(Box::new(try_start_owned_audio())))
+            }
+        }
+    }
+
+    /// Wait for the pre-flight's result (bounded by its own internal budgets; see the
+    /// type doc). A panicked pre-flight thread reports as an ordinary named failure.
+    pub(super) fn join(self) -> Result<OwnedAudioStart, String> {
+        match self.0 {
+            PreflightState::Running(thread) => thread.join().unwrap_or_else(|_| {
+                Err("the audio pre-flight thread panicked".to_string())
+            }),
+            PreflightState::Done(result) => *result,
+        }
+    }
+
+    /// Join and tear down: for a worker whose VIDEO side already failed, so whatever
+    /// the pre-flight started (captures, FIFOs) never leaks past the failed session.
+    pub(super) fn abandon(self) {
+        if let Ok(owned) = self.join() {
+            owned.cleanup();
+        }
+    }
 }
 
 #[cfg(test)]

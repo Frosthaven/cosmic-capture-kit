@@ -4,6 +4,7 @@
 //! drives, `app/preview`.)
 
 mod capture;
+mod color_picker;
 mod detect;
 mod recording;
 mod settings;

@@ -131,7 +131,32 @@ impl App {
                 // Drain the tray menu clicks and dispatch each. The recording controls map
                 // to their `RecordingMsg`; the idle session icon's Quit (DRAGON-174) ends the
                 // whole capture session (there is no resident to quit on a child-owned icon).
-                let events = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+                // The `mut` is used by the recording-control `extend` just below, which is
+                // `cfg(target_os = "linux")` only. So off Linux the binding is honestly
+                // immutable, and the attribute says exactly where rather than blanketing
+                // the file. macOS and Windows both hold a ZERO-warning clippy bar.
+                #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+                let mut events = self.tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+                // DRAGON-583: recording-control commands from ANOTHER process (a Linux
+                // global hotkey running `--toggle-mic` and friends) arrive on the same
+                // tick, as the same five `TrayEvent`s the resident's own menu commands
+                // already become. Mapped exactly as `tray.rs`'s resident reader maps them,
+                // so a hotkey, a resident menu click and a tray click are one code path
+                // from here down.
+                #[cfg(target_os = "linux")]
+                if let Some(inlet) = self.record_control.as_ref() {
+                    events.extend(inlet.drain().into_iter().map(|cmd| match cmd {
+                        crate::daemon_ipc::Command::TogglePause => {
+                            crate::tray::TrayEvent::TogglePause
+                        }
+                        crate::daemon_ipc::Command::ToggleMic => crate::tray::TrayEvent::ToggleMic,
+                        crate::daemon_ipc::Command::ToggleSystemAudio => {
+                            crate::tray::TrayEvent::ToggleSystemAudio
+                        }
+                        crate::daemon_ipc::Command::Stop => crate::tray::TrayEvent::Stop,
+                        crate::daemon_ipc::Command::Cancel => crate::tray::TrayEvent::Cancel,
+                    }));
+                }
                 let mut task = Task::none();
                 for ev in events {
                     let msg = match ev {
@@ -139,6 +164,40 @@ impl App {
                         crate::tray::TrayEvent::TogglePause => RecordingMsg::TogglePause,
                         crate::tray::TrayEvent::ToggleMic => RecordingMsg::ToggleMic,
                         crate::tray::TrayEvent::ToggleSystemAudio => RecordingMsg::ToggleSystemAudio,
+                        // DRAGON-558: an "Audio Recording" radio pick carries the COMPLETE
+                        // arm state. The app owns the arms, so it computes the toggle diff
+                        // against its own pair and runs each flip through the existing
+                        // handlers — persist, meters, tray refresh and the push-to-talk
+                        // rule all apply exactly as if the toggles were clicked one by one.
+                        crate::tray::TrayEvent::AudioArms(choice) => {
+                            let current = (self.record_mic, self.record_system_audio);
+                            for action in
+                                crate::recording_ui::audio_pick_live_actions(current, choice)
+                            {
+                                let msg = match action {
+                                    crate::recording_ui::RecordingAction::ToggleMic => {
+                                        RecordingMsg::ToggleMic
+                                    }
+                                    crate::recording_ui::RecordingAction::ToggleSystemAudio => {
+                                        RecordingMsg::ToggleSystemAudio
+                                    }
+                                    _ => continue,
+                                };
+                                task = Task::batch([task, self.update_recording(msg)]);
+                            }
+                            continue;
+                        }
+                        // DRAGON-574: a "Countdown Timer" radio pick carries the preset
+                        // index. The app owns the delay state, so it routes through the
+                        // SAME `PickDelay` handler as the overlay's delay chip — persist
+                        // and the live chip follow in one place.
+                        crate::tray::TrayEvent::CountdownPick(idx) => {
+                            task = Task::batch([
+                                task,
+                                self.update_capture(CaptureMsg::PickDelay(idx)),
+                            ]);
+                            continue;
+                        }
                         crate::tray::TrayEvent::Cancel => RecordingMsg::CancelRecording,
                         crate::tray::TrayEvent::Quit => {
                             task = Task::batch([task, self.finish_session()]);

@@ -198,7 +198,7 @@ pub fn reconnect_reason(message: &str) -> &str {
 /// `APP_ICON`; that one feeds an iced `Handle`, this one feeds raw HTML text, so the two
 /// cannot share one constant). Same file, same asset, so the browser landing page carries the
 /// same brand mark the app shows everywhere else.
-static APP_ICON_SVG: &str = include_str!("../../res/icons/dev.frosthaven.CosmicCaptureKit.svg");
+static APP_ICON_SVG: &str = include_str!("../../res/icons/dev.thedragon.CosmicCaptureKit.svg");
 
 /// [`APP_ICON_SVG`] with its XML declaration and DOCTYPE stripped off. Pure; unit-tested.
 ///
@@ -1780,8 +1780,7 @@ mod authorize_url_tests {
                 continue;
             }
             let offline = extras.iter().any(|(k, v)| {
-                (*k == "access_type" && *v == "offline")
-                    || (*k == "token_access_type" && *v == "offline")
+                (*k == "access_type" || *k == "token_access_type") && *v == "offline"
             }) || scopes.contains(&"offline_access");
             assert!(offline, "{} would never get a refresh token", spec.id);
         }

@@ -63,6 +63,31 @@ pub(super) fn overlay_surface_with(
     input_zone: Option<Vec<cosmic::iced::Rectangle>>,
     keyboard_interactivity: wlr_layer::KeyboardInteractivity,
 ) -> Task<cosmic::Action<Msg>> {
+    // A capture overlay REQUIRES layer shell, and when the compositor will not hand it over
+    // the request below simply produces nothing (`lab/flatpak`). Silence there is the worst
+    // outcome: the session would end having shown no overlay and delivered no capture, which
+    // is the shape CLAUDE.md's "never add a new silent exit" rule exists to prevent.
+    //
+    // So say it once, in both vocabularies. `note_failure` is FIRST-NOTE-WINS, so this records
+    // the ROOT cause and the later "overlay never shown" symptom cannot displace it, and the
+    // `error!` puts the reason in the debug log for a reader who has one turned on.
+    //
+    // Two ways to reach this, and the message names both because the remedy differs: a Flatpak
+    // is refused the global by cosmic-comp's security-context filter, while a GNOME session
+    // has no `wlr-layer-shell` for anyone, sandboxed or not.
+    if !crate::platform::layer_overlay_available() {
+        crate::diag::note_failure(
+            crate::diag::Failure::OverlayNeverShown,
+            "no wlr-layer-shell: sandboxed (cosmic-comp hides it from Flatpak clients) or a \
+             compositor that never implemented it",
+        );
+        log::error!(
+            "overlay: zwlr_layer_shell_v1 is not available to this process, so no capture \
+             overlay can be created. Inside a Flatpak cosmic-comp hides it from sandboxed \
+             clients; on GNOME it does not exist at all."
+        );
+        return Task::none();
+    }
     get_layer_surface(SctkLayerSurfaceSettings {
         id,
         layer: wlr_layer::Layer::Overlay,
@@ -76,6 +101,51 @@ pub(super) fn overlay_surface_with(
         exclusive_zone: -1,
         size_limits: Limits::NONE.min_height(1.0).min_width(1.0),
     })
+}
+
+/// `lab/flatpak` (Linux): the PORTAL-FROZEN fallback capture overlay: ONE ordinary
+/// fullscreen xdg toplevel for the whole session, minted only when
+/// [`crate::platform::layer_overlay_available`] is false (sandboxed, or a compositor
+/// with no `wlr-layer-shell`) and a seed-time portal grant has already frozen the
+/// granted monitor. The overlay UI renders over that still through the untouched
+/// `view_window` → `overlay_view` chain; like [`overlay_window`], winit mints the id
+/// and the caller records it in the granted output's `OutputState`.
+///
+/// `fullscreen: true` in the SETTINGS (not a post-open `window::set_mode`) on purpose:
+/// the attribute rides the window's creation (`conversion::window_attributes` →
+/// `with_fullscreen(Borderless(None))`), so the toplevel's first configure is already
+/// fullscreen, with no windowed first frame and no same-batch command racing the surface's
+/// creation (the documented layer-surface trap above). `Borderless(None)` means the
+/// COMPOSITOR picks the monitor; a mismatch with the granted one is absorbed by the
+/// letterbox bridge (`OutputState::fallback_win_size`), not fought here.
+///
+/// `size` seeds the buffer at the granted monitor's logical size so the pre-fullscreen
+/// surface already has sane dimensions; the compositor's configure overrides it.
+#[cfg(target_os = "linux")]
+pub(super) fn overlay_fallback_window(
+    logical_size: (u32, u32),
+) -> (window::Id, Task<cosmic::Action<Msg>>) {
+    let (w, h) = (logical_size.0.max(1) as f32, logical_size.1.max(1) as f32);
+    let (id, task) = window::open(window::Settings {
+        size: cosmic::iced::Size::new(w, h),
+        fullscreen: true,
+        resizable: false,
+        decorations: false,
+        transparent: true,
+        exit_on_close_request: false,
+        // The app id matches our installed `.desktop`, exactly like the preview window,
+        // so the compositor and any WM rules recognise the surface.
+        platform_specific: cosmic::iced::window::settings::PlatformSpecific {
+            application_id: "dev.thedragon.CosmicCaptureKit".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    // Nothing native to finish after open (unlike the mac/Windows overlays): a Wayland
+    // toplevel needs no placement call, and the compositor focuses a fresh fullscreen
+    // window itself, which is what makes Escape work without a click.
+    let open = task.map(|_| cosmic::Action::App(Msg::WindowChrome(super::WindowChromeMsg::Ignore)));
+    (id, open)
 }
 
 /// macOS/Windows PlainWindows capture overlay (DRAGON-94 phase 2b): one
@@ -426,7 +496,7 @@ pub(super) fn preview_window(
         // is a Wayland-only field of iced's PlatformSpecific; macOS uses its defaults.
         #[cfg(target_os = "linux")]
         platform_specific: cosmic::iced::window::settings::PlatformSpecific {
-            application_id: "dev.frosthaven.CosmicCaptureKit".to_string(),
+            application_id: "dev.thedragon.CosmicCaptureKit".to_string(),
             ..Default::default()
         },
         // macOS: fill content behind the (soon-invisible) transparent titlebar so the

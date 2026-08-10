@@ -28,6 +28,13 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            SettingsMsg::SetWindowRecompositing(b) => {
+                // The master switch only; the individual aesthetic preferences are
+                // preserved so re-enabling restores them exactly.
+                self.window_recompositing = b;
+                self.save_state();
+                Task::none()
+            }
             SettingsMsg::SetSelectionBoxThickness(w) => {
                 self.selection_box_thickness = w.clamp(1, 8);
                 self.save_state();
@@ -240,17 +247,66 @@ impl App {
                 // item is registered iff the tray is on AND autostart is on. Turning the tray
                 // off unregisters it (the login item makes no sense with no resident to launch);
                 // turning it on registers it when the user hasn't opted autostart off.
-                self.reconcile_login_item();
-                Task::none()
+                self.reconcile_login_item()
             }
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             SettingsMsg::SetAutostartOnLogin(b) => {
                 // The "Automatically start on login" toggle (DRAGON-296). Only ever visible
                 // while the tray is on (the row is hidden otherwise), so this just persists the
                 // preference and re-derives the OS login-item state from both toggles.
+                // DRAGON-618: ignore the click while a Background-portal request is still
+                // outstanding. The answer to the LAST request is not known yet, so acting on
+                // a new one would race two registrations and settle the toggle from whichever
+                // replied last. Guarded here rather than by making the row inert in `view`,
+                // because this covers every route into the setting, not just that one widget.
+                #[cfg(target_os = "linux")]
+                if self.autostart_pending {
+                    log::debug!("autostart toggle ignored: a portal request is still in flight");
+                    return Task::none();
+                }
                 self.autostart_on_login = b;
                 self.save_state();
-                self.reconcile_login_item();
+                self.reconcile_login_item()
+            }
+            // DRAGON-618: the Flatpak Background-portal request has come back. Settle the
+            // toggle from what the portal actually granted, never from what was asked for:
+            // the user can decline the dialog, and the request can fail outright.
+            #[cfg(target_os = "linux")]
+            SettingsMsg::AutostartPortalSettled(result) => {
+                self.autostart_pending = false;
+                let granted = crate::platform::linux_autostart::settled_toggle(&result);
+                match &result {
+                    Ok(_) => log::info!("autostart portal settled: registered={granted}"),
+                    Err(e) => log::warn!("autostart portal request failed: {e}"),
+                }
+                // DRAGON-625: carry the REASON to the settings row, so a toggle that springs
+                // back explains itself instead of just refusing. Cleared on success, because
+                // the notice describes one attempt and must not outlive it.
+                self.autostart_notice = match &result {
+                    Ok(_) => None,
+                    Err(e) => Some(e.clone()),
+                };
+                // Only the AUTOSTART preference is settled here. `resident` is untouched: the
+                // portal was asked about launching at login, not about the tray.
+                //
+                // DRAGON-625: and only when the tray is ON. `settled_preference` holds that
+                // guard, which the file path always had and this path shipped without: with
+                // the tray off the item is unregistered BY DESIGN, so the truthful `Ok(false)`
+                // coming back was overwriting the user's preference and destroying "start on
+                // login" whenever the tray was toggled off and on.
+                if let Some(next) = crate::platform::linux_autostart::settled_preference(
+                    self.resident,
+                    self.autostart_on_login,
+                    &result,
+                ) {
+                    self.autostart_on_login = next;
+                    self.save_state();
+                }
+                Task::none()
+            }
+            SettingsMsg::SetColorPickerOpacity(v) => {
+                self.color_picker_overlay_opacity = v.clamp(0.0, 1.0);
+                self.save_state();
                 Task::none()
             }
             SettingsMsg::SetRegionOpacity(v) => {
@@ -349,6 +405,14 @@ impl App {
                 self.update_health_nav_icon();
                 Task::none()
             }
+            // DRAGON-564: the off-thread tool-version probe finished. A version never
+            // changes a row's severity, so no nav-icon refresh; the message arriving is
+            // what re-renders the Health rows with each present binary's version.
+            SettingsMsg::ToolVersionsProbed(list) => {
+                self.settings.tool_versions = Some(list);
+                self.settings.tool_versions_probing = false;
+                Task::none()
+            }
             SettingsMsg::SetBenchMonitor(i) => {
                 if i < self.bench_monitors.len() {
                     self.bench_monitor_idx = i;
@@ -373,7 +437,15 @@ impl App {
                 Task::none()
             }
             SettingsMsg::ResetScreencastPermission => {
-                self.pw_restore_token = None;
+                // The Forget row clears BOTH source-type slots. Honest forget
+                // (DRAGON-570): this only drops our replay tokens, so the next
+                // capture prompts again; the portal's mode-2 permission-store
+                // entry outlives the app, and the log names the full removal.
+                self.pw_restore_token.clear();
+                log::info!(
+                    "screencast permission forgotten (both restore-token slots cleared). {}",
+                    crate::app::portal::FORGET_SCREEN_ACCESS_NOTE
+                );
                 self.save_state();
                 Task::none()
             }
@@ -398,11 +470,14 @@ impl App {
                 Task::none()
             }
             SettingsMsg::SetPreviewWindowed(b) => {
-                // DRAGON-427: on Windows 10 the appearance is not the user's to choose — the
-                // row is inert there and this arm is unreachable from the UI, but the write
-                // is refused rather than merely hidden. Persisting `false` would put the NEXT
-                // process (which re-reads the setting through `effective_preview_windowed`)
-                // one bug away from an overlay editor the software rasterizer cannot draw.
+                // Where the overlay editor cannot exist (Windows 10, DRAGON-427; a Linux
+                // session with no layer shell, `lab/flatpak`) the appearance is not the
+                // user's to choose — the row is hidden there (the owner's third live test;
+                // it was inert-with-a-warning before) and this arm is unreachable from
+                // the UI, but the write is refused rather than merely hidden. Persisting
+                // `false` would put the NEXT process (which re-reads the setting through
+                // `effective_preview_windowed`) one bug away from an overlay editor that
+                // cannot draw, or has no surface to draw on.
                 if !crate::platform::overlay_preview_available() {
                     return Task::none();
                 }
@@ -431,9 +506,13 @@ impl App {
             // DRAGON-540. The text is copied exactly as the row shows it, so what the user
             // reads and what they paste are the same thing.
             SettingsMsg::CopyHealthLocation(text) => {
-                crate::platform::services::copy_text(&text);
+                // `copy_text_task`, not `copy_text`: on a compositor with no data-control the
+                // detached worker cannot serve a selection, so this row reported "Copied!" and
+                // put nothing on the clipboard. The task routes the write through this settings
+                // window instead, which is focused by definition when the button was pressed.
+                let write = crate::share::copy_text_task(&text);
                 self.settings.health_copied = Some((text, std::time::Instant::now()));
-                Task::none()
+                write
             }
             SettingsMsg::HealthCopyTick => Task::none(),
             #[cfg(target_os = "macos")]
@@ -701,6 +780,11 @@ impl App {
                 } else {
                     Some(action)
                 };
+                // DRAGON-617: a refusal notice belongs to the attempt that earned it. Clearing
+                // on every BEGIN (including the cancelling toggle) means it never lingers over
+                // a row the user has moved on from, and a fresh attempt starts with a clean
+                // helper line rather than last time's complaint.
+                self.settings.rebind_refused = None;
                 Task::none()
             }
             SettingsMsg::SetShortcut(action, shortcut) => {
@@ -892,6 +976,13 @@ impl App {
                 Task::none()
             }
             SettingsMsg::CheckForUpdates => {
+                // On a build with no update channel (a Flatpak, DRAGON-561) this message
+                // should be unreachable: every sender is gated on `channel_available`
+                // and the About page offers no check button. A stray one must still
+                // never fetch update.json, so the gate holds here too.
+                if !crate::update::channel_available() {
+                    return Task::none();
+                }
                 // Non-blocking: the curl fetch runs on a detached worker; the result
                 // lands back as `UpdateChecked`. Mark "Checking" so the About page
                 // shows progress and a repeat click is a no-op while in flight.
@@ -991,6 +1082,59 @@ impl App {
                 // Post-update relaunch (or the CCK_SETTINGS_TAB=about spawn): land the
                 // user on About so the new version's "What's new" is immediately visible.
                 self.activate_config_tab(crate::app::ConfigTab::About);
+                // The OTHER route onto About (the nav rail's `SetConfigTab`) fires the
+                // same message, so a deep link and a click behave identically. A no-op
+                // on every build with an update channel.
+                self.update_settings(SettingsMsg::FetchReleaseNotes)
+            }
+            SettingsMsg::FetchReleaseNotes => {
+                // DRAGON-605: the About page is showing on a build with no update channel
+                // (a Flatpak), which means no check will ever fill in "What's new". Fetch
+                // the notes on their own.
+                //
+                // NOT an update check by the back door. The result is a `ReleaseNotes`,
+                // which carries no artifact at all, so it can produce no install button;
+                // it never becomes an `UpdateStatus`, so it cannot tint the nav rail or
+                // raise the DRAGON-177 dialog; and it never writes the manifest cache.
+                // See `update.rs`'s module doc for the full reasoning, including why the
+                // notes are fetched rather than baked into the build.
+                if crate::update::notes_source() != crate::update::NotesSource::OwnFetch {
+                    // A build WITH a channel already parsed these out of the manifest its
+                    // check fetched; a second request would buy nothing.
+                    return Task::none();
+                }
+                if self.release_notes_fetched {
+                    return Task::none();
+                }
+                // Latched BEFORE the fetch, so re-visiting About while one is in flight
+                // (or after one came back empty) costs no further requests.
+                self.release_notes_fetched = true;
+                log::info!("release notes: fetching (this build has no update channel)");
+                Task::perform(
+                    // Detached worker, off the executor's blocking pool, for the reason
+                    // `CheckForUpdates` uses one (DRAGON-499): a slow network must never
+                    // pin the runtime's drop when the settings window closes.
+                    off_thread(crate::update::fetch_release_notes),
+                    |notes| {
+                        // A worker that died without answering reads as "no notes", the
+                        // same quiet outcome every other failure has.
+                        cosmic::Action::App(Msg::Settings(SettingsMsg::ReleaseNotesFetched(
+                            notes.flatten(),
+                        )))
+                    },
+                )
+            }
+            SettingsMsg::ReleaseNotesFetched(notes) => {
+                // Parse the markdown once, here, exactly as `UpdateChecked` does and for
+                // the same reason: the view cannot hold the borrow `markdown::view` needs.
+                // `update_status` is deliberately NOT touched, so the About page keeps
+                // offering no update controls at all.
+                if let Some(notes) = notes {
+                    self.update_notes = Some((
+                        notes.version,
+                        cosmic::widget::markdown::Content::parse(&notes.notes),
+                    ));
+                }
                 Task::none()
             }
             SettingsMsg::SetNotifyUpdates(on) => {
@@ -1123,6 +1267,7 @@ impl App {
             crate::app::CaptureHotkeySlot::ActiveMonitorNoEditor => {
                 &self.capture_active_monitor_no_editor_hotkey
             }
+            crate::app::CaptureHotkeySlot::ColorPicker => &self.color_picker_hotkey,
         }
     }
 
@@ -1143,6 +1288,7 @@ impl App {
             crate::app::CaptureHotkeySlot::ActiveMonitorNoEditor => {
                 &mut self.capture_active_monitor_no_editor_hotkey
             }
+            crate::app::CaptureHotkeySlot::ColorPicker => &mut self.color_picker_hotkey,
         }
     }
 
@@ -1150,8 +1296,58 @@ impl App {
     /// order — the input the pure [`crate::shortcuts::capture_hotkey_conflict`] check reads.
     /// One accessor so the check can never see a different set of slots than the rows do.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    pub(in crate::app) fn capture_hotkey_specs(&self) -> [&str; 6] {
+    pub(in crate::app) fn capture_hotkey_specs(&self) -> [&str; 7] {
         crate::app::CaptureHotkeySlot::ALL.map(|slot| self.capture_hotkey_slot(slot))
+    }
+
+    /// DRAGON-628: read the OS login item when the settings window opens, so the
+    /// "Automatically start on login" row shows what the machine will really do.
+    ///
+    /// **This READS and never writes.** No file, no registry value, no portal request, no
+    /// correction of the stored preference. Opening a window is not a request for anything,
+    /// and every write this could have done turns out to be wrong on some platform:
+    ///
+    /// * A Flatpak's registration goes through the Background portal, so a "reconcile" there
+    ///   IS a `RequestBackground` call, asynchronous and possibly interactive. On COSMIC,
+    ///   which ships no Background backend, it fails, sets the notice and flips the toggle
+    ///   off, which would have happened every single time the window opened.
+    /// * An unbundled macOS dev binary cannot register at all, so `set` always errors, and
+    ///   the failure path would have rewritten the user's stored preference to `false` on
+    ///   every open.
+    /// * A registration that is absent may have been removed on purpose. Re-creating it
+    ///   because a window opened overrides a choice we have no evidence was withdrawn.
+    ///
+    /// The REPAIR lives in the resident daemons instead
+    /// (`platform::autostart_repair_at_daemon_start`), which is a better home for it anyway:
+    /// the daemon is the thing autostart exists to launch. So this path is purely honest
+    /// display, and it cannot have side effects to get wrong.
+    ///
+    /// Portable on the outside: the body branches by `cfg`, so both settings-window mints
+    /// (`App::open_settings` for the in-process convert, `OpenSettingsAtStartup` for a
+    /// standalone `--settings` process) call it with no `cfg` of their own. BOTH need it.
+    /// That is not belt and braces: the Cloud page's reload was wired to only one of them and
+    /// the other listed no accounts at all, which on macOS is the only mint there is.
+    pub(in crate::app) fn autostart_settings_opened(&mut self) {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        {
+            let registered =
+                crate::platform::autostart_registration().map(|r| r.is_live());
+            self.autostart_registered = registered;
+            // Nothing about a login item we cannot honour may be silent (DRAGON-628). The
+            // debug log is where a support question gets answered, and "the row says off
+            // although the setting says on" is unanswerable without this line.
+            match crate::platform::autostart_row(self.autostart_on_login, registered) {
+                crate::platform::AutostartRow::Agrees(_) => {}
+                crate::platform::AutostartRow::Unobservable(pref) => log::debug!(
+                    "autostart: this build cannot read the login item; the row shows the \
+                     stored preference ({pref})"
+                ),
+                crate::platform::AutostartRow::Disagrees { shown, preference } => log::warn!(
+                    "autostart: the login item is registered={shown} but the setting says \
+                     {preference}; the row shows what the next login will really do"
+                ),
+            }
+        }
     }
 
     /// Reconcile the OS "launch at login" item with the current settings (DRAGON-296).
@@ -1164,10 +1360,29 @@ impl App {
     /// backend hides behind a `is_enabled()`/`set(bool)` seam with the SAME signature
     /// (macOS `SMAppService`, Linux XDG autostart `.desktop`, Windows HKCU `Run`), so this
     /// body is byte-identical across platforms bar the `#[cfg]`-selected module path.
-    /// Best-effort: only writes when the current state differs, logs on failure, never panics.
+    /// Best-effort: only writes when the current state differs, and never panics.
+    ///
+    /// **A failed write takes the toggle back down with it** (DRAGON-618). Registering can
+    /// genuinely fail, and a Flatpak is the case that made this matter: writing the host's
+    /// autostart entry needs a filesystem grant a shippable manifest does not carry, so the
+    /// write returns a permission error. Leaving `autostart_on_login` on after that would
+    /// show the user a setting that is not true, which is the same silent lie the old
+    /// wrong-directory bug told, just one layer up. So the toggle is re-derived from what the
+    /// OS actually reports and persisted, and the user sees it fall back.
+    ///
+    /// Only when `resident` is on, because that is the only case where the login item's
+    /// absence proves anything: with the tray off the item is unregistered BY DESIGN, and the
+    /// user's autostart preference is being kept for when they turn the tray back on.
+    ///
+    /// **Only a user TOGGLE reaches this** (DRAGON-628). Nothing else in the app reconciles:
+    /// opening the settings window only reads (`autostart_settings_opened`), and the
+    /// unprompted repair of a stale registration belongs to the resident daemons
+    /// (`platform::autostart_repair_at_daemon_start`). So the preference correction below is
+    /// always answering a click somebody just made.
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    pub(in crate::app) fn reconcile_login_item(&self) {
-        let want = self.resident && self.autostart_on_login;
+    pub(in crate::app) fn reconcile_login_item(&mut self) -> Task<cosmic::Action<Msg>> {
+        // The ONE expression of "should there be a login item", shared with the daemons.
+        let want = crate::platform::autostart_wanted(self.resident, self.autostart_on_login);
         // Each seam exposes `is_enabled()` (query the OS/file/registry) + `set(bool)`
         // (register/unregister), returning an honest `Result<(), String>`. Cfg-select the
         // one for this OS; the reconcile logic below is shared.
@@ -1177,8 +1392,37 @@ impl App {
         use crate::platform::linux_autostart as login;
         #[cfg(target_os = "windows")]
         use crate::platform::windows_autostart as login;
+
+        // DRAGON-618: a Flatpak does not own the host's autostart directory, so registration
+        // is the Background portal's job rather than a file write. That makes it ASYNC and
+        // possibly interactive, which is why this function returns a `Task` at all; every
+        // other platform and package kind still takes the synchronous path below and is
+        // byte-identical to what it was.
+        //
+        // No `is_enabled()` early-return on this path, deliberately. The portal writes the
+        // entry on the host where a sandbox cannot see it, so `is_enabled()` has no honest
+        // answer here and is never asked. Skipping the check costs one portal round trip per
+        // user click, and the portal remembers its decision per app id, so a repeat request
+        // for an already-granted app is normally silent.
+        #[cfg(target_os = "linux")]
+        if login::autostart_mechanism(crate::util::package_kind())
+            == login::Mechanism::BackgroundPortal
+        {
+            // DRAGON-628: unobservable here by construction, so the row falls back to the
+            // preference, which `settled_preference` fills in from the portal's real answer
+            // when this request comes back.
+            self.autostart_registered = None;
+            self.autostart_pending = true;
+            return Task::perform(login::request_background_autostart(want), |r| {
+                cosmic::Action::App(Msg::Settings(SettingsMsg::AutostartPortalSettled(r)))
+            });
+        }
+
         if login::is_enabled() == want {
-            return; // already in the desired state; no write.
+            // Already in the desired state; no write. The probe just answered, so record it
+            // rather than asking the OS the same question twice.
+            self.autostart_registered = Some(want);
+            return Task::none();
         }
         match login::set(want) {
             Ok(()) => log::info!(
@@ -1187,8 +1431,29 @@ impl App {
                 self.resident,
                 self.autostart_on_login
             ),
-            Err(e) => log::warn!("login item reconcile ({want}) failed: {e}"),
+            Err(e) => {
+                log::warn!("login item reconcile ({want}) failed: {e}");
+                // Re-derive the toggle from what the OS really reports, so the settings row
+                // stops claiming something the write did not achieve. See the doc above for
+                // why this is gated on `resident`, and for why only a click gets here at all.
+                if self.resident {
+                    let actual = login::is_enabled();
+                    if self.autostart_on_login != actual {
+                        self.autostart_on_login = actual;
+                        self.save_state();
+                        log::info!(
+                            "autostart toggle corrected to {actual}: the login item write did \
+                             not land"
+                        );
+                    }
+                }
+            }
         }
+        // DRAGON-628: the row renders this, so the ONE function in the app that can change
+        // the login item is the one that keeps the displayed state honest. Re-probed rather
+        // than assumed `want`, because the write above may have failed.
+        self.autostart_registered = crate::platform::autostart_registration().map(|r| r.is_live());
+        Task::none()
     }
 
     /// Dismiss the launch-time update dialog (DRAGON-177), first applying its

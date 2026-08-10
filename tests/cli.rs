@@ -38,6 +38,41 @@ fn test_unknown_subcommand_reports_then_lists() {
         .stderr(predicate::str::contains("usage:"));
 }
 
+/// DRAGON-583: a recording-control flag with nothing recording must END, saying so, and
+/// must never fall through to a normal launch.
+///
+/// That fall-through is the whole reason this test is black-box: an argument `main` does
+/// not recognise reaches the ordinary launch path and opens a CAPTURE OVERLAY, so the flag
+/// being parsed at all is a property only the real binary can prove. A non-zero exit with
+/// the reason on stderr is also what a script (or a desktop shortcut's error report) reads.
+///
+/// `XDG_RUNTIME_DIR` is redirected at a temp dir, deliberately and not just for hygiene:
+/// against the developer's real runtime dir this test could FIND a live recording and stop
+/// it. Off Linux the flags are inert, and the message says which, so the assertion is on
+/// the exit status and the flag name, which both platforms share.
+#[test]
+fn a_recording_command_with_no_recording_reports_and_exits() {
+    let dir = std::env::temp_dir().join(format!("cck-cli-no-recording-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp runtime dir");
+    for flag in [
+        "--toggle-mic",
+        "--toggle-system-audio",
+        "--pause-recording",
+        "--finish-recording",
+        "--cancel-recording",
+    ] {
+        cck()
+            .arg(flag)
+            .env("XDG_RUNTIME_DIR", &dir)
+            // Keep the run out of the developer's debug log as well.
+            .env("CCK_DEBUG_LOG", "0")
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains(flag));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn inspect_reports_when_no_metadata_present() {
     // A plain file carries no Cosmic Capture Kit metadata; --inspect should say so and

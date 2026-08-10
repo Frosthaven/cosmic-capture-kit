@@ -49,7 +49,11 @@ use crate::cloud::upload::tray::{
 /// the nearest and shows it 1:1, which is what keeps the blocks on the pixel grid; the old
 /// single fitted 64px source left the HOST to downscale, which re-blurred exactly the
 /// edges the pixel font exists to keep hard.
-const DIGIT_SIZES: [u32; 6] = [16, 20, 22, 24, 32, 48];
+///
+/// `pub(crate)` since DRAGON-563: the countdown tray (`platform/linux/tray.rs`) renders
+/// its remaining-seconds digits through the same ladder, so the two digit surfaces stay
+/// pixel-siblings instead of each keeping its own list of panel sizes.
+pub(crate) const DIGIT_SIZES: [u32; 6] = [16, 20, 22, 24, 32, 48];
 
 /// The `ksni` item: the account label and the number it is drawing, plus the accent it is
 /// tinted with, a one-entry icon cache, and the cancel flag its one menu entry sets.
@@ -202,7 +206,16 @@ pub fn start(label: &str, face: Face, canceled: Arc<AtomicBool>) -> Option<Item>
         icon_cache: RefCell::new(None),
         canceled,
     };
-    match with_budget("counter", move || tray.spawn())? {
+    // Same sandbox rule as every other item of ours (DRAGON-563 reopened): inside a
+    // Flatpak the D-Bus proxy refuses the well-known `org.kde.StatusNotifierItem-<pid>-<n>`
+    // name ksni requests by default, and this was the ONE ksni spawn still requesting it —
+    // its "no tray host ... ServiceUnknown" lines were the reproducer trail for child
+    // items failing to register where the resident's succeeds. See `daemon.rs` for the
+    // full rationale (no finish-arg can grant the name; ksni documents taking the
+    // connection's unique name instead, which the watcher accepts).
+    match with_budget("counter", move || {
+        tray.disable_dbus_name(crate::util::flatpak_sandboxed()).spawn()
+    })? {
         Ok(handle) => Some(Item { handle }),
         Err(e) => {
             log::debug!("cloud upload: no tray host for the progress counter ({e})");
@@ -297,7 +310,7 @@ mod tests {
     fn the_item_id_is_per_process() {
         let t = tray("Work Drive", Face::Percent(40));
         assert_eq!(t.id(), crate::cloud::upload::tray::item_id(std::process::id()));
-        assert!(t.id().starts_with("dev.frosthaven.CosmicCaptureKit.Upload."));
+        assert!(t.id().starts_with("dev.thedragon.CosmicCaptureKit.Upload."));
         assert!(t.id().ends_with(&std::process::id().to_string()));
         // A sibling child's item would be a different one, which is what lets two counters sit
         // side by side.

@@ -150,6 +150,15 @@ impl App {
     ) -> Task<cosmic::Action<Msg>> {
         crate::util::timing_mark("preview: open_preview_spinner (pre-open, no path yet)");
         let Some((output, monitor)) = self.preview_output.clone() else {
+            // Not a failure ending: the capture still delivers, because `present_capture`
+            // falls back to the editor-less `finish_share`. It IS a degraded experience
+            // the user will notice (no editor opens), so name the reason here instead of
+            // bailing silently. lab/flatpak: this silent return was the visible half of
+            // the daemon-tray "Finish & Save did nothing" report.
+            log::warn!(
+                "preview spinner: no known output to open the editor on; the capture \
+                 will deliver without it"
+            );
             return Task::none();
         };
         // A pre-opened video spinner is a stopped recording; pause other media right now if it
@@ -182,6 +191,7 @@ impl App {
             surface_open: true,
             toasts: Toasts::default(),
             copied_on_open: false,
+            auto_copy_waiting: false,
             demoted: false,
             bake_src: None,
             saved_path: None,
@@ -255,11 +265,11 @@ impl App {
         // keep the ONE listener already bound. A bind failure is non-fatal: we just don't
         // host, and every child behaves exactly as it did before this existed.
         #[cfg(unix)]
-        if self.preview_host.is_none() {
+        if self.handoff_host.is_none() {
             match crate::preview_ipc::start_host() {
                 Ok(host) => {
                     log::info!("preview handoff: hosting on {}", host.socket_path());
-                    self.preview_host = Some(host);
+                    self.handoff_host = Some(host);
                 }
                 Err(e) => log::warn!("preview handoff: not hosting ({e})"),
             }
@@ -290,6 +300,21 @@ impl App {
         // doesn't count: its old surface is being torn down in the same pass. Never true
         // with a single preview open, so the single-document decision is byte-identical.
         let overlay_taken = self.overlay_barred(existing);
+        // `lab/flatpak`: the Linux fullscreen overlay preview is a LAYER surface
+        // (`preview_surface_on` → `get_layer_surface`), so on a session without the
+        // protocol (sandboxed, or a compositor that never shipped it) the window is the
+        // only preview this process can mint: the overlay branch would create nothing
+        // and the capture would end invisible. Read through the ONE seam every other
+        // "may the editor be an overlay here" caller reads (the titlebar button, the
+        // settings row, the appearance toggle), so the mint and the controls cannot drift.
+        //
+        // The `cfg!` stays, and is NOT redundant: off Linux the seam also answers `false`
+        // on Windows 10, where the CAPTURE half deliberately keeps minting fullscreen
+        // preview surfaces (its software-rendered loaders and covers). Forcing the window
+        // there would take those away, so the term is Linux-only by construction and every
+        // layer-shell session folds it to `false` exactly as before.
+        let overlay_impl_missing =
+            cfg!(target_os = "linux") && !crate::platform::overlay_preview_available();
         // Bound rather than returned from each arm purely so ONE mark below records what was
         // minted, whichever branch produced it (DRAGON-454). The branches themselves are
         // unchanged.
@@ -300,8 +325,8 @@ impl App {
         // overlay implementation), so their decisions stay byte-identical to before —
         // and Windows now switches modes from the appearance toggle instead of always
         // opening a window.
-        if (self.preview_windowed && !force_neutral_overlay)
-            || (overlay_taken && !force_neutral_overlay)
+        if ((self.preview_windowed || overlay_taken) && !force_neutral_overlay)
+            || overlay_impl_missing
             || cfg!(all(
                 not(target_os = "linux"),
                 not(target_os = "macos"),
@@ -426,21 +451,39 @@ impl App {
         // permissive, so at 300% the window could open TALLER than its own display.
         // `1.0` (unchanged) on Linux, macOS, and every 96-DPI Windows monitor.
         let monitor = monitor_fit_points(capture_monitor, monitor_point_scale(output.as_ref()));
-        // Both platforms size through the SAME `windowed_fit_size`, which caps the
-        // window at 90% of the monitor height (rule 3, DRAGON-221) so it clears the
-        // Dock / menu bar / panels neither compositor can measure client-side —
-        // macOS won't shrink an over-large window after open, and this keeps the
-        // request inside the usable area up front. Only fall back to ~80% of the
-        // monitor width / 90% of its height when the size is genuinely unknown (a
-        // pre-opened spinner still decoding), since the compositor won't shrink an
-        // over-large window later.
+        // Every platform sizes through the SAME `windowed_fit_size`, whose rule-3 height
+        // budget (DRAGON-221) keeps the request inside the display's USABLE area as a 90
+        // percent guess, on every session and platform (DRAGON-579 retired the DRAGON-549
+        // full-height ask; `sizing::USABLE_H_FRAC`'s doc carries the story).
+        // Only fall back to the conservative size-unknown box when the media dims are
+        // genuinely unknown (a pre-opened spinner still decoding).
+        let fallback = self.overlay_fallback_active();
         let (w, h) = match media {
-            Some(m) => windowed_fit_size(m, Some(monitor), extra_h, self.preview_toolbar_labels),
-            None => (
-                (monitor.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
-                (monitor.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
-            ),
+            Some(m) => {
+                windowed_fit_size(m, Some(monitor), extra_h, self.preview_toolbar_labels)
+            }
+            None => size_unknown_fallback(monitor),
         };
+        // DRAGON-549: the open fit, on the record. Geometry only, no path and no pixels — the
+        // same class of fact the capture log already carries ("frozen frame ready 5120x1440
+        // px for a 5120x1440 logical output"). It exists because "the editor opened slightly
+        // too small" could not be answered from a log at all: the media, the monitor bound,
+        // the budget and the request are four numbers, and only together do they say whether
+        // the fit was wrong or the compositor reshaped what we asked for. Pair it with the
+        // first-configure line in `preview_resized` to see what the compositor actually gave.
+        // `fallback` stays logged as session context (which overlay shape produced the
+        // capture) even though the budget itself is one constant again (DRAGON-579).
+        log::debug!(
+            "preview open fit: media={:?}pt monitor={:?}pt chrome_h={:.0} h_budget={:.2} \
+             fallback={} request={}x{}",
+            media,
+            monitor,
+            PreviewSurface::Window.chrome_h(self.preview_toolbar_labels) + extra_h,
+            sizing::USABLE_H_FRAC,
+            fallback,
+            w.round(),
+            h.round(),
+        );
         // DRAGON-309: remember the intended open size so the macOS native finalize can
         // re-assert it after moving the window to the trigger monitor (winit births it on
         // the capture/active monitor, where macOS may clamp its height to a smaller screen
@@ -671,10 +714,13 @@ impl App {
     /// every edit survive. The new appearance is also persisted as the default.
     /// No-op when no preview is open.
     pub(super) fn toggle_preview_appearance(&mut self, id: window::Id) -> Task<cosmic::Action<Msg>> {
-        // DRAGON-427: nothing to flip TO on Windows 10 — the overlay editor would inherit the
-        // software rasterizer that cannot draw its shader layers. The button is hidden there
-        // (`chrome.rs`), so this only catches a keyboard/message route reaching it anyway; it
-        // must still refuse, or the flip would strand the user on an unusable surface.
+        // Nothing to flip TO where the overlay editor cannot exist: Windows 10, whose overlay
+        // would inherit the software rasterizer that cannot draw these shader layers
+        // (DRAGON-427), and a Linux session with no layer shell, where the overlay preview
+        // has no surface type to be (`lab/flatpak`). The button is hidden in both cases
+        // (`chrome.rs` reads the same seam), so this only catches a keyboard/message route
+        // reaching it anyway; it must still refuse, or the flip would tear the working
+        // surface down and mint nothing.
         if !crate::platform::overlay_preview_available() {
             return Task::none();
         }
@@ -962,6 +1008,7 @@ impl App {
             surface_open: true,
             toasts: Toasts::default(),
             copied_on_open: false,
+            auto_copy_waiting: false,
             demoted: false,
             bake_src: None,
             saved_path: None,
@@ -1034,6 +1081,7 @@ impl App {
             surface_open: true,
             toasts: Toasts::default(),
             copied_on_open: false,
+            auto_copy_waiting: false,
             demoted: false,
             bake_src: None,
             saved_path: None,
@@ -1048,21 +1096,25 @@ impl App {
         Task::batch([open_task, task])
     }
 
-    /// DRAGON-336 phase 3b — the HOST half of the preview handoff: drain every request other
-    /// processes' capture children have posted, opening each as a NEW preview document.
+    /// DRAGON-336 phase 3b — the HOST half of the handoff: drain every request our siblings
+    /// have posted and serve each one.
     ///
-    /// The ack is written in THIS SAME arm, only after the document is actually in
-    /// `self.previews` — that is what makes the "host is exiting" race safe: a child
-    /// concludes "accepted" only because a live host explicitly said so, and a host that
-    /// dies (or drops the request) closes the connection unacked, which the child reads as
-    /// "open your own preview". A request we cannot serve is REJECTED rather than dropped,
-    /// so the child stops waiting immediately instead of burning `ACK_TIMEOUT`.
+    /// The ack is written in THIS SAME arm, only after the request has actually changed our
+    /// state — that is what makes the "host is exiting" race safe: a sibling concludes
+    /// "accepted" only because a live host explicitly said so, and a host that dies (or drops
+    /// the request) closes the connection unacked, which the sibling reads as "do it
+    /// yourself". A request we cannot serve is REJECTED rather than dropped, so the sibling
+    /// stops waiting immediately instead of burning `ACK_TIMEOUT`.
+    ///
+    /// DRAGON-613: the arms are keyed on the request's own DESTINATION, never on what this
+    /// process happens to be. A destination we cannot serve is refused for that reason
+    /// alone, which is what keeps "who is this value for" a property of the message.
     #[cfg(unix)]
     pub(in crate::app) fn drain_preview_handoffs(&mut self) -> Task<cosmic::Action<Msg>> {
-        // Take the whole batch off the channel first: opening a preview needs `&mut self`,
-        // which can't be borrowed while `self.preview_host` is.
+        // Take the whole batch off the channel first: serving a request needs `&mut self`,
+        // which can't be borrowed while `self.handoff_host` is.
         let mut inbound = Vec::new();
-        if let Some(host) = &self.preview_host {
+        if let Some(host) = &self.handoff_host {
             while let Ok(h) = host.requests.try_recv() {
                 inbound.push(h);
             }
@@ -1070,21 +1122,71 @@ impl App {
         let mut tasks = Vec::new();
         for handoff in inbound {
             // Cloned so the borrow of `handoff` ends before it is consumed by accept/reject.
-            let req = handoff.request().clone();
-            match self.open_handoff_preview(&req) {
-                Some(task) => {
-                    log::info!("preview handoff: took ownership of {}", req.path.display());
-                    tasks.push(task);
-                    // Only NOW may the child exit — the document is in our state.
-                    handoff.accept();
+            match handoff.request().clone() {
+                crate::preview_ipc::Request::Open(req) => {
+                    match self.open_handoff_preview(&req) {
+                        Some(task) => {
+                            log::info!(
+                                "preview handoff: took ownership of {}",
+                                req.path.display()
+                            );
+                            tasks.push(task);
+                            // Only NOW may the child exit — the document is in our state.
+                            handoff.accept();
+                        }
+                        None => {
+                            log::warn!(
+                                "preview handoff: refusing {} — the child keeps it",
+                                req.path.display()
+                            );
+                            handoff.reject(crate::preview_ipc::RejectReason::Busy);
+                        }
+                    }
                 }
-                None => {
-                    log::warn!(
-                        "preview handoff: refusing {} — the child keeps it",
-                        req.path.display()
-                    );
-                    handoff.reject(crate::preview_ipc::RejectReason::Busy);
-                }
+                // DRAGON-587: a colour picker WE launched has picked one. It lands on the
+                // focused document through the editor's own custom-colour path, so it
+                // behaves exactly like applying a colour from the wheel. With no document
+                // to put it on we refuse, and the picker shows its result window instead;
+                // never an ack for a colour that went nowhere.
+                crate::preview_ipc::Request::Color {
+                    to: crate::preview_ipc::ColorDest::Editor,
+                    rgb: [r, g, b],
+                } => match self.focused_preview_id() {
+                    Some(target) => {
+                        // The colour itself is user content and is never logged.
+                        log::debug!("preview: a picked color arrived from our color picker");
+                        tasks.push(self.apply_custom_annot_color(target, [r, g, b, 255]));
+                        handoff.accept();
+                    }
+                    None => {
+                        log::info!(
+                            "preview: a picked color arrived with no open document to put \
+                             it on; the picker keeps it"
+                        );
+                        handoff.reject(crate::preview_ipc::RejectReason::Busy);
+                    }
+                },
+                // DRAGON-613: a pick from anywhere else (the tray, the CLI, a shortcut, or
+                // this window's own pipette) belongs to THE colour picker window, and this
+                // process has it. Apply it exactly as a local pick and ack; with no picker
+                // window here we refuse, and the sender opens its own rather than losing it.
+                crate::preview_ipc::Request::Color {
+                    to: crate::preview_ipc::ColorDest::PickerWindow,
+                    rgb,
+                } => match self.apply_handoff_pick(rgb) {
+                    Some(task) => {
+                        tasks.push(task);
+                        // Only NOW may the sender exit — the colour is in our state.
+                        handoff.accept();
+                    }
+                    None => {
+                        log::info!(
+                            "color picker: a picked color arrived but this process has no \
+                             picker window; the sender keeps it"
+                        );
+                        handoff.reject(crate::preview_ipc::RejectReason::Busy);
+                    }
+                },
             }
         }
         Task::batch(tasks)
@@ -1174,6 +1276,7 @@ impl App {
             surface_open: true,
             toasts: Toasts::default(),
             copied_on_open: false,
+            auto_copy_waiting: false,
             demoted: false,
             bake_src: None,
             saved_path: None,
@@ -1397,8 +1500,7 @@ impl App {
         }
         // This configure is the WINDOW's FIRST map iff the transient max-size hint was still
         // pending (set at mint, cleared here exactly once) — the signal DRAGON-317's re-home
-        // below piggybacks on (Linux-only, so gated to stay warning-clean elsewhere).
-        #[cfg(target_os = "linux")]
+        // piggybacks on, and the DRAGON-549 open-fit line below.
         let first_window_configure =
             self.preview_for(id).is_some_and(|p| p.max_hint_pending);
         let clear_hint = match self.preview_for_mut(id) {
@@ -1408,6 +1510,20 @@ impl App {
             }
             _ => Task::none(),
         };
+        // DRAGON-549: what the window system actually GAVE us, against what the open fit
+        // asked for. The pair is the whole diagnostic: equal means our request stood, smaller
+        // means the compositor clamped it (to the work area, which is the answer we want and
+        // cannot compute), and a suspiciously round two-thirds means the max-size hint did not
+        // land. Geometry only, and only on the FIRST configure — a later resize is the user.
+        if first_window_configure
+            && let Some((rw, rh)) = self.preview_open_size
+            && (rw, rh) != (w, h)
+        {
+            log::debug!(
+                "preview open fit: the compositor mapped the editor at {w}x{h}, not the \
+                 {rw}x{rh} requested"
+            );
+        }
         // DRAGON-317 (Linux windowed): the first map of the preview WINDOW. cosmic-comp maps a
         // fresh xdg_toplevel on the seat's ACTIVE (pointer) output (`Shell::map_window` →
         // `seat.active_output()`, updated on pointer motion) — and an xdg_toplevel cannot
@@ -1787,7 +1903,7 @@ impl App {
                     let radius = crate::app::theme::rounding(theme).window();
                     cosmic::iced::widget::container::Style {
                         background: Some(Background::Color(crate::app::theme::frost_color(
-                            cosmic.background.base.into(),
+                            cosmic.background(false).base.into(),
                             glass,
                         ))),
                         border: Border {
@@ -2000,11 +2116,11 @@ impl App {
             .class(cosmic::theme::Container::custom(|theme| {
                 let c = theme.cosmic();
                 cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(c.background.base.into())),
+                    background: Some(Background::Color(c.background(false).base.into())),
                     border: Border {
                         radius: crate::app::theme::rounding(theme).m.into(),
                         width: 1.0,
-                        color: c.background.divider.into(),
+                        color: c.background(false).divider.into(),
                     },
                     ..Default::default()
                 }
@@ -2022,7 +2138,7 @@ impl App {
     /// message set), with the close (x) cancel group below so the wait is cancellable — this
     /// portable view is what mac (its existing X affordance) and Windows both show, so the SAME
     /// X abort is present on both platforms. The X fires `PreviewMsg::Cancel` — the SAME abort
-    /// the Esc hotkey triggers (`keyboard.rs`: `Action::PreviewCancel -> PreviewMsg::Cancel`),
+    /// the Esc hotkey triggers (`keyboard.rs`: `FixedEditorAction::Close -> PreviewMsg::Cancel`),
     /// which routes through `finish_session` for a clean one-shot teardown (focus / menu-bar /
     /// window-order state restored, then exit). It stays clickable even while the window
     /// focus-then-grab is slow/hung because that grab runs OFF the UI thread
@@ -2053,7 +2169,7 @@ impl App {
         ])
         .spacing(20.0)
         .align_x(Alignment::Center);
-        let content = widget::column(vec![status.into(), tb.cancel_group(&self.keymap)])
+        let content = widget::column(vec![status.into(), tb.cancel_group()])
             .spacing(20.0)
             .align_x(Alignment::Center);
         // Swallow any press that lands off the cancel affordance so it can't reach a window

@@ -119,6 +119,57 @@ impl GlobalRect {
     pub fn contains(self, g: (i32, i32)) -> bool {
         g.0 > self.left && g.0 < self.right && g.1 > self.top && g.1 < self.bottom
     }
+
+    /// **Pure**, unit-tested: this rectangle TRANSLATED by `(dx, dy)`, kept inside `bounds`
+    /// (DRAGON-599, the arrow / `hjkl` region nudge).
+    ///
+    /// **It moves and it never resizes.** The size is preserved by construction, because the
+    /// clamp is applied to the TRANSLATION and then the whole rectangle is shifted by it,
+    /// rather than to the four edges independently. Clamping edges is the obvious way to write
+    /// this and it is wrong: pushing a rectangle into a wall would shrink it against that wall
+    /// and the user would silently lose a region they had sized deliberately. Walking into a
+    /// wall stops the move instead.
+    ///
+    /// The two axes are independent, so sliding along a wall works: a region already flush
+    /// against the top still moves left and right, and only the vertical half of a diagonal
+    /// step is refused.
+    ///
+    /// A rectangle WIDER than the bounds cannot satisfy both walls at once, so that axis
+    /// refuses to move at all rather than picking a wall to favour. That is reachable in
+    /// practice: a region dragged across two monitors is wider than either one, and on a
+    /// non-rectangular desktop the bounding box has corners no output covers.
+    ///
+    /// A rectangle ALREADY outside the bounds (a display was unplugged under a remembered
+    /// region) can still be walked back IN, one step at a time, but never further OUT, and
+    /// never in the direction opposite the key. Snapping it flush in one tap would be a jump
+    /// nobody asked for, and letting it drift further out would strand it for good.
+    ///
+    /// `self` is normalized first, so a rectangle dragged right-to-left (which is stored with
+    /// `left > right`) moves the same way as one dragged the other way. `bounds` is expected
+    /// normalized, as `(left, top, right, bottom)`.
+    pub fn nudged(self, dx: i32, dy: i32, bounds: (i32, i32, i32, i32)) -> Self {
+        let r = self.normalize();
+        let (bl, bt, br, bb) = bounds;
+        // The allowed travel on one axis: at most `d`, never past a border, never further out
+        // than the rectangle already is, and ZERO when the span does not fit at all. The two
+        // `room` terms are signed and straddle zero, so the clamp can never invert.
+        let travel = |d: i32, lo: i32, hi: i32, blo: i32, bhi: i32| -> i32 {
+            if hi - lo > bhi - blo {
+                return 0;
+            }
+            let room_back = (blo - lo).min(0);
+            let room_on = (bhi - hi).max(0);
+            d.clamp(room_back, room_on)
+        };
+        let mx = travel(dx, r.left, r.right, bl, br);
+        let my = travel(dy, r.top, r.bottom, bt, bb);
+        Self {
+            left: r.left + mx,
+            top: r.top + my,
+            right: r.right + mx,
+            bottom: r.bottom + my,
+        }
+    }
 }
 
 impl From<(i32, i32, i32, i32)> for GlobalRect {
@@ -163,6 +214,18 @@ impl From<GlobalRect> for (i32, i32, i32, i32) {
 /// `1.0` — a layer surface's app space is points. Multi-monitor is per-OUTPUT: a 100% +
 /// 300% pair carries one of these EACH, never one global scale.
 ///
+/// The Linux portal-frozen FALLBACK overlay (`lab/flatpak`) adds a third kind of bridge:
+/// a sandboxed / layer-shell-less session draws region selection in ONE fullscreen
+/// toplevel over a frozen frame of the PORTAL-GRANTED monitor, and the compositor, not
+/// us, decides which monitor that toplevel maps on. When it lands on a monitor of a
+/// different geometry, the frame is shown LETTERBOXED ([`Self::letterbox`]): one uniform
+/// scale that keeps its aspect, capped at 1 so a smaller frame is never enlarged,
+/// centred, bars on the leftover axis (all four sides when the cap bites). Round 1 shipped a
+/// PER-AXIS stretch instead (`ContentFit::Fill` plus a `stretched()` constructor); it
+/// mapped correctly but DISTORTED the still whenever the shapes differed, and the owner
+/// requires the captured frame keep its aspect, so the per-axis form is gone and must not
+/// come back.
+///
 /// At `factor == 1.0` every conversion here is the exact identity (an f32 multiply and
 /// divide by 1.0 are bit-exact), which is what keeps Linux, macOS and every 96-DPI
 /// Windows box byte-identical.
@@ -172,21 +235,97 @@ pub struct OverlayUnits {
     origin: (i32, i32),
     /// CAPTURE units per POINT for this output. Always finite and `> 0`.
     factor: f32,
+    /// POINT-space position of the frame's first pixel inside the surface: the letterbox
+    /// bars of the fallback bridge. `(0.0, 0.0)` on every uniform bridge, where the
+    /// surface shows capture pixels edge to edge (subtracting and adding a literal zero
+    /// is bit-exact, which is what keeps those bridges byte-identical).
+    offset: (f32, f32),
+    /// The letterbox extras. `None` on every uniform bridge.
+    letterbox: Option<Letterbox>,
+}
+
+/// The letterbox bridge's extras (`lab/flatpak`), absent on every uniform bridge.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Letterbox {
+    /// The frozen frame's CAPTURE extent: what [`OverlayUnits::to_capture`] clamps into
+    /// and what [`OverlayUnits::visible_capture_size`] reports.
+    frame: (u32, u32),
+    /// The fallback window's POINT extent: the real iced viewport
+    /// ([`OverlayUnits::size_to_point`]'s answer).
+    viewport: (f32, f32),
+    /// The frame's displayed POINT extent (`frame * scale`): the letterbox destination
+    /// the backdrop draws the still at ([`OverlayUnits::letterbox_dest`]).
+    dest: (f32, f32),
 }
 
 impl OverlayUnits {
-    /// Build a bridge for one output. A non-finite or non-positive `factor` degrades to
-    /// the identity rather than being trusted: a zero would divide the whole overlay to
-    /// infinity, and a negative would mirror it — both far worse than "unscaled".
+    /// Guard a factor: non-finite or non-positive degrades to the identity rather
+    /// than being trusted: a zero would divide the whole overlay to infinity, and a
+    /// negative would mirror it, both far worse than "unscaled".
+    fn guard(factor: f32) -> f32 {
+        if factor.is_finite() && factor > 0.0 { factor } else { 1.0 }
+    }
+
+    /// Build a UNIFORM bridge for one output. A non-finite or non-positive `factor`
+    /// degrades to the identity (see [`Self::guard`]).
     pub fn new(origin: (i32, i32), factor: f32) -> Self {
-        let factor = if factor.is_finite() && factor > 0.0 { factor } else { 1.0 };
-        Self { origin, factor }
+        Self { origin, factor: Self::guard(factor), offset: (0.0, 0.0), letterbox: None }
+    }
+
+    /// Pure, unit-tested: build the LETTERBOX bridge, the Linux fallback overlay's
+    /// mismatch guard (`lab/flatpak`). `frame` is the portal-granted monitor's logical
+    /// size (the frozen frame's capture extent); `win` is the fullscreen toplevel's
+    /// ACTUAL size in points, as its resize event reported it. Wayland gives a client no
+    /// say in which monitor a fullscreen toplevel maps on, so the two can disagree.
+    ///
+    /// The mapping is uniform-scale-plus-offset: `scale = min(win/frame)` per the two
+    /// axes, CAPPED at 1 (POINTS per capture unit, so the WHOLE frame fits at its own
+    /// aspect and is never enlarged), and the offsets centre the displayed frame,
+    /// leaving equal bars on the leftover axis. The cap is the owner's call from the
+    /// third live test: a smaller monitor's capture must not be blown up, so a frame
+    /// smaller than the window renders at NATIVE size, centred, bars on all four
+    /// sides. A window point maps into the frame by
+    /// subtracting the offsets and dividing by the scale; points in the BARS land
+    /// outside the frame and CLAMP to its edge ([`Self::to_capture`]), which is what
+    /// confines selection to visible pixels. A matching window computes scale 1 and
+    /// zero offsets, identical to the uniform bridge over the whole window. Degenerate
+    /// inputs (zero frame; zero / negative / non-finite window) degrade to the plain
+    /// uniform identity, the same safe side [`Self::guard`] takes.
+    // Its one production caller is the Linux `OutputState::units`; compiled into every
+    // test build so the mapping is proven on any host (the house pattern).
+    #[cfg(any(target_os = "linux", test))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn letterbox(origin: (i32, i32), frame: (u32, u32), win: (f32, f32)) -> Self {
+        let ok = |v: f32| v.is_finite() && v >= 1.0;
+        if frame.0 == 0 || frame.1 == 0 || !ok(win.0) || !ok(win.1) {
+            return Self::new(origin, 1.0);
+        }
+        let (fw, fh) = (frame.0 as f32, frame.1 as f32);
+        // POINTS per CAPTURE unit: the one uniform scale at which the whole frame fits,
+        // capped at 1 so a frame smaller than the window is shown at native size (bars
+        // all around) instead of blown up. The clamp geometry below reads the capped
+        // dest, so point mapping and selection confinement follow the cap for free.
+        let scale = (win.0 / fw).min(win.1 / fh).min(1.0);
+        // The displayed extent comes from the scale DIRECTLY (not back through the
+        // reciprocal factor), so friendly ratios stay exact and the offsets derived
+        // from it centre the frame without float drift.
+        let dest = (fw * scale, fh * scale);
+        let offset = (
+            ((win.0 - dest.0) / 2.0).max(0.0),
+            ((win.1 - dest.1) / 2.0).max(0.0),
+        );
+        Self {
+            origin,
+            factor: Self::guard(1.0 / scale),
+            offset,
+            letterbox: Some(Letterbox { frame, viewport: win, dest }),
+        }
     }
 
     /// The unscaled bridge — capture space IS point space, only shifted by `origin`. The
     /// Linux/macOS case, and what every pre-DRAGON-448 call site did implicitly.
     pub const fn identity(origin: (i32, i32)) -> Self {
-        Self { origin, factor: 1.0 }
+        Self { origin, factor: 1.0, offset: (0.0, 0.0), letterbox: None }
     }
 
     /// The output's top-left in CAPTURE space.
@@ -203,37 +342,115 @@ impl OverlayUnits {
     ///
     /// This is what builds the physical `Selection` a capture consumes. The truncating
     /// `as i32` is deliberate and matches what the region widget always did, so a 1.0
-    /// factor lands on the same integer it used to.
+    /// factor lands on the same integer it used to. On the letterbox bridge the result
+    /// is CLAMPED into the frame before the origin shift: a point in the bars has no
+    /// captured pixel under it, so it maps to the nearest frame edge instead of past it.
     pub fn to_capture(self, p: (f32, f32)) -> (i32, i32) {
-        (
-            (p.0 * self.factor) as i32 + self.origin.0,
-            (p.1 * self.factor) as i32 + self.origin.1,
-        )
+        let (cx, cy) = self.capture_offset_f(p);
+        (cx as i32 + self.origin.0, cy as i32 + self.origin.1)
+    }
+
+    /// Pure, unit-tested: the FRACTIONAL capture offset of a surface-local POINT from
+    /// this output's own top-left, letterbox clamp applied, origin NOT added.
+    ///
+    /// The float half of [`Self::to_capture`], which is now written in terms of it, so
+    /// there is exactly one copy of the scale-and-clamp arithmetic. `to_capture` is
+    /// byte-identical to before: it still truncates the OFFSET and adds the origin
+    /// afterwards, which is not the same as truncating the sum on a monitor whose origin
+    /// is negative.
+    ///
+    /// It exists because the colour picker (DRAGON-582) must resolve a POINT to a single
+    /// SOURCE PIXEL, and the truncation `to_capture` performs throws away exactly the
+    /// sub-capture-unit precision that decides which pixel that is. On a HiDPI output the
+    /// snapshot has two or three image pixels per capture unit, so a truncated coordinate
+    /// can never address the last column of the last unit, and the screen's furthest edge
+    /// pixel would be unreachable.
+    pub fn capture_offset_f(self, p: (f32, f32)) -> (f32, f32) {
+        let cx = (p.0 - self.offset.0) * self.factor;
+        let cy = (p.1 - self.offset.1) * self.factor;
+        match self.letterbox {
+            Some(lb) => (
+                cx.clamp(0.0, lb.frame.0 as f32),
+                cy.clamp(0.0, lb.frame.1 as f32),
+            ),
+            None => (cx, cy),
+        }
     }
 
     /// **OUT**: a global CAPTURE coordinate → the surface-local POINT to draw/place it at.
     pub fn to_point(self, g: (i32, i32)) -> (f32, f32) {
         (
-            (g.0 - self.origin.0) as f32 / self.factor,
-            (g.1 - self.origin.1) as f32 / self.factor,
+            (g.0 - self.origin.0) as f32 / self.factor + self.offset.0,
+            (g.1 - self.origin.1) as f32 / self.factor + self.offset.1,
         )
     }
 
-    /// A CAPTURE-space LENGTH in points (no origin shift) — widths, heights, radii.
+    /// A CAPTURE-space LENGTH in points (no origin shift, no letterbox offset). Kept for
+    /// the on-screen "feel" constants; a WIDTH-AND-HEIGHT pair reads better through the
+    /// pair form [`Self::size_f_to_point`].
     pub fn len_to_point(self, n: f32) -> f32 {
         n / self.factor
     }
 
     /// A POINT-space LENGTH in capture units — the on-screen "feel" constants (grab radii,
-    /// drag thresholds) that must stay the same SIZE on screen at any scale.
+    /// drag thresholds) that must stay the same SIZE on screen at any scale. The pair
+    /// form is [`Self::size_to_capture`].
     pub fn len_to_capture(self, n: f32) -> f32 {
         n * self.factor
     }
 
+    /// A CAPTURE-space (width, height) extent in points: the pair convenience of
+    /// [`Self::len_to_point`]. Extents carry no origin and no letterbox offset; both
+    /// axes share the one uniform factor (the round-1 per-axis form died with the
+    /// stretched bridge, see the type doc).
+    pub fn size_f_to_point(self, size: (f32, f32)) -> (f32, f32) {
+        (size.0 / self.factor, size.1 / self.factor)
+    }
+
+    /// A POINT-space (width, height) extent in capture units: the pair counterpart of
+    /// [`Self::size_f_to_point`].
+    pub fn size_to_capture(self, size: (f32, f32)) -> (f32, f32) {
+        (size.0 * self.factor, size.1 * self.factor)
+    }
+
     /// An output's CAPTURE size (`OutputState::logical_size`) as the POINT extent of the
     /// surface iced laid out for it — the viewport every overlay layout must fit inside.
+    /// On the letterbox bridge that surface is the fallback WINDOW, whose real size the
+    /// constructor was handed, so the answer is the window's extent regardless of `size`
+    /// (the frame's own displayed extent is smaller by the bars; [`Self::letterbox_dest`]
+    /// carries that one).
     pub fn size_to_point(self, size: (u32, u32)) -> (f32, f32) {
-        (self.len_to_point(size.0 as f32), self.len_to_point(size.1 as f32))
+        match self.letterbox {
+            Some(lb) => lb.viewport,
+            None => (size.0 as f32 / self.factor, size.1 as f32 / self.factor),
+        }
+    }
+
+    /// Pure, unit-tested: the CAPTURE extent of the pixels a viewport of `size` POINTS
+    /// actually SHOWS. A uniform bridge shows capture pixels edge to edge, so this is
+    /// exactly [`Self::size_to_capture`]; the letterbox bridge's bars show NOTHING, so
+    /// the answer is the frozen frame's own extent. This is what confines the
+    /// region-selection walls to the visible image instead of the whole window
+    /// (`lab/flatpak`).
+    pub fn visible_capture_size(self, size: (f32, f32)) -> (f32, f32) {
+        match self.letterbox {
+            Some(lb) => (lb.frame.0 as f32, lb.frame.1 as f32),
+            None => self.size_to_capture(size),
+        }
+    }
+
+    /// The POINT-space placement of the frozen frame inside the fallback window: the
+    /// letterbox `(offset, displayed extent)` the backdrop must draw the still at, so
+    /// the pixels on screen and [`Self::to_capture`]'s mapping share ONE math source and
+    /// cannot drift. `None` on every uniform bridge, which is what keeps the layer-shell
+    /// backdrop path byte-identical.
+    // Its one production caller is the Linux fallback backdrop (`with_frozen_bg`);
+    // compiled into every test build so the placement is proven on any host.
+    #[cfg(any(target_os = "linux", test))]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn letterbox_dest(self) -> Option<((f32, f32), (f32, f32))> {
+        let lb = self.letterbox?;
+        Some((self.offset, lb.dest))
     }
 }
 
@@ -466,5 +683,284 @@ mod overlay_units_tests {
         assert_eq!(u.len_to_capture(16.0), 32.0);
         assert_eq!(u.len_to_point(32.0), 16.0);
         assert_eq!(u.len_to_point(u.len_to_capture(8.0)), 8.0);
+    }
+
+}
+
+#[cfg(test)]
+mod letterbox_tests {
+    use super::OverlayUnits;
+
+    /// A matching window (the common case: the fullscreen toplevel landed on the granted
+    /// monitor) is byte-identical to the plain uniform bridge over the whole window:
+    /// scale 1, zero offsets, and the clamp inert because every window point is already
+    /// inside the frame.
+    #[test]
+    fn a_matching_window_is_byte_identical_to_the_uniform_bridge() {
+        for origin in [(0, 0), (1920, 200), (-2560, -1440)] {
+            let lb = OverlayUnits::letterbox(origin, (1920, 1080), (1920.0, 1080.0));
+            let plain = OverlayUnits::new(origin, 1.0);
+            assert_eq!(lb.factor(), 1.0);
+            for p in [(0.0f32, 0.0f32), (10.4, 10.6), (960.0, 540.0), (1920.0, 1080.0)] {
+                assert_eq!(lb.to_capture(p), plain.to_capture(p), "origin {origin:?} p {p:?}");
+            }
+            for g in [origin, (origin.0 + 300, origin.1 + 600), (origin.0 + 1920, origin.1 + 1080)] {
+                assert_eq!(lb.to_point(g), plain.to_point(g), "origin {origin:?} g {g:?}");
+            }
+            // The viewport is the window; the frame fills it edge to edge.
+            assert_eq!(lb.size_to_point((1920, 1080)), (1920.0, 1080.0));
+            assert_eq!(lb.visible_capture_size((1920.0, 1080.0)), (1920.0, 1080.0));
+            assert_eq!(lb.letterbox_dest(), Some(((0.0, 0.0), (1920.0, 1080.0))));
+        }
+    }
+
+    /// A window with LESS height per width than the frame needs (an ultrawide frame on a
+    /// 16:9 monitor) letterboxes with TOP/BOTTOM bars: uniform scale from the width, the
+    /// frame centred vertically, and bar points clamping to the frame's edge rows.
+    #[test]
+    fn an_ultrawide_frame_letterboxes_top_and_bottom() {
+        // Granted monitor 5120x1440 at (0, 0); the toplevel landed on 1920x1080.
+        // scale = min(1920/5120, 1080/1440) = 0.375: shown 1920x540, bars 270 each.
+        let u = OverlayUnits::letterbox((0, 0), (5120, 1440), (1920.0, 1080.0));
+        assert_eq!(u.letterbox_dest(), Some(((0.0, 270.0), (1920.0, 540.0))));
+        // The displayed frame's corners map onto the frame's corners (the far one is
+        // pinned by the clamp), and the window centre is the frame centre: a uniform
+        // scale keeps the aspect, where the round-1 per-axis stretch did not.
+        assert_eq!(u.to_capture((0.0, 270.0)), (0, 0));
+        assert_eq!(u.to_capture((1920.0, 810.0)), (5120, 1440));
+        assert_eq!(u.to_capture((960.0, 540.0)), (2560, 720));
+        // Bar points have no captured pixel under them: they CLAMP to the frame edge
+        // instead of mapping past it (the window's own top/bottom rows included).
+        assert_eq!(u.to_capture((500.0, 0.0)), (1333, 0));
+        assert_eq!(u.to_capture((500.0, 1080.0)), (1333, 1440));
+        // The viewport the layout must fit inside is the WINDOW's size; the pixels the
+        // selection walls confine to are the FRAME's.
+        assert_eq!(u.size_to_point((5120, 1440)), (1920.0, 1080.0));
+        assert_eq!(u.visible_capture_size((1920.0, 1080.0)), (5120.0, 1440.0));
+        // Whole capture coordinates inside the frame survive the round trip to within
+        // the one capture unit the truncation allows.
+        for g in [(0, 0), (2560, 720), (5119, 1439)] {
+            let back = u.to_capture(u.to_point(g));
+            assert!(
+                (back.0 - g.0).abs() <= 1 && (back.1 - g.1).abs() <= 1,
+                "{g:?} -> {back:?}"
+            );
+        }
+        // A non-origin monitor keeps its origin unshifted and unscaled, applied AFTER
+        // the clamp, exactly like the uniform form.
+        let u = OverlayUnits::letterbox((1920, 200), (5120, 1440), (1920.0, 1080.0));
+        assert_eq!(u.to_capture((0.0, 0.0)), (1920, 200));
+    }
+
+    /// A window with MORE width per height than the frame needs letterboxes with SIDE
+    /// bars: uniform scale from the height, the frame centred horizontally, and points
+    /// in either bar clamping to the frame's edge columns.
+    #[test]
+    fn a_wider_window_letterboxes_the_sides() {
+        // Granted monitor 1920x1080 at (100, 50); the toplevel landed on 2560x1080.
+        // scale = min(2560/1920, 1080/1080) = 1.0: shown 1920x1080, bars 320 each side.
+        let u = OverlayUnits::letterbox((100, 50), (1920, 1080), (2560.0, 1080.0));
+        assert_eq!(u.factor(), 1.0);
+        assert_eq!(u.letterbox_dest(), Some(((320.0, 0.0), (1920.0, 1080.0))));
+        // The displayed frame's corners map onto the frame's corners.
+        assert_eq!(u.to_capture((320.0, 0.0)), (100, 50));
+        assert_eq!(u.to_capture((2240.0, 1080.0)), (2020, 1130));
+        // A left-bar point clamps to the frame's left edge; a right-bar point (and the
+        // window's own far corner) to the right edge.
+        assert_eq!(u.to_capture((0.0, 540.0)), (100, 590));
+        assert_eq!(u.to_capture((2560.0, 1080.0)), (2020, 1130));
+        // And the draw direction places frame coordinates at their on-screen spot,
+        // inside the bars.
+        assert_eq!(u.to_point((100, 50)), (320.0, 0.0));
+        assert_eq!(u.to_point((2020, 1130)), (2240.0, 1080.0));
+        assert_eq!(u.size_to_point((1920, 1080)), (2560.0, 1080.0));
+        assert_eq!(u.visible_capture_size((2560.0, 1080.0)), (1920.0, 1080.0));
+    }
+
+    /// A frame SMALLER than the window in both axes renders at NATIVE size, centred,
+    /// bars on all four sides. The scale is capped at 1: this test's first shape once
+    /// upscaled to fill (scale 1.5, no bars), and the owner's third live test overruled
+    /// that: a smaller monitor's capture must not be blown up. The clamp geometry reads
+    /// the capped dest, so every bar edge confines selection to the native-size frame.
+    #[test]
+    fn a_smaller_frame_renders_at_native_size_with_bars_all_around() {
+        // 1280x720 frame on a 1920x1080 window: uncapped scale would be 1.5; capped it
+        // is 1.0, shown 1280x720, bars 320 each side and 180 top/bottom.
+        let u = OverlayUnits::letterbox((0, 0), (1280, 720), (1920.0, 1080.0));
+        assert_eq!(u.factor(), 1.0, "capture unit per point stays 1:1, never magnified");
+        let Some((offset, dest)) = u.letterbox_dest() else {
+            panic!("a well-formed letterbox must carry a dest");
+        };
+        assert_eq!(offset, (320.0, 180.0), "the native-size frame is centred");
+        assert_eq!(dest, (1280.0, 720.0), "the dest is the frame's own extent");
+        // The displayed frame's corners and centre map onto the frame's own.
+        assert_eq!(u.to_capture((320.0, 180.0)), (0, 0));
+        assert_eq!(u.to_capture((1600.0, 900.0)), (1280, 720));
+        assert_eq!(u.to_capture((960.0, 540.0)), (640, 360));
+        // Points in all FOUR bars clamp to the nearest frame edge instead of mapping
+        // past it: left, right, top, bottom, plus the window's own far corner.
+        assert_eq!(u.to_capture((0.0, 540.0)), (0, 360));
+        assert_eq!(u.to_capture((1920.0, 540.0)), (1280, 360));
+        assert_eq!(u.to_capture((960.0, 0.0)), (640, 0));
+        assert_eq!(u.to_capture((960.0, 1080.0)), (640, 720));
+        assert_eq!(u.to_capture((1920.0, 1080.0)), (1280, 720));
+        // The layout viewport is still the WINDOW; the selection walls confine to the
+        // FRAME.
+        assert_eq!(u.size_to_point((1280, 720)), (1920.0, 1080.0));
+        assert_eq!(u.visible_capture_size((1920.0, 1080.0)), (1280.0, 720.0));
+        // The origin stays unshifted and unscaled, applied AFTER the clamp.
+        let u = OverlayUnits::letterbox((100, 50), (1280, 720), (1920.0, 1080.0));
+        assert_eq!(u.to_capture((0.0, 0.0)), (100, 50));
+        assert_eq!(u.to_point((100, 50)), (320.0, 180.0));
+    }
+
+    /// Degenerate sizes never poison the mapping: a zero frame or a zero / negative /
+    /// non-finite window size degrades to the plain uniform identity (no clamp, no
+    /// offset), instead of dividing the selection to infinity.
+    #[test]
+    fn degenerate_sizes_degrade_to_the_uniform_identity() {
+        for (frame, win) in [
+            ((0u32, 0u32), (1920.0f32, 1080.0f32)),
+            ((1920, 0), (1920.0, 1080.0)),
+            ((1920, 1080), (0.0, 1080.0)),
+            ((1920, 1080), (f32::NAN, 1080.0)),
+            ((1920, 1080), (1920.0, -5.0)),
+            ((1920, 1080), (f32::INFINITY, 1080.0)),
+        ] {
+            let u = OverlayUnits::letterbox((10, 20), frame, win);
+            assert_eq!(u, OverlayUnits::new((10, 20), 1.0), "frame {frame:?} win {win:?}");
+            assert_eq!(u.letterbox_dest(), None);
+            // The plain shifted mapping, unclamped — exactly the uniform bridge.
+            assert_eq!(u.to_capture((5.0, 5.0)), (15, 25));
+            assert_eq!(u.to_capture((-30.0, 5.0)), (-20, 25));
+        }
+    }
+}
+
+/// DRAGON-599: the keyboard nudge moves a drawn region and never resizes it.
+#[cfg(test)]
+mod nudged_tests {
+    use super::GlobalRect;
+
+    /// A 1920x1080 desktop at the origin, and a 200x100 region well inside it.
+    const OUT: (i32, i32, i32, i32) = (0, 0, 1920, 1080);
+
+    fn r() -> GlobalRect {
+        GlobalRect::new(500, 400, 700, 500)
+    }
+
+    fn size(g: GlobalRect) -> (i32, i32) {
+        (g.right - g.left, g.bottom - g.top)
+    }
+
+    /// The plain case: one unit per call, in each of the four directions, size untouched.
+    #[test]
+    fn one_step_moves_the_whole_rectangle() {
+        assert_eq!(r().nudged(-1, 0, OUT), GlobalRect::new(499, 400, 699, 500));
+        assert_eq!(r().nudged(1, 0, OUT), GlobalRect::new(501, 400, 701, 500));
+        assert_eq!(r().nudged(0, -1, OUT), GlobalRect::new(500, 399, 700, 499));
+        assert_eq!(r().nudged(0, 1, OUT), GlobalRect::new(500, 401, 700, 501));
+        for (dx, dy) in [(-1, 0), (1, 0), (0, -1), (0, 1)] {
+            assert_eq!(size(r().nudged(dx, dy, OUT)), size(r()), "({dx},{dy})");
+        }
+    }
+
+    /// **The rule this function exists for.** At a wall the move STOPS; it does not shrink the
+    /// region against the wall, which is what clamping the four edges instead of the
+    /// translation would silently do. Every wall, with the size checked at each.
+    #[test]
+    fn a_wall_stops_the_move_and_never_shrinks_the_region() {
+        let walls = [
+            (GlobalRect::new(0, 400, 200, 500), (-1, 0)),
+            (GlobalRect::new(1720, 400, 1920, 500), (1, 0)),
+            (GlobalRect::new(500, 0, 700, 100), (0, -1)),
+            (GlobalRect::new(500, 980, 700, 1080), (0, 1)),
+        ];
+        for (rect, (dx, dy)) in walls {
+            let out = rect.nudged(dx, dy, OUT);
+            assert_eq!(out, rect, "{rect:?} + ({dx},{dy}) must not move");
+            assert_eq!(size(out), size(rect), "{rect:?} + ({dx},{dy}) must not resize");
+        }
+    }
+
+    /// Every CORNER, both of its walls, and the diagonal into it. A corner is where an
+    /// edge-clamping implementation shrinks in two directions at once.
+    #[test]
+    fn every_corner_holds_its_size() {
+        let corners = [
+            (GlobalRect::new(0, 0, 200, 100), (-1, -1)),
+            (GlobalRect::new(1720, 0, 1920, 100), (1, -1)),
+            (GlobalRect::new(0, 980, 200, 1080), (-1, 1)),
+            (GlobalRect::new(1720, 980, 1920, 1080), (1, 1)),
+        ];
+        for (rect, (dx, dy)) in corners {
+            let out = rect.nudged(dx, dy, OUT);
+            assert_eq!(out, rect, "{rect:?} is cornered");
+            assert_eq!(size(out), size(rect));
+        }
+    }
+
+    /// The axes are independent, so a region flush against one wall still slides ALONG it.
+    /// Without this, a region parked at the top edge would be stuck there.
+    #[test]
+    fn a_region_at_a_wall_still_slides_along_it() {
+        let top = GlobalRect::new(500, 0, 700, 100);
+        assert_eq!(top.nudged(-1, 0, OUT), GlobalRect::new(499, 0, 699, 100));
+        assert_eq!(top.nudged(1, 0, OUT), GlobalRect::new(501, 0, 701, 100));
+        // A DIAGONAL into that wall keeps its horizontal half.
+        assert_eq!(top.nudged(1, -1, OUT), GlobalRect::new(501, 0, 701, 100));
+    }
+
+    /// A region that does not FIT on an axis refuses to move on it, rather than picking a wall
+    /// to favour. Reachable in practice: a region dragged across two displays is wider than
+    /// either, and a non-rectangular desktop's bounding box has corners no output covers. The
+    /// other axis is unaffected.
+    #[test]
+    fn a_region_wider_than_the_bounds_refuses_that_axis() {
+        let wide = GlobalRect::new(-50, 400, 2000, 500);
+        assert_eq!(wide.nudged(-1, 0, OUT), wide);
+        assert_eq!(wide.nudged(1, 0, OUT), wide);
+        // Vertically it fits, so it still moves there.
+        assert_eq!(wide.nudged(1, 1, OUT), GlobalRect::new(-50, 401, 2000, 501));
+    }
+
+    /// A remembered region left outside the bounds (a display was unplugged under it) walks
+    /// back IN one step at a time, never further out, and never against the key.
+    #[test]
+    fn an_out_of_bounds_region_walks_back_in_but_never_further_out() {
+        let off_right = GlobalRect::new(2000, 400, 2100, 500);
+        assert_eq!(off_right.nudged(-1, 0, OUT), GlobalRect::new(1999, 400, 2099, 500));
+        assert_eq!(off_right.nudged(1, 0, OUT), off_right, "never further out");
+        let off_left = GlobalRect::new(-300, 400, -100, 500);
+        assert_eq!(off_left.nudged(1, 0, OUT), GlobalRect::new(-299, 400, -99, 500));
+        assert_eq!(off_left.nudged(-1, 0, OUT), off_left, "never further out");
+    }
+
+    /// A region dragged right-to-left is stored un-normalized (`left > right`). It moves the
+    /// same way as one dragged the other way, and comes back normalized.
+    #[test]
+    fn an_unnormalized_rectangle_moves_like_a_normal_one() {
+        let backwards = GlobalRect::new(700, 500, 500, 400);
+        assert_eq!(backwards.nudged(-1, 0, OUT), GlobalRect::new(499, 400, 699, 500));
+        assert_eq!(backwards.nudged(0, 1, OUT), GlobalRect::new(500, 401, 700, 501));
+    }
+
+    /// A desktop whose origin is not `(0,0)` (a second monitor left of the primary) walls at
+    /// its own borders, not at zero.
+    #[test]
+    fn the_bounds_origin_is_honoured() {
+        let bounds = (-1920, -200, 1920, 1080);
+        let rect = GlobalRect::new(-1920, -200, -1720, -100);
+        assert_eq!(rect.nudged(-1, -1, bounds), rect, "flush at the far origin");
+        assert_eq!(rect.nudged(1, 1, bounds), GlobalRect::new(-1919, -199, -1719, -99));
+    }
+
+    /// A zero step is the identity, wherever the region is. Cheap, and it pins that a refused
+    /// axis and an unrequested one look the same to the caller.
+    #[test]
+    fn a_zero_step_changes_nothing() {
+        assert_eq!(r().nudged(0, 0, OUT), r());
+        let cornered = GlobalRect::new(0, 0, 200, 100);
+        assert_eq!(cornered.nudged(0, 0, OUT), cornered);
     }
 }

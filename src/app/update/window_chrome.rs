@@ -80,6 +80,66 @@ pub(in crate::app) fn overlay_giveup_action(any_placed: bool) -> OverlayGiveUp {
     }
 }
 
+/// Which of this process's surfaces a mouse press landed on, as far as the DRAGON-599
+/// right-click cancel is concerned. Three cases, because only three answers change the rule.
+///
+/// Resolved by [`App::click_surface`], which mirrors `Application::view_window`'s dispatch
+/// exactly — the same id, asked the same questions in the same order — so "what is drawing
+/// here" and "what does a right click mean here" can never disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::app) enum ClickSurface {
+    /// One of this session's per-output overlays: the capture selector (region / window /
+    /// monitor, with the floating toolbar) OR the colour picker, which mints the SAME
+    /// overlays and only draws something else on them (`app::color_picker`). Both are the
+    /// "this launch is asking you to point at something" surface, and both are the surface
+    /// the owner asked a right click to back out of.
+    CaptureOverlay,
+    /// A preview editor document, window or overlay. Its own right-click behaviour already
+    /// exists (the timeline's Cut here / Delete segment menu), and closing an editor full of
+    /// unsaved annotations on a stray click is exactly the accident this must not cause.
+    Preview,
+    /// Anything else this process owns: the settings window, the permission checker, the
+    /// picker's RESULT window, or a surface we do not recognise.
+    Other,
+}
+
+/// **Pure**, unit-tested: may a right press CANCEL the session right now (DRAGON-599)?
+///
+/// One predicate rather than a check at each call site, because the answer has to be the same
+/// in every capture mode and the failure mode of getting it wrong is destructive: a stray
+/// right click ending a take, or an editor.
+///
+/// The three terms, and why each is a term:
+///
+/// * `surface` — the owner's request was "any capture mode where we have the floating
+///   toolbar", which is [`ClickSurface::CaptureOverlay`]. A right click on a preview editor
+///   or on an ordinary window of ours means whatever that surface already made it mean.
+/// * `!recording` — stated by the owner, and load-bearing rather than defensive: a REGION
+///   recording keeps an overlay on screen for its whole run, so without this term a stray
+///   right click over the recorded area would end a take. This is the one state where the
+///   toolbar IS live and a cancel is still wrong.
+/// * `!countdown` — a countdown has already committed to a shot, and its overlays are the
+///   frozen, click-through ones with no floating toolbar left to back out of (see
+///   `toolbar_layout` / `restore_interactive_overlays`). Escape still steps a countdown back
+///   to selection; a right click deliberately does nothing, because "the toolbar is live" is
+///   the whole licence for this binding and there is no toolbar there.
+///
+/// Deliberately NOT a term: the capture MODE. Region, window and monitor selection are the
+/// same situation for this purpose, and a mode term would only invite them to drift apart.
+/// Nor the KIND: a scanner overlay is still a selector, and its own right-click meanings (the
+/// OCR word menu, a code mark's contents menu) never reach this decision at all, because
+/// those handlers capture the event and the subscription only forwards ignored ones.
+///
+/// A `false` here is a no-op, never a swallow: the press was already unclaimed when it got
+/// this far, so declining leaves the session exactly as it was.
+pub(in crate::app) fn right_click_cancels(
+    surface: ClickSurface,
+    recording: bool,
+    countdown: bool,
+) -> bool {
+    matches!(surface, ClickSurface::CaptureOverlay) && !recording && !countdown
+}
+
 impl App {
     /// Derive `nav_open` from the width the settings window will actually spawn
     /// at. Mirrors `open_config_window`'s clamp: the saved width (or the default)
@@ -105,6 +165,30 @@ impl App {
     fn adopt_settings_size(&mut self, w: f32, h: f32) {
         self.settings_size = Some((w.round() as u32, h.round() as u32));
         self.settings.nav_open = nav_should_open(w);
+    }
+
+    /// DRAGON-599: which kind of surface `id` is, for [`right_click_cancels`].
+    ///
+    /// The effectful half of that decision, and nothing more: it looks ids up, it decides
+    /// nothing. The order is `view_window`'s order, on purpose — the settings / permissions /
+    /// picker-result toplevels first, then a preview document (window OR overlay, which is
+    /// what `is_preview_window` already answers), then this session's per-output overlays.
+    /// Keeping the two dispatches in step is what stops a surface drawing one thing while a
+    /// right click on it means another.
+    pub(in crate::app) fn click_surface(&self, id: window::Id) -> ClickSurface {
+        if Some(id) == self.settings.window
+            || Some(id) == self.permissions.window
+            || Some(id) == self.color_picker.window
+        {
+            return ClickSurface::Other;
+        }
+        if self.is_preview_window(id) {
+            return ClickSurface::Preview;
+        }
+        if self.outputs.iter().any(|o| o.id == id) {
+            return ClickSurface::CaptureOverlay;
+        }
+        ClickSurface::Other
     }
 
     pub(in crate::app) fn update_window_chrome(&mut self, message: WindowChromeMsg) -> Task<cosmic::Action<Msg>> {
@@ -152,16 +236,24 @@ impl App {
                 // DRAGON-177: seed the update state from the on-disk manifest cache FIRST
                 // (notes, nav tint, launch dialog render instantly); the network check
                 // follows right behind and refreshes the seed.
-                if let Some(seed) = crate::update::seeded_status_from_cache() {
+                //
+                // Both are skipped on a build with no update channel (a Flatpak,
+                // DRAGON-561): the store owns its updates, so nothing may fetch
+                // update.json, and the cache seed would only light update state the
+                // About page no longer shows.
+                if crate::update::channel_available() {
+                    if let Some(seed) = crate::update::seeded_status_from_cache() {
+                        tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
+                            SettingsMsg::UpdateChecked(seed),
+                        ))));
+                    }
+                    // DRAGON-175: a settings window is showing, so kick off a background
+                    // update check (non-blocking; lights up the About nav + fills the
+                    // About page).
                     tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
-                        SettingsMsg::UpdateChecked(seed),
+                        SettingsMsg::CheckForUpdates,
                     ))));
                 }
-                // DRAGON-175: a settings window is showing, so kick off a background update
-                // check (non-blocking; lights up the About nav + fills the About page).
-                tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
-                    SettingsMsg::CheckForUpdates,
-                ))));
                 // DRAGON-482: fill the Cloud Accounts page from disk, exactly as
                 // `settings::open_settings` does for the in-process convert path.
                 //
@@ -176,6 +268,13 @@ impl App {
                 tasks.push(Task::done(cosmic::Action::App(Msg::Settings(SettingsMsg::Cloud(
                     crate::app::CloudSettingsMsg::Reload,
                 )))));
+                // DRAGON-628: read the OS login item so the "Automatically start on login"
+                // row shows what the machine will really do. The same call
+                // `settings::open_settings` makes for the in-process convert path, for the
+                // same reason the Cloud reload above needs to be in both: this is the OTHER
+                // way a settings window is born, and on macOS it is the only one. A read
+                // only, so there is no task to batch.
+                self.autostart_settings_opened();
                 if about {
                     tasks.push(Task::done(cosmic::Action::App(Msg::Settings(
                         SettingsMsg::ShowAboutPage,
@@ -276,8 +375,8 @@ impl App {
                 Task::none()
             }
             WindowChromeMsg::Ignore => Task::none(),
-            WindowChromeMsg::KeyPressed(window, modifiers, key, location, text) => {
-                self.handle_key(window, modifiers, key, location, text)
+            WindowChromeMsg::KeyPressed(window, modifiers, key, location, text, repeat) => {
+                self.handle_key(window, modifiers, key, location, text, repeat)
             }
             WindowChromeMsg::KeyReleased(window, modifiers, key) => {
                 // DRAGON-325: some keys are delivered only on RELEASE, never on press — most
@@ -317,6 +416,9 @@ impl App {
                         key,
                         cosmic::iced::keyboard::Location::Standard,
                         None,
+                        // A release is never an auto-repeat, and this route only ever feeds a
+                        // chord recorder, which does not consult the flag at all.
+                        false,
                     );
                 }
                 // Push-to-talk release: re-mute the mic when the held mic key is let go.
@@ -329,6 +431,32 @@ impl App {
                     self.ptt_held = false;
                     self.log_audio_toggle(crate::record::AudioChannel::Mic, false);
                 }
+                // DRAGON-599: letting a directional key go ENDS the region nudge, so this is
+                // where the moved region is persisted — one config write per gesture, the same
+                // place a mouse drag persists through `RegionDone`. Saving on the PRESS instead
+                // would write the file once per auto-repeat for as long as the key is held.
+                //
+                // `RegionDone` is reused rather than reimplemented: it already means "the
+                // region gesture is over, write it down". Sending it when the region did not
+                // actually move is harmless (it saves the same bytes) and costs one write per
+                // release, which is why the gate is the cheap `region_nudge_settles` rather
+                // than tracked "did it move" state.
+                if crate::shortcuts::nudge_direction(modifiers, &key).is_some() {
+                    // DRAGON-601: the hold is over, so forget when it started. Both nudge
+                    // consumers share this one piece of state, and clearing it here is what
+                    // makes the NEXT press a fresh tap that always moves. It is cleared for
+                    // every directional release, including ones the settle gate below declines,
+                    // because a stale hold outliving its key would make a later tap look like a
+                    // repeat and cost the user their one guaranteed pixel.
+                    self.nudge_hold = None;
+                    if keyboard::region_nudge_settles(
+                        self.mode,
+                        self.color_picking(),
+                        self.countdown.is_some() || self.recording.is_some(),
+                    ) {
+                        return self.update_capture(CaptureMsg::RegionDone);
+                    }
+                }
                 Task::none()
             }
             WindowChromeMsg::SetConfigTab(entity) => {
@@ -339,6 +467,15 @@ impl App {
                 // check. The launch-time check (settings window open) already refreshes
                 // the notes/version; the manual "Check for updates" button remains the
                 // way to re-check on demand, so opening About no longer costs a request.
+                //
+                // DRAGON-605: a build with NO update channel (a Flatpak) never ran that
+                // launch-time check, so its "What's new" block has nothing to render.
+                // Landing on About is what fetches the notes there, once per session.
+                // The arm itself is the gate, so this stays one unconditional send and
+                // every build with a channel still costs zero requests here.
+                if self.settings.active() == crate::app::ConfigTab::About {
+                    return self.update_settings(SettingsMsg::FetchReleaseNotes);
+                }
                 Task::none()
             }
             WindowChromeMsg::RequestReset(scope) => {
@@ -375,12 +512,17 @@ impl App {
                     self.sync_mic_input();
                 }
                 let title_task = self.set_window_title(settings::WINDOW_TITLE.to_string(), id);
+                // DRAGON-564: probe each Health-row binary's version OFF the UI thread
+                // now (every spawn bounded), so the Health rows can annotate present
+                // tools without the page ever waiting on a spawn.
+                let versions_task = self.kick_tool_version_probe();
                 // macOS (DRAGON-135): once the async title lands, centre the native
                 // traffic lights against the CSD header (polled by title).
                 #[cfg(target_os = "macos")]
                 return Task::batch([
                     window::gain_focus(id),
                     title_task,
+                    versions_task,
                     Task::done(cosmic::Action::App(Msg::WindowChrome(
                         WindowChromeMsg::MacCenterTitlebar(settings::WINDOW_TITLE, 0),
                     ))),
@@ -394,6 +536,7 @@ impl App {
                 #[cfg(windows)]
                 return Task::batch([
                     title_task,
+                    versions_task,
                     // DRAGON-238: probe the encoder list OFF the UI thread now (the video
                     // page's ffmpeg `-encoders` + hardware probe-encodes take seconds); the
                     // result fills the cache before the user reaches the Video tab.
@@ -403,7 +546,7 @@ impl App {
                     ))),
                 ]);
                 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-                title_task
+                Task::batch([title_task, versions_task])
             }
             #[cfg(windows)]
             WindowChromeMsg::ConfigWindowFloat(id, attempt) => {
@@ -558,8 +701,33 @@ impl App {
                 Task::none()
             }
             WindowChromeMsg::WindowFocused(id) => {
+                // The window system's own answer to "who holds the keyboard", as opposed to
+                // `focused_preview` (our routing pointer, set the moment a document opens).
+                // `lab/flatpak`: a clipboard write on the `CopyRoute::ThisWindow` route needs
+                // a serial from an input event delivered to this client, and this focus IS
+                // that event — so record it BEFORE flushing anything that depends on it.
+                self.focused_window = Some(id);
+                // DRAGON-600: THE signal. On a tray-menu launch the host's dropdown is
+                // still up, and cosmic-comp retires it by handing keyboard focus to our
+                // Exclusive overlay: the popup gets `wl_keyboard.leave` and cosmic-panel
+                // closes it. This event IS that focus, so it starts the settle after which
+                // the held frozen-flats grab can run. Guarded to our capture overlays: a
+                // preview or settings toplevel taking focus says nothing about a dropdown,
+                // and it is the overlay's Exclusive grab that does the work.
+                if let Some(hold) = self.menu_hold.as_mut()
+                    && hold.focused.is_none()
+                    && self.outputs.iter().any(|o| o.id == id)
+                {
+                    hold.focused = Some(std::time::Instant::now());
+                    crate::util::timing_mark("menu hold: overlay took keyboard focus");
+                }
                 self.refresh_preview_cloud_accounts(id);
-                Task::none()
+                // Both are no-ops unless a copy was deferred waiting for exactly this focus:
+                // a preview document's open-time copy (`flush_deferred_auto_copy`) or the
+                // colour picker's pick (`flush_deferred_pick_copy`, DRAGON-587). They can
+                // never both fire for one window — a window is one or the other — so the
+                // batch is a pairing, not a race.
+                Task::batch([self.flush_deferred_auto_copy(id), self.flush_deferred_pick_copy(id)])
             }
             WindowChromeMsg::ConfigWindowResized(id, w, h) => {
                 // Remember the settings window's size so it reopens at the size it was
@@ -651,6 +819,19 @@ impl App {
                             crate::app::shell::PREVIEW_WINDOW_TITLE,
                         );
                 }
+                // `lab/flatpak`: the fallback selection toplevel resized (its fullscreen
+                // configure, or a later monitor change). The compositor, not us, picked
+                // the monitor it fullscreened on, so record the window's REAL size;
+                // `OutputState::units` builds the letterbox bridge from it, which shows
+                // the GRANTED output's frozen frame centred at its own aspect and maps
+                // window points back onto it. Identity whenever the sizes agree (the
+                // common case), so nothing moves there.
+                #[cfg(target_os = "linux")]
+                if self.fallback_window == Some(id)
+                    && let Some(o) = self.outputs.iter_mut().find(|o| o.id == id)
+                {
+                    o.fallback_win_size = Some((w, h));
+                }
                 // Learn the preview overlay's monitor size (needed for `--preview`, which
                 // opens on the active output before its size is known). The returned task
                 // clears the windowed preview's transient max_size hint on first configure.
@@ -712,10 +893,24 @@ impl App {
                     Task::done(cosmic::Action::App(Msg::WindowChrome(
                         WindowChromeMsg::MacCenterTitlebar(permissions::WINDOW_TITLE, 0),
                     ))),
+                    // DRAGON-587: and pin the size, the same way the colour-picker window
+                    // does. The window opens at `min_size == max_size`, which AppKit clamps
+                    // every drag to; this takes away the zoom button and full-screen spaces,
+                    // which that clamp does not cover.
+                    Task::done(cosmic::Action::App(Msg::WindowChrome(
+                        WindowChromeMsg::MacPinWindow(permissions::WINDOW_TITLE, 0),
+                    ))),
                 ]);
                 #[cfg(not(target_os = "macos"))]
                 title_task
             }
+            WindowChromeMsg::ColorPickerWindowOpened(id, attempt) => {
+                self.finalize_color_picker_window(id, attempt)
+            }
+            WindowChromeMsg::ColorPickerWindowDrag => match self.color_picker.window {
+                Some(id) => window::drag(id),
+                None => Task::none(),
+            },
             WindowChromeMsg::ClosePermissionsWindow => match self.permissions.window {
                 Some(id) => window::close(id),
                 None => Task::none(),
@@ -796,6 +991,36 @@ impl App {
                     )
                 }
             }
+            #[cfg(target_os = "macos")]
+            WindowChromeMsg::MacPinWindow(title, attempt) => {
+                // Same poll shape as `MacCenterTitlebar` above, and for the same reason: the
+                // NSWindow is found by title and the title is set by an async task that may
+                // not have landed yet. Bounded, then it gives up loudly.
+                const MAX_ATTEMPTS: u8 = 30;
+                const RETRY_MS: u64 = 40;
+                if crate::platform::mac::window::pin_window_size(title) {
+                    return Task::none();
+                }
+                if attempt >= MAX_ATTEMPTS {
+                    log::warn!(
+                        "'{title}' never matched its title after {MAX_ATTEMPTS} attempts, so \
+                         its zoom button stays live; the size is still pinned by the equal \
+                         min/max the window opened with"
+                    );
+                    return Task::none();
+                }
+                Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(RETRY_MS)).await;
+                    },
+                    move |()| {
+                        cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::MacPinWindow(
+                            title,
+                            attempt + 1,
+                        )))
+                    },
+                )
+            }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             WindowChromeMsg::SettingsFocusPoke => {
                 // A blocked second `--settings` launch asked us to come forward. The
@@ -870,13 +1095,28 @@ impl App {
                 Task::none()
             }
             WindowChromeMsg::WindowCloseRequested(id) => {
-                if Some(id) == self.settings.window || Some(id) == self.permissions.window {
+                if Some(id) == self.settings.window
+                    || Some(id) == self.permissions.window
+                    // DRAGON-582: the colour picker's result window closes like the
+                    // other two standalone toplevels. Without this arm a native close
+                    // would be swallowed and the process would live on with no window
+                    // at all, which is the invisible-immortal-child shape.
+                    || Some(id) == self.color_picker.window
+                {
                     window::close(id)
                 } else if self.is_preview_window(id) {
                     // A preview's native ✕ / WM close closes THAT document (which ends the
                     // process only if it was the last one — `close_preview`).
                     self.update_preview(id, PreviewMsg::Cancel)
                 } else {
+                    // `lab/flatpak`: a WM close of the fallback selection toplevel is the
+                    // session's Escape: the ordinary Cancelled ending, never a lingering
+                    // windowless process. Layer surfaces receive no close requests, so
+                    // this arm is unreachable on a normal session.
+                    #[cfg(target_os = "linux")]
+                    if self.fallback_window == Some(id) {
+                        return self.teardown();
+                    }
                     Task::none()
                 }
             }
@@ -899,6 +1139,15 @@ impl App {
                     } else {
                         Task::none()
                     };
+                }
+                if Some(id) == self.color_picker.window {
+                    // DRAGON-582: the colour picker's window closed, and it is the whole
+                    // session — a picker launch has nothing to return to. Save first so
+                    // the recents survive (they are the one thing this window persists),
+                    // then end the instance through the ONE lifecycle seam.
+                    self.save_state();
+                    self.color_picker.window = None;
+                    return self.finish_session();
                 }
                 if Some(id) == self.permissions.window {
                     // The permission-checker window closed — end this instance (it,
@@ -979,6 +1228,39 @@ impl App {
                         }
                     };
                 }
+                // `lab/flatpak`: the fallback selection toplevel was destroyed while its
+                // id is STILL recorded. Our own teardown clears `fallback_window` before
+                // issuing the close, so a set id here means the compositor took the
+                // surface away out of band. With it goes the whole selector, so end the
+                // session as a cancel rather than lingering windowless. (On a normal
+                // session `fallback_window` is permanently None; this never fires.)
+                #[cfg(target_os = "linux")]
+                if self.fallback_window == Some(id) {
+                    log::warn!(
+                        "overlay fallback: the selection window was destroyed out of band; \
+                         ending the session"
+                    );
+                    return self.teardown();
+                }
+                Task::none()
+            }
+            // DRAGON-599: a right press the UI ignored. It CANCELS where the floating toolbar
+            // is the live surface, and does nothing anywhere else (see `right_click_cancels`).
+            //
+            // It routes into `Close`, the Escape path, rather than calling `teardown` itself.
+            // That is the point: "cancel" already has ONE meaning in this app, and a second
+            // teardown here would be a second definition of it that could drift. The gate
+            // above rules out both of `Close`'s non-teardown branches (recording, countdown),
+            // so this always reaches the same ending Escape reaches on a selector overlay.
+            WindowChromeMsg::RightPressed(id) => {
+                if right_click_cancels(
+                    self.click_surface(id),
+                    self.recording.is_some(),
+                    self.countdown.is_some(),
+                ) {
+                    log::debug!("right click on the capture overlay: cancelling the session");
+                    return self.update_window_chrome(WindowChromeMsg::Close);
+                }
                 Task::none()
             }
             WindowChromeMsg::Close => {
@@ -1020,6 +1302,86 @@ impl App {
         }
     }
 
+}
+
+/// DRAGON-599: when a right press cancels the session, stated as a full matrix so no term
+/// can be widened or dropped without a test saying so.
+#[cfg(test)]
+mod right_click_cancel_tests {
+    use super::{right_click_cancels, ClickSurface};
+
+    /// The happy path, and the only surface that has it. Region, window and monitor
+    /// selection are the same case (the mode is deliberately not a term), and the colour
+    /// picker rides the SAME per-output overlays, so it is this case too.
+    #[test]
+    fn an_idle_capture_overlay_is_the_one_surface_that_cancels() {
+        assert!(right_click_cancels(ClickSurface::CaptureOverlay, false, false));
+    }
+
+    /// The owner's explicit guard, and the one that matters most. A REGION recording keeps an
+    /// overlay on screen for the whole take, so this is the state where the toolbar is live
+    /// and the cancel is still wrong. A stray right click must never end a recording.
+    #[test]
+    fn a_live_recording_is_never_cancelled_by_a_click() {
+        assert!(!right_click_cancels(ClickSurface::CaptureOverlay, true, false));
+        // And not even together with a countdown, whatever order the two are read in.
+        assert!(!right_click_cancels(ClickSurface::CaptureOverlay, true, true));
+    }
+
+    /// A countdown has committed to a shot and has no floating toolbar left (its overlays are
+    /// the frozen, click-through ones). Escape still steps it back to selection; a right click
+    /// does nothing, because the toolbar being live is the whole licence for this binding.
+    #[test]
+    fn a_countdown_has_no_toolbar_to_back_out_of() {
+        assert!(!right_click_cancels(ClickSurface::CaptureOverlay, false, true));
+    }
+
+    /// The preview editor keeps its own right-click meanings (the timeline's context menu),
+    /// and an editor full of unsaved annotations must not close on a stray click. Never, in
+    /// any state.
+    #[test]
+    fn the_preview_editor_is_never_cancelled_this_way() {
+        for recording in [true, false] {
+            for countdown in [true, false] {
+                assert!(
+                    !right_click_cancels(ClickSurface::Preview, recording, countdown),
+                    "recording={recording} countdown={countdown}"
+                );
+            }
+        }
+    }
+
+    /// Settings, the permission checker and the picker's RESULT window are ordinary windows
+    /// of ours. A right click in one is not a session cancel.
+    #[test]
+    fn an_ordinary_window_of_ours_is_left_alone() {
+        for recording in [true, false] {
+            for countdown in [true, false] {
+                assert!(
+                    !right_click_cancels(ClickSurface::Other, recording, countdown),
+                    "recording={recording} countdown={countdown}"
+                );
+            }
+        }
+    }
+
+    /// The whole matrix, exhaustively, so a term added or removed later cannot quietly widen
+    /// what a right click destroys.
+    #[test]
+    fn every_other_combination_does_nothing() {
+        for surface in [ClickSurface::CaptureOverlay, ClickSurface::Preview, ClickSurface::Other] {
+            for recording in [true, false] {
+                for countdown in [true, false] {
+                    let want = surface == ClickSurface::CaptureOverlay && !recording && !countdown;
+                    assert_eq!(
+                        right_click_cancels(surface, recording, countdown),
+                        want,
+                        "{surface:?} / recording={recording} / countdown={countdown}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

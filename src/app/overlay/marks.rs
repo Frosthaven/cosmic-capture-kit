@@ -190,8 +190,8 @@ fn tooltip_box(text: &str) -> Element<'static, Msg> {
         .class(cosmic::theme::Container::Custom(Box::new(|t| {
             let c = t.cosmic();
             cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background.component.base.into())),
-                text_color: Some(c.background.component.on.into()),
+                background: Some(Background::Color(c.background(false).component.base.into())),
+                text_color: Some(c.background(false).component.on.into()),
                 border: Border {
                     radius: crate::app::theme::rounding(t).s.into(),
                     ..Default::default()

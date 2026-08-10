@@ -286,17 +286,30 @@ pub(super) fn centered_button<'a>(
         inner = inner.push(crate::widgets::icons::handle(name).icon().size(16));
     }
     inner = inner.push(widget::text(label));
-    let btn = widget::button::custom(
-        widget::container(inner)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .width(Length::Fill)
-            .height(Length::Fill),
-    )
-    .class(class)
-    .padding([0.0, pad_x])
-    .height(Length::Fixed(h))
-    .width(width);
+    // DRAGON-607: the centring container below is NOT neutral. libcosmic's default class
+    // sets BOTH `text_color` and `icon_color` to the ambient window foreground, which
+    // OVERRIDES whatever ink `class` put on the button. On an accent-filled class that
+    // silently replaced the on-accent ink with near-white, so the About page's accent
+    // buttons (donate, and every "Get <version>" state) drew white labels on purple while
+    // a stock `button::suggested` beside them drew the correct dark ink.
+    //
+    // The fix carries the ink THROUGH the wrapper instead (`theme::on_accent_content`,
+    // whose doc holds the general rule). Deciding from the class rather than from a new
+    // parameter is deliberate: every caller already passes the class, and a separate ink
+    // argument is one more thing a call site can forget, which is how this happened.
+    // Neutral classes keep the default container exactly as before, so the pill buttons
+    // are byte-identical.
+    let content = widget::container(inner)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .class(theme::button_content_class(&class));
+    let btn = widget::button::custom(content)
+        .class(class)
+        .padding([0.0, pad_x])
+        .height(Length::Fixed(h))
+        .width(width);
     match on_press {
         Some(msg) => crate::widgets::arrow_cursor::arrow_cursor(btn.on_press(msg)),
         None => crate::widgets::arrow_cursor::arrow_cursor(btn),
@@ -522,17 +535,138 @@ pub(super) fn subtle_caption<'a>(s: impl Into<Cow<'a, str>> + 'a) -> Element<'a,
 /// width. Same tone, same size; an `Element` can no longer be sized, which is the only reason
 /// this is separate.
 ///
-/// One caller today (DRAGON-540): the Health page's tool-location line, which sits in a row
-/// beside a copy button and takes `Length::Fill` so it WRAPS. A caption at its natural
-/// `Shrink` width wraps against whatever space it is handed, so on its own it is fine; in a
-/// row it is handed everything and leaves nothing, which pushed the button beside it off the
-/// visible edge of the pane.
+/// One caller (DRAGON-540): [`path_line`], whose path sits in a row beside a copy button and
+/// takes `Length::Fill` so it WRAPS. A caption at its natural `Shrink` width wraps against
+/// whatever space it is handed, so on its own it is fine; in a row it is handed everything and
+/// leaves nothing, which pushed the button beside it off the visible edge of the pane.
 pub(super) fn subtle_caption_text<'a>(
     s: impl Into<Cow<'a, str>> + 'a,
 ) -> widget::Text<'a, cosmic::Theme> {
     widget::text::caption(s).class(cosmic::theme::Text::Custom(|t| {
         cosmic::iced::widget::text::Style { color: Some(theme::subtle(t)), ..Default::default() }
     }))
+}
+
+/// A FILESYSTEM PATH shown inside a settings row: the path in the subtle tone, led by a copy
+/// button, wrapping inside the pane rather than past its edge.
+///
+/// The one place any row renders a path, so the three that do cannot drift in tone, spacing
+/// or behaviour. The Health page's tool-location line established the shape (DRAGON-540) and
+/// the owner asked for the Scanner's language-pack folder and the preview editor's covermark
+/// folder to match it, both of which previously printed a bare path into their description
+/// with no way to copy it.
+///
+/// **The button LEADS and the text FILLS**, which is load-bearing rather than cosmetic. A row
+/// lays its fixed-size children out first and divides only what is left among the `Fill`
+/// ones, so a long path at its natural width claims the WHOLE row and pushes anything after
+/// it past the visible edge. Leading with the button (fixed, tiny) and giving the text
+/// `Length::Fill` measures the text against the space that survives the button, which is also
+/// where it wraps. `Alignment::Start` keeps the button level with the FIRST line instead of
+/// floating in the middle of a wrapped block.
+///
+/// `copied` drives the "Copied!" flash and is computed by [`path_line_copied`], keyed on the
+/// text rather than on which row asked, so the caller needs no state of its own.
+pub(super) fn path_line<'a>(path: String, copied: bool) -> Element<'a, Msg> {
+    // Collapse the home prefix to `~` for every path the app shows (owner call). Settings
+    // screens get screenshotted into bug reports and pasted into chats, and the full path
+    // leaks the account name to everyone who sees it while telling the reader nothing.
+    //
+    // Done HERE rather than at each source, because this is the one builder every path row
+    // goes through (Health tool locations, the debug-log folder, the Scanner's language
+    // folder, the covermark folder), so one call covers them all and none can drift.
+    //
+    // The COPY carries the collapsed form too, which is deliberate: the doc below says the
+    // button copies exactly what is shown, and `~` is a real path any shell expands, so the
+    // copied string still works where the user pastes it. `util::expand_tilde` is the inverse
+    // if it ever comes back to us as input.
+    let path = crate::util::collapse_home(&path);
+    let copy = crate::widgets::copy_button::subtle_copy_button(
+        copied,
+        2,
+        widget::tooltip::Position::Top,
+        "Copy path",
+        Msg::Settings(SettingsMsg::CopyHealthLocation(path.clone())),
+    );
+    widget::row(vec![copy, subtle_caption_text(path).width(Length::Fill).into()])
+        .spacing(4.0)
+        .width(Length::Fill)
+        .align_y(Alignment::Start)
+        .into()
+}
+
+/// A shell COMMAND shown inside a settings row: the command in the subtle tone, led by a copy
+/// button, wrapping inside the pane rather than past its edge (DRAGON-589).
+///
+/// [`path_line`]'s twin, built from the same two pieces (the copy button LEADS, the text
+/// FILLS) for the same load-bearing reason, so the Global tab's rows read as the same kind of
+/// thing as the Health page's tool locations. Two differences, both deliberate:
+///
+/// * The tooltip says "Copy command", because that is what the press carries.
+/// * The text is rendered VERBATIM. A path is collapsed and quoted here, at the last moment,
+///   because `path_line` is the only place a path is shown; a command has already been
+///   assembled by `util::launch_command`, which collapsed the home directory and quoted
+///   whatever needed quoting while it still knew which part of the string was the path.
+///   Running the whole line through `collapse_home` again would be harmless but running it
+///   through a quoter would not, so this renders what it is given.
+///
+/// `copied` drives the "Copied!" flash and is computed by [`path_line_copied`], keyed on the
+/// text rather than on which row asked, exactly as for a path.
+pub(super) fn command_line<'a>(command: String, copied: bool) -> Element<'a, Msg> {
+    let copy = crate::widgets::copy_button::subtle_copy_button(
+        copied,
+        2,
+        widget::tooltip::Position::Top,
+        "Copy command",
+        Msg::Settings(SettingsMsg::CopyHealthLocation(command.clone())),
+    );
+    widget::row(vec![copy, subtle_caption_text(command).width(Length::Fill).into()])
+        .spacing(4.0)
+        .width(Length::Fill)
+        .align_y(Alignment::Start)
+        .into()
+}
+
+/// A description that ENDS IN A PATH: the sentence in the ordinary description tone, the path
+/// below it in [`path_line`]'s treatment.
+///
+/// The tone split is the point, and it was wrong in the first cut of DRAGON-540 (owner review):
+/// only the PATH is secondary. The sentence introducing it is an ordinary row description and
+/// must read as one, which here means a plain `caption` with no custom class, exactly what the
+/// row builder renders a `desc` string as. Styling both halves alike made the whole helper line
+/// look dimmed and out of place beside every other row on the page.
+///
+/// Pairing them in one builder is what keeps that true: the two pages that show a path this way
+/// (the Scanner's language folder, the preview editor's covermark folder) now name the pairing
+/// rather than each assembling a column, so neither can drift in tone or spacing again.
+pub(super) fn path_desc<'a>(
+    prose: impl Into<Cow<'a, str>> + 'a,
+    path: String,
+    copied: bool,
+) -> Element<'a, Msg> {
+    widget::column(vec![widget::text::caption(prose).into(), path_line(path, copied)])
+        .spacing(2.0)
+        .width(Length::Fill)
+        .into()
+}
+
+/// Is `path`'s copy button inside its flash window? Keyed on the copied TEXT, which is what
+/// the press carried, so any row showing that exact path flashes and no row needs a flag of
+/// its own. Shared with the Health page, which is why one tick subscription covers all three.
+pub(in crate::app) fn path_line_copied(
+    path: &str,
+    copied: &Option<(String, std::time::Instant)>,
+) -> bool {
+    // Collapse before comparing, because [`path_line`] collapses before COPYING: the press
+    // carries `~/…`, so comparing a caller's raw path against it would never match and the
+    // flash would silently never fire. Both sides have to speak the same form, and the shown
+    // form is the one the user pressed.
+    let path = crate::util::collapse_home(path);
+    match copied {
+        Some((text, at)) => {
+            *text == path && crate::widgets::copy_button::copied_recently(Some(*at))
+        }
+        None => false,
+    }
 }
 
 /// Caption text in the accent tone, for a caption that IS a link's label: the press it sits

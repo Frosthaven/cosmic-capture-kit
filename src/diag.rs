@@ -365,6 +365,11 @@ pub fn component_from_args<S: AsRef<str>>(args: &[S]) -> Component {
         "--scan",
         "--scanner",
         "--countdown",
+        // DRAGON-586: the colour picker mints the same per-output overlays a capture
+        // does, so it reads as `capture` in the shared log. Without it the picker's
+        // lines said `app`, which is the tag a BARE launch wears, and that mislabel is
+        // exactly what made the real bug (the picker being treated as bare) hard to see.
+        "--color-picker",
     ];
     if CAPTURE_FLAGS.iter().any(|f| has(f)) {
         return Component::Capture;
@@ -420,10 +425,12 @@ pub enum Failure {
     /// No display/output could be enumerated, so no overlay could be minted and no capture
     /// target exists. On macOS this is the shape of a ScreenCaptureKit that has stopped
     /// answering; on Linux, a compositor with no usable capture protocol.
-    /// Constructed by `seed_overlays_mac`, which is `not(target_os = "linux")` — Linux
-    /// receives its outputs through Wayland `OutputEvent`s and has no single "we ended up
-    /// with none" moment to record.
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    /// Constructed by `seed_overlays_mac` off Linux (Linux receives its outputs through
+    /// Wayland `OutputEvent`s and has no single "we ended up with none" moment), and on
+    /// Linux by the immediate `--active-window` / `--active-monitor` gate (`lab/flatpak`,
+    /// `capture_flow::immediate_target_resolvable`), where the compositor exposes no
+    /// protocol that could resolve or grab the active target. Same vocabulary entry
+    /// because both mean the same thing: no capture target exists for this process.
     NoOutputs,
     /// Displays WERE found and an overlay window was minted for them, but it could never be
     /// brought on screen, so the user had nothing to interact with (DRAGON-437).
@@ -934,9 +941,17 @@ fn session_header(reason: &str) {
     // self-mounts at a fresh random directory every launch and carries its ffmpeg/tesseract
     // sidecars inside that bundle, where a distro build, the `.app` and an MSI install do
     // not. It is the first thing to know when a report says a bundled tool went missing.
+    //
+    // A Flatpak is a THIRD kind and has to say so (`lab/flatpak`). It was reporting "plain
+    // binary" while every tool line beside it read `Flatpak://…`, which is the one combination
+    // that makes a log actively misleading: a reader would conclude the sandbox detection was
+    // broken. Its delivery facts are also genuinely distinct, and all three matter when a
+    // report comes in: `/app` is read-only so nothing can self-update, the config directory is
+    // private rather than the user's, and the runtime supplies some tools while `/app` supplies
+    // the rest.
     write_line(&format!(
         "package: {}",
-        if crate::util::running_from_appimage() { "AppImage" } else { "plain binary" },
+        crate::util::package_kind().diag_name(),
     ));
     log_tool_locations();
     announce_sandbox();
@@ -1782,7 +1797,7 @@ mod tests {
             home_collapsed("/home/jane/bin/ffmpeg", Some(Path::new("/home/jane/"))),
             "~/bin/ffmpeg"
         );
-        for line in ["/usr/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg", "AppImage: usr/bin/ffmpeg"] {
+        for line in ["/usr/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg", "AppImage://usr/bin/ffmpeg"] {
             assert_eq!(home_collapsed(line, Some(home)), line, "{line} was altered");
         }
         // A machine with no home directory resolves nothing away rather than guessing.
@@ -1932,6 +1947,10 @@ mod tests {
         assert_eq!(c(&["cck", "resident"]), Component::App);
         assert_eq!(c(&["cck", "--region"]), Component::Capture);
         assert_eq!(c(&["cck", "--video", "--monitor"]), Component::Capture);
+        // DRAGON-586: the colour picker is a capture-shaped launch, NOT the `app` tag a
+        // bare launch wears. It read as `app` while the launch itself was mis-sorted as
+        // bare, so the log agreed with the bug instead of exposing it.
+        assert_eq!(c(&["cck", "--color-picker"]), Component::Capture);
         assert_eq!(c(&["cck", "--settings"]), Component::Settings);
         assert_eq!(c(&["cck", "--preview", "/x/y.png"]), Component::Preview);
         assert_eq!(c(&["cck", "--permissions"]), Component::Permissions);

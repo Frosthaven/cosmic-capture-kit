@@ -1,16 +1,40 @@
 //! The cleaned-microphone capture pipeline: the recording-path tap feeder
 //! ([`setup_clean_mic_tap`] + [`MicTapHandle`], DRAGON-125 — the media-clock owned
 //! pipeline's mic source) and the live settings-page mic test ([`spawn_mic_test`]),
-//! both built on the shared PulseAudio PCM capture helper ([`spawn_pulse_pcm`]) and
-//! the [`crate::audio::InputProcessor`] cleanup chain. (DRAGON-127 retired the
+//! both built on the shared PCM capture seam ([`open_mic_pcm`]) and the
+//! [`crate::audio::InputProcessor`] cleanup chain. (DRAGON-127 retired the
 //! recording-path FIFO feeder — `setup_clean_mic_input` + `CleanMicHandle` — this
 //! module used to ALSO export for the legacy recording path; the tap mode is the
 //! only recording consumer now.)
+//!
+//! # Where the mic PCM comes from
+//!
+//! [`open_mic_pcm`] is the ONE place that answers "how do we get mono 48 kHz f32 off
+//! the microphone", and its answer is per-platform:
+//!
+//! - Linux (`-f pulse`) and Windows (`-f dshow`) spawn an ffmpeg child and read its
+//!   stdout, which is what this module always did ([`spawn_pulse_pcm`]).
+//! - **macOS uses a native `AVCaptureSession`** (`platform::mac::mic_capture`) and
+//!   spawns nothing. ffmpeg's avfoundation indev keeps exactly ONE un-queued
+//!   `CMSampleBuffer` and `CFRelease`s it the moment the next one arrives, which cost
+//!   a measured 19% of the mic's buffers and, through `StreamAnchor`'s contiguous
+//!   stamping, put 10-17% of every mac mic track on disk as half-second holes of
+//!   silence. The measurements and the ffmpeg source are in that module's doc.
+//!
+//! The SPEAKER-MONITOR capture (the AEC far-end reference) still goes through
+//! [`spawn_pulse_pcm`] on every platform: it is a pulse `.monitor` source, not a
+//! microphone, and on macOS the recording path never uses it at all (the owned
+//! recording's own SCK system capture tees the far-end instead, DRAGON-128).
+//!
+//! Everything downstream of the seam — the framing, the [`super::capture::StreamAnchor`]
+//! stamping, and the whole DSP chain — is byte-identical across platforms, per
+//! CLAUDE.md's audio CAUTION section.
 
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 
 use super::filters::aec::FarEndRing;
+use crate::audio::FRAME;
 
 /// Spawn an ffmpeg reading mono 48 kHz 32-bit-float PCM from a capture `source` to its
 /// stdout. On Linux `source` is a PulseAudio source name captured via `-f pulse`; on
@@ -21,6 +45,10 @@ use super::filters::aec::FarEndRing;
 /// audio-only device (avfoundation's `"[video]:[audio]"` input grammar; no video).
 /// `PR_SET_PDEATHSIG` keeps it from orphaning if we exit (Linux only). Returns the child
 /// plus its piped stdout, or None if ffmpeg won't start.
+///
+/// The macOS arm survives for the SPEAKER-MONITOR reference only ([`spawn_aec_monitor`]).
+/// The MICROPHONE stopped coming through here on macOS: see [`open_mic_pcm`] and the
+/// module doc for the buffer loss that forced a native capture.
 fn spawn_pulse_pcm(source: &str) -> Option<(Child, std::process::ChildStdout)> {
     let mut cmd = crate::util::ffmpeg_command();
     cmd.args(["-hide_banner", "-loglevel", "error"]);
@@ -66,6 +94,91 @@ fn spawn_pulse_pcm(source: &str) -> Option<(Child, std::process::ChildStdout)> {
     let mut child = cmd.spawn().ok()?;
     let stdout = child.stdout.take()?;
     Some((child, stdout))
+}
+
+// ---------------------------------------------------------------------------
+// The mic PCM seam (see the module doc). Two halves, exactly like `Child` and
+// `ChildStdout`: the owner keeps the STOP half, the DSP thread takes the READ half.
+// ---------------------------------------------------------------------------
+
+/// The control half of a running mic capture: what the owner keeps so it can end it.
+pub enum MicPcmStop {
+    /// An ffmpeg child reading a pulse / dshow source. Dead on macOS, where
+    /// [`open_mic_pcm`] only ever mints `Native`; it stays because it is the arm every
+    /// OTHER platform uses, and the enum is the seam, not a per-platform type.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Ffmpeg(Child),
+    /// macOS: a native `AVCaptureSession` (module doc).
+    #[cfg(target_os = "macos")]
+    Native(crate::platform::mac::mic_capture::MicSession),
+}
+
+impl MicPcmStop {
+    /// End the capture, bounded. Returns whether it ended cleanly — for the ffmpeg arm
+    /// that means SIGTERM won (its flushed tail made it out) rather than SIGKILL.
+    pub fn stop(&mut self) -> bool {
+        match self {
+            Self::Ffmpeg(child) => term_then_wait(child),
+            #[cfg(target_os = "macos")]
+            Self::Native(session) => session.stop(),
+        }
+    }
+}
+
+/// The read half of a running mic capture: whole FRAME-sized mono 48 kHz f32 blocks.
+pub enum MicPcmReader {
+    /// ffmpeg's piped stdout, read a frame's worth of bytes at a time. Dead on macOS,
+    /// for the same reason as [`MicPcmStop::Ffmpeg`].
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Ffmpeg(Box<std::io::BufReader<std::process::ChildStdout>>),
+    /// macOS: the native session's chunk queue, re-framed to FRAME.
+    #[cfg(target_os = "macos")]
+    Native(crate::platform::mac::mic_capture::MicReader),
+}
+
+impl MicPcmReader {
+    /// Fill `out` with the next FRAME samples; `false` once the capture has ended
+    /// (stopped, or gone) — the signal every reader loop here treats as "stop".
+    pub fn read_frame(&mut self, out: &mut [f32; FRAME]) -> bool {
+        match self {
+            Self::Ffmpeg(rdr) => {
+                use std::io::Read;
+                let mut bytes = [0u8; FRAME * 4];
+                if rdr.read_exact(&mut bytes).is_err() {
+                    return false;
+                }
+                for (i, c) in bytes.as_chunks::<4>().0.iter().enumerate() {
+                    out[i] = f32::from_le_bytes(*c);
+                }
+                true
+            }
+            #[cfg(target_os = "macos")]
+            Self::Native(reader) => reader.read_frame(out),
+        }
+    }
+}
+
+/// Open the MICROPHONE as mono 48 kHz f32 PCM. `source` is the persisted device id
+/// (`crate::audio::config::mic_source`, or a Settings picker choice); `"default"` and
+/// the empty string mean the system default input.
+///
+/// macOS captures natively; every other platform spawns the ffmpeg child. See the module
+/// doc for why those differ. `None` means the capture would not start, which the
+/// recording path turns into a named failure rather than a silent track.
+fn open_mic_pcm(source: &str) -> Option<(MicPcmStop, MicPcmReader)> {
+    #[cfg(target_os = "macos")]
+    {
+        let (session, reader) = crate::platform::mac::mic_capture::start(source)?;
+        Some((MicPcmStop::Native(session), MicPcmReader::Native(reader)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let (child, stdout) = spawn_pulse_pcm(source)?;
+        Some((
+            MicPcmStop::Ffmpeg(child),
+            MicPcmReader::Ffmpeg(Box::new(std::io::BufReader::new(stdout))),
+        ))
+    }
 }
 
 /// Ask a capture child to stop gracefully (SIGTERM → ffmpeg flushes its input queue to
@@ -165,7 +278,7 @@ fn spawn_aec_monitor(
 /// from (there is none) — the reader thread's channel send simply errors once the
 /// pump drops its receiver, which is what ends the thread instead.
 pub(crate) struct MicTapHandle {
-    mic_child: Child,
+    mic: MicPcmStop,
     monitor_child: Option<Child>,
     reader: Option<std::thread::JoinHandle<()>>,
     latency_ms: f64,
@@ -180,11 +293,11 @@ impl MicTapHandle {
     }
 
     /// Stop the captures and bounded-join the reader thread. No FIFO to self-drain a
-    /// wedged reader out of: once the captures are killed, `rdr.read_exact` fails and
-    /// the loop ends on its own; this only bounds the (otherwise unlikely) case where
-    /// the reader is instead blocked on a full/abandoned channel send.
+    /// wedged reader out of: once the captures are stopped, `read_frame` returns false
+    /// and the loop ends on its own; this only bounds the (otherwise unlikely) case
+    /// where the reader is instead blocked on a full/abandoned channel send.
     pub(crate) fn drain(&mut self) -> bool {
-        let mut clean = term_then_wait(&mut self.mic_child);
+        let mut clean = self.mic.stop();
         if let Some(mc) = self.monitor_child.as_mut() {
             clean &= term_then_wait(mc);
         }
@@ -233,7 +346,7 @@ pub(crate) fn setup_clean_mic_tap(
 ) -> Option<(MicTapHandle, std::sync::mpsc::Receiver<crate::audio::filters::StreamTap>)> {
     use crate::audio::processing_latency_ms;
 
-    let (mic_child, mic_stdout) = spawn_pulse_pcm(&crate::audio::config::mic_source())?;
+    let (mic, mic_reader) = open_mic_pcm(&crate::audio::config::mic_source())?;
     let (monitor_child, render_buf) = match external_farend {
         Some(ring) if cfg.echo_cancellation => (None, Some(ring)),
         _ => spawn_aec_monitor(cfg, speaker),
@@ -243,8 +356,8 @@ pub(crate) fn setup_clean_mic_tap(
     // headroom absorbs normal scheduling jitter while still applying real
     // backpressure (a blocking `send`) if the pump ever falls meaningfully behind.
     let (tx, rx) = std::sync::mpsc::sync_channel(256);
-    let reader = spawn_tap_reader_thread(mic_stdout, render_buf, cfg, l, tx);
-    Some((MicTapHandle { mic_child, monitor_child, reader: Some(reader), latency_ms: l }, rx))
+    let reader = spawn_tap_reader_thread(mic_reader, render_buf, cfg, l, tx);
+    Some((MicTapHandle { mic, monitor_child, reader: Some(reader), latency_ms: l }, rx))
 }
 
 /// The tap-mode reader thread: the SAME per-frame DSP loop as
@@ -264,21 +377,18 @@ pub(crate) fn setup_clean_mic_tap(
 /// shifts `audible_time` further by the session's A/V-sync offset; nothing else
 /// adjusts it.
 fn spawn_tap_reader_thread(
-    mic_stdout: std::process::ChildStdout,
+    mut mic: MicPcmReader,
     render_buf: Option<FarEndRing>,
     cfg: crate::audio::InputConfig,
     dsp_latency_ms: f64,
     tx: std::sync::mpsc::SyncSender<crate::audio::filters::StreamTap>,
 ) -> std::thread::JoinHandle<()> {
     use crate::audio::filters::StreamTap;
-    use crate::audio::{InputProcessor, FRAME};
-    use std::io::Read;
+    use crate::audio::InputProcessor;
 
     let latency = std::time::Duration::from_secs_f64(dsp_latency_ms.max(0.0) / 1000.0);
     std::thread::spawn(move || {
-        let mut rdr = std::io::BufReader::new(mic_stdout);
         let mut proc = InputProcessor::new(cfg);
-        let mut bytes = [0u8; FRAME * 4];
         let mut inp = [0f32; FRAME];
         let mut pcm = [0f32; FRAME];
         // The stream's contiguous stamping clock (fn doc): anchored at the first
@@ -287,11 +397,8 @@ fn spawn_tap_reader_thread(
         // shifting every arrival time fed to it.
         let mut anchor: Option<super::capture::StreamAnchor> = None;
         loop {
-            if rdr.read_exact(&mut bytes).is_err() {
+            if !mic.read_frame(&mut inp) {
                 break; // mic capture gone (stopped) -> end
-            }
-            for (i, c) in bytes.as_chunks::<4>().0.iter().enumerate() {
-                inp[i] = f32::from_le_bytes(*c);
             }
             if let Some(rb) = render_buf.as_ref() {
                 let rf = rb.lock().ok().and_then(|mut q| q.pop_front()).unwrap_or([0.0; FRAME]);
@@ -330,13 +437,17 @@ fn spawn_tap_reader_thread(
 /// Input Sensitivity bar shows so it matches what the threshold is compared against.
 pub type MicColumn = (f32, f32, f32);
 
-/// Start a live microphone test: an ffmpeg reading mono 48 kHz float PCM from `device`
-/// (empty = system default), plus a reader thread that runs each 10 ms frame through the
-/// shared [`InputProcessor`] cleanup chain (per `cfg`) and reduces it to a rolling
-/// `(clean, raw)` RMS envelope (≈100 columns/sec, newest at the back, capped to
-/// `columns`) on the meters' dBFS scale. When echo cancellation is on, the chosen
-/// `speaker`'s monitor is captured as the AEC far-end reference. Returns the mic process
-/// + shared buffer, or None if ffmpeg won't start. `PR_SET_PDEATHSIG` prevents orphans.
+/// Start a live microphone test: a mono 48 kHz float PCM capture of `device` (empty =
+/// system default) through [`open_mic_pcm`], plus a reader thread that runs each 10 ms
+/// frame through the shared [`InputProcessor`] cleanup chain (per `cfg`) and reduces it
+/// to a rolling `(clean, raw)` RMS envelope (≈100 columns/sec, newest at the back,
+/// capped to `columns`) on the meters' dBFS scale. When echo cancellation is on, the
+/// chosen `speaker`'s monitor is captured as the AEC far-end reference. Returns the
+/// capture's stop handle + shared buffer, or None if the capture won't start.
+///
+/// The meter reads the SAME capture the recording does, which is the point: on macOS it
+/// used to read an ffmpeg child that was quietly dropping a fifth of its buffers, so the
+/// waveform under-reported what a recording would sound like.
 ///
 /// [`InputProcessor`]: crate::audio::InputProcessor
 #[allow(clippy::type_complexity)]
@@ -345,8 +456,8 @@ pub fn spawn_mic_test(
     columns: usize,
     cfg: crate::audio::InputConfig,
     speaker: &str,
-) -> Option<(Child, Arc<Mutex<(std::collections::VecDeque<MicColumn>, usize)>>)> {
-    use crate::audio::{InputProcessor, FRAME};
+) -> Option<(MicPcmStop, Arc<Mutex<(std::collections::VecDeque<MicColumn>, usize)>>)> {
+    use crate::audio::InputProcessor;
     use std::collections::VecDeque;
 
     let mic_source = if device.trim().is_empty() {
@@ -354,7 +465,7 @@ pub fn spawn_mic_test(
     } else {
         device.trim().to_string()
     };
-    let (child, stdout) = spawn_pulse_pcm(&mic_source)?;
+    let (stop, mut mic) = open_mic_pcm(&mic_source)?;
 
     // Echo cancellation needs a live reference of what's going to the speakers: capture
     // the chosen sink's monitor as the AEC far-end. A dedicated thread reads it into a
@@ -405,18 +516,12 @@ pub fn spawn_mic_test(
         Arc::new(Mutex::new((std::collections::VecDeque::with_capacity(columns), 0)));
     let shared = buf.clone();
     std::thread::spawn(move || {
-        use std::io::Read;
-        let mut rdr = std::io::BufReader::new(stdout);
         let mut proc = InputProcessor::new(cfg);
-        let mut bytes = [0u8; FRAME * 4];
         let mut inp = [0f32; FRAME];
         loop {
-            // Read a full frame; EOF/err means ffmpeg exited (dialog closed) -> stop.
-            if rdr.read_exact(&mut bytes).is_err() {
+            // Read a full frame; false means the capture ended (dialog closed) -> stop.
+            if !mic.read_frame(&mut inp) {
                 break;
-            }
-            for (i, c) in bytes.as_chunks::<4>().0.iter().enumerate() {
-                inp[i] = f32::from_le_bytes(*c);
             }
             // Feed the far-end reference for this frame (silence if the monitor hasn't
             // produced one yet), so AEC3 can align and subtract the echo path.
@@ -456,5 +561,5 @@ pub fn spawn_mic_test(
             let _ = mc.wait();
         }
     });
-    Some((child, buf))
+    Some((stop, buf))
 }

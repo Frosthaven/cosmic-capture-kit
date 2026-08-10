@@ -224,12 +224,42 @@ cosmic_client_toolkit::delegate_screencopy!(ScreencopyClient);
 /// (its events trickle in over later roundtrips) — callers that need it use the
 /// wait loop in [`connect`] or the targeted wait in [`connect_for_toplevel`].
 fn connect_raw() -> Option<(Connection, EventQueue<ScreencopyClient>, ScreencopyClient)> {
+    // The capture globals must be VISIBLE to this process before anything below binds them
+    // (`lab/flatpak`). `ToplevelInfoState::new` is `try_new(..).unwrap()`, so on a compositor
+    // that does not advertise `ext_foreign_toplevel_list_v1` this function does not fail, it
+    // PANICS, and it does so on whichever worker thread happened to call it.
+    //
+    // DRAGON-620 corrected the second name here. This comment used to say `ScreencopyState::new`
+    // unwraps its global too. It does not, and it never did at the pinned cctk rev: all four of
+    // its binds are `.ok()`, so a session missing the capture managers gets a `Capturer` that
+    // simply has none. Only the toplevel-info bind can abort, which is why only it is named now
+    // and why only it gets the `try_new` below.
+    //
+    // That is the crash the first sandboxed launch hit. cosmic-comp hides every one of these
+    // from a client carrying a security context, so a Flatpak reached this line, aborted, and
+    // took the process with it before any window appeared.
+    //
+    // This is the single funnel for every screencopy connection (`connect`,
+    // `connect_for_toplevel`), so guarding here covers all of them. Returning `None` is
+    // exactly the shape callers already handle: it is what a machine with no Wayland display
+    // has always produced, and every caller already treats it as "no native capture".
+    //
+    // `toplevel_list` is now EXACTLY `ext_foreign_toplevel_list_v1`, which is exactly the global
+    // the constructor below binds. It used to be that name ORed with `zcosmic_toplevel_info_v1`,
+    // so this guard was testing a superset of what it protects.
+    let p = crate::platform::backend::wayland_protocols();
+    if !p.image_copy_capture || !p.toplevel_list {
+        return None;
+    }
     let conn = Connection::connect_to_env().ok()?;
     let (globals, mut queue) = registry_queue_init::<ScreencopyClient>(&conn).ok()?;
     let qh = queue.handle();
     let registry_state = RegistryState::new(&globals);
     let output_state = OutputState::new(&globals, &qh);
-    let toplevel_info_state = ToplevelInfoState::new(&registry_state, &qh);
+    // `try_new`, not `new`: the probe above matches interface NAMES while `bind_one` also
+    // demands a version range, so the only way to make an abort structurally impossible is to
+    // let the toolkit answer.
+    let toplevel_info_state = ToplevelInfoState::try_new(&registry_state, &qh)?;
     let screencopy_state = ScreencopyState::new(&globals, &qh);
     let shm = Shm::bind(&globals, &qh).ok()?;
     let seat_state = SeatState::new(&globals, &qh);

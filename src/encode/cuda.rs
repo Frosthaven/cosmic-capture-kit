@@ -561,7 +561,8 @@ impl CudaDevice {
                         .then(|| std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned())
                 });
             let Some(node) = node else { continue };
-            if !driver_for_node(&node).is_some_and(|d| d == "nvidia") {
+            let Some(driver) = driver_for_node(&node) else { continue };
+            if driver != "nvidia" {
                 continue;
             }
             let display =

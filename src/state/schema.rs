@@ -50,6 +50,14 @@ pub struct Persisted {
     /// again (`skip_serializing`).
     #[serde(default = "default_window_border_style", skip_serializing)]
     pub window_border_style: u8,
+    /// MASTER switch for the single-window screenshot recompositing ("Enable
+    /// single window aesthetic effects"): the aesthetic decorations composited
+    /// onto a captured window (borders, drop shadow, rounding, padding, the
+    /// wallpaper backdrop). OFF delivers the BARE captured frame on every platform
+    /// and path (native and portal) while PRESERVING every individual aesthetic
+    /// preference below, so re-enabling restores them exactly. Default on.
+    #[serde(default = "default_true")]
+    pub window_recompositing: bool,
     /// Window-capture ACTIVE (focused) border colour, RGBA. `None` = follow the
     /// system accent colour (resolved at draw time); `Some` = a user-pinned custom
     /// colour. DRAGON-191. Omitted from disk when unset.
@@ -347,6 +355,13 @@ pub struct Persisted {
     /// without the editor. Default UNSET (empty).
     #[serde(default = "default_capture_hotkey")]
     pub capture_active_monitor_no_editor_hotkey: String,
+    /// macOS/Windows (DRAGON-582): the resident daemon's global hotkey for the COLOUR
+    /// PICKER tool. Default UNSET (empty), like every other global hotkey here. A
+    /// serde-defaulted additive field, so old configs load with it absent (no
+    /// store-version bump). Linux has no daemon-owned global hotkey and ignores it; a
+    /// Linux user binds a COSMIC custom shortcut to `--color-picker` instead (README).
+    #[serde(default = "default_capture_hotkey")]
+    pub color_picker_hotkey: String,
     /// macOS (DRAGON-130): whether the first-run Screen Recording permission prompt
     /// has already been fired. On the first ever capture launch, if the grant is
     /// absent, the app requests it once (the OS dialog) and sets this so it never
@@ -387,6 +402,51 @@ pub struct Persisted {
     /// Opacity (0..1) of the black dim behind the post-capture preview overlay.
     #[serde(default = "default_preview_opacity")]
     pub preview_overlay_opacity: f32,
+    /// DRAGON-582: opacity (0..1) of the black dim behind the COLOUR PICKER overlay.
+    ///
+    /// Its own setting rather than sharing the region one: the picker dims the screen to
+    /// make a magnifier readable, not to mark a selection. Default 33%, the same figure as
+    /// [`default_active_opacity`], so the two overlays that sit over a working desktop feel
+    /// alike.
+    ///
+    /// It went to ZERO briefly during DRAGON-588, on the reasoning that you are judging
+    /// COLOURS and any dim changes what every pixel looks like. The owner took it back to
+    /// 33% because a picker with no dim is indistinguishable from an ordinary desktop, and
+    /// on the portal-fallback path that is a fullscreen toplevel sitting invisibly over
+    /// everything. The dim is what says the tool is armed. Do not re-argue this without a
+    /// different reason: the colour REPORTED is unaffected either way, since the sample
+    /// comes from the frozen snapshot rather than the composited screen (see
+    /// `app::color_picker`'s `PixelSource`), so this is purely about legibility.
+    #[serde(default = "default_color_picker_opacity")]
+    pub color_picker_overlay_opacity: f32,
+    /// DRAGON-615: the magnifier's magnification, in rendered pixels per source pixel.
+    ///
+    /// Remembered between sessions because the picker is a ONE-SHOT process: without this a
+    /// user who prefers a tighter or wider lens re-sets it on every single launch.
+    ///
+    /// Never trusted as read. `color_picker::geom::zoom_from_persisted` clamps it into the
+    /// bounds THIS build allows, because the ceiling has already moved once (12 to 26,
+    /// DRAGON-601) and a config written either side of such a change must not be able to
+    /// produce an out-of-range lens. A missing key reads as the default, so anyone who has
+    /// never touched the zoom is unaffected.
+    ///
+    /// Deliberately absent from the Settings window: it is a per-use view preference the
+    /// picker already exposes directly on three routes (trackpad, wheel, numpad `+`/`-`), not
+    /// a configuration choice, so a settings row would be a second way to say the same thing.
+    #[serde(default = "default_color_picker_zoom")]
+    pub color_picker_zoom: u32,
+    /// DRAGON-582: recently PICKED colours, newest first, as `#RRGGBB` strings.
+    ///
+    /// Persisted because the app is one-shot: the picker process exits when its window
+    /// closes, so an in-memory list would be empty every single time the window opened
+    /// and the feature would do nothing. Capped at `color_picker::geom::RECENTS_CAP` when
+    /// written; an over-long or malformed list from a hand-edited config is truncated and
+    /// filtered on load rather than rejected.
+    ///
+    /// This is user CONTENT. It is written to the config like any other setting and NEVER
+    /// to the debug log (see `app::color_picker`'s privacy note).
+    #[serde(default)]
+    pub recent_colors: Vec<String>,
     /// Video recording frame rate (fps).
     #[serde(default = "default_record_fps")]
     pub record_fps: u32,
@@ -428,12 +488,28 @@ pub struct Persisted {
     /// or `hevc` (smaller files). Default `auto`. Software encoding is always H.264.
     #[serde(default = "default_record_codec")]
     pub record_codec: String,
-    /// Preferred video encoder id ("nvenc" | "vaapi" | "software"). Only used when
-    /// hardware encoding is enabled. Defaults to the "auto" sentinel, which the app
-    /// replaces with the best available concrete encoder on first launch (and then
-    /// persists), so there's no user-facing "auto" option.
+    /// Preferred video encoder id: the "auto" sentinel (the default) or a concrete id
+    /// ("nvenc" | "vaapi" | "software" on Linux, plus "videotoolbox" / "amf" / "qsv"
+    /// off Linux). "auto" STAYS persisted until the user explicitly picks in the
+    /// settings encoder dropdown; an auto resolution is NEVER written back here
+    /// (DRAGON-571: it used to be, so one transient first-launch probe failure, a
+    /// sleeping driver or an NVENC session held by a game, pinned "software" forever
+    /// with nothing ever reconsidering). Auto resolves per recording through the
+    /// hint-first ladder seeded by [`encoder_auto_hint`](Self::encoder_auto_hint).
+    /// The legacy `record_hardware = false` toggle still maps this to software at
+    /// read time.
     #[serde(default = "default_preferred_encoder")]
     pub preferred_encoder: String,
+    /// Last-known-good AUTO encoder resolution (DRAGON-571): a CACHE, not a choice.
+    /// The auto ladder probes this id first (one probe-encode on the happy path, the
+    /// same single probe a concrete pick pays) and any recording session may overwrite
+    /// it with its winner (`state::note_encoder_auto_hint`). Empty = no resolution
+    /// recorded yet. Kept separate from `preferred_encoder` so the cache can be
+    /// written freely while the preference stays the user's alone; the settings
+    /// snapshot carries this field from DISK (see `app/persist.rs`), so a settings
+    /// save never reverts a worker's fresh note.
+    #[serde(default)]
+    pub encoder_auto_hint: String,
     /// Detect QR codes / barcodes inside the region in region mode (default on).
     #[serde(default = "default_true")]
     pub scan_codes: bool,
@@ -473,11 +549,16 @@ pub struct Persisted {
     // `share::AUTO_COPY_MAX_MB` — the editor toasts a named error when it declines a copy
     // for size, so the knob existed only to pre-empt a failure the user can now read. See
     // that constant's doc for why the limit itself survives.
-    /// Record microphone audio with videos (default off).
-    #[serde(default)]
+    /// Record microphone audio with videos (owner's call: default ON, mic + system is the
+    /// expected default recording mode). `default_true` only fires when the key is absent
+    /// from the file at all, i.e. a genuinely fresh install: `save` always writes the WHOLE
+    /// struct, so anyone who has ever saved settings already has their own explicit `true`
+    /// or `false` on disk, which always wins over this default.
+    #[serde(default = "default_true")]
     pub record_mic: bool,
-    /// Record system/desktop audio with videos (default off).
-    #[serde(default)]
+    /// Record system/desktop audio with videos (owner's call: default ON, same reasoning as
+    /// `record_mic`).
+    #[serde(default = "default_true")]
     pub record_system_audio: bool,
     /// Hide the floating recording toolbar on full-screen captures (DRAGON-174):
     /// when the toolbar can't fit OUTSIDE the recording area, `true` hides it instead
@@ -501,23 +582,56 @@ pub struct Persisted {
     pub screenshot_pipewire: bool,
     /// The capture backend recordings go through, as a stable
     /// `platform::backend` id ("screencopy" | "portal" | "sck"). Replaces
-    /// `prefer_pipewire` (config v3): Linux defaults to the portal (first launch
-    /// swaps in the probe result, exactly as the boolean did); macOS has only
-    /// ScreenCaptureKit. A saved id that doesn't exist in the running session is
-    /// clamped at use, never rewritten.
+    /// `prefer_pipewire` (config v3): Linux defaults to the portal; macOS has
+    /// only ScreenCaptureKit. This field is USER INTENT (DRAGON-575, the
+    /// DRAGON-571 rule): only a real settings pick writes it. A saved id that
+    /// doesn't exist in the running session is clamped at use and shown resolved
+    /// in the method dropdown, never rewritten. (A first-launch probe used to
+    /// write its auto-pick here once; see the tombstone at
+    /// `CaptureMsg::PipewireProbed`.)
     #[serde(default = "default_record_backend")]
     pub record_backend: String,
     /// The capture backend screenshots go through (same id space). Replaces
     /// `screenshot_pipewire` (config v3); defaults to the platform's native
-    /// backend (screencopy is instant + needs no permission prompt).
+    /// backend (screencopy is instant + needs no permission prompt). User intent
+    /// like `record_backend`: on a session without the native protocols (GNOME/
+    /// KDE, the Flatpak sandbox) the default id is clamped to the portal at use
+    /// and shown resolved, never rewritten.
     #[serde(default = "default_screenshot_backend")]
     pub screenshot_backend: String,
-    /// ScreenCast restore token from the last successful grant — replayed to skip
-    /// the portal dialog next time (cleared on cancel / wrong-monitor so the user
-    /// can re-pick). Single token; a stale cross-type one just makes the portal
-    /// re-prompt.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// DEPRECATED (config v11, DRAGON-570): the single-token era's ScreenCast
+    /// restore token. Read only for the one-time migration into the per-source
+    /// slot named by `pw_restore_source` (see `store::migrate`) and never written
+    /// again (`skip_serializing`). The single slot was the bug's second half: a
+    /// window grant overwrote the monitor token and vice versa, so alternating
+    /// capture kinds re-prompted even when replay worked.
+    #[serde(default, skip_serializing)]
     pub pw_restore_token: Option<String>,
+    /// DEPRECATED (config v11, DRAGON-570): which source type the legacy
+    /// `pw_restore_token` was granted for ("monitor" / "window"), the DRAGON-544
+    /// cross-type replay guard. Read only so the migration can route the legacy
+    /// token into its matching slot; a `None` or unknown source drops the token
+    /// (it never replayed under DRAGON-544's gate either). Never written again.
+    #[serde(default, skip_serializing)]
+    pub pw_restore_source: Option<String>,
+    /// ScreenCast restore token from the last successful MONITOR grant, replayed
+    /// to skip the portal dialog for the next monitor request (region and monitor
+    /// captures). One slot PER SOURCE TYPE since DRAGON-570, so a window grant no
+    /// longer discards the monitor token. Every use reissues the token (the spent
+    /// one is invalid), so this always holds the latest reissue. Cleared on a
+    /// declined monitor request, the wrong-monitor region bounce, the settings
+    /// Forget row, and factory reset. Persisted grants survive our one-shot
+    /// processes because the portal request uses persist mode 2
+    /// (`ExplicitlyRevoked`, the on-disk permission store); see
+    /// `platform/linux/portal/screencast.rs` for why mode 1 could never work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pw_restore_token_monitor: Option<String>,
+    /// ScreenCast restore token from the last successful WINDOW grant, the window
+    /// captures' own slot. Same lifecycle as `pw_restore_token_monitor`: reissued
+    /// on every use, cleared on a declined window request, the settings Forget
+    /// row, and factory reset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pw_restore_token_window: Option<String>,
     /// Audio→video sync offset (ms) for recordings: positive delays the audio (when
     /// the sound lands before the picture), negative advances it. Device-latency
     /// dependent; default 0. When `audio_sync_auto` is on, this is maintained
@@ -624,8 +738,10 @@ pub struct Persisted {
     #[serde(default = "default_true")]
     pub appearance_contrast_boost: bool,
     /// Region selection box thickness (logical px, 1-8). Drives the viewfinder corner
-    /// brackets AND the side lines uniformly so they match. Always applies (NOT gated by
-    /// `appearance_use_system`). DRAGON-209. Default 4.
+    /// brackets AND the side lines uniformly so they match, and (DRAGON-582) the colour
+    /// picker's magnifier ring. Always applies (NOT gated by `appearance_use_system`).
+    /// DRAGON-209. Default 3 (owner's call, DRAGON-588; it was 2, and this doc line said
+    /// 4 while the code said 2, so the two are now one number in one place).
     #[serde(default = "default_selection_box_thickness")]
     pub selection_box_thickness: u32,
     /// About (DRAGON-177): show the launch-time "a new update is available" dialog
@@ -681,6 +797,22 @@ fn default_active_opacity() -> f32 {
 
 fn default_preview_opacity() -> f32 {
     0.9
+}
+
+/// The colour picker's dim (DRAGON-582), the owner's 33%: light enough to read colours
+/// through, dark enough to say the screen is not interactive right now.
+fn default_color_picker_opacity() -> f32 {
+    0.33
+}
+
+/// The magnifier's opening magnification (DRAGON-615), which is exactly the value the picker
+/// used before it was persisted, so a user who has never changed it sees no difference at all.
+///
+/// Deferring to the picker's own const rather than repeating the number keeps this honest if
+/// the designed span ever moves again, and keeps the `floor < default < ceiling` compile-time
+/// assert in `color_picker::geom` the single authority on the bounds.
+fn default_color_picker_zoom() -> u32 {
+    crate::app::color_picker::geom::MAGNIFIER_ZOOM_DEFAULT
 }
 
 /// The customize-mode corner-rounding default (used when `appearance_use_system` is
@@ -757,16 +889,27 @@ fn default_true() -> bool {
 }
 
 fn default_resident() -> bool {
-    // The macOS AND Windows (DRAGON-296) global capture hotkeys only work while the resident
-    // daemon runs, so residency defaults on there; Linux stays one-shot (PrintScreen is a
-    // COSMIC custom shortcut, not owned by a daemon).
-    cfg!(any(target_os = "macos", target_os = "windows"))
+    // ON everywhere (DRAGON-584, owner's call). macOS and Windows (DRAGON-296) have always
+    // defaulted on, because their global capture hotkeys are dead without the daemon.
+    //
+    // LINUX defaulted OFF until now, on the reasoning that the one-shot model still exits and
+    // PrintScreen is a COSMIC custom shortcut nothing else owns. That reasoning expired:
+    // DRAGON-574 turned the tray into the app's primary launcher (Capture / Record / Countdown
+    // / Audio submenus), and on a sandboxed install the user's PrintScreen shortcut points at a
+    // dev binary path the sandbox does not even have, so a Linux user with no tray has no
+    // obvious way in at all. DRAGON-583 goes further: with no portal GlobalShortcuts interface
+    // on COSMIC, the tray plus the CLI is the ONLY way to control a live recording there.
+    //
+    // Existing configs are untouched: `resident` is a persisted field, so this changes what a
+    // FRESH install gets and what the settings row's reset arrow restores, not anyone's saved
+    // choice.
+    true
 }
 
 fn default_record_backend() -> String {
-    // Mirrors the retired `prefer_pipewire` default (on): Linux prefers the portal
-    // until the first-launch probe picks the real default; elsewhere the native
-    // backend is the only one.
+    // Mirrors the retired `prefer_pipewire` default (on): Linux prefers the
+    // portal (the dispatch clamp falls back to native per session when the
+    // portal is unreachable); elsewhere the native backend is the only one.
     if cfg!(target_os = "linux") {
         crate::platform::backend::PORTAL_ID.to_string()
     } else {
@@ -816,9 +959,11 @@ fn default_inactive_border_width() -> u32 {
     1
 }
 
-/// Default region selection box thickness (px). DRAGON-209.
+/// Default region selection box thickness (px). DRAGON-209; raised 2 to 3 by the owner
+/// (DRAGON-588). Persisted values are untouched: this moves what a fresh install gets and
+/// what the settings reset arrow restores.
 fn default_selection_box_thickness() -> u32 {
-    2
+    3
 }
 
 /// Default INACTIVE window-capture border colour (0xff414550 = the user's prior
@@ -844,11 +989,24 @@ mod shortcut_overrides {
     }
 
     /// An action name parsed TOLERANTLY: a name that no longer exists in [`Action`]
-    /// (one a later build removed — DRAGON-158 dropped `FocusSearch` and
-    /// `PreviewNoAi`) comes back as `None` instead of a parse error. This matters
-    /// because a single failing entry fails the whole `Persisted` parse, and
-    /// `store::load_raw` answers a failed parse with DEFAULTS — a stale override
-    /// must drop silently, never take every other setting down with it.
+    /// comes back as `None` instead of a parse error. This matters because a single
+    /// failing entry fails the whole `Persisted` parse, and `store::load_raw` answers a
+    /// failed parse with DEFAULTS — a stale override must drop silently, never take
+    /// every other setting down with it.
+    ///
+    /// Retired names this has already had to absorb, so the list stays honest about how
+    /// often it earns its keep: DRAGON-158 dropped `FocusSearch` and `PreviewNoAi`,
+    /// DRAGON-467 dropped `PreviewSaveAs` and `PreviewDelete`, DRAGON-617 dropped the
+    /// five it BAKED (`PreviewSave`, `PreviewUpload`, `PreviewCancel`, `PreviewUndo`,
+    /// `PreviewRedo`), and DRAGON-627 dropped the three IT baked, the scanner's OCR text
+    /// actions (`CopyText`, `SelectAllText`, `DeselectText`). The DRAGON-617 group is the
+    /// biggest single drop, and it is exactly the case this was built for: a user who had
+    /// customised some OTHER binding keeps it, because only the entries naming a retired
+    /// action fall away.
+    ///
+    /// The DRAGON-627 three are the OLDEST names on that list, shipped since the first
+    /// build, so they are the ones most likely to be sitting in a long-lived config. Pinned
+    /// by `store`'s `the_baked_ocr_three_drop_and_the_users_other_bindings_survive`.
     struct CompatAction(Option<Action>);
 
     /// Map an action name to its variant, `None` when the name is unknown/removed.

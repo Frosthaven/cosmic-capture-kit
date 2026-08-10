@@ -69,12 +69,19 @@ impl App {
 
     /// Capture source label for metadata: PipeWire portal vs the COSMIC compositor,
     /// for the current kind.
+    ///
+    /// DRAGON-595: asks the SELECTED backend which one it is, instead of re-deriving
+    /// the choice from the saved ids. The two agree by construction, because
+    /// `active_*_backend` resolves a portal object on exactly the
+    /// `uses_portal() && pipewire_available` pairing this used to test inline. Off
+    /// Linux the selected backend is SCK or WGC, so the label stays "cosmic" as it
+    /// always did (`pipewire_available` is false there).
     pub(super) fn source_label(&self) -> &'static str {
-        let pw = match self.kind {
-            Kind::Video => self.recording_uses_portal(),
-            Kind::Image | Kind::Scanner => self.screenshot_uses_portal(),
+        let backend = match self.kind {
+            Kind::Video => self.active_record_backend(),
+            Kind::Image | Kind::Scanner => self.active_screenshot_backend(),
         };
-        if pw && self.pipewire_available {
+        if backend.id() == crate::platform::backend::PORTAL_ID {
             "pipewire"
         } else {
             "cosmic"
@@ -162,12 +169,27 @@ impl App {
         self.encoders.list()
     }
 
-    /// The live preferred-encoder id, resolved lazily on first read (DRAGON-201).
+    /// The DISPLAYED preferred-encoder id (what the settings picker shows), resolved
+    /// lazily on first read (DRAGON-201). A display resolution only: it is never
+    /// persisted (DRAGON-571); saves write `encoder_requested` instead.
     pub(super) fn preferred_encoder(&self) -> String {
         self.encoders.preferred()
     }
 
-    /// Overwrite the live preferred-encoder id (user pick / persist apply).
+    /// The persisted encoder INTENT ("auto" or the user's pick): what `save_state`
+    /// writes back to `preferred_encoder`, never a resolution (DRAGON-571).
+    pub(super) fn encoder_requested(&self) -> String {
+        self.encoders.requested()
+    }
+
+    /// The `(requested, hint)` pair a recording start hands to `RecordSettings`: see
+    /// `EncoderResolve::request` (DRAGON-571). "auto" travels as "auto" so the
+    /// worker's hint-first ladder re-resolves it every session.
+    pub(super) fn encoder_request(&self) -> (String, Option<String>) {
+        self.encoders.request()
+    }
+
+    /// Overwrite the live preferred-encoder INTENT (user pick / persist apply).
     pub(super) fn set_preferred_encoder(&self, id: String) {
         self.encoders.set_preferred(id);
     }
@@ -377,13 +399,18 @@ impl App {
         // recording's files are spared (DRAGON-322/351).
         crate::record::recover::sweep_wreckage(out_path.parent());
         let (max_w, max_h) = self.res_limit();
+        // DRAGON-571: the request travels verbatim ("auto" stays "auto", with its
+        // last-known-good hint), so the worker's ladder resolves auto fresh each
+        // session instead of this process pinning a one-time answer.
+        let (requested_encoder, encoder_hint) = self.encoder_request();
         let handle = crate::record::start_pipewire_recording(crate::record::PipewireRecordParams {
             fd: held.fd,
             node_id: held.node_id,
             crop: held.crop,
             settings: crate::record::RecordSettings {
                 fps: self.record_fps.value,
-                preferred_encoder: self.preferred_encoder(),
+                preferred_encoder: requested_encoder,
+                encoder_hint,
                 presets: self.presets(),
                 zero_copy: self.record_zero_copy,
                 mic: self.mic_armed(),
@@ -406,6 +433,16 @@ impl App {
         self.recording_paused_at = None;
         self.recording_paused_accum = std::time::Duration::ZERO;
         self.arm_session_bound(&out_path);
+        // lab/flatpak: the fallback path has no layer shell, so `recreate_active_overlays`
+        // (below) tears the selection window and `self.outputs` down the moment recording
+        // starts. Resolve the finished recording's editor anchor NOW, while the outputs
+        // are still known; `stop_recording` prefers a fresh stop-time answer and only
+        // falls back to this one. Protocol-keyed (`overlay_fallback_active`), and native
+        // sessions keep their surfaces up and never take this branch, so they stay
+        // byte-identical.
+        if self.overlay_fallback_active() {
+            self.snapshot_preview_anchor(&sel);
+        }
         self.pending = Some(sel);
         self.begin_recording_tray();
         self.recreate_active_overlays()
@@ -422,7 +459,9 @@ impl App {
         // outside the recorded crop); window/monitor record the full target.
         let rec = inset_region(sel.clone());
         let (max_w, max_h) = self.res_limit();
-        let preferred_encoder = self.preferred_encoder();
+        // DRAGON-571: the request travels verbatim ("auto" stays "auto", with its
+        // last-known-good hint); the worker's ladder resolves auto fresh each session.
+        let (requested_encoder, encoder_hint) = self.encoder_request();
         let handle = crate::record::start_region_recording(crate::record::RegionRecordParams {
             x: rec.x,
             y: rec.y,
@@ -440,13 +479,17 @@ impl App {
             win_target: win_record_target(&rec),
             settings: crate::record::RecordSettings {
                 fps: self.record_fps.value,
-                preferred_encoder: preferred_encoder.clone(),
+                preferred_encoder: requested_encoder.clone(),
+                encoder_hint,
                 presets: self.presets(),
                 // GPU zero-copy applies to a full output (Monitor mode, no crop) with a
-                // hardware encoder; Region/Window crop, so they take the CPU path.
+                // hardware encoder; Region/Window crop, so they take the CPU path. An
+                // "auto" request passes this gate (it may resolve to hardware); on a
+                // GPU-less box the zero-copy attempt declines on its own and the CPU
+                // fallback takes over, exactly like any other zero-copy decline.
                 zero_copy: self.mode == Mode::Monitor
                     && self.record_zero_copy
-                    && preferred_encoder != "software",
+                    && requested_encoder != "software",
                 mic: self.mic_armed(),
                 system_audio: self.record_system_audio,
                 bitrate_kbps: self.record_bitrate_kbps.value,
@@ -469,6 +512,13 @@ impl App {
         // The live size readout tracks the temp capture as it grows; the final file
         // (after the finalize pass) is what `RecordingPoll` reports on `done`.
         self.arm_session_bound(&out_path);
+        // lab/flatpak: the same record-start anchor snapshot as the portal path (see
+        // there for the why). Reached on the fallback path only when the portal grant
+        // failed into screencopy, but the teardown below is the same, so the anchor
+        // must be taken the same way.
+        if self.overlay_fallback_active() {
+            self.snapshot_preview_anchor(&sel);
+        }
         // Keep the ORIGINAL selection for the overlay/border + toolbar anchor.
         self.pending = Some(sel);
         self.begin_recording_tray();
@@ -496,6 +546,23 @@ impl App {
     /// (DRAGON-182) — there is no idle session icon anymore, so an icon is always
     /// raised fresh here and dropped in `end_recording_tray`.
     fn begin_recording_tray(&mut self) {
+        // DRAGON-583: open this recording to control commands from other processes, so a
+        // desktop global hotkey bound to `--toggle-mic` / `--pause-recording` /
+        // `--finish-recording` / `--cancel-recording` / `--toggle-system-audio` can reach
+        // it. Bound BEFORE the tray, and deliberately independent of it: a sandboxed child
+        // often fails to register a tray item at all, and that is exactly the session where
+        // these commands are the only control the user has left. A bind failure costs only
+        // the commands, never the recording, so it logs and carries on.
+        #[cfg(target_os = "linux")]
+        {
+            self.record_control = match crate::daemon_ipc::start_control_inlet() {
+                Ok(inlet) => Some(inlet),
+                Err(e) => {
+                    log::warn!("recording control commands unavailable ({e})");
+                    None
+                }
+            };
+        }
         // Prefer a resident/daemon relay: when the mac menu-bar daemon / Linux resident is
         // present, ALL in-recording controls belong in ITS one icon (DRAGON-170/173).
         // Failure (no resident: a terminal / CLI recording, or the resident off) raises
@@ -509,6 +576,9 @@ impl App {
                 self.record_mic,
                 self.record_system_audio,
                 self.tray_accent(),
+                // DRAGON-574: the live countdown preset, which the (disabled while
+                // recording) Countdown Timer submenu titles itself from.
+                self.delay_idx,
             );
         }
         // DRAGON-174: the ONLY thing that hides the in-frame toolbar now is the user's
@@ -535,6 +605,14 @@ impl App {
     pub(super) fn end_recording_tray(&mut self) {
         self.tray = None;
         self.tray_hides_toolbar = false;
+        // DRAGON-583: the control inlet has the same lifetime as the icon it sits beside:
+        // there is no recording left to command. Dropping it unlinks the socket, so a
+        // command sent a moment later reports "no recording is in progress" instead of
+        // vanishing into a socket nobody reads.
+        #[cfg(target_os = "linux")]
+        {
+            self.record_control = None;
+        }
     }
 
     /// Tear the session status icon down entirely (DRAGON-174) — the end of the whole
@@ -543,6 +621,17 @@ impl App {
     pub(super) fn drop_session_icon(&mut self) {
         self.tray = None;
         self.tray_hides_toolbar = false;
+        // DRAGON-583: and the control inlet, on the same terms. `finish_session` exits
+        // through `iced::exit`, which runs no destructor, so the socket file this misses is
+        // the one `instance::sweep_stale_markers` clears on the next launch, exactly like
+        // the preview host's.
+        #[cfg(target_os = "linux")]
+        {
+            self.record_control = None;
+        }
+        // DRAGON-563: the countdown digits item comes down with the session too, so no
+        // ending can leave it on the panel past the process.
+        self.countdown_tray = None;
     }
 
     /// Apply the portal hotkey events delivered since the last poll: PTT hold
@@ -563,21 +652,19 @@ impl App {
             .unwrap_or_default();
         for (at, ev) in events {
             match ev {
-                Ev::PttPressed if self.ptt_active() => {
-                    // Same dedup as the keyboard path: only the first press of a
-                    // held span un-mutes.
-                    if !self.ptt_held {
-                        self.ptt_held = true;
-                        if self.recording.is_some() {
-                            self.log_audio_toggle_at(at, crate::record::AudioChannel::Mic, true);
-                        }
+                // Same dedup as the keyboard path, carried in the guards: only the first
+                // press of a held span un-mutes, and only a press that actually happened
+                // re-mutes. A repeat of either falls to the catch-all below and does
+                // nothing, exactly as the inner `if` it replaces did.
+                Ev::PttPressed if self.ptt_active() && !self.ptt_held => {
+                    self.ptt_held = true;
+                    if self.recording.is_some() {
+                        self.log_audio_toggle_at(at, crate::record::AudioChannel::Mic, true);
                     }
                 }
-                Ev::PttReleased if self.ptt_active() => {
-                    if self.ptt_held {
-                        self.ptt_held = false;
-                        self.log_audio_toggle_at(at, crate::record::AudioChannel::Mic, false);
-                    }
+                Ev::PttReleased if self.ptt_active() && self.ptt_held => {
+                    self.ptt_held = false;
+                    self.log_audio_toggle_at(at, crate::record::AudioChannel::Mic, false);
                 }
                 Ev::Stop if self.recording.is_some() => {
                     tasks.push(self.stop_recording());
@@ -622,8 +709,10 @@ impl App {
             // rect against a physical one on a scaled Windows monitor).
             let units = o.units();
             let (cx, cy) = units.to_point((sel.x, sel.y));
-            let cw = units.len_to_point(sel.width as f32);
-            let ch = units.len_to_point(sel.height as f32);
+            // The pair form of `len_to_point`; on the letterbox fallback bridge
+            // (`lab/flatpak`) `to_point` above already carried the bar offsets, and the
+            // extent scales uniformly. Identical arithmetic everywhere else.
+            let (cw, ch) = units.size_f_to_point((sel.width as f32, sel.height as f32));
             let overlap_x = tb.x < cx + cw && tb.x + tb.width > cx;
             let overlap_y = tb.y < cy + ch && tb.y + tb.height > cy;
             overlap_x && overlap_y
@@ -790,6 +879,24 @@ impl App {
         }
     }
 
+    /// Record-start snapshot of the finished recording's editor anchor: the trigger
+    /// display, else the selection's output, plus that output's backing scale. Taken on
+    /// the portal-fallback path only (`lab/flatpak`), where `recreate_active_overlays`
+    /// tears the selection window and `self.outputs` down the moment recording starts,
+    /// so a stop-time resolution can no longer see any output. That empty answer is what
+    /// the daemon-tray "Finish & Save did nothing" report was: `preview_output` stayed
+    /// `None`, the preview spinner refused to open, and `present_capture` delivered the
+    /// file through the editor-less `finish_share` with no editor ever appearing.
+    ///
+    /// `pub(super)` since DRAGON-563: a TRAY countdown tears the same surfaces down at
+    /// COUNTDOWN start, so `enter_countdown` takes the same snapshot for the delayed
+    /// still/recording it is counting toward (`keep_countdown_anchor` reads it back).
+    pub(super) fn snapshot_preview_anchor(&mut self, sel: &Selection) {
+        self.preview_output =
+            self.active_trigger_display().or_else(|| self.output_for_selection(sel));
+        self.preview_output_scale = self.scale_for_selection(sel);
+    }
+
     /// Stop the recording: signal the worker (it finalizes the file) and clear the
     /// overlay, opening the video preview overlay (a spinner) right away to cover the
     /// finalize wait. `RecordingPoll` fills in the poster once the file is ready.
@@ -808,9 +915,23 @@ impl App {
         // the still-capture path. Fall back to the selection's output when the trigger can't be
         // resolved. Captured before the overlay (and `self.outputs`) tears down; the finalize
         // pass is a file op (no live-screen read), so the preview overlay is safe to show.
+        //
+        // lab/flatpak: on the portal-fallback path the overlays (and `self.outputs`) went
+        // down at record START, so the fresh resolution below always comes back empty. The
+        // anchor snapshotted then (`snapshot_preview_anchor`) stands in, with the scale it
+        // stored riding along. Overwriting the pair with the empty stop-time answer is what
+        // left the finished recording with no output to open its editor on, which the user
+        // saw as "Finish & Save from the daemon tray does nothing".
         if let Some(sel) = self.pending.clone() {
-            self.preview_output =
-                self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
+            let fresh = self
+                .active_trigger_display()
+                .or_else(|| self.output_for_selection(&sel))
+                .map(|a| (a, self.scale_for_selection(&sel)));
+            let snapshot = self.preview_output.take().map(|a| (a, self.preview_output_scale));
+            if let Some((anchor, scale)) = stop_preview_anchor(fresh, snapshot) {
+                self.preview_output = Some(anchor);
+                self.preview_output_scale = scale;
+            }
             // DRAGON-317 regression fix: the windowed-preview re-home target is the RELIABLE
             // capture-origin monitor ONLY — the pointer's output from the capture overlay's
             // first pointer-enter (`capture_pointer_output`), not the focused-toplevel guess;
@@ -821,7 +942,6 @@ impl App {
             {
                 self.preview_output_name = self.capture_pointer_output.clone();
             }
-            self.preview_output_scale = self.scale_for_selection(&sel);
         }
         let mut cmds = self.destroy_surfaces();
         // The recording's CAPTURED footprint sizes the windowed preview at open, so
@@ -897,6 +1017,21 @@ fn toolbar_hidden(hide_setting: bool, cant_fit_outside: bool) -> bool {
     hide_setting && cant_fit_outside
 }
 
+/// Which preview anchor a stopping recording keeps. Pure, unit-tested (lab/flatpak).
+///
+/// The STOP-TIME resolution wins whenever it produced one: on the native path the
+/// capture surfaces are still up at stop, so the fresh answer reflects the pointer and
+/// outputs as they are NOW (the DRAGON-309 trigger-display rule). When it produced
+/// nothing, the RECORD-START snapshot stands: the portal-fallback path tears the
+/// selection window and the output list down at record start, so its stop-time
+/// resolution is always empty, and erasing the snapshot with that empty answer is what
+/// made "Finish & Save" from the daemon tray end a recording with no editor. Both
+/// absent stays absent: the editor-less `finish_share` delivery is then the honest
+/// route, exactly as before.
+fn stop_preview_anchor<T>(fresh: Option<T>, start_snapshot: Option<T>) -> Option<T> {
+    fresh.or(start_snapshot)
+}
+
 /// Map a resolved [`Selection`] to its macOS SCK recording target (DRAGON-130): a
 /// picked window (`window_id`, a `CGWindowID` string) records that window directly
 /// (occlusion-independent); a monitor selection (`output`, a `Display-<id>` name)
@@ -927,6 +1062,40 @@ pub(super) fn win_record_target(sel: &Selection) -> crate::record::WinRecordTarg
         crate::record::WinRecordTarget::Display(name.clone())
     } else {
         crate::record::WinRecordTarget::Region
+    }
+}
+
+#[cfg(test)]
+mod stop_preview_anchor_tests {
+    use super::stop_preview_anchor;
+
+    // The lab/flatpak live-test bug, distilled: the daemon tray's "Finish & Save"
+    // reached the child and the file was written, but the finished recording opened no
+    // editor, because the stop-time anchor resolution ran against an output list the
+    // portal-fallback path had torn down at record START, and its empty answer erased
+    // the record-start snapshot.
+
+    #[test]
+    fn a_fresh_resolution_wins() {
+        // The native path: the surfaces are still up at stop, so the fresh answer is
+        // the better one and must shadow any record-start snapshot.
+        assert_eq!(stop_preview_anchor(Some("fresh"), Some("start")), Some("fresh"));
+        assert_eq!(stop_preview_anchor(Some("fresh"), None), Some("fresh"));
+    }
+
+    #[test]
+    fn an_empty_resolution_keeps_the_start_snapshot() {
+        // The portal-fallback path: the outputs went down at record start, so the
+        // stop-time resolution is empty and the snapshot must stand instead of being
+        // erased. This is the "Finish & Save did nothing" fix.
+        assert_eq!(stop_preview_anchor(None, Some("start")), Some("start"));
+    }
+
+    #[test]
+    fn nothing_resolvable_stays_none() {
+        // No anchor from either moment: the editor-less delivery is then the honest
+        // route, exactly as before this decision existed.
+        assert_eq!(stop_preview_anchor::<&str>(None, None), None);
     }
 }
 

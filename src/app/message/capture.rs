@@ -17,10 +17,18 @@ pub enum CaptureMsg {
     /// hovered output (drives the whole-monitor highlight). Whichever overlay the cursor
     /// is in wins, so it reassigns cleanly across monitors (no cursor-left dependence).
     HoverOutput(String),
+    /// DRAGON-612: re-ask a HELD accept, from `sub_accept_pending`.
+    ///
+    /// Its ONLY producer is that re-ask: an accept KEY PRESS never sends a message at all. The
+    /// lane in `app::keyboard` calls `App::request_accept` directly, because only the press
+    /// knows which surface it was delivered to, and that is a term the accept needs. This
+    /// variant exists purely so the held request has something to arrive on, and it resolves
+    /// through the same `request_accept`, which is the only thing that decides.
+    AcceptPending,
     /// While windows are loading: advance the spinner + poll the pre-capture slot.
     LoadingTick,
     /// DRAGON-336: ~100ms drain of the preview-HANDOFF channel while this process hosts
-    /// (`App::preview_host` bound). Each inbound request is another process's finished
+    /// (`App::handoff_host` bound). Each inbound request is another process's finished
     /// capture: open it as a new preview document and ACK in the same arm, so the child
     /// may exit. Lives in the CAPTURE domain rather than `PreviewMsg` because a handoff
     /// poll has no preview to address — it may be what CREATES the first one, and
@@ -70,8 +78,28 @@ pub enum CaptureMsg {
     Tick,
     /// ✕ on the countdown badge — abort the capture.
     CancelCapture,
+    /// DRAGON-563: ~80ms drain of the countdown TRAY item's clicks while the countdown
+    /// digits live in the tray (every session; on the `lab/flatpak` fallback path the
+    /// selection window is closed, so the tray's Cancel countdown entry is the only
+    /// cancel surface there). A Cancel click routes to the ordinary Cancelled ending
+    /// (`teardown`).
+    CountdownTrayPoll,
     RegionChange(GlobalRect),
     RegionDone,
+    /// DRAGON-599: MOVE the drawn region one logical pixel, from an arrow key or its vim
+    /// letter (`shortcuts::nudge_direction`, gated by `keyboard::region_nudge_fires`).
+    ///
+    /// A [`crate::shortcuts::Direction`] rather than a `(dx, dy)` pair, because that type is
+    /// where the arrows and `hjkl` converge: nothing past key dispatch can tell which key was
+    /// pressed, so the two families cannot drift.
+    ///
+    /// Distinct from [`Self::RegionChange`] on purpose, twice over. It never re-homes the
+    /// toolbar (a one-pixel move is not a fresh selection, and yanking a toolbar the user has
+    /// dragged would be a surprise), and it never raises `region_dragging`, which HIDES the
+    /// toolbar for as long as it is set: a per-keypress flash of it disappearing is exactly
+    /// what nobody wants while lining a region up. Persisting is the key RELEASE's job, so a
+    /// held arrow writes the config once instead of once per repeat.
+    NudgeRegion(crate::shortcuts::Direction),
     Capture { output: String },
     /// Window mode: capture the picked window's pixels directly (by stable id).
     CaptureWindow { id: String, rect: WinRect },
@@ -84,6 +112,14 @@ pub enum CaptureMsg {
     /// DRAGON-460: advance the refresh button's spin while a scan is in flight. Carries no
     /// data — the angle lives on the App and this only says "another frame".
     ScanSpinTick,
+    /// DRAGON-600 (Linux, tray-menu launches): poll the held frozen-flats grab. Carries no
+    /// data; the two clocks it consults live on `App::menu_hold`. Fires only while the
+    /// hold is up, and the hold ends the first time it releases the grab.
+    MenuHoldTick,
+    /// DRAGON-606: advance the dim's fade-in by one frame. Carries no data; the start
+    /// instant lives on `App::dim_fade`. Fires only while the fade is actually running and
+    /// stops for good when it completes, so a finished animation idles no timer.
+    DimFadeTick,
     /// Linux: run a DEFERRED overlay-less immediate capture
     /// (`--active-window` / `--active-monitor`). Kicked once, a short settle after the FIRST
     /// output registers, so the REST of the outputs have populated `self.outputs` first —
@@ -118,6 +154,17 @@ pub enum CaptureMsg {
     // the never-constructed lint on this variant alone.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     PipewireCastReady,
+    /// `lab/flatpak` (Linux): the SEED-TIME portal request of the fallback overlay path
+    /// finished; its result is in `pw_slot`. Distinct from [`Self::PipewireCastReady`]
+    /// because the seed grant does not COMMIT a capture: it freezes the granted monitor
+    /// and mints the fallback selection window instead of proceeding to record/save.
+    #[cfg(target_os = "linux")]
+    FallbackCastReady,
+    /// `lab/flatpak` (Linux): the seed-time single-frame grab posted into
+    /// `fallback_frame_slot` (or its worker died): build the frozen backdrop and mint
+    /// the fallback window, or fail the session out loud.
+    #[cfg(target_os = "linux")]
+    FallbackFrozenReady,
     /// An off-UI-thread screenshot finished (path, outcome) — share or report + exit.
     /// Used by both the PipeWire path and the async window-capture path.
     ///

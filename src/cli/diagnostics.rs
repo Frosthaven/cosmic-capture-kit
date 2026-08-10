@@ -385,12 +385,28 @@ fn capture_relay_test() {
     );
 }
 
-/// `--test backend`: exercise the CaptureBackend seam end-to-end — print every
+/// `--test backend`: exercise the CaptureBackend seam end-to-end. Print every
 /// backend's capabilities, and for the capable ones prove the pixel methods
-/// (outputs, a screenshot, the window list + one window grab, the cursor). The
-/// trait's live consumer until capture dispatch moves behind it (DRAGON-93).
-/// The portal probe needs the GUI runtime's session plumbing, so it reports as
-/// unavailable here.
+/// (outputs, a screenshot, the window list + one window grab, the cursor).
+///
+/// This is the ONLY consumer of those pixel methods, measured rather than
+/// assumed: nothing else in the tree calls `screenshot_output`,
+/// `screenshot_window`, `list_windows` or `cursor` THROUGH a `CaptureBackend`,
+/// so without this probe they would be code that still has to stay correct with
+/// nothing exercising it. That is the whole reason to keep this subcommand.
+///
+/// It used to say "the trait's live consumer until capture dispatch moves behind
+/// it (DRAGON-93)" (DRAGON-594 correction). DRAGON-93 is done and never carried
+/// that work, and DRAGON-595 then answered the question DRAGON-594 left open:
+/// dispatch does NOT move behind these methods, because the portal's pixels exist
+/// only inside a grant the GUI holds and the real paths key on that held stream
+/// rather than on which backend is selected (`platform::backend`'s module doc has
+/// the reasoning).
+///
+/// So a SESSION-driven backend reports its `Acquisition` here instead of being
+/// probed for pixels it structurally cannot hand over standalone. It previously
+/// printed its caps line and then nothing at all, which read as a backend that sees
+/// no monitors rather than a healthy portal with no stateless grab.
 fn backend_test() {
     let ffmpeg = crate::encode::ffmpeg_available();
     for b in crate::platform::backend::backends(false, ffmpeg) {
@@ -402,24 +418,54 @@ fn backend_test() {
             c.record,
             c.window_list,
             c.window_capture,
-            c.cursor_session,
+            c.cursor_toggle,
             c.layer_overlay,
             c.wallpaper_path,
         );
-        if c.screenshot {
-            let outs = b.outputs();
-            for o in &outs {
-                println!(
-                    "  output {} {}x{} at {},{}",
-                    o.name, o.logical_size.0, o.logical_size.1, o.logical_pos.0, o.logical_pos.1
-                );
-            }
-            if let Some(first) = outs.first() {
-                match b.screenshot_output(&first.name) {
-                    Some(img) => println!("  screenshot({}): {}x{}", first.name, img.width(), img.height()),
-                    None => println!("  screenshot({}): FAILED", first.name),
+        // DRAGON-595: the cursor MECHANISM, which is a different question again from
+        // the `cursor=` capability above and from the sprite probe below. The bit says
+        // this backend can include or omit the pointer; this says by what means, and
+        // the sprite probe then shows whether a sprite really comes back. Reading all
+        // three together is how a portal session reads as coherent (can toggle = yes,
+        // by = in-stream, sprite = none) rather than as a contradiction.
+        println!("  cursor delivery: {:?}", b.cursor_delivery());
+        // DRAGON-595: say WHERE the pixels would come from before probing for them.
+        // A session-driven backend answers empty from every stateless method, which
+        // used to print as a working portal with no monitors attached. That is not a
+        // failure and not a missing implementation: its pixels only exist inside a
+        // grant the GUI negotiates, so there is nothing for this harness to ask.
+        match b.acquisition() {
+            crate::platform::backend::Acquisition::OnDemand => {
+                if c.screenshot {
+                    let outs = b.outputs();
+                    for o in &outs {
+                        println!(
+                            "  output {} {}x{} at {},{}",
+                            o.name,
+                            o.logical_size.0,
+                            o.logical_size.1,
+                            o.logical_pos.0,
+                            o.logical_pos.1
+                        );
+                    }
+                    if let Some(first) = outs.first() {
+                        match b.screenshot_output(&first.name) {
+                            Some(img) => println!(
+                                "  screenshot({}): {}x{}",
+                                first.name,
+                                img.width(),
+                                img.height()
+                            ),
+                            None => println!("  screenshot({}): FAILED", first.name),
+                        }
+                    }
                 }
             }
+            crate::platform::backend::Acquisition::Session => println!(
+                "  acquisition: session-driven (pixels come from a held ScreenCast \
+                 grant the GUI negotiates, so there is no stateless grab to probe \
+                 here; an empty output list below is that, not a fault)"
+            ),
         }
         if c.window_list {
             let wins = b.list_windows();
@@ -433,16 +479,22 @@ fn backend_test() {
                 }
             }
         }
-        if c.cursor_session {
-            match b.cursor() {
-                // `..` tolerates the macOS `CursorSprite`'s trailing sprite-scale
-                // element (DRAGON-156); Linux's is a 3-tuple.
-                Some((img, pos, hot, ..)) => println!(
-                    "  cursor: {}x{} at {},{} hotspot {},{}",
-                    img.width(), img.height(), pos.0, pos.1, hot.0, hot.1
-                ),
-                None => println!("  cursor: none (pointer off every monitor?)"),
-            }
+        // The SPRITE probe, which is a different question from the `cursor=`
+        // capability printed above (DRAGON-592): that bit says the backend can
+        // include or omit the pointer, by whatever means, while this asks for a
+        // repositionable sprite. Probed unconditionally and reported either way,
+        // because gating it on the capability is what conflated the two.
+        match b.cursor() {
+            // `..` tolerates the macOS `CursorSprite`'s trailing sprite-scale
+            // element (DRAGON-156); Linux's is a 3-tuple.
+            Some((img, pos, hot, ..)) => println!(
+                "  cursor sprite: {}x{} at {},{} hotspot {},{}",
+                img.width(), img.height(), pos.0, pos.1, hot.0, hot.1
+            ),
+            None => println!(
+                "  cursor sprite: none (this backend hands back no sprite, or the \
+                 pointer is off every monitor)"
+            ),
         }
     }
 }
@@ -1213,7 +1265,8 @@ fn mac_daemon_repro_test(app: &str, scratch: &str) {
     }
 }
 
-/// `--test mac-rec-bench [Display-<id>|largest] [secs] [encoder] [fps] [maxside]`: drive a
+/// `--test mac-rec-bench [Display-<id>|largest] [secs] [encoder] [fps] [maxside] [nomic]
+/// [nosys] [manualsync]`: drive a
 /// REAL recording of a whole display through the production SCK media-clock pipeline
 /// (`start_region_recording`), while forcing on-screen motion, then measure the ACHIEVED
 /// distinct-frame rate of the output — the honest full-pipeline number the DRAGON-163
@@ -1225,6 +1278,16 @@ fn mac_daemon_repro_test(app: &str, scratch: &str) {
 ///   encoder   `software` | `videotoolbox` | `auto` (default `software`)
 ///   fps       configured frame rate (default 60)
 ///   maxside   a max-resolution box side to honor (0 = no user cap; default 0)
+///
+/// The audio settings DEFAULT TO WHAT A REAL RECORDING USES: mic on, system on, automatic
+/// A/V sync compensation on, matching `Persisted`'s `record_mic` / `record_system_audio` /
+/// `audio_sync_auto` (all `default_true`). They were hardcoded to all-three-OFF, which is a
+/// configuration no shipped install has, and it did not merely make the numbers
+/// unrepresentative: `auto_device_compensation: false` reproduced the DRAGON-629 pending-sys
+/// deadlock on 4 runs out of 4, so the harness "failed" on a bug the user's own settings
+/// hid. Keyword flags, anywhere in the args, opt back out one at a time (the
+/// `--test windows-record` convention): `nomic` gates the mic track off, `nosys` the system
+/// track, `manualsync` turns automatic device-latency compensation off.
 ///
 /// Prints the resolved encode dims, the container fps/duration, and the distinct-content
 /// frame rate (via `mpdecimate`, which drops near-duplicate frames — so distinct/duration
@@ -1259,6 +1322,10 @@ fn mac_rec_bench(rest: &[String]) {
     let encoder = if arg(2).is_empty() { "software" } else { arg(2) };
     let fps: u32 = arg(3).parse().unwrap_or(60);
     let maxside: u32 = arg(4).parse().unwrap_or(0);
+    // Production-matching audio defaults, opted out of by keyword (see the fn doc).
+    let mic = !rest.iter().any(|a| a == "nomic");
+    let system_audio = !rest.iter().any(|a| a == "nosys");
+    let auto_sync = !rest.iter().any(|a| a == "manualsync");
 
     // The display's global TOP-LEFT origin + logical size, so the motion source can be
     // spawned centered on it (ffplay places windows by the primary display; we just need
@@ -1268,7 +1335,8 @@ fn mac_rec_bench(rest: &[String]) {
     let (ox, oy) = td.logical_pos;
     let (lw, lh) = td.logical_size;
     println!(
-        "mac-rec-bench: target {} {}x{} (logical) at {},{}  encoder={encoder} fps={fps} secs={secs} maxside={maxside}",
+        "mac-rec-bench: target {} {}x{} (logical) at {},{}  encoder={encoder} fps={fps} \
+         secs={secs} maxside={maxside} mic={mic} sys={system_audio} autosync={auto_sync}",
         td.name, lw, lh, ox, oy
     );
 
@@ -1318,13 +1386,14 @@ fn mac_rec_bench(rest: &[String]) {
     let settings = crate::record::RecordSettings {
         fps,
         preferred_encoder: encoder.to_string(),
+        encoder_hint: None,
         presets: crate::encode::Presets::default(),
         zero_copy: false,
-        mic: false,
-        system_audio: false,
+        mic,
+        system_audio,
         bitrate_kbps: 8000,
         audio_offset_ms: 0,
-        auto_device_compensation: false,
+        auto_device_compensation: auto_sync,
         max_res: (maxside, maxside),
         metadata: String::new(),
         out_path: out.clone(),
@@ -1725,7 +1794,13 @@ fn pw_test(src: ashpd::desktop::screencast::SourceType) {
             return;
         }
     };
-    match rt.block_on(crate::platform::screencast::request(src, None)) {
+    // DRAGON-592: `Keep` (the historical `CursorMode::Embedded`) on purpose. This
+    // probe exists to reproduce what a real capture does end to end, a real capture
+    // ships with "Preserve mouse cursor" defaulting ON, and a visible pointer in the
+    // reported frames is a free liveness signal while reading them. `Omit` would
+    // silently change what the diagnostic reproduces.
+    let cursor = crate::platform::screencast::CursorRequest::Keep;
+    match rt.block_on(crate::platform::screencast::request(src, None, cursor)) {
         Ok(session) => {
             eprintln!(
                 "pw-test: granted {} stream(s), restore_token={}",
@@ -1781,7 +1856,11 @@ fn dmabuf_test(src: ashpd::desktop::screencast::SourceType) {
             return;
         }
     };
-    match rt.block_on(crate::platform::screencast::request(src, None)) {
+    // DRAGON-592: `Keep`, matching `pw_test` and the pre-DRAGON-592 behaviour. This
+    // probe reports DRM formats and modifiers, which the cursor mode does not touch,
+    // so holding it constant keeps the comparison against past runs honest.
+    let cursor = crate::platform::screencast::CursorRequest::Keep;
+    match rt.block_on(crate::platform::screencast::request(src, None, cursor)) {
         Ok(session) => {
             let Some(stream) = session.streams.first() else {
                 eprintln!("dmabuf-test: no streams returned");
@@ -2295,18 +2374,20 @@ fn selftest() {
     }
 
     // Verify wallpaper crop (jpeg decode + cover-map) for the first window.
+    //
+    // DRAGON-619: `host_config_dir`, the same reader the real COSMIC wallpaper path uses, so
+    // this diagnostic sees what the app sees. `dirs::config_dir()` would read our own private
+    // store inside a Flatpak and report "no wallpaper" on a machine that plainly has one.
     if let (Some(wp), Some(win)) = (
-        std::fs::read_to_string(
-            dirs::config_dir()
-                .unwrap()
-                .join("cosmic/com.system76.CosmicBackground/v1/all"),
-        )
-        .ok()
-        .and_then(|t| {
-            let i = t.find("Path(\"")? + 6;
-            let e = t[i..].find('"')?;
-            Some(std::path::PathBuf::from(&t[i..i + e]))
-        }),
+        crate::util::host_config_dir()
+            .and_then(|d| {
+                std::fs::read_to_string(d.join("cosmic/com.system76.CosmicBackground/v1/all")).ok()
+            })
+            .and_then(|t| {
+                let i = t.find("Path(\"")? + 6;
+                let e = t[i..].find('"')?;
+                Some(std::path::PathBuf::from(&t[i..i + e]))
+            }),
         groups.values().flatten().next().cloned(),
     ) {
         let (x, y, w, h) = win.rect;
@@ -2706,6 +2787,7 @@ fn windows_record_test(rest: &[String]) {
         settings: crate::record::RecordSettings {
             fps: 30,
             preferred_encoder: enc.clone(),
+            encoder_hint: None,
             presets,
             zero_copy: false,
             mic,

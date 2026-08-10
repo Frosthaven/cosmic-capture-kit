@@ -25,8 +25,13 @@ impl DesktopProfile for WlrootsProfile {
 
 /// sway/hyprland: best-effort parse of hyprpaper.conf (`wallpaper = mon,path` /
 /// `preload = path`) and the sway config (`output * bg <path> <mode>`).
+///
+/// `util::host_config_dir()`, NOT `dirs::config_dir()` (DRAGON-619). These are the
+/// COMPOSITOR's config files, not ours, so the read must see past a Flatpak sandbox, where
+/// `$XDG_CONFIG_HOME` is our own private store and sway has never written to it. Outside a
+/// sandbox the two calls are identical, so nothing changes for an ordinary build.
 fn sway_hyprland() -> Option<PathBuf> {
-    let config = dirs::config_dir()?;
+    let config = crate::util::host_config_dir()?;
     if let Ok(text) = std::fs::read_to_string(config.join("hypr/hyprpaper.conf"))
         && let Some(p) = parse_hyprpaper(&text)
     {

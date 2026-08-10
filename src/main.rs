@@ -36,6 +36,12 @@ mod instance;
 mod media;
 mod wallpaper;
 mod detect;
+// The colour-picker's pure colour model (DRAGON-582): the seven notations the picker
+// window shows, their formatters and their parsers, over ONE sRGB / linear / XYZ
+// conversion stack. Crate root next to `geometry` for the same reason that one is: it is
+// shared by the picker overlay, the picker window and the persisted recent-colours list,
+// and belongs to none of them.
+mod color;
 mod geometry;
 // Freehand pen-stroke beautification (DRAGON-342): the pure smoothing / pseudo-pressure /
 // ribbon-outline math the preview's canvas AND its full-res bake both render through. Sits at
@@ -69,6 +75,8 @@ mod startup_guard;
 // System-tray recording controls: ksni/StatusNotifierItem (D-Bus) on Linux; a menu-bar
 // NSStatusItem + NSMenu on macOS (DRAGON-159); a no-op stub on any other platform. All
 // three expose the same `TraySession` seam so the app's tray handling is platform-free.
+// Since DRAGON-563 every mount also exposes `CountdownTraySession` (the pre-capture
+// countdown's tray digits + Cancel countdown entry) on the same platform-free shape.
 #[cfg(target_os = "linux")]
 #[path = "platform/linux/tray.rs"]
 mod tray;
@@ -846,6 +854,22 @@ fn main() -> cosmic::iced::Result {
         platform::compositor::activate_title(app::WINDOW_TITLE);
         return Ok(());
     }
+    // Recording CONTROL commands (DRAGON-583): drive a recording that is already running,
+    // from a second process. This is what a Linux desktop-level global hotkey binds, the
+    // same way one already binds `--region`, because on Linux an in-app shortcut cannot
+    // reach a recording at all: COSMIC's portal has no GlobalShortcuts interface, and at
+    // record start the app deliberately hands keyboard focus back to the window being
+    // recorded (a native session) or destroys its one toplevel (the portal fallback).
+    //
+    // It sits HERE, with the other one-shot helpers, and RETURNS either way. Returning is
+    // the load-bearing part: an argument this early parse does not recognise falls all the
+    // way through to a normal launch and silently opens a capture overlay, which is the
+    // last thing a "pause my recording" key should do. It is also before the three
+    // resident-daemon `bare` checks below, so none of them needs to learn these flags.
+    if let Some(cmd) = cli::recording_command_from_args(&args) {
+        cli::run_recording_command(cmd);
+        return Ok(());
+    }
     // The banner's wording rides the helper's own argv (DRAGON-450): which flag launched
     // it says whether the capture reached the clipboard, and the optional `--notify-kind` /
     // `--notify-reason` tokens say what was captured and, when it was not copied, why.
@@ -914,6 +938,15 @@ fn main() -> cosmic::iced::Result {
                     | "--scan"
                     | "--scanner"
                     | "--countdown"
+                    // DRAGON-586: the colour picker is a GUI launch that mints overlays,
+                    // exactly like a capture. Missing here it read as BARE, so with the
+                    // tray on it ran the resident branch, found the daemon lock held,
+                    // signalled "capture now" and exited: the user got a region overlay
+                    // instead of the picker.
+                    | "--color-picker"
+                    // DRAGON-559: the per-launch audio-arm override is a capture-launch
+                    // modifier (like --no-editor), never a resident trigger.
+                    | "--audio"
                     | "--overlay"
             )
         });
@@ -928,7 +961,12 @@ fn main() -> cosmic::iced::Result {
             // reader untangle the long-lived menu-bar process from the one-shot capture
             // children it spawns into the same shared file.
             diag::mark_component(diag::Component::Daemon);
-            daemon::run(); // never returns — runs the AppKit run loop or exits
+            // Intent from the argv shape, exactly as the Linux and Windows branches below do
+            // (DRAGON-473). Until then this branch alone passed nothing, so the mac daemon
+            // could not tell a launch-at-login `resident` from a capture keypress once it
+            // found its lock already held, and answered both with a capture.
+            let daemon_intent = instance::daemon_intent_from_args(&args);
+            daemon::run(daemon_intent); // never returns — runs the AppKit run loop or exits
         }
     }
     // Linux resident RESIDENT (DRAGON-173): the full-parity counterpart of the mac
@@ -960,6 +998,15 @@ fn main() -> cosmic::iced::Result {
                     | "--scan"
                     | "--scanner"
                     | "--countdown"
+                    // DRAGON-586: the colour picker is a GUI launch that mints overlays,
+                    // exactly like a capture. Missing here it read as BARE, so with the
+                    // tray on it ran the resident branch, found the daemon lock held,
+                    // signalled "capture now" and exited: the user got a region overlay
+                    // instead of the picker.
+                    | "--color-picker"
+                    // DRAGON-559: the per-launch audio-arm override is a capture-launch
+                    // modifier (like --no-editor), never a resident trigger.
+                    | "--audio"
                     | "--overlay"
                     | "--preview"
                     // DRAGON-427: the spawned preview EDITOR child. Without it here a
@@ -1009,6 +1056,15 @@ fn main() -> cosmic::iced::Result {
                     | "--scan"
                     | "--scanner"
                     | "--countdown"
+                    // DRAGON-586: the colour picker is a GUI launch that mints overlays,
+                    // exactly like a capture. Missing here it read as BARE, so with the
+                    // tray on it ran the resident branch, found the daemon lock held,
+                    // signalled "capture now" and exited: the user got a region overlay
+                    // instead of the picker.
+                    | "--color-picker"
+                    // DRAGON-559: the per-launch audio-arm override is a capture-launch
+                    // modifier (like --no-editor), never a resident trigger.
+                    | "--audio"
                     | "--overlay"
                     | "--preview"
                     // DRAGON-427: the spawned preview EDITOR child. Without it here a
@@ -1192,6 +1248,12 @@ fn main() -> cosmic::iced::Result {
     // "preview" because `--preview <file>` already means something else entirely (open a
     // file in the viewer), and `--no-preview` would read as that flag's opposite.
     let no_editor = has("--no-editor");
+    // DRAGON-582: `--color-picker` launches the COLOUR PICKER instead of a capture. It
+    // is its own launch shape rather than a `--kind`, because it captures nothing: it
+    // shows a dimmed magnifier overlay, samples one pixel, and opens a result window.
+    // Linux needs the flag most (the tray and a COSMIC custom shortcut are the only ways
+    // to start it there), but it works identically on every platform.
+    let color_picker = has("--color-picker");
     let kind = if has("--scan") || has("--scanner") {
         Some(app::Kind::Scanner)
     } else if has("--video") {
@@ -1206,6 +1268,29 @@ fn main() -> cosmic::iced::Result {
     let countdown_secs = after("--countdown")
         .and_then(|p| p.to_str().and_then(|s| s.parse::<u64>().ok()))
         .map(|s| s.min(u8::MAX as u64));
+    // DRAGON-559: `--audio <channels>` — arm exactly these audio channels FOR THIS LAUNCH,
+    // overriding the persisted arms without writing them back (the pure decision is
+    // `recording_ui::launch_audio_arms`, applied in `App::init`). A modifier like
+    // `--no-editor`, chainable with every capture launch (`--window --video --audio system`).
+    // A bad or missing value REJECTS the launch instead of guessing: unlike `--countdown`
+    // (where a typo just keeps the persisted delay), silently keeping the persisted arms
+    // here could record a microphone the user asked to silence.
+    let audio_arms = match args.iter().position(|a| a == "--audio") {
+        None => None,
+        Some(i) => {
+            let value = args.get(i + 1).filter(|v| !v.starts_with("--")).map(String::as_str);
+            match value.and_then(recording_ui::AudioArmState::parse_flag) {
+                Some(state) => Some(state),
+                None => {
+                    eprintln!(
+                        "--audio: expected one of both|mic|system|none (got {})",
+                        value.unwrap_or("nothing")
+                    );
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
     // DRAGON-413: arm the startup self-exit guard for a CAPTURE launch. From here the
     // child has a bounded window to put something on screen; if it never does — a wedged
     // TCC probe, a stalled scene grab, a GUI that never maps — it ends itself quietly
@@ -1225,9 +1310,11 @@ fn main() -> cosmic::iced::Result {
         settings_only,
         permissions_only,
         preview: None,
+        color_picker,
         mode,
         kind,
         countdown_secs,
+        audio_arms,
         immediate,
         preview_windowed: None,
         preview_handoff: None,
@@ -1261,7 +1348,17 @@ Launch (opens the capture overlay by default):\n\
     --image                 Capture a screenshot (default)\n\
     --video                 Capture a screen recording\n\
     --scan                  Start the QR/OCR scanner (forces region)\n\
+    --color-picker          Pick a color from the screen (magnifier overlay)\n\
     --countdown <secs>      Pre-capture countdown in seconds (any value, e.g. 7)\n\
+    --audio <channels>      Arm exactly these audio channels for this launch only:\n\
+                            both | mic | system | none (persisted arms are untouched)\n\
+\n\
+Control a recording that is already running (Linux; bind these to system shortcuts):\n\
+    --pause-recording       Pause the recording, or resume it when paused\n\
+    --finish-recording      Finish the recording and save it\n\
+    --cancel-recording      Cancel the recording and delete it\n\
+    --toggle-mic            Toggle the microphone\n\
+    --toggle-system-audio   Toggle system audio\n\
 \n\
 Other:\n\
     --preview <file>        Open an existing image/video in the preview (windowed)\n\
@@ -1281,8 +1378,11 @@ Other:\n\
 \n\
 Examples:\n\
     cosmic-capture-kit --region --video --countdown 3\n\
+    cosmic-capture-kit --monitor --video --audio system\n\
     cosmic-capture-kit --monitor\n\
-    cosmic-capture-kit --scan",
+    cosmic-capture-kit --scan\n\
+    cosmic-capture-kit --color-picker\n\
+    cosmic-capture-kit --toggle-mic",
         cli::SYNC_WORKFLOW
     );
 }

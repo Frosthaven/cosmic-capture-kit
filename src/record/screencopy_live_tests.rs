@@ -117,6 +117,7 @@ fn live_settings(out_path: std::path::PathBuf) -> RecordSettings {
     RecordSettings {
         fps: 30,
         preferred_encoder: "software".to_string(),
+        encoder_hint: None,
         presets: crate::encode::Presets::default(),
         zero_copy: false,
         mic: true,

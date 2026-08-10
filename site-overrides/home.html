@@ -30,7 +30,7 @@
   ONE canonical description sentence, reused by the card, the meta preview tags
   and the structured data below, so the four can never drift apart.
 #}
-{% set cck_description = "Cross-platform screen region, window, and monitor capture with support for translucent windows, image, video, voice, QR, barcodes, OCR text, and annotation." %}
+{% set cck_description = "Quickly capture your screen/audio to the clipboard for sharing with others. Supports QR/barcode/OCR scanning, cloud upload with automatic sharing links, and post-capture annotations." %}
 {% set cck_og_image = config.site_url ~ "assets/og-card.png" %}
 {% set cck_download = config.repo_url ~ "/releases/latest" %}
 {% set cck_author_url = "https://github.com/Frosthaven" %}
@@ -201,6 +201,7 @@
           A secondary availability line under the description. Placeholder copy for
           now (the platforms and their versions), to be revisited later.
         #}
+        <p class="cck-glass__tagline">Capture &bull; Annotate &bull; Share</p>
         <p class="cck-glass__platforms">Available for Windows 11, macOS 14, and COSMIC.</p>
         {#
           One download link for every platform. The release page always lists the

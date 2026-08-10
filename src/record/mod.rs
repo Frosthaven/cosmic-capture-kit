@@ -129,6 +129,22 @@ mod zero_copy;
 // needs a working pre-flight loudly skips without a Pulse server.
 #[cfg(all(test, target_os = "linux", feature = "zero-copy"))]
 mod zc_fallback_live_tests;
+
+/// ONE process-wide lock for every test that touches the recording pipeline's
+/// process-globals: the `CCK_TEST_FORCE_OWNED_FAILURE` / `CCK_TEST_MONITOR_SOURCE`
+/// env seams, the mic-source override, and the pre-flight counter read as a delta
+/// (`owned::preflights_started`). `media_clock_e2e_tests` and
+/// `zc_fallback_live_tests` used to carry their OWN locks for these same globals,
+/// which is no lock at all ACROSS the two modules; the race was latent until
+/// DRAGON-554's fast new pre-flight tests shifted the schedule and it fired: one
+/// module's forced-failure env failed the other module's real pre-flight mid-test,
+/// and that pre-flight inflated the first module's counter delta. Both modules'
+/// `test_lock()` now delegate here.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn recording_globals_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
 #[cfg(test)]
 mod av_sync_tests;
 // The owned media-clock E2E tests exercise the Linux pipewire owned-audio path
@@ -719,7 +735,13 @@ impl RecordShared {
 /// see [`RegionRecordParams`] / [`PipewireRecordParams`]).
 pub struct RecordSettings {
     pub fps: u32,
+    /// The encoder REQUEST: "auto" (travels as "auto" so the worker's hint-first
+    /// ladder resolves it fresh each session, DRAGON-571) or a concrete user pick.
     pub preferred_encoder: String,
+    /// The last-known-good auto hint accompanying an "auto" request (`None` for a
+    /// concrete pick): the ladder probes it first, so the happy path pays one
+    /// probe-encode. See [`resolve_session_plan`].
+    pub encoder_hint: Option<String>,
     pub presets: crate::encode::Presets,
     pub zero_copy: bool,
     pub mic: bool,
@@ -733,6 +755,40 @@ pub struct RecordSettings {
     pub max_res: (u32, u32),
     pub metadata: String,
     pub out_path: PathBuf,
+}
+
+/// Resolve a recording session's encode plan through the DRAGON-571 hint-first auto
+/// ladder ([`crate::encode::EncodePlan::resolve_hinted`]), then apply the resolution's
+/// write-backs in ONE place for every worker (screencopy, PipeWire, SCK, WGC): warn
+/// when a previously-good hardware encoder just lost to software, and update the
+/// persisted last-known-good hint. The hint is a cache; `preferred_encoder` itself is
+/// never written here: only a real settings-picker click writes that.
+pub(crate) fn resolve_session_plan(
+    requested: &str,
+    hint: Option<&str>,
+    ew: u32,
+    eh: u32,
+    presets: &crate::encode::Presets,
+) -> crate::encode::EncodePlan {
+    let plan = crate::encode::EncodePlan::resolve_hinted(requested, hint, ew, eh, presets);
+    let outcome = crate::encode::auto_resolution_outcome(requested, plan.encoder_id(), hint);
+    if outcome.hardware_hint_failed {
+        // The DRAGON-571 regression signature: hardware that worked before failed its
+        // probe THIS session (driver asleep, NVENC sessions held by a game or overlay,
+        // the ffmpeg sidecar missing the encoder). Nothing gets pinned (the next
+        // session re-probes from scratch), but this recording runs on CPU, so say so
+        // loudly instead of letting the stutter be the first symptom.
+        log::warn!(
+            "auto encoder resolution fell back to software: the last-known-good hardware \
+             encoder ({}) failed its probe this session; this recording is CPU-encoded, \
+             and the next recording re-probes from scratch",
+            hint.unwrap_or("?"),
+        );
+    }
+    if let Some(id) = outcome.new_hint {
+        crate::state::note_encoder_auto_hint(&id);
+    }
+    plan
 }
 
 /// The macOS SCK capture target for a recording (DRAGON-130). On macOS every record
@@ -845,8 +901,8 @@ fn unsupported_recording(msg: &str) -> RecordHandle {
 pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
     let RegionRecordParams { x, y, w, h, cursor, mac_target, settings } = params;
     let RecordSettings {
-        fps, preferred_encoder, presets, zero_copy, mic, system_audio, bitrate_kbps,
-        audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+        fps, preferred_encoder, encoder_hint, presets, zero_copy, mic, system_audio,
+        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
     } = settings;
     // No GPU zero-copy path on macOS: h264_videotoolbox encodes inside ffmpeg from
     // the RGBA feed, so there is nothing for the (Linux DRM/DMA-BUF) zero-copy path
@@ -861,9 +917,10 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
             let result = sck::record_sck(
-                x, y, w, h, fps.max(1), cursor, &preferred_encoder, &presets, mic,
-                system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res,
-                &out_path, stop, paused, &events, &dims, &metadata, mac_target,
+                x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
+                &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
+                auto_device_compensation, max_res, &out_path, stop, paused, &events, &dims,
+                &metadata, mac_target,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -893,8 +950,8 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
 pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
     let RegionRecordParams { x, y, w, h, cursor, win_target, settings } = params;
     let RecordSettings {
-        fps, preferred_encoder, presets, zero_copy, mic, system_audio, bitrate_kbps,
-        audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+        fps, preferred_encoder, encoder_hint, presets, zero_copy, mic, system_audio,
+        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
     } = settings;
     // No GPU zero-copy path on Windows: libx264 encodes inside ffmpeg from the RGBA feed
     // (the Linux DRM/DMA-BUF zero-copy path has no Windows analog).
@@ -908,9 +965,10 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
             let result = wgc::record_wgc(
-                x, y, w, h, fps.max(1), cursor, &preferred_encoder, &presets, mic,
-                system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res,
-                &out_path, stop, paused, &events, &dims, &metadata, win_target,
+                x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
+                &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
+                auto_device_compensation, max_res, &out_path, stop, paused, &events, &dims,
+                &metadata, win_target,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -926,8 +984,8 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
 pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
     let RegionRecordParams { x, y, w, h, cursor, settings } = params;
     let RecordSettings {
-        fps, preferred_encoder, presets, zero_copy, mic, system_audio, bitrate_kbps,
-        audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+        fps, preferred_encoder, encoder_hint, presets, zero_copy, mic, system_audio,
+        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
     } = settings;
     let shared = RecordShared::new();
     {
@@ -938,9 +996,10 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
             let result = screencopy::record_screencopy(
-                x, y, w, h, fps.max(1), cursor, &preferred_encoder, &presets, mic,
-                system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res,
-                &out_path, stop, paused, &events, &dims, &metadata, zero_copy,
+                x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
+                &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
+                auto_device_compensation, max_res, &out_path, stop, paused, &events, &dims,
+                &metadata, zero_copy,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -1010,8 +1069,8 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
 pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
     let PipewireRecordParams { fd, node_id, crop, settings } = params;
     let RecordSettings {
-        fps, preferred_encoder, presets, zero_copy, mic, system_audio, bitrate_kbps,
-        audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+        fps, preferred_encoder, encoder_hint, presets, zero_copy, mic, system_audio,
+        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
     } = settings;
     let shared = RecordShared::new();
     // The opt-in GPU zero-copy path applies only to a full (uncropped) stream with
@@ -1031,9 +1090,10 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
             let paused_cpu = paused.clone();
             let cpu = |fd: OwnedFd, stop: Arc<AtomicBool>| {
                 pipewire::record_pipewire(
-                    fd, node_id, crop, fps.max(1), &preferred_encoder, &presets, mic,
-                    system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res,
-                    &out_path, stop, paused_cpu, &events, &measured, &dims, &metadata,
+                    fd, node_id, crop, fps.max(1), &preferred_encoder, encoder_hint.as_deref(),
+                    &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
+                    auto_device_compensation, max_res, &out_path, stop, paused_cpu, &events,
+                    &measured, &dims, &metadata,
                 )
             };
             #[cfg(feature = "zero-copy")]

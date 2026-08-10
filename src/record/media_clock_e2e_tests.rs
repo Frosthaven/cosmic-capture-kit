@@ -56,17 +56,21 @@ use crate::mixer::clock::MediaClock;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Serializes the two E2E tests (and guards against any future one) against each
-/// other: both mutate the SAME process-global env var
-/// (`CCK_TEST_MONITOR_SOURCE`) and `crate::audio::config`'s mic-source override,
-/// and both claim fixed-name pactl modules — none of which is safe to do from two
-/// threads at once (`cargo test`'s default runner is multi-threaded).
+/// Serializes the E2E tests (and guards against any future one) against each
+/// other: they mutate the SAME process-global env vars
+/// (`CCK_TEST_MONITOR_SOURCE`, `CCK_TEST_FORCE_OWNED_FAILURE`) and
+/// `crate::audio::config`'s mic-source override, and claim fixed-name pactl
+/// modules — none of which is safe to do from two threads at once (`cargo test`'s
+/// default runner is multi-threaded). Since DRAGON-554 this is the CRATE-WIDE
+/// recording-globals lock (`super::recording_globals_lock`), shared with
+/// `zc_fallback_live_tests`: those tests read the pre-flight counter as a delta and
+/// set the same forced-failure env, so a module-local lock here was no lock at all
+/// against them.
 fn test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    super::recording_globals_lock()
 }
 
 /// Resets the process-global state these tests mutate (`CCK_TEST_MONITOR_SOURCE`,
@@ -1646,4 +1650,173 @@ fn media_clock_pause_jump_cuts_both_streams_e2e() {
     }
 
     let _ = std::fs::remove_file(&s.path);
+}
+
+/// E2E-8 (DRAGON-554 — the opening prime reaches the muxer's side of both FIFOs
+/// promptly): ffmpeg 7.x will not finish OPENING an f32le FIFO input until it has read
+/// [`super::pump::FFMPEG7_INPUT_OPEN_BYTES`] from it (measured against the Flatpak
+/// runtime's 7.1.3; see the constant's doc), and while an input hangs in open ffmpeg
+/// reads no video from stdin either — so if the FIRST FIFO byte only exists once the
+/// render horizon reaches media 0 (wall ~1.5s), every ffmpeg-7.x recording opens on
+/// ~1.1s of frozen, then jumping, video (the DRAGON-554 evidence file). The pump's
+/// opening prime renders that many bytes right after its startup catch-up drain
+/// instead.
+///
+/// This test stands in for ffmpeg on the READ side of both FIFOs (no ffmpeg needed for
+/// the property under test) and measures the wall time from `pump::spawn` until each
+/// FIFO has delivered the ffmpeg-7.x open threshold. Without the prime the mic side
+/// measures ~1.5s+ (the render horizon); with it, well under a second — the bound
+/// asserted here splits those cleanly with CI slack.
+#[test]
+fn media_clock_opening_prime_reaches_the_muxer_promptly_e2e() {
+    require_e2e_tools!("media_clock_opening_prime_reaches_the_muxer_promptly_e2e");
+    let _ = env_logger::try_init();
+    let _lock = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = GlobalStateGuard;
+
+    let mic_sink = NullSink::load("cck_e2e8_mic").expect("load the mic null sink");
+    let sys_sink = NullSink::load("cck_e2e8_sys").expect("load the sys null sink");
+    crate::audio::config::set_mic_source(&mic_sink.monitor_source());
+    // SAFETY: `test_lock()` is held for this whole test.
+    unsafe {
+        std::env::set_var("CCK_TEST_MONITOR_SOURCE", sys_sink.monitor_source());
+    }
+
+    let owned = super::owned::try_start_owned_audio().expect("the pre-flight must come up");
+    let super::owned::OwnedAudioStart {
+        capture_start: _, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } = owned;
+
+    // The ffmpeg stand-ins: open each FIFO's read end, record how long the pump takes
+    // to deliver the 7.x open threshold, then keep draining so the session stays
+    // healthy until the test ends it.
+    let spawn_reader = |path: std::path::PathBuf,
+                        slot: Arc<Mutex<Option<Duration>>>,
+                        spawned_at: Instant,
+                        stop: Arc<AtomicBool>| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let Ok(mut f) = std::fs::File::open(&path) else { return };
+            let mut got = 0usize;
+            let mut buf = [0u8; 8192];
+            loop {
+                match f.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        got += n;
+                        if got >= super::pump::FFMPEG7_INPUT_OPEN_BYTES
+                            && let Ok(mut g) = slot.lock()
+                        {
+                            g.get_or_insert(spawned_at.elapsed());
+                        }
+                    }
+                }
+                if stop.load(Ordering::Relaxed) && got >= super::pump::FFMPEG7_INPUT_OPEN_BYTES {
+                    break;
+                }
+            }
+        })
+    };
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicBool::new(false));
+    let events: Mutex<Vec<ToggleEvent>> = Mutex::new(Vec::new());
+    let cfg = PumpConfig {
+        fps: FPS,
+        audio_offset_ms: 0,
+        auto_device_compensation: false,
+        mic_on0: true,
+        sys_on0: true,
+        duck_system: false,
+    };
+    let mic_time: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+    let sys_time: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+
+    let spawned_at = Instant::now();
+    let mic_reader =
+        spawn_reader(mic_fifo_path.clone(), mic_time.clone(), spawned_at, stop.clone());
+    let sys_reader =
+        spawn_reader(sys_fifo_path.clone(), sys_time.clone(), spawned_at, stop.clone());
+
+    std::thread::scope(|scope| {
+        let (pump_handle, _ticker) = super::pump::spawn(
+            scope, spawned_at, cfg, mic_fifo_path.clone(), sys_fifo_path.clone(), mic_tap,
+            mic_rx, monitor, sys_rx, &stop, &paused, &events,
+        )
+        .expect("pump spawn must succeed in the E2E harness");
+
+        // Wait (bounded) for both measurements, then end the session.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let read = |s: &Arc<Mutex<Option<Duration>>>| s.lock().ok().and_then(|g| *g);
+        while (read(&mic_time).is_none() || read(&sys_time).is_none())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = pump_handle.join();
+    });
+    let _ = mic_reader.join();
+    let _ = sys_reader.join();
+
+    let mic_t = mic_time.lock().ok().and_then(|g| *g);
+    let sys_t = sys_time.lock().ok().and_then(|g| *g);
+    eprintln!(
+        "E2E-8: ffmpeg-7.x open threshold ({} bytes) delivered — mic {:?}, sys {:?}",
+        super::pump::FFMPEG7_INPUT_OPEN_BYTES,
+        mic_t,
+        sys_t
+    );
+    let bound = Duration::from_millis(1000);
+    for (name, t) in [("mic", mic_t), ("sys", sys_t)] {
+        let t = t.unwrap_or_else(|| {
+            panic!(
+                "the {name} FIFO never delivered the ffmpeg-7.x open threshold — without \
+                 the opening prime this is exactly the DRAGON-554 park (first byte at \
+                 wall ~1.5s, video frozen meanwhile)"
+            )
+        });
+        assert!(
+            t < bound,
+            "the {name} FIFO took {t:?} to deliver ffmpeg 7.x's input-open threshold; \
+             it must arrive well before the render horizon's ~1.5s (the opening prime, \
+             DRAGON-554) or every 7.x session opens on frozen video"
+        );
+    }
+}
+
+/// DRAGON-554: the [`super::owned::AudioPreflight`] seam both the PipeWire and the SCK
+/// workers overlap their video bring-up with. A forced pre-flight failure must come
+/// back through `join()` with the same named, actionable reason the inline call
+/// reports, promptly (the seam adds no wait of its own), and `abandon()` on a failed
+/// pre-flight must be a quiet no-op — the video-side failure paths call it blind.
+#[test]
+fn audio_preflight_thread_reports_the_named_failure() {
+    let _lock = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = GlobalStateGuard;
+    // SAFETY: `test_lock()` is held for this whole test.
+    unsafe {
+        std::env::set_var("CCK_TEST_FORCE_OWNED_FAILURE", "1");
+    }
+
+    let started = Instant::now();
+    let result = super::owned::AudioPreflight::start().join();
+    let elapsed = started.elapsed();
+    match result {
+        Ok(owned) => {
+            owned.cleanup();
+            panic!("the forced-failure seam must fail through the threaded pre-flight too");
+        }
+        Err(reason) => assert_eq!(
+            reason, "forced failure (test seam)",
+            "the threaded pre-flight must carry the same named reason the inline call reports"
+        ),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the seam must add no wait of its own (took {elapsed:?})"
+    );
+
+    // The blind-teardown path the video-side failures use.
+    super::owned::AudioPreflight::start().abandon();
 }

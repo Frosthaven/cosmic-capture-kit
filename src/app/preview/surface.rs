@@ -169,25 +169,58 @@ impl PreviewSurface {
 /// that axis — the compositor clamps it at map time and the resize event re-fits the
 /// content. The `max_size` hint set at open (see [`super::shell::preview_window`])
 /// keeps cosmic-comp from reshaping the request to 2/3-per-axis on the way.
+///
+/// The open size when the media dims are genuinely UNKNOWN (a pre-opened spinner still
+/// decoding): a conservative box, ~80% of the monitor's width and the rule-3 height budget
+/// ([`sizing::USABLE_H_FRAC`]) of its height, clamped to the editor floor and a sane
+/// ceiling. ONE home (DRAGON-579): `open.rs` consumed a hand-copied twin of this
+/// expression and the DRAGON-449 regression test another, so the test could not catch the
+/// production copy drifting; both now call this.
+pub(super) fn size_unknown_fallback(monitor: (u32, u32)) -> (f32, f32) {
+    (
+        (monitor.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
+        (monitor.1 as f32 * sizing::USABLE_H_FRAC).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
+    )
+}
+
+/// The rule-3 height budget is [`sizing::USABLE_H_FRAC`] on every session and platform
+/// again (DRAGON-579): the DRAGON-549 full-height ask is retired, see that constant's doc.
 pub(super) fn windowed_fit_size(
     media: (u32, u32),
     monitor: Option<(u32, u32)>,
     extra_h: f32,
     labels: bool,
 ) -> (f32, f32) {
+    windowed_fit_size_with(media, monitor, extra_h, labels, sizing::USABLE_H_FRAC)
+}
+
+/// [`windowed_fit_size`] with the rule-3 height budget INJECTED (DRAGON-549) — the house
+/// `foo_with(<dependency>, …)` seam.
+///
+/// The effectful half is the platform read `windowed_fit_size` does; splitting it out is what
+/// keeps every test below deterministic. Without this the fit would answer differently on a
+/// COSMIC dev box and a GNOME one, and the sizing tests would be pinning the tester's desktop
+/// rather than the arithmetic.
+pub(super) fn windowed_fit_size_with(
+    media: (u32, u32),
+    monitor: Option<(u32, u32)>,
+    extra_h: f32,
+    labels: bool,
+    usable_h_frac: f32,
+) -> (f32, f32) {
     // Horizontal chrome is just the 1px CSD border each side; vertical is the
     // header + toolbars + the media kind's transport strip.
     let chrome = (2.0, PreviewSurface::Window.chrome_h(labels) + extra_h);
     // ALL the rule 1-5 math lives in the portable, unit-tested `sizing` module —
-    // this only supplies THIS surface's chrome, floor, and the shared 80% height
-    // budget (rule 3). `media` is already in LOGICAL points (callers divide the
+    // this only supplies THIS surface's chrome, floor, and the rule-3 height
+    // budget. `media` is already in LOGICAL points (callers divide the
     // capture's physical pixels by the source backing scale first, rule 6).
     sizing::spawn_window_size(
         media,
         monitor,
         chrome,
         (super::shell::PREVIEW_MIN_W, super::shell::PREVIEW_MIN_H),
-        sizing::USABLE_H_FRAC,
+        usable_h_frac,
     )
 }
 
@@ -396,7 +429,7 @@ mod tests {
         assert_eq!(PreviewSurface::Window.chrome_h(false), historical_window);
         // And the open fit that reads it is byte-identical too, media by media.
         for media in [(1280u32, 720u32), (3840, 2160), (400, 300)] {
-            let (w, h) = windowed_fit_size(media, Some((2560, 1440)), 0.0, false);
+            let (w, h) = windowed_fit_size_with(media, Some((2560, 1440)), 0.0, false, sizing::USABLE_H_FRAC);
             let want = sizing::spawn_window_size(
                 media,
                 Some((2560, 1440)),
@@ -435,8 +468,8 @@ mod tests {
         );
         // The window's open fit spends that delta on chrome, not on the canvas: the SAME
         // media opens exactly that much taller and no wider.
-        let off = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0, false);
-        let on = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0, true);
+        let off = windowed_fit_size_with((1280, 720), Some((3840, 2160)), 0.0, false, sizing::USABLE_H_FRAC);
+        let on = windowed_fit_size_with((1280, 720), Some((3840, 2160)), 0.0, true, sizing::USABLE_H_FRAC);
         assert_eq!(on.0, off.0);
         assert!(
             (on.1 - (off.1 + band - traded)).abs() < 0.001,
@@ -512,7 +545,7 @@ mod tests {
         let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
         for output in [(3840, 2160), (5120, 1440), (2560, 1440), (1920, 1080), (3440, 1440)] {
             for media in [(3840u32, 2160u32), (5120, 1440), (1920, 1080), (1280, 720)] {
-                let (w, h) = windowed_fit_size(media, Some(output), 0.0, LABELS);
+                let (w, h) = windowed_fit_size_with(media, Some(output), 0.0, LABELS, sizing::USABLE_H_FRAC);
                 let (cw, ch) = (w - 2.0, h - chrome_h);
                 // Skip combinations where the PREVIEW_MIN floor bites (aspect yields there).
                 if w > super::shell::PREVIEW_MIN_W && h > super::shell::PREVIEW_MIN_H {
@@ -532,8 +565,8 @@ mod tests {
     #[test]
     fn video_open_reserves_the_transport_strip() {
         let transport = PreviewSurface::Window.transport_h();
-        let still = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0, LABELS);
-        let video = windowed_fit_size((1280, 720), Some((3840, 2160)), transport, LABELS);
+        let still = windowed_fit_size_with((1280, 720), Some((3840, 2160)), 0.0, LABELS, sizing::USABLE_H_FRAC);
+        let video = windowed_fit_size_with((1280, 720), Some((3840, 2160)), transport, LABELS, sizing::USABLE_H_FRAC);
         assert_eq!(video.0, still.0);
         assert!((video.1 - (still.1 + transport)).abs() < 0.001);
     }
@@ -543,15 +576,31 @@ mod tests {
     #[test]
     fn windowed_fit_never_upscales_past_native() {
         let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
-        let (w, h) = windowed_fit_size((1280, 720), Some((3840, 2160)), 0.0, LABELS);
+        let (w, h) = windowed_fit_size_with((1280, 720), Some((3840, 2160)), 0.0, LABELS, sizing::USABLE_H_FRAC);
         assert_eq!((w - 2.0).round(), 1280.0);
         assert_eq!((h - chrome_h).round(), 720.0);
+    }
+
+    /// DRAGON-579, at the surface's own chrome: the height budget is the 90 percent guess
+    /// on every path (the DRAGON-549 full-height ask is retired; `sizing::USABLE_H_FRAC`'s
+    /// doc carries the story).
+    #[test]
+    fn the_open_fit_stays_inside_the_ninety_percent_budget() {
+        // DRAGON-579: the DRAGON-549 full-height ask is retired (the README-recommended
+        // floating exception voids the map-time clamp it bet on, native sessions included).
+        // Two over-tall captures both bind to the guess, never the whole output.
+        let monitor = Some((5120u32, 1440u32));
+        let fit = |media| windowed_fit_size(media, monitor, 0.0, LABELS);
+        let (win_cap, mon_cap) = (fit((2542, 1384)), fit((5120, 1440)));
+        assert!((win_cap.1 - mon_cap.1).abs() < 0.5, "{win_cap:?} vs {mon_cap:?}");
+        assert!((win_cap.1 - 1440.0 * sizing::USABLE_H_FRAC).abs() < 0.5);
+        assert!(mon_cap.1 < 1440.0, "never the whole output height: {mon_cap:?}");
     }
 
     /// The floor always wins (toolbars must not clip), even for tiny media.
     #[test]
     fn windowed_fit_respects_the_floor() {
-        let (w, h) = windowed_fit_size((320, 200), Some((1920, 1080)), 0.0, LABELS);
+        let (w, h) = windowed_fit_size_with((320, 200), Some((1920, 1080)), 0.0, LABELS, sizing::USABLE_H_FRAC);
         assert_eq!(w, super::shell::PREVIEW_MIN_W);
         assert_eq!(h, super::shell::PREVIEW_MIN_H);
     }
@@ -578,7 +627,7 @@ mod tests {
     #[test]
     fn windowed_fit_without_a_monitor_is_native_sized() {
         let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
-        let (w, h) = windowed_fit_size((1600, 900), None, 0.0, LABELS);
+        let (w, h) = windowed_fit_size_with((1600, 900), None, 0.0, LABELS, sizing::USABLE_H_FRAC);
         assert_eq!((w - 2.0).round(), 1600.0);
         assert_eq!((h - chrome_h).round(), 900.0);
     }
@@ -603,15 +652,60 @@ mod dpi_proof_tests {
         let monitor = Some((6000u32, 3400u32));
         let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
         // BUG: physical pixels treated as logical.
-        let buggy = windowed_fit_size((2800, 1800), monitor, 0.0, LABELS);
+        let buggy = windowed_fit_size_with((2800, 1800), monitor, 0.0, LABELS, sizing::USABLE_H_FRAC);
         // FIX: physical / source_scale(2.0) = the 1400×900 logical footprint.
-        let fixed = windowed_fit_size((1400, 900), monitor, 0.0, LABELS);
+        let fixed = windowed_fit_size_with((1400, 900), monitor, 0.0, LABELS, sizing::USABLE_H_FRAC);
         // The fixed window's canvas IS the true 1400×900 logical footprint...
         assert!((fixed.0 - (1400.0 + 2.0)).abs() < 0.5, "fixed w {}", fixed.0);
         assert!((fixed.1 - (900.0 + chrome_h)).abs() < 0.5, "fixed h {}", fixed.1);
         // ...and the buggy window's canvas was 2× that (the reported user symptom).
         assert!((buggy.0 - 2.0 - 2800.0).abs() < 0.5, "buggy w {}", buggy.0);
         assert!(((buggy.0 - 2.0) - 2.0 * (fixed.0 - 2.0)).abs() < 1.0, "buggy must be ~2× fixed");
+    }
+}
+
+/// DRAGON-549 reopened: the sixth live test's WINDOW captures, pinned end to end. COSMIC's
+/// portal gives a window stream no position, so the preview origin resolves through the
+/// SHARED synthetic-anchor decision (`capture_flow::largest_output_index`) rather than
+/// falling to registration order. THIS anchor resolution is what fixed the Flatpak's
+/// too-small previews, and it survives DRAGON-579's budget retirement untouched: the
+/// fallback session has run the [`sizing::USABLE_H_FRAC`] budget since the reopened round,
+/// and these tests pin that exact combination. The absolute request numbers (924x732 and
+/// 1362x949 at chrome 163) are pinned beside the arithmetic in `sizing`'s tests.
+#[cfg(test)]
+mod portal_window_origin_fit_tests {
+    use super::*;
+
+    /// See `tests::LABELS`.
+    const LABELS: bool = true;
+
+    /// The DEFECT: anchored to the first-registered output, the 800x480 side panel, a
+    /// 1360x786 window capture is best-fit scaled into 480pt of height and then floored,
+    /// so EVERY window capture opened at the same minimum-sized window (the log's five
+    /// identical `monitor=(800, 480)pt` fits).
+    #[test]
+    fn anchored_to_the_panel_the_fit_floors_at_the_editor_minimums() {
+        let budget = sizing::USABLE_H_FRAC;
+        let (w, h) = windowed_fit_size_with((1360, 786), Some((800, 480)), 0.0, LABELS, budget);
+        assert_eq!((w, h), (super::shell::PREVIEW_MIN_W, super::shell::PREVIEW_MIN_H));
+    }
+
+    /// The FIX: the shared anchor decision names the ultrawide from the owner's own
+    /// registration order (panel first), the fit bound becomes (5120, 1440), and the
+    /// media opens at 1:1: the canvas IS the picture, no best-fit scaling, no floor.
+    #[test]
+    fn anchored_through_the_shared_decision_the_window_capture_opens_one_to_one() {
+        // The owner's desktop in registration order: the side panel registers FIRST.
+        let outputs = [(800, 480), (5120, 1440)];
+        let origin = crate::app::capture_flow::largest_output_index(&outputs)
+            .expect("two real outputs always yield an anchor");
+        assert_eq!(origin, 1, "the anchor is the ultrawide, not the first-registered panel");
+        let monitor = (outputs[origin].0 as u32, outputs[origin].1 as u32);
+        let budget = sizing::USABLE_H_FRAC;
+        let (w, h) = windowed_fit_size_with((1360, 786), Some(monitor), 0.0, LABELS, budget);
+        let chrome_h = PreviewSurface::Window.chrome_h(LABELS);
+        assert_eq!((w - 2.0).round(), 1360.0, "the canvas is the media, exactly");
+        assert_eq!((h - chrome_h).round(), 786.0, "no best-fit scaling on the ultrawide");
     }
 }
 
@@ -638,8 +732,8 @@ mod monitor_points_tests {
             for media in [(1280u32, 720u32), (3840, 2160), (400, 300)] {
                 for extra_h in [0.0f32, PreviewSurface::Window.transport_h()] {
                     assert_eq!(
-                        windowed_fit_size(media, Some(pts), extra_h, LABELS),
-                        windowed_fit_size(media, Some(capture), extra_h, LABELS),
+                        windowed_fit_size_with(media, Some(pts), extra_h, LABELS, sizing::USABLE_H_FRAC),
+                        windowed_fit_size_with(media, Some(capture), extra_h, LABELS, sizing::USABLE_H_FRAC),
                     );
                 }
             }
@@ -679,12 +773,9 @@ mod monitor_points_tests {
     #[test]
     fn the_size_unknown_fallback_no_longer_exceeds_the_display() {
         let capture = (3840u32, 2160u32);
-        let fallback = |m: (u32, u32)| {
-            (
-                (m.0 as f32 * 0.8).clamp(super::shell::PREVIEW_MIN_W, 1600.0),
-                (m.1 as f32 * 0.9).clamp(super::shell::PREVIEW_MIN_H, 1000.0),
-            )
-        };
+        // The REAL production fn (DRAGON-579), not a hand-copied twin of its expression:
+        // this test used to re-code the box and so could not catch the open path drifting.
+        let fallback = size_unknown_fallback;
         let pts = monitor_fit_points(capture, 3.0);
         assert_eq!(pts, (1280, 720));
         let (bw, bh) = fallback(capture);
@@ -712,7 +803,7 @@ mod monitor_points_tests {
         let capture = (3840u32, 2160u32);
         let pts = monitor_fit_points(capture, 2.0);
         let media = sizing::to_points(capture, 2.0);
-        let (w, h) = windowed_fit_size(media, Some(pts), 0.0, LABELS);
+        let (w, h) = windowed_fit_size_with(media, Some(pts), 0.0, LABELS, sizing::USABLE_H_FRAC);
         assert!(w <= pts.0 as f32 + 0.5, "width {w} spills off a {}pt screen", pts.0);
         assert!(
             h <= pts.1 as f32 * sizing::USABLE_H_FRAC + 0.5,
@@ -721,7 +812,7 @@ mod monitor_points_tests {
             pts.1,
         );
         // The un-divided bound let the SAME capture ask for a window taller than the screen.
-        let (_, buggy_h) = windowed_fit_size(media, Some(capture), 0.0, LABELS);
+        let (_, buggy_h) = windowed_fit_size_with(media, Some(capture), 0.0, LABELS, sizing::USABLE_H_FRAC);
         assert!(buggy_h > pts.1 as f32, "the bug: {buggy_h}pt tall on a {}pt screen", pts.1);
     }
 

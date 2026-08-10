@@ -55,21 +55,31 @@ impl crate::app::App {
         // Hide the floating toolbar on full-screen captures (DRAGON-174): when the
         // toolbar can't sit OUTSIDE the recording area, hide it instead of placing it
         // in-frame. The tray icon always carries the recording controls regardless.
-        secs.push(SectionSpec {
-            title: "Behavior",
-            items: vec![Item::new(
-                "Hide toolbar on full screen captures",
-                "When the floating toolbar can't fit outside of the recording area, this will hide it instead of placing it in-frame. You can still control the recording via the system tray icon.",
-                toggle(self.hide_toolbar_fullscreen, |a0| {
-                    Msg::Settings(SettingsMsg::SetHideToolbarFullscreen(a0))
-                }),
-            )
-            .reset_with(
-                self.hide_toolbar_fullscreen,
-                d.hide_toolbar_fullscreen,
-                |a0| Msg::Settings(SettingsMsg::SetHideToolbarFullscreen(a0)),
-            )],
-        });
+        //
+        // DRAGON-569: on the portal-fallback path (`overlay_fallback_active`, no layer
+        // shell) the in-frame toolbar this governs can NEVER appear — every fallback
+        // recording tears its surfaces down at record start (`recreate_active_overlays`),
+        // whatever mode picked it, so the setting is inert there. The rule for a choice
+        // that cannot apply is to HIDE the row entirely (never an inert/warning row), and
+        // this row is the Behavior group's only item, so the group header hides with it.
+        // The persisted value is untouched; layer-shell sessions are byte-identical.
+        if !self.overlay_fallback_active() {
+            secs.push(SectionSpec {
+                title: "Behavior",
+                items: vec![Item::new(
+                    "Hide toolbar on full screen captures",
+                    "When the floating toolbar can't fit outside of the recording area, this will hide it instead of placing it in-frame. You can still control the recording via the system tray icon.",
+                    toggle(self.hide_toolbar_fullscreen, |a0| {
+                        Msg::Settings(SettingsMsg::SetHideToolbarFullscreen(a0))
+                    }),
+                )
+                .reset_with(
+                    self.hide_toolbar_fullscreen,
+                    d.hide_toolbar_fullscreen,
+                    |a0| Msg::Settings(SettingsMsg::SetHideToolbarFullscreen(a0)),
+                )],
+            });
+        }
 
         secs
     }

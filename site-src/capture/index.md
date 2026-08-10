@@ -84,4 +84,5 @@ region". You can press straight through it to start a region on that screen.
   screenshot looks.
 - [Recording](recording.md): starting, pausing, muting and stopping.
 - [The scanner](scanner.md): QR codes, barcodes and text.
+- [The colour picker](color-picker.md): reading a colour off the screen.
 - [Keyboard shortcuts](keyboard.md): every key the overlay listens for.

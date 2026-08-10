@@ -5,11 +5,13 @@ title: Keyboard Shortcuts
 # Settings: Keyboard Shortcuts
 
 This page is where you change any key the app listens for. It is split into
-three tabs, and it always opens on the first one.
+tabs, and it always opens on the first one. A tab with nothing to show on your
+system is not shown at all, so you may see fewer than these four.
 
 | Tab | What it holds |
 |---|---|
-| Capture | The global capture keys, and the scanner's text keys |
+| Global | The keys your operating system owns, so they work with any window focused |
+| Capture | The scanner's text keys |
 | Recording | Stop, microphone and system audio |
 | Preview Editor | Everything the editor listens for |
 
@@ -30,17 +32,12 @@ Keys are shown the way your computer writes them. macOS shows the modifier
 symbols, Windows writes Ctrl, Alt, Shift and Win, and Linux writes Ctrl, Alt,
 Shift and Super.
 
-## Capture
+## Global
 
-### Global
-
-*macOS and Windows only.* On Linux your desktop owns global keys, so this
-section is not shown. See [Getting started](../getting-started.md) for how to
-add them on Linux instead.
-
-These six are different from every other row on the page. They are system-wide
-keys, owned by the background helper, so they work when no window of the app is
-focused. **All six ship with no key set.** Give a key to the ones you want.
+These rows are different from every other row on the page. They are system-wide
+keys, so they work when no window of the app is focused. Under **Global Capture**
+there are seven of them, and **all seven ship with no key set**. Give a key to the
+ones you want.
 
 | Shortcut | What it does |
 |---|---|
@@ -50,13 +47,36 @@ focused. **All six ship with no key set.** Give a key to the ones you want.
 | Capture All In One (no editor) | The same picker, but the result is saved, copied and announced without the editor opening |
 | Capture Active Window (no editor) | The same instant window capture, delivered without the editor |
 | Capture Active Monitor (no editor) | The same instant monitor capture, delivered without the editor |
+| Color Picker | Opens [the colour picker](../capture/color-picker.md) |
 
-A clash is never accepted quietly. If you give one row a key that another row
-already had, the row that took it says "This shortcut was taken from *the other
-one*. That shortcut is now unbound", and the row that lost it says "Unbound.
-*The other one* now uses this shortcut". If some other app on your computer
-already owns the key system-wide, the row tells you: "Another app is already
-using this shortcut, so it will not work here."
+**On macOS and Windows** the background helper owns these keys, so each row is a
+button you press to record a chord, the same as any other row here.
+
+**On Linux** your desktop owns global keys instead, so each row shows the command
+that performs the action rather than a chord. Copy it into your own desktop's
+shortcut settings. The tab says so at the top: "Global shortcuts are handled by
+your operating system." See [Getting started](../getting-started.md) for the
+walkthrough.
+
+An action your build cannot perform gets no row at all, rather than a shortcut
+that would do nothing. Under a Flatpak install that is Capture Active Window and
+Capture Active Monitor, because a sandboxed app cannot ask which window or monitor
+is active.
+
+On Linux, below Global Capture, sits **Global Recording**: five commands that act
+on a recording already in progress, being pause or resume, stop and save, cancel
+and delete, and the two audio toggles. They are commands rather than chords for
+the same reason, and macOS and Windows do not show the group at all, because their
+in-app Recording tab already reaches a live recording.
+
+Where rows take a chord, a clash is never accepted quietly. If you give one row a
+key that another row already had, the row that took it says "This shortcut was
+taken from *the other one*. That shortcut is now unbound", and the row that lost
+it says "Unbound. *The other one* now uses this shortcut". If some other app on
+your computer already owns the key system-wide, the row tells you: "Another app is
+already using this shortcut, so it will not work here."
+
+## Capture
 
 ### OCR Text Recognition
 

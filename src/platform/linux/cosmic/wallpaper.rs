@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// cosmic-bg: RON files under `~/.config/cosmic/com.system76.CosmicBackground/v1`
 /// — the shared `all` entry, else any per-output entry (same-on-all off).
 pub fn cosmic_bg() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("cosmic/com.system76.CosmicBackground/v1");
+    let dir = crate::util::host_config_dir()?.join("cosmic/com.system76.CosmicBackground/v1");
     if let Ok(text) = std::fs::read_to_string(dir.join("all"))
         && let Some(p) = parse_cosmic_bg(&text)
     {

@@ -155,6 +155,16 @@ pub enum PreviewMsg {
     /// `--focus-settings` poke when one is already open — this multi-document HOST must
     /// never convert ITSELF into the settings pane the way the capture overlay's gear does.
     OpenSettings,
+    /// DRAGON-582: launch the COLOUR PICKER tool from the image editor's bottom bar.
+    ///
+    /// Spawns a detached `--color-picker` child rather than running the picker in this
+    /// process, for the same reason the editor's gear spawns a `--settings` child: the
+    /// picker needs its own launch-instant frozen scene of the WHOLE desktop (which this
+    /// process, opened long after its capture, does not have) and its own per-output
+    /// overlays. The editor stays open underneath, and the picker's overlay covers it
+    /// like anything else on screen, so a colour can be sampled straight off the capture
+    /// being edited.
+    OpenColorPicker,
     /// Toggle inline playback of a recording (play / pause).
     Play,
     /// Poll the playback worker for the next decoded frame (while playing).
@@ -232,6 +242,11 @@ pub enum PreviewMsg {
     /// that used to be posted inline; nothing gates on it (DRAGON-454, which moved the copy
     /// off the UI thread — see [`crate::app::App::auto_copy_preview_on_open`]).
     AutoCopied(bool),
+    /// `lab/flatpak`: the bounded wait for a DEFERRED open-time copy's window to take focus
+    /// expired ([`crate::app::preview::AUTO_COPY_FOCUS_BUDGET`]). A no-op unless the document
+    /// is still waiting — the focus normally arrives first and clears the flag — and when it
+    /// is, the copy is reported as the failure it is rather than claimed as a success.
+    AutoCopyDeadline,
     /// Open/close the covermark picker flyout.
     Covermark,
     /// Apply a specific covermark picker entry (mouse click).
@@ -358,6 +373,15 @@ pub enum PreviewMsg {
     /// their result — the canvas widget publishes `InputMethod::Enabled` so the OS knows a text
     /// field is focused, then routes the `Ime::Commit` here.
     TextImeCommit(String),
+    /// The focused window's clipboard READ finished (DRAGON-572): on a session without a
+    /// data-control global (`crate::share::CopyRoute::ThisWindow` — a Flatpak on COSMIC,
+    /// GNOME, sandboxed niri/Hyprland) the Cmd/Ctrl+V paste in an edited text box cannot use
+    /// the in-process `wl_clipboard_rs` read, so it goes out over the editor window's own
+    /// `wl_data_offer` (`cosmic::iced::clipboard::read`) and the result lands here. `None` =
+    /// no text on the clipboard (or the read failed): insert nothing, exactly like the
+    /// worker-read path. Insertion shares [`Self::TextImeCommit`]'s lane, so normalize, cap
+    /// and the undo step behave identically on both routes.
+    TextPasted(Option<String>),
     /// Open/close the color-swatch palette popover.
     ToggleAnnotPalette,
     /// Swap the ACTIVE annotation color to its COMPANION (its complement), toggling back on a
@@ -486,6 +510,9 @@ impl PreviewMsg {
                 | Self::TextClickAt { .. }
                 | Self::TextDragTo(..)
                 | Self::TextImeCommit(..)
+                // DRAGON-572: the window-route paste is the same hands-on text edit an IME
+                // commit is; it only arrives as a message because the read is asynchronous.
+                | Self::TextPasted(..)
                 | Self::Pan(..)
                 // ── Video timeline / scrubbing ───────────────────────────────────────
                 | Self::Seek(_)
@@ -522,6 +549,9 @@ mod tests {
             PreviewMsg::AnnotDrawBegin(Tool::Arrow, 1.0, 2.0),
             PreviewMsg::AnnotGestureEnd,
             PreviewMsg::SelectAnnotation(None),
+            // DRAGON-572: a delivered window-route paste is a text edit, IME-commit's twin.
+            PreviewMsg::TextImeCommit("hi".to_string()),
+            PreviewMsg::TextPasted(Some("hi".to_string())),
             PreviewMsg::Pan(3.0, 4.0),
             PreviewMsg::Seek(1.5),
             PreviewMsg::TimelineCut(2.0),

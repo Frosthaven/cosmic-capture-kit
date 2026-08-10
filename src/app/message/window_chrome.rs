@@ -182,11 +182,30 @@ pub enum WindowChromeMsg {
     /// Permission-checker window titlebar: drag to move.
     #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     PermissionsWindowDrag,
+    /// DRAGON-582: the colour-picker result window finished opening. Carries `(id,
+    /// attempt)` because the native finalize is TITLE-matched and the set-title task can
+    /// land a frame or two later, exactly like the preview window's.
+    ColorPickerWindowOpened(window::Id, u8),
+    /// Colour-picker window titlebar: drag to move.
+    ColorPickerWindowDrag,
     /// macOS (DRAGON-135): apply the empty-toolbar tweak that vertically centres
     /// the native traffic lights over the CSD header. Title-matched (the async
     /// set-title task must land first), so it polls: (window title, attempt).
     #[cfg(target_os = "macos")]
     MacCenterTitlebar(&'static str, u8),
+    /// macOS (DRAGON-587): make the window titled this genuinely UNRESIZABLE, by disabling
+    /// its zoom button and opting it out of full-screen spaces. Those are the two things
+    /// `min_size == max_size` cannot cover, and neither touches the style mask, which on
+    /// macOS must keep `Titled | Resizable` (see `platform::mac::window::pin_window_size`).
+    ///
+    /// Title-matched like [`Self::MacCenterTitlebar`], so it carries the attempt count and
+    /// polls: the async set-title task can land a frame or two after the window exists.
+    ///
+    /// ONE message for every window that wants this, rather than one per window: the colour
+    /// picker's result window and the permission checker both send it, and a second copy of
+    /// the poll would be a second place for the retry budget to drift.
+    #[cfg(target_os = "macos")]
+    MacPinWindow(&'static str, u8),
     /// Toggle the settings nav rail (header hamburger).
     ToggleConfigNav,
     /// Expand the header search field (and focus it).
@@ -226,11 +245,25 @@ pub enum WindowChromeMsg {
     /// LOGICAL key cannot tell numpad Enter from main Enter: both backends map `KP_Enter` to
     /// `Key::Named(Named::Enter)` and record the difference ONLY here (see
     /// [`crate::app::preview::annotate::text_edit_exits`]).
-    KeyPressed(window::Id, Modifiers, Key, Location, Option<String>),
+    /// The trailing `bool` is iced's REPEAT flag (DRAGON-601): `false` for a real press,
+    /// `true` for an auto-repeat the compositor synthesised while the key stayed down. It was
+    /// dropped on the floor until DRAGON-601, so nothing in the app could tell a tap from a
+    /// hold; the nudge lane needs exactly that distinction to spend one pixel per tap while
+    /// still offering hold-to-move (see [`crate::shortcuts::nudge_step_allowed`]).
+    KeyPressed(window::Id, Modifiers, Key, Location, Option<String>, bool),
     /// A raw key release — only push-to-talk cares (release = mute the mic again). Carries
     /// the delivering surface for symmetry with [`Self::KeyPressed`] (a release routed into
     /// an armed chord recorder goes through the same `handle_key`).
     KeyReleased(window::Id, Modifiers, Key),
+    /// DRAGON-599: a RIGHT mouse press on this surface that no widget claimed.
+    ///
+    /// Only presses the UI ignored are forwarded (the subscription filters on
+    /// `event::Status`), so a right-click that already means something — the scanner's
+    /// word / code copy menus, the preview timeline's context menu — is never seen here and
+    /// keeps its own meaning. Whether this one CANCELS the session is decided in `update` by
+    /// [`crate::app::update::window_chrome::right_click_cancels`]; the surface it landed on is
+    /// the first term of that decision, which is why the id rides along.
+    RightPressed(window::Id),
     /// Escape / contextual back: settings → mode → region → quit.
     Close,
     /// The toolbar ✕: always quit the tool outright.

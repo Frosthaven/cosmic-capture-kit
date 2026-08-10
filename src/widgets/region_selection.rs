@@ -743,14 +743,14 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                     new
                 } else {
                     // The surface's bounds are POINTS; the wall is fought in CAPTURE
-                    // space, so widen them to the output's true capture rect.
+                    // space, so widen them to the capture rect of the pixels this
+                    // surface actually SHOWS (`visible_capture_size`). Everywhere but
+                    // the letterbox fallback bridge (`lab/flatpak`) that is the whole
+                    // surface; there it is the frozen frame, so the walls confine
+                    // dragging to the visible image instead of the letterbox bars.
                     let (ox, oy) = self.units.origin();
-                    let ob = (
-                        ox,
-                        oy,
-                        ox + self.units.len_to_capture(bounds.width).round() as i32,
-                        oy + self.units.len_to_capture(bounds.height).round() as i32,
-                    );
+                    let (bw, bh) = self.units.visible_capture_size((bounds.width, bounds.height));
+                    let ob = (ox, oy, ox + bw.round() as i32, oy + bh.round() as i32);
                     wall_rect(new, state.grab, ob, edge_break)
                 };
                 shell.publish((self.on_change)(GlobalRect::from_tuple(new)));
@@ -851,13 +851,23 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
             (rr - ll >= 1.0 && bb - tt >= 1.0).then_some((ll, tt, rr, bb))
         });
 
+        // DRAGON-606: a fully transparent dim is not drawn at all, rather than drawn as a
+        // zero-alpha quad. The two composite identically, so this changes no pixel on any
+        // platform; it exists so that "the fade has not started" is the SAME nothing the
+        // DRAGON-600 / DRAGON-456 paint gates rely on, instead of something that merely
+        // happens to be invisible. The frozen-flats grab must be able to photograph this
+        // overlay and get nothing back.
+        let dim_visible = dim.a > 0.0;
         match local {
-            None => fill(ox, oy, w, h, dim, Border::default()),
+            None if dim_visible => fill(ox, oy, w, h, dim, Border::default()),
+            None => {}
             Some((ll, tt, rr, bb)) => {
-                fill(ox, oy, w, tt, dim, Border::default()); // top
-                fill(ox, oy + bb, w, h - bb, dim, Border::default()); // bottom
-                fill(ox, oy + tt, ll, bb - tt, dim, Border::default()); // left
-                fill(ox + rr, oy + tt, w - rr, bb - tt, dim, Border::default()); // right
+                if dim_visible {
+                    fill(ox, oy, w, tt, dim, Border::default()); // top
+                    fill(ox, oy + bb, w, h - bb, dim, Border::default()); // bottom
+                    fill(ox, oy + tt, ll, bb - tt, dim, Border::default()); // left
+                    fill(ox + rr, oy + tt, w - rr, bb - tt, dim, Border::default()); // right
+                }
 
                 // Draw each border side only when the rect's TRUE edge lies on
                 // this monitor. An edge that falls on a monitor boundary (the
@@ -865,10 +875,14 @@ impl<Msg: Clone + 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for Regi
                 // cross-monitor selection looks seamless.
                 let (gl, gt, gr, gb) = self.region.map(|r| r.normalize().to_tuple()).unwrap_or_default();
                 // The monitor's own borders, in CAPTURE space (the space `gl..gb` are in):
-                // the surface bounds are points, so widen them by this output's factor.
+                // the surface bounds are points, so widen them to the capture rect of the
+                // pixels this surface shows (`visible_capture_size`; on the letterbox
+                // fallback bridge, `lab/flatpak`, that is the frozen frame, whose edges
+                // ARE the monitor borders a clamped selection can reach).
                 let (mx0, my0) = self.units.origin();
-                let mx1 = mx0 + self.units.len_to_capture(w) as i32;
-                let my1 = my0 + self.units.len_to_capture(h) as i32;
+                let (mw, mh) = self.units.visible_capture_size((w, h));
+                let mx1 = mx0 + mw as i32;
+                let my1 = my0 + mh as i32;
                 let (show_l, show_r, show_t, show_b) = (gl >= mx0, gr <= mx1, gt >= my0, gb <= my1);
                 let mut accent = crate::app::theme::accent(theme);
                 accent.a = self.line_alpha;

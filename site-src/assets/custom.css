@@ -563,6 +563,20 @@ body:has(.cck-space) .md-content__inner::before {
 }
 
 /*
+ * The tagline above the platform line: the three verbs, bold and full-white so
+ * they read a step STRONGER than the dimmed availability note below, at the SAME
+ * size (owner's call: emphasis by weight and colour, never by size).
+ */
+.md-typeset .cck-glass__tagline {
+  font-size: clamp(0.55rem, 1.6vmin, 0.68rem);
+  line-height: 1.5;
+  margin: 0 auto clamp(0.3rem, 1.2vmin, 0.6rem);
+  max-width: 22rem;
+  color: #ffffff;
+  font-weight: 700;
+}
+
+/*
  * The platform-availability line: a secondary note beneath the description, so it
  * reads a step smaller and dimmer than `.cck-glass__desc`. Placeholder copy for
  * now; it sits between the description and the download button.

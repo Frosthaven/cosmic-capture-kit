@@ -1,0 +1,19 @@
+# Pin every build to ONE compiler.
+#
+# WHY: the Flatpak SDK extension `org.freedesktop.Sdk.Extension.rust-stable`
+# on SDK 25.08 ships rustc 1.95.0, and it is not ours to choose. Before this
+# file the dev box built on nightly and CI on whatever it had, so three
+# compilers saw the same code. On 2026-08-09 that produced two
+# `unfulfilled_lint_expectations` warnings that appeared ONLY in the Flatpak
+# build, because rustc after 1.95 propagates deadness through a chain of dead
+# items and 1.95 does not. The local gate was clean and the shipped build was
+# not, which is the failure mode this file removes.
+#
+# So: match the SDK, and change this only when the SDK's rust extension moves.
+# Check with:
+#   flatpak info org.freedesktop.Sdk.Extension.rust-stable//<sdk-branch>
+#
+# Nothing here needs nightly; the crate is edition 2024, which is stable.
+[toolchain]
+channel = "1.95.0"
+components = ["clippy", "rustfmt"]

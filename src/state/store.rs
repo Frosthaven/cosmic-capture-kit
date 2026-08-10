@@ -37,13 +37,10 @@ fn legacy_ron_path() -> Option<PathBuf> {
     Some(dir.join("cosmic-capture-kit").join("state.ron"))
 }
 
-/// Whether a persisted state file already exists (i.e. this is not the very first
-/// launch). Used to pick smart capture-method defaults only once. A legacy RON
-/// file counts — a migrating user is not a fresh install.
-pub fn file_exists() -> bool {
-    config_path().map(|p| p.exists()).unwrap_or(false)
-        || legacy_ron_path().map(|p| p.exists()).unwrap_or(false)
-}
+// A `file_exists()` helper lived here, the "is this the very first launch?"
+// probe behind the retired capture-method auto-default. DRAGON-575 removed both:
+// see the tombstone at `CaptureMsg::PipewireProbed` (app/update/capture.rs) for
+// why a file-existence trigger could never be a reliable first-launch signal.
 
 pub fn load() -> Persisted {
     let mut p = load_raw().unwrap_or_else(defaults);
@@ -72,7 +69,7 @@ fn load_raw() -> Option<Persisted> {
 
 /// Current config schema version. Bump when a stored index changes meaning and
 /// add a guarded step in `migrate`.
-pub const CONFIG_VERSION: u32 = 10;
+pub const CONFIG_VERSION: u32 = 12;
 
 /// One-time migrations for configs saved by older versions, keyed on
 /// `config_version`. Idempotent — running it on an already-current config is a
@@ -216,6 +213,61 @@ fn migrate(p: &mut Persisted) {
         // change to their meaning would need. Same shape as the v5 and v9 entries above,
         // both of which also carry nothing.
     }
+    if p.config_version < 11 {
+        // v11 (DRAGON-570): the single ScreenCast restore-token pair
+        // (`pw_restore_token` + `pw_restore_source`) became one slot per source
+        // type, so a window grant no longer discards the monitor token. The legacy
+        // pair is read ONCE here, routed into the slot its recorded source names,
+        // and never written again (both fields are skip_serializing now, the v3
+        // capture-boolean shape). A `None` or unknown source drops the token: it
+        // never replayed under the DRAGON-544 gate either, so nothing is lost.
+        //
+        // The carried token is best-effort on top of that: it was minted under
+        // persist mode 1, whose grant died with the granting process's D-Bus
+        // connection (the DRAGON-570 root cause), so the portal will likely
+        // re-prompt once and reissue a mode-2 token into the same slot. Carrying
+        // it costs nothing and covers portals that honored the old token.
+        if let Some(tok) = p.pw_restore_token.take() {
+            match p.pw_restore_source.as_deref() {
+                Some("monitor") if p.pw_restore_token_monitor.is_none() => {
+                    p.pw_restore_token_monitor = Some(tok);
+                }
+                Some("window") if p.pw_restore_token_window.is_none() => {
+                    p.pw_restore_token_window = Some(tok);
+                }
+                _ => {}
+            }
+        }
+        p.pw_restore_source = None;
+    }
+    if p.config_version < 12 {
+        // v12 (DRAGON-571): `preferred_encoder` used to default to an "auto" sentinel
+        // that the app REPLACED with the best probed encoder on first access and
+        // PERSISTED as if the user had chosen it. Any transient first-launch condition
+        // (driver asleep, NVENC sessions held by a game or overlay, the ffmpeg sidecar
+        // mid-install) therefore pinned "software" permanently; nothing ever
+        // reconsidered. "auto" now stays persisted and resolves per recording (the
+        // hint-first ladder over `encoder_auto_hint`).
+        //
+        // Every pre-v12 CONCRETE id migrates back to "auto" ONCE. On disk a real user
+        // pick and a persisted auto-resolution are indistinguishable (both were
+        // written through the same save), so we cannot know retroactively which were
+        // real picks. A genuine picker choice costs that user one re-pick; the
+        // alternative leaves every mis-pinned config broken forever. The old id seeds
+        // the last-known-good hint (only when the hint is still empty), so a config
+        // whose auto-pick was correct keeps its single happy-path probe. A "software"
+        // seed is harmless: the probe order ignores software hints, since hoisting one
+        // would re-create the exact pin this migration removes.
+        //
+        // The legacy `record_hardware = false` mapping to software is a read-time rule
+        // and stays honored regardless of this reset.
+        if p.preferred_encoder != "auto" {
+            if p.encoder_auto_hint.is_empty() {
+                p.encoder_auto_hint = p.preferred_encoder.clone();
+            }
+            p.preferred_encoder = "auto".to_string();
+        }
+    }
     // Version-independent safety net: an empty id (hand-edited config) falls back
     // to the platform default rather than persisting as unset.
     if p.record_backend.is_empty() {
@@ -260,6 +312,25 @@ pub fn save(p: &Persisted) {
     }
 }
 
+/// Update the persisted last-known-good AUTO encoder hint (DRAGON-571). The hint is
+/// a CACHE, never user intent (`preferred_encoder` is written only by a real settings
+/// pick), so it is writable from wherever resolution actually ran: in practice the
+/// recording workers, off the UI thread, once at session start. A whole-file
+/// load-then-save is safe against the settings window's own saves because the app's
+/// snapshot carries this field from DISK, not from a live mirror (the
+/// `mac_first_run_seen` pattern in `app/persist.rs`), so a later settings save cannot
+/// revert a fresh note. The reverse race, this load-then-save landing over a
+/// concurrent save from another writer, is the same last-writer-wins window every
+/// existing `save` already has, only microseconds wide here. No-op when unchanged.
+pub fn note_encoder_auto_hint(id: &str) {
+    let mut p = load();
+    if p.encoder_auto_hint == id {
+        return;
+    }
+    p.encoder_auto_hint = id.to_string();
+    save(&p);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,11 +350,70 @@ mod tests {
         // Canaries: scalars declared AFTER `covermark_prefs` in the struct.
         p.capture_hotkey = "F13".into();
         p.region_overlay_opacity = 0.42;
+        // DRAGON-582: `recent_colors` is a second ARRAY declared after the array of
+        // tables, which is the one shape this test exists to catch. An array of plain
+        // strings is a VALUE to toml, not a table, so it must survive alongside them.
+        p.color_picker_overlay_opacity = 0.4;
+        p.recent_colors = vec!["#FF8800".into(), "#123456".into()];
         let s = toml::to_string(&p).expect("serialize must succeed");
         let back: Persisted = toml::from_str(&s).expect("deserialize must succeed");
         assert_eq!(back.capture_hotkey, "F13", "scalar after covermark_prefs survived");
         assert_eq!(back.region_overlay_opacity, 0.42);
         assert_eq!(back.covermark_prefs.len(), 1);
+        assert_eq!(back.color_picker_overlay_opacity, 0.4);
+        assert_eq!(back.recent_colors, vec!["#FF8800", "#123456"]);
+    }
+
+    /// DRAGON-582: the colour picker's own defaults, which a fresh install ships with.
+    /// The dim is 33%, the same as the ACTIVE overlay, so the two overlays that sit over a
+    /// working desktop match. It was briefly zero (DRAGON-588) and the owner took it back:
+    /// with no dim, nothing says the picker is armed. Nothing has been picked yet.
+    #[test]
+    fn the_colour_picker_defaults_are_the_owners() {
+        let d = defaults();
+        assert_eq!(d.color_picker_overlay_opacity, 0.33);
+        assert_eq!(
+            d.color_picker_overlay_opacity, d.active_overlay_opacity,
+            "the picker dim tracks the active overlay's, which is what 'like the other' means"
+        );
+        assert!(d.recent_colors.is_empty());
+        assert!(d.color_picker_hotkey.is_empty(), "the global hotkey ships UNBOUND");
+        // DRAGON-615: a fresh install opens the magnifier exactly where it always did, so
+        // persisting the zoom changes nothing for anyone who has not touched it.
+        assert_eq!(
+            d.color_picker_zoom,
+            crate::app::color_picker::geom::MAGNIFIER_ZOOM_DEFAULT,
+            "the stored default must be the picker's own opening lens"
+        );
+    }
+
+    /// DRAGON-615: an existing config predates the zoom key entirely, and must read as the
+    /// default rather than as a zero that would ask for no magnification at all. This is the
+    /// "do not write the default eagerly" contract seen from the load side.
+    #[test]
+    fn a_config_without_the_zoom_key_reads_as_the_default() {
+        let p: Persisted =
+            toml::from_str("record_fps = 30\n").expect("an old config still deserializes");
+        assert_eq!(
+            p.color_picker_zoom,
+            crate::app::color_picker::geom::MAGNIFIER_ZOOM_DEFAULT
+        );
+        assert_eq!(p.record_fps, 30, "and the keys it DOES have are untouched");
+    }
+
+    /// DRAGON-615: a zoom the user actually chose survives a save and load unchanged. The
+    /// canary style of `config_roundtrips_with_populated_covermark_prefs`: it is a scalar
+    /// declared after an array, which is the shape TOML is fussy about.
+    #[test]
+    fn a_chosen_zoom_roundtrips() {
+        let mut p = defaults();
+        p.color_picker_zoom = crate::app::color_picker::geom::MAGNIFIER_ZOOM_MAX;
+        let s = toml::to_string(&p).expect("serialize must succeed");
+        let back: Persisted = toml::from_str(&s).expect("deserialize must succeed");
+        assert_eq!(
+            back.color_picker_zoom,
+            crate::app::color_picker::geom::MAGNIFIER_ZOOM_MAX
+        );
     }
 
     // The real reset mechanism: `load()` falls back to `defaults()` if `toml::from_str`
@@ -355,9 +485,10 @@ record_fps = 60\n";
         assert!(d.cloud_auto_share);
         // DRAGON-174: the new toolbar-hiding setting defaults OFF (do not hide).
         assert!(!d.hide_toolbar_fullscreen);
-        // Residency defaults on where the global hotkey needs the daemon (macOS AND Windows,
-        // DRAGON-296); Linux stays one-shot. The login-item seed markers always start unset.
-        assert_eq!(d.resident, cfg!(any(target_os = "macos", target_os = "windows")));
+        // DRAGON-584: residency defaults ON everywhere now, Linux included (the tray is the
+        // app's primary launcher there, and on COSMIC it is the only live-recording control).
+        // The login-item seed markers always start unset.
+        assert!(d.resident);
         // DRAGON-296: launch-at-login defaults ON (gated by `resident` at reconcile time).
         assert!(d.autostart_on_login);
         assert!(!d.mac_login_item_seeded);
@@ -426,14 +557,17 @@ record_fps = 60\n";
     fn legacy_ron_still_parses() {
         let on_disk = "(region: Some((10, 20, 110, 220)), delay_idx: 3, config_version: 2, \
                         pw_restore_token: Some(\"tok\"), \
-                        shortcuts: [(CopyText, None)])";
+                        shortcuts: [(PreviewCopy, None)])";
         let p: Persisted = ron::from_str(on_disk).expect("old RON must still parse");
         assert_eq!(p.region, Some((10, 20, 110, 220)));
         assert_eq!(p.delay_idx, 3);
         assert_eq!(p.pw_restore_token.as_deref(), Some("tok"));
-        // The legacy TUPLE shortcut-override shape (incl. an unbound None) survives.
+        // The legacy TUPLE shortcut-override shape (incl. an unbound None) survives. The
+        // action named has to be one this build still HAS: DRAGON-627 retired `CopyText`,
+        // which stood here, and a retired name is dropped by design (see the tolerant-parse
+        // tests below), which would have made this assert nothing.
         assert_eq!(p.shortcuts.len(), 1);
-        assert_eq!(p.shortcuts[0].0, crate::shortcuts::Action::CopyText);
+        assert_eq!(p.shortcuts[0].0, crate::shortcuts::Action::PreviewCopy);
         assert!(p.shortcuts[0].1.is_none());
     }
 
@@ -445,21 +579,23 @@ record_fps = 60\n";
         let mut p = defaults();
         p.region = Some((-1920, 0, 236, 902)); // negative coords (left-of-primary)
         p.settings_size = Some((2542, 1384));
-        p.pw_restore_token = Some("yxxZ".into());
+        p.pw_restore_token_monitor = Some("yxxZ".into());
+        p.pw_restore_token_window = Some("wxxW".into());
         p.record_bitrate_kbps = 2500;
         p.record_dir = "~/Videos".into();
         p.av_calibration_base_ms = -260;
-        p.shortcuts = vec![(crate::shortcuts::Action::CopyText, None)];
+        p.shortcuts = vec![(crate::shortcuts::Action::PreviewCopy, None)];
         let s = toml::to_string(&p).expect("serialize");
         let q: Persisted = toml::from_str(&s).expect("parse back");
         assert_eq!(q.region, p.region);
         assert_eq!(q.settings_size, p.settings_size);
-        assert_eq!(q.pw_restore_token, p.pw_restore_token);
+        assert_eq!(q.pw_restore_token_monitor, p.pw_restore_token_monitor);
+        assert_eq!(q.pw_restore_token_window, p.pw_restore_token_window);
         assert_eq!(q.record_bitrate_kbps, 2500);
         assert_eq!(q.record_dir, "~/Videos");
         assert_eq!(q.av_calibration_base_ms, -260);
         assert_eq!(q.shortcuts.len(), 1);
-        assert_eq!(q.shortcuts[0].0, crate::shortcuts::Action::CopyText);
+        assert_eq!(q.shortcuts[0].0, crate::shortcuts::Action::PreviewCopy);
         assert!(q.shortcuts[0].1.is_none());
     }
 
@@ -474,18 +610,90 @@ record_fps = 60\n";
                        [[shortcuts]]\n\
                        action = \"FocusSearch\"\n\
                        [[shortcuts]]\n\
-                       action = \"CopyText\"\n";
+                       action = \"PreviewCovermark\"\n";
         let p: Persisted = toml::from_str(on_disk).expect("stale override must not fail the parse");
         assert_eq!(p.record_dir, "~/Videos", "other settings survive");
         assert_eq!(p.shortcuts.len(), 1, "only the removed action's entry drops");
-        assert_eq!(p.shortcuts[0].0, crate::shortcuts::Action::CopyText);
+        assert_eq!(p.shortcuts[0].0, crate::shortcuts::Action::PreviewCovermark);
 
         let legacy = "(record_dir: \"~/Videos\", \
-                      shortcuts: [(PreviewNoAi, None), (CopyText, None)])";
+                      shortcuts: [(PreviewNoAi, None), (PreviewCovermark, None)])";
         let q: Persisted = ron::from_str(legacy).expect("stale RON override must not fail");
         assert_eq!(q.record_dir, "~/Videos");
         assert_eq!(q.shortcuts.len(), 1);
-        assert_eq!(q.shortcuts[0].0, crate::shortcuts::Action::CopyText);
+        assert_eq!(q.shortcuts[0].0, crate::shortcuts::Action::PreviewCovermark);
+    }
+
+    // DRAGON-617 BAKED five actions (Save, Upload, Close, Undo, Redo), the biggest single drop
+    // the tolerant parse has had to absorb. A keymap saved by an older build can name all five
+    // AND carry the user's real customisations beside them, so this pins the thing that
+    // actually matters: the five fall away and everything else the user changed survives,
+    // rather than one stale name resetting the whole config through load_raw's defaults.
+    #[test]
+    fn the_baked_five_drop_and_the_users_other_bindings_survive() {
+        use crate::shortcuts::Action;
+        let mut on_disk = String::from("record_dir = \"~/Videos\"\nrecord_fps = 60\n");
+        for baked in ["PreviewSave", "PreviewUpload", "PreviewCancel", "PreviewUndo", "PreviewRedo"]
+        {
+            on_disk.push_str(&format!("[[shortcuts]]\naction = \"{baked}\"\n"));
+        }
+        // A real customisation, sitting AFTER the stale entries, so a parse that gave up part
+        // way through would lose it.
+        on_disk.push_str(
+            "[[shortcuts]]\naction = \"PreviewCopy\"\n[shortcuts.shortcut]\nctrl = true\n\
+             key = { Char = \"q\" }\n",
+        );
+        let p: Persisted =
+            toml::from_str(&on_disk).expect("five stale overrides must not fail the parse");
+        assert_eq!(p.record_dir, "~/Videos", "settings before the stale block survive");
+        assert_eq!(p.record_fps, 60);
+        assert_eq!(p.shortcuts.len(), 1, "exactly the five baked entries drop");
+        assert_eq!(p.shortcuts[0].0, Action::PreviewCopy);
+        assert!(p.shortcuts[0].1.is_some(), "the surviving override keeps its chord");
+
+        // The legacy RON shape drops them too, since that is the format a long-installed
+        // config is most likely to still be in.
+        let legacy = "(record_dir: \"~/Videos\", shortcuts: [(PreviewUndo, None), \
+                      (PreviewRedo, None), (PreviewCovermark, None)])";
+        let q: Persisted = ron::from_str(legacy).expect("stale RON overrides must not fail");
+        assert_eq!(q.shortcuts.len(), 1);
+        assert_eq!(q.shortcuts[0].0, Action::PreviewCovermark);
+    }
+
+    // DRAGON-627 BAKED the scanner's three OCR text actions. They are the OLDEST names the
+    // tolerant parse has had to absorb (`CopyText` / `SelectAllText` / `DeselectText` shipped
+    // in the first build), so a long-lived config is the likeliest place to still hold one,
+    // and one stale name must not reset every other setting through load_raw's defaults.
+    #[test]
+    fn the_baked_ocr_three_drop_and_the_users_other_bindings_survive() {
+        use crate::shortcuts::Action;
+        let mut on_disk = String::from("record_dir = \"~/Videos\"\nrecord_fps = 60\n");
+        for baked in ["CopyText", "SelectAllText", "DeselectText"] {
+            on_disk.push_str(&format!("[[shortcuts]]\naction = \"{baked}\"\n"));
+        }
+        // A real customisation, sitting AFTER the stale entries, so a parse that gave up part
+        // way through would lose it. It is deliberately on primary+C, the chord `CopyText`
+        // used to hold: the two never collided (different surfaces) and the rebind must
+        // survive the removal exactly as it was.
+        on_disk.push_str(
+            "[[shortcuts]]\naction = \"PreviewCopy\"\n[shortcuts.shortcut]\nctrl = true\n\
+             key = { Char = \"c\" }\n",
+        );
+        let p: Persisted =
+            toml::from_str(&on_disk).expect("three stale overrides must not fail the parse");
+        assert_eq!(p.record_dir, "~/Videos", "settings before the stale block survive");
+        assert_eq!(p.record_fps, 60);
+        assert_eq!(p.shortcuts.len(), 1, "exactly the three baked entries drop");
+        assert_eq!(p.shortcuts[0].0, Action::PreviewCopy);
+        assert!(p.shortcuts[0].1.is_some(), "the surviving override keeps its chord");
+
+        // And in the legacy RON shape, beside a live entry, for the same reason.
+        let legacy = "(record_dir: \"~/Videos\", shortcuts: [(SelectAllText, None), \
+                      (DeselectText, None), (PreviewCovermark, None)])";
+        let q: Persisted = ron::from_str(legacy).expect("stale RON overrides must not fail");
+        assert_eq!(q.record_dir, "~/Videos");
+        assert_eq!(q.shortcuts.len(), 1);
+        assert_eq!(q.shortcuts[0].0, Action::PreviewCovermark);
     }
 
     // DRAGON-392 RENAMED an action (`PreviewTogglePan` → `PreviewAnnotHand`, when panning became
@@ -515,6 +723,8 @@ record_fps = 60\n";
         assert!(!has_key("region ="), "None region must be omitted, got: {s}");
         assert!(!has_key("settings_size ="));
         assert!(!has_key("pw_restore_token ="));
+        assert!(!has_key("pw_restore_token_monitor ="));
+        assert!(!has_key("pw_restore_token_window ="));
         let q: Persisted = toml::from_str(&s).expect("parse back");
         assert_eq!(q.region, None);
         assert_eq!(q.settings_size, None);
@@ -529,8 +739,11 @@ record_fps = 60\n";
         let d = defaults();
         #[cfg(windows)]
         assert!(d.resident, "Windows residency defaults on (DRAGON-296)");
+        // DRAGON-584: Linux joined them. It defaulted off while the one-shot model plus a
+        // COSMIC PrintScreen shortcut was the whole story; the tray is now the primary
+        // launcher and, on COSMIC, the only control for a live recording.
         #[cfg(target_os = "linux")]
-        assert!(!d.resident, "Linux stays one-shot");
+        assert!(d.resident, "Linux residency defaults on too (DRAGON-584)");
         assert!(!d.win_login_item_seeded, "the seed marker starts unset");
         let mut p = defaults();
         p.win_login_item_seeded = true;
@@ -711,6 +924,144 @@ record_fps = 60\n";
         // Colours land on the new defaults for every style.
         assert_eq!(s3.active_border_color, None);
         assert_eq!(s3.inactive_border_color, [65, 69, 80, 255]);
+    }
+
+    #[test]
+    fn migrate_v11_lands_the_legacy_token_in_its_matching_slot() {
+        // DRAGON-570: the legacy single pair routes into the slot its recorded
+        // source names, in BOTH directions, and is consumed (never written again).
+        let mut m = defaults();
+        m.config_version = 10;
+        m.pw_restore_token = Some("mtok".into());
+        m.pw_restore_source = Some("monitor".into());
+        migrate(&mut m);
+        assert_eq!(m.config_version, CONFIG_VERSION);
+        assert_eq!(m.pw_restore_token_monitor.as_deref(), Some("mtok"));
+        assert_eq!(m.pw_restore_token_window, None, "the other slot stays empty");
+        assert_eq!(m.pw_restore_token, None, "the legacy token is consumed");
+        assert_eq!(m.pw_restore_source, None);
+
+        let mut w = defaults();
+        w.config_version = 10;
+        w.pw_restore_token = Some("wtok".into());
+        w.pw_restore_source = Some("window".into());
+        migrate(&mut w);
+        assert_eq!(w.pw_restore_token_window.as_deref(), Some("wtok"));
+        assert_eq!(w.pw_restore_token_monitor, None);
+        assert_eq!(w.pw_restore_token, None);
+    }
+
+    #[test]
+    fn migrate_v11_drops_a_legacy_token_with_no_or_unknown_source() {
+        // A token whose source was never recorded (pre-DRAGON-544) or is not a
+        // slot we request ("virtual") never replayed under the old gate either,
+        // so it lands nowhere: one portal prompt, then the slot self-heals.
+        for src in [None, Some("virtual".to_string()), Some("garbage".to_string())] {
+            let mut p = defaults();
+            p.config_version = 10;
+            p.pw_restore_token = Some("tok".into());
+            p.pw_restore_source = src;
+            migrate(&mut p);
+            assert_eq!(p.pw_restore_token_monitor, None);
+            assert_eq!(p.pw_restore_token_window, None);
+            assert_eq!(p.pw_restore_token, None, "consumed either way");
+        }
+    }
+
+    #[test]
+    fn migrate_v11_never_clobbers_an_already_filled_slot() {
+        // Defensive: a hand-edited pre-v11 file carrying both the legacy pair and
+        // a new slot keeps the slot (the newer grant); the legacy token drops.
+        let mut p = defaults();
+        p.config_version = 10;
+        p.pw_restore_token = Some("stale".into());
+        p.pw_restore_source = Some("monitor".into());
+        p.pw_restore_token_monitor = Some("fresh".into());
+        migrate(&mut p);
+        assert_eq!(p.pw_restore_token_monitor.as_deref(), Some("fresh"));
+    }
+
+    #[test]
+    fn migrate_v12_resets_a_concrete_encoder_to_auto_and_seeds_the_hint() {
+        // DRAGON-571: pre-v12 builds persisted the auto-RESOLVED encoder as if the
+        // user chose it, so a pre-v12 concrete id cannot be trusted as intent. It
+        // resets to "auto" once, seeding the last-known-good hint so a config whose
+        // auto-pick was correct keeps its single-probe happy path.
+        let mut p = defaults();
+        p.config_version = 11;
+        p.preferred_encoder = "nvenc".to_string();
+        migrate(&mut p);
+        assert_eq!(p.config_version, CONFIG_VERSION);
+        assert_eq!(p.preferred_encoder, "auto");
+        assert_eq!(p.encoder_auto_hint, "nvenc");
+    }
+
+    #[test]
+    fn migrate_v12_resets_a_software_pin_too() {
+        // The mis-pinned "software" config this migration exists for resets like any
+        // other concrete id. Its hint seed is harmless: the probe order ignores
+        // software hints (see `encode::auto_probe_order`), so the next auto
+        // resolution walks the full ladder and recovers the hardware encoder.
+        let mut p = defaults();
+        p.config_version = 11;
+        p.preferred_encoder = "software".to_string();
+        migrate(&mut p);
+        assert_eq!(p.preferred_encoder, "auto");
+        assert_eq!(p.encoder_auto_hint, "software");
+    }
+
+    #[test]
+    fn migrate_v12_leaves_auto_and_an_existing_hint_alone() {
+        // "auto" has nothing to reset and must not invent a hint.
+        let mut p = defaults();
+        p.config_version = 11;
+        migrate(&mut p);
+        assert_eq!(p.preferred_encoder, "auto");
+        assert_eq!(p.encoder_auto_hint, "");
+        // A pre-v12 file that somehow already carries a hint keeps it: the hint may
+        // be fresher than the stale pick it would be seeded from.
+        let mut q = defaults();
+        q.config_version = 11;
+        q.preferred_encoder = "software".to_string();
+        q.encoder_auto_hint = "vaapi".to_string();
+        migrate(&mut q);
+        assert_eq!(q.preferred_encoder, "auto");
+        assert_eq!(q.encoder_auto_hint, "vaapi");
+    }
+
+    #[test]
+    fn migrate_v12_runs_once_a_current_concrete_pick_is_user_intent() {
+        // The other direction: from v12 on, only a real settings-picker click writes
+        // a concrete id, so a current config's pick must survive every later load
+        // untouched (the one-time reset never repeats).
+        let mut p = defaults();
+        p.preferred_encoder = "nvenc".to_string(); // config_version is already current
+        migrate(&mut p);
+        assert_eq!(p.preferred_encoder, "nvenc", "a post-v12 concrete id is user intent");
+        assert_eq!(p.encoder_auto_hint, "");
+    }
+
+    #[test]
+    fn legacy_restore_pair_is_never_written_again() {
+        // The retired pair is skip_serializing: even a struct that still carries
+        // values (mid-migration state) writes only the per-source slots. Key-LINE
+        // matching, because "pw_restore_token_monitor" contains the legacy name as
+        // a substring.
+        let mut p = defaults();
+        p.pw_restore_token = Some("stale".into());
+        p.pw_restore_source = Some("monitor".into());
+        p.pw_restore_token_monitor = Some("kept".into());
+        let s = toml::to_string(&p).expect("serialize");
+        let has_key = |k: &str| s.lines().any(|l| l.trim_start().starts_with(k));
+        assert!(!has_key("pw_restore_token ="), "legacy token written: {s}");
+        assert!(!has_key("pw_restore_source"), "legacy source written: {s}");
+        assert!(has_key("pw_restore_token_monitor ="), "the slot IS written: {s}");
+        // And a config that still carries the legacy keys on disk parses them for
+        // the migration (the read direction stays alive).
+        let old = "pw_restore_token = \"tok\"\npw_restore_source = \"window\"\n";
+        let mut q: Persisted = toml::from_str(old).expect("legacy keys must still parse");
+        migrate(&mut q);
+        assert_eq!(q.pw_restore_token_window.as_deref(), Some("tok"));
     }
 
     /// **ALL SIX preview-editor toggles default ON, on BOTH media kinds** (DRAGON-467, owner's

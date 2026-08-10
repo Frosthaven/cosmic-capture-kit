@@ -12,13 +12,28 @@
 //! END of a capture: instead of opening its OWN preview, the child hands the finished
 //! file to a live host and exits.
 //!
-//! ## The one rule: never lose the user's capture
+//! ## The one rule: never lose what the user asked for
 //!
 //! A handoff is an OPTIMISATION, never a dependency. EVERY failure mode — no host, a
 //! host that is exiting, a wedged host, a version-mismatched host, a refused connect, a
 //! platform with no transport — surfaces as an `Err` from [`send_to_host`], and the
 //! caller's ONLY correct response is to open its own preview exactly as it does today.
 //! Nothing here may ever consume a capture without a positive acknowledgement.
+//!
+//! **This is ONE rule, not a list of handled cases, and that is what makes it structural**
+//! (DRAGON-613). The three situations that look like they need their own handling all
+//! collapse into it. A picker window that has JUST CLOSED cleared its marker and unlinked
+//! its socket in `finish_session` before exiting, so the scan finds nothing: `NoHost`. One
+//! that is MID-CLOSE may still have both on disk and may still accept a connection, but its
+//! `Ack` drops unaccepted when its channel dies, so the sender reads EOF: `NotAccepted`. Any
+//! OTHER failure is already one of those two. There is no fourth answer to write, because
+//! every branch ends at the same place: the sender does the job itself, which is exactly
+//! what it did before any of this existed, and says in the log why. So a colour can no more
+//! vanish than a capture can, and neither can vanish SILENTLY.
+//!
+//! One thing the rule relies on and is worth naming: a peer in a DIFFERENT user session is
+//! not discoverable at all, because the runtime dir is per-user and every candidate is
+//! liveness-probed by pid before it is offered.
 //!
 //! ## Transport
 //!
@@ -41,12 +56,24 @@
 //! line, in the plain-words spirit of [`crate::daemon_ipc`]:
 //!
 //! ```text
-//! child -> host: cck-preview 1 open path=<hex> video=<0|1> dims=<WxH|-> scale=<f32> external=<0|1> size=<u64|->
+//! child -> host: cck-preview 3 open path=<hex> video=<0|1> dims=<WxH|-> scale=<f32> external=<0|1> size=<u64|->
+//! child -> host: cck-preview 3 color to=<editor|picker> rgb=<RRGGBB>
 //! host  -> child: ok
 //!                 err version | err parse | err busy
 //! ```
 //!
-//! * **Versioned**: the `1` is [`PROTOCOL_VERSION`], checked BEFORE the verb, so a
+//! * **Two verbs** ([`Request`]). `open` hands over a finished capture. `color` (DRAGON-587)
+//!   hands a picked colour to whoever it is FOR: every picker launch is its own process, so
+//!   "put this colour where it belongs" is a cross-process message of exactly this shape.
+//! * **`color` carries its DESTINATION** ([`ColorDest`], DRAGON-613), and the two
+//!   destinations are found in opposite ways on purpose. `to=editor` is ADDRESSED
+//!   ([`send_color_to_pid`], the pid rides the launch), so an editor's pick can never reach
+//!   an editor that did not ask for it. `to=picker` is SEARCHED for
+//!   ([`send_color_to_picker`], via [`crate::instance::live_color_picker_windows`]), because
+//!   the colour picker window is a singleton the user thinks of as one thing no matter which
+//!   process owns it. A host handed a destination it cannot serve REFUSES, and the sender's
+//!   answer to a refusal is the same as to every other failure below: do the job itself.
+//! * **Versioned**: the `2` is [`PROTOCOL_VERSION`], checked BEFORE the verb, so a
 //!   mismatched pair fails cleanly (`err version`) instead of half-parsing a future
 //!   line. Bump it on ANY change to the field set or shape.
 //! * **`path` is hex** (lowercase, raw bytes): a path may contain spaces, newlines, or
@@ -102,12 +129,12 @@
 //!
 //! **Host side**
 //! 1. [`start_host`] is called from `App::preview_surface_for` (the ONE choke point every
-//!    preview mint routes through), storing the [`PreviewHost`] in `App::preview_host`. It
+//!    preview mint routes through), storing the [`PreviewHost`] in `App::handoff_host`. It
 //!    binds BEFORE `instance::set_preview_marker(true)`, so a marker a child discovers
 //!    always implies a bound socket, and it is idempotent — re-mints keep the one listener.
 //!    `App::finish_session` drops it (its `Drop` unlinks the socket) as the process ends.
 //! 2. `App::sub_preview_handoff` (`app/subscriptions.rs`) is a 100ms tick gated on
-//!    `self.preview_host.is_some()`, emitting `Msg::Capture(CaptureMsg::HandoffPoll)`. The
+//!    `self.handoff_host.is_some()`, emitting `Msg::Capture(CaptureMsg::HandoffPoll)`. The
 //!    poll lives in the CAPTURE domain because it has no preview to address — it may be
 //!    what creates the first one, and `Msg::Preview` carries a `window::Id`.
 //! 3. `App::drain_preview_handoffs` (`preview/open.rs`) drains with `try_recv`, opens each
@@ -154,7 +181,22 @@ const MAGIC: &str = "cck-preview";
 /// interpreted, so a child and host from different builds fail cleanly (`err version` →
 /// the child opens its own preview) instead of misparsing each other. Bump on ANY change
 /// to the request line's field set, shape, or field semantics.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// `2` since DRAGON-587 added the `color` verb (a colour picker launched BY an editor hands
+/// its pick back to that editor). The verb set is part of the shape, so it takes the bump,
+/// and a mixed pair simply falls back the way it always has.
+///
+/// `3` since DRAGON-613 gave the `color` verb its `to=` DESTINATION, because a picked colour
+/// now has two possible consumers (an editor's swatch, or the one colour picker window) and
+/// a receiver must never have to guess which it is holding.
+///
+/// **A mixed pair degrades cleanly, which matters because a user mid-upgrade IS one.** The
+/// version is checked before the verb, so an old host answers a new sender `err version` and
+/// a new host answers an old sender the same. Both sides read that as "not accepted", and
+/// every "not accepted" in this module has exactly one meaning: the sender does the job
+/// itself. So a v2 picker window plus a v3 pick simply opens a second window, which is the
+/// behaviour that shipped before this feature, never a lost colour and never a lost capture.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Longest request/reply line accepted, in bytes. A path is the only unbounded field and
 /// hex-doubles, so 64 KiB is ~32 KiB of path — far past any real one, while keeping a
@@ -293,6 +335,133 @@ impl OpenRequest {
             external: external.ok_or(WireError::Malformed)?,
             size: size.ok_or(WireError::Malformed)?,
         })
+    }
+}
+
+/// What one request line ASKS FOR. One socket, one protocol, two verbs (DRAGON-587).
+///
+/// The second verb exists because the colour picker launched from a preview editor's pipette
+/// is a separate PROCESS (every picker launch is), and its whole purpose is to put a colour
+/// into the editor that asked for it. That is the same shape as a handoff, at the same
+/// address, so it rides this socket rather than growing a second channel: the DRAGON-583
+/// lesson, where the recording relay gained an address instead of a fork.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Request {
+    /// `open`: take ownership of a finished capture and show it.
+    Open(OpenRequest),
+    /// `color`: deliver a picked sRGB triple to the consumer named by [`ColorDest`].
+    ///
+    /// Carries the colour and WHO IT IS FOR, and nothing else (DRAGON-613). The destination
+    /// is on the wire rather than inferred by the receiver from its own identity, because
+    /// "who is this value for" is the property being modelled: a host that is handed a
+    /// destination it cannot serve REFUSES, which the sender turns into doing the job
+    /// itself, instead of quietly applying a colour somewhere nobody asked for.
+    Color {
+        /// Which consumer this colour belongs to.
+        to: ColorDest,
+        /// The picked colour, straight sRGB.
+        rgb: [u8; 3],
+    },
+}
+
+/// Who a picked colour is FOR (DRAGON-613): the wire form of
+/// `app::color_picker::PickDestination`.
+///
+/// It is a DESTINATION rather than a source on purpose. Keying on "which UI opened the
+/// picker" means every future consumer has to be special-cased at every site that handles a
+/// pick; keying on who the value is for means a new consumer adds one variant, one wire
+/// word, and one arm in the drain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorDest {
+    /// A preview editor's annotation swatch. The pick belongs to the editor whose pipette
+    /// launched this picker, addressed by ITS pid, so it can never reach an unrelated one.
+    Editor,
+    /// The colour picker's own result window: this becomes the colour it shows and the
+    /// newest entry in its recents.
+    PickerWindow,
+}
+
+impl ColorDest {
+    /// The wire word. One plain word, like every other value in this protocol.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ColorDest::Editor => "editor",
+            ColorDest::PickerWindow => "picker",
+        }
+    }
+
+    /// The inverse of [`Self::as_str`]. `None` for anything else, which parses as
+    /// malformed rather than defaulting: guessing a destination is exactly the failure
+    /// this field exists to prevent.
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "editor" => Some(ColorDest::Editor),
+            "picker" => Some(ColorDest::PickerWindow),
+            _ => None,
+        }
+    }
+}
+
+impl Request {
+    /// Encode as the single newline-terminated request line the host parses.
+    pub fn encode(&self) -> String {
+        match self {
+            Request::Open(r) => r.encode(),
+            Request::Color { to, rgb: [r, g, b] } => {
+                format!(
+                    "{MAGIC} {PROTOCOL_VERSION} color to={} rgb={r:02x}{g:02x}{b:02x}\n",
+                    to.as_str()
+                )
+            }
+        }
+    }
+
+    /// Parse one request line, whichever verb it carries.
+    ///
+    /// The version is checked FIRST, before the verb, for the reason [`OpenRequest::parse`]
+    /// gives: a future protocol must report [`WireError::Version`] rather than look like
+    /// corruption. An unknown verb is [`WireError::Malformed`].
+    pub fn parse(line: &str) -> Result<Self, WireError> {
+        let mut it = line.split_whitespace();
+        if it.next() != Some(MAGIC) {
+            return Err(WireError::Malformed);
+        }
+        let ver: u32 = it.next().and_then(|v| v.parse().ok()).ok_or(WireError::Malformed)?;
+        if ver != PROTOCOL_VERSION {
+            return Err(WireError::Version(ver));
+        }
+        match it.next() {
+            // Re-parsed from the whole line so the `open` verb keeps ONE parser, the strict
+            // one with its exhaustive closed field set.
+            Some("open") => OpenRequest::parse(line).map(Request::Open),
+            Some("color") => {
+                // Order-independent, exhaustive and closed, exactly like `open`: every field
+                // exactly once, no unknown key. A `color` line missing its destination is
+                // malformed rather than defaulted, because a colour applied to a guessed
+                // consumer is precisely the silent wrongness this protocol exists to avoid.
+                let mut to: Option<ColorDest> = None;
+                let mut rgb: Option<[u8; 3]> = None;
+                for tok in it {
+                    let (key, val) = tok.split_once('=').ok_or(WireError::Malformed)?;
+                    match key {
+                        "to" => set(&mut to, ColorDest::parse(val).ok_or(WireError::Malformed)?)?,
+                        "rgb" => {
+                            let bytes = hex_decode(val).ok_or(WireError::Malformed)?;
+                            let [r, g, b] = bytes[..] else {
+                                return Err(WireError::Malformed);
+                            };
+                            set(&mut rgb, [r, g, b])?
+                        }
+                        _ => return Err(WireError::Malformed),
+                    }
+                }
+                Ok(Request::Color {
+                    to: to.ok_or(WireError::Malformed)?,
+                    rgb: rgb.ok_or(WireError::Malformed)?,
+                })
+            }
+            _ => Err(WireError::Malformed),
+        }
     }
 }
 
@@ -456,8 +625,12 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 /// inherited by a spawned child (ffmpeg, a capture grandchild) would hold the ack channel
 /// open past the process that owns it, and the child's fallback rides on exactly that
 /// EOF. Cheap, idempotent, and unit-tested.
+///
+/// `pub(crate)` since DRAGON-583: the recording-control inlet in [`crate::daemon_ipc`] is
+/// the same kind of runtime-dir unix socket under the same rule, and one tested helper is
+/// better than a second copy of it.
 #[cfg(unix)]
-fn ensure_cloexec<F: std::os::fd::AsFd>(fd: &F) -> std::io::Result<()> {
+pub(crate) fn ensure_cloexec<F: std::os::fd::AsFd>(fd: &F) -> std::io::Result<()> {
     use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
     let flags = fcntl_getfd(fd)?;
     if !flags.contains(FdFlags::CLOEXEC) {
@@ -504,14 +677,14 @@ impl Ack {
 /// One inbound handoff: the parsed request plus the [`Ack`] that answers it.
 #[cfg(unix)]
 pub struct Handoff {
-    request: OpenRequest,
+    request: Request,
     ack: Ack,
 }
 
 #[cfg(unix)]
 impl Handoff {
-    /// The capture being handed over.
-    pub fn request(&self) -> &OpenRequest {
+    /// What is being asked of this host.
+    pub fn request(&self) -> &Request {
         &self.request
     }
 
@@ -568,9 +741,20 @@ impl Drop for PreviewHost {
 /// implies a socket that already exists.
 #[cfg(unix)]
 pub fn start_host() -> std::io::Result<PreviewHost> {
+    start_host_at(crate::instance::preview_socket_path(std::process::id()))
+}
+
+/// [`start_host`] against an EXPLICIT socket path, so a process that is not a preview host
+/// can listen on the same protocol at its OWN address (DRAGON-613: the colour picker
+/// window listens at `instance::color_picker_socket_path`).
+///
+/// Generalised rather than copied for the reason `instance::live_marker_hosts_in` was: the
+/// bind, the cloexec repair, the accept thread and the unlink-on-drop are the transport, not
+/// the preview, and two copies of them would be two things to keep in step.
+#[cfg(unix)]
+pub fn start_host_at(path: String) -> std::io::Result<PreviewHost> {
     use std::os::unix::net::UnixListener;
 
-    let path = crate::instance::preview_socket_path(std::process::id());
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
     ensure_cloexec(&listener)?;
@@ -613,7 +797,7 @@ fn accept_loop(
             Err(_) => continue, // EOF / timeout / I/O: drop it, the child falls back
         };
         let ack = Ack(Some(stream));
-        match OpenRequest::parse(&line) {
+        match Request::parse(&line) {
             Ok(request) => {
                 // A dropped receiver means the host has stopped hosting: the returned
                 // `Handoff` (and its `Ack`) drops here, closing the connection with no
@@ -705,6 +889,7 @@ pub fn send_to_host(req: &OpenRequest) -> Result<u32, HandoffError> {
         return Err(HandoffError::NoHost);
     }
     let mut last: Option<String> = None;
+    let req = Request::Open(req.clone());
     for pid in hosts {
         let path = crate::instance::preview_socket_path(pid);
         // A marker with no socket isn't a host at all (an older build's preview, or a
@@ -712,7 +897,7 @@ pub fn send_to_host(req: &OpenRequest) -> Result<u32, HandoffError> {
         if !std::path::Path::new(&path).exists() {
             continue;
         }
-        match send_to_socket(&path, req) {
+        match send_to_socket(&path, &req) {
             Ok(()) => return Ok(pid),
             Err(why) => {
                 log::info!("preview handoff to pid {pid} failed: {why}");
@@ -724,6 +909,85 @@ pub fn send_to_host(req: &OpenRequest) -> Result<u32, HandoffError> {
         Some(why) => Err(HandoffError::NotAccepted(why)),
         None => Err(HandoffError::NoHost),
     }
+}
+
+/// Hand a picked colour to ONE named preview host (DRAGON-587): the editor whose pipette
+/// launched this picker, and no other.
+///
+/// Addressed by pid rather than searched for, which is the whole point. A pick started from
+/// the tray, the CLI or a keybinding has no target and never calls this; a pick started by an
+/// editor targets THAT editor, so it can never reach into an unrelated one that happens to be
+/// open. The pid rides the launch (`color_picker::COLOR_TO_PID_ENV`).
+///
+/// `Err` for every failure, including the ordinary one where the editor has since closed.
+/// The caller's response is to carry on and show the picked colour its usual way; nothing
+/// here may be treated as a lost pick.
+#[cfg(unix)]
+pub fn send_color_to_pid(pid: u32, rgb: [u8; 3]) -> Result<(), HandoffError> {
+    let path = crate::instance::preview_socket_path(pid);
+    if !std::path::Path::new(&path).exists() {
+        return Err(HandoffError::NoHost);
+    }
+    send_to_socket(&path, &Request::Color { to: ColorDest::Editor, rgb })
+        .map_err(HandoffError::NotAccepted)
+}
+
+/// Windows stub: no unix socket, so an editor-launched pick simply shows its own result
+/// window, exactly as every other pick does.
+#[cfg(not(unix))]
+pub fn send_color_to_pid(_pid: u32, _rgb: [u8; 3]) -> Result<(), HandoffError> {
+    Err(HandoffError::Unsupported)
+}
+
+/// Hand a picked colour to the EXISTING colour picker window, wherever it is (DRAGON-613).
+///
+/// The twin of [`send_color_to_pid`] and its deliberate opposite in one respect: an editor's
+/// pick is ADDRESSED, because it must reach the one editor that asked for it, while a
+/// general pick is SEARCHED for, because "the colour picker window" is a singleton the user
+/// thinks of as one thing regardless of which process happens to own it this time.
+///
+/// Returns the pid that took it. `Err` for every failure, including the ordinary ones where
+/// no window is open or the open one is mid-close, and the caller's only correct response is
+/// the same in all of them: open a window of its own, exactly as it did before this existed.
+#[cfg(unix)]
+pub fn send_color_to_picker(rgb: [u8; 3]) -> Result<u32, HandoffError> {
+    let windows = crate::instance::live_color_picker_windows();
+    if windows.is_empty() {
+        return Err(HandoffError::NoHost);
+    }
+    let req = Request::Color { to: ColorDest::PickerWindow, rgb };
+    let mut last: Option<String> = None;
+    for pid in windows {
+        let path = crate::instance::color_picker_socket_path(pid);
+        // A marker with no socket is not a listening window at all (a picker from an older
+        // build, or one whose bind failed) — skip without counting it as a refusal.
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        match send_to_socket(&path, &req) {
+            Ok(()) => return Ok(pid),
+            Err(why) => {
+                log::info!("color handoff to picker window at pid {pid} failed: {why}");
+                last = Some(why);
+            }
+        }
+    }
+    match last {
+        Some(why) => Err(HandoffError::NotAccepted(why)),
+        None => Err(HandoffError::NoHost),
+    }
+}
+
+/// Windows stub: no unix-socket transport, so every pick opens its own window there, exactly
+/// as it does today (DRAGON-613).
+///
+/// Deliberately a stub and not a pretend success. A Windows transport is a real option and
+/// its shape is already established: it would mirror `daemon_ipc`'s named-pipe split
+/// (`daemon_ipc::pipe_name`) behind this same seam, which is the same note the module doc
+/// carries for the capture handoff. Nothing else in this feature would change.
+#[cfg(not(unix))]
+pub fn send_color_to_picker(_rgb: [u8; 3]) -> Result<u32, HandoffError> {
+    Err(HandoffError::Unsupported)
 }
 
 /// Windows stub: there is no unix socket, so a capture always opens its own preview,
@@ -749,7 +1013,7 @@ pub const fn host_supported() -> bool {
 /// [`send_to_host`] so the whole exchange is testable against a socket in a temp dir,
 /// with no dependency on the real runtime dir.
 #[cfg(unix)]
-fn send_to_socket(path: &str, req: &OpenRequest) -> Result<(), String> {
+fn send_to_socket(path: &str, req: &Request) -> Result<(), String> {
     use std::io::Write as _;
     use std::os::unix::net::UnixStream;
 
@@ -869,9 +1133,9 @@ mod tests {
             String::new(),
             "   \n".to_string(),
             "cck-recording 1 open".to_string(),          // wrong magic
-            format!("{MAGIC} 1"),                        // no verb
-            format!("{MAGIC} 1 close path=2f61"),        // wrong verb
-            format!("{MAGIC} 1 open"),                   // no fields
+            format!("{MAGIC} {PROTOCOL_VERSION}"),                        // no verb
+            format!("{MAGIC} {PROTOCOL_VERSION} close path=2f61"),        // wrong verb
+            format!("{MAGIC} {PROTOCOL_VERSION} open"),                   // no fields
             ok.replace("video=0 ", ""),                  // missing field
             ok.replace("path=", "pth="),                 // unknown key (and missing path)
             format!("{ok} extra=1").replace('\n', ""),   // unknown key alongside a full set
@@ -902,6 +1166,102 @@ mod tests {
             );
             assert_eq!(OpenRequest::parse(&line), Err(WireError::Malformed), "{hex}");
         }
+    }
+
+    /// DRAGON-587's verb, carrying DRAGON-613's destination: it round-trips for BOTH
+    /// consumers, and its field set is as closed as `open`'s.
+    #[test]
+    fn the_color_verb_round_trips_and_is_strict() {
+        for to in [ColorDest::Editor, ColorDest::PickerWindow] {
+            for rgb in [[0, 0, 0], [255, 255, 255], [255, 136, 0], [1, 2, 3]] {
+                let req = Request::Color { to, rgb };
+                let line = req.encode();
+                assert!(line.ends_with('\n'));
+                assert_eq!(Request::parse(&line), Ok(req.clone()), "round trip {to:?} {rgb:?}");
+                assert_eq!(Request::parse(line.trim_end()), Ok(req));
+            }
+        }
+        assert_eq!(
+            Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0] }.encode().trim_end(),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=editor rgb=ff8800")
+        );
+        assert_eq!(
+            Request::Color { to: ColorDest::PickerWindow, rgb: [255, 136, 0] }.encode().trim_end(),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800")
+        );
+        // Order-independent, exactly like `open`.
+        assert_eq!(
+            Request::parse(&format!("{MAGIC} {PROTOCOL_VERSION} color rgb=ff8800 to=picker")),
+            Ok(Request::Color { to: ColorDest::PickerWindow, rgb: [255, 136, 0] })
+        );
+        for bad in [
+            format!("{MAGIC} {PROTOCOL_VERSION} color"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker"),          // no colour
+            format!("{MAGIC} {PROTOCOL_VERSION} color rgb=ff8800"),         // no destination
+            format!("{MAGIC} {PROTOCOL_VERSION} color to= rgb=ff8800"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=nobody rgb=ff8800"), // unknown dest
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=Editor rgb=ff8800"), // case matters
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb="),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff88"), // too few bytes
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800ff"), // too many
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=gg8800"), // not hex
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker hex=ff8800"), // wrong key
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 rgb=000000"), // dup
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=editor to=picker rgb=ff8800"), // dup
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 extra=1"), // unknown
+            format!("{MAGIC} {PROTOCOL_VERSION} colour to=picker rgb=ff8800"), // unknown verb
+        ] {
+            assert_eq!(Request::parse(&bad), Err(WireError::Malformed), "should reject {bad:?}");
+        }
+        // The version is still checked FIRST, before the verb.
+        assert_eq!(
+            Request::parse(&format!("{MAGIC} 99 color to=picker rgb=ff8800")),
+            Err(WireError::Version(99))
+        );
+    }
+
+    /// DRAGON-613, and the case a user mid-upgrade actually IS: a v2 peer and a v3 peer.
+    ///
+    /// The old `color` line has no destination, so a new host must not half-understand it,
+    /// and the version check must be what catches it rather than the field parser, so the
+    /// peer learns WHY. Both directions land on `err version`, which every sender in this
+    /// module reads as "not accepted" and answers by doing the job itself.
+    #[test]
+    fn a_v2_color_line_is_refused_by_version_not_misparsed() {
+        let v2 = format!("{MAGIC} 2 color rgb=ff8800");
+        assert_eq!(Request::parse(&v2), Err(WireError::Version(2)));
+        // And the reverse direction: a v2 host reading our v3 line sees the same shape, so
+        // pin that our line still carries a plain integer version a v2 parser can read.
+        let v3 = Request::Color { to: ColorDest::PickerWindow, rgb: [255, 136, 0] }.encode();
+        let mut it = v3.split_whitespace();
+        assert_eq!(it.next(), Some(MAGIC));
+        assert_eq!(it.next().and_then(|v| v.parse::<u32>().ok()), Some(PROTOCOL_VERSION));
+    }
+
+    /// The destination words are the wire, so they are pinned literally: changing one
+    /// silently breaks every mixed pair without changing the version.
+    #[test]
+    fn the_destination_words_round_trip() {
+        for dest in [ColorDest::Editor, ColorDest::PickerWindow] {
+            assert_eq!(ColorDest::parse(dest.as_str()), Some(dest));
+        }
+        assert_eq!(ColorDest::Editor.as_str(), "editor");
+        assert_eq!(ColorDest::PickerWindow.as_str(), "picker");
+        for junk in ["", "Editor", "PICKER", "window", "preview", "0", "1"] {
+            assert_eq!(ColorDest::parse(junk), None, "{junk}");
+        }
+    }
+
+    /// Both verbs share one parser entry point, and an `open` line still parses exactly as
+    /// it did: the second verb must not have loosened the first.
+    #[test]
+    fn the_open_verb_is_unchanged_by_the_second_one() {
+        let line = sample().encode();
+        assert_eq!(Request::parse(&line), Ok(Request::Open(sample())));
+        assert_eq!(OpenRequest::parse(&line), Ok(sample()));
+        // And a `color` line is not an `open` one.
+        let colour = Request::Color { to: ColorDest::Editor, rgb: [1, 2, 3] }.encode();
+        assert_eq!(OpenRequest::parse(&colour), Err(WireError::Malformed));
     }
 
     #[test]
@@ -978,7 +1338,7 @@ mod tests {
         // Detached, like the real host thread: it dies with the process.
         std::thread::spawn(move || accept_loop(&listener, &tx));
 
-        let req = sample();
+        let req = Request::Open(sample());
         let child_path = path.clone();
         let child_req = req.clone();
         let child = std::thread::spawn(move || send_to_socket(&child_path, &child_req));
@@ -989,6 +1349,61 @@ mod tests {
         handoff.accept();
 
         assert!(child.join().unwrap().is_ok(), "child must see the ack");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// One sample colour message, so the round trip asserts the DESTINATION as well as the
+    /// colour without repeating the literal at both ends of the socket.
+    #[cfg(unix)]
+    const COLOR_TO_EDITOR: Request =
+        Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0] };
+
+    /// DRAGON-587 end to end: a picked colour crosses the SAME socket and is acknowledged
+    /// the same way, so the editor's pipette reaches the editor that asked.
+    #[cfg(unix)]
+    #[test]
+    fn a_picked_color_reaches_the_host_and_is_acked() {
+        use std::os::unix::net::UnixListener;
+
+        let path = temp_socket("color");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let (tx, rx) = std::sync::mpsc::channel::<Handoff>();
+        std::thread::spawn(move || accept_loop(&listener, &tx));
+
+        let child_path = path.clone();
+        let child = std::thread::spawn(move || {
+            send_to_socket(&child_path, &COLOR_TO_EDITOR)
+        });
+
+        let handoff = rx.recv_timeout(Duration::from_secs(5)).expect("the colour arrives");
+        assert_eq!(handoff.request(), &COLOR_TO_EDITOR, "the exact colour and destination");
+        handoff.accept();
+        assert!(child.join().unwrap().is_ok(), "the picker must see the ack");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A host with no document to put a colour on refuses it, and the picker must read that
+    /// as "not delivered" so it shows its own result window instead of losing the pick.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_color_is_not_a_delivery() {
+        use std::os::unix::net::UnixListener;
+
+        let path = temp_socket("color-refused");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind");
+        let (tx, rx) = std::sync::mpsc::channel::<Handoff>();
+        std::thread::spawn(move || accept_loop(&listener, &tx));
+
+        let child_path = path.clone();
+        let child = std::thread::spawn(move || {
+            send_to_socket(&child_path, &Request::Color { to: ColorDest::Editor, rgb: [1, 2, 3] })
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the colour arrives")
+            .reject(RejectReason::Busy);
+        assert!(child.join().unwrap().is_err(), "a rejection is never a delivery");
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1007,7 +1422,7 @@ mod tests {
         std::thread::spawn(move || accept_loop(&listener, &tx));
 
         let child_path = path.clone();
-        let child = std::thread::spawn(move || send_to_socket(&child_path, &sample()));
+        let child = std::thread::spawn(move || send_to_socket(&child_path, &Request::Open(sample())));
 
         let handoff = rx.recv_timeout(Duration::from_secs(5)).expect("handoff arrives");
         drop(handoff); // the host dies / gives up before acking
@@ -1031,7 +1446,7 @@ mod tests {
         drop(rx); // the host has stopped hosting
         std::thread::spawn(move || accept_loop(&listener, &tx));
 
-        let err = send_to_socket(&path, &sample()).expect_err("must not report acceptance");
+        let err = send_to_socket(&path, &Request::Open(sample())).expect_err("must not report acceptance");
         assert!(err.contains("no ack"), "{err}");
         let _ = std::fs::remove_file(&path);
     }
@@ -1049,7 +1464,7 @@ mod tests {
         std::thread::spawn(move || accept_loop(&listener, &tx));
 
         let child_path = path.clone();
-        let child = std::thread::spawn(move || send_to_socket(&child_path, &sample()));
+        let child = std::thread::spawn(move || send_to_socket(&child_path, &Request::Open(sample())));
         rx.recv_timeout(Duration::from_secs(5))
             .expect("handoff arrives")
             .reject(RejectReason::Busy);
@@ -1114,7 +1529,7 @@ mod tests {
         drop(conn);
 
         let child_path = path.clone();
-        let child = std::thread::spawn(move || send_to_socket(&child_path, &sample()));
+        let child = std::thread::spawn(move || send_to_socket(&child_path, &Request::Open(sample())));
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the loop still serves")
             .accept();
@@ -1129,7 +1544,7 @@ mod tests {
     fn a_missing_socket_fails_fast() {
         let path = temp_socket("missing");
         let _ = std::fs::remove_file(&path);
-        let err = send_to_socket(&path, &sample()).expect_err("nothing is listening");
+        let err = send_to_socket(&path, &Request::Open(sample())).expect_err("nothing is listening");
         assert!(err.starts_with("connect:"), "{err}");
     }
 
@@ -1180,7 +1595,7 @@ mod tests {
         assert!(std::path::Path::new(&path).exists(), "socket must exist while hosting");
 
         // A real end-to-end handoff over the REAL host path.
-        let req = sample();
+        let req = Request::Open(sample());
         let send_path = path.clone();
         let send_req = req.clone();
         let child = std::thread::spawn(move || send_to_socket(&send_path, &send_req));

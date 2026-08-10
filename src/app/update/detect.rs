@@ -268,10 +268,13 @@ impl App {
                     .filter_map(|&i| self.text_words.get(i).cloned())
                     .collect();
                 let text = crate::detect::join_words(&picked);
-                if !text.is_empty() {
-                    crate::platform::services::copy_text(&text);
+                if text.is_empty() {
+                    return Task::none();
                 }
-                Task::none()
+                // `copy_text_task`: the scanner overlay is focused when this fires, and on a
+                // compositor with no data-control that window is the only thing that can hold
+                // the selection. `copy_text` would have reported nothing and copied nothing.
+                crate::share::copy_text_task(&text)
             }
             DetectMsg::WordMenu(idx, x, y) => {
                 // Right-clicking a word outside the current selection selects just it;
@@ -296,12 +299,11 @@ impl App {
                 // Copy the code's full decoded value and stay open (unlike a left-click,
                 // which runs the code's action and exits).
                 self.code_menu = None;
-                if let Some(mark) = self.marks.get(idx)
-                    && !mark.value.is_empty()
-                {
-                    crate::platform::services::copy_text(&mark.value);
-                }
-                Task::none()
+                let Some(mark) = self.marks.get(idx).filter(|m| !m.value.is_empty()) else {
+                    return Task::none();
+                };
+                // See the OCR copy above for why this is the task form.
+                crate::share::copy_text_task(&mark.value)
             }
             DetectMsg::DismissCodeMenu => {
                 self.code_menu = None;

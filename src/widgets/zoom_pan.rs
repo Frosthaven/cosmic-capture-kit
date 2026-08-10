@@ -266,7 +266,7 @@ impl<'a, Msg> ZoomPan<'a, Msg> {
         bounds: Rectangle,
     ) {
         use cosmic::iced::Color;
-        let track: Color = theme.cosmic().background.base.into();
+        let track: Color = theme.cosmic().background(false).base.into();
         let thumb_dim = Color::from_rgba(0.5, 0.5, 0.5, 0.5);
         let thumb_hot = Color::from_rgba(0.78, 0.78, 0.78, 0.9);
         let over = cursor.position();
@@ -370,41 +370,40 @@ impl<'a, Msg: Clone + 'a> Widget<Msg, cosmic::Theme, cosmic::Renderer> for ZoomP
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                 st.mods = *m;
             }
-            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                if cursor.is_over(bounds) {
-                    let (dx, dy) = match delta {
-                        mouse::ScrollDelta::Lines { x, y } => (*x, *y),
-                        mouse::ScrollDelta::Pixels { x, y } => {
-                            (*x / WHEEL_PAN_STEP, *y / WHEEL_PAN_STEP)
-                        }
-                    };
-                    if st.mods.control() {
-                        // Ctrl+wheel → zoom on the dominant axis, toward the cursor.
-                        let step = if dy != 0.0 { dy } else { dx };
-                        let (ux, uy) = cursor
-                            .position()
-                            .map(|p| {
-                                (
-                                    p.x - (bounds.x + bounds.width / 2.0),
-                                    p.y - (bounds.y + bounds.height / 2.0),
-                                )
-                            })
-                            .unwrap_or((0.0, 0.0));
-                        shell.publish((self.on_zoom)(step, ux, uy));
-                    } else if st.mods.shift() {
-                        // Shift+wheel → horizontal pan (whichever axis the wheel gave).
-                        let d = if dx != 0.0 { dx } else { dy };
-                        let (px, py) = self.pan_delta(bounds, d * WHEEL_PAN_STEP, 0.0);
-                        shell.publish((self.on_pan)(px, py));
-                    } else {
-                        // Plain wheel → pan (no Alt needed); trackpads may give both axes.
-                        let (px, py) =
-                            self.pan_delta(bounds, dx * WHEEL_PAN_STEP, dy * WHEEL_PAN_STEP);
-                        shell.publish((self.on_pan)(px, py));
+            // Off the widget the wheel is not ours: the guard drops it to the catch-all, which
+            // is what the `is_over` test inside this arm used to do.
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) if cursor.is_over(bounds) => {
+                let (dx, dy) = match delta {
+                    mouse::ScrollDelta::Lines { x, y } => (*x, *y),
+                    mouse::ScrollDelta::Pixels { x, y } => {
+                        (*x / WHEEL_PAN_STEP, *y / WHEEL_PAN_STEP)
                     }
-                    shell.capture_event();
-                    return;
+                };
+                if st.mods.control() {
+                    // Ctrl+wheel → zoom on the dominant axis, toward the cursor.
+                    let step = if dy != 0.0 { dy } else { dx };
+                    let (ux, uy) = cursor
+                        .position()
+                        .map(|p| {
+                            (
+                                p.x - (bounds.x + bounds.width / 2.0),
+                                p.y - (bounds.y + bounds.height / 2.0),
+                            )
+                        })
+                        .unwrap_or((0.0, 0.0));
+                    shell.publish((self.on_zoom)(step, ux, uy));
+                } else if st.mods.shift() {
+                    // Shift+wheel → horizontal pan (whichever axis the wheel gave).
+                    let d = if dx != 0.0 { dx } else { dy };
+                    let (px, py) = self.pan_delta(bounds, d * WHEEL_PAN_STEP, 0.0);
+                    shell.publish((self.on_pan)(px, py));
+                } else {
+                    // Plain wheel → pan (no Alt needed); trackpads may give both axes.
+                    let (px, py) = self.pan_delta(bounds, dx * WHEEL_PAN_STEP, dy * WHEEL_PAN_STEP);
+                    shell.publish((self.on_pan)(px, py));
                 }
+                shell.capture_event();
+                return;
             }
             // Grab a scrollbar thumb (takes priority over the pan drag).
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {

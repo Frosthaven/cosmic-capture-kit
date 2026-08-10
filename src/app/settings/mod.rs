@@ -190,34 +190,125 @@ pub enum AudioVideoTab {
 }
 
 /// The Keyboard Shortcuts page's in-page tabs (DRAGON-142): a horizontal strip
-/// splitting the page's sections along the app's usage phases — "Capture" (the
-/// capture overlay and app-wide contexts: the macOS global hotkey, OCR text
-/// recognition, the settings panel, region selection), "Recording" (the live
-/// recording session) and "Preview" (the post-capture editor, by far the largest
-/// group). Selection lives in `SettingsState::shortcuts_tab`'s model; it is NOT
-/// persisted — the page always opens on "Capture".
+/// splitting the page's sections along the app's usage phases: "Global" (the
+/// OS-owned hotkeys, DRAGON-588), "Capture" (the capture overlay's own in-app
+/// bindings), "Recording" (the live recording session) and "Preview Editor" (the
+/// post-capture editor, by far the largest group). Selection lives in
+/// `SettingsState::shortcuts_tab`'s model; it is NOT persisted, so the page always
+/// opens on "Global".
+///
+/// A tab appears only while it has something to show ([`ShortcutsTab::occupied`]).
+/// **Capture no longer does**: DRAGON-627 baked its three OCR text keys, leaving no
+/// in-app binding on the capture overlay at all, so the tab is absent on every
+/// platform. The variant stays as the mechanism that reports that, and as
+/// [`ShortcutsTab::for_group`]'s fallback; see `occupied`'s doc.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ShortcutsTab {
+    /// DRAGON-588: OS-level hotkeys, the ones the operating system owns rather than the
+    /// app. First, because "can I press a key with another app focused" is the question a
+    /// user asks before any in-app binding matters.
+    Global,
     Capture,
     Recording,
     Preview,
 }
 
 impl ShortcutsTab {
+    /// The capture half of the Global tab: the seven actions a global hotkey can start.
+    pub const GLOBAL_CAPTURE_GROUP: &'static str = "Global Capture";
+    /// The recording half of the Global tab: the five controls that act on a recording which
+    /// is already running.
+    pub const GLOBAL_RECORDING_GROUP: &'static str = "Global Recording";
+
+    /// The Global tab's NOTE group, whose title is deliberately EMPTY (DRAGON-589).
+    ///
+    /// It leads the tab, above both named groups, and it holds one thing:
+    /// [`Self::GLOBAL_EMPTY_NOTE`]. The title is empty because the note is not a group of
+    /// shortcuts, it is the answer to the question the groups below it raise, so naming it
+    /// would invent a category. It still occupies a heading's worth of space, so the rhythm
+    /// down the page matches the named groups; `section_card` reserves that box explicitly
+    /// rather than trusting an empty string to measure the same as a word.
+    pub const GLOBAL_NOTE_GROUP: &'static str = "";
+
+    /// What the Global tab says about the rows the operating system owns (DRAGON-588, owner's
+    /// copy, kept verbatim).
+    ///
+    /// DRAGON-589 moved it and changed when it appears. It used to REPLACE both groups on a
+    /// system with nothing bindable; now the groups are always there, listing every action by
+    /// name, and this sentence sits above them explaining why some of them show a command
+    /// instead of a chord. Shown exactly when at least one row is a command row (see
+    /// `keyboard::global_note_shown`), so a machine where every global hotkey is bindable
+    /// never sees it.
+    pub const GLOBAL_EMPTY_NOTE: &'static str =
+        "Global shortcuts are handled by your operating system.";
+
+    /// Whether this tab has anything to show on THIS system, and so whether it appears in
+    /// the strip at all (DRAGON-588). An empty tab a user can click into reads as a broken
+    /// page; an absent one reads as "not a thing here", which is the truth.
+    ///
+    /// Driven by the SAME facts the section builder uses, never a second opinion:
+    ///
+    /// * **Global** always shows, and since DRAGON-589 it always has content: every global
+    ///   action gets a row, with a chord editor where the app can bind it and the command
+    ///   that runs it where it cannot. In the impossible case that a build offers neither,
+    ///   the builder falls back to [`Self::GLOBAL_EMPTY_NOTE`], so "always" stays honest.
+    /// * **Capture** shows while any in-app capture-context group exists. **It never does any
+    ///   more**, and that is this predicate doing exactly the job it was written for. Its only
+    ///   group was OCR Text Recognition, and DRAGON-627 baked those three keys, so no
+    ///   [`crate::shortcuts::Action`] maps here and the tab left the strip on its own with no
+    ///   edit to the strip. The arm stays because it is the mechanism, not a special case: it
+    ///   reads `Action::ALL`, so an in-app capture-context action added later brings the tab
+    ///   back the same way, and [`Self::for_group`] still needs somewhere to send a group
+    ///   title it does not recognise.
+    /// * **Recording** shows only where an in-app chord can actually reach a live recording
+    ///   ([`crate::platform::in_app_recording_shortcuts_work`], DRAGON-583). On COSMIC it
+    ///   cannot, so the tab is gone rather than empty. Untouched by DRAGON-589: the five CLI
+    ///   controls that replace those chords are GLOBAL shortcuts and live on the Global tab,
+    ///   which is a different question from whether an IN-APP chord can reach a recording.
+    /// * **Preview** always shows; the editor's shortcuts exist on every platform.
+    ///
+    /// Pure given its inputs; the platform probe behind Recording is memoized, so this is
+    /// cheap to call while building the strip.
+    pub fn occupied(self) -> bool {
+        match self {
+            ShortcutsTab::Global | ShortcutsTab::Preview => true,
+            ShortcutsTab::Capture => crate::shortcuts::Action::ALL
+                .iter()
+                .any(|a| Self::for_group(a.group()) == ShortcutsTab::Capture),
+            ShortcutsTab::Recording => crate::platform::in_app_recording_shortcuts_work(),
+        }
+    }
+
     /// The in-page tab a shortcut section lives under, keyed by its group title
     /// ([`crate::shortcuts::Action::group`] — the single source of section grouping).
     /// Used by both the page view (which sections render under the active tab) and
     /// the per-tab reset scoping in `reset_page`.
     pub fn for_group(group: &str) -> Self {
         match group {
+            // DRAGON-588: the OS-owned hotkeys, both halves, plus the single note that
+            // stands in for them where the OS owns them outright. DRAGON-589 added the
+            // EMPTY title, which the note group carries; an unknown group falls through to
+            // Capture below, so without this arm the note would surface on the wrong tab.
+            g if g == Self::GLOBAL_CAPTURE_GROUP
+                || g == Self::GLOBAL_RECORDING_GROUP
+                || g == Self::GLOBAL_NOTE_GROUP
+                || g == "Global" =>
+            {
+                ShortcutsTab::Global
+            }
             "Recording" => ShortcutsTab::Recording,
             // The post-capture Preview Editor's two groups (DRAGON-158):
             // action shortcuts + the video editor's transport shortcuts.
             "Action Shortcuts" | "Image Editor Shortcuts" | "Video Editor Shortcuts" => {
                 ShortcutsTab::Preview
             }
-            // Global (the macOS Start Capture hotkey), OCR Text Recognition,
-            // Region Selection — the capture overlay / app-wide contexts.
+            // The capture overlay / app-wide in-app contexts. "OCR Text Recognition" and
+            // "Region Selection" came here; DRAGON-627 and DRAGON-451 retired both groups
+            // with their actions, so nothing reaches this arm today. It stays as the
+            // FALLBACK for an unrecognised title, which is what makes a group added to
+            // `Action::group()` without a matching arm land somewhere nameable rather than
+            // on the editor's page: `ShortcutsTab::Capture.occupied()` then reports it and
+            // the tab comes back on its own.
             _ => ShortcutsTab::Capture,
         }
     }
@@ -311,13 +402,42 @@ pub struct SettingsState {
     /// `None` until the first copy.
     ///
     /// Keyed by the copied TEXT rather than by a row id, because that text is what the press
-    /// carried and no two rows can name the same binary. It lives here and not on `Dep`
-    /// because the Health page rebuilds every `Dep` from scratch on each render, so nothing
-    /// on one survives a frame.
+    /// carried. It lives here and not on `Dep` because the Health page rebuilds every `Dep`
+    /// from scratch on each render, so nothing on one survives a frame.
+    ///
+    /// Keying on the text is what let the mechanism spread for free: every row rendering a
+    /// path through `settings::row::path_line` shares this one stamp, one message and one tick
+    /// subscription, across Health, Scanner's language folder and the preview editor's
+    /// covermark folder. Two rows showing the SAME path would flash together, which is
+    /// correct rather than a defect: they are the same path.
     pub(in crate::app) health_copied: Option<(String, std::time::Instant)>,
+    /// DRAGON-564: what each Health-row binary reported for its version, probed once OFF
+    /// the UI thread when the settings window opens (`App::kick_tool_version_probe`).
+    /// `None` until the probe lands; the rows show the tool name alone until then, so
+    /// the Health page never blocks on a spawn.
+    pub(in crate::app) tool_versions: Option<Vec<crate::util::ToolVersion>>,
+    /// Whether the version probe is in flight, so a repeated open can't kick a second one.
+    pub(in crate::app) tool_versions_probing: bool,
     /// The keyboard-shortcut action currently capturing a new binding on the Keyboard
     /// Shortcuts page, if any — the next key press becomes its shortcut.
     pub rebinding: Option<crate::shortcuts::Action>,
+    /// The action whose row last had a chord REFUSED, and the chord's LABEL, because the
+    /// chord is one DRAGON-617 baked (`shortcuts::is_fixed_editor_chord`). Its row says so,
+    /// in the helper line, at [`row::Severity::Error`].
+    ///
+    /// It exists because the alternative is silence. A baked chord wins over the keymap, so
+    /// a binding accepted onto one would be real, persisted and permanently dead: the row
+    /// would show the key the user chose and the key would keep doing something else. The
+    /// same rule the DRAGON-452 duplicate notice states for the global rows applies here, and
+    /// for the same reason: a binding that cannot work is never taken in silence.
+    ///
+    /// The label is carried rather than re-derived so the sentence can NAME the key that was
+    /// refused. "Ctrl+Z is a fixed shortcut" is answerable; "that key is fixed" leaves the
+    /// user guessing which of the two keys they just pressed was the problem.
+    ///
+    /// Cleared when any rebind capture BEGINS, so the notice belongs to the attempt the user
+    /// just made and never lingers over an unrelated row.
+    pub rebind_refused: Option<(crate::shortcuts::Action, String)>,
     /// Appearance (DRAGON-139): the custom-accent colour picker model (hex/RGB input,
     /// hue slider, recent colours). Re-seeded to the live accent when the sidebar opens.
     pub accent_picker: widget::ColorPickerModel,
@@ -457,19 +577,44 @@ impl SettingsState {
         audio_video_tab.activate(audio_video_tab_audio);
         // The Keyboard Shortcuts page's in-page tab strip (DRAGON-142): the page's
         // sections split along the app's usage phases; the window always opens on the
-        // first ("Capture").
+        // first, which has been "Global" since DRAGON-588.
         let mut shortcuts_tab = widget::segmented_button::SingleSelectModel::default();
+        // DRAGON-588: the OS-owned hotkeys lead, and the page opens on them: whether a key
+        // works with another app focused is the first thing a user needs to know. Lucide
+        // `globe` (the owner's pick) says "anywhere on the system", which is the whole
+        // distinction between this tab and the three in-app ones.
+        //
+        // A tab is inserted only if it will have something to show (`ShortcutsTab::occupied`).
+        // Recording empties out on a session that cannot deliver an in-app recording chord,
+        // and an empty tab that a user can click into is worse than no tab: it reads as a
+        // broken page rather than as an honest absence. The Global tab always shows, because
+        // where it has no rows it carries the one sentence that explains why.
+        //
+        // CAPTURE is now permanently on the other side of that gate: DRAGON-627 baked its
+        // three OCR keys and it has had nothing to show since. The insert is left standing
+        // rather than deleted, because it is what an in-app capture-context action added
+        // later would need, and because deleting it would say the tab is impossible when what
+        // is true is that it is currently empty.
         let shortcuts_tab_capture = shortcuts_tab
             .insert()
-            .text("Capture")
-            .icon(crate::widgets::icons::handle("camera-photo-symbolic").icon())
-            .data(ShortcutsTab::Capture)
+            .text("Global")
+            .icon(crate::widgets::icons::handle("globe-symbolic").icon())
+            .data(ShortcutsTab::Global)
             .id();
-        shortcuts_tab
-            .insert()
-            .text("Recording")
-            .icon(crate::widgets::icons::handle("media-record-symbolic").icon())
-            .data(ShortcutsTab::Recording);
+        if ShortcutsTab::Capture.occupied() {
+            shortcuts_tab
+                .insert()
+                .text("Capture")
+                .icon(crate::widgets::icons::handle("camera-photo-symbolic").icon())
+                .data(ShortcutsTab::Capture);
+        }
+        if ShortcutsTab::Recording.occupied() {
+            shortcuts_tab
+                .insert()
+                .text("Recording")
+                .icon(crate::widgets::icons::handle("media-record-symbolic").icon())
+                .data(ShortcutsTab::Recording);
+        }
         shortcuts_tab
             .insert()
             .text("Preview Editor")
@@ -500,7 +645,10 @@ impl SettingsState {
             // file read on that path buys nothing.
             cloud: CloudPageState::default(),
             health_copied: None,
+            tool_versions: None,
+            tool_versions_probing: false,
             rebinding: None,
+            rebind_refused: None,
             accent_picker: widget::ColorPickerModel::new("Hex", "RGB", None, None),
             accent_editor_open: false,
             border_picker: widget::ColorPickerModel::new("Hex", "RGB", None, None),
@@ -596,16 +744,16 @@ impl SettingsState {
         self.shortcuts_tab
             .active_data::<ShortcutsTab>()
             .copied()
-            .unwrap_or(ShortcutsTab::Capture)
+            .unwrap_or(ShortcutsTab::Global)
     }
 
-    /// Return the Keyboard Shortcuts page to its first ("Capture") in-page tab —
+    /// Return the Keyboard Shortcuts page to its first ("Global") in-page tab —
     /// called when the window opens so it never reopens on another tab (the
-    /// selection is not persisted).
+    /// selection is not persisted). DRAGON-588 moved first from "Capture" to "Global".
     #[cfg_attr(target_os = "macos", allow(dead_code))] // Linux in-process settings only (DRAGON-153)
     pub fn reset_shortcuts_tab(&mut self) {
         let first = self.shortcuts_tab.iter().find(|&e| {
-            self.shortcuts_tab.data::<ShortcutsTab>(e) == Some(&ShortcutsTab::Capture)
+            self.shortcuts_tab.data::<ShortcutsTab>(e) == Some(&ShortcutsTab::Global)
         });
         if let Some(e) = first {
             self.shortcuts_tab.activate(e);
@@ -689,7 +837,7 @@ pub(super) fn open_config_window(
         // a Wayland-only field of iced's PlatformSpecific; macOS uses its own defaults.
         #[cfg(target_os = "linux")]
         platform_specific: cosmic::iced::window::settings::PlatformSpecific {
-            application_id: "dev.frosthaven.CosmicCaptureKit".to_string(),
+            application_id: "dev.thedragon.CosmicCaptureKit".to_string(),
             ..Default::default()
         },
         // macOS: no visible titlebar (transparent, no title text), content full-size
@@ -839,11 +987,24 @@ impl App {
             // async-only title path stays byte-identical.
             #[cfg(windows)]
             let _ = self.set_window_title(WINDOW_TITLE.to_string(), id);
-            let check = self.update_settings(SettingsMsg::CheckForUpdates);
+            // Skipped on a build with no update channel (a Flatpak, DRAGON-561): the
+            // store owns its updates, so no check may run and the About page shows an
+            // informational row instead of the update controls.
+            let check = if crate::update::channel_available() {
+                self.update_settings(SettingsMsg::CheckForUpdates)
+            } else {
+                Task::none()
+            };
             // DRAGON-482: fill the Cloud Accounts page from disk, and probe the stored
             // sign-ins on a background task. Batched at open, like the update check, so the
             // page is ready whenever the user reaches it and the window is never delayed.
             let cloud = self.update_settings(SettingsMsg::Cloud(CloudSettingsMsg::Reload));
+            // DRAGON-628: read the OS login item so the "Automatically start on login" row
+            // shows what the machine will really do rather than the stored preference. A
+            // READ only (one file read / registry query / status call), never a write and
+            // never a portal request; the repair of a stale registration belongs to the
+            // resident daemon. The OTHER mint, `OpenSettingsAtStartup`, does the same.
+            self.autostart_settings_opened();
             Task::batch([task, self.hide_overlays(), check, cloud])
         }
     }
@@ -1406,7 +1567,7 @@ impl App {
                 let radius = [0.0f32; 4];
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(theme::frost_color(
-                        cosmic.background.base.into(),
+                        cosmic.background(false).base.into(),
                         glass,
                     ))),
                     border: Border {
@@ -1717,9 +1878,24 @@ impl App {
             })
             .collect();
         let list = widget::column(wrapped).width(Length::Fill).spacing(1.0);
-        widget::column(vec![widget::text::heading(title).into(), list.into()])
-            .spacing(8.0)
-            .into()
+        // An EMPTY title still occupies a heading's worth of space (DRAGON-589, the Global
+        // tab's note group). The owner asked for a group with no name that keeps the normal
+        // group-name space, so the note sits on the page's rhythm rather than jammed against
+        // the first named group below it.
+        //
+        // Reserved EXPLICITLY rather than by handing `text::heading` an empty string, because
+        // what an empty string measures to is a property of the text stack, not something
+        // this page states. libcosmic's `heading` preset pins an ABSOLUTE line box (size 14,
+        // line height 21), so a heading is exactly that tall whatever it says, and a spacer of
+        // the same height is the same box with nothing drawn in it. If that preset ever
+        // changes, this number moves with it.
+        const HEADING_LINE_H: f32 = 21.0;
+        let head: Element<'a, Msg> = if title.is_empty() {
+            widget::space::vertical().height(Length::Fixed(HEADING_LINE_H)).into()
+        } else {
+            widget::text::heading(title).into()
+        };
+        widget::column(vec![head, list.into()]).spacing(8.0).into()
     }
 
     /// Activate the nav entry for `tab` programmatically (flows that jump the
@@ -1813,7 +1989,7 @@ impl App {
             .class(cosmic::theme::Container::custom(|theme| {
                 let cosmic = theme.cosmic();
                 cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(cosmic.primary.base.into())),
+                    background: Some(Background::Color(cosmic.primary(false).base.into())),
                     border: Border {
                         radius: theme::rounding(theme).s.into(),
                         ..Default::default()
@@ -1860,7 +2036,7 @@ impl App {
             .class(cosmic::theme::Container::custom(|theme| {
                 let cosmic = theme.cosmic();
                 cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(cosmic.primary.base.into())),
+                    background: Some(Background::Color(cosmic.primary(false).base.into())),
                     border: Border {
                         radius: theme::rounding(theme).s.into(),
                         ..Default::default()
@@ -2036,5 +2212,104 @@ mod tests {
     #[test]
     fn the_preview_editor_page_feeds_the_search() {
         assert!(ConfigTab::ALL.contains(&ConfigTab::PreviewEditor));
+    }
+
+    /// DRAGON-588: both halves of the Global tab route to it, and nothing else does.
+    /// The legacy "Global" title is kept in the mapping because a section built before
+    /// the rename must not silently fall through to Capture, which is where an unknown
+    /// group lands.
+    #[test]
+    fn both_global_groups_route_to_the_global_tab() {
+        for title in [
+            ShortcutsTab::GLOBAL_CAPTURE_GROUP,
+            ShortcutsTab::GLOBAL_RECORDING_GROUP,
+            "Global",
+        ] {
+            assert_eq!(ShortcutsTab::for_group(title), ShortcutsTab::Global, "{title}");
+        }
+        for (title, want) in [
+            ("Recording", ShortcutsTab::Recording),
+            ("Action Shortcuts", ShortcutsTab::Preview),
+            ("Image Editor Shortcuts", ShortcutsTab::Preview),
+            ("Video Editor Shortcuts", ShortcutsTab::Preview),
+            // Two RETIRED group titles (DRAGON-451's "Region Selection", DRAGON-627's "OCR
+            // Text Recognition"), kept here as the fallback's worked examples: no live group
+            // routes to Capture any more, and an unrecognised one still must.
+            ("OCR Text Recognition", ShortcutsTab::Capture),
+            ("Region Selection", ShortcutsTab::Capture),
+        ] {
+            assert_eq!(ShortcutsTab::for_group(title), want, "{title}");
+        }
+    }
+
+    /// **DRAGON-627: the Capture tab is gone, and it went by itself.**
+    ///
+    /// The owner asked for the tab to be removed once its OCR rows were baked. Nothing in
+    /// the strip builder was edited to do it: `occupied` enumerates `Action::ALL`, no action
+    /// routes to Capture, so the insert is skipped. This pins all three links in that chain,
+    /// because any one of them coming back would put an EMPTY tab on the page, which is the
+    /// exact thing DRAGON-588 built `occupied` to prevent.
+    #[test]
+    fn the_capture_tab_is_unoccupied_and_absent_from_the_strip() {
+        assert!(
+            !crate::shortcuts::Action::ALL
+                .iter()
+                .any(|a| ShortcutsTab::for_group(a.group()) == ShortcutsTab::Capture),
+            "no in-app action may route to the Capture tab"
+        );
+        assert!(!ShortcutsTab::Capture.occupied(), "the Capture tab has nothing to show");
+        let state = SettingsState::new();
+        assert!(
+            state
+                .shortcuts_tab
+                .iter()
+                .all(|e| state.shortcuts_tab.data::<ShortcutsTab>(e) != Some(&ShortcutsTab::Capture)),
+            "an unoccupied tab must not be in the strip"
+        );
+        // The two that always show still do, so this removed one tab and not the page.
+        assert!(ShortcutsTab::Global.occupied());
+        assert!(ShortcutsTab::Preview.occupied());
+    }
+
+    /// The empty-state sentence is the owner's, verbatim, and it is ONE sentence: the
+    /// point of DRAGON-588 was that a settings page should say who owns these keys, not
+    /// reproduce the documentation for them. DRAGON-589 moved it and left the words alone.
+    #[test]
+    fn the_global_empty_note_is_the_owners_sentence() {
+        assert_eq!(
+            ShortcutsTab::GLOBAL_EMPTY_NOTE,
+            "Global shortcuts are handled by your operating system."
+        );
+    }
+
+    /// DRAGON-589: the note group's title is EMPTY, and an empty title still routes to the
+    /// Global tab. Without that arm it would fall through to `_ => Capture`, and the sentence
+    /// explaining the Global tab would appear on a different tab entirely.
+    #[test]
+    fn the_note_group_is_unnamed_and_still_lands_on_the_global_tab() {
+        assert_eq!(ShortcutsTab::GLOBAL_NOTE_GROUP, "");
+        assert_eq!(ShortcutsTab::for_group(""), ShortcutsTab::Global);
+        assert_eq!(
+            ShortcutsTab::for_group(ShortcutsTab::GLOBAL_NOTE_GROUP),
+            ShortcutsTab::Global
+        );
+        // No in-app group is unnamed, so this arm can only ever catch the note group.
+        for a in crate::shortcuts::Action::ALL {
+            assert!(!a.group().is_empty(), "{a:?} has an unnamed group");
+        }
+    }
+
+    /// The Global tab is always in the strip, and DRAGON-589 is what makes that promise
+    /// honest: every global action gets a row, and where none would the builder falls back to
+    /// the note. Recording's rule is untouched, and it is a DIFFERENT question (can an IN-APP
+    /// chord reach a live recording), so the two must not be collapsed.
+    #[test]
+    fn the_global_tab_is_always_occupied_and_recording_keeps_its_own_rule() {
+        assert!(ShortcutsTab::Global.occupied());
+        assert!(ShortcutsTab::Preview.occupied());
+        assert_eq!(
+            ShortcutsTab::Recording.occupied(),
+            crate::platform::in_app_recording_shortcuts_work()
+        );
     }
 }

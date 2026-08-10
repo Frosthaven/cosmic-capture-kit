@@ -13,10 +13,22 @@ use layout::V_W;
 /// [`crate::shortcuts::region_copy_chord_label`], the same `Shortcut` the key handler matches
 /// against, so the tooltip cannot advertise a chord the app does not listen for.
 ///
+/// DRAGON-577: on a portal-FALLBACK session (`fallback`, the caller's
+/// `overlay_fallback_active`) the chord cannot deliver at all — no data-control protocol,
+/// and the clipboard fallback rides the preview window's focus, which the skip-editor path
+/// never creates — so the chord is dead there (`keyboard.rs`'s `region_copy_fires`
+/// fallback term) and this tooltip must not advertise it: the fallback copy is just
+/// "Capture this region". Hide-where-dead, the DRAGON-551/569 rule. Keyed on the session
+/// being the fallback, never on "is Flatpak".
+///
 /// Memoized to a `&'static str` so the `tip` closure keeps its `&'static str` label type and
 /// this bar's other thirteen tooltips stay allocation-free borrows: `capture_button_layer`
-/// rebuilds on every frame.
-fn region_capture_tip() -> &'static str {
+/// rebuilds on every frame. The fallback arm is a plain literal, so only the chord-carrying
+/// arm needs its `OnceLock`.
+fn region_capture_tip(fallback: bool) -> &'static str {
+    if fallback {
+        return "Capture this region";
+    }
     static TIP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TIP.get_or_init(|| {
         format!(
@@ -58,7 +70,11 @@ fn render_chip(
         row.push(white_icon(name, size));
     }
     let main = widget::text(text).size(text_size);
-    let main = if mono { main.font(cosmic::iced::Font::MONOSPACE) } else { main };
+    // DRAGON-601: `theme::mono_font`, not `Font::MONOSPACE`. The generic request resolves
+    // through ONE family name and renders PROPORTIONAL, silently, when that name is not
+    // installed, which is what macOS and Windows were getting for this timer. The helper is
+    // the app's one mono treatment and the hex label shares it.
+    let main = if mono { main.font(crate::app::theme::mono_font(false)) } else { main };
     row.push(main.line_height(line_height).into());
     if let Some(trail) = trail {
         row.push(widget::text(trail).size(16).line_height(line_height).into());
@@ -203,11 +219,24 @@ impl App {
                     // A standalone button, so BOTH outer corners round.
                     crate::app::theme::segment_style(t, true, hovered, true, true)
                 };
-                // The DEFAULT icon class: the button's own per-state `icon_color` (on-accent,
-                // from the style above) colours the glyph, exactly as the kind pair does. An
-                // `Svg::Custom` accent class here would paint accent-on-accent — invisible.
+                // The DEFAULT icon class, so the glyph takes the AMBIENT icon colour rather
+                // than a tint of its own. An `Svg::Custom` accent class here would paint
+                // accent-on-accent, invisible.
+                //
+                // DRAGON-607 correction: this comment used to claim the button's own
+                // `icon_color` (on-accent, from the style above) reached the glyph. It did
+                // not. `mode_icon` wraps the glyph in a centring container, and a container
+                // OVERRIDES the ink of everything below it, so the button's on-accent value
+                // was being replaced by the ambient window foreground and the checkmark drew
+                // near-white on the accent fill. Carrying the ink on that container
+                // (`theme::on_accent_content`, whose doc holds the general rule) is what
+                // makes the claim true. The kind pair below had the identical defect.
                 return crate::widgets::arrow_cursor::arrow_cursor(
-                    widget::button::custom(mode_icon("emblem-ok-symbolic", false))
+                    widget::button::custom(
+                        mode_icon("emblem-ok-symbolic", false).class(
+                            cosmic::theme::Container::custom(crate::app::theme::on_accent_content),
+                        ),
+                    )
                         .class(cosmic::theme::Button::Custom {
                             active: Box::new(move |_, t| seg_style(t, false)),
                             disabled: Box::new(move |t| seg_style(t, false)),
@@ -262,9 +291,21 @@ impl App {
         // on-accent glyph, the other half sits flat on the group with a subdued
         // glyph, and only the pair's outer corners are rounded.
         let kind_btn = |name: &'static str, active: bool, msg: Msg, round_left: bool, round_right: bool, enabled: bool| {
-            // Default icon class: the button's per-state `icon_color` (below) colours
-            // it, so the glyph can react to hover — an Svg::Custom class can't see
-            // hover state.
+            // Default icon class, so the glyph can react to hover: it takes the ambient
+            // icon colour, which the wrapper below sets per state, and an `Svg::Custom`
+            // class cannot see hover state.
+            //
+            // DRAGON-607 correction: this comment used to say the button's per-state
+            // `icon_color` reached the glyph directly. It did not. The centring container
+            // below OVERRIDES the ink of everything under it, so on the ACTIVE segment the
+            // on-accent value was replaced by the ambient window foreground and the glyph
+            // drew near-white on the accent fill. The container now carries the ink.
+            //
+            // It carries `segment_ink(t, active)`, NOT a flat on-accent value: only the
+            // ACTIVE half is filled with the accent, and the inactive half wears the
+            // `state_mix` wash, which needs its own legible ink. That is the same
+            // per-segment rule `segment_style` applies to the button itself, read from the
+            // same function, so the wrapper and the button style cannot disagree.
             let icon = crate::widgets::icons::sized(name, ICON_BOX);
             // The shared segmented-pair style (theme.rs) — one source for this
             // pair and the preview's pointer/razor toggle.
@@ -275,7 +316,12 @@ impl App {
                 widget::button::custom(
                     widget::container(icon)
                         .width(Length::Fill)
-                        .align_x(Alignment::Center),
+                        .align_x(Alignment::Center)
+                        .class(cosmic::theme::Container::custom(move |t: &cosmic::Theme| {
+                            crate::app::theme::ink_content(
+                                crate::app::theme::segment_ink(t, active),
+                            )
+                        })),
                 )
                 .class(cosmic::theme::Button::Custom {
                     active: Box::new(move |_, t| seg_style(t, false)),
@@ -334,7 +380,7 @@ impl App {
             cosmic::theme::Container::Custom(Box::new(|theme| {
                 let c = theme.cosmic();
                 cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(c.background.component.base.into())),
+                    background: Some(Background::Color(c.background(false).component.base.into())),
                     border: Border {
                         radius: crate::app::theme::rounding(theme)
                             .xl_capped(GROUP_H_BASE / 2.0)
@@ -356,7 +402,11 @@ impl App {
             widget::row(vec![
                 tip(
                     mode_btn("screenshot-selection-symbolic", Mode::Region, region_active),
-                    if region_active { region_capture_tip() } else { "Select a region" },
+                    if region_active {
+                        region_capture_tip(self.overlay_fallback_active())
+                    } else {
+                        "Select a region"
+                    },
                 ),
                 tip(
                     mode_btn("screenshot-window-symbolic", Mode::Window, window_active),
@@ -442,9 +492,24 @@ impl App {
         // preview's disabled Share/Upload: a control that will not press is exactly the one
         // a user hovers to ask why.
         let refresh_btn = tip(refresh_btn, if scanning { "Scanning" } else { "Scan again" });
+        // DRAGON-576: the `.width(group_width)` on the container and `.width(row_width)`
+        // on the row are load-bearing, exactly as on `mode_group` above. Stacked beside a
+        // region (left/right anchor) `btn_width` is `Length::Fill`, and a Fill button in a
+        // group with no width of its own resolves against the OUTERMOST bound: the
+        // fill-width overlay container, so the whole surface (the output on the native
+        // layer-shell session, the window on the portal-fallback session). This group was
+        // the one group missing both widths, so the docked scanner toolbar's refresh
+        // button grew to the surface width. Bounding the group to `group_width` (fixed
+        // `V_W` when stacked) makes the button fill the width-matched group like the
+        // delay chip does. Horizontally both widths are `Shrink`, the container/row
+        // default, so that layout is unchanged.
         let scan_group = widget::container(
-            widget::row(vec![refresh_btn]).spacing(2.0).align_y(Alignment::Center),
+            widget::row(vec![refresh_btn])
+                .spacing(2.0)
+                .width(row_width)
+                .align_y(Alignment::Center),
         )
+        .width(group_width)
         .align_x(Alignment::Center)
         .padding(GROUP_PAD)
         .class(group_shell());
@@ -604,12 +669,12 @@ impl App {
                         let fg = if zero_delay {
                             state_mix(theme, MIX_OFF)
                         } else {
-                            c.background.component.on.into()
+                            c.background(false).component.on.into()
                         };
                         let bg = if cancel_hovered {
-                            c.background.component.hover
+                            c.background(false).component.hover
                         } else {
-                            c.background.component.base
+                            c.background(false).component.base
                         };
                         cosmic::iced::widget::container::Style {
                             background: Some(Background::Color(bg.into())),
@@ -649,12 +714,14 @@ impl App {
                     crate::widgets::arrow_cursor::arrow_cursor(
                         widget::button::custom(
                             widget::text(format!("{s:02}"))
-                                .font(cosmic::iced::Font::MONOSPACE)
+                                // DRAGON-601: the app's one mono treatment, for the reason
+                                // `render_chip` above spells out.
+                                .font(crate::app::theme::mono_font(false))
                                 .size(16)
                                 // Match the chip: theme foreground, not the text-button accent.
                                 .class(cosmic::theme::Text::Custom(|t| {
                                     cosmic::iced::widget::text::Style {
-                                        color: Some(t.cosmic().background.component.on.into()),
+                                        color: Some(t.cosmic().background(false).component.on.into()),
                                         ..Default::default()
                                     }
                                 })),
@@ -671,7 +738,7 @@ impl App {
                 .class(cosmic::theme::Container::Custom(Box::new(|theme| {
                     let c = theme.cosmic();
                     cosmic::iced::widget::container::Style {
-                        background: Some(Background::Color(c.background.component.base.into())),
+                        background: Some(Background::Color(c.background(false).component.base.into())),
                         border: Border {
                             radius: crate::app::theme::rounding(theme).s.into(),
                             ..Default::default()
@@ -798,7 +865,7 @@ impl App {
                         // On: the default icon foreground (same as the gear/close
                         // buttons — white in dark mode, dark in light mode), also
                         // legible over the half-transparent meter tint when armed.
-                        t.cosmic().background.component.on.into()
+                        t.cosmic().background(false).component.on.into()
                     } else {
                         // Turned off: subtle, but clearly present.
                         state_mix(t, MIX_OFF)

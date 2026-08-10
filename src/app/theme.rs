@@ -27,6 +27,14 @@ use cosmic::iced::Color;
 
 use cosmic::cosmic_config::CosmicConfigEntry;
 use cosmic::cosmic_theme::{CornerRadii, Roundness, ThemeBuilder};
+// The auto-glass opt-out below (`toolkit_auto_glass`) speaks libcosmic's own
+// vocabulary: `Core::set_auto_blur` takes a `BitFlags<Auto>`. `enumflags2` is a
+// direct dependency ONLY so that empty set can be spelled `BitFlags::EMPTY`
+// instead of a `Default::default()` whose meaning would change silently if
+// upstream ever gave `Auto` a custom default. It is the same version libcosmic
+// already resolves, so it adds no extra build.
+use cosmic::core::Auto;
+use enumflags2::BitFlags;
 
 /// The persisted roundness byte (0 round / 1 slightly / 2 square) as a cosmic
 /// [`Roundness`]. Any out-of-range value degrades to `Round` (the default look).
@@ -452,12 +460,190 @@ pub(crate) fn accent(theme: &Theme) -> Color {
     theme.cosmic().accent_color().into()
 }
 
-/// The foreground drawn ON an accent fill (glyphs on selected segments).
+/// The foreground drawn ON an accent fill: labels AND glyphs, one value for both.
+///
+/// THE one source of truth for on-accent ink (DRAGON-607). It is `accent_button.on`,
+/// which is exactly what libcosmic's own [`Button::Suggested`](cosmic::theme::Button)
+/// paints, so a custom accent button of ours and a stock suggested one standing next to
+/// it can never disagree. That "next to it" case is not hypothetical: the preview
+/// toolbar shows Apply Crop and Upload side by side.
+///
+/// **It is deliberately NOT `on_accent_color()` (`accent.on`), which is what this
+/// returned until DRAGON-607, and the name is the whole trap.** That token is a fixed
+/// neutral step chosen by LIGHT/DARK MODE ALONE: `control_steps_array[0]`, reversed for
+/// light, so a dark theme always gets near-black and a light theme always gets
+/// near-white. **The accent colour is never consulted.** It looks correct on the COSMIC
+/// defaults only because those pair a LIGHT accent with a dark theme, which is the case
+/// where "always near-black" happens to be the right answer. Give it a DARK accent in a
+/// dark theme and it returns near-black ink for a near-black fill.
+/// `accent_button.on` instead comes from cosmic-theme's `get_text`, which derives the
+/// ink from the accent's own lightness, so it tracks the colour it sits on. There is a
+/// test below that fails if this is ever pointed back.
 pub(crate) fn on_accent(theme: &Theme) -> Color {
-    theme.cosmic().on_accent_color().into()
+    theme.cosmic().accent_button.on.into()
+}
+
+/// The container style that content wrapped INSIDE an accent-filled button must wear.
+///
+/// **The rule this exists to enforce, which has now been rediscovered twice
+/// (DRAGON-601's hex label, DRAGON-607's accent buttons): a container's `text_color` and
+/// `icon_color` are not a suggestion that the leaf can decline, they are an
+/// UNCONDITIONAL override of everything below, and the LAST container before the leaf
+/// wins.** Depth changes nothing: one wrapper and three wrappers behave identically.
+///
+/// The other half of that lesson, which rules out a whole family of false suspects: only
+/// a DESCENDANT of the button can override its ink. An ANCESTOR cannot, because the
+/// button's own style is applied deeper and deeper wins. So the cluster containers and
+/// group backgrounds that accent buttons sit inside are all innocent, and the search for
+/// this bug is always "what sits BETWEEN the button and its label".
+///
+/// Two consequences worth keeping in mind before styling anything nested:
+///  - Setting ink on an ancestor (a button, an outer container) does NOT reach a leaf
+///    that has any styled container between them. That is the bug both tickets were.
+///  - A PLAIN `widget::container` is not neutral. libcosmic's default class is
+///    `Container::Transparent`, and that class explicitly sets BOTH fields to the
+///    surrounding container's `component.on`, the ordinary window foreground. Dropping
+///    one between an accent button and its label therefore REPLACES the on-accent ink
+///    with near-white in a dark theme, which is precisely how the owner ended up with
+///    some purple buttons in black and some in white.
+///
+/// So: wrap with THIS instead of a bare container, and the ink survives the trip. It
+/// paints nothing itself (no background, no border), it only refuses to clobber the ink.
+/// Both fields are set together on purpose, because setting one and forgetting the other
+/// is the exact shape of the defect.
+///
+/// **One hazard, learned by making the mistake while fixing this ticket.** This helper is
+/// for a surface that is ALWAYS the accent. A surface that is only SOMETIMES the accent,
+/// such as either half of a segmented pair, must not use it: the inactive half is filled
+/// with the [`state_mix`] wash, and giving it on-accent ink reproduces the very bug this
+/// helper exists to fix, just somewhere new. Use [`ink_content`] with [`segment_ink`]
+/// there. A shared helper makes a fix easy to apply and equally easy to MISapply, so check
+/// what the surface actually is before reaching for this one.
+pub(crate) fn on_accent_content(theme: &Theme) -> cosmic::iced::widget::container::Style {
+    ink_content(on_accent(theme))
+}
+
+/// A wrapper container that CARRIES `ink` down to the leaf instead of resetting it, for
+/// content whose ink is not the plain on-accent value (DRAGON-607).
+///
+/// Pure; unit-tested. THE one place both ink fields are written, which is the point:
+/// every wrapper in the app goes through here, so no site can set the text colour and
+/// forget the glyph colour. [`on_accent_content`] is this with the accent's ink already
+/// filled in; a segmented control passes [`segment_ink`] instead, because its inactive
+/// half is not filled with the accent.
+///
+/// It paints nothing. No background, no border, no radius: it exists only to refuse to
+/// clobber the ink. See [`on_accent_content`] for why a bare container does clobber it.
+pub(crate) fn ink_content(ink: Color) -> cosmic::iced::widget::container::Style {
+    cosmic::iced::widget::container::Style {
+        text_color: Some(ink),
+        icon_color: Some(ink),
+        ..Default::default()
+    }
+}
+
+/// The container class a button's wrapped CONTENT must wear, decided from the button's
+/// own class (DRAGON-607).
+///
+/// Pure; unit-tested. This is the decision extracted out of the call sites, so the
+/// settings helper and the preview's Upload button cannot answer it differently: an
+/// accent-filled class gets a wrapper that carries the on-accent ink, anything else keeps
+/// the toolkit default and is byte-identical to before.
+///
+/// Stock classes only, via [`fills_with_accent`]. A `Button::Custom` owns its own ink and
+/// gets the default here; segmented controls pass [`ink_content`] with [`segment_ink`]
+/// directly, because their answer depends on which segment it is rather than on the class.
+pub(crate) fn button_content_class(
+    class: &cosmic::theme::Button,
+) -> cosmic::theme::Container<'static> {
+    if fills_with_accent(class) {
+        cosmic::theme::Container::custom(on_accent_content)
+    } else {
+        cosmic::theme::Container::default()
+    }
+}
+
+/// The legible ink for a fill the toolkit has NO on-colour token for: our own blended
+/// surfaces, such as the inactive segment's [`state_mix`] wash (DRAGON-607).
+///
+/// Pure; unit-tested. Black or white, chosen by [`crate::color::Srgb::wants_dark_text`],
+/// which is the app's one WCAG crossover and the same decision the colour picker's hex
+/// label makes. Reusing it is the point: this is not a second opinion about contrast, it
+/// is the SAME opinion applied to a second surface.
+///
+/// This does NOT replace [`on_accent`] and must not be used for an accent fill. For the
+/// accent we defer to the toolkit's own `accent_button.on`, so our accent buttons match
+/// libcosmic's stock ones exactly. This exists only for the surfaces libcosmic never
+/// derived a token for, because we invented them.
+///
+/// Alpha is ignored: the fill is treated as opaque. Every surface this is used on today
+/// is opaque, and answering honestly for a translucent one would need the composite.
+pub(crate) fn legible_ink_on(fill: Color) -> Color {
+    let s = crate::color::Srgb::from_unit_clamped([fill.r as f64, fill.g as f64, fill.b as f64]);
+    if s.wants_dark_text() { Color::BLACK } else { Color::WHITE }
+}
+
+/// The ink ONE segment of a segmented pair draws its glyph and its label in (DRAGON-607).
+///
+/// Pure; unit-tested. THE shared answer for both consumers, so the capture toolbar's kind
+/// pair and the preview timeline's pointer/scissor pair can never drift: [`segment_style`]
+/// reads it for the button's own `icon_color`/`text_color`, and `preview::chrome`'s
+/// `seg_toggle` reads it for the explicit SVG class its glyph needs.
+///
+/// Active segments are filled with the accent, so they take [`on_accent`], the toolkit's
+/// own value. Inactive segments are filled with our [`state_mix`] wash, which is NOT the
+/// accent, so they take the ink that fill actually needs ([`legible_ink_on`]). See
+/// [`segment_style`] for why the two used to share one colour and why the owner changed it.
+///
+/// The inactive answer is deliberately computed against the RESTING fill and then used for
+/// the hover fill too. The hover wash is only a little lighter, the assertion in this
+/// module's tests pins that one ink clears the bar on BOTH, and a glyph that changed
+/// colour under the pointer would be a new annoyance in place of the old one.
+pub(crate) fn segment_ink(t: &Theme, active: bool) -> Color {
+    if active { on_accent(t) } else { legible_ink_on(state_mix(t, SEGMENT_MIX_OFF)) }
+}
+
+/// The inactive segment's resting fill blend, shared by [`segment_style`] and the ink
+/// [`segment_ink`] derives from it, so the fill and its ink can never be computed from two
+/// different numbers.
+pub(crate) const SEGMENT_MIX_OFF: f32 = 0.2;
+
+/// The inactive segment's HOVER fill blend. Stronger than [`SEGMENT_MIX_OFF`] so hover
+/// separates from both the group base and the resting fill.
+pub(crate) const SEGMENT_MIX_HOVER: f32 = 0.35;
+
+const _: () = assert!(
+    SEGMENT_MIX_HOVER > SEGMENT_MIX_OFF,
+    "DRAGON-607: hover must be a STRONGER wash than rest, or the segment stops reacting and \
+     the one ink chosen for the resting fill is no longer the ink hover was checked against"
+);
+
+/// Whether a STOCK libcosmic button class fills its box with the accent, and so needs its
+/// content to carry on-accent ink rather than the ordinary window foreground.
+///
+/// Pure; unit-tested. It exists so a helper that takes a button class as a PARAMETER
+/// (`settings::row::centered_button`) can decide for itself, instead of every caller
+/// remembering to pass the right ink alongside the right class. Forgetting is the whole
+/// failure mode this ticket is about.
+///
+/// It answers for the stock classes only. `Button::Custom` carries an opaque closure, so
+/// this cannot see whether it paints an accent fill and deliberately says `false` rather
+/// than guessing; a custom style owns its own ink (see [`segment_style`]).
+pub(crate) fn fills_with_accent(class: &cosmic::theme::Button) -> bool {
+    matches!(class, cosmic::theme::Button::Suggested)
 }
 
 /// The accent variant tuned for TEXT/icons on the plain background.
+///
+/// **Never use this as ink ON an accent fill; that is [`on_accent`].** The names read as
+/// alternatives and they are not: this one is accent-COLOURED text for a normal surface,
+/// the other is the contrasting ink for an accent surface. Misusing it here fails harder
+/// than the DRAGON-607 bug did, because [`apply_contrast_boost`] pins this app's
+/// `accent_text` to `accent.base`: the text would be the accent drawn on the accent, so
+/// INVISIBLE rather than merely low contrast.
+///
+/// Its one non-test consumer is the settings nav rail's active icon, which sits on a
+/// neutral pill. That is the correct shape for this helper.
 pub(crate) fn accent_text(theme: &Theme) -> Color {
     theme.cosmic().accent_text_color().into()
 }
@@ -477,7 +663,7 @@ pub(crate) fn accent_text(theme: &Theme) -> Color {
 /// Lived in `preview::chrome` until DRAGON-475 gave it a second consumer; moved here
 /// rather than copied, so the two toolbars can never drift apart.
 pub(crate) fn cluster_border(theme: &Theme) -> Color {
-    theme.cosmic().background.divider.into()
+    theme.cosmic().background(false).divider.into()
 }
 
 // ── Shared segmented-pair styling ────────────────────────────────────────────
@@ -508,7 +694,7 @@ pub(crate) fn segment_style(
     } else if hovered {
         // A fixed blend toward the foreground, strong enough to separate from
         // BOTH the group base and the segment's resting fill.
-        state_mix(t, 0.35)
+        state_mix(t, SEGMENT_MIX_HOVER)
     } else {
         // An OPAQUE resting fill (a low blend toward the foreground) rather than the
         // theme's translucent `component.divider`: the divider's alpha let the frosted
@@ -518,16 +704,38 @@ pub(crate) fn segment_style(
         // active state. Shared by both preview toggles + the capture mode selector, so all
         // three stay consistent. Bumped 0.12 -> 0.2 so unselected items read stronger against
         // the glass (still clearly below the accent-filled active state).
-        state_mix(t, 0.2)
+        state_mix(t, SEGMENT_MIX_OFF)
     };
-    // Uniform icon color across the whole group: the unselected glyphs match the SELECTED one
-    // (`on_accent`) instead of the subdued component base, so every button-group icon reads the
-    // same color app-wide (user request) — the segment fill alone signals selection.
-    let icon_color = on_accent(t);
+    // The ink is chosen PER SEGMENT, against the fill that segment actually has.
+    //
+    // HISTORY, so this is not quietly reverted (DRAGON-607). This group used to paint EVERY
+    // glyph with `on_accent`, active and inactive alike, deliberately: the owner asked for one
+    // uniform icon colour across a group, with the fill alone signalling selection. The flaw
+    // is that `on_accent` means "ink for a surface that IS the accent", and an inactive
+    // segment is not filled with the accent, it is filled with `state_mix(t, 0.2)`. So the
+    // uniform rule put on-accent ink on a non-accent surface, which is wrong by the definition
+    // of the token and not merely low contrast: on a dark theme that is near-black ink on a
+    // dark grey fill. Put the tradeoff to the owner, they chose legibility over uniformity, so
+    // active and inactive glyphs no longer match and that IS the intended look now.
+    //
+    // The inactive ink is derived from its OWN fill rather than being a second hardcoded
+    // constant, so it keeps tracking `state_mix` if that factor or the theme ever moves.
+    //
+    // TEXT gets the same value as the glyph, set here rather than left unset. `Style::new()`
+    // leaves `text_color` as `None`, so a segment carrying a LABEL rather than a glyph used to
+    // inherit the ambient window foreground while its glyph took the segment's ink: one
+    // button, two answers. Every segment today is icon-only, so that half changes nothing on
+    // screen; it is here so the first labelled segment cannot reintroduce the split.
+    //
+    // NOTE this only reaches content that is not wrapped in a styled container. A segment
+    // whose content sits inside a plain `widget::container` loses BOTH of these; see
+    // [`on_accent_content`] for why, and use it there.
+    let ink = if active { on_accent(t) } else { legible_ink_on(bg) };
     cosmic::widget::button::Style {
         background: Some(cosmic::iced::Background::Color(bg)),
         border_radius: [rl, rr, rr, rl].into(),
-        icon_color: Some(icon_color),
+        icon_color: Some(ink),
+        text_color: Some(ink),
         ..cosmic::widget::button::Style::new()
     }
 }
@@ -630,12 +838,18 @@ pub(crate) fn theme_is_dark() -> bool {
 // ── Frosted-glass ("liquid glass") config ────────────────────────────────────
 // COSMIC's frosted windows (cosmic-settings → Appearance → Style): the
 // compositor blurs the backdrop behind an opted-in surface, and the theme paints
-// its surfaces translucent so the blur shows through. Our PINNED libcosmic
-// (4657b6a) predates the theme's `frosted`/`alpha_map` fields, so we read them
-// straight off the active theme's v2 config on disk and supply the alpha
-// ourselves (see `frost_color`). Enrollment is done separately (the two toplevel
-// windows set `window::Settings.blur`; DRAGON-217). Ticket DRAGON-218 reuses this
-// reader to reproduce the glass inside single-window captures.
+// its surfaces translucent so the blur shows through. We read the `frosted` /
+// `alpha_map` preferences straight off the active theme's v2 config on disk and
+// supply the alpha ourselves (see `frost_color`), which started as a workaround
+// for a libcosmic pin that predated those theme fields and is now simply the one
+// reader: it answers the same question on every platform and it does not depend
+// on which surface the toolkit happens to have themed.
+//
+// ENROLLMENT is separate and stays EXPLICIT. The two toplevel windows that want
+// glass set `window::Settings.blur` themselves (DRAGON-217), and DRAGON-602 turns
+// the toolkit's automatic enrollment off for everything else, so nothing gets
+// compositor glass it did not ask for (see `toolkit_auto_glass`). DRAGON-218
+// reuses this reader to reproduce the glass inside single-window captures.
 
 /// The glass ordinal → `alpha_map` field names, in `BlurStrength` order (0..=13).
 /// Matches cosmic-theme's `AlphaMap`/`BlurStrength::try_from` (theme.rs:1671/1696
@@ -839,7 +1053,7 @@ fn windows_glass_config() -> Option<GlassConfig> {
 /// fallback (DRAGON-268 follow-up, Task 2). Reads the live `cosmic::theme::active()`.
 #[cfg(target_os = "macos")]
 pub(crate) fn background_base_rgba() -> [u8; 4] {
-    let bg: Color = cosmic::theme::active().cosmic().background.base.into();
+    let bg: Color = cosmic::theme::active().cosmic().background(false).base.into();
     let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     [c(bg.r), c(bg.g), c(bg.b), 255]
 }
@@ -889,6 +1103,44 @@ fn macos_glass_config() -> Option<GlassConfig> {
 #[cfg_attr(windows, allow(dead_code))]
 pub(crate) fn glass_windows_enabled() -> bool {
     glass_config().is_some_and(|g| g.frosted_windows)
+}
+
+/// Which surface classes the TOOLKIT may enroll in the compositor's backdrop blur
+/// on its own, from the user's frosted-windows theme preference and nothing else.
+/// NONE of them (DRAGON-602).
+///
+/// This is a correctness rule, not a taste one. We are a capture tool: an overlay
+/// exists so the user can see the desktop they are about to capture, and a
+/// compositor that frosts what is behind that overlay shows them a picture of
+/// their screen that is not their screen. It reached the owner as "the entire
+/// screen is highly blurred" in region select AND in monitor select, because both
+/// are the same fullscreen layer surface, and with `freeze = false` nothing is
+/// drawn on it at all: what you look through the overlay AT is the live desktop,
+/// so only the compositor could have blurred it.
+///
+/// The mechanism, for the next reader. libcosmic 8a017a1 added an auto-blur
+/// feature whose `Core::auto_blur` defaults to every class
+/// (`Auto::System | Auto::Popup | Auto::Window`). Once cosmic-comp advertises
+/// `ext_background_effect_manager_v1` with the Blur capability, libcosmic answers
+/// each surface's `Opened` with `iced::window::enable_blur`, which on Wayland is a
+/// `set_blur_region` covering the whole surface (measured under `WAYLAND_DEBUG=1`:
+/// `wl_region.add(0, 0, 2147483647, 2147483647)`, three surfaces, one per
+/// overlay). Emptying `auto_blur` also pins `Theme::transparent` to false, which
+/// is what keeps every `background(false)` call site rendering the same opaque
+/// containers it always did instead of flipping to the translucent variants
+/// part-way through a session.
+///
+/// Emptying this does NOT turn glass off. It removes the IMPLICIT arm only. A
+/// surface that ASKS for glass still gets it: the colour picker and the macOS
+/// permission window pass `window::Settings.blur` at creation (gated on
+/// [`glass_windows_enabled`]), `crate::glass` still reproduces cosmic-comp's frost
+/// inside reconstructed captures, and libcosmic's per-surface
+/// `LiveSettings.blur` override is untouched. Glass because we asked, never by
+/// default.
+///
+/// Pure; unit-tested.
+pub(crate) fn toolkit_auto_glass() -> BitFlags<Auto> {
+    BitFlags::EMPTY
 }
 
 /// Overlay the frosted-glass surface alpha onto an opaque base colour, when the
@@ -961,7 +1213,7 @@ pub(crate) fn wallpaper_path() -> Option<std::path::PathBuf> {
 fn toward_bg(theme: &Theme, t: f32) -> Color {
     let cosmic = theme.cosmic();
     let on: Color = cosmic.on_bg_color().into();
-    let bg: Color = cosmic.background.base.into();
+    let bg: Color = cosmic.background(false).base.into();
     Color::from_rgb(
         on.r * (1.0 - t) + bg.r * t,
         on.g * (1.0 - t) + bg.g * t,
@@ -1000,8 +1252,8 @@ pub(crate) const MIX_OFF: f32 = 0.40;
 /// dimming primitive behind every toolbar toggle state.
 pub(crate) fn state_mix(t: &Theme, amount: f32) -> Color {
     let c = t.cosmic();
-    let b = c.background.component.base;
-    let o = c.background.component.on;
+    let b = c.background(false).component.base;
+    let o = c.background(false).component.on;
     let mix = |x: f32, y: f32| x + (y - x) * amount;
     Color::from_rgb(mix(b.red, o.red), mix(b.green, o.green), mix(b.blue, o.blue))
 }
@@ -1023,7 +1275,7 @@ pub(crate) const DANGER: Color = Color { r: 0.93, g: 0.36, b: 0.34, a: 1.0 };
 /// Whether the active theme's background is light — so the semantic colours need
 /// deepening to stay legible as text (the bright variants wash out on near-white).
 fn bg_is_light(theme: &Theme) -> bool {
-    let bg: Color = theme.cosmic().background.base.into();
+    let bg: Color = theme.cosmic().background(false).base.into();
     0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b >= 0.5
 }
 
@@ -1051,6 +1303,177 @@ pub(crate) fn danger(theme: &Theme) -> Color {
         Color::from_rgb(0.78, 0.15, 0.12)
     } else {
         DANGER
+    }
+}
+
+// ── The monospace face (DRAGON-601) ──────────────────────────────────────────
+//
+// **Asking for `Font::MONOSPACE` does not get you a monospace face.** That request reaches
+// cosmic-text as `Family::Monospace`, which fontdb resolves to ONE literal family NAME,
+// whatever `set_monospace_family` was given. cosmic-text sets it to "Noto Sans Mono"
+// (`font/system.rs`), and `fontdb::Database::query` returns `None` when no installed face
+// carries that name (`lib.rs:661`), at which point cosmic-text falls back to the head of its
+// all-faces list — a PROPORTIONAL face. Nothing anywhere reports that this happened.
+//
+// Measured, not assumed, by shaping "#FF8800" through the app's own global font system and
+// reading back the resolved face and per-glyph advances:
+//
+// * `Font::MONOSPACE` on this Linux box -> NotoSansMono-Regular, every advance 16.800 at 28px.
+//   Real monospace, because "Noto Sans Mono" happens to be installed.
+// * the same request with an UNINSTALLED family -> Noto Sans, advances 18.088 / 14.532 /
+//   16.016. Silently proportional, with no warning of any kind.
+//
+// macOS and Windows do not ship "Noto Sans Mono", so the second shape is what they were
+// getting. The fix is to name families that actually exist and check before asking.
+
+/// The families this app accepts for monospace text, best first.
+///
+/// Everything here is a REAL family name, never a generic: a generic is exactly the request
+/// that fails silently. The list spans the three platforms deliberately, because the same
+/// binary ships to all of them and the first installed entry wins.
+pub(crate) const MONO_FAMILY_LADDER: &[&str] = &[
+    // cosmic-text's own generic target, and COSMIC's configured default. First so a Linux box
+    // resolves to the same face it always did and nothing about that platform changes.
+    "Noto Sans Mono",
+    // The common Linux fallbacks, for a distro with no Noto.
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "JetBrains Mono",
+    // Windows. Cascadia ships with Windows 11 and the terminal; Consolas goes back much
+    // further; Courier New is the floor and is also fontdb's own generic default.
+    "Cascadia Mono",
+    "Consolas",
+    "Courier New",
+    // macOS.
+    "SF Mono",
+    "Menlo",
+    "Monaco",
+];
+
+/// **Pure**, unit-tested: the first family in `ladder` the font stack can really render.
+///
+/// `has_face(family, bold)` answers whether that family has a face at that weight. Two passes,
+/// and the order is the point: a family with BOTH a regular and a bold face is preferred over
+/// one with only a regular, because the caller may ask for bold and **cosmic-text does not
+/// synthesise it**. Weight matching there picks the nearest available face, so a bold request
+/// against a regular-only family renders regular, silently, exactly like the family miss this
+/// whole ladder exists to prevent. Preferring a complete family is how that is avoided without
+/// the call site having to know which weights exist.
+///
+/// `None` when nothing in the ladder is installed, which is the caller's cue to fall back to
+/// the toolkit's generic request rather than to name a family that is not there.
+pub(crate) fn pick_mono_family<'a>(
+    ladder: &[&'a str],
+    has_face: impl Fn(&str, bool) -> bool,
+) -> Option<&'a str> {
+    ladder
+        .iter()
+        .copied()
+        .find(|f| has_face(f, false) && has_face(f, true))
+        .or_else(|| ladder.iter().copied().find(|f| has_face(f, false)))
+}
+
+/// Whether `family` has an installed face at the requested weight. The effectful half of
+/// [`pick_mono_family`]: it reads the process-global font database the renderer itself shapes
+/// against, so the answer is the one the screen will actually give.
+fn font_family_has_face(family: &str, bold: bool) -> bool {
+    let Ok(fs) = cosmic::iced::advanced::graphics::text::font_system().read() else {
+        return false;
+    };
+    fs.db().faces().any(|f| {
+        f.families.iter().any(|(name, _)| name == family)
+            // 600 is the usual semibold/bold crossover. A face at or above it can serve a
+            // bold request; one below it serves the regular one.
+            && (f.weight.0 >= 600) == bold
+    })
+}
+
+/// The user's COSMIC-configured monospace family, if it is a named one.
+///
+/// Tried before [`MONO_FAMILY_LADDER`] because it is the face the user actually chose for
+/// monospace text on this desktop, and matching it keeps our chips looking like the rest of
+/// their session. Off COSMIC this is libcosmic's own default ("Noto Sans Mono"), which the
+/// ladder names anyway, so nothing is lost.
+fn configured_mono_family() -> Option<&'static str> {
+    match cosmic::font::mono().family {
+        cosmic::iced::font::Family::Name(name) => Some(name),
+        _ => None,
+    }
+}
+
+/// THE monospace font this app renders with, at the requested weight.
+///
+/// One treatment for every monospace chip in the app, so the hex label and the capture
+/// toolbar's timer can never resolve to different faces. Resolved ONCE per process (the
+/// database walk is not free and the answer cannot change under us), and it says in the debug
+/// log which family it landed on, so a report of "that does not look monospace" is answerable
+/// from the log instead of by guesswork.
+pub(crate) fn mono_font(bold: bool) -> cosmic::iced::Font {
+    static FAMILY: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    let family = *FAMILY.get_or_init(|| {
+        let mut ladder: Vec<&'static str> = Vec::with_capacity(MONO_FAMILY_LADDER.len() + 1);
+        ladder.extend(configured_mono_family());
+        ladder.extend_from_slice(MONO_FAMILY_LADDER);
+        let picked = pick_mono_family(&ladder, font_family_has_face);
+        match picked {
+            Some(f) => log::debug!("monospace text resolves to the '{f}' family"),
+            None => log::warn!(
+                "no monospace family this app knows about is installed, so monospace text \
+                 falls back to the toolkit's generic request and may render proportional"
+            ),
+        }
+        picked
+    });
+    let weight = if bold {
+        cosmic::iced::font::Weight::Bold
+    } else {
+        cosmic::iced::font::Weight::Normal
+    };
+    match family {
+        Some(name) => cosmic::iced::Font { weight, ..cosmic::iced::Font::with_name(name) },
+        // Nothing installed matched. The generic is no worse than what we asked for before,
+        // and the warning above has already said the face may not be monospace.
+        None => cosmic::iced::Font { weight, ..cosmic::iced::Font::MONOSPACE },
+    }
+}
+
+#[cfg(test)]
+mod toolkit_auto_glass_tests {
+    use super::*;
+
+    // DRAGON-602. The failure these pin is one the compiler cannot see: adding a
+    // class back makes the compositor frost the LIVE desktop behind whatever
+    // surface it covers, and a capture overlay that frosts its own subject is
+    // showing the user a screen that is not their screen.
+
+    #[test]
+    fn layer_surfaces_are_never_auto_frosted() {
+        // `Auto::System` is libcosmic's name for layer-shell surfaces, which is
+        // every capture overlay we mint on Linux: region select, monitor select,
+        // window select, the countdown, the preview overlay.
+        assert!(!toolkit_auto_glass().contains(Auto::System));
+    }
+
+    #[test]
+    fn toplevel_windows_are_never_auto_frosted() {
+        // Settings, preview-in-a-window, the colour picker, and the Flatpak
+        // fallback capture overlay, which is a plain toplevel and covers the
+        // screen exactly like the layer-shell one does.
+        assert!(!toolkit_auto_glass().contains(Auto::Window));
+    }
+
+    #[test]
+    fn popups_are_never_auto_frosted() {
+        // The overlay's own dropdown menus sit over the capture subject too.
+        assert!(!toolkit_auto_glass().contains(Auto::Popup));
+    }
+
+    #[test]
+    fn the_set_is_empty_so_a_new_upstream_class_is_off_by_default() {
+        // Asserting emptiness rather than three absences: if libcosmic adds a
+        // fourth `Auto` variant, an opt-in must be a deliberate edit here, not
+        // something a dependency bump turns on for us.
+        assert!(toolkit_auto_glass().is_empty());
     }
 }
 
@@ -1325,5 +1748,351 @@ mod tests {
         let on = accent(&resolve_appearance_theme(false, 1, bright, 0, true));
         let d = (on.r - off.r).abs() + (on.g - off.g).abs() + (on.b - off.b).abs();
         assert!(d < 0.02, "boost must not shift a high-contrast accent: on={on:?} off={off:?}");
+    }
+}
+
+/// DRAGON-601: which monospace family we ask for, and why asking for the generic was not
+/// enough. The installed-face probe is injected, so these run identically on a build machine
+/// with every font and on one with none.
+#[cfg(test)]
+mod mono_family_tests {
+    use super::*;
+
+    /// A stack described as `(family, has_regular, has_bold)`.
+    fn stack(faces: &'static [(&'static str, bool, bool)]) -> impl Fn(&str, bool) -> bool {
+        move |family, bold| {
+            faces
+                .iter()
+                .any(|(n, reg, bld)| *n == family && if bold { *bld } else { *reg })
+        }
+    }
+
+    /// The ordinary case: the first installed family in the ladder wins, and the ones above it
+    /// that are not installed are skipped rather than named.
+    #[test]
+    fn the_first_installed_family_wins() {
+        // A Windows-shaped stack: nothing above Consolas in the ladder is installed.
+        let has = stack(&[("Consolas", true, true), ("Courier New", true, true)]);
+        assert_eq!(pick_mono_family(MONO_FAMILY_LADDER, &has), Some("Consolas"));
+        // A Linux-shaped one resolves at the top, which is why that platform's rendering is
+        // unchanged by this ladder existing.
+        let has = stack(&[("Noto Sans Mono", true, true), ("Consolas", true, true)]);
+        assert_eq!(pick_mono_family(MONO_FAMILY_LADDER, &has), Some("Noto Sans Mono"));
+    }
+
+    /// THE reason the two passes exist. A family with a regular face but NO bold one loses to a
+    /// complete family further down, because cosmic-text does not synthesise bold: a bold
+    /// request against a regular-only family renders regular and says nothing.
+    #[test]
+    fn a_family_with_no_bold_face_loses_to_a_complete_one() {
+        let has = stack(&[("Noto Sans Mono", true, false), ("DejaVu Sans Mono", true, true)]);
+        assert_eq!(
+            pick_mono_family(MONO_FAMILY_LADDER, &has),
+            Some("DejaVu Sans Mono"),
+            "a regular-only family cannot serve the bold hex label"
+        );
+    }
+
+    /// But a regular-only family is still far better than nothing, so it is taken when it is
+    /// all there is. Rendering bold-as-regular in a real monospace face is a much smaller
+    /// failure than rendering the label proportional.
+    #[test]
+    fn a_regular_only_family_is_still_taken_when_it_is_all_there_is() {
+        let has = stack(&[("Menlo", true, false)]);
+        assert_eq!(pick_mono_family(MONO_FAMILY_LADDER, &has), Some("Menlo"));
+    }
+
+    /// Nothing installed means NONE, never a guess. The caller turns that into the toolkit's
+    /// generic request plus a warning; naming a family that is not there would land us back on
+    /// the silent proportional fallback this ladder exists to prevent.
+    #[test]
+    fn an_empty_stack_names_nothing() {
+        let has = stack(&[]);
+        assert_eq!(pick_mono_family(MONO_FAMILY_LADDER, &has), None);
+        // And a stack with only fonts we never ask for is the same answer.
+        let has = stack(&[("Inter", true, true), ("Open Sans", true, true)]);
+        assert_eq!(pick_mono_family(MONO_FAMILY_LADDER, &has), None);
+    }
+
+    /// The ladder itself: real family names only, no duplicates, and one entry for each of the
+    /// three platforms we ship. A generic slipping in here would reintroduce the exact silent
+    /// fallback that made the hex label proportional on macOS and Windows.
+    #[test]
+    fn the_ladder_names_real_families_for_every_platform() {
+        for f in MONO_FAMILY_LADDER {
+            assert!(!f.is_empty());
+            assert!(
+                !matches!(*f, "monospace" | "sans-serif" | "serif"),
+                "{f} is a generic, which is the request that fails silently"
+            );
+        }
+        let mut seen = MONO_FAMILY_LADDER.to_vec();
+        seen.sort_unstable();
+        let before = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), before, "a duplicate family only costs a second lookup");
+        for want in ["Noto Sans Mono", "Consolas", "Menlo"] {
+            assert!(MONO_FAMILY_LADDER.contains(&want), "{want} covers a platform we ship to");
+        }
+    }
+}
+
+/// On-accent ink: the ONE source of truth every accent-filled surface reads (DRAGON-607).
+///
+/// These build REAL cosmic themes rather than asserting on colour literals, because the
+/// bug was never our arithmetic. It was reading the wrong token out of the toolkit, and
+/// only a real theme can tell two tokens apart.
+#[cfg(test)]
+mod on_accent_ink_tests {
+    use super::*;
+    use crate::color::Srgb;
+    use cosmic::cosmic_theme::ThemeBuilder;
+    use cosmic::cosmic_theme::palette::Srgb as PSrgb;
+
+    /// The AA bar for body text, the same one DRAGON-601 held the picker's hex label to.
+    const AA: f64 = 4.5;
+
+    fn srgb(c: Color) -> Srgb {
+        Srgb::from_unit_clamped([c.r as f64, c.g as f64, c.b as f64])
+    }
+
+    /// A dark theme carrying `accent`, which is what every case here varies.
+    fn dark_theme_with(accent: [f32; 3]) -> cosmic::Theme {
+        let built = ThemeBuilder::dark()
+            .accent(PSrgb::new(accent[0], accent[1], accent[2]))
+            .build();
+        cosmic::Theme::custom(std::sync::Arc::new(built))
+    }
+
+    /// The owner's real accent, read from their COSMIC config: the purple that started this.
+    const OWNER_PURPLE: [f32; 3] = [0.5921569, 0.49019608, 0.9254902];
+
+    /// The ink we choose must be READABLE on the accent it sits on. This is the whole
+    /// contract, stated against a real built theme.
+    #[test]
+    fn the_owners_accent_gets_readable_ink() {
+        let t = dark_theme_with(OWNER_PURPLE);
+        let fill = srgb(accent(&t));
+        let ink = srgb(on_accent(&t));
+        let ratio = fill.contrast_ratio(ink);
+        assert!(ratio >= AA, "on-accent ink reads at only {ratio:.2}:1 on the owner's purple");
+    }
+
+    /// **The regression guard for the actual change, and it FAILS against the old source.**
+    ///
+    /// `on_accent` used to return `accent.on` (`on_accent_color()`). That token is a fixed
+    /// neutral step chosen by light/dark mode alone and never looks at the accent, so in a
+    /// DARK theme it is always near-black. Give it a DARK accent and it puts near-black ink
+    /// on a near-black fill. `accent_button.on` is derived from the accent's own lightness,
+    /// so it flips to light ink instead.
+    ///
+    /// Both halves are asserted on purpose: that the OLD source really does fail here (so
+    /// this test is proving something, not passing by luck on either source), and that the
+    /// NEW one clears AA. Repointing `on_accent` back at `on_accent_color()` fails this.
+    #[test]
+    fn a_dark_accent_in_a_dark_theme_is_where_the_old_source_broke() {
+        // A deep indigo: dark enough that black ink on it is unreadable.
+        let t = dark_theme_with([0.13, 0.07, 0.38]);
+        let fill = srgb(accent(&t));
+
+        let old = srgb(t.cosmic().on_accent_color().into());
+        let old_ratio = fill.contrast_ratio(old);
+        assert!(
+            old_ratio < AA,
+            "the OLD source (accent.on) was supposed to fail here but read {old_ratio:.2}:1; \
+             if the toolkit changed, this test needs a new accent, not a lowered bar"
+        );
+
+        let new_ratio = fill.contrast_ratio(srgb(on_accent(&t)));
+        assert!(new_ratio >= AA, "on-accent ink reads at only {new_ratio:.2}:1 on a dark accent");
+    }
+
+    /// Our helper must agree with the toolkit's own suggested button EXACTLY, because they
+    /// stand side by side (the preview toolbar shows Apply Crop next to Upload). Same value,
+    /// not merely both readable: two different readable answers is still the reported bug.
+    #[test]
+    fn we_draw_the_same_ink_the_toolkits_suggested_button_draws() {
+        for accent_rgb in [OWNER_PURPLE, [0.13, 0.07, 0.38], [0.95, 0.9, 0.2]] {
+            let t = dark_theme_with(accent_rgb);
+            let ours = on_accent(&t);
+            let toolkit: Color = t.cosmic().accent_button.on.into();
+            assert_eq!(ours, toolkit, "our accent ink diverged from Button::Suggested");
+        }
+    }
+
+    /// The ink really does FLIP with the accent. A source that ignores the accent (which is
+    /// exactly what the old one did) returns one constant for a whole theme mode, so it
+    /// passes any single-colour test. Only comparing a light accent against a dark one in
+    /// the SAME mode catches that.
+    #[test]
+    fn the_ink_flips_between_a_light_and_a_dark_accent() {
+        let light = on_accent(&dark_theme_with([0.95, 0.9, 0.2]));
+        let dark = on_accent(&dark_theme_with([0.13, 0.07, 0.38]));
+        assert_ne!(light, dark, "the ink must depend on the accent, not only on the theme mode");
+    }
+
+    /// The INACTIVE segment, checked against its OWN fill (`state_mix`), never against the
+    /// accent. Checking ink against the wrong surface is the mistake this whole ticket is,
+    /// so a test that measured against the accent here would reproduce it.
+    ///
+    /// The owner chose legibility over one uniform glyph colour when the tradeoff was put to
+    /// them; this is the assertion that keeps that choice honest.
+    /// ONE ink is chosen (from the RESTING fill) and must clear the bar on the resting fill
+    /// AND the hover fill, since the glyph deliberately does not change colour under the
+    /// pointer. Testing each fill against its own ink would let the two answers diverge and
+    /// still pass, which is the thing being ruled out.
+    #[test]
+    fn an_inactive_segment_is_readable_against_its_own_fill() {
+        for accent_rgb in [OWNER_PURPLE, [0.13, 0.07, 0.38]] {
+            let t = dark_theme_with(accent_rgb);
+            let ink = srgb(segment_ink(&t, false));
+            for mix in [SEGMENT_MIX_OFF, SEGMENT_MIX_HOVER] {
+                let ratio = srgb(state_mix(&t, mix)).contrast_ratio(ink);
+                assert!(
+                    ratio >= AA,
+                    "the inactive glyph reads at only {ratio:.2}:1 on its own fill at mix {mix}"
+                );
+            }
+        }
+    }
+
+    /// The two consumers of [`segment_ink`], `segment_style` and `preview::chrome`'s
+    /// `seg_toggle`, must read the SAME answer. `seg_toggle` cannot call `segment_style`
+    /// (it needs a bare colour for an SVG class), so the shared function is the only thing
+    /// stopping the two from drifting; this pins that they agree.
+    #[test]
+    fn the_button_style_and_the_glyph_class_read_one_answer() {
+        let t = dark_theme_with(OWNER_PURPLE);
+        for active in [true, false] {
+            let from_style = segment_style(&t, active, false, true, true).icon_color;
+            assert_eq!(
+                from_style,
+                Some(segment_ink(&t, active)),
+                "active={active}: the button style and `segment_ink` disagree"
+            );
+        }
+    }
+
+    /// The inactive ink must not simply BE the on-accent ink under another name. On the
+    /// owner's theme both the accent and the wash are dark enough to want light ink in
+    /// some themes, so "they differ" is asserted where the fills genuinely differ in
+    /// lightness rather than blanket-asserted.
+    #[test]
+    fn the_inactive_ink_answers_for_its_own_fill_not_the_accent() {
+        // A LIGHT accent in a dark theme: the accent wants dark ink, the dark wash wants
+        // light ink, so the two answers must come out different.
+        let t = dark_theme_with([0.95, 0.9, 0.2]);
+        assert_ne!(
+            segment_ink(&t, true),
+            segment_ink(&t, false),
+            "a light accent beside a dark wash must not share one ink"
+        );
+    }
+
+    /// `segment_style` must ink BOTH text and glyph, and must not hand the inactive segment
+    /// the accent's ink. The asymmetry (one field set, the other left to inherit) is the
+    /// shape of the original defect, so it is pinned rather than left to review.
+    #[test]
+    fn segment_style_inks_both_fields_and_picks_per_segment() {
+        let t = dark_theme_with(OWNER_PURPLE);
+        for active in [true, false] {
+            let s = segment_style(&t, active, false, true, true);
+            assert!(s.text_color.is_some(), "active={active}: text_color left to inherit");
+            assert_eq!(s.icon_color, s.text_color, "active={active}: label and glyph disagree");
+        }
+        let on = segment_style(&t, true, false, true, true).icon_color;
+        let off = segment_style(&t, false, false, true, true).icon_color;
+        assert_eq!(on, Some(on_accent(&t)), "the ACTIVE segment takes the on-accent ink");
+        assert_ne!(on, off, "the inactive segment must not reuse the accent's ink on its own fill");
+    }
+
+    /// The class predicate that decides whether a wrapped button's content needs on-accent
+    /// ink. `Suggested` is the only stock class that fills with the accent; `Custom` owns
+    /// its own ink and must answer false rather than guess.
+    #[test]
+    fn only_the_suggested_class_counts_as_accent_filled() {
+        assert!(fills_with_accent(&cosmic::theme::Button::Suggested));
+        for class in [
+            cosmic::theme::Button::Standard,
+            cosmic::theme::Button::Text,
+            cosmic::theme::Button::Destructive,
+            cosmic::theme::Button::Icon,
+            cosmic::theme::Button::Link,
+        ] {
+            assert!(!fills_with_accent(&class), "a non-accent class must not claim accent ink");
+        }
+    }
+
+    /// The wrapper helper sets BOTH fields, to the SAME value, and that value is
+    /// [`on_accent`]. Setting one and forgetting the other is precisely the bug, so "both"
+    /// is the property worth pinning, not the colour.
+    #[test]
+    fn the_content_wrapper_carries_both_inks() {
+        let t = dark_theme_with(OWNER_PURPLE);
+        let s = on_accent_content(&t);
+        assert_eq!(s.text_color, Some(on_accent(&t)));
+        assert_eq!(s.icon_color, Some(on_accent(&t)));
+        assert!(s.background.is_none(), "the wrapper must paint nothing, only carry ink");
+    }
+
+    /// [`ink_content`] is the ONE place both ink fields are written, so it is the one place
+    /// the "set one, forget the other" defect could come back. It must write both, write
+    /// the same value to both, and paint nothing.
+    #[test]
+    fn the_ink_wrapper_writes_both_fields_and_paints_nothing() {
+        for ink in [Color::BLACK, Color::WHITE, Color::from_rgb(0.2, 0.4, 0.9)] {
+            let s = ink_content(ink);
+            assert_eq!(s.text_color, Some(ink));
+            assert_eq!(s.icon_color, Some(ink));
+            assert!(s.background.is_none(), "the wrapper must not paint a background");
+            assert_eq!(s.border.width, 0.0, "the wrapper must not paint a border");
+        }
+    }
+
+    /// **The ticket's proof obligation, discharged headlessly.**
+    ///
+    /// The reported bug is "two accent buttons, two different inks". The settings helper
+    /// (`settings::row::centered_button`, which the About page's donate and update buttons
+    /// use) and the preview toolbar's Upload button now both derive their content wrapper
+    /// from [`button_content_class`] with the SAME class, so asserting that this decision
+    /// is a function of the class alone proves they agree, on every theme, forever. A
+    /// screenshot could only show it once, on one accent, on one machine.
+    ///
+    /// It also asserts the resolved ink actually clears AA on the accent, so "they agree"
+    /// cannot be satisfied by both being wrong together.
+    #[test]
+    fn every_accent_filled_button_resolves_one_readable_ink() {
+        for accent_rgb in [OWNER_PURPLE, [0.13, 0.07, 0.38], [0.95, 0.9, 0.2]] {
+            let t = dark_theme_with(accent_rgb);
+            // Both call sites ask the same question with the same class, so they cannot
+            // diverge: the wrapper is chosen by the class, not by the call site.
+            let settings = button_content_class(&cosmic::theme::Button::Suggested);
+            let upload = button_content_class(&cosmic::theme::Button::Suggested);
+            let resolved = |c: &cosmic::theme::Container<'static>| match c {
+                cosmic::theme::Container::Custom(f) => f(&t),
+                _ => panic!("an accent-filled button must get the ink-carrying wrapper"),
+            };
+            let (a, b) = (resolved(&settings), resolved(&upload));
+            assert_eq!(a.text_color, b.text_color, "the two accent buttons disagreed on label ink");
+            assert_eq!(a.icon_color, b.icon_color, "the two accent buttons disagreed on glyph ink");
+
+            let ink = a.text_color.expect("the wrapper sets the label ink");
+            let ratio = srgb(accent(&t)).contrast_ratio(srgb(ink));
+            assert!(ratio >= AA, "the agreed ink reads at only {ratio:.2}:1 on the accent");
+        }
+    }
+
+    /// A NON-accent class must keep the toolkit default, so the settings pill buttons stay
+    /// byte-identical to before this ticket. The fix has to be surgical: it would be no
+    /// better to have repainted every button in the app.
+    #[test]
+    fn a_neutral_class_keeps_the_default_wrapper() {
+        assert!(
+            matches!(
+                button_content_class(&cosmic::theme::Button::Standard),
+                cosmic::theme::Container::Transparent
+            ),
+            "a neutral button's content must keep the toolkit default wrapper"
+        );
     }
 }

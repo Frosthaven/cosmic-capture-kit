@@ -64,6 +64,15 @@ mod shell;
 mod surfaces;
 mod portal;
 mod overlay;
+// The colour picker tool (DRAGON-582): the dimmed magnifier overlay and the result
+// window. Read its module doc before touching where the picked pixel comes from — the
+// `PixelSource` seam and the per-platform live-read analysis live there.
+//
+// pub(crate) since DRAGON-615: `state::schema`'s serde default for the persisted magnifier
+// zoom defers to `geom::MAGNIFIER_ZOOM_DEFAULT` rather than repeating the number, so the
+// picker's own `floor < default < ceiling` compile-time assert stays the single authority
+// on the bounds and the stored default cannot drift away from the opening lens.
+pub(crate) mod color_picker;
 mod settings;
 // pub(crate): the macOS daemon (platform/mac/daemon.rs) reads the auto-open decision +
 // probe from here at startup; `App`'s own routing uses it directly.
@@ -115,6 +124,14 @@ pub struct Startup {
     // renderer, so it is no longer dead off macOS.
     pub permissions_only: bool,
     pub preview: Option<std::path::PathBuf>,
+    /// DRAGON-582: this launch is the COLOUR PICKER (`--color-picker`), not a capture.
+    ///
+    /// It still opens overlays (see [`Startup::opens_overlays`]), and deliberately so:
+    /// the picker's dimmed magnifier surface IS a capture-shaped overlay, minted through
+    /// the same `app::shell` seam on every platform, so it inherits the layer-shell /
+    /// portal-fallback / PlainWindows / Windows-10-software-rasterizer routing without a
+    /// second copy of any of it.
+    pub color_picker: bool,
     /// Launch straight into this capture mode (`--region`/`--window`/`--monitor`);
     /// `None` uses the default (Region).
     pub mode: Option<Mode>,
@@ -124,6 +141,16 @@ pub struct Startup {
     /// Pre-capture countdown seconds (`--countdown <secs>`) — an EXACT value that may
     /// not match a UI preset (e.g. 7). `None` uses the persisted delay.
     pub countdown_secs: Option<u64>,
+    /// DRAGON-559: `--audio <channels>` — arm exactly these audio channels FOR THIS
+    /// LAUNCH. `None` (no flag) keeps the persisted arms; `Some` overrides them in
+    /// memory only, through the pure `recording_ui::launch_audio_arms` decision in
+    /// `App::init`. NOTHING writes the override back: the launch itself never saves it,
+    /// and only a user's own later toggle persists (as any toggle does).
+    ///
+    /// A modifier like [`Self::no_editor`], chainable with every capture launch
+    /// (`--window --video --audio system`). Meaningful for video launches; inert for a
+    /// screenshot, which reads no arms.
+    pub audio_arms: Option<crate::recording_ui::AudioArmState>,
     /// DRAGON-295 (macOS/Windows): an IMMEDIATE capture that skips the interactive picker
     /// overlay entirely — `--active-window` grabs the frontmost window, `--active-monitor`
     /// grabs the monitor under the cursor. `None` = the normal overlay launch. The seed
@@ -241,13 +268,16 @@ fn present_mode_env_override(existing: Option<&str>) -> Option<&'static str> {
 
 /// DRAGON-427: this process's effective preview appearance, given the `chosen` one (the
 /// persisted setting, or a `--preview` launch's override), whether this process
-/// [`opens overlays`](Startup::opens_overlays), and whether the machine can show the
-/// preview EDITOR as a fullscreen overlay at all ([`crate::platform::overlay_preview_available`]).
+/// [`opens overlays`](Startup::opens_overlays), whether the machine can show the preview
+/// EDITOR as a fullscreen overlay at all ([`crate::platform::overlay_preview_available`]),
+/// and whether this process renders its overlays in SOFTWARE
+/// ([`crate::platform::software_overlays`], which is Windows 10 and nothing else).
 ///
-/// Pure, and the ONE place the Windows 10 rule is expressed:
+/// Pure, and the ONE place the rule is expressed:
 ///
-/// * **Where the overlay editor is available** (Linux, macOS, Windows 11) nothing changes —
-///   the chosen value is returned untouched, so those platforms stay byte-identical.
+/// * **Where the overlay editor is available** (macOS, Windows 11, a layer-shell Linux
+///   session) nothing changes — the chosen value is returned untouched, so those platforms
+///   stay byte-identical.
 /// * **A Windows 10 process that opens overlays** is the CAPTURE half. It renders in
 ///   software and must therefore never mint the real editor, but it still shows fullscreen
 ///   loaders and covers — which ARE preview surfaces, and which want to be translucent
@@ -258,15 +288,22 @@ fn present_mode_env_override(existing: Option<&str>) -> Option<&'static str> {
 ///   WINDOW there, so a stored `preview_windowed = false` — or an explicit `--overlay` — is
 ///   overridden rather than honoured. Hiding the setting while still applying it would drop
 ///   such a user onto an overlay editor that cannot draw its own media.
+/// * **Linux with no layer shell** (`lab/flatpak`) has no fullscreen preview SURFACE of any
+///   kind, loaders and covers included, so BOTH halves answer `true`. That is why the Windows
+///   10 exception is keyed on `software_overlays` rather than on "opens overlays" alone: read
+///   the other way round, a sandboxed capture child would set `preview_windowed = false` in
+///   memory and the next `save_state` would write that back, silently flipping the user's
+///   persisted appearance to an overlay their normal session would then honour.
 pub fn effective_preview_windowed(
     chosen: bool,
     opens_overlays: bool,
     overlay_preview_available: bool,
+    software_overlays: bool,
 ) -> bool {
     if overlay_preview_available {
         return chosen;
     }
-    !opens_overlays
+    !(opens_overlays && software_overlays)
 }
 
 /// The iced renderer name for the software (CPU) rasterizer — the one value DRAGON-427
@@ -365,6 +402,23 @@ pub fn restore_user_backend_env(cmd: &mut std::process::Command) {
 /// decided from `startup.settings_only == false`, so the new version's release notes were
 /// presented by an Accessory process. It is the last hole in "Regular policy ⟺ the UI is a
 /// real window".
+///
+/// **The COLOUR PICKER is deliberately not on that list, and this is the tombstone so it is
+/// not "fixed" onto it.** A `--color-picker` launch ends in a real window the user is meant
+/// to Cmd+Tab to, so it looks like a sixth case, and it is not: it is overlay-FIRST. It
+/// mints the same per-output capture-shaped overlays a screenshot does (see
+/// [`Startup::color_picker`], which is why [`Startup::opens_overlays`] answers true for it),
+/// and only a PICK turns it into a window launch. Booting it Regular would promote the
+/// OVERLAY phase and cost three things: the DRAGON-154 AeroSpace opt-out (which only ignores
+/// a window whose owner is `.accessory` at its first AX exposure, so the picker's overlays
+/// would start being tiled off their target displays), the DRAGON-151 menu-bar stamp, which
+/// for this tool lands in the frozen snapshot the picker reads its colours FROM, and a Dock
+/// icon for the two picker launches that open no window at all (a pick delivered to an
+/// editor, DRAGON-587, or handed to an already-live picker window, DRAGON-613). The picker
+/// window takes Regular the OTHER way instead, the post-boot flip the windowed preview has
+/// always used: `platform::mac::window::ensure_regular_policy`, called from
+/// `App::finalize_color_picker_window` once the window is up. Anything else that is
+/// overlay-first and window-second belongs there too, not here.
 ///
 /// Pure so the table is unit-testable — the two macOS gates in [`run`] (the policy, and the
 /// inverted overlay chrome strip) both read this one function rather than repeating the
@@ -1080,6 +1134,150 @@ fn launch_precapture_runs(active: bool, mode: Mode) -> bool {
     active && mode == Mode::Window
 }
 
+/// Does this capture want the pointer in the picture AT ALL? Pure, unit-tested
+/// (`cursor_wanted_tests`). DRAGON-595 made this the ONE copy of the rule.
+///
+/// `want_cursor` is the "Preserve mouse cursor" preference (the raw persisted one at
+/// launch, the capability-gated effective extra once a backend is resolved).
+/// `color_picker` overrides it off: the picker is overlay-shaped but captures nothing
+/// it will keep, and a baked pointer there is not a cosmetic blemish, it is a
+/// permanent blind spot sitting over the pixels the user is trying to sample.
+///
+/// Deliberately says nothing about HOW the pointer would get there. That is the
+/// backend's business and it answers with [`crate::platform::backend::CursorDelivery`]:
+/// a native backend stamps a sprite it grabbed, the portal asks its stream to bake one
+/// in. Before DRAGON-595 this rule existed TWICE, as `launch_cursor_needed` here and
+/// `portal::cursor_request` there, each computing `want && !picker` for its own
+/// mechanism and held together only by a test asserting they still agreed. Splitting
+/// the WHETHER from the HOW is what let the two collapse into one.
+pub(crate) fn cursor_wanted(want_cursor: bool, color_picker: bool) -> bool {
+    want_cursor && !color_picker
+}
+
+/// Pure, unit-tested (`kind_cursor_veto_tests`): may a capture of this KIND keep the
+/// pointer at all? DRAGON-604.
+///
+/// The scanner answers no, and this is not a preference the user can overrule. The
+/// scanner exists to DECODE the pixels it is handed, QR and barcode finder patterns
+/// through `detect::codes`, glyphs through `detect::text`. A pointer composited into
+/// those pixels is not a blemish on a picture, it is opaque noise sitting on top of the
+/// very thing being read, and it can land exactly on the finder pattern or the glyph
+/// that decides whether the scan succeeds. There is no scan a user wants their mouse
+/// in, so "Preserve mouse cursor" is not the right question to ask for one.
+///
+/// Written as an exhaustive `match` rather than a `matches!`, on purpose: a new [`Kind`]
+/// must come here and state its answer instead of defaulting into someone else's lane.
+pub(crate) fn kind_keeps_pointer(kind: Kind) -> bool {
+    match kind {
+        Kind::Scanner => false,
+        // A screenshot and a screen recording are both PICTURES of the desktop, where
+        // the pointer is content the user may legitimately want. They follow the
+        // preference.
+        Kind::Image | Kind::Video => true,
+    }
+}
+
+/// Pure, unit-tested (`kind_cursor_veto_tests`): the capture extras a capture of `kind`
+/// will actually apply. DRAGON-604.
+///
+/// THREE terms now, and the third can only ever take an extra away:
+///
+/// 1. `caps`, the ACTIVE backend's capability set ([`crate::platform::backend::Caps::capture_extras`]).
+/// 2. `prefs`, the user's persisted preferences. `CaptureExtras::and` has folded these
+///    two together since DRAGON-186, and that half is unchanged.
+/// 3. `kind`, the capture MODE, via [`kind_keeps_pointer`].
+///
+/// # Why the veto lives in ONE function and not at the call sites
+///
+/// Because "the scanner must not photograph the mouse" is a property of SCANNING, so
+/// every route into the scanner has to get the same answer, and a per-call-site check
+/// is the shape that leaves one route uncovered. The routes are not a short list: the
+/// overlay's scanner button, a `--scan` argv, the tray and menu-bar entries, a global
+/// shortcut, and switching INTO the scanner from image or video part-way through a
+/// session. They do, however, all share one seam, because every one of them ends up
+/// asking [`App::effective_capture_extras`] what this capture applies, and that is the
+/// only caller of this function. Putting the rule here means a route added later
+/// inherits it without anyone remembering to wire it up.
+///
+/// It also reaches both MECHANISMS for free, which matters because the owner hit this
+/// through the portal and the rule is not portal-specific
+/// ([`crate::platform::backend::CursorDelivery`]): the portal path turns this bit into
+/// its stream's cursor mode at request time (`portal::cursor_request`), and the native
+/// path uses it to decide whether to stamp its launch-locked sprite
+/// (`capture_flow::do_pixel_capture`). Two further readers come along at no cost and
+/// stay honest: the on-overlay cursor indicator stops promising a pointer the scan will
+/// not contain, and `screenshot_metadata` writes `cursor=off`.
+///
+/// # What deliberately does NOT consult this
+///
+/// [`launch_cursor_needed`], the launch-time decision to grab a cursor sprite at all.
+/// A `--scan` launch still pays for that grab, because the grab is a ONE-SHOT locked at
+/// startup (DRAGON-214) while the kind is free to change all session: veto it there and
+/// a user who scans and then switches to image mode has silently lost the pointer for
+/// the rest of the session, with no way to get it back. An unread sprite costs one
+/// thread and nothing else, which its own doc already says. The veto belongs at the
+/// point of USE, which is also what makes it survive a mode switch in either direction.
+pub(crate) fn capture_extras_for_kind(
+    caps: crate::platform::backend::CaptureExtras,
+    prefs: crate::platform::backend::CaptureExtras,
+    kind: Kind,
+) -> crate::platform::backend::CaptureExtras {
+    let mut extras = caps.and(prefs);
+    if !kind_keeps_pointer(kind) {
+        extras.cursor = false;
+    }
+    extras
+}
+
+/// Pure, unit-tested (`fallback_reseed_tests`): must the portal-frozen fallback overlay
+/// GRAB ITS SEED FRAME AGAIN? DRAGON-604.
+///
+/// [`capture_extras_for_kind`] is enough everywhere the pointer is decided against
+/// pixels we already hold, because it is re-read per capture. The `lab/flatpak`
+/// fallback overlay is the one place that is not true, and the reason is structural:
+/// with no layer shell there is nothing to draw a selector on, so the session grabs ONE
+/// portal frame at launch and uses it as both the backdrop and, through
+/// `scan_reads_frozen`, the pixels the scanner actually decodes. The portal bakes the
+/// pointer into that frame at grab time (`CursorDelivery::InStream`), so a user who
+/// launches an image capture with the preference on and then presses the scanner button
+/// is scanning pixels with a mouse already in them, and no amount of re-reading the
+/// rule can take it back out. Only a new frame can.
+///
+/// `seeded_with_cursor` is what the frame on screen was grabbed with, `None` before any
+/// seed has been requested. Re-seeding is worth a portal round trip only when the
+/// answer actually CHANGED, which keeps every kind switch that does not move the
+/// pointer bit (image to video, or any switch with the preference already off) free.
+///
+/// The replacement request rides `RequestOrigin::InSession`, so it REPLAYS the monitor
+/// token the launch seed banked and the user is not asked again. That is the owner's
+/// "handle this intelligently": switching capture mode is not a target choice, which is
+/// exactly the distinction `portal::replay_allowed` already draws.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn fallback_reseed_needed(
+    fallback_active: bool,
+    seeded_with_cursor: Option<bool>,
+    wants_cursor: bool,
+) -> bool {
+    fallback_active && seeded_with_cursor.is_some_and(|had| had != wants_cursor)
+}
+
+/// DRAGON-582: should this launch LOCK the pointer sprite at startup? Pure, unit-tested.
+///
+/// [`cursor_wanted`] with the LAUNCH inputs: the persisted preference, before any
+/// backend is resolved. Kept as its own name because the call site's question is
+/// "which parts of the capture scene does this launch pay for", alongside
+/// [`launch_flats_needed`] and [`launch_precapture_runs`], not "does this capture
+/// draw a pointer".
+///
+/// It stays capability-UNGATED on purpose: the sprite grab is kicked before the
+/// session's backend matters, and a sprite that turns out unusable costs one thread
+/// and is simply never read (on a sandboxed portal session the native grab fails on
+/// its own, since `screencopy::connect_raw` needs protocols that session lacks).
+fn launch_cursor_needed(want_cursor: bool, color_picker: bool) -> bool {
+    cursor_wanted(want_cursor, color_picker)
+}
+
 /// DRAGON-336: whether the LAUNCH-time frozen-flats grab must run. The flats are ONE
 /// full-resolution RGBA snapshot PER OUTPUT held for the whole session (a 5120x1440
 /// monitor is 28.1 MB), and only TWO features can ever read them:
@@ -1094,8 +1292,20 @@ fn launch_precapture_runs(active: bool, mode: Mode) -> bool {
 /// mid-session: entering the scanner kicks a lazy grab (`App::kick_frozen_flats`), and
 /// see that function's doc for the one limitation a lazy grab carries. Pure so the
 /// gating is unit-testable without the App.
-fn launch_flats_needed(active: bool, want_freeze: bool, launch_kind: Kind) -> bool {
-    active && (want_freeze || launch_kind == Kind::Scanner)
+///
+/// DRAGON-582 added the THIRD reader: the COLOUR PICKER samples the flats for every
+/// pointer move, and it is not a `Kind` (it is its own launch shape, `--color-picker`),
+/// so it needs its own term. Its grab is unconditional rather than
+/// preference-gated, because the picker cannot function at all without a pixel source:
+/// see `app::color_picker`'s `PixelSource` for why a live read would return our own
+/// dimming layer instead of the desktop.
+fn launch_flats_needed(
+    active: bool,
+    want_freeze: bool,
+    launch_kind: Kind,
+    color_picker: bool,
+) -> bool {
+    active && (want_freeze || launch_kind == Kind::Scanner || color_picker)
 }
 
 /// DRAGON-456: whether pressing the scan kind button REFRESHES the scan rather than
@@ -1121,12 +1331,16 @@ fn scan_press_refreshes(current: Kind, pressed: Kind) -> bool {
 // at all. Scan refreshes no longer write through the flats slot — a failed live region shot
 // is handled where it lands, in `MarksPoll`, by leaving the previous answer standing.
 
+/// `want_flats` is [`launch_flats_needed`]'s answer, resolved by the CALLER rather than
+/// re-derived here from a kind plus two flags. That keeps the decision visible next to the
+/// other launch gates in `App::init`, and keeps this signature inside clippy's argument
+/// budget now that the colour picker is a third reader of the flats.
 fn acquire_scene(
     active: bool,
     launch_mode: Mode,
-    launch_kind: Kind,
     want_cursor: bool,
     want_freeze: bool,
+    want_flats: bool,
     wallpaper: Option<std::path::PathBuf>,
     radius: f32,
 ) -> (PrecaptureSlot, HashMap<String, FrozenOutput>, FrozenSlot, WallpaperSlot, CursorSlot) {
@@ -1177,7 +1391,6 @@ fn acquire_scene(
     // live capture path (`freezing()` is false on an empty map) until the next launch —
     // the same "next launch" contract the per-window freeze pixels already carry above.
     let frozen_slot: FrozenSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let want_flats = launch_flats_needed(active, want_freeze, launch_kind);
     // With the grab skipped nothing would ever fill the slot, so `frozen_pending` (armed
     // from `scene_active` in `init`) would poll at 16ms forever and macOS's commit-time
     // `await_frozen_flats` would burn its whole 750ms budget waiting on it. Park an EMPTY
@@ -1249,19 +1462,80 @@ fn acquire_scene(
         // DRAGON-336: `want_flats` (not bare `active`) — a freeze-off, non-scanner launch
         // has no reader for the flats, so it neither grabs nor retains them.
         if want_flats {
-            let slot = frozen_slot.clone();
-            crate::util::timing_mark("acquire_scene: frozen all_outputs (kick DEFERRED thread)");
-            std::thread::spawn(move || {
-                let flats = grab_frozen_flats(want_cursor);
-                crate::util::timing_mark("acquire_scene: frozen all_outputs (deferred thread done)");
-                if let Ok(mut g) = slot.lock() {
-                    *g = Some(flats);
-                }
-            });
+            // DRAGON-600 (Linux, tray-menu launches only): HOLD the grab. The host's
+            // dropdown is still on screen and is dismissed by THIS process taking keyboard
+            // focus, which has not happened yet, so grabbing now photographs the menu.
+            // `App::tick_menu_hold` runs the identical grab once the overlay has focus.
+            if menu_flats_held(want_flats) {
+                crate::util::timing_mark(
+                    "acquire_scene: frozen all_outputs (HELD for the tray dropdown)",
+                );
+            } else {
+                spawn_frozen_flats_grab(frozen_slot.clone(), want_cursor);
+            }
         }
         HashMap::new()
     };
     (precapture, frozen, frozen_slot, wallpaper_slot, cursor_slot)
+}
+
+/// The DEFERRED frozen-flats grab, on its own thread, depositing into `slot` for
+/// `CaptureMsg::FrozenReady` to drain (DRAGON-212). Safe to thread: `all_outputs` opens
+/// its OWN wayland connection.
+///
+/// Extracted from [`acquire_scene`] by DRAGON-600 because there are now TWO moments it can
+/// start from. The usual one is launch. The other is once a tray-menu child's overlay has
+/// taken keyboard focus and the dropdown that launched it is gone. Both must run the same
+/// grab, so there is one body.
+#[cfg(not(target_os = "macos"))]
+fn spawn_frozen_flats_grab(slot: FrozenSlot, want_cursor: bool) {
+    crate::util::timing_mark("acquire_scene: frozen all_outputs (kick DEFERRED thread)");
+    std::thread::spawn(move || {
+        let flats = grab_frozen_flats(want_cursor);
+        crate::util::timing_mark("acquire_scene: frozen all_outputs (deferred thread done)");
+        if let Ok(mut g) = slot.lock() {
+            *g = Some(flats);
+        }
+    });
+}
+
+/// macOS: the ONLY caller, `update::capture::tick_menu_hold`, is gated behind
+/// `App::menu_hold` being `Some`, and [`menu_flats_held`] (its one source) is
+/// `cfg!(target_os = "linux")`-gated to answer `false` everywhere else — mac has its own
+/// synchronous flats grab inline in [`acquire_scene`], never this deferred one. So this call
+/// site is structurally unreachable here; it still needs to exist so the portable call in
+/// `update/capture.rs` compiles with no `cfg` of its own, matching the shape `menu_flats_held`
+/// itself uses.
+#[cfg(target_os = "macos")]
+fn spawn_frozen_flats_grab(_slot: FrozenSlot, _want_cursor: bool) {}
+
+/// Whether this process was launched by activating a tray-menu row
+/// ([`crate::recording_ui::MENU_LAUNCH_ENV`], set by the Linux resident and recording
+/// tray). Read from the environment rather than argv because it is not a capture option:
+/// it says how we were started, not what to capture.
+pub(crate) fn menu_launched() -> bool {
+    std::env::var_os(crate::recording_ui::MENU_LAUNCH_ENV).is_some()
+}
+
+/// Whether the frozen-flats grab is held for the tray dropdown (DRAGON-600). The `cfg!`
+/// (not a `#[cfg]`) keeps ONE compiled body on every platform and answers false off Linux,
+/// where the daemon owns its own menu and has already dismissed it before spawning, so
+/// macOS and Windows keep byte-identical launch behaviour.
+pub(crate) fn menu_flats_held(want_flats: bool) -> bool {
+    cfg!(target_os = "linux") && capture_flow::menu_flats_hold_needed(menu_launched(), want_flats)
+}
+
+/// Linux (DRAGON-600): the tray-dropdown hold on the frozen-flats grab. `None` for every
+/// launch that has no dropdown on screen, which is every launch except a tray-menu one.
+#[derive(Debug, Clone, Copy)]
+pub struct MenuFlatsHold {
+    /// Carried from the launch gates so the held grab is the same grab.
+    pub want_cursor: bool,
+    /// When the hold was armed. Drives the OUTER bound, `MENU_HOLD_BUDGET_MS`.
+    pub armed: std::time::Instant,
+    /// When one of our overlays took keyboard focus: the event that dismisses the
+    /// dropdown. `None` until it happens, and the settle is counted from it.
+    pub focused: Option<std::time::Instant>,
 }
 
 struct OutputState {
@@ -1285,6 +1559,16 @@ struct OutputState {
     /// backing scale live from `NSScreen` (`platform::mac::scale_for`).
     #[cfg(target_os = "linux")]
     scale: f32,
+    /// `lab/flatpak` (Linux, portal-frozen fallback only): the ONE fallback toplevel's
+    /// ACTUAL point size, as its last resize event reported it. Wayland gives a client
+    /// no say in which monitor a fullscreen toplevel maps on, so the window can land on
+    /// a monitor whose geometry differs from this (the granted) output's; [`Self::units`]
+    /// then builds the LETTERBOX bridge (`geometry::OverlayUnits::letterbox`) that shows
+    /// the frozen frame centred at its OWN aspect and maps window points back onto it,
+    /// bar points clamping to the frame's edge. `None` on every layer-surface output:
+    /// the uniform bridge, byte-identical to before this existed.
+    #[cfg(target_os = "linux")]
+    fallback_win_size: Option<(f32, f32)>,
     /// Whether this overlay has been natively placed. Interior-mutable because
     /// `configure_overlay` observes placement behind `&self`.
     ///
@@ -1309,7 +1593,18 @@ impl OutputState {
     /// This overlay's units bridge (DRAGON-448): CAPTURE space ↔ POINT space, for THIS
     /// output. Every crossing between `OutputState` geometry and anything iced hands us or
     /// renders goes through the returned [`OverlayUnits`] — see its doc for the contract.
+    /// The Linux fallback toplevel carries the letterbox bridge (see
+    /// `fallback_win_size`); every other output takes the uniform bridge exactly as
+    /// before.
     fn units(&self) -> crate::geometry::OverlayUnits {
+        #[cfg(target_os = "linux")]
+        if let Some(win) = self.fallback_win_size {
+            return crate::geometry::OverlayUnits::letterbox(
+                self.logical_pos,
+                self.logical_size,
+                win,
+            );
+        }
         crate::geometry::OverlayUnits::new(self.logical_pos, self.point_scale)
     }
 
@@ -1481,8 +1776,9 @@ fn precapture_should_assign_wallpaper<T>(precapture_map: &HashMap<String, T>) ->
 /// to a rolling peak envelope (0..1, the same dBFS->norm scale as the meters) in
 /// `shared`, which the waveform canvas reads directly each vsync frame.
 struct MicTest {
-    /// ffmpeg capture process — explicitly killed when the dialog closes.
-    child: std::process::Child,
+    /// The live mic capture's stop handle — explicitly stopped when the dialog closes.
+    /// An ffmpeg child on Linux/Windows, a native `AVCaptureSession` on macOS.
+    mic: crate::audio::clean_mic::MicPcmStop,
     /// Reader thread's rolling envelope of `(clean, raw)` columns (oldest..newest) plus
     /// the total columns ever produced (monotonic, for smooth scrolling). The canvas
     /// holds an Arc clone and reads it directly; the watchdog tick reads the counter.
@@ -1751,20 +2047,32 @@ pub struct BenchResult {
 /// `ffmpeg -encoders` (see `crate::encode::available_encoders`), a cost every launch
 /// used to pay synchronously in `App::init` even for a screenshot that never encodes.
 /// This holder defers that probe until the encoder list / preferred encoder is FIRST
-/// actually read (entering the recording UI, the settings video/Health pages, or
-/// starting a recording), so a region/window/scan capture launch never spawns ffmpeg.
+/// actually read (entering the recording UI or the settings video/Health pages), so a
+/// region/window/scan capture launch never spawns ffmpeg.
 ///
 /// Interior-mutable so the `&self` settings-view accessors can trigger the probe on
-/// first read. The resolution is IDENTICAL to the old eager init block — probe the
-/// list (dropping hardware under `CCK_HEALTH_FORCE_WARN`), keep the persisted choice
-/// when still available else pick+persist the best, then map `record_hardware=off`
-/// to software — only WHEN it runs has changed.
+/// first read.
+///
+/// DRAGON-571 split the old single "preferred" notion in two. The REQUEST
+/// (`requested`) is the persisted intent: "auto", or the concrete id a real
+/// settings-picker click wrote (the legacy `record_hardware=off` still maps to
+/// software at read time). The DISPLAY resolution (`preferred`) is what the picker
+/// shows for that intent right now, computed from the probed list plus the
+/// last-known-good hint, and NEVER persisted. The old holder resolved "auto" once and
+/// wrote the winner into `preferred_encoder` as if the user had chosen it, which let
+/// one transient probe failure pin "software" forever; a recording now carries the
+/// request itself (see `request`), so the worker's hint-first ladder re-resolves auto
+/// every session.
 #[derive(Default)]
 pub struct EncoderResolve {
     /// The probed encoder list, computed once on first access.
     list: std::cell::OnceCell<Vec<crate::encode::EncoderInfo>>,
-    /// The resolved preferred-encoder id. `None` until first resolved; thereafter the
-    /// live user choice (SetPreferredEncoder / persist apply set it directly).
+    /// The persisted encoder INTENT ("auto" or a concrete user pick), loaded lazily
+    /// from state and overwritten only by `set_preferred` (a picker click or a
+    /// whole-config apply). What `App::save_state` persists back.
+    requested: std::cell::RefCell<Option<String>>,
+    /// The DISPLAY resolution of `requested`. `None` until first computed (or after
+    /// an "auto" apply); never written to disk.
     preferred: std::cell::RefCell<Option<String>>,
     /// Windows (DRAGON-238): whether the OFF-THREAD encoder probe has been kicked. The
     /// Windows hardware tier probes each encoder with a real ffmpeg encode (seconds), so
@@ -1825,42 +2133,62 @@ impl EncoderResolve {
         self.probing.set(false);
     }
 
-    /// The resolved preferred-encoder id, computing it on first access from the probed
-    /// list and the persisted choice (mirroring the old init block byte-for-byte):
-    /// keep the saved choice when still available, else pick the best available and
-    /// PERSIST it; then honour a legacy `record_hardware=off` by mapping to software.
+    /// The persisted encoder INTENT: "auto" or the user's explicit pick, with the
+    /// legacy `record_hardware=off` toggle honoured by mapping to "software" (the
+    /// same read-time rule as ever). Never a resolution (DRAGON-571): resolving
+    /// happens per recording (the worker's hint-first ladder) and per display
+    /// (`preferred`), and neither writes back here.
+    fn requested(&self) -> String {
+        if let Some(r) = self.requested.borrow().as_ref() {
+            return r.clone();
+        }
+        let p = crate::state::load();
+        // The "use hardware encoding" toggle was removed (the Software entry in the
+        // encoder picker covers it); honour an old off setting by picking software.
+        let r = if p.record_hardware { p.preferred_encoder } else { "software".to_string() };
+        *self.requested.borrow_mut() = Some(r.clone());
+        r
+    }
+
+    /// The `(requested, hint)` pair a recording start hands to `RecordSettings`
+    /// (DRAGON-571): the intent verbatim, so "auto" travels AS "auto" and the
+    /// worker's ladder resolves it fresh each session, plus, for auto only, the
+    /// last-known-good hint that keeps the happy path at one probe-encode. Reads NO
+    /// probed list: a recording start no longer pays the `ffmpeg -encoders` scan (or,
+    /// on Windows, blocks on the off-thread probe) just to name its encoder.
+    fn request(&self) -> (String, Option<String>) {
+        let requested = self.requested();
+        let hint = if requested == "auto" { stored_auto_hint() } else { None };
+        (requested, hint)
+    }
+
+    /// The encoder id the settings picker DISPLAYS, computing it on first access from
+    /// the persisted intent, the probed list and the auto hint
+    /// (`display_encoder_choice`). For a concrete pick this is the pick while still
+    /// probed-usable; for "auto" it is what auto would resolve to right now. NEVER
+    /// persisted (DRAGON-571): displaying a resolution and recording the user's
+    /// choice are different facts, and only `set_preferred` writes the latter.
     fn preferred(&self) -> String {
         if let Some(p) = self.preferred.borrow().as_ref() {
             return p.clone();
         }
+        let (requested, hint) = self.request();
         let list = self.list();
-        let mut persisted = crate::state::load();
-        let base = if list.iter().any(|e| e.id == persisted.preferred_encoder) {
-            persisted.preferred_encoder.clone()
-        } else {
-            let best = list
-                .first()
-                .map(|e| e.id.clone())
-                .unwrap_or_else(|| "software".to_string());
-            persisted.preferred_encoder = best.clone();
-            crate::state::save(&persisted);
-            best
-        };
-        // The "use hardware encoding" toggle was removed (the Software entry in the
-        // encoder picker covers it); honour an old off setting by picking software.
-        let resolved = if persisted.record_hardware {
-            base
-        } else {
-            "software".to_string()
-        };
+        let ids: Vec<&str> = list.iter().map(|e| e.id.as_str()).collect();
+        let resolved = display_encoder_choice(&requested, hint.as_deref(), &ids);
         *self.preferred.borrow_mut() = Some(resolved.clone());
         resolved
     }
 
-    /// Overwrite the live preferred-encoder id (user picked one, or persist apply
-    /// resolved it). Also seeds the cache so a later `preferred()` returns this.
+    /// Overwrite the live preferred-encoder INTENT (a real settings-picker click, or
+    /// a whole-config apply). A concrete id also seeds the display cache, so a later
+    /// `preferred()` returns it without probing; "auto" clears the cache instead, so
+    /// the display re-resolves against the probed list on the next read. Persisting
+    /// is the caller's save (`save_state` snapshots `requested()`), which is exactly
+    /// why an auto RESOLUTION can never land on disk: only intent flows through here.
     fn set_preferred(&self, id: String) {
-        *self.preferred.borrow_mut() = Some(id);
+        *self.preferred.borrow_mut() = if id == "auto" { None } else { Some(id.clone()) };
+        *self.requested.borrow_mut() = Some(id);
     }
 
     /// Whether the ffmpeg-spawning encoder probe has run yet (test-only inspector: the
@@ -1869,6 +2197,33 @@ impl EncoderResolve {
     fn probed(&self) -> bool {
         self.list.get().is_some()
     }
+}
+
+/// The persisted last-known-good auto-encoder hint, empty mapped to `None`. Read
+/// fresh from disk rather than mirrored on `App`: the recording workers update it
+/// directly (`state::note_encoder_auto_hint`), so a live mirror would only be a
+/// staleness bug waiting to happen, and `App::save_state` carries the field from
+/// disk for the same reason (see `app/persist.rs`).
+fn stored_auto_hint() -> Option<String> {
+    let h = crate::state::load().encoder_auto_hint;
+    (!h.is_empty()).then_some(h)
+}
+
+/// Pure, unit-tested (DRAGON-571). What the settings encoder picker displays, given
+/// the persisted intent, the auto hint, and the PROBED list's ids (ranked best
+/// first): a concrete pick shows itself while still usable; everything else shows
+/// what auto would resolve to right now, the hint-first ladder order filtered through
+/// the list. The picker deliberately keeps its no-"auto"-row UI: this is the READ
+/// side only, and writing `preferred_encoder` stays exclusively a real user click.
+fn display_encoder_choice(requested: &str, hint: Option<&str>, available: &[&str]) -> String {
+    if requested != "auto" && available.contains(&requested) {
+        return requested.to_string();
+    }
+    crate::encode::auto_probe_order(crate::encode::AUTO_LADDER, hint)
+        .into_iter()
+        .find(|id| available.contains(id))
+        .unwrap_or("software")
+        .to_string()
 }
 
 pub struct App {
@@ -2030,6 +2385,10 @@ pub struct App {
     /// Permission-checker window UI state (macOS onboarding surface; only ever
     /// opened on macOS — a default empty state on Linux, never minted).
     permissions: permissions::PermissionsState,
+    /// The colour picker tool's state (DRAGON-582): whether this process IS a picker
+    /// launch, what the pointer is over, the picked colour and the result window.
+    /// A default empty state on every other launch, where nothing reads it.
+    color_picker: color_picker::ColorPickerState,
     /// Live keyboard-shortcut bindings (`Action -> Shortcut`) — the single source of
     /// truth for key handling and the Keyboard Shortcuts settings page.
     keymap: crate::shortcuts::Keymap,
@@ -2140,6 +2499,28 @@ pub struct App {
     /// whenever ANY preview is open (which keeps the single-preview behavior identical to
     /// the pre-multi-document code).
     focused_preview: Option<window::Id>,
+    /// The surface that REALLY holds keyboard focus, as the window system last reported it
+    /// (`window::Event::Focused` → [`WindowChromeMsg::WindowFocused`]) — as opposed to
+    /// [`Self::focused_preview`], which is our own routing pointer and is set the moment a
+    /// document opens, long before its surface is mapped.
+    ///
+    /// `lab/flatpak`: this exists because a clipboard write on the
+    /// [`crate::share::CopyRoute::ThisWindow`] route goes out over `wl_data_device`, which
+    /// needs a serial from an input event delivered to this client. Without focus there is no
+    /// such serial and the compositor refuses the selection, so the open-time automatic copy
+    /// has to know whether the window it is writing through is actually focused YET. `None`
+    /// until the first focus of the process's life.
+    focused_window: Option<window::Id>,
+    /// DRAGON-549: the NAME of the output a PORTAL grant was made on, when it resolved to a
+    /// registered one ([`portal::output_for_grant_position`], which documents why the grant is
+    /// the capture-origin signal in a session with no capture overlay). A WINDOW grant with
+    /// no position, which is every one COSMIC's portal makes, resolves instead to the largest
+    /// registered output, the SAME synthetic anchor the wallpaper compose stands its crop on
+    /// (`capture_flow::largest_output_index`, DRAGON-549 reopened). `None` on every
+    /// native-capture launch, where nothing writes it and every ladder that reads it is
+    /// byte-identical.
+    #[cfg(target_os = "linux")]
+    portal_origin_output: Option<String>,
     /// The preview the IN-FLIGHT capture is feeding (its spinner pre-open, the
     /// cover→window swap, the content prep at `present_capture`). A capture produces
     /// exactly ONE preview, so this names it unambiguously even when other documents are
@@ -2155,18 +2536,49 @@ pub struct App {
     /// The previews currently holding the [`Self::preview_duck`] guard (see
     /// [`preview::DuckRefs`]).
     preview_duck_refs: preview::DuckRefs,
-    /// The preview-HANDOFF listener (DRAGON-336 phase 3b), bound the moment this process
-    /// mints its first preview surface and dropped at [`App::finish_session`]. Its presence
-    /// is what makes this process a preview HOST: a later one-shot capture child discovers
-    /// it (via the per-pid preview marker) and hands its finished file over instead of
-    /// paying a second ~233 MB process, and `sub_preview_handoff` drains the inbound
-    /// requests. `None` before any preview exists, or when the bind failed (then nothing
-    /// discovers us and every child opens its own preview, exactly as before).
+    /// The HANDOFF listener (DRAGON-336 phase 3b, widened by DRAGON-613), dropped at
+    /// [`App::finish_session`]. Its presence is what makes this process reachable by a
+    /// later one-shot sibling, and `sub_preview_handoff` drains the inbound requests.
     ///
-    /// Unix-only: Windows has no unix-socket transport, so it never hosts and its capture
-    /// path stays byte-identical (see `crate::preview_ipc`'s Platforms note).
+    /// ONE listener per process, at ONE address, serving whichever of the two windows this
+    /// process actually owns. It is bound by whichever comes first:
+    ///
+    /// * a PREVIEW surface (`preview_surface_for`), at the per-pid `preview.sock`, so a
+    ///   later capture child hands its finished file over instead of paying a second
+    ///   ~233 MB process;
+    /// * the colour picker's RESULT WINDOW (`color_picker_pick`), at the per-pid
+    ///   `colorpicker.sock`, so a later pick updates this window instead of opening a
+    ///   second one.
+    ///
+    /// A process is only ever one of those, so there is no third case and no contention for
+    /// the field. It was called `preview_host` until DRAGON-613; the name was renamed rather
+    /// than documented around, because a field that holds either listener and claims to hold
+    /// one of them is the kind of small lie that later gets believed.
+    ///
+    /// `None` before either window exists, or when the bind failed. A failed bind is never
+    /// fatal: nothing discovers us and every sibling does the job itself, exactly as before.
+    ///
+    /// Unix-only: Windows has no unix-socket transport, so it never hosts and both paths
+    /// stay byte-identical (see `crate::preview_ipc`'s Platforms note).
     #[cfg(unix)]
-    preview_host: Option<crate::preview_ipc::PreviewHost>,
+    handoff_host: Option<crate::preview_ipc::PreviewHost>,
+    /// The recording-CONTROL listener (DRAGON-583), bound for the life of a recording and
+    /// dropped with it (its `Drop` unlinks the socket). Its presence is what lets a second
+    /// process drive this recording: the `--toggle-mic` / `--pause-recording` /
+    /// `--finish-recording` / `--cancel-recording` / `--toggle-system-audio` commands a
+    /// Linux global hotkey runs connect here and send one `daemon_ipc::Command`, the same
+    /// word a resident's menu click sends, drained by the same `RecordingMsg::TrayPoll`.
+    ///
+    /// Deliberately SEPARATE from `self.tray`, which it might look like it belongs to: a
+    /// sandboxed child often fails to register a tray item at all (the DRAGON-563 finding),
+    /// and that is exactly the session where these commands are the only control left.
+    ///
+    /// `None` outside a recording, and when the bind failed (then the recording is
+    /// unaffected and only the CLI commands cannot reach it). Linux-only: macOS and Windows
+    /// keep their overlay windows and their menu-bar / tray controls through a recording,
+    /// so DRAGON-583 leaves them byte-identical.
+    #[cfg(target_os = "linux")]
+    record_control: Option<crate::daemon_ipc::ControlInlet>,
     /// DRAGON-309: the TRIGGER display's NAME, snapshotted ONCE at launch (in `App::init`,
     /// before the picker overlay is shown / the cursor moves to the target / our overlay grabs
     /// focus). This is the monitor active when the capture was INITIATED, and drives where the
@@ -2279,6 +2691,11 @@ pub struct App {
     /// Include the wallpaper in region/monitor captures (persisted; default on).
     /// When off, only the windows are composited (transparent/black elsewhere).
     capture_wallpaper: bool,
+    /// MASTER switch for the single-window recompositing (persisted; default on):
+    /// "Enable single window aesthetic effects". OFF delivers the bare captured
+    /// frame (no borders, shadow, rounding, padding, wallpaper backdrop) on every
+    /// platform and path while the individual preferences below stay persisted.
+    window_recompositing: bool,
     /// Window-capture ACTIVE (focused) border colour (persisted; DRAGON-191). `None`
     /// = follow the system accent (resolved at draw time); `Some` = a pinned custom
     /// colour.
@@ -2313,6 +2730,57 @@ pub struct App {
     /// toggles route through `reconcile_login_item`, which computes the desired state as
     /// `resident && autostart_on_login`.
     autostart_on_login: bool,
+    /// DRAGON-628: whether the OS login item will REALLY run at the next login, as last
+    /// observed, or `None` when this build has no read-only way to find out (a Flatpak, whose
+    /// registration lives with the Background portal on the host; an unbundled macOS dev
+    /// binary, which has no `SMAppService` to ask). `platform::autostart_registration` is the
+    /// probe; the row only needs its `is_live()`, since a registration that exists and cannot
+    /// run is not launching anything.
+    ///
+    /// NOT persisted, and it must never be: it is an OBSERVATION of the machine, and a stored
+    /// copy would be exactly the stale claim this ticket exists to remove.
+    ///
+    /// Exists because the settings row used to render `autostart_on_login`, the persisted
+    /// PREFERENCE, which is what the user asked for rather than what the machine will do. The
+    /// two really do come apart: the owner's entry named an AppImage DRAGON-590 relocated, so
+    /// every login refused it while the row said the feature was on. The row now renders
+    /// `platform::autostart_row(self.autostart_on_login, self.autostart_registered)`, which
+    /// shows the observation wherever there is one and the preference where there is not.
+    ///
+    /// Refreshed by `reconcile_login_item` at every exit, so the one function in the app that
+    /// can change the login item is also the one that keeps this honest; and by
+    /// `autostart_settings_opened`, so the row is right the moment it can first be seen. That
+    /// second one is a READ with no side effects at all: the unprompted repair of a stale
+    /// registration belongs to the resident daemons, not to opening a window.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    autostart_registered: Option<bool>,
+    /// Linux (DRAGON-618): a Background-portal autostart request is in flight.
+    ///
+    /// NOT persisted, deliberately: an outstanding portal request cannot survive the process
+    /// that made it, so a stored `true` would only ever be a stale claim on the next launch.
+    ///
+    /// Exists because a Flatpak's registration is asynchronous and may show a dialog, so the
+    /// toggle has a third state between "asked" and "settled". While it is set,
+    /// `SettingsMsg::SetAutostartOnLogin` is IGNORED: the answer to the outstanding request is
+    /// not known yet, and acting on a second click would race two registrations and settle the
+    /// toggle from whichever replied last. Guarded in the update handler rather than by making
+    /// the row inert in `view`, so it covers every route into the setting.
+    #[cfg(target_os = "linux")]
+    autostart_pending: bool,
+    /// Linux (DRAGON-625): why the last autostart registration did not happen, in words
+    /// meant for the user, shown as the "Automatically start on login" row's description.
+    ///
+    /// NOT persisted: it describes one attempt, not a setting, and a stored copy would
+    /// outlive the condition that produced it (a desktop that gains a Background portal
+    /// would still be told it has none). Cleared on every success, so the row carries a
+    /// reason only while there is one.
+    ///
+    /// Exists because the toggle otherwise just springs back with no explanation. The
+    /// honest-failure contract stops us CLAIMING something untrue, but silence is its own
+    /// kind of unhelpful: on COSMIC the portal does not exist, the request cannot be made
+    /// at all, and the user deserves to be told that rather than left clicking.
+    #[cfg(target_os = "linux")]
+    autostart_notice: Option<String>,
     /// macOS/Windows (DRAGON-130 / DRAGON-295): the resident daemon's global "Capture All
     /// In One" hotkey spec (e.g. "PrintScreen", "Cmd+Shift+2"); persisted, default UNSET.
     /// Opens the full capture overlay. Edited on the Shortcuts settings page (macOS/Windows
@@ -2336,6 +2804,9 @@ pub struct App {
     capture_no_editor_hotkey: String,
     capture_active_window_no_editor_hotkey: String,
     capture_active_monitor_no_editor_hotkey: String,
+    /// DRAGON-582 (macOS/Windows): the daemon's global hotkey for the COLOUR PICKER tool.
+    /// Same round-trip / settings-row role as the six above; Linux never reads it.
+    color_picker_hotkey: String,
     /// macOS (DRAGON-130): the death-pipe babysitter guard held for a capture session
     /// that paused a tiling WM (AeroSpace). Armed once the pause completes
     /// (`seed_overlays_mac`), dropped on session end (`finish_session`/`quit_now` +
@@ -2361,6 +2832,10 @@ pub struct App {
     active_overlay_opacity: f32,
     /// Opacity of the dim behind the post-capture preview overlay (persisted; default 0.90).
     preview_overlay_opacity: f32,
+    /// DRAGON-582: dim opacity (0..1) behind the COLOUR PICKER overlay. Its own setting
+    /// (see `state::schema`): the picker dims to make a magnifier readable, not to mark a
+    /// selection, so its default is much lighter than region selection's.
+    color_picker_overlay_opacity: f32,
     /// Recording frame rate (persisted; default 15) + its live text-field buffer.
     record_fps: NumField<u32>,
     /// Recording target bitrate in Kbps (persisted) + its live text-field buffer.
@@ -2519,6 +2994,19 @@ pub struct App {
     /// relays instead of raising a second icon). A daemon-relay backing is likewise
     /// held here once recording starts.
     tray: Option<crate::tray::TraySession>,
+    /// The countdown digits tray item (DRAGON-563), alive only while a pre-capture
+    /// countdown runs: the remaining seconds render in the tray icon (pixel digits in
+    /// the recording glyph's red on the tinting platforms, a Cancel countdown menu
+    /// entry). Minted in `enter_countdown` on EVERY session, owner's call ("doesn't
+    /// need to be gated at all"): normal sessions keep their on-screen countdown and
+    /// get the digits in addition; the `lab/flatpak` PORTAL-FROZEN fallback path gets
+    /// them as its ONLY countdown surface (there the plain toplevel counted down over
+    /// a gray sheet, and window/monitor countdowns had no surface at all, so the
+    /// fallback window closes at countdown start when this minted). Re-drawn each
+    /// `Tick`, dropped when the countdown fires or cancels. `None` when no tray host
+    /// answered (Linux without an SNI host keeps the historical window countdown on
+    /// the fallback path).
+    countdown_tray: Option<crate::tray::CountdownTraySession>,
     /// Whether the active tray/daemon control surface REPLACES the in-frame toolbar
     /// (DRAGON-172). Decoupled from `tray.is_some()`: on macOS a daemon relay can be
     /// attached (the daemon menu is live) while the in-frame toolbar STAYS visible in
@@ -2709,10 +3197,26 @@ pub struct App {
     /// an arbitrary angle is invisible for a symmetric refresh arrow, and resetting it to 0
     /// would make every scan start with a visible snap back.
     scan_spin: f32,
-    /// The deferred flats grab hasn't landed yet (macOS). Drives the poll
-    /// subscription that drains `frozen_slot`; always false on Linux (synchronous
-    /// grab, ready before `init` returns).
+    /// The deferred flats grab hasn't landed yet. Drives the poll subscription that
+    /// drains `frozen_slot`.
     frozen_pending: bool,
+    /// Linux (DRAGON-600): the frozen-flats grab is HELD until the tray dropdown that
+    /// launched this child is gone. `None` on every launch with no menu on screen and on
+    /// every other platform, so nothing but a tray launch pays for it.
+    menu_hold: Option<MenuFlatsHold>,
+    /// DRAGON-606: how far the capture overlay's dim has faded in. Starts `Waiting`, which
+    /// paints NO dim, becomes `Armed` when the frozen-flats grab has landed
+    /// (`overlay::dim_fade_may_start`), and only starts its clock on the first painted
+    /// frame. A `Cell` because that last step happens inside the view, where there is no
+    /// `&mut self`, exactly like `OutputState::placed`. See `src/app/overlay/mod.rs` for
+    /// why the later of those two events is the only correct start.
+    dim_fade: std::cell::Cell<overlay::DimFade>,
+    /// The directional key currently held down, if any (DRAGON-601). `None` between holds.
+    ///
+    /// ONE field for BOTH nudge consumers, the colour picker's sample and the drawn region,
+    /// because they are never on screen together (`region_nudge_fires` has `!color_picking`
+    /// precisely so) and because two copies of a cadence are two cadences that can drift.
+    nudge_hold: Option<keyboard::NudgeHold>,
     /// Deferred per-output picker wallpaper slot (macOS, DRAGON-200). `None` while
     /// the grab is in flight (it runs AFTER the frozen flats, on the same deferred
     /// thread, so SCK never contends with the launch-critical still), then drained
@@ -2769,9 +3273,6 @@ pub struct App {
     /// rebuilt when the portal probe lands (the only mid-session input).
     screenshot_methods: crate::platform::backend::MethodChoices,
     record_methods: crate::platform::backend::MethodChoices,
-    /// True when no state file existed at startup (very first launch), so we can
-    /// pick smart capture-method defaults once the portal probe completes.
-    first_launch: bool,
     /// Whether the ScreenCast portal is reachable with usable source types
     /// (probed once at startup). Drives the indicator + whether the path is tried.
     pipewire_available: bool,
@@ -2781,8 +3282,26 @@ pub struct App {
     /// Transient overlay message — e.g. "selected region not found in selected
     /// output" after a wrong-monitor portal pick. Auto-dismissed by a timer.
     toast: Option<String>,
-    /// ScreenCast restore token from the last grant (replayed to skip the dialog).
-    pw_restore_token: Option<String>,
+    /// DRAGON-612: an accept key has been pressed on the colour picker and there is no pixel
+    /// to take yet, held since this instant.
+    ///
+    /// The instant IS the state, saying both that a request is outstanding (which drives
+    /// `sub_accept_pending`) and how long it has waited (against
+    /// `keyboard::ACCEPT_WAIT_BUDGET_MS`, because nothing here waits unboundedly). Set on the
+    /// FIRST ask only, so a re-ask cannot quietly renew the budget.
+    ///
+    /// Only the PICKER can hold one. A region accept is answered immediately either way: the
+    /// rectangle is drawn or it is not, and no amount of waiting draws one.
+    accept_pending: Option<std::time::Instant>,
+    /// ScreenCast restore tokens, ONE SLOT PER SOURCE TYPE (monitor / window,
+    /// DRAGON-570), replayed to skip the portal dialog. Per-source slots make the
+    /// DRAGON-544 cross-type mis-replay (cosmic's portal silently restoring the
+    /// WRONG source, the "window mode captured the whole monitor" bug) impossible
+    /// by construction, and granting one kind no longer discards the other's
+    /// token. The field keeps its single-token-era name because the capture
+    /// settings page reads `pw_restore_token.is_some()` for its "Saved screen
+    /// permission" row; see `portal::RestoreTokens`.
+    pw_restore_token: portal::RestoreTokens,
     /// In-flight portal recording: context kept while the async ScreenCast request
     /// runs (its result lands in `pw_slot`, which the handler then consumes).
     pw_pending: Option<PwPending>,
@@ -2792,6 +3311,44 @@ pub struct App {
     /// A granted portal stream awaiting the start of recording (held across the
     /// countdown). When set, the recorder uses it instead of direct screencopy.
     pw_held: Option<HeldStream>,
+    /// `lab/flatpak` (Linux): whether the fallback overlay path's ONE seed-time portal
+    /// request has been kicked. Set by `on_output`'s first qualifying event so later
+    /// output events only register geometry. The `immediate_kicked` shape.
+    #[cfg(target_os = "linux")]
+    fallback_seed_kicked: bool,
+    /// `lab/flatpak` (Linux), DRAGON-604: the cursor answer the CURRENT seed frame was
+    /// grabbed with, or `None` before any seed request. The portal bakes the pointer in
+    /// at grab time, so those pixels cannot be un-decided later; this is what lets a
+    /// kind change notice that the frame on screen no longer matches what the new kind
+    /// needs (see `fallback_reseed_needed`).
+    #[cfg(target_os = "linux")]
+    fallback_seed_cursor: Option<bool>,
+    /// `lab/flatpak` (Linux), DRAGON-604: a REPLACEMENT seed request is in flight. The
+    /// grant handlers read it to keep a live session alive: the launch seed's endings
+    /// are rightly fatal (there is no overlay yet, which is the whole premise), but a
+    /// re-seed already has one on screen, so a declined or unreachable replacement must
+    /// leave the existing frame standing instead of killing the session under the user.
+    #[cfg(target_os = "linux")]
+    fallback_reseeding: bool,
+    /// `lab/flatpak` (Linux): the fallback overlay toplevel's winit id, once minted.
+    /// This is what tells the close paths that ONE `self.outputs` entry is backed by a
+    /// plain window (closed via `window::close`) while the rest are placeholder ids with
+    /// no surface at all, so a layer-surface destroy for either would be wrong. `None` on
+    /// every layer-shell session, and cleared by `destroy_surfaces` before the close is
+    /// issued so the window's own `Closed` echo reads as ours.
+    #[cfg(target_os = "linux")]
+    fallback_window: Option<window::Id>,
+    /// `lab/flatpak` (Linux): the seed grant's monitor (name + logical geometry). Set at
+    /// `FallbackCastReady` and kept for the session: `FallbackFrozenReady` builds the
+    /// `FrozenOutput` and mints the window from it, and the yield/restore dance around a
+    /// portal dialog re-mints from it too.
+    #[cfg(target_os = "linux")]
+    fallback_grant: Option<FallbackGrant>,
+    /// `lab/flatpak` (Linux): hand-off slot for the seed-time single-frame portal grab
+    /// (an `RgbaImage` is ~30 MB, so it rides the house slot idiom, never a `Msg`).
+    /// Outer `Option` = posted; inner = whether a frame arrived before the 5s watchdog.
+    #[cfg(target_os = "linux")]
+    fallback_frame_slot: FallbackFrameSlot,
     /// In-app update state (DRAGON-175): the cached result of the last update
     /// check, which drives the About nav-rail tint/icon and the About page's
     /// update rows. Checked when the settings window opens + on the manual
@@ -2819,7 +3376,19 @@ pub struct App {
     /// then refreshed by `UpdateChecked`. The parse lives here (not in the view)
     /// because `markdown::view` borrows the parsed `Item`s for the element's
     /// lifetime.
+    ///
+    /// On a build with NO update channel (a Flatpak, DRAGON-605) neither of those two
+    /// fills it, because neither runs; `ReleaseNotesFetched` does instead, from the
+    /// notes-only fetch the About page starts. Same field, same rendering, so the
+    /// changelog looks identical whoever fetched it.
     update_notes: Option<(String, cosmic::widget::markdown::Content)>,
+    /// Whether the notes-only fetch has already run this session (DRAGON-605). Set on a
+    /// build with no update channel (a Flatpak), where the About page fetches its own
+    /// "What's new" text because no update check will ever supply it. Set BEFORE the
+    /// fetch starts, and never cleared, so repeatedly navigating to About costs exactly
+    /// one request, and a fetch that comes back empty is not retried on every visit.
+    /// Always false on a build with a channel, which never sends the message at all.
+    release_notes_fetched: bool,
 }
 
 /// The launch-time update dialog's transient state (DRAGON-177). Present only while
@@ -2845,6 +3414,9 @@ struct PwPending {
     /// Region mode only: the target monitor's logical geometry + the clamped region
     /// (global logical), used to validate the granted output and compute the crop.
     region: Option<RegionTarget>,
+    /// The request's source-type key ("monitor" / "window"), recorded so the grant
+    /// stores it beside the restore token and a cancel clears the right pair.
+    source_key: &'static str,
 }
 
 /// The monitor a region was clamped to, for validating the portal pick + cropping.
@@ -2852,6 +3424,56 @@ struct RegionTarget {
     out_pos: (i32, i32),
     out_size: (u32, u32),
     rect: (i32, i32, u32, u32),
+}
+
+/// `lab/flatpak` (Linux): the monitor the seed-time portal grant resolved to: the
+/// output the fallback overlay freezes, names its capture after, and fullscreens onto
+/// (as far as the compositor allows; see `OutputState::fallback_win_size` for the
+/// mismatch guard when it lands elsewhere). Kept for the WHOLE session, because the
+/// window is closed while a portal dialog is up (`yield_overlays`) and re-minted from
+/// this on cancel/countdown (`mint_fallback_window`).
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct FallbackGrant {
+    /// The granted output's wl_output name (`OutputState::name`), the `self.frozen` key.
+    name: String,
+    pos: (i32, i32),
+    size: (u32, u32),
+}
+
+/// `lab/flatpak` (Linux): the seed-frame hand-off slot (see the field doc on `App`).
+#[cfg(target_os = "linux")]
+type FallbackFrameSlot = std::sync::Arc<std::sync::Mutex<Option<Option<image::RgbaImage>>>>;
+
+/// DRAGON-562 (Linux): the grant-time facts a portal WINDOW still needs to run
+/// the native single-window aesthetics over the finished portal frame. Snapshotted
+/// in `on_pipewire_cast_ready`, the only moment that has them: `self.outputs` is
+/// torn down with the overlays before `do_pixel_capture` runs, and the stream's
+/// position is not retrievable later. Rides [`HeldStream`], so a countdown keeps
+/// it alive for free and a video launch simply never reads it.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct PortalWindowGrant {
+    /// The window's global logical position (`StreamInfo.position`). `None` is
+    /// the NORM, not an edge case: COSMIC's portal constructs every window
+    /// stream with an explicit `position: None` (measured, fifth Flatpak live
+    /// test; its screencast source only positions monitor streams). The
+    /// fullscreen gate degrades honestly on `None` (decorate), while the
+    /// wallpaper backdrop falls back to a SYNTHETIC anchor
+    /// (`capture_flow::synthetic_window_anchor`) — waiting for a real position
+    /// meant the backdrop never engaged at all.
+    pos: Option<(i32, i32)>,
+    /// The origin output's logical rect (x, y, w, h), resolved at grant time by
+    /// the SAME containment (`output_for_grant_position`) that names
+    /// `portal_origin_output`. The fullscreen gate's "out" input.
+    origin_rect: Option<(i32, i32, i32, i32)>,
+    /// The origin output's buffer scale (physical px per logical unit); `1.0`
+    /// when no output matched.
+    scale: f32,
+    /// Every registered output's (name, logical_pos, logical_size): the window
+    /// composite's wallpaper arm resolves the window's output, and its cosmic-bg
+    /// entry, from these.
+    outputs: Vec<crate::screenshot::OutputGeom>,
 }
 
 /// A granted portal stream held between the permission grant and the actual start
@@ -2867,14 +3489,20 @@ struct HeldStream {
     node_id: u32,
     /// Region crop in stream pixels; `None` for whole monitor/window.
     crop: Option<(u32, u32, u32, u32)>,
+    /// DRAGON-562: `Some` exactly when this grant is a WINDOW source — the facts
+    /// the still path's aesthetics need (see [`PortalWindowGrant`]). The
+    /// recording path ignores it.
+    #[cfg(target_os = "linux")]
+    window_grant: Option<PortalWindowGrant>,
 }
 
 mod message;
 pub use message::{
-    BorderColorTarget, CaptureMsg, CloudSettingsMsg, RecordingMsg, DetectMsg, SettingsMsg,
-    PermissionsMsg, WindowChromeMsg, PreviewMsg, VideoMeta,
+    BorderColorTarget, CaptureMsg, CloudSettingsMsg, ColorPickerMsg, RecordingMsg, DetectMsg,
+    SettingsMsg, PermissionsMsg, WindowChromeMsg, PreviewMsg, VideoMeta,
 };
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+// DRAGON-589: portable, because every platform's Global tab lists these seven actions. Only
+// the two with a resident daemon can BIND them; the rest show the command that runs each.
 pub use message::CaptureHotkeySlot;
 
 #[derive(Debug, Clone)]
@@ -2888,6 +3516,9 @@ pub enum Msg {
     #[cfg_attr(not(target_os = "macos"), expect(dead_code))]
     Permissions(PermissionsMsg),
     WindowChrome(WindowChromeMsg),
+    /// A colour-picker message (DRAGON-582): the dimmed picker overlay's pointer moves
+    /// and pick, plus the result window's row edits, copies and recent-swatch loads.
+    ColorPicker(ColorPickerMsg),
     /// A preview-editor message, ADDRESSED to the preview surface it belongs to
     /// (DRAGON-336 phase 2). The id lives on the wrapper rather than on each of
     /// `PreviewMsg`'s ~80 variants: view code always has its `PreviewState` (hence
@@ -2940,6 +3571,18 @@ mod tests {
         assert_eq!(countdown_index(3), 1);
         assert_eq!(countdown_index(5), 2);
         assert_eq!(countdown_index(10), 3);
+    }
+
+    /// DRAGON-574: the tray's "Countdown Timer" radio submenu writes `delay_idx`, the
+    /// index into THIS table, so the two preset tables must stay equal entry for entry.
+    /// A drift would make a tray pick of "05" count down some other number of seconds.
+    #[test]
+    fn tray_countdown_presets_match_the_delay_table() {
+        assert_eq!(crate::recording_ui::COUNTDOWN_PRESET_SECS.len(), DELAYS.len());
+        for (idx, &secs) in crate::recording_ui::COUNTDOWN_PRESET_SECS.iter().enumerate() {
+            assert_eq!(DELAYS[idx].1, secs, "preset {idx} disagrees with the delay chips");
+            assert_eq!(countdown_index(secs), idx, "countdown_index round-trip for {secs}s");
+        }
     }
 
     /// DRAGON-243 (Windows): the transparent-overlay present-mode override forces `fifo`
@@ -3117,6 +3760,50 @@ mod tests {
         assert!(!boots_regular_policy(false, false, false, false, false));
     }
 
+    /// The COLOUR PICKER pin. A `--color-picker` launch ends in a real window, so it reads
+    /// like a sixth window-shaped reason and must NOT become one: it is overlay-first, so
+    /// from `startup` alone it is shaped exactly like a capture launch and answers FALSE
+    /// here, and its window takes Regular after the fact through
+    /// `platform::mac::window::ensure_regular_policy`. Promoting the launch would tile the
+    /// picker's own overlays under AeroSpace (DRAGON-154), stamp the menu bar into the
+    /// frozen snapshot the picker samples (DRAGON-151), and mint a Dock icon for the picker
+    /// launches that open no window at all (DRAGON-587 / DRAGON-613). The predicate's doc
+    /// carries the full account.
+    #[test]
+    fn a_colour_picker_launch_does_not_boot_regular() {
+        let picker = Startup { color_picker: true, ..Default::default() };
+        assert!(picker.opens_overlays(), "the picker mints capture-shaped overlays");
+        // `post_update` (like the two `boots_regular_policy` gates themselves) is
+        // macOS-only, but this table runs on every host; a fresh `Startup` never sets
+        // it, so the literal `false` this test wants is the same value the field
+        // would read on the one platform where it exists.
+        assert!(!boots_regular_policy(
+            picker.settings_only,
+            picker.permissions_only,
+            picker.preview.is_some() || picker.preview_handoff.is_some(),
+            false,
+            false,
+        ));
+    }
+
+    /// A colour-picker launch that ROUTES to the permission checker is the one exception,
+    /// and it needs no special case: it is covered by the fourth argument exactly like any
+    /// other routed capture launch. Worth pinning, because a picker with no Screen Recording
+    /// grant has no pixels to sample and really does show only the checker window.
+    #[test]
+    fn a_routed_colour_picker_launch_still_boots_regular() {
+        let picker = Startup { color_picker: true, ..Default::default() };
+        // See the sibling test above for why this is a literal `false` rather than
+        // `picker.post_update` (macOS-only field, this table runs on every host).
+        assert!(boots_regular_policy(
+            picker.settings_only,
+            picker.permissions_only,
+            false,
+            true,
+            false,
+        ));
+    }
+
     /// The whole table, so a future argument cannot be added without a decision about it:
     /// the predicate is an OR, and each input is on its own sufficient and on its own
     /// insufficient.
@@ -3138,27 +3825,45 @@ mod tests {
     /// The Windows 10 preview-appearance rule, and its total absence everywhere else.
     #[test]
     fn windows_10_forces_the_windowed_editor_without_touching_other_platforms() {
-        // Overlay editor available (Linux, macOS, Windows 11): the chosen value is returned
-        // untouched for every combination — these platforms are byte-identical.
+        // Overlay editor available (macOS, Windows 11, a layer-shell Linux session): the
+        // chosen value is returned untouched for every combination — byte-identical.
         for chosen in [false, true] {
             for opens in [false, true] {
-                assert_eq!(
-                    effective_preview_windowed(chosen, opens, true),
-                    chosen,
-                    "chosen={chosen} opens_overlays={opens}"
-                );
+                for software in [false, true] {
+                    assert_eq!(
+                        effective_preview_windowed(chosen, opens, true, software),
+                        chosen,
+                        "chosen={chosen} opens_overlays={opens} software={software}"
+                    );
+                }
             }
         }
         // Windows 10, the EDITOR half (opens no overlays): always the window, even when the
         // persisted setting says overlay or `--preview --overlay` asked for one. Hiding the
         // setting while still honouring it would strand such a user on a broken editor.
-        assert!(effective_preview_windowed(false, false, false));
-        assert!(effective_preview_windowed(true, false, false));
+        assert!(effective_preview_windowed(false, false, false, true));
+        assert!(effective_preview_windowed(true, false, false, true));
         // Windows 10, the CAPTURE half (opens overlays): its preview surfaces are fullscreen
         // loaders and covers, which must stay translucent overlays in the software-rendered
         // process. The real editor is spawned as its own process instead.
-        assert!(!effective_preview_windowed(false, true, false));
-        assert!(!effective_preview_windowed(true, true, false));
+        assert!(!effective_preview_windowed(false, true, false, true));
+        assert!(!effective_preview_windowed(true, true, false, true));
+    }
+
+    /// `lab/flatpak`: a Linux session with no layer shell has no fullscreen preview surface
+    /// of ANY kind, so both halves land on the window. The capture half especially: it must
+    /// NOT come out `false` here, because `save_state` persists `preview_windowed` and a
+    /// sandboxed capture would then quietly rewrite the user's chosen appearance.
+    #[test]
+    fn a_linux_session_without_layer_shell_is_windowed_in_both_halves() {
+        for chosen in [false, true] {
+            for opens in [false, true] {
+                assert!(
+                    effective_preview_windowed(chosen, opens, false, false),
+                    "chosen={chosen} opens_overlays={opens}"
+                );
+            }
+        }
     }
 
     /// A spawned editor child receives its request as ONE argv word-set with no trailing
@@ -3298,23 +4003,43 @@ mod tests {
     #[test]
     fn launch_flats_are_grabbed_only_when_freeze_or_the_scanner_can_read_them() {
         // Freeze on: every kind needs the flats (the backdrop AND the freeze capture).
-        assert!(launch_flats_needed(true, true, Kind::Image));
-        assert!(launch_flats_needed(true, true, Kind::Video));
-        assert!(launch_flats_needed(true, true, Kind::Scanner));
+        assert!(launch_flats_needed(true, true, Kind::Image, false));
+        assert!(launch_flats_needed(true, true, Kind::Video, false));
+        assert!(launch_flats_needed(true, true, Kind::Scanner, false));
         // Freeze off, scanner launch (`--scan`): the scan source IS the flats crop.
-        assert!(launch_flats_needed(true, false, Kind::Scanner));
+        assert!(launch_flats_needed(true, false, Kind::Scanner, false));
         // Freeze off, plain photo/video launch: nothing can read them — skip the grab.
-        assert!(!launch_flats_needed(true, false, Kind::Image));
-        assert!(!launch_flats_needed(true, false, Kind::Video));
+        assert!(!launch_flats_needed(true, false, Kind::Image, false));
+        assert!(!launch_flats_needed(true, false, Kind::Video, false));
+    }
+
+    // DRAGON-582: the colour picker is the third reader, and its need is unconditional —
+    // it samples the flats for every pointer move, so freeze-off must not skip the grab.
+    #[test]
+    fn a_colour_picker_launch_always_grabs_the_flats() {
+        assert!(launch_flats_needed(true, false, Kind::Image, true));
+        assert!(launch_flats_needed(true, true, Kind::Image, true));
+        // And it still needs an ACTIVE scene: a settings launch grabs nothing.
+        assert!(!launch_flats_needed(false, false, Kind::Image, true));
+    }
+
+    // The picker wants the flats and NOTHING else of the capture scene: no window
+    // pre-capture (it is never a window-mode launch) and no locked cursor sprite.
+    #[test]
+    fn a_colour_picker_launch_wants_only_the_flats() {
+        assert!(!launch_cursor_needed(true, true), "no captured pointer to draw");
+        assert!(launch_cursor_needed(true, false), "an ordinary capture is untouched");
+        assert!(!launch_cursor_needed(false, false), "and the preference still rules");
+        assert!(!launch_precapture_runs(true, Mode::Region));
     }
 
     // A non-capture launch (settings / preview / permissions -> active=false) never
     // grabs the flats, whatever the persisted freeze setting or kind says.
     #[test]
     fn launch_flats_are_never_grabbed_for_a_non_capture_launch() {
-        assert!(!launch_flats_needed(false, true, Kind::Scanner));
-        assert!(!launch_flats_needed(false, true, Kind::Image));
-        assert!(!launch_flats_needed(false, false, Kind::Scanner));
+        assert!(!launch_flats_needed(false, true, Kind::Scanner, false));
+        assert!(!launch_flats_needed(false, true, Kind::Image, false));
+        assert!(!launch_flats_needed(false, false, Kind::Scanner, false));
     }
 
     // DRAGON-456: the scan kind button carries two meanings, and which one it carries
@@ -3389,6 +4114,282 @@ mod tests {
         // dash right at the cap boundary — the trailing separator must still be trimmed.
         let input = format!("{} next", "a".repeat(47));
         assert_eq!(slugify(&input), "a".repeat(47));
+    }
+}
+
+// DRAGON-571: the settings picker's READ side, pinned as its own island. It only
+// displays a resolution; the write side (a real click through SetPreferredEncoder)
+// is the sole path that persists a concrete id. All cases use ids present in every
+// platform's `encode::AUTO_LADDER` ("nvenc", "vaapi", "software"), so the module
+// passes unchanged on Linux, macOS and Windows.
+/// DRAGON-595: the ONE cursor rule, pinned in its own module because it is now the
+/// single copy that two mechanisms translate. Its whole job is to answer WHETHER a
+/// capture takes the pointer; HOW is `platform::backend::CursorDelivery`, and the
+/// separation is what let the native and portal copies collapse into this.
+#[cfg(test)]
+mod cursor_wanted_tests {
+    use super::cursor_wanted;
+
+    // The plain preference, both ways. This is the user-facing feature.
+    #[test]
+    fn an_ordinary_capture_follows_the_preference() {
+        assert!(cursor_wanted(true, false));
+        assert!(!cursor_wanted(false, false));
+    }
+
+    // The colour picker overrides it OFF whatever the setting says. The ON case is
+    // the one that matters: the preference defaults on, and a picker session with a
+    // baked pointer has a permanent blind spot over the pixels it exists to read.
+    #[test]
+    fn the_colour_picker_always_declines_the_pointer() {
+        assert!(!cursor_wanted(true, true));
+        assert!(!cursor_wanted(false, true));
+    }
+
+    // The whole table, so a future term has to be placed deliberately rather than
+    // defaulting into someone else's lane: exactly one of the four states wants it.
+    #[test]
+    fn only_a_non_picker_capture_with_the_preference_on_wants_the_pointer() {
+        let wants: Vec<_> = [(true, false), (true, true), (false, true), (false, false)]
+            .into_iter()
+            .filter(|(want, picker)| cursor_wanted(*want, *picker))
+            .collect();
+        assert_eq!(wants, vec![(true, false)]);
+    }
+
+    // The launch gate is this rule with the LAUNCH inputs, not a second rule. Pinned
+    // so a change here cannot quietly leave the startup sprite grab behind.
+    #[test]
+    fn the_launch_gate_is_the_same_rule() {
+        for (want, picker) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert_eq!(super::launch_cursor_needed(want, picker), cursor_wanted(want, picker));
+        }
+    }
+}
+
+/// DRAGON-604: the capture MODE's veto over the pointer. Its own module because it
+/// pins one rule and one promise, that NO route into the scanner can photograph the
+/// mouse. The tests are deliberately table-driven over every [`Kind`] rather than one
+/// case per entry point: a new entry point is invisible to a per-route test, but a new
+/// KIND, or a kind that quietly starts honouring the preference again, fails the table.
+#[cfg(test)]
+mod kind_cursor_veto_tests {
+    use super::{Kind, capture_extras_for_kind, kind_keeps_pointer};
+    use crate::platform::backend::CaptureExtras;
+
+    /// Every `Kind` there is. The `match` in [`kind_keeps_pointer`] is exhaustive, so
+    /// adding a variant breaks the build there; this list is what makes it break HERE
+    /// too, where the promise is written down.
+    const EVERY_KIND: [Kind; 3] = [Kind::Scanner, Kind::Image, Kind::Video];
+
+    const ALL_ON: CaptureExtras = CaptureExtras {
+        freeze: true,
+        cursor: true,
+        transparency: true,
+        wallpaper: true,
+        fullscreen_aware: true,
+    };
+    const ALL_OFF: CaptureExtras = CaptureExtras {
+        freeze: false,
+        cursor: false,
+        transparency: false,
+        wallpaper: false,
+        fullscreen_aware: false,
+    };
+
+    // The headline promise. A fully capable backend plus the preference ON is the
+    // strongest case the veto has to beat, and it is the DEFAULT state: the pref ships
+    // on. Whatever route reached the scanner, the answer is no pointer.
+    #[test]
+    fn the_scanner_never_keeps_the_pointer_however_loudly_the_preference_says_yes() {
+        assert!(!kind_keeps_pointer(Kind::Scanner));
+        assert!(!capture_extras_for_kind(ALL_ON, ALL_ON, Kind::Scanner).cursor);
+    }
+
+    // The other half, so the veto is a veto and not a blanket off switch: a picture
+    // still follows the preference in both directions.
+    #[test]
+    fn a_picture_still_follows_the_preference_in_both_directions() {
+        for kind in [Kind::Image, Kind::Video] {
+            assert!(kind_keeps_pointer(kind), "{kind:?} is a picture of the desktop");
+            assert!(capture_extras_for_kind(ALL_ON, ALL_ON, kind).cursor, "{kind:?} pref on");
+            let pref_off = CaptureExtras { cursor: false, ..ALL_ON };
+            assert!(!capture_extras_for_kind(ALL_ON, pref_off, kind).cursor, "{kind:?} pref off");
+        }
+    }
+
+    // The whole table in one place: for every kind, crossed with every combination of
+    // capability and preference, the cursor extra is on in exactly the states where the
+    // kind allows it AND both older terms agree. This is the test that catches an entry
+    // point someone adds later, because it constrains the ANSWER rather than the route.
+    #[test]
+    fn the_cursor_extra_is_capability_and_preference_and_kind() {
+        for kind in EVERY_KIND {
+            for cap in [true, false] {
+                for pref in [true, false] {
+                    let caps = CaptureExtras { cursor: cap, ..ALL_ON };
+                    let prefs = CaptureExtras { cursor: pref, ..ALL_ON };
+                    let got = capture_extras_for_kind(caps, prefs, kind).cursor;
+                    assert_eq!(
+                        got,
+                        cap && pref && kind_keeps_pointer(kind),
+                        "kind={kind:?} capability={cap} preference={pref}"
+                    );
+                }
+            }
+        }
+    }
+
+    // A backend that cannot toggle the pointer still wins, for every kind: the veto is
+    // additional to the DRAGON-186 gating, never a replacement that could talk an
+    // incapable backend into trying.
+    #[test]
+    fn an_incapable_backend_still_forces_the_pointer_off_for_every_kind() {
+        for kind in EVERY_KIND {
+            assert!(!capture_extras_for_kind(ALL_OFF, ALL_ON, kind).cursor, "{kind:?}");
+        }
+    }
+
+    // The veto touches the CURSOR bit and nothing else. Scanning still freezes, still
+    // preserves transparency and still composites the wallpaper, because none of those
+    // obscure what is being decoded. Pinned so a future edit cannot widen the veto into
+    // a general "the scanner gets no extras" rule by accident.
+    #[test]
+    fn the_veto_takes_the_pointer_and_leaves_every_other_extra_alone() {
+        let scan = capture_extras_for_kind(ALL_ON, ALL_ON, Kind::Scanner);
+        assert_eq!(scan, CaptureExtras { cursor: false, ..ALL_ON });
+        // And with the cursor already off, a scan is byte-identical to a picture, so
+        // the veto adds nothing where nothing was asked for.
+        let pref_off = CaptureExtras { cursor: false, ..ALL_ON };
+        assert_eq!(
+            capture_extras_for_kind(ALL_ON, pref_off, Kind::Scanner),
+            capture_extras_for_kind(ALL_ON, pref_off, Kind::Image)
+        );
+    }
+
+    // Switching kind must be enough on its own to change the answer, in BOTH
+    // directions, with the capability and the preference held fixed. That is the
+    // "cannot be a one-shot applied at launch and then lost" property: the readers call
+    // this per capture with the CURRENT kind, so image -> scanner -> image recovers the
+    // pointer instead of stranding the session with it off.
+    #[test]
+    fn a_mode_switch_alone_flips_the_answer_and_flips_it_back() {
+        let seq = [Kind::Image, Kind::Scanner, Kind::Image, Kind::Scanner, Kind::Video];
+        let got: Vec<bool> =
+            seq.iter().map(|k| capture_extras_for_kind(ALL_ON, ALL_ON, *k).cursor).collect();
+        assert_eq!(got, vec![true, false, true, false, true]);
+    }
+
+    // The end-to-end translation into the portal's own mechanism (a scan asks its
+    // ScreenCast stream to OMIT the pointer, rather than merely declining to draw one)
+    // is pinned next to `cursor_request` itself, in `portal::cursor_request_tests`,
+    // where that private fn is in scope.
+}
+
+/// DRAGON-604: the one place the mode veto is not enough on its own, the `lab/flatpak`
+/// fallback overlay's single seed frame. Its own module because it guards a different
+/// promise from the veto's: not "what does this capture apply" but "do the pixels we
+/// are holding still match it".
+#[cfg(test)]
+mod fallback_reseed_tests {
+    use super::fallback_reseed_needed;
+
+    // The reported shape: a session seeded WITH the pointer, then the user enters the
+    // scanner, so the veto now wants it gone. Those pixels cannot be changed in place,
+    // so the frame has to be grabbed again.
+    #[test]
+    fn entering_the_scanner_on_a_pointer_bearing_frame_re_seeds() {
+        assert!(fallback_reseed_needed(true, Some(true), false));
+    }
+
+    // And the mirror, which is what stops the veto being a one-way door: leaving the
+    // scanner has to bring the pointer back for the rest of the session.
+    #[test]
+    fn leaving_the_scanner_re_seeds_to_get_the_pointer_back() {
+        assert!(fallback_reseed_needed(true, Some(false), true));
+    }
+
+    // An unchanged answer costs nothing. This is most kind switches: image to video
+    // either way, and every switch at all with the preference already off.
+    #[test]
+    fn an_unchanged_answer_never_pays_for_a_portal_round_trip() {
+        assert!(!fallback_reseed_needed(true, Some(true), true));
+        assert!(!fallback_reseed_needed(true, Some(false), false));
+    }
+
+    // Before the launch seed there is no frame to disagree with, so there is nothing to
+    // replace. The seed request itself picks up the right answer when it runs.
+    #[test]
+    fn nothing_to_replace_before_the_first_seed() {
+        assert!(!fallback_reseed_needed(true, None, true));
+        assert!(!fallback_reseed_needed(true, None, false));
+    }
+
+    // Every session WITH layer shell is untouched, whatever the bits say. Those
+    // sessions re-read the rule per capture and never hold a baked-in frame, which is
+    // why the veto alone is sufficient there.
+    #[test]
+    fn a_layer_shell_session_never_re_seeds() {
+        for seeded in [None, Some(true), Some(false)] {
+            for wants in [true, false] {
+                assert!(!fallback_reseed_needed(false, seeded, wants), "{seeded:?} {wants}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod display_encoder_choice_tests {
+    use super::display_encoder_choice;
+
+    #[test]
+    fn a_concrete_pick_displays_itself_while_usable() {
+        assert_eq!(display_encoder_choice("nvenc", None, &["nvenc", "software"]), "nvenc");
+        // A software pick is a real choice too.
+        assert_eq!(display_encoder_choice("software", None, &["nvenc", "software"]), "software");
+    }
+
+    #[test]
+    fn an_unusable_pick_displays_the_ladder_fallback() {
+        // The pick stays persisted (intent is not touched by display); the picker
+        // just shows what a recording would actually land on.
+        assert_eq!(display_encoder_choice("nvenc", None, &["software"]), "software");
+    }
+
+    #[test]
+    fn auto_displays_the_ranked_best_available() {
+        assert_eq!(display_encoder_choice("auto", None, &["nvenc", "software"]), "nvenc");
+        assert_eq!(display_encoder_choice("auto", None, &["software"]), "software");
+    }
+
+    #[test]
+    fn auto_displays_a_usable_hint_first() {
+        // The hint leads the probe order, so it leads the display too: display and
+        // recording cannot disagree.
+        assert_eq!(
+            display_encoder_choice("auto", Some("vaapi"), &["nvenc", "vaapi", "software"]),
+            "vaapi"
+        );
+    }
+
+    #[test]
+    fn auto_ignores_a_software_or_failed_hint() {
+        // A software hint must never pin the display on the CPU fallback (the
+        // DRAGON-571 bug), and a hint whose encoder dropped out of the probed list
+        // degrades to the ranked order.
+        assert_eq!(
+            display_encoder_choice("auto", Some("software"), &["nvenc", "software"]),
+            "nvenc"
+        );
+        assert_eq!(
+            display_encoder_choice("auto", Some("vaapi"), &["nvenc", "software"]),
+            "nvenc"
+        );
+    }
+
+    #[test]
+    fn an_empty_probed_list_is_software() {
+        assert_eq!(display_encoder_choice("auto", None, &[]), "software");
     }
 }
 

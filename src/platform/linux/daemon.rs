@@ -19,14 +19,17 @@
 //!
 //! * ONE `ksni` StatusNotifierItem showing the shared three-state viewfinder icon
 //!   (corner brackets; + centre dot while a child records; + centre pause bars while
-//!   paused, all from [`crate::recording_ui`]) and a menu built from the SAME portable
-//!   sources as the mac daemon + the Linux recording tray, so the surfaces can never
-//!   drift. Idle: the capture group flat (Scanner / Capture Region / Capture Window /
-//!   Capture Monitor, separator, Settings, Quit). While a child records (DRAGON-173): the
-//!   uniform in-recording menu — the six-entry control group (Toggle Microphone, Toggle
-//!   System Audio, separator, Pause/Resume Recording, Finish & Save Recording, Cancel &
-//!   Delete Recording), a separator, then the SAME capture group nested under a "Capture
-//!   Menu" submenu (Quit disabled while recording).
+//!   paused, all from [`crate::recording_ui`]) and a menu built from the ONE portable
+//!   [`crate::recording_ui::visible_tray_menu`] model (DRAGON-574 + the hide round),
+//!   so the surfaces can never
+//!   drift. Idle: Scanner, the "Capture" and "Record" submenus (Region / Window /
+//!   Monitor trios), the "Countdown Timer: NN" radio submenu (persisting `delay_idx`,
+//!   the same field every capture launch reads), the "Audio Recording: <state>" radio
+//!   submenu (the DRAGON-558 persistent audio-arm control), separator, Settings...,
+//!   Quit. While a child records: the three controls lead (Pause/Resume Recording,
+//!   Finish & Save Recording, Cancel & Delete Recording), then the same group with the
+//!   flagged-off rows HIDDEN — no Record, no Countdown Timer, no Quit; Scanner /
+//!   Capture / Audio Recording (live arms) / Settings remain.
 //! * The recording-control IPC socket ([`crate::daemon_ipc::socket_path`]): a recording
 //!   child connects at start, streams its [`RecordingState`], and receives the menu's
 //!   [`Command`]s back — identical wire protocol to the mac daemon.
@@ -53,8 +56,10 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::daemon_ipc::{icon_svg, icon_state, Command, IconState, RecordingState};
-use crate::recording_ui::{recording_menu, CaptureAction, MenuItemKind, RecordingAction};
+use crate::daemon_ipc::{icon_state, Command, IconState, RecordingState};
+use crate::recording_ui::{
+    visible_tray_menu, CaptureAction, MenuItemKind, RadioSubmenu, RecordingAction, TrayItem,
+};
 use std::io::Write as _;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,7 +67,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// The CLI flag the SIGUSR1 "capture NOW" default spawns (Region). The menu launchers spawn
-/// via [`crate::recording_ui::CaptureAction::spawn_flag`] (the ONE shared mapping); this
+/// via [`crate::recording_ui::CaptureAction::spawn_args`] (the ONE shared mapping); this
 /// constant names only the second-launch default so both agree on it.
 const REGION_FLAG: &str = "--region";
 
@@ -175,6 +180,19 @@ struct ResidentTray {
     ipc: IpcShared,
     accent: [u8; 3],
     icon_cache: std::cell::RefCell<Option<IconCacheEntry>>,
+    /// The persisted audio arms (`record_mic` / `record_system_audio`), the state the
+    /// "Audio Recording: <state>" submenu titles and marks itself from while IDLE
+    /// (DRAGON-558). CACHED here rather than read per menu build, for the same reason the
+    /// accent is: a config read does not belong on the ksni thread inside a menu callback.
+    /// Kept fresh two ways: the trigger loop's config-mtime tick re-reads them (so a
+    /// settings window's change lands within ~1s), and an idle radio pick updates them
+    /// directly with the pair it just persisted.
+    armed_mic: bool,
+    armed_system: bool,
+    /// The persisted countdown preset index (`delay_idx`), the state the "Countdown
+    /// Timer: NN" submenu titles and marks itself from (DRAGON-574). Cached and kept
+    /// fresh exactly like the audio arms above (mtime tick + the idle pick's own write).
+    delay_idx: usize,
 }
 
 impl ResidentTray {
@@ -193,7 +211,7 @@ impl ksni::Tray for ResidentTray {
     const MENU_ON_ACTIVATE: bool = true;
 
     fn id(&self) -> String {
-        "dev.frosthaven.CosmicCaptureKit.Resident".to_string()
+        "dev.thedragon.CosmicCaptureKit.Resident".to_string()
     }
 
     fn title(&self) -> String {
@@ -207,99 +225,126 @@ impl ksni::Tray for ResidentTray {
         {
             return icons.clone();
         }
-        let icons = crate::tray::render_icon(icon_svg(key.0), self.accent)
-            .map(|i| vec![i])
-            .unwrap_or_default();
+        let icons =
+            crate::tray::render_state_icon(key.0, self.accent).map(|i| vec![i]).unwrap_or_default();
         *self.icon_cache.borrow_mut() = Some((key, icons.clone()));
         icons
     }
 
-    /// The resident menu. Built from the ONE portable model so labels + order match the mac
-    /// daemon exactly (see [`resident_menu_labels`] for the pinned shape). Idle: the capture
-    /// group rendered FLAT (launchers, separator, Settings, Quit). While a child records
-    /// (DRAGON-173): the uniform in-recording menu — the six-entry control group from
-    /// [`recording_menu`], a separator, then the SAME capture group nested under a "Capture
-    /// Menu" submenu (Quit disabled while recording).
+    /// The resident menu: the ONE portable [`visible_tray_menu`] model (DRAGON-574 +
+    /// the hide round), both
+    /// states, so labels + order + visibility match the mac daemon, the Windows daemon
+    /// and the Linux recording tray exactly (see [`resident_menu_shapes`] for the
+    /// pinned shape). Idle: Scanner, the Capture / Record submenus, the Countdown
+    /// Timer and Audio Recording radio submenus, Settings..., Quit. While a child
+    /// records: the three controls lead, then the same group with Record / Countdown /
+    /// Quit HIDDEN.
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         let st = self.ipc.snapshot();
-
-        if !crate::daemon_ipc::shows_recording_controls(&st) {
-            // Idle: the capture group, flat.
-            return capture_group_items(&st);
-        }
-
-        // In-recording: the six-entry control group, a separator, then the "Capture Menu"
-        // submenu of the whole capture group.
-        use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
-        // Relay each shared action to the connected child over the IPC socket.
-        fn relay(t: &ResidentTray, action: RecordingAction) {
-            let cmd = match action {
-                RecordingAction::TogglePause => Command::TogglePause,
-                RecordingAction::ToggleMic => Command::ToggleMic,
-                RecordingAction::ToggleSystemAudio => Command::ToggleSystemAudio,
-                RecordingAction::Stop => Command::Stop,
-                RecordingAction::Cancel => Command::Cancel,
-            };
-            t.ipc.send(cmd);
-        }
-        let mut items: Vec<ksni::MenuItem<Self>> = Vec::new();
-        for item in recording_menu(st.paused, st.mic, st.system) {
-            match item.kind {
-                MenuItemKind::Separator => items.push(ksni::MenuItem::Separator),
-                MenuItemKind::Standard => {
-                    let action = item.action;
-                    items.push(
-                        StandardItem {
-                            label: item.label.to_string(),
-                            activate: Box::new(move |t: &mut Self| relay(t, action)),
-                            ..Default::default()
-                        }
-                        .into(),
-                    );
-                }
-                MenuItemKind::Checkmark(checked) => {
-                    let action = item.action;
-                    items.push(
-                        CheckmarkItem {
-                            label: item.label.to_string(),
-                            checked,
-                            activate: Box::new(move |t: &mut Self| relay(t, action)),
-                            ..Default::default()
-                        }
-                        .into(),
-                    );
-                }
-            }
-        }
-        items.push(ksni::MenuItem::Separator);
-        items.push(
-            SubMenu {
-                label: crate::recording_ui::CAPTURE_MENU_LABEL.to_string(),
-                submenu: capture_group_items(&st),
-                ..Default::default()
-            }
-            .into(),
+        // The pair the Audio Recording submenu titles/marks itself from: the live child
+        // arms while recording, the cached persisted arms while idle — the ONE shared
+        // split, so the submenu can never render a different source than a pick routes to.
+        let arms = crate::recording_ui::audio_arm_source(
+            st.recording,
+            (st.mic, st.system),
+            (self.armed_mic, self.armed_system),
         );
-        items
+        build_menu_items(&st, arms, self.delay_idx, self.accent)
     }
 }
 
-/// The capture group as ksni menu items (launchers, separator, Settings, Quit), from the ONE
-/// portable [`crate::recording_ui::capture_menu`] model. Used BOTH as the flat idle menu and
-/// as the "Capture Menu" submenu contents while recording, so the two can never drift. Quit
-/// is disabled while recording (it would orphan the child's control surface) and uses the
-/// resident's full "Quit Cosmic Capture Kit Tray" label; the launchers carry the model labels.
-fn capture_group_items(st: &RecordingState) -> Vec<ksni::MenuItem<ResidentTray>> {
-    use ksni::menu::StandardItem;
+/// Relay one shared in-recording action to the connected child over the IPC socket.
+/// Module-level (not nested in `menu`) since DRAGON-558, because a live Audio Recording
+/// radio pick relays its toggle diff through it too ([`audio_pick`]).
+fn relay(t: &ResidentTray, action: RecordingAction) {
+    let cmd = match action {
+        RecordingAction::TogglePause => Command::TogglePause,
+        RecordingAction::ToggleMic => Command::ToggleMic,
+        RecordingAction::ToggleSystemAudio => Command::ToggleSystemAudio,
+        RecordingAction::Stop => Command::Stop,
+        RecordingAction::Cancel => Command::Cancel,
+    };
+    t.ipc.send(cmd);
+}
+
+/// An "Audio Recording" radio pick (DRAGON-558), routed by the portable decision: while a
+/// child records, relay the TOGGLE DIFF from its current live arms to the picked state
+/// (gain automation, reversible; the child's own handler persists each flip, so the saved
+/// default follows); while idle, write the picked pair as the PERSISTED arms a new
+/// recording reads at start and update the cached render state with what was written. The
+/// recording snapshot is read FRESH at pick time (not baked into the closure at menu
+/// build), so a menu opened idle and picked after a recording started still routes right.
+fn audio_pick(t: &mut ResidentTray, choice: crate::recording_ui::AudioArmState) {
+    let st = t.ipc.snapshot();
+    if crate::recording_ui::audio_toggles_are_live(st.recording) {
+        for action in crate::recording_ui::audio_pick_live_actions((st.mic, st.system), choice) {
+            relay(t, action);
+        }
+    } else {
+        let (mic, system) = crate::recording_ui::persist_audio_arms(choice);
+        t.armed_mic = mic;
+        t.armed_system = system;
+    }
+}
+
+/// A "Countdown Timer" radio pick (DRAGON-574), the countdown twin of [`audio_pick`].
+/// The submenu is disabled while a child records, but the guard re-checks a FRESH
+/// snapshot anyway (some hosts still deliver picks into disabled submenus, and a menu
+/// opened idle can be picked after a recording started). Idle: persist the preset index
+/// (`delay_idx`, the same field every capture launch reads) and update the cached render
+/// state with what was written.
+fn countdown_pick(t: &mut ResidentTray, index: usize) {
+    let st = t.ipc.snapshot();
+    if st.recording {
+        return;
+    }
+    if let Some(idx) = crate::recording_ui::countdown_choice_at(index) {
+        t.delay_idx = crate::recording_ui::persist_countdown_idx(idx);
+    }
+}
+
+/// The whole resident dropdown as ksni items, walked from the ONE portable
+/// [`visible_tray_menu`] model (DRAGON-574; the flagged-off rows are HIDDEN, never
+/// rendered). The resident's own routing: controls relay over the
+/// IPC socket, launchers spawn detached one-shot children, the audio radio picks route
+/// through [`audio_pick`], the countdown picks through [`countdown_pick`], and Quit
+/// (label "Quit Cosmic Capture Kit Tray", present only while the model shows it,
+/// [`quit_enabled`] pins the same rule) asks the trigger thread for the clean shutdown.
+fn build_menu_items(
+    st: &RecordingState,
+    arms: (bool, bool),
+    delay_idx: usize,
+    accent: [u8; 3],
+) -> Vec<ksni::MenuItem<ResidentTray>> {
+    use ksni::menu::{StandardItem, SubMenu};
+    let menu_icon = |icon| crate::tray::menu_icon_png(icon, accent);
     let mut items: Vec<ksni::MenuItem<ResidentTray>> = Vec::new();
-    for item in crate::recording_ui::capture_menu() {
-        match item.kind {
-            MenuItemKind::Separator => items.push(ksni::MenuItem::Separator),
-            MenuItemKind::Checkmark(_) | MenuItemKind::Standard => match item.action {
+    for entry in visible_tray_menu(st.recording, st.paused) {
+        match entry {
+            TrayItem::Separator => items.push(ksni::MenuItem::Separator),
+            TrayItem::Control(control) => match control.kind {
+                MenuItemKind::Separator => items.push(ksni::MenuItem::Separator),
+                MenuItemKind::Standard | MenuItemKind::Checkmark(_) => {
+                    let action = control.action;
+                    items.push(
+                        StandardItem {
+                            label: control.label.to_string(),
+                            // The control rows: the shared three-way rule (Finish
+                            // success-green, Discard red, Pause/Resume the accent).
+                            icon_data: menu_icon(control.icon),
+                            activate: Box::new(move |t: &mut ResidentTray| relay(t, action)),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                }
+            },
+            TrayItem::Action { item, enabled } => match item.action {
                 CaptureAction::Quit => items.push(
                     StandardItem {
                         label: "Quit Cosmic Capture Kit Tray".to_string(),
-                        enabled: quit_enabled(st),
+                        enabled,
+                        icon_data: menu_icon(item.icon),
                         activate: Box::new(|_t: &mut ResidentTray| {
                             // Ask the trigger thread to tear the item down + exit (a menu
                             // click runs on the ksni thread; do the clean shutdown centrally).
@@ -310,62 +355,197 @@ fn capture_group_items(st: &RecordingState) -> Vec<ksni::MenuItem<ResidentTray>>
                     .into(),
                 ),
                 action => {
-                    // A launcher / Settings: spawn a one-shot child via the ONE portable path.
-                    let flag = action.spawn_flag().unwrap_or("--region");
+                    // A launcher / Settings: spawn a one-shot child via the ONE portable
+                    // path. `spawn_args` because a record entry's argv is its capture
+                    // twin's flag plus `--video` (DRAGON-559). A row that spawns a child
+                    // defers past the menu dismiss (DRAGON-574: the dropdown was getting
+                    // baked into the fallback's frozen frame; DRAGON-598 derived the set
+                    // from `spawn_args` so a new row cannot fall out of it). DRAGON-600
+                    // moved WHERE that wait happens: the host owns the dropdown and closes
+                    // it only when the launched process takes keyboard focus, so the child
+                    // is tagged and does the waiting, and the spawn itself is immediate.
+                    let args = action.spawn_args().unwrap_or(&[REGION_FLAG]);
+                    let from_menu = crate::recording_ui::spawn_waits_for_menu_dismiss(action);
                     items.push(
                         StandardItem {
                             label: item.label.to_string(),
-                            activate: Box::new(move |_t: &mut ResidentTray| spawn_child(flag)),
+                            enabled,
+                            icon_data: menu_icon(item.icon),
+                            activate: Box::new(move |_t: &mut ResidentTray| {
+                                if from_menu {
+                                    crate::recording_ui::spawn_capture_child_args_from_menu(
+                                        args,
+                                        Vec::new(),
+                                    );
+                                } else {
+                                    crate::recording_ui::spawn_capture_child_args(args, &[]);
+                                }
+                            }),
                             ..Default::default()
                         }
                         .into(),
                     );
                 }
             },
+            TrayItem::Launchers { menu, enabled, items: rows } => items.push(
+                SubMenu {
+                    label: menu.label().to_string(),
+                    enabled,
+                    icon_data: menu_icon(Some(menu.icon())),
+                    submenu: rows
+                        .into_iter()
+                        .map(|row| {
+                            let args = row.action.spawn_args().unwrap_or(&[REGION_FLAG]);
+                            StandardItem {
+                                label: row.label.to_string(),
+                                // Belt and braces: a host that opens a disabled submenu
+                                // still gets inert rows.
+                                enabled,
+                                icon_data: menu_icon(row.icon),
+                                // Every launcher row grabs pixels, so every one is tagged
+                                // as menu-launched (DRAGON-574, DRAGON-600).
+                                activate: Box::new(move |_t: &mut ResidentTray| {
+                                    crate::recording_ui::spawn_capture_child_args_from_menu(
+                                        args,
+                                        Vec::new(),
+                                    );
+                                }),
+                                ..Default::default()
+                            }
+                            .into()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }
+                .into(),
+            ),
+            TrayItem::Radio { menu: RadioSubmenu::Audio, enabled } => {
+                items.push(audio_submenu_items(arms, enabled, accent));
+            }
+            TrayItem::Radio { menu: RadioSubmenu::Countdown, enabled } => {
+                items.push(countdown_submenu_items(delay_idx, enabled, accent));
+            }
         }
     }
     items
 }
 
-/// The capture-group labels the resident renders (the flat idle menu AND the "Capture Menu"
-/// submenu contents), in order: Scanner, Capture Region, Capture Window, Capture Monitor, a
-/// separator, Settings, Quit. Mirrors what [`capture_group_items`] builds (the ksni widgets
-/// come from the identical `capture_menu` model), factored out so the composition is
-/// unit-testable without a D-Bus / ksni host. `#[cfg(test)]` because only the tests consume
-/// it — the live menu builds ksni items directly.
+/// The "Audio Recording: <state>" radio SUBMENU as one ksni item (DRAGON-558): the title
+/// carries the current state so it reads without opening, and inside is ONE
+/// `ksni::menu::RadioGroup` with the four portable rows in [`AUDIO_ARM_ORDER`] order
+/// ("Mic + System", "Mic Only", "System Only", "None"), the current state marked. A pick
+/// maps its index back through [`crate::recording_ui::audio_arm_choice_at`] (a stray
+/// index arms nothing) and routes via [`audio_pick`].
+fn audio_submenu_items(
+    arms: (bool, bool),
+    enabled: bool,
+    accent: [u8; 3],
+) -> ksni::MenuItem<ResidentTray> {
+    use crate::recording_ui::{
+        audio_arm_choice_at, audio_arm_items, audio_submenu_title, AudioArmState,
+        AUDIO_ARM_ORDER,
+    };
+    use ksni::menu::{RadioGroup, RadioItem, SubMenu};
+    let current = AudioArmState::from_arms(arms.0, arms.1);
+    let rows = audio_arm_items(current);
+    let selected = AUDIO_ARM_ORDER.iter().position(|s| *s == current).unwrap_or(0);
+    SubMenu {
+        label: audio_submenu_title(current),
+        enabled,
+        icon_data: crate::tray::menu_icon_png(Some(RadioSubmenu::Audio.icon()), accent),
+        submenu: vec![RadioGroup {
+            selected,
+            select: Box::new(|t: &mut ResidentTray, index: usize| {
+                if let Some(choice) = audio_arm_choice_at(index) {
+                    audio_pick(t, choice);
+                }
+            }),
+            options: rows
+                .into_iter()
+                .map(|row| RadioItem { label: row.label.to_string(), ..Default::default() })
+                .collect(),
+        }
+        .into()],
+        ..Default::default()
+    }
+    .into()
+}
+
+/// The "Countdown Timer: NN" radio SUBMENU as one ksni item (DRAGON-574): the title
+/// carries the current persisted preset zero-padded ("00" = off) so it reads without
+/// opening, and inside is ONE `RadioGroup` with the four preset rows, the current one
+/// marked. A pick maps its index back through
+/// [`crate::recording_ui::countdown_choice_at`] (a stray index persists nothing) and
+/// routes via [`countdown_pick`].
+fn countdown_submenu_items(
+    delay_idx: usize,
+    enabled: bool,
+    accent: [u8; 3],
+) -> ksni::MenuItem<ResidentTray> {
+    use crate::recording_ui::{countdown_items, countdown_submenu_title};
+    use ksni::menu::{RadioGroup, RadioItem, SubMenu};
+    let rows = countdown_items(delay_idx);
+    let selected = rows.iter().position(|r| r.selected).unwrap_or(0);
+    SubMenu {
+        label: countdown_submenu_title(delay_idx),
+        enabled,
+        icon_data: crate::tray::menu_icon_png(Some(RadioSubmenu::Countdown.icon()), accent),
+        submenu: vec![RadioGroup {
+            selected,
+            select: Box::new(|t: &mut ResidentTray, index: usize| countdown_pick(t, index)),
+            options: rows
+                .into_iter()
+                .map(|row| RadioItem { label: row.label, ..Default::default() })
+                .collect(),
+        }
+        .into()],
+        ..Default::default()
+    }
+    .into()
+}
+
+/// The TOP-LEVEL resident menu as `(label, enabled)` pairs, in order, for a given state,
+/// cached persisted `armed` pair and cached `delay_idx`. Mirrors what
+/// [`ResidentTray::menu`] builds — the identical [`visible_tray_menu`] walk (hidden
+/// rows absent) with the resident's label overrides (the full Quit label, the radio
+/// submenu titles) — so the whole composition is unit-testable without a D-Bus / ksni
+/// host. `#[cfg(test)]` because only the tests consume it; the live menu builds ksni
+/// items directly.
 #[cfg(test)]
-fn capture_group_labels() -> Vec<String> {
-    crate::recording_ui::capture_menu()
+fn resident_menu_shapes(
+    st: &RecordingState,
+    armed: (bool, bool),
+    delay_idx: usize,
+) -> Vec<(String, bool)> {
+    let arms =
+        crate::recording_ui::audio_arm_source(st.recording, (st.mic, st.system), armed);
+    let state = crate::recording_ui::AudioArmState::from_arms(arms.0, arms.1);
+    visible_tray_menu(st.recording, st.paused)
         .into_iter()
-        .map(|item| match item.action {
-            CaptureAction::Quit => "Quit Cosmic Capture Kit Tray".to_string(),
-            _ => item.label.to_string(),
+        .map(|entry| match entry {
+            TrayItem::Control(c) => (c.label.to_string(), true),
+            TrayItem::Separator => (String::new(), true),
+            TrayItem::Action { item, enabled } => match item.action {
+                CaptureAction::Quit => ("Quit Cosmic Capture Kit Tray".to_string(), enabled),
+                _ => (item.label.to_string(), enabled),
+            },
+            TrayItem::Launchers { menu, enabled, .. } => (menu.label().to_string(), enabled),
+            TrayItem::Radio { menu: RadioSubmenu::Audio, enabled } => {
+                (crate::recording_ui::audio_submenu_title(state), enabled)
+            }
+            TrayItem::Radio { menu: RadioSubmenu::Countdown, enabled } => {
+                (crate::recording_ui::countdown_submenu_title(delay_idx), enabled)
+            }
         })
         .collect()
 }
 
-/// The TOP-LEVEL resident menu labels the resident renders, in order, for a given state.
-/// Idle: the capture group, flat (so this equals [`capture_group_labels`]). While a child
-/// records (DRAGON-173): the six-entry in-recording group from [`recording_menu`], a
-/// separator, then a single "Capture Menu" submenu entry (its contents are
-/// [`capture_group_labels`]). Mirrors what [`ResidentTray::menu`] builds so the whole
-/// composition is unit-testable without a D-Bus / ksni host.
+/// Whether the resident's Quit item is usable for a state (hidden while recording,
+/// paused or not, since the hide round). Pure and unit-tested. Since DRAGON-574 the
+/// LIVE rule comes from the portable model (`tray_menu`'s Quit flag, rendered as
+/// visibility by `visible_tray_menu`), so this is test-only: it pins that the model
+/// keeps the rule every surface applied by hand before.
 #[cfg(test)]
-fn resident_menu_labels(st: &RecordingState) -> Vec<String> {
-    if !crate::daemon_ipc::shows_recording_controls(st) {
-        return capture_group_labels();
-    }
-    let mut labels = Vec::new();
-    for item in recording_menu(st.paused, st.mic, st.system) {
-        labels.push(item.label.to_string());
-    }
-    labels.push(String::new()); // separator
-    labels.push(crate::recording_ui::CAPTURE_MENU_LABEL.to_string());
-    labels
-}
-
-/// Whether the resident's Quit item is enabled for a state (disabled while recording,
-/// paused or not) — the exact rule the mac daemon applies. Pure, so it is unit-tested.
 fn quit_enabled(st: &RecordingState) -> bool {
     !st.recording
 }
@@ -462,8 +642,9 @@ fn serve_recording_ipc(
 ///
 /// 1. Install the SIGUSR1 (capture NOW) + SIGTERM (quit) handlers (before recording our
 ///    pid — no boot race).
-/// 2. Take the resident single-instance lock; if it's already held, a resident is up —
-///    signal IT to capture (the second-launch UX) and exit.
+/// 2. Take the resident single-instance lock; if it's already held, a resident is up — ask it
+///    for whatever THIS launch actually wanted ([`crate::instance::held_lock_action`]: a
+///    capture for a capture-intent launch, nothing at all for a `resident` one) and exit.
 /// 3. Spawn the `ksni` StatusNotifierItem; if no SNI host is present, log and exit (a
 ///    tray with nowhere to show is useless — the user can retry when a panel is up).
 /// 4. Bind + serve the recording-control IPC socket.
@@ -488,31 +669,59 @@ pub fn run(daemon_intent: bool) -> ! {
         crate::instance::try_acquire_daemon_lock()
     };
     if !acquired {
-        // ...UNLESS this is a post-update relaunch (DRAGON-532). Nobody asked for a
-        // capture: the installer started us to restore the shape the app was in before
-        // the update, and losing the lock only means something else got there first. The
-        // winner consumes the marker and opens About, so the right move here is to leave
-        // quietly rather than drop an unrequested overlay on screen seconds after an
-        // update. The marker is PEEKED, never taken, so the winner still finds it.
+        // A resident is already up. WHAT this launch asks it for depends on what this launch
+        // wanted, never on the lock being held (DRAGON-471's rule, extended to every
+        // daemon-intent launch by DRAGON-473 and shared with macOS and Windows).
         //
-        // Same defect DRAGON-465 fixed on Windows, reached differently: there the
-        // relaunch's ARGV was read as capture intent (fixed by
-        // `update::post_update_relaunch_args`, which this flow already uses); here the
-        // argv is right and losing the lock is itself read as intent. Seen for real while
-        // testing the AppImage self-update.
-        if !crate::update::signal_capture_after_lost_lock(
+        // The marker is PEEKED, never taken: on Linux this process does not deliver the
+        // About window itself, so consuming the marker here would lose the release notes for
+        // the process that will. The winner of the lock is the one that consumes it.
+        match crate::instance::held_lock_action(
             daemon_intent,
             crate::update::post_update_marker_pending(),
         ) {
-            log::info!(
-                "resident: post-update relaunch found a live resident; exiting without capturing"
-            );
-            std::process::exit(0);
-        }
-        if crate::instance::signal_existing_capture() {
-            log::info!("resident: another instance is up; asked it to capture");
-        } else {
-            log::info!("resident: another instance holds the resident lock; exiting");
+            // The user pressed the capture key (or re-ran the binary bare) while a resident
+            // was up. That IS a capture request, and handing it over is the second-launch UX.
+            crate::instance::HeldLockAction::SignalCapture => {
+                if crate::instance::signal_existing_capture() {
+                    log::info!("resident: another instance is up; asked it to capture");
+                } else {
+                    log::info!("resident: another instance holds the resident lock; exiting");
+                }
+            }
+            // A post-update relaunch (DRAGON-532) that lost the race. Nobody asked for
+            // anything: the installer started us to restore the shape the app was in before
+            // the update, and being beaten to it means the winner is already doing that job.
+            // Leave quietly rather than drop an unrequested overlay seconds after an update.
+            //
+            // Same defect DRAGON-465 fixed on Windows, reached differently: there the
+            // relaunch's ARGV was read as capture intent (fixed by
+            // `update::post_update_relaunch_args`, which this flow already uses); here the
+            // argv is right and losing the lock was itself read as intent. Seen for real
+            // while testing the AppImage self-update.
+            crate::instance::HeldLockAction::RestoreAbout => {
+                log::info!(
+                    "resident: post-update relaunch found a live resident; exiting without \
+                     capturing"
+                );
+            }
+            // DRAGON-473: a plain `resident` launch (the autostart entry at login, the
+            // settings tray toggle, a manual re-run) that raced a live resident. It asked for
+            // a TRAY and one is already running, so it is simply redundant. It used to ask
+            // that resident to CAPTURE, which put a region overlay on screen for a user who
+            // had asked for a tray icon.
+            //
+            // Nothing else is owed here. Windows turns this answer into a liveness ping,
+            // because a wedged tray daemon there is reachable-but-not-pumping and worth
+            // taking over; Linux has no equivalent test to run from out here (its signal is a
+            // `SIGUSR1` to a pid whose liveness it already checked), so exiting IS the whole
+            // job. `info`, not `warn`: a working tray is up and nothing was lost.
+            crate::instance::HeldLockAction::ProbeOnly => {
+                log::info!(
+                    "resident: a `resident` launch found the resident lock held by a live \
+                     instance; nothing to do, exiting without asking it to capture"
+                );
+            }
         }
         std::process::exit(0);
     }
@@ -536,24 +745,59 @@ pub fn run(daemon_intent: bool) -> ! {
     // `daemon_intent` is true and this branch is skipped; with `resident` off it never
     // reaches this file at all, because `main` only routes a bare launch here when the
     // persisted `resident` setting is on, and `app::run`'s marker check turns it into a
-    // settings window on About. The remaining hole was the LOST-LOCK path above, which is
-    // now closed by `update::signal_capture_after_lost_lock`.
+    // settings window on About. The remaining hole was the LOST-LOCK path above, closed by
+    // `instance::held_lock_action` (DRAGON-532 closed the post-update half of it first, in a
+    // Linux-only predicate that DRAGON-473 then subsumed).
     if !daemon_intent {
         log::info!("resident: capture-intent launch became the resident; spawning the capture");
         spawn_child(REGION_FLAG);
     }
 
+    // 2b. Repair a STALE autostart entry (DRAGON-628). We are the resident, which is the
+    //     thing the autostart entry exists to launch, so this is the right moment to make
+    //     that entry name a binary that still exists. Only ever rewrites an entry that is
+    //     PRESENT and no longer resolves: an absent one may have been removed on purpose and
+    //     is left alone. Runs after the single-instance lock so exactly one process per
+    //     session does it, and before the tray so a session that ends at the no-SNI-host
+    //     exit below has still had its entry fixed.
+    //
+    //     Reached identically by the macOS and Windows daemons; the portable body decides
+    //     what each can do (`platform::autostart_repair_at_daemon_start`).
+    crate::platform::autostart_repair_at_daemon_start();
+
     // 3. Raise the tray item. Tint the icon with the app's accent colour (read from the
     //    COSMIC theme files, dependency-free) so it matches the recording tray + toolbar.
     let ipc = IpcShared::default();
     let accent = effective_accent_rgb();
+    // DRAGON-558: seed the persisted audio arms ONCE here (a config read, fine at startup,
+    // not on the ksni thread). The trigger loop's config-mtime tick keeps them fresh.
+    // DRAGON-574: the countdown preset (`delay_idx`) rides the same seed + tick.
+    let persisted = crate::state::load();
+    let arms = (persisted.record_mic, persisted.record_system_audio);
+    let delay_idx = persisted.delay_idx;
     let tray = ResidentTray {
         ipc: ipc.clone(),
         accent,
         icon_cache: std::cell::RefCell::new(None),
+        armed_mic: arms.0,
+        armed_system: arms.1,
+        delay_idx,
     };
     use ksni::blocking::TrayMethods;
-    let handle = match tray.spawn() {
+    // `disable_dbus_name` inside a sandbox (`lab/flatpak`). ksni normally requests its own
+    // well-known bus name, `org.kde.StatusNotifierItem-<pid>-<n>`, and Flatpak's D-Bus proxy
+    // refuses to let a sandboxed app own it. There is no finish-arg that fixes this: the
+    // wildcard `--own-name=org.kde.StatusNotifierItem-*` is not valid Flatpak syntax (only a
+    // trailing `.*` matches), and Flathub's own rule says that exception is never granted.
+    //
+    // ksni documents this exact case and takes the connection's unique name instead, which the
+    // watcher accepts just as happily. Without it the daemon reached its "no StatusNotifierItem
+    // host available" arm and EXITED, so the tray never appeared and the resident looked like
+    // it had failed to start at all.
+    //
+    // Gated on the sandbox rather than applied everywhere, because outside one the well-known
+    // name is the conventional behaviour and there is no reason to change what already works.
+    let handle = match tray.disable_dbus_name(crate::util::flatpak_sandboxed()).spawn() {
         Ok(h) => h,
         Err(e) => {
             log::warn!("resident: no StatusNotifierItem host available ({e}); exiting");
@@ -617,6 +861,8 @@ pub fn run(daemon_intent: bool) -> ! {
     // 5. Trigger loop: drain SIGUSR1 (→ default capture) and SIGTERM (→ clean shutdown).
     //    A short sleep keeps the loop cheap; the ksni item + IPC live on their own threads.
     let mut last_accent = accent;
+    let mut last_arms = arms;
+    let mut last_delay = delay_idx;
     let mut last_config_mtime = crate::state::config_mtime();
     let mut ticks: u32 = 0;
     loop {
@@ -637,15 +883,28 @@ pub fn run(daemon_intent: bool) -> ! {
         // the recording socket treats ANY connection as the recording child
         // (stashes the write half, resets to idle on disconnect), so a transient
         // notifier connection could clobber a live recording's controls.
+        // DRAGON-558 rides the same tick for the persisted audio arms, so a settings
+        // window (or a capture child's toolbar toggle) changing them re-checks the
+        // tray's Enable items within ~1s.
         ticks = ticks.wrapping_add(1);
         if ticks.is_multiple_of(25) {
             let mtime = crate::state::config_mtime();
             if mtime != last_config_mtime {
                 last_config_mtime = mtime;
                 let now = effective_accent_rgb();
-                if now != last_accent {
+                let p = crate::state::load();
+                let now_arms = (p.record_mic, p.record_system_audio);
+                let now_delay = p.delay_idx;
+                if now != last_accent || now_arms != last_arms || now_delay != last_delay {
                     last_accent = now;
-                    let _ = handle.update(|t: &mut ResidentTray| t.accent = now);
+                    last_arms = now_arms;
+                    last_delay = now_delay;
+                    let _ = handle.update(|t: &mut ResidentTray| {
+                        t.accent = now;
+                        t.armed_mic = now_arms.0;
+                        t.armed_system = now_arms.1;
+                        t.delay_idx = now_delay;
+                    });
                 }
             }
         }
@@ -687,95 +946,122 @@ mod tests {
 
     #[test]
     fn capture_flags_match_the_shared_launch_flags() {
-        // The launchers + Settings map to the exact CLI flags via the ONE shared
-        // `CaptureAction::spawn_flag`; the SIGUSR1 default is Region.
-        assert_eq!(CaptureAction::Scan.spawn_flag(), Some("--scan"));
-        assert_eq!(CaptureAction::Region.spawn_flag(), Some("--region"));
-        assert_eq!(CaptureAction::Window.spawn_flag(), Some("--window"));
-        assert_eq!(CaptureAction::Monitor.spawn_flag(), Some("--monitor"));
-        assert_eq!(CaptureAction::Settings.spawn_flag(), Some("--settings"));
+        // The launchers + Settings map to the exact CLI argv via the ONE shared
+        // `CaptureAction::spawn_args` (the record entries are their capture twins plus
+        // `--video`, DRAGON-559); the SIGUSR1 default is Region.
+        assert_eq!(CaptureAction::Scan.spawn_args(), Some(&["--scan"][..]));
+        assert_eq!(CaptureAction::Region.spawn_args(), Some(&["--region"][..]));
+        assert_eq!(CaptureAction::Window.spawn_args(), Some(&["--window"][..]));
+        assert_eq!(CaptureAction::Monitor.spawn_args(), Some(&["--monitor"][..]));
+        assert_eq!(
+            CaptureAction::RecordRegion.spawn_args(),
+            Some(&["--region", "--video"][..])
+        );
+        assert_eq!(
+            CaptureAction::RecordWindow.spawn_args(),
+            Some(&["--window", "--video"][..])
+        );
+        assert_eq!(
+            CaptureAction::RecordMonitor.spawn_args(),
+            Some(&["--monitor", "--video"][..])
+        );
+        assert_eq!(CaptureAction::Settings.spawn_args(), Some(&["--settings"][..]));
         assert_eq!(REGION_FLAG, "--region");
     }
 
     #[test]
-    fn idle_menu_is_the_flat_capture_group() {
-        // No child recording: the capture group rendered FLAT — four launchers, a separator,
-        // Settings, Quit. NO in-recording group, NO submenu. Unchanged from before.
-        let labels = resident_menu_labels(&rec(false, false, false, false));
+    fn idle_menu_is_the_owners_shape() {
+        // No child recording (DRAGON-574, plus DRAGON-582's Color Picker at the
+        // head): Color Picker, Scanner, the Capture / Record submenus, the
+        // Countdown Timer and Audio Recording radio submenus, a separator, Settings...,
+        // Quit — everything enabled. The radio titles carry the CACHED persisted state
+        // (mic-only arms, preset index 1) so both read without opening.
+        let shapes = resident_menu_shapes(&rec(false, false, false, false), (true, false), 1);
         assert_eq!(
-            labels,
+            shapes,
             vec![
-                "Scanner".to_string(),
-                "Capture Region".to_string(),
-                "Capture Window".to_string(),
-                "Capture Monitor".to_string(),
-                String::new(), // separator
-                "Settings".to_string(),
-                "Quit Cosmic Capture Kit Tray".to_string(),
+                ("Color Picker".to_string(), true),
+                ("Scanner".to_string(), true),
+                ("Capture".to_string(), true),
+                ("Record".to_string(), true),
+                ("Countdown Timer: 03".to_string(), true),
+                ("Audio Recording: Mic Only".to_string(), true),
+                (String::new(), true), // separator
+                ("Settings...".to_string(), true),
+                ("Quit Cosmic Capture Kit Tray".to_string(), true),
             ]
         );
     }
 
     #[test]
-    fn recording_menu_is_the_six_group_then_a_capture_submenu() {
-        // While a child records: the six-entry in-recording group (new DRAGON-173 order), a
-        // separator, then a single "Capture Menu" submenu entry — the uniform menu every
-        // surface renders, drawn from the SAME models so it can never drift.
-        let labels = resident_menu_labels(&rec(true, false, true, false));
+    fn recording_menu_leads_with_audio_then_the_controls() {
+        // While a child records (DRAGON-574 + the recolour-round amendment; hide
+        // round): the Audio Recording submenu leads the WHOLE menu, then the three
+        // controls and a separator, then the same group with the flagged-off rows
+        // HIDDEN — no Record, no Countdown Timer, no Quit (the COSMIC applet cannot
+        // gray or subdue a dbusmenu row, so the uniform answer everywhere is
+        // omission; see `visible_tray_menu`). The audio title carries the LIVE arms
+        // (system-only here), not the persisted ones, and a radio pick applies live.
+        let shapes = resident_menu_shapes(&rec(true, false, false, true), (true, false), 2);
         assert_eq!(
-            labels,
+            shapes,
             vec![
-                "Toggle Microphone".to_string(),
-                "Toggle System Audio".to_string(),
-                String::new(), // the recording_menu's own separator
-                "Pause Recording".to_string(),
-                "Finish & Save Recording".to_string(),
-                "Cancel & Delete Recording".to_string(),
-                String::new(), // separator before the Capture Menu submenu
-                "Capture Menu".to_string(),
-            ]
-        );
-        // The submenu (and the flat idle menu) contents are the capture group.
-        assert_eq!(
-            capture_group_labels(),
-            vec![
-                "Scanner".to_string(),
-                "Capture Region".to_string(),
-                "Capture Window".to_string(),
-                "Capture Monitor".to_string(),
-                String::new(), // separator
-                "Settings".to_string(),
-                "Quit Cosmic Capture Kit Tray".to_string(),
+                ("Audio Recording: System Only".to_string(), true),
+                ("Pause Recording".to_string(), true),
+                ("Finish & Save Recording".to_string(), true),
+                ("Cancel & Delete Recording".to_string(), true),
+                (String::new(), true), // separator
+                ("Color Picker".to_string(), true),
+                ("Scanner".to_string(), true),
+                ("Capture".to_string(), true),
+                (String::new(), true), // separator
+                ("Settings...".to_string(), true),
             ]
         );
     }
 
     #[test]
     fn paused_flips_the_pause_label_to_resume() {
-        let labels = resident_menu_labels(&rec(true, true, false, false));
-        assert!(labels.contains(&"Resume Recording".to_string()));
-        assert!(!labels.contains(&"Pause Recording".to_string()));
+        let shapes = resident_menu_shapes(&rec(true, true, false, false), (false, false), 0);
+        let labels: Vec<&str> = shapes.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(labels.contains(&"Resume Recording"));
+        assert!(!labels.contains(&"Pause Recording"));
     }
 
     #[test]
-    fn quit_is_disabled_only_while_recording() {
-        assert!(quit_enabled(&rec(false, false, false, false)), "idle: Quit enabled");
-        assert!(!quit_enabled(&rec(true, false, false, false)), "recording: Quit disabled");
-        assert!(!quit_enabled(&rec(true, true, false, false)), "paused: Quit still disabled");
+    fn quit_is_hidden_only_while_recording() {
+        assert!(quit_enabled(&rec(false, false, false, false)), "idle: Quit present");
+        assert!(!quit_enabled(&rec(true, false, false, false)), "recording: Quit hidden");
+        assert!(!quit_enabled(&rec(true, true, false, false)), "paused: Quit still hidden");
+        // The rendered menu agrees with the pinned rule, state by state: the row
+        // exists exactly when the rule says it is usable (hide round: a false flag is
+        // rendered as omission, not as a grayed row).
+        for st in [rec(false, false, false, false), rec(true, false, false, false)] {
+            let shapes = resident_menu_shapes(&st, (false, false), 0);
+            let has_quit =
+                shapes.iter().any(|(l, _)| l == "Quit Cosmic Capture Kit Tray");
+            assert_eq!(has_quit, quit_enabled(&st));
+            if has_quit {
+                let (label, flag) = shapes.last().expect("Quit closes the idle menu");
+                assert_eq!(label, "Quit Cosmic Capture Kit Tray");
+                assert!(*flag);
+            }
+        }
     }
 
     #[test]
     fn no_menu_label_contains_a_dash() {
         for st in [rec(false, false, false, false), rec(true, false, true, true), rec(true, true, true, true)] {
-            for l in resident_menu_labels(&st) {
-                assert!(
-                    !l.contains('\u{2014}') && !l.contains('\u{2013}'),
-                    "dash in {l:?}"
-                );
+            for armed in [(false, false), (true, true)] {
+                for delay_idx in [0usize, 3] {
+                    for (l, _) in resident_menu_shapes(&st, armed, delay_idx) {
+                        assert!(
+                            !l.contains('\u{2014}') && !l.contains('\u{2013}'),
+                            "dash in {l:?}"
+                        );
+                    }
+                }
             }
-        }
-        for l in capture_group_labels() {
-            assert!(!l.contains('\u{2014}') && !l.contains('\u{2013}'), "dash in {l:?}");
         }
     }
 

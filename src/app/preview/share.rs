@@ -45,6 +45,23 @@
 
 use super::*;
 
+/// How long a DEFERRED open-time copy waits for its window to take keyboard focus before it
+/// gives up and says so (`lab/flatpak`).
+///
+/// The budget itself lives in `share::clipboard` since DRAGON-587, because the colour picker's
+/// pick waits on exactly the same thing for exactly the same reason. This name is kept as the
+/// preview editor's spelling of it; the two can never drift because there is one value.
+pub(super) const AUTO_COPY_FOCUS_BUDGET: std::time::Duration =
+    crate::share::WINDOW_COPY_FOCUS_BUDGET;
+
+// DRAGON-587 moved `AutoCopyStep` / `auto_copy_step` out of here and into
+// `share::clipboard` as `CopyStep` / `copy_step`, unchanged. The colour picker's pick hit the
+// same ordering bug this decision was written for (a `ThisWindow` write issued while the
+// surface that must carry it is still an open task), and the house rule is one vocabulary per
+// decision: a second copy of this ladder is exactly the drift DRAGON-550 was about. The
+// preview editor's use of it below is byte-identical.
+use crate::share::{CopyStep, copy_step};
+
 impl App {
     /// Post a toast on `id`'s document, carrying the outcome's own glyph (copied / saved, and
     /// their failures) rather than a severity default. A no-op for a document that has already
@@ -65,22 +82,47 @@ impl App {
         }
     }
 
-    /// Put `path` on the clipboard and TOAST the outcome. Returns what was reported.
+    /// Put `path` on the clipboard and TOAST the outcome, handing back the write when it has to
+    /// run through THIS window (`lab/flatpak`).
     ///
-    /// See [`crate::share::copy_to_clipboard`]'s doc for what "success" can mean here: on
-    /// Linux the selection is served by a detached worker, so a `true` is "handed to a
-    /// worker", never a verified round-trip. The toast wording ("Copied to clipboard")
-    /// matches what the app can honestly claim; a `false` is a real failure (no worker
-    /// could be launched at all) and reads as one.
-    pub(super) fn copy_to_clipboard_now(
+    /// See [`crate::share::copy_to_clipboard`]'s doc for what "success" can mean: on Linux a
+    /// `true` is "handed off", never a verified round-trip, on either path. The toast wording
+    /// ("Copied to clipboard") matches what the app can honestly claim; a `false` is a real
+    /// failure and reads as one.
+    ///
+    /// Two shapes, and which one applies is decided by the compositor, not by us:
+    ///
+    /// * **A data-control global exists** (COSMIC natively, KDE, wlroots). A detached worker
+    ///   takes the selection and OUTLIVES this process, which is the better behaviour and the
+    ///   only one that makes copy-then-exit work. Unchanged, and the returned task is empty.
+    /// * **It does not** (a Flatpak on COSMIC, GNOME anywhere, sandboxes on niri/Hyprland). The
+    ///   worker cannot serve a selection at all, so the write goes out over this window's own
+    ///   `wl_data_device` instead, which needs no privilege because we have keyboard focus.
+    ///
+    /// The cost of the second shape is real and worth stating: Wayland makes the source app
+    /// serve paste requests, so that selection lives exactly as long as this process. Closing
+    /// the editor takes the copy with it unless a clipboard manager has claimed it. That is
+    /// still strictly better than the alternative, which was reporting success and copying
+    /// nothing.
+    pub(super) fn copy_to_clipboard_task(
         &mut self,
         id: window::Id,
         path: &std::path::Path,
         is_video: bool,
-    ) -> bool {
+    ) -> (bool, Task<cosmic::Action<Msg>>) {
+        if crate::share::needs_window_clipboard() {
+            let Some(payload) = crate::share::window_payload(path, is_video) else {
+                self.toast_copy_outcome(id, false);
+                return (false, Task::none());
+            };
+            // `true` claims exactly what the detached-worker path claims: the write was handed
+            // off, not verified. iced applies it on the next runtime pass.
+            self.toast_copy_outcome(id, true);
+            return (true, cosmic::iced::clipboard::write_data(payload));
+        }
         let ok = crate::platform::services::copy_to_clipboard(path, is_video);
         self.toast_copy_outcome(id, ok);
-        ok
+        (ok, Task::none())
     }
 
     /// Post the clipboard outcome's toast, and record the history position the clipboard now
@@ -178,24 +220,99 @@ impl App {
             );
             return Task::none();
         }
-        // DRAGON-454: OFF the UI thread, bracketed on the launch timeline at both ends. A
-        // plain OS thread rather than `spawn_blocking`, matching every other "this blocks, get
-        // it off the loop" worker in the app (the image decode right beside it, the capture
-        // worker): the executor's blocking pool is not something the one-shot process wants to
-        // wait on at teardown.
-        crate::util::timing_mark("preview: auto-copy on open (begin, worker thread)");
-        let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
-        std::thread::spawn(move || {
-            let ok = crate::platform::services::copy_to_clipboard(&path, is_video);
-            crate::util::timing_mark("preview: auto-copy on open (done, worker thread)");
-            let _ = tx.send(ok);
-        });
-        Task::perform(rx, move |res| {
-            // A dropped sender means the worker died mid-write. Nothing was put on the
-            // clipboard, so it reads as the failure it is — the same toast a refused write
-            // gets. The capture is on disk either way; only the courtesy copy is lost.
-            cosmic::Action::App(Msg::Preview(id, PreviewMsg::AutoCopied(res.unwrap_or(false))))
-        })
+        // `lab/flatpak`: ASK HOW A COPY HAPPENS HERE, the same question the Copy button asks
+        // (`copy_to_clipboard_task` → `share::copy_route`). Until this existed the automatic
+        // copy went to the detached worker unconditionally, so on a session without
+        // data-control it could only ever fail — the owner's report: "we try to copy to
+        // clipboard the moment the preview editor opens, currently that is failing with a
+        // toast; is our copy fix not going through the same code path?". It was not.
+        let focused = self.focused_window == self.preview_for(id).map(|p| p.window);
+        match copy_step(crate::share::copy_route(), focused, false) {
+            CopyStep::Detached => {
+                // DRAGON-454: OFF the UI thread, bracketed on the launch timeline at both
+                // ends. A plain OS thread rather than `spawn_blocking`, matching every other
+                // "this blocks, get it off the loop" worker in the app (the image decode right
+                // beside it, the capture worker): the executor's blocking pool is not
+                // something the one-shot process wants to wait on at teardown.
+                crate::util::timing_mark("preview: auto-copy on open (begin, worker thread)");
+                let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
+                std::thread::spawn(move || {
+                    let ok = crate::platform::services::copy_to_clipboard(&path, is_video);
+                    crate::util::timing_mark("preview: auto-copy on open (done, worker thread)");
+                    let _ = tx.send(ok);
+                });
+                Task::perform(rx, move |res| {
+                    // A dropped sender means the worker died mid-write. Nothing was put on the
+                    // clipboard, so it reads as the failure it is — the same toast a refused
+                    // write gets. The capture is on disk either way; only the courtesy copy is
+                    // lost.
+                    cosmic::Action::App(Msg::Preview(
+                        id,
+                        PreviewMsg::AutoCopied(res.unwrap_or(false)),
+                    ))
+                })
+            }
+            // The surface is already up and focused (a pre-opened spinner whose capture has
+            // just landed): write through it now, inline, exactly as the button does. There is
+            // no worker to move off the UI thread here — the window write is a message to the
+            // runtime, not a blocking pasteboard call.
+            CopyStep::ThroughWindow => {
+                crate::util::timing_mark("preview: auto-copy on open (through this window)");
+                self.copy_to_clipboard_task(id, &path, is_video).1
+            }
+            // The usual shape on this route: the copy starts while the surface is still an
+            // open task ("surface minted; open task queued, not yet created"), so there is no
+            // focused window to serve a selection. Wait for the focus, bounded.
+            CopyStep::WaitForFocus => {
+                crate::util::timing_mark(
+                    "preview: auto-copy on open (deferred; waiting for the window's focus)",
+                );
+                if let Some(p) = self.preview_for_mut(id) {
+                    p.auto_copy_waiting = true;
+                }
+                Task::perform(
+                    async {
+                        tokio::time::sleep(AUTO_COPY_FOCUS_BUDGET).await;
+                    },
+                    move |()| cosmic::Action::App(Msg::Preview(id, PreviewMsg::AutoCopyDeadline)),
+                )
+            }
+            // Unreachable from here (`budget_spent` is false at this seam); the deadline arm
+            // is where this case is actually produced. Reported, never claimed.
+            CopyStep::ReportFailed => {
+                self.toast_copy_outcome(id, false);
+                Task::none()
+            }
+        }
+    }
+
+    /// `lab/flatpak`: a surface took keyboard focus — if it belongs to a document whose
+    /// open-time copy is DEFERRED, that copy can finally be written.
+    ///
+    /// This is the arrival the [`AutoCopyStep::WaitForFocus`] branch above is waiting for: on
+    /// the [`crate::share::CopyRoute::ThisWindow`] route the selection is served over
+    /// `wl_data_device`, which needs a serial from an input event delivered to this client,
+    /// and a keyboard focus IS that event. The write itself goes through
+    /// [`Self::copy_to_clipboard_task`], the SAME implementation the Copy button uses, so the
+    /// two can never word or shape the same copy differently.
+    ///
+    /// A no-op for every other document, every other route, and any document whose deadline
+    /// already fired — the flag is the one-shot latch.
+    pub(in crate::app) fn flush_deferred_auto_copy(
+        &mut self,
+        id: window::Id,
+    ) -> Task<cosmic::Action<Msg>> {
+        let Some(p) = self.preview_for(id) else { return Task::none() };
+        if !p.auto_copy_waiting {
+            return Task::none();
+        }
+        let Some(path) = p.path.clone() else { return Task::none() };
+        let is_video = matches!(p.kind, PreviewKind::Video(_));
+        if let Some(p) = self.preview_for_mut(id) {
+            p.auto_copy_waiting = false;
+        }
+        crate::util::timing_mark("preview: auto-copy on open (window focused; writing now)");
+        self.copy_to_clipboard_task(id, &path, is_video).1
     }
 
     /// Run one of the unsaved-changes dialog's ACTION buttons: dismiss the dialog, arm
@@ -825,30 +942,77 @@ impl App {
     ///
     /// The BACKUP copy, for the user who copied something else after the upload's own automatic
     /// one. Everything about it is deliberately small: the link is already in this document's
-    /// watch, the copy goes through `share::copy_text` exactly as every other copy in this app
-    /// does, and nothing else changes. The meter's own tick is the whole acknowledgement, and it
-    /// is stamped here rather than after the copy so a press is answered at once.
+    /// watch, and the meter's own tick is the whole acknowledgement, stamped here rather than
+    /// after the copy so a press is answered at once.
+    ///
+    /// DRAGON-553: it goes through [`crate::share::copy_text_task`], NOT `copy_text`. This
+    /// button is drawn in the editor's own titlebar, so it always has a focused window to write
+    /// through, and on a session with no data-control the detached worker it used to call could
+    /// not serve a selection at all. That was the owner's report, and it is the same drift as
+    /// the open-time copy: one decision ([`crate::share::copy_route`]), consulted by every copy
+    /// site rather than assumed by each one.
     ///
     /// No toast. The tick appears in the control the user just pressed, which is where they are
     /// looking; a "Copied to clipboard" banner would be the third time this session has said so.
     ///
     /// **The link is never logged**, not even to say a copy happened with it in hand: it opens
     /// the capture for anyone holding it. The line below reports the BEHAVIOUR.
-    pub(super) fn copy_upload_link(&mut self, id: window::Id, session_id: &str) {
-        let Some(preview) = self.preview_for_mut(id) else { return };
+    pub(super) fn copy_upload_link(
+        &mut self,
+        id: window::Id,
+        session_id: &str,
+    ) -> Task<cosmic::Action<Msg>> {
+        let Some(preview) = self.preview_for_mut(id) else { return Task::none() };
         let Some(watch) = preview.edit.uploads.iter_mut().find(|w| w.session_id == session_id)
         else {
-            return;
+            return Task::none();
         };
         // `copyable` is the same gate the control is drawn behind, asked again here: a press
         // that arrived by some other route must not put an empty string on the clipboard.
         let Some(url) = watch.copyable().map(str::to_string) else {
             log::warn!("preview: an upload had no link to copy again; the clipboard was untouched");
-            return;
+            return Task::none();
         };
         watch.copied_at = Some(std::time::Instant::now());
-        crate::share::copy_text(&url);
         log::debug!("preview: an upload's share link was copied again");
+        crate::share::copy_text_task(&url)
+    }
+
+    /// DRAGON-553: put a just-finished upload's share link on the clipboard from the EDITOR,
+    /// because the upload child could not.
+    ///
+    /// The child creates the link and normally copies it itself, which is right: it is the only
+    /// process that ever holds the link, and a detached worker owning the selection outlives
+    /// everyone. On the [`crate::share::CopyRoute::ThisWindow`] route it cannot — the child has
+    /// no window, and `FLATPAK_LAB.md`'s "Ruled out" section settles why no background process
+    /// ever will (the blocker is FOCUS, not process lifetime). So the child reports
+    /// `shared: false` with the link still attached, and this document, which HAS a focused
+    /// window, does the write.
+    ///
+    /// Returns the write plus a toast of the REAL outcome, so "Copied to clipboard" is never
+    /// claimed over an empty clipboard on either route. `None` when there is nothing to do,
+    /// which is every session where the child already copied.
+    pub(super) fn copy_upload_link_on_finish(
+        &mut self,
+        id: window::Id,
+        url: &str,
+    ) -> Task<cosmic::Action<Msg>> {
+        if url.is_empty() {
+            return Task::none();
+        }
+        self.preview_toast_icon(
+            id,
+            ToastKind::Success,
+            "Copied to clipboard",
+            "clipboard-check-symbolic",
+        );
+        // The link itself is never logged; this line reports the behaviour (see
+        // `cloud::session::UploadState::Done`).
+        log::debug!(
+            "preview: the upload child could not hold the selection on this session's copy \
+             route, so the editor put its share link on the clipboard through its own window"
+        );
+        crate::share::copy_text_task(url)
     }
 
     /// THE completion seam a share lands on — after a bake (`baked` = the temp it wrote), on
@@ -1041,8 +1205,16 @@ impl App {
             Some(temp) => Some(temp.clone()),
             None => self.preview_current_file(id),
         };
+        let mut tasks = tasks;
         let copy_ok = match source {
-            Some(src) => self.copy_to_clipboard_now(id, &src, is_video),
+            Some(src) => {
+                // The window-clipboard path returns a real write to run; the worker path
+                // returns an empty task. Batched with the rest either way, so this call site
+                // does not have to know which compositor it is on.
+                let (ok, write) = self.copy_to_clipboard_task(id, &src, is_video);
+                tasks.push(write);
+                ok
+            }
             None => {
                 self.preview_toast_icon(id, ToastKind::Error, "Nothing to copy yet", "clipboard-x-symbolic");
                 false
@@ -1351,4 +1523,28 @@ mod tests {
         }
     }
 
+}
+
+/// `lab/flatpak`: the open-time copy's route decision, as the PREVIEW EDITOR reads it. The
+/// ladder itself moved to `share::clipboard` in DRAGON-587 (its tests went with it); what is
+/// left here is the editor's own end of the contract.
+#[cfg(test)]
+mod auto_copy_step_tests {
+    use super::AUTO_COPY_FOCUS_BUDGET;
+
+    /// The editor's spelling of the budget IS the shared one, so the preview and the colour
+    /// picker can never wait for different lengths of time.
+    #[test]
+    fn the_editors_budget_is_the_shared_one() {
+        assert_eq!(AUTO_COPY_FOCUS_BUDGET, crate::share::WINDOW_COPY_FOCUS_BUDGET);
+    }
+
+    /// The budget is a bound on a courtesy copy, not a schedule: long enough that a normal
+    /// map-then-focus never trips it, short enough that a user who has clicked away is not
+    /// ambushed by the clipboard changing under them.
+    #[test]
+    fn the_focus_budget_is_seconds_not_frames_and_not_minutes() {
+        assert!(AUTO_COPY_FOCUS_BUDGET >= std::time::Duration::from_secs(1));
+        assert!(AUTO_COPY_FOCUS_BUDGET <= std::time::Duration::from_secs(10));
+    }
 }

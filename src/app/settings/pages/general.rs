@@ -62,16 +62,47 @@ impl crate::app::App {
                         // force-unregistered there by `reconcile_login_item`). Sits directly
                         // below the tray row it depends on.
                         if self.resident {
+                            // DRAGON-625: normally this row needs no description. When a
+                            // registration attempt failed it carries the reason, so a toggle
+                            // that springs back says why instead of just refusing. On COSMIC
+                            // in a Flatpak that is permanent, not transient: the desktop has
+                            // no Background portal, so the request cannot be made at all.
+                            // Linux-only because it is the only platform that registers
+                            // through a portal; the others write a file or a registry key
+                            // and fail synchronously.
+                            #[cfg(target_os = "linux")]
+                            let autostart_note: &str =
+                                self.autostart_notice.as_deref().unwrap_or("");
+                            #[cfg(not(target_os = "linux"))]
+                            let autostart_note: &str = "";
+                            // DRAGON-628: what the machine will REALLY do at the next login,
+                            // not what the config remembers being asked for. The two come
+                            // apart on their own: the owner's autostart entry named an
+                            // AppImage DRAGON-590 had relocated, so the session refused it at
+                            // every login while this row kept reading on. `autostart_row`
+                            // shows the observation wherever there is one and falls back to
+                            // the preference where there cannot be one (a Flatpak, an
+                            // unbundled mac dev binary). No probe happens here: `view` runs on
+                            // every redraw, so the read is taken once per settings-window
+                            // open by `autostart_settings_opened` and cached.
+                            let autostart_shown = crate::platform::autostart_row(
+                                self.autostart_on_login,
+                                self.autostart_registered,
+                            )
+                            .shown();
                             items.push(
                                 Item::new(
                                     "Automatically start on login",
-                                    "",
-                                    toggle(self.autostart_on_login, |a0| {
+                                    autostart_note,
+                                    toggle(autostart_shown, |a0| {
                                         Msg::Settings(SettingsMsg::SetAutostartOnLogin(a0))
                                     }),
                                 )
+                                // The reset arrow compares the DISPLAYED state too, so a row
+                                // that has fallen off the default because the registration
+                                // did not survive offers the one click that puts it back.
                                 .reset_with(
-                                    self.autostart_on_login,
+                                    autostart_shown,
                                     d.autostart_on_login,
                                     |a0| Msg::Settings(SettingsMsg::SetAutostartOnLogin(a0)),
                                 ),
@@ -196,6 +227,21 @@ impl crate::app::App {
         secs.push(SectionSpec {
             title: "Overlay Opacity",
             items: vec![
+                // DRAGON-582: the colour picker leads the group, before Region Selection,
+                // as the owner specified. Its default is much lighter than the others
+                // (33%) because the user reads colours THROUGH this dim.
+                Item::new(
+                    "During Color Picker",
+                    "",
+                    opacity_slider(self.color_picker_overlay_opacity, |a0| {
+                        Msg::Settings(SettingsMsg::SetColorPickerOpacity(a0))
+                    }),
+                )
+                .reset_with(
+                    self.color_picker_overlay_opacity,
+                    d.color_picker_overlay_opacity,
+                    |a0| Msg::Settings(SettingsMsg::SetColorPickerOpacity(a0)),
+                ),
                 Item::new(
                     "During Region Selection",
                     "",
@@ -444,7 +490,7 @@ fn style_preview_style(
 ) -> cosmic::widget::button::Style {
     let cosmic = theme.cosmic();
     let mut s = cosmic::widget::button::Style::new();
-    s.background = Some(Background::Color(cosmic.background.component.base.into()));
+    s.background = Some(Background::Color(cosmic.background(false).component.base.into()));
     s.border_radius = radius.into();
     if selected {
         s.border_width = 2.0;

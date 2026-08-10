@@ -17,7 +17,7 @@
 //! Required-but-missing is red, optional-but-missing is amber, present is green.
 
 use super::*;
-use super::row::{action_button, severity_caption, status_icon, subtle_caption_text, Item, Severity};
+use super::row::{action_button, severity_caption, status_icon, Item, Severity};
 #[cfg(target_os = "macos")]
 use crate::platform::mac::tcc::TccStatus;
 use std::borrow::Cow;
@@ -86,6 +86,13 @@ pub(in crate::app::settings) struct Dep {
     /// tick. Read from `SettingsState::health_copied` when the `Dep` is built, because a
     /// `Dep` is rebuilt from scratch on every render and can hold no state of its own.
     location_copied: bool,
+    /// For a requirement that IS an external binary, the version that binary REPORTS
+    /// (`-version` / `--version`, probed once off the UI thread when the settings window
+    /// opens; DRAGON-564). `None` for every requirement with no binary behind it, for a
+    /// missing one, until the probe lands, and when the output carried no recognisable
+    /// version: in all of those the name stands alone. Shown after the name on the
+    /// Health row's title only.
+    version: Option<String>,
 }
 
 impl Dep {
@@ -116,6 +123,11 @@ impl Dep {
 
     /// Compact inline note for a setting page: a status icon followed by
     /// "name: message", coloured by severity. Renders as a full-width row, no control.
+    ///
+    /// When the dep carries a location, the note gets the same path line the Health row does.
+    /// That matters most in exactly the case this note appears in, which is the FAILING one:
+    /// "no usable language data" tells the user something is wrong and leaves them nowhere to
+    /// put the fix, while the folder plus a copy button IS the instruction. Owner report.
     pub(in crate::app::settings) fn note<'a>(&self) -> Item<'a> {
         let sev = self.severity();
         let line = widget::row(vec![
@@ -124,7 +136,17 @@ impl Dep {
         ])
         .spacing(8.0)
         .align_y(Alignment::Center);
-        Item::note(line)
+        match &self.location {
+            Some(loc) => Item::note(
+                widget::column(vec![
+                    line.into(),
+                    super::row::path_line(loc.clone(), self.location_copied),
+                ])
+                .spacing(2.0)
+                .width(Length::Fill),
+            ),
+            None => Item::note(line),
+        }
     }
 
     /// The inline note, but only when the dependency has a problem - so settings pages
@@ -149,7 +171,7 @@ impl Dep {
     /// The copy control is the app's shared `widgets::copy_button`, in its subtle tint so it
     /// belongs to the line of text it leads rather than competing with it, and it copies the
     /// location EXACTLY as shown. For a real path that is what a terminal wants. Inside an
-    /// AppImage the shown form ("AppImage: usr/bin/ffmpeg") is the better thing to paste
+    /// AppImage the shown form ("AppImage://usr/bin/ffmpeg") is the better thing to paste
     /// anyway: the mount root it stands in for is a different random directory on every
     /// launch, so it tells a support thread nothing it can use.
     ///
@@ -171,25 +193,20 @@ impl Dep {
             Some((label, msg)) => action_button(label, msg.clone()),
             None => status_icon(sev),
         };
-        let item = Item::new(self.name, self.message(), control).status(sev);
+        let mut item = Item::new(self.name, self.message(), control).status(sev);
+        // A present binary's reported version rides after the name, in the subtle
+        // secondary tone and never bold: an annotation, not part of the name. The plain
+        // `title` stays populated so the settings search still finds the row.
+        if let Some(v) = &self.version {
+            item = item.title_el(name_with_version(self.name, v.clone()));
+        }
         match &self.location {
             Some(loc) => {
-                let copy = crate::widgets::copy_button::subtle_copy_button(
-                    self.location_copied,
-                    2,
-                    widget::tooltip::Position::Top,
-                    "Copy path",
-                    Msg::Settings(SettingsMsg::CopyHealthLocation(loc.clone())),
-                );
-                let line = widget::row(vec![
-                    copy,
-                    subtle_caption_text(loc.clone()).width(Length::Fill).into(),
-                ])
-                .spacing(4.0)
-                .width(Length::Fill)
-                .align_y(Alignment::Start);
+                // The shared builder, so this line and the two in Scanner / Preview editor
+                // cannot drift apart in tone, spacing or copy behaviour.
+                let line = super::row::path_line(loc.clone(), self.location_copied);
                 item.desc_el(
-                    widget::column(vec![severity_caption(sev, self.message()), line.into()])
+                    widget::column(vec![severity_caption(sev, self.message()), line])
                         .spacing(2.0)
                         .width(Length::Fill),
                 )
@@ -199,24 +216,47 @@ impl Dep {
     }
 }
 
-/// Where the binary behind a requirement actually resolved, for the four requirements that
-/// ARE a binary. `None` for everything else: a TCC grant, a capability satisfied by a capture
-/// backend, and OCR language data have no single file to point at, so there is nothing
-/// honest to show.
-///
-/// The lookup goes through [`crate::util::tool_locations`], the same cached list the debug
-/// log's session header prints, so a customer's Health page and their log can never name
-/// different binaries. macOS and Windows have no pactl (their audio-device row is about
-/// ffmpeg, whose own row already names it), so that entry is Linux-only on both sides.
-fn tool_location(id: DepId) -> Option<String> {
-    let name = match id {
+/// A Health row's title for a present binary with a known version: the name in the normal
+/// bold title weight, the version after it in the SUBTLE secondary tone
+/// ([`super::row::subtle_caption`], the same treatment the location line under it gets),
+/// mirroring the About page's mixed-weight "Version <n>" title. Never bold: the version is
+/// an annotation, not part of the name.
+fn name_with_version(name: &'static str, version: String) -> Element<'static, Msg> {
+    widget::row(vec![
+        widget::text::body(name).font(cosmic::font::bold()).into(),
+        super::row::subtle_caption(version),
+    ])
+    .spacing(6.0)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The binary behind a requirement, for the four requirements that ARE one; `None` for
+/// everything else (a TCC grant, a capability, language data). ONE mapping shared by
+/// [`tool_location`] and the version lookup, so the two annotations can never cover
+/// different rows. macOS and Windows have no pactl (their audio-device row is about
+/// ffmpeg, whose own row already names it), so that entry is Linux-only.
+fn tool_row_binary(id: DepId) -> Option<&'static str> {
+    Some(match id {
         DepId::Ffmpeg => "ffmpeg",
         DepId::Ffprobe => "ffprobe",
         DepId::Tesseract => "tesseract",
         #[cfg(not(any(target_os = "macos", windows)))]
         DepId::Pactl => "pactl",
         _ => return None,
-    };
+    })
+}
+
+/// Where the binary behind a requirement actually resolved, for the four requirements that
+/// ARE a binary ([`tool_row_binary`]). `None` for everything else: a TCC grant, a capability
+/// satisfied by a capture backend, and OCR language data have no single file to point at, so
+/// there is nothing honest to show.
+///
+/// The lookup goes through [`crate::util::tool_locations`], the same cached list the debug
+/// log's session header prints, so a customer's Health page and their log can never name
+/// different binaries.
+fn tool_location(id: DepId) -> Option<String> {
+    let name = tool_row_binary(id)?;
     crate::util::tool_locations()
         .iter()
         .find(|t| t.name == name)
@@ -475,16 +515,74 @@ impl crate::app::App {
         // Where this row's binary is, for the rows that have one. Only while it is present:
         // a missing tool has no location, and a row forced missing by a CCK_HEALTH_FORCE_*
         // review flag must read exactly like the real thing.
-        let location = present.then(|| tool_location(id)).flatten();
+        //
+        // LANGUAGE DATA is the exception, and the exception is the whole point (owner report).
+        // For a binary, "missing" means there is no file to name. For a FOLDER we read, missing
+        // means the folder is empty or absent, and the one thing the user needs at that moment
+        // is WHERE to put the file. "no usable language data, install a language pack" without
+        // a path is an instruction with the address torn off. So this row names its directory
+        // in both states, and `Dep::note` renders it on the Scanner page too, not just Health.
+        let location = match id {
+            DepId::TesseractLang => {
+                crate::util::tessdata_dir().map(|d| d.display().to_string())
+            }
+            _ => present.then(|| tool_location(id)).flatten(),
+        };
         // Whether THIS row's copy button is inside its flash window. Keyed by the copied text,
         // which is what the press carried; two rows can never name the same binary.
-        let location_copied = match (&location, &self.settings.health_copied) {
-            (Some(loc), Some((copied, at))) => {
-                loc == copied && crate::widgets::copy_button::copied_recently(Some(*at))
-            }
-            _ => false,
-        };
-        Dep { name, present, requirement, ok, missing, action, location, location_copied }
+        // Through `row::path_line_copied`, NOT a comparison of its own.
+        //
+        // This used to compare the RAW location against the copied text, which was correct
+        // until `path_line` started collapsing the home prefix to `~` before building the copy
+        // message. From then on the press carried `~/…` while this compared `/home/…`, so the
+        // "Copied!" flash silently stopped firing for exactly the rows whose path lives under
+        // home, and kept working for the ones outside it. That is the shape the owner spotted:
+        // the tesseract language folder went quiet while the system tool paths did not.
+        //
+        // One comparison, in the same module as the builder that decides the displayed form, so
+        // the two cannot drift apart again.
+        let location_copied = location
+            .as_deref()
+            .is_some_and(|loc| super::row::path_line_copied(loc, &self.settings.health_copied));
+        // The version that binary reports (DRAGON-564), for the same rows the location
+        // covers, and like it only while present: a missing tool has no version, and a
+        // row forced missing by a CCK_HEALTH_FORCE_* review flag must read exactly like
+        // the real thing. `None` until the settings-open probe has landed; the name
+        // stands alone until then, so nothing ever waits on the probe.
+        let version = if present { self.tool_version(id) } else { None };
+        Dep { name, present, requirement, ok, missing, action, location, location_copied, version }
+    }
+
+    /// The version the row's binary reported to the settings-open probe
+    /// ([`Self::kick_tool_version_probe`]): `None` for a non-binary row, before the
+    /// probe lands, and when its output carried no recognisable version.
+    fn tool_version(&self, id: DepId) -> Option<String> {
+        let name = tool_row_binary(id)?;
+        self.settings
+            .tool_versions
+            .as_ref()?
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| t.version.clone())
+    }
+
+    /// Kick the tool-version probe OFF the UI thread (DRAGON-564): each Health-row binary
+    /// is spawned once with its version flag, every spawn bounded
+    /// (`util::probe_tool_versions`), and the results land as
+    /// `SettingsMsg::ToolVersionsProbed`. Fired when the settings window opens; a no-op
+    /// when the results are already in or a probe is in flight, so the process pays it
+    /// once. Detached rather than `spawn_blocking` (see `app::background`): a probe
+    /// nobody is waiting for any more is simply abandoned at close.
+    pub(in crate::app) fn kick_tool_version_probe(&mut self) -> Task<cosmic::Action<Msg>> {
+        if self.settings.tool_versions.is_some() || self.settings.tool_versions_probing {
+            return Task::none();
+        }
+        self.settings.tool_versions_probing = true;
+        Task::perform(crate::app::off_thread(crate::util::probe_tool_versions), |v| {
+            cosmic::Action::App(Msg::Settings(SettingsMsg::ToolVersionsProbed(
+                v.unwrap_or_default(),
+            )))
+        })
     }
 
     /// The remediation action for a macOS TCC health row, given its resolved presence.

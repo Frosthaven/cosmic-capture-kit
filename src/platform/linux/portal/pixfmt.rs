@@ -77,6 +77,45 @@ pub(crate) fn convert_crop(
     });
 }
 
+/// Pure, unit-tested (DRAGON-562 alpha probe): histogram byte 3 of every pixel
+/// in the cropped sub-rect of `src` — the byte [`convert_crop`] overwrites with
+/// 255 — as `(zero, partial, opaque)` counts. This is the measurement the
+/// portal backend's `transparency` capability waits on: whether a Window
+/// stream's raw buffer ever carries real per-pixel alpha.
+///
+/// Format-agnostic on purpose: whether byte 3 MEANS alpha (BGRA/RGBA) or
+/// padding (BGRx/RGBx) is the caller's report; the counting is the same.
+/// `None` when `bpp != 4` (RGB has no fourth byte to read). Out-of-range
+/// indices (a short mapping) are skipped rather than counted.
+pub(crate) fn alpha_histogram(
+    src: &[u8],
+    stride: usize,
+    bpp: usize,
+    cx: u32,
+    cy: u32,
+    cw: u32,
+    ch: u32,
+) -> Option<(u64, u64, u64)> {
+    if bpp != 4 {
+        return None;
+    }
+    let (mut zero, mut partial, mut opaque) = (0u64, 0u64, 0u64);
+    for y in 0..ch as usize {
+        let row = (cy as usize + y) * stride + cx as usize * bpp;
+        for x in 0..cw as usize {
+            let Some(&a) = src.get(row + x * bpp + 3) else {
+                continue;
+            };
+            match a {
+                0 => zero += 1,
+                255 => opaque += 1,
+                _ => partial += 1,
+            }
+        }
+    }
+    Some((zero, partial, opaque))
+}
+
 /// DRM `FourCC` for a PipeWire video format (only the single-plane packed RGB cases
 /// a compositor offers for screen capture). `None` = we don't map it (caller falls
 /// back). The DRM names encode little-endian byte order, the reverse of the SPA name.
@@ -92,4 +131,54 @@ pub(crate) fn drm_fourcc(fmt: spa::param::video::VideoFormat) -> Option<u32> {
         V::RGBA => cc(b"AB24"), // DRM_FORMAT_ABGR8888
         _ => return None,
     })
+}
+
+/// DRAGON-562: the alpha-probe histogram's counting, pinned on a synthetic
+/// buffer with a known alpha layout (stride slack, crop offset, every bucket).
+#[cfg(test)]
+mod alpha_histogram_tests {
+    use super::alpha_histogram;
+
+    /// A 4x2 BGRA frame inside a stride of 20 bytes (4 bytes slack per row),
+    /// with alphas laid out row-major: row 0 = [0, 128, 255, 255],
+    /// row 1 = [255, 7, 0, 255].
+    fn frame() -> Vec<u8> {
+        let alphas = [[0u8, 128, 255, 255], [255, 7, 0, 255]];
+        let mut src = vec![0u8; 2 * 20];
+        for (y, row) in alphas.iter().enumerate() {
+            for (x, a) in row.iter().enumerate() {
+                src[y * 20 + x * 4 + 3] = *a;
+            }
+        }
+        src
+    }
+
+    #[test]
+    fn full_frame_counts_every_bucket() {
+        let (zero, partial, opaque) =
+            alpha_histogram(&frame(), 20, 4, 0, 0, 4, 2).expect("bpp 4 histograms");
+        assert_eq!((zero, partial, opaque), (2, 2, 4));
+    }
+
+    #[test]
+    fn crop_offsets_are_honored() {
+        // The right 2x2 corner: alphas [255, 255] / [0, 255].
+        let (zero, partial, opaque) =
+            alpha_histogram(&frame(), 20, 4, 2, 0, 2, 2).expect("bpp 4 histograms");
+        assert_eq!((zero, partial, opaque), (1, 0, 3));
+    }
+
+    #[test]
+    fn three_byte_formats_have_nothing_to_read() {
+        // RGB (bpp 3) has no fourth byte: the probe answers None, never a lie.
+        assert_eq!(alpha_histogram(&frame(), 20, 3, 0, 0, 4, 2), None);
+    }
+
+    #[test]
+    fn short_mappings_do_not_panic() {
+        // A crop whose rows reach past the buffer skips the missing rows.
+        let (zero, partial, opaque) =
+            alpha_histogram(&frame(), 20, 4, 0, 0, 4, 4).expect("bpp 4 histograms");
+        assert_eq!((zero, partial, opaque), (2, 2, 4));
+    }
 }

@@ -3,6 +3,9 @@
 pub mod annotation_canvas;
 pub mod annotation_fx;
 pub mod arrow_cursor;
+/// The colour picker's transparent input surface (DRAGON-582): pointer moves + the pick
+/// click. It draws nothing; see its module doc for why the visuals are stacked elements.
+pub mod color_pick;
 pub mod copy_button;
 pub mod crop_canvas;
 pub mod crop_window;
@@ -54,6 +57,39 @@ pub mod cursor_reassert {
         entered_at.is_some_and(|t| (SETTLE.saturating_sub(DIP)..SETTLE).contains(&t.elapsed()))
     }
 
+    /// Start the dance from the surface's own APPEARANCE instead of from a pointer enter
+    /// (DRAGON-601, second pass). Call from `update` on any event the widget is guaranteed to
+    /// see, then let [`arm`] carry the schedule forward as usual. A no-op once armed, so a real
+    /// `CursorEntered` later still re-arms through [`arm`] and nothing double-schedules.
+    ///
+    /// **Why the enter is not a good enough trigger, measured.** An overlay that maps UNDER a
+    /// resting pointer asks for its cursor on its very first frame, and on cosmic-comp that
+    /// frame lands about 55 ms BEFORE the compositor sends `wl_pointer.enter`. A cursor
+    /// request with no enter serial cannot be made: sctk drops it, and the seat then records
+    /// the icon as applied anyway (`active_icon`, and our fork's `hidden`), so the enter's own
+    /// re-assert compares equal and skips. The request is lost in a way nothing reports, and
+    /// the compositor's default sprite stays on screen until the user moves the mouse and
+    /// something finally issues a request while a serial exists.
+    ///
+    /// Arming here puts the re-assert at [`SETTLE`] after the surface appeared, which on that
+    /// timeline is about 150 ms after the enter: late enough that a serial exists, and late
+    /// enough to clear cosmic-comp's own post-enter drop window, which is the reason [`SETTLE`]
+    /// is 200 ms in the first place.
+    ///
+    /// The old trigger could not have worked on a layer surface for a second, independent
+    /// reason: the widget never receives `CursorEntered` there at all. The compositor delivers
+    /// `wl_pointer.enter` with a position, and the toolkit passes neither the event nor the
+    /// position on until the pointer MOVES. That is a toolkit-side gap, not something a caller
+    /// can close, which is exactly why this trigger does not depend on it.
+    pub fn arm_on_appear<Msg>(entered_at: &mut Option<Instant>, shell: &mut Shell<'_, Msg>) {
+        if entered_at.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        *entered_at = Some(now);
+        shell.request_redraw_at(now + SETTLE.saturating_sub(DIP));
+    }
+
     /// Maintain `entered_at` from pointer lifecycle events and schedule the dip-start + deadline
     /// redraws so the re-assert fires (call from `update`, before consuming the event).
     pub fn arm<Msg>(entered_at: &mut Option<Instant>, event: &Event, shell: &mut Shell<'_, Msg>) {
@@ -65,7 +101,20 @@ pub mod cursor_reassert {
                 shell.request_redraw_at(now + dip_start);
             }
             Event::Mouse(mouse::Event::CursorLeft) => *entered_at = None,
-            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+            // A REDRAW carries the schedule forward exactly as a move does (DRAGON-601), and
+            // that is what makes the dance complete under a pointer nobody is touching.
+            //
+            // The enter above books ONE redraw, at the start of the dip. Reaching it used to
+            // book nothing further, so the deadline redraw only ever arrived if the user
+            // happened to move the mouse in that 24ms window; with a stationary pointer the
+            // widget dipped to the default cursor and stayed there, which is the opposite of
+            // the bug this module exists to fix. It went unnoticed because the two widgets
+            // using it are a region selector and a drawing canvas, where a hand is on the
+            // mouse by definition. The colour picker's overlay appears UNDER a resting pointer
+            // and asks for a hidden cursor, so it is the first caller that has to survive
+            // enter-then-nothing.
+            Event::Mouse(mouse::Event::CursorMoved { .. })
+            | Event::Window(cosmic::iced::core::window::Event::RedrawRequested(_)) => {
                 if let Some(t) = *entered_at {
                     let e = t.elapsed();
                     if e < dip_start {
@@ -76,6 +125,43 @@ pub mod cursor_reassert {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// DRAGON-331 / DRAGON-601: the dip window. Small, but a widget returning its default
+    /// cursor is a VISIBLE state, so both edges matter: too early and the cursor flickers on
+    /// every enter, too late and the re-assert lands inside cosmic-comp's drop window and the
+    /// whole dance achieves nothing.
+    #[cfg(test)]
+    mod dip_window_tests {
+        use super::*;
+
+        /// The dip sits at the END of the settle window, immediately before the deadline, so
+        /// the re-assert that follows it is both a change AND late enough to stick.
+        #[test]
+        fn the_dip_is_the_last_moments_before_the_deadline() {
+            assert!(DIP < SETTLE, "a dip at least as long as the settle never re-asserts");
+            let start = SETTLE.saturating_sub(DIP);
+            let now = Instant::now();
+            // Just inside the dip, and just past its far edge.
+            assert!(in_dip(Some(now - start)), "the dip must be open at its start");
+            assert!(!in_dip(Some(now - SETTLE)), "the dip must be closed at the deadline");
+        }
+
+        /// Before the dip the widget asserts its REAL cursor immediately, so a compositor that
+        /// honours the first request shows no flicker at all.
+        #[test]
+        fn nothing_dips_before_the_window_opens() {
+            let now = Instant::now();
+            assert!(!in_dip(Some(now)), "a fresh enter asserts the real cursor at once");
+            assert!(!in_dip(Some(now - Duration::from_millis(1))));
+        }
+
+        /// No entry stamp means no dance: a widget whose pointer has left, or which never saw
+        /// an enter, keeps its ordinary cursor resolution.
+        #[test]
+        fn an_unarmed_widget_never_dips() {
+            assert!(!in_dip(None));
         }
     }
 }

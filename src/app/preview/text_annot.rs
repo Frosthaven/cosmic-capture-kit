@@ -1230,6 +1230,72 @@ mod tests {
         assert_eq!(cap_graphemes("", 4), "");
     }
 
+    /// DRAGON-572: paste-shaped insertion ([`replace_range`], at a caret and over a
+    /// selection) is char-correct for emoji — a single-codepoint emoji, a multi-codepoint
+    /// ZWJ sequence, and mixed ASCII+emoji all land whole, with the caret after the
+    /// insertion. This is the pure half of the editor's paste, on both read routes.
+    #[test]
+    fn paste_insertion_is_char_correct_for_emoji() {
+        // Single codepoint: 😀 is one char, one grapheme.
+        let (t, c) = replace_range("ab", 1, 1, "😀");
+        assert_eq!((t.as_str(), c), ("a😀b", 2));
+        // A ZWJ sequence (👨‍👩‍👧 = 5 chars, ONE grapheme) pasted over a selection: the
+        // selection goes, the whole cluster lands, the caret sits after it.
+        let family = "👨‍👩‍👧";
+        assert_eq!(char_len(family), 5);
+        let (t, c) = replace_range("hello", 1, 4, family);
+        assert_eq!(t, format!("h{family}o"));
+        assert_eq!(c, 6, "caret = selection start + the pasted char count");
+        // Mixed ASCII+emoji, order-independent range, caret at the end of the insertion.
+        let (t, c) = replace_range("xy", 1, 0, "a😀b");
+        assert_eq!((t.as_str(), c), ("a😀by", 3));
+        // The paste cap never bites a paste-sized emoji string (it bounds pathology, not use).
+        let mixed = format!("a😀{family}b");
+        assert_eq!(cap_graphemes(&mixed, 32 * 1024), mixed.as_str());
+    }
+
+    /// DRAGON-572: caret math around pasted emoji moves by whole grapheme — over the
+    /// single-codepoint kind, the ZWJ kind, and their ASCII neighbours in mixed text.
+    #[test]
+    fn caret_math_steps_over_pasted_emoji_whole() {
+        let family = "👨‍👩‍👧"; // 5 chars, one grapheme
+        let s = format!("a😀{family}b"); // char indices: a=0, 😀=1, family=2..7, b=7
+        assert_eq!(char_len(&s), 8);
+        // Rightward: a → 😀 → the whole family → b, one grapheme per step.
+        assert_eq!(move_right(&s, 0), 1);
+        assert_eq!(move_right(&s, 1), 2);
+        assert_eq!(move_right(&s, 2), 7, "the whole ZWJ family is one step");
+        assert_eq!(move_right(&s, 7), 8);
+        // And back left over the same boundaries.
+        assert_eq!(move_left(&s, 8), 7);
+        assert_eq!(move_left(&s, 7), 2);
+        assert_eq!(move_left(&s, 2), 1);
+        // Backspace after the family removes the whole cluster, never a stray joiner…
+        let (t, c) = backspace(&s, 7);
+        assert_eq!((t.as_str(), c), ("a😀b", 2));
+        // …and forward-delete at its start is its mirror.
+        let (t, c) = delete_forward(&s, 2);
+        assert_eq!((t.as_str(), c), ("a😀b", 2));
+    }
+
+    /// DRAGON-572: wrap (and so measure, which it drives) treats a pasted emoji cluster as
+    /// an unsplittable unit in mixed ASCII+emoji text — a ZWJ family wider than the line
+    /// gets its own line rather than a mid-cluster break.
+    #[test]
+    fn wrap_gives_an_oversize_emoji_cluster_its_own_line() {
+        let family = "👨‍👩‍👧"; // 5 chars = 50 wide under mock10 — wider than the 45px line
+        let text = format!("aa {family} bb");
+        let lines = wrap_with(&mock10, &text, 45.0);
+        assert_eq!(
+            lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(),
+            vec!["aa", family, "bb"],
+            "the cluster overflows whole on its own line; its neighbours wrap around it"
+        );
+        // Nothing was dropped or split: the ranges cover the string end to end.
+        assert_eq!(lines.first().map(|l| l.start), Some(0));
+        assert_eq!(lines.last().map(|l| l.end), Some(char_len(&text)));
+    }
+
     #[test]
     fn word_range_at_selects_the_word_under_the_caret() {
         // "hello world": a caret inside "world" selects [6, 11).

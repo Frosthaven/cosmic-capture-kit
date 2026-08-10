@@ -55,7 +55,7 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 VERSION="$(grep -m1 '^version' "$SRC/Cargo.toml" | cut -d'"' -f2)"
 [[ -n "$VERSION" ]] || die "could not read the version out of Cargo.toml"
 APP=cosmic-capture-kit
-ID=dev.frosthaven.CosmicCaptureKit
+ID=dev.thedragon.CosmicCaptureKit
 
 # The architecture is simply the one we are running on (DRAGON-529). Nothing here
 # cross-compiles: an aarch64 artifact comes from running this same image on an

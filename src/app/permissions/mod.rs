@@ -56,8 +56,32 @@ pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Permissions";
 
 /// Open a permission-checker toplevel and a Task reporting its id once mapped.
 /// Mirrors `settings::open_config_window`'s window recipe (CSD, transparent
-/// surface, resize border) at a smaller onboarding size. A fixed, compact size —
-/// nothing here scrolls at the default height, and it isn't a size worth persisting.
+/// surface, resize border) at a smaller onboarding size.
+///
+/// **The window is exactly 629x707 and cannot be resized** (DRAGON-587, the owner's
+/// instruction, and the same treatment the colour-picker result window gets).
+///
+/// Two things had to be checked before taking the resize away, because this window exists to
+/// tell the user what is WRONG and clipping that would be worse than letting it grow:
+///
+/// * **Can the content be taller than 707?** Yes, in the fullest state (all four cards, with
+///   Screen Recording granted adding its Relaunch button and Accessibility granted adding
+///   Restart Background Helper, plus the skip footer). It cannot CLIP, though: the whole card
+///   column lives inside a `widget::scrollable` (`view::permissions_window_view`), so a tall
+///   state scrolls, exactly as it already did at this size before the resize went away.
+/// * **Does 707 still fit?** Yes on every supported Mac at its default scaling: the smallest
+///   is the 13" MacBook Air at 1440x900 points, leaving roughly 90pt spare under the menu bar
+///   and over the Dock. It is only tight on a NON-default "Larger Text" scaled mode
+///   (1280x800 leaves about 705) and does not fit at 1024x640. That is not a regression: 707
+///   has been the min_size FLOOR since DRAGON-533, so those displays could never shrink this
+///   window anyway. What the pin removes is only the ability to make it BIGGER.
+///
+/// The lock is `min_size == max_size` on every platform, which is what actually pins it.
+/// `resizable` STAYS TRUE, and must: on macOS clearing it drops `NSWindowStyleMask::Resizable`,
+/// and winit's `is_zoomed` reacts to a mask missing `Titled | Resizable` by rewriting the mask
+/// mid-reframe, which is the DRAGON-130 abort. `platform::mac::window::pin_window_size`
+/// (dispatched from `PermissionsWindowOpened`) covers what the size clamp cannot: the zoom
+/// button and full-screen spaces. Its own doc carries the whole argument.
 pub(super) fn open_permissions_window() -> (window::Id, Task<cosmic::Action<Msg>>) {
     // DRAGON-533: the old 520x560 read as too short (some cards' content clipped/scrolled
     // more than felt right). Owner resized their live window to a comfortable 629x707 and
@@ -82,10 +106,16 @@ pub(super) fn open_permissions_window() -> (window::Id, Task<cosmic::Action<Msg>
         blur,
         // The opening size IS the floor (owner report: the window read as too short at
         // the old 460x460 minimum). Was smaller than the default, so shrinking it ever
-        // clipped content the default size was chosen to fit.
+        // clipped content the default size was chosen to fit. DRAGON-587 made it the
+        // CEILING too: equal floor and ceiling, so the size IS the window.
         min_size: Some(cosmic::iced::Size::new(W, H)),
+        max_size: Some(cosmic::iced::Size::new(W, H)),
+        // Stays TRUE on macOS on purpose: clearing it hands winit's `is_zoomed` a style mask
+        // to rewrite mid-reframe (the DRAGON-130 abort). The equal min/max above are what
+        // make it unresizable, and `pin_window_size` takes the zoom button. See the doc.
         resizable: true,
-        resize_border: 8,
+        // No drag-resize band to reserve, since there is no resize left to start.
+        resize_border: 0,
         // macOS (DRAGON-135): native decorations with a hidden/transparent titlebar —
         // the traffic lights render over our CSD header, which drops its own close
         // button there. Same recipe as `settings::open_config_window`.
@@ -102,7 +132,7 @@ pub(super) fn open_permissions_window() -> (window::Id, Task<cosmic::Action<Msg>
         exit_on_close_request: false,
         #[cfg(target_os = "linux")]
         platform_specific: cosmic::iced::window::settings::PlatformSpecific {
-            application_id: "dev.frosthaven.CosmicCaptureKit".to_string(),
+            application_id: "dev.thedragon.CosmicCaptureKit".to_string(),
             ..Default::default()
         },
         #[cfg(target_os = "macos")]
@@ -439,7 +469,15 @@ pub fn card_action(status: PermStatus, request_spent: bool) -> CardAction {
 ///   Presents itself ONCE; a grant, a denial, OR a dismissal ends that for good.
 /// * [`Tier::Optional`] — a side feature. Same once-only presentation as Recommended;
 ///   the tiers differ only in the word on the card and in how strongly it is urged.
-#[cfg_attr(all(not(target_os = "macos"), not(test)), expect(dead_code))]
+// `allow`, not `expect`, and the difference is not style (DRAGON-625). `Tier` is
+// reachable only from `Permission::tier`, which is itself dead off macOS, and rustc
+// only learned to propagate deadness through a chain of dead items after 1.95. The
+// Flatpak SDK ships rustc 1.95, where the `dead_code` lint therefore does NOT fire
+// here, so an `expect` is unfulfilled and warns; the dev box's newer rustc fulfils it
+// and says nothing. `allow` is correct on every toolchain, and it is what the other
+// ~276 dead-code gates in this tree already use. Do not "tighten" this back to
+// `expect` without building on the SDK's rustc first.
+#[cfg_attr(all(not(target_os = "macos"), not(test)), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
     Required,

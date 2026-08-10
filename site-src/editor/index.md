@@ -130,7 +130,7 @@ on macOS.
 | T | Text |
 | B | Freehand |
 | E | Eraser |
-| S | Colour picker |
+| S | The annotation colour swatch and its palette |
 | X | Swap to the companion colour |
 | L | Next line width |
 | D | Duplicate what is selected |

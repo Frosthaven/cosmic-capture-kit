@@ -456,6 +456,7 @@ fn run_opening_proof(count_on: CountOn, shape: Shape) {
         settings: RecordSettings {
             fps: 30,
             preferred_encoder: shape.encoder.to_string(),
+            encoder_hint: None,
             presets: crate::encode::Presets::default(),
             zero_copy: shape.zero_copy,
             // The MIC is always on — it is the deep source path, and the app's default.

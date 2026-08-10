@@ -151,8 +151,14 @@ pub enum UploadState {
     /// percentage that would either freeze at one number or lie about how far along the
     /// transfer is.
     Indeterminate,
-    /// Finished. `shared` is whether a share link was made AND copied to the clipboard, so
-    /// the editor knows whether to ALSO fire the "Copied to clipboard" toast.
+    /// Finished. `shared` is whether a share link was made AND copied to the clipboard BY THE
+    /// CHILD, so the editor knows whether to ALSO fire the "Copied to clipboard" toast.
+    ///
+    /// DRAGON-553 narrowed that to "by the child" and it is load-bearing. On a session whose
+    /// copies must go through a FOCUSED WINDOW ([`crate::share::CopyRoute::ThisWindow`]) the
+    /// child cannot hold a selection at all, so it writes `shared: false` with the `url` still
+    /// attached and the editor does the copy through its own window. `false` therefore means
+    /// "not copied yet", never "no link".
     ///
     /// `file_id` is the provider's own id for the file that landed (DRAGON-507), so the
     /// EDITOR can undo the upload during the meter's finish-hold: by then the child has
@@ -165,10 +171,12 @@ pub enum UploadState {
     /// The privacy rule in CLAUDE.md covers it: this module logs what happened, never what
     /// was uploaded.
     ///
-    /// `url` is the SHARE LINK the child made and put on the clipboard, when it made one
-    /// (DRAGON-520), so the editor's meter can offer to copy it AGAIN after the user has
-    /// copied something else. `None` whenever `shared` is false, and `None` for a done state
-    /// written by a build before DRAGON-520; a reader treats both as "no copy control".
+    /// `url` is the SHARE LINK the child made, when it made one (DRAGON-520), so the editor's
+    /// meter can offer to copy it AGAIN after the user has copied something else — and, since
+    /// DRAGON-553, so the editor can make the FIRST copy on the window route. It is `None`
+    /// when no link was made, and `None` for a done state written by a build before
+    /// DRAGON-520; a reader treats both as "no copy control". It is deliberately INDEPENDENT
+    /// of `shared`: the wire format carries the two separately and always has.
     ///
     /// **Never logged either, and for a stronger reason than the file id.** A share link
     /// opens the capture for anyone holding it. It is written to one file in the session

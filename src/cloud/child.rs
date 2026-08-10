@@ -270,7 +270,9 @@ pub fn run_cloud_upload(
 
     // The share link. Best-effort from here down: the file has landed, so nothing below can
     // turn this into a failed upload.
-    let link = if share_link_wanted(auto_share, caps) {
+    // `copied_here` is whether THIS process put the link on the clipboard. It is not the same
+    // question as "is there a link" (DRAGON-553): see the `CopyRoute::ThisWindow` arm below.
+    let (link, copied_here) = if share_link_wanted(auto_share, caps) {
         match super::providers::create_share_link(&acct, &file.id) {
             // The link is CHECKED before it is used (DRAGON-482). It is provider output, and
             // its two consumers are the clipboard and the banner's click target, which on
@@ -279,11 +281,34 @@ pub fn run_cloud_upload(
             // asks whether it belongs to THIS account's provider, not merely whether it is a
             // host the app talks to.
             Ok(url) if super::web_url_allowed(&acct.provider, &url) => {
-                // The clipboard write is a detached worker on Linux and inline elsewhere, so
-                // it is fire-and-forget by construction. That is exactly why the banner says
-                // the link is READY rather than claiming it is on the clipboard.
-                crate::share::copy_text(&url);
-                Some(url)
+                // ONE decision decides how a copy happens anywhere in this app
+                // (`share::copy_route`), and this process is the one place it can answer "not
+                // by you" (DRAGON-553). We are DETACHED and own no window, so on the
+                // `ThisWindow` route we cannot serve a selection at all — `FLATPAK_LAB.md`'s
+                // "Ruled out" section settles why no background process ever can: the blocker
+                // is FOCUS, not process lifetime. Calling `copy_text` here would be exactly
+                // the silent no-op the owner reported, dressed up as a success by the
+                // `shared` flag below.
+                //
+                // So hand the link on and let the EDITOR copy it through its own focused
+                // window (`App::copy_upload_link_on_finish`). Where the route IS standalone
+                // nothing changes: the detached worker takes the selection and OUTLIVES the
+                // editor, which is the better behaviour and why it stays preferred.
+                let standalone =
+                    crate::share::copy_route() == crate::share::CopyRoute::Standalone;
+                if standalone {
+                    // The clipboard write is a detached worker on Linux and inline elsewhere,
+                    // so it is fire-and-forget by construction. That is exactly why the banner
+                    // says the link is READY rather than claiming it is on the clipboard.
+                    crate::share::copy_text(&url);
+                } else {
+                    log::debug!(
+                        "cloud upload: this session serves the clipboard from a focused \
+                         window, which a detached child has none of; the share link goes to \
+                         the editor to copy instead"
+                    );
+                }
+                (Some(url), standalone)
             }
             Ok(_) => {
                 // Behaviour, not content: the rejected URL is never logged.
@@ -292,7 +317,7 @@ pub fn run_cloud_upload(
                      {} does not use; it was not offered",
                     acct.provider
                 );
-                None
+                (None, false)
             }
             Err(e) => {
                 // Redacted for the same reason as the upload's own failure above. There is
@@ -301,15 +326,19 @@ pub fn run_cloud_upload(
                     "cloud upload: no share link for account {account_id}: {}",
                     crate::diag::redact_oauth(&e)
                 );
-                None
+                (None, false)
             }
         }
     } else {
-        None
+        (None, false)
     };
     // Terminal state for whoever is watching (DRAGON-490): `shared` is whether the link
-    // above was BOTH made and handed to the clipboard, so the editor knows whether to fire
-    // its own "Copied to clipboard" toast alongside "Uploaded".
+    // above was BOTH made and handed to the clipboard BY THIS PROCESS, so the editor knows
+    // whether to fire its own "Copied to clipboard" toast alongside "Uploaded".
+    // DRAGON-553 made that "by this process" explicit rather than assumed: `link.is_some()`
+    // used to stand in for it, which claimed a copy on every session whose clipboard we
+    // cannot write to at all. A `false` here with a `url` attached is the editor's cue to do
+    // the copy itself, and it is the only reason the two are now separate values.
     // DRAGON-507: the file's own id rides along, so the EDITOR can undo this upload
     // during the meter's finish-hold. The child is about to exit; without the id the
     // editor would know a file landed but not which one to take back.
@@ -320,7 +349,7 @@ pub fn run_cloud_upload(
     session::write_state(
         session_id,
         &session::UploadState::Done {
-            shared: link.is_some(),
+            shared: copied_here,
             file_id: Some(file.id.clone()),
             url: link.clone(),
         },

@@ -12,7 +12,7 @@
 //! International keyboards: matching is on the logical key for now; the physical-key
 //! fallback for non-Latin layouts (as libcosmic's `KeyBind` does) is a future add.
 
-use cosmic::iced::keyboard::{key::Named, Key, Modifiers};
+use cosmic::iced::keyboard::{key::Named, Key, Location, Modifiers};
 use serde::{Deserialize, Serialize};
 
 /// Which surface an action belongs to. Actions in different contexts may share a
@@ -20,12 +20,16 @@ use serde::{Deserialize, Serialize};
 /// context is ever active at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Context {
-    /// The capture overlay (region/window/monitor select, OCR, settings search).
-    Overlay,
     // DRAGON-451: a `Region` context lived here — a drawn region selection, its own lane so
-    // primary+C could mean "copy the drawn region" there and "copy recognized text" in
-    // [`Self::Overlay`] without the two fighting. Its sole action (`RegionCopy`) is retired,
+    // primary+C could mean "copy the drawn region" there and "copy recognized text" in the
+    // capture overlay without the two fighting. Its sole action (`RegionCopy`) is retired,
     // so the context went with it and primary+C in the overlay is the OCR copy outright.
+    //
+    // DRAGON-627: an `Overlay` context lived here too, the capture overlay, holding exactly
+    // the three OCR text actions (`CopyText`, `SelectAllText`, `DeselectText`). All three are
+    // BAKED now ([`fixed_scanner_action`]), so the context has no members left and went the
+    // same way `Region` did. The capture overlay still answers keys; it answers them from the
+    // fixed matchers in `app::keyboard` rather than from a keymap lane.
     /// The post-capture preview overlay.
     Preview,
     /// An in-progress recording (stop / toggle mic / toggle system audio).
@@ -35,36 +39,34 @@ pub enum Context {
 /// A user action that can be triggered by a keyboard shortcut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Action {
-    /// Copy the selected recognized text (default Ctrl+C).
-    CopyText,
-    /// Select all recognized text in the region (default Ctrl+A).
-    SelectAllText,
-    /// Clear the RECOGNIZED-text selection in the scanner overlay (default Ctrl+D).
-    ///
-    /// DESELECT IS `Ctrl+D` IN EVERY CONTEXT (DRAGON-369) — the rule, not a coincidence:
-    /// select-all was already one key everywhere ([`Self::SelectAllText`] /
-    /// [`Self::PreviewSelectAll`], both Ctrl+A), resolved by what is on screen, and deselect
-    /// simply was not following it. `Ctrl+D` is also Photoshop's Deselect. A future action that
-    /// DESELECTS something must join this key in its own context; [`Keymap::set`] de-duplicates
-    /// only WITHIN a context, so that is a no-conflict addition by construction.
-    DeselectText,
-    /// Preview: save the capture, choosing where (default Ctrl+S). DRAGON-467 folded the
-    /// separate `PreviewSaveAs` (Ctrl+Shift+S) into this one: Save opens the destination
-    /// picker pre-filled with what a plain overwrite-save would have written, so the two
-    /// actions had become the same action. An override stored against the retired name
-    /// deserializes to `None` and is dropped (see `state::schema`'s `shortcut_overrides`).
-    PreviewSave,
+    // DRAGON-627: `CopyText` (primary+C), `SelectAllText` (primary+A) and `DeselectText`
+    // (primary+D) lived here, the scanner overlay's three OCR text actions and the only
+    // members of the retired `Context::Overlay`. All three are BAKED now: fixed bindings, off
+    // the Keyboard Shortcuts page, no longer remappable and no longer persisted. See
+    // [`fixed_scanner_action`] for the chords and the whole of why. Their DEFAULTS are
+    // unchanged, so nothing a user pressed before presses differently now.
+    //
+    // An override stored against any of the three deserializes to `None` and is dropped
+    // (see `state::schema`'s `shortcut_overrides`), so a user who had customised OTHER
+    // bindings keeps every one of them.
+    //
+    // DESELECT IS `Ctrl+D` IN EVERY CONTEXT (DRAGON-369) survives the removal as a rule, and
+    // is worth keeping written down: select-all is one key everywhere and deselect follows
+    // it, which is why [`Self::PreviewDeselectAll`] is `Ctrl+D` and the baked scanner
+    // deselect is too. `Ctrl+D` is also Photoshop's Deselect. A future action that DESELECTS
+    // something takes this key in its own context.
+    // DRAGON-617: `PreviewSave` (primary+S), `PreviewUpload` (primary+U), `PreviewCancel`
+    // (Escape), `PreviewUndo` (primary+Z) and `PreviewRedo` (primary+Shift+Z) lived here.
+    // All five are BAKED now: fixed bindings, off the Keyboard Shortcuts page, no longer
+    // remappable and no longer persisted. See [`fixed_editor_action`] for the chords and
+    // the whole of why. Their DEFAULTS are unchanged, so nothing a user pressed before
+    // presses differently now.
+    //
+    // An override stored against any of the five deserializes to `None` and is dropped
+    // (see `state::schema`'s `shortcut_overrides`), so a user who had customised OTHER
+    // bindings keeps every one of them.
     /// Preview: copy the capture to the clipboard (default Ctrl+C).
     PreviewCopy,
-    /// Preview: open the Upload flyout, which picks a connected cloud account and starts an
-    /// upload (default Ctrl+U). DRAGON-482.
-    ///
-    /// `U` for Upload, and it is free in this context: the preview's other `primary+`
-    /// bindings are S, C, Z, Shift+Z, A and D. It opens the FLYOUT rather than uploading
-    /// straight away, because an upload picks a destination account and is not undoable.
-    PreviewUpload,
-    /// Preview: close without deleting (default Esc).
-    PreviewCancel,
     // DRAGON-467: `PreviewDelete` (Ctrl+Shift+X, "delete the file and close") lived here,
     // with a long note on why that awkward chord was chosen for an irreversible unlink. The
     // editor does not delete anything any more, so the action went with the button. The
@@ -76,10 +78,6 @@ pub enum Action {
     // dropped (see `state::schema`'s `shortcut_overrides`).
     /// Preview: open/close the covermark picker (default W).
     PreviewCovermark,
-    /// Preview: undo the last edit (default Ctrl+Z).
-    PreviewUndo,
-    /// Preview: redo the last undone edit (default Ctrl+Shift+Z).
-    PreviewRedo,
     /// Preview: play/pause a recording inline (default P).
     PreviewPlay,
     /// Preview: step to the previous frame (default ,).
@@ -95,8 +93,9 @@ pub enum Action {
     /// DRAGON-341.
     PreviewSelectAll,
     /// Preview: clear the annotation selection (default Ctrl+D) — DRAGON-369. The matched pair
-    /// to [`Self::PreviewSelectAll`], and Photoshop's Deselect; see [`Self::DeselectText`] for
-    /// the everywhere-we-deselect rule.
+    /// to [`Self::PreviewSelectAll`], and Photoshop's Deselect; the tombstone at the head of
+    /// this enum carries the everywhere-we-deselect rule, and
+    /// [`FixedScannerAction::Deselect`] is the other key that follows it.
     PreviewDeselectAll,
     /// Preview: the Arrow annotation tool (default A). SOLO on purpose — the highest-frequency
     /// tool in a screenshot annotator must never cost two presses (DRAGON-369).
@@ -172,11 +171,11 @@ pub enum Action {
     /// load (`serde(alias)`) so a user who rebound the pan key keeps their binding.
     #[serde(alias = "PreviewTogglePan")]
     PreviewAnnotHand,
-    /// Recording: stop + save the in-progress recording (default Enter).
+    /// Recording: stop + save the in-progress recording (default Shift+Alt+Enter).
     RecordStop,
-    /// Recording: toggle the microphone channel (default M).
+    /// Recording: toggle the microphone channel (default Shift+Alt+M).
     RecordToggleMic,
-    /// Recording: toggle the system-audio channel (default S).
+    /// Recording: toggle the system-audio channel (default Shift+Alt+S).
     RecordToggleSystemAudio,
 }
 
@@ -209,20 +208,17 @@ impl Action {
     /// [`Keymap::apply_overrides`] — which does not de-duplicate against changed defaults —
     /// a no-op for anyone who had rebound a tool, and it gives the third member of a slot a
     /// first-class escape hatch. Keep the ordering when adding tools.
-    pub const ALL: [Action; 39] = [
-        Action::SelectAllText,
-        Action::DeselectText,
-        Action::CopyText,
-        Action::PreviewSave,
+    pub const ALL: [Action; 31] = [
+        // DRAGON-617 took Save and Upload out from either side of Copy, and Close, Undo and
+        // Redo from after it. The "Action Shortcuts" group is down to these two, and they are
+        // still CONTIGUOUS, which is what `group()` requires of every group in this list.
+        //
+        // DRAGON-627 took the three OCR text actions from the head of this list, and with them
+        // the whole "OCR Text Recognition" group. Nothing maps to the settings page's Capture
+        // tab any more, which is exactly how that tab stops being shown: see
+        // `app::settings::ShortcutsTab::occupied`.
         Action::PreviewCopy,
-        // Straight after Copy, matching the editor's own toolbar order (Save, Copy, Share,
-        // Upload) and keeping the "Action Shortcuts" group contiguous, which `group()`
-        // requires.
-        Action::PreviewUpload,
-        Action::PreviewCancel,
         Action::PreviewCovermark,
-        Action::PreviewUndo,
-        Action::PreviewRedo,
         Action::PreviewAnnotPointer,
         // The HAND (DRAGON-392) rides with the pointer: both are selection-family tools that
         // draw nothing, and like every per-tool action it is listed BEFORE the slot cycles.
@@ -261,19 +257,11 @@ impl Action {
     /// Short title for the settings row.
     pub fn label(self) -> &'static str {
         match self {
-            Action::CopyText => "Copy selected text",
-            Action::SelectAllText => "Select all text",
-            Action::DeselectText => "Deselect all text",
-            Action::PreviewSave => "Save",
             Action::PreviewCopy => "Copy to clipboard",
-            Action::PreviewUpload => "Upload",
             Action::PreviewPlay => "Play",
             Action::PreviewFramePrev => "Previous frame",
             Action::PreviewFrameNext => "Next frame",
-            Action::PreviewCancel => "Close",
             Action::PreviewCovermark => "Covermark",
-            Action::PreviewUndo => "Undo",
-            Action::PreviewRedo => "Redo",
             Action::PreviewDeleteSegment => "Delete segment",
             Action::PreviewAnnotPointer => "Select tool",
             Action::PreviewSelectAll => "Select all annotations",
@@ -306,18 +294,9 @@ impl Action {
     /// Helper line for the settings row.
     pub fn description(self) -> &'static str {
         match self {
-            // OCR group: descriptions removed per DRAGON-158.
-            Action::CopyText => "",
-            Action::SelectAllText => "",
-            Action::DeselectText => "",
             // Action Shortcuts group: descriptions removed per DRAGON-158.
-            Action::PreviewSave => "",
             Action::PreviewCopy => "",
-            Action::PreviewUpload => "Upload to a connected cloud account.",
-            Action::PreviewCancel => "",
             Action::PreviewCovermark => "",
-            Action::PreviewUndo => "",
-            Action::PreviewRedo => "",
             Action::PreviewPlay => "Play or pause a recording in the preview.",
             Action::PreviewFramePrev => "Step to the previous frame.",
             Action::PreviewFrameNext => "Step to the next frame.",
@@ -366,18 +345,13 @@ impl Action {
 
     /// The settings-page group this action is shown under (actions of the same group
     /// are contiguous in [`Action::ALL`], so the page can build one section per group).
+    ///
+    /// DRAGON-627 retired the one group that was NOT the preview editor's or the recording
+    /// session's, "OCR Text Recognition", when its three actions were baked. No group here
+    /// maps to `ShortcutsTab::Capture` any more, and that is what takes the tab off the strip.
     pub fn group(self) -> &'static str {
         match self {
-            Action::CopyText | Action::SelectAllText | Action::DeselectText => {
-                "OCR Text Recognition"
-            }
-            Action::PreviewSave
-            | Action::PreviewCopy
-            | Action::PreviewUpload
-            | Action::PreviewCancel
-            | Action::PreviewCovermark
-            | Action::PreviewUndo
-            | Action::PreviewRedo => "Action Shortcuts",
+            Action::PreviewCopy | Action::PreviewCovermark => "Action Shortcuts",
             Action::PreviewPlay
             | Action::PreviewFramePrev
             | Action::PreviewFrameNext
@@ -413,19 +387,11 @@ impl Action {
     /// Which surface this action belongs to.
     pub fn context(self) -> Context {
         match self {
-            Action::CopyText
-            | Action::SelectAllText
-            | Action::DeselectText => Context::Overlay,
-            Action::PreviewSave
-            | Action::PreviewCopy
-            | Action::PreviewUpload
+            Action::PreviewCopy
             | Action::PreviewPlay
             | Action::PreviewFramePrev
             | Action::PreviewFrameNext
-            | Action::PreviewCancel
             | Action::PreviewCovermark
-            | Action::PreviewUndo
-            | Action::PreviewRedo
             | Action::PreviewDeleteSegment
             | Action::PreviewAnnotPointer
             | Action::PreviewSelectAll
@@ -465,19 +431,11 @@ impl Action {
     /// DRAGON-384, retiring its former solo `S` default.
     pub fn default_shortcut(self) -> Option<Shortcut> {
         Some(match self {
-            Action::CopyText => Shortcut::primary_char('c'),
-            Action::SelectAllText => Shortcut::primary_char('a'),
-            Action::DeselectText => Shortcut::primary_char('d'),
-            Action::PreviewSave => Shortcut::primary_char('s'),
             Action::PreviewCopy => Shortcut::primary_char('c'),
-            Action::PreviewUpload => Shortcut::primary_char('u'),
             Action::PreviewPlay => Shortcut::char('p'),
             Action::PreviewFramePrev => Shortcut::char(','),
             Action::PreviewFrameNext => Shortcut::char('.'),
-            Action::PreviewCancel => Shortcut::named(NamedKey::Escape),
             Action::PreviewCovermark => Shortcut::char('w'),
-            Action::PreviewUndo => Shortcut::primary_char('z'),
-            Action::PreviewRedo => Shortcut::primary_shift_char('z'),
             Action::PreviewDeleteSegment => Shortcut::named(NamedKey::Delete),
             Action::PreviewAnnotPointer => Shortcut::char('v'),
             Action::PreviewSelectAll => Shortcut::primary_char('a'),
@@ -505,9 +463,12 @@ impl Action {
             // DRAGON-392: H arms the HAND TOOL (it toggled a pan MODE before) — same key, and
             // still Photoshop's Hand.
             Action::PreviewAnnotHand => Shortcut::char('h'),
-            Action::RecordStop => Shortcut::named(NamedKey::Enter),
-            Action::RecordToggleMic => Shortcut::char('m'),
-            Action::RecordToggleSystemAudio => Shortcut::char('s'),
+            // The recording lane rides Shift+Alt (DRAGON-581, owner's call): see
+            // `Shortcut::shift_alt` for why these three are the app's only chorded
+            // defaults, and what the bare keys cost.
+            Action::RecordStop => Shortcut::shift_alt_named(NamedKey::Enter),
+            Action::RecordToggleMic => Shortcut::shift_alt_char('m'),
+            Action::RecordToggleSystemAudio => Shortcut::shift_alt_char('s'),
         })
     }
 }
@@ -919,6 +880,30 @@ impl Shortcut {
         }
     }
 
+    /// A Shift+Alt default, the RECORDING lane's modifier pair (DRAGON-581).
+    ///
+    /// The three recording actions used to be bare keys (M, S, Enter), which made them
+    /// the only bindings in the app that could collide with ordinary typing, and cost
+    /// them their portal global shortcut: [`Self::xdg_trigger`] refuses an unmodified
+    /// letter or Enter, because a desktop would either reject it or let it shadow every
+    /// text field. Shift+Alt is the same shape on every platform (no Cmd-vs-Ctrl split,
+    /// so unlike [`Self::primary_char`] there is nothing to branch on), and it clears
+    /// that bar, so hold-to-talk and stop now register focus-free where the desktop ships
+    /// the GlobalShortcuts interface.
+    fn shift_alt(key: ShortcutKey) -> Self {
+        Shortcut { ctrl: false, alt: true, shift: true, logo: false, key }
+    }
+
+    /// [`Self::shift_alt`] on a character key.
+    fn shift_alt_char(c: char) -> Self {
+        Self::shift_alt(ShortcutKey::Char(c.to_ascii_lowercase().to_string()))
+    }
+
+    /// [`Self::shift_alt`] on a named key.
+    fn shift_alt_named(k: NamedKey) -> Self {
+        Self::shift_alt(ShortcutKey::Named(k))
+    }
+
     /// Whether a keypress (modifiers + logical key) triggers this shortcut. Modifiers
     /// must match exactly, so Ctrl+A and Ctrl+Shift+A are distinct.
     pub fn matches(&self, modifiers: Modifiers, key: &Key) -> bool {
@@ -1117,7 +1102,13 @@ impl Shortcut {
 /// dead there rather than hiding behind a blanket allow.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn is_character_palette_chord(modifiers: Modifiers, key: &Key) -> bool {
-    if !(modifiers.control() && modifiers.logo() && !modifiers.alt() && !modifiers.shift()) {
+    // The chord is NAMED rather than tested inline so the rule reads forwards, as the doc
+    // states it: Control + Command and nothing else. Spelled inline it is a negated
+    // conjunction, which clippy's `nonminimal_bool` rewrites into four scattered negatives
+    // that no longer look like a chord at all.
+    let ctrl_cmd_only =
+        modifiers.control() && modifiers.logo() && !modifiers.alt() && !modifiers.shift();
+    if !ctrl_cmd_only {
         return false;
     }
     matches!(key, Key::Character(c) if c.as_str() == " " || c.as_str() == "\0")
@@ -1133,9 +1124,10 @@ pub fn is_character_palette_chord(modifiers: Modifiers, key: &Key) -> bool {
 ///
 /// * it is the operating system's own copy convention, not an app preference. A user who rebound
 ///   it would be rebinding "copy" itself, which no other app on their desktop lets them do here.
-/// * `Ctrl+C` ALREADY has a second, different meaning in this overlay: in SCANNER kind it is
-///   [`Action::CopyText`], which copies recognized text. Two configurable bindings on one chord
-///   is a conflict the settings page would have to explain and the user would have to resolve.
+/// * `Ctrl+C` ALREADY has a second, different meaning in this overlay: in SCANNER kind it
+///   copies recognized text ([`FixedScannerAction::Copy`], a configurable `Action::CopyText`
+///   until DRAGON-627 baked it too). Two configurable bindings on one chord is a conflict the
+///   settings page would have to explain and the user would have to resolve.
 ///   Fixed, the precedence is a single readable rule in `keyboard.rs` (`region_copy_fires`):
 ///   scanner kind never fires this, so the OCR copy keeps the chord there untouched.
 ///
@@ -1148,6 +1140,484 @@ pub fn is_region_copy_chord(modifiers: Modifiers, key: &Key) -> bool {
     // for and the chord the tooltip advertises cannot drift. `matches` compares all four
     // modifier flags exactly, so a stray Shift or Alt does NOT fire it.
     Shortcut::primary_char('c').matches(modifiers, key)
+}
+
+/// A one-step movement on screen (DRAGON-599). The ONE thing an arrow key and its vim letter
+/// both reduce to, so nothing downstream ever sees which key was pressed.
+///
+/// That is the whole reason it exists as a type rather than as a `(dx, dy)` pair produced at
+/// two call sites: the owner asked for arrows AND `hjkl`, and two families of keys feeding two
+/// handlers is two chances to disagree about what "left" does. Here they converge at the edge
+/// of key dispatch ([`nudge_direction`]), and every consumer — the drawn region, the colour
+/// picker's sample point — takes this and only this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl Direction {
+    /// The movement as a `(dx, dy)` step of ONE unit, in screen orientation: x grows right,
+    /// y grows DOWN, which is what every coordinate space in this app uses (compositor
+    /// logical coordinates, surface points, image pixels alike). So `Up` is `-1` on y.
+    ///
+    /// The unit is the caller's: one logical pixel for a drawn region, one source pixel for
+    /// the colour picker's sample. Pure.
+    pub fn delta(self) -> (i32, i32) {
+        match self {
+            Direction::Left => (-1, 0),
+            Direction::Right => (1, 0),
+            Direction::Up => (0, -1),
+            Direction::Down => (0, 1),
+        }
+    }
+}
+
+/// **Pure**, unit-tested: the FIXED directional-movement keys (DRAGON-599) — the four arrows
+/// and the four vim letters `h` `j` `k` `l`, as one [`Direction`].
+///
+/// **Deliberately NOT [`Keymap`] entries**, for the reason [`is_region_copy_chord`] spells out
+/// and with the same shape of argument. Directional movement is not an app preference: the
+/// arrows are the operating system's own convention for "move this by one", `hjkl` are the
+/// convention of every vim user's fingers, and a settings page offering to rebind "move left"
+/// would be offering to break the only thing those keys mean. Eight bindings that must stay in
+/// lockstep would also be eight rows to explain and eight ways to half-rebind the feature.
+///
+/// **No modifiers, exactly.** [`Modifiers::empty`] and nothing else, so `Ctrl+H`, `Alt+Left`
+/// and `Shift+K` all fall through untouched. That leaves a modified arrow free for a future
+/// bigger step, and it stops this from shadowing any chord a user has bound.
+///
+/// The letters are safe in the two surfaces that consult this, and that is checked rather than
+/// assumed. The capture overlay answers exactly three chords of its own and all three are
+/// primary chords ([`fixed_scanner_action`]: `Ctrl+C` / `Ctrl+A` / `Ctrl+D`, keymap entries in
+/// a `Context::Overlay` lane until DRAGON-627 baked them); `Context::Recording`'s three are
+/// all `Shift+Alt` chords.
+/// The bare annotation letters — `H` hand, `L` stroke cycle, `V`, `T`, `B` and the rest — are
+/// all `Context::Preview`, and a preview owns the keyboard through its own modal lane in
+/// `app::keyboard`, which returns long before this is reached. No widget on either overlay
+/// consumes a key PRESS at all (they read `ModifiersChanged` and nothing else), including the
+/// scanner's, whose text selection is entirely mouse-driven.
+pub fn nudge_direction(modifiers: Modifiers, key: &Key) -> Option<Direction> {
+    if modifiers != Modifiers::empty() {
+        return None;
+    }
+    match key {
+        Key::Named(Named::ArrowLeft) => Some(Direction::Left),
+        Key::Named(Named::ArrowRight) => Some(Direction::Right),
+        Key::Named(Named::ArrowUp) => Some(Direction::Up),
+        Key::Named(Named::ArrowDown) => Some(Direction::Down),
+        // The vim directionals, and ONLY those four (the owner's limit): no counts, no `gg`,
+        // no word motions. Case-insensitively, so a Caps Lock session still moves — Caps Lock
+        // is not one of the four modifier flags, so the guard above lets `H` through.
+        Key::Character(c) if c.eq_ignore_ascii_case("h") => Some(Direction::Left),
+        Key::Character(c) if c.eq_ignore_ascii_case("l") => Some(Direction::Right),
+        Key::Character(c) if c.eq_ignore_ascii_case("k") => Some(Direction::Up),
+        Key::Character(c) if c.eq_ignore_ascii_case("j") => Some(Direction::Down),
+        _ => None,
+    }
+}
+
+/// How long a directional key must be HELD before it starts repeating (DRAGON-601).
+///
+/// **This is OUR delay, not the desktop's**, and owning it is the point. The compositor
+/// announces a repeat cadence to every client at bind time, and on the owner's session that is
+/// `wl_keyboard.repeat_info(rate = 25, delay = 600)`, cosmic-comp's built-in default. Those
+/// numbers are tuned for TEXT ENTRY, where a repeat means "keep deleting" and 600ms of lead-in
+/// is generous. Pixel nudging is a different job with a different tolerance: the owner asked
+/// for "1px per tap, but hold to move should be available too", and a tap that costs two pixels
+/// because it ran slightly long fails the first half of that sentence.
+///
+/// So the cadence is ours on every machine, and that is what makes the behaviour predictable:
+/// a desktop configured with a 150ms text delay would otherwise turn a deliberate tap into
+/// three pixels, and the same build would nudge differently on two machines for reasons the
+/// user never connected to their keyboard settings.
+///
+/// 400ms is comfortably longer than any deliberate tap (a quick press is 80 to 150ms) and short
+/// enough that "hold it down" feels like it starts moving promptly rather than sticking.
+pub const NUDGE_HOLD_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// The fastest a HELD directional key may step, once [`NUDGE_HOLD_DELAY`] has passed.
+///
+/// **A ceiling, not a metronome.** We cannot invent repeats the compositor never sent, so this
+/// can only ever discard repeats that arrive too close together, never manufacture extra ones.
+/// On a session repeating at 25/s (40ms apart) nothing is discarded and the hold runs at the
+/// desktop's own rate. On one configured to fire at 100/s it is capped here, so a hold crosses
+/// the screen at a speed a human can still stop on.
+///
+/// Deliberately BELOW the common 25/s cadence so the ordinary case passes through untouched: a
+/// cap that bit on a normal desktop would make hold-to-move feel slower than the system
+/// everywhere, to defend against a configuration almost nobody has.
+pub const NUDGE_REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(30);
+
+const _: () = assert!(
+    NUDGE_HOLD_DELAY.as_millis() >= NUDGE_REPEAT_INTERVAL.as_millis() * 5,
+    "DRAGON-601: the hold delay must stay several repeat intervals long, or the first repeat \
+     lands so soon after the press that a tap and a hold are the same gesture, which is exactly \
+     the overshoot this pair was added to remove"
+);
+
+/// **Pure**, unit-tested: whether a directional key event should MOVE anything (DRAGON-601).
+///
+/// One decision, shared by both nudge consumers (the colour picker's sample and the drawn
+/// region), so the two can never disagree about what a tap costs.
+///
+/// * `is_repeat` is iced's own flag: `false` for a real key press, `true` for an auto-repeat
+///   the compositor synthesised. A PRESS always moves, exactly once, which is the whole of
+///   "1px per tap" and it holds no matter what cadence the desktop is configured with.
+/// * `held_for` is how long the key has been down. A repeat before [`NUDGE_HOLD_DELAY`] is
+///   discarded, so the desktop's text-entry delay cannot leak into pixel nudging.
+/// * `since_last_step` is how long since we last moved for this hold. A repeat closer than
+///   [`NUDGE_REPEAT_INTERVAL`] is discarded, which caps the speed of a hold.
+///
+/// Discarding is always a no-op, never a swallow of some other meaning: these keys mean
+/// "move" or they mean nothing at all on these surfaces.
+pub fn nudge_step_allowed(
+    is_repeat: bool,
+    held_for: std::time::Duration,
+    since_last_step: std::time::Duration,
+) -> bool {
+    if !is_repeat {
+        return true;
+    }
+    held_for >= NUDGE_HOLD_DELAY && since_last_step >= NUDGE_REPEAT_INTERVAL
+}
+
+/// **Pure**, unit-tested: whether this directional key event starts a FRESH hold (DRAGON-601).
+///
+/// A real press obviously does. So does a REPEAT that arrives with no hold on record, and that
+/// second case is the one worth naming: it is what a focus change mid-hold looks like, and what
+/// a repeat delivered to a surface that only just appeared looks like. Treating it as a fresh
+/// press measures our delay from an event we actually saw, instead of trusting an elapsed time
+/// derived from a press that was delivered somewhere else.
+///
+/// The alternative, ignoring an orphan repeat, would strand the user: the key is already down,
+/// so no further press is coming, and nudging would do nothing until they released and pressed
+/// again.
+pub fn nudge_rearms(has_hold: bool, is_repeat: bool) -> bool {
+    !is_repeat || !has_hold
+}
+
+/// **Pure**, unit-tested: the colour picker's magnifier-zoom keys (DRAGON-587) — the NUMPAD
+/// `+` and `-`, as a signed notch count, positive = zoom in.
+///
+/// **Deliberately NOT a [`Keymap`] entry**, for the reason [`is_region_copy_chord`] spells
+/// out: everything in the keymap is user-configurable by construction, and these are not app
+/// preferences, they are the universal zoom keys. Every viewer on the desktop uses `+` and
+/// `-` for this, and the picker overlay owns the keyboard for the few seconds it is up, so
+/// there is no other meaning to collide with and nothing for a settings page to explain.
+///
+/// It is keyed on the physical [`Location::Numpad`] group, which is the owner's request and
+/// also the safe reading: the main-row `+` is `Shift+=` on most layouts and would have to
+/// guess at the shift state, while the keypad keys are unambiguous. `KP_Add` / `KP_Subtract`
+/// reach us as `Key::Character("+"/"-")` with that location on both the winit and the Wayland
+/// layer-shell paths (`keysym_location`, DRAGON-364 plumbed the field through for the text
+/// editor's numpad Enter; this is its second consumer). Verified in libcosmic's own keymap:
+/// its `KP_Add => Named::Add` arm is commented out, so the keypad keys fall through to the
+/// character path, and its round-trip table pairs `('+', Numpad)` back to `KP_Add`.
+pub fn magnifier_zoom_step(key: &Key, location: Location) -> Option<i32> {
+    if location != Location::Numpad {
+        return None;
+    }
+    match key {
+        Key::Character(c) if c.as_str() == "+" => Some(1),
+        Key::Character(c) if c.as_str() == "-" => Some(-1),
+        _ => None,
+    }
+}
+
+/// **Pure**, unit-tested: the FIXED accept keys (DRAGON-612) — bare **Enter** and bare
+/// **Space**, the two keys that mean "take what is on screen" everywhere else on the desktop.
+///
+/// **Deliberately NOT [`Keymap`] entries**, and the argument is [`nudge_direction`]'s rather
+/// than a new one: accepting with Enter is an operating-system convention, not an app
+/// preference, and a settings page offering to rebind it would be offering to break the only
+/// thing that key means. The decisive term is that this COMPLETES the nudge. DRAGON-599 baked
+/// the eight directional keys, and a loop with a baked half and a configurable half is worse
+/// than either choice made whole. When the DRAGON-588 / DRAGON-589 fixed-shortcut tab lands,
+/// these belong in it, listed and non-remappable, beside [`is_region_copy_chord`].
+///
+/// It also sidesteps a question the keymap could not answer as it stands: [`Keymap`] holds
+/// exactly one [`Shortcut`] per [`Action`], and space has no [`NamedKey`] spelling at all
+/// (iced's `Named` carries no `Space` variant — space is a CHARACTER key), so a bindable Space
+/// would need a change to the persisted on-disk form before it could even be expressed.
+/// Reducing both keys to one meaning here is the same move [`Direction`] makes for eight.
+///
+/// **No modifiers, exactly.** [`Modifiers::empty`] and nothing else, so `Ctrl+Enter`,
+/// `Shift+Space` and the rest fall through untouched. That is also what keeps this clear of the
+/// one default that names Enter at all: [`Action::RecordStop`] is `Shift+Alt+Enter`, and
+/// [`Shortcut::matches`] compares all four modifier flags exactly, so the two cannot collide.
+/// Pinned by `accept_key_tests`.
+///
+/// **Both Enters accept**, main row and keypad alike, so this takes no [`Location`]. That is
+/// the opposite of the live text-annotation editor (DRAGON-364), where numpad Enter settles the
+/// edit and main Enter inserts a newline: there the two keys had to mean different things, and
+/// here there is only one thing to mean.
+pub fn is_accept_key(modifiers: Modifiers, key: &Key) -> bool {
+    if modifiers != Modifiers::empty() {
+        return false;
+    }
+    match key {
+        Key::Named(Named::Enter) => true,
+        // Space is a CHARACTER key in iced's UI-Events model, not a `Named` one, so it is
+        // matched on the character. Unlike [`is_character_palette_chord`]'s pair of spellings,
+        // only the plain `" "` can reach here: the ASCII NUL twin is what a CONTROL-modified
+        // space produces, and the guard above has already refused every modifier.
+        Key::Character(c) => c.as_str() == " ",
+        _ => false,
+    }
+}
+
+/// The five BAKED editor actions (DRAGON-617): Save, Upload, Close, Undo and Redo.
+///
+/// They were ordinary [`Action`]s with ordinary [`Keymap`] entries until DRAGON-617 took them
+/// out. See [`fixed_editor_action`] for why, and for the chords.
+///
+/// An enum rather than five predicates for the reason [`Direction`] is one: five bindings
+/// that must stay in lockstep are five chances to half-change the feature, and every consumer
+/// (the two dispatch sites, the five tooltips, the rebind refusal) wants the same vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixedEditorAction {
+    /// Save the capture, choosing where. Opens the destination picker pre-filled with what a
+    /// plain overwrite-save would have written (DRAGON-467 folded "Save As" into it).
+    Save,
+    /// Open the Upload FLYOUT, which picks a connected cloud account (DRAGON-482). The key
+    /// opens the flyout rather than starting an upload: an upload picks a destination and
+    /// cannot be undone, so a keystroke must not commit one.
+    Upload,
+    /// Close without deleting. On a preview this is the document's own close-or-confirm
+    /// decision; on the capture overlay it dismisses the overlay.
+    Close,
+    /// Undo the last edit.
+    Undo,
+    /// Redo the last undone edit.
+    Redo,
+}
+
+impl FixedEditorAction {
+    /// Every baked action, in the order [`Self::index`] numbers them.
+    pub const ALL: [FixedEditorAction; 5] = [
+        FixedEditorAction::Save,
+        FixedEditorAction::Upload,
+        FixedEditorAction::Close,
+        FixedEditorAction::Undo,
+        FixedEditorAction::Redo,
+    ];
+
+    /// This action's position in [`Self::ALL`], for the memoized label table. Pinned by
+    /// `fixed_editor_chord_tests` so the two can never drift.
+    const fn index(self) -> usize {
+        match self {
+            FixedEditorAction::Save => 0,
+            FixedEditorAction::Upload => 1,
+            FixedEditorAction::Close => 2,
+            FixedEditorAction::Undo => 3,
+            FixedEditorAction::Redo => 4,
+        }
+    }
+
+    /// The chord, as a [`Shortcut`]. Built from the SAME constructors the retired
+    /// [`Action::default_shortcut`] arms used, so every one of these five is byte-identical
+    /// to the binding it shipped with and nothing a user pressed before presses differently.
+    fn chord(self) -> Shortcut {
+        match self {
+            FixedEditorAction::Save => Shortcut::primary_char('s'),
+            FixedEditorAction::Upload => Shortcut::primary_char('u'),
+            FixedEditorAction::Close => Shortcut::named(NamedKey::Escape),
+            FixedEditorAction::Undo => Shortcut::primary_char('z'),
+            FixedEditorAction::Redo => Shortcut::primary_shift_char('z'),
+        }
+    }
+
+    /// A SECOND conventional spelling, where the desktop really has two.
+    ///
+    /// Only Redo has one, and only off macOS: `Ctrl+Y` is the redo convention on Windows
+    /// (Office, Explorer) and is common on Linux (LibreOffice), beside the `Ctrl+Shift+Z`
+    /// that GTK and Photoshop use. **Not `⌘Y` on macOS**, and that is the deliberate
+    /// per-platform difference: ⌘Y is not redo there (Finder gives it Quick Look, Mail its
+    /// own meaning), so adding it would be inventing a chord rather than honouring a
+    /// convention, and honouring conventions is the entire premise of baking these five.
+    ///
+    /// This is what [`Keymap`] could not express, and the reason DRAGON-612's two accept keys
+    /// became a matcher function too: the map holds exactly ONE [`Shortcut`] per [`Action`],
+    /// so a second form was never available to the configurable version of this action.
+    ///
+    /// `primary_char('y')` rather than a literal Ctrl+Y because the alternate exists only
+    /// where the primary modifier IS Ctrl, so the two spellings are the same thing said once.
+    fn alt_chord(self) -> Option<Shortcut> {
+        if !matches!(self, FixedEditorAction::Redo) {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            None
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Some(Shortcut::primary_char('y'))
+        }
+    }
+
+    /// The DISPLAY form, for the editor tooltips: `"Ctrl+S"` / `"⌘S"`, `"Esc"`, and so on.
+    ///
+    /// The PRIMARY spelling only. A tooltip advertising both of Redo's forms would be teaching
+    /// two keys for one button, where the job is to name the one to press.
+    ///
+    /// Rendered by [`Shortcut::label`], the ONE in-app chord formatter, from the same
+    /// [`Self::chord`] the matcher listens on, so the key the app answers and the key the
+    /// tooltip promises cannot drift. Memoized into `&'static str` for the reason
+    /// [`region_copy_chord_label`] is: these reach a per-frame view and must not allocate.
+    pub fn label(self) -> &'static str {
+        static LABELS: std::sync::OnceLock<[String; 5]> = std::sync::OnceLock::new();
+        LABELS.get_or_init(|| FixedEditorAction::ALL.map(|a| a.chord().label()))[self.index()]
+            .as_str()
+    }
+}
+
+/// **Pure**, unit-tested: the FIXED editor actions (DRAGON-617) — Save (primary+S), Upload
+/// (primary+U), Close (Escape), Undo (primary+Z) and Redo (primary+Shift+Z, plus `Ctrl+Y` off
+/// macOS).
+///
+/// **Deliberately NOT [`Keymap`] entries**, and the argument is [`is_region_copy_chord`]'s
+/// rather than a new one: everything in the keymap is user-configurable by construction, and
+/// these five are operating-system conventions, not app preferences. Nobody wants to rebind
+/// Ctrl+Z; they want it to BE Ctrl+Z. That is the same line DRAGON-612 drew for the accept
+/// keys and DRAGON-599 for the directional keys. When the DRAGON-588 / DRAGON-589
+/// fixed-shortcut tab lands, these belong in it, listed and non-remappable, beside
+/// [`is_region_copy_chord`] and [`is_accept_key`].
+///
+/// **Baked WINS over a user binding, so this is asked BEFORE the keymap lane.** That is the
+/// opposite of where [`is_accept_key`] and [`nudge_direction`] sit, and the difference is the
+/// same test the file already applies: is there a real collision to arbitrate? For those two
+/// there was none, so the safe order let a configured binding win. Here there is. These five
+/// chords were the DEFAULTS of the five actions this replaces, right up to this commit, so a
+/// persisted keymap on disk can still name any of them for some other action. A chord that is
+/// fixed has to be fixed.
+///
+/// The remaining exposure is small and closed at the other end: [`is_fixed_editor_chord`]
+/// makes the rebind capture REFUSE one of these chords, so no new collision can be created,
+/// and `no_remaining_default_collides_with_a_baked_chord` pins that a default install has
+/// none. What is left is a keymap customised before this build shipped, which loses one
+/// binding rather than silently doing the wrong thing.
+///
+/// **Escape is the one BARE key here**, and it is worth saying out loud because the other
+/// four are modifier chords and the hazard is not the same. Key presses reach dispatch with no
+/// `Status` filter, so a bare key can collide with typing. Escape does not, for two reasons:
+/// it is not a printable key, and every modal lane in `preview_modal_key` that wants Escape
+/// (the crop session, the live text edit, the unsaved-changes dialog, the colour wheel, the
+/// flyout, the annotation deselect) is asked BEFORE this is. Nothing about that ordering
+/// changed; this only replaces what the bottom of that function resolves to.
+///
+/// **No modifiers on Escape, exactly.** [`Shortcut::matches`] compares all four flags, so
+/// `Shift+Escape` and the rest fall through untouched, exactly as the retired
+/// `Action::PreviewCancel` binding did.
+pub fn fixed_editor_action(modifiers: Modifiers, key: &Key) -> Option<FixedEditorAction> {
+    FixedEditorAction::ALL.into_iter().find(|a| {
+        a.chord().matches(modifiers, key)
+            || a.alt_chord().is_some_and(|alt| alt.matches(modifiers, key))
+    })
+}
+
+/// **Pure**, unit-tested: is `shortcut` one of the baked chords (DRAGON-617)?
+///
+/// The rebind capture consults this and REFUSES a match, which is the other half of
+/// [`fixed_editor_action`]'s precedence. Without it a user could bind some other action to
+/// Ctrl+Z, watch the row accept it, and then find the key still undoing: the binding would be
+/// real, persisted and permanently dead, because the baked matcher answers first. Refusing at
+/// capture time says no once, out loud, instead of failing quietly forever.
+///
+/// It covers Redo's SECOND form as well as its first, so `Ctrl+Y` is refused off macOS and
+/// accepted on it, matching exactly what each platform actually answers.
+pub fn is_fixed_editor_chord(shortcut: &Shortcut) -> bool {
+    FixedEditorAction::ALL
+        .iter()
+        .any(|a| a.chord() == *shortcut || a.alt_chord().as_ref() == Some(shortcut))
+}
+
+/// The three BAKED scanner actions (DRAGON-627): Copy, Select all and Deselect, on the
+/// RECOGNIZED TEXT the scanner overlay has read off the screen.
+///
+/// They were ordinary [`Action`]s with ordinary [`Keymap`] entries, and the only members of a
+/// `Context::Overlay` lane, until DRAGON-627 took them out. See [`fixed_scanner_action`] for
+/// why, and for the chords.
+///
+/// An enum rather than three predicates for the reason [`FixedEditorAction`] is one: three
+/// bindings that must stay in lockstep are three chances to half-change the feature, and the
+/// one consumer wants one vocabulary to match on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixedScannerAction {
+    /// Copy the selected recognized text.
+    Copy,
+    /// Select every recognized text run in the region.
+    SelectAll,
+    /// Clear the recognized-text selection.
+    Deselect,
+}
+
+impl FixedScannerAction {
+    /// Every baked scanner action, in the order the overlay's own context menu lists them
+    /// (`app::overlay::menus`: Copy, Select all, Select none).
+    pub const ALL: [FixedScannerAction; 3] = [
+        FixedScannerAction::Copy,
+        FixedScannerAction::SelectAll,
+        FixedScannerAction::Deselect,
+    ];
+
+    /// The chord, as a [`Shortcut`]. Built from the SAME constructor the retired
+    /// [`Action::default_shortcut`] arms used, so every one of these three is byte-identical
+    /// to the binding it shipped with and nothing a user pressed before presses differently.
+    ///
+    /// Deselect is `primary+D` because [`Action::PreviewDeselectAll`] is (DRAGON-369's
+    /// deselect-is-one-key rule), and select-all is `primary+A` for the same reason.
+    fn chord(self) -> Shortcut {
+        match self {
+            FixedScannerAction::Copy => Shortcut::primary_char('c'),
+            FixedScannerAction::SelectAll => Shortcut::primary_char('a'),
+            FixedScannerAction::Deselect => Shortcut::primary_char('d'),
+        }
+    }
+}
+
+/// **Pure**, unit-tested: the FIXED scanner text actions (DRAGON-627). Copy (primary+C),
+/// Select all (primary+A) and Deselect (primary+D), on the text the scanner has recognized.
+///
+/// **Deliberately NOT [`Keymap`] entries**, and the argument is [`fixed_editor_action`]'s
+/// rather than a new one: everything in the keymap is user-configurable by construction, and
+/// these three are the operating system's own selection and copy conventions, not app
+/// preferences. Nobody wants to rebind Ctrl+C; they want it to BE Ctrl+C. That is the same
+/// line DRAGON-617 drew for save/upload/close/undo/redo, DRAGON-612 for the accept keys and
+/// DRAGON-599 for the directional keys. When the DRAGON-588 / DRAGON-589 fixed-shortcut tab
+/// lands, these belong in it, listed and non-remappable, beside [`is_region_copy_chord`],
+/// [`is_accept_key`] and the five above.
+///
+/// **A SEPARATE matcher from [`fixed_editor_action`], and folding the two together would be a
+/// bug, not a tidy-up.** That matcher is asked BEFORE the keymap on the preview's own modal
+/// lane, and these three chords are the LIVE defaults of three actions that are still
+/// configurable: [`Action::PreviewCopy`] is primary+C, [`Action::PreviewSelectAll`] primary+A
+/// and [`Action::PreviewDeselectAll`] primary+D. Merged, Ctrl+C in an open preview would copy
+/// recognized text instead of the picture. The two sets are kept apart by SURFACE, which is
+/// exactly what the retired `Context` split expressed, and it is why these chords are also
+/// absent from [`is_fixed_editor_chord`]: the rebind rows must go on accepting Ctrl+C for a
+/// preview action.
+///
+/// **Asked where the keymap lane it replaces was asked**, at the bottom of `handle_key`'s
+/// overlay run, so precedence is unchanged: the baked Close (Escape), then the region-copy
+/// chord (whose `region_copy_fires` already declines in scanner kind, leaving primary+C to
+/// this), then the fixed settings-search chord, then this.
+///
+/// **Every one of the three is a modifier CHORD, and no bare key is involved.** Key presses
+/// reach dispatch with no `Status` filter, so a bare key can collide with typing and needs
+/// the `press_on_overlay` delivery test the accept and directional lanes use. A primary chord
+/// is not typing, which is why the region-copy chord and the five baked editor chords do not
+/// consult it either, and why this does not.
+///
+/// **No stray modifiers.** [`Shortcut::matches`] compares all four flags, so `Ctrl+Shift+C`
+/// and the rest fall through untouched, exactly as the retired keymap bindings did.
+pub fn fixed_scanner_action(modifiers: Modifiers, key: &Key) -> Option<FixedScannerAction> {
+    FixedScannerAction::ALL
+        .into_iter()
+        .find(|a| a.chord().matches(modifiers, key))
 }
 
 /// [`is_region_copy_chord`]'s DISPLAY form, for the capture toolbar's tooltip: `"Ctrl+C"` on
@@ -1533,7 +2003,7 @@ mod tests {
 
     #[test]
     fn matches_is_modifier_exact_and_case_insensitive() {
-        let copy = def(Action::CopyText); // primary+C
+        let copy = def(Action::PreviewCopy); // primary+C
         assert!(copy.matches(PRIMARY, &ch("c")));
         assert!(copy.matches(PRIMARY, &ch("C"))); // case-insensitive
         assert!(!copy.matches(PRIMARY | Modifiers::SHIFT, &ch("c"))); // extra modifier
@@ -1541,22 +2011,38 @@ mod tests {
         assert!(!copy.matches(PRIMARY, &ch("x"))); // wrong key
     }
 
-    /// Select-all is primary+A and DESELECT IS primary+D — in EVERY context that has one
+    /// Select-all is primary+A and DESELECT IS primary+D, on EVERY surface that has one
     /// (DRAGON-369). One key, one meaning, resolved by what is on screen; the old
     /// primary+Shift+A deselect is retired and left UNBOUND rather than reassigned. This test
     /// is the stated invariant: a future deselect-shaped action must join it here.
+    ///
+    /// DRAGON-627 baked the scanner's pair, so half of this is now asserted through
+    /// [`fixed_scanner_action`] rather than through the keymap. The RULE is unchanged and so
+    /// are both chords; only where they are matched moved.
     #[test]
-    fn deselect_is_primary_d_in_every_context() {
+    fn deselect_is_primary_d_on_every_surface() {
         let km = Keymap::defaults();
-        for (ctx, select, deselect) in [
-            (Context::Overlay, Action::SelectAllText, Action::DeselectText),
-            (Context::Preview, Action::PreviewSelectAll, Action::PreviewDeselectAll),
-        ] {
-            assert_eq!(km.action_for(ctx, PRIMARY, &ch("a")), Some(select), "{ctx:?} select-all");
-            assert_eq!(km.action_for(ctx, PRIMARY, &ch("d")), Some(deselect), "{ctx:?} deselect");
-            // The chord it replaced is freed, not reassigned.
-            assert_eq!(km.action_for(ctx, PRIMARY | Modifiers::SHIFT, &ch("a")), None, "{ctx:?}");
-        }
+        // The preview's pair, still configurable, still on the two keys.
+        assert_eq!(
+            km.action_for(Context::Preview, PRIMARY, &ch("a")),
+            Some(Action::PreviewSelectAll)
+        );
+        assert_eq!(
+            km.action_for(Context::Preview, PRIMARY, &ch("d")),
+            Some(Action::PreviewDeselectAll)
+        );
+        // The chord it replaced is freed, not reassigned.
+        assert_eq!(km.action_for(Context::Preview, PRIMARY | Modifiers::SHIFT, &ch("a")), None);
+        // The scanner's pair, baked, on the same two keys.
+        assert_eq!(
+            fixed_scanner_action(PRIMARY, &ch("a")),
+            Some(FixedScannerAction::SelectAll)
+        );
+        assert_eq!(
+            fixed_scanner_action(PRIMARY, &ch("d")),
+            Some(FixedScannerAction::Deselect)
+        );
+        assert_eq!(fixed_scanner_action(PRIMARY | Modifiers::SHIFT, &ch("a")), None);
         // Every action whose NAME says it deselects is on the key — the general rule, checked
         // by enumeration so a new one cannot quietly pick something else.
         for action in Action::ALL.into_iter().filter(|a| format!("{a:?}").contains("Deselect")) {
@@ -1565,38 +2051,31 @@ mod tests {
         }
     }
 
-    /// Upload is primary+U in the preview, and only in the preview (DRAGON-482).
+    /// Upload is primary+U in the preview (DRAGON-482), and DRAGON-617 BAKED it, so the
+    /// assertion moved from the keymap to the matcher while the chord itself did not move
+    /// at all.
     ///
-    /// The point of the test is not the letter, it is that the new action goes through the
-    /// SAME machinery every other one does: the platform primary modifier resolves itself
-    /// (Ctrl off macOS, Cmd on it, asserted by `primary_defaults_are_*`), the per-OS label
-    /// rendering falls out of `Shortcut::label` with nothing added for it, and `Keymap::set`
-    /// de-duplicates within the context so the key cannot be double-booked.
+    /// What still matters here is the thing the original test was really protecting: BARE U
+    /// keeps the shape-tool slot it has held since DRAGON-369. A chord and a bare letter are
+    /// different bindings, and this is the assertion that says so.
     #[test]
-    fn upload_is_primary_u_in_the_preview() {
+    fn upload_is_primary_u_and_bare_u_is_still_the_shape_slot() {
         let km = Keymap::defaults();
         assert_eq!(
-            km.action_for(Context::Preview, PRIMARY, &ch("u")),
-            Some(Action::PreviewUpload)
+            fixed_editor_action(PRIMARY, &ch("u")),
+            Some(FixedEditorAction::Upload)
         );
-        // Not a key the capture overlay or a recording answers: the editor owns it.
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("u")), None);
-        assert_eq!(km.action_for(Context::Recording, PRIMARY, &ch("u")), None);
-        // BARE U keeps the shape-tool slot it has held since DRAGON-369: adding a primary+U
-        // chord stole nothing. This is the assertion worth having, because `Keymap::set`
-        // de-duplicates within a context and a careless default could have taken the tool key.
+        // No keymap lane answers it any more, in any context: it is not an `Action`.
+        for ctx in [Context::Preview, Context::Recording] {
+            assert_eq!(km.action_for(ctx, PRIMARY, &ch("u")), None, "{ctx:?}");
+        }
         assert_eq!(
             km.action_for(Context::Preview, Modifiers::empty(), &ch("u")),
             Some(Action::PreviewAnnotShapeCycle)
         );
         // It renders through the existing per-OS label machinery with no special case.
-        let label = def(Action::PreviewUpload).label();
+        let label = FixedEditorAction::Upload.label();
         assert!(label.ends_with('U'), "the label should name the key: {label}");
-        assert!(!label.is_empty());
-        // And it sits in the same settings group as the other committing actions, which is
-        // what puts its row beside Save and Copy.
-        assert_eq!(Action::PreviewUpload.group(), Action::PreviewCopy.group());
-        assert!(!Action::PreviewUpload.label().is_empty());
     }
 
     // ── DRAGON-369: the Photoshop-parity preview keymap ──────────────────────────────
@@ -1735,7 +2214,10 @@ mod tests {
         let shift = PRIMARY | Modifiers::SHIFT;
         assert_eq!(km.action_for(Context::Preview, shift, &ch("x")), None);
         assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("x")), None);
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("x")), None);
+        // Nor does the capture overlay's baked set claim either of them (DRAGON-627: that
+        // surface answers three chords now, and `x` is not one).
+        assert_eq!(fixed_scanner_action(PRIMARY, &ch("x")), None);
+        assert_eq!(fixed_scanner_action(shift, &ch("x")), None);
         // Plain Delete still belongs to the TIMELINE (deleting a segment, which is undoable
         // and touches no file). That one stays.
         assert_eq!(
@@ -1744,11 +2226,14 @@ mod tests {
         );
     }
 
+    /// A NAMED-key binding takes no modifiers, so a modified press falls through. Asserted
+    /// on the timeline's plain Delete now that Close (the historical subject, Esc) is baked;
+    /// `fixed_editor_chord_tests` makes the same assertion for Escape on the matcher.
     #[test]
     fn named_key_matches_and_has_no_modifiers() {
-        let close = def(Action::PreviewCancel); // Esc
-        assert!(close.matches(Modifiers::empty(), &Key::Named(Named::Escape)));
-        assert!(!close.matches(Modifiers::CTRL, &Key::Named(Named::Escape)));
+        let del = def(Action::PreviewDeleteSegment); // Delete
+        assert!(del.matches(Modifiers::empty(), &Key::Named(Named::Delete)));
+        assert!(!del.matches(Modifiers::CTRL, &Key::Named(Named::Delete)));
     }
 
     #[test]
@@ -1756,17 +2241,40 @@ mod tests {
         assert!(Shortcut::from_event(PRIMARY, &Key::Named(Named::Control)).is_none());
         assert_eq!(
             Shortcut::from_event(PRIMARY, &ch("c")),
-            Some(def(Action::CopyText))
+            Some(def(Action::PreviewCopy))
         );
     }
 
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn label_formats_modifiers() {
-        assert_eq!(def(Action::CopyText).label(), "Ctrl+C");
-        assert_eq!(def(Action::DeselectText).label(), "Ctrl+D");
-        assert_eq!(def(Action::PreviewCancel).label(), "Esc");
-        assert_eq!(def(Action::PreviewUpload).label(), "Ctrl+U");
+        assert_eq!(def(Action::PreviewCopy).label(), "Ctrl+C");
+        assert_eq!(def(Action::PreviewDeselectAll).label(), "Ctrl+D");
+        // The baked five render through the very same formatter (DRAGON-617), including the
+        // named-key form that has no modifier to print.
+        assert_eq!(FixedEditorAction::Close.label(), "Esc");
+        assert_eq!(FixedEditorAction::Upload.label(), "Ctrl+U");
+    }
+
+    /// DRAGON-581: the three recording actions default to Shift+Alt, the same chord
+    /// shape on every platform (no primary-modifier split), and the exact keys the
+    /// owner named. Pinned as a set because their value is being CHORDED at all: as
+    /// bare M / S / Enter they were the only defaults that could collide with typing,
+    /// and `xdg_trigger` refused them as global hotkeys.
+    #[test]
+    fn the_recording_lane_defaults_to_shift_alt() {
+        for (action, key) in [
+            (Action::RecordToggleMic, ShortcutKey::Char("m".into())),
+            (Action::RecordToggleSystemAudio, ShortcutKey::Char("s".into())),
+            (Action::RecordStop, ShortcutKey::Named(NamedKey::Enter)),
+        ] {
+            let sc = def(action);
+            assert_eq!(sc.key, key, "{action:?} keeps its key");
+            assert!(sc.shift && sc.alt, "{action:?} defaults to Shift+Alt");
+            assert!(!sc.ctrl && !sc.logo, "{action:?} takes no other modifier");
+            // The point of the chord: these can now be portal global shortcuts.
+            assert!(sc.xdg_trigger().is_some(), "{action:?} must be globally bindable");
+        }
     }
 
     /// Linux/Windows defaults use Ctrl (the primary command modifier), never logo,
@@ -1775,18 +2283,30 @@ mod tests {
     #[test]
     fn primary_defaults_are_ctrl_off_macos() {
         for action in [
-            Action::CopyText,
-            Action::SelectAllText,
-            Action::DeselectText,
-            Action::PreviewSave,
             Action::PreviewCopy,
-            Action::PreviewUpload,
-            Action::PreviewUndo,
-            Action::PreviewRedo,
+            Action::PreviewSelectAll,
+            Action::PreviewDeselectAll,
         ] {
             let sc = def(action);
             assert!(sc.ctrl, "{action:?} should default to Ctrl off macOS");
             assert!(!sc.logo, "{action:?} should not default to logo off macOS");
+        }
+        // The five DRAGON-617 baked chords resolve the primary modifier the same way, and
+        // they are checked here too, because leaving them out of this test is exactly how
+        // the modifier could drift on one platform without anything noticing.
+        for baked in FixedEditorAction::ALL {
+            let sc = baked.chord();
+            if matches!(sc.key, ShortcutKey::Named(_)) {
+                continue; // Escape takes no modifier at all.
+            }
+            assert!(sc.ctrl, "{baked:?} should use Ctrl off macOS");
+            assert!(!sc.logo, "{baked:?} should not use logo off macOS");
+        }
+        // …and so do the three DRAGON-627 baked scanner chords, for the same reason.
+        for baked in FixedScannerAction::ALL {
+            let sc = baked.chord();
+            assert!(sc.ctrl, "{baked:?} should use Ctrl off macOS");
+            assert!(!sc.logo, "{baked:?} should not use logo off macOS");
         }
     }
 
@@ -1796,28 +2316,38 @@ mod tests {
     #[test]
     fn primary_defaults_are_cmd_on_macos() {
         for action in [
-            Action::CopyText,
-            Action::SelectAllText,
-            Action::DeselectText,
-            Action::PreviewSave,
             Action::PreviewCopy,
-            Action::PreviewUpload,
-            Action::PreviewUndo,
-            Action::PreviewRedo,
+            Action::PreviewSelectAll,
+            Action::PreviewDeselectAll,
         ] {
             let sc = def(action);
             assert!(sc.logo, "{action:?} should default to Cmd (logo) on macOS");
             assert!(!sc.ctrl, "{action:?} should not default to Ctrl on macOS");
         }
-        // The shifted chords keep Shift alongside Cmd.
-        assert!(def(Action::PreviewRedo).shift);
+        // The DRAGON-617 baked chords resolve the primary modifier the same way.
+        for baked in FixedEditorAction::ALL {
+            let sc = baked.chord();
+            if matches!(sc.key, ShortcutKey::Named(_)) {
+                continue; // Escape takes no modifier at all.
+            }
+            assert!(sc.logo, "{baked:?} should use Cmd (logo) on macOS");
+            assert!(!sc.ctrl, "{baked:?} should not use Ctrl on macOS");
+        }
+        // …and so do the three DRAGON-627 baked scanner chords.
+        for baked in FixedScannerAction::ALL {
+            let sc = baked.chord();
+            assert!(sc.logo, "{baked:?} should use Cmd (logo) on macOS");
+            assert!(!sc.ctrl, "{baked:?} should not use Ctrl on macOS");
+        }
+        // The shifted chord keeps Shift alongside Cmd.
+        assert!(FixedEditorAction::Redo.chord().shift);
         // Bare-key defaults stay unmodified on macOS too.
         let play = def(Action::PreviewPlay);
         assert!(!play.ctrl && !play.logo && !play.alt && !play.shift);
         // macOS labels render the ⌘ glyph.
-        assert_eq!(def(Action::CopyText).label(), "⌘C");
-        assert_eq!(def(Action::PreviewSave).label(), "⌘S");
-        assert_eq!(def(Action::PreviewUpload).label(), "⌘U");
+        assert_eq!(def(Action::PreviewCopy).label(), "⌘C");
+        assert_eq!(FixedEditorAction::Save.label(), "⌘S");
+        assert_eq!(FixedEditorAction::Upload.label(), "⌘U");
     }
 
     /// A persisted override (e.g. a Linux config carried to a Mac) is applied
@@ -1826,47 +2356,61 @@ mod tests {
     /// platform default.
     #[test]
     fn overrides_are_literal_over_platform_defaults() {
-        // A Linux-shaped override: Ctrl+K for SelectAllText (logo unset).
-        let ov = vec![(Action::SelectAllText, Some(Shortcut::ctrl_char('k')))];
+        // A Linux-shaped override: Ctrl+K for PreviewSelectAll (logo unset).
+        let ov = vec![(Action::PreviewSelectAll, Some(Shortcut::ctrl_char('k')))];
         let mut km = Keymap::defaults();
         km.apply_overrides(&ov);
-        let fs = km.get(Action::SelectAllText).unwrap();
+        let fs = km.get(Action::PreviewSelectAll).unwrap();
         assert!(fs.ctrl && !fs.logo, "override keeps its literal Ctrl, not the platform primary");
         // An action with no override still gets the platform default.
-        assert_eq!(km.get(Action::CopyText), Some(def(Action::CopyText)));
+        assert_eq!(km.get(Action::PreviewCopy), Some(def(Action::PreviewCopy)));
     }
 
     #[test]
     fn set_steals_on_conflict() {
         let mut km = Keymap::defaults();
-        // Rebind "copy" to primary+A, which "select all" already holds.
-        km.set(Action::CopyText, def(Action::SelectAllText));
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("a")), Some(Action::CopyText));
+        // Rebind "copy to clipboard" to primary+A, which "select all annotations" holds.
+        km.set(Action::PreviewCopy, def(Action::PreviewSelectAll));
+        assert_eq!(
+            km.action_for(Context::Preview, PRIMARY, &ch("a")),
+            Some(Action::PreviewCopy)
+        );
         // Select-all loses primary+A (now unbound); Copy's old primary+C is no longer matched.
-        assert_eq!(km.get(Action::SelectAllText), None);
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("c")), None);
+        assert_eq!(km.get(Action::PreviewSelectAll), None);
+        assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("c")), None);
     }
 
     #[test]
-    fn contexts_share_bindings_without_conflict() {
+    fn a_surface_and_a_context_share_a_chord_without_conflict() {
         let km = Keymap::defaults();
-        // primary+C is bound in BOTH contexts by default; each resolves per surface. Esc is the
-        // single Close action (Preview context); the overlay reuses its binding in handle_key.
-        let esc = Key::Named(Named::Escape);
-        assert_eq!(km.action_for(Context::Overlay, Modifiers::empty(), &esc), None);
-        assert_eq!(km.action_for(Context::Preview, Modifiers::empty(), &esc), Some(Action::PreviewCancel));
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("c")), Some(Action::CopyText));
+        // primary+C means "copy" on BOTH surfaces by default; each resolves where it lives.
+        // The scanner's half is baked (DRAGON-627), the preview's is a keymap entry, and
+        // `handle_key` reaches the preview's modal lane before the scanner's ever runs.
+        assert_eq!(fixed_scanner_action(PRIMARY, &ch("c")), Some(FixedScannerAction::Copy));
         assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("c")), Some(Action::PreviewCopy));
+        // Escape belongs to NO context now (DRAGON-617 baked Close). It is one fixed key with
+        // two meanings resolved by surface in `handle_key`, which is what the keymap could
+        // never express: it holds one `Shortcut` per `Action`, per context.
+        let esc = Key::Named(Named::Escape);
+        for ctx in [Context::Preview, Context::Recording] {
+            assert_eq!(km.action_for(ctx, Modifiers::empty(), &esc), None, "{ctx:?}");
+        }
+        assert_eq!(
+            fixed_editor_action(Modifiers::empty(), &esc),
+            Some(FixedEditorAction::Close)
+        );
     }
 
     /// DRAGON-451 retired `RegionCopy` (the region "Copy selection" quick-action), and with
     /// it the whole `Context::Region` lane. Three tests covered its shared-primary+C
     /// arrangement; what survives them is the thing that still matters — primary+C in the
     /// capture overlay is the OCR copy, unconditionally, with nothing left to take it first.
+    /// DRAGON-627 baked that copy, so the assertion reads the matcher; the chord and the
+    /// precedence are the same.
     #[test]
     fn primary_c_in_the_overlay_is_the_ocr_copy() {
+        assert_eq!(fixed_scanner_action(PRIMARY, &ch("c")), Some(FixedScannerAction::Copy));
         let km = Keymap::defaults();
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("c")), Some(Action::CopyText));
         assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("c")), Some(Action::PreviewCopy));
         // No action claims a region-draw context any more.
         assert!(!Action::ALL.iter().any(|a| a.label() == "Copy selection"));
@@ -1875,24 +2419,27 @@ mod tests {
     #[test]
     fn unbind_removes_trigger_and_persists() {
         let mut km = Keymap::defaults();
-        km.unbind(Action::CopyText);
-        assert_eq!(km.get(Action::CopyText), None);
-        assert_eq!(km.action_for(Context::Overlay, PRIMARY, &ch("c")), None);
+        km.unbind(Action::PreviewCopy);
+        assert_eq!(km.get(Action::PreviewCopy), None);
+        assert_eq!(km.action_for(Context::Preview, PRIMARY, &ch("c")), None);
         // An unbind is an override and round-trips through persistence.
         let mut km2 = Keymap::defaults();
         km2.apply_overrides(&km.overrides());
-        assert_eq!(km2.get(Action::CopyText), None);
+        assert_eq!(km2.get(Action::PreviewCopy), None);
     }
 
     #[test]
     fn overrides_roundtrip() {
         let mut km = Keymap::defaults();
         assert!(km.overrides().is_empty());
-        km.set(Action::SelectAllText, Shortcut::ctrl_char('k'));
+        km.set(Action::PreviewSelectAll, Shortcut::ctrl_char('k'));
         let ov = km.overrides();
         let mut km2 = Keymap::defaults();
         km2.apply_overrides(&ov);
-        assert_eq!(km2.action_for(Context::Overlay, Modifiers::CTRL, &ch("k")), Some(Action::SelectAllText));
+        assert_eq!(
+            km2.action_for(Context::Preview, Modifiers::CTRL, &ch("k")),
+            Some(Action::PreviewSelectAll)
+        );
     }
 }
 
@@ -2087,5 +2634,704 @@ mod capture_hotkey_conflict_tests {
         // A real chord normalizes to its canonical text.
         assert_eq!(normalized_chord("Ctrl+Alt+K").as_deref(), Some("ctrl+alt+k"));
         assert_eq!(normalized_chord("  shift + cmd + 2  ").as_deref(), Some("cmd+shift+2"));
+    }
+}
+
+/// DRAGON-587: the colour picker's magnifier-zoom keys. Its own module because it pins ONE
+/// predicate: which presses zoom, and, just as importantly, which do not.
+#[cfg(test)]
+mod magnifier_zoom_key_tests {
+    use super::*;
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    /// The owner's request, both directions: numpad `+` zooms IN, numpad `-` zooms OUT, one
+    /// notch each, which is the same notch the wheel and the trackpad send.
+    #[test]
+    fn the_numpad_plus_and_minus_are_one_notch_each() {
+        assert_eq!(magnifier_zoom_step(&ch("+"), Location::Numpad), Some(1));
+        assert_eq!(magnifier_zoom_step(&ch("-"), Location::Numpad), Some(-1));
+    }
+
+    /// The MAIN-ROW `+` and `-` are not these keys. On most layouts the main `+` is `Shift+=`,
+    /// so honouring it would mean guessing at a shift state; the keypad group is unambiguous,
+    /// which is why the request named it.
+    #[test]
+    fn the_main_row_keys_are_left_alone() {
+        for loc in [Location::Standard, Location::Left, Location::Right] {
+            assert_eq!(magnifier_zoom_step(&ch("+"), loc), None, "{loc:?}");
+            assert_eq!(magnifier_zoom_step(&ch("-"), loc), None, "{loc:?}");
+        }
+    }
+
+    /// Nothing else on the keypad zooms — not its digits, not its Enter (which the live text
+    /// editor claims, DRAGON-364), not its other operators. A predicate that fired on "any
+    /// numpad press" would swallow keys other lanes own.
+    #[test]
+    fn no_other_keypad_key_zooms() {
+        for other in ["0", "5", "*", "/", ".", "="] {
+            assert_eq!(magnifier_zoom_step(&ch(other), Location::Numpad), None, "{other}");
+        }
+        assert_eq!(magnifier_zoom_step(&Key::Named(Named::Enter), Location::Numpad), None);
+        assert_eq!(magnifier_zoom_step(&Key::Named(Named::Escape), Location::Numpad), None);
+    }
+
+    /// It is NOT a keymap entry and must not become one: these are the universal zoom keys,
+    /// not an app preference (the `is_region_copy_chord` reasoning). Pinned by checking that
+    /// no action's DEFAULT binding is a bare `+` or `-`, so the picker's lane cannot be
+    /// swallowing a binding that already means something else.
+    #[test]
+    fn no_keymap_action_claims_these_keys() {
+        let map = Keymap::default();
+        for action in Action::ALL {
+            if let Some(sc) = map.get(action) {
+                assert!(
+                    !sc.matches(Modifiers::default(), &ch("+"))
+                        && !sc.matches(Modifiers::default(), &ch("-")),
+                    "{action:?} would collide with the picker's zoom keys"
+                );
+            }
+        }
+    }
+}
+
+/// DRAGON-599: the fixed directional keys, and the one thing both families reduce to.
+#[cfg(test)]
+mod nudge_direction_tests {
+    use super::*;
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    fn named(n: Named) -> Key {
+        Key::Named(n)
+    }
+
+    /// THE test this module exists for: `h` `j` `k` `l` are the four arrows, exactly. Written
+    /// as a paired table rather than as two lists, so the two families cannot drift apart
+    /// without this failing.
+    #[test]
+    fn the_vim_letters_are_the_arrows() {
+        let pairs = [
+            (Named::ArrowLeft, "h", Direction::Left),
+            (Named::ArrowDown, "j", Direction::Down),
+            (Named::ArrowUp, "k", Direction::Up),
+            (Named::ArrowRight, "l", Direction::Right),
+        ];
+        for (arrow, letter, want) in pairs {
+            let from_arrow = nudge_direction(Modifiers::empty(), &named(arrow));
+            let from_letter = nudge_direction(Modifiers::empty(), &ch(letter));
+            assert_eq!(from_arrow, Some(want), "{arrow:?}");
+            assert_eq!(from_letter, from_arrow, "'{letter}' must be {arrow:?}");
+        }
+    }
+
+    /// Screen orientation, stated once: x grows right and y grows DOWN, so Up is negative y.
+    /// Every consumer works in a space with that convention, so getting it backwards here
+    /// would invert movement everywhere at once.
+    #[test]
+    fn a_step_is_one_unit_in_screen_orientation() {
+        assert_eq!(Direction::Left.delta(), (-1, 0));
+        assert_eq!(Direction::Right.delta(), (1, 0));
+        assert_eq!(Direction::Up.delta(), (0, -1));
+        assert_eq!(Direction::Down.delta(), (0, 1));
+    }
+
+    /// Caps Lock is not one of the four modifier flags, so a shouting keyboard still moves.
+    #[test]
+    fn the_letters_are_case_insensitive() {
+        assert_eq!(nudge_direction(Modifiers::empty(), &ch("H")), Some(Direction::Left));
+        assert_eq!(nudge_direction(Modifiers::empty(), &ch("J")), Some(Direction::Down));
+        assert_eq!(nudge_direction(Modifiers::empty(), &ch("K")), Some(Direction::Up));
+        assert_eq!(nudge_direction(Modifiers::empty(), &ch("L")), Some(Direction::Right));
+    }
+
+    /// A MODIFIED arrow or letter is somebody else's. `Ctrl+H` must not move anything, and
+    /// neither must `Shift+Left` — which also leaves a modified arrow free for a future
+    /// bigger step.
+    #[test]
+    fn any_modifier_declines() {
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::SHIFT, Modifiers::LOGO] {
+            for key in [named(Named::ArrowLeft), ch("h"), named(Named::ArrowUp), ch("k")] {
+                assert_eq!(nudge_direction(m, &key), None, "{m:?} + {key:?}");
+            }
+        }
+        // And a combination, in case one flag were ever tested instead of all four.
+        assert_eq!(
+            nudge_direction(Modifiers::CTRL | Modifiers::SHIFT, &ch("l")),
+            None
+        );
+    }
+
+    /// "Just the directionals" is a LIMIT (the owner's word). No other vim motion, no counts,
+    /// and no other named key, so this lane can never swallow a press that means something
+    /// else on the surfaces that consult it.
+    #[test]
+    fn nothing_else_is_a_direction() {
+        for other in ["g", "w", "b", "0", "$", "y", "d", "v", "u", "i", "x", "m", "t", "e"] {
+            assert_eq!(nudge_direction(Modifiers::empty(), &ch(other)), None, "{other}");
+        }
+        for other in [Named::Enter, Named::Escape, Named::Tab, Named::Home, Named::PageUp] {
+            assert_eq!(nudge_direction(Modifiers::empty(), &named(other)), None, "{other:?}");
+        }
+    }
+
+    /// These are FIXED bindings, outside the keymap, so the surfaces that consult them must
+    /// not already answer the same bare key. Pinned against the Recording context's DEFAULTS
+    /// and against the capture overlay's own baked chords (DRAGON-627 replaced that surface's
+    /// keymap lane with [`fixed_scanner_action`], so its half of this check reads the matcher
+    /// now); the preview's bare annotation letters are `Context::Preview`, which a preview's
+    /// own modal lane answers long before either nudge lane is reached.
+    #[test]
+    fn no_overlay_or_recording_binding_claims_a_bare_directional() {
+        let map = Keymap::default();
+        let keys = [
+            named(Named::ArrowLeft),
+            named(Named::ArrowRight),
+            named(Named::ArrowUp),
+            named(Named::ArrowDown),
+            ch("h"),
+            ch("j"),
+            ch("k"),
+            ch("l"),
+        ];
+        for action in Action::ALL {
+            if action.context() != Context::Recording {
+                continue;
+            }
+            let Some(sc) = map.get(action) else { continue };
+            for key in &keys {
+                assert!(
+                    !sc.matches(Modifiers::empty(), key),
+                    "{action:?} would collide with the directional {key:?}"
+                );
+            }
+        }
+        for key in &keys {
+            assert!(
+                fixed_scanner_action(Modifiers::empty(), key).is_none(),
+                "the capture overlay's baked set would collide with the directional {key:?}"
+            );
+        }
+    }
+}
+
+/// DRAGON-617: the five BAKED editor chords, Save / Upload / Close / Undo / Redo.
+#[cfg(test)]
+mod fixed_editor_chord_tests {
+    use super::*;
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    /// The platform PRIMARY command modifier, matching the main test module's.
+    #[cfg(target_os = "macos")]
+    const PRIMARY: Modifiers = Modifiers::LOGO;
+    #[cfg(not(target_os = "macos"))]
+    const PRIMARY: Modifiers = Modifiers::CTRL;
+
+    /// THE table: every baked chord, and the one action it means. Written out as a table
+    /// rather than derived from `chord()`, so a change to a chord is a visible diff here and
+    /// not a test that silently agrees with whatever the code now says.
+    #[test]
+    fn every_baked_chord_maps_to_its_one_action() {
+        let esc = Key::Named(Named::Escape);
+        let cases: [(Modifiers, Key, FixedEditorAction); 5] = [
+            (PRIMARY, ch("s"), FixedEditorAction::Save),
+            (PRIMARY, ch("u"), FixedEditorAction::Upload),
+            (Modifiers::empty(), esc, FixedEditorAction::Close),
+            (PRIMARY, ch("z"), FixedEditorAction::Undo),
+            (PRIMARY | Modifiers::SHIFT, ch("z"), FixedEditorAction::Redo),
+        ];
+        for (m, key, want) in cases {
+            assert_eq!(fixed_editor_action(m, &key), Some(want), "{m:?} + {key:?}");
+        }
+    }
+
+    /// No two baked chords collide, and every action in the enum is reachable. The pair of
+    /// properties the table above cannot prove on its own: it could name the same chord twice
+    /// and still pass every individual case.
+    #[test]
+    fn the_five_are_distinct_and_all_reachable() {
+        let mut chords: Vec<Shortcut> =
+            FixedEditorAction::ALL.iter().map(|a| a.chord()).collect();
+        let before = chords.len();
+        chords.sort_by_key(|c| format!("{c:?}"));
+        chords.dedup();
+        assert_eq!(chords.len(), before, "two baked actions share a chord");
+        // Every alternate form is distinct from every primary form too.
+        for a in FixedEditorAction::ALL {
+            if let Some(alt) = a.alt_chord() {
+                assert!(
+                    FixedEditorAction::ALL.iter().all(|b| b.chord() != alt),
+                    "{a:?}'s alternate collides with a primary chord"
+                );
+            }
+        }
+        // Each action's own chord resolves back to it, which is what "reachable" means.
+        for a in FixedEditorAction::ALL {
+            let sc = a.chord();
+            assert!(is_fixed_editor_chord(&sc), "{a:?} is not recognised as baked");
+        }
+    }
+
+    /// `ALL` and `index` are two statements of one order, and the memoized label table reads
+    /// the second to index the first. Drift between them would silently label Undo "Ctrl+U".
+    #[test]
+    fn the_index_matches_the_all_order() {
+        for (i, a) in FixedEditorAction::ALL.into_iter().enumerate() {
+            assert_eq!(a.index(), i, "{a:?}");
+        }
+        // And the labels really line up with their actions, not just with their slots.
+        for a in FixedEditorAction::ALL {
+            assert_eq!(a.label(), a.chord().label(), "{a:?}");
+        }
+    }
+
+    /// Redo's SECOND conventional form, and the deliberate per-platform difference.
+    ///
+    /// `Ctrl+Y` is the Windows redo convention (Office, Explorer) and common on Linux
+    /// (LibreOffice). `⌘Y` is NOT redo on macOS (Finder gives it Quick Look), so adding it
+    /// there would be inventing a chord rather than honouring a convention, and honouring
+    /// conventions is the entire premise of baking these five.
+    #[test]
+    fn redo_takes_ctrl_y_off_macos_and_never_on_it() {
+        let got = fixed_editor_action(PRIMARY, &ch("y"));
+        if cfg!(target_os = "macos") {
+            assert_eq!(got, None, "Cmd+Y must not be redo on macOS");
+        } else {
+            assert_eq!(got, Some(FixedEditorAction::Redo));
+        }
+        // Either way the SHIFTED form works everywhere: it is the primary spelling and the
+        // only one macOS has.
+        assert_eq!(
+            fixed_editor_action(PRIMARY | Modifiers::SHIFT, &ch("z")),
+            Some(FixedEditorAction::Redo)
+        );
+        // The tooltip advertises the primary form only, on every platform.
+        assert_eq!(FixedEditorAction::Redo.label(), FixedEditorAction::Redo.chord().label());
+    }
+
+    /// Modifiers are compared EXACTLY, so a stray flag falls through to whatever else wants
+    /// the key. Escape is the case that matters most: it is the one bare key in the set, and
+    /// `Shift+Escape` must not close a document.
+    #[test]
+    fn a_stray_modifier_declines() {
+        let esc = Key::Named(Named::Escape);
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::SHIFT, Modifiers::LOGO] {
+            assert_eq!(fixed_editor_action(m, &esc), None, "{m:?} + Escape");
+        }
+        // Undo is primary+Z and nothing else: bare Z and primary+Alt+Z both fall through.
+        assert_eq!(fixed_editor_action(Modifiers::empty(), &ch("z")), None);
+        assert_eq!(fixed_editor_action(PRIMARY | Modifiers::ALT, &ch("z")), None);
+        // Undo and Redo differ by Shift alone, so this is the pair most at risk of merging.
+        assert_eq!(fixed_editor_action(PRIMARY, &ch("z")), Some(FixedEditorAction::Undo));
+    }
+
+    /// **A baked EDITOR chord wins over the keymap, so no remaining DEFAULT may claim one.**
+    ///
+    /// This is what keeps a default install free of the one residual the design accepts (a
+    /// keymap customised before this build shipped can still name a baked chord for some
+    /// other action, and loses that binding). Checked by enumeration over every surviving
+    /// action in every context, so a future default cannot quietly land on Ctrl+Z.
+    ///
+    /// **The DRAGON-627 scanner chords are deliberately NOT part of this check, and that is
+    /// the interesting half.** They are baked too, but on a different SURFACE: the capture
+    /// overlay, matched at the bottom of `handle_key`'s overlay run, where a preview binding
+    /// can never be reached (a preview owns the keyboard through its own modal lane, which
+    /// returns first). So primary+C, primary+A and primary+D remain the live defaults of
+    /// `PreviewCopy`, `PreviewSelectAll` and `PreviewDeselectAll`, and asserting them free
+    /// here would be asserting the opposite of what the feature wants.
+    /// `fixed_scanner_chord_tests` pins that separation from the other end.
+    #[test]
+    fn no_remaining_default_collides_with_a_baked_chord() {
+        for action in Action::ALL {
+            let Some(sc) = action.default_shortcut() else {
+                continue; // ships unbound
+            };
+            assert!(
+                !is_fixed_editor_chord(&sc),
+                "{action:?} defaults to {}, which DRAGON-617 baked",
+                sc.label()
+            );
+        }
+        // The two baked SETS must not collide with EACH OTHER either. They are matched on
+        // different surfaces, so a shared chord would not be a crash, it would be one key
+        // quietly meaning two things depending on what is on screen, which is precisely the
+        // ambiguity both sets exist to remove.
+        for scanner in FixedScannerAction::ALL {
+            assert!(
+                !is_fixed_editor_chord(&scanner.chord()),
+                "{scanner:?} takes {}, which DRAGON-617 already baked",
+                scanner.chord().label()
+            );
+        }
+    }
+
+    /// The rebind capture's refusal list is exactly the baked set, no more and no less.
+    ///
+    /// The "no less" half is the interesting one: a chord that fires but is not refused is a
+    /// binding the settings page would happily accept and then never honour, which is the
+    /// silent-death shape this refusal exists to prevent.
+    #[test]
+    fn the_refusal_covers_every_chord_that_fires_and_nothing_else() {
+        for a in FixedEditorAction::ALL {
+            assert!(is_fixed_editor_chord(&a.chord()), "{a:?}");
+            if let Some(alt) = a.alt_chord() {
+                assert!(is_fixed_editor_chord(&alt), "{a:?} alternate");
+            }
+        }
+        // An ordinary preview binding is NOT refused, or the page would reject half the keys
+        // a user might reasonably choose.
+        for action in [Action::PreviewCopy, Action::PreviewCovermark, Action::PreviewCrop] {
+            let sc = action.default_shortcut().expect("these three ship bound");
+            assert!(!is_fixed_editor_chord(&sc), "{action:?} must stay bindable");
+        }
+        // Ctrl+Y is refused exactly where it fires.
+        let ctrl_y = Shortcut::primary_char('y');
+        assert_eq!(is_fixed_editor_chord(&ctrl_y), !cfg!(target_os = "macos"));
+    }
+}
+
+/// DRAGON-627: the three BAKED scanner chords, Copy / Select all / Deselect.
+#[cfg(test)]
+mod fixed_scanner_chord_tests {
+    use super::*;
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    /// The platform PRIMARY command modifier, matching the main test module's.
+    #[cfg(target_os = "macos")]
+    const PRIMARY: Modifiers = Modifiers::LOGO;
+    #[cfg(not(target_os = "macos"))]
+    const PRIMARY: Modifiers = Modifiers::CTRL;
+
+    /// THE table: every baked scanner chord, and the one action it means. Written out rather
+    /// than derived from `chord()`, so a change to a chord is a visible diff here and not a
+    /// test that silently agrees with whatever the code now says.
+    ///
+    /// These are the DEFAULTS the retired `Action::CopyText` / `SelectAllText` /
+    /// `DeselectText` shipped with, unchanged, so nothing a user pressed before presses
+    /// differently now.
+    #[test]
+    fn every_baked_scanner_chord_maps_to_its_one_action() {
+        let cases: [(Modifiers, Key, FixedScannerAction); 3] = [
+            (PRIMARY, ch("c"), FixedScannerAction::Copy),
+            (PRIMARY, ch("a"), FixedScannerAction::SelectAll),
+            (PRIMARY, ch("d"), FixedScannerAction::Deselect),
+        ];
+        for (m, key, want) in cases {
+            assert_eq!(fixed_scanner_action(m, &key), Some(want), "{m:?} + {key:?}");
+        }
+    }
+
+    /// No two of the three collide, and every action in the enum is reachable. The pair of
+    /// properties the table above cannot prove on its own: it could name the same chord twice
+    /// and still pass every individual case.
+    #[test]
+    fn the_three_are_distinct_and_all_reachable() {
+        let mut chords: Vec<Shortcut> =
+            FixedScannerAction::ALL.iter().map(|a| a.chord()).collect();
+        let before = chords.len();
+        chords.sort_by_key(|c| format!("{c:?}"));
+        chords.dedup();
+        assert_eq!(chords.len(), before, "two baked scanner actions share a chord");
+        // Each action's own chord resolves back to it, which is what "reachable" means. All
+        // three are primary chords, so the modifiers are the platform primary and nothing
+        // else; `a_stray_modifier_declines` pins that from the other side.
+        for a in FixedScannerAction::ALL {
+            assert_eq!(
+                fixed_scanner_action(PRIMARY, &a.chord().iced_key()),
+                Some(a),
+                "{a:?} does not resolve back to itself"
+            );
+        }
+    }
+
+    /// **The separation from the DRAGON-617 set, asserted from both ends.**
+    ///
+    /// These three chords must NOT be refused by the rebind capture, because they are the
+    /// live defaults of three actions that are still configurable. Folding them into
+    /// `is_fixed_editor_chord` would make the Keyboard Shortcuts page reject Ctrl+C for
+    /// "Copy to clipboard", the very binding it ships with.
+    #[test]
+    fn the_scanner_chords_stay_bindable_for_the_preview() {
+        for a in FixedScannerAction::ALL {
+            assert!(
+                !is_fixed_editor_chord(&a.chord()),
+                "{a:?}'s chord must stay bindable: a preview action holds it by default"
+            );
+        }
+        // Named explicitly, so a future rename cannot quietly drop one from the check.
+        for (action, scanner) in [
+            (Action::PreviewCopy, FixedScannerAction::Copy),
+            (Action::PreviewSelectAll, FixedScannerAction::SelectAll),
+            (Action::PreviewDeselectAll, FixedScannerAction::Deselect),
+        ] {
+            let sc = action.default_shortcut().expect("these three ship bound");
+            assert_eq!(sc, scanner.chord(), "{action:?} shares {scanner:?}'s chord by design");
+            assert!(!is_fixed_editor_chord(&sc), "{action:?} must stay bindable");
+        }
+    }
+
+    /// Modifiers are compared EXACTLY, so a stray flag falls through to whatever else wants
+    /// the key. That is also what keeps these clear of the bare directional keys and the bare
+    /// accept keys, which take no modifier at all.
+    #[test]
+    fn a_stray_modifier_declines() {
+        for key in ["c", "a", "d"] {
+            assert_eq!(fixed_scanner_action(Modifiers::empty(), &ch(key)), None, "bare {key}");
+            assert_eq!(
+                fixed_scanner_action(PRIMARY | Modifiers::SHIFT, &ch(key)),
+                None,
+                "shifted {key}"
+            );
+            assert_eq!(
+                fixed_scanner_action(PRIMARY | Modifiers::ALT, &ch(key)),
+                None,
+                "alted {key}"
+            );
+        }
+        // A key none of them claims falls through.
+        assert_eq!(fixed_scanner_action(PRIMARY, &ch("q")), None);
+        assert_eq!(fixed_scanner_action(Modifiers::empty(), &Key::Named(Named::Escape)), None);
+    }
+
+    /// **No `Action` is left on the capture overlay**, which is the whole reason the settings
+    /// page's Capture tab disappears. `ShortcutsTab::occupied` enumerates `Action::ALL` and
+    /// finds nothing for that tab; this asserts the fact that makes it so, from the shortcuts
+    /// side, where a new action would be added.
+    #[test]
+    fn nothing_in_the_keymap_belongs_to_the_capture_overlay_any_more() {
+        for action in Action::ALL {
+            assert!(
+                matches!(action.context(), Context::Preview | Context::Recording),
+                "{action:?} claims a surface the keymap no longer serves"
+            );
+        }
+        // The three retired group titles are gone with them, so no section can route to the
+        // Capture tab.
+        assert!(
+            !Action::ALL.iter().any(|a| a.group() == "OCR Text Recognition"),
+            "the OCR group must be retired with its actions"
+        );
+    }
+}
+
+/// DRAGON-612: THE accept keys, bare Enter and bare Space.
+///
+/// This module proves the KEY half of the feature; the other half, that the surface really is
+/// in a state that can accept, is `app::keyboard`'s `accept_verdict_tests`.
+#[cfg(test)]
+mod accept_key_tests {
+    use super::*;
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    /// The whole of the feature at the key level: both keys, no modifiers, one meaning.
+    #[test]
+    fn bare_enter_and_bare_space_accept() {
+        assert!(is_accept_key(Modifiers::empty(), &Key::Named(Named::Enter)));
+        assert!(is_accept_key(Modifiers::empty(), &ch(" ")));
+    }
+
+    /// A MODIFIED Enter or Space belongs to somebody else. This is also the term that keeps
+    /// the accept clear of [`Action::RecordStop`], whose default is `Shift+Alt+Enter`: proved
+    /// against the real `Shortcut` rather than against a hand-written modifier set, so a
+    /// change to that default cannot pass this test while breaking the app.
+    #[test]
+    fn any_modifier_declines_and_record_stop_keeps_its_chord() {
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::SHIFT, Modifiers::LOGO] {
+            for key in [Key::Named(Named::Enter), ch(" ")] {
+                assert!(!is_accept_key(m, &key), "{m:?} + {key:?}");
+            }
+        }
+        let shift_alt = Modifiers::SHIFT | Modifiers::ALT;
+        let enter = Key::Named(Named::Enter);
+        assert!(!is_accept_key(shift_alt, &enter));
+        let stop = Action::RecordStop.default_shortcut().expect("RecordStop ships bound");
+        assert!(
+            stop.matches(shift_alt, &enter),
+            "Shift+Alt+Enter must still stop a recording"
+        );
+        assert!(
+            !stop.matches(Modifiers::empty(), &enter),
+            "a bare Enter must never stop a recording"
+        );
+    }
+
+    /// No OTHER key accepts. The near misses are the ones worth naming: Escape is the cancel
+    /// on these very surfaces, and the arrows are the nudge this feature completes, so any of
+    /// them leaking into the accept would commit a capture the user was still aiming.
+    #[test]
+    fn no_other_key_accepts() {
+        for named in [
+            Named::Escape,
+            Named::Tab,
+            Named::Backspace,
+            Named::Delete,
+            Named::ArrowLeft,
+            Named::ArrowRight,
+            Named::ArrowUp,
+            Named::ArrowDown,
+        ] {
+            assert!(!is_accept_key(Modifiers::empty(), &Key::Named(named)), "{named:?}");
+        }
+        // The vim directionals and the picker's zoom characters, all bare, all not an accept.
+        for c in ["h", "j", "k", "l", "+", "-", "a", "c", "\0", ""] {
+            assert!(!is_accept_key(Modifiers::empty(), &ch(c)), "{c:?}");
+        }
+    }
+
+    /// The accept keys and the NUDGE keys are disjoint, stated as a crossing rather than as
+    /// two lists. They arrive at the same fall-through lanes in `app::keyboard`, so one key
+    /// answering both would make the dispatch order load-bearing, which it must not be.
+    #[test]
+    fn the_accept_keys_are_disjoint_from_the_nudge_keys() {
+        let keys = [
+            Key::Named(Named::Enter),
+            ch(" "),
+            Key::Named(Named::ArrowLeft),
+            Key::Named(Named::ArrowRight),
+            Key::Named(Named::ArrowUp),
+            Key::Named(Named::ArrowDown),
+            ch("h"),
+            ch("j"),
+            ch("k"),
+            ch("l"),
+        ];
+        for key in keys {
+            let accepts = is_accept_key(Modifiers::empty(), &key);
+            let nudges = nudge_direction(Modifiers::empty(), &key).is_some();
+            assert!(!(accepts && nudges), "{key:?} cannot be both an accept and a nudge");
+        }
+    }
+
+    /// NUMPAD Enter accepts too. The picker's zoom keys are keyed on `Location::Numpad`
+    /// (DRAGON-587) and the text editor tells the two Enters apart (DRAGON-364), so the
+    /// keypad group is live in this codebase and "both Enters" has to be a decision rather
+    /// than an accident. This function takes no `Location` at all, which IS that decision.
+    #[test]
+    fn the_keypad_enter_accepts_as_well() {
+        // Same logical key on both the winit and the Wayland layer-shell paths; only the
+        // `Location` differs, and this predicate never asks for it.
+        assert!(is_accept_key(Modifiers::empty(), &Key::Named(Named::Enter)));
+        assert_eq!(magnifier_zoom_step(&Key::Named(Named::Enter), Location::Numpad), None);
+    }
+}
+
+/// DRAGON-601: the nudge CADENCE. The owner asked for "1px per tap, but hold to move should be
+/// available too", and the two halves of that sentence pull in opposite directions, so the rule
+/// that separates them is worth pinning exhaustively.
+#[cfg(test)]
+mod nudge_cadence_tests {
+    use super::*;
+    use std::time::Duration;
+
+    const ZERO: Duration = Duration::ZERO;
+    /// Longer than any deliberate tap, shorter than the hold delay.
+    const LONGISH_TAP: Duration = Duration::from_millis(250);
+
+    /// THE first half of the requirement, and the one the owner reported broken: a real press
+    /// moves, exactly once, no matter how the rest of the world is configured. Neither timer
+    /// can veto it, which is why the press arm returns before either is consulted.
+    #[test]
+    fn a_press_always_moves_exactly_once() {
+        for held in [ZERO, LONGISH_TAP, NUDGE_HOLD_DELAY, Duration::from_secs(30)] {
+            for since in [ZERO, Duration::from_millis(1), Duration::from_secs(30)] {
+                assert!(
+                    nudge_step_allowed(false, held, since),
+                    "a press must move (held={held:?} since={since:?})"
+                );
+            }
+        }
+    }
+
+    /// A repeat that arrives before OUR delay is discarded, however early it turns up. This is
+    /// what makes a tap exact on a desktop whose text-entry repeat delay is short: the owner's
+    /// session announces 600ms, but the build must behave the same on one announcing 150.
+    #[test]
+    fn an_early_repeat_never_moves() {
+        for held in [ZERO, Duration::from_millis(150), LONGISH_TAP] {
+            assert!(held < NUDGE_HOLD_DELAY, "{held:?} must be inside the tap window");
+            assert!(
+                !nudge_step_allowed(true, held, Duration::from_secs(30)),
+                "a repeat at {held:?} is still part of a tap"
+            );
+        }
+    }
+
+    /// The second half: once the key really has been held, repeats DO move. Hold-to-move is a
+    /// feature, not noise to discard, so the delay must open rather than close the door.
+    #[test]
+    fn a_held_key_moves_once_the_delay_has_passed() {
+        assert!(nudge_step_allowed(true, NUDGE_HOLD_DELAY, NUDGE_REPEAT_INTERVAL));
+        assert!(nudge_step_allowed(
+            true,
+            NUDGE_HOLD_DELAY + Duration::from_secs(5),
+            NUDGE_REPEAT_INTERVAL
+        ));
+    }
+
+    /// The interval is a CEILING on speed. A repeat closer than it is dropped, so a compositor
+    /// configured to fire very fast cannot make the region skate away from the user.
+    #[test]
+    fn the_interval_caps_how_fast_a_hold_can_step() {
+        let held = NUDGE_HOLD_DELAY + Duration::from_secs(1);
+        assert!(!nudge_step_allowed(true, held, ZERO), "two steps in the same instant");
+        assert!(!nudge_step_allowed(
+            true,
+            held,
+            NUDGE_REPEAT_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(nudge_step_allowed(true, held, NUDGE_REPEAT_INTERVAL), "exactly at the interval");
+    }
+
+    /// A fresh hold starts on every real press, and also on an ORPHAN repeat, one that turns up
+    /// with no press on record. That is what a focus change mid-hold looks like, and ignoring it
+    /// would strand the user: the key is already down, so no further press is coming.
+    #[test]
+    fn a_press_or_an_orphan_repeat_starts_a_fresh_hold() {
+        assert!(nudge_rearms(false, false), "a press with no hold");
+        assert!(nudge_rearms(true, false), "a press always re-arms, even mid-hold");
+        assert!(nudge_rearms(false, true), "an orphan repeat is treated as a press");
+        assert!(!nudge_rearms(true, true), "a repeat during a known hold continues it");
+    }
+
+    /// The measured cadence of the owner's own session, `repeat_info(rate = 25, delay = 600)`,
+    /// played through the gate as the compositor would deliver it. Two properties matter and
+    /// both are checked: nothing repeats during a tap, and once the hold is real EVERY repeat
+    /// the compositor sends is honoured, so the cap does not make their hold feel sluggish.
+    #[test]
+    fn the_measured_cosmic_cadence_taps_once_and_holds_smoothly() {
+        // cosmic-comp's announced defaults, measured with `wayland-info -i wl_seat`.
+        let compositor_delay = Duration::from_millis(600);
+        let compositor_period = Duration::from_millis(1000 / 25);
+        // A tap: one press, released long before the compositor would repeat at all.
+        assert!(nudge_step_allowed(false, ZERO, Duration::from_secs(30)));
+        // The compositor's first repeat, at 600ms, is past our 400ms delay, so the hold starts.
+        assert!(compositor_delay >= NUDGE_HOLD_DELAY, "our delay must not out-wait the desktop");
+        assert!(nudge_step_allowed(true, compositor_delay, Duration::from_secs(30)));
+        // And every subsequent repeat clears the cap, so the hold runs at the desktop's rate.
+        assert!(
+            compositor_period >= NUDGE_REPEAT_INTERVAL,
+            "the cap must not bite at the common 25/s cadence"
+        );
+        let mut held = compositor_delay;
+        for _ in 0..10 {
+            held += compositor_period;
+            assert!(
+                nudge_step_allowed(true, held, compositor_period),
+                "a steady 25/s hold dropped a step at {held:?}"
+            );
+        }
     }
 }

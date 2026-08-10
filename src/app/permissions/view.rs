@@ -126,7 +126,7 @@ impl App {
         // vibrancy enrolled on this surface (`open_permissions_window`'s `blur`,
         // `enable_window_vibrancy`'s reparenting) actually shows through. This
         // container's own comment used to claim it "matches the settings window's
-        // outer container", but painted a hardcoded opaque `cosmic.background.base`
+        // outer container", but painted a hardcoded opaque `cosmic.background(false).base`
         // instead of settings' `frost_color(.., glass)`, so the window-level
         // vibrancy was set up correctly and then completely hidden behind this
         // view's own opaque paint. `glass` is captured by value (`Option<GlassConfig>`
@@ -151,7 +151,7 @@ impl App {
                 let radius = [0.0f32; 4];
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(theme::frost_color(
-                        cosmic.background.base.into(),
+                        cosmic.background(false).base.into(),
                         glass,
                     ))),
                     border: Border {
@@ -391,7 +391,7 @@ impl App {
             .class(cosmic::theme::Container::custom(|theme| {
                 let cosmic = theme.cosmic();
                 cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(cosmic.primary.base.into())),
+                    background: Some(Background::Color(cosmic.primary(false).base.into())),
                     border: Border {
                         color: cosmic.bg_divider().into(),
                         width: 1.0,

@@ -72,7 +72,7 @@ fn annot_context_menu(pid: window::Id, spotlight: bool) -> Element<'static, Msg>
         )
         .class(cosmic::theme::Container::custom(|theme| {
             cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(theme.cosmic().background.divider.into())),
+                background: Some(Background::Color(theme.cosmic().background(false).divider.into())),
                 ..Default::default()
             }
         }));
@@ -114,11 +114,11 @@ fn annot_context_menu(pid: window::Id, spotlight: bool) -> Element<'static, Msg>
         .class(cosmic::theme::Container::custom(|theme| {
             let c = theme.cosmic();
             cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background.component.base.into())),
+                background: Some(Background::Color(c.background(false).component.base.into())),
                 border: Border {
                     radius: crate::app::theme::rounding(theme).s.into(),
                     width: 1.0,
-                    color: c.background.divider.into(),
+                    color: c.background(false).divider.into(),
                 },
                 ..Default::default()
             }

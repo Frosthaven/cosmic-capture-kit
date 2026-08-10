@@ -214,12 +214,12 @@ fn timeline_menu(pid: window::Id, t: f32, can_delete: bool) -> Element<'static, 
         .class(cosmic::theme::Container::Custom(Box::new(|t| {
             let c = t.cosmic();
             cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background.component.base.into())),
-                text_color: Some(c.background.component.on.into()),
+                background: Some(Background::Color(c.background(false).component.base.into())),
+                text_color: Some(c.background(false).component.on.into()),
                 border: Border {
                     radius: crate::app::theme::rounding(t).s.into(),
                     width: 1.0,
-                    color: c.background.component.divider.into(),
+                    color: c.background(false).component.divider.into(),
                 },
                 ..Default::default()
             }

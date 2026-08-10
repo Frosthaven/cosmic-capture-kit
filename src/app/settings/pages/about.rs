@@ -6,7 +6,7 @@ use super::super::row::{Item, SectionSpec};
 /// The app icon, compiled in so the About page never depends on the icon being
 /// installed system-wide (packaging installs the same file to hicolor).
 const APP_ICON: &[u8] =
-    include_bytes!("../../../../res/icons/dev.frosthaven.CosmicCaptureKit.svg");
+    include_bytes!("../../../../res/icons/dev.thedragon.CosmicCaptureKit.svg");
 
 /// The docs site's own rendered patch-notes history page. The Version row's description
 /// links here ("View All Patch Notes") on every platform. This is text only, no download
@@ -79,6 +79,14 @@ impl crate::app::App {
         // The changelog stays visible in the UpToDate state too (the manifest's
         // notes ARE the installed version's), so users can always read what is
         // in their version; notes_element carries its own "What's new" heading.
+        //
+        // It also stays visible on a build with NO update channel (a Flatpak,
+        // DRAGON-605), where `update_items` above returned the store card instead of
+        // the update controls. The notes go BELOW that card on purpose: the card says
+        // where updates come from, the notes say what is in them, and the pair is more
+        // useful than either alone. Nothing here is conditional, because the notes are
+        // not the channel's to withhold; `update::notes_source` decides only who
+        // FETCHES them, and on a Flatpak that is `SettingsMsg::FetchReleaseNotes`.
         if let Some(notes) = self.notes_element() {
             items.push(Item::note(notes));
         }
@@ -97,8 +105,16 @@ impl crate::app::App {
     /// the "Check for updates" button (no standalone check row). The installed version is
     /// no longer shown here (it reads in the row's title now), so the button stands alone,
     /// right-aligned, sharing [`shared_button_width`] with the Donate button.
+    ///
+    /// On a build with no update channel (a Flatpak, DRAGON-561) there is no action to
+    /// offer: no check button, and Available can never arrive (nothing checks). The
+    /// control slot stays empty, and the store row from [`Self::update_items`] says
+    /// where updates come from instead.
     fn version_row_control(&self) -> Element<'_, Msg> {
         use crate::update::UpdateStatus;
+        if !crate::update::channel_available() {
+            return widget::text("").into();
+        }
         if let UpdateStatus::Available(info) = &self.update_status {
             let action_w = shared_button_width(Some(&info.version));
             update_action_button(info, self.update_installing, action_w)
@@ -146,8 +162,24 @@ impl crate::app::App {
         )
     }
 
-    /// The always-present notify toggle (the check button lives on the Version row).
+    /// The notify toggle (the check button lives on the Version row), or, on a build
+    /// with no update channel (a Flatpak, DRAGON-561), ONE inert informational row in
+    /// place of both update controls: the store owns updates there, so a check button
+    /// and a notify toggle would each promise something this build cannot do. The copy
+    /// deliberately names no specific store (owner decision): a Flatpak cannot tell
+    /// which remote installed it.
     fn update_items(&self) -> Vec<Item<'_>> {
+        if !crate::update::channel_available() {
+            return vec![
+                Item::new(
+                    "Updates come from your software store",
+                    "This build is a Flatpak. New versions arrive through the store you \
+                     installed it from, or by running flatpak update.",
+                    widget::text(""),
+                )
+                .flush(),
+            ];
+        }
         vec![
             // DRAGON-177: the launch-time update-dialog toggle (no description). This is
             // the SAME setting the dialog's "Don't remind me again" checkbox drives.
@@ -315,6 +347,41 @@ fn install_button<'a>(version: &str, installing: bool, width: f32) -> Element<'a
     )
 }
 
+/// Wrap the Cargo description "generally around where the first sentence ends"
+/// (the owner's rule, DRAGON-578, third reading of the same request: not a fixed
+/// pixel width, not sentence-per-line). The opening sentence is line one and
+/// DEFINES the measure; the rest of the description word-wraps greedily to that
+/// measure, in characters. A character count is deliberate, not a font metric:
+/// the caption font is proportional, but "around" is the spec, and a pure count
+/// keeps the decision testable with no font stack (the `text_annot::wrap_with`
+/// precedent). Words are never split; a word longer than the measure gets its
+/// own line. A description with no ". " boundary comes back as a single line.
+/// Pure; unit-tested in `tagline_wrap_tests`.
+fn wrap_tagline(desc: &str) -> Vec<String> {
+    let Some((first, rest)) = desc.split_once(". ") else {
+        return if desc.is_empty() { Vec::new() } else { vec![desc.to_string()] };
+    };
+    let first = format!("{first}.");
+    let measure = first.chars().count();
+    let mut lines = vec![first];
+    let mut line = String::new();
+    for word in rest.split_whitespace() {
+        if line.is_empty() {
+            line = word.to_string();
+        } else if line.chars().count() + 1 + word.chars().count() <= measure {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut line));
+            line = word.to_string();
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 /// Centered header: the app icon (with the icon-credit badge tucked at its
 /// corner), the app name, and the tagline.
 fn hero() -> Element<'static, Msg> {
@@ -334,7 +401,20 @@ fn hero() -> Element<'static, Msg> {
             .align_y(Alignment::End)
             .into(),
             widget::text::title3("Cosmic Capture Kit").into(),
-            widget::text::caption("Desktop Screenshot & Recorder").into(),
+            // The tagline comes from Cargo.toml rather than a literal, so the crate metadata
+            // and the About page cannot drift (owner request). `Cargo.toml` is the single
+            // source: change the wording there and this follows. The block wraps around
+            // where the first sentence ends (owner's call, DRAGON-578): wrap_tagline
+            // pre-breaks the lines, each rendered unwrapped and centered.
+            {
+                let lines = wrap_tagline(env!("CARGO_PKG_DESCRIPTION"));
+                let mut col = widget::column::with_capacity(lines.len());
+                for line in lines {
+                    col = col.push(widget::text::caption(line).align_x(Alignment::Center));
+                }
+                col.align_x(Alignment::Center).into()
+            },
+            release_kind(),
         ])
         .spacing(8.0)
         .align_x(Alignment::Center),
@@ -342,6 +422,43 @@ fn hero() -> Element<'static, Msg> {
     .width(Length::Fill)
     .align_x(Alignment::Center)
     .padding([12.0, 0.0])
+    .into()
+}
+
+/// How this build was delivered, as a subdued icon plus label under the tagline: "Linux Binary
+/// Release", "Linux AppImage Release", "Linux Flatpak Release", "macOS Release" or "Windows
+/// Release" (owner request; DRAGON-614 added the last two and put the platform on the first
+/// three, which stopped the badge reading as Linux-only).
+///
+/// It answers a question support threads open with and users cannot otherwise answer: WHICH
+/// build is this. The Linux three behave differently in ways that matter the moment something
+/// is wrong, since they disagree about where the app's files live, whether it can update
+/// itself, and which copy of ffmpeg or tesseract is really being spawned.
+///
+/// The wording and the debug log's `package:` line come from ONE source
+/// ([`crate::util::PackageKind`]), so a screenshot of this row and a log file cannot contradict
+/// each other. They are deliberately not the same STRING: the log says what the thing is
+/// ("plain binary"), this names a release channel.
+///
+/// Subdued and small on purpose. It is provenance, not a headline, and it sits below the
+/// tagline so it reads as a footnote to the identity above it rather than as a feature.
+fn release_kind() -> Element<'static, Msg> {
+    let kind = crate::util::package_kind();
+    widget::row(vec![
+        crate::widgets::icons::sized(kind.icon_name(), 14.0)
+            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|t: &cosmic::Theme| {
+                cosmic::widget::svg::Style { color: Some(theme::subtle(t)) }
+            })))
+            .into(),
+        widget::text::caption(kind.label())
+            .class(cosmic::theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+                color: Some(theme::subtle(t)),
+                ..Default::default()
+            }))
+            .into(),
+    ])
+    .spacing(6.0)
+    .align_y(Alignment::Center)
     .into()
 }
 
@@ -432,6 +549,60 @@ fn donate_button(width: f32) -> Element<'static, Msg> {
         cosmic::theme::Button::Suggested,
         Some(Msg::WindowChrome(WindowChromeMsg::OpenUrl(DONATE_URL))),
     )
+}
+
+// The tagline wrap: the first sentence is line one and sets the measure; the rest of the
+// description wraps to it (DRAGON-578).
+#[cfg(test)]
+mod tagline_wrap_tests {
+    use super::wrap_tagline;
+
+    #[test]
+    fn the_first_sentence_is_line_one_and_nothing_runs_wider() {
+        let lines = wrap_tagline(env!("CARGO_PKG_DESCRIPTION"));
+        assert!(
+            lines[0].starts_with("Quickly capture") && lines[0].ends_with('.'),
+            "line one is the whole opening sentence: {}",
+            lines[0]
+        );
+        assert!(lines.len() > 2, "the remainder wraps into more than one line: {lines:?}");
+        let measure = lines[0].chars().count();
+        for line in &lines[1..] {
+            assert!(
+                line.chars().count() <= measure,
+                "wrapped line exceeds the first-sentence measure: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_content_is_lost_or_reordered() {
+        assert_eq!(wrap_tagline(env!("CARGO_PKG_DESCRIPTION")).join(" "), env!("CARGO_PKG_DESCRIPTION"));
+    }
+
+    #[test]
+    fn the_remainder_wraps_greedily_to_the_measure() {
+        assert_eq!(wrap_tagline("AAAA. bb cc dd"), vec!["AAAA.", "bb cc", "dd"]);
+    }
+
+    #[test]
+    fn a_word_longer_than_the_measure_gets_its_own_line() {
+        assert_eq!(
+            wrap_tagline("AA. supercalifragilistic word"),
+            vec!["AA.", "supercalifragilistic", "word"]
+        );
+    }
+
+    #[test]
+    fn a_single_sentence_description_degrades_to_one_line() {
+        assert_eq!(wrap_tagline("Just one line"), vec!["Just one line"]);
+        assert_eq!(wrap_tagline("Ends with a period."), vec!["Ends with a period."]);
+    }
+
+    #[test]
+    fn an_empty_description_renders_nothing() {
+        assert!(wrap_tagline("").is_empty());
+    }
 }
 
 #[cfg(test)]

@@ -26,6 +26,36 @@ pub(in crate::app) fn recording_save_name(stem: &str) -> String {
 /// need the same answer and a typo between them would send captures to two places.
 pub(in crate::app) const DEFAULT_CAPTURE_DIR: &str = "~/Capture";
 
+/// **Pure**, unit-tested: the bounding box, in CAPTURE coordinates, of a set of output rects
+/// given as `(pos, size)` — the whole desktop this session can reach (DRAGON-599).
+///
+/// The walls a keyboard nudge fights, and the reason they are the DESKTOP's rather than one
+/// output's: a drawn region may already span two displays (the drag wall lets you push through
+/// a monitor border on purpose, see `widgets::region_selection::wall`), so confining a nudge to
+/// the surface the key arrived on would refuse to move such a region at all.
+///
+/// A bounding BOX is deliberately coarser than the desktop's true shape. On an L-shaped layout
+/// it includes corners no output covers, so a nudge can walk a region into dead space, exactly
+/// as a DRAG already can. Matching the drag is worth more here than a tighter wall, and the
+/// capture itself already handles a region that overhangs an output.
+///
+/// `None` for an empty set, and zero-sized outputs are skipped: an output with no extent
+/// contributes no place a region could go, and folding its origin in would drag the box to it.
+pub(in crate::app) fn desktop_bounds_of(
+    rects: impl IntoIterator<Item = ((i32, i32), (u32, u32))>,
+) -> Option<(i32, i32, i32, i32)> {
+    rects
+        .into_iter()
+        .filter(|(_, (w, h))| *w > 0 && *h > 0)
+        .fold(None, |acc: Option<(i32, i32, i32, i32)>, ((x, y), (w, h))| {
+            let (r, b) = (x + w as i32, y + h as i32);
+            Some(match acc {
+                None => (x, y, r, b),
+                Some((l0, t0, r0, b0)) => (l0.min(x), t0.min(y), r0.max(r), b0.max(b)),
+            })
+        })
+}
+
 /// WHERE a fresh capture's file is written (DRAGON-467).
 ///
 /// `configured` is the user's save folder for this media kind; `transient` is wherever
@@ -97,12 +127,84 @@ fn picking_phase(countdown: bool, capture_live: bool, recording: bool) -> bool {
     !countdown && !capture_live && !recording
 }
 
+// ── The tray-menu dropdown hold (Linux, DRAGON-600) ──────────────────────────
+//
+// A child launched from the tray menu finds the host's dropdown STILL ON SCREEN, and it
+// stays there until something takes keyboard focus away from it. That something is us:
+// `picking_phase` above mints the capture overlays EXCLUSIVE, cosmic-comp auto-focuses an
+// Exclusive Overlay-layer surface on its first commit, the panel's popup gets
+// `wl_keyboard.leave`, and cosmic-panel closes it. Confirmed in cosmic-comp
+// (`shell/focus/mod.rs`, the `KeyboardInteractivity::Exclusive` arm that calls
+// `keyboard.unset_grab` so the following `set_focus` actually lands) and in cosmic-panel
+// (`wrapper_space.rs::keyboard_leave` -> `close_popups`).
+//
+// So the dismissal is CAUSED BY THIS PROCESS, which is why no pre-spawn delay in the
+// daemon could ever work: it delayed the very thing it was waiting for. The launch-time
+// flats grab just runs too early, finishing before the overlay is up.
+//
+// The fix is ordering, not duration: hold the grab until our overlay reports keyboard
+// focus, then let the panel finish tearing the popup down, then grab. While the hold is
+// up the overlay paints NOTHING, which is the same trick DRAGON-456 used for the scan
+// re-read: a mapped Linux layer surface that draws nothing composites to nothing, so it
+// cannot photograph itself.
+
+/// After our overlay takes keyboard focus, how long the panel is given to actually retire
+/// its popup and the compositor to composite a frame without it. This is a settle, not a
+/// guess about whether the dismissal will happen: the causal event has already been
+/// observed by the time it starts. cosmic-panel closes the popup synchronously on the
+/// keyboard leave, so this only has to cover one client round trip plus a frame or two.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // Linux is the only host-owned menu
+pub(super) const MENU_DISMISS_SETTLE_MS: u64 = 150;
+
+/// The OUTER bound on the whole hold (DRAGON-118: nothing waits unboundedly). If keyboard
+/// focus never arrives, because the compositor refused the Exclusive grab or there are no
+/// outputs, the grab runs anyway and the launch proceeds with whatever is on screen. A
+/// stale dropdown in a snapshot is a blemish; a capture that never happens is a loss.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) const MENU_HOLD_BUDGET_MS: u64 = 1200;
+
+const _: () = assert!(
+    MENU_DISMISS_SETTLE_MS < MENU_HOLD_BUDGET_MS,
+    "DRAGON-600: the post-focus settle must fit inside the outer hold budget, or the \
+     budget would fire first and the settle could never be observed"
+);
+
+/// **Pure**, unit-tested: whether this launch holds its frozen-flats grab for the tray
+/// dropdown. Only a menu-launched child has a dropdown on screen, and only a launch that
+/// actually grabs flats has anything to protect, so a PrintScreen or hotkey launch pays
+/// nothing at all. `menu_launch` is [`crate::recording_ui::MENU_LAUNCH_ENV`]'s presence,
+/// `want_flats` is [`super::launch_flats_needed`]'s answer.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn menu_flats_hold_needed(menu_launch: bool, want_flats: bool) -> bool {
+    menu_launch && want_flats
+}
+
+/// **Pure**, unit-tested: whether a held grab should run NOW.
+///
+/// `since_focus_ms` is `None` until our overlay has taken keyboard focus, which is the
+/// event that dismisses the dropdown; once it is `Some`, the settle is counted from there.
+/// `since_launch_ms` is measured from the hold being armed and drives the outer bound, so
+/// the two clocks answer different questions: one "has the dismissal had time to land",
+/// the other "have we waited long enough that waiting is now the bigger risk".
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn menu_hold_release(since_focus_ms: Option<u64>, since_launch_ms: u64) -> bool {
+    since_focus_ms.is_some_and(|ms| ms >= MENU_DISMISS_SETTLE_MS)
+        || since_launch_ms >= MENU_HOLD_BUDGET_MS
+}
+
 impl App {
     /// The keyboard interactivity to MINT a capture overlay with right now:
     /// Exclusive during picking (see [`picking_phase`]), OnDemand otherwise.
     #[cfg(target_os = "linux")]
     pub(super) fn overlay_pick_exclusive(&self) -> bool {
         picking_phase(self.countdown.is_some(), self.capture_live, self.recording.is_some())
+    }
+
+    /// DRAGON-599: this session's whole desktop, in CAPTURE coordinates, as the walls a
+    /// keyboard region nudge stops at. The effectful half of [`desktop_bounds_of`]: it reads
+    /// `self.outputs` and decides nothing.
+    pub(super) fn desktop_bounds(&self) -> Option<(i32, i32, i32, i32)> {
+        desktop_bounds_of(self.outputs.iter().map(|o| (o.logical_pos, o.logical_size)))
     }
 
     /// The region selection normalized to (x, y, w, h), if non-empty.
@@ -158,10 +260,42 @@ impl App {
     /// caller can fall back to the picker overlay. The pipeline mode was already pinned to
     /// Window / Monitor in `init` so the right worker (window-focus grab vs monitor grab)
     /// runs. Never called on Linux (its capture keys are COSMIC custom shortcuts).
+    ///
+    /// Linux exception (`lab/flatpak`): when the compositor exposes NONE of the protocols
+    /// an immediate capture needs (a sandboxed client, or a compositor that never
+    /// implemented them), this returns the honest failure ending (`diag::note_failure` +
+    /// [`App::fail_session`]) instead of `None`: the picker overlay is not a fallback in
+    /// those sessions (layer shell is hidden by the same filter), and a portal dialog
+    /// would defeat the point of a zero-interaction capture. See
+    /// [`immediate_target_resolvable`].
     pub(super) fn immediate_capture(
         &mut self,
         imm: ImmediateCapture,
     ) -> Option<Task<cosmic::Action<Msg>>> {
+        // lab/flatpak: an immediate capture needs the COMPOSITOR to say which target is
+        // active and to hand over its pixels. When this session has no protocol access
+        // for that, end through the honest failure path NOW: the native grab below
+        // cannot work, and the picker fallback cannot draw either (the same sessions
+        // hide layer shell). Keyed on the protocol probe, never on sandbox detection,
+        // so a normal COSMIC session (protocols present) is byte-identical.
+        #[cfg(target_os = "linux")]
+        {
+            let (native_capture, window_list) = immediate_protocol_terms();
+            if !immediate_target_resolvable(imm, native_capture, window_list) {
+                log::warn!(
+                    "immediate capture ({imm:?}) is not available in this session: the \
+                     compositor exposes no protocol to resolve or grab the active target"
+                );
+                crate::diag::note_failure(
+                    crate::diag::Failure::NoOutputs,
+                    &format!(
+                        "immediate capture ({imm:?}) has no usable capture target: \
+                         native_capture={native_capture} toplevel_list={window_list}"
+                    ),
+                );
+                return Some(self.fail_session());
+            }
+        }
         // Linux: an overlay-less immediate capture mints NO picker overlay, so — unlike the
         // interactive path — nothing fills `capture_pointer_output` from an overlay's
         // pointer-enter. Learn the cursor's output DIRECTLY from the momentary transparent
@@ -313,16 +447,29 @@ impl App {
                 ashpd::desktop::screencast::SourceType::Monitor,
                 Some(rt),
                 sel,
+                // A region COMMIT: the session's target was picked at the seed,
+                // so replaying the session token avoids a second prompt.
+                super::portal::RequestOrigin::InSession,
             );
         }
         // Region screenshot + PipeWire: same portal request; the single-frame grab
         // happens in `do_pixel_capture`. (Freeze is inert under PipeWire.)
+        //
+        // `lab/flatpak` (`fallback_region_still_from_frozen`): a NON-DELAYED region
+        // still on the fallback path skips this request: the seed grant already froze
+        // the granted monitor, the user drew over exactly that still, and a fresh live
+        // frame could differ from what they selected (WYSIWYG). It falls through to
+        // `proceed_capture`, whose `do_pixel_capture` crops the frozen frame. A DELAYED
+        // shot keeps this request: the delay exists to change the screen, so the fresh
+        // portal frame at fire time is the honest source (the restore token means no
+        // second dialog).
         #[cfg(target_os = "linux")]
         if matches!(self.kind, Kind::Image | Kind::Scanner)
             && self.screenshot_uses_portal()
             && self.pipewire_available
             && self.mode == Mode::Region
             && self.pw_held.is_none()
+            && !self.fallback_region_still_from_frozen()
             && let Some(rt) = self.region_clamped(&inset_region(sel.clone()))
         {
             if let Some(disp) = self.region_clamped(&sel) {
@@ -333,6 +480,8 @@ impl App {
                 ashpd::desktop::screencast::SourceType::Monitor,
                 Some(rt),
                 sel,
+                // Same commit-time shape as the video arm above: in-session.
+                super::portal::RequestOrigin::InSession,
             );
         }
         self.proceed_capture(sel)
@@ -391,6 +540,36 @@ impl App {
         // fire re-focuses in case focus was stolen mid-countdown). No-op for region/monitor
         // picks and for Inactive-styled window picks (the fire-time defocus handles those).
         self.focus_target_at_countdown_start(&sel);
+        // DRAGON-563: the remaining seconds also render IN the tray icon, on EVERY
+        // session (the owner ungated it: "we can have that across the board"). Normal
+        // sessions keep their on-screen countdown and get the digits in addition. On the
+        // `lab/flatpak` fallback path the digits are the ONLY countdown surface: the
+        // plain toplevel counted down over a gray sheet, and window/monitor countdowns
+        // had no surface at all, so `recreate_active_overlays` (below) tears the
+        // fallback window down for the countdown's whole run (its arm keys on
+        // `self.countdown`, set above). There the editor anchor is snapshotted NOW,
+        // while the outputs are still known, the same rule as the fallback record-start
+        // snapshot; `begin_capture` keeps it when its fresh resolution comes back empty
+        // (`keep_countdown_anchor`).
+        //
+        // No tray host answering: NORMAL sessions keep their historical on-screen
+        // countdown (nothing changes for them). The FALLBACK path proceeds with NO
+        // visual countdown at all — the reopened DRAGON-563: sandboxed child trays can
+        // fail to register where the resident's succeeds, and the "keep the window so
+        // the timer is visible" failure-safe put the gray sheet right back. The capture
+        // still fires on schedule and Cancel stays possible from any surface that does
+        // exist (a resident tray, Escape on a still-open selector); the warn names the
+        // condition so the log shows WHY nothing was on screen.
+        self.countdown_tray = crate::tray::CountdownTraySession::start(secs);
+        if self.overlay_fallback_active() {
+            if self.countdown_tray.is_none() {
+                log::warn!(
+                    "portal-fallback countdown: no tray host answered, proceeding with no \
+                     visual countdown ({secs}s still fires on schedule)"
+                );
+            }
+            self.snapshot_preview_anchor(&sel);
+        }
         self.pending = Some(sel);
         self.recreate_active_overlays()
     }
@@ -439,6 +618,22 @@ impl App {
     /// Tear down the overlay and arm the pixel-capture tick. Capturing while the
     /// overlay is still mapped would grab our own UI, so the actual grab happens
     /// one short subscription tick later in [`Self::do_pixel_capture`].
+    ///
+    /// **A capture excludes our overlay by TIMING, not by any filter** (DRAGON-608), and the
+    /// distinction matters more than it looks. Nothing marks our surfaces as un-capturable;
+    /// what keeps them out of the shot is only that we have already left the screen by the
+    /// time it is read. That exclusion therefore reaches exactly ONE process, our own.
+    ///
+    /// Two consequences, and both are relied on:
+    ///
+    /// * A capture started over a live COLOUR PICKER photographs the picker, correctly and
+    ///   with no feature of its own, because the picker is a separate process whose overlay
+    ///   nothing here tore down. That is the whole of DRAGON-608's delivered behaviour.
+    /// * The teardown DISTURBS whatever is underneath. The compositor hands the pointer to the
+    ///   newly topmost surface as a `wl_pointer.enter`, and a live picker there used to read
+    ///   that as a real move and jump its loupe into the shot (DRAGON-611). The rule that
+    ///   separates a revealed pointer from a moved one is
+    ///   [`crate::widgets::color_pick`]'s `pointer_report_moves_sample`.
     pub(super) fn begin_capture(&mut self, sel: Selection) -> Task<cosmic::Action<Msg>> {
         // macOS (DRAGON-148 option C): the frozen flats are grabbed on a deferred
         // thread, so a commit could in principle race ahead of them (the user drew +
@@ -469,8 +664,22 @@ impl App {
         // back to the selection's output when the trigger can't be resolved (keeps the
         // DRAGON-304 immediate-capture behavior). Captured before the overlay (and
         // `self.outputs`) tears down, so the fullscreen preview overlay can open there.
-        self.preview_output =
-            self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
+        //
+        // `lab/flatpak` (DRAGON-563): on the fallback path a TRAY countdown tore the
+        // selection window and `self.outputs` down at COUNTDOWN start, so the fresh
+        // resolutions here come back empty at fire time; the countdown-start snapshot
+        // (`snapshot_preview_anchor`, holding both the anchor and its scale) stands in,
+        // the same precedence `stop_recording` applies at record stop. Every other path
+        // has no snapshot to keep, so the historical overwrite below is untouched.
+        let fresh = self.active_trigger_display().or_else(|| self.output_for_selection(&sel));
+        let keep_snapshot = keep_countdown_anchor(
+            self.overlay_fallback_active(),
+            fresh.is_some(),
+            self.preview_output.is_some(),
+        );
+        if !keep_snapshot {
+            self.preview_output = fresh;
+        }
         // DRAGON-317 regression fix: the windowed-preview re-home target is the RELIABLE
         // capture-origin monitor ONLY — the pointer's output learned from the capture
         // overlay's first pointer-enter (`capture_pointer_output`), NOT the launch
@@ -483,7 +692,9 @@ impl App {
         {
             self.preview_output_name = self.capture_pointer_output.clone();
         }
-        self.preview_output_scale = self.scale_for_selection(&sel);
+        if !keep_snapshot {
+            self.preview_output_scale = self.scale_for_selection(&sel);
+        }
         // Immediate captures (a window grab, or a freeze crop) don't read the live
         // composited screen, so we can show the preview overlay (a spinner) the instant
         // the capture is accepted — covering the grab + encode wait instead of flashing
@@ -720,6 +931,24 @@ impl App {
         }
         let cx = sel.x + sel.width as i32 / 2;
         let cy = sel.y + sel.height as i32 / 2;
+        // DRAGON-549: the LAST resort used to be `outputs.first()`, i.e. wl_output
+        // registration order. It is reached by a portal `--window` launch, whose selection is
+        // a 1x1 placeholder that names no output and lands wherever the origin happens to be,
+        // and its answer feeds `scale_for_selection` — the divisor that turns the capture's
+        // physical pixels back into points. Prefer the output the PORTAL GRANT was made on,
+        // which is the display the media really came from. Untouched (and `None`) on every
+        // native-capture launch, where a real selection resolves above this.
+        let portal_origin = || {
+            #[cfg(target_os = "linux")]
+            {
+                let name = self.portal_origin_output.as_deref()?;
+                self.outputs.iter().find(|o| o.name == name)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                None
+            }
+        };
         self.outputs
             .iter()
             .find(|o| {
@@ -727,6 +956,7 @@ impl App {
                 let (lw, lh) = o.logical_size;
                 cx >= lx && cx < lx + lw as i32 && cy >= ly && cy < ly + lh as i32
             })
+            .or_else(portal_origin)
             .or_else(|| self.outputs.first())
     }
 
@@ -780,6 +1010,20 @@ impl App {
             // Fallback: the launch focused-toplevel output name, matched into `self.outputs`
             // (empty at init, populated by commit) for its WlOutput handle + logical size.
             if let Some(name) = self.trigger_display.as_deref()
+                && let Some(o) = self.outputs.iter().find(|o| o.name == name)
+            {
+                return Some((o.output.clone(), o.logical_size));
+            }
+            // DRAGON-549: the output a PORTAL grant was made on. A portal session has no
+            // capture overlay, so neither signal above can exist there — the pointer output is
+            // learned from an overlay that was never minted, and the focused-toplevel name
+            // needs a protocol a sandboxed client cannot see. The grant is what knows, and it
+            // has to be consulted BEFORE the fallback below, which is wl_output registration
+            // order and names an arbitrary display. On the owner's box that arbitrary display
+            // is an 800x480 panel beside a 5120x1440 ultrawide, and bounding the windowed
+            // editor's open fit to it floors every capture at the same small window. `None` on
+            // every native-capture launch, where the two signals above already answered.
+            if let Some(name) = self.portal_origin_output.as_deref()
                 && let Some(o) = self.outputs.iter().find(|o| o.name == name)
             {
                 return Some((o.output.clone(), o.logical_size));
@@ -1143,8 +1387,16 @@ impl App {
         // exactly the bug this fixes), and a MONITOR pick needs no motion-stop
         // to aim. Mode switches mid-overlay recompute this live, so the frozen
         // backdrop appears/disappears with the Region mode selection.
+        //
+        // `lab/flatpak`: the portal-frozen FALLBACK forces the freeze term. There the
+        // active backend is the portal, whose `freeze` capability is honestly false
+        // (finished frames, nothing to reconstruct), but the fallback seeding grabbed
+        // a real frame of the granted monitor at launch, the selection window draws
+        // over that still, and delivering anything OTHER than a crop of it would hand
+        // the user different pixels than the ones they drew on. Freeze is structural on
+        // that path, not a preference; a normal session never sets the term.
         self.mode == Mode::Region
-            && self.effective_capture_extras().freeze
+            && (self.effective_capture_extras().freeze || self.overlay_fallback_active())
             && matches!(self.kind, Kind::Image | Kind::Scanner)
             && !self.frozen.is_empty()
     }
@@ -1167,8 +1419,55 @@ impl App {
     /// DRAGON-460 dropped the scanner's own arm here: it reads a live region shot now, so
     /// it needs no frozen view to agree with. The freeze PREFERENCE still applies to it
     /// exactly as it does to any other kind.
+    ///
+    /// `lab/flatpak` (DRAGON-547 reopened): the countdown release above is the NATIVE
+    /// session's rule only. The fallback term stays frozen under a configured delay;
+    /// the pure [`freeze_backdrop_active`] states the by-path split and its why.
     pub(super) fn freeze_backdrop_active(&self) -> bool {
-        freeze_backdrop_active(self.freezing(), self.configured_delay_secs())
+        // `lab/flatpak`: the fallback overlay shows the seed still for the region
+        // SELECTION phase of EVERY kind, video included ([`fallback_backdrop`]), not
+        // just the still kinds `freezing()` speaks for. The delay release applies
+        // ONLY to the native `freezing()` term: a plain toplevel has no live desktop
+        // to release to, so the pure fn keeps the fallback term frozen under a delay.
+        freeze_backdrop_active(
+            self.freezing(),
+            fallback_backdrop(
+                self.overlay_fallback_active(),
+                self.mode == Mode::Region,
+                !self.frozen.is_empty(),
+            ),
+            self.configured_delay_secs(),
+        )
+    }
+
+    /// `lab/flatpak`: whether a REGION STILL commit on the fallback path delivers by
+    /// cropping the seed-frozen frame instead of requesting a fresh portal frame. The
+    /// decision itself is pure ([`fallback_still_from_frozen`]); this feeds it the live
+    /// state. Linux-only: its one caller is `run_capture`'s Linux portal branch.
+    #[cfg(target_os = "linux")]
+    fn fallback_region_still_from_frozen(&self) -> bool {
+        fallback_still_from_frozen(
+            self.overlay_fallback_active(),
+            self.configured_delay_secs(),
+            !self.frozen.is_empty(),
+        )
+    }
+
+    /// `lab/flatpak`: whether the SCANNER's region read comes from the seed-frozen frame
+    /// rather than a live native grab. Same rule as
+    /// [`Self::fallback_region_still_from_frozen`] with the delay term fixed at `0`,
+    /// because the scanner never delays (`capture_live` excludes `Kind::Scanner`), so its
+    /// WYSIWYG case always applies. False off Linux, where the live read is the only
+    /// source and always works.
+    pub(super) fn scan_reads_frozen(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            fallback_still_from_frozen(self.overlay_fallback_active(), 0, !self.frozen.is_empty())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     /// The frozen scene's windows that intersect the region (global logical coords), in z-order, as
@@ -1357,6 +1656,65 @@ impl App {
         )
     }
 
+    /// DRAGON-562: build the portal window still's decoration bundle ON THE UI
+    /// THREAD (settings, theme and border resolution all live here), so the
+    /// worker only pays for the compose. Mirrors the native window branch's job
+    /// wiring field for field, minus what the portal cannot supply: no live grab
+    /// id (`frozen_px` is always the portal frame), no cursor sprite, and
+    /// transparency off pending the alpha probe (both via the effective extras,
+    /// which fold the portal caps table in).
+    #[cfg(target_os = "linux")]
+    fn portal_window_deco(&self, grant: super::PortalWindowGrant) -> PortalWindowDeco {
+        let extras = self.effective_capture_extras();
+        let borders = crate::decoration::WindowBorders::resolve(
+            self.active_border_color,
+            self.active_border_width,
+            self.inactive_border_color,
+            self.inactive_border_width,
+        );
+        let job = crate::screenshot::WindowCaptureJob {
+            // Never grabbed live: `apply` always sets `frozen_px` (the frame).
+            id: String::new(),
+            cursor: false,
+            // Finalized in `apply` from the grabbed frame's dimensions; the
+            // grant's position seeds x/y there too.
+            sel: Selection { x: 0, y: 0, width: 1, height: 1, output: None, window_id: None },
+            capture_transparency: extras.transparency,
+            capture_wallpaper: extras.wallpaper,
+            window_radius: self.window_radius,
+            // ALWAYS the Active border on the portal path, whatever the "Window
+            // focus appearance" setting says (`single_window_border_active`'s
+            // portal arm). The grant carries no activation info and the portal
+            // cannot drive the window's real focus state, so the state-keyed
+            // choice is unanswerable here; the portal-picked window was
+            // interactively chosen by the user, so Active is the honest
+            // deterministic default. The titlebar stays whatever the compositor
+            // rendered.
+            border: borders.for_active(single_window_border_active(
+                true,
+                self.window_single_active,
+            )),
+            window_shadow: self.window_drop_shadow,
+            pad_logical: if self.window_padding {
+                self.window_padding_px.value as f32
+            } else {
+                0.0
+            },
+            dark: super::theme_is_dark(),
+            // The grant-time output snapshot: `self.outputs` is torn down by now.
+            frozen_geom: grant.outputs.clone(),
+            frozen_px: None,
+            // No sprite session on the portal (embedded-or-hidden only).
+            cursor_overlay: None,
+        };
+        PortalWindowDeco {
+            fullscreen_aware: extras.fullscreen_aware,
+            grant,
+            job,
+            recompositing: self.window_recompositing,
+        }
+    }
+
     /// Grab pixels natively (cosmic screencopy), save the PNG to the screenshots
     /// folder, then share it (clipboard / notify / reveal) and exit.
     pub(super) fn do_pixel_capture(&mut self) -> Task<cosmic::Action<Msg>> {
@@ -1370,8 +1728,8 @@ impl App {
 
         // Committing a capture collapses a multi-instance session: tear down any
         // other overlays so only this shot proceeds. DRAGON-322: a recording / preview
-        // sibling is spared, so a still capture can run alongside a recording and a
-        // self-capture keeps the existing preview open.
+        // sibling is spared, so a still capture can run alongside a recording and can be
+        // taken of the open preview.
         crate::instance::close_other_instances();
 
         // Destination path (shared by both the screencopy and PipeWire paths). DRAGON-467:
@@ -1386,9 +1744,21 @@ impl App {
         // Linux-only (the portal/PipeWire path); on macOS `pw_held` is always None.
         #[cfg(target_os = "linux")]
         if let Some(held) = self.pw_held.take() {
-            let HeldStream { fd, node_id, crop } = held;
+            let HeldStream { fd, node_id, crop, window_grant } = held;
             let fallback = path.clone();
             let meta = self.screenshot_metadata();
+            // DRAGON-562: a WINDOW-mode portal still runs the SAME single-window
+            // aesthetics pipeline a native capture does (padding / borders /
+            // shadow / rounding / wallpaper-or-black backdrop), built here on the
+            // UI thread and applied on the worker. `None` — the frame stays
+            // untouched, the historical behavior — for monitor/region grants
+            // (no single owning window), scanner shots (analysis wants raw
+            // pixels), and any launch that held no window grant.
+            let deco = if self.kind == Kind::Image {
+                window_grant.map(|g| self.portal_window_deco(g))
+            } else {
+                None
+            };
             // Grab + save on a dedicated OS thread (the PipeWire loop blocks); hand
             // the result back through a oneshot the Task awaits (executor-agnostic).
             let (tx, rx) = cosmic::iced::futures::channel::oneshot::channel();
@@ -1397,10 +1767,20 @@ impl App {
                 // arrived and a frame that could not be written are different problems.
                 let outcome = match crate::platform::pipewire::grab_frame(fd, node_id, crop) {
                     None => super::failure::ShotOutcome::NoImage,
-                    Some(img) if crate::media::png::save_png(&img, &path, &meta) => {
-                        super::failure::ShotOutcome::Saved
+                    Some(img) => {
+                        // DRAGON-562: decorate a window grant like a native
+                        // single-window capture; a truly-fullscreen window (and
+                        // every non-window grant) keeps the bare frame.
+                        let img = match deco {
+                            Some(d) => d.apply(img),
+                            None => img,
+                        };
+                        if crate::media::png::save_png(&img, &path, &meta) {
+                            super::failure::ShotOutcome::Saved
+                        } else {
+                            super::failure::ShotOutcome::SaveFailed
+                        }
                     }
-                    Some(_) => super::failure::ShotOutcome::SaveFailed,
                 };
                 let _ = tx.send((path, outcome));
             });
@@ -1475,12 +1855,18 @@ impl App {
             && sel.window_id.is_some()
             && (self
                 .output_rect_for_window(&sel)
-                .is_some_and(|out| is_fullscreen((sel.x, sel.y, sel.width as i32, sel.height as i32), out, 2))
+                .is_some_and(|out| is_fullscreen((sel.x, sel.y, sel.width as i32, sel.height as i32), out, FULLSCREEN_TOL))
                 || sel
                     .window_id
                     .as_deref()
                     .is_some_and(crate::screenshot::window_is_fullscreen));
 
+        // The ONE bare-frame gate for this window capture's aesthetics (native and
+        // portal both consult `window_recomposite`): the master "Enable recompositing
+        // of window screenshots" toggle ANDed with the fullscreen owner rule. False
+        // zeroes every aesthetic knob below, exactly the treatment a fullscreen
+        // window always got, so master OFF delivers the bare frame.
+        let recomposite = window_recomposite(self.window_recompositing, fullscreen_window);
         // Window borders: two explicit user-configured borders (DRAGON-191) drawn via
         // the portable alpha-dilation mechanism — an ACTIVE border for the focused /
         // single-window capture and an INACTIVE border for unfocused windows in a
@@ -1495,9 +1881,9 @@ impl App {
             self.inactive_border_color,
             self.inactive_border_width,
         );
-        // A fullscreen window (e.g. a fullscreen game) captured AS-IS: strip both
-        // borders and the shadow so nothing is drawn over its edge-to-edge pixels.
-        let borders = if fullscreen_window {
+        // A bare-frame capture (fullscreen window, or the recompositing master off):
+        // strip both borders and the shadow so nothing is drawn over its pixels.
+        let borders = if !recomposite {
             crate::decoration::WindowBorders {
                 active: crate::decoration::BorderSpec { width: 0, ..borders.active },
                 inactive: crate::decoration::BorderSpec { width: 0, ..borders.inactive },
@@ -1505,7 +1891,7 @@ impl App {
         } else {
             borders
         };
-        let window_shadow = self.window_drop_shadow && !fullscreen_window;
+        let window_shadow = self.window_drop_shadow && recomposite;
         // The corner radius to hug for rounding/shadow: the COSMIC theme's window
         // radius on Linux (macOS derives the real radius from the captured alpha
         // corner downstream). A fullscreen window rounds to 0 (raw edge-to-edge).
@@ -1616,23 +2002,34 @@ impl App {
                 // the launch-locked cursor (below) at the correct window-relative spot instead.
                 cursor: false,
                 sel: sel.clone(),
-                capture_transparency: extras.transparency,
+                // Master OFF delivers the frame with its own alpha KEPT (no flatten,
+                // no black backing): bare means the pixels as captured. Keyed on the
+                // MASTER alone, deliberately NOT the folded `recomposite` gate: the
+                // fullscreen bare rule always left this extra untouched and must
+                // stay byte-identical. The grab side (the focus grab above) still
+                // reads the extra, so WHICH pixels arrive is unchanged.
+                capture_transparency: extras.transparency || !self.window_recompositing,
                 // A fullscreen window covers the whole output: no background shows, so
-                // suppress wallpaper-behind regardless of the pref. DRAGON-186 Phase 3.
-                capture_wallpaper: extras.wallpaper && !fullscreen_window,
-                // A fullscreen window is captured raw (edge-to-edge, no rounding). Any
+                // suppress wallpaper-behind regardless of the pref (DRAGON-186 Phase 3);
+                // a master-off capture is bare, so no backdrop either.
+                capture_wallpaper: extras.wallpaper && recomposite,
+                // A bare-frame capture keeps raw edge-to-edge pixels (no rounding). Any
                 // other window rounds to the theme radius (macOS derives its real radius
                 // from the captured alpha corner downstream and overrides this).
-                window_radius: if fullscreen_window { 0.0 } else { deco_radius },
+                window_radius: if recomposite { deco_radius } else { 0.0 },
                 // A single-window capture's portrayal is the "Window focus appearance"
-                // choice (Active by default): draw the Active or Inactive border. A
-                // fullscreen window already had both widths zeroed above.
-                border: borders.for_active(self.window_single_active),
+                // choice (Active by default): draw the Active or Inactive border
+                // (`single_window_border_active`'s native arm; the portal arm pins
+                // Active). A fullscreen window already had both widths zeroed above.
+                border: borders.for_active(single_window_border_active(
+                    false,
+                    self.window_single_active,
+                )),
                 window_shadow,
                 // TOTAL margin from the window edge; the active-hint border lives inside it,
-                // so the wallpaper/shadow gap is padding - border. A fullscreen capture
-                // gets no padding (raw edge-to-edge pixels). DRAGON-186 Phase 3.
-                pad_logical: if self.window_padding && !fullscreen_window {
+                // so the wallpaper/shadow gap is padding - border. A bare-frame capture
+                // (fullscreen, or master off) gets no padding. DRAGON-186 Phase 3.
+                pad_logical: if self.window_padding && recomposite {
                     self.window_padding_px.value as f32
                 } else {
                     0.0
@@ -1783,8 +2180,20 @@ impl App {
         // selection. That way it lands where the pointer actually was (not wherever it drifted while
         // you drew the box, and not an unreliable post-teardown grab), and it's never lost switching
         // between the region/window/monitor selectors.
+        // DRAGON-595 looked at gating this on the active backend's declared cursor
+        // MECHANISM (`CursorDelivery`), to make the portal fallback's double-pointer
+        // hazard unrepresentable: that path crops a seed frame which already carries
+        // whatever pointer the stream was asked for, and stamping our sprite on top
+        // would be a second one. It is the WRONG predicate here and the attempt is
+        // recorded so it is not retried. The backend SELECTED is not the backend
+        // SERVING: with layer shell present, the portal chosen, and the grant failing
+        // `CastError::Unavailable`, the capture degrades to native screencopy and
+        // reaches this line while `active_screenshot_backend()` still answers Portal.
+        // Gating on it drops the cursor from that capture. The question this line
+        // actually asks is "did the frozen scene come from the portal", which is
+        // `overlay_fallback_active()`, and the very next line already uses it.
         let cursor_overlay = self.frozen_cursor.as_ref().filter(|_| extras.cursor);
-        let frozen_source = frozen_region_source(extras.wallpaper);
+        let frozen_source = frozen_region_source(extras.wallpaper, self.overlay_fallback_active());
         // DRAGON-454: the window path above hands its grab to a worker thread, but this one
         // composites AND encodes on the UI thread — and it sits directly in front of the
         // editor opening. Bracketed so the launch timeline says how much of the wait is here.
@@ -2093,6 +2502,12 @@ fn wallpaper_backdrop_experiment_active() -> bool {
     }
 }
 
+/// The shared tolerance (logical px) for the fullscreen geometry gate: the ONE
+/// constant both consumers of [`is_fullscreen`] pass — the native single-window
+/// gate in `do_pixel_capture` and the portal-path gate
+/// ([`portal_window_fullscreen`], DRAGON-562) — so the two rules cannot drift.
+pub(super) const FULLSCREEN_TOL: i32 = 2;
+
 /// Whether a window rectangle covers its output rectangle within `tol` logical
 /// pixels on every edge — i.e. the window is TRULY fullscreen (fills the whole
 /// output, no visible decoration gap). Both rects are (x, y, w, h) in the same
@@ -2115,15 +2530,299 @@ pub(super) fn is_fullscreen(win: (i32, i32, i32, i32), out: (i32, i32, i32, i32)
         && ((wy + wh) - (oy + oh)).abs() <= tol
 }
 
+/// Pure, unit-tested (`window_recomposite_tests`): whether a single-window capture
+/// runs the aesthetics recomposite at all (borders / drop shadow / rounding /
+/// padding / wallpaper backdrop), or delivers the BARE frame. This is THE one gate
+/// both window-still paths consult, so native and portal cannot drift:
+///
+/// - the NATIVE window branch keys its aesthetic-knob zeroing on it (the treatment
+///   a truly-fullscreen window always got, DRAGON-186 Phase 3);
+/// - [`PortalWindowDeco::apply`] returns the untouched frame when it says bare.
+///
+/// Two inputs, ANDed: the MASTER "Enable single window aesthetic effects"
+/// setting (`window_recompositing`; OFF = the user wants raw window frames, every
+/// per-extra preference preserved for a later re-enable), and the fullscreen owner
+/// rule (a truly-fullscreen application is never decorated, whatever the master
+/// says).
+pub(super) fn window_recomposite(master: bool, fullscreen: bool) -> bool {
+    master && !fullscreen
+}
+
+/// Pure, unit-tested (DRAGON-562): the fullscreen bare-frame gate as the PORTAL
+/// window-still path consumes it. A CONSUMER of the native rule, not a second
+/// rule: the verdict is [`is_fullscreen`] with the shared [`FULLSCREEN_TOL`],
+/// fed the grant's own facts — the window's global logical position
+/// (`StreamInfo.position`), the grabbed frame's physical size mapped through the
+/// origin output's buffer scale, and that output's logical rect (resolved at
+/// grant time by `output_for_grant_position`, the DRAGON-549 containment).
+///
+/// Missing facts (a position-less portal impl, a position on no registered
+/// output) answer false, the same shape as the native gate's `is_some_and`: an
+/// undecidable window is decorated rather than silently stripped. The native
+/// path's per-platform override (`crate::screenshot::window_is_fullscreen`) is
+/// constant `false` on Linux, so consuming only the geometry gate loses nothing.
+/// A degenerate `scale` (<= 0) falls back to 1.0 rather than dividing by zero.
+// Its one production caller is the Linux portal still branch of
+// `do_pixel_capture`; compiled into every test build so the decision is proven
+// on any host (the house pattern).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn portal_window_fullscreen(
+    fullscreen_aware: bool,
+    pos: Option<(i32, i32)>,
+    origin_rect: Option<(i32, i32, i32, i32)>,
+    frame_px: (u32, u32),
+    scale: f32,
+) -> bool {
+    if !fullscreen_aware {
+        return false;
+    }
+    let Some(out) = origin_rect else {
+        return false;
+    };
+    let s = if scale > 0.0 { scale } else { 1.0 };
+    let w = (frame_px.0 as f32 / s).round() as i32;
+    let h = (frame_px.1 as f32 / s).round() as i32;
+    match pos {
+        // A grant that carries its position gets the full rule, position and size both.
+        Some((px, py)) => is_fullscreen((px, py, w, h), out, FULLSCREEN_TOL),
+        // DRAGON-593: no position, so SIZE is the only signal, and it is enough. This is
+        // not a degraded guess: we already know WHICH output the grant came from
+        // (`origin_rect`), so a frame whose logical size matches that output's size is
+        // covering it, and where it starts cannot change that.
+        //
+        // This arm is the common case, not the exception. cosmic-comp's portal sends
+        // `position: None` for EVERY window stream (measured in DRAGON-562, which is how
+        // the wallpaper backdrop was found to be silently skipped). The old code required
+        // BOTH terms, so the guard tripped on every portal window capture and the
+        // fullscreen rule could never fire at all: a fullscreen game came back padded,
+        // bordered and rounded, which is exactly what the owner reported.
+        None => {
+            let (_, _, ow, oh) = out;
+            (w - ow).abs() <= FULLSCREEN_TOL && (h - oh).abs() <= FULLSCREEN_TOL
+        }
+    }
+}
+
+/// DRAGON-562: everything a portal WINDOW still needs to run the native
+/// single-window aesthetics off the UI thread. The JOB half is the SAME
+/// [`crate::screenshot::WindowCaptureJob`] the native window branch builds (same
+/// fields, same `run()`), fed the portal frame as its pixel source; the GRANT
+/// half carries the geometry the fullscreen gate and the wallpaper crop need.
+///
+/// What is structurally absent here, on purpose: frosted glass (reproducing it
+/// needs the scene BEHIND the window, which the portal cannot provide;
+/// `run()`'s glass arm keys on `capture_transparency`, false on this backend)
+/// and the cursor sprite overlay (the portal offers only embedded-or-hidden
+/// cursors, never a sprite session).
+#[cfg(target_os = "linux")]
+pub(super) struct PortalWindowDeco {
+    grant: super::PortalWindowGrant,
+    job: crate::screenshot::WindowCaptureJob,
+    fullscreen_aware: bool,
+    /// The master "Enable single window aesthetic effects" setting, read on the
+    /// UI thread at build time like every other knob here; [`Self::apply`] folds it
+    /// with the fullscreen verdict through the ONE shared [`window_recomposite`]
+    /// gate, the same gate the native window branch keys its zeroing on.
+    recompositing: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl PortalWindowDeco {
+    /// Run the portal frame through the native single-window pipeline, or return
+    /// it untouched when the shared [`window_recomposite`] gate says bare frame:
+    /// the fullscreen owner rule (a truly-fullscreen application is never
+    /// decorated — no padding, border, shadow, corners, or wallpaper) or the
+    /// recompositing master switched off. Worker-thread code: the compose is the
+    /// slow part; every setting was read on the UI thread at build time.
+    fn apply(mut self, img: image::RgbaImage) -> image::RgbaImage {
+        let fullscreen = portal_window_fullscreen(
+            self.fullscreen_aware,
+            self.grant.pos,
+            self.grant.origin_rect,
+            (img.width(), img.height()),
+            self.grant.scale,
+        );
+        // DRAGON-593: the decorate-or-not verdict, with the numbers it was reached from.
+        // Geometry only, no pixels and no path, exactly the class of fact the capture log
+        // already carries. It exists because "my fullscreen game came back decorated" could
+        // not be answered from a log at all: whether the grant carried a position, what the
+        // frame measured, and what output it was judged against are three facts that only
+        // together say whether the rule fired or could not fire.
+        log::debug!(
+            "portal window deco: fullscreen={fullscreen} recompositing={} \
+             frame={}x{}px scale={:.2} grant_pos={:?} origin={:?}",
+            self.recompositing,
+            img.width(),
+            img.height(),
+            self.grant.scale,
+            self.grant.pos,
+            self.grant.origin_rect,
+        );
+        if !window_recomposite(self.recompositing, fullscreen) {
+            return img;
+        }
+        let scale = if self.grant.scale > 0.0 { self.grant.scale } else { 1.0 };
+        // The window's logical rect: the grant position plus the frame's size
+        // mapped back through the origin output's buffer scale. `run()` re-derives
+        // its scale from exactly this pair (raw px / sel logical), so the two stay
+        // consistent by construction.
+        let lw = (img.width() as f32 / scale).round().max(1.0) as u32;
+        let lh = (img.height() as f32 / scale).round().max(1.0) as u32;
+        // The wallpaper anchor, and the ONE behavior line saying what was decided
+        // (fifth live test: the silent no-position drop read as "the backdrop
+        // never engages", with nothing in the log to say why).
+        match (self.grant.pos, self.job.capture_wallpaper) {
+            (Some((px, py)), wallpaper) => {
+                self.job.sel.x = px;
+                self.job.sel.y = py;
+                log::debug!(
+                    "portal window still: {} (grant position)",
+                    if wallpaper { "wallpaper backdrop engaged" } else { "wallpaper extra off" },
+                );
+            }
+            // No position — the MEASURED norm, not an edge case: COSMIC's own
+            // portal builds every window stream with `position: None` (its
+            // screencast source constructs monitor streams from the output's
+            // logical position and window streams with an explicit None). So a
+            // real anchor never arrives here, and dropping the wallpaper "until
+            // one does" means the backdrop never engages at all. Instead:
+            // synthesize one (centered on the largest registered output) so the
+            // aesthetic the toggle promises survives a position-less portal. The
+            // crop is a fiction either way — there is no desktop alignment to
+            // preserve — and the black fallback stays for the outputless case.
+            (None, true) => match synthetic_window_anchor(&self.grant.outputs, (lw, lh)) {
+                Some((ax, ay)) => {
+                    self.job.sel.x = ax;
+                    self.job.sel.y = ay;
+                    log::debug!(
+                        "portal window still: wallpaper backdrop engaged (synthetic anchor; \
+                         the portal gave this window stream no position)"
+                    );
+                }
+                None => {
+                    self.job.capture_wallpaper = false;
+                    log::debug!(
+                        "portal window still: wallpaper backdrop skipped (no position from \
+                         the portal and no registered outputs to anchor a crop)"
+                    );
+                }
+            },
+            (None, false) => {
+                log::debug!("portal window still: wallpaper extra off (no grant position)");
+            }
+        }
+        self.job.sel.width = lw;
+        self.job.sel.height = lh;
+        self.job.frozen_px = Some(img);
+        self.job
+            .run()
+            .expect("WindowCaptureJob with frozen_px set never fails to produce an image")
+    }
+}
+
+/// Pure; unit-tested (`synthetic_window_anchor_tests`). Where to PLACE a portal
+/// window frame whose grant carries no position, so the wallpaper crop has an
+/// anchor (DRAGON-562 fix round). COSMIC's portal sends `position: None` for
+/// EVERY window stream (measured against its screencast source: monitor streams
+/// carry the output's logical position, window streams an explicit None), so
+/// waiting for a real position means the wallpaper backdrop never engages at
+/// all on the one compositor the Flatpak targets.
+///
+/// The anchor centers the frame on the LARGEST registered output (first wins a
+/// tie; the WHICH-output half of the decision is [`largest_output_index`],
+/// shared with the preview-origin resolution so the two cannot drift):
+/// registration order is meaningless (this desktop's first-registered
+/// output is an 800x480 side panel, the mistake DRAGON-563 already corrected
+/// once), and the largest display is where desktop windows overwhelmingly
+/// live. The anchor is clamped to the output's top-left so the frame's CENTER
+/// stays on-output (the composite resolves the wallpaper by center
+/// containment). `frame_logical` is the frame mapped through the grant scale;
+/// a position-less grant resolves no origin output, so that scale is 1.0 and
+/// the fiction is centered in physical pixels — acceptable, because with no
+/// position there is no true desktop alignment to preserve anyway. `None` when
+/// no output has positive area: black stays the honest fallback.
+// Consumed by `PortalWindowDeco::apply` (Linux portal still path); compiled
+// into every test build so the decision is proven on any host (the house
+// pattern).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn synthetic_window_anchor(
+    outputs: &[AnchorOutput],
+    frame_logical: (u32, u32),
+) -> Option<(i32, i32)> {
+    let sizes: Vec<(i32, i32)> = outputs.iter().map(|(_, _, size)| *size).collect();
+    let (_, pos, size) = &outputs[largest_output_index(&sizes)?];
+    let ((ox, oy), (ow, oh)) = (*pos, *size);
+    let (lw, lh) = (frame_logical.0 as i32, frame_logical.1 as i32);
+    let x = ox + (ow - lw) / 2;
+    let y = oy + (oh - lh) / 2;
+    Some((x.max(ox), y.max(oy)))
+}
+
+/// Pure, unit-tested (`largest_output_index_tests`): WHICH registered output the synthetic
+/// window anchor stands on, as an index into `sizes` (each entry one output's logical
+/// size, in registration order). Largest logical area wins, first wins a tie; `None` when
+/// no output has positive area.
+///
+/// One decision with two consumers, deliberately (DRAGON-549 reopened):
+/// [`synthetic_window_anchor`] centers a position-less portal window frame's wallpaper
+/// crop on it, and the portal grant handler (`App::on_pipewire_cast_ready`) resolves
+/// `portal_origin_output` through it when a WINDOW grant carries no position. COSMIC's
+/// portal sends `position: None` for EVERY window stream (the DRAGON-562 measurement), so
+/// the DRAGON-549 containment can never fire on one, and without this the preview's
+/// anchor ladder fell through to `outputs.first()`: registration order, the owner's
+/// 800x480 side panel, which bounded every window capture's editor to the same floored
+/// window (the sixth live test's `monitor=(800, 480)pt` lines). The wallpaper compose and
+/// the preview must agree on the display a position-less window "belongs to"; a second
+/// copy of this scan is how they would drift.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn largest_output_index(sizes: &[(i32, i32)]) -> Option<usize> {
+    let mut best: Option<(i64, usize)> = None;
+    for (i, size) in sizes.iter().enumerate() {
+        let area = (size.0.max(0) as i64) * (size.1.max(0) as i64);
+        if area > 0 && best.is_none_or(|(a, _)| area > a) {
+            best = Some((area, i));
+        }
+    }
+    best.map(|(_, i)| i)
+}
+
+/// One registered output as [`synthetic_window_anchor`] needs it — the same
+/// `(name, logical_pos, logical_size)` triple `crate::screenshot::OutputGeom`
+/// aliases on both desktop platforms, spelled locally so the pure decision's
+/// signature names no platform module (and clippy's type-complexity gate stays
+/// quiet without an allow).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+type AnchorOutput = (String, (i32, i32), (i32, i32));
+
 /// Whether the frozen backdrop is shown DURING SELECTION, factored pure so the
-/// countdown-release rule is testable on any OS. `freezing` is the freeze gate
-/// (`App::freezing`); `delay_secs` is the configured pre-capture delay
-/// (`configured_delay_secs`). DRAGON-186 Phase 4: an armed countdown (`delay_secs >
-/// 0`) releases the backdrop so selection previews the LIVE screen the delayed shot
-/// will actually grab — mirroring how video mode releases it (there `freezing` is
-/// already false). No delay re-freezes.
-pub(super) fn freeze_backdrop_active(freezing: bool, delay_secs: u64) -> bool {
-    freezing && delay_secs == 0
+/// countdown-release rule is testable on any OS. `freezing` is the native freeze gate
+/// (`App::freezing`); `fallback` is the fallback overlay's seed-still term
+/// ([`fallback_backdrop`]); `delay_secs` is the configured pre-capture delay
+/// (`configured_delay_secs`).
+///
+/// The delay rule splits BY PATH (`lab/flatpak`, DRAGON-547 reopened):
+///
+/// - NATIVE sessions, the `freezing` term: DRAGON-186 Phase 4, unchanged. An armed
+///   countdown (`delay_secs > 0`) releases the backdrop so selection previews the
+///   LIVE screen the delayed shot will actually grab, mirroring how video mode
+///   releases it (there `freezing` is already false). No delay re-freezes. The
+///   release informs because a transparent layer-shell overlay really does show
+///   the live desktop behind it.
+/// - The FALLBACK path, the `fallback` term: the seed still shows REGARDLESS of the
+///   delay. A plain toplevel has no live desktop composited behind it (the
+///   compositor backs it with a flat fill), so a released backdrop there renders
+///   flat gray for scanner, photo and video alike: the owner's seventh live test.
+///   And the still lies about nothing the capture will take: a delayed fallback
+///   capture re-grabs at fire time ([`fallback_still_from_frozen`]'s delay rule,
+///   the DRAGON-546 round), so the delayed shot never delivers these pixels anyway.
+///   The countdown PHASE is untouched (DRAGON-563: the fallback window closes at
+///   countdown start); this governs the SELECTION phase only.
+pub(super) fn freeze_backdrop_active(freezing: bool, fallback: bool, delay_secs: u64) -> bool {
+    (freezing && delay_secs == 0) || fallback
 }
 
 // DRAGON-460 removed `scanner_backdrop_active`.
@@ -2173,6 +2872,23 @@ pub(super) fn use_capture_moment_cursor(cursor_active: bool, capture_live: bool)
 ///
 /// Pure so the visibility is unit-testable on any OS, holding on both platforms and with
 /// freeze on or off.
+///
+/// # What this promises on a PORTAL session (DRAGON-592)
+///
+/// It promises PRESENCE, not position. The extra can now be on for a portal capture
+/// (`Caps::cursor_toggle`), and a portal frame really will carry a pointer, so the
+/// indicator saying "your capture will include it" is true. WHERE it lands is not
+/// ours to preview there: the portal bakes the pointer in at grab time, which is a
+/// beat after its permission dialog closes, while this sprite is the LAUNCH-LOCKED
+/// one. Nothing in the tree can reconcile that, since the portal hands back a
+/// finished frame and no sprite (`PortalBackend::cursor` answers `None`).
+///
+/// It is a narrow case: it needs a session that has BOTH a native cursor session to
+/// lock a sprite from AND the portal method chosen in settings, so it cannot happen
+/// in a Flatpak sandbox (no native sprite there, `frozen_cursor` stays `None` and the
+/// indicator is inert by construction). Left as-is deliberately rather than gated:
+/// suppressing it would mean asking which backend is running from view code, and the
+/// capability table is the only thing allowed to answer that.
 pub(super) fn show_launch_cursor_indicator(
     mode: Mode,
     cursor_active: bool,
@@ -2206,12 +2922,100 @@ pub(super) enum FrozenRegionSource {
 /// state. See [`FrozenRegionSource`]. Deliberately does NOT take a "has any frozen
 /// window" flag: the whole point of the Phase-3 fix is that emptiness must not
 /// change the background choice.
-pub(super) fn frozen_region_source(keep_wallpaper: bool) -> FrozenRegionSource {
-    if keep_wallpaper {
+///
+/// `portal_seeded` (`lab/flatpak`) is the fallback overlay's structural override: its
+/// frozen scene is ONE finished portal frame of the granted monitor, with no
+/// per-window pixels and no wallpaper channel, so the flat snapshot is the only honest source
+/// whatever the wallpaper preference says. Routing wallpaper-OFF through the
+/// windows-only composite there would build the empty-set canvas and deliver a black
+/// rectangle for a selection the user drew over real content. Pure, unit-tested.
+pub(super) fn frozen_region_source(keep_wallpaper: bool, portal_seeded: bool) -> FrozenRegionSource {
+    if keep_wallpaper || portal_seeded {
         FrozenRegionSource::FlatSnapshot
     } else {
         FrozenRegionSource::WindowsOnly
     }
+}
+
+/// Pure, unit-tested (`lab/flatpak`, DRAGON-563): must `begin_capture` KEEP the
+/// countdown-start preview anchor instead of overwriting it with its fresh resolution?
+/// Only on the fallback path can a snapshot exist at all (EVERY fallback countdown
+/// snapshots it and then tears the outputs down — tray or no tray, since the reopened
+/// DRAGON-563 removed the window-countdown degrade there), and only there does the
+/// fresh resolution come back empty at fire time. A fresh answer always wins, the same
+/// precedence `stop_preview_anchor` gives the record-stop resolution. Every
+/// non-fallback path answers false, keeping the historical overwrite byte-identical.
+pub(super) fn keep_countdown_anchor(
+    fallback: bool,
+    fresh_resolved: bool,
+    snapshot_held: bool,
+) -> bool {
+    fallback && !fresh_resolved && snapshot_held
+}
+
+/// Pure, unit-tested (`lab/flatpak`, the one-shot countdown round): does a countdown
+/// that just FIRED consume the persisted timer, resetting `delay_idx` to the "No
+/// delay" preset? The owner's rule: the countdown timer is ONE-SHOT. Actually
+/// performing the delayed capture/recording spends it, so the next launch and every
+/// menu title read "Countdown Timer: 00"; it is not saved forever. Consumption
+/// happens at the FIRE instant, whether or not the action then succeeds: the
+/// countdown ran and fired, so it is spent. This is global on purpose: the overlay's
+/// delay chips, the tray radio picks and the fallback tray digits all share
+/// `delay_idx`, so native and fallback sessions get the same one-shot semantic.
+///
+/// Deliberate limits, each here for a reason:
+///
+/// - A CANCELLED countdown keeps the setting: the user did not get their capture, so
+///   the timer they configured is still owed to the retry. (Flagged for owner veto in
+///   the round's report.)
+/// - A CLI `--countdown` override (`cli_override`) drove this fire without reading
+///   the persisted preset, so it must not spend somebody else's setting.
+/// - `delay_idx == 0` has nothing to spend, and skipping it avoids a pointless
+///   config write on every immediate capture.
+pub(super) fn countdown_consumed(fired: bool, cli_override: bool, delay_idx: usize) -> bool {
+    fired && !cli_override && delay_idx != 0
+}
+
+/// Pure, unit-tested (`lab/flatpak`): does the fallback overlay show the seed-frozen
+/// backdrop during SELECTION? Keyed on region mode and the seed frame being present,
+/// and DELIBERATELY not on the capture kind: a fullscreen toplevel has no live
+/// desktop composited behind it (the compositor backs it with a flat fill, seen live
+/// as "video mode is just a flat gray screen"), so the seed still is the only honest
+/// backdrop for VIDEO region selection too. The normal-session rule is untouched:
+/// video there releases the backdrop to show the genuinely live desktop, which the
+/// fallback simply does not have. The countdown DELAY is deliberately not an input
+/// either (DRAGON-547 reopened): [`freeze_backdrop_active`] keeps this term frozen
+/// whatever the configured delay, because the flat gray fill is the only alternative
+/// and a delayed fallback capture re-grabs at fire time anyway.
+pub(super) fn fallback_backdrop(
+    fallback: bool,
+    region_mode: bool,
+    frozen_has_pixels: bool,
+) -> bool {
+    fallback && region_mode && frozen_has_pixels
+}
+
+/// Pure, unit-tested (`lab/flatpak`): does a REGION STILL commit on the fallback
+/// overlay crop from the SEED-FROZEN frame instead of requesting a fresh portal frame?
+///
+/// Yes exactly when the fallback is active, no delay is configured, and the seed frame
+/// actually landed (`frozen_has_pixels`). The frozen crop is the WYSIWYG source: the
+/// user drew their region over that still, so a fresh live frame could deliver
+/// different pixels than the ones they selected. A configured DELAY flips it the other
+/// way: the delay exists to change the screen, so the per-capture portal request (and
+/// its live frame at fire time) is the honest source, exactly like the native path's
+/// `capture_live` rule. Off the fallback this is always false, which is what keeps the
+/// normal portal region-still request byte-identical.
+// Its one production caller is the Linux portal branch of `run_capture`; compiled into
+// every test build so the decision is proven on any host (the house pattern).
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn fallback_still_from_frozen(
+    fallback: bool,
+    delay_secs: u64,
+    frozen_has_pixels: bool,
+) -> bool {
+    fallback && delay_secs == 0 && frozen_has_pixels
 }
 
 /// Which pixel source a WINDOW-mode capture decorates. DRAGON-186 Phase 5b: on
@@ -2333,6 +3137,22 @@ pub(super) fn window_focus_intent(single_active: bool) -> WindowFocusIntent {
     }
 }
 
+/// Pure, unit-tested (`single_window_border_tests`): the active-vs-inactive flag a
+/// single-window capture's drawn border keys on (`WindowBorders::for_active`).
+///
+/// - NATIVE path (`portal` false): the persisted "Window focus appearance" choice.
+///   Honest there because the capture DRIVES the window's real focus state to match
+///   before grabbing (DRAGON-194), so the drawn border and the native chrome agree.
+/// - PORTAL path (`portal` true): ALWAYS the Active border, whatever the setting
+///   says. The grant carries no activation info and the portal cannot activate or
+///   deactivate windows, so the state-keyed choice is unanswerable there; the
+///   portal-picked window was interactively chosen by the user, so Active is the
+///   honest deterministic default. (The settings page hides the focus-appearance
+///   selector and the Inactive border rows on fallback sessions for the same reason.)
+pub(super) fn single_window_border_active(portal: bool, single_active: bool) -> bool {
+    portal || single_active
+}
+
 /// Linux (DRAGON-194): which OTHER toplevel to activate so the picked window becomes
 /// DEactivated (there is no deactivate request in the cosmic toplevel-manager protocol —
 /// activating a different toplevel is the only way to drop a window's `activated` state).
@@ -2439,6 +3259,79 @@ pub(crate) fn pick_immediate_window(
     }
     // 4. Ambiguous — let the caller show the picker.
     None
+}
+
+/// `lab/flatpak`: can an immediate, picker-free capture (`--active-window` /
+/// `--active-monitor`) resolve and grab its target in this session at all? The immediate
+/// flags exist to capture the ACTIVE target with zero interaction, so a portal dialog
+/// cannot stand in; the answer has to come from the compositor's own protocols:
+///
+/// * `ActiveWindow` needs the toplevel list (to know WHICH window is active) AND the
+///   native capture protocols (to grab it).
+/// * `ActiveMonitor` needs the native capture protocols (`image_copy_capture` +
+///   `output_source`). The cursor-output probe can degrade to the primary output, but
+///   without screencopy there is no picker-free monitor grab to run at all.
+///
+/// `false` sends the launch to the honest failure path (`diag::note_failure` +
+/// `App::fail_session`): the sessions that hide these protocols hide layer shell too, so
+/// the picker overlay is not a fallback there. Keyed on the PROTOCOL probe, never on
+/// sandbox detection, so a normal COSMIC session answers `true` for both flags and stays
+/// byte-identical. The same rule covers a video kind: the gate runs before the kind
+/// branches. macOS/Windows never consult this (their immediates resolve through OS APIs
+/// that always exist). Pure; unit-tested in `immediate_target_tests`.
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn immediate_target_resolvable(
+    imm: ImmediateCapture,
+    native_capture: bool,
+    window_list: bool,
+) -> bool {
+    match imm {
+        ImmediateCapture::ActiveWindow => native_capture && window_list,
+        ImmediateCapture::ActiveMonitor => native_capture,
+    }
+}
+
+/// The two protocol terms [`immediate_target_resolvable`] asks for, read once from the live
+/// session (the probe itself is memoized). Split out of `immediate_capture` so the launch gate
+/// and the settings page cannot disagree about what this session can do.
+#[cfg(target_os = "linux")]
+fn immediate_protocol_terms() -> (bool, bool) {
+    let p = crate::platform::backend::wayland_protocols();
+    // The window term is the SAME predicate behind `Caps.window_list` (DRAGON-620). It used to
+    // be the bare `toplevel_list` flag, which wlroots sets while being unable to place a single
+    // window, so `--active-window` there passed this gate and then resolved nothing. Answering
+    // false sends the launch to `note_failure` + `fail_session`, which is the honest end for a
+    // compositor that cannot locate the active window, and needs no new failure vocabulary.
+    (
+        p.image_copy_capture && p.output_source,
+        crate::platform::backend::window_list_supported(&p),
+    )
+}
+
+/// Runtime seam: [`immediate_target_resolvable`] for the session we are actually running in,
+/// so a caller needs no `cfg` of its own (DRAGON-589).
+///
+/// This is the "is the action in this build AT ALL" question, and it is a different question
+/// from "can the app bind a key to it". A launch that answers `false` here ends in
+/// `App::fail_session` rather than capturing anything, so Settings must not list the action:
+/// an unbindable action still WORKS from a terminal and earns a row with its command, while
+/// an absent one earns no mention at all.
+///
+/// Linux answers from the compositor's advertised protocols. macOS and Windows answer `true`,
+/// and that is a fact about their code rather than an assumption: both resolve the frontmost
+/// window and the monitor under the cursor through OS APIs that are always present.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+pub(crate) fn immediate_capture_available(imm: ImmediateCapture) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let (native_capture, window_list) = immediate_protocol_terms();
+        immediate_target_resolvable(imm, native_capture, window_list)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        true
+    }
 }
 
 /// DRAGON-304: the [`crate::platform::backend::OutputDesc`] a selection sits on, chosen from
@@ -2686,6 +3579,58 @@ mod window_focus_intent_tests {
     }
 }
 
+// The active-vs-inactive border key for a single-window capture: the persisted choice
+// on the native path, ALWAYS Active on the portal path (the grant carries no
+// activation info and the portal cannot drive focus).
+#[cfg(test)]
+mod single_window_border_tests {
+    use super::single_window_border_active;
+
+    // Native: the drawn border follows the persisted "Window focus appearance".
+    #[test]
+    fn native_follows_the_persisted_choice() {
+        assert!(single_window_border_active(false, true));
+        assert!(!single_window_border_active(false, false));
+    }
+
+    // Portal: ALWAYS Active, both settings. The setting cannot be honored there (no
+    // activation info, no way to drive focus), so the interactively-picked window is
+    // portrayed Active deterministically.
+    #[test]
+    fn portal_always_pins_active() {
+        assert!(single_window_border_active(true, true));
+        assert!(single_window_border_active(true, false));
+    }
+}
+
+// The ONE bare-frame gate for a single-window capture's aesthetics, consulted by the
+// native window branch (knob zeroing) and the portal deco (untouched-frame return).
+#[cfg(test)]
+mod window_recomposite_tests {
+    use super::window_recomposite;
+
+    // Master ON, windowed: the existing behavior, the aesthetics composite runs.
+    #[test]
+    fn master_on_windowed_recomposites() {
+        assert!(window_recomposite(true, false));
+    }
+
+    // Master OFF: the bare frame on BOTH paths, fullscreen or not. This is the
+    // owner's contract: no borders, shadow, corners, padding, or wallpaper compose.
+    #[test]
+    fn master_off_is_bare_on_every_path() {
+        assert!(!window_recomposite(false, false));
+        assert!(!window_recomposite(false, true));
+    }
+
+    // Fullscreen stays bare whatever the master says (the DRAGON-186 owner rule the
+    // gate folds in; master ON must not re-decorate a fullscreen window).
+    #[test]
+    fn fullscreen_is_bare_even_with_the_master_on() {
+        assert!(!window_recomposite(true, true));
+    }
+}
+
 // DRAGON-295: the pure "monitor under the pointer" resolver for the picker-free
 // "Capture Active Monitor" hotkey. Compiled (and tested) on every platform now — Linux
 // feeds it the active toplevel's centre (DRAGON-317).
@@ -2826,6 +3771,46 @@ mod pick_immediate_window_tests {
         assert!(pick_immediate_window(&ws, Some("DP-9")).is_none());
         // No windows at all is also None.
         assert!(pick_immediate_window(&[], Some("DP-3")).is_none());
+    }
+}
+
+// lab/flatpak: the pure "can an immediate capture work here at all?" gate. Compiled (and
+// tested) on every platform; only the Linux immediate path consults it.
+#[cfg(test)]
+mod immediate_target_tests {
+    use super::immediate_target_resolvable;
+    use crate::app::ImmediateCapture;
+
+    #[test]
+    fn a_full_native_session_serves_both_flags() {
+        // Normal COSMIC: every protocol present. Both flags keep today's behavior.
+        assert!(immediate_target_resolvable(ImmediateCapture::ActiveWindow, true, true));
+        assert!(immediate_target_resolvable(ImmediateCapture::ActiveMonitor, true, true));
+    }
+
+    #[test]
+    fn a_sandboxed_session_serves_neither() {
+        // The lab/flatpak measurement: cosmic-comp hides both the capture protocols and
+        // the toplevel list from any client carrying a security context.
+        assert!(!immediate_target_resolvable(ImmediateCapture::ActiveWindow, false, false));
+        assert!(!immediate_target_resolvable(ImmediateCapture::ActiveMonitor, false, false));
+    }
+
+    #[test]
+    fn active_window_needs_both_seams() {
+        // A toplevel list alone (KDE-shaped: a list without ext-image-copy-capture)
+        // cannot grab the window it resolves, and capture protocols alone cannot say
+        // which window is active. Either half missing disables the flag.
+        assert!(!immediate_target_resolvable(ImmediateCapture::ActiveWindow, false, true));
+        assert!(!immediate_target_resolvable(ImmediateCapture::ActiveWindow, true, false));
+    }
+
+    #[test]
+    fn active_monitor_ignores_the_window_list() {
+        // A hidden toplevel list must not disable a monitor grab that can still run; a
+        // list without capture protocols must not enable one that cannot.
+        assert!(immediate_target_resolvable(ImmediateCapture::ActiveMonitor, true, false));
+        assert!(!immediate_target_resolvable(ImmediateCapture::ActiveMonitor, false, true));
     }
 }
 
@@ -3124,26 +4109,46 @@ mod freeze_backdrop_tests {
     // No delay + freeze on: the frozen backdrop is shown (picture mode, no countdown).
     #[test]
     fn freeze_no_delay_shows_backdrop() {
-        assert!(freeze_backdrop_active(true, 0));
+        assert!(freeze_backdrop_active(true, false, 0));
     }
 
-    // Freeze on but a countdown armed: release the backdrop so selection previews the
-    // LIVE screen the delayed shot will grab (the DRAGON-186 Phase 4 fix). Any nonzero
-    // delay releases it.
+    // NATIVE freeze with a countdown armed: release the backdrop so selection previews
+    // the LIVE screen the delayed shot will grab (the DRAGON-186 Phase 4 fix). Any
+    // nonzero delay releases it.
     #[test]
     fn freeze_with_armed_countdown_releases_backdrop() {
-        assert!(!freeze_backdrop_active(true, 3));
-        assert!(!freeze_backdrop_active(true, 5));
-        assert!(!freeze_backdrop_active(true, 10));
-        assert!(!freeze_backdrop_active(true, 1));
+        assert!(!freeze_backdrop_active(true, false, 3));
+        assert!(!freeze_backdrop_active(true, false, 5));
+        assert!(!freeze_backdrop_active(true, false, 10));
+        assert!(!freeze_backdrop_active(true, false, 1));
     }
 
-    // Freeze off (e.g. video mode, or freeze disabled): never a backdrop regardless of
-    // the delay — matches how video mode already releases it.
+    // Freeze off (e.g. video mode, or freeze disabled) with no fallback term: never a
+    // backdrop regardless of the delay, matching how video mode already releases it.
     #[test]
     fn freeze_off_never_shows_backdrop() {
-        assert!(!freeze_backdrop_active(false, 0));
-        assert!(!freeze_backdrop_active(false, 5));
+        assert!(!freeze_backdrop_active(false, false, 0));
+        assert!(!freeze_backdrop_active(false, false, 5));
+    }
+
+    // DRAGON-547 reopened: the delay release splits BY PATH. The native term releases
+    // under a countdown (a transparent layer-shell overlay shows the live desktop the
+    // delayed shot will grab); the FALLBACK term stays frozen whatever the delay,
+    // because a plain toplevel has no live desktop behind it (released = flat gray,
+    // the owner's seventh live test) and a delayed fallback capture re-grabs at fire
+    // time, so the seed still misleads about nothing. The four-way pin:
+    #[test]
+    fn the_delay_release_splits_by_path() {
+        // Native + no delay: frozen when freezing.
+        assert!(freeze_backdrop_active(true, false, 0));
+        // Native + delay: released (DRAGON-186 Phase 4, byte-identical).
+        assert!(!freeze_backdrop_active(true, false, 5));
+        // Fallback + no delay: frozen.
+        assert!(freeze_backdrop_active(false, true, 0));
+        // Fallback + delay: STILL frozen. The fix, for any nonzero delay.
+        assert!(freeze_backdrop_active(false, true, 1));
+        assert!(freeze_backdrop_active(false, true, 5));
+        assert!(freeze_backdrop_active(false, true, 10));
     }
 }
 
@@ -3165,9 +4170,9 @@ mod scanner_backdrop_tests {
     #[test]
     fn the_scanner_has_no_backdrop_rule_of_its_own() {
         // Freeze off = live view, whatever the kind. No scanner exception.
-        assert!(!freeze_backdrop_active(false, 0));
+        assert!(!freeze_backdrop_active(false, false, 0));
         // Freeze on, no delay = frozen, again with no kind involved in the decision.
-        assert!(freeze_backdrop_active(true, 0));
+        assert!(freeze_backdrop_active(true, false, 0));
     }
 }
 
@@ -3180,13 +4185,153 @@ mod frozen_source_tests {
     // window-count input by design).
     #[test]
     fn wallpaper_off_is_windows_only() {
-        assert_eq!(frozen_region_source(false), FrozenRegionSource::WindowsOnly);
+        assert_eq!(frozen_region_source(false, false), FrozenRegionSource::WindowsOnly);
     }
 
     // Wallpaper ON uses the flat snapshot (the wallpaper is the wanted background).
     #[test]
     fn wallpaper_on_is_flat_snapshot() {
-        assert_eq!(frozen_region_source(true), FrozenRegionSource::FlatSnapshot);
+        assert_eq!(frozen_region_source(true, false), FrozenRegionSource::FlatSnapshot);
+    }
+
+    // `lab/flatpak`: a portal-seeded frozen scene is ONE finished frame with no
+    // per-window pixels to composite, so the flat snapshot is the only honest source whatever the
+    // wallpaper preference says. Without this override, wallpaper-OFF would build the
+    // empty windows-only canvas and deliver a black rectangle.
+    #[test]
+    fn a_portal_seeded_scene_is_always_the_flat_snapshot() {
+        assert_eq!(frozen_region_source(false, true), FrozenRegionSource::FlatSnapshot);
+        assert_eq!(frozen_region_source(true, true), FrozenRegionSource::FlatSnapshot);
+    }
+}
+
+#[cfg(test)]
+mod fallback_backdrop_tests {
+    use super::fallback_backdrop;
+
+    // The owner's live report: switching the fallback overlay to VIDEO kind showed a
+    // flat gray screen, because the backdrop keyed on the still kinds. The decision
+    // deliberately has NO kind input, so the seed still shows for region selection of
+    // every kind; this test documents that absence rather than enumerating kinds.
+    // The DELAY is not an input either (DRAGON-547 reopened): the by-path delay split
+    // lives in `freeze_backdrop_active`, whose four-way pin sits in
+    // `freeze_backdrop_tests::the_delay_release_splits_by_path`.
+    #[test]
+    fn the_backdrop_ignores_the_capture_kind_by_construction() {
+        assert!(fallback_backdrop(true, true, true));
+    }
+
+    // Off region mode there is no selection to back (the portal picker owns
+    // monitor/window picks), and without the seed frame there is nothing to draw.
+    #[test]
+    fn only_region_mode_with_a_seed_frame_draws() {
+        assert!(!fallback_backdrop(true, false, true));
+        assert!(!fallback_backdrop(true, true, false));
+    }
+
+    // A normal session never takes this term; its backdrop stays `freezing()`'s
+    // preference-and-caps decision alone.
+    #[test]
+    fn a_normal_session_never_takes_the_fallback_term() {
+        assert!(!fallback_backdrop(false, true, true));
+    }
+}
+
+#[cfg(test)]
+mod keep_countdown_anchor_tests {
+    use super::keep_countdown_anchor;
+
+    // DRAGON-563: every fallback countdown (tray or not, since the reopened ticket
+    // removed the window-countdown degrade) tears the outputs down at countdown start,
+    // so at fire time the fresh resolution is empty and the countdown-start snapshot is
+    // the only anchor left. This is the one combination that keeps it.
+    #[test]
+    fn an_empty_fresh_answer_keeps_the_snapshot_on_the_fallback_path() {
+        assert!(keep_countdown_anchor(true, false, true));
+    }
+
+    // A fresh answer always wins, and with no snapshot there is nothing to keep.
+    #[test]
+    fn a_fresh_answer_or_a_missing_snapshot_takes_the_overwrite() {
+        assert!(!keep_countdown_anchor(true, true, true));
+        assert!(!keep_countdown_anchor(true, false, false));
+    }
+
+    // A normal session never keeps anything: the historical overwrite stands whatever
+    // the other two terms claim, which is the byte-identity guarantee.
+    #[test]
+    fn a_normal_session_always_overwrites() {
+        for fresh in [false, true] {
+            for snapshot in [false, true] {
+                assert!(!keep_countdown_anchor(false, fresh, snapshot));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod countdown_consumed_tests {
+    use super::countdown_consumed;
+
+    // The owner's one-shot rule: a fired countdown driven by the persisted preset is
+    // spent, whatever the preset was.
+    #[test]
+    fn a_fired_preset_countdown_is_spent() {
+        assert!(countdown_consumed(true, false, 1));
+        assert!(countdown_consumed(true, false, 2));
+        assert!(countdown_consumed(true, false, 3));
+    }
+
+    // A cancelled countdown keeps the setting: the user did not get their capture, so
+    // the configured timer is still owed to the retry. (Owner-vetoable choice; the
+    // round's report flags it.)
+    #[test]
+    fn a_cancelled_countdown_keeps_the_setting() {
+        assert!(!countdown_consumed(false, false, 2));
+        assert!(!countdown_consumed(false, true, 2));
+    }
+
+    // A CLI --countdown override never spends the persisted preset it did not read,
+    // and a zero preset has nothing to spend (no pointless config write).
+    #[test]
+    fn overrides_and_zero_presets_spend_nothing() {
+        assert!(!countdown_consumed(true, true, 2));
+        assert!(!countdown_consumed(true, false, 0));
+        assert!(!countdown_consumed(true, true, 0));
+    }
+}
+
+#[cfg(test)]
+mod fallback_still_tests {
+    use super::fallback_still_from_frozen;
+
+    // `lab/flatpak` WYSIWYG: on the fallback overlay, a non-delayed region still crops
+    // the exact still the user drew their selection over.
+    #[test]
+    fn a_non_delayed_fallback_still_crops_the_seed_frame() {
+        assert!(fallback_still_from_frozen(true, 0, true));
+    }
+
+    // A configured delay flips to the fresh per-capture portal frame: the delay exists
+    // to change the screen, so the frozen still is the WRONG content by definition.
+    #[test]
+    fn a_delay_takes_the_fresh_portal_frame() {
+        assert!(!fallback_still_from_frozen(true, 3, true));
+    }
+
+    // No seed frame landed (the grab failed a moment before commit, or the scene was
+    // already released): nothing to crop, so the portal request stays the source.
+    #[test]
+    fn no_seed_frame_means_no_frozen_crop() {
+        assert!(!fallback_still_from_frozen(true, 0, false));
+    }
+
+    // Off the fallback the answer is always false: the normal portal region-still
+    // request is byte-identical, frozen scene or not.
+    #[test]
+    fn a_normal_session_never_takes_the_frozen_crop() {
+        assert!(!fallback_still_from_frozen(false, 0, true));
+        assert!(!fallback_still_from_frozen(false, 5, false));
     }
 }
 
@@ -3328,6 +4473,193 @@ mod fullscreen_tests {
     }
 }
 
+/// DRAGON-562: the fullscreen bare-frame gate as the PORTAL window-still path
+/// consumes it. These pin the CONSUMPTION — the grant-fact plumbing into the one
+/// shared `is_fullscreen` rule — not the geometry itself, which
+/// `fullscreen_tests` above already owns.
+#[cfg(test)]
+mod portal_window_fullscreen_tests {
+    use super::portal_window_fullscreen;
+
+    /// DRAGON-593, the owner's report: a fullscreen game came back padded and bordered.
+    /// cosmic-comp's portal sends `position: None` for EVERY window stream, and the rule
+    /// used to require both a position and an origin, so the guard tripped every time and
+    /// the fullscreen rule could never fire on the portal path at all. Size alone answers
+    /// it, because the origin output is already known.
+    #[test]
+    fn a_positionless_grant_still_recognises_a_fullscreen_window() {
+        const OUT: Option<(i32, i32, i32, i32)> = Some((0, 0, 5120, 1440));
+        // The owner's ultrawide, a window covering it, no position from the portal.
+        assert!(portal_window_fullscreen(true, None, OUT, (5120, 1440), 1.0));
+        // A HiDPI grant of the same window: physical pixels over the buffer scale.
+        assert!(portal_window_fullscreen(true, None, OUT, (10240, 2880), 2.0));
+        // A window that does NOT cover the output is still decorated, which is the whole
+        // point of the rule: a maximised window is a window.
+        assert!(!portal_window_fullscreen(true, None, OUT, (5120, 1400), 1.0));
+        assert!(!portal_window_fullscreen(true, None, OUT, (2560, 1440), 1.0));
+        // Without an origin there is nothing to compare against, so no claim is made.
+        assert!(!portal_window_fullscreen(true, None, None, (5120, 1440), 1.0));
+        // The extra stays the master switch: unaware means never bare.
+        assert!(!portal_window_fullscreen(false, None, OUT, (5120, 1440), 1.0));
+    }
+
+
+    const OUT: Option<(i32, i32, i32, i32)> = Some((0, 0, 1920, 1080));
+
+    // A window grant exactly filling its output at 1x scale is fullscreen: the
+    // bare frame, no decoration.
+    #[test]
+    fn exact_fill_at_1x_is_fullscreen() {
+        assert!(portal_window_fullscreen(true, Some((0, 0)), OUT, (1920, 1080), 1.0));
+    }
+
+    // On a 2x output the stream is physical pixels; the scale maps it back into
+    // the logical space the output rect lives in.
+    #[test]
+    fn scaled_output_maps_physical_to_logical() {
+        assert!(portal_window_fullscreen(true, Some((0, 0)), OUT, (3840, 2160), 2.0));
+        // The same physical frame WITHOUT the scale applied would look 2x the
+        // output and must not read as fullscreen.
+        assert!(!portal_window_fullscreen(true, Some((0, 0)), OUT, (3840, 2160), 1.0));
+    }
+
+    // A second monitor at a global offset: the grant position carries the offset.
+    #[test]
+    fn offset_output_fills_by_its_own_origin() {
+        let out = Some((1920, 0, 2560, 1440));
+        assert!(portal_window_fullscreen(true, Some((1920, 0)), out, (2560, 1440), 1.0));
+        assert!(!portal_window_fullscreen(true, Some((0, 0)), out, (2560, 1440), 1.0));
+    }
+
+    // A maximized-but-decorated window (a titlebar's worth short) is decorated —
+    // the same verdict the native gate gives the same geometry.
+    #[test]
+    fn maximized_with_titlebar_is_decorated() {
+        assert!(!portal_window_fullscreen(true, Some((0, 32)), OUT, (1920, 1048), 1.0));
+    }
+
+    // A missing ORIGIN answers false (decorate): with no output to compare against there
+    // is nothing to be fullscreen ON, so no claim is made.
+    //
+    // DRAGON-593: this test used to assert that a missing POSITION also meant decorate,
+    // which encoded the bug as if it were the intent. cosmic-comp sends `position: None`
+    // for every window stream, so that arm was not an edge case at all, it was every
+    // portal window capture, and it is why a fullscreen game came back padded and
+    // bordered. Size against the known origin answers it without a position.
+    #[test]
+    fn a_missing_origin_means_decorated() {
+        assert!(!portal_window_fullscreen(true, Some((0, 0)), None, (1920, 1080), 1.0));
+        assert!(!portal_window_fullscreen(true, None, None, (1920, 1080), 1.0));
+    }
+
+    // The capability gate is ANDed first, exactly like the native branch's
+    // `extras.fullscreen_aware &&`.
+    #[test]
+    fn capability_off_means_decorated() {
+        assert!(!portal_window_fullscreen(false, Some((0, 0)), OUT, (1920, 1080), 1.0));
+    }
+
+    // A degenerate scale falls back to 1.0 instead of dividing by zero.
+    #[test]
+    fn degenerate_scale_falls_back_to_1x() {
+        assert!(portal_window_fullscreen(true, Some((0, 0)), OUT, (1920, 1080), 0.0));
+        assert!(portal_window_fullscreen(true, Some((0, 0)), OUT, (1920, 1080), -1.0));
+    }
+}
+
+/// DRAGON-562 fix round: the synthetic wallpaper anchor for a position-less
+/// window grant (COSMIC's portal sends `position: None` for every window
+/// stream, so this is the NORMAL portal window still, not an edge case).
+#[cfg(test)]
+mod synthetic_window_anchor_tests {
+    use super::synthetic_window_anchor;
+
+    fn out(name: &str, pos: (i32, i32), size: (i32, i32)) -> (String, (i32, i32), (i32, i32)) {
+        (name.to_string(), pos, size)
+    }
+
+    // The largest output wins regardless of registration order — the fifth
+    // test's desktop registers an 800x480 side panel FIRST, and anchoring
+    // there was the exact mistake DRAGON-563 corrected for the preview.
+    #[test]
+    fn largest_output_wins_over_registration_order() {
+        let outs = [out("panel", (5120, 0), (800, 480)), out("ultrawide", (0, 0), (5120, 1440))];
+        // 1194x962 centered on the ultrawide.
+        assert_eq!(
+            synthetic_window_anchor(&outs, (1194, 962)),
+            Some(((5120 - 1194) / 2, (1440 - 962) / 2))
+        );
+    }
+
+    // The anchor lives in the chosen output's own global space.
+    #[test]
+    fn offset_output_centers_in_global_coordinates() {
+        let outs = [out("right", (1920, 200), (2560, 1440))];
+        assert_eq!(
+            synthetic_window_anchor(&outs, (560, 440)),
+            Some((1920 + 1000, 200 + 500))
+        );
+    }
+
+    // A frame larger than the output clamps to the output's top-left, keeping
+    // the frame's center on-output (the composite resolves the wallpaper by
+    // center containment).
+    #[test]
+    fn oversize_frame_clamps_to_the_output_origin() {
+        let outs = [out("small", (100, 50), (800, 480))];
+        assert_eq!(synthetic_window_anchor(&outs, (1200, 900)), Some((100, 50)));
+    }
+
+    // Ties keep the FIRST registered of the equal-area outputs (stable, and
+    // pinned so a refactor to `max_by_key` — last-wins on ties — is caught).
+    #[test]
+    fn equal_areas_keep_the_first() {
+        let outs = [out("a", (0, 0), (1920, 1080)), out("b", (1920, 0), (1920, 1080))];
+        assert_eq!(synthetic_window_anchor(&outs, (400, 300)), Some((760, 390)));
+    }
+
+    // No outputs, or only degenerate ones: no anchor — the caller keeps the
+    // honest black fallback.
+    #[test]
+    fn no_usable_output_means_no_anchor() {
+        assert_eq!(synthetic_window_anchor(&[], (400, 300)), None);
+        let outs = [out("dead", (0, 0), (0, 1080)), out("gone", (0, 0), (1920, 0))];
+        assert_eq!(synthetic_window_anchor(&outs, (400, 300)), None);
+    }
+}
+
+/// The WHICH-output half of the synthetic anchor (DRAGON-549 reopened), shared by
+/// the wallpaper compose and the portal window-grant preview-origin resolution.
+#[cfg(test)]
+mod largest_output_index_tests {
+    use super::largest_output_index;
+
+    /// The owner's desktop, in registration order: the 800x480 side panel registers
+    /// FIRST, the 5120x1440 ultrawide second. The decision must name the ultrawide;
+    /// `outputs.first()` naming the panel is the exact defect the sixth live test
+    /// logged (`monitor=(800, 480)pt` for every window capture).
+    #[test]
+    fn the_ultrawide_beats_the_first_registered_panel() {
+        assert_eq!(largest_output_index(&[(800, 480), (5120, 1440)]), Some(1));
+        // And the same answer when registration order flips.
+        assert_eq!(largest_output_index(&[(5120, 1440), (800, 480)]), Some(0));
+    }
+
+    // Ties keep the FIRST registered (stable, matching the anchor's rule).
+    #[test]
+    fn equal_areas_keep_the_first() {
+        assert_eq!(largest_output_index(&[(1920, 1080), (1920, 1080)]), Some(0));
+    }
+
+    // No outputs, or only degenerate ones: no answer, and the caller keeps its
+    // existing fallback.
+    #[test]
+    fn no_positive_area_means_no_index() {
+        assert_eq!(largest_output_index(&[]), None);
+        assert_eq!(largest_output_index(&[(0, 1080), (1920, 0), (-5, -5)]), None);
+    }
+}
+
 #[cfg(test)]
 mod picker_keyboard_tests {
     use super::picking_phase;
@@ -3431,5 +4763,122 @@ mod capture_dir_tests {
             crate::util::TRANSIENT_MAX_AGE,
             std::time::Duration::from_secs(7 * 24 * 60 * 60)
         );
+    }
+}
+
+/// DRAGON-599: the walls a keyboard region nudge stops at.
+#[cfg(test)]
+mod desktop_bounds_tests {
+    use super::desktop_bounds_of;
+
+    /// One display is its own rect, right/bottom EXCLUSIVE (position plus size), which is the
+    /// same convention `GlobalRect` uses, so a region flush against the far edge reads as
+    /// flush rather than one pixel over.
+    #[test]
+    fn a_single_output_is_its_own_rect() {
+        assert_eq!(
+            desktop_bounds_of([((0, 0), (1920, 1080))]),
+            Some((0, 0, 1920, 1080))
+        );
+    }
+
+    /// Side-by-side displays make one box wide enough for a region that spans both, which is
+    /// the case this exists for: a dragged region can already cross a monitor border, so a
+    /// nudge must be able to move it there.
+    #[test]
+    fn two_displays_make_one_box_wide_enough_for_both() {
+        assert_eq!(
+            desktop_bounds_of([((0, 0), (5120, 1440)), ((5120, 960), (800, 480))]),
+            Some((0, 0, 5920, 1440)),
+            "the owner's own layout"
+        );
+    }
+
+    /// A display at a NEGATIVE origin (one placed left of, or above, the primary) moves the
+    /// box's origin with it. Walling at zero would strand a region on that monitor.
+    #[test]
+    fn a_negative_origin_moves_the_box() {
+        assert_eq!(
+            desktop_bounds_of([((0, 0), (1920, 1080)), ((-1280, -200), (1280, 1024))]),
+            Some((-1280, -200, 1920, 1080))
+        );
+    }
+
+    /// A zero-sized output contributes nothing. Folding its ORIGIN in anyway would drag the
+    /// box out to a place no pixel exists, and every region on the real display would then be
+    /// able to walk into nothing.
+    #[test]
+    fn a_zero_sized_output_is_skipped() {
+        assert_eq!(
+            desktop_bounds_of([((0, 0), (1920, 1080)), ((9000, 9000), (0, 0))]),
+            Some((0, 0, 1920, 1080))
+        );
+        assert_eq!(desktop_bounds_of([((5, 5), (1920, 0))]), None);
+    }
+
+    /// No outputs, no walls, and the caller must handle it: the nudge arm declines rather than
+    /// inventing a desktop.
+    #[test]
+    fn no_outputs_have_no_bounds() {
+        assert_eq!(desktop_bounds_of([]), None);
+    }
+}
+
+/// DRAGON-600: the tray-menu dropdown hold. These pin the ORDERING rule, which is the
+/// whole fix: the dismissal is caused by this process, so the wait has to sit after the
+/// cause, not before it.
+#[cfg(test)]
+mod menu_flats_hold_tests {
+    use super::*;
+
+    /// Only a menu launch that grabs flats holds. The other three combinations are the
+    /// launches that must pay nothing: a PrintScreen capture, and any launch with no
+    /// flats to protect.
+    #[test]
+    fn only_a_menu_launch_that_grabs_flats_holds() {
+        assert!(menu_flats_hold_needed(true, true));
+        assert!(!menu_flats_hold_needed(true, false));
+        assert!(!menu_flats_hold_needed(false, true));
+        assert!(!menu_flats_hold_needed(false, false));
+    }
+
+    /// Before focus there is nothing to settle from, so no amount of elapsed time short of
+    /// the outer budget releases the hold. This is the property that makes the mechanism a
+    /// SIGNAL rather than a timer: waiting alone never satisfies it.
+    #[test]
+    fn without_focus_only_the_outer_budget_releases() {
+        assert!(!menu_hold_release(None, 0));
+        assert!(!menu_hold_release(None, MENU_DISMISS_SETTLE_MS));
+        assert!(!menu_hold_release(None, MENU_HOLD_BUDGET_MS - 1));
+        assert!(menu_hold_release(None, MENU_HOLD_BUDGET_MS));
+        assert!(menu_hold_release(None, MENU_HOLD_BUDGET_MS + 5_000));
+    }
+
+    /// Once focus lands, the settle is counted from THAT instant, not from launch.
+    #[test]
+    fn focus_starts_the_settle_and_the_settle_releases() {
+        assert!(!menu_hold_release(Some(0), 0));
+        assert!(!menu_hold_release(Some(MENU_DISMISS_SETTLE_MS - 1), 0));
+        assert!(menu_hold_release(Some(MENU_DISMISS_SETTLE_MS), 0));
+    }
+
+    /// A late focus still gets its full settle, right up until the outer budget takes
+    /// over. Pinned because the tempting simplification, releasing on focus alone, would
+    /// grab while the panel is still tearing the popup down.
+    #[test]
+    fn a_late_focus_still_gets_its_settle_until_the_budget_wins() {
+        let nearly = MENU_HOLD_BUDGET_MS - 1;
+        assert!(!menu_hold_release(Some(0), nearly));
+        assert!(menu_hold_release(Some(0), MENU_HOLD_BUDGET_MS));
+    }
+
+    /// The two bounds, pinned to the values a reader would otherwise have to go and look
+    /// up. Their RELATION is the compile-time assert beside the constants, so it is not
+    /// restated here; what this adds is that both are finite and named, which is the
+    /// DRAGON-118 rule applied to the launch path.
+    #[test]
+    fn the_hold_is_bounded_at_both_ends() {
+        assert_eq!(MENU_DISMISS_SETTLE_MS, 150);
+        assert_eq!(MENU_HOLD_BUDGET_MS, 1200);
     }
 }

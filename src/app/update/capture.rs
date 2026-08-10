@@ -24,8 +24,13 @@ impl App {
                 }
                 // PipeWire source: monitor/window are picked through the portal (not
                 // our native overlay picker), so launch it when the icon is chosen.
+                // Pressing Monitor or Window on the floating toolbar IS the user
+                // choosing a target, so the picker must show: `TargetSwitch` never
+                // replays (DRAGON-580; it rode the replaying in-session lane until
+                // then, which silently re-granted the seed's own monitor).
                 if self.mode_uses_portal()
-                    && let Some(task) = self.portal_for_mode(m)
+                    && let Some(task) =
+                        self.portal_for_mode(m, crate::app::portal::RequestOrigin::TargetSwitch)
                 {
                     return task;
                 }
@@ -80,11 +85,25 @@ impl App {
                 }
                 // Meters are only armed in video mode; (de)activate accordingly.
                 self.sync_meters();
-                // Switching kind while in monitor/window mode arms the portal picker
-                // for the new kind's source, mirroring the mode-select behaviour.
+                // Switching kind while in monitor/window mode re-arms the portal for
+                // the new kind's source. Deliberately NOT the mode-select route
+                // (DRAGON-580): image ↔ video ↔ scanner does not re-choose the
+                // target, so this continues on the already-granted monitor or window
+                // and must not raise a second picker for it.
                 if self.mode_uses_portal()
-                    && let Some(task) = self.portal_for_mode(self.mode)
+                    && let Some(task) =
+                        self.portal_for_mode(self.mode, crate::app::portal::RequestOrigin::InSession)
                 {
+                    return task;
+                }
+                // DRAGON-604: the `lab/flatpak` fallback overlay never reaches the
+                // branch above (it is pinned to Region, and `portal_for_mode` answers
+                // None for Region), and its ONE seed frame is also the pixels the
+                // scanner decodes. Entering or leaving the scanner changes what those
+                // pixels must contain, so re-grab them on the saved grant. No-op on
+                // every other session; see `reseed_fallback_for_kind`.
+                #[cfg(target_os = "linux")]
+                if let Some(task) = self.reseed_fallback_for_kind() {
                     return task;
                 }
                 Task::none()
@@ -159,8 +178,46 @@ impl App {
                     // (`finish_scan_shot`) both went with that: they existed because a
                     // refresh wrote through this same slot, and calling the re-arm here now
                     // would reset a shot in flight the moment unrelated launch flats landed.
-                    self.frozen = flats;
+                    //
+                    // `lab/flatpak`: on the fallback path the launch flats are a NATIVE
+                    // grab this session cannot make (empty at best), while `self.frozen`
+                    // holds the PORTAL seed frame the selector is drawing over. The
+                    // unconditional assign would clobber that frame, and with a restore
+                    // token the seed grant is instant, so the race is real. Drop the
+                    // delivery there; everywhere else the assign is unchanged.
+                    if !self.overlay_fallback_active() {
+                        self.frozen = flats;
+                    }
                     self.frozen_pending = false;
+                }
+                // DRAGON-606: THE ordering seam. The grab thread has posted and been
+                // drained, so nothing is reading the screen any more and the dim may
+                // finally start fading in. Placed here, in the completion handler itself,
+                // rather than behind a timer, because "the grab is over" is an event and
+                // not a duration. One-way and idempotent, so the repeated drain ticks a
+                // pre-parked empty result produces cannot restart it.
+                self.start_dim_fade();
+                // DRAGON-601: the COLOUR PICKER has been waiting for exactly this.
+                //
+                // The flats grab is deferred off the launch critical path, so the picker's
+                // first sample almost always runs while `frozen_pending` and correctly
+                // declines: there is no snapshot to read yet, and saying "this display has no
+                // pixel source" there would be a false alarm once per launch. The pointer
+                // position IS already known by then (a layer surface mapping under the cursor
+                // gets `wl_pointer.enter`, which iced turns into a `CursorMoved`), so the only
+                // thing missing was anybody re-asking once the pixels arrived. Nothing did,
+                // and the loupe stayed absent until the user moved the mouse and generated a
+                // fresh sample by hand. That is the owner's "the circle appears only after I
+                // move", arriving a moment after the pointer-hide half of the same report.
+                //
+                // Guarded by the pure `picker_wants_frozen_resample` so the condition is one
+                // readable statement rather than two terms inlined here, and so it can be
+                // tested without a compositor.
+                if crate::app::color_picker::picker_wants_frozen_resample(
+                    self.color_picking(),
+                    self.color_picker.pointer.is_some(),
+                ) {
+                    return self.color_picker_resample();
                 }
                 Task::none()
             }
@@ -179,6 +236,29 @@ impl App {
             // DRAGON-460: the frame without the marks is on screen, so take the region shot.
             CaptureMsg::ScanShotTick => {
                 self.run_scan_shot();
+                Task::none()
+            }
+            // DRAGON-600: the tray dropdown may be gone by now, so maybe run the held grab.
+            CaptureMsg::MenuHoldTick => {
+                self.tick_menu_hold();
+                Task::none()
+            }
+            // DRAGON-606: one frame of the dim's fade-in. The tick exists only to force the
+            // redraw; the alpha itself is derived from the start instant at draw time, so a
+            // dropped or late frame cannot leave the ramp behind where it should be.
+            // DRAGON-612: the held accept's re-ask, from `sub_accept_pending`. Same resolver
+            // as the key press (`request_accept`), so the two arrival routes cannot answer
+            // differently, and the same reason for asking the gate again here: a session that
+            // moved on since the press must not have a capture committed under it.
+            CaptureMsg::AcceptPending => self.request_accept(),
+            CaptureMsg::DimFadeTick => {
+                if let crate::app::overlay::DimFade::Running(start) = self.dim_fade.get()
+                    && start.elapsed().as_millis() as u64 >= crate::app::overlay::DIM_FADE_MS
+                {
+                    // Latch the end state so `sub_dim_fade` stops scheduling ticks. Without
+                    // this the poll would run for the whole session to animate nothing.
+                    self.dim_fade.set(crate::app::overlay::DimFade::Done);
+                }
                 Task::none()
             }
             CaptureMsg::CursorReady => {
@@ -287,10 +367,31 @@ impl App {
             CaptureMsg::Tick => match self.countdown {
                 Some(n) if n > 1 => {
                     self.countdown = Some(n - 1);
+                    // DRAGON-563: the tray digits follow the tick.
+                    if let Some(tray) = &self.countdown_tray {
+                        tray.set_remaining(n - 1);
+                    }
                     Task::none()
                 }
                 Some(_) => {
                     self.countdown = None;
+                    // DRAGON-563: the digits come down the moment the capture fires (a
+                    // recording mints its own tray next; a still delivers and exits).
+                    self.countdown_tray = None;
+                    // The one-shot countdown (owner rule; `countdown_consumed` carries
+                    // the full why): firing SPENDS the persisted preset, so the next
+                    // launch and every menu title read "Countdown Timer: 00". Cancels
+                    // keep it; a CLI --countdown never spends it. Written through the
+                    // app's own save path, the same one `PickDelay` uses, so the
+                    // in-memory chip and the config file move together.
+                    if capture_flow::countdown_consumed(
+                        true,
+                        self.countdown_override.is_some(),
+                        self.delay_idx,
+                    ) {
+                        self.delay_idx = 0;
+                        self.save_state();
+                    }
                     match self.pending.take() {
                         Some(sel) => self.begin(sel),
                         None => self.teardown(),
@@ -298,10 +399,33 @@ impl App {
                 }
                 None => Task::none(),
             },
+            // DRAGON-563: drain the countdown tray's clicks. A Cancel is the ordinary
+            // Cancelled ending — on the fallback path the selection window is closed, so
+            // there is no picker to return to, and the tray menu's "Cancel countdown"
+            // reads as "end this" on every session, so this is `teardown`, not
+            // `CancelCapture`'s back-to-selection. The failure is noted FIRST with the
+            // precise cause (first-note-wins), so the verdict line says "tray cancel",
+            // not the generic Escape wording `teardown` would fall back to.
+            CaptureMsg::CountdownTrayPoll => {
+                let events = self.countdown_tray.as_ref().map(|t| t.poll()).unwrap_or_default();
+                if events.contains(&crate::tray::TrayEvent::Cancel) {
+                    self.countdown_tray = None;
+                    self.countdown = None;
+                    self.pending = None;
+                    crate::diag::note_failure(
+                        crate::diag::Failure::Cancelled,
+                        "the user cancelled the pre-capture countdown from the tray",
+                    );
+                    return self.teardown();
+                }
+                Task::none()
+            }
             CaptureMsg::CancelCapture => {
                 // Abort the countdown and return to region select (don't quit),
                 // restoring the fully-interactive selection overlay.
                 self.countdown = None;
+                // DRAGON-563: a countdown abort takes the digits down too.
+                self.countdown_tray = None;
                 self.pending = None;
                 self.capture_live = false;
                 // Drop any granted-but-unused portal stream (closes the fd).
@@ -337,6 +461,26 @@ impl App {
                 self.save_state();
                 Task::none()
             }
+            // DRAGON-599: one logical pixel, from an arrow key or its vim letter. The geometry
+            // is `GlobalRect::nudged`, which moves and never resizes; all this arm decides is
+            // WHAT WALLS the move is fought against, which is `desktop_bounds`.
+            //
+            // Re-checked here rather than trusted from the gate, like `CopySelection`: the
+            // message could arrive by another route, and a nudge with no region drawn has
+            // nothing to move.
+            CaptureMsg::NudgeRegion(dir) => {
+                let (Some(rect), Some(bounds)) = (self.region, self.desktop_bounds()) else {
+                    return Task::none();
+                };
+                let (dx, dy) = dir.delta();
+                let moved = rect.nudged(dx, dy, bounds);
+                // A refused step (the region is against that wall) writes nothing, so a held
+                // key at a wall does not churn state or force redraws.
+                if moved != rect.normalize() {
+                    self.region = Some(moved);
+                }
+                Task::none()
+            }
             CaptureMsg::PipewireProbed(ok, types) => {
                 self.pipewire_available = ok;
                 self.pipewire_source_types = types;
@@ -344,37 +488,30 @@ impl App {
                 // and changes which backends the method dropdowns list.
                 self.update_health_nav_icon();
                 self.rebuild_capture_methods();
-                // First launch only: recordings default to the portal when it's
-                // reachable, otherwise the native backend (on macOS `ok` is always
-                // false, so this resolves to SCK). Screenshots default to native —
-                // UNLESS the compositor doesn't advertise screencopy (GNOME/KDE),
-                // where the portal is the only path that can work. Never overrides
-                // a saved choice.
-                if self.first_launch {
-                    self.first_launch = false;
-                    self.record_backend = if ok {
-                        crate::platform::backend::PORTAL_ID
-                    } else {
-                        crate::platform::backend::native_backend_id()
-                    }
-                    .to_string();
-                    // The screenshot default only differs from native when the
-                    // compositor lacks ext-image-copy-capture — a Wayland-only probe.
-                    // On macOS the only backend is SCK, so there's nothing to fall
-                    // back FROM.
-                    #[cfg(target_os = "linux")]
-                    {
-                        let p = crate::platform::backend::wayland_protocols();
-                        if ok && !(p.image_copy_capture && p.output_source) {
-                            self.screenshot_backend =
-                                crate::platform::backend::PORTAL_ID.to_string();
-                        }
-                    }
-                    self.save_state();
-                }
+                // A first-launch auto-default used to live here (DRAGON-129): it
+                // wrote the probe's pick into `record_backend` /
+                // `screenshot_backend` and saved, once, keyed on "no config file
+                // existed at init". DRAGON-575 removed it, for two reasons. It
+                // persisted an AUTO-RESOLUTION as the user's intent, the exact
+                // disease DRAGON-571 cured for encoders (a transient portal outage
+                // at first launch pinned "screencopy" as the recording choice
+                // forever). And its trigger was fragile: ANY config file created
+                // before the first GUI probe disarmed it for good. The Flatpak
+                // recipe's `resident = true` seed did exactly that, which left the
+                // sandbox's screenshot method on the unavailable native default and
+                // the settings dropdown with no selection. Nothing replaces the
+                // write: the schema defaults plus the dispatch clamp
+                // (`screenshot_uses_portal` / `recording_uses_portal`) already land
+                // every session on the same method the old heal picked, re-derived
+                // each launch instead of frozen at the first one, and the method
+                // dropdowns DISPLAY that resolution (`MethodChoices::display_position`).
                 Task::none()
             }
             CaptureMsg::PipewireCastReady => self.on_pipewire_cast_ready(),
+            #[cfg(target_os = "linux")]
+            CaptureMsg::FallbackCastReady => self.on_fallback_cast_ready(),
+            #[cfg(target_os = "linux")]
+            CaptureMsg::FallbackFrozenReady => self.on_fallback_frozen_ready(),
             CaptureMsg::ShotSaved(path, outcome) => {
                 if let Some(failure) = outcome.failure() {
                     // DRAGON-419 (silent-exit path S2) + DRAGON-415. This was ONE boolean
@@ -447,6 +584,9 @@ impl App {
                 // the full output list has settled into `self.outputs`. Resolve + drive it;
                 // if it can't resolve a target, mint the picker overlays instead so the user
                 // can still pick (the deferral suppressed the picker while it was pending).
+                // A session with no protocol access at all never reaches the picker:
+                // `immediate_capture` ends it through the honest failure path instead
+                // (lab/flatpak, `immediate_target_resolvable`).
                 #[cfg(target_os = "linux")]
                 {
                     if let Some(imm) = self.startup_immediate.take() {
@@ -535,6 +675,36 @@ impl App {
         self.rebuild_marks();
     }
 
+    /// DRAGON-600: one poll of the tray-dropdown hold on the frozen-flats grab.
+    ///
+    /// Releases when [`super::super::capture_flow::menu_hold_release`] says so, which is
+    /// either a settle after our overlay took keyboard focus (the event that dismisses the
+    /// dropdown) or the outer budget, so a compositor that never gives us focus still
+    /// captures. Clearing `menu_hold` does three things at once, on purpose: it runs the
+    /// grab, it stops this poll, and it lets the overlay start painting again.
+    pub(in crate::app) fn tick_menu_hold(&mut self) {
+        let Some(hold) = self.menu_hold else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let since_focus = hold.focused.map(|f| now.duration_since(f).as_millis() as u64);
+        let since_armed = now.duration_since(hold.armed).as_millis() as u64;
+        if !crate::app::capture_flow::menu_hold_release(since_focus, since_armed) {
+            return;
+        }
+        // Behaviour, not content: whether the causal signal arrived, and how long the whole
+        // hold cost. That pair is what tells a real dismissal from a lucky wait.
+        log::debug!(
+            "menu hold: releasing the frozen-flats grab after {since_armed}ms ({})",
+            match since_focus {
+                Some(ms) => format!("overlay took keyboard focus {ms}ms ago"),
+                None => "no overlay focus arrived, the outer budget fired".to_string(),
+            }
+        );
+        self.menu_hold = None;
+        crate::app::spawn_frozen_flats_grab(self.frozen_slot.clone(), hold.want_cursor);
+    }
+
     /// DRAGON-460 step 2 of 2: the frame without marks is on screen, so take the shot.
     ///
     /// A LIVE region shot through `crate::screenshot::region` — the portable seam, with an
@@ -558,11 +728,25 @@ impl App {
             return;
         };
         self.scan_shot = ScanShot::Shooting;
-        crate::util::timing_mark("scan shot: live region read (begin)");
         let slot = self.scan_shot_slot.clone();
         if let Ok(mut g) = slot.lock() {
             *g = None;
         }
+        // `lab/flatpak`: on the fallback overlay the live read below is a NATIVE grab this
+        // session cannot make, so it would answer `None` and the scan would find nothing
+        // with no way to say why. Read the seed-frozen frame instead. Shown and read stay
+        // the same pixels for the same reason they do on the live path: the selector is
+        // drawing that very frame. Cropping is a memcpy of the selection, so it runs
+        // inline rather than on a thread.
+        if self.scan_reads_frozen() {
+            crate::util::timing_mark("scan shot: frozen region read (fallback overlay)");
+            let shot = self.crop_frozen(x, y, w, h);
+            if let Ok(mut g) = slot.lock() {
+                *g = Some(shot);
+            }
+            return;
+        }
+        crate::util::timing_mark("scan shot: live region read (begin)");
         std::thread::spawn(move || {
             let shot = crate::screenshot::region(x, y, w, h, None);
             crate::util::timing_mark("scan shot: live region read (done)");

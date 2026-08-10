@@ -61,6 +61,69 @@ pub fn start(_ptt_trigger: Option<String>, _stop_trigger: Option<String>) -> Hot
     }
 }
 
+/// Whether this desktop exposes the portal `GlobalShortcuts` interface AT ALL: the one
+/// capability question behind "can a recording shortcut be delivered without focus"
+/// (DRAGON-583).
+///
+/// A REAL probe, not a guess and not a sandbox test. It reads the interface's `version`
+/// property off the portal; a desktop that does not implement it answers with an error,
+/// which is exactly what a `busctl introspect` of COSMIC's portal shows today (an empty
+/// introspection: the interface is simply not there). Whether the interface is missing
+/// because the desktop never shipped it or because a sandbox hid it, the answer we need is
+/// the same, so this never asks about Flatpak.
+///
+/// Memoized for the process: at most one D-Bus round trip per launch, and the settings
+/// page re-renders many times. Bounded, per DRAGON-118's rule: zbus's blocking calls wait
+/// for a reply indefinitely, so the call runs on its own thread against
+/// [`PROBE_BUDGET`] and a portal that never answers reads as "not available" instead of
+/// stalling the UI. The thread is DETACHED on timeout rather than joined, exactly as
+/// `platform/linux/secrets.rs` does, because it is parked inside zbus and waiting for it
+/// would be the hang this exists to prevent.
+#[cfg(target_os = "linux")]
+pub fn interface_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        if std::thread::Builder::new()
+            .name("cck-global-shortcuts-probe".into())
+            .spawn(move || {
+                let _ = tx.send(probe_interface());
+            })
+            .is_err()
+        {
+            return false;
+        }
+        let found = rx.recv_timeout(PROBE_BUDGET).unwrap_or(false);
+        log::debug!("portal GlobalShortcuts interface available: {found}");
+        found
+    })
+}
+
+/// How long the interface probe may take before it is treated as "not available". The
+/// portal is a local service on the session bus, so a real answer is sub-millisecond;
+/// this is a bound, not an expectation.
+#[cfg(target_os = "linux")]
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The blocking half of [`interface_available`]: one `Properties.Get` for the interface's
+/// `version`. Any error at all (no session bus, no portal, no such interface, an
+/// unreadable reply) means we cannot promise a focus-free shortcut, which is the answer
+/// the caller wants.
+#[cfg(target_os = "linux")]
+fn probe_interface() -> bool {
+    let Ok(conn) = zbus::blocking::Connection::session() else {
+        return false;
+    };
+    conn.call_method(
+        Some("org.freedesktop.portal.Desktop"),
+        "/org/freedesktop/portal/desktop",
+        Some("org.freedesktop.DBus.Properties"),
+        "Get",
+        &("org.freedesktop.portal.GlobalShortcuts", "version"),
+    )
+    .is_ok()
+}
+
 /// Bind the recording shortcuts through the portal and stream their
 /// activations. Returns immediately; `bound`/`dead` report the outcome.
 /// `ptt_trigger` / `stop_trigger` are optional XDG-spec trigger hints (e.g.

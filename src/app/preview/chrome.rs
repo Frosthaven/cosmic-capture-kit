@@ -127,13 +127,19 @@ pub(super) fn action_tip(name: &str, action: crate::shortcuts::Action, km: &crat
 /// A tooltip for a control whose key is **not** in the keymap — same `"Name  (KEY)"` shape as
 /// [`action_tip`], with the key spelled literally.
 ///
-/// Used by exactly two controls: the crop session's ACCEPT (Enter) and REJECT (Esc). Those are
-/// not [`crate::shortcuts::Action`]s and deliberately so — a live crop session is MODAL and takes
-/// the keyboard whole in `keyboard.rs`'s `preview_modal_key`, matching `Named::Enter` /
-/// `Named::Escape` directly and swallowing everything else, exactly as a live text edit does.
-/// There is nothing in the keymap to read, and nothing a user could rebind, so the literal is
-/// honest rather than a shortcut around the live-binding rule. Keep the FORM here so the two
-/// tooltips still match the rest of the tray's.
+/// Two families of caller, for the same underlying reason: there is nothing in the keymap to
+/// read, because the key is not user-configurable.
+///
+/// * The crop session's ACCEPT (Enter) and REJECT (Esc). A live crop session is MODAL and takes
+///   the keyboard whole in `keyboard.rs`'s `preview_modal_key`, matching `Named::Enter` /
+///   `Named::Escape` directly and swallowing everything else, exactly as a live text edit does.
+/// * The five DRAGON-617 BAKED actions (Save, Upload, Close, Undo, Redo), whose key comes from
+///   [`crate::shortcuts::FixedEditorAction::label`]. Those callers pass a rendered label rather
+///   than a literal, so the tooltip still resolves the chord from the SAME `Shortcut` the
+///   matcher listens on and cannot drift from it. On a default install every one of these
+///   tooltips reads exactly as it did when the actions were bindable.
+///
+/// Keep the FORM here so all of them still match the rest of the tray's.
 ///
 /// (Verified rather than assumed, DRAGON-392: Enter really does accept and Esc really does
 /// cancel; the crop branch runs BEFORE the keymap dispatch, so Esc cancels the SESSION and never
@@ -359,7 +365,7 @@ impl Tb {
                 let c = theme.cosmic();
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(crate::app::theme::frost_color(
-                        c.background.component.base.into(),
+                        c.background(false).component.base.into(),
                         glass,
                     ))),
                     border: Border {
@@ -405,7 +411,7 @@ impl Tb {
             .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(crate::app::theme::frost_color(
-                        theme.cosmic().background.component.base.into(),
+                        theme.cosmic().background(false).component.base.into(),
                         glass,
                     ))),
                     border: Border {
@@ -447,7 +453,7 @@ impl Tb {
                 let c = theme.cosmic();
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(crate::app::theme::frost_color(
-                        c.background.component.base.into(),
+                        c.background(false).component.base.into(),
                         glass,
                     ))),
                     border: Border {
@@ -479,11 +485,11 @@ impl Tb {
                 let c = theme.cosmic();
                 cosmic::iced::widget::container::Style {
                     // Opaque component base — the standard menu/popover surface, NO frost.
-                    background: Some(Background::Color(c.background.component.base.into())),
+                    background: Some(Background::Color(c.background(false).component.base.into())),
                     border: Border {
                         radius: crate::app::theme::rounding(theme).s.into(),
                         width: 1.0,
-                        color: c.background.divider.into(),
+                        color: c.background(false).divider.into(),
                     },
                     ..Default::default()
                 }
@@ -560,14 +566,15 @@ impl Tb {
         // Never `accounts::list()` from here: this runs on every frame, and that reads and
         // parses a file (see `EditState::cloud_accounts`).
         let accounts = &preview.edit.cloud_accounts;
-        let upload_key = km.get(Action::PreviewUpload).map(|sc| sc.label());
+        // DRAGON-617 baked Upload, so the key is fixed and always present.
+        let upload_key = crate::shortcuts::FixedEditorAction::Upload.label();
         // DRAGON-514: one upload at a time. The predicate is shared with the handler the
         // keybind arrives through, so the button and Ctrl+U cannot disagree about whether an
         // upload may start; here it only decides how the button DRAWS.
         let busy = super::edit::upload_in_flight(&preview.edit.uploads);
         let upload_btn = self.tool_button_gated(
             "upload-symbolic",
-            upload_tip(!accounts.is_empty(), busy, upload_key.as_deref()),
+            upload_tip(!accounts.is_empty(), busy, upload_key),
             PreviewMsg::UploadFlyoutToggle,
             pos,
             !accounts.is_empty() && !busy,
@@ -597,7 +604,7 @@ impl Tb {
         let mut buttons: Vec<Element<'a, Msg>> = vec![
             self.tool_button_tinted(
                 "document-save-symbolic",
-                action_tip("Save", Action::PreviewSave, km),
+                fixed_key_tip("Save", crate::shortcuts::FixedEditorAction::Save.label()),
                 PreviewMsg::Save,
                 pos,
                 tint,
@@ -741,11 +748,12 @@ impl Tb {
     /// The close (x) action group — shown alone while loading, and beside the other actions
     /// once the content is ready. Esc triggers the same `Cancel`; it never deletes (that's
     /// the Delete trash button), so it just closes.
-    pub(super) fn cancel_group(self, km: &crate::shortcuts::Keymap) -> Element<'static, Msg> {
+    /// (DRAGON-617 baked Close, so this no longer takes the keymap: its key is fixed.)
+    pub(super) fn cancel_group(self) -> Element<'static, Msg> {
         // Lives on the top edit toolbar → tooltip drops below.
         self.tool_group(vec![self.tool_button(
             "window-close-symbolic",
-            action_tip("Close", crate::shortcuts::Action::PreviewCancel, km),
+            fixed_key_tip("Close", crate::shortcuts::FixedEditorAction::Close.label()),
             PreviewMsg::Cancel,
             widget::tooltip::Position::Bottom,
         )])
@@ -926,12 +934,12 @@ pub(super) fn transport_bar(
                 let background = if glass.is_some_and(|g| g.frosted_windows) {
                     None
                 } else {
-                    Some(Background::Color(c.background.base.into()))
+                    Some(Background::Color(c.background(false).base.into()))
                 };
                 cosmic::iced::widget::container::Style { background, ..Default::default() }
             } else {
                 // A washed-down group panel: present but quieter than the toolbars.
-                let mut bg: cosmic::iced::Color = c.background.component.base.into();
+                let mut bg: cosmic::iced::Color = c.background(false).component.base.into();
                 bg.a *= 0.65;
                 cosmic::iced::widget::container::Style {
                     background: Some(Background::Color(bg)),
@@ -986,7 +994,7 @@ pub(super) fn preview_bar(
             let background = if glass.is_some_and(|g| g.frosted_windows) {
                 None
             } else {
-                Some(Background::Color(c.primary.base.into()))
+                Some(Background::Color(c.primary(false).base.into()))
             };
             cosmic::iced::widget::container::Style {
                 background,
@@ -1162,13 +1170,21 @@ impl Tb {
         // this one used to leave the class at its default, so the bundled lucide SVG rendered
         // with its own `currentColor` instead of the segment's. On the accent-filled ACTIVE
         // segment that reads as a dark knockout — the owner's "the icons seem like they are
-        // cutouts". `segment_style` already declares the intent ("Uniform icon color across the
-        // whole group: ... `on_accent`"); this makes the glyph actually obey it, so the checkmark
-        // is a SOLID on-accent mark in the middle of the fill. (The video timeline's
-        // pointer/scissor pair goes through here too and had the same defect.)
+        // cutouts". An explicit class also makes this glyph immune to the container below,
+        // which would otherwise replace its ink (see `theme::on_accent_content`).
+        //
+        // DRAGON-607: the colour is now `theme::segment_ink(t, active)` rather than a flat
+        // `on_accent`. It has to depend on `active`, because only the ACTIVE segment is filled
+        // with the accent; the inactive one wears the `state_mix` wash, and on-accent ink there
+        // was near-black on dark grey. `segment_ink` is the SAME function `segment_style` uses
+        // for the button's own `icon_color`/`text_color`, so the explicit class here and the
+        // button style can never disagree. The owner chose legibility over one uniform glyph
+        // colour when that tradeoff was put to them; `segment_style`'s doc carries the history.
         let glyph = crate::widgets::icons::sized(icon, self.icon_box())
-            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|t: &cosmic::Theme| {
-                cosmic::widget::svg::Style { color: Some(crate::app::theme::on_accent(t)) }
+            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |t: &cosmic::Theme| {
+                cosmic::widget::svg::Style {
+                    color: Some(crate::app::theme::segment_ink(t, active)),
+                }
             })));
         let style = move |t: &cosmic::Theme, hovered: bool| {
             crate::app::theme::segment_style(t, active, hovered, round_left, round_right)
@@ -1200,13 +1216,21 @@ impl Tb {
     /// A crop session now hides every other top-bar control ([`top_bar_item_state`]), so the pair
     /// is alone on the bar: nothing is being crowded, and the one control the user must find gets
     /// named rather than left as a glyph to decode. It is built as
-    /// `button::suggested(..).leading_icon(..)` — the SAME composition as the settings About
-    /// page's donate button — so the icon-to-label gap, the label's size/weight and the accent
-    /// fill are libcosmic's own and match a settings button BY CONSTRUCTION. Copying a spacing
+    /// `button::suggested(..).leading_icon(..)` — so the icon-to-label gap, the label's
+    /// size/weight and the accent fill are libcosmic's own and match a settings button BY
+    /// CONSTRUCTION. Copying a spacing
     /// number here instead would drift the moment the theme's `space_xxxs` moves. The button's
     /// stock height (`space_l`, 32px) is a hair over the tray's scaled button box (~31px), which
     /// the cluster absorbs; it is NOT overridden, because overriding it is exactly the
     /// hand-tuning this composition exists to avoid.
+    ///
+    /// This doc used to add "the SAME composition as the settings About page's donate
+    /// button". It was not, and the difference was the DRAGON-607 bug: donate goes through
+    /// `settings::row::centered_button`, which wraps its label in a centring container, and
+    /// a container overrides the ink beneath it, so donate drew a near-white label on the
+    /// accent while THIS button drew the correct dark one. They match now because that
+    /// wrapper carries the on-accent ink, but the compositions are still different, so do
+    /// not reason about one from the other.
     ///
     /// **The accept mark is a CHECKMARK at the set's own stroke weight** — no bold variant. The
     /// owner's rule (DRAGON-392): the crop, accept and cancel glyphs carry the same weight as
@@ -1402,28 +1426,30 @@ impl Tb {
     /// its `on_press` (undo/redo on an empty stack no-op in the update) so it still absorbs
     /// clicks — see [`flat_icon_button`]. Shared by the overlay header row and (via
     /// [`App::preview_header_controls`]) the titlebar, so the two stay identical.
+    ///
+    /// (DRAGON-617 baked both keys, so this no longer takes the keymap.)
     fn flat_history(
         e: &EditState,
-        km: &crate::shortcuts::Keymap,
         build: impl Fn(&'static str, String, PreviewMsg, fn(&cosmic::Theme) -> cosmic::iced::Color) -> Element<'static, Msg>,
     ) -> Vec<Element<'static, Msg>> {
-        let one = |icon, name, action, msg, on: bool| {
+        use crate::shortcuts::FixedEditorAction;
+        let one = |icon, name, action: FixedEditorAction, msg, on: bool| {
             let tint: fn(&cosmic::Theme) -> cosmic::iced::Color =
                 if on { crate::app::theme::foreground } else { crate::app::theme::subdued };
-            build(icon, action_tip(name, action, km), msg, tint)
+            build(icon, fixed_key_tip(name, action.label()), msg, tint)
         };
         vec![
             one(
                 "edit-undo-symbolic",
                 "Undo",
-                crate::shortcuts::Action::PreviewUndo,
+                FixedEditorAction::Undo,
                 PreviewMsg::Undo,
                 e.can_undo(),
             ),
             one(
                 "edit-redo-symbolic",
                 "Redo",
-                crate::shortcuts::Action::PreviewRedo,
+                FixedEditorAction::Redo,
                 PreviewMsg::Redo,
                 e.can_redo(),
             ),
@@ -1442,10 +1468,13 @@ impl App {
     ) -> Vec<Element<'static, Msg>> {
         let pid = preview.window;
         let mut items: Vec<Element<'static, Msg>> = Vec::new();
-        // DRAGON-427: no "pop out to fullscreen" button on Windows 10 — there is no overlay
-        // editor to pop out to there (the overlay would inherit the software rasterizer that
-        // cannot draw these shader layers). Offering a button that refuses is worse than not
-        // offering it. Every other platform keeps the button exactly where it was.
+        // No "pop out to fullscreen" button where there is no fullscreen editor to pop out
+        // to: Windows 10, whose overlay would inherit the software rasterizer that cannot
+        // draw these shader layers (DRAGON-427), and a Linux session with no layer shell,
+        // where the overlay preview has no surface type to be at all (`lab/flatpak`: cosmic-comp
+        // hides the global from sandboxed clients, and mutter never shipped it). Offering a
+        // button that refuses is worse than not offering it. Every session that CAN show the
+        // overlay editor keeps the button exactly where it was.
         if crate::platform::overlay_preview_available() {
             items.push(titlebar_button(
                 pid,
@@ -1464,7 +1493,7 @@ impl App {
             PreviewMsg::OpenSettings,
             crate::app::theme::accent,
         ));
-        items.extend(Tb::flat_history(&preview.edit, &self.keymap, move |i, t, m, c| {
+        items.extend(Tb::flat_history(&preview.edit, move |i, t, m, c| {
             titlebar_button(pid, i, t, m, c)
         }));
         items
@@ -1585,7 +1614,7 @@ fn upload_meter(
         .class(cosmic::theme::Container::Custom(Box::new(move |theme| {
             cosmic::iced::widget::container::Style {
                 background: Some(Background::Color(
-                    theme.cosmic().background.component.base.into(),
+                    theme.cosmic().background(false).component.base.into(),
                 )),
                 border: Border {
                     radius: crate::app::theme::rounding(theme).xl.into(),
@@ -1946,7 +1975,7 @@ pub(super) use crate::app::theme::cluster_border;
 /// [`quiet_on`] the CLUSTER fill (`background.component.base`) — content inside a bordered
 /// toolbar group: the slider glyphs, and every control the crop session disables.
 pub(super) fn quiet_on_cluster(t: &cosmic::Theme) -> cosmic::iced::Color {
-    quiet_on(t, t.cosmic().background.component.base.into())
+    quiet_on(t, t.cosmic().background(false).component.base.into())
 }
 
 /// [`quiet_on`] the BAR fill (`primary.base`, what [`preview_bar`] paints) — content drawn
@@ -1957,7 +1986,7 @@ pub(super) fn quiet_on_cluster(t: &cosmic::Theme) -> cosmic::iced::Color {
 /// plain token is still measured against a surface this text does not sit on. It is close enough
 /// in the light themes and visibly wrong in the dark ones.
 pub(super) fn quiet_on_bar(t: &cosmic::Theme) -> cosmic::iced::Color {
-    quiet_on(t, t.cosmic().primary.base.into())
+    quiet_on(t, t.cosmic().primary(false).base.into())
 }
 
 /// **THE rail width (px) of every slider that rides a toolbar button group** — the covermark
@@ -2134,7 +2163,8 @@ impl App {
     /// row's height — ONE flat button box, NOT a full toolbar group (there's no capsule
     /// padding around it any more).
     pub(super) fn overlay_header_row(&self, preview: &PreviewState, tb: Tb) -> Element<'static, Msg> {
-        let km = &self.keymap;
+        // (No keymap read here since DRAGON-617: every key this row advertises, undo, redo
+        // and Close, is baked, so their labels come from `FixedEditorAction` directly.)
         // The glyph advertises the DESTINATION: a restore/window glyph while in the overlay
         // (click to pop out into a window). No hotkey binds the appearance toggle, so the
         // tip carries no key.
@@ -2155,13 +2185,13 @@ impl App {
                 crate::app::theme::accent,
             ),
         ];
-        left.extend(Tb::flat_history(&preview.edit, km, move |n, t, m, c| {
+        left.extend(Tb::flat_history(&preview.edit, move |n, t, m, c| {
             tb.header_button(n, t, m, c)
         }));
         // Esc triggers the same `Cancel`; it never deletes (that's the Delete trash button).
         let close = tb.header_button(
             "window-close-symbolic",
-            action_tip("Close", crate::shortcuts::Action::PreviewCancel, km),
+            fixed_key_tip("Close", crate::shortcuts::FixedEditorAction::Close.label()),
             PreviewMsg::Cancel,
             crate::app::theme::accent,
         );
@@ -2265,7 +2295,7 @@ impl App {
             // takes the empty-caption band so it stays on the same line as the captioned groups
             // beside it — the row centres its items vertically, so an item short by the band
             // would visibly sink.
-            right.push(tb.captioned(tb.cancel_group(km), ""));
+            right.push(tb.captioned(tb.cancel_group(), ""));
         }
         toolbar_row(left, Vec::new(), right)
     }
@@ -2289,6 +2319,29 @@ impl App {
             // cluster (the same container the top-left tray groups use), instead of two
             // borderless controls.
             groups.push(tb.tool_cluster(vec![
+                // DRAGON-582: the colour picker tool sits BEFORE the colour swatch (the
+                // owner's placement). It launches the picker as its own child, because
+                // every picker launch is its own process.
+                //
+                // This comment used to say the pick does NOT set the annotation colour.
+                // DRAGON-587 made it do exactly that, and the correction is worth keeping
+                // rather than just deleting: the launch carries this editor's pid
+                // (`color_picker::COLOR_TO_PID_ENV`, set by `PreviewMsg::OpenColorPicker`),
+                // the picked colour comes back over the preview handoff socket
+                // (`preview_ipc`'s `color` verb) and lands in
+                // `App::apply_custom_annot_color`, which is where the colour wheel's own
+                // custom colour lands too. A pick that reaches an editor opens no result
+                // window at all.
+                //
+                // So the two controls are not rivals: the swatch chooses a colour you
+                // already have, the pipette takes one off the screen, and both end in the
+                // same place.
+                tb.tool_button(
+                    "color-select-symbolic",
+                    "Color Picker".to_string(),
+                    PreviewMsg::OpenColorPicker,
+                    widget::tooltip::Position::Top,
+                ),
                 annot_swatch_flyout(preview, &self.annot_recent_colors, &self.keymap, tb),
                 tb.stroke_width_group(e.stroke(), &self.keymap),
             ]));
@@ -3186,6 +3239,17 @@ pub(super) fn dropdown_chip_tall<'a>(
             cosmic::widget::svg::Style { color: Some(disabled_label_tone(t)) }
         })))
     };
+    // KNOWN, and deliberately left alone (DRAGON-607). These un-classed containers are the
+    // SAME trap that ticket fixed on the accent-filled buttons: a container overrides the ink
+    // of everything below it, so the label never receives the `Button::Text` class's own
+    // colour. Since libcosmic's `text_button.on` IS `accent_text`, that silently strips the
+    // accent from these chip labels and they draw in the ordinary window foreground.
+    //
+    // It is not being changed here because it is not what was reported, the current look is
+    // what these dropdown chips have always had, and restyling them unasked would be a visible
+    // change to a surface nobody complained about. This note exists so the next person finds a
+    // recorded decision instead of rediscovering it as a fresh bug. `theme::on_accent_content`
+    // is the fix shape if it is ever wanted.
     let row = widget::row(vec![
         widget::container(label).width(Length::Fill).into(),
         caret.into(),
@@ -3395,11 +3459,14 @@ fn text_font_panel(
 /// missing account is the more fundamental answer, and an account disconnected mid-transfer can
 /// genuinely be in both.
 ///
-/// `keybind` is the live keymap label for `PreviewUpload` (`None` when the user has unbound
-/// it), so an enabled Upload advertises its key exactly like Save and Copy beside it. An
-/// unbound action drops the parenthetical rather than showing an empty one, which is
-/// [`action_tip`]'s rule too.
-pub(super) fn upload_tip(has_accounts: bool, busy: bool, keybind: Option<&str>) -> String {
+/// `keybind` is the label for Upload's chord, so an enabled Upload advertises its key exactly
+/// like Save and Copy beside it.
+///
+/// It used to be an `Option`, for a user who had unbound the action. DRAGON-617 BAKED Upload,
+/// so there is no longer any way to unbind it and the `None` arm had become a state the app
+/// cannot reach. Keeping it would have been a branch that reads as a supported case and is
+/// really dead, so the parameter says what is now true: there is always a key.
+pub(super) fn upload_tip(has_accounts: bool, busy: bool, keybind: &str) -> String {
     if !has_accounts {
         // Says what is MISSING, not that the feature is missing: DRAGON-467's wording
         // ("accounts are not available yet") was true when there was no feature at all, and
@@ -3409,10 +3476,7 @@ pub(super) fn upload_tip(has_accounts: bool, busy: bool, keybind: Option<&str>) 
     if busy {
         return "Upload  (an upload is already running)".to_string();
     }
-    match keybind {
-        Some(key) => format!("Upload  ({key})"),
-        None => "Upload".to_string(),
-    }
+    format!("Upload  ({keybind})")
 }
 
 /// One row's content (icon + label, the label tinted accent when `hot`) shared by the
@@ -3537,11 +3601,20 @@ fn upload_panel<'a>(
             .text_size(TEXT_MENU_LABEL_SIZE)
             .on_toggle(move |on| Msg::Preview(pid, PreviewMsg::UploadAutoShareToggled(on))),
     );
+    // DRAGON-607: the centring container carries the on-accent ink rather than the default
+    // class, which would overwrite it with the ambient window foreground. Without this the
+    // label rendered near-white on the accent fill, while the crop tray's Apply Crop button
+    // (a stock `button::suggested`, so nothing sits between it and its label) rendered the
+    // correct dark ink. Two accent buttons in one chrome, two answers: that pair is the
+    // owner's report. See `theme::on_accent_content` for the rule.
     let start = crate::widgets::arrow_cursor::arrow_cursor(
         widget::button::custom(
             widget::container(widget::text("Upload").size(TEXT_MENU_LABEL_SIZE))
                 .width(Length::Fill)
-                .align_x(Alignment::Center),
+                .align_x(Alignment::Center)
+                .class(crate::app::theme::button_content_class(
+                    &cosmic::theme::Button::Suggested,
+                )),
         )
         .width(Length::Fill)
         .class(cosmic::theme::Button::Suggested)
@@ -3842,8 +3915,8 @@ fn annot_plus_swatch(pid: window::Id, hi: bool) -> Element<'static, Msg> {
 fn plus_swatch_style(hi: bool, theme: &cosmic::Theme) -> cosmic::widget::button::Style {
     let cosmic = theme.cosmic();
     let mut s = cosmic::widget::button::Style::new();
-    s.background = Some(Background::Color(cosmic.background.component.base.into()));
-    s.text_color = Some(cosmic.background.component.on.into());
+    s.background = Some(Background::Color(cosmic.background(false).component.base.into()));
+    s.text_color = Some(cosmic.background(false).component.on.into());
     s.border_radius = crate::app::theme::rounding(theme).xs.into();
     s.border_width = 1.0;
     s.border_color = cosmic.palette.neutral_8.into();
@@ -4134,23 +4207,68 @@ mod tests {
 
     /// The tooltip key-resolver reads the LIVE binding: `"Name  (KEY)"` (two spaces) when
     /// bound, just `"Name"` when unbound, and it tracks a rebind.
+    ///
+    /// Asserted on Copy since DRAGON-617 baked Save, which used to be the subject. Copy is the
+    /// right replacement precisely because it is still bindable: this test exists to prove the
+    /// resolver follows the keymap, so its subject has to be something the keymap still owns.
     #[test]
     fn action_tip_reads_live_key_and_omits_when_unbound() {
         use crate::shortcuts::{Action, Keymap, Shortcut, ShortcutKey};
         let mut km = Keymap::defaults();
         // Bound: two spaces then the keymap's own label in parens.
-        let key = km.get(Action::PreviewSave).unwrap().label();
-        assert_eq!(action_tip("Save", Action::PreviewSave, &km), format!("Save  ({key})"));
+        let key = km.get(Action::PreviewCopy).unwrap().label();
+        assert_eq!(
+            action_tip("Copy to clipboard", Action::PreviewCopy, &km),
+            format!("Copy to clipboard  ({key})")
+        );
         // A rebind is reflected in the tip.
         km.set(
-            Action::PreviewSave,
+            Action::PreviewCopy,
             Shortcut { ctrl: true, alt: false, shift: false, logo: false, key: ShortcutKey::Char("q".into()) },
         );
-        let rekey = km.get(Action::PreviewSave).unwrap().label();
-        assert_eq!(action_tip("Save", Action::PreviewSave, &km), format!("Save  ({rekey})"));
+        let rekey = km.get(Action::PreviewCopy).unwrap().label();
+        assert_eq!(
+            action_tip("Copy to clipboard", Action::PreviewCopy, &km),
+            format!("Copy to clipboard  ({rekey})")
+        );
         // Unbound: name only.
-        km.unbind(Action::PreviewSave);
-        assert_eq!(action_tip("Save", Action::PreviewSave, &km), "Save");
+        km.unbind(Action::PreviewCopy);
+        assert_eq!(action_tip("Copy to clipboard", Action::PreviewCopy, &km), "Copy to clipboard");
+    }
+
+    /// DRAGON-617: the five BAKED buttons wear the same tooltip SHAPE as their bindable
+    /// neighbours, and they wear the same STRING they wore before the bake.
+    ///
+    /// The second half is what makes this worth a test. The bake was meant to change where a
+    /// chord is matched and nothing a user can see, so the tooltips are the visible surface
+    /// where a regression would show, and "it still says Ctrl+S" is the claim.
+    #[test]
+    fn the_baked_buttons_keep_the_tooltip_shape_and_the_string() {
+        use crate::shortcuts::FixedEditorAction;
+        for (name, action) in [
+            ("Save", FixedEditorAction::Save),
+            ("Upload", FixedEditorAction::Upload),
+            ("Close", FixedEditorAction::Close),
+            ("Undo", FixedEditorAction::Undo),
+            ("Redo", FixedEditorAction::Redo),
+        ] {
+            let tip = fixed_key_tip(name, action.label());
+            assert!(tip.starts_with(&format!("{name}  (")), "{tip} broke the tip shape");
+            assert!(tip.ends_with(')'), "{tip} broke the tip shape");
+            assert!(!tip.contains('\u{2014}'), "{tip} must stay em-dash free");
+        }
+        // The exact strings the pre-bake keymap produced, off macOS. Pinned literally,
+        // because deriving them from the same `label()` the code uses would assert nothing.
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(fixed_key_tip("Save", FixedEditorAction::Save.label()), "Save  (Ctrl+S)");
+            assert_eq!(fixed_key_tip("Close", FixedEditorAction::Close.label()), "Close  (Esc)");
+            assert_eq!(fixed_key_tip("Undo", FixedEditorAction::Undo.label()), "Undo  (Ctrl+Z)");
+            assert_eq!(
+                fixed_key_tip("Redo", FixedEditorAction::Redo.label()),
+                "Redo  (Ctrl+Shift+Z)"
+            );
+        }
     }
 
     // ── the declared annotation tray (DRAGON-340) ────────────────────────────────────
@@ -4342,7 +4460,7 @@ mod tests {
             // Opaque, so the SVG rasterizer's alpha-discarding tint path renders it faithfully
             // (see `cluster_border`). A translucent token here would silently paint full-strength.
             assert!((tone.a - 1.0).abs() < f32::EPSILON, "{name}: the tone must be opaque");
-            let fill: cosmic::iced::Color = theme.cosmic().background.component.base.into();
+            let fill: cosmic::iced::Color = theme.cosmic().background(false).component.base.into();
             let gap = (lum(tone) - lum(fill)).abs();
             assert!(gap > 0.05, "{name}: the disabled glyph vanished into the cluster fill ({gap})");
         }
@@ -4367,7 +4485,7 @@ mod tests {
         {
             let track = upload_track_tone(&theme);
             // The meter pill's own fill: the surface this bar is drawn on.
-            let surface: cosmic::iced::Color = theme.cosmic().background.component.base.into();
+            let surface: cosmic::iced::Color = theme.cosmic().background(false).component.base.into();
             let text = crate::app::theme::foreground(&theme);
             let to_surface = (lum(track) - lum(surface)).abs();
             let to_text = (lum(track) - lum(text)).abs();
@@ -4683,7 +4801,7 @@ mod tests {
             }
         }
         // An action that names no slot has no members — a stray cycle press is a no-op.
-        assert!(slot_tools(Action::PreviewSave).is_empty());
+        assert!(slot_tools(Action::PreviewCopy).is_empty());
         // Solo tools belong to no slot, so their key can never be stolen by a cycle. Spotlight is
         // NOT among them any more — DRAGON-384 moved it into the shape slot.
         for solo in [Tool::Pointer, Tool::Arrow, Tool::Badge, Tool::Text, Tool::Pen, Tool::Eraser] {
@@ -5094,60 +5212,47 @@ mod upload_tip_tests {
     use super::*;
     use rstest::rstest;
 
-    /// Every state the Upload tooltip has, one case each: with and without accounts, bound
-    /// and unbound, and (DRAGON-514) already busy. A table because they are one rule seen from
-    /// several sides, and a loop would report "one of six" instead of naming the state that
-    /// broke.
+    /// Every state the Upload tooltip has, one case each: with and without accounts, and
+    /// (DRAGON-514) already busy. A table because they are one rule seen from several sides,
+    /// and a loop would report "one of four" instead of naming the state that broke.
+    ///
+    /// The two UNBOUND cases are gone (DRAGON-617): Upload is baked, so there is no longer a
+    /// way to unbind it and those rows described a state the app cannot reach.
     #[rstest]
-    #[case::live_and_bound(true, false, Some("Ctrl+U"), "Upload  (Ctrl+U)")]
-    // Unbound drops the parenthetical rather than showing an empty one.
-    #[case::live_and_unbound(true, false, None, "Upload")]
+    #[case::live(true, false, "Ctrl+U", "Upload  (Ctrl+U)")]
     // With NO accounts the tip is the only explanation the disabled button has, so it names
     // what is MISSING rather than declaring the feature unavailable, and it never advertises
     // a key that would do nothing.
-    #[case::gated_and_bound(false, false, Some("Ctrl+U"), "Upload  (no cloud accounts yet)")]
-    #[case::gated_and_unbound(false, false, None, "Upload  (no cloud accounts yet)")]
+    #[case::gated(false, false, "Ctrl+U", "Upload  (no cloud accounts yet)")]
     // DRAGON-514: one upload at a time. The busy tip must not advertise the key either, for
     // the same reason the account-less one does not: pressing it does nothing.
-    #[case::busy(true, true, Some("Ctrl+U"), "Upload  (an upload is already running)")]
+    #[case::busy(true, true, "Ctrl+U", "Upload  (an upload is already running)")]
     // No accounts AND busy: the account answer wins, matching `edit::upload_toggle`'s order.
-    #[case::busy_without_accounts(false, true, None, "Upload  (no cloud accounts yet)")]
+    #[case::busy_without_accounts(false, true, "Ctrl+U", "Upload  (no cloud accounts yet)")]
     fn the_upload_tip_says_what_the_button_will_do(
         #[case] has_accounts: bool,
         #[case] busy: bool,
-        #[case] keybind: Option<&str>,
+        #[case] keybind: &str,
         #[case] expected: &str,
     ) {
         let tip = upload_tip(has_accounts, busy, keybind);
         assert_eq!(tip, expected);
-        if busy && has_accounts {
+        if busy || !has_accounts {
             assert!(!tip.contains("Ctrl"), "a dead button must not advertise a key: {tip}");
         }
-        if !has_accounts {
-            assert!(!tip.contains("Ctrl"), "a dead button must not advertise a key: {tip}");
-        }
-        // The house separator: a name, TWO spaces, one parenthetical. Only checked where
-        // there IS a parenthetical, which is what the previous version of this test got
-        // wrong: it asserted the shape over a list that included the bare "Upload" and
-        // happened never to reach it.
-        if tip.contains('(') {
-            assert!(tip.starts_with("Upload  ("), "{tip} broke the tip shape");
-            assert!(tip.ends_with(')'), "{tip} broke the tip shape");
-        }
+        // The house separator: a name, TWO spaces, one parenthetical.
+        assert!(tip.starts_with("Upload  ("), "{tip} broke the tip shape");
+        assert!(tip.ends_with(')'), "{tip} broke the tip shape");
         assert!(!tip.contains('\u{2014}'), "{tip} must stay em-dash free");
     }
 
-    /// The live tip is the SAME shape `action_tip` gives Save and Copy beside it, proven
-    /// against it rather than asserted, so the three read as one control family.
+    /// The live tip is the SAME shape its neighbours get, proven against `fixed_key_tip`
+    /// rather than asserted, so Save, Upload and Close read as one control family.
     #[test]
     fn a_live_upload_advertises_its_key_like_its_neighbours() {
-        use crate::shortcuts::{Action, Keymap};
-        let km = Keymap::defaults();
-        let key = km.get(Action::PreviewUpload).unwrap().label();
-        assert_eq!(
-            upload_tip(true, false, Some(&key)),
-            action_tip("Upload", Action::PreviewUpload, &km)
-        );
+        use crate::shortcuts::FixedEditorAction;
+        let key = FixedEditorAction::Upload.label();
+        assert_eq!(upload_tip(true, false, key), fixed_key_tip("Upload", key));
     }
 }
 

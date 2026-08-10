@@ -1,5 +1,20 @@
+# cargo's tree, which since DRAGON-590 also holds `target/artifacts/`: the ONE
+# build-output directory, the same relative path on every platform, where each
+# `just` recipe leaves its finished artifact plus the stable path a desktop
+# shortcut points at. Covered by this line, nothing extra needed.
 /target
-# Vendored static ffmpeg/ffprobe for the mac build — never committed (huge binaries).
+# The container and cross-boot BUILD STATE, which deliberately stays OUT of
+# target/ (see scripts/artifacts.sh for the full reasoning). These are scratch,
+# not output: the finished artifact is moved into target/artifacts/ afterwards.
+#   target-appimage/  the AppImage container's CARGO_HOME + CARGO_TARGET_DIR
+#   target-dist/      the Rocky 9 shipping container's output mount (root-owned)
+#   target-win/       the Windows boot's whole cargo tree (dual-boot shared tree)
+#   target-mac/       cross-target mac CHECK artifacts (never a real build)
+/target-appimage/
+/target-dist/
+/target-win/
+/target-mac/
+# Vendored static ffmpeg/ffprobe for the mac build, never committed (huge binaries).
 /vendor/
 # `mkdocs build` output for the documentation site (mkdocs.yml + site-src/).
 # The built site is published by CI, never committed.

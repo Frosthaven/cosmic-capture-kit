@@ -163,19 +163,18 @@ impl App {
             self.input_config(),
             &self.speaker_device,
         )
-        .map(|(child, shared)| super::MicTest {
-            child,
+        .map(|(mic, shared)| super::MicTest {
+            mic,
             shared,
             produced: 0,
             stall_ticks: 0,
         })
     }
 
-    /// Kill the mic chain capture and zero its level.
+    /// Stop the mic chain capture and zero its level.
     pub(super) fn stop_mic_chain(&mut self) {
         if let Some(mut t) = self.mic_chain.take() {
-            let _ = t.child.kill();
-            let _ = t.child.wait();
+            t.mic.stop();
         }
         self.mic_level = 0.0;
     }
@@ -259,14 +258,14 @@ impl App {
         // canvas right-aligns to this same capacity so bars stay a fixed width and fill
         // in from the right.
         let columns = super::settings::MIC_WAVE_COLUMNS;
-        if let Some((child, shared)) = crate::audio::clean_mic::spawn_mic_test(
+        if let Some((mic, shared)) = crate::audio::clean_mic::spawn_mic_test(
             &self.mic_device,
             columns,
             self.input_config(),
             &self.speaker_device,
         ) {
             self.mic_test = Some(super::MicTest {
-                child,
+                mic,
                 shared,
                 produced: 0,
                 stall_ticks: 0,
@@ -274,11 +273,10 @@ impl App {
         }
     }
 
-    /// Close the live mic test: kill the capture process and drop its state.
+    /// Close the live mic test: stop the capture and drop its state.
     pub(super) fn close_mic_test(&mut self) {
         if let Some(mut t) = self.mic_test.take() {
-            let _ = t.child.kill();
-            let _ = t.child.wait();
+            t.mic.stop();
         }
     }
 
@@ -388,11 +386,14 @@ impl crate::app::App {
     ///
     /// Falls back to naming no directory at all if the probe could not report one, since a
     /// sentence ending in an empty line is worse than a shorter sentence.
+    /// The PROSE half only. The folder itself is rendered separately as a copyable path line
+    /// (`settings::row::path_line`), the same treatment the Health page gives a tool location,
+    /// because a path baked into a sentence cannot be copied and reads in the body tone rather
+    /// than as the distinct thing it is (owner's call).
     pub(in crate::app) fn ocr_lang_desc(&self) -> String {
         match &self.ocr_lang_dir {
-            Some(dir) => {
-                format!("Install more language packs from your package manager, or place them in:\n{dir}")
-            }
+            Some(_) => "Install more language packs from your package manager, or place them in:"
+                .to_string(),
             None => "Install more language packs from your package manager.".to_string(),
         }
     }

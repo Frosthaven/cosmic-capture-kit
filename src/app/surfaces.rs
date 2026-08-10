@@ -43,13 +43,53 @@ impl App {
             self.passthrough_active = false;
             self.passthrough_solid = None;
         }
+        // DRAGON-612: a HELD accept refers to the picker overlay that is about to be gone, so
+        // drop it HERE rather than letting the next poll tick notice. Two reasons, and the
+        // second is the one that matters. It stops `sub_accept_pending` keeping a 16ms tick
+        // alive for a request nothing can answer, which on the commit path means the whole
+        // preview phase. And it means a stale `Instant` can never outlive the overlay it was
+        // measured against, which is the shape a late fire would have. The gate's `on_overlay`
+        // term would decline on the very next tick regardless (`outputs` is emptied just
+        // below), so this is the same answer given one update sooner, with no timer armed to
+        // give it.
+        self.accept_pending = None;
         let cmds: Vec<_> = self
             .outputs
             .iter()
-            .map(|o| super::shell::close_surface(o.id))
+            .map(|o| self.close_overlay_surface(o.id))
             .collect();
         self.outputs.clear();
+        // `lab/flatpak`: the fallback window's close was just issued (through the helper
+        // above); clearing the id FIRST-thing-after means its `Closed` echo reads as our
+        // own teardown, never as an out-of-band loss.
+        #[cfg(target_os = "linux")]
+        {
+            self.fallback_window = None;
+        }
         cmds
+    }
+
+    /// Close ONE capture-overlay surface by id, whatever backs it. On the normal Linux
+    /// path that is a layer-surface destroy, exactly as before. On the `lab/flatpak`
+    /// fallback path only the granted output's entry is backed by a real surface (the
+    /// fullscreen toplevel, closed via `window::close`); every other `OutputState` holds
+    /// a placeholder id that never got a surface, so there is nothing to destroy and a
+    /// layer-surface destroy would be addressed to a surface that never existed.
+    #[cfg(target_os = "linux")]
+    fn close_overlay_surface(&self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        if self.fallback_window == Some(id) {
+            return window::close(id);
+        }
+        if self.overlay_fallback_active() {
+            return Task::none();
+        }
+        super::shell::close_surface(id)
+    }
+
+    /// macOS/Windows: every overlay is a plain window; the shell close is already right.
+    #[cfg(not(target_os = "linux"))]
+    fn close_overlay_surface(&self, id: window::Id) -> Task<cosmic::Action<Msg>> {
+        super::shell::close_surface(id)
     }
 
     /// The one-shot session is finished — capture shared, preview closed, or an
@@ -80,16 +120,23 @@ impl App {
         // swept by `any_other_recording`'s liveness check, this is the tidy path). Idempotent.
         crate::instance::set_recording_marker(false);
         crate::instance::set_preview_marker(false);
-        // DRAGON-336 phase 3b: stop hosting preview handoffs, marker FIRST then socket, so
-        // no child can discover us at any point during teardown. Dropping the host unlinks
+        // DRAGON-582: and the colour picker's window marker, on the same terms.
+        crate::instance::set_color_picker_marker(false);
+        // DRAGON-336 phase 3b: stop hosting handoffs, marker FIRST then socket, so no
+        // sibling can discover us at any point during teardown. Dropping the host unlinks
         // its socket; any handoff still sitting unacked in its channel drops with it, which
         // closes that connection WITHOUT an `ok` — precisely the signal that sends the
-        // waiting child back to opening its own preview (nothing is ever consumed without a
+        // waiting sibling back to doing the job itself (nothing is ever consumed without a
         // positive ack, see `crate::preview_ipc`). Explicit rather than left to process
-        // exit, so the socket is gone before the last preview's surface is.
+        // exit, so the socket is gone before the last surface is.
+        //
+        // Both markers above are cleared BEFORE this, which is what makes the "just closed"
+        // and "mid-close" cases collapse into the one fall-back rule: whichever of the two
+        // a sibling catches us in, it never gets an ack, so it opens its own window.
+        // DRAGON-613 rides this unchanged; the picker window's listener is the same field.
         #[cfg(unix)]
         {
-            self.preview_host = None;
+            self.handoff_host = None;
         }
         #[cfg(target_os = "macos")]
         {
@@ -1215,6 +1262,33 @@ impl App {
     /// `toolbar_layout` reflects the now-active state, so it returns the chip rect.
     #[cfg(target_os = "linux")]
     pub(super) fn recreate_active_overlays(&mut self) -> Task<cosmic::Action<Msg>> {
+        // `lab/flatpak`: a plain toplevel has no input zones, so the click-through
+        // recreate below cannot be expressed on the fallback path.
+        //
+        // - RECORDING: the fullscreen window must GO AWAY entirely. It would sit inside
+        //   the portal's own recording of the monitor AND swallow every click meant for
+        //   the desktop being recorded. The session tray (`begin_recording_tray`, already
+        //   armed by the caller) is the stop/pause control, the same shape as an
+        //   overlay-less immediate recording.
+        // - COUNTDOWN (DRAGON-563, reopened): the window goes away too, tray or NO tray.
+        //   It has no live desktop behind it, so the timer counted down over a gray sheet
+        //   (the owner's third live test), and it would sit inside a delayed capture the
+        //   delay exists to rearrange the screen for. The countdown tray
+        //   (`enter_countdown`, minted by the caller) carries the remaining seconds in
+        //   its icon and the cancel in its menu. The polish round KEPT the window when no
+        //   tray host answered ("a gray-but-visible timer beats an invisible one") — the
+        //   fourth sandbox test disproved that: child trays can fail to register where
+        //   the resident's succeeds, and the owner hit the gray sheet on every delayed
+        //   capture, image and video alike. So the fallback path never mints the window
+        //   countdown at all; with no tray the countdown is invisible (a warn names it,
+        //   `enter_countdown`) and still fires + cancels on schedule.
+        if self.overlay_fallback_active() {
+            return if self.recording.is_some() || self.countdown.is_some() {
+                Task::batch(self.destroy_surfaces())
+            } else {
+                self.mint_fallback_window()
+            };
+        }
         let plans: Vec<(OutputHandle, window::Id, window::Id, Option<cosmic::iced::Rectangle>)> = self
             .outputs
             .iter()
@@ -1370,11 +1444,16 @@ impl App {
     /// the instance, so the overlay is never recreated afterwards.
     #[cfg(target_os = "linux")] // macOS hands settings off to a fresh process (DRAGON-153)
     pub(super) fn hide_overlays(&mut self) -> Task<cosmic::Action<Msg>> {
+        // Through the id-aware helper (`lab/flatpak`): the fallback toplevel closes as a
+        // window and the placeholder entries close as nothing. Clearing `fallback_window`
+        // after building the tasks marks the close as OUR OWN, so its `Closed` echo does
+        // not read as an out-of-band loss and tear down the settings window it yielded to.
         let cmds: Vec<_> = self
             .outputs
             .iter()
-            .map(|o| super::shell::close_surface(o.id))
+            .map(|o| self.close_overlay_surface(o.id))
             .collect();
+        self.fallback_window = None;
         Task::batch(cmds)
     }
 
@@ -1410,6 +1489,21 @@ impl App {
     #[cfg(target_os = "linux")]
     pub(super) fn restore_interactive_overlays(&mut self) -> Task<cosmic::Action<Msg>> {
         use cosmic_client_toolkit::sctk::shell::wlr_layer::KeyboardInteractivity;
+        // `lab/flatpak`: the fallback toplevel is never recreated click-through, so
+        // "restore" here means only "bring the selection window back if a portal dialog
+        // yielded it" (idempotent when it is already up). Re-minting layer surfaces
+        // would only re-note OverlayNeverShown against a session that is working fine.
+        //
+        // With NO seed grant there is nothing to restore TO: this is a Window/Monitor
+        // LAUNCH (daemon `--window` / `--monitor`) whose portal dialog was dismissed,
+        // and the process has no surface at all. Leaving it running would be an
+        // invisible zombie, so the dismissal is the session's Cancelled ending.
+        if self.overlay_fallback_active() {
+            if self.fallback_grant.is_some() {
+                return self.mint_fallback_window();
+            }
+            return self.teardown();
+        }
         let kb = if self.overlay_pick_exclusive() {
             KeyboardInteractivity::Exclusive
         } else {
@@ -1468,10 +1562,22 @@ impl App {
     /// Linux-only: the sole caller is `request_pipewire` (the xdg-portal cast path).
     #[cfg(target_os = "linux")]
     pub(super) fn yield_overlays(&mut self) -> Vec<Task<cosmic::Action<Msg>>> {
-        self.outputs
+        // `lab/flatpak`: close the fallback toplevel for the dialog's duration too, for
+        // the same reason the layer path yields, plus one of its own: a mode toggle
+        // leaves the overlay in the Monitor/Window view while the dialog is up, and on
+        // this path that view would be a CLICKABLE native picker whose commit cannot
+        // succeed (no native capture). The frozen frame and the seed grant survive, so
+        // the cancel path re-mints the window (`mint_fallback_window`) with the backdrop
+        // intact.
+        let cmds = self
+            .outputs
             .iter()
-            .map(|o| super::shell::close_surface(o.id))
-            .collect()
+            .map(|o| self.close_overlay_surface(o.id))
+            .collect();
+        if self.overlay_fallback_active() {
+            self.fallback_window = None;
+        }
+        cmds
     }
 
     #[cfg(target_os = "linux")]
@@ -1482,6 +1588,22 @@ impl App {
     #[cfg(target_os = "linux")]
     pub(super) fn mint_startup_pickers(&mut self) -> Task<cosmic::Action<Msg>> {
         use cosmic_client_toolkit::sctk::shell::wlr_layer::KeyboardInteractivity;
+        // `lab/flatpak`: an unresolved immediate capture degrades into the fallback
+        // selector on this path: the layer surfaces below cannot exist, so kick the
+        // seed-time portal request instead (once; a repeat means it is already
+        // running). Same launch-mode dispatch as `on_output`'s seed.
+        if self.overlay_fallback_active() {
+            if !self.fallback_seed_kicked {
+                self.fallback_seed_kicked = true;
+                if let Some(task) =
+                    self.portal_for_mode(self.mode, super::portal::RequestOrigin::LaunchSeed)
+                {
+                    return task;
+                }
+                return self.request_fallback_cast(super::portal::RequestOrigin::LaunchSeed);
+            }
+            return Task::none();
+        }
         let kb = if self.overlay_pick_exclusive() {
             KeyboardInteractivity::Exclusive
         } else {
@@ -1564,6 +1686,11 @@ impl App {
                     point_scale: 1.0,
                     #[cfg(target_os = "linux")]
                     scale,
+                    // Identity until this entry becomes the fallback toplevel AND its
+                    // resize event reports the window's real size (`lab/flatpak`);
+                    // permanently None on a layer-shell session.
+                    #[cfg(target_os = "linux")]
+                    fallback_win_size: None,
                     // Never taken on Linux (this whole fn is cfg(linux) and the field is
                     // cfg(not(linux))); kept in step with the struct so the two cannot drift.
                     #[cfg(not(target_os = "linux"))]
@@ -1607,6 +1734,36 @@ impl App {
                     // NOT mint a picker while the deferred immediate capture is pending.
                     return Task::none();
                 }
+                // `lab/flatpak`: the portal-frozen FALLBACK seeding. The layer surface
+                // below cannot exist (cosmic-comp hides `zwlr_layer_shell_v1` from
+                // sandboxed clients; mutter never implemented it), so this path records
+                // the output's GEOMETRY only (no surface, and no OverlayNeverShown note
+                // for a session that is about to work) and kicks the ONE seed-time
+                // portal request on the first qualifying event.
+                //
+                // The kick honors the LAUNCH MODE (the daemon's Capture Window /
+                // Capture Monitor entries spawn `--window` / `--monitor`): those go
+                // STRAIGHT to the portal picker of the matching source and deliver
+                // through the normal held-stream path, with no region overlay and no
+                // mode rewrite, exactly like the in-overlay mode toggle. Only a
+                // Region launch (`portal_for_mode` answers None there) seeds the
+                // frozen selection overlay, whose grant handler
+                // (`on_fallback_cast_ready` → `on_fallback_frozen_ready`) freezes the
+                // granted monitor and mints the single fullscreen toplevel. Later
+                // output events land in the registration above, which is exactly what
+                // the grants' re-anchor and `region_clamped` read.
+                if self.overlay_fallback_active() {
+                    if !self.fallback_seed_kicked {
+                        self.fallback_seed_kicked = true;
+                        if let Some(task) =
+                            self.portal_for_mode(self.mode, super::portal::RequestOrigin::LaunchSeed)
+                        {
+                            return task;
+                        }
+                        return self.request_fallback_cast(super::portal::RequestOrigin::LaunchSeed);
+                    }
+                    return Task::none();
+                }
                 // No auto-seeded region: monitors without a region show a "begin
                 // drawing" hint instead, and the user draws where they want.
                 // Full-input overlay for the interactive UI. DRAGON-228: the picking
@@ -1624,7 +1781,10 @@ impl App {
             OutputEvent::Removed => {
                 if let Some(pos) = self.outputs.iter().position(|o| o.output == output) {
                     let st = self.outputs.remove(pos);
-                    super::shell::close_surface(st.id)
+                    // Through the id-aware helper (`lab/flatpak`): on the fallback path a
+                    // placeholder entry has no surface to destroy, and the granted
+                    // output's entry is a plain window.
+                    self.close_overlay_surface(st.id)
                 } else {
                     Task::none()
                 }

@@ -9,7 +9,8 @@
 - **Proton Drive, any build**: yes, but it is a different kind of step. Proton
   has no app registration to make. Instead you install Proton's own free
   command-line tool once, and the app uses it. The Proton Drive section below
-  has the download and the steps.
+  has the download and the steps. The Flatpak build is the one exception: it
+  ships the tool inside the app, so there is nothing to install there.
 - **Any provider, a build you made yourself from source**: yes, for each
   provider you want to use.
 
@@ -361,6 +362,18 @@ app talks to it.
 That is the whole difference. Once the tool is installed, connecting is the
 same two clicks as any other provider.
 
+One honest note, which the app also shows on Proton Drive's row in the picker:
+this integration is **not officially supported by Proton**. The command-line
+tool is Proton's own, but Proton offers no API for outside apps and has not
+endorsed this app's use of the tool. If Proton changes or withdraws the tool,
+this integration follows it.
+
+If you installed this app as a **Flatpak**, skip the download entirely: the
+Flatpak bundles the tool inside the app, and the store updates the bundled
+copy along with the app. That is not only a convenience: a sandboxed app
+cannot see a tool installed on the host, so a copy inside the package is the
+only one it could ever find. Jump straight to "Connect the account" below.
+
 ### 1. Download the tool
 
 Go to [proton.me/support/drive-cli](https://proton.me/support/drive-cli) and
@@ -565,7 +578,7 @@ will actually start this app.
 
 The practical route is a per-user LaunchAgent that runs `launchctl setenv` when
 you log in. Create
-`~/Library/LaunchAgents/dev.frosthaven.cck-env.plist` with this content,
+`~/Library/LaunchAgents/dev.thedragon.cck-env.plist` with this content,
 replacing the values with your own:
 
 ```xml
@@ -575,7 +588,7 @@ replacing the values with your own:
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>dev.frosthaven.cck-env</string>
+  <string>dev.thedragon.cck-env</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/sh</string>
@@ -591,7 +604,7 @@ replacing the values with your own:
 Then load it once, so you do not have to log out to try it:
 
 ```sh
-launchctl load ~/Library/LaunchAgents/dev.frosthaven.cck-env.plist
+launchctl load ~/Library/LaunchAgents/dev.thedragon.cck-env.plist
 ```
 
 It runs at every login from then on. Quit and restart the app afterwards.
