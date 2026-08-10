@@ -168,7 +168,6 @@ along with their statuses.
 | OneDrive     | ✅     |
 | Proton Drive | ✅     |
 | SFTP         | 📅     |
-| YouTube      | ✅     |
 
 </details>
 
@@ -286,9 +285,12 @@ This route tells you when an update is out but does not install it: you unpacked
 the binary wherever you liked, so there is no install location to replace safely.
 Settings > About opens the releases page instead, and you repeat the steps above.
 
-Cloud uploads need no setup in this build: the provider registrations are
-already compiled in. A build from source does not have them, and needs one
-one-time step per provider.
+Google Drive, OneDrive and Dropbox need no setup in this build: their provider
+registrations are already compiled in. A build from source does not have them,
+and needs one one-time step per provider.
+
+Proton Drive is different. It also needs the `proton-drive` command line tool
+installed separately, which only the Flatpak bundles.
 
 To get an entry in the application menu, install the shipped desktop file as
 described in [DEVELOPERS.md](DEVELOPERS.md).
