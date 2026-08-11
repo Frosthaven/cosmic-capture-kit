@@ -355,12 +355,13 @@ pub(super) struct OwnedAudioStart {
     /// both streams.
     ///
     /// WHAT those covering ticks show is the worker's own call, and it is not free
-    /// (DRAGON-628). The Linux and Windows workers repeat the first captured frame,
-    /// which reads as a frozen opening; `record::sck` on macOS instead spends them on
-    /// the frames its capture had already delivered and was discarding, which halved
-    /// the measured frozen head. If you touch a worker's covering burst, the rule is
-    /// that the tick COUNT is the contract and the pixels are not: changing the count
-    /// changes media time, changing the pixels does not.
+    /// (DRAGON-628). The Linux workers repeat the first captured frame, which reads
+    /// as a frozen opening; `record::sck` on macOS (DRAGON-628) and `record::wgc` on
+    /// Windows (DRAGON-652) instead spend them on the frames their captures had
+    /// already delivered and were discarding, which halved the measured frozen head.
+    /// If you touch a worker's covering burst, the rule is that the tick COUNT is the
+    /// contract and the pixels are not: changing the count changes media time,
+    /// changing the pixels does not.
     pub(super) capture_start: std::time::Instant,
     pub(super) mic_fifo_path: PathBuf,
     pub(super) sys_fifo_path: PathBuf,
@@ -563,10 +564,12 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
 
 /// The audio pre-flight, STARTED on its own thread (DRAGON-554) so a worker's
 /// video-side bring-up — the PipeWire connect + format negotiation + first frame on
-/// Linux, the SCK target resolution + stream build/start + first frame on macOS —
+/// Linux, the SCK target resolution + stream build/start + first frame on macOS, the
+/// D3D device + WGC session bring-up + first frame on Windows (DRAGON-652) —
 /// overlaps it instead of following it. Serialized, those two independent startups
-/// summed into the session's opening span, every millisecond of which the file covers
-/// with copies of the first captured frame; overlapped, the span is their MAX.
+/// summed into the session's opening span, every millisecond of which the file must
+/// cover on the video side (see [`OwnedAudioStart::capture_start`]'s doc for what a
+/// worker shows there); overlapped, the span is their MAX.
 ///
 /// The invariant is untouched: media time 0 is still the pre-flight's own entry
 /// instant (`OwnedAudioStart::capture_start`), and `start()` is the FIRST thing a
@@ -580,14 +583,8 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
 /// bounded by those same budgets. A worker whose video side failed first calls
 /// [`abandon`](Self::abandon) instead, which joins and tears down whatever the
 /// pre-flight managed to start.
-// Dead on Windows only: the WGC worker still runs its pre-flight inline (its capture
-// bring-up has not shown the multi-second serialized startup this seam exists for);
-// the seam stays portable so wiring it there is a call-site change, not a port.
-#[cfg_attr(windows, allow(dead_code))]
 pub(super) struct AudioPreflight(PreflightState);
 
-// Dead on Windows only — see `AudioPreflight`.
-#[cfg_attr(windows, allow(dead_code))]
 enum PreflightState {
     Running(std::thread::JoinHandle<Result<OwnedAudioStart, String>>),
     /// The spawn-failure fallback: the pre-flight already ran inline on the caller's
@@ -598,8 +595,6 @@ enum PreflightState {
     Done(Box<Result<OwnedAudioStart, String>>),
 }
 
-// Dead on Windows only — see `AudioPreflight`.
-#[cfg_attr(windows, allow(dead_code))]
 impl AudioPreflight {
     /// Start the pre-flight on its own thread. Call FIRST in a worker, before any
     /// video-side bring-up, so `capture_start` (media 0) stays within a millisecond

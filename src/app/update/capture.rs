@@ -118,8 +118,10 @@ impl App {
             // new preview document (and ack it) in the preview domain.
             CaptureMsg::HandoffPoll => self.drain_preview_handoffs(),
             CaptureMsg::LoadingTick => {
-                // Pick up the pre-capture result the moment the thread posts it.
-                if let Some((
+                // Pick up the pre-capture result the moment the thread posts it. Whether it
+                // landed on THIS tick is the one effectful input the loading state machine
+                // takes; everything it decides from there is pure (`PickerLoad::advance`).
+                let landed = if let Some((
                     windows,
                     origin,
                     wallpaper_px,
@@ -153,12 +155,30 @@ impl App {
                         // fires if a future inline mac resolve ever carried real pixels.
                         self.wallpaper_handles = wallpaper_handles_from_px(wallpaper_px);
                     }
-                    self.windows_loading = false;
-                    // Keep the loading overlay up a few frames so the picker can
-                    // render (GPU-upload) behind it before it lifts — no flash.
-                    self.window_warmup = 3;
-                } else if self.window_warmup > 0 {
-                    self.window_warmup -= 1;
+                    true
+                } else {
+                    false
+                };
+                // DRAGON-645: ONE state machine decides whether the spinner is revealed at
+                // all, how long it stays once it has been, and when the picker takes over.
+                // It replaces the `windows_loading` + `window_warmup` pair, which drew the
+                // spinner unconditionally from the pre-capture's first frame and so flashed
+                // it on every fast load. The warmup frames that keep the picker's GPU upload
+                // hidden are still here, folded into the `Settling` hold.
+                let before = self.picker_load;
+                self.picker_load = self.picker_load.advance(landed, self.picker_painted.get());
+                // BEHAVIOUR, not content, and worth a line of its own: the reveal only
+                // happens on a desktop where enumerating the windows really is slow, so its
+                // presence in a log says which of the two paths a session took. Its ABSENCE
+                // is the fast path, which is the one this ticket is about and the one that
+                // cannot be seen any other way (nothing is drawn, so there is nothing on
+                // screen to point at).
+                if !before.spinner_up() && self.picker_load.spinner_up() {
+                    log::debug!(
+                        "window picker: the pre-capture outlasted {}ms, so the loading \
+                         spinner is being revealed",
+                        crate::app::overlay::PICKER_SPINNER_REVEAL_MS
+                    );
                 }
                 Task::none()
             }
@@ -252,12 +272,31 @@ impl App {
             // moved on since the press must not have a capture committed under it.
             CaptureMsg::AcceptPending => self.request_accept(),
             CaptureMsg::DimFadeTick => {
-                if let crate::app::overlay::DimFade::Running(start) = self.dim_fade.get()
-                    && start.elapsed().as_millis() as u64 >= crate::app::overlay::DIM_FADE_MS
+                if let crate::app::overlay::DimFade::Running { elapsed_ms, last } =
+                    self.dim_fade.get()
                 {
-                    // Latch the end state so `sub_dim_fade` stops scheduling ticks. Without
-                    // this the poll would run for the whole session to animate nothing.
-                    self.dim_fade.set(crate::app::overlay::DimFade::Done);
+                    // TWO ways this ramp ends, and since DRAGON-644 they are different
+                    // questions. The ramp itself advances only on painted frames
+                    // (`dim_now`), so `elapsed_ms` is the honest "the animation is over".
+                    let finished = elapsed_ms >= crate::app::overlay::DIM_FADE_MS;
+                    // And the bound that used to come for free from a wall clock: a surface
+                    // that stops being painted at all would otherwise hold this 16ms tick
+                    // open for the rest of the session animating nothing. See
+                    // `DIM_FADE_ABANDON_MS`.
+                    let abandoned = last.elapsed().as_millis() as u64
+                        >= crate::app::overlay::DIM_FADE_ABANDON_MS;
+                    if finished || abandoned {
+                        if abandoned && !finished {
+                            log::debug!(
+                                "dim fade abandoned: no painted frame for {}ms with the ramp \
+                                 {elapsed_ms}ms/{}ms in",
+                                last.elapsed().as_millis(),
+                                crate::app::overlay::DIM_FADE_MS
+                            );
+                        }
+                        // Latch the end state so `sub_dim_fade` stops scheduling ticks.
+                        self.dim_fade.set(crate::app::overlay::DimFade::Done);
+                    }
                 }
                 Task::none()
             }
@@ -609,9 +648,9 @@ impl App {
     /// grabs -> thumbnails) the first time the user enters window mode on a launch that
     /// deferred it (region / monitor / scan). Idempotent: a second switch into window
     /// mode does nothing (the thumbnails are already loaded or in flight). Arms the
-    /// picker's loading spinner (`windows_loading`), which the `sub_loading_tick` poll
-    /// then drains via `LoadingTick` exactly like a window-mode launch does. A no-op
-    /// when the pre-capture already ran at launch (window-mode launch).
+    /// picker's loading state (`picker_load`), which the `sub_loading_tick` poll then
+    /// drains via `LoadingTick` exactly like a window-mode launch does. A no-op when the
+    /// pre-capture already ran at launch (window-mode launch).
     /// Drain the dedicated launch cursor grab (DRAGON-213) into `frozen_cursor`, building
     /// its display handle ONCE here (view() must never mint a handle — a fresh id per
     /// frame forces a GPU re-upload while the indicator shows). Idempotent: once drained,
@@ -766,7 +805,10 @@ impl App {
         }
         crate::util::timing_mark("kick_window_precapture: lazy window pre-capture (begin)");
         self.window_precapture_started = true;
-        self.windows_loading = true;
+        // QUIET, not spinner-up (DRAGON-645). The picker's loading state begins here, but
+        // nothing is drawn until the pre-capture outlasts the reveal threshold, so switching
+        // into window mode on a fast desktop shows the picker and never a spinner.
+        self.picker_load = crate::app::overlay::PickerLoad::Quiet { ticks: 0 };
         spawn_window_precapture(
             self.precapture.clone(),
             self.freeze,

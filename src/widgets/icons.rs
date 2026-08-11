@@ -354,6 +354,12 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "view-timeline-symbolic" => "timeline",
         "video-x-generic-symbolic" => "film", // video placeholder
         "pan-down-symbolic" => "chevron-down",
+        "pan-up-symbolic" => "chevron-up", // vendored for DRAGON-630's first stepper; kept bundled
+        // The picker value row's layout toggle (DRAGON-630): split channel boxes vs the
+        // one whole-value box. Outward chevrons say "expand into channels", inward say
+        // "collapse into one".
+        "list-expand-symbolic" => "list-chevrons-up-down",
+        "list-collapse-symbolic" => "list-chevrons-down-up",
         // Settings + misc.
         "folder-open-symbolic" => "folder-open",
         // The PHOTO ALBUM mark (DRAGON-485, the owner's pick): lucide `book-image`, a book with
@@ -503,6 +509,9 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "timeline" => svg!("timeline"),
         "film" => svg!("film"),
         "chevron-down" => svg!("chevron-down"),
+        "chevron-up" => svg!("chevron-up"),
+        "list-chevrons-up-down" => svg!("list-chevrons-up-down"),
+        "list-chevrons-down-up" => svg!("list-chevrons-down-up"),
         "folder-open" => svg!("folder-open"),
         "book-image" => svg!("book-image"),
         "inbox" => svg!("inbox"),
@@ -562,7 +571,9 @@ mod tests {
             "sun-dim-symbolic", "spotlight-symbolic", "view-grid-symbolic",
             "image-filter-symbolic", "edit-cut-symbolic", "view-timeline-symbolic",
             "minus-1", "minus-2", "minus-4", "minus-6", "minus-8", "minus-10", "minus-12",
-            "video-x-generic-symbolic", "pan-down-symbolic", "folder-open-symbolic",
+            "video-x-generic-symbolic", "pan-down-symbolic", "pan-up-symbolic",
+            "list-expand-symbolic", "list-collapse-symbolic",
+            "folder-open-symbolic",
             // The cloud setup step's two destination tabs and its album rows (DRAGON-485, tab
             // marks added by DRAGON-522).
             "book-image-symbolic", "inbox-symbolic",

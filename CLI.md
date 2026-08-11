@@ -116,7 +116,7 @@ General (33% by default), and the ring around the magnifier is drawn at the
 
 A click copies the hex and opens a small window: a swatch, then one editable row
 per notation (HEX, RGB, HSL, HSV, OKLCH, CMYK, LAB) each with its own copy button,
-then the last ten colors you picked. Typing in any row updates the swatch and every
+then the last twenty colors you picked. Typing in any row updates the swatch and every
 other row. The recents are persisted, because the app is one-shot and an in-memory
 list would be empty at every launch; clicking one loads it without reordering the
 list, and only an actual pick writes to it. Picking a color already in the row

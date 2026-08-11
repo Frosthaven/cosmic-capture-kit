@@ -338,6 +338,64 @@ fn backend_env_override(existing: Option<&str>, want_software: bool) -> Option<&
     }
 }
 
+/// **Pure**, unit-tested: does THIS launch want the Windows 10 software rasterizer
+/// (DRAGON-427, narrowed by DRAGON-650)?
+///
+/// The DRAGON-427 force exists because Windows 10's DWM appears to discard per-pixel alpha
+/// on our layered overlay windows (wgpu presents them solid black; the whole account is on
+/// `platform::win_build_software_overlays` and `win_overlay_is_layered`), so a process that
+/// will put a TRANSLUCENT overlay on screen must render on tiny-skia there.
+///
+/// The COLOUR PICKER is the one overlay launch that exemption reasoning does not reach
+/// (DRAGON-650): its overlay draws an OPAQUE fullscreen frozen snapshot with the dim
+/// composited in-app, on top of it, inside our own surface. It never needs per-pixel window
+/// translucency, so it has nothing to lose to the alpha bug and everything to gain from the
+/// GPU (the magnifier re-rasters on effectively every pointer move, and the shader-backed
+/// lens is barred on tiny-skia). So a `--color-picker` process keeps wgpu even on Windows
+/// 10. Narrowed HERE, at the one renderer decision, and not inside
+/// `Startup::opens_overlays`, whose other callers (flats grabs, boot policy,
+/// `effective_preview_windowed`'s overlay term) all still want "the picker opens overlays"
+/// to be true. `effective_preview_windowed` in particular keeps reading the raw PLATFORM
+/// fact, which stays correct because a picker launch never mints a preview surface of
+/// either shape.
+///
+/// Unverified on real Windows 10 hardware (nobody on the project has any): this is
+/// implemented on the alpha-hypothesis reasoning above, and the worst case is a
+/// picker-only regression there, reversible by deleting the `!color_picker` term.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wants_software_backend(
+    opens_overlays: bool,
+    color_picker: bool,
+    platform_software: bool,
+) -> bool {
+    opens_overlays && !color_picker && platform_software
+}
+
+/// DRAGON-650: whether THIS process was actually FORCED onto the software rasterizer by the
+/// DRAGON-427 gate — i.e. [`backend_env_override`] returned a backend and `run` wrote it
+/// into the environment. Written once, before any window exists; false everywhere the force
+/// never runs (Linux, macOS, Windows 11, and every Windows 10 launch the gate exempts).
+static FORCED_SOFTWARE_BACKEND: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// DRAGON-650: was THIS process forced onto the software (tiny-skia) rasterizer?
+///
+/// The question the magnifier's raster form actually needs answered
+/// (`color_picker::build_magnifier_raster`): a shader widget is BLANK on tiny-skia, so
+/// what matters is the renderer THIS process runs, not the platform fact that decides it.
+/// Before DRAGON-650 the two were interchangeable — every Windows 10 overlay process was
+/// forced — but the picker now keeps wgpu there, and asking the platform would have parked
+/// its lens on the atlas-churning image arm for no reason.
+///
+/// Deliberately narrower than "is this process on tiny-skia": a user who sets
+/// `ICED_BACKEND=tiny-skia` themselves is out of scope, answered `false`, exactly as
+/// `platform::software_overlays()` answered before. Honouring a hand-set backend without
+/// silently rewiring views around it is the same rule [`backend_env_override`] applies to
+/// the variable itself.
+pub(in crate::app) fn process_forced_software_backend() -> bool {
+    FORCED_SOFTWARE_BACKEND.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The value `ICED_BACKEND` held BEFORE this process touched it — captured once, at the
 /// moment [`run`] decides, and `None` when the user had not set one.
 ///
@@ -460,8 +518,12 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
     // (Escape worked this way all along). Verified end-to-end with a standalone
     // accessory-app harness (panel key + Escape delivery + crosshair via cursor
     // probe).
-    #[cfg(target_os = "macos")]
-    crate::platform::mac::window::enable_background_cursor();
+    //
+    // The call itself now lives a few lines down, INSIDE the DRAGON-440 block, so that the
+    // permission pre-flight and the SCK pre-warm are started before it rather than after it
+    // and this resolve (~28ms measured, a framework load) overlaps them. Nothing about the
+    // property changes: it is still set on this thread, still before any window exists, and
+    // still on every macOS launch.
     // macOS (DRAGON-440): take the permission snapshot HERE, before the policy block below,
     // for launches that would otherwise open capture overlays.
     //
@@ -490,19 +552,56 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
     // the TOCTOU shape DRAGON-440 removed for the permission probe. One read, passed forward,
     // is the pattern that already works. Off macOS there is no preamble at all, so `App::init`
     // keeps taking the marker itself, in the same place, byte-identically.
+    //
+    // The probe is still taken HERE, and the policy below still reads it. What changed is
+    // only WHEN it runs relative to the rest of this preamble. It used to run inline, so the
+    // launch paid its ~37ms with nothing else in flight, and it cannot be moved any LATER
+    // for the reason this whole block exists. So it moves EARLIER instead: it is started on
+    // its own thread as this preamble's first act (`ProbePreflight::start`, whose doc carries
+    // the boundedness and off-main-thread arguments) and joined at the one line that needs
+    // its answer. Everything between those two points — the post-update marker read, the SCK
+    // pre-warm kick, the SkyLight resolve — now runs alongside it instead of before it.
+    // Nothing downstream can tell the difference: `routed_to_permissions` and
+    // `Startup::route_probe` are the same values, from ONE snapshot, computed at the same
+    // point in the launch.
     #[cfg(target_os = "macos")]
     let (startup, routed_to_permissions) = {
         let mut startup = startup;
+        // The marker read moves ABOVE the pre-flight so the pre-flight can be gated on
+        // exactly the condition the inline probe used, with no window where the two could
+        // disagree. It is a single file `take`, so it costs the overlap nothing.
         startup.post_update = crate::update::take_post_update_marker();
         // Skipped for a post-update relaunch as well as for the window launches: it shows the
         // About page, mints no overlay, and has no capture to be missing a grant for. Probing
         // there would be the nag interrupting the release notes — and would leave the policy
         // gate and the routing decision reading different pictures of this launch, which is
         // the disagreement DRAGON-440 exists to prevent.
-        let routed = if startup.opens_overlays() && !startup.post_update {
-            crate::util::timing_mark("app::run -> permissions::probe_now_fast (begin)");
-            let probe = permissions::probe_now_fast();
-            crate::util::timing_mark("app::run <- permissions::probe_now_fast (done)");
+        let preflight = (startup.opens_overlays() && !startup.post_update)
+            .then(permissions::ProbePreflight::start);
+        if preflight.is_some() {
+            crate::util::timing_mark("app::run -> permissions::probe_now_fast (kicked, own thread)");
+        }
+        // The DRAGON-150/151 SkyLight property (see the long note above). Its ~28ms is now
+        // spent alongside the probe instead of in front of it, which is the whole point of
+        // the kick above.
+        //
+        // It stays AHEAD of the SCK pre-warm below, and that order is deliberate, not
+        // incidental: this is the call that resolves `SLSMainConnectionID` and stamps
+        // `SetsCursorInBackground` onto this process's window-server connection, and before
+        // this line NOTHING in the process has talked to the window server — which was true
+        // before this change too, and is worth keeping true. ScreenCaptureKit is a
+        // window-server client, so kicking it first would put a background thread into that
+        // connection ahead of the property being set, for no gain: the pre-warm's answer is
+        // not needed for another ~120ms and it still lands ~60ms early from here.
+        crate::platform::mac::window::enable_background_cursor();
+        // Start the launch's ScreenCaptureKit content fetch, on its own thread. Its first
+        // consumer is `App::init`'s trigger-display snapshot, ~120ms from here, which used to
+        // pay the whole round trip inline; see `prewarm_shareable_content`. Unconditional
+        // because that consumer is unconditional.
+        crate::platform::mac::prewarm_shareable_content();
+        let routed = if let Some(preflight) = preflight {
+            let probe = preflight.join();
+            crate::util::timing_mark("app::run <- permissions::probe_now_fast (joined)");
             let routed = permissions::should_auto_open_probe(&probe);
             startup.route_probe = Some(probe);
             routed
@@ -609,14 +708,27 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
     // The editor is deliberately NOT here: it runs as its OWN process (see
     // `preview::open`'s `try_spawn_editor_child`), so it keeps the GPU renderer. iced picks
     // one compositor per process, so that separation is the only way to have both.
+    //
+    // The COLOUR PICKER is exempt too (DRAGON-650): its overlay is an OPAQUE frozen
+    // snapshot with the dim composited in-app, so it never needs the per-pixel window
+    // alpha Windows 10 discards, and it keeps wgpu. `wants_software_backend` carries the
+    // reasoning and the tests.
     #[cfg(windows)]
     {
-        let want_software = startup.opens_overlays() && crate::platform::software_overlays();
+        let want_software = wants_software_backend(
+            startup.opens_overlays(),
+            startup.color_picker,
+            crate::platform::software_overlays(),
+        );
         let existing = std::env::var("ICED_BACKEND").ok();
         if let Some(backend) = backend_env_override(existing.as_deref(), want_software) {
             // Remember what the user had (nothing, here) BEFORE we write, so every GUI child
             // this process spawns can be given their environment back rather than ours.
             let _ = USER_ICED_BACKEND.set(existing);
+            // The force is now actually APPLYING, which is what the magnifier's raster-form
+            // predicate reads (DRAGON-650, `process_forced_software_backend`). Before any
+            // window exists, so no view can race the write.
+            FORCED_SOFTWARE_BACKEND.store(true, std::sync::atomic::Ordering::Relaxed);
             log::info!(
                 "windows 10: rendering this process's overlays with the {backend} \
                  software rasterizer (wgpu cannot present a translucent HWND surface here)"
@@ -1028,7 +1140,16 @@ fn resolve_wallpaper_handles(
         // rendered wallpaper per display.
         let _ = wallpaper;
         for desc in crate::screenshot::output_descs() {
-            if let Some(img) = crate::platform::mac::capture_wallpaper(&desc.name) {
+            // The PREWARMED variant, and only here. This is the launch path: the SCK
+            // content snapshot it needs was already fetched by `prewarm_shareable_content`
+            // moments ago, so the ordinary entry point's DRAGON-188 Bug 4 refresh would
+            // throw that away and pay a second full round trip (~52ms measured warm) —
+            // once per output, since this loops. `capture_wallpaper_prewarmed`'s doc
+            // carries the argument for why reusing it is sound on the include-only filter
+            // and how the deny-list fallback still gets its fresh snapshot. Every OTHER
+            // caller of `capture_wallpaper` keeps the refresh; see that doc for why they
+            // must.
+            if let Some(img) = crate::platform::mac::capture_wallpaper_prewarmed(&desc.name) {
                 out.insert(desc.name, std::sync::Arc::new(img));
             }
         }
@@ -1581,12 +1702,27 @@ struct OutputState {
     ///
     /// Windows (DRAGON-437): the same flag with a NARROWER meaning — it is set ONLY on a
     /// confirmed placement, never on give-up, because on Windows it is what tells
-    /// `sub_overlay_finalize` this output is done. Nothing on Windows reads it to decide
-    /// what to draw (the window is hidden until placed, so there is no transparent phase to
-    /// gate), which is why `overlay_view`'s gate stays macOS-only and mac behaviour is
-    /// byte-identical.
+    /// `sub_overlay_finalize` this output is done. The view keeps DRAWING through the
+    /// whole placement dance (the window presents real frames while DWM-cloaked, which is
+    /// what the cloak phase is for), so `overlay_view`'s draw-nothing gate stays
+    /// macOS-only and mac behaviour is byte-identical. What Windows DOES read this flag
+    /// for at draw time is the dim fade's latch (DRAGON-653, `dim_now_revealed`): the
+    /// faded dim is held at zero, without consulting the latch, until placement lands, so
+    /// the 200ms ramp cannot spend itself on cloaked frames nobody can see.
     #[cfg(not(target_os = "linux"))]
     placed: std::cell::Cell<bool>,
+    /// macOS (DRAGON-646): `place_overlay` changed this window's frame and iced has not seen
+    /// the resize yet, so `placed` is deliberately still false.
+    ///
+    /// The overlay is minted at winit's `AlwaysOnTop` level, which AppKit clamps below the
+    /// menu bar, and `place_overlay` grows it back to the full display. Until winit delivers
+    /// the matching `Resized`, iced lays the view out for the OLD size while the window is
+    /// already the NEW one, so any content drawn in that gap is stretched and then snaps.
+    /// Cleared by `ConfigWindowResized` when the reported size matches, or by the bounded
+    /// `OverlayFrameSettled` fallback; either way `placed` is set at the same moment. Not a
+    /// second paint gate: `placed` remains the ONE thing the view reads.
+    #[cfg(target_os = "macos")]
+    frame_pending: std::cell::Cell<bool>,
 }
 
 impl OutputState {
@@ -2248,13 +2384,26 @@ pub struct App {
     toolbar_offset: HashMap<String, (f32, f32)>,
     /// Pre-captured window thumbnails per output (window mode).
     windows: HashMap<String, Vec<WindowThumb>>,
-    /// The background window pre-capture is still running.
-    windows_loading: bool,
-    /// Frames to keep the loading overlay up *after* windows are ready, so the
-    /// picker renders (and GPU-uploads) behind it and is visible the instant the
-    /// overlay lifts — no blank flash between the spinner and the picker.
-    window_warmup: u8,
-    /// Shared slot the pre-capture thread fills; polled while `windows_loading`.
+    /// Where the window picker's loading state has got to (DRAGON-645): whether the
+    /// background pre-capture is still running, whether its spinner has been revealed at
+    /// all, and how much longer it stays up once it has.
+    ///
+    /// Replaces the old `windows_loading` + `window_warmup` pair. That pair drew the spinner
+    /// unconditionally from the pre-capture's first frame, so a load that finished in 60ms
+    /// got a 60ms spinner, which reads as a glitch rather than as a loading state. See
+    /// [`overlay::PickerLoad`] for the reveal threshold and the minimum-once-shown.
+    picker_load: overlay::PickerLoad,
+    /// Has the window picker drawn a frame yet (DRAGON-645)? Latched once, from
+    /// `overlay::window_view`, and read by the `LoadingTick` handler.
+    ///
+    /// It is what the spinner's reveal threshold is counted from, because the poll driving
+    /// that threshold starts in `App::init` while a macOS window-mode launch does not put an
+    /// overlay on screen for the better part of a second. Counting from the subscription
+    /// spends the whole threshold before anything is visible and reveals a spinner for a wait
+    /// the user never had. A `Cell` because the only honest place to observe "we drew a
+    /// frame" is inside the view, which holds `&self`.
+    picker_painted: std::cell::Cell<bool>,
+    /// Shared slot the pre-capture thread fills; polled while `picker_load` is not `Idle`.
     precapture: PrecaptureSlot,
     /// Whether the window pre-capture has been kicked yet (DRAGON-204). A window-mode
     /// launch kicks it in `acquire_scene` (true from init); every other launch defers
@@ -2543,12 +2692,12 @@ pub struct App {
     /// ONE listener per process, at ONE address, serving whichever of the two windows this
     /// process actually owns. It is bound by whichever comes first:
     ///
-    /// * a PREVIEW surface (`preview_surface_for`), at the per-pid `preview.sock`, so a
-    ///   later capture child hands its finished file over instead of paying a second
-    ///   ~233 MB process;
-    /// * the colour picker's RESULT WINDOW (`color_picker_pick`), at the per-pid
-    ///   `colorpicker.sock`, so a later pick updates this window instead of opening a
-    ///   second one.
+    /// * a PREVIEW surface (`preview_surface_for`), at the per-pid preview address
+    ///   (`instance::preview_host_address`), so a later capture child hands its finished
+    ///   file over instead of paying a second ~233 MB process;
+    /// * the colour picker's RESULT WINDOW (`color_picker_pick`), at the per-pid picker
+    ///   address (`instance::color_picker_host_address`), so a later pick updates this
+    ///   window instead of opening a second one.
     ///
     /// A process is only ever one of those, so there is no third case and no contention for
     /// the field. It was called `preview_host` until DRAGON-613; the name was renamed rather
@@ -2558,9 +2707,9 @@ pub struct App {
     /// `None` before either window exists, or when the bind failed. A failed bind is never
     /// fatal: nothing discovers us and every sibling does the job itself, exactly as before.
     ///
-    /// Unix-only: Windows has no unix-socket transport, so it never hosts and both paths
-    /// stay byte-identical (see `crate::preview_ipc`'s Platforms note).
-    #[cfg(unix)]
+    /// Absent only where no transport exists: unix listens on a per-pid socket, Windows on
+    /// the per-pid named-pipe twin (DRAGON-651; see `crate::preview_ipc`'s Platforms note).
+    #[cfg(any(unix, windows))]
     handoff_host: Option<crate::preview_ipc::PreviewHost>,
     /// The recording-CONTROL listener (DRAGON-583), bound for the life of a recording and
     /// dropped with it (its `Drop` unlinks the socket). Its presence is what lets a second
@@ -3674,6 +3823,42 @@ mod tests {
             .opens_overlays(),
             "the spawned editor child"
         );
+    }
+
+    /// DRAGON-650: the colour picker keeps the GPU renderer even where the platform says
+    /// overlays must be software-rendered. Its overlay is an OPAQUE frozen snapshot with
+    /// the dim composited in-app, so it never needs the per-pixel window alpha the Windows
+    /// 10 force works around — and its magnifier wants the shader-backed lens that force
+    /// would bar. Portable and always run, like the other decisions in this block: the
+    /// Windows arm it gates cannot be exercised here, so this table is its only net.
+    #[test]
+    fn the_colour_picker_never_asks_for_the_software_renderer() {
+        // THE new case: a Windows 10 picker launch keeps wgpu.
+        assert!(!wants_software_backend(true, true, true));
+        // A Windows 10 capture launch is forced exactly as before — the exemption must
+        // reach nothing but the picker.
+        assert!(wants_software_backend(true, false, true));
+        // Windows 11 / Linux / macOS (`platform_software` false): nobody is forced, picker
+        // or not.
+        assert!(!wants_software_backend(true, false, false));
+        assert!(!wants_software_backend(true, true, false));
+        // A launch with no overlays never was, whatever the other flags say.
+        for (picker, platform) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert!(!wants_software_backend(false, picker, platform));
+        }
+        // And the picker still OPENS overlays (`Startup::opens_overlays` is untouched):
+        // the narrowing lives at the renderer decision only, because the flats grab, the
+        // boot policy and the surface routing all still need the true answer.
+        assert!(Startup { color_picker: true, ..Default::default() }.opens_overlays());
+    }
+
+    /// DRAGON-650: the forced-backend predicate answers false wherever the force never ran.
+    /// This process's own test run IS such a process (nothing here calls the force), so the
+    /// read is the honest baseline every non-Windows-10 launch sees — and what keeps the
+    /// magnifier on the shader arm everywhere the exemption applies.
+    #[test]
+    fn an_unforced_process_reports_no_software_force() {
+        assert!(!process_forced_software_backend());
     }
 
     // ── DRAGON-440: which launches boot the macOS REGULAR activation policy ───────

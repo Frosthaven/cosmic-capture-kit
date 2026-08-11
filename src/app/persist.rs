@@ -109,6 +109,11 @@ impl App {
                 .take(crate::app::color_picker::geom::RECENTS_CAP)
                 .map(|c| c.hex())
                 .collect(),
+            // DRAGON-630: the remembered value mode, as its stable id, and the value
+            // row's split-vs-whole layout. Their writers (the dropdown, the list
+            // toggle) each save as they change.
+            color_picker_mode: self.color_picker.mode.id().to_string(),
+            color_picker_split_inputs: self.color_picker.split_inputs,
             record_fps: self.record_fps.value,
             record_bitrate_kbps: self.record_bitrate_kbps.value,
             // The INTENT ("auto" or the user's pick), never the display resolution
@@ -239,6 +244,11 @@ impl App {
             .filter_map(|s| crate::color::ColorFormat::Hex.parse(s))
             .take(crate::app::color_picker::geom::RECENTS_CAP)
             .collect();
+        // DRAGON-630: the remembered value mode; junk (or a factory reset's default)
+        // resolves to hex, the tool's historical copy. The layout toggle rides along.
+        self.color_picker.mode = crate::color::ColorFormat::from_id(&p.color_picker_mode)
+            .unwrap_or(crate::color::ColorFormat::Hex);
+        self.color_picker.split_inputs = p.color_picker_split_inputs;
         self.record_fps.set_value(p.record_fps.clamp(1, 240));
         self.record_bitrate_kbps.set_value(p.record_bitrate_kbps.clamp(100, 500_000));
         self.record_res_preset = p.record_res_preset.min(RES_CUSTOM as u8);

@@ -2414,7 +2414,7 @@ use crate::widgets::annotation_canvas::Tool;
 /// flyout now lives on the BOTTOM bar (covermark picker + color palette / wheel), so all of
 /// them float UP; the former `Down` (top-bar) direction is gone with the swatch's move down.
 #[derive(Clone, Copy)]
-pub(super) enum FlyoutDir {
+pub(in crate::app) enum FlyoutDir {
     /// Anchor on the BOTTOM toolbar → expand UPWARD, LEFT-aligned to the button. Carries the
     /// panel's KNOWN height so the popup is offset up by exactly that (bottom flush with the
     /// button top) — deterministic in BOTH surface kinds, not dependent on the popover's
@@ -2441,7 +2441,7 @@ pub(super) enum FlyoutDir {
 /// This does NOT rely on the popover's room-below auto-flip (which never triggers on the
 /// fullscreen overlay, where the bottom bar has open space below it) — hence the panel must be
 /// a KNOWN fixed height.
-pub(super) fn flyout<'a>(
+pub(in crate::app) fn flyout<'a>(
     base: Element<'a, Msg>,
     panel: Element<'a, Msg>,
     dir: FlyoutDir,

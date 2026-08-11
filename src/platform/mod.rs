@@ -1058,6 +1058,143 @@ pub fn win_backdrop_seated_below(
     false
 }
 
+// ──────────────── macOS: a stray capture overlay must not land in a capture ────────────────
+//
+// DRAGON-TBD (no ticket filed yet; replace this marker when one is). Reported as: with
+// "freeze pixels" on, a region capture SOMETIMES comes back with a ghost of a PREVIOUS
+// capture's selection area in the frozen pixels. With freeze on that is not a preview
+// artefact: the saved file IS a crop of the launch-time flats (`capture_flow::crop_frozen`),
+// so whatever the flats grab photographed is what the user sends to someone.
+//
+// WHERE IT COMES FROM, verified by direct experiment rather than by reading. Launch a region
+// capture, leave its overlay up, and run a second process through the same grab
+// (`--test mac-shot`, which calls `platform::mac::capture_output`): the PNG that comes back
+// contains the first instance's dim wash, its "Begin drawing a capture region" hint and its
+// whole toolbar, as ordinary desktop pixels. `capture_output` built its `SCContentFilter`
+// with an unconditionally EMPTY exclusion list, so nothing of ours was ever kept out of it.
+// Capture instances are deliberately concurrent (DRAGON-351 deleted the single-instance
+// capture lock outright) and nothing tears a sibling's overlay down until that sibling
+// COMMITS (`instance::close_other_instances`, called from `do_pixel_capture`), so a second
+// hotkey press while the first overlay is still on screen is an ordinary thing to do.
+//
+// WHY PID MATCHING WOULD NOT HAVE FIXED IT, and this is the crux. The nearest existing
+// exclusion, `mac::recording_display_target_excluding_own_ui`, matches
+// `owningApplication.processID == std::process::id()`. The ghost is a DIFFERENT PROCESS:
+// same app, same binary, another one-shot capture child. Identity here has to be the
+// APPLICATION, which is what [`MacAppIdentity`] and [`mac_same_app`] express.
+//
+// WHY A LEVEL BAND rather than "every window we own". Our ordinary toplevels (the settings
+// window, the windowed preview editor, the colour picker's result window) sit at the normal
+// window level and are legitimate capture subjects: somebody documenting this app must still
+// be able to photograph its own UI. Capture chrome does not, and is identifiable without a
+// title match, which matters because `place_overlay` titles every overlay with its DISPLAY
+// name and the colour picker mints the same windows with the same titles. Measured on this
+// machine: a placed overlay reports `windowLayer == CGShieldingWindowLevel == 2147483628`,
+// and winit parks one at `kCGFloatingWindowLevel == 3` between creation and placement, so
+// the whole set sits strictly above the ordinary level of 0.
+// The menu-bar item is not a concern either way: macOS hosts `NSStatusItem` windows in
+// Control Center's process (verified, the item reports `owner=Control Center`), so it is
+// never in the exclusion set and a full-display capture keeps a gap-free menu bar.
+//
+// THE COLOUR PICKER IS CARVED OUT, and this is not a detail. DRAGON-608 shipped, on the
+// owner's explicit correction, the behaviour that "an ordinary region capture, started over a
+// live overlay with the existing keybinds, must produce a correct image of that overlay" —
+// photographing the picker's loupe is the whole of what that ticket delivered, and
+// `capture_flow::begin_capture`'s doc records that it works precisely BECAUSE the exclusion
+// "reaches exactly ONE process, our own". A filter keyed on app identity alone would delete
+// that feature. The picker's overlay is indistinguishable from a capture overlay by every
+// window property there is (same process, same level, same `Display-<id>` title), so the
+// carve-out cannot be made from the window: it is made from the OWNER PROCESS's argv
+// (`instance::is_color_picker_instance`), the same source `is_settings_instance` and
+// `is_resident_instance` already read.
+//
+// Our OWN process is excluded unconditionally, with no picker carve-out, because a picker
+// launch grabs the flats it will later sample from: `app::color_picker`'s `PixelSource` doc
+// says a live read would return our own dimming layer instead of the desktop.
+
+/// The CoreGraphics window level ordinary application windows sit at
+/// (`kCGNormalWindowLevel`, measured 0). Anything of ours strictly above it is capture
+/// chrome rather than content. See the note above.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const MAC_APP_WINDOW_LAYER: isize = 0;
+
+/// macOS: the handles the system offers for "which application owns this window".
+///
+/// Three of them, because no single one answers on every build. `pid` is free and exact but
+/// only ever recognises the current process. `exe` is the identity
+/// `instance::close_other_instances` already uses to recognise a macOS sibling, and it is the
+/// one that works for an unbundled `cargo run` dev binary, which has no bundle identifier at
+/// all. `bundle_id` is what recognises two instances launched from DIFFERENT copies of the
+/// app, a dev build beside the one in `/Applications`.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MacAppIdentity<'a> {
+    /// The owning process id, or `0` when ScreenCaptureKit named no owning application.
+    pub pid: i32,
+    /// The owning process's executable image (`proc_pidpath`), or `None` when it could not
+    /// be read (a process that exited between the snapshot and this call).
+    pub exe: Option<&'a std::path::Path>,
+    /// The owning application's bundle identifier, or `None` for an unbundled binary.
+    pub bundle_id: Option<&'a str>,
+}
+
+/// **Pure**, unit-tested: do two identities name the same APPLICATION, i.e. this process or
+/// any other running instance of the same app?
+///
+/// Any ONE of the three handles agreeing is enough, because each covers a case the others
+/// cannot. Deliberately NOT an all-three match: a dev binary has no bundle identifier, and a
+/// sibling's exe path is unreadable once it has exited.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn mac_same_app(a: MacAppIdentity<'_>, b: MacAppIdentity<'_>) -> bool {
+    // Same process. Cheapest, and the only handle that needs no syscall. `0` is SCK's "no
+    // owning application", so it never matches, not even another 0.
+    if a.pid != 0 && a.pid == b.pid {
+        return true;
+    }
+    if let (Some(x), Some(y)) = (a.exe, b.exe)
+        && x == y
+    {
+        return true;
+    }
+    // Empty never matches empty: SCK reports an unbundled process's identifier as an empty
+    // string, and treating that as an identity would make every unbundled process on the
+    // system "us".
+    match (a.bundle_id, b.bundle_id) {
+        (Some(x), Some(y)) => !x.is_empty() && x == y,
+        _ => false,
+    }
+}
+
+/// **Pure**, unit-tested: must this window be kept out of a whole-display grab because it is
+/// a stray piece of THIS APP's capture chrome?
+///
+/// `owner_is_color_picker` is the DRAGON-608 carve-out and applies to SIBLINGS only: a live
+/// colour picker is something the user may deliberately be photographing, and no window
+/// property can tell its overlay apart from a capture overlay. See the note above this
+/// function for why the carve-out has to come from the owner's argv.
+#[cfg(any(target_os = "macos", test))]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn mac_window_is_stray_chrome(
+    owner: MacAppIdentity<'_>,
+    me: MacAppIdentity<'_>,
+    window_layer: isize,
+    owner_is_color_picker: bool,
+) -> bool {
+    if window_layer <= MAC_APP_WINDOW_LAYER {
+        return false; // ordinary application window: content, not chrome
+    }
+    // Our own chrome, always. Nothing this process draws belongs in a scene this process is
+    // reading, and that holds for a picker launch too (its own dim would otherwise become
+    // the pixels it later samples).
+    if owner.pid != 0 && owner.pid == me.pid {
+        return true;
+    }
+    !owner_is_color_picker && mac_same_app(owner, me)
+}
+
 // ───────────────────────── Launch at login: what the row may claim ─────────────────────────
 //
 // DRAGON-628. The "Automatically start on login" row rendered the PERSISTED PREFERENCE, which
@@ -2062,5 +2199,125 @@ mod win_run_value_tests {
     #[test]
     fn both_platforms_strip_the_same_resident_token() {
         assert_eq!(crate::instance::RESIDENT_ARG, "resident");
+    }
+}
+
+/// DRAGON-TBD: which windows a macOS whole-display grab must keep out of the picture. The
+/// SCK and `libproc` reads are in `platform::mac`; the RULE is here so `cargo test` proves it
+/// on Linux and Windows too.
+#[cfg(test)]
+mod mac_stray_chrome_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The app under test: pid 100, the installed bundle, bundled.
+    fn me() -> MacAppIdentity<'static> {
+        MacAppIdentity {
+            pid: 100,
+            exe: Some(Path::new("/Applications/Cosmic Capture Kit.app/Contents/MacOS/cck")),
+            bundle_id: Some("dev.thedragon.CosmicCaptureKit"),
+        }
+    }
+
+    /// A placed capture overlay, measured on a real machine.
+    const SHIELDING: isize = 2147483628;
+    /// Where winit parks an `AlwaysOnTop` window before `place_overlay` raises it.
+    const FLOATING: isize = 3;
+
+    /// Each handle recognises a case the other two cannot, so any one of them agreeing is
+    /// enough. Requiring all three would fail on a dev binary (no bundle id) and on a
+    /// sibling that has already exited (no readable exe path).
+    #[test]
+    fn any_single_handle_agreeing_names_the_same_app() {
+        // Same process.
+        assert!(mac_same_app(MacAppIdentity { pid: 100, ..Default::default() }, me()));
+        // A DIFFERENT process running the same binary: the whole point of this predicate.
+        assert!(mac_same_app(
+            MacAppIdentity { pid: 200, exe: me().exe, bundle_id: None },
+            me()
+        ));
+        // A dev build beside the installed one: exe paths differ, bundle ids agree.
+        assert!(mac_same_app(
+            MacAppIdentity {
+                pid: 200,
+                exe: Some(Path::new("/repo/target/release/cck")),
+                bundle_id: Some("dev.thedragon.CosmicCaptureKit"),
+            },
+            me()
+        ));
+    }
+
+    /// Nothing about another application may ever look like us.
+    #[test]
+    fn a_foreign_app_is_never_us() {
+        assert!(!mac_same_app(
+            MacAppIdentity {
+                pid: 200,
+                exe: Some(Path::new("/Applications/Zen.app/Contents/MacOS/zen")),
+                bundle_id: Some("app.zen-browser.zen"),
+            },
+            me()
+        ));
+    }
+
+    /// SCK reports "no owning application" as pid 0 and an unbundled process's identifier as
+    /// an empty string. Either one matching itself would make half the system "us".
+    #[test]
+    fn unknown_owners_never_match() {
+        assert!(!mac_same_app(MacAppIdentity::default(), MacAppIdentity::default()));
+        assert!(!mac_same_app(
+            MacAppIdentity { pid: 0, exe: None, bundle_id: Some("") },
+            MacAppIdentity { pid: 100, exe: None, bundle_id: Some("") }
+        ));
+    }
+
+    /// The reported bug: a SIBLING capture instance's overlay, which a pid-only rule leaves
+    /// in the picture. Both of the levels an overlay is ever seen at must be caught, because
+    /// `place_overlay` raises it from one to the other a frame or two after creation.
+    #[test]
+    fn a_sibling_capture_overlay_is_stray_at_both_of_its_levels() {
+        let sibling = MacAppIdentity { pid: 200, exe: me().exe, bundle_id: me().bundle_id };
+        assert!(mac_window_is_stray_chrome(sibling, me(), SHIELDING, false));
+        assert!(mac_window_is_stray_chrome(sibling, me(), FLOATING, false));
+    }
+
+    /// DRAGON-608, and it is a shipped feature rather than a nicety: a capture started over a
+    /// live colour picker must still photograph the picker. Its overlay is the SAME window
+    /// kind at the SAME level, so only the owner's argv can separate the two.
+    #[test]
+    fn a_sibling_color_picker_overlay_survives_the_filter() {
+        let picker = MacAppIdentity { pid: 200, exe: me().exe, bundle_id: me().bundle_id };
+        assert!(!mac_window_is_stray_chrome(picker, me(), SHIELDING, true));
+    }
+
+    /// The carve-out is for SIBLINGS. A picker grabbing its own flats must still drop its own
+    /// dim, or the pixels it later samples are its own dimming layer.
+    #[test]
+    fn our_own_chrome_is_stray_even_on_a_picker_launch() {
+        let mine = MacAppIdentity { pid: 100, exe: me().exe, bundle_id: me().bundle_id };
+        assert!(mac_window_is_stray_chrome(mine, me(), SHIELDING, true));
+    }
+
+    /// Our ordinary toplevels are legitimate capture subjects: documenting this app means
+    /// photographing its settings window and its preview editor.
+    #[test]
+    fn our_own_ordinary_windows_are_content_and_stay() {
+        let mine = MacAppIdentity { pid: 100, exe: me().exe, bundle_id: me().bundle_id };
+        assert!(!mac_window_is_stray_chrome(mine, me(), MAC_APP_WINDOW_LAYER, false));
+        // And the negative-layer desktop band (wallpaper, desktop icons) is never ours.
+        assert!(!mac_window_is_stray_chrome(mine, me(), -2147483624, false));
+    }
+
+    /// A foreign app's always-on-top panel is somebody else's content. The level band alone
+    /// must never decide.
+    #[test]
+    fn a_foreign_floating_panel_is_never_stray() {
+        let other = MacAppIdentity {
+            pid: 300,
+            exe: Some(Path::new("/Applications/Ice.app/Contents/MacOS/Ice")),
+            bundle_id: Some("com.jordanbaird.Ice"),
+        };
+        assert!(!mac_window_is_stray_chrome(other, me(), SHIELDING, false));
+        assert!(!mac_window_is_stray_chrome(other, me(), 25, false));
     }
 }

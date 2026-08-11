@@ -122,19 +122,20 @@ impl App {
         crate::instance::set_preview_marker(false);
         // DRAGON-582: and the colour picker's window marker, on the same terms.
         crate::instance::set_color_picker_marker(false);
-        // DRAGON-336 phase 3b: stop hosting handoffs, marker FIRST then socket, so no
+        // DRAGON-336 phase 3b: stop hosting handoffs, marker FIRST then listener, so no
         // sibling can discover us at any point during teardown. Dropping the host unlinks
-        // its socket; any handoff still sitting unacked in its channel drops with it, which
-        // closes that connection WITHOUT an `ok` — precisely the signal that sends the
-        // waiting sibling back to doing the job itself (nothing is ever consumed without a
-        // positive ack, see `crate::preview_ipc`). Explicit rather than left to process
-        // exit, so the socket is gone before the last surface is.
+        // its socket (or stops the Windows pipe thread, DRAGON-651); any handoff still
+        // sitting unacked in its channel drops with it, which closes that connection
+        // WITHOUT an `ok` — precisely the signal that sends the waiting sibling back to
+        // doing the job itself (nothing is ever consumed without a positive ack, see
+        // `crate::preview_ipc`). Explicit rather than left to process exit, so the
+        // listener is gone before the last surface is.
         //
         // Both markers above are cleared BEFORE this, which is what makes the "just closed"
         // and "mid-close" cases collapse into the one fall-back rule: whichever of the two
         // a sibling catches us in, it never gets an ack, so it opens its own window.
         // DRAGON-613 rides this unchanged; the picker window's listener is the same field.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.handoff_host = None;
         }
@@ -462,6 +463,8 @@ impl App {
                 point_scale,
                 #[cfg(not(target_os = "linux"))]
                 placed: std::cell::Cell::new(false),
+                #[cfg(target_os = "macos")]
+                frame_pending: std::cell::Cell::new(false),
             });
         }
         // DRAGON-437 (Windows): arm the finalize re-driver the moment overlays exist. Armed
@@ -673,6 +676,13 @@ impl App {
     /// paused for the session, so the overlay stays put — no per-frame fighting needed).
     /// Retries briefly if the window's async-set title hasn't landed yet. Ignores ids
     /// that aren't ours.
+    ///
+    /// macOS also owns the DRAGON-204 paint gate here, and since DRAGON-646 it opens that gate
+    /// on iced's viewport rather than on the NSWindow's frame. The two are not the same
+    /// moment: this function moves the WINDOW synchronously and iced learns about it from a
+    /// `Resized` event that has not been delivered yet, so content drawn in between is laid
+    /// out for the pre-clamp size and stretched to fit the post-clamp window. The body says
+    /// what that cost, measured.
     #[cfg(not(target_os = "linux"))]
     // The macOS retry branch is a cfg'd `{ return … }` block followed by a cfg'd-out
     // `not(macos)` tail; dropping `return` there is a compile error, so allow the lint on
@@ -689,19 +699,74 @@ impl App {
             // 1.2s, far longer than the one-or-two frames it normally takes.
             const MAX_ATTEMPTS: u8 = 30;
             const RETRY_MS: u64 = 40;
-            if crate::platform::mac::window::place_overlay(&o.name, o.logical_pos, o.logical_size) {
+            /// How long the DRAGON-646 paint gate waits for iced's viewport to catch up with
+            /// the frame `place_overlay` just set, before drawing anyway.
+            ///
+            /// A BOUND, not a delay: the resize normally lands within a frame or two, and the
+            /// `ConfigWindowResized` arm releases the gate the moment it does. This is only
+            /// what stops a resize that never arrives from leaving the overlay invisible,
+            /// which would be a far worse bug than the stretched frame it is preventing. 150ms
+            /// because the whole point of the gate is to be released by the event, so this
+            /// wants to be comfortably longer than the event takes rather than tight.
+            const OVERLAY_FRAME_SETTLE_MS: u64 = 150;
+            use crate::platform::mac::window::Placement;
+            let placement =
+                crate::platform::mac::window::place_overlay(&o.name, o.logical_pos, o.logical_size);
+            if placement != Placement::Unmatched {
                 // Opt the overlay out of the user's tiling WM via the portable seam. The
                 // pre-order-front chrome strip already classified it as an AeroSpace popup;
                 // this backstops that title-scoped, through the shared entry point.
                 crate::platform::opt_out_of_tiling(&o.name);
-                // Placed. A tiling WM never manages the overlay (the DRAGON-154
-                // chrome-strip opt-out, or the escape-hatch pause), so nothing
-                // re-homes it — no burst needed. DRAGON-204: mark placed so the view
-                // stops rendering transparent and draws the UI now that the window sits
-                // at its final full-display frame (no visible clamp-then-reframe shift).
-                o.placed.set(true);
-                crate::util::timing_mark("configure_overlay: place_overlay MATCHED (overlay visible + framed) *** USER SEES UI ***");
-                return Task::none();
+                // A tiling WM never manages the overlay (the DRAGON-154 chrome-strip opt-out,
+                // or the escape-hatch pause), so nothing re-homes it — no burst needed.
+                //
+                // DRAGON-204 marked `placed` HERE, so the view stops rendering transparent and
+                // draws the UI "now that the window sits at its final full-display frame".
+                // DRAGON-646: the WINDOW does, but iced's viewport for it does not yet, and
+                // the view is laid out against the viewport. The overlay is minted at winit's
+                // `AlwaysOnTop` level, below the menu bar, so AppKit clamps it at creation
+                // (measured: 2048x1330 asked for, 2048x1286 given) and the `setFrame` inside
+                // `place_overlay` grows it back. winit only learns that from a `Resized` event
+                // it has not delivered yet, so a content frame drawn now is laid out for 1286
+                // points and displayed in a 1330-point window: everything is stretched 3.4%
+                // vertically until the event lands, and then it snaps. Measured on a
+                // `--region` launch: the corrected size reached iced 169ms after this line, so
+                // the selection box sat several pixels low for a sixth of a second and then
+                // jumped up. That jump is DRAGON-646, and it is intermittent for the obvious
+                // reason: it only shows if a frame is actually presented inside the gap.
+                //
+                // So `placed` waits for the viewport, not for the window. `Unchanged` means no
+                // resize was issued and none is coming, so there is nothing to wait for and
+                // this is byte-identical to the old path.
+                if placement == Placement::Unchanged {
+                    o.placed.set(true);
+                    crate::util::timing_mark("configure_overlay: place_overlay MATCHED (overlay visible + framed) *** USER SEES UI ***");
+                    return Task::none();
+                }
+                // `Reframed`: hold the paint gate until `ConfigWindowResized` reports this
+                // window at the size we just gave it. Holding it is also CHEAP, and that is
+                // not a coincidence: the empty `Space` the gate draws is what keeps the main
+                // thread free enough to process the resize promptly, where the expensive first
+                // content frame would block it (measured at 53-148ms) and let the stale size
+                // sit on screen for the whole of it.
+                o.frame_pending.set(true);
+                crate::util::timing_mark(
+                    "configure_overlay: place_overlay MATCHED (reframed; waiting for the surface)",
+                );
+                let id = o.id;
+                return Task::perform(
+                    async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            OVERLAY_FRAME_SETTLE_MS,
+                        ))
+                        .await;
+                    },
+                    move |()| {
+                        cosmic::Action::App(Msg::WindowChrome(WindowChromeMsg::OverlayFrameSettled(
+                            id,
+                        )))
+                    },
+                );
             }
             crate::util::timing_mark("configure_overlay: place_overlay not matched yet (title lag, will retry)");
             if attempt >= MAX_ATTEMPTS {
@@ -806,6 +871,18 @@ impl App {
             true,
         );
         if placed {
+            // DRAGON-653: mark the FLIP only. `place_overlay` is idempotent and both
+            // drivers re-call this on stragglers, so an unguarded mark would repeat.
+            // This is the Windows launch timeline's reveal instant: phase 2 landed and
+            // the window is uncloaked on its monitor, which is what the dim fade's
+            // latch (`dim_now_revealed`) holds for. Without it, "reveal" vs "ramp
+            // begins" cannot be read off a timing run. The macOS twins are
+            // `configure_overlay`'s "*** USER SEES UI ***" marks.
+            if !o.placed.get() {
+                crate::util::timing_mark(
+                    "place_overlay: phase 2 landed, overlay uncloaked *** USER SEES UI ***",
+                );
+            }
             o.placed.set(true);
             self.on_overlay_placed(&o.name);
         }
@@ -1165,11 +1242,18 @@ impl App {
         }
         const MAX_ATTEMPTS: u8 = 30;
         const RETRY_MS: u64 = 40;
+        // DRAGON-646 gave `place_overlay` a three-way answer so the CAPTURE overlay can tell a
+        // reframe from a no-op. The preview overlay asks the older question, "did you find
+        // it", because it has no `placed` paint gate to hold: it opens over a still image it
+        // owns, not over a live desktop it must not photograph, so a frame at the pre-clamp
+        // size costs a stretch on a picture that is about to be replaced rather than a capture
+        // drawn at the wrong coordinates.
         if crate::platform::mac::window::place_overlay(
             super::shell::PREVIEW_OVERLAY_TITLE,
             pos,
             size,
-        ) {
+        ) != crate::platform::mac::window::Placement::Unmatched
+        {
             // DRAGON-216: while pre-opening to cover the grab, `place_overlay` has placed +
             // order-fronted it (non-key) — but DON'T take focus yet, which would flip the
             // picked window off frontmost mid-grab. `WindowGrabbed` clears the flag and

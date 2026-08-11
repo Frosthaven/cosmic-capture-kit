@@ -104,7 +104,7 @@ RUN . /opt/pins.env \
  && make PREFIX=/usr/local install \
  && cd /tmp && rm -rf "nv-codec-headers-$NVCODEC_VERSION" nvcodec.tar.gz
 
-# ── ffmpeg 8.1.2, the binary AND the libav libraries the AppImage bundles ─────
+# ── ffmpeg (pins.env's FFMPEG_VERSION), the binary AND libav libraries bundled ──
 #
 # VERIFIED BY UPSTREAM GPG SIGNATURE, not just a checksum, exactly as
 # release.yml's build-linux does: a hash we carry only proves the file did not

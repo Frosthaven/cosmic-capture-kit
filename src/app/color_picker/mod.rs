@@ -382,13 +382,75 @@ pub fn pixel_source() -> PixelSource {
     PixelSource::Frozen
 }
 
+/// The magnifier disc's pixels, in whatever form THIS renderer can actually draw
+/// (DRAGON-TBD).
+///
+/// One raster, two destinations, and the split is a RUNTIME question rather than a `cfg`
+/// because the constraint is a Windows BUILD NUMBER, not a target
+/// ([`crate::platform::software_overlays`]).
+///
+/// # Why the shader arm exists
+/// The disc is rebuilt on effectively every real pointer move (a fresh ~156x156 RGBA buffer),
+/// and a fresh `widget::image::Handle` per rebuild makes iced allocate and trim a texture-atlas
+/// entry each time. That churn is the exact problem `preview::layers` was built to solve for the
+/// preview editor, with a persistent per-layer GPU texture re-uploaded in place, and the
+/// magnifier is the same shape of content. It was never given that treatment only because the
+/// view could not use `widget::shader` at all while Windows 10 was in scope.
+///
+/// # Why the image arm stays
+/// A process on iced's software rasterizer cannot draw a shader widget AT ALL: routing the
+/// magnifier there unconditionally would not be slow, it would be BLANK. So a
+/// software-forced process keeps the historical `widget::image` path, byte for byte.
+///
+/// DRAGON-650 changed WHO that is. The split used to key on the platform fact
+/// (`platform::software_overlays`, true on every Windows 10 launch), but the picker process
+/// is now exempt from the Windows 10 software force — its overlay is an opaque snapshot
+/// that never needs the per-pixel window alpha that force exists to work around — so the
+/// key is the process's OWN renderer (`app::process_forced_software_backend`). With the
+/// exemption in place no picker launch is ever forced, so this arm is expected dormant; it
+/// stays because the constraint it answers (no shaders on tiny-skia) is a property of the
+/// renderer, not of DRAGON-650's exemption, and any future force that reaches a picker
+/// process lands here safely instead of on a blank lens.
+///
+/// Both arms show the same pixels with the same NEAREST sampling, which is not an optimisation
+/// but the tool's whole point: a colour picker that blurs its cell boundaries is lying about
+/// which pixel is which.
+pub enum MagnifierRaster {
+    /// A software-forced process (`app::process_forced_software_backend`): the software
+    /// rasterizer cannot draw a shader widget, so the disc stays an ordinary image handle.
+    Image(widget::image::Handle),
+    /// Everywhere else: a persistent GPU texture through `preview::LayerStack`, re-uploaded in
+    /// place instead of re-allocated.
+    Layer(std::sync::Arc<crate::app::preview::PixelFrame>),
+}
+
+/// **Pure**, unit-tested: wrap a freshly rasterised magnifier disc in the form this renderer
+/// can draw (DRAGON-TBD). See [`MagnifierRaster`] for why there are two.
+///
+/// `software` is `app::process_forced_software_backend`'s answer (DRAGON-650; it was the
+/// platform's `software_overlays` before the picker was exempted from the Windows 10
+/// force), taken as a plain bool rather than read in here, the same way
+/// `preview::effective_preview_windowed` takes its platform facts: it is what keeps the
+/// decision testable on a host that is not the one it describes.
+pub(super) fn build_magnifier_raster(
+    w: u32,
+    h: u32,
+    rgba: Vec<u8>,
+    software: bool,
+) -> MagnifierRaster {
+    if software {
+        MagnifierRaster::Image(widget::image::Handle::from_rgba(w, h, rgba))
+    } else {
+        MagnifierRaster::Layer(crate::app::preview::PixelFrame::new(rgba, w, h))
+    }
+}
+
 /// What the pointer is currently over, recomputed on every move.
 ///
-/// `magnifier` is built in the update handler, NOT in `view`: a per-frame
-/// `Handle::from_rgba` mints a new id each call and forces a GPU re-upload plus a fresh
-/// atlas entry on every redraw (the same trap `cursor_indicator` documents). It is
-/// rebuilt only when the SOURCE PIXEL changes, so a mouse move inside one pixel costs
-/// nothing.
+/// `magnifier` is built in the update handler, NOT in `view`: minting the raster per frame
+/// would re-upload it on every redraw (and on the `widget::image` arm mint a fresh atlas entry
+/// too, the same trap `cursor_indicator` documents). It is rebuilt only when the SOURCE PIXEL
+/// changes, so a mouse move inside one pixel costs nothing.
 pub struct Hover {
     /// Which output's overlay the pointer is over.
     pub output: String,
@@ -401,16 +463,21 @@ pub struct Hover {
     pub pixel: (u32, u32),
     /// The colour of that pixel.
     pub color: Srgb,
-    /// The magnifier disc, pre-rasterised for that pixel.
-    pub magnifier: widget::image::Handle,
+    /// The magnifier disc, pre-rasterised for that pixel, in whatever form this renderer can
+    /// draw ([`MagnifierRaster`]).
+    pub magnifier: MagnifierRaster,
     /// The magnification the disc was rasterised AT (DRAGON-587). The re-raster guard reads
     /// the pixel AND this: a zoom change with the pointer still over the same pixel is a
     /// different picture of the same place, and skipping it would leave the lens stuck.
     pub zoom: u32,
-    /// Which PART of the disc that raster is, and where it goes (DRAGON-587). Near a screen
-    /// edge the disc is CLIPPED, so the buffer is smaller than the full diameter and the
-    /// view places it at this origin, at this size. The guard reads it too: a pointer sliding
-    /// along an edge changes the clip without necessarily changing the pixel.
+    /// Which PART of the disc that raster is (DRAGON-587): near a screen edge the disc is
+    /// CLIPPED, so the buffer is smaller than the full diameter. This is the raster's
+    /// IDENTITY, not the drawn position: the view draws the buffer at [`Self::disc`]'s size
+    /// but PLACES it from the live [`Self::sample`] through `geom::drawn_disc_origin`
+    /// (DRAGON-650), so a paced frame's lens follows the pointer while its picture lags.
+    /// The two agree exactly whenever the raster is fresh. The re-raster guard reads this
+    /// too: a pointer sliding along an edge changes the clip without necessarily changing
+    /// the pixel.
     pub disc: geom::DiscView,
 }
 
@@ -434,13 +501,45 @@ pub struct ColorPickerState {
     pub window: Option<window::Id>,
     /// The colour the window is showing.
     pub color: Srgb,
-    /// The row being typed into, and its RAW text.
+    /// The notation the value row currently shows (DRAGON-630). PERSISTED
+    /// (`state::schema::color_picker_mode`): the picker is a one-shot process, so an
+    /// in-memory mode would reset on every launch, and the owner asked for the
+    /// remembered one. It is also the spelling the pick's own clipboard copy takes.
+    pub mode: ColorFormat,
+    /// Whether the value row shows SPLIT per-channel boxes (`true`, the original
+    /// layout) or ONE whole-value box holding the full spelling exactly as the copy
+    /// button would take it (DRAGON-630 rev 3). PERSISTED
+    /// (`state::schema::color_picker_split_inputs`), toggled by the list button beside
+    /// the copy button.
+    pub split_inputs: bool,
+    /// The mode chip's menu is open (DRAGON-630 rev 4). Transient view state, never
+    /// persisted: a menu that reopened itself on the next launch would be a bug.
+    pub mode_menu_open: bool,
+    /// The window's alpha (DRAGON-630), `255` = opaque. A PICK (and a recent-click)
+    /// resets it: a screen pixel is opaque, and the alpha is an authoring control for
+    /// the value being copied out, not a property of anything sampled.
+    pub alpha: u8,
+    /// The HSV the gradient square and the hue strip move through (DRAGON-630),
+    /// tracked by `color::hsv_tracking` so the user's aim survives the achromatic
+    /// colours where RGB stops carrying a hue (white, greys) or a saturation (black).
+    pub hsv: [f64; 3],
+    /// The window's pre-rastered gradients (DRAGON-630), rebuilt in the update handler
+    /// only when their inputs change and NEVER in `view` (the magnifier's own rule:
+    /// minting image handles per frame churns iced's texture atlas). `sv` follows the
+    /// hue, `alpha_strip` and `swatch` follow the colour and the alpha, and
+    /// `hue_strip` never changes once built.
+    pub sv_raster: Option<widget::image::Handle>,
+    pub hue_raster: Option<widget::image::Handle>,
+    pub alpha_raster: Option<widget::image::Handle>,
+    pub swatch_raster: Option<widget::image::Handle>,
+    /// The value BOX being typed into: the mode it belongs to, its index (the mode's
+    /// own components, alpha one past them), and its RAW text.
     ///
-    /// While a row is being edited the window must not rewrite that box from the
-    /// canonical colour: the user would see their half-typed value replaced by a
-    /// normalised one mid-keystroke. So the edited row renders its draft and every OTHER
-    /// row renders the derived value.
-    pub draft: Option<(ColorFormat, String)>,
+    /// While a box is being edited the window must not rewrite it from the canonical
+    /// colour: the user would see their half-typed value replaced by a normalised one
+    /// mid-keystroke. So the edited box renders its draft and every OTHER box renders
+    /// the derived value.
+    pub draft: Option<(ColorFormat, usize, String)>,
     /// Recent colours, newest first. Only a PICK writes this (see [`geom::writes_recents`]).
     pub recents: Vec<Srgb>,
     /// The row whose Copy button was last pressed, and WHEN, for the transient
@@ -495,6 +594,29 @@ pub struct ColorPickerState {
     /// [`geom::nudge_after`], which is also where "a real pointer motion resets it" is
     /// stated, so no call site can accumulate an offset the mouse can never undo.
     pub nudge: (i32, i32),
+    /// DRAGON-TBD: a pointer position has been recorded that the lens has not caught up with
+    /// yet, so the next RENDERED FRAME should re-sample.
+    ///
+    /// This is the whole of the picker's re-sampling cadence, and it is a flag rather than a
+    /// timer on purpose. [`ColorPickerMsg::Moved`] sets it and
+    /// [`crate::widgets::color_pick::ColorPickSurface`] publishes one
+    /// [`ColorPickerMsg::ResamplePoll`] per redraw while it is true, so the lens updates
+    /// exactly once per frame the display actually presents, at whatever rate that display
+    /// runs, and the app goes fully idle the moment it clears.
+    ///
+    /// It is ALSO what makes the raster pacing ([`geom::raster_due`]) safe: a resample that
+    /// declines to raster leaves this true, which buys exactly one more look on the next
+    /// frame, and repeats until the pointer has slowed enough to take one. Without that, a
+    /// sweep that ended on a paced frame would leave stale pixels in the lens with nothing
+    /// left to correct them.
+    pub resample_due: bool,
+    /// When the last resample read the pointer, for [`geom::sample_speed`] (DRAGON-TBD). The
+    /// position it is paired with is [`Hover::sample`], which is already the previous sample
+    /// point, so no second copy of it is kept here.
+    pub sampled_at: Option<std::time::Instant>,
+    /// When the magnifier's raster was last rebuilt, for [`geom::raster_due`] (DRAGON-TBD).
+    /// `None` until the first one, which is never paced.
+    pub rastered_at: Option<std::time::Instant>,
     /// macOS: the FRACTION of a magnifier zoom notch a trackpad pinch has carried since the
     /// last whole notch was published ([`geom::pinch_notches`]).
     ///
@@ -517,6 +639,15 @@ impl Default for ColorPickerState {
             unavailable: false,
             window: None,
             color: Srgb::default(),
+            mode: ColorFormat::Hex,
+            split_inputs: true,
+            mode_menu_open: false,
+            alpha: u8::MAX,
+            hsv: [0.0, 0.0, 0.0],
+            sv_raster: None,
+            hue_raster: None,
+            alpha_raster: None,
+            swatch_raster: None,
             draft: None,
             recents: Vec::new(),
             copied: None,
@@ -525,19 +656,46 @@ impl Default for ColorPickerState {
             zoom: geom::MAGNIFIER_ZOOM_DEFAULT,
             pointer: None,
             nudge: (0, 0),
+            resample_due: false,
+            sampled_at: None,
+            rastered_at: None,
             pinch_accum: 0.0,
         }
     }
 }
 
+/// The value row's WHOLE-VALUE box, as a component index (DRAGON-630 rev 3): the
+/// layout toggle's collapsed state edits the full spelling through the same draft and
+/// message plumbing the channel boxes use, and this sentinel is how the handlers tell
+/// the two apart. `usize::MAX` can never collide with a real component index (the
+/// widest mode has five).
+pub const WHOLE_VALUE_BOX: usize = usize::MAX;
+
 impl ColorPickerState {
-    /// The text a row shows: the live draft for the row being edited, the canonical value
-    /// for every other row.
-    pub fn row_text(&self, format: ColorFormat) -> String {
+    /// The current mode's whole value in its canonical spelling, alpha included: what
+    /// the copy button, the mode dropdown and the pick's own copy put on the clipboard
+    /// (DRAGON-630).
+    pub fn value_text(&self) -> String {
+        self.mode.format_with_alpha(self.color, self.alpha)
+    }
+
+    /// The text box `idx` shows: the live draft for the box being edited, the canonical
+    /// component text for every other box (DRAGON-630; the draft rule is DRAGON-582's,
+    /// per box now instead of per row). [`WHOLE_VALUE_BOX`] is the collapsed layout's
+    /// single box and shows the full spelling.
+    pub fn box_text(&self, idx: usize) -> String {
         match &self.draft {
-            Some((f, text)) if *f == format => text.clone(),
-            _ => format.format(self.color),
+            Some((m, i, text)) if *m == self.mode && *i == idx => text.clone(),
+            _ if idx == WHOLE_VALUE_BOX => self.value_text(),
+            _ => self.mode.component_text(self.color, self.alpha, idx),
         }
+    }
+
+    /// How many BOXES the current mode's value row shows: the mode's own components
+    /// plus the shared alpha box. Hex included: the owner split its one wide box into
+    /// per-channel hex pairs, so it counts like everyone else.
+    pub fn box_count(&self) -> usize {
+        self.mode.component_labels().len() + 1
     }
 }
 
@@ -546,6 +704,25 @@ impl App {
     /// keyboard grab and the flats gate all ask, so no surface re-derives it.
     pub(super) fn color_picking(&self) -> bool {
         self.color_picker.active
+    }
+
+    /// Every picker OVERLAY surface currently mapped, for the magnifier layer's closed-window
+    /// eviction (DRAGON-TBD). The picker's answer to `App::live_preview_windows`, and it is
+    /// needed for the same reason: iced keys a shader `Pipeline` by primitive TYPE and shares
+    /// it across every window's renderer, exposing NO external handle, so the only way a slot
+    /// is ever freed is a prepare being told which windows are still alive.
+    ///
+    /// `self.outputs` is exactly that set: it is what the overlay maps to, and
+    /// `destroy_surfaces` clears it. A picker LAUNCH is its own process (see this module's
+    /// doc), so there are no preview documents here to protect as well; if that ever changes,
+    /// this is the one place that has to learn about them.
+    ///
+    /// Known and accepted: an output the pointer has LEFT stops mounting its stack, so its
+    /// magnifier slot is not reclaimed until the process exits. That is bounded by the display
+    /// count (a disc is ~97KB) and a picker session is short-lived, which is the same trade
+    /// `layers`' own doc accepts for a preview that closed.
+    pub(in crate::app) fn live_picker_windows(&self) -> Vec<window::Id> {
+        self.outputs.iter().map(|o| o.id).collect()
     }
 
     /// Sample the pixel under a POINT on `output`'s overlay, through [`pixel_source`].
@@ -714,6 +891,67 @@ mod frozen_resample_tests {
     }
 }
 
+/// DRAGON-TBD: which renderer draws the magnifier. The whole risk of the change is in this
+/// one branch: get it wrong on Windows 10 and the disc is not slow, it is BLANK, and no test
+/// that runs on this machine can see that happen. So the decision is pure and pinned here,
+/// separately from the platform read that feeds it.
+#[cfg(test)]
+mod magnifier_raster_tests {
+    use super::*;
+
+    /// A raster small enough to write out by hand, so the test can prove the PIXELS survive
+    /// the wrap rather than just the variant.
+    fn raster() -> (u32, u32, Vec<u8>) {
+        (2, 1, vec![1, 2, 3, 4, 250, 251, 252, 253])
+    }
+
+    /// The GPU arm, which is every machine but Windows 10: a `PixelFrame` for the persistent
+    /// texture slot, carrying the same dimensions and the same bytes.
+    #[test]
+    fn a_gpu_renderer_takes_the_persistent_texture_path() {
+        let (w, h, rgba) = raster();
+        match build_magnifier_raster(w, h, rgba.clone(), false) {
+            MagnifierRaster::Layer(frame) => {
+                assert_eq!((frame.w, frame.h), (w, h));
+                assert_eq!(frame.rgba, rgba, "the disc's pixels must survive the wrap");
+            }
+            MagnifierRaster::Image(_) => panic!("a GPU renderer must take the shader path"),
+        }
+    }
+
+    /// Windows 10, the arm nothing here can render-test: the software rasterizer cannot draw a
+    /// shader widget at all, so the disc has to stay an ordinary image handle. A wrong answer
+    /// here is a blank magnifier on that machine.
+    #[test]
+    fn a_software_rasterizer_keeps_the_image_handle() {
+        let (w, h, rgba) = raster();
+        match build_magnifier_raster(w, h, rgba.clone(), true) {
+            MagnifierRaster::Image(handle) => match handle {
+                widget::image::Handle::Rgba { width, height, pixels, .. } => {
+                    assert_eq!((width, height), (w, h));
+                    assert_eq!(pixels.as_ref(), rgba.as_slice());
+                }
+                other => panic!("the software arm must mint an RGBA handle, got {other:?}"),
+            },
+            MagnifierRaster::Layer(_) => {
+                panic!("the software rasterizer cannot draw a shader widget")
+            }
+        }
+    }
+
+    /// And the two answers are genuinely different, so a future refactor that collapsed the
+    /// branch (in either direction) fails here rather than on a machine nobody on the project
+    /// owns.
+    #[test]
+    fn the_branch_actually_branches() {
+        let (w, h, rgba) = raster();
+        let gpu = build_magnifier_raster(w, h, rgba.clone(), false);
+        let software = build_magnifier_raster(w, h, rgba, true);
+        assert!(matches!(gpu, MagnifierRaster::Layer(_)));
+        assert!(matches!(software, MagnifierRaster::Image(_)));
+    }
+}
+
 /// DRAGON-587: which pick belongs to an editor. One predicate, because "does this pick
 /// target an editor" has to be an explicit property of the LAUNCH rather than something
 /// guessed later from whatever editor happens to be open.
@@ -815,28 +1053,71 @@ mod pick_destination_tests {
 }
 
 #[cfg(test)]
-mod row_text_tests {
+mod box_text_tests {
     use super::*;
 
-    /// THE rule that keeps typing usable: the row being EDITED shows the user's raw text,
-    /// every other row shows the canonical value derived from the colour.
+    /// THE rule that keeps typing usable (DRAGON-582, per box since DRAGON-630): the
+    /// box being EDITED shows the user's raw text, every other box shows the canonical
+    /// value derived from the colour.
     ///
     /// Without it, each keystroke would re-render the box from the parsed colour and
     /// replace the half-typed value under the caret. It is worth a test rather than a
     /// comment because the failure only shows up with a human at the keyboard.
     #[test]
-    fn only_the_edited_row_shows_its_draft() {
-        let mut st = ColorPickerState { color: Srgb::new(255, 136, 0), ..Default::default() };
-        // No draft: every row is canonical.
-        assert_eq!(st.row_text(ColorFormat::Hex), "#FF8800");
-        assert_eq!(st.row_text(ColorFormat::Rgb), "rgb(255, 136, 0)");
-        // Mid-edit in the RGB box, with a value that does not parse yet.
-        st.draft = Some((ColorFormat::Rgb, "rgb(255, 13".to_string()));
-        assert_eq!(st.row_text(ColorFormat::Rgb), "rgb(255, 13", "the caret's row is left alone");
-        assert_eq!(st.row_text(ColorFormat::Hex), "#FF8800", "every other row is derived");
-        assert_eq!(st.row_text(ColorFormat::Lab), ColorFormat::Lab.format(st.color));
-        // Committing drops the draft, so the row re-renders canonically.
+    fn only_the_edited_box_shows_its_draft() {
+        let mut st = ColorPickerState {
+            color: Srgb::new(255, 136, 0),
+            mode: ColorFormat::Rgb,
+            ..Default::default()
+        };
+        // No draft: every box is canonical.
+        assert_eq!(st.box_text(0), "255");
+        assert_eq!(st.box_text(1), "136");
+        assert_eq!(st.box_text(3), "1", "the alpha box shows opaque");
+        // Mid-edit in the G box, with a value that does not parse yet.
+        st.draft = Some((ColorFormat::Rgb, 1, "13.".to_string()));
+        assert_eq!(st.box_text(1), "13.", "the caret's box is left alone");
+        assert_eq!(st.box_text(0), "255", "every other box is derived");
+        // Committing drops the draft, so the box re-renders canonically.
         st.draft = None;
-        assert_eq!(st.row_text(ColorFormat::Rgb), "rgb(255, 136, 0)");
+        assert_eq!(st.box_text(1), "136");
+        // A draft from ANOTHER mode never leaks into this one's boxes.
+        st.draft = Some((ColorFormat::Hsl, 1, "50".to_string()));
+        assert_eq!(st.box_text(1), "136", "a stale mode's draft is ignored");
+    }
+
+    /// The value the window copies is the MODE's whole spelling, alpha included, which
+    /// is what makes the stepper's copy and the pick's copy one vocabulary.
+    #[test]
+    fn value_text_is_the_modes_whole_spelling() {
+        let mut st = ColorPickerState {
+            color: Srgb::new(255, 136, 0),
+            mode: ColorFormat::Rgb,
+            ..Default::default()
+        };
+        assert_eq!(st.value_text(), "rgb(255, 136, 0)");
+        st.alpha = 204;
+        assert_eq!(st.value_text(), "rgba(255, 136, 0, 0.8)");
+        st.mode = ColorFormat::Hex;
+        assert_eq!(st.value_text(), "#FF8800CC");
+    }
+
+    /// The box counts the layout depends on: every mode's components plus the shared
+    /// alpha box, hex included since its split into channel pairs.
+    #[test]
+    fn box_counts_match_the_modes() {
+        let mut st = ColorPickerState::default();
+        assert_eq!(st.box_count(), 4, "hex is four channel-pair boxes");
+        for (mode, want) in [
+            (ColorFormat::Rgb, 4),
+            (ColorFormat::Hsl, 4),
+            (ColorFormat::Hsv, 4),
+            (ColorFormat::Oklch, 4),
+            (ColorFormat::Cmyk, 5),
+            (ColorFormat::Lab, 4),
+        ] {
+            st.mode = mode;
+            assert_eq!(st.box_count(), want, "{}", mode.id());
+        }
     }
 }

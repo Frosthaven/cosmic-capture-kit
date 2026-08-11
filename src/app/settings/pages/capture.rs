@@ -150,10 +150,12 @@ impl crate::app::App {
                 Item::new(
                     "Encoder quality preset",
                     "",
-                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                        &crate::encode::NVENC_PRESET_LABELS,
-                        Some(sel),
-                        |a0| Msg::Settings(SettingsMsg::SetNvencPreset(a0)),
+                    crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                        widget::dropdown(
+                            &crate::encode::NVENC_PRESET_LABELS,
+                            Some(sel),
+                            |a0| Msg::Settings(SettingsMsg::SetNvencPreset(a0)),
+                        ),
                     )),
                 )
                 .reset_with(sel, def, |a0| Msg::Settings(SettingsMsg::SetNvencPreset(a0)))
@@ -170,10 +172,12 @@ impl crate::app::App {
                 Item::new(
                     "Encoder quality preset",
                     "",
-                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                        &crate::encode::X264_PRESET_LABELS,
-                        Some(sel),
-                        |a0| Msg::Settings(SettingsMsg::SetX264Preset(a0)),
+                    crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                        widget::dropdown(
+                            &crate::encode::X264_PRESET_LABELS,
+                            Some(sel),
+                            |a0| Msg::Settings(SettingsMsg::SetX264Preset(a0)),
+                        ),
                     )),
                 )
                 .reset_with(sel, def, |a0| Msg::Settings(SettingsMsg::SetX264Preset(a0)))
@@ -190,10 +194,12 @@ impl crate::app::App {
                 Item::new(
                     "Encoder quality preset",
                     "",
-                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                        &crate::encode::VAAPI_CL_LABELS,
-                        Some(sel),
-                        |a0| Msg::Settings(SettingsMsg::SetVaapiPreset(a0)),
+                    crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                        widget::dropdown(
+                            &crate::encode::VAAPI_CL_LABELS,
+                            Some(sel),
+                            |a0| Msg::Settings(SettingsMsg::SetVaapiPreset(a0)),
+                        ),
                     )),
                 )
                 .reset_with(sel, def, |a0| Msg::Settings(SettingsMsg::SetVaapiPreset(a0)))
@@ -231,7 +237,7 @@ impl crate::app::App {
         Item::new(
             "Video codec",
             "",
-            crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(&crate::encode::CODEC_LABELS, Some(sel), |a0| Msg::Settings(SettingsMsg::SetRecordCodec(a0)))),
+            crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(widget::dropdown(&crate::encode::CODEC_LABELS, Some(sel), |a0| Msg::Settings(SettingsMsg::SetRecordCodec(a0))))),
         )
         .reset_with(sel, def, |a0| Msg::Settings(SettingsMsg::SetRecordCodec(a0)))
     }
@@ -358,7 +364,7 @@ impl crate::app::App {
             Item::new(
                 "Capture method",
                 "",
-                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(&methods.labels, cur, move |i| setter(ids[i].to_string()))),
+                crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(widget::dropdown(&methods.labels, cur, move |i| setter(ids[i].to_string())))),
             )
             .reset_with(selected.to_string(), default_id, setter),
         );

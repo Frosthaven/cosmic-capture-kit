@@ -40,10 +40,12 @@ impl crate::app::App {
                     Item::new(
                         "Max resolution",
                         "",
-                        crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                            &RES_LABELS,
-                            Some(self.record_res_preset as usize),
-                            |a0| Msg::Settings(SettingsMsg::SetRecordResPreset(a0)),
+                        crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                            widget::dropdown(
+                                &RES_LABELS,
+                                Some(self.record_res_preset as usize),
+                                |a0| Msg::Settings(SettingsMsg::SetRecordResPreset(a0)),
+                            ),
                         )),
                     )
                     .reset_with(
@@ -113,7 +115,7 @@ impl crate::app::App {
                 Item::new(
                     "Encoder",
                     "",
-                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(encoders, selected, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0)))),
+                    crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(widget::dropdown(encoders, selected, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0))))),
                 )
                 // Default = the best available encoder (index 0).
                 .reset_with(selected.unwrap_or(0), 0, |a0| Msg::Settings(SettingsMsg::SetPreferredEncoder(a0))),
@@ -146,8 +148,16 @@ impl crate::app::App {
         // GPU zero-copy needs a hardware encoder and a reachable capture path; it
         // negotiates DMA-BUF frames and encodes them on the buffer's own GPU, falling
         // back to the CPU path when that can't be done.
+        //
+        // `runtime_available` is the DRAGON-631 term: the compiled-in feature is only
+        // half of "available", because the binary is ABI-locked to one libav
+        // generation and the system's can differ (a rolling distro moving a major
+        // ahead of a ZIP build, or an old distro behind a fresh one). Offering the
+        // toggle then advertises a path that cannot load, which is how the owner
+        // caught it. The probe is cached and closes its handles (see its doc).
         #[cfg(feature = "zero-copy")]
-        if self.effective_encoder() != "software"
+        if crate::encode::gpu::runtime_available()
+            && self.effective_encoder() != "software"
             && (self.record_backend != crate::platform::backend::PORTAL_ID
                 || self.pipewire_available)
         {
@@ -173,9 +183,11 @@ impl crate::app::App {
             exp_items.push(Item::new(
                 "Benchmark monitor",
                 "The encoder benchmark tests this monitor's true capture resolution.",
-                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(labels, Some(selected), |i| {
-                    Msg::Settings(SettingsMsg::SetBenchMonitor(i))
-                })),
+                crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                    widget::dropdown(labels, Some(selected), |i| {
+                        Msg::Settings(SettingsMsg::SetBenchMonitor(i))
+                    }),
+                )),
             ));
         }
         exp_items.push(Item::new(

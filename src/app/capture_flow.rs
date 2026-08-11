@@ -1167,8 +1167,17 @@ impl App {
     /// delayed live shot), block BRIEFLY on the slot so freeze isn't silently downgraded
     /// to a live grab. Bounded to a short budget (nothing in the capture path waits
     /// unboundedly); on timeout we leave `frozen` empty and the existing live fallback
-    /// runs. A no-op on Linux (flats grabbed synchronously; `frozen_pending` never set)
-    /// and whenever the flats already landed or this capture wouldn't freeze.
+    /// runs. A no-op whenever the flats already landed or this capture wouldn't freeze.
+    ///
+    /// macOS-ONLY, and not because the other platforms grab synchronously. This said "a no-op
+    /// on Linux (flats grabbed synchronously; `frozen_pending` never set)", which DRAGON-212
+    /// made false: Linux and Windows defer the grab exactly like macOS does, they simply have
+    /// no commit-race guard, so committing before the grab lands silently degrades freeze to a
+    /// live grab there. That is a real asymmetry rather than a documented absence.
+    ///
+    /// Note for DRAGON-606: this is the ONE other place `frozen_pending` is cleared, and it
+    /// does not arm the dim's fade. `overlay::dim_now`'s `Waiting` arm covers that; its
+    /// comment carries the reasoning.
     #[cfg(target_os = "macos")]
     fn await_frozen_flats(&mut self, sel: &Selection) {
         // Only wait when this capture would actually consume the flats: freeze on
@@ -1205,8 +1214,15 @@ impl App {
         }
     }
 
-    /// Linux: the flats are grabbed synchronously in `init`, so there's never a
-    /// deferred grab to wait on — a no-op (keeps `begin_capture` platform-agnostic).
+    /// Linux and Windows: no commit-race guard, so this is a no-op that keeps
+    /// `begin_capture` platform-agnostic.
+    ///
+    /// The old wording here, "the flats are grabbed synchronously in `init`, so there's never
+    /// a deferred grab to wait on", has been wrong since DRAGON-212 deferred the grab on these
+    /// platforms too. There IS a deferred grab to wait on; nothing waits on it. Left as a
+    /// no-op rather than quietly given macOS's 750ms poll, because adding a blocking wait to
+    /// two platforms' commit path is a change that should be made deliberately and measured,
+    /// not smuggled in as a doc fix.
     #[cfg(not(target_os = "macos"))]
     #[allow(clippy::unused_self)]
     fn await_frozen_flats(&mut self, _sel: &Selection) {}
@@ -2431,6 +2447,12 @@ impl App {
             // transparency choice is applied downstream, not at the focus grab. The mac
             // wallpaper-backdrop recomposite is a SEPARATE path (`wm/wallpaper_backdrop`),
             // so the Windows `backdrop` decision is unused here.
+            // DRAGON-643: both mac arms wait on the WINDOW SERVER's z-order agreeing that the
+            // picked window is the front one, not on the app reporting its own focus. Picking
+            // a window of a MULTI-WINDOW app (typically the one on another monitor, since the
+            // one on this monitor is usually the app's last-active window anyway) used to
+            // confirm instantly off an attribute we had just written and grab the inactive
+            // chrome. The wait is still bounded and still best-effort on timeout.
             let _ = (transparency, backdrop);
             let id = id.to_string();
             Some(Box::new(move || match intent {

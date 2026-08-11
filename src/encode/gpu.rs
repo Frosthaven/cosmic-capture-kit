@@ -200,6 +200,36 @@ fn libav() -> Option<&'static Libav> {
     LIBAV.get_or_init(|| unsafe { load_libav() }).as_ref()
 }
 
+/// Can the libav GENERATION this binary was compiled against actually load on this
+/// system (DRAGON-631)? The settings window's zero-copy toggle asks before offering
+/// the switch: a compiled-in feature whose libraries cannot load is not "available"
+/// in any sense the user cares about, and the owner caught the toggle advertising
+/// zero-copy on a system whose ffmpeg had moved a major ahead of the build.
+///
+/// Probes with the same exact-major discipline as [`dlopen_libav`] and then CLOSES
+/// the handles: a settings launch must not keep three codec libraries mapped for the
+/// sake of one toggle row (DRAGON-336's lesson), and the real vtable still loads
+/// lazily on first encode. Cached, because the answer cannot change within a process
+/// lifetime in any way this process could detect.
+pub fn runtime_available() -> bool {
+    static PROBE: OnceLock<bool> = OnceLock::new();
+    *PROBE.get_or_init(|| unsafe {
+        for (name, major) in [
+            ("avutil", LIBAVUTIL_VERSION_MAJOR as u32),
+            ("avcodec", LIBAVCODEC_VERSION_MAJOR as u32),
+            ("avfilter", LIBAVFILTER_VERSION_MAJOR as u32),
+        ] {
+            match dlopen_libav(name, major) {
+                Some(h) => {
+                    libc::dlclose(h);
+                }
+                None => return false,
+            }
+        }
+        true
+    })
+}
+
 /// An in-process VAAPI H.264/HEVC encoder bound to one DRM render node, producing
 /// Annex-B packets (SPS/PPS repeated in-band, so the byte stream is self-contained
 /// for `ffmpeg -f h264|hevc -i -`). Scales on the GPU when the encode size differs

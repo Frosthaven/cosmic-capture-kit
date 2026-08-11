@@ -14,6 +14,36 @@
 //!
 //! The widget is transparent and sits ON TOP of that stack, so it receives the events the
 //! elements below would otherwise not care about.
+//!
+//! # Pointer reports ride the redraw, not the raw event (DRAGON-650)
+//!
+//! A raw `CursorMoved` does NOT publish a message. It records the position in [`State`] and
+//! books a frame; the redraw dispatch then publishes ONE `Moved` carrying the latest
+//! position, with the re-sample poll right behind it in the same batch. So a burst of motion
+//! costs one message batch per PRESENTED frame, not one per input event, and an input event
+//! costs microseconds.
+//!
+//! WHY, measured on Windows (the blank-magnifier defect that blocked this ticket's
+//! verification): every published message makes the toolkit rebuild and re-lay-out EVERY
+//! window's view before the loop returns to its pump. Publishing per raw move put that whole
+//! machinery on the path of each 8.7ms mouse update, so the UI thread's per-move turnaround
+//! sat exactly AT the input cadence. Win32 only synthesizes a real `WM_PAINT` (the only
+//! thing that presents a frame) when the thread's queue has nothing better, so whenever the
+//! turnaround crossed the cadence, presents starved: a message-pump tap showed the overlay
+//! retrieving 0 to 12 paints per half-second during a cursor sweep while pointer updates and
+//! rasters ran at full rate underneath. The lens froze on whatever raster had last been
+//! PRESENTED (over a dark gap it reads as an empty disc), while the same machinery kept
+//! sampling perfectly. Which side of the cadence a given BINARY landed on was decided by
+//! code layout, which is why one build read as broken and a sibling build of the same source
+//! read as fine, consistently per binary (measured across interleaved runs). Coalescing the
+//! report onto the redraw removed the per-event cost entirely and presents returned to the
+//! display's own rate on every build.
+//!
+//! Latency is unchanged: iced's redraw arm processes messages published from a redraw
+//! dispatch and rebuilds BEFORE it draws and presents, so the frame that publishes the
+//! report is the frame that shows its lens. The other platforms get the same batching;
+//! macOS in particular delivers pointer motion uncoupled from the display cadence, so it
+//! simply stops paying for reports no frame would have shown.
 
 use cosmic::iced::core::widget::{Tree, tree};
 use cosmic::iced::core::{
@@ -73,11 +103,28 @@ const ENTER_EDGE_BAND: f32 = 8.0;
 /// APPEARANCE (`cursor_reassert::arm_on_appear`) rather than from a `CursorEntered` that never
 /// arrives on a layer surface: the re-assert lands 200 ms after the surface appeared, by which
 /// time the serial exists.
+///
+/// `resampled_for` is the redraw instant this surface last published a re-sample for
+/// (DRAGON-TBD). See [`ColorPickSurface::needs_resample`]: iced re-dispatches its redraw event
+/// after a message published from one, carrying the SAME instant, so without this the paced
+/// case (which deliberately leaves the request standing) would publish two or three times in
+/// one pass and trip iced's "More than 3 consecutive RedrawRequested events produced layout
+/// invalidation" warning every frame.
+///
+/// `pending_move` is the latest pointer position a raw `CursorMoved` recorded and no redraw
+/// has published yet (DRAGON-650, the module doc's "Pointer reports ride the redraw").
+/// Overwritten by every later move (only the newest position matters to a lens that draws
+/// once per frame) and cleared on `CursorLeft`: on a multi-output session the neighbouring
+/// output's surface starts reporting the instant the pointer crosses, and a departed
+/// surface's held position published a frame LATER would land after the new output's report
+/// and flip the sample back across the seam.
 #[derive(Default)]
 struct State {
     zoom_accum: f32,
     after_enter: bool,
     entered_at: Option<cosmic::iced::core::time::Instant>,
+    resampled_for: Option<cosmic::iced::core::time::Instant>,
+    pending_move: Option<(f32, f32)>,
 }
 
 /// **Pure**, unit-tested: the cursor this surface asks the toolkit for.
@@ -181,6 +228,21 @@ fn picker_wants_redraw_sample(needs_pointer: bool, cursor_placeable: bool) -> bo
     needs_pointer && cursor_placeable
 }
 
+/// **Pure**, unit-tested: does the re-sample poll ride THIS redraw dispatch? (DRAGON-650)
+///
+/// `resample_due` is the view-built [`ColorPickSurface::needs_resample`] flag, and it is one
+/// frame STALE by construction: the view that built this widget ran before the batch this
+/// redraw is about to publish. When the coalesced pointer report goes out in this same
+/// dispatch, the app's flag is about to be set by a `Moved` the view never saw, so the poll
+/// must ride along on the report's own say-so. Without the ride-along every motion frame
+/// publishes its report, presents a stale lens, and only the NEXT frame looks, so the lens
+/// (and the hex chip, which the same look feeds) trails the pointer by a full frame at all
+/// times. The once-per-instant `resampled_for` stamp still applies on top of this answer, so
+/// riding along can never double-publish within one pass.
+fn poll_rides_this_redraw(published_report: bool, resample_due: bool) -> bool {
+    published_report || resample_due
+}
+
 /// **Pure**, unit-tested: may this pointer report MOVE the picker's sample? (DRAGON-611)
 ///
 /// # The two facts that arrive in one event
@@ -275,6 +337,11 @@ pub struct ColorPickSurface<Msg> {
     /// `ColorPickerState::pointer.is_none()`, never from this widget's own `State`; the
     /// predicate's doc says why that distinction is load-bearing.
     needs_pointer: bool,
+    /// A recorded pointer position the lens has not caught up with yet (DRAGON-TBD). Fed from
+    /// `ColorPickerState::resample_due`. See [`ColorPickSurface::needs_resample`].
+    needs_resample: bool,
+    /// Built when this surface's redraw should drive that catch-up.
+    on_resample: Option<Box<dyn Fn() -> Msg>>,
 }
 
 impl<Msg> ColorPickSurface<Msg> {
@@ -289,7 +356,37 @@ impl<Msg> ColorPickSurface<Msg> {
             on_zoom: Box::new(on_zoom),
             hide_pointer: false,
             needs_pointer: false,
+            needs_resample: false,
+            on_resample: None,
         }
+    }
+
+    /// DRAGON-TBD: drive the magnifier's re-sampling from this surface's REDRAW, so it runs
+    /// once per frame the display actually presents.
+    ///
+    /// # Why the redraw and not a timer
+    /// The first version of the coalescing used a fixed 16ms subscription, which is ~62.5Hz.
+    /// On the owner's ProMotion panel real frames land every ~8.3ms, so the lens updated on
+    /// fewer than half of them and a sweep read as stepped rather than smooth. A number picked
+    /// in the source cannot track a variable-refresh display; the redraw already does, on every
+    /// platform, because that is what a redraw IS.
+    ///
+    /// This costs nothing at rest, which the timer did not: `needs` is false whenever the lens
+    /// has caught up, nothing is published, no redraw is requested, and the app idles. It is
+    /// also not late: iced runs `update` and rebuilds the interface for messages published
+    /// during a redraw pass BEFORE it draws, so the re-sampled lens is in the frame that asked
+    /// for it rather than the one after.
+    ///
+    /// Deliberately NOT gated on the pointer being over this surface. A picker mints one of
+    /// these per output, so on a multi-monitor session the others do publish a redundant
+    /// request, and it is answered by the app clearing the flag before their pass runs. Adding
+    /// the gate would mean trusting the toolkit to place the cursor, which on a Wayland layer
+    /// surface it cannot do until the pointer moves (DRAGON-601's measurement) - the one
+    /// condition under which the lens must still be able to settle.
+    pub fn needs_resample(mut self, needs: bool, on_resample: impl Fn() -> Msg + 'static) -> Self {
+        self.needs_resample = needs;
+        self.on_resample = Some(Box::new(on_resample));
+        self
     }
 
     /// Hide the pointer sprite while the picker is up. See [`Self::hide_pointer`].
@@ -370,22 +467,63 @@ impl<Msg: 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for ColorPickSur
         // handed, and on a layer surface it is the only one it gets under a resting pointer:
         // the compositor's `wl_pointer.enter` never reaches a widget there. See
         // `cursor_reassert::arm_on_appear` for the measurement.
-        if matches!(event, Event::Window(cosmic::iced::core::window::Event::RedrawRequested(_))) {
+        if let Event::Window(cosmic::iced::core::window::Event::RedrawRequested(at)) = event {
             crate::widgets::cursor_reassert::arm_on_appear(
                 &mut tree.state.downcast_mut::<State>().entered_at,
                 shell,
             );
+            // DRAGON-650: the coalesced pointer report, at most one per presented frame, and
+            // FIRST in the batch so the poll below reads the position it carries. See the
+            // module doc ("Pointer reports ride the redraw") for the starvation measurement
+            // this ordering comes from.
+            let pending = tree.state.downcast_mut::<State>().pending_move.take();
+            if let Some(pos) = pending {
+                shell.publish((self.on_move)(pos));
+            }
+            // DRAGON-TBD: the magnifier's cadence. A frame is being presented and the lens has
+            // not caught up with the pointer, so ask for exactly one re-sample. See
+            // `needs_resample` for why this rides the redraw rather than a fixed-interval
+            // timer, `State::resampled_for` for why the instant is remembered, and
+            // `poll_rides_this_redraw` for why a just-published report brings the poll along
+            // even while the view-built flag is still false.
+            if poll_rides_this_redraw(pending.is_some(), self.needs_resample)
+                && let Some(on_resample) = self.on_resample.as_ref()
+            {
+                // BOOK THE NEXT FRAME, and do it OUTSIDE the publish guard below. Without this
+                // the lens can be left stale for good: a re-sample that declines to raster
+                // (the pointer is sweeping) deliberately leaves the request standing, and if
+                // the hand then STOPS there is no pointer event left to produce another frame,
+                // so nothing would ever come back to finish the job. Iced takes the redraw
+                // request from the LAST pass over this widget, which is why it cannot sit
+                // under the once-per-instant guard: on the pass where the app has caught up,
+                // `needs_resample` is already false and nothing is booked, so this settles
+                // after one spare frame instead of spinning.
+                shell.request_redraw();
+                let st = tree.state.downcast_mut::<State>();
+                if st.resampled_for != Some(*at) {
+                    st.resampled_for = Some(*at);
+                    shell.publish(on_resample());
+                }
+            }
             // DRAGON-610: stand in for the `wl_pointer.enter` this widget never received,
             // using the position the toolkit is already holding. See
             // `picker_wants_redraw_sample` for the measurement, for why the gate is the
             // app's `pointer.is_none()` rather than anything in `State`, and for why the
-            // loupe still does not appear until the flats land.
+            // loupe still does not appear until the flats land. Skipped when the coalesced
+            // report above already went out this dispatch: that report IS a position, so a
+            // second one from the toolkit's cursor would only say the same thing twice.
             let placeable = cursor.position_over(bounds);
-            if picker_wants_redraw_sample(self.needs_pointer, placeable.is_some())
+            if pending.is_none()
+                && picker_wants_redraw_sample(self.needs_pointer, placeable.is_some())
                 && let Some(p) = placeable
             {
                 shell.publish((self.on_move)((p.x - bounds.x, p.y - bounds.y)));
             }
+        }
+        // DRAGON-650: a held position must not outlive the pointer's presence on this surface.
+        // See `State::pending_move` for the cross-output reordering this prevents.
+        if matches!(event, Event::Mouse(mouse::Event::CursorLeft)) {
+            tree.state.downcast_mut::<State>().pending_move = None;
         }
         // BEFORE the position guard, deliberately: the two events this has to see are
         // `CursorEntered` (which starts the dance) and `CursorLeft` (which cancels it), and a
@@ -459,7 +597,12 @@ impl<Msg: 'static> Widget<Msg, cosmic::Theme, cosmic::Renderer> for ColorPickSur
                     local,
                     (bounds.width, bounds.height),
                 ) {
-                    shell.publish((self.on_move)(local));
+                    // DRAGON-650: record and book a frame instead of publishing here; the
+                    // redraw dispatch above reports the LATEST position once per presented
+                    // frame. Publishing per raw move is what starved presents on Windows,
+                    // see the module doc.
+                    tree.state.downcast_mut::<State>().pending_move = Some(local);
+                    shell.request_redraw();
                 } else {
                     log::debug!(
                         "DRAGON-611 picker: held the sample; an enter revealed the pointer at \
@@ -610,6 +753,38 @@ mod picker_redraw_sample_tests {
         assert!(!picker_wants_redraw_sample(true, false));
         assert!(!picker_wants_redraw_sample(false, true));
         assert!(!picker_wants_redraw_sample(false, false));
+    }
+}
+
+/// DRAGON-650: the poll's ride-along rule. The property pinned from both sides: a redraw
+/// that publishes a pointer report ALWAYS polls (the view-built flag is one frame stale by
+/// construction, and a report without its look leaves the lens trailing the pointer by a
+/// frame for the whole sweep), and a redraw with neither a report nor a standing request
+/// publishes nothing (the picker at rest costs nothing, DRAGON-TBD's original property).
+#[cfg(test)]
+mod poll_ride_along_tests {
+    use super::*;
+
+    #[test]
+    fn a_published_report_always_brings_the_poll() {
+        for stale_flag in [true, false] {
+            assert!(
+                poll_rides_this_redraw(true, stale_flag),
+                "resample_due={stale_flag}: the report's own say-so must be enough"
+            );
+        }
+    }
+
+    #[test]
+    fn a_standing_request_still_polls_without_a_report() {
+        // The settle: the hand stopped, no more pointer events exist, and the paced skip
+        // left the request standing. The next frame must still look.
+        assert!(poll_rides_this_redraw(false, true));
+    }
+
+    #[test]
+    fn a_picker_at_rest_publishes_nothing() {
+        assert!(!poll_rides_this_redraw(false, false));
     }
 }
 

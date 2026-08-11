@@ -131,8 +131,9 @@
 //! 1. [`start_host`] is called from `App::preview_surface_for` (the ONE choke point every
 //!    preview mint routes through), storing the [`PreviewHost`] in `App::handoff_host`. It
 //!    binds BEFORE `instance::set_preview_marker(true)`, so a marker a child discovers
-//!    always implies a bound socket, and it is idempotent — re-mints keep the one listener.
-//!    `App::finish_session` drops it (its `Drop` unlinks the socket) as the process ends.
+//!    always implies a bound listener, and it is idempotent — re-mints keep the one listener.
+//!    `App::finish_session` drops it (its `Drop` unlinks the socket, or stops the Windows
+//!    pipe thread) as the process ends.
 //! 2. `App::sub_preview_handoff` (`app/subscriptions.rs`) is a 100ms tick gated on
 //!    `self.handoff_host.is_some()`, emitting `Msg::Capture(CaptureMsg::HandoffPoll)`. The
 //!    poll lives in the CAPTURE domain because it has no preview to address — it may be
@@ -153,20 +154,24 @@
 //!
 //! ## Platforms
 //!
-//! Unix (Linux + macOS) get the real transport; both already share the runtime-dir
+//! Unix (Linux + macOS) get the socket transport; both already share the runtime-dir
 //! marker convention, so the code is one arm, not two. Windows has no unix sockets: it
-//! keeps honest stubs ([`start_host`] returns `Unsupported`, [`send_to_host`] returns
-//! `Err(HandoffError::Unsupported)`), so every Windows capture opens its own preview
-//! exactly as it does today — byte-identical behaviour. A Windows transport would mirror
-//! `daemon_ipc`'s named-pipe split (`daemon_ipc::pipe_name`) behind these same seams.
+//! speaks the SAME wire protocol over per-pid NAMED PIPES (DRAGON-651), which is exactly
+//! `daemon_ipc`'s socket/pipe split (`daemon_ipc::pipe_name`) behind these same seams.
+//! The addresses are `instance.rs`'s (`preview_host_address` /
+//! `color_picker_host_address`), the Win32 server/client bodies live in
+//! `platform::windows::preview_pipe` (closed split), and this module keeps the portable
+//! spine — the wire protocol, [`Handoff`]/[`Ack`]/[`PreviewHost`], and thin per-platform
+//! dispatch arms. Only a target that is NEITHER unix nor Windows keeps the honest stubs
+//! (no [`start_host`], senders returning `Err(HandoffError::Unsupported)`).
 
 // The HOST half of this protocol — the request PARSER, the reply writer, the listener and
-// everything they reach — is `#[cfg(unix)]`, because unix sockets are the transport. On a
-// platform with no transport (Windows) the child side is all that survives, so the parsing
-// side is legitimately unreferenced there. Gated honestly per-platform rather than with a
-// blanket allow: on unix (Linux + macOS) nothing here is exempt, so a genuinely dead item
-// still shows up.
-#![cfg_attr(not(unix), allow(dead_code))]
+// everything they reach — is compiled only where a transport exists (unix sockets, or the
+// Windows named-pipe twin). On a target with neither, the child side is all that survives,
+// so the parsing side is legitimately unreferenced there. Gated honestly per-platform
+// rather than with a blanket allow: where a transport exists nothing here is exempt, so a
+// genuinely dead item still shows up.
+#![cfg_attr(not(any(unix, windows)), allow(dead_code))]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -201,20 +206,26 @@ pub const PROTOCOL_VERSION: u32 = 3;
 /// Longest request/reply line accepted, in bytes. A path is the only unbounded field and
 /// hex-doubles, so 64 KiB is ~32 KiB of path — far past any real one, while keeping a
 /// garbage (or hostile) sender from making either side allocate without bound.
-const MAX_LINE: u64 = 64 * 1024;
+/// `pub(crate)` since DRAGON-651: the Windows pipe transport enforces the same cap (and
+/// sizes its kernel buffers past it, which is what bounds its send with no write timeout).
+pub(crate) const MAX_LINE: u64 = 64 * 1024;
 
 /// How long a child waits for the host's `ok` before giving up and opening its own
 /// preview. Generous next to the host's ~100ms drain tick, but BOUNDED: a wedged host
 /// must cost a capture a short pause, never the capture itself.
 pub const ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long the child will spend writing its (single, small) request line.
+/// How long the child will spend writing its (single, small) request line. Unix only:
+/// the Windows pipe's write is bounded structurally instead (its kernel buffer holds a
+/// whole [`MAX_LINE`], so the one write never waits on the host).
+#[cfg(unix)]
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the HOST waits for a connected peer to finish its request line before
 /// dropping the connection. Keeps one stalled connector from pinning the accept thread
-/// and starving real handoffs.
-const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
+/// and starving real handoffs. `pub(crate)` since DRAGON-651: the Windows accept loop
+/// applies the same bound.
+pub(crate) const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Everything the host needs to open a preview IDENTICAL to the one the child would have
 /// opened. The field names match `app::preview::PreviewState`'s deliberately; the host
@@ -575,8 +586,10 @@ fn path_bytes(p: &std::path::Path) -> Vec<u8> {
 
 #[cfg(not(unix))]
 fn path_bytes(p: &std::path::Path) -> Vec<u8> {
-    // Windows paths are UTF-16; their lossy UTF-8 form round-trips every real path and
-    // this arm has no transport behind it anyway (see the module doc's Platforms note).
+    // Windows paths are UTF-16; their lossy UTF-8 form round-trips every real path (a
+    // path with unpaired surrogates would mangle, fail at open, and land on the fallback
+    // rule — never a lost capture). The DRAGON-427 spawn handoff has fed this exact
+    // encoding to `open_handoff_preview` since before the pipes existed.
     p.to_string_lossy().into_owned().into_bytes()
 }
 
@@ -639,18 +652,28 @@ pub(crate) fn ensure_cloexec<F: std::os::fd::AsFd>(fd: &F) -> std::io::Result<()
     Ok(())
 }
 
+/// The connection an [`Ack`] answers over: the transport's own stream type.
+#[cfg(unix)]
+type AckConn = std::os::unix::net::UnixStream;
+/// Windows (DRAGON-651): the accepted named-pipe instance, wrapped in a plain `File`.
+/// Closing it without a reply is the rejection, exactly as with the socket. The written
+/// reply survives the close (`CloseHandle` keeps buffered bytes readable; only
+/// `DisconnectNamedPipe` would discard them, which is why the transport never calls it).
+#[cfg(windows)]
+type AckConn = std::fs::File;
+
 /// The host's still-open connection back to a waiting child — the ACK half of a
 /// [`Handoff`].
 ///
-/// **Dropping an `Ack` without [`accept`](Ack::accept)ing rejects the handoff**: the fd
-/// closes, the child reads EOF and opens its own preview. That default is what makes the
-/// host-is-exiting race safe (a dropped channel receiver, a dropped `Handoff`, a
-/// panicking update, or plain process death all land here), so there is deliberately no
-/// `Drop` impl to get wrong — closing the socket IS the rejection.
-#[cfg(unix)]
-pub struct Ack(Option<std::os::unix::net::UnixStream>);
+/// **Dropping an `Ack` without [`accept`](Ack::accept)ing rejects the handoff**: the
+/// connection closes, the child reads EOF and opens its own preview. That default is what
+/// makes the host-is-exiting race safe (a dropped channel receiver, a dropped `Handoff`,
+/// a panicking update, or plain process death all land here), so there is deliberately no
+/// `Drop` impl to get wrong — closing the connection IS the rejection.
+#[cfg(any(unix, windows))]
+pub struct Ack(Option<AckConn>);
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Ack {
     /// Tell the child the host has TAKEN OWNERSHIP — the child may exit. Call this only
     /// once the request is actually stored in App state.
@@ -675,13 +698,28 @@ impl Ack {
 }
 
 /// One inbound handoff: the parsed request plus the [`Ack`] that answers it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub struct Handoff {
     request: Request,
     ack: Ack,
 }
 
-#[cfg(unix)]
+/// Mint a [`Handoff`] from a connection the Windows pipe server accepted — the plugin's
+/// (`platform::windows::preview_pipe`) way into the portable acknowledgement model, whose
+/// fields stay private so nothing else can build one half-formed.
+#[cfg(windows)]
+pub(crate) fn pipe_handoff(request: Request, conn: std::fs::File) -> Handoff {
+    Handoff { request, ack: Ack(Some(conn)) }
+}
+
+/// Answer a connection whose request line never parsed — the Windows accept loop's
+/// error-reply path, the twin of the unix loop's own `ack.reject(...)` arms.
+#[cfg(windows)]
+pub(crate) fn pipe_reject(conn: std::fs::File, reason: RejectReason) {
+    Ack(Some(conn)).reject(reason);
+}
+
+#[cfg(any(unix, windows))]
 impl Handoff {
     /// What is being asked of this host.
     pub fn request(&self) -> &Request {
@@ -701,23 +739,30 @@ impl Handoff {
 
 /// A bound preview-handoff listener plus the channel its accept thread feeds.
 ///
-/// Hold one on `App` for as long as any preview window is open. `Drop` unlinks the
-/// socket, so a host that has stopped hosting stops being discoverable immediately (the
-/// accept thread itself is detached and dies with the process — a one-shot-model process
-/// exits when its last preview closes, so there is nothing to join).
-#[cfg(unix)]
+/// Hold one on `App` for as long as any preview window is open. `Drop` makes a host that
+/// has stopped hosting stop being discoverable immediately: on unix it unlinks the socket
+/// (the accept thread itself is detached and dies with the process — a one-shot-model
+/// process exits when its last preview closes, so there is nothing to join); on Windows
+/// it stops the accept thread, whose closed instance handle is what frees the pipe name
+/// (see the Drop impl).
+#[cfg(any(unix, windows))]
 pub struct PreviewHost {
-    path: String,
+    /// The listener's address: the socket path on unix, the pipe name on Windows.
+    address: String,
     /// Inbound handoffs. Drain with `try_recv` from the host's update loop; see the
     /// module doc's integration recipe.
     pub requests: std::sync::mpsc::Receiver<Handoff>,
+    /// Windows: tells the accept thread to stop; `Drop` sets it and then wakes the
+    /// thread's blocking connect with a throwaway self-connection.
+    #[cfg(windows)]
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl PreviewHost {
-    /// The socket path this host is listening on.
-    pub fn socket_path(&self) -> &str {
-        &self.path
+    /// The address this host is listening on (the socket path / the pipe name).
+    pub fn address(&self) -> &str {
+        &self.address
     }
 }
 
@@ -726,31 +771,51 @@ impl Drop for PreviewHost {
     fn drop(&mut self) {
         // Best-effort: an unlink failure only leaves a stale socket, which
         // `instance::sweep_stale_markers` clears on the next launch.
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.address);
     }
 }
 
-/// Begin hosting preview handoffs for THIS process: bind `{runtime}/cosmic-capture-kit.<pid>.preview.sock`
-/// and start the accept thread.
-///
-/// A leftover socket at our own path (a previous process with the same pid, SIGKILLed)
-/// is unlinked first — binding over it is the only way to reclaim the name, and a live
-/// process cannot be holding our own pid's path.
-///
-/// Bind BEFORE `instance::set_preview_marker(true)` so a marker a child discovers always
-/// implies a socket that already exists.
-#[cfg(unix)]
-pub fn start_host() -> std::io::Result<PreviewHost> {
-    start_host_at(crate::instance::preview_socket_path(std::process::id()))
+#[cfg(windows)]
+impl Drop for PreviewHost {
+    fn drop(&mut self) {
+        // A pipe name cannot be unlinked; it lives while any instance handle does. So:
+        // STORE the stop flag, then SELF-CONNECT. The throwaway connection is what
+        // unsticks the accept thread's blocking `ConnectNamedPipe`; the flag (re-checked
+        // right after every connect and every fresh instance) is what it acts on — it
+        // returns, its handle drops, the name disappears. A residual interleaving (the
+        // store landing while the thread is between instances) leaves the thread parked
+        // until process exit, which is the unix accept thread's ordinary shape anyway:
+        // these are one-shot processes, and `finish_session` ends them moments after this
+        // drop. A sender that connects in that window gets no ack and falls back, the
+        // same mid-close rule the module doc names.
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        crate::platform::windows::preview_pipe::wake_accept(&self.address);
+    }
 }
 
-/// [`start_host`] against an EXPLICIT socket path, so a process that is not a preview host
+/// Begin hosting preview handoffs for THIS process at its per-pid preview address
+/// (`instance::preview_host_address`: the `….<pid>.preview.sock` socket on unix, the
+/// `\\.\pipe\….<pid>.preview` pipe on Windows) and start the accept thread.
+///
+/// Bind BEFORE `instance::set_preview_marker(true)` so a marker a child discovers always
+/// implies a listener that already exists.
+#[cfg(any(unix, windows))]
+pub fn start_host() -> std::io::Result<PreviewHost> {
+    start_host_at(crate::instance::preview_host_address(std::process::id()))
+}
+
+/// [`start_host`] against an EXPLICIT address, so a process that is not a preview host
 /// can listen on the same protocol at its OWN address (DRAGON-613: the colour picker
-/// window listens at `instance::color_picker_socket_path`).
+/// window listens at `instance::color_picker_host_address`).
 ///
 /// Generalised rather than copied for the reason `instance::live_marker_hosts_in` was: the
 /// bind, the cloexec repair, the accept thread and the unlink-on-drop are the transport, not
 /// the preview, and two copies of them would be two things to keep in step.
+///
+/// A leftover socket at our own unix path (a previous process with the same pid,
+/// SIGKILLed) is unlinked first — binding over it is the only way to reclaim the name,
+/// and a live process cannot be holding our own pid's path. (A Windows pipe name needs no
+/// such reclaim: it died with its owner's handles.)
 #[cfg(unix)]
 pub fn start_host_at(path: String) -> std::io::Result<PreviewHost> {
     use std::os::unix::net::UnixListener;
@@ -767,7 +832,26 @@ pub fn start_host_at(path: String) -> std::io::Result<PreviewHost> {
         let _ = std::fs::remove_file(&path);
         return Err(e);
     }
-    Ok(PreviewHost { path, requests })
+    Ok(PreviewHost { address: path, requests })
+}
+
+/// The Windows arm of [`start_host_at`] (DRAGON-651): create the pipe's first listening
+/// instance SYNCHRONOUSLY — so a bind failure is reported to the caller exactly as a
+/// failed socket bind is, never swallowed inside a thread — then hand it to the accept
+/// loop in `platform::windows::preview_pipe`.
+#[cfg(windows)]
+pub fn start_host_at(address: String) -> std::io::Result<PreviewHost> {
+    use crate::platform::windows::preview_pipe;
+
+    let first = preview_pipe::create_instance(&address)?;
+    let (tx, requests) = std::sync::mpsc::channel::<Handoff>();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let name = address.clone();
+    std::thread::Builder::new()
+        .name("cck-preview-host-ipc".into())
+        .spawn(move || preview_pipe::accept_loop(name, first, tx, thread_stop))?;
+    Ok(PreviewHost { address, requests, stop })
 }
 
 /// The blocking accept loop, factored out so it can be driven directly by a test (or by
@@ -840,10 +924,11 @@ pub enum HandoffError {
     /// A host was found but did not accept: it was exiting, wedged, version-mismatched,
     /// refused the connection, or explicitly rejected. Carries a reason for the log.
     NotAccepted(String),
-    /// This platform has no preview-handoff transport (Windows today). Constructed ONLY by
-    /// the non-unix [`send_to_host`] stub, so on unix it is legitimately unreachable — the
-    /// honest platform gate rather than a blanket module allow.
-    #[cfg_attr(unix, allow(dead_code))]
+    /// This platform has no preview-handoff transport (neither unix sockets nor Windows
+    /// named pipes). Constructed ONLY by the no-transport sender stubs, so wherever a
+    /// transport exists it is legitimately unreachable — the honest platform gate rather
+    /// than a blanket module allow.
+    #[cfg_attr(any(unix, windows), allow(dead_code))]
     Unsupported,
 }
 
@@ -863,15 +948,15 @@ impl std::fmt::Display for HandoffError {
 /// Advisory ONLY: a host can exit between this call and [`send_to_host`], and a marker
 /// with no socket isn't a host at all. Never branch on this alone; the acknowledged
 /// [`send_to_host`] exchange is the only proof of a handoff.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn host_pid() -> Option<u32> {
     crate::instance::live_preview_host()
 }
 
-/// Windows stub: with no transport there is never a host to find, so the child's fast-out
-/// answers honestly without a `cfg` at the call site (its companion is
-/// [`host_supported`]).
-#[cfg(not(unix))]
+/// No-transport stub (neither unix sockets nor Windows named pipes): there is never a
+/// host to find, so the child's fast-out answers honestly without a `cfg` at the call
+/// site (its companion is [`host_supported`]).
+#[cfg(not(any(unix, windows)))]
 pub fn host_pid() -> Option<u32> {
     None
 }
@@ -932,9 +1017,24 @@ pub fn send_color_to_pid(pid: u32, rgb: [u8; 3]) -> Result<(), HandoffError> {
         .map_err(HandoffError::NotAccepted)
 }
 
-/// Windows stub: no unix socket, so an editor-launched pick simply shows its own result
-/// window, exactly as every other pick does.
-#[cfg(not(unix))]
+/// The Windows arm of [`send_color_to_pid`] (DRAGON-651): the same addressed delivery,
+/// over the editor's per-pid named pipe. There is no socket FILE whose absence pre-answers
+/// "nobody listening" — the connect's own not-found does, carried as
+/// [`HandoffError::NoHost`] so the caller's ladder reads identically on every platform.
+#[cfg(windows)]
+pub fn send_color_to_pid(pid: u32, rgb: [u8; 3]) -> Result<(), HandoffError> {
+    use crate::platform::windows::preview_pipe::SendError;
+    let addr = crate::instance::preview_host_address(pid);
+    match send_to_pipe(&addr, &Request::Color { to: ColorDest::Editor, rgb }) {
+        Ok(()) => Ok(()),
+        Err(SendError::NoListener) => Err(HandoffError::NoHost),
+        Err(SendError::Failed(why)) => Err(HandoffError::NotAccepted(why)),
+    }
+}
+
+/// No-transport stub (neither unix sockets nor Windows named pipes): an editor-launched
+/// pick simply shows its own result window, exactly as every other pick does.
+#[cfg(not(any(unix, windows)))]
 pub fn send_color_to_pid(_pid: u32, _rgb: [u8; 3]) -> Result<(), HandoffError> {
     Err(HandoffError::Unsupported)
 }
@@ -978,33 +1078,90 @@ pub fn send_color_to_picker(rgb: [u8; 3]) -> Result<u32, HandoffError> {
     }
 }
 
-/// Windows stub: no unix-socket transport, so every pick opens its own window there, exactly
-/// as it does today (DRAGON-613).
-///
-/// Deliberately a stub and not a pretend success. A Windows transport is a real option and
-/// its shape is already established: it would mirror `daemon_ipc`'s named-pipe split
-/// (`daemon_ipc::pipe_name`) behind this same seam, which is the same note the module doc
-/// carries for the capture handoff. Nothing else in this feature would change.
-#[cfg(not(unix))]
+/// The Windows arm of [`send_color_to_picker`] (DRAGON-651): the same searched delivery —
+/// the discovery scan is the SAME portable marker scan — over each candidate's per-pid
+/// named pipe. A "nobody listening" connect is skipped without counting as a refusal,
+/// exactly the skip the unix arm gives a marker with no socket file beside it.
+#[cfg(windows)]
+pub fn send_color_to_picker(rgb: [u8; 3]) -> Result<u32, HandoffError> {
+    use crate::platform::windows::preview_pipe::SendError;
+    let windows = crate::instance::live_color_picker_windows();
+    if windows.is_empty() {
+        return Err(HandoffError::NoHost);
+    }
+    let req = Request::Color { to: ColorDest::PickerWindow, rgb };
+    let mut last: Option<String> = None;
+    for pid in windows {
+        match send_to_pipe(&crate::instance::color_picker_host_address(pid), &req) {
+            Ok(()) => return Ok(pid),
+            // A marker whose pipe no longer answers is not a listening window at all (its
+            // owner is mid-exit, or its bind failed) — skip without counting it as a
+            // refusal.
+            Err(SendError::NoListener) => continue,
+            Err(SendError::Failed(why)) => {
+                log::info!("color handoff to picker window at pid {pid} failed: {why}");
+                last = Some(why);
+            }
+        }
+    }
+    match last {
+        Some(why) => Err(HandoffError::NotAccepted(why)),
+        None => Err(HandoffError::NoHost),
+    }
+}
+
+/// No-transport stub (neither unix sockets nor Windows named pipes): every pick opens its
+/// own window there. Deliberately a stub and not a pretend success — see
+/// [`HandoffError::Unsupported`].
+#[cfg(not(any(unix, windows)))]
 pub fn send_color_to_picker(_rgb: [u8; 3]) -> Result<u32, HandoffError> {
     Err(HandoffError::Unsupported)
 }
 
-/// Windows stub: there is no unix socket, so a capture always opens its own preview,
-/// exactly as it does today. The CHILD side is the portable one on purpose — it sits in
-/// the shared capture-finish path, so it must compile and answer honestly everywhere.
-#[cfg(not(unix))]
+/// The Windows arm of [`send_to_host`] (DRAGON-651): the same discovery scan and the same
+/// preference order, over each candidate's per-pid preview pipe.
+#[cfg(windows)]
+pub fn send_to_host(req: &OpenRequest) -> Result<u32, HandoffError> {
+    use crate::platform::windows::preview_pipe::SendError;
+    let hosts = crate::instance::live_preview_hosts();
+    if hosts.is_empty() {
+        return Err(HandoffError::NoHost);
+    }
+    let mut last: Option<String> = None;
+    let req = Request::Open(req.clone());
+    for pid in hosts {
+        match send_to_pipe(&crate::instance::preview_host_address(pid), &req) {
+            Ok(()) => return Ok(pid),
+            // A marker whose pipe does not answer isn't a host at all (an older build's
+            // preview, or a failed bind) — skip without counting it as a refusal.
+            Err(SendError::NoListener) => continue,
+            Err(SendError::Failed(why)) => {
+                log::info!("preview handoff to pid {pid} failed: {why}");
+                last = Some(why);
+            }
+        }
+    }
+    match last {
+        Some(why) => Err(HandoffError::NotAccepted(why)),
+        None => Err(HandoffError::NoHost),
+    }
+}
+
+/// No-transport stub (neither unix sockets nor Windows named pipes): a capture always
+/// opens its own preview there. The CHILD side is the portable one on purpose — it sits
+/// in the shared capture-finish path, so it must compile and answer honestly everywhere.
+#[cfg(not(any(unix, windows)))]
 pub fn send_to_host(_req: &OpenRequest) -> Result<u32, HandoffError> {
     Err(HandoffError::Unsupported)
 }
 
 /// Whether THIS build can host preview handoffs at all, so a caller can branch without
-/// a `cfg`. `false` on Windows (no unix sockets — see the module doc's Platforms note),
-/// where the host half ([`PreviewHost`] / [`start_host`]) isn't compiled: host-side
-/// integration is therefore `#[cfg(unix)]`, while the child-side [`send_to_host`] is
-/// portable and simply reports [`HandoffError::Unsupported`].
+/// a `cfg`. `true` on unix (sockets) and on Windows (named pipes, DRAGON-651); `false`
+/// only where neither transport exists, where the host half ([`PreviewHost`] /
+/// [`start_host`]) isn't compiled and the child-side senders report
+/// [`HandoffError::Unsupported`].
 pub const fn host_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// One handoff attempt against ONE socket path: connect, send, and WAIT for the host's
@@ -1030,6 +1187,26 @@ fn send_to_socket(path: &str, req: &Request) -> Result<(), String> {
         Some(Reply::Accepted) => Ok(()),
         Some(Reply::Rejected(r)) => Err(format!("rejected ({})", r.as_str())),
         None => Err(format!("unrecognised reply {:?}", line.trim())),
+    }
+}
+
+/// One handoff attempt against ONE pipe name — [`send_to_socket`]'s Windows twin
+/// (DRAGON-651). The connect/send/read-ack syscalls are the plugin's
+/// (`platform::windows::preview_pipe::exchange`, bounded by [`ACK_TIMEOUT`]); the reply
+/// PARSE stays here so both transports read the same words the same way. The "nobody is
+/// listening" case keeps its own variant because a pipe has no socket file whose absence
+/// pre-answers it — the callers map it to [`HandoffError::NoHost`] / a skip.
+#[cfg(windows)]
+fn send_to_pipe(
+    address: &str,
+    req: &Request,
+) -> Result<(), crate::platform::windows::preview_pipe::SendError> {
+    use crate::platform::windows::preview_pipe::{SendError, exchange};
+    let line = exchange(address, &req.encode(), ACK_TIMEOUT)?;
+    match Reply::parse(&line) {
+        Some(Reply::Accepted) => Ok(()),
+        Some(Reply::Rejected(r)) => Err(SendError::Failed(format!("rejected ({})", r.as_str()))),
+        None => Err(SendError::Failed(format!("unrecognised reply {:?}", line.trim()))),
     }
 }
 
@@ -1587,7 +1764,7 @@ mod tests {
                 return;
             }
         };
-        let path = host.socket_path().to_string();
+        let path = host.address().to_string();
         assert!(
             path.ends_with(&format!("cosmic-capture-kit.{}.preview.sock", std::process::id())),
             "{path}"
@@ -1609,5 +1786,151 @@ mod tests {
             !std::path::Path::new(&path).exists(),
             "dropping the host must unlink its socket"
         );
+    }
+
+    // ── Pipe-level tests (DRAGON-651: the Windows transport, a real named pipe under a
+    // test-only name; no compositor, GPU or runtime-dir dependency) ──────────────
+
+    /// A test-only pipe name, per-pid + per-case so parallel tests never share one.
+    #[cfg(windows)]
+    fn test_pipe(tag: &str) -> String {
+        format!(r"\\.\pipe\cck-preview-ipc-test-{}-{tag}", std::process::id())
+    }
+
+    #[cfg(windows)]
+    use crate::platform::windows::preview_pipe::SendError;
+
+    /// The whole Windows exchange end-to-end: bind the pipe host, send a colour, ack it —
+    /// the pipe twin of `a_picked_color_reaches_the_host_and_is_acked`.
+    #[cfg(windows)]
+    #[test]
+    fn a_picked_color_crosses_the_pipe_and_is_acked() {
+        let host = start_host_at(test_pipe("color")).expect("bind the pipe");
+        let addr = host.address().to_string();
+        let child = std::thread::spawn(move || send_to_pipe(&addr, &COLOR_TO_EDITOR));
+        let handoff = host.requests.recv_timeout(Duration::from_secs(5)).expect("the colour arrives");
+        assert_eq!(handoff.request(), &COLOR_TO_EDITOR, "the exact colour and destination");
+        handoff.accept();
+        assert!(child.join().unwrap().is_ok(), "the sender must see the ack");
+    }
+
+    /// One sample colour message for the pipe tests, like the unix `COLOR_TO_EDITOR`.
+    #[cfg(windows)]
+    const COLOR_TO_EDITOR: Request =
+        Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0] };
+
+    /// A refusal crosses the pipe as a refusal — never as a delivery.
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_color_on_the_pipe_is_not_a_delivery() {
+        let host = start_host_at(test_pipe("refuse")).expect("bind the pipe");
+        let addr = host.address().to_string();
+        let child = std::thread::spawn(move || send_to_pipe(&addr, &COLOR_TO_EDITOR));
+        host.requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the colour arrives")
+            .reject(RejectReason::Busy);
+        match child.join().unwrap() {
+            Err(SendError::Failed(why)) => assert!(why.contains("busy"), "{why}"),
+            other => panic!("a rejection is never a delivery: {other:?}"),
+        }
+    }
+
+    /// THE failure mode that must never lose a pick: the host drops the handoff unacked
+    /// (mid-exit). The pipe closes, the sender reads no ack, and it must fall back.
+    #[cfg(windows)]
+    #[test]
+    fn host_exiting_mid_pipe_connect_makes_the_sender_fall_back() {
+        let host = start_host_at(test_pipe("exiting")).expect("bind the pipe");
+        let addr = host.address().to_string();
+        let child = std::thread::spawn(move || send_to_pipe(&addr, &Request::Open(sample())));
+        let handoff = host.requests.recv_timeout(Duration::from_secs(5)).expect("handoff arrives");
+        drop(handoff); // the host dies / gives up before acking
+        match child.join().unwrap() {
+            Err(SendError::Failed(why)) => assert!(why.contains("no ack"), "{why}"),
+            other => panic!("the sender must NOT think it was accepted: {other:?}"),
+        }
+    }
+
+    /// Nobody listening at the name: the connect's not-found IS the "no host" answer
+    /// (there is no socket file to pre-check on Windows), and it fails fast.
+    #[cfg(windows)]
+    #[test]
+    fn a_missing_pipe_fails_fast_as_no_listener() {
+        match send_to_pipe(&test_pipe("missing"), &Request::Open(sample())) {
+            Err(SendError::NoListener) => {}
+            other => panic!("nothing is listening: {other:?}"),
+        }
+    }
+
+    /// A version-mismatched sender is refused by the accept loop itself, `err version`,
+    /// and the request never reaches the host's update loop.
+    #[cfg(windows)]
+    #[test]
+    fn version_mismatch_is_refused_by_the_pipe_accept_loop() {
+        let host = start_host_at(test_pipe("version")).expect("bind the pipe");
+        let future = sample().encode().replacen(
+            &format!("{MAGIC} {PROTOCOL_VERSION} "),
+            &format!("{MAGIC} {} ", PROTOCOL_VERSION + 1),
+            1,
+        );
+        let reply = crate::platform::windows::preview_pipe::exchange(
+            host.address(),
+            &future,
+            Duration::from_secs(5),
+        )
+        .expect("a reply");
+        assert_eq!(Reply::parse(&reply), Some(Reply::Rejected(RejectReason::Version)));
+        assert!(
+            host.requests.try_recv().is_err(),
+            "a version-mismatched line must never reach the update loop"
+        );
+    }
+
+    /// Dropping the host shuts the accept thread down and frees the NAME: a later sender
+    /// finds nobody listening instead of a zombie listener nobody drains.
+    #[cfg(windows)]
+    #[test]
+    fn dropping_the_pipe_host_frees_the_name() {
+        let host = start_host_at(test_pipe("drop")).expect("bind the pipe");
+        let addr = host.address().to_string();
+        drop(host);
+        // The wake unsticks the accept thread; give it a bounded moment to close out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match send_to_pipe(&addr, &COLOR_TO_EDITOR) {
+                Err(SendError::NoListener) => return, // the name is gone
+                _ => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the pipe name must disappear after the host drops"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    /// Garbage on the pipe is refused (`err parse`) and the loop KEEPS SERVING: the next
+    /// (valid) sender still gets through — the pipe twin of the unix garbage test.
+    #[cfg(windows)]
+    #[test]
+    fn pipe_garbage_is_refused_and_the_loop_keeps_serving() {
+        let host = start_host_at(test_pipe("garbage")).expect("bind the pipe");
+        let reply = crate::platform::windows::preview_pipe::exchange(
+            host.address(),
+            "hello there\n",
+            Duration::from_secs(5),
+        )
+        .expect("a reply");
+        assert_eq!(Reply::parse(&reply), Some(Reply::Rejected(RejectReason::Parse)));
+
+        let addr = host.address().to_string();
+        let child = std::thread::spawn(move || send_to_pipe(&addr, &COLOR_TO_EDITOR));
+        host.requests
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the loop still serves")
+            .accept();
+        assert!(child.join().unwrap().is_ok());
     }
 }

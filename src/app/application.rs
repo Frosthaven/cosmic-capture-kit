@@ -1,5 +1,55 @@
 use super::*;
 
+/// The two launch marks that bracket the span `App::init` hands BACK to the toolkit.
+///
+/// Between `App::init returning` and the first thing this app does again, control belongs
+/// entirely to iced/libcosmic/winit/wgpu: the returned `Task` batch is spawned, the
+/// bootstrap surface is created, and the wgpu compositor (instance, adapter, device,
+/// surface, first pipelines) is built lazily around it. Until these marks existed that was
+/// one unlabelled hole in the timeline, and it is the largest single block in a macOS
+/// capture launch: the last mark on a wedged launch was `App::init returning`, which cannot
+/// distinguish "the toolkit never came back" from "our own first update never finished".
+///
+/// Two marks split it, because the toolkit hands control back at two different seams and
+/// which one comes first is itself the diagnosis:
+///
+/// * **first `view_window`** — the compositor exists and is asking us for a scene. Time
+///   spent BEFORE this is toolkit/GPU bring-up and is not ours.
+/// * **first `update`** — the message loop is draining. `init`'s batched `SeedOutputs` is
+///   normally the message that lands here, so this is when the overlay minting can start.
+///
+/// **What they measured on macOS**, warm, region capture, so the next person does not have
+/// to re-derive it: ~65ms from `init` returning to the first `view_window` (wgpu compositor
+/// bring-up), ~9ms more to the first `update`, then a further **~59ms before the SECOND
+/// message drain**, and only then can the overlays be minted. That 59ms is NOT work we hand
+/// the toolkit, and two A/B runs proved it. Dropping `set_theme` out of `init`'s task batch
+/// moved it by 0.1ms (59.8 → 59.7). Moving `SeedOutputs` to the FRONT of the batch drained
+/// it 59ms earlier and changed first paint by nothing (335.6 → 340.8ms): the follow-up
+/// `SeedOverlays` simply inherited the same stall. In both runs the queue unblocked at the
+/// exact moment the bootstrap `window::open` reported back, which is what the stall is —
+/// the message loop blocked behind the 1x1 bootstrap window's creation and first present,
+/// a window libcosmic's `no_main_window(true)` requires us to open. Do not spend another
+/// afternoon re-testing task ORDER; the order is not the variable.
+///
+/// One-shot on purpose: `update` and `view_window` run on every frame and every message, and
+/// a mark per call would bury the launch timeline in its own noise. `Once::call_once` is a
+/// single relaxed atomic load on the (overwhelmingly common) already-called path, which is
+/// the same order of cost the marks themselves already pay when logging is off.
+fn mark_first_update() {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        crate::util::timing_mark("App::update FIRST call (toolkit message loop draining)");
+    });
+}
+
+/// The view half of [`mark_first_update`]; see that doc for why both exist.
+fn mark_first_view() {
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        crate::util::timing_mark("App::view_window FIRST call (wgpu compositor up, asking for a scene)");
+    });
+}
+
 impl cosmic::Application for App {
     type Executor = cosmic::executor::Default;
     /// How the app was launched (`--settings`, `--preview <file>`, or a normal capture).
@@ -231,7 +281,7 @@ impl cosmic::Application for App {
         // scan launch defers the pre-capture, so it starts UNARMED — the poll is armed
         // lazily by `SetMode(Window)` when it kicks the deferred grab. A settings /
         // preview launch never captures, so it's unarmed too.
-        let windows_loading = launch_precapture_runs(scene_active, launch_mode);
+        let precapture_running = launch_precapture_runs(scene_active, launch_mode);
         // DRAGON-212: the flats grab is DEFERRED on BOTH platforms now (empty `frozen`
         // here); it lands via `FrozenReady`, so mark it pending whenever the scene is active
         // so the drain poll runs.
@@ -419,13 +469,21 @@ impl cosmic::Application for App {
                 windows: HashMap::new(),
                 // Armed only for a window-mode launch (its pre-capture is running);
                 // deferred launches arm it lazily on the first switch to window mode
-                // (DRAGON-204).
-                windows_loading,
-                window_warmup: 0,
+                // (DRAGON-204). QUIET rather than spinner-up: the spinner is not drawn
+                // unless the pre-capture outlasts the reveal threshold (DRAGON-645), so a
+                // fast window-mode launch goes straight to the picker.
+                picker_load: if precapture_running {
+                    overlay::PickerLoad::Quiet { ticks: 0 }
+                } else {
+                    overlay::PickerLoad::Idle
+                },
+                // Nothing is on screen yet, which is the whole point: the reveal threshold
+                // does not begin until the picker has actually drawn (DRAGON-645).
+                picker_painted: std::cell::Cell::new(false),
                 precapture,
                 // Kicked at launch only for a window-mode launch; a deferred launch
                 // kicks it lazily on the first switch into window mode (DRAGON-204).
-                window_precapture_started: windows_loading,
+                window_precapture_started: precapture_running,
                 // Random per launch (no rng dep): seed from the clock's subsec nanos.
                 loading_msg: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -473,6 +531,12 @@ impl cosmic::Application for App {
                     // path a picker actually takes, so the read has to happen HERE and not
                     // only in `apply_persisted`, which runs for a reset or a reload.
                     zoom: color_picker::geom::zoom_from_persisted(persisted.color_picker_zoom),
+                    // DRAGON-630: the remembered value mode, same launch-path reasoning.
+                    // Junk resolves to hex, the tool's historical copy. The value row's
+                    // split-vs-whole layout is remembered the same way.
+                    mode: crate::color::ColorFormat::from_id(&persisted.color_picker_mode)
+                        .unwrap_or(crate::color::ColorFormat::Hex),
+                    split_inputs: persisted.color_picker_split_inputs,
                     ..Default::default()
                 },
                 keymap,
@@ -517,7 +581,7 @@ impl cosmic::Application for App {
                 preview_duck_refs: Default::default(),
                 // Bound lazily, at the first preview mint (`preview_surface_for`) — a
                 // capture that never opens a preview never hosts.
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 handoff_host: None,
                 // Bound lazily too, at record start (`begin_recording_tray`): a session
                 // that never records is never reachable by a recording command.
@@ -866,6 +930,7 @@ impl cosmic::Application for App {
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Msg> {
+        mark_first_view();
         // The settings window is its own toplevel, rendered independently of the
         // per-output capture overlays.
         if Some(id) == self.settings.window {
@@ -940,6 +1005,7 @@ impl cosmic::Application for App {
     }
 
     fn update(&mut self, message: Msg) -> Task<cosmic::Action<Msg>> {
+        mark_first_update();
         let task = match message {
             Msg::Capture(message) => self.update_capture(message),
             Msg::Recording(message) => self.update_recording(message),

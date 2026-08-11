@@ -447,6 +447,25 @@ pub struct Persisted {
     /// to the debug log (see `app::color_picker`'s privacy note).
     #[serde(default)]
     pub recent_colors: Vec<String>,
+    /// DRAGON-630: the colour picker window's value MODE, as a `ColorFormat::id` string
+    /// (`hex`, `rgb`, `hsl`, `hsv`, `oklch`, `cmyk`, `lab`).
+    ///
+    /// Persisted because the picker is a ONE-SHOT process and the owner asked for the
+    /// remembered mode: it is what the window's value row opens showing, AND the
+    /// spelling the pick's own clipboard copy takes, so a user who works in `rgb()` gets
+    /// `rgb()` on every pick without touching the stepper again.
+    ///
+    /// Never trusted as read: `ColorFormat::from_id` resolves it and anything
+    /// unrecognised falls back to hex (the tool's historical copy), so a hand-edited
+    /// config cannot invent a notation.
+    #[serde(default = "default_color_picker_mode")]
+    pub color_picker_mode: String,
+    /// DRAGON-630: whether the picker window's value row shows SPLIT per-channel boxes
+    /// (`true`, the default and the original layout) or ONE whole-value box holding the
+    /// full spelling exactly as the copy button would take it. The row's list toggle
+    /// writes it; remembered because the picker is one-shot, like the mode above.
+    #[serde(default = "default_true")]
+    pub color_picker_split_inputs: bool,
     /// Video recording frame rate (fps).
     #[serde(default = "default_record_fps")]
     pub record_fps: u32,
@@ -813,6 +832,12 @@ fn default_color_picker_opacity() -> f32 {
 /// assert in `color_picker::geom` the single authority on the bounds.
 fn default_color_picker_zoom() -> u32 {
     crate::app::color_picker::geom::MAGNIFIER_ZOOM_DEFAULT
+}
+
+/// The picker window's opening value mode (DRAGON-630): hex, which is what the tool
+/// always copied before modes existed, so an untouched config behaves byte-identically.
+fn default_color_picker_mode() -> String {
+    crate::color::ColorFormat::Hex.id().to_string()
 }
 
 /// The customize-mode corner-rounding default (used when `appearance_use_system` is

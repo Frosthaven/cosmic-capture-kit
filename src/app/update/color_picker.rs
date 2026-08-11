@@ -12,8 +12,63 @@
 //! (`ColorFormat::id`) or the event, never a colour value.
 
 use super::super::*;
-use crate::app::color_picker::{geom, Hover};
-use crate::color::{ColorFormat, Srgb};
+use crate::app::color_picker::{build_magnifier_raster, geom, Hover};
+use crate::color::Srgb;
+
+/// The corner radius the window's gradient rasters take, so the square and the tracks
+/// follow the appearance page's "Edge rounding" exactly as the swatches do
+/// (DRAGON-630, the owner's review): the same `s` token `view::swatch_radius` reads,
+/// off the live theme the way `picker_ring` reads the accent.
+fn picker_corner_radius() -> f64 {
+    crate::app::theme::rounding(&cosmic::theme::active()).s[0] as f64
+}
+
+/// The round swatch's rim tone as raster bytes: the theme's SUBDUED tone
+/// (`theme::subdued`), the owner's "subdued, not white/black" for swatch borders.
+/// `theme::subtle` stood here first and the owner flagged it as brighter than asked.
+fn picker_rim() -> [u8; 3] {
+    let c = crate::app::theme::subdued(&cosmic::theme::active());
+    [
+        (c.r * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c.g * 255.0).round().clamp(0.0, 255.0) as u8,
+        (c.b * 255.0).round().clamp(0.0, 255.0) as u8,
+    ]
+}
+
+/// May a resample leave the magnifier's RASTER stale to keep up with a fast pointer
+/// (DRAGON-TBD)?
+///
+/// One question, asked once, because the answer is a property of the CALLER and not of the
+/// picker's state. Getting it from the state instead is the mistake this type exists to make
+/// impossible: the pacing measures pointer speed, and a keyboard nudge arriving while the hand
+/// is still coasting would inherit that speed and have its raster deferred, so the arrow keys
+/// would feel broken in exactly the moment the user reached for them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RasterPolicy {
+    /// Rebuild the raster whenever the picture changed. Every route but the pointer's own
+    /// per-frame one: the keyboard nudge (DRAGON-599), the frozen-snapshot delivery
+    /// (DRAGON-601) and a session's first sample. All byte-identical to before the pacing.
+    Always,
+    /// The pointer's per-frame path, and ONLY it: may decline a raster while the pointer is
+    /// sweeping (`geom::raster_due`), re-arming itself so the settle is never missed.
+    Paced,
+}
+
+/// **Pure**, unit-tested: may this resample leave the magnifier's raster stale (DRAGON-TBD)?
+///
+/// One line, and it has its own name and its own tests because of what the FIRST term
+/// guarantees: [`RasterPolicy::Always`] refuses to skip whatever the pointer is doing, so a
+/// keyboard nudge pressed while the hand is still coasting from a sweep cannot inherit that
+/// speed and have its raster deferred. That is the failure this seam exists to prevent, it is
+/// invisible in a headless build, and a person reading the call site cannot tell it holds; a
+/// test can.
+fn skips_raster(
+    policy: RasterPolicy,
+    since_last_raster: Option<std::time::Duration>,
+    speed: f32,
+) -> bool {
+    policy == RasterPolicy::Paced && !geom::raster_due(since_last_raster, speed)
+}
 
 impl App {
     pub(in crate::app) fn update_color_picker(
@@ -24,12 +79,64 @@ impl App {
             ColorPickerMsg::Moved(output, point) => {
                 // DRAGON-599: the pointer really moved, so the sample belongs to the pointer
                 // again and the keyboard's displacement is dropped. Recording the position and
-                // resetting the nudge are the whole of this arm; everything else is the
-                // shared resample below, which is also what a key press runs.
+                // resetting the nudge are the whole of this arm.
+                //
+                // DRAGON-TBD: and, once the lens exists, it is now nearly the whole arm. The
+                // resample used to run right here, once per raw `CursorMoved`, and that is more
+                // often than the screen is redrawn: every intermediate raster between two
+                // presented frames is built and thrown away unseen, and macOS delivers pointer
+                // motion uncoupled from the display's cadence, so it paid for most of them.
+                // The lens is re-sampled once per RENDERED FRAME instead, by the redraw
+                // published from `widgets::color_pick` while `resample_due` is set, so the
+                // cadence is whatever the display actually runs at (120Hz on a ProMotion panel,
+                // where a fixed 16ms timer visibly under-sampled and read as stepped motion).
+                //
+                // The bookkeeping stays synchronous because it is two field writes and because
+                // `needs_pointer` (DRAGON-610) reads `pointer` on the very next redraw.
+                //
+                // DRAGON-650: this message itself now arrives at most once per PRESENTED
+                // frame, coalesced by `widgets::color_pick` (its module doc, "Pointer reports
+                // ride the redraw", carries the Windows present-starvation measurement that
+                // forced it). Nothing here had to change for that: the arm was already shaped
+                // for "record the latest position", however often it arrives.
                 self.color_picker.nudge =
                     geom::nudge_after(self.color_picker.nudge, geom::SampleMove::Pointer);
                 self.color_picker.pointer = Some((output.clone(), point));
-                self.color_picker_resample()
+                self.color_picker.resample_due = true;
+                // …with ONE exception, and it is a correctness one rather than a latency one.
+                // While there is NO hover yet, "the pointer is known, the snapshot has landed
+                // and there is still no sample" is what `keyboard::picker_sample_state` reads
+                // as UNREADABLE, and an accept key pressed in that gap would tell the user this
+                // display cannot be read (DRAGON-612). Before the deferral that gap could not
+                // exist, because the move that set the pointer also set the hover. So the FIRST
+                // sample after any gap still runs inline, which is also what keeps the loupe
+                // appearing the instant the pointer is located (DRAGON-609/610).
+                //
+                // Nothing is lost by it: with no hover there is nothing to coalesce, and every
+                // reason a hover STAYS absent (the snapshot still in flight, a display with no
+                // pixel source, a disc entirely off-surface) makes the resample return early
+                // without rastering anything at all. The burst this defers is a moving pointer
+                // over a hover that already exists, which is the whole of the reported problem.
+                if self.color_picker.hover.is_none() {
+                    self.color_picker.resample_due = false;
+                    return self.color_picker_resample();
+                }
+                Task::none()
+            }
+            // DRAGON-TBD: one per RENDERED FRAME, published by `widgets::color_pick` from the
+            // redraw it is already handed while `resample_due` is set (or riding the frame's
+            // own coalesced `Moved`, DRAGON-650). It reads the pointer position that report
+            // just recorded, so a burst of motion costs ONE look per frame rather than one
+            // per event, and it arrives at the display's own cadence rather than a number we
+            // picked.
+            //
+            // Clearing the flag FIRST is what stops the loop: iced re-dispatches its redraw
+            // event after a message published from one, so a flag left set would publish again
+            // in the same pass. The paced branch inside the resample is the one thing allowed
+            // to set it back, which is precisely the "look again next frame" it needs.
+            ColorPickerMsg::ResamplePoll => {
+                self.color_picker.resample_due = false;
+                self.color_picker_resample_with(RasterPolicy::Paced)
             }
             ColorPickerMsg::Pick(output, point) => self.color_picker_pick(&output, point),
             ColorPickerMsg::Zoom(steps) => self.color_picker_zoom(steps),
@@ -63,38 +170,108 @@ impl App {
                     geom::nudge_after(self.color_picker.nudge, geom::SampleMove::Keys(dx, dy));
                 self.color_picker_resample()
             }
-            ColorPickerMsg::RowEdited(format, text) => {
+            // DRAGON-630: the gradient square. The square hands back field units: x is
+            // saturation, y runs DOWN while value runs up. The TRACKED HSV is the
+            // master here, written before the colour, so a drag through the achromatic
+            // edge cannot snap the hue (`color::hsv_tracking`), and `apply_picker_color`
+            // (not `set_picker_color`) so the byte-quantised colour cannot re-track the
+            // exact position the hand just chose.
+            ColorPickerMsg::SvChanged(nx, ny) => {
+                let hsv = [
+                    self.color_picker.hsv[0],
+                    nx.clamp(0.0, 1.0) as f64,
+                    (1.0 - ny.clamp(0.0, 1.0)) as f64,
+                ];
+                self.color_picker.hsv = hsv;
+                self.color_picker.draft = None;
+                self.apply_picker_color(crate::color::srgb_from_hsv(hsv), geom::ColorSource::Edit);
+                Task::none()
+            }
+            // DRAGON-630: the hue strip. Same master-HSV rule as the square; this is
+            // also the one interaction that re-rasters the square (its whole picture is
+            // the hue).
+            ColorPickerMsg::HueChanged(nx) => {
+                let mut hsv = self.color_picker.hsv;
+                hsv[0] = (nx.clamp(0.0, 1.0) as f64) * 360.0;
+                self.color_picker.hsv = hsv;
+                self.color_picker.draft = None;
+                self.refresh_sv_raster();
+                self.apply_picker_color(crate::color::srgb_from_hsv(hsv), geom::ColorSource::Edit);
+                Task::none()
+            }
+            // DRAGON-630: the alpha strip. Only the alpha moves: the colour, the recents
+            // and the square stay put, and only the swatch disc re-rasters (the strip
+            // itself paints the alpha RANGE, which does not depend on the alpha).
+            ColorPickerMsg::AlphaChanged(na) => {
+                self.color_picker.alpha = (na.clamp(0.0, 1.0) * 255.0).round() as u8;
+                self.color_picker.draft = None;
+                self.refresh_color_rasters();
+                Task::none()
+            }
+            // DRAGON-630: the mode dropdown. Persist (the remembered mode is the
+            // owner's ask, and this is its one writer, so the save rides here) and copy
+            // the value in the NEW mode's spelling, the control's stated contract.
+            // Re-selecting the current mode is a no-op: nothing changed, so nothing is
+            // saved and nothing lands on the clipboard.
+            ColorPickerMsg::ModeSelected(idx) => {
+                // A selection always CLOSES the menu, even the no-op re-selection of
+                // the current mode: the click landed, so the menu's job is done.
+                self.color_picker.mode_menu_open = false;
+                let Some(mode) = crate::color::ColorFormat::ALL.get(idx).copied() else {
+                    return Task::none();
+                };
+                if mode == self.color_picker.mode {
+                    return Task::none();
+                }
+                self.color_picker.mode = mode;
+                self.color_picker.draft = None;
+                self.save_state();
+                self.copy_picker_value()
+            }
+            // DRAGON-630 rev 4: the mode chip's menu. Transient view state, no save.
+            ColorPickerMsg::ModeMenuToggled => {
+                self.color_picker.mode_menu_open = !self.color_picker.mode_menu_open;
+                Task::none()
+            }
+            ColorPickerMsg::BoxEdited(idx, text) => {
                 // The colour follows the box the moment the text PARSES; a value that
                 // does not parse yet (half typed) leaves the colour where it was, so the
                 // swatch never flashes through nonsense on the way to a valid value.
-                if let Some(c) = format.parse(&text) {
+                // The WHOLE-VALUE box (the layout toggle's collapsed state) parses the
+                // full spelling; a channel box parses its one component.
+                let parsed = if idx == crate::app::color_picker::WHOLE_VALUE_BOX {
+                    self.color_picker.mode.parse_with_alpha(&text)
+                } else {
+                    self.color_picker.mode.with_component(
+                        self.color_picker.color,
+                        self.color_picker.alpha,
+                        idx,
+                        &text,
+                    )
+                };
+                if let Some((c, a)) = parsed {
+                    self.color_picker.alpha = a;
                     self.set_picker_color(c, geom::ColorSource::Edit);
                 }
-                self.color_picker.draft = Some((format, text));
+                self.color_picker.draft = Some((self.color_picker.mode, idx, text));
                 Task::none()
             }
-            ColorPickerMsg::RowCommitted => {
-                // Drop the draft so every row, including this one, re-renders in its
+            ColorPickerMsg::BoxCommitted => {
+                // Drop the draft so every box, including this one, re-renders in its
                 // canonical spelling.
                 self.color_picker.draft = None;
                 Task::none()
             }
-            ColorPickerMsg::CopyRow(format) => {
-                let value = self.color_picker.row_text(format);
-                self.color_picker.copied = Some((format, std::time::Instant::now()));
-                log::debug!("color picker: copied the {} row", format.id());
-                Task::batch([
-                    crate::share::copy_text_task(&value),
-                    // One delayed clear, rather than a subscription ticking for two
-                    // seconds: the flash needs exactly one redraw, at its end.
-                    Task::perform(
-                        async {
-                            tokio::time::sleep(crate::widgets::copy_button::COPIED_FLASH).await;
-                        },
-                        |()| cosmic::Action::App(Msg::ColorPicker(ColorPickerMsg::ClearCopied)),
-                    ),
-                ])
+            // DRAGON-630 rev 3: the split-vs-whole layout toggle. Persisted like the
+            // mode (one-shot process, remembered state, this is the one writer). The
+            // draft drops because it belonged to a box that no longer exists.
+            ColorPickerMsg::InputLayoutToggled => {
+                self.color_picker.split_inputs = !self.color_picker.split_inputs;
+                self.color_picker.draft = None;
+                self.save_state();
+                Task::none()
             }
+            ColorPickerMsg::CopyValue => self.copy_picker_value(),
             ColorPickerMsg::PickAgain => {
                 // The SAME route every other launcher takes (the tray entry, the global
                 // shortcut, the editor's toolbar pipette): a detached `--color-picker` child.
@@ -199,8 +376,10 @@ impl App {
     /// SOURCE PIXEL changed.
     ///
     /// The guard matters: a move inside one pixel is the common case at any sensible
-    /// pointer speed, and rebuilding the disc would mint a fresh image handle (a GPU
-    /// upload and an atlas entry) for a picture that has not changed.
+    /// pointer speed, and rebuilding the disc would raster ~24k pixels and re-upload them (on
+    /// the software-forced image arm, mint a fresh atlas entry too) for a picture that has
+    /// not changed.
+    /// It is also what makes DRAGON-TBD's 16ms poll free on a tick where nothing moved.
     ///
     /// The point READ is the pointer's own point, plus any keyboard nudge. It used to be
     /// displaced one point up and left as well, to escape an arrow sprite that covered its own
@@ -213,7 +392,19 @@ impl App {
     /// no position. Both routes write `ColorPickerState::pointer` / `nudge` first and then run
     /// this, so there is one sampling path rather than a pointer one and a nearly-identical
     /// keyboard one that could drift.
+    ///
+    /// DRAGON-TBD: this entry point is the ACCURATE one and always was. It rebuilds the raster
+    /// whenever the picture changed, full stop, and it is what the keyboard nudge, the
+    /// frozen-snapshot delivery and the first sample of a session all call. Only the pointer's
+    /// own per-frame path goes through [`Self::color_picker_resample_with`] with
+    /// [`RasterPolicy::Paced`].
     pub(in crate::app) fn color_picker_resample(&mut self) -> Task<cosmic::Action<Msg>> {
+        self.color_picker_resample_with(RasterPolicy::Always)
+    }
+
+    /// The body of [`Self::color_picker_resample`], with the one question the two callers
+    /// disagree about handed in (DRAGON-TBD). See [`RasterPolicy`].
+    fn color_picker_resample_with(&mut self, policy: RasterPolicy) -> Task<cosmic::Action<Msg>> {
         let Some((output, pointer)) = self.color_picker.pointer.clone() else {
             return Task::none();
         };
@@ -254,6 +445,17 @@ impl App {
             self.color_picker.hover = None;
             return Task::none();
         };
+        // How fast the pointer is travelling, from the PREVIOUS sample point (which is exactly
+        // `Hover::sample`) and the instant it was taken. Computed before the early returns
+        // below so the clock advances on every look, not only on the ones that raster.
+        let now = std::time::Instant::now();
+        let speed = match (self.color_picker.hover.as_ref(), self.color_picker.sampled_at) {
+            (Some(h), Some(at)) => geom::sample_speed(h.sample, sample, now.duration_since(at)),
+            // No previous sample to measure against is not a fast pointer, it is no
+            // information, and no information rasters (`geom::sample_speed`'s own rule).
+            _ => 0.0,
+        };
+        self.color_picker.sampled_at = Some(now);
         let same_picture = self.color_picker.hover.as_ref().is_some_and(|h| {
             h.output == output && h.pixel == (px, py) && h.zoom == zoom && h.disc == disc
         });
@@ -262,6 +464,53 @@ impl App {
             if let Some(h) = self.color_picker.hover.as_mut() {
                 h.sample = sample;
             }
+            return Task::none();
+        }
+        // DRAGON-TBD: the picture DID change, but on the pointer's own per-frame path a fast
+        // sweep changes it every single frame, and none of those pictures is one the user is
+        // reading: they are travelling. `geom::raster_min_interval` carries the measurement
+        // (57.5µs a raster, so this is about not doing invisible work rather than about a
+        // frame budget) and the ramp.
+        //
+        // What is skipped is ONLY the raster. The lens still follows the pointer and the hex
+        // chip still reports the pixel under it, because `sample` and `color` are not what the
+        // raster describes. `pixel`, `zoom` and `disc` deliberately are NOT updated: they are
+        // the IDENTITY of the pixels currently in the buffer, so writing them here would make
+        // the `same_picture` guard above agree with a lens showing something else, and a
+        // pointer that then stopped would keep that stale picture for good.
+        //
+        // DRAGON-650: "the lens still follows the pointer" is now actually true, and it was
+        // not when this pacing landed. The view used to PLACE the disc from `h.disc.origin`,
+        // the raster's own identity, so on every skipped frame the lens stood still and then
+        // jumped up to `RASTER_MAX_INTERVAL` of travel in one step — the reported "skips
+        // around erratically", obvious on a 60Hz panel where ordinary motion clears
+        // `DELIBERATE_SPEED`. The view now derives the drawn position from `h.sample` on
+        // every frame (`geom::drawn_disc_origin`), so this branch's `h.sample` write IS the
+        // lens's movement, and the raster identity stays honestly stale.
+        //
+        // The skip also requires the hover to be on THIS output (DRAGON-650): `h.sample` is a
+        // point in `h.output`'s own surface space, so writing a NEW output's coordinates into
+        // a hover still tagged with the old one would place the lens and the chip at a
+        // meaningless position on the wrong display for up to a pacing interval. A monitor
+        // crossing happens once per crossing, not once per frame, so rastering it immediately
+        // costs nothing the pacing exists to save.
+        //
+        // Leaving `resample_due` set is what guarantees the settle: it buys one more look on
+        // the next frame, and the frame after a hand stops measures zero speed, so it rasters.
+        let hover_on_this_output =
+            self.color_picker.hover.as_ref().is_some_and(|h| h.output == output);
+        if hover_on_this_output
+            && skips_raster(
+                policy,
+                self.color_picker.rastered_at.map(|t| now.duration_since(t)),
+                speed,
+            )
+        {
+            if let Some(h) = self.color_picker.hover.as_mut() {
+                h.sample = sample;
+                h.color = color;
+            }
+            self.color_picker.resample_due = true;
             return Task::none();
         }
         let Some(frozen) = self.frozen.get(output) else {
@@ -273,15 +522,28 @@ impl App {
             sample,
             pixel: (px, py),
             color,
-            magnifier: widget::image::Handle::from_rgba(w, h, rgba),
+            // DRAGON-650: keyed on what THIS process was forced to render with, not on the
+            // platform fact — the Windows 10 picker keeps wgpu now, so asking the platform
+            // would park its lens on the atlas-churning image arm for no reason. See
+            // `process_forced_software_backend`.
+            magnifier: build_magnifier_raster(
+                w,
+                h,
+                rgba,
+                crate::app::process_forced_software_backend(),
+            ),
             zoom,
             disc,
         });
+        self.color_picker.rastered_at = Some(now);
         Task::none()
     }
 
     /// The magnifier's accent RING, as the raster wants it: thickness in points and a
     /// straight RGBA ink (DRAGON-587 baked it into the buffer so it clips with the disc).
+    ///
+    /// (The two free functions below feed the WINDOW rasters the same way: theme facts
+    /// read at build time, because this all runs in `update` with no theme in hand.)
     ///
     /// The thickness is the user's "Selection box thickness", the same setting the region
     /// selector's box reads, which is what DRAGON-582 asked for: one width for both. The
@@ -309,8 +571,13 @@ impl App {
     /// [`geom::zoom_after_step`]'s. A step that lands on the value we already have does
     /// nothing at all, so holding `+` at the ceiling costs no re-raster.
     ///
-    /// The disc is rebuilt HERE rather than in `view`, for the reason `Hover` documents: a
-    /// per-frame `Handle::from_rgba` mints a new id and forces a GPU upload every redraw.
+    /// The disc is rebuilt HERE rather than in `view`, for the reason `Hover` documents:
+    /// rasterising per frame would re-upload the disc on every redraw.
+    ///
+    /// It stays SYNCHRONOUS, unlike the pointer's resample (DRAGON-TBD). A zoom route is a
+    /// wheel notch, a pinch notch or a key press, all of which are already coarse, and the
+    /// clamp above makes a step that changes nothing cost nothing; there is no burst here to
+    /// coalesce.
     fn color_picker_zoom(&mut self, steps: i32) -> Task<cosmic::Action<Msg>> {
         let zoom = geom::zoom_after_step(self.color_picker.zoom, steps);
         if zoom == self.color_picker.zoom {
@@ -328,7 +595,14 @@ impl App {
         let (pixel, disc) = (h.pixel, h.disc);
         let (w, ht, rgba) = geom::magnifier_rgba(&frozen.img, pixel, zoom, self.picker_ring(), disc);
         if let Some(h) = self.color_picker.hover.as_mut() {
-            h.magnifier = widget::image::Handle::from_rgba(w, ht, rgba);
+            // DRAGON-650: the same forced-backend predicate as the resample's raster, and
+            // for the same reason.
+            h.magnifier = build_magnifier_raster(
+                w,
+                ht,
+                rgba,
+                crate::app::process_forced_software_backend(),
+            );
             h.zoom = zoom;
         }
         Task::none()
@@ -389,8 +663,12 @@ impl App {
         }
         log::debug!("color picker: picked a color and opened the result window");
         let mut cmds = self.destroy_surfaces();
-        // The hex goes on the clipboard as part of the pick, and HOW it gets there is the one
-        // question every copy in the app asks (`share::copy_step`).
+        // The picked value goes on the clipboard as part of the pick, IN THE REMEMBERED
+        // MODE's spelling (DRAGON-630, the owner's ask: what the window copies on
+        // opening is the mode you left it in, not always hex). A pick is opaque and
+        // `set_picker_color` above has already reset the alpha, so this is the mode's
+        // plain spelling. HOW it gets there is the one question every copy in the app
+        // asks (`share::copy_step`).
         //
         // DRAGON-587, the owner's report that this copy simply did not happen. It used to be
         // an unconditional `copy_text_task` pushed into THIS batch, which is right on the
@@ -402,11 +680,11 @@ impl App {
         //
         // The window cannot possibly hold focus yet (it is minted three lines below), so the
         // focus term is a literal `false` rather than a lookup that could only ever say so.
-        let hex = ColorFormat::Hex.format(color);
+        let value = self.color_picker.value_text();
         match crate::share::copy_step(crate::share::copy_route(), false, false) {
             // A detached worker owns the selection and outlives us: spawn it now, exactly as
             // before. `copy_text_task` returns an empty task on this route.
-            crate::share::CopyStep::Detached => cmds.push(crate::share::copy_text_task(&hex)),
+            crate::share::CopyStep::Detached => cmds.push(crate::share::copy_text_task(&value)),
             // The window route: arm the latch and bound the wait. `flush_deferred_pick_copy`
             // writes it the moment the result window takes the keyboard, which is also the
             // input event whose serial the selection needs.
@@ -437,12 +715,12 @@ impl App {
         // that is not listening and needlessly opens a second one. (That direction only
         // costs the optimisation, never the colour.) A bind failure is non-fatal: we simply
         // do not receive, and every later pick behaves exactly as it did before this existed.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if self.handoff_host.is_none() {
-            let path = crate::instance::color_picker_socket_path(std::process::id());
-            match crate::preview_ipc::start_host_at(path) {
+            let addr = crate::instance::color_picker_host_address(std::process::id());
+            match crate::preview_ipc::start_host_at(addr) {
                 Ok(host) => {
-                    log::info!("color picker: listening for picks on {}", host.socket_path());
+                    log::info!("color picker: listening for picks on {}", host.address());
                     self.handoff_host = Some(host);
                 }
                 Err(e) => log::warn!("color picker: not listening for picks ({e})"),
@@ -490,13 +768,14 @@ impl App {
             match crate::preview_ipc::send_color_to_pid(pid, rgb) {
                 Ok(()) => {
                     log::debug!("color picker: the editor at pid {pid} took the picked color");
-                    // The hex COPY is deliberately skipped here when the session copies
+                    // The value COPY is deliberately skipped here when the session copies
                     // through a window, and the reason is stated rather than hidden: there is
                     // no window here to serve a selection from, and the colour has already
                     // gone where it was asked to go. On a data-control session the detached
-                    // worker still runs, so the hex is on the clipboard as a bonus.
+                    // worker still runs, so the value (in the remembered mode's spelling,
+                    // DRAGON-630) is on the clipboard as a bonus.
                     if crate::share::copy_route() == crate::share::CopyRoute::Standalone {
-                        crate::share::copy_text(&ColorFormat::Hex.format(color));
+                        crate::share::copy_text(&self.color_picker.mode.format(color));
                     }
                     let mut cmds = self.destroy_surfaces();
                     cmds.push(self.finish_session());
@@ -556,11 +835,12 @@ impl App {
     /// Hyprland). Handing off and exiting with no window would have quietly stopped that, so
     /// the copy moves to the process that still HAS a window, through the app's one copy
     /// ladder (`share::copy_step`) rather than a second reading of it.
-    // Its only caller is the unix drain (`drain_preview_handoffs`), which is a `Task::none()`
-    // stub off unix because there is no transport there. So this is honestly dead on Windows
-    // and stays portable anyway: the body is plain app state plus the shared copy ladder, and
-    // a Windows named-pipe transport would call it unchanged.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    // Its only caller is the drain (`drain_preview_handoffs`), which is a `Task::none()`
+    // stub only where no transport exists (neither unix sockets nor Windows named pipes).
+    // So this is honestly dead only there, and it stays portable: the body is plain app
+    // state plus the shared copy ladder. DRAGON-651 proved the old claim here — that a
+    // Windows named-pipe transport would call it unchanged — by doing exactly that.
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     pub(in crate::app) fn apply_handoff_pick(
         &mut self,
         rgb: [u8; 3],
@@ -575,14 +855,16 @@ impl App {
         // reporting it, so leaving it behind whatever they were looking at would read as the
         // pick having done nothing.
         let mut cmds = vec![window::gain_focus(id)];
-        let hex = ColorFormat::Hex.format(color);
+        // The remembered mode's spelling (DRAGON-630), like every other pick copy; the
+        // pick just reset the alpha, so this is the mode's plain form.
+        let value = self.color_picker.value_text();
         // Unlike the pick handler, the window here already EXISTS, so the focus term is a
         // real lookup rather than a literal `false`, and an already-focused window writes
         // immediately instead of waiting for a focus event that would never come.
         let focused = self.focused_window == Some(id);
         match crate::share::copy_step(crate::share::copy_route(), focused, false) {
             crate::share::CopyStep::Detached | crate::share::CopyStep::ThroughWindow => {
-                cmds.push(crate::share::copy_text_task(&hex));
+                cmds.push(crate::share::copy_text_task(&value));
             }
             // Our window exists but is not focused. The `gain_focus` above is the request
             // that fixes that, and `flush_deferred_pick_copy` writes the hex when it lands.
@@ -624,24 +906,108 @@ impl App {
             return Task::none();
         }
         self.color_picker.copy_waiting = false;
-        log::debug!("color picker: the result window took focus, writing the pick's hex copy");
-        // Re-derived from the live colour rather than stored twice. Nothing can have changed
-        // it between the pick and this focus: the window is only now becoming interactive.
-        crate::share::copy_text_task(&ColorFormat::Hex.format(self.color_picker.color))
+        log::debug!("color picker: the result window took focus, writing the pick's copy");
+        // Re-derived from the live state rather than stored twice (and in the remembered
+        // mode's spelling, DRAGON-630). Nothing can have changed it between the pick and
+        // this focus: the window is only now becoming interactive.
+        crate::share::copy_text_task(&self.color_picker.value_text())
     }
 
     /// Set the colour the window shows, and write the recents only when the SOURCE says
     /// so ([`geom::writes_recents`]). The one place that rule is applied.
+    ///
+    /// The tracked HSV follows the colour here (`color::hsv_tracking`), which is what
+    /// keeps the square and the hue strip honest after a pick, a recent-click, a typed
+    /// edit or a handed-over pick. The square and hue handlers deliberately do NOT come
+    /// through here: they own the HSV and call [`Self::apply_picker_color`] directly,
+    /// so byte quantisation cannot re-track the exact position the hand just chose.
     fn set_picker_color(&mut self, color: Srgb, source: geom::ColorSource) {
+        self.color_picker.hsv = crate::color::hsv_tracking(self.color_picker.hsv, color);
+        self.refresh_sv_raster();
+        self.apply_picker_color(color, source);
+    }
+
+    /// The body of [`Self::set_picker_color`] minus the HSV tracking (DRAGON-630).
+    fn apply_picker_color(&mut self, color: Srgb, source: geom::ColorSource) {
         self.color_picker.color = color;
         // A new colour makes any in-flight draft stale: it belonged to the old value.
         if source != geom::ColorSource::Edit {
             self.color_picker.draft = None;
+            // A pick or a loaded recent IS an opaque colour: alpha is an authoring
+            // control for the value being copied out, not a property of anything
+            // sampled, so it resets rather than tinting a colour the user just took.
+            self.color_picker.alpha = u8::MAX;
         }
         if geom::writes_recents(source) {
             self.color_picker.recents =
                 geom::push_recent(&self.color_picker.recents, color, geom::RECENTS_CAP);
         }
+        self.refresh_color_rasters();
+    }
+
+    /// Rebuild the SATURATION/VALUE square's raster (and the hue strip's, once): the
+    /// square's whole picture is the hue, so only hue changes come here (DRAGON-630).
+    /// Rasters are built in update, never in `view`, the magnifier's own rule: a handle
+    /// minted per frame churns iced's texture atlas.
+    fn refresh_sv_raster(&mut self) {
+        use crate::app::color_picker::geom as g;
+        let radius = picker_corner_radius();
+        let cp = &mut self.color_picker;
+        if cp.hue_raster.is_none() {
+            let (w, h) = (g::STRIPS_W as u32, g::STRIP_H as u32);
+            cp.hue_raster = Some(widget::image::Handle::from_rgba(
+                w,
+                h,
+                crate::color::hue_strip_rgba(w, h, radius),
+            ));
+        }
+        let (w, h) = (g::CONTENT_W as u32, g::SV_H as u32);
+        cp.sv_raster = Some(widget::image::Handle::from_rgba(
+            w,
+            h,
+            crate::color::sv_square_rgba(cp.hsv[0], w, h, radius),
+        ));
+    }
+
+    /// Rebuild the rasters that follow the COLOUR and the ALPHA: the alpha strip (the
+    /// colour ramps across it) and the round swatch (DRAGON-630).
+    fn refresh_color_rasters(&mut self) {
+        use crate::app::color_picker::geom as g;
+        let radius = picker_corner_radius();
+        let rim = picker_rim();
+        let cp = &mut self.color_picker;
+        let (w, h) = (g::STRIPS_W as u32, g::STRIP_H as u32);
+        cp.alpha_raster = Some(widget::image::Handle::from_rgba(
+            w,
+            h,
+            crate::color::alpha_strip_rgba(cp.color, w, h, radius),
+        ));
+        let d = g::SWATCH_CIRCLE as u32;
+        cp.swatch_raster = Some(widget::image::Handle::from_rgba(
+            d,
+            d,
+            crate::color::swatch_circle_rgba(cp.color, cp.alpha, d, rim),
+        ));
+    }
+
+    /// Copy the current mode's whole value and flash the copy affordance: the shared
+    /// tail of the copy button and the mode stepper (DRAGON-630).
+    fn copy_picker_value(&mut self) -> Task<cosmic::Action<Msg>> {
+        let value = self.color_picker.value_text();
+        self.color_picker.copied =
+            Some((self.color_picker.mode, std::time::Instant::now()));
+        log::debug!("color picker: copied the {} value", self.color_picker.mode.id());
+        Task::batch([
+            crate::share::copy_text_task(&value),
+            // One delayed clear, rather than a subscription ticking for two
+            // seconds: the flash needs exactly one redraw, at its end.
+            Task::perform(
+                async {
+                    tokio::time::sleep(crate::widgets::copy_button::COPIED_FLASH).await;
+                },
+                |()| cosmic::Action::App(Msg::ColorPicker(ColorPickerMsg::ClearCopied)),
+            ),
+        ])
     }
 
     /// Finish the result window natively once its async-set title has landed: the mac
@@ -756,6 +1122,67 @@ impl App {
     }
 }
 
+/// DRAGON-TBD: which resample routes may leave the magnifier's raster stale. The pacing is a
+/// performance choice and the keyboard nudge is a correctness one, so the property pinned here
+/// is that the first can never reach the second.
+#[cfg(test)]
+mod raster_policy_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Every speed worth naming, from stopped to an absurd one, so "any speed" below is not
+    /// three convenient samples.
+    const SPEEDS: [f32; 7] =
+        [0.0, 100.0, geom::DELIBERATE_SPEED, 2_000.0, geom::FLICK_SPEED, 50_000.0, f32::NAN];
+
+    /// THE guarantee the owner asked for. An arrow key (or its vim letter) must move the
+    /// sample and rebuild the lens immediately, EVERY time, and it routes through
+    /// `color_picker_resample`, which is `RasterPolicy::Always`. No pointer speed and no
+    /// recent raster may make that skip.
+    ///
+    /// The realistic hazard is not hypothetical: a nudge is most likely pressed just after the
+    /// hand has stopped moving, which is exactly when the measured speed is still high and a
+    /// raster is freshly spent. Both conditions are pinned here together.
+    #[test]
+    fn a_keyboard_nudge_is_never_paced_whatever_the_pointer_was_doing() {
+        for speed in SPEEDS {
+            for since in [None, Some(Duration::ZERO), Some(Duration::from_micros(1)),
+                          Some(Duration::from_millis(39)), Some(Duration::from_secs(9))]
+            {
+                assert!(
+                    !skips_raster(RasterPolicy::Always, since, speed),
+                    "an unpaced route skipped its raster at {speed} pt/s, {since:?} since the last"
+                );
+            }
+        }
+    }
+
+    /// The same for the two other `Always` routes, which are correctness paths too: the
+    /// frozen-snapshot delivery that makes the loupe appear at all (DRAGON-601) and a
+    /// session's first sample. Both share the arm above, so this is really one more statement
+    /// of intent than a second mechanism, and it is worth stating because the pacing would be
+    /// invisible on those routes until someone reported a picker that opened blank.
+    #[test]
+    fn the_first_lens_of_a_session_is_never_paced() {
+        for speed in SPEEDS {
+            assert!(!skips_raster(RasterPolicy::Always, None, speed));
+            // …and even on the paced route, "nothing rastered yet" always rasters.
+            assert!(!skips_raster(RasterPolicy::Paced, None, speed));
+        }
+    }
+
+    /// The pacing still DOES something, or this seam would be decoration: on the pointer's own
+    /// route, mid-flick and one frame after a raster, it declines.
+    #[test]
+    fn the_pointer_route_still_paces_a_flick() {
+        let one_frame = Some(Duration::from_micros(8_333));
+        assert!(skips_raster(RasterPolicy::Paced, one_frame, geom::FLICK_SPEED));
+        // And releases as soon as the hand slows, on the very next look.
+        assert!(!skips_raster(RasterPolicy::Paced, one_frame, 0.0));
+        assert!(!skips_raster(RasterPolicy::Paced, one_frame, geom::DELIBERATE_SPEED));
+    }
+}
+
 /// DRAGON-587: what the PICK's clipboard copy does, on each session shape. It pins the
 /// picker to the app's ONE copy ladder (`share::copy_step`) rather than to a second copy of
 /// the reasoning, which is the whole point of the fix.
@@ -805,17 +1232,35 @@ mod pick_copy_tests {
     }
 }
 
-/// The hex the pick puts on the clipboard. One assertion, but it is the ticket's actual
-/// wording ("the hex INCLUDING the leading `#`"), and the copy is a string the user pastes
-/// into a stylesheet, so its exact spelling is the feature.
+/// The value the pick puts on the clipboard: the REMEMBERED mode's spelling
+/// (DRAGON-630, the owner's ask). Hex is the default mode, so DRAGON-582's original
+/// wording ("the hex INCLUDING the leading `#`") still holds on an untouched config,
+/// and both facts are pinned because the copy is a string the user pastes into a
+/// stylesheet: its exact spelling is the feature.
 #[cfg(test)]
 mod pick_copy_text_tests {
+    use crate::app::color_picker::ColorPickerState;
     use crate::color::{ColorFormat, Srgb};
 
     #[test]
-    fn the_copied_hex_carries_its_leading_hash() {
-        let hex = ColorFormat::Hex.format(Srgb::new(255, 136, 0));
-        assert_eq!(hex, "#FF8800");
-        assert!(hex.starts_with('#'), "a hex without the # is not a colour anyone can paste");
+    fn the_default_mode_still_copies_the_leading_hash_hex() {
+        let st = ColorPickerState { color: Srgb::new(255, 136, 0), ..Default::default() };
+        assert_eq!(st.value_text(), "#FF8800");
+        assert!(
+            st.value_text().starts_with('#'),
+            "a hex without the # is not a colour anyone can paste"
+        );
+    }
+
+    /// A remembered RGB mode makes the pick copy `rgb(…)`: the mode the user left the
+    /// window in is the spelling the next pick delivers.
+    #[test]
+    fn a_remembered_mode_spells_the_pick_copy() {
+        let st = ColorPickerState {
+            color: Srgb::new(255, 136, 0),
+            mode: ColorFormat::Rgb,
+            ..Default::default()
+        };
+        assert_eq!(st.value_text(), "rgb(255, 136, 0)");
     }
 }

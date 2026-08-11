@@ -172,10 +172,12 @@ impl crate::app::App {
                     Item::new(
                         "Window focus appearance",
                         "",
-                        crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                            &WINDOW_FOCUS_APPEARANCES,
-                            Some(focus_idx),
-                            |a0| Msg::Settings(SettingsMsg::SetWindowFocusAppearance(a0)),
+                        crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                            widget::dropdown(
+                                &WINDOW_FOCUS_APPEARANCES,
+                                Some(focus_idx),
+                                |a0| Msg::Settings(SettingsMsg::SetWindowFocusAppearance(a0)),
+                            ),
                         )),
                     )
                     .reset_with(focus_idx, def_focus, |a0| Msg::Settings(SettingsMsg::SetWindowFocusAppearance(a0))),

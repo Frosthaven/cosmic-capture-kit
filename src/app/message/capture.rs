@@ -32,13 +32,21 @@ pub enum CaptureMsg {
     /// capture: open it as a new preview document and ACK in the same arm, so the child
     /// may exit. Lives in the CAPTURE domain rather than `PreviewMsg` because a handoff
     /// poll has no preview to address — it may be what CREATES the first one, and
-    /// `Msg::Preview` now requires a `window::Id`. Never constructed off unix (no
-    /// transport, so nothing ever hosts — see `crate::preview_ipc`).
-    #[cfg_attr(not(unix), allow(dead_code))]
+    /// `Msg::Preview` now requires a `window::Id`. Never constructed where no transport
+    /// exists (neither unix sockets nor Windows named pipes, DRAGON-651 — see
+    /// `crate::preview_ipc`), because nothing ever hosts there.
+    #[cfg_attr(not(any(unix, windows)), allow(dead_code))]
     HandoffPoll,
-    /// macOS (DRAGON-148 option C): drain the DEFERRED frozen-flats grab slot into
+    /// DRAGON-148 option C, then DRAGON-212: drain the DEFERRED frozen-flats grab slot into
     /// `self.frozen` + redraw against the still image. Fired by the drain poll
-    /// while `frozen_pending`. Never constructed on Linux (synchronous grab).
+    /// while `frozen_pending`.
+    ///
+    /// Constructed on EVERY platform. This said "never constructed on Linux (synchronous
+    /// grab)", which was true when only macOS deferred the grab and stopped being true at
+    /// DRAGON-212, when Linux (and Windows) started deferring it too: `sub_frozen_ready`
+    /// carries no `cfg` at all. The line is corrected rather than deleted because DRAGON-606
+    /// now hangs the dim's fade-in off this drain on every platform, so a reader who believes
+    /// the old claim concludes the fade can never start on Linux.
     FrozenReady,
     /// macOS (DRAGON-200): drain the DEFERRED per-output picker wallpaper slot into
     /// `self.wallpaper_handles`. Fired by the drain poll while `wallpaper_pending`.

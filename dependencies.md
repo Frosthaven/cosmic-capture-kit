@@ -22,7 +22,7 @@ UI) when its dependency is missing.
 | **libpipewire** (`libpipewire-0.3.so.0`) | The xdg-portal ScreenCast capture path (the `pipewire` crate binds it). | **Linked** into the binary, and an unconditional Linux dependency rather than a feature-gated one. See §7. |
 | **libwayland-client** | Wayland client transport. | `dlopen`ed at runtime by the Wayland client stack, so no dev package is needed to build. |
 | **libgbm** (`libgbm.so.1`) | Allocates the GPU buffer for **zero-copy recording** (via the `gbm` crate): the compositor copies each frame straight into it. | Part of Mesa; present on any GPU desktop. Used only when GPU zero-copy is enabled. |
-| **libavcodec / libavutil** | **In-process** hardware video encoding for the zero-copy path (via `ffmpeg-next`), distinct from the external `ffmpeg` binary. | Linked at build time, version-matched to ffmpeg 8.1. Used only for GPU zero-copy. |
+| **libavcodec / libavutil** | **In-process** hardware video encoding for the zero-copy path (via `ffmpeg-next`), distinct from the external `ffmpeg` binary. | Linked at build time, version-matched to ffmpeg 9.0. Used only for GPU zero-copy. |
 | **DRM render node** (`/dev/dri/renderD*`) | The GPU the compositor renders on — zero-copy allocates its capture buffer and runs the in-process encoder on this same device. | Requires membership in the `render` / `video` group. Zero-copy only. |
 
 ### Wayland protocols the compositor must implement
@@ -153,7 +153,7 @@ the in-process **libavcodec / libavutil** (all listed in §1).
 
 This whole path is a compile-time cargo feature, **`zero-copy`**, on by default.
 Build with **`--no-default-features`** to drop `ffmpeg-next` + `libgbm` entirely;
-the app then builds on distros without ffmpeg 8 (Debian/Ubuntu/Pop!_OS LTS) and
+the app then builds on distros without ffmpeg 9 (Debian/Ubuntu/Pop!_OS LTS) and
 recording uses only the external `ffmpeg` binary (no in-process zero-copy). **See
 §7** for when this is mandatory rather than optional.
 
@@ -211,13 +211,13 @@ sudo apt install build-essential pkg-config libclang-dev \
 `libwayland` is deliberately absent: the Wayland client stack is `dlopen`ed
 (§1), so no dev package is required for it.
 
-### `zero-copy` needs ffmpeg 8, which LTS distros do not have
+### `zero-copy` needs ffmpeg 9, which LTS distros do not have
 
 The default `zero-copy` feature links the system libavcodec/libavutil through
-`ffmpeg-next`, which binds the **ffmpeg 8.1** headers. Rolling distros (Arch,
+`ffmpeg-next`, which binds the **ffmpeg 9.0** headers. Rolling distros (Arch,
 CachyOS, recent Fedora) have that. The LTS distros do not: Ubuntu 24.04 (and so
 Mint 22) ships ffmpeg **6.1.1**, and no `-dev` package there can satisfy an
-ffmpeg 8 binding at any version, so the build stops inside `ffmpeg-sys-next`.
+ffmpeg 9 binding at any version, so the build stops inside `ffmpeg-sys-next`.
 
 On those distros, build with the feature off:
 
@@ -323,13 +323,13 @@ changes with it, which is what forces the re-fetch.
 
 | Component | Version | Where it comes from | Verified by |
 |---|---|---|---|
-| ffmpeg + ffprobe (macOS arm64) | **8.1.2** | martin-riedl.de, a permanent per-build URL with a published `.sha256` | SHA-256 |
-| ffmpeg + ffprobe + ffplay (Windows x86_64) | **8.1.2** | BtbN/FFmpeg-Builds, the `win64-gpl` static build from a month-end `autobuild-*` tag | SHA-256 |
+| ffmpeg + ffprobe (macOS arm64) | **9.0** | martin-riedl.de, a permanent per-build URL with a published `.sha256` | SHA-256 |
+| ffmpeg + ffprobe + ffplay (Windows x86_64) | **9.0** | gyan.dev, the `full_build-shared` release at a permanent versioned URL with a published `.sha256` (DRAGON-631 moved off BtbN, which builds no 9.0 branch) | SHA-256 |
 | tesseract (macOS arm64) | **5.5.3** | built from source, with leptonica **1.87.0** and libpng **1.6.50** | SHA-256 |
 | tesseract (Windows x86_64) | **5.5.3** | the official installer published as a GitHub release asset by the tesseract project, unpacked with 7-Zip (never executed) | SHA-256 |
 | `eng.traineddata` | `tessdata_fast` tag **4.1.0** | the same file and hash on both platforms, so OCR results match | SHA-256 |
-| ffmpeg **source** (Linux artifact) | **8.1.2** | ffmpeg.org, built inside the Rocky 9 container only to supply the headers `ffmpeg-sys-next` compiles against | **GPG signature** + SHA-256 |
-| ffmpeg **source** (Linux AppImage) | **8.1.2** | the same tarball, built wider (x264, pulse, VAAPI, NVENC) because the AppImage *ships* the binary and its libraries rather than just compiling against the headers | **GPG signature** + SHA-256 |
+| ffmpeg **source** (Linux artifact) | **9.0** | ffmpeg.org, built inside the Rocky 9 container only to supply the headers `ffmpeg-sys-next` compiles against | **GPG signature** + SHA-256 |
+| ffmpeg **source** (Linux AppImage) | **9.0** | the same tarball, built wider (x264, pulse, VAAPI, NVENC) because the AppImage *ships* the binary and its libraries rather than just compiling against the headers | **GPG signature** + SHA-256 |
 | x264 (Linux AppImage) | git **0480cb0** (2025-09-10) | Debian's immutable pool tarball. x264 publishes no releases and no tags, videolan's snapshot directory stopped in 2019, and GitLab's `/-/archive/` tarballs are generated per request so their bytes can change under a hash | SHA-256 |
 | nv-codec-headers (Linux AppImage) | **13.0.19.1** | header-only NVENC interface; links nothing, and decides only whether the bundled ffmpeg has `h264_nvenc` at all | SHA-256 |
 | tesseract + leptonica + libpng (Linux AppImage) | **5.5.3** / **1.87.0** / **1.6.50** | the same sources and the same static-link recipe the macOS package uses | SHA-256 |
@@ -347,14 +347,15 @@ requires the signature to be made by that exact fingerprint, so a compromised ke
 URL supplying both a key and a matching signature still fails.
 
 None of the other upstreams publish signatures (probed 2026-08: martin-riedl.de
-offers `.sha256` only, BtbN only a `checksums.sha256` asset, and the libpng,
+offers `.sha256` only, gyan.dev a `.sha256` beside each package, and the libpng,
 leptonica, tesseract and tessdata downloads none at all), so for those a pinned
 hash is the honest best available rather than an equivalent guarantee.
 
 **ffmpeg is held at 8.x deliberately.** The recording pipeline is written against
-ffmpeg 8's observed behaviour, including workarounds for it (the `MuxerWatchdog`
-exists because ffmpeg 8 can wedge on a session's first video write; a live
-`-itsoffset` is banned because ≥ ~200 ms deterministically stalls ffmpeg 8's
+ffmpeg's observed behaviour, including workarounds measured on ffmpeg 8 that
+stay as bounded defenses on 9 (the `MuxerWatchdog`
+exists because ffmpeg 8 could wedge on a session's first video write; a live
+`-itsoffset` is banned because ≥ ~200 ms deterministically stalled ffmpeg 8's
 scheduler). Both upstreams now serve 9.x as their current build, so moving up is
 a real change that needs a recording test pass behind it, not something a version
 bump does quietly.

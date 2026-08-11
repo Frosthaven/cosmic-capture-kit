@@ -45,6 +45,15 @@
 //!    key order. If the layer's content occupies only PART of the picture, use
 //!    `Layer::at(key, frame, dest)` and raster only that region — see [`Layer::dest`].
 //!
+//! # Not only the preview editor (DRAGON-TBD)
+//! Nothing above is preview-specific, and the colour picker's magnifier is the first user
+//! outside it: a [`LayerKey`] is (window, slot), and a picker OVERLAY is simply another
+//! window, so it gets its own texture slots for free. Two things came with that guest, both
+//! additive: [`LayerSlot::COLOR_MAGNIFIER`], and [`Filter`], because the magnifier is the one
+//! layer that must NOT be smoothed. The word "preview" in the names below is history, not a
+//! constraint; `live` in [`LayerStack::new`] means "every window whose slots must survive this
+//! prepare", which for a picker session is its overlays (`App::live_picker_windows`).
+//!
 //! # Sizing a layer's raster (DRAGON-362)
 //! Two rules, both cost-critical on a large (5K+) capture:
 //! * Raster at the layer's ON-SCREEN device-pixel size, via `edit::layer_raster_scale`
@@ -115,6 +124,16 @@ impl LayerSlot {
     /// DRAGON-330; box/arrow stay vector geometry drawn by the `AnnotationCanvas`, which since
     /// DRAGON-373 also draws the per-item TEXT layers so they interleave with those vectors.)
     pub const COVERMARK: LayerSlot = LayerSlot(1);
+    /// The colour picker's magnifier disc (DRAGON-TBD). A raster rebuilt on nearly every real
+    /// pointer move, which is exactly the churn this shader exists to stop: the older
+    /// `widget::image` path minted a fresh `Handle` per move and iced allocated + trimmed an
+    /// atlas entry for each one. It is the only slot so far that does NOT belong to a preview
+    /// document, and nothing about the pipeline had to change for that: a [`LayerKey`] is
+    /// (window, slot), and a picker overlay is simply another window.
+    ///
+    /// It is also the only slot that asks for [`Filter::Nearest`] (see that type): the tool
+    /// exists to show exact, unblurred source pixels.
+    pub const COLOR_MAGNIFIER: LayerSlot = LayerSlot(2);
     /// Where the per-text-item slots start (DRAGON-373). Well clear of the fixed slots above,
     /// and of any that get added beside them.
     const TEXT_BASE: u32 = 0x8000_0000;
@@ -171,6 +190,15 @@ impl LayerKey {
         Self::new(window, LayerSlot::COVERMARK)
     }
 
+    /// **Pure**, unit-tested: this window's colour-picker magnifier disc (DRAGON-TBD).
+    ///
+    /// `window` here is a picker OVERLAY, one per output, not a preview document. The pipeline
+    /// needs no notion of that: the key already says "whose", so the picker's slots and a
+    /// preview's cannot collide even in the impossible case of one process owning both.
+    pub fn color_magnifier(window: window::Id) -> Self {
+        Self::new(window, LayerSlot::COLOR_MAGNIFIER)
+    }
+
     /// This window's raster for the text annotation `id` (DRAGON-354/373).
     pub fn text(window: window::Id, id: u64) -> Self {
         Self::new(window, LayerSlot::text(id))
@@ -190,6 +218,32 @@ pub type Dest = [f32; 4];
 /// The whole widget: the placement every full-frame layer (video, covermark) uses.
 pub const DEST_FULL: Dest = [0.0, 0.0, 1.0, 1.0];
 
+/// How a layer's texture is SAMPLED when the pixels it holds and the device pixels it covers
+/// are not the same count, which is nearly always: a zoomed preview, a fractional display
+/// scale, a raster drawn at its own POINT size on a HiDPI output.
+///
+/// [`Filter::Linear`] is the default and is what every layer this shader was originally built
+/// for wants: video frames, the covermark and the text rasters are all photographic or
+/// antialiased content, and smoothing is the correct answer for them.
+///
+/// [`Filter::Nearest`] exists for the one kind of layer that must NOT be smoothed, the colour
+/// picker's magnifier (DRAGON-TBD). That tool's whole job is to show exact, unblurred source
+/// pixels, so its `widget::image` always asked for `FilterMethod::Nearest`; routing it through
+/// the shared Linear sampler would blur every magnifier cell boundary, which is the lens lying
+/// about which pixel is which rather than a cosmetic nit.
+///
+/// It is a property of the LAYER rather than of the pipeline because one stack can hold both
+/// kinds at once, and it is carried into the [`TextureSlot`] so a slot whose filter changed is
+/// re-bound instead of silently keeping the old sampler.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Filter {
+    /// Smoothed. Every preview-editor layer.
+    #[default]
+    Linear,
+    /// Blocky, exact texels. The colour picker's magnifier, and nothing else so far.
+    Nearest,
+}
+
 /// One layer to draw: a stable identity, the pixels currently on it, and WHERE in the canvas
 /// they go ([`Layer::dest`]).
 #[derive(Clone, Debug)]
@@ -206,17 +260,31 @@ pub struct Layer {
     /// (a caption) rasters just that region and places it here instead, so its cost tracks
     /// the CONTENT's area rather than the capture's.
     pub dest: Dest,
+    /// How this layer's texels are sampled, see [`Filter`]. [`Filter::Linear`] unless the
+    /// layer opted out with [`Layer::nearest`], so every pre-DRAGON-TBD call site is
+    /// byte-identical.
+    pub filter: Filter,
 }
 
 impl Layer {
     /// A layer whose raster spans the whole picture (video frames, the covermark).
     pub fn full(key: LayerKey, frame: Arc<PixelFrame>) -> Self {
-        Self { key, frame, dest: DEST_FULL }
+        Self { key, frame, dest: DEST_FULL, filter: Filter::Linear }
     }
 
     /// A layer whose raster covers only `dest` (fractions of the canvas) — see [`Layer::dest`].
     pub fn at(key: LayerKey, frame: Arc<PixelFrame>, dest: Dest) -> Self {
-        Self { key, frame, dest }
+        Self { key, frame, dest, filter: Filter::Linear }
+    }
+
+    /// **Pure**, unit-tested: draw this layer's texels UNSMOOTHED ([`Filter::Nearest`]).
+    ///
+    /// Opt-in, and deliberately a builder rather than a parameter on the two constructors: the
+    /// smoothed answer is right for every layer but one, so the constructors stay the shape
+    /// they were and only the colour picker's magnifier says otherwise (DRAGON-TBD).
+    pub fn nearest(mut self) -> Self {
+        self.filter = Filter::Nearest;
+        self
     }
 }
 
@@ -319,7 +387,7 @@ impl shader::Primitive for LayerStackPrimitive {
             }
         }
         for layer in &self.layers {
-            pipeline.upsert(device, queue, layer.key, &layer.frame, layer.dest);
+            pipeline.upsert(device, queue, layer.key, &layer.frame, layer.dest, layer.filter);
         }
         // Two reclaims in one pass over the process-wide slot map:
         //  * WITHIN a window this primitive drew, anything the WINDOW stopped drawing (e.g. the
@@ -391,6 +459,11 @@ struct TextureSlot {
     /// write — the same "only touch the GPU when something actually changed" rule the `seq`
     /// check applies to the pixels.
     dest: Dest,
+    /// Which sampler the [`Self::bind_group`] above was built against (DRAGON-TBD). A sampler
+    /// is baked into the bind group, so it cannot be swapped in place: a layer that changed
+    /// its [`Filter`] has to be re-bound, and that is only detectable by remembering what the
+    /// slot was built with.
+    filter: Filter,
     seq: u64,
 }
 
@@ -409,7 +482,12 @@ struct TextureSlot {
 pub struct LayerStackPipeline {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    sampler: wgpu::Sampler,
+    /// The smoothing sampler every preview-editor layer takes ([`Filter::Linear`]).
+    sampler_linear: wgpu::Sampler,
+    /// The exact-texel sampler ([`Filter::Nearest`], DRAGON-TBD), for the colour picker's
+    /// magnifier. Created once beside the other rather than per slot: a sampler carries no
+    /// per-layer state, so two of them cover every layer this stack will ever hold.
+    sampler_nearest: wgpu::Sampler,
     /// The frame texture format, chosen to match iced's image atlas: sRGB only when the
     /// target is sRGB (i.e. gamma correction is on). libcosmic builds with `web-colors`,
     /// so the target is linear `Unorm` and the texture must NOT sRGB-decode (else the
@@ -494,13 +572,25 @@ impl shader::Pipeline for LayerStackPipeline {
             multiview_mask: None,
             cache: None,
         });
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        let sampler_linear = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("cck-video-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // The same descriptor with both filters flipped to Nearest (DRAGON-TBD). Everything
+        // else about it, the clamped address modes included, must match: only the smoothing
+        // differs between a video frame and the picker's magnifier.
+        let sampler_nearest = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("cck-video-sampler-nearest"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
         // Match iced's image atlas: sRGB texture only when the target is sRGB.
@@ -512,7 +602,8 @@ impl shader::Pipeline for LayerStackPipeline {
         Self {
             pipeline,
             bind_group_layout,
-            sampler,
+            sampler_linear,
+            sampler_nearest,
             tex_format,
             slots: HashMap::new(),
         }
@@ -520,10 +611,20 @@ impl shader::Pipeline for LayerStackPipeline {
 }
 
 impl LayerStackPipeline {
-    /// Upsert `key`'s slot: (re)create its texture when missing or its dimensions
-    /// changed (forcing a re-upload below), then upload `frame`'s pixels — but skip the
-    /// upload when the frame hasn't changed since last time (its `seq` already matches).
-    /// `dest` is the layer's placement; it is only written when it actually moved.
+    /// The sampler a layer asking for `filter` binds to (DRAGON-TBD). Both are created once in
+    /// `new`; nothing here allocates.
+    fn sampler_for(&self, filter: Filter) -> &wgpu::Sampler {
+        match filter {
+            Filter::Linear => &self.sampler_linear,
+            Filter::Nearest => &self.sampler_nearest,
+        }
+    }
+
+    /// Upsert `key`'s slot: (re)create its texture when missing, its dimensions
+    /// changed, or its [`Filter`] changed (any of which forces a re-upload below), then
+    /// upload `frame`'s pixels, but skip the upload when the frame hasn't changed since last
+    /// time (its `seq` already matches). `dest` is the layer's placement; it is only written
+    /// when it actually moved.
     fn upsert(
         &mut self,
         device: &wgpu::Device,
@@ -531,13 +632,18 @@ impl LayerStackPipeline {
         key: LayerKey,
         frame: &PixelFrame,
         dest: Dest,
+        filter: Filter,
     ) {
         let (w, h) = (frame.w, frame.h);
         if w == 0 || h == 0 {
             return;
         }
+        // A sampler is baked into the bind group, so a filter change is rebuilt exactly like a
+        // dimension change rather than patched in place. It cannot happen on any layer the app
+        // draws today (a layer's filter is a property of WHAT it is), so this is the cheap
+        // honest answer rather than a hot path.
         let needs_new = match self.slots.get(&key) {
-            Some(slot) => slot.dims != (w, h),
+            Some(slot) => slot.dims != (w, h) || slot.filter != filter,
             None => true,
         };
         if needs_new {
@@ -568,7 +674,7 @@ impl LayerStackPipeline {
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        resource: wgpu::BindingResource::Sampler(self.sampler_for(filter)),
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
@@ -586,6 +692,7 @@ impl LayerStackPipeline {
                     bind_group,
                     dims: (w, h),
                     dest: [f32::NAN; 4],
+                    filter,
                     seq: 0,
                 },
             );
@@ -833,6 +940,60 @@ mod tests {
         map.insert(LayerKey::covermark(a), 3);
         assert_eq!(map.len(), 3, "each (window, slot) pair owns its own texture slot");
         assert_eq!(map.get(&LayerKey::new(a, LayerSlot::VIDEO)), Some(&1));
+    }
+
+    /// DRAGON-TBD: the colour picker's magnifier is a slot like any other, and the property
+    /// that matters is that it is DISTINCT: from the other slots of the same window, and from
+    /// the same slot of another window (each picker overlay has its own). A collision would
+    /// show as one display's lens drawing another's pixels, which is the one thing a colour
+    /// picker may not do.
+    #[test]
+    fn the_magnifier_slot_is_its_own_texture_everywhere() {
+        let (a, b) = (window::Id::unique(), window::Id::unique());
+        assert_ne!(LayerKey::color_magnifier(a), LayerKey::video(a), "same window, video");
+        assert_ne!(LayerKey::color_magnifier(a), LayerKey::covermark(a), "same window, covermark");
+        assert_ne!(LayerKey::color_magnifier(a), LayerKey::text(a, 1), "same window, text");
+        assert_ne!(LayerKey::color_magnifier(a), LayerKey::color_magnifier(b), "two overlays");
+        assert_eq!(
+            LayerKey::color_magnifier(a),
+            LayerKey::new(a, LayerSlot::COLOR_MAGNIFIER),
+            "the constructor is the slot, spelled once"
+        );
+        // Hash identity is what the `slots` HashMap actually looks up on, so pin it there too:
+        // a two-display picker session holds two magnifier textures at once.
+        let mut map = HashMap::new();
+        map.insert(LayerKey::color_magnifier(a), 1);
+        map.insert(LayerKey::color_magnifier(b), 2);
+        map.insert(LayerKey::video(a), 3);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&LayerKey::color_magnifier(b)), Some(&2));
+    }
+
+    /// DRAGON-TBD: smoothing is the DEFAULT and stays the default. Every preview-editor layer
+    /// predates the filter and must be byte-identical, so both constructors answer Linear and
+    /// only an explicit `nearest()` opts out.
+    #[test]
+    fn layers_smooth_unless_they_ask_not_to() {
+        let key = LayerKey::video(window::Id::unique());
+        assert_eq!(Layer::full(key, dummy_frame()).filter, Filter::Linear, "full() smooths");
+        assert_eq!(
+            Layer::at(key, dummy_frame(), [0.0, 0.0, 0.5, 0.5]).filter,
+            Filter::Linear,
+            "at() smooths"
+        );
+        assert_eq!(Filter::default(), Filter::Linear, "the default is the preview editor's");
+        let n = Layer::full(key, dummy_frame()).nearest();
+        assert_eq!(n.filter, Filter::Nearest, "nearest() is the opt-out");
+        // The builder changes NOTHING else about the layer.
+        let plain = Layer::full(key, dummy_frame());
+        assert_eq!(n.key, plain.key);
+        assert_eq!(n.dest, plain.dest);
+        // …and it survives a `Layer::at` placement too, so a future partial-canvas layer can
+        // take both.
+        assert_eq!(
+            Layer::at(key, dummy_frame(), [0.1, 0.2, 0.3, 0.4]).nearest().dest,
+            [0.1, 0.2, 0.3, 0.4]
+        );
     }
 
     /// The whole point of the window scoping: window A's prepare must never be able to

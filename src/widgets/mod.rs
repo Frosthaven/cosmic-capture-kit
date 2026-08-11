@@ -3,6 +3,9 @@
 pub mod annotation_canvas;
 pub mod annotation_fx;
 pub mod arrow_cursor;
+/// A draggable gradient field with a marker (DRAGON-630): the colour picker window's
+/// SV square and hue/alpha strips, reusable for any future gradient control.
+pub mod color_field;
 /// The colour picker's transparent input surface (DRAGON-582): pointer moves + the pick
 /// click. It draws nothing; see its module doc for why the visuals are stacked elements.
 pub mod color_pick;
@@ -17,6 +20,10 @@ pub mod hide_when_clipped;
 pub mod icons;
 pub mod notched_slider;
 pub mod output_selection;
+/// Requests the frame a captured press earned (DRAGON-648): wraps every
+/// `widget::dropdown`, whose open/close press changes only private widget state
+/// and would otherwise wait for the next mouse move to paint on Wayland.
+pub mod press_redraw;
 pub mod region_selection;
 pub mod upload_stripes;
 pub mod zoom_pan;
@@ -25,6 +32,7 @@ pub use drag_area::DragArea;
 pub use hide_when_clipped::hide_when_clipped;
 pub use notched_slider::notched_slider;
 pub use output_selection::OutputSelection;
+pub use press_redraw::press_redraw;
 pub use region_selection::RegionSelection;
 pub use crop_window::CropWindow;
 pub use zoom_pan::ZoomPan;

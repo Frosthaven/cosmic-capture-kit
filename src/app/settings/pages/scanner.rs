@@ -44,10 +44,12 @@ impl crate::app::App {
             let lang_item = Item::new(
                 "Tesseract language pack",
                 self.ocr_lang_desc(),
-                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                    &self.ocr_lang_labels,
-                    Some(self.ocr_lang_index()),
-                    |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0)),
+                crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                    widget::dropdown(
+                        &self.ocr_lang_labels,
+                        Some(self.ocr_lang_index()),
+                        |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0)),
+                    ),
                 )),
             )
             .reset_with(self.ocr_lang_index(), 0usize, |a0| Msg::Detect(DetectMsg::SetOcrLanguage(a0)));

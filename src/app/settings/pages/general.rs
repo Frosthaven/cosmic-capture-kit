@@ -161,11 +161,13 @@ impl crate::app::App {
                         Item::new(
                             "Light/dark mode",
                             "Automatic follows the system's light or dark preference.",
-                            crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                                &["Automatic", "Dark", "Light"],
-                                Some(self.appearance_mode.min(2) as usize),
-                                |i| Msg::Settings(SettingsMsg::SetAppearanceMode(i as u8)),
-                            )),
+                            crate::widgets::arrow_cursor::arrow_cursor(
+                                crate::widgets::press_redraw(widget::dropdown(
+                                    &["Automatic", "Dark", "Light"],
+                                    Some(self.appearance_mode.min(2) as usize),
+                                    |i| Msg::Settings(SettingsMsg::SetAppearanceMode(i as u8)),
+                                )),
+                            ),
                         )
                         .reset_with(self.appearance_mode, d.appearance_mode, |a0| {
                             Msg::Settings(SettingsMsg::SetAppearanceMode(a0))

@@ -50,6 +50,8 @@ pub fn run_test(name: &str, rest: &[String]) {
         }
         #[cfg(target_os = "macos")]
         "mac-active-window" => mac_active_window_test(),
+        #[cfg(target_os = "macos")]
+        "mac-focus-trace" => mac_focus_trace_test(arg(0)),
         // DRAGON-229 M1 Windows capture checkpoints (W1-SPEC §7). Each dispatches into
         // the Windows plugin primitives (`crate::screenshot` / `platform::windows`) and
         // does portable PNG/print glue — the mac-route pattern.
@@ -1098,6 +1100,81 @@ fn mac_active_window_test() {
     }
 }
 
+/// `--test mac-focus-trace <windowID>` (DRAGON-643): trace, sample by sample, WHAT each
+/// candidate "is the picked window key now" signal reports while the real focus sequence
+/// runs. Three signals side by side:
+///
+/// * `ax_focus`: the owning app's `AXFocusedWindow` (the pre-DRAGON-643 confirm).
+/// * `front_pid`: `NSWorkspace.frontmostApplication` (the pre-DRAGON-310 confirm).
+/// * `cg_app_front` / `zorder`: the window server's own front-to-back order: the app's
+///   frontmost ordinary window, and the DRAGON-643 verdict for the target.
+///
+/// Phase 1 does the AX attribute writes ALONE (no app activate) and re-reads `ax_focus`
+/// immediately: if it flips to the target while the app is still in the background, the
+/// AX confirm is reading back our own write and proves nothing about what renders.
+/// Phase 2 runs the real [`mac::focus::focus_and_verify_window`] and keeps sampling past
+/// its return, which is where a confirm-at-0ms that the window server has not caught up
+/// with shows itself.
+#[cfg(target_os = "macos")]
+fn mac_focus_trace_test(arg0: &str) {
+    use crate::platform::mac;
+    if arg0.is_empty() {
+        eprintln!("mac-focus-trace: usage: --test mac-focus-trace <windowID>");
+        return;
+    }
+    let _ = mac::output_descs(); // CG warmup
+    let Ok(target) = arg0.parse::<u32>() else {
+        eprintln!("mac-focus-trace: <windowID> must be a number");
+        return;
+    };
+    let Some(pid) = mac::window_owner_pid(arg0) else {
+        eprintln!("mac-focus-trace: no owning app for window {target}");
+        return;
+    };
+    let me = std::process::id() as libc::pid_t;
+    println!("target window {target} owned by pid {pid}; this process is pid {me}");
+    println!("Accessibility (AX) granted: {}", mac::focus::accessibility_granted());
+
+    let sample = |label: &str| {
+        let front = objc2_app_kit::NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .map(|a| a.processIdentifier());
+        let ax = mac::focus::app_focused_window_id(pid);
+        let order = mac::focus::onscreen_window_order();
+        let app_front = mac::focus::app_front_window(&order, pid);
+        let zorder = mac::focus::zorder_evidence(&order, target, me);
+        println!(
+            "  {label:>12}: front_pid={front:?} ax_focus={ax:?} cg_app_front={app_front:?} zorder={zorder:?}"
+        );
+    };
+
+    println!("\n-- pre-state (nothing touched yet) --");
+    sample("pre");
+    println!("  owning app's ordinary windows, front to back:");
+    for w in mac::focus::onscreen_window_order().iter().filter(|w| w.pid == pid && w.layer == 0) {
+        println!("    id={} layer={}", w.id, w.layer);
+    }
+
+    println!("\n-- phase 1: AX raise/main/focused writes ONLY (no app activate) --");
+    let raised = mac::focus::ax_raise_window(target, pid);
+    println!("  ax_raise_window -> {raised}");
+    sample("t+0ms");
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    sample("t+150ms");
+
+    println!("\n-- phase 2: the real focus_and_verify_window --");
+    let t0 = std::time::Instant::now();
+    let confirmed = mac::focus::focus_and_verify_window(target, pid);
+    println!(
+        "  focus_and_verify_window -> confirmed={confirmed} after {}ms",
+        t0.elapsed().as_millis()
+    );
+    for step in 0..12 {
+        sample(&format!("t+{}ms", step * 100));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// `--test mac-grab-id <windowID> [out.png]` (DRAGON-189): grab ONE specific window by its
 /// `windowID` right now (whatever the current frontmost app is) and score its traffic-light
 /// region. Used to prove a target window renders GRAY when it is NOT the frontmost/key
@@ -1602,7 +1679,8 @@ fn print_test_help() {
          mac-active-shot                   grab the frontmost app's window + score its traffic lights (DRAGON-189)\n\
          mac-focus-shot [windowID]         focus a non-front window, verify, re-grab; before/after traffic-light score (DRAGON-189)\n\
          mac-wallpaper [display-name]      SCK wallpaper grab + FILE fallback: pixel stats, black-vs-content verdict -> PNG pair (DRAGON-291)\n\
-         mac-active-window                 what active_window() resolves vs AXFocusedWindow + the owned-window z-order (DRAGON-295)\n"
+         mac-active-window                 what active_window() resolves vs AXFocusedWindow + the owned-window z-order (DRAGON-295)\n\
+         mac-focus-trace <windowID>        sample AXFocusedWindow vs frontmost vs the window-server z-order across a real focus (DRAGON-643)\n"
     );
     // DRAGON-229/241: the Windows capture + recording checkpoints (W1-SPEC §7 / W3-SPEC §8),
     // one line per `windows-*` match arm above.

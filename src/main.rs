@@ -1131,8 +1131,9 @@ fn main() -> cosmic::iced::Result {
     //
     // Spawning is the transport here, not a socket: the capture child creates this process
     // rather than finding one already running, so there is nothing to connect to and no ack
-    // to wait for. That also means it needs no `#[cfg(unix)]` transport — it works on
-    // Windows, which is the whole point (`preview_ipc` has no named-pipe host yet).
+    // to wait for. It CREATES the first host — once open, later captures can reach it over
+    // `preview_ipc`'s named pipes (DRAGON-651), but nothing can create a host by connecting
+    // to one, so this spawn route stays.
     //
     // A malformed line is a hard error rather than a fallback: only our own capture child
     // ever writes one, so a bad line means the two halves disagree and silently opening

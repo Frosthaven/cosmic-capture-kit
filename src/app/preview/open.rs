@@ -264,11 +264,11 @@ impl App {
         // toggle, the cover→window swap, a Save-As re-open) routes through here and must
         // keep the ONE listener already bound. A bind failure is non-fatal: we just don't
         // host, and every child behaves exactly as it did before this existed.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if self.handoff_host.is_none() {
             match crate::preview_ipc::start_host() {
                 Ok(host) => {
-                    log::info!("preview handoff: hosting on {}", host.socket_path());
+                    log::info!("preview handoff: hosting on {}", host.address());
                     self.handoff_host = Some(host);
                 }
                 Err(e) => log::warn!("preview handoff: not hosting ({e})"),
@@ -1109,7 +1109,7 @@ impl App {
     /// DRAGON-613: the arms are keyed on the request's own DESTINATION, never on what this
     /// process happens to be. A destination we cannot serve is refused for that reason
     /// alone, which is what keeps "who is this value for" a property of the message.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(in crate::app) fn drain_preview_handoffs(&mut self) -> Task<cosmic::Action<Msg>> {
         // Take the whole batch off the channel first: serving a request needs `&mut self`,
         // which can't be borrowed while `self.handoff_host` is.
@@ -1192,9 +1192,10 @@ impl App {
         Task::batch(tasks)
     }
 
-    /// Off unix nothing can host (no transport), so there is never anything to drain — a
-    /// stub keeping the `CaptureMsg::HandoffPoll` dispatch platform-uniform.
-    #[cfg(not(unix))]
+    /// With no transport (neither unix sockets nor Windows named pipes) nothing can host,
+    /// so there is never anything to drain — a stub keeping the `CaptureMsg::HandoffPoll`
+    /// dispatch platform-uniform.
+    #[cfg(not(any(unix, windows)))]
     pub(in crate::app) fn drain_preview_handoffs(&mut self) -> Task<cosmic::Action<Msg>> {
         Task::none()
     }
@@ -1322,9 +1323,10 @@ impl App {
         // below is unconditional — the checks that remain are all about whether a handoff
         // is POSSIBLE, never whether it is permitted.
         //
-        // No transport ⇒ nobody can be hosting (Windows): skip the discovery scan entirely
-        // so that platform's capture path is byte-identical. Branching on the seam rather
-        // than a `cfg` keeps this one code path on every OS.
+        // No transport ⇒ nobody can be hosting (a target that is neither unix nor Windows
+        // — Windows speaks the named-pipe twin since DRAGON-651): skip the discovery scan
+        // entirely. Branching on the seam rather than a `cfg` keeps this one code path on
+        // every OS.
         if !crate::preview_ipc::host_supported() {
             return None;
         }

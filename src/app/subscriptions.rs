@@ -491,10 +491,16 @@ impl App {
     /// `Armed` DOES tick, and it has to: the state only advances when a frame is built, so
     /// on a launch where nothing else is asking for redraws this tick is what produces the
     /// frame that starts the clock. Without it an armed fade could sit unstarted.
+    ///
+    /// Since DRAGON-644 that is true of `Running` too, and more strongly. The ramp no longer
+    /// reads a wall clock: it accumulates painted frames, so this tick is not merely what
+    /// makes the animation SMOOTH, it is what makes it PROGRESS at all. The matching
+    /// no-frames bound moved into the tick's own handler (`DIM_FADE_ABANDON_MS`), since a
+    /// wall clock is no longer there to end the ramp by itself.
     fn sub_dim_fade(&self) -> Option<Subscription<Msg>> {
         if matches!(
             self.dim_fade.get(),
-            crate::app::overlay::DimFade::Armed | crate::app::overlay::DimFade::Running(_)
+            crate::app::overlay::DimFade::Armed | crate::app::overlay::DimFade::Running { .. }
         ) {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(16))
@@ -516,14 +522,26 @@ impl App {
         }
     }
 
-    /// Poll the pre-capture result, then run down the warmup frames that keep the
-    /// overlay up until the picker is ready. (The loading spinner self-animates via
-    /// libcosmic's `indeterminate_circular`, so no tick is needed to draw it.)
+    /// Poll the pre-capture result, and drive the picker's loading state machine down to
+    /// `Idle`. (The loading spinner self-animates via libcosmic's `indeterminate_circular`,
+    /// so no tick is needed to DRAW it.)
+    ///
+    /// Armed on exactly the predicate that says the loading state exists
+    /// (`PickerLoad::covering`), because since DRAGON-645 this poll is not only the drain,
+    /// it is the machine's clock: the reveal threshold and the minimum-once-shown are both
+    /// counted in ticks of it. The state and its timer therefore begin and end together, and
+    /// `Idle` schedules nothing, so a finished load leaves no timer running.
+    ///
+    /// The interval comes from `overlay::PICKER_LOAD_TICK_MS` rather than a literal here:
+    /// those thresholds are expressed in polls of that length, so a second copy of the number
+    /// would let the two drift and quietly change the delay.
     fn sub_loading_tick(&self) -> Option<Subscription<Msg>> {
-        if self.windows_loading || self.window_warmup > 0 {
+        if self.picker_load.covering() {
             Some(
-                cosmic::iced::time::every(std::time::Duration::from_millis(50))
-                    .map(|_| Msg::Capture(CaptureMsg::LoadingTick)),
+                cosmic::iced::time::every(std::time::Duration::from_millis(
+                    crate::app::overlay::PICKER_LOAD_TICK_MS,
+                ))
+                .map(|_| Msg::Capture(CaptureMsg::LoadingTick)),
             )
         } else {
             None
@@ -628,6 +646,27 @@ impl App {
             None
         }
     }
+
+    // DRAGON-TBD deleted `sub_color_picker_resample` from here, and the reason is worth keeping
+    // because a timer is the obvious thing to reach for and it is the wrong tool.
+    //
+    // It was a fixed `time::every(16ms)` publishing `ColorPickerMsg::ResamplePoll`, to coalesce
+    // the magnifier's re-sampling off the raw pointer-event rate. The coalescing was right; the
+    // CLOCK was not. 16ms is ~62.5Hz, and the owner's built-in display is a ProMotion panel
+    // running up to 120Hz, so real frames landed every ~8.3ms and the lens updated on fewer
+    // than half of them. Live-tested: it read as visibly stepped motion during a sweep, which
+    // is the defect it was meant to remove. Shortening it to 8ms would only move the mismatch,
+    // since no constant here can track a variable-refresh display.
+    //
+    // The cadence now comes from the redraw itself: `widgets::color_pick::ColorPickSurface`
+    // publishes one `ResamplePoll` per presented frame while `ColorPickerState::resample_due`
+    // is set (`ColorPickSurface::needs_resample`). That matches whatever the display does, on
+    // every platform, with no number to keep in step, AND it costs nothing at rest, which the
+    // timer did not: a subscription that ticks 60 times a second keeps the whole app awake for
+    // the picker's entire life.
+    //
+    // So: do not reintroduce a timer here. If the lens ever needs driving again, the redraw is
+    // the hook.
 
     /// Expire each document's in-editor toasts (DRAGON-353).
     ///
@@ -821,8 +860,9 @@ impl App {
     ///
     /// DRAGON-613 widened WHAT can be waiting on it (a colour for the picker window as well
     /// as a capture for a preview) without changing the tick or the gate: one listener, one
-    /// poll, one drain.
-    #[cfg(unix)]
+    /// poll, one drain. DRAGON-651 widened WHERE it runs (Windows hosts over named pipes),
+    /// again without changing either.
+    #[cfg(any(unix, windows))]
     fn sub_preview_handoff(&self) -> Option<Subscription<Msg>> {
         if self.handoff_host.is_some() {
             Some(
@@ -834,9 +874,9 @@ impl App {
         }
     }
 
-    /// Off unix there is no handoff transport, so nothing ever hosts — a `None` stub so the
-    /// batch call site stays platform-uniform (Windows' subscription set is unchanged).
-    #[cfg(not(unix))]
+    /// With no handoff transport (neither unix sockets nor Windows named pipes) nothing
+    /// ever hosts — a `None` stub so the batch call site stays platform-uniform.
+    #[cfg(not(any(unix, windows)))]
     fn sub_preview_handoff(&self) -> Option<Subscription<Msg>> {
         None
     }

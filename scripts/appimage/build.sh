@@ -16,11 +16,11 @@
 # BUNDLED, because the user may not have them and `util::locate_tool` finds a
 # sidecar next to our own binary before it looks at PATH:
 #
-#   ffmpeg / ffprobe   pinned 8.1.2, built in this container (see the Dockerfile)
+#   ffmpeg / ffprobe   pinned 9.0, built in this container (see the Dockerfile)
 #   libav*.so + libx264  the same build's libraries, so the in-process GPU
 #                      zero-copy encoder (`encode/gpu.rs` dlopens libavcodec /
 #                      libavutil / libavfilter) works on a host that has no
-#                      ffmpeg 8 at all. Debian-family users have never been able
+#                      ffmpeg 9 at all. Debian-family users have never been able
 #                      to have zero-copy; this is what gives it to them.
 #   tesseract + tessdata  OCR, statically linked against leptonica and libpng so
 #                      it needs nothing bundled beside it.

@@ -80,11 +80,13 @@ impl crate::app::App {
                             Item::new(
                                 "Editor appearance",
                                 "",
-                                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                                    &PREVIEW_APPEARANCES,
-                                    Some(usize::from(self.preview_windowed)),
-                                    |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
-                                )),
+                                crate::widgets::arrow_cursor::arrow_cursor(
+                                    crate::widgets::press_redraw(widget::dropdown(
+                                        &PREVIEW_APPEARANCES,
+                                        Some(usize::from(self.preview_windowed)),
+                                        |i| Msg::Settings(SettingsMsg::SetPreviewWindowed(i == 1)),
+                                    )),
+                                ),
                             )
                             .reset_with(
                                 usize::from(self.preview_windowed),

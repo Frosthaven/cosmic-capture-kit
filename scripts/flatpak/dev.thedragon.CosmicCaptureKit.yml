@@ -18,8 +18,8 @@
 # What it does NOT give us, and why each costs something:
 #
 #   tesseract          absent entirely, so OCR needs leptonica + tesseract modules below
-#   libavcodec 61      that is ffmpeg 7.1, and our `zero-copy` feature binds the ffmpeg 8.1
-#                      headers through ffmpeg-next. Building ffmpeg 8 as a module would add
+#   libavcodec 61      that is ffmpeg 7.1, and our `zero-copy` feature binds the ffmpeg 9.0
+#                      headers through ffmpeg-next. Building ffmpeg 9 as a module would add
 #                      15+ minutes to every build for a feature the sandbox degrades anyway,
 #                      so this build is --no-default-features and loses IN-PROCESS GPU
 #                      encoding. Recording still works through the runtime's ffmpeg binary,
@@ -245,7 +245,7 @@ modules:
       - echo "4e3c74a7a25da00d7a0ca9ee223a9b7b0b238da357ab6fcfee04a5c313ddf4d1  /app/bin/proton-drive"
         | sha256sum -c -
       # --no-default-features: the runtime's libavcodec is 61 (ffmpeg 7.1) and `zero-copy`
-      # binds ffmpeg 8.1 headers. See the header comment. Recording still works through the
+      # binds ffmpeg 9.0 headers. See the header comment. Recording still works through the
       # runtime's ffmpeg BINARY, which is exactly what macOS and Windows ship.
       - cargo build --release --no-default-features
       - install -Dm755 target/release/cosmic-capture-kit /app/bin/cosmic-capture-kit

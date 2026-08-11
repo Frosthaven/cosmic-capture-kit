@@ -284,6 +284,109 @@ pub fn nudge_after(current: (i32, i32), mv: SampleMove) -> (i32, i32) {
     }
 }
 
+// ── Pacing the magnifier's raster against a moving pointer (DRAGON-TBD) ──────
+
+/// Pointer speed, in surface POINTS per second, at or below which the magnifier's raster is
+/// rebuilt on EVERY frame: the pointer is being aimed, so every picture is worth having.
+///
+/// At 120Hz this is 5 points per frame, and at the default magnification a point is about a
+/// source pixel, so consecutive discs still share 8 of the 13 pixels they span
+/// ([`MAGNIFIER_SPAN`]). The lens therefore reads as continuous motion, which is the whole
+/// reason to keep rastering. It is comfortably above ordinary targeting; only a deliberate
+/// flick clears it.
+pub const DELIBERATE_SPEED: f32 = 600.0;
+
+/// Pointer speed, in surface POINTS per second, at or above which the raster is paced as
+/// slowly as it ever gets ([`RASTER_MAX_INTERVAL`]).
+///
+/// At 120Hz this is 50 points per frame, roughly FOUR TIMES the disc's own
+/// [`MAGNIFIER_SPAN`], so two consecutive rasters would share not one source pixel: the
+/// pictures in between are not a motion the eye can follow, they are unrelated stills. The
+/// owner's own case, a flick across a 3456-point display in about 200ms, is ~17000, well past
+/// this.
+pub const FLICK_SPEED: f32 = 6000.0;
+
+/// The longest the magnifier's CONTENT may go unrefreshed while the pointer is sweeping.
+///
+/// 40ms is 25 refreshes a second, which is deliberately not a freeze: the disc keeps showing
+/// where it is, just less often, which is what the owner asked for ("fast movements should be
+/// careful", not "fast movements show nothing"). It cuts the raster count during a flick by
+/// about 80% at 120Hz.
+pub const RASTER_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
+const _: () = assert!(
+    DELIBERATE_SPEED < FLICK_SPEED,
+    "the pacing ramp needs a below-which and an above-which, in that order, or \
+     raster_min_interval divides by a non-positive width"
+);
+
+/// **Pure**, unit-tested: the pointer's speed in surface POINTS per second, from the two most
+/// recent sample points and the time between them (DRAGON-TBD).
+///
+/// `dt` that is zero or negative answers `0.0` rather than infinity, and the direction of that
+/// choice is the point: an unknown speed must fall toward ACCURACY (raster now), never toward
+/// the throttle. Two samples in the same instant is not a fast pointer, it is a clock that
+/// could not separate them.
+pub fn sample_speed(prev: (f32, f32), now: (f32, f32), dt: std::time::Duration) -> f32 {
+    let secs = dt.as_secs_f32();
+    if secs <= 0.0 {
+        return 0.0;
+    }
+    let (dx, dy) = (now.0 - prev.0, now.1 - prev.1);
+    (dx * dx + dy * dy).sqrt() / secs
+}
+
+/// **Pure**, unit-tested: the shortest time that may separate two magnifier rasters at this
+/// pointer speed (DRAGON-TBD). `Duration::ZERO` means "every frame".
+///
+/// # Why pace this at all
+/// The raster is not expensive: measured at **57.5µs** for the whole 156x156 disc, flat across
+/// the zoom range, which at 120Hz is 0.69% of one core plus a 97KB texture upload per frame.
+/// So this is not rescuing a frame budget, and it must not behave as though it were. What it
+/// removes is work whose RESULT nobody can see: during a flick across the screen the sample
+/// lands on an unrelated source pixel every frame, and the user is not reading the lens, they
+/// are travelling. The measurement is quoted so the next person can tell how little is at
+/// stake before they make this more aggressive.
+///
+/// # The shape, and why it is a ramp rather than a switch
+/// A hard on/off gate at one speed flickers for anyone moving near it: the content would
+/// freeze and unfreeze as the hand wavers across the threshold. A ramp degrades instead, so
+/// the same wobble only changes how often the picture refreshes, by a little.
+///
+/// Below [`DELIBERATE_SPEED`] the answer is ZERO, so the aiming case is byte-identical to
+/// having no pacing at all. Above [`FLICK_SPEED`] it saturates at [`RASTER_MAX_INTERVAL`].
+/// In between it is linear.
+///
+/// **A stopped pointer answers ZERO**, which is what makes the settle exact rather than
+/// approximate: the frame after the hand stops is already below `DELIBERATE_SPEED` (it moved
+/// nothing), so the lens catches up on that frame with no timer, no decay and nothing to
+/// tune. See `App::color_picker_resample_with`, which re-arms itself for exactly one more
+/// look whenever it declines to raster, so the settle cannot be missed.
+pub fn raster_min_interval(speed: f32) -> std::time::Duration {
+    // NaN is spelled out rather than left to fall through a negated comparison: it can only
+    // mean the speed is unknown, and an unknown speed rasters, like every other unknown here.
+    if speed.is_nan() || speed <= DELIBERATE_SPEED {
+        return std::time::Duration::ZERO;
+    }
+    if speed >= FLICK_SPEED {
+        return RASTER_MAX_INTERVAL;
+    }
+    let t = (speed - DELIBERATE_SPEED) / (FLICK_SPEED - DELIBERATE_SPEED);
+    RASTER_MAX_INTERVAL.mul_f32(t)
+}
+
+/// **Pure**, unit-tested: may the magnifier's raster be rebuilt now, given how long it has
+/// been since the last one and how fast the pointer is moving (DRAGON-TBD)?
+///
+/// `since_last` is `None` when nothing has been rastered yet, which is always due: a picker
+/// with no lens at all must never be made to wait for one.
+pub fn raster_due(since_last: Option<std::time::Duration>, speed: f32) -> bool {
+    match since_last {
+        None => true,
+        Some(elapsed) => elapsed >= raster_min_interval(speed),
+    }
+}
+
 /// **Pure**, unit-tested: how far one directional key moves the sample, in surface POINTS, so
 /// that a press is exactly ONE SOURCE PIXEL on any display (DRAGON-599).
 ///
@@ -553,6 +656,56 @@ pub fn disc_view(centre: (f32, f32), viewport: (f32, f32)) -> Option<DiscView> {
     Some(DiscView { origin: (x, y), crop: (crop_x, crop_y), size: (w, h) })
 }
 
+/// **Pure**, unit-tested: where the view PLACES a rastered magnifier buffer whose identity
+/// is `raster`, now that the sample point is `sample` (DRAGON-650).
+///
+/// The buffer's PLACEMENT and its CONTENTS are two different questions, and welding them
+/// together was the reported defect. The pacing (see [`raster_min_interval`]) may leave the
+/// CONTENTS up to [`RASTER_MAX_INTERVAL`] stale during a sweep, which is its whole point —
+/// but the raster's own `origin` was also where the view drew the disc, so on every paced
+/// frame the lens simply did not move, then jumped the accumulated distance when the next
+/// raster landed. On a 60Hz panel that is up to 40ms of travel in one step, read as "the
+/// lens skips around erratically", while the hex chip (placed from the live sample every
+/// frame) glided on ahead of it. The lens must FOLLOW the sample on every frame; only its
+/// picture may lag.
+///
+/// So: place the buffer where the disc centred on TODAY's sample would want the disc
+/// pixels it actually holds. [`disc_view`] answers where disc pixel `crop` of a disc
+/// centred on `sample` lands; the buffer's first pixel is disc pixel `raster.crop`, so it
+/// goes at `origin + (raster.crop - crop)`, integer arithmetic on `disc_view`'s own
+/// rounding. **With a fresh raster this is `raster.origin` exactly** (the current view IS
+/// the raster's identity, so the correction is zero), which is what keeps every unpaced
+/// path — and the settled lens — byte-identical to before this function existed.
+///
+/// The clamp keeps the buffer fully on the surface, and it is not decoration: the view
+/// places absolutely by PADDING a fill container, and a padding cannot be negative, while a
+/// buffer given less room than it asks for is contain-fitted — the exact clamp-and-squash
+/// pair [`disc_view`] exists to prevent. A stale FULL buffer swept against a wall therefore
+/// parks flush with the wall instead of squashing, at most half a diameter from the sample,
+/// for at most one pacing interval: the next raster is built clipped for that position and
+/// the correction term vanishes.
+///
+/// `None` from [`disc_view`] (no part of the disc on screen, which a pointer over its own
+/// surface cannot produce) answers the raster's own origin: the one placement known to have
+/// been valid, rather than a guess.
+pub fn drawn_disc_origin(
+    sample: (f32, f32),
+    raster: DiscView,
+    viewport: (f32, f32),
+) -> (i32, i32) {
+    let Some(current) = disc_view(sample, viewport) else {
+        return raster.origin;
+    };
+    let axis = |origin: i32, crop_now: u32, crop_buf: u32, size_buf: u32, extent: f32| -> i32 {
+        let max = ((extent - size_buf as f32).floor() as i32).max(0);
+        (origin + crop_buf as i32 - crop_now as i32).clamp(0, max)
+    };
+    (
+        axis(current.origin.0, current.crop.0, raster.crop.0, raster.size.0, viewport.0),
+        axis(current.origin.1, current.crop.1, raster.crop.1, raster.size.1, viewport.1),
+    )
+}
+
 /// The disc's TRUE box as `(left, top, right, bottom)`: full size, centred on `centre`, and
 /// free to run off the surface.
 ///
@@ -710,108 +863,196 @@ pub fn label_origin(
 
 // ── The result window's size ─────────────────────────────────────────────────
 //
-// The owner's brief was "half the size of mac's permission window", refined on review to
-// "half width but not strict, use best judgement". So the WIDTH starts from half of the
-// permission window's 629pt (= 314.5) and is then checked against what a row actually
-// needs; the HEIGHT is simply the sum of the window's parts. Nothing here scrolls: a
-// scrollbar would be a way of not answering the sizing question.
+// DRAGON-630 rebuilt the window around the reference layout the owner supplied (the
+// WinUI-style picker): a saturation/value square on top, then a controls row (pipette,
+// round current-colour swatch, stacked hue and alpha strips), then ONE value row of
+// per-component boxes with a mode stepper, then the recents strip. The seven stacked
+// notation rows are gone; the stepper cycles the same seven notations through the one
+// row instead, and nothing scrolls: a scrollbar would be a way of not answering the
+// sizing question.
+//
+// The tombstone worth keeping from the pre-630 layout: the width used to be derived
+// from the widest of the seven value rows versus the recents row (each spelled out in
+// its own constant), and the owner's original brief was "half the mac permission
+// window's width, best judgement". The judgement now sizes the SQUARE: a gradient field
+// much under 400pt is too coarse to aim in, and everything else fits comfortably inside
+// that width.
 
 /// Padding inside the window, per side.
 pub const WINDOW_PADDING: f32 = 16.0;
-/// The notation label column ("OKLCH" is the widest).
-pub const ROW_LABEL_W: f32 = 52.0;
-/// The editable value box.
+/// The content width every section shares: the SV square's width, and the budget the
+/// value row, the controls row and the recents grid are laid out inside.
 ///
-/// Sized for the LONGEST value a row can hold plus room to type: `oklch(75.6% 0.176
-/// 60.7)` is 23 characters, a hand-typed value can reasonably run to 27 with the caret,
-/// and 8pt per character at the body text size gives 216pt, plus the text input's own
-/// ~24pt of horizontal padding. That arithmetic asks for 240.
-///
-/// It is 262 because of the RECENTS ROW (DRAGON-587). That row is now ten swatches plus the
-/// pick-again pipette, which needs more width than a value row does, and the window is a
-/// single fixed width for both. So the recents row sets the width and the value box takes the
-/// surplus rather than leaving a ragged gap at the end of every row; the rows stay flush and
-/// the OKLCH one gets a couple more characters of typing room. See [`color_window_size`].
-pub const ROW_INPUT_W: f32 = 262.0;
-/// The per-row copy button (a 16pt icon in a standard icon button).
+/// 478, and the number is CHOSEN rather than arrived at: it is what puts the history
+/// grid on whole points now that a row holds ten swatches (DRAGON-649): `478 - 10 * 28`
+/// swatch points splits into nine history gaps of exactly 22 ([`recents_gap`]), which
+/// keeps the flush right edge the owner asked of the history. At eight swatches a row,
+/// 476 satisfied BOTH whole-point demands at once, the history gap AND the value row's
+/// box division; at ten swatches no sane width satisfies both, so the value row keeps
+/// its floor() ([`value_box_width`]) and the sub-point remainder is absorbed by the
+/// fixed-width frame the view already wraps the boxes in (DRAGON-630 rev 4), where it
+/// shifts nothing visible.
+pub const CONTENT_W: f32 = 478.0;
+/// The saturation/value square's height.
+pub const SV_H: f32 = 180.0;
+/// The gap under the square, before the controls row, and the gap under the controls
+/// row, before the value row. Both LARGER than the ordinary section gap, by the owner's
+/// review: the square and the controls read as one instrument without air between them.
+pub const GAP_SQUARE_CONTROLS: f32 = 20.0;
+pub const GAP_CONTROLS_VALUE: f32 = 20.0;
+/// One slider strip's height (hue, alpha).
+pub const STRIP_H: f32 = 20.0;
+/// The vertical gap between the two strips.
+pub const STRIP_GAP: f32 = 8.0;
+/// The round current-colour swatch's diameter, which is also the controls row's height:
+/// the strips column (two strips plus their gap) comes out to the same 48, pinned below.
+pub const SWATCH_CIRCLE: f32 = 48.0;
+/// The gap between the round swatch and the strips: wider than [`ROW_SPACING`], the
+/// owner's review ("slightly more space to the right of the current color swatch").
+pub const GAP_SWATCH_TRACKS: f32 = 16.0;
+/// The controls row's height.
+pub const CONTROLS_H: f32 = SWATCH_CIRCLE;
+/// One value box's height (the same control height the old rows used).
+pub const VALUE_BOX_H: f32 = 34.0;
+/// The caption band under the boxes ("R", "G", "B", "A"), and the gap above it.
+pub const VALUE_LABEL_H: f32 = 16.0;
+pub const VALUE_LABEL_GAP: f32 = 4.0;
+/// The whole value row: boxes plus their caption band.
+pub const VALUE_ROW_H: f32 = VALUE_BOX_H + VALUE_LABEL_GAP + VALUE_LABEL_H;
+/// The mode picker: ONE dropdown control (the owner's review replaced the two separate
+/// chevron buttons), wide enough for "OKLCH" plus the dropdown's own chevron.
+pub const MODE_PICKER_W: f32 = 84.0;
+/// The copy button beside the value row (a 16pt icon in a standard icon button).
 pub const ROW_COPY_W: f32 = 32.0;
-/// Gap between a row's label, input and copy button.
+/// The value row's LAYOUT TOGGLE, left of the copy button (the owner's rev-3 ask):
+/// split channel boxes vs the one whole-value box. Same square as the copy button so
+/// the right-edge cluster reads as one group.
+pub const LAYOUT_TOGGLE_W: f32 = 32.0;
+/// Gap between the value row's parts (boxes block, mode picker, copy button), and
+/// between the pipette and the swatch in the controls row.
 pub const ROW_SPACING: f32 = 8.0;
-/// One value row's height.
-pub const ROW_H: f32 = 34.0;
-/// Gap between value rows.
-pub const ROW_GAP: f32 = 6.0;
-/// The full-width swatch at the top.
-pub const SWATCH_H: f32 = 72.0;
-/// Gap between the window's sections (swatch, rows, recents).
+/// Gap between neighbouring value boxes.
+pub const BOX_GAP: f32 = 6.0;
+/// Gap between the window's remaining sections (value row, divider, recents).
 pub const SECTION_GAP: f32 = 12.0;
+/// The horizontal divider between the value row and the colour history (the owner's
+/// review): one hairline, [`SECTION_GAP`] of air on each side.
+pub const DIVIDER_H: f32 = 1.0;
 /// One recent-colour swatch.
 pub const RECENT_SWATCH: f32 = 28.0;
-/// Gap between recent swatches.
-pub const RECENT_GAP: f32 = 6.0;
-/// The pick-again pipette that shares the recents row, right-aligned (DRAGON-587).
-///
-/// Square, and exactly a swatch tall, so the bottom row's height is still [`RECENT_SWATCH`]
-/// and the window's height arithmetic is unchanged by adding it.
-pub const PICK_AGAIN_W: f32 = RECENT_SWATCH;
+/// The pick-again pipette, the LEFT end of the controls row (DRAGON-630; the reference
+/// layout leads its controls with the eyedropper). As tall as the round swatch since
+/// the owner asked for the icon doubled; [`PICK_AGAIN_ICON`] is the glyph inside it.
+pub const PICK_AGAIN_W: f32 = SWATCH_CIRCLE;
+/// The pipette glyph: 32, double the original 16 (the owner's review).
+pub const PICK_AGAIN_ICON: u16 = 32;
+/// The slider strips' width: what the controls row leaves after the pipette, the round
+/// swatch and the spacing between the three. Narrower than rev 1 on purpose: the
+/// doubled pipette and the wider swatch gap both come out of the strips' travel.
+pub const STRIPS_W: f32 =
+    CONTENT_W - PICK_AGAIN_W - ROW_SPACING - SWATCH_CIRCLE - GAP_SWATCH_TRACKS;
 
-/// How many recent colours the row holds. Beyond this the OLDEST is dropped.
+const _: () = assert!(
+    STRIP_H * 2.0 + STRIP_GAP == CONTROLS_H,
+    "DRAGON-630: the stacked hue and alpha strips must fill the controls row exactly, \
+     or the row centres them against a height that is not theirs and the swatch and \
+     strips visibly misalign"
+);
+
+/// How many recent colours the history holds. Beyond this the OLDEST is dropped.
 ///
-/// Ten, and it still fits now that the pipette shares the row: `10 * 28 + 9 * 6 = 334pt` of
-/// swatches, plus [`ROW_SPACING`] and the [`PICK_AGAIN_W`] pipette, is the 370pt of content
-/// the window is now sized FROM (see [`color_window_size`]). So the row never wraps and never
-/// scrolls at a full ten. It is also about as many as anyone can pick out by eye.
-pub const RECENTS_CAP: usize = 10;
+/// TWENTY, as two rows of [`RECENTS_PER_ROW`] (DRAGON-649 widened the rows from eight
+/// to ten so the grid's gaps tighten; the two-row shape is the DRAGON-630 review's,
+/// matching the reference layout, and before that it was one row of ten).
+pub const RECENTS_CAP: usize = 20;
+/// Swatches per history row (ten since DRAGON-649; eight through DRAGON-630).
+pub const RECENTS_PER_ROW: usize = 10;
 /// The client-side header bar's height (the same chrome the settings and preview windows
 /// draw), which the content has to sit below.
 pub const HEADER_H: f32 = 44.0;
-/// A little slack on the width, so the widest row is not flush against the padding.
-pub const WINDOW_SLACK: f32 = 8.0;
+/// Vertical SLACK added to the window height (DRAGON-630 rev 4): the widgets carry
+/// natural padding this arithmetic cannot measure headlessly (text inputs and captions
+/// resolve their own line heights), and every under-count lands on whichever section is
+/// LAST — the history rows, which the owner has twice photographed squished. The slack
+/// is one named knob rather than quiet inflation of a real part, so the next person can
+/// see exactly how much of the height is measurement humility. 24 overshot by about
+/// 16 on the owner's screen (air under the last history row); 8 is the measured rest.
+pub const LAYOUT_SLACK_H: f32 = 8.0;
+
+/// Pure, unit-tested: the gap of the history GRID, both directions (the owner's rev-3
+/// ask made the row gap equal the column gap). Chosen so a FULL row of
+/// [`RECENTS_PER_ROW`] spans exactly [`CONTENT_W`]: the first swatch sits on the
+/// content's left edge and the last lands flush with the tracks' right edge, which is
+/// the owner's alignment ask. Whole points by [`CONTENT_W`]'s own construction.
+pub fn recents_gap() -> f32 {
+    (CONTENT_W - RECENTS_PER_ROW as f32 * RECENT_SWATCH) / (RECENTS_PER_ROW as f32 - 1.0)
+}
+
+/// The budget the value BOXES share: the content minus the dropdown, the layout
+/// toggle, the copy button and the gaps between the four blocks.
+fn value_boxes_total() -> f32 {
+    CONTENT_W
+        - ROW_SPACING
+        - MODE_PICKER_W
+        - ROW_SPACING
+        - LAYOUT_TOGGLE_W
+        - ROW_SPACING
+        - ROW_COPY_W
+}
+
+/// Pure, unit-tested: the width of ONE value box when the row holds `boxes` of them
+/// (DRAGON-630).
+///
+/// The row is `[boxes] [mode picker] … [toggle] [copy]` inside [`CONTENT_W`], so the
+/// boxes share what the fixed parts leave. Floored to whole points so a box never sits
+/// on a half-pixel edge; the sub-point remainder joins the flexible space before the
+/// right-edge cluster, which is PINNED there and therefore never shifts (the owner's
+/// ask). The count is the mode's components plus the alpha box: 4 everywhere except
+/// CMYK's 5, and every count must leave a box a number is actually readable in (pinned
+/// by the tests).
+pub fn value_box_width(boxes: usize) -> f32 {
+    let boxes = boxes.max(1) as f32;
+    ((value_boxes_total() - (boxes - 1.0) * BOX_GAP) / boxes).floor()
+}
+
+/// Pure, unit-tested: the WHOLE-VALUE box's width (the layout toggle's collapsed
+/// state, DRAGON-630 rev 3): the entire budget the split boxes would share, so the two
+/// layouts occupy the same span and the right-edge cluster never moves between them.
+pub fn value_whole_width() -> f32 {
+    value_boxes_total()
+}
 
 /// Pure, unit-tested: the colour-picker window's size in LOGICAL POINTS. Its ONLY size.
 ///
-/// **This is no longer a spawn size with a floor under it: since DRAGON-587 the window is
-/// exactly this and cannot be resized** (`min_size == max_size`, see
-/// [`super::open_color_picker_window`]). The arithmetic below is kept because it is still
-/// what the number MEANS, and it is now a constraint rather than a starting point: whatever
-/// the widest row needs, the window is, and there is no user resize to absorb a mistake.
+/// **The window is exactly this and cannot be resized** (`min_size == max_size`, see
+/// [`super::open_color_picker_window`], DRAGON-587): whatever the layout needs, the
+/// window is, and there is no user resize to absorb a mistake.
 ///
-/// **Width**, spelled out: `2 * 16` padding + `52` label + `8` + `262` input + `8` +
-/// `32` copy button + `8` slack = **402pt**.
+/// **Width**: `2 * 16` padding + [`CONTENT_W`] = **510pt**. Still inside the ballpark
+/// of the original "about half the permission window, best judgement" brief (the
+/// permission window is 629), and sized by the SQUARE and the value row together.
 ///
-/// That is wider than the ~315 half-of-the-permission-window the ticket started from,
-/// and deliberately so. At 315 the value box would get about 175pt, which cannot hold a
-/// typed `oklch(75.6% 0.176 60.7)` without truncating it under the caret, and the owner
-/// asked for judgement rather than the number. Growing the width is the honest answer;
-/// the alternatives were a squeezed row or a scrollbar, and both hide the problem.
-///
-/// It grew again, from 380 to 402, when the pick-again pipette joined the RECENTS ROW
-/// (DRAGON-587). Two rows now compete for one fixed width, and the recents row is the wider:
-/// ten swatches (`10 * 28 + 9 * 6 = 334`) plus `8` plus the `28` pipette is **370pt** of
-/// content, where a value row wanted 348. Since the window can no longer be resized, that is
-/// a hard constraint rather than something a user could work around, so the window is sized
-/// to the wider row and [`ROW_INPUT_W`] absorbs the surplus, keeping every row flush.
-///
-/// **Height** is the sum of the parts, and is UNCHANGED by the pipette: it is a swatch tall,
-/// so the bottom row is still [`RECENT_SWATCH`] high. Header + padding + swatch + gap + the
-/// seven value rows + gap + the recents row + padding.
+/// **Height** is the sum of the parts: header + padding + the square + the wide gap +
+/// the controls row + the wide gap + the value row + gap + the divider + gap + the two
+/// history rows with their grid gap between them + padding. The history gap is
+/// [`recents_gap`] in BOTH directions (the owner's rev-3 ask), which is also why the
+/// height must be a function of it: under-counting it is exactly how the second row
+/// got clamped short once.
 pub fn color_window_size() -> (f32, f32) {
-    let rows = crate::color::ColorFormat::ALL.len() as f32;
-    let w = 2.0 * WINDOW_PADDING
-        + ROW_LABEL_W
-        + ROW_SPACING
-        + ROW_INPUT_W
-        + ROW_SPACING
-        + ROW_COPY_W
-        + WINDOW_SLACK;
+    let w = 2.0 * WINDOW_PADDING + CONTENT_W;
     let h = HEADER_H
         + 2.0 * WINDOW_PADDING
-        + SWATCH_H
+        + SV_H
+        + GAP_SQUARE_CONTROLS
+        + CONTROLS_H
+        + GAP_CONTROLS_VALUE
+        + VALUE_ROW_H
         + SECTION_GAP
-        + rows * ROW_H
-        + (rows - 1.0) * ROW_GAP
+        + DIVIDER_H
         + SECTION_GAP
-        + RECENT_SWATCH;
+        + 2.0 * RECENT_SWATCH
+        + recents_gap()
+        + LAYOUT_SLACK_H;
     (w, h)
 }
 
@@ -1185,6 +1426,116 @@ mod disc_clip_tests {
         assert_eq!(at(mid - MAGNIFIER_CELL, mid - MAGNIFIER_CELL)[3], 0);
         // The rim on that same side is still the ring.
         assert_eq!(at(2, mid), [7, 8, 9, 255], "the lens keeps its edge");
+    }
+}
+
+/// DRAGON-650: the lens's PLACEMENT follows the live sample even while the pacing leaves
+/// its raster stale. These pin the two ends: a fresh raster places exactly where
+/// [`disc_view`] put it (so every unpaced path is byte-identical), and a stale one follows
+/// the sample instead of parking at the raster's own origin, which was the reported
+/// "skips around erratically".
+#[cfg(test)]
+mod drawn_origin_tests {
+    use super::*;
+
+    const VIEW: (f32, f32) = (1920.0, 1080.0);
+    const R: f32 = MAGNIFIER_DIAMETER as f32 / 2.0;
+
+    /// THE identity that keeps everything except the paced frames byte-identical: whenever
+    /// the raster IS the current view (every unpaced route, and the settled lens), the drawn
+    /// origin is the raster's own origin, exactly. Sampled across the open screen, every
+    /// wall, every corner, and fractional positions.
+    #[test]
+    fn a_fresh_raster_is_placed_exactly_where_disc_view_put_it() {
+        for sample in [
+            (960.0, 540.0),
+            (0.0, 0.0),
+            (3.0, 540.0),
+            (VIEW.0, 540.0),
+            (960.0, VIEW.1),
+            (VIEW.0, VIEW.1),
+            (0.5, 0.5),
+            (75.5, 540.0), // half-point sample with the disc off the left edge
+            (1.0, VIEW.1 - 1.0),
+            (1234.25, 77.75),
+        ] {
+            let v = disc_view(sample, VIEW).expect("on screen");
+            assert_eq!(
+                drawn_disc_origin(sample, v, VIEW),
+                v.origin,
+                "{sample:?}: a fresh raster must not move"
+            );
+        }
+    }
+
+    /// The fix itself: a stale FULL raster follows the sample on every frame. Mid-sweep the
+    /// buffer is uncropped and the current view (away from walls) is uncropped too, so the
+    /// drawn origin is the CURRENT view's origin — the lens glides with the pointer while
+    /// its picture lags, instead of standing still and jumping.
+    #[test]
+    fn a_stale_raster_follows_the_sample_across_the_open_screen() {
+        let rastered_at = (400.0, 400.0);
+        let raster = disc_view(rastered_at, VIEW).expect("on screen");
+        assert_eq!(raster.crop, (0, 0), "mid-screen rasters are whole");
+        // 40ms of the owner's own flick (~17000 pt/s) is ~680 points of travel.
+        for sample in [(420.0, 400.0), (700.0, 500.0), (1080.0, 400.0)] {
+            let current = disc_view(sample, VIEW).expect("on screen");
+            assert_eq!(
+                drawn_disc_origin(sample, raster, VIEW),
+                current.origin,
+                "{sample:?}: the lens must be where a fresh disc would be"
+            );
+        }
+    }
+
+    /// At a wall a stale FULL buffer cannot be drawn half off the surface: the view places
+    /// by padding (never negative) and squashes an overflowing image, so the placement
+    /// clamps flush instead. One pacing interval later the raster is rebuilt clipped for
+    /// that position and the clamp is moot.
+    #[test]
+    fn a_stale_full_raster_parks_flush_at_the_walls_rather_than_squashing() {
+        let raster = disc_view((400.0, 400.0), VIEW).expect("on screen");
+        let d = MAGNIFIER_DIAMETER as f32;
+        // Swept to the left wall: never negative.
+        let at_left = drawn_disc_origin((0.0, 400.0), raster, VIEW);
+        assert_eq!(at_left.0, 0);
+        // Swept to the right wall: the whole buffer still fits.
+        let at_right = drawn_disc_origin((VIEW.0, 400.0), raster, VIEW);
+        assert_eq!(at_right.0, (VIEW.0 - d) as i32);
+        // Top and bottom, same rule.
+        assert_eq!(drawn_disc_origin((400.0, 0.0), raster, VIEW).1, 0);
+        assert_eq!(drawn_disc_origin((400.0, VIEW.1), raster, VIEW).1, (VIEW.1 - d) as i32);
+    }
+
+    /// The other direction: a raster built CLIPPED at a wall, swept back inland before the
+    /// next rebuild. The buffer's first pixel is disc pixel `crop`, so it lands `crop`
+    /// points right of where the full disc's left edge would be — the visible part stays
+    /// glued to the disc the sample describes, with the missing slice honestly absent.
+    #[test]
+    fn a_clipped_raster_swept_inland_keeps_its_pixels_on_the_disc() {
+        let raster = disc_view((10.0, 540.0), VIEW).expect("on screen");
+        assert!(raster.crop.0 > 0, "a near-wall raster is clipped");
+        let sample = (400.0, 540.0);
+        let current = disc_view(sample, VIEW).expect("on screen");
+        assert_eq!(current.crop, (0, 0));
+        let drawn = drawn_disc_origin(sample, raster, VIEW);
+        assert_eq!(
+            drawn.0,
+            current.origin.0 + raster.crop.0 as i32,
+            "disc pixel `crop` belongs `crop` points right of the disc's left edge"
+        );
+        assert_eq!(drawn.1, current.origin.1);
+    }
+
+    /// A sample with no visible disc at all (unreachable from a pointer over its own
+    /// surface) answers the raster's own origin: the one placement known to be valid.
+    #[test]
+    fn an_off_surface_sample_keeps_the_rasters_own_placement() {
+        let raster = disc_view((400.0, 400.0), VIEW).expect("on screen");
+        assert_eq!(
+            drawn_disc_origin((-R - 1.0, 540.0), raster, VIEW),
+            raster.origin
+        );
     }
 }
 
@@ -1988,83 +2339,131 @@ mod window_size_tests {
     use super::*;
 
     /// The permission window's width (`app::permissions::open_permissions_window`), the
-    /// reference the owner named. A test-only constant: production code derives the
-    /// picker's width from its own rows, and the only thing this is for is checking that
-    /// the result sits where the brief said it should.
+    /// reference the owner named at DRAGON-582. A test-only constant: production code
+    /// derives the picker's size from its own parts, and the only thing this is for is
+    /// checking the result stayed in the neighbourhood the brief described.
     const PERMISSIONS_WINDOW_W: f32 = 629.0;
 
-    /// The width is the ROW's own arithmetic, and it is wider than the ~315 the ticket
-    /// started from on purpose (see the function's doc). Pinned so a later tweak to any
-    /// column has to be a deliberate one.
+    /// The width is the CONTENT width plus padding, still bigger than the brief's naive
+    /// half and still smaller than the window it derived from. Pinned so a later tweak
+    /// has to be a deliberate one.
     #[test]
-    fn the_width_is_what_a_row_actually_needs() {
+    fn the_width_is_the_content_plus_padding() {
         let (w, _) = color_window_size();
-        assert_eq!(w, 402.0);
-        let row = ROW_LABEL_W + ROW_SPACING + ROW_INPUT_W + ROW_SPACING + ROW_COPY_W;
-        assert_eq!(w, 2.0 * WINDOW_PADDING + row + WINDOW_SLACK);
-        assert!(w > PERMISSIONS_WINDOW_W / 2.0, "honest layout maths grew it past the start point");
-        assert!(w < PERMISSIONS_WINDOW_W, "and it is still smaller than the window it derives from");
+        assert_eq!(w, 510.0);
+        assert_eq!(w, 2.0 * WINDOW_PADDING + CONTENT_W);
+        assert!(w > PERMISSIONS_WINDOW_W / 2.0);
+        assert!(w < PERMISSIONS_WINDOW_W, "still smaller than the window it derives from");
     }
 
-    /// DRAGON-587: the RECENTS row is what the width is really sized from now, because the
-    /// pipette shares it. The two rows must come out to the same content width, or one of
-    /// them is either clipped or trailing empty space in a window nobody can resize.
+    /// CONTENT_W's whole reason for being 478: the history grid lands on whole points,
+    /// so nothing floors away from its flush right edge. The value row's division is no
+    /// longer exact (DRAGON-649: at ten swatches a row no sane width satisfies both),
+    /// and that stopped being load-bearing at rev 4: the view wraps the boxes in a
+    /// fixed-width frame of `value_whole_width`, which absorbs the floor() remainder,
+    /// so the split block only has to FIT the frame, never fill it exactly.
     #[test]
-    fn both_rows_want_exactly_the_content_width() {
-        let (w, _) = color_window_size();
-        let content = w - 2.0 * WINDOW_PADDING;
-        let strip = RECENTS_CAP as f32 * RECENT_SWATCH + (RECENTS_CAP as f32 - 1.0) * RECENT_GAP;
-        assert_eq!(strip + ROW_SPACING + PICK_AGAIN_W, content, "the recents row fits exactly");
-        let value_row =
-            ROW_LABEL_W + ROW_SPACING + ROW_INPUT_W + ROW_SPACING + ROW_COPY_W + WINDOW_SLACK;
-        assert_eq!(value_row, content, "and so does a value row");
+    fn the_content_width_divides_evenly() {
+        assert_eq!(recents_gap(), 22.0, "nine whole-point history gaps");
+        assert_eq!(value_box_width(5), 56.0, "CMYK's five boxes floor to a readable 56");
+        assert!(
+            5.0 * value_box_width(5) + 4.0 * BOX_GAP <= value_whole_width(),
+            "the split layout fits the fixed-width frame the whole layout defines"
+        );
     }
 
-    /// The height is the sum of its parts, so the seven rows and the recents strip fit
-    /// with no scrolling. Recomputed here from the same constants, which is what would
-    /// catch a part being dropped from the sum.
+    /// The height is the sum of its parts (DRAGON-630's stack, rev 2's gaps, divider
+    /// and second history row included), so nothing scrolls. Recomputed here from the
+    /// same constants, which is what would catch a part being dropped from the sum.
     #[test]
     fn the_height_is_the_sum_of_the_parts() {
         let (_, h) = color_window_size();
-        let rows = crate::color::ColorFormat::ALL.len() as f32;
         let want = HEADER_H
             + 2.0 * WINDOW_PADDING
-            + SWATCH_H
+            + SV_H
+            + GAP_SQUARE_CONTROLS
+            + CONTROLS_H
+            + GAP_CONTROLS_VALUE
+            + VALUE_ROW_H
             + SECTION_GAP
-            + rows * ROW_H
-            + (rows - 1.0) * ROW_GAP
+            + DIVIDER_H
             + SECTION_GAP
-            + RECENT_SWATCH;
+            + 2.0 * RECENT_SWATCH
+            + recents_gap()
+            + LAYOUT_SLACK_H;
         assert_eq!(h, want);
-        assert_eq!(h, 474.0);
+        assert_eq!(h, 509.0);
     }
 
-    /// The recents row FITS the content width at the cap, WITH the pipette beside it: no
-    /// wrapping, no horizontal scrolling, and the pipette never pushed off the edge.
+    /// Every section fits the content width EXACTLY where the owner asked for
+    /// alignment: the controls row is flush, and a full history row's last swatch lands
+    /// on the content's right edge, which is the tracks' right edge.
     #[test]
-    fn the_recents_row_fits_at_the_cap() {
-        let (w, _) = color_window_size();
-        let content = w - 2.0 * WINDOW_PADDING;
-        let strip = RECENTS_CAP as f32 * RECENT_SWATCH + (RECENTS_CAP as f32 - 1.0) * RECENT_GAP;
-        assert!(strip + ROW_SPACING + PICK_AGAIN_W <= content, "{strip} + the pipette in {content}");
-        // And one more swatch would NOT fit, so the cap is the real limit rather than an
-        // arbitrary round number.
-        let one_more = strip + RECENT_GAP + RECENT_SWATCH + ROW_SPACING + PICK_AGAIN_W;
-        assert!(one_more > content, "the cap is what the width allows");
+    fn the_rows_align_to_the_content_edges() {
+        assert_eq!(
+            PICK_AGAIN_W + ROW_SPACING + SWATCH_CIRCLE + GAP_SWATCH_TRACKS + STRIPS_W,
+            CONTENT_W,
+            "the controls row is flush"
+        );
+        let row = RECENTS_PER_ROW as f32 * RECENT_SWATCH
+            + (RECENTS_PER_ROW as f32 - 1.0) * recents_gap();
+        assert!(
+            (row - CONTENT_W).abs() < 0.01,
+            "a full history row spans the content exactly ({row} vs {CONTENT_W})"
+        );
+        assert!(recents_gap() > 0.0, "the swatches do not overlap");
+        const { assert!(STRIPS_W > 200.0, "the strips keep enough travel to aim a hue in") };
     }
 
-    /// The cap is TEN, and the eleventh pick drops the oldest. The owner asked to have this
-    /// confirmed rather than changed, so it is pinned here as a number rather than left to
-    /// the recents tests' use of the constant.
+    /// The cap is two FULL rows, so the grid can always be drawn ragged-last-row at
+    /// worst and never a third row.
     #[test]
-    fn the_cap_is_ten_and_the_eleventh_pick_drops_the_oldest() {
-        assert_eq!(RECENTS_CAP, 10);
-        let ten: Vec<Srgb> = (0..10u8).map(|i| Srgb::new(i, 0, 0)).collect();
-        let after = push_recent(&ten, Srgb::new(200, 0, 0), RECENTS_CAP);
-        assert_eq!(after.len(), 10, "still ten");
+    fn the_cap_is_two_full_rows() {
+        assert_eq!(RECENTS_CAP, RECENTS_PER_ROW * 2);
+    }
+
+    /// Every box count a mode can produce (4 everywhere, CMYK's 5) gets a box a value
+    /// is actually readable in, and the row never overflows the content width. The
+    /// floor means a sub-point of trailing slack, never an overflow; the copy button is
+    /// pinned to the content's right edge by the view, so slack never moves it.
+    #[test]
+    fn value_boxes_stay_readable_at_every_mode() {
+        for f in crate::color::ColorFormat::ALL {
+            let boxes = f.component_labels().len() + 1;
+            let bw = value_box_width(boxes);
+            assert!(
+                bw >= 54.0,
+                "{}: {boxes} boxes of {bw}pt cannot hold a 5-character value",
+                f.id()
+            );
+            let row = boxes as f32 * bw
+                + (boxes as f32 - 1.0) * BOX_GAP
+                + ROW_SPACING
+                + MODE_PICKER_W
+                + ROW_SPACING
+                + LAYOUT_TOGGLE_W
+                + ROW_SPACING
+                + ROW_COPY_W;
+            assert!(row <= CONTENT_W, "{}: the row overflows ({row})", f.id());
+        }
+        // And the whole-value box fits the longest spelling a mode can produce, at the
+        // ~8pt-per-character the original row arithmetic used: `oklch(75.6% 0.176 60.7
+        // / 0.502)` is 32 characters with the caret.
+        assert!(value_whole_width() >= 32.0 * 8.0 + 24.0);
+    }
+
+    /// The cap is TWENTY (two rows of ten since DRAGON-649; two rows of eight through
+    /// DRAGON-630, one row of ten before that), and the twenty-first pick drops the
+    /// oldest.
+    #[test]
+    fn the_cap_is_twenty_and_the_twenty_first_pick_drops_the_oldest() {
+        assert_eq!(RECENTS_CAP, 20);
+        let full: Vec<Srgb> = (0..20u8).map(|i| Srgb::new(i, 0, 0)).collect();
+        let after = push_recent(&full, Srgb::new(200, 0, 0), RECENTS_CAP);
+        assert_eq!(after.len(), 20, "still twenty");
         assert_eq!(after[0], Srgb::new(200, 0, 0), "the newest leads");
-        assert_eq!(after.last(), Some(&Srgb::new(8, 0, 0)), "the list ends one earlier");
-        assert!(!after.contains(&Srgb::new(9, 0, 0)), "and the oldest fell off entirely");
+        assert_eq!(after.last(), Some(&Srgb::new(18, 0, 0)), "the list ends one earlier");
+        assert!(!after.contains(&Srgb::new(19, 0, 0)), "and the oldest fell off entirely");
     }
 }
 
@@ -2146,6 +2545,134 @@ mod recents_tests {
         assert_eq!(after[0], c(200));
         assert_eq!(after.last(), Some(&c(RECENTS_CAP as u8 - 2)), "the oldest fell off");
         assert_eq!(push_recent(&full, c(200), 0), vec![c(200)], "a zero cap still keeps one");
+    }
+}
+
+/// DRAGON-TBD: pacing the magnifier's raster against a moving pointer.
+///
+/// The property that matters is NOT "it saves work", it is that the two ends are right: an
+/// aiming pointer is byte-identical to having no pacing at all, and a pointer that STOPS gets
+/// its accurate lens back on the very next frame. Everything in between is a ramp whose exact
+/// value nobody should depend on, so these tests pin the ends and the monotonicity rather than
+/// interpolated numbers.
+#[cfg(test)]
+mod raster_pacing_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// One frame at the two refresh rates this app actually meets: the owner's ProMotion panel
+    /// and an ordinary display.
+    const FRAME_120: Duration = Duration::from_micros(8_333);
+    const FRAME_60: Duration = Duration::from_micros(16_667);
+
+    /// Speed is plain distance over time, on both axes together, in points per second.
+    #[test]
+    fn speed_is_the_distance_covered_per_second() {
+        // 3-4-5: 5 points in 10ms is 500 pt/s.
+        let at = |from, to| sample_speed(from, to, Duration::from_millis(10));
+        assert!((at((0.0, 0.0), (3.0, 4.0)) - 500.0).abs() < 0.1);
+        // Direction is irrelevant, only distance.
+        assert!((at((10.0, 10.0), (7.0, 6.0)) - 500.0).abs() < 0.1);
+        // A pointer that did not move has no speed, whatever the interval.
+        assert_eq!(sample_speed((5.0, 5.0), (5.0, 5.0), FRAME_120), 0.0);
+    }
+
+    /// An unknown interval must fall toward ACCURACY, never toward the throttle. Two samples
+    /// stamped in the same instant say the clock could not separate them, which is not
+    /// evidence of a fast pointer.
+    #[test]
+    fn an_unmeasurable_interval_reads_as_stationary_rather_than_infinite() {
+        let unmeasurable = sample_speed((0.0, 0.0), (900.0, 900.0), Duration::ZERO);
+        assert_eq!(unmeasurable, 0.0);
+        assert!(raster_due(Some(Duration::ZERO), unmeasurable));
+    }
+
+    /// THE end that must not regress: a pointer being aimed is paced exactly as it was before
+    /// pacing existed. Anything at or under `DELIBERATE_SPEED` rasters on every single frame.
+    #[test]
+    fn an_aiming_pointer_is_never_paced() {
+        for speed in [0.0, 1.0, 120.0, 599.0, DELIBERATE_SPEED] {
+            assert_eq!(raster_min_interval(speed), Duration::ZERO, "{speed} pt/s was paced");
+            assert!(raster_due(Some(Duration::ZERO), speed), "{speed} pt/s was refused a raster");
+        }
+    }
+
+    /// THE other end, and the one the owner explicitly asked about: the frame after the hand
+    /// stops is already stationary, so the lens catches up immediately. No decay, no timer.
+    #[test]
+    fn a_pointer_that_stops_gets_its_accurate_lens_back_on_the_next_frame() {
+        let settled = sample_speed((2000.0, 500.0), (2000.0, 500.0), FRAME_120);
+        assert_eq!(settled, 0.0);
+        assert_eq!(raster_min_interval(settled), Duration::ZERO);
+        // Even with a raster only microseconds old, having stopped means due NOW.
+        assert!(raster_due(Some(Duration::from_micros(1)), settled));
+    }
+
+    /// A full-screen flick, which is the case this exists for: the owner's 3456-point display
+    /// crossed in ~200ms. It saturates the ramp, so the content refreshes at
+    /// `RASTER_MAX_INTERVAL` instead of every frame.
+    #[test]
+    fn a_full_screen_flick_is_paced_to_the_ceiling() {
+        let flick = sample_speed((0.0, 700.0), (3456.0, 700.0), Duration::from_millis(200));
+        assert!(flick > FLICK_SPEED, "a screen-crossing flick should saturate, got {flick} pt/s");
+        assert_eq!(raster_min_interval(flick), RASTER_MAX_INTERVAL);
+        // Mid-flick, one frame after a raster, it declines…
+        assert!(!raster_due(Some(FRAME_120), flick));
+        assert!(!raster_due(Some(FRAME_60), flick));
+        // …and once the ceiling has passed, it takes one.
+        assert!(raster_due(Some(RASTER_MAX_INTERVAL), flick));
+    }
+
+    /// What the pacing is actually worth on the owner's hardware, stated as a test so the
+    /// claim in `raster_min_interval`'s doc cannot rot: a flick that would have rastered on
+    /// every one of 120 frames a second refreshes 25 times instead.
+    #[test]
+    fn the_ceiling_is_a_reduction_and_not_a_freeze() {
+        let per_sec = 1.0 / RASTER_MAX_INTERVAL.as_secs_f32();
+        assert!((20.0..=30.0).contains(&per_sec), "{per_sec}/s is no longer 'less often'");
+        let frames_120 = 1.0 / FRAME_120.as_secs_f32();
+        assert!(per_sec < frames_120 / 3.0, "the ceiling saves less than two thirds of the work");
+    }
+
+    /// It is a RAMP, not a switch: the pacing only ever grows with speed, so a hand wavering
+    /// near a threshold changes how often the lens refreshes by a little rather than freezing
+    /// and unfreezing it.
+    #[test]
+    fn the_pacing_only_ever_grows_with_speed() {
+        let mut last = Duration::ZERO;
+        let mut speed = 0.0f32;
+        while speed <= FLICK_SPEED * 1.5 {
+            let got = raster_min_interval(speed);
+            assert!(got >= last, "the ramp went backwards at {speed} pt/s");
+            assert!(got <= RASTER_MAX_INTERVAL, "the ramp overshot its ceiling at {speed} pt/s");
+            last = got;
+            speed += 25.0;
+        }
+        // And it really does move in between, or it would be a switch wearing a ramp's name.
+        let mid = raster_min_interval((DELIBERATE_SPEED + FLICK_SPEED) / 2.0);
+        assert!(
+            mid > Duration::ZERO && mid < RASTER_MAX_INTERVAL,
+            "the middle is not a ramp: {mid:?}"
+        );
+    }
+
+    /// Nonsense must not become a throttle. NaN can only mean the speed is unknown, and an
+    /// unknown speed rasters.
+    #[test]
+    fn a_speed_that_is_not_a_number_rasters() {
+        assert_eq!(raster_min_interval(f32::NAN), Duration::ZERO);
+        assert!(raster_due(Some(Duration::ZERO), f32::NAN));
+        // A negative cannot arise from `sample_speed`, but the ramp must not invert if it did.
+        assert_eq!(raster_min_interval(-1.0), Duration::ZERO);
+    }
+
+    /// A picker that has never rastered is ALWAYS due, at any speed. Otherwise a session that
+    /// opened under a hand already in motion could show no lens at all until it stopped.
+    #[test]
+    fn the_very_first_raster_is_never_paced() {
+        for speed in [0.0, DELIBERATE_SPEED, FLICK_SPEED, 50_000.0] {
+            assert!(raster_due(None, speed), "the first raster was paced at {speed} pt/s");
+        }
     }
 }
 

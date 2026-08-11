@@ -1,13 +1,31 @@
 //! The colour picker's two views: the dimmed magnifier OVERLAY and the result WINDOW.
 //!
-//! Both are built from ordinary iced elements. Nothing here uses
-//! `cosmic::iced::widget::shader`, and that is a hard constraint rather than a
-//! preference: Windows 10 renders our overlays through iced's software rasterizer
-//! (`platform::software_overlays`), which cannot draw a shader widget at all. The
-//! magnifier is a `widget::image` over a `widget::container` ring, and the swatches are
-//! containers, so the whole tool works on every renderer the app ships with.
+//! Everything here is built from ordinary iced elements, with ONE exception, and the
+//! exception is exactly as narrow as the constraint allows.
+//!
+//! **The constraint**: a process on iced's software rasterizer cannot draw a
+//! `widget::shader` AT ALL. A shader in this view unconditionally would not be slower
+//! there, it would be BLANK. That is why this file said "nothing here uses
+//! `cosmic::iced::widget::shader`" and treated it as a hard rule.
+//!
+//! **The exception** (DRAGON-TBD): the magnifier disc is rebuilt on effectively every real
+//! pointer move, and minting a fresh `image::Handle` each time makes iced allocate and trim a
+//! texture-atlas entry per move, which is the churn `preview::layers` exists to stop with a
+//! persistent GPU texture re-uploaded in place. So the disc now draws through that stack, and
+//! the rule becomes a BRANCH rather than a ban: `super::MagnifierRaster` carries whichever form
+//! this machine can draw, decided once in the update handler. The key was the platform's
+//! `software_overlays()` until DRAGON-650 exempted the picker process from the Windows 10
+//! software force (its overlay is an opaque snapshot needing no per-pixel window alpha);
+//! it is now the process's own renderer, `app::process_forced_software_backend`, and the
+//! image arm is the historical `widget::image` code byte for byte. Every other part of this
+//! view (the ring, the hex chip, the swatches, the unavailable pill) is still a plain
+//! container, so nothing else has to care.
 
 use super::*;
+// The persistent-texture layer stack, re-exported by `preview` for exactly this caller
+// (DRAGON-TBD). Named imports rather than a glob so it is obvious at the use site that the
+// magnifier is drawing through the SAME machinery the preview editor's video and covermark do.
+use crate::app::preview::{Layer, LayerKey, LayerStack};
 
 /// The gap between the magnifier's rim and the hex label.
 const LABEL_GAP: f32 = 10.0;
@@ -63,8 +81,9 @@ impl App {
         // one), scaled by the shared fade-in. The picker always grabs the flats, so this is
         // the overlay whose dim most needs to stay off the screen until the grab is done:
         // the picker READS that snapshot, and a dim baked into it would be reported back to
-        // the user as the colour they picked.
-        let dim = self.dim_now(self.color_picker_overlay_opacity);
+        // the user as the colour they picked. On Windows the fade is additionally held
+        // until this overlay is revealed (DRAGON-653, `dim_now_revealed`).
+        let dim = self.dim_now_revealed(o, self.color_picker_overlay_opacity);
         layers.push(
             widget::container(widget::space::Space::new())
                 .width(Length::Fill)
@@ -89,7 +108,7 @@ impl App {
             .filter(|h| h.output == o.name)
         {
             let viewport = o.units().size_to_point(o.logical_size);
-            layers.push(self.magnifier_layer(h));
+            layers.push(self.magnifier_layer(h, o.id, viewport));
             layers.push(self.hex_label_layer(h, viewport));
         }
         // The input surface goes LAST so it is on top and receives the events.
@@ -118,6 +137,13 @@ impl App {
             // the view's structure changes, which this very view does when the hover layers
             // above are inserted, and a later publish would reset the keyboard nudge.
             .needs_pointer(self.color_picker.pointer.is_none())
+            // DRAGON-TBD: the magnifier's cadence IS the display's. While a recorded pointer
+            // position has not reached the lens, each presented frame publishes one re-sample;
+            // when it has, nothing is published and the picker costs nothing at rest. A fixed
+            // timer stood here first and under-sampled a 120Hz panel by half.
+            .needs_resample(self.color_picker.resample_due, || {
+                Msg::ColorPicker(ColorPickerMsg::ResamplePoll)
+            })
             .into(),
         );
         // The shared transient banner. Added by DRAGON-608 for a self-capture decline and
@@ -140,17 +166,25 @@ impl App {
         cosmic::iced::widget::stack(layers).into()
     }
 
-    /// The magnifier disc, absolutely placed where [`geom::disc_view`] put it, and CLIPPED
-    /// by the screen edge rather than moved or resized by it.
+    /// The magnifier disc, placed by [`geom::drawn_disc_origin`] from the LIVE sample point,
+    /// and CLIPPED by the screen edge rather than moved or resized by it.
     ///
     /// Its centre is the SAMPLE POINT (DRAGON-587), which is the pointer itself where the sprite
     /// can be hidden and one point up and left of it where the arrow is on screen. Either way
     /// the lens sits on the pointer; the update handler already resolved which, and the disc's
     /// own contents are the same picture.
     ///
+    /// DRAGON-650: placed from `h.sample` on every frame, NOT from `h.disc.origin`. The two
+    /// agree exactly whenever the raster is fresh (`drawn_disc_origin`'s pinned identity), and
+    /// they disagree precisely on the paced frames of a fast sweep, where `h.disc` is the
+    /// identity of a raster up to `RASTER_MAX_INTERVAL` old. Placing from the raster there is
+    /// what made the lens stand still and then jump 40ms of travel in one step — "skips around
+    /// erratically" on a 60Hz panel — while the hex chip (placed from `h.sample` below) glided
+    /// ahead of it. The picture inside the lens may lag during a sweep; its position may not.
+    ///
     /// One piece now: the pre-rasterised disc, built in the update handler (never in `view` —
-    /// a per-frame `Handle::from_rgba` mints a new id and forces a GPU re-upload every
-    /// redraw), accent ring and all.
+    /// re-rasterising per frame would re-upload the texture on every redraw), accent ring and
+    /// all.
     ///
     /// DRAGON-587: the ring used to be a second, bordered container stacked over the image,
     /// and the image was placed at a clamped origin at the full diameter. Both had to go.
@@ -161,12 +195,52 @@ impl App {
     /// (`geom::disc_view`) and placed at exactly the size it occupies, so there is nothing
     /// left to clamp and nothing to rescale. The ring came along because a widget cannot be
     /// cropped the way a buffer can.
-    fn magnifier_layer<'a>(&'a self, h: &'a Hover) -> Element<'a, Msg> {
-        let disc = widget::image::Image::new(h.magnifier.clone())
-            .width(Length::Fixed(h.disc.size.0 as f32))
-            .height(Length::Fixed(h.disc.size.1 as f32))
-            .filter_method(cosmic::iced::widget::image::FilterMethod::Nearest);
-        absolute(disc.into(), (h.disc.origin.0 as f32, h.disc.origin.1 as f32))
+    ///
+    /// DRAGON-TBD: two ways to put those same pixels on screen, chosen by
+    /// [`super::MagnifierRaster`] (see this module's doc, and that type's, for why). Both are
+    /// placed identically, at exactly the size the clipped disc occupies, and both sample
+    /// NEAREST: a picker that smooths its cell boundaries is lying about which pixel is
+    /// which, so the shader arm asks for it explicitly with [`Layer::nearest`] rather than
+    /// inheriting the stack's smoothing default.
+    ///
+    /// `window` is the OUTPUT's overlay surface, which is what scopes the texture slot: each
+    /// display's lens owns its own, so one display's disc can never draw another's pixels.
+    fn magnifier_layer<'a>(
+        &'a self,
+        h: &'a Hover,
+        window: window::Id,
+        viewport: (f32, f32),
+    ) -> Element<'a, Msg> {
+        let (w, ht) = (h.disc.size.0 as f32, h.disc.size.1 as f32);
+        let disc: Element<'a, Msg> = match &h.magnifier {
+            // A software-forced process (dormant since DRAGON-650 exempted the picker from
+            // the Windows 10 force; see `MagnifierRaster`). Unchanged from before
+            // DRAGON-TBD, deliberately: the software rasterizer draws no shader at all, so
+            // this arm is the whole tool there.
+            super::MagnifierRaster::Image(handle) => widget::image::Image::new(handle.clone())
+                .width(Length::Fixed(w))
+                .height(Length::Fixed(ht))
+                .filter_method(cosmic::iced::widget::image::FilterMethod::Nearest)
+                .into(),
+            // Everywhere else: the persistent GPU texture. `live_picker_windows` is the set
+            // whose slots this prepare must not reclaim, the picker's answer to the preview
+            // editor's `live_preview_windows`.
+            super::MagnifierRaster::Layer(frame) => {
+                let stack = LayerStack::new(
+                    vec![Layer::full(LayerKey::color_magnifier(window), frame.clone()).nearest()],
+                    self.live_picker_windows(),
+                );
+                Element::new(
+                    cosmic::iced::widget::shader::Shader::new(stack)
+                        .width(Length::Fixed(w))
+                        .height(Length::Fixed(ht)),
+                )
+            }
+        };
+        // DRAGON-650: derived from the LIVE sample, not read off the raster's identity —
+        // see this function's doc and `geom::drawn_disc_origin`.
+        let origin = geom::drawn_disc_origin(h.sample, h.disc, viewport);
+        absolute(disc, (origin.0 as f32, origin.1 as f32))
     }
 
     /// The hex chip: the picked colour as its own background, its hex in the ink that
@@ -265,8 +339,10 @@ impl App {
 
     // ── The result window ────────────────────────────────────────────────────
 
-    /// The colour picker window: a CSD header, the full-width swatch, one row per
-    /// notation, and the recent-colours strip.
+    /// The colour picker window (DRAGON-630's reference layout): a CSD header, the
+    /// saturation/value square, the controls row (pipette, round current-colour swatch,
+    /// hue and alpha strips), one value row of per-component boxes with the mode
+    /// stepper, and the recent-colours strip.
     ///
     /// Nothing SCROLLS. The window is sized from these exact parts
     /// ([`geom::color_window_size`]), so a scrollbar would only ever mean the sizing
@@ -277,31 +353,70 @@ impl App {
             .title(WINDOW_TITLE)
             .focused(focused)
             .on_drag(Msg::WindowChrome(WindowChromeMsg::ColorPickerWindowDrag));
-        // macOS: the native traffic lights carry close (the window opens with a
-        // transparent titlebar over our header), so no CSD close is drawn there. Every
-        // other platform draws its own, exactly as the settings window does.
-        #[cfg(not(target_os = "macos"))]
-        let header = header.on_close(Msg::WindowChrome(WindowChromeMsg::Close));
-
-        let mut items: Vec<Element<'_, Msg>> = vec![self.color_swatch()];
-        items.push(
-            widget::column(
-                crate::color::ColorFormat::ALL
-                    .into_iter()
-                    .map(|f| self.color_row(f))
-                    .collect::<Vec<_>>(),
+        // DRAGON-649: minimize, but NEVER maximize. The window is deliberately
+        // fixed-size (`min_size == max_size`, see `open_color_picker_window`), so a
+        // maximize button would offer an operation the window refuses; minimize is the
+        // one window control left worth having. The same asymmetry already holds on
+        // macOS, where `MacPinWindow` disables the native zoom button and leaves the
+        // native minimize alone.
+        //
+        // Who draws the buttons, per platform:
+        // - macOS: the native traffic lights carry close and minimize (the window opens
+        //   with a transparent titlebar over our header), so no CSD buttons at all.
+        // - Windows 11: the finalize path installs the native DWM caption cluster
+        //   (`install_native_caption_buttons`), which owns minimize/close top-right, so
+        //   the CSD buttons are OMITTED and a trailing spacer reserves the cluster's
+        //   width, exactly as the settings and preview headers do. (The CSD close this
+        //   header used to draw unconditionally sat under that cluster.)
+        // - Windows 10: the cluster hit-tests but never paints (DRAGON-403), so the CSD
+        //   close + minimize render instead; minimize routes to the native helper
+        //   because iced's `window::minimize` is a no-op for a frameless toplevel.
+        // - Linux (and any other CSD platform): the app paints its own captions, so
+        //   close and minimize are both ours.
+        #[cfg(windows)]
+        let header = if crate::platform::windows::caption::native_caption_buttons_supported() {
+            header.end(
+                widget::space::Space::new()
+                    .width(Length::Fixed(crate::app::settings::WIN_CAPTION_INSET)),
             )
-            .spacing(geom::ROW_GAP)
-            .into(),
-        );
-        items.push(self.recent_colors_row());
+        } else {
+            header
+                .on_close(Msg::WindowChrome(WindowChromeMsg::Close))
+                .on_minimize(Msg::WindowChrome(WindowChromeMsg::ColorPickerWindowMinimize))
+        };
+        #[cfg(all(not(target_os = "macos"), not(windows)))]
+        let header = header
+            .on_close(Msg::WindowChrome(WindowChromeMsg::Close))
+            .on_minimize(Msg::WindowChrome(WindowChromeMsg::ColorPickerWindowMinimize));
 
-        let content = widget::container(
-            widget::column(items).spacing(geom::SECTION_GAP).width(Length::Fill),
-        )
-        .padding(geom::WINDOW_PADDING)
-        .width(Length::Fill)
-        .height(Length::Fill);
+        // DRAGON-630: the reference layout, top to bottom — the saturation/value
+        // square, the controls row (pipette, round swatch, hue + alpha strips), the one
+        // value row (component boxes + mode dropdown + copy), a hairline divider, and
+        // the two-row colour history. The gaps are EXPLICIT spacers rather than one
+        // column spacing, because the owner sized them individually on review (wider
+        // air around the controls row, ordinary gaps around the divider).
+        let items: Vec<Element<'_, Msg>> = vec![
+            self.sv_square(),
+            vspace(geom::GAP_SQUARE_CONTROLS),
+            self.controls_row(),
+            vspace(geom::GAP_CONTROLS_VALUE),
+            self.value_row(),
+            vspace(geom::SECTION_GAP),
+            // Wrapped at exactly DIVIDER_H: the divider widget carries its own padding,
+            // and un-counted height here is what once clamped the second history row
+            // short (iced clamps Fixed children to whatever room is left).
+            widget::container(widget::divider::horizontal::default())
+                .width(Length::Fill)
+                .height(Length::Fixed(geom::DIVIDER_H))
+                .into(),
+            vspace(geom::SECTION_GAP),
+            self.recent_colors_grid(),
+        ];
+
+        let content = widget::container(widget::column(items).width(Length::Fill))
+            .padding(geom::WINDOW_PADDING)
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         let stacked = widget::column(vec![header.into(), content.into()])
             .width(Length::Fill)
@@ -346,122 +461,446 @@ impl App {
             .into()
     }
 
-    /// The full-width swatch of the current colour. Its corners come from the app's
-    /// configured "Edge rounding" through [`swatch_radius`], the ONE radius every swatch in
-    /// this window shares, so switching Round / Slightly Round / Square in settings moves
-    /// the whole window's corners together.
-    fn color_swatch(&self) -> Element<'_, Msg> {
-        let c = self.color_picker.color;
-        let fill = cosmic::iced::Color::from_rgb8(c.r, c.g, c.b);
-        widget::container(widget::space::Space::new())
-            .width(Length::Fill)
-            .height(Length::Fixed(geom::SWATCH_H))
-            .class(cosmic::theme::Container::custom(move |t| {
-                cosmic::iced::widget::container::Style {
-                    background: Some(Background::Color(fill)),
-                    border: Border {
-                        radius: swatch_radius(t).into(),
-                        width: 1.0,
-                        color: t.cosmic().palette.neutral_8.into(),
-                    },
-                    ..Default::default()
-                }
-            }))
-            .into()
-    }
-
-    /// One notation row: its label, an editable value box, and a copy button.
-    ///
-    /// The value box shows the live DRAFT while this row is the one being typed into,
-    /// and the canonical spelling otherwise, so a half-typed value is never rewritten
-    /// under the caret (see `ColorPickerState::draft`).
-    fn color_row(&self, format: crate::color::ColorFormat) -> Element<'_, Msg> {
-        let text = self.color_picker.row_text(format);
-        let copied = self
-            .color_picker
-            .copied
-            .is_some_and(|(f, at)| f == format && crate::widgets::copy_button::copied_recently(Some(at)));
-        widget::row(vec![
-            widget::container(widget::text::body(format.label()))
-                .width(Length::Fixed(geom::ROW_LABEL_W))
-                .align_y(Alignment::Center)
-                .into(),
-            widget::text_input("", text)
-                .on_input(move |s| Msg::ColorPicker(ColorPickerMsg::RowEdited(format, s)))
-                .on_submit(|_| Msg::ColorPicker(ColorPickerMsg::RowCommitted))
-                .width(Length::Fixed(geom::ROW_INPUT_W))
-                .into(),
-            crate::widgets::copy_button::subtle_copy_button(
-                copied,
-                4,
-                widget::tooltip::Position::Left,
-                "Copy",
-                Msg::ColorPicker(ColorPickerMsg::CopyRow(format)),
-            ),
-        ])
-        .spacing(geom::ROW_SPACING)
-        .align_y(Alignment::Center)
-        .height(Length::Fixed(geom::ROW_H))
+    /// The saturation/value square (DRAGON-630): the current hue's gradient under a
+    /// draggable marker at the tracked S/V. The raster is built in the update handler
+    /// (`refresh_sv_raster`) and only re-built when the HUE moves; dragging inside the
+    /// square moves only the marker and the derived colour.
+    fn sv_square(&self) -> Element<'_, Msg> {
+        let cp = &self.color_picker;
+        let content = raster_image(cp.sv_raster.as_ref(), geom::CONTENT_W, geom::SV_H);
+        // The marker speaks the field's units: x is saturation, y runs down while
+        // value runs up. The same inversion `SvChanged` applies, so the marker sits
+        // exactly where the last drag put it.
+        let marker = (cp.hsv[1] as f32, 1.0 - cp.hsv[2] as f32);
+        // The ring's ink flips black/white with the colour UNDER it (the owner's spec),
+        // which is exactly the colour the marker is parked on. Same crossover as the
+        // hex chip's ink (`Srgb::wants_dark_text`), so one rule decides both.
+        let ink = if cp.color.wants_dark_text() {
+            cosmic::iced::Color::BLACK
+        } else {
+            cosmic::iced::Color::WHITE
+        };
+        let fill = cosmic::iced::Color::from_rgb8(cp.color.r, cp.color.g, cp.color.b);
+        crate::widgets::color_field::ColorField::new(
+            content,
+            marker,
+            crate::widgets::color_field::FieldAxis::Both,
+            |x, y| Msg::ColorPicker(ColorPickerMsg::SvChanged(x, y)),
+        )
+        .marker_style(move |_t| crate::widgets::color_field::MarkerStyle {
+            // FILLED with the selected colour (the owner's review; it was hollow): the
+            // ring is a little swatch of exactly what a pick here means.
+            fill: Some(fill),
+            border: ink,
+            border_width: 2.0,
+            // The owner's "very faint" drop shadow, just enough to lift the ring off
+            // the gradient when the ink and the colour run close.
+            shadow: cosmic::iced::core::Shadow {
+                color: cosmic::iced::Color { a: 0.18, ..cosmic::iced::Color::BLACK },
+                offset: cosmic::iced::core::Vector::new(0.0, 1.0),
+                blur_radius: 2.0,
+            },
+        })
         .into()
     }
 
-    /// The bottom row: the recent-colours strip from the left, and the pick-again pipette
-    /// pinned to the RIGHT edge of the same row (DRAGON-587).
+    /// The controls row (DRAGON-630): the pick-again pipette, the round current-colour
+    /// swatch (checkerboard showing through a translucent alpha), and the stacked hue
+    /// and alpha strips.
+    fn controls_row(&self) -> Element<'_, Msg> {
+        let cp = &self.color_picker;
+        let swatch = raster_image(
+            cp.swatch_raster.as_ref(),
+            geom::SWATCH_CIRCLE,
+            geom::SWATCH_CIRCLE,
+        );
+        let hue = gradient_strip(
+            cp.hue_raster.as_ref(),
+            (cp.hsv[0] / 360.0) as f32,
+            |x, _| Msg::ColorPicker(ColorPickerMsg::HueChanged(x)),
+        );
+        let alpha = gradient_strip(
+            cp.alpha_raster.as_ref(),
+            cp.alpha as f32 / 255.0,
+            |x, _| Msg::ColorPicker(ColorPickerMsg::AlphaChanged(x)),
+        );
+        let strips = widget::column(vec![hue, alpha]).spacing(geom::STRIP_GAP);
+        // Explicit spacers: the swatch-to-tracks gap is wider than the pipette-to-
+        // swatch one (the owner's review), so one row spacing cannot express the row.
+        widget::row(vec![
+            pick_again_button(),
+            hspace(geom::ROW_SPACING),
+            swatch,
+            hspace(geom::GAP_SWATCH_TRACKS),
+            strips.into(),
+        ])
+        .align_y(Alignment::Center)
+        .height(Length::Fixed(geom::CONTROLS_H))
+        .into()
+    }
+
+    /// The value row (DRAGON-630): the current mode's component boxes with their
+    /// captions beneath, the mode DROPDOWN, and the copy button pinned to the content's
+    /// right edge (the tracks' own right edge, the owner's alignment ask, held by the
+    /// flexible spacer so it can never shift when the box count changes). Each box
+    /// shows the live DRAFT while it is the one being typed into, and the canonical
+    /// spelling otherwise, so a half-typed value is never rewritten under the caret
+    /// (see `ColorPickerState::draft`).
+    fn value_row(&self) -> Element<'_, Msg> {
+        let cp = &self.color_picker;
+        // Split channel boxes, or the ONE whole-value box, by the remembered layout
+        // toggle (DRAGON-630 rev 3). Both spans are the same budget, so the right-edge
+        // cluster never moves between them.
+        let boxes: Element<'_, Msg> = if cp.split_inputs {
+            let bw = geom::value_box_width(cp.box_count());
+            // Single letters everywhere, hex included (the owner's call): the hex boxes
+            // hold pairs like `FF`, and the content is what says which dialect this is.
+            let mut labels = cp.mode.component_labels().to_vec();
+            labels.push("A");
+            let mut cells: Vec<Element<'_, Msg>> = Vec::new();
+            for (i, label) in labels.iter().enumerate() {
+                let input = widget::text_input("", cp.box_text(i))
+                    .on_input(move |s| Msg::ColorPicker(ColorPickerMsg::BoxEdited(i, s)))
+                    .on_submit(|_| Msg::ColorPicker(ColorPickerMsg::BoxCommitted))
+                    .width(Length::Fixed(bw));
+                cells.push(value_cell(input.into(), label, bw));
+            }
+            widget::row(cells).spacing(geom::BOX_GAP).into()
+        } else {
+            let w = geom::value_whole_width();
+            let input = widget::text_input("", cp.box_text(crate::app::color_picker::WHOLE_VALUE_BOX))
+                .on_input(|s| {
+                    Msg::ColorPicker(ColorPickerMsg::BoxEdited(
+                        crate::app::color_picker::WHOLE_VALUE_BOX,
+                        s,
+                    ))
+                })
+                .on_submit(|_| Msg::ColorPicker(ColorPickerMsg::BoxCommitted))
+                .width(Length::Fixed(w));
+            value_cell(input.into(), cp.mode.label(), w)
+        };
+        // A FIXED-width frame around whichever layout is showing, so toggling between
+        // them can never move the mode chip or anything right of it (the owner's ask;
+        // the split block's floor() had been coming out a couple of points narrower
+        // than the whole box).
+        let boxes: Element<'_, Msg> = widget::container(boxes)
+            .width(Length::Fixed(geom::value_whole_width()))
+            .into();
+        // ONE mode control (the owner's review; a chevron pair stood here first, then
+        // the stock dropdown widget, which could not take the icon-button hover, a
+        // fixed text span or our own caret): the hand-built chip + flyout below.
+        let picker_cell = value_cell(
+            mode_picker(cp.mode, cp.mode_menu_open),
+            "",
+            geom::MODE_PICKER_W,
+        );
+        let copied = cp
+            .copied
+            .is_some_and(|(_, at)| crate::widgets::copy_button::copied_recently(Some(at)));
+        let copy = widget::container(crate::widgets::copy_button::subtle_copy_button(
+            copied,
+            4,
+            widget::tooltip::Position::Bottom,
+            "Copy",
+            Msg::ColorPicker(ColorPickerMsg::CopyValue),
+        ))
+        .height(Length::Fixed(geom::VALUE_BOX_H))
+        .align_y(Alignment::Center);
+        let toggle = widget::container(layout_toggle_button(cp.split_inputs))
+            .height(Length::Fixed(geom::VALUE_BOX_H))
+            .align_y(Alignment::Center);
+        widget::row(vec![
+            boxes,
+            hspace(geom::ROW_SPACING),
+            picker_cell,
+            // The flexible spacer that pins the toggle + copy cluster to the right edge.
+            widget::space::Space::new().width(Length::Fill).into(),
+            toggle.into(),
+            hspace(geom::ROW_SPACING),
+            copy.into(),
+        ])
+        .align_y(Alignment::Start)
+        .width(Length::Fill)
+        .height(Length::Fixed(geom::VALUE_ROW_H))
+        .into()
+    }
+
+    /// The colour history: TWO rows of [`geom::RECENTS_PER_ROW`] swatches (the two-row
+    /// grid is the owner's rev-2 ask, matching the reference layout; DRAGON-649 widened
+    /// the rows from eight to ten so the gaps tighten; it began as one row of ten). A
+    /// full row is JUSTIFIED across the content ([`geom::recents_gap`]), so its last swatch
+    /// lands flush with the tracks' right edge; a part-filled row keeps the same grid
+    /// positions rather than re-spacing itself as picks arrive.
     ///
     /// Clicking a swatch LOADS it and nothing else: the list never reorders (see
     /// [`geom::writes_recents`]). Each swatch carries its hex as a tooltip, and takes
-    /// the same configured rounding as the big swatch above.
-    ///
-    /// The strip is the row's FILL child, so the pipette holds the right edge whether there
-    /// are no recents or a full ten. The window is sized so both ends fit at the cap
-    /// ([`geom::color_window_size`]), which matters more now that it cannot be resized.
-    fn recent_colors_row(&self) -> Element<'_, Msg> {
+    /// the same configured rounding as every swatch here.
+    fn recent_colors_grid(&self) -> Element<'_, Msg> {
+        let block_h = 2.0 * geom::RECENT_SWATCH + geom::recents_gap();
         let recents = &self.color_picker.recents;
-        let strip: Element<'_, Msg> = if recents.is_empty() {
-            // Nothing picked yet on this machine. A row of empty boxes would read as
-            // broken, so say what the strip is for instead.
-            widget::container(widget::text::caption("Colors you pick appear here."))
-                .height(Length::Fixed(geom::RECENT_SWATCH))
+        if recents.is_empty() {
+            // Nothing picked yet on this machine. A grid of empty boxes would read as
+            // broken, so say what the space is for instead.
+            return widget::container(widget::text::caption("Colors you pick appear here."))
+                .width(Length::Fill)
+                .height(Length::Fixed(block_h))
                 .align_y(Alignment::Center)
-                .into()
-        } else {
-            let current = self.color_picker.color;
-            let swatches: Vec<Element<'_, Msg>> = recents
-                .iter()
-                .take(geom::RECENTS_CAP)
-                .enumerate()
-                .map(|(i, c)| recent_swatch(*c, i, *c == current))
-                .collect();
-            widget::row(swatches)
-                .spacing(geom::RECENT_GAP)
-                .align_y(Alignment::Center)
-                .height(Length::Fixed(geom::RECENT_SWATCH))
-                .into()
-        };
-        widget::row(vec![
-            widget::container(strip).width(Length::Fill).into(),
-            pick_again_button(),
-        ])
-        .spacing(geom::ROW_SPACING)
-        .align_y(Alignment::Center)
-        .height(Length::Fixed(geom::RECENT_SWATCH))
-        .into()
+                .into();
+        }
+        let current = self.color_picker.color;
+        let gap = geom::recents_gap();
+        let swatches: Vec<Element<'_, Msg>> = recents
+            .iter()
+            .take(geom::RECENTS_CAP)
+            .enumerate()
+            .map(|(i, c)| recent_swatch(*c, i, *c == current))
+            .collect();
+        let mut grid_rows: Vec<Element<'_, Msg>> = Vec::new();
+        let mut row: Vec<Element<'_, Msg>> = Vec::new();
+        for (i, s) in swatches.into_iter().enumerate() {
+            row.push(s);
+            if (i + 1) % geom::RECENTS_PER_ROW == 0 {
+                grid_rows.push(
+                    widget::row(std::mem::take(&mut row))
+                        .spacing(gap)
+                        .height(Length::Fixed(geom::RECENT_SWATCH))
+                        .into(),
+                );
+            }
+        }
+        if !row.is_empty() {
+            grid_rows.push(
+                widget::row(row)
+                    .spacing(gap)
+                    .height(Length::Fixed(geom::RECENT_SWATCH))
+                    .into(),
+            );
+        }
+        widget::column(grid_rows)
+            .spacing(gap)
+            .width(Length::Fill)
+            .into()
     }
 }
 
-/// The pick-again pipette: start a new pick, exactly as launching the tool does.
+/// A window raster as a fixed-size NEAREST-free image, or an equally-sized blank while
+/// the first refresh has not run (a one-frame state at most; the rasters are built in
+/// the update handler before the window opens). Fixed sizes on both arms, so the layout
+/// cannot shift when the raster lands.
+fn raster_image<'a>(
+    raster: Option<&widget::image::Handle>,
+    w: f32,
+    h: f32,
+) -> Element<'a, Msg> {
+    match raster {
+        Some(handle) => widget::image::Image::new(handle.clone())
+            .width(Length::Fixed(w))
+            .height(Length::Fixed(h))
+            .into(),
+        None => widget::container(widget::space::Space::new())
+            .width(Length::Fixed(w))
+            .height(Length::Fixed(h))
+            .into(),
+    }
+}
+
+/// One slider strip (DRAGON-630): the pre-rastered gradient under `widgets::color_field`'s
+/// draggable marker, at normalized position `t`.
+///
+/// The thumb is the owner's spec: a solid disc in the WINDOW's own background with a
+/// subdued-text border, so it reads as a control sitting on the window rather than as a
+/// hole in the gradient. `theme::subtle` is the app's one subdued-text token.
+fn gradient_strip<'a>(
+    raster: Option<&widget::image::Handle>,
+    t: f32,
+    on_change: impl Fn(f32, f32) -> Msg + 'a,
+) -> Element<'a, Msg> {
+    crate::widgets::color_field::ColorField::new(
+        raster_image(raster, geom::STRIPS_W, geom::STRIP_H),
+        (t, 0.5),
+        crate::widgets::color_field::FieldAxis::X,
+        on_change,
+    )
+    .marker_diameter(geom::STRIP_H + 4.0)
+    .marker_style(|t| crate::widgets::color_field::MarkerStyle {
+        fill: Some(t.cosmic().background(false).base.into()),
+        border: theme::subdued(t),
+        border_width: 1.0,
+        shadow: cosmic::iced::core::Shadow::default(),
+    })
+    .into()
+}
+
+/// One value-row cell: the control with its caption centred beneath, the reference
+/// layout's "255 over R" shape (DRAGON-630).
+fn value_cell<'a>(control: Element<'a, Msg>, label: &'a str, w: f32) -> Element<'a, Msg> {
+    widget::column(vec![
+        control,
+        widget::container(widget::text::caption(label))
+            .center_x(Length::Fill)
+            .height(Length::Fixed(geom::VALUE_LABEL_H))
+            .into(),
+    ])
+    .spacing(geom::VALUE_LABEL_GAP)
+    .width(Length::Fixed(w))
+    .into()
+}
+
+/// The mode chip's label span: fixed at what the widest label ("OKLCH") needs, so the
+/// caret sits still when the mode changes (the owner's ask). With the chip's own
+/// padding, gap and caret this comes out to [`geom::MODE_PICKER_W`].
+const MODE_TEXT_W: f32 = 50.0;
+
+/// The mode chip and, while open, its menu (DRAGON-630 rev 4).
+///
+/// Hand-built on the zoom combo's chip + `chrome::flyout` recipe because the stock
+/// dropdown widget could meet none of the owner's three asks: its closed face styles
+/// through the theme-global pick_list catalog (no icon-button hover wash), its caret is
+/// whatever the SYSTEM icon theme resolves for `pan-down-symbolic` (not the app's
+/// vendored lucide chevron), and its text span breathes with the selection. The chip is
+/// an ordinary `Button::Icon` (the wash for free), a fixed [`MODE_TEXT_W`] label span,
+/// and the lucide chevron vertically centred beside it; the menu opens UPWARD by a
+/// known panel height, exactly like the zoom combo (the history block below leaves no
+/// room down), and a click anywhere else closes it through the flyout's own dismissal.
+fn mode_picker<'a>(mode: ColorFormat, open: bool) -> Element<'a, Msg> {
+    let label = widget::container(widget::text(mode.label()).size(13))
+        .width(Length::Fixed(MODE_TEXT_W))
+        .align_y(Alignment::Center);
+    // Lucide chevron-down IS chevron-up flipped (the owner's spec named the flip); one
+    // vendored glyph serves both spellings.
+    let caret = widget::container(
+        widget::icon(crate::widgets::icons::handle("pan-down-symbolic")).size(14),
+    )
+    .align_y(Alignment::Center);
+    // The row is wrapped in a CENTRING fill container because a cosmic button
+    // positions its content at its padding rather than centring it (the same quirk
+    // `chrome::dropdown_chip_tall` documents): the bare row sat top-aligned in the
+    // 34pt chip.
+    let chip = widget::button::custom(
+        widget::container(
+            widget::row(vec![label.into(), caret.into()])
+                .spacing(4.0)
+                .align_y(Alignment::Center),
+        )
+        .center_y(Length::Fill),
+    )
+    .width(Length::Fixed(geom::MODE_PICKER_W))
+    .height(Length::Fixed(geom::VALUE_BOX_H))
+    .padding([0, 8])
+    .class(cosmic::theme::Button::Icon)
+    .on_press(Msg::ColorPicker(ColorPickerMsg::ModeMenuToggled));
+    let chip: Element<'a, Msg> = crate::widgets::arrow_cursor::arrow_cursor(chip);
+    if !open {
+        return chip;
+    }
+    let items: Vec<Element<'a, Msg>> = crate::color::ColorFormat::ALL
+        .into_iter()
+        .enumerate()
+        .map(|(i, f)| {
+            // The current mode reads accent, like every other menu in the app.
+            let text = if f == mode {
+                widget::text(f.label()).size(13).class(cosmic::theme::Text::Custom(|t| {
+                    cosmic::iced::widget::text::Style {
+                        color: Some(theme::accent(t)),
+                        ..Default::default()
+                    }
+                }))
+            } else {
+                widget::text(f.label()).size(13)
+            };
+            crate::widgets::arrow_cursor::arrow_cursor(
+                widget::button::custom(text)
+                    .width(Length::Fill)
+                    .class(cosmic::theme::Button::Text)
+                    .on_press(Msg::ColorPicker(ColorPickerMsg::ModeSelected(i))),
+            )
+        })
+        .collect();
+    let menu = widget::container(widget::column(items).spacing(2.0))
+        .width(Length::Fixed(geom::MODE_PICKER_W))
+        .padding(4)
+        .class(cosmic::theme::Container::custom(|t| {
+            // The opaque menu surface every editor dropdown wears (see
+            // `chrome::menu_container`): component base at full alpha, divider outline,
+            // panel rounding.
+            let c = t.cosmic();
+            cosmic::iced::widget::container::Style {
+                background: Some(Background::Color(c.background(false).component.base.into())),
+                border: Border {
+                    radius: theme::rounding(t).m.into(),
+                    width: 1.0,
+                    color: c.background(false).component.divider.into(),
+                },
+                ..Default::default()
+            }
+        }));
+    crate::app::preview::chrome::flyout(
+        chip,
+        menu.into(),
+        crate::app::preview::chrome::FlyoutDir::Up(mode_menu_panel_h()),
+        Msg::ColorPicker(ColorPickerMsg::ModeMenuToggled),
+    )
+}
+
+/// The mode menu's on-screen height, for the upward flyout's fixed offset: seven text
+/// rows at their ~27pt natural height, the 2pt gaps, and the panel's 4pt inset — the
+/// zoom combo's own arithmetic over this menu's row count. A small over-estimate only
+/// lifts the menu a hair clear of the chip; an under-estimate overlaps it.
+fn mode_menu_panel_h() -> f32 {
+    let n = crate::color::ColorFormat::ALL.len() as f32;
+    n * 27.0 + (n - 1.0) * 2.0 + 2.0 * 4.0
+}
+
+/// A fixed vertical gap, for the window column whose section gaps the owner sized
+/// individually (so one uniform column spacing cannot express them).
+fn vspace<'a>(h: f32) -> Element<'a, Msg> {
+    widget::space::Space::new().height(Length::Fixed(h)).into()
+}
+
+/// A fixed horizontal gap, same reason, for the rows whose gaps differ pair by pair.
+fn hspace<'a>(w: f32) -> Element<'a, Msg> {
+    widget::space::Space::new().width(Length::Fixed(w)).into()
+}
+
+/// The value row's layout toggle (DRAGON-630 rev 3), left of the copy button: the
+/// lucide list-chevrons pair, SHOWING the remembered state — chevrons pointing outward
+/// while the channels are split apart, inward while they are collapsed into the one
+/// whole-value box. Dressed as a bare icon button like its copy neighbour.
+fn layout_toggle_button<'a>(split: bool) -> Element<'a, Msg> {
+    // The copy button's own construction, one glyph (`copy_button::subtle_icon_button`,
+    // same halo, same tint, same tooltip mechanics), so the pair beside each other read
+    // as one family: the first version hand-rolled a bigger button and the owner
+    // called the padding mismatch out. One tooltip either way (the owner's wording):
+    // the icon carries the state, the tooltip names the control.
+    let icon = if split { "list-expand-symbolic" } else { "list-collapse-symbolic" };
+    crate::widgets::copy_button::subtle_icon_button(
+        icon,
+        4,
+        widget::tooltip::Position::Bottom,
+        "Toggle split inputs",
+        Msg::ColorPicker(ColorPickerMsg::InputLayoutToggled),
+    )
+}
+
+/// The pick-again pipette: start a new pick, exactly as launching the tool does. It
+/// leads the CONTROLS row since DRAGON-630 (the reference layout's eyedropper
+/// position); it shared the recents row before that.
 ///
 /// The same lucide `pipette` the tray entry and the editor's toolbar button wear
 /// (`MenuIcon::ColorPicker` vendors it, `icons::handle` maps the name), so the tool has one
-/// glyph everywhere. Square and swatch-sized so it lines up with the row it shares, but
-/// dressed as a BARE ICON BUTTON rather than as a swatch: see [`pick_again_style`].
+/// glyph everywhere. Dressed as a BARE ICON BUTTON rather than as a swatch: see
+/// [`pick_again_style`].
 fn pick_again_button<'a>() -> Element<'a, Msg> {
-    let glyph = widget::icon(crate::widgets::icons::handle("color-select-symbolic")).size(16);
+    // The glyph doubled (16 to 32) on the owner's review, and the button grew to the
+    // round swatch's own square so the controls row leads with something the size of
+    // what it sits beside; the strips gave up the width.
+    let glyph = widget::icon(crate::widgets::icons::handle("color-select-symbolic"))
+        .size(geom::PICK_AGAIN_ICON);
     let button = widget::button::custom(
         widget::container(glyph).center_x(Length::Fill).center_y(Length::Fill),
     )
     .width(Length::Fixed(geom::PICK_AGAIN_W))
-    .height(Length::Fixed(geom::RECENT_SWATCH))
+    .height(Length::Fixed(geom::PICK_AGAIN_W))
     .padding(0)
     .class(cosmic::theme::Button::Custom {
         active: Box::new(|_f, t| pick_again_style(t, false, false)),
@@ -563,7 +1002,9 @@ fn recent_swatch<'a>(c: Srgb, index: usize, selected: bool) -> Element<'a, Msg> 
         // The SAME radius the big swatch takes (DRAGON-587): one lookup, `swatch_radius`.
         s.border_radius = swatch_radius(theme).into();
         s.border_width = 1.0;
-        s.border_color = theme.cosmic().palette.neutral_8.into();
+        // SUBDUED, the owner's review: the same quiet-text tone the slider thumbs and
+        // the round swatch's rim wear, not a near-white/near-black neutral.
+        s.border_color = theme::subdued(theme);
         if selected {
             // An outline OUTSIDE the swatch reads as selection without recolouring it,
             // the same affordance the settings accent palette uses.

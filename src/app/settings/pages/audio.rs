@@ -55,10 +55,12 @@ impl crate::app::App {
                 Item::new(
                     "Output device",
                     output_desc,
-                    crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                        &self.speaker_device_labels,
-                        Some(self.speaker_device_index()),
-                        |a0| Msg::Settings(SettingsMsg::SetSpeakerDevice(a0)),
+                    crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                        widget::dropdown(
+                            &self.speaker_device_labels,
+                            Some(self.speaker_device_index()),
+                            |a0| Msg::Settings(SettingsMsg::SetSpeakerDevice(a0)),
+                        ),
                     )),
                 )
                 .reset_with(self.speaker_device_index(), 0usize, |a0| Msg::Settings(SettingsMsg::SetSpeakerDevice(a0)))
@@ -75,10 +77,12 @@ impl crate::app::App {
             Item::new(
                 "Input device",
                 "",
-                crate::widgets::arrow_cursor::arrow_cursor(widget::dropdown(
-                    &self.mic_device_labels,
-                    Some(self.mic_device_index()),
-                    |a0| Msg::Settings(SettingsMsg::SetMicDevice(a0)),
+                crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::press_redraw(
+                    widget::dropdown(
+                        &self.mic_device_labels,
+                        Some(self.mic_device_index()),
+                        |a0| Msg::Settings(SettingsMsg::SetMicDevice(a0)),
+                    ),
                 )),
             )
             .reset_with(self.mic_device_index(), 0usize, |a0| Msg::Settings(SettingsMsg::SetMicDevice(a0)))

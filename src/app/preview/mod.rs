@@ -19,7 +19,10 @@ use super::*;
 use std::path::PathBuf;
 
 mod annotate;
-mod chrome;
+// `pub(in crate::app)`: the colour picker window borrows `chrome::flyout` (the shared
+// chip + popover recipe) for its mode menu (DRAGON-630), so the module has to be
+// reachable from a sibling; everything else in it stays `pub(super)`.
+pub(in crate::app) mod chrome;
 mod covermark;
 mod crop;
 // `pub(crate)` for ONE caller outside this module: `subscriptions::sub_upload_poll` reads
@@ -43,7 +46,12 @@ mod viewport;
 
 pub use image::ImagePreview;
 pub use video::VideoPreview;
-pub use layers::PixelFrame;
+// The persistent-GPU-texture layer stack. `PixelFrame` was the only name that had to leave
+// this module until DRAGON-TBD; the colour picker's magnifier now draws through the same
+// shader (its raster was churning iced's atlas on every pointer move), and `mod layers` is
+// private to `preview`, so the three names its view builds a stack from come out here too.
+// Nothing about the stack was preview-specific, see `layers`' own module doc.
+pub use layers::{Layer, LayerKey, LayerStack, PixelFrame};
 pub use edit::covermark_dir;
 pub(crate) use annotate::AnnotId;
 // The STAGED escape (DRAGON-468): `keyboard.rs` asks what a press gives up before the keymap
@@ -2628,14 +2636,16 @@ impl App {
                 //
                 // DRAGON-436 round 2 (Windows) / DRAGON-415 (macOS): "say so, THEN close" has
                 // to be sequenced by hand on both platforms — neither may close inline. A
-                // `MessageBox` does not block, and on Windows this close almost always ends
-                // the PROCESS — the preview is single-document there (`handoff_host` is
-                // cfg(unix), and a handoff spawns a fresh process), so `Cancel` reaches
-                // `finish_session` and its 1.5s hard exit within milliseconds, killing the
-                // alert thread before anyone could read a word. `NSAlert::runModal` DOES
-                // block, but only safely off the winit thread (see `platform::mac::alert`'s
-                // module doc), so mac needs the exact same deferral. Both wait for the
-                // dismissal (or, on Windows, its 120s bound) before closing.
+                // `MessageBox` does not block, and on Windows this close usually ends the
+                // PROCESS — a single-document session is the common case there (since
+                // DRAGON-651 a Windows preview can host handed-off siblings too, but a
+                // load failure with no siblings is the shape this guards), so `Cancel`
+                // reaches `finish_session` and its 1.5s hard exit within milliseconds,
+                // killing the alert thread before anyone could read a word.
+                // `NSAlert::runModal` DOES block, but only safely off the winit thread
+                // (see `platform::mac::alert`'s module doc), so mac needs the exact same
+                // deferral. Both wait for the dismissal (or, on Windows, its 120s bound)
+                // before closing.
                 #[cfg(windows)]
                 if let Some(dismissal) = self.show_failure_alert() {
                     return Task::perform(super::failure::await_dismissal(dismissal), move |()| {

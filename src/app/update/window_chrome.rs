@@ -199,6 +199,27 @@ impl App {
             WindowChromeMsg::SeedOutputs => self.seed_outputs_mac(),
             #[cfg(not(target_os = "linux"))]
             WindowChromeMsg::OverlayOpened(id, attempt) => self.configure_overlay(id, attempt),
+            // macOS (DRAGON-646): the paint gate's bounded fallback. `ConfigWindowResized`
+            // normally opens the gate long before this lands, so the usual outcome here is
+            // that `frame_pending` is already false and nothing happens.
+            #[cfg(target_os = "macos")]
+            WindowChromeMsg::OverlayFrameSettled(id) => {
+                if let Some(o) = self.outputs.iter().find(|o| o.id == id)
+                    && o.frame_pending.get()
+                {
+                    log::debug!(
+                        "overlay '{}' never reported the frame it was given; drawing anyway",
+                        o.name
+                    );
+                    o.frame_pending.set(false);
+                    o.placed.set(true);
+                    crate::util::timing_mark(
+                        "configure_overlay: frame-settle fallback fired (overlay visible) \
+                         *** USER SEES UI ***",
+                    );
+                }
+                Task::none()
+            }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             WindowChromeMsg::PreviewOpened(id, attempt) => self.finalize_preview_window(id, attempt),
             #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -730,6 +751,27 @@ impl App {
                 Task::batch([self.flush_deferred_auto_copy(id), self.flush_deferred_pick_copy(id)])
             }
             WindowChromeMsg::ConfigWindowResized(id, w, h) => {
+                // macOS (DRAGON-646): this is the event `configure_overlay` is holding the
+                // overlay's paint gate for. iced's viewport for the window is now `w`x`h`, so
+                // once that matches the frame `place_overlay` set, content laid out against it
+                // lands where it belongs and the gate can open. Anything else is a size we did
+                // not ask for (the mint-time menu-bar clamp arrives first and is exactly that)
+                // and is ignored rather than accepted, which is what keeps the ONE stretched
+                // frame off the screen.
+                #[cfg(target_os = "macos")]
+                if let Some(o) = self.outputs.iter().find(|o| o.id == id)
+                    && o.frame_pending.get()
+                {
+                    let (pw, ph) = o.point_size();
+                    if (w - pw).abs() < 0.5 && (h - ph).abs() < 0.5 {
+                        o.frame_pending.set(false);
+                        o.placed.set(true);
+                        crate::util::timing_mark(
+                            "configure_overlay: surface caught up (overlay visible + framed) \
+                             *** USER SEES UI ***",
+                        );
+                    }
+                }
                 // Remember the settings window's size so it reopens at the size it was
                 // closed at (persisted on close).
                 if Some(id) == self.settings.window && w >= 1.0 && h >= 1.0 {
@@ -911,6 +953,23 @@ impl App {
                 Some(id) => window::drag(id),
                 None => Task::none(),
             },
+            WindowChromeMsg::ColorPickerWindowMinimize => {
+                // Windows (DRAGON-258's lesson, same as the settings and preview arms):
+                // iced's `window::minimize` is a no-op for a frameless natively-managed
+                // toplevel, so route to the native `ShowWindow(SW_MINIMIZE)` helper,
+                // keyed on the async-set title like every other picker-window helper.
+                // Only Windows 10's CSD fallback constructs this on Windows; Windows
+                // 11's native cluster minimizes by itself (DRAGON-649).
+                #[cfg(windows)]
+                crate::platform::windows::window::minimize(color_picker::WINDOW_TITLE);
+                #[cfg(windows)]
+                return Task::none();
+                #[cfg(not(windows))]
+                match self.color_picker.window {
+                    Some(id) => window::minimize(id, true),
+                    None => Task::none(),
+                }
+            }
             WindowChromeMsg::ClosePermissionsWindow => match self.permissions.window {
                 Some(id) => window::close(id),
                 None => Task::none(),

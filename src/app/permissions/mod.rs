@@ -226,6 +226,75 @@ pub fn probe_now_fast() -> Probe {
     probe_with(false)
 }
 
+/// A [`probe_now_fast`] STARTED EARLY, on its own thread, and joined where its answer is
+/// first actually needed. Mirrors `record::owned::AudioPreflight` exactly, including the
+/// spawn-failure fallback that runs the work inline rather than losing it.
+///
+/// **Why this exists rather than "just move the probe later".** It cannot move later. The
+/// macOS activation policy is boot-time-only (DRAGON-150), and DRAGON-440 hoisted this probe
+/// out of `App::init` precisely BECAUSE init was already too late for it: the policy has to
+/// know whether this launch routes to the permission checker before `cosmic::app::run`
+/// creates the first window. So the probe's ~37ms sat in front of everything, on its own,
+/// paying for nothing else. It could only get cheaper by starting SOONER, which is what this
+/// does: `app::run` starts it as its first act, and the preamble work that does NOT depend
+/// on it (the SkyLight `enable_background_cursor` resolve, ~28ms measured) then runs
+/// alongside it instead of in front of it.
+///
+/// **Why the join needs no timeout.** This is the variant with no blocking query in it. Its
+/// three reads (`CGPreflightScreenCaptureAccess`, `AVCaptureDevice
+/// .authorizationStatusForMediaType`, `AXIsProcessTrusted`) are synchronous framework
+/// predicates and the rest is a config read; the ONE query that can block, the notification
+/// settings fetch, is exactly what `_fast` excludes — and is itself `recv_timeout`-bounded
+/// where it is used. The wait is bounded by the work, which is the same argument
+/// `AudioPreflight::join` makes for its own plain `join`.
+///
+/// **Why it is sound off the main thread.** Nothing on this path is AppKit. `is_bundled`'s
+/// `NSBundle` read is the only AppKit-adjacent call in `probe_with`, and it sits behind the
+/// `include_notifications &&` short-circuit, so a `_fast` probe never reaches it. The thread
+/// also starts before `NSApplication` exists, so it cannot race the app's own bring-up.
+#[cfg(target_os = "macos")]
+pub struct ProbePreflight(ProbeState);
+
+#[cfg(target_os = "macos")]
+enum ProbeState {
+    Running(std::thread::JoinHandle<Probe>),
+    /// The spawn-failure fallback: the probe already ran inline on the caller's thread, so
+    /// a machine that cannot spawn a thread this early still gets its ordinary serialized
+    /// launch rather than an unrouted one.
+    Done(Probe),
+}
+
+#[cfg(target_os = "macos")]
+impl ProbePreflight {
+    /// Start the probe on its own thread. Call FIRST in `app::run`, before any preamble
+    /// work, so as much of that work as possible overlaps it.
+    pub fn start() -> Self {
+        match std::thread::Builder::new()
+            .name("cck-permission-probe".to_string())
+            .spawn(probe_now_fast)
+        {
+            Ok(thread) => ProbePreflight(ProbeState::Running(thread)),
+            Err(e) => {
+                log::warn!("permission pre-flight: could not spawn its thread ({e}); running it inline");
+                ProbePreflight(ProbeState::Done(probe_now_fast()))
+            }
+        }
+    }
+
+    /// Wait for the snapshot (bounded by the work itself; see the type doc). A panicked
+    /// probe thread degrades to a fresh inline probe rather than taking the launch down —
+    /// the routing decision must still be made from a real snapshot, never from a default.
+    pub fn join(self) -> Probe {
+        match self.0 {
+            ProbeState::Running(thread) => thread.join().unwrap_or_else(|_| {
+                log::warn!("permission pre-flight thread panicked; re-probing inline");
+                probe_now_fast()
+            }),
+            ProbeState::Done(probe) => probe,
+        }
+    }
+}
+
 /// Shared body for [`probe_now`] / [`probe_now_fast`]: `include_notifications` gates the
 /// one potentially-blocking query (the notification settings fetch); everything else is
 /// prompt-free. macOS-only.
@@ -261,20 +330,32 @@ fn probe_with(include_notifications: bool) -> Probe {
     } else {
         None
     };
+    // ONE config read for the three persisted flags below. It used to be three separate
+    // `crate::state::load()` calls, one per field, and each one is a full open + read +
+    // TOML parse + `migrate` of the whole `Persisted` struct — so this function did that
+    // work three times to answer three booleans out of the SAME snapshot. On macOS it is
+    // also on the launch's critical path (`app::run`'s routing probe), which is why it is
+    // worth the local.
+    //
+    // Reading once is also the more correct of the two: three loads are three separate
+    // points in time, so a `state::save` landing between them (the permission window's own
+    // poll re-probes while the user is in System Settings) could mint a Probe whose flags
+    // came from two different versions of the file. One read cannot disagree with itself.
+    let persisted = crate::state::load();
     Probe {
         // FORCE_DANGER forces the screen grant missing + prompt spent ⇒ Denied.
         screen_granted: !force_danger && tcc::screen_capture_granted(),
-        screen_request_spent: force_danger || crate::state::load().mac_first_run_seen,
+        screen_request_spent: force_danger || persisted.mac_first_run_seen,
         microphone,
         notifications,
         // Accessibility is RECOMMENDED, so FORCE_WARN (not FORCE_DANGER) drives it
         // missing + prompt spent ⇒ amber Denied (Open Settings), matching how FORCE_WARN
         // exercises the other non-required cards' remediation button.
         accessibility_granted: !force_warn && tcc::accessibility_granted(),
-        accessibility_request_spent: force_warn || crate::state::load().mac_accessibility_prompt_seen,
+        accessibility_request_spent: force_warn || persisted.mac_accessibility_prompt_seen,
         // DRAGON-412: read straight off the store — the review flags exercise CARD
         // states, and this one only gates AUTO-open, which they don't drive.
-        nag_spent: crate::state::load().mac_permission_nag_spent,
+        nag_spent: persisted.mac_permission_nag_spent,
     }
 }
 

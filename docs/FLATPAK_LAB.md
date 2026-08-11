@@ -243,7 +243,7 @@ From a live COSMIC session, Flatpak 1.18.0, cosmic-store 1.5.0:
 | `XDG_CONFIG_HOME` | the app's PRIVATE store; host config readable at `$HOME/.config` |
 
 **Why `--no-default-features`:** the runtime's libavcodec is 61 (ffmpeg 7.1) and `zero-copy`
-binds the ffmpeg 8.1 headers. Building ffmpeg 8 as a module adds ~15 min to every build for a
+binds the ffmpeg 9.0 headers. Building ffmpeg 9 as a module adds ~15 min to every build for a
 feature the sandbox degrades anyway. Recording still works through the runtime's ffmpeg binary,
 which is the path macOS and Windows already ship.
 

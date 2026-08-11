@@ -355,6 +355,8 @@ mod tests {
         // strings is a VALUE to toml, not a table, so it must survive alongside them.
         p.color_picker_overlay_opacity = 0.4;
         p.recent_colors = vec!["#FF8800".into(), "#123456".into()];
+        // DRAGON-630: the remembered mode is a scalar declared after that array.
+        p.color_picker_mode = "oklch".into();
         let s = toml::to_string(&p).expect("serialize must succeed");
         let back: Persisted = toml::from_str(&s).expect("deserialize must succeed");
         assert_eq!(back.capture_hotkey, "F13", "scalar after covermark_prefs survived");
@@ -362,6 +364,7 @@ mod tests {
         assert_eq!(back.covermark_prefs.len(), 1);
         assert_eq!(back.color_picker_overlay_opacity, 0.4);
         assert_eq!(back.recent_colors, vec!["#FF8800", "#123456"]);
+        assert_eq!(back.color_picker_mode, "oklch", "the chosen mode round-trips");
     }
 
     /// DRAGON-582: the colour picker's own defaults, which a fresh install ships with.
@@ -378,6 +381,9 @@ mod tests {
         );
         assert!(d.recent_colors.is_empty());
         assert!(d.color_picker_hotkey.is_empty(), "the global hotkey ships UNBOUND");
+        // DRAGON-630: a fresh install (and any config predating the key) opens the value
+        // row in HEX, which is what the tool always copied before modes existed.
+        assert_eq!(d.color_picker_mode, "hex");
         // DRAGON-615: a fresh install opens the magnifier exactly where it always did, so
         // persisting the zoom changes nothing for anyone who has not touched it.
         assert_eq!(

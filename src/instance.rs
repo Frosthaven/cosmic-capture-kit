@@ -1155,9 +1155,9 @@ fn set_self_marker(suffix: &str, active: bool) {
 /// DRAGON-351: this used to be gated on the "allow multiple capture instances" setting
 /// too (`allow_multiple && (recording || preview)`); that setting is gone and the sparing
 /// is now unconditional. The predicate itself deliberately STAYS — macOS and Windows spawn
-/// a process per preview and depend on it (Windows has no preview-handoff transport at
-/// all, so its sweep is the only thing standing between a recording session and a fresh
-/// capture).
+/// a process per preview and depend on it, and the sweep is what stands between a
+/// recording session and a fresh capture whenever a handoff did not happen (a handoff is
+/// an optimisation on every platform, never something the sparing may assume).
 ///
 /// DRAGON-438 added `alert`. A sibling showing the DRAGON-415 capture-failure dialog is
 /// mid-conversation with the user: the sweep would `TerminateProcess` it, so the dialog
@@ -1280,10 +1280,12 @@ fn any_other_marker_in(dir: &str, self_pid: u32, marker: &str) -> bool {
 // fresh capture child needs to FIND that host to hand its file over
 // (`crate::preview_ipc`). There is deliberately no second registry: a preview host is
 // exactly a pid whose [`PREVIEW_MARKER`] exists and is LIVE — the same marker
-// `close_other_instances` already spares. The transport socket is that pid's
-// [`PREVIEW_SOCKET_MARKER`] sibling ([`preview_socket_path`]); a marker with no socket is
-// simply a preview that isn't hosting, and the child's connect fails into its own
-// preview. Unix-only: Windows has no unix-socket transport (see `preview_ipc`).
+// `close_other_instances` already spares. The transport ADDRESS is per-platform
+// ([`preview_host_address`]): on unix that pid's [`PREVIEW_SOCKET_MARKER`] sibling (a
+// marker with no socket is simply a preview that isn't hosting, and the child's connect
+// fails into its own preview), on Windows that pid's named pipe (DRAGON-651; a pipe is
+// not a file in this dir, so "not hosting" surfaces as the client's own failed connect
+// instead of a missing sidecar). The scan itself is portable.
 
 /// The preview-handoff socket path for `pid` — the sibling of that pid's preview marker.
 #[cfg(unix)]
@@ -1291,24 +1293,47 @@ pub(crate) fn preview_socket_path(pid: u32) -> String {
     state_marker_path(pid, PREVIEW_SOCKET_MARKER)
 }
 
+/// Windows (DRAGON-651): the preview-handoff named pipe for `pid` — the transport analog
+/// of [`preview_socket_path`], carrying the same per-pid stem the markers use.
+/// Per-pid, unlike the session-wide `daemon_ipc::pipe_name`, because every preview host
+/// is its own process and a sender addresses ONE of them.
+#[cfg(windows)]
+pub(crate) fn preview_pipe_name(pid: u32) -> String {
+    format!(r"\\.\pipe\cosmic-capture-kit.{pid}.preview")
+}
+
+/// The address `pid`'s preview host listens on: the socket path on unix, the named pipe
+/// on Windows. The one name the bind/send sites use, so they carry no `cfg`.
+#[cfg(any(unix, windows))]
+pub(crate) fn preview_host_address(pid: u32) -> String {
+    #[cfg(unix)]
+    {
+        preview_socket_path(pid)
+    }
+    #[cfg(windows)]
+    {
+        preview_pipe_name(pid)
+    }
+}
+
 /// Every OTHER live preview host, in the order a child should try them: most recently
 /// opened first (its marker's mtime), ties broken by pid so the order is deterministic.
 /// Markers left by dead pids are swept as we scan, exactly like [`any_other_recording`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn live_preview_hosts() -> Vec<u32> {
     live_preview_hosts_in(&crate::util::runtime_dir(), std::process::id())
 }
 
 /// The pid of a live preview host, if any (excluding self) — the first candidate of
 /// [`live_preview_hosts`]. The "is anyone hosting?" question in one call.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn live_preview_host() -> Option<u32> {
     live_preview_hosts().into_iter().next()
 }
 
 /// [`live_preview_hosts`] against an EXPLICIT runtime dir + self pid, so the scan (and
 /// its stale sweep) is testable without touching the live runtime dir.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn live_preview_hosts_in(dir: &str, self_pid: u32) -> Vec<u32> {
     live_marker_hosts_in(dir, self_pid, PREVIEW_MARKER, PREVIEW_SOCKET_MARKER)
 }
@@ -1319,8 +1344,11 @@ fn live_preview_hosts_in(dir: &str, self_pid: u32) -> Vec<u32> {
 /// out of `any_other_recording` for the same reason.
 ///
 /// Dead pids are swept as we scan: BOTH the marker and its socket sidecar, so a recycled
-/// pid can never inherit a socket nothing listens on.
-#[cfg(unix)]
+/// pid can never inherit a socket nothing listens on. On Windows (DRAGON-651) the sidecar
+/// never exists — the transport is a named pipe, which is not a file in this dir — so
+/// that removal is a harmless no-op and the ONE body stays shared; a dead pipe is caught
+/// by the sender's own failed connect instead.
+#[cfg(any(unix, windows))]
 fn live_marker_hosts_in(
     dir: &str,
     self_pid: u32,
@@ -1362,12 +1390,13 @@ fn live_marker_hosts_in(
 // reads. Its control socket is that pid's [`RECORDING_SOCKET_MARKER`] sibling, speaking
 // the resident relay's own [`crate::daemon_ipc::Command`] words.
 //
-// LINUX-only, and deliberately narrower than the preview transport's `cfg(unix)`. Linux is
-// the platform where an in-app recording shortcut cannot be delivered at all, so it is the
-// platform that needs a CLI route to the recording. macOS and Windows keep their overlay
-// windows (and their menu-bar / tray controls) through a recording and are left
-// byte-identical by DRAGON-583; widening this to `cfg(unix)` is the whole of what it would
-// take to give macOS the same commands, once someone can test them there.
+// LINUX-only, and deliberately narrower than the preview transport's gate (now
+// `any(unix, windows)`, DRAGON-651). Linux is the platform where an in-app recording
+// shortcut cannot be delivered at all, so it is the platform that needs a CLI route to
+// the recording. macOS and Windows keep their overlay windows (and their menu-bar / tray
+// controls) through a recording and are left byte-identical by DRAGON-583; widening this
+// to `cfg(unix)` is the whole of what it would take to give macOS the same commands, once
+// someone can test them there.
 
 /// The recording-control socket path for `pid`, the sibling of that pid's recording
 /// marker.
@@ -1403,8 +1432,8 @@ pub(crate) fn live_recording_hosts() -> Vec<u32> {
 // address is that pid's [`COLOR_PICKER_SOCKET_MARKER`] sibling, speaking
 // [`crate::preview_ipc`]'s `color` verb.
 //
-// Unix-only, like the preview transport and for the same reason: Windows has no unix
-// sockets, so a pick there opens its own window exactly as it does today.
+// The address is per-platform like the preview host's ([`color_picker_host_address`]):
+// a unix socket beside the marker, or the pid's named pipe on Windows (DRAGON-651).
 
 /// The picked-colour socket path for `pid`, the sibling of that pid's picker-window marker.
 #[cfg(unix)]
@@ -1412,11 +1441,32 @@ pub(crate) fn color_picker_socket_path(pid: u32) -> String {
     state_marker_path(pid, COLOR_PICKER_SOCKET_MARKER)
 }
 
+/// Windows (DRAGON-651): the picked-colour named pipe for `pid` — the transport analog of
+/// [`color_picker_socket_path`], on the same per-pid stem as [`preview_pipe_name`].
+#[cfg(windows)]
+pub(crate) fn color_picker_pipe_name(pid: u32) -> String {
+    format!(r"\\.\pipe\cosmic-capture-kit.{pid}.colorpicker")
+}
+
+/// The address `pid`'s picker window listens on for picked colours: the socket path on
+/// unix, the named pipe on Windows — [`preview_host_address`]'s picker sibling.
+#[cfg(any(unix, windows))]
+pub(crate) fn color_picker_host_address(pid: u32) -> String {
+    #[cfg(unix)]
+    {
+        color_picker_socket_path(pid)
+    }
+    #[cfg(windows)]
+    {
+        color_picker_pipe_name(pid)
+    }
+}
+
 /// Every live picker WINDOW other than ours, newest first (the same ordering rule as the
 /// preview hosts, and for the same reason: the most recently opened window is the one the
 /// user is looking at). In practice there is at most one, because this scan is what keeps
 /// it that way; the list shape is kept so no caller has to assume it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn live_color_picker_windows() -> Vec<u32> {
     live_marker_hosts_in(
         &crate::util::runtime_dir(),
@@ -1429,7 +1479,7 @@ pub(crate) fn live_color_picker_windows() -> Vec<u32> {
 /// Order host candidates for a handoff attempt: newest marker first (the most recently
 /// opened preview host is the one the user is most likely looking at), unknown mtimes
 /// last, ties broken by ascending pid so the order never depends on readdir.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn order_preview_hosts(mut found: Vec<(u32, Option<std::time::SystemTime>)>) -> Vec<u32> {
     found.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     found.into_iter().map(|(pid, _)| pid).collect()
@@ -1610,8 +1660,14 @@ fn mac_all_pids() -> Vec<u32> {
 /// macOS (DRAGON-459): `pid`'s executable path via `libproc`'s `proc_pidpath` — the mac
 /// analog of Linux's `/proc/<pid>/exe` readlink. `None` for a dead/inaccessible pid,
 /// exactly like the Linux body's `read_link` failure.
+///
+/// DRAGON-TBD made it `pub(crate)`: the ScreenCaptureKit display filter needs the same
+/// "is that window's owner another instance of US" answer this sweep already asks, and
+/// deriving it from a second source would let the two drift. Read the WHOLE of that answer
+/// from here rather than from `std::env::current_exe`, on both sides of the comparison, so a
+/// symlinked launch cannot make a process disagree with itself.
 #[cfg(target_os = "macos")]
-fn mac_exe_path(pid: u32) -> Option<std::path::PathBuf> {
+pub(crate) fn mac_exe_path(pid: u32) -> Option<std::path::PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: `buf` is exactly `PROC_PIDPATHINFO_MAXSIZE` bytes, the size this call
@@ -1846,6 +1902,32 @@ fn is_settings_instance(pid: u32) -> bool {
         return true;
     }
     mac_argv(pid).iter().any(|arg| arg == "--settings")
+}
+
+/// macOS (DRAGON-TBD): whether `pid` is a COLOUR PICKER instance, read the same way
+/// [`is_settings_instance`] and [`is_resident_instance`] read theirs, from the process's own
+/// argv.
+///
+/// The one reader is the ScreenCaptureKit display filter
+/// (`platform::mac_window_is_stray_chrome`), which keeps a sibling instance's capture chrome
+/// out of a whole-display grab and must NOT do that to a live picker: DRAGON-608 shipped the
+/// behaviour that an ordinary capture started over the picker photographs it, and
+/// `capture_flow::begin_capture`'s doc records that this works only because our overlay
+/// exclusion "reaches exactly ONE process, our own".
+///
+/// **It has to be argv, because the window cannot answer.** A picker launch mints the very
+/// same per-output overlay windows as a capture: same process image, same
+/// `CGShieldingWindowLevel`, same `Display-<id>` titles. Verified side by side with
+/// `CGWindowListCopyWindowInfo` — the two are byte-identical in every property SCK exposes.
+/// The only thing that differs is how the process was started.
+///
+/// NOT a sparing rule, and deliberately not wired into [`should_spare_sibling`]: DRAGON-582
+/// decided that the picker's OVERLAY phase stays sweepable ("a bare selector overlay is what
+/// this sweep is for") and only its RESULT WINDOW is spared. This answers a different
+/// question, whether the overlay may be PHOTOGRAPHED, and leaves that decision untouched.
+#[cfg(target_os = "macos")]
+pub(crate) fn is_color_picker_instance(pid: u32) -> bool {
+    mac_argv(pid).iter().any(|arg| arg == "--color-picker")
 }
 
 #[cfg(test)]
@@ -2391,6 +2473,25 @@ mod tests {
         assert!(rec.ends_with("cosmic-capture-kit.4242.recording"), "{rec}");
         assert!(prev.ends_with("cosmic-capture-kit.4242.preview"), "{prev}");
         assert_ne!(rec, prev);
+    }
+
+    /// DRAGON-651: the Windows handoff pipes are per-pid, on the marker stem, and the
+    /// portable address helpers resolve to them. The names are the wire — a sender and a
+    /// host from different builds must keep computing the same string for the same pid.
+    #[cfg(windows)]
+    #[test]
+    fn handoff_pipe_names_are_per_pid_and_pinned() {
+        assert_eq!(
+            preview_pipe_name(4242),
+            r"\\.\pipe\cosmic-capture-kit.4242.preview"
+        );
+        assert_eq!(
+            color_picker_pipe_name(4242),
+            r"\\.\pipe\cosmic-capture-kit.4242.colorpicker"
+        );
+        assert_ne!(preview_pipe_name(4242), color_picker_pipe_name(4242));
+        assert_eq!(preview_host_address(7), preview_pipe_name(7));
+        assert_eq!(color_picker_host_address(7), color_picker_pipe_name(7));
     }
 
     /// DRAGON-336: the sweep's filename parser is the inverse of `state_marker_path`,

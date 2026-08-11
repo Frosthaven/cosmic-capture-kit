@@ -77,7 +77,10 @@ fn spawn_pulse_pcm(source: &str) -> Option<(Child, std::process::ChildStdout)> {
     cmd.args(["-ac", "1", "-ar", "48000", "-f", "f32le", "-"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        // PIPED, not null (DRAGON-647): a capture child that dies silently is
+        // exactly how the PDEATHSIG bug hid — its exit reason has nowhere else
+        // to go. The drain thread below forwards stderr to the debug log.
+        .stderr(Stdio::piped());
     // Kill the ffmpeg child if we die (PR_SET_PDEATHSIG). Linux-only; macOS has no
     // equivalent, so there the DoneGuard / explicit reaping handles cleanup.
     // SAFETY: only an async-signal-safe syscall in the forked child before exec.
@@ -92,6 +95,24 @@ fn spawn_pulse_pcm(source: &str) -> Option<(Child, std::process::ChildStdout)> {
         });
     }
     let mut child = cmd.spawn().ok()?;
+    log::debug!("mic capture: ffmpeg child spawned (pid {})", child.id());
+    // The capture child's stderr, forwarded to the debug log (DRAGON-647): it is
+    // the only place the child can say why it exited, and a whole diagnosis
+    // session was spent without it. Redacted like all ffmpeg output (CLAUDE.md's
+    // privacy rule); an idle child at `-loglevel error` writes nothing, so this
+    // thread costs nothing in the healthy case and exits on the child's stderr EOF.
+    if let Some(stderr) = child.stderr.take() {
+        let pid = child.id();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                log::info!(
+                    "mic capture stderr (pid {pid}): {}",
+                    crate::diag::redact_paths(&line)
+                );
+            }
+        });
+    }
     let stdout = child.stdout.take()?;
     Some((child, stdout))
 }
@@ -144,7 +165,8 @@ impl MicPcmReader {
             Self::Ffmpeg(rdr) => {
                 use std::io::Read;
                 let mut bytes = [0u8; FRAME * 4];
-                if rdr.read_exact(&mut bytes).is_err() {
+                if let Err(e) = rdr.read_exact(&mut bytes) {
+                    log::info!("mic capture: pcm stream ended ({:?})", e.kind());
                     return false;
                 }
                 for (i, c) in bytes.as_chunks::<4>().0.iter().enumerate() {
@@ -346,21 +368,55 @@ pub(crate) fn setup_clean_mic_tap(
 ) -> Option<(MicTapHandle, std::sync::mpsc::Receiver<crate::audio::filters::StreamTap>)> {
     use crate::audio::processing_latency_ms;
 
-    let (mic, mic_reader) = open_mic_pcm(&crate::audio::config::mic_source())?;
-    let (monitor_child, render_buf) = match external_farend {
-        Some(ring) if cfg.echo_cancellation => (None, Some(ring)),
-        _ => spawn_aec_monitor(cfg, speaker),
-    };
     let l = processing_latency_ms(&cfg);
     // Generous bound: the pump renders/drains every ~100ms, so a few hundred ms of
     // headroom absorbs normal scheduling jitter while still applying real
     // backpressure (a blocking `send`) if the pump ever falls meaningfully behind.
     let (tx, rx) = std::sync::mpsc::sync_channel(256);
-    let reader = spawn_tap_reader_thread(mic_reader, render_buf, cfg, l, tx);
+    // The CAPTURES ARE SPAWNED ON THE READER THREAD, and that placement is the whole
+    // DRAGON-647 fix, not an arrangement detail. The ffmpeg children carry
+    // `PR_SET_PDEATHSIG(SIGKILL)` as orphan protection, and Linux binds that signal to
+    // the spawning THREAD, not the process: a child spawned from a short-lived thread
+    // is SIGKILLed the moment that thread exits, however healthy its process still is.
+    // This function is called from exactly such a thread — the audio pre-flight
+    // (`record::owned::AudioPreflight`), which returns milliseconds after the smoke
+    // check — so a mic child spawned HERE died ~120ms into every Linux recording,
+    // silently (SIGKILL writes no stderr), and the mixer wrote an honest all-silence
+    // mic track. The reader thread lives for the whole session, so it is the right
+    // PDEATHSIG anchor; better than the process, even — a dead reader means nothing is
+    // consuming the capture, at which point killing it is exactly correct.
+    //
+    // The handshake below (one bounded channel) keeps this function's contract
+    // unchanged: it still returns `None` when the mic cannot start, and the dedicated
+    // AEC monitor — same PDEATHSIG hazard, reachable with an explicit speaker — is
+    // only spawned after the mic came up, exactly as the old inline order did.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let source = crate::audio::config::mic_source();
+    let speaker = speaker.to_string();
+    let reader = std::thread::spawn(move || {
+        let Some((mic, mic_reader)) = open_mic_pcm(&source) else {
+            let _ = ready_tx.send(None);
+            return;
+        };
+        let (monitor_child, render_buf) = match external_farend {
+            Some(ring) if cfg.echo_cancellation => (None, Some(ring)),
+            _ => spawn_aec_monitor(cfg, &speaker),
+        };
+        let _ = ready_tx.send(Some((mic, monitor_child)));
+        run_tap_reader(mic_reader, render_buf, cfg, l, tx);
+    });
+    let Ok(Some((mic, monitor_child))) = ready_rx.recv() else {
+        // The captures never started; the thread has already returned (or panicked),
+        // so this join is immediate rather than a wait.
+        let _ = reader.join();
+        return None;
+    };
     Some((MicTapHandle { mic, monitor_child, reader: Some(reader), latency_ms: l }, rx))
 }
 
-/// The tap-mode reader thread: the SAME per-frame DSP loop as
+/// The tap-mode reader BODY, run on the session's reader thread (which also owns the
+/// capture children it reads — see `setup_clean_mic_tap`'s DRAGON-647 note): the SAME
+/// per-frame DSP loop as
 /// [`spawn_reader_thread`] (feed the AEC far-end reference, run
 /// [`crate::audio::InputProcessor::process`], rebuild on a DSP panic rather than drop
 /// a frame) — only the output step differs (channel send instead of FIFO write).
@@ -376,18 +432,18 @@ pub(crate) fn setup_clean_mic_tap(
 /// recovering, a device swap) re-anchors with a loud log instead. `record::pump`
 /// shifts `audible_time` further by the session's A/V-sync offset; nothing else
 /// adjusts it.
-fn spawn_tap_reader_thread(
+fn run_tap_reader(
     mut mic: MicPcmReader,
     render_buf: Option<FarEndRing>,
     cfg: crate::audio::InputConfig,
     dsp_latency_ms: f64,
     tx: std::sync::mpsc::SyncSender<crate::audio::filters::StreamTap>,
-) -> std::thread::JoinHandle<()> {
+) {
     use crate::audio::filters::StreamTap;
     use crate::audio::InputProcessor;
 
     let latency = std::time::Duration::from_secs_f64(dsp_latency_ms.max(0.0) / 1000.0);
-    std::thread::spawn(move || {
+    {
         let mut proc = InputProcessor::new(cfg);
         let mut inp = [0f32; FRAME];
         let mut pcm = [0f32; FRAME];
@@ -396,8 +452,13 @@ fn spawn_tap_reader_thread(
         // discontinuity. The constant DSP latency is folded into the anchor by
         // shifting every arrival time fed to it.
         let mut anchor: Option<super::capture::StreamAnchor> = None;
+        let mut frames_delivered: u64 = 0;
         loop {
             if !mic.read_frame(&mut inp) {
+                log::info!(
+                    "mic tap reader: capture ended after {frames_delivered} frames (~{:.2}s)",
+                    frames_delivered as f64 * FRAME as f64 / 48000.0
+                );
                 break; // mic capture gone (stopped) -> end
             }
             if let Some(rb) = render_buf.as_ref() {
@@ -425,10 +486,15 @@ fn spawn_tap_reader_thread(
                 );
             }
             if tx.send(StreamTap::new(pcm.to_vec(), capture_time, capture_time)).is_err() {
+                log::info!(
+                    "mic tap reader: pump hung up after {frames_delivered} frames (~{:.2}s)",
+                    frames_delivered as f64 * FRAME as f64 / 48000.0
+                );
                 break; // pump gone (recording stopped) -> end
             }
+            frames_delivered += 1;
         }
-    })
+    }
 }
 
 /// One waveform column: `(clean, raw, gate_in)` levels (0..1, dBFS-normalized). `clean` is the
@@ -563,3 +629,4 @@ pub fn spawn_mic_test(
     });
     Some((stop, buf))
 }
+

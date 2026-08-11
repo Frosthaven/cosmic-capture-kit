@@ -30,6 +30,15 @@ pub enum WindowChromeMsg {
     /// incremented count to poll briefly until the overlay can be matched + placed.
     #[cfg(not(target_os = "linux"))]
     OverlayOpened(window::Id, u8),
+    /// macOS (DRAGON-646): the bounded fallback for the post-placement paint gate.
+    ///
+    /// `configure_overlay` holds `OutputState::placed` false while the resize it just issued
+    /// is in flight, so no content is laid out for the pre-clamp viewport. Normally
+    /// `ConfigWindowResized` releases that gate within a frame or two. This fires once,
+    /// shortly after, and releases it regardless — an overlay that never sees its resize must
+    /// still draw. A no-op if the gate is already released, which is the usual case.
+    #[cfg(target_os = "macos")]
+    OverlayFrameSettled(window::Id),
     /// macOS (DRAGON-130 crash-dodge) / Windows (DRAGON-229 komorebi opt-out): the
     /// windowed preview finished opening (Windows: opened HIDDEN, floated + shown by
     /// `finalize_preview_window`'s Windows arm). Fired
@@ -188,6 +197,14 @@ pub enum WindowChromeMsg {
     ColorPickerWindowOpened(window::Id, u8),
     /// Colour-picker window titlebar: drag to move.
     ColorPickerWindowDrag,
+    /// Colour-picker window titlebar: minimize (DRAGON-649). There is deliberately no
+    /// maximize sibling: the window is fixed-size (`min_size == max_size`), and on macOS
+    /// `MacPinWindow` already disables the zoom button for the same reason. Constructed
+    /// by the CSD header on Linux and by Windows 10's CSD fallback captions; macOS
+    /// minimizes through the native traffic lights and Windows 11 through the native
+    /// DWM cluster, so neither constructs it.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    ColorPickerWindowMinimize,
     /// macOS (DRAGON-135): apply the empty-toolbar tweak that vertically centres
     /// the native traffic lights over the CSD header. Title-matched (the async
     /// set-title task must land first), so it polls: (window title, attempt).

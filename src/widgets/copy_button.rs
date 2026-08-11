@@ -95,6 +95,28 @@ pub fn subtle_copy_button<M: Clone + 'static>(
     copy_button_with(copied, halo, tip_pos, label, theme::subtle, press)
 }
 
+/// A one-glyph sibling of [`subtle_copy_button`], for controls that sit BESIDE a copy
+/// button and must read as the same family (DRAGON-630's split-inputs toggle): the same
+/// `button::icon` construction, the same subtle resting tint, the same halo and tooltip
+/// mechanics, just no copied state. Built here rather than at the call site so the
+/// paddings cannot drift apart again — the toggle's first version was a hand-rolled
+/// 32pt button beside the copy's 24pt halo, which the owner called out.
+pub fn subtle_icon_button<M: Clone + 'static>(
+    icon: &'static str,
+    halo: u16,
+    tip_pos: widget::tooltip::Position,
+    label: &'static str,
+    press: M,
+) -> Element<'static, M> {
+    let button = crate::widgets::arrow_cursor::arrow_cursor(
+        widget::button::icon(crate::widgets::icons::handle(icon))
+            .class(icon_button_class(false, theme::subtle))
+            .padding(halo)
+            .on_press(press),
+    );
+    widget::tooltip(button, widget::text(label).size(12), tip_pos).into()
+}
+
 /// The one body both public copy controls are built from: `tint` is the RESTING glyph colour
 /// and `label` the resting tooltip, and everything else (the glyph pair, the flash, the tick,
 /// the "Copied!" wording, the tooltip mechanics) is shared so the two cannot drift.

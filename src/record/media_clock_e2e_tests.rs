@@ -1820,3 +1820,64 @@ fn audio_preflight_thread_reports_the_named_failure() {
     // The blind-teardown path the video-side failures use.
     super::owned::AudioPreflight::start().abandon();
 }
+
+
+/// DRAGON-647: the capture children carry `PR_SET_PDEATHSIG(SIGKILL)` as orphan
+/// protection, and Linux binds that signal to the spawning THREAD, not the process.
+/// The audio pre-flight runs on a short-lived worker thread (`AudioPreflight`), so a
+/// mic child spawned from it was SIGKILLed ~120ms into every Linux recording the
+/// moment that thread returned — silently (SIGKILL writes no stderr), leaving an
+/// honest all-silence mic track and a "source stopped delivering" pump summary. The
+/// fix spawns the captures on the session-long READER thread instead.
+///
+/// This drives the real tap from a spawner thread that exits immediately — the exact
+/// production shape — and asserts the capture SURVIVES its spawner by well over the
+/// ~120ms the bug allowed. A null sink stands in for the mic so the test is
+/// deterministic on any box with pactl; like its siblings it skips loudly without one.
+#[test]
+fn mic_tap_survives_its_spawning_threads_exit() {
+    let _guard = test_lock().lock().unwrap();
+    let _state = GlobalStateGuard;
+    let Some(mic_sink) = NullSink::load("cckpdsigmic") else {
+        eprintln!("SKIPPED: pactl/null-sink unavailable");
+        return;
+    };
+    crate::audio::config::set_mic_source(&mic_sink.monitor_source());
+    let cfg = crate::audio::InputConfig {
+        noise_suppression: false,
+        echo_cancellation: false,
+        auto_gain: false,
+        gate: false,
+        gate_auto: false,
+        gate_threshold: 0.5,
+        advanced_vad: false,
+    };
+    // The production shape: the tap is set up on a thread that dies right away.
+    let setup = std::thread::spawn(move || {
+        crate::audio::clean_mic::setup_clean_mic_tap(cfg, "", None)
+    })
+    .join()
+    .expect("spawner thread panicked");
+    let Some((mut handle, rx)) = setup else {
+        eprintln!("SKIPPED: mic tap did not start (no ffmpeg?)");
+        return;
+    };
+    // The spawner is gone. Before the fix the ffmpeg child died with it, the reader
+    // saw EOF within ~120ms, and this loop would collect a handful of frames at
+    // most. 1.5s of wall time and a full second of delivered audio is comfortably
+    // beyond any startup jitter while keeping the suite fast.
+    let t0 = Instant::now();
+    let mut samples = 0usize;
+    while t0.elapsed() < Duration::from_millis(1500) {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(tap) => samples += tap.samples.len(),
+            Err(_) => break,
+        }
+    }
+    handle.drain();
+    assert!(
+        samples >= 48_000,
+        "the mic capture died with its spawning thread (DRAGON-647 regressed): only          {samples} samples (~{:.2}s) arrived",
+        samples as f64 / 48000.0
+    );
+}

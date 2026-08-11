@@ -327,7 +327,8 @@ points to.
   magnifier's accent ring, the same width the region box uses, which is what DRAGON-582
   asked for), and the theme's rounding token (every swatch in the window, one lookup, so
   they cannot drift). `recent_colors` is the one field it WRITES: `#RRGGBB` strings,
-  newest first, capped at `geom::RECENTS_CAP` (10). It is persisted because the app is
+  newest first, capped at `geom::RECENTS_CAP` (20, two rows of ten since DRAGON-649).
+  It is persisted because the app is
   one-shot, so an in-memory list would be empty at every window open and the feature
   would do nothing. It is also user CONTENT, so it goes to the config and never to the
   debug log; nothing in the picker logs a colour value, only a `ColorFormat::id`.

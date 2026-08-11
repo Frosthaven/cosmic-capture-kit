@@ -233,7 +233,7 @@ Raspberry Pi 5 desktops and ARM laptops.
 3. Run it with `--settings` to look around and set your save folders, then bind
    the [shortcuts](#shortcuts) below.
 
-The AppImage carries its own **ffmpeg 8.1.2 and tesseract**, so recording and
+The AppImage carries its own **ffmpeg 9.0 and tesseract**, so recording and
 OCR work with nothing else installed, and it carries ffmpeg's libraries too, so
 GPU zero-copy recording is available even on a distro whose own ffmpeg is older.
 Graphics, audio and GPU drivers deliberately come from your system, since a
