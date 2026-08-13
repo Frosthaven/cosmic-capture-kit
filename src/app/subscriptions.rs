@@ -26,9 +26,11 @@ impl App {
                 self.sub_pixel_capture(),
                 self.sub_scan_shot(),
                 self.sub_menu_hold(),
+                self.sub_picker_countdown_arm(),
+                self.sub_picker_reveal(),
                 self.sub_dim_fade(),
                 self.sub_accept_pending(),
-                self.sub_scan_spin(),
+                self.sub_busy_spin(),
                 self.sub_loading_tick(),
                 self.sub_playback_poll(),
                 self.sub_preview_toasts(),
@@ -358,7 +360,7 @@ impl App {
     /// refresh glyph spins. That spin is the browser's only loading indication, the
     /// "Reading your folders..." line having been deleted with this ticket.
     ///
-    /// The scanner's `sub_scan_spin` in every respect, including the rule that matters: gated on
+    /// The toolbar's `sub_busy_spin` in every respect, including the rule that matters: gated on
     /// the listing, so an idle dialog (and a settings window with no dialog open) ticks nothing.
     /// It stops on its own when the listing lands, which is also when the button becomes
     /// pressable again, so the animation and the affordance cannot disagree.
@@ -450,17 +452,25 @@ impl App {
     /// continues: nothing was torn down, the overlay just stopped painting, so the same
     /// 200ms is what the compositor needs to present the empty surface. Stops immediately
     /// once the grab is away (`Grabbing`), so it is one tick, not a poll.
-    /// DRAGON-460: drive the refresh button's spin while the scanner is busy.
+    /// DRAGON-460: drive a busy glyph's spin while something is busy.
     ///
-    /// ~30fps, and ONLY while `scanning()` — an idle scanner ticks nothing, so this cannot
-    /// become a background redraw the way an always-on animation clock would. It stops on
-    /// its own when the passes finish, which is also when the button becomes pressable
-    /// again, so the animation and the affordance can never disagree.
-    fn sub_scan_spin(&self) -> Option<Subscription<Msg>> {
-        if self.scanning() {
+    /// ~30fps, and ONLY while a spinner is actually on screen: an idle toolbar ticks
+    /// nothing, so this cannot become a background redraw the way an always-on animation
+    /// clock would. The scanner's arm stops when the passes finish, which is also when its
+    /// button becomes pressable again, so the animation and the affordance can never
+    /// disagree.
+    ///
+    /// DRAGON-659 added the second term. The two consumers are never DRAWN together (the
+    /// toolbar shows either the kind row or the chip), but they CAN be true together: the
+    /// video kind is not disabled while a scan is resolving, so a user can switch to Video
+    /// and start recording with an OCR pass still in flight. Gated on `scanning()` alone,
+    /// the shared angle would freeze mid-turn the moment that pass landed, under a warming
+    /// spinner still on screen.
+    fn sub_busy_spin(&self) -> Option<Subscription<Msg>> {
+        if self.scanning() || self.warming_spinner() {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(33))
-                    .map(|_| Msg::Capture(CaptureMsg::ScanSpinTick)),
+                    .map(|_| Msg::Capture(CaptureMsg::BusySpinTick)),
             )
         } else {
             None
@@ -477,6 +487,52 @@ impl App {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(16))
                     .map(|_| Msg::Capture(CaptureMsg::MenuHoldTick)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// DRAGON-663: a colour picker with a configured delay is waiting for somewhere to draw
+    /// its countdown. One frame's cadence, because the wait is only until the overlays this
+    /// launch is already minting arrive, and every millisecond of it is time the user asked
+    /// to spend counting down instead. Stops for good the moment the countdown starts, since
+    /// arming spends `picker_countdown_pending`.
+    ///
+    /// Gated on `self.outputs` rather than on a timer, so it costs exactly one tick on a
+    /// normal launch and cannot start a countdown onto surfaces that do not exist yet
+    /// (`capture_flow::picker_countdown_arms` carries the reasoning).
+    fn sub_picker_countdown_arm(&self) -> Option<Subscription<Msg>> {
+        if crate::app::capture_flow::picker_countdown_arms(
+            self.picker_countdown_pending.is_some(),
+            self.outputs.len(),
+        ) {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(16))
+                    .map(|_| Msg::Capture(CaptureMsg::PickerCountdownArm)),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// DRAGON-663: one short tick to let the BLANKED picker overlay clear the countdown's
+    /// dim and timer chip off the screen before the held flats grab reads it. The twin of
+    /// [`Self::sub_pixel_capture`] and of the DRAGON-456 scan re-read, sharing their 200ms
+    /// for the same reason: nothing was torn down, the overlay just stopped painting, so
+    /// that is what the compositor needs to present the empty surface.
+    ///
+    /// The stake is higher here than for either of them. A capture that grabs early has our
+    /// chrome in the shot; a PICK that grabs early reports the countdown's dim back to the
+    /// user as the colour under their cursor.
+    ///
+    /// Stops immediately once the grab is away (`run_picker_flats_grab` clears the flag), so
+    /// it is one tick, not a poll.
+    fn sub_picker_reveal(&self) -> Option<Subscription<Msg>> {
+        if self.picker_revealing {
+            Some(
+                cosmic::iced::time::every(std::time::Duration::from_millis(200))
+                    .map(|_| Msg::Capture(CaptureMsg::PickerReveal)),
             )
         } else {
             None
@@ -553,8 +609,13 @@ impl App {
     /// (the grab is in flight); the overlay is already mapped and showing the live screen,
     /// and this poll flips it to the still as soon as the flats land. Cheap (a mutex
     /// try-drain), and stops the tick after the single delivery.
+    ///
+    /// DRAGON-663 added the second term. A colour picker counting down is holding the grab
+    /// (`super::FlatsPlan::Hold`), so `frozen_pending` stays armed for the WHOLE countdown
+    /// with nothing in flight to drain. Without this, a 10s delay would poll a mutex at one
+    /// frame's cadence for ten seconds and keep the process out of idle for all of it.
     fn sub_frozen_ready(&self) -> Option<Subscription<Msg>> {
-        if self.frozen_pending {
+        if self.frozen_pending && !self.picker_flats_on_hold() {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(16))
                     .map(|_| Msg::Capture(CaptureMsg::FrozenReady)),
@@ -635,9 +696,14 @@ impl App {
     /// window, where there is no magnifier left to zoom. `self.outputs` is what the overlay
     /// actually maps to and is cleared the moment it closes (`destroy_surfaces`), so pairing the
     /// two is exactly "the picker's dimmed overlay is on screen right now".
+    ///
+    /// DRAGON-663 added the third term for the same reason the second one exists. A picker
+    /// counting down has its overlays mapped and `self.outputs` full, but it is drawing the
+    /// countdown view, so there is no magnifier on screen to zoom and no reason to poll a
+    /// gesture recognizer at one frame's cadence for the whole delay.
     #[cfg(target_os = "macos")]
     fn sub_color_picker_pinch(&self) -> Option<Subscription<Msg>> {
-        if self.color_picking() && !self.outputs.is_empty() {
+        if self.color_picking() && !self.outputs.is_empty() && self.countdown.is_none() {
             Some(
                 cosmic::iced::time::every(std::time::Duration::from_millis(16))
                     .map(|_| Msg::ColorPicker(ColorPickerMsg::PinchPoll)),

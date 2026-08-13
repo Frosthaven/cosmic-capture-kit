@@ -27,6 +27,24 @@ impl App {
                 // Portal hotkey events (PTT hold / stop) arrive on their own thread,
                 // stamped at signal time; apply them on this poll's cadence.
                 let hotkey_task = self.drain_portal_hotkeys();
+                // DRAGON-659/661: has the worker settled yet? `settled_at`, the end of its
+                // opening phase, is media 0: it anchors the elapsed clock where the file
+                // begins AND raises the tray, which is the same "this is live" claim the
+                // record chip's STOP face makes (DRAGON-673 collapsed the two onto this one
+                // signal; the anchor used to read the first frame, a whole countdown early).
+                // Both latches are idempotent, so this costs one `Option` test per tick for
+                // the rest of the recording.
+                //
+                // The rebuild is only owed when the tray took the toolbar's place, so it
+                // follows the TRAY half: the input regions were cut at promotion, when
+                // `tray_hides_toolbar` was still false, so without this the hidden toolbar's
+                // zone would keep eating clicks. Every other session skips it (the flag is
+                // off by default).
+                let warm_task = if self.adopt_warm_start() && self.tray_hides_toolbar {
+                    self.recreate_active_overlays()
+                } else {
+                    Task::none()
+                };
                 let done = self
                     .recording
                     .as_ref()
@@ -100,7 +118,7 @@ impl App {
                         None => Task::none(),
                     },
                 };
-                Task::batch([hotkey_task, main])
+                Task::batch([hotkey_task, warm_task, main])
             }
             RecordingMsg::MeterTick => {
                 self.read_levels();

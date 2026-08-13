@@ -50,6 +50,22 @@ const SIDECHAIN_STARVED_FRAMES: u64 = 48_000; // 1 s
 const ATTACK_STEP: f32 = (1.0 - DUCK_GAIN) / (ATTACK_SECS * 48_000.0);
 const RELEASE_STEP: f32 = (1.0 - DUCK_GAIN) / (RELEASE_SECS * 48_000.0);
 
+/// What the ducker DID over a session, for the pump's end-of-session log line. Counters
+/// only: they answer "did we pull the system track down, and by how much" without anyone
+/// having to measure the delivered file. Nothing here feeds the envelope back.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DuckStats {
+    /// System frames the envelope was applied to (48 kHz), ducked or not.
+    pub(crate) sys_frames: u64,
+    /// Of those, how many carried a gain BELOW unity, i.e. were attenuated.
+    pub(crate) ducked_frames: u64,
+    /// The lowest envelope gain reached in the session (1.0 = never ducked).
+    pub(crate) min_gain: f32,
+    /// Sidechain (mic tap) frames the detector judged ACTIVE, i.e. speech that
+    /// re-armed the hold.
+    pub(crate) sidechain_active: u64,
+}
+
 /// The stateful ducker: [`feed_sidechain`](Self::feed_sidechain) with each mic tap
 /// block (10 ms, mono), [`process`](Self::process) each system chunk (interleaved,
 /// any length) — both on the pump's control thread, so no synchronization is needed.
@@ -62,11 +78,23 @@ pub(crate) struct Ducker {
     /// System frames processed since the last sidechain feed — the starvation
     /// failsafe's clock.
     frames_since_sidechain: u64,
+    /// Session counters, reported by [`stats`](Self::stats). Observability only.
+    stats: DuckStats,
 }
 
 impl Ducker {
     pub(crate) fn new() -> Self {
-        Self { hold_left: 0, gain: 1.0, frames_since_sidechain: 0 }
+        Self {
+            hold_left: 0,
+            gain: 1.0,
+            frames_since_sidechain: 0,
+            stats: DuckStats { min_gain: 1.0, ..DuckStats::default() },
+        }
+    }
+
+    /// What this ducker did over the session (see [`DuckStats`]).
+    pub(crate) fn stats(&self) -> DuckStats {
+        self.stats
     }
 
     /// Feed one mic tap block (post-gate mono PCM). `live` is whether the mic
@@ -77,6 +105,7 @@ impl Ducker {
         self.frames_since_sidechain = 0;
         let active = live && rms(mic) > SIDECHAIN_OPEN_RMS;
         if active {
+            self.stats.sidechain_active = self.stats.sidechain_active.saturating_add(1);
             self.hold_left = HOLD_FRAMES;
         } else {
             self.hold_left = self.hold_left.saturating_sub(1);
@@ -96,7 +125,13 @@ impl Ducker {
             } else if self.gain < target {
                 self.gain = (self.gain + RELEASE_STEP).min(target);
             }
+            // Counting only: the branch below is the DSP and is untouched.
+            self.stats.sys_frames = self.stats.sys_frames.saturating_add(1);
+            if self.gain < self.stats.min_gain {
+                self.stats.min_gain = self.gain;
+            }
             if self.gain < 1.0 {
+                self.stats.ducked_frames = self.stats.ducked_frames.saturating_add(1);
                 for s in frame {
                     *s *= self.gain;
                 }
@@ -195,6 +230,42 @@ mod tests {
             prev = f[0];
         }
         assert!(prev < 1.0, "the envelope should have started attacking");
+    }
+
+    /// The counters must SEE an attenuation the log line is meant to report, and must
+    /// stay at their untouched values when nothing ducked. This is the whole point of
+    /// them: "we pulled the system track down" and "the source was quiet" have to be
+    /// distinguishable from the log alone.
+    #[test]
+    fn stats_report_an_attenuation_and_stay_clean_without_one() {
+        let mut quiet = Ducker::new();
+        run(&mut quiet, &silent(), true, 50);
+        let s = quiet.stats();
+        assert_eq!(s.ducked_frames, 0, "nothing was attenuated");
+        assert_eq!(s.min_gain, 1.0, "the envelope never left unity");
+        assert_eq!(s.sidechain_active, 0, "silence is never active speech");
+        assert_eq!(s.sys_frames, 50 * FRAME as u64, "every system frame is counted");
+
+        let mut ducked = Ducker::new();
+        run(&mut ducked, &loud(), true, 20);
+        let s = ducked.stats();
+        assert!(s.ducked_frames > 0, "the attenuated frames are counted");
+        assert!(s.min_gain < 1.0, "the lowest gain reached is remembered: {}", s.min_gain);
+        assert!((s.min_gain - DUCK_GAIN).abs() < 1e-3, "it bottoms out at the configured gain");
+        assert_eq!(s.sidechain_active, 20, "every speech frame armed the hold");
+    }
+
+    /// A muted mic ducks nothing, so its sidechain frames must not read as active
+    /// either. That combination is exactly what the pump's log line is being asked
+    /// about, so it may not be blurred by the counters.
+    #[test]
+    fn a_muted_mic_counts_no_active_sidechain() {
+        let mut d = Ducker::new();
+        run(&mut d, &loud(), false, 30);
+        let s = d.stats();
+        assert_eq!(s.sidechain_active, 0);
+        assert_eq!(s.ducked_frames, 0);
+        assert_eq!(s.min_gain, 1.0);
     }
 
     #[test]

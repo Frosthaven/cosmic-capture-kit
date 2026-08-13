@@ -88,7 +88,7 @@ impl EncodePlan {
             "qsv" => qsv_plan(w, h, &presets.codec),
             #[cfg(target_os = "macos")]
             "videotoolbox" | "vt" => videotoolbox_plan(w, h, &presets.codec),
-            "software" | "sw" | "x264" => Some(software_plan(&presets.x264, &presets.codec, w, h)),
+            "software" | "sw" | "x264" => Some(software_plan(&presets.x264)),
             _ => None,
         }
     }
@@ -129,7 +129,7 @@ impl EncodePlan {
                 "qsv" => qsv_plan(w, h, &presets.codec),
                 #[cfg(target_os = "macos")]
                 "videotoolbox" => videotoolbox_plan(w, h, &presets.codec),
-                "software" => Some(software_plan(&presets.x264, &presets.codec, w, h)),
+                "software" => Some(software_plan(&presets.x264)),
                 _ => None,
             }
         };
@@ -145,7 +145,7 @@ impl EncodePlan {
             .find_map(build)
             // Unreachable (every order ends in "software", which always builds), but a
             // recording resolver must never panic.
-            .unwrap_or_else(|| software_plan(&presets.x264, &presets.codec, w, h));
+            .unwrap_or_else(|| software_plan(&presets.x264));
         // DRAGON-419: which encoder a session actually got was never recorded anywhere. It is
         // the first question of every recording report — a silent fall-through from the
         // requested hardware tier to software changes CPU load, frame pacing and quality all
@@ -334,48 +334,36 @@ fn pick_h264_or_hevc(
 }
 
 /// Software encode (RGBA in, ffmpeg converts) — the universal fallback that needs no
-/// special hardware. `libx264` (H.264) or `libx265` (HEVC) per the codec choice;
-/// `-tune zerolatency` keeps the real-time pipeline from buffering, and CRF gives a
-/// constant quality (small for static content, capped by the bitrate in spawn_ffmpeg).
-fn software_plan(x264_preset: &str, codec_choice: &str, w: u32, h: u32) -> EncodePlan {
+/// special hardware. ALWAYS `libx264` (H.264); `-tune zerolatency` keeps the real-time
+/// pipeline from buffering, and CRF gives a constant quality (small for static content,
+/// capped by the bitrate in spawn_ffmpeg).
+///
+/// **The software tier does not do HEVC** (DRAGON-674), whatever the codec setting says.
+/// This is the RUNTIME half of the rule `encode::hevc_offerable` enforces in the
+/// settings row, and it has to exist separately from that row: a config file travels
+/// between machines, a driver breaks overnight, a game holds every NVENC session — so a
+/// plan can land on software with `codec=hevc` persisted from a machine where it was a
+/// perfectly honest choice. Measured in the field (DRAGON-671): a tester's NVENC probe
+/// failed, the resolver fell to software, and the session logged `chosen=software …
+/// hevc=true`, then `encoder backlog - 660 frames dropped`, then the DRAGON-118 muxer
+/// watchdog correctly killed a recording that had written nothing for 12s. libx265
+/// cannot encode 1080p in real time; a slightly larger file always beats a killed
+/// recording, so the resolver degrades to H.264 itself rather than trusting the UI.
+///
+/// This subsumes the DRAGON-162 macOS carve-out, which said the same thing for one
+/// platform and one reason (libx264 is ~2.4× faster — measured ~16 vs ~6.6 fps at
+/// 5120x2880 on an M1 Pro — so `auto` switching to libx265 above 4096 px made a big
+/// software recording FREEZE rather than merely look worse). The rule is unconditional
+/// now, which is why neither the codec choice nor the frame size reaches this plan any
+/// more: there is nothing left for them to decide.
+fn software_plan(x264_preset: &str) -> EncodePlan {
     let preset = valid_x264_preset(x264_preset);
-    // `auto` stays H.264 (fast, universally compatible) unless the frame exceeds
-    // H.264's 4096 limit; `hevc`/`h264` force the choice. HEVC needs libx265.
-    //
-    // macOS (DRAGON-162): `auto` NEVER auto-switches to libx265 for the software path.
-    // libx264 is ~2.4× faster for real-time capture (measured ~16 vs ~6.6 fps at
-    // 5120x2880 on an M1 Pro), so switching to HEVC above 4096 px made a big software
-    // recording FREEZE, not just look worse. The mac SCK worker caps the software
-    // encode side to a sustainable value (`encoder_capped_resolution`), so the frame is
-    // already within H.264's limit here; only an EXPLICIT `hevc` choice pays the x265
-    // cost. Linux keeps its historical size-based auto behaviour (byte-identical).
-    #[cfg(target_os = "macos")]
-    let want_hevc = {
-        let _ = (w, h); // size does not drive the mac software codec choice
-        codec_choice == "hevc"
-    };
-    #[cfg(not(target_os = "macos"))]
-    let want_hevc = match codec_choice {
-        "hevc" => true,
-        "h264" => false,
-        _ => w.max(h) > 4096,
-    };
-    // HEVC's CRF scale runs higher for similar quality, so 28 ≈ x264's 23 but smaller;
-    // hvc1 tag so the mp4 plays in Apple players.
-    let codec = if want_hevc && software_supports_hevc() {
-        vstr(&[
-            "-c:v", "libx265", "-preset", preset, "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p", "-crf", "28", "-tag:v", "hvc1",
-        ])
-    } else {
-        vstr(&[
-            "-c:v", "libx264", "-preset", preset, "-tune", "zerolatency",
-            "-pix_fmt", "yuv420p", "-crf", "23",
-        ])
-    };
     EncodePlan {
         pre: Vec::new(),
-        codec,
+        codec: vstr(&[
+            "-c:v", "libx264", "-preset", preset, "-tune", "zerolatency",
+            "-pix_fmt", "yuv420p", "-crf", "23",
+        ]),
         env: Vec::new(),
         vf: None,
         color_tags: false,
@@ -617,6 +605,15 @@ pub(crate) fn vaapi_device() -> Option<(String, String)> {
 /// recording start (or the settings/Health page) never re-spawns the probe. Mirrors
 /// `vaapi_supports_qvbr`'s cached-probe idiom; routed through the console-free
 /// `util::ffmpeg_command` seam (DRAGON-236).
+///
+/// A FAILING probe is logged, once, with ffmpeg's own error text (DRAGON-669). It used to
+/// discard stderr, which made "recording no longer detects my GPU" unanswerable: the only
+/// other evidence is `chosen=software` on the plan line, and that is the SYMPTOM of every
+/// possible cause at once. Two testers on NVENC-capable NVIDIA cards were diagnosed by
+/// guesswork for want of the one line ffmpeg was already printing. The spawn failure and
+/// the non-zero exit are reported SEPARATELY: `unwrap_or(false)` collapsed "there is no
+/// ffmpeg to run" into "the hardware said no", which are different problems with different
+/// fixes.
 #[cfg(windows)]
 pub(crate) fn hw_encoder_probe_ok(encoder: &str) -> bool {
     static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
@@ -625,7 +622,9 @@ pub(crate) fn hw_encoder_probe_ok(encoder: &str) -> bool {
     if let Some(&v) = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(encoder) {
         return v;
     }
-    let ok = crate::util::ffmpeg_command()
+    // `.output()` rather than `.status()`, so stderr is captured instead of discarded.
+    // `-loglevel error` is already set, so what comes back IS the reason and nothing else.
+    let ok = match crate::util::ffmpeg_command()
         .args([
             "-hide_banner", "-loglevel", "error",
             "-f", "lavfi", "-i", "color=c=black:s=256x256:r=5:d=1",
@@ -634,15 +633,53 @@ pub(crate) fn hw_encoder_probe_ok(encoder: &str) -> bool {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+        .stderr(Stdio::piped())
+        .output()
+    {
+        Ok(out) if out.status.success() => true,
+        Ok(out) => {
+            log::warn!(
+                "hardware encoder probe failed for {encoder} (ffmpeg exit {}): {}",
+                out.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string()),
+                probe_failure_reason(&String::from_utf8_lossy(&out.stderr)),
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!("hardware encoder probe for {encoder} could not run ffmpeg at all: {e}");
+            false
+        }
+    };
     cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(encoder.to_string(), ok);
     ok
+}
+
+/// How many trailing lines of a failed probe's stderr reach the log. ffmpeg names the real
+/// cause in its LAST lines (the driver-version refusal, the missing API library, the
+/// "Cannot load" from the loader); anything earlier is the lavfi source announcing itself.
+#[cfg(any(windows, test))]
+const PROBE_REASON_LINES: usize = 3;
+
+/// The loggable one-line reason from a failed probe's raw stderr: the last
+/// [`PROBE_REASON_LINES`] non-blank lines, joined with `; `, run through
+/// [`crate::diag::redact_paths`] because ffmpeg names files in its errors and the debug log
+/// records what the app DID, never the user's filesystem. Empty stderr becomes an explicit
+/// phrase rather than a blank, so a silent failure is still distinguishable in the log from
+/// a missing log line.
+///
+/// Pure, unit-tested.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn probe_failure_reason(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return "(ffmpeg printed nothing)".to_string();
+    }
+    let tail = &lines[lines.len().saturating_sub(PROBE_REASON_LINES)..];
+    crate::diag::redact_paths(&tail.join("; "))
 }
 
 /// AMD AMF hardware encoder (`h264_amf` / `hevc_amf`), fed NV12 (our own threaded BT.709
@@ -888,12 +925,11 @@ mod tests {
         assert!(!plan_with_codec(&["-c:v", "libx264", "-crf", "23"]).is_hevc());
     }
 
-    // software_plan only invokes ffmpeg (software_supports_hevc) when want_hevc is
-    // true, which `&&` short-circuits away for the h264 / auto-small cases below — so
-    // these stay pure (no external binary).
+    // software_plan spawns nothing at all now (DRAGON-674 took the last ffmpeg probe out
+    // of it), so these are pure on every platform.
     #[test]
-    fn software_plan_forced_h264_picks_libx264_with_validated_preset() {
-        let p = software_plan("medium", "h264", 1920, 1080);
+    fn software_plan_is_libx264_with_a_validated_preset() {
+        let p = software_plan("medium");
         assert!(p.codec.iter().any(|a| a == "libx264"));
         assert!(p.codec.iter().any(|a| a == "medium")); // valid preset passes through
         assert!(!p.is_hevc());
@@ -903,30 +939,47 @@ mod tests {
     }
 
     #[test]
-    fn software_plan_auto_under_4096_stays_h264() {
-        // auto codec + side <= 4096 -> want_hevc == false -> libx264 (no ffmpeg probe),
-        // on every platform.
-        let p = software_plan("fast", "auto", 3840, 2160);
-        assert!(p.codec.iter().any(|a| a == "libx264"));
-        assert!(!p.is_hevc());
-    }
-
-    // DRAGON-162: the software path's `auto` codec choice above 4096 px is platform-split.
-    // macOS never switches to libx265 (far too slow for real-time; the SCK worker caps the
-    // size so H.264 always fits); Linux keeps its historical size-based auto → x265.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn software_plan_auto_stays_h264_even_over_4096_on_mac() {
-        let p = software_plan("fast", "auto", 5120, 2880);
-        assert!(p.codec.iter().any(|a| a == "libx264"), "mac auto @5K must stay x264");
-        assert!(!p.is_hevc());
-    }
-
-    #[test]
     fn software_plan_invalid_preset_falls_back_to_default() {
-        let p = software_plan("not-a-preset", "h264", 1280, 720);
+        let p = software_plan("not-a-preset");
         assert!(p.codec.iter().any(|a| a == crate::encode::DEFAULT_X264_PRESET));
         assert!(!p.codec.iter().any(|a| a == "not-a-preset"));
+    }
+
+    /// DRAGON-674: the runtime safety net. A resolution that lands on software must
+    /// emit H.264 no matter what the persisted codec setting says — a config travels
+    /// between machines, so the UI gate alone cannot be the only guard. The field
+    /// signature this replaces is the `chosen=software … hevc=true` plan line that
+    /// preceded 660 dropped frames and a watchdog kill (DRAGON-671).
+    ///
+    /// Also subsumes the old macOS-only DRAGON-162 assertion (auto above 4096 px must
+    /// never become libx265): the 5120x2880 case below is that one, now checked on
+    /// every platform because the rule is no longer platform-split.
+    #[test]
+    fn no_software_plan_ever_resolves_to_hevc() {
+        for codec in ["hevc", "auto", "h264"] {
+            let presets = Presets {
+                nvenc: "p4".into(),
+                x264: "fast".into(),
+                vaapi_cl: 3,
+                codec: codec.into(),
+            };
+            // Both entry points, at a size that used to route `auto` to libx265.
+            for (w, h) in [(1920, 1080), (5120, 2880)] {
+                let direct = EncodePlan::for_backend("software", w, h, &presets)
+                    .expect("software always builds");
+                assert!(!direct.is_hevc(), "for_backend codec={codec} {w}x{h}");
+                assert_eq!(direct.encoder_id(), "software");
+                // `resolve` on a concrete "software" request builds it first, so this
+                // stays probe-free (no hardware tier is ever reached).
+                let resolved = EncodePlan::resolve("software", w, h, &presets);
+                assert!(!resolved.is_hevc(), "resolve codec={codec} {w}x{h}");
+                assert!(
+                    resolved.codec.iter().all(|a| a != "libx265"),
+                    "libx265 must never reach the command line: {:?}",
+                    resolved.codec
+                );
+            }
+        }
     }
 
     // DRAGON-238: the Windows hardware-encoder ranker (NVENC > AMF > QSV > software) is a
@@ -1298,5 +1351,52 @@ mod auto_resolution_outcome_tests {
             auto_resolution_outcome("wxyz", "nvenc", None).new_hint.as_deref(),
             Some("nvenc")
         );
+    }
+}
+
+/// DRAGON-669: the failed-probe reason is what a "recording no longer detects my GPU"
+/// report is diagnosed from, so it has to survive intact and carry no filesystem.
+#[cfg(test)]
+mod probe_failure_reason_tests {
+    use super::probe_failure_reason;
+
+    #[test]
+    fn the_driver_refusal_survives_verbatim() {
+        // The line that actually settles the two open field reports.
+        let out = probe_failure_reason(
+            "[h264_nvenc @ 0000021c] The minimum required Nvidia driver for nvenc is 570.0 \
+             or newer\nError initializing output stream: Error while opening encoder",
+        );
+        assert!(out.contains("minimum required Nvidia driver"), "{out}");
+        assert!(out.contains("Error while opening encoder"), "{out}");
+    }
+
+    #[test]
+    fn only_the_last_lines_are_kept_and_they_join_readably() {
+        let out = probe_failure_reason("one\ntwo\nthree\nfour\nfive");
+        assert_eq!(out, "three; four; five");
+    }
+
+    #[test]
+    fn blank_lines_are_not_spent_from_the_budget() {
+        // ffmpeg pads its error blocks; a run of newlines must not push the real
+        // cause out of the tail.
+        let out = probe_failure_reason("the real cause\n\n\n\n");
+        assert_eq!(out, "the real cause");
+    }
+
+    #[test]
+    fn silence_is_reported_as_silence() {
+        // Distinguishable in the log from "we forgot to log anything".
+        assert_eq!(probe_failure_reason("   \n\n"), "(ffmpeg printed nothing)");
+    }
+
+    #[test]
+    fn a_path_in_the_reason_is_redacted() {
+        // The privacy rule is hard: the debug log records what the app DID, never
+        // what the user captured or where it lives.
+        let out = probe_failure_reason("Unable to open C:\\Users\\Jane Smith\\Videos\\standup.mp4");
+        assert!(!out.contains("Jane Smith"), "{out}");
+        assert!(!out.contains("standup"), "{out}");
     }
 }

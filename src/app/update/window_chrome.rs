@@ -1346,7 +1346,30 @@ impl App {
                     // opens the player).
                     self.stop_recording()
                 } else if self.countdown.is_some() {
+                    // DRAGON-659: the same abandon the toolbar's ✕ does, since a video countdown
+                    // has a recording worker running behind it, and Escape must not leave it
+                    // running (or leave its file behind).
+                    self.abandon_warming();
                     self.countdown = None;
+                    // DRAGON-663: and the same tray teardown every other cancel route does.
+                    // This line was MISSING, which is a real defect and not tidying: Escape
+                    // ended the countdown while leaving its digits in the tray, offering a
+                    // Cancel row for a countdown that no longer existed. Clicking that row
+                    // then tore the session down (`CountdownTrayPoll`) from what the user had
+                    // just stepped back to. All three platforms' tray sessions were affected,
+                    // because the leak is here in the portable state, not in any of them.
+                    self.countdown_tray = None;
+                    // DRAGON-663: a colour picker's countdown ends the session on Escape.
+                    // Its own overlay is the only thing this launch has, so there is no
+                    // selector to restore; see `CaptureMsg::CancelCapture`, which is where
+                    // the toolbar chip's press lands with the same reasoning.
+                    if self.color_picking() {
+                        crate::diag::note_failure(
+                            crate::diag::Failure::Cancelled,
+                            "the user cancelled the colour picker's countdown",
+                        );
+                        return self.teardown();
+                    }
                     self.pending = None;
                     self.capture_live = false;
                     self.mode = Mode::Region;

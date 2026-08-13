@@ -100,7 +100,7 @@ use std::time::{Duration, Instant};
 
 use crate::audio::capture::{CaptureChunk, MonitorCapture};
 use crate::audio::clean_mic::MicTapHandle;
-use crate::audio::filters::duck::Ducker;
+use crate::audio::filters::duck::{DuckStats, Ducker};
 use crate::audio::filters::StreamTap;
 use crate::mixer::clock::MediaClock;
 use crate::mixer::control::{AppliedEvent, ControlEvent, ControlKind};
@@ -376,6 +376,103 @@ impl PumpOut {
             final_media: 0.0,
         }
     }
+}
+
+/// The dBFS a track with no samples, or with nothing but digital silence, reports.
+/// A real `-inf` is correct and unreadable; this is the floor the log prints instead,
+/// far below anything a capture chain produces.
+const SILENT_DBFS: f64 = -120.0;
+
+/// Sum of squares + sample count → RMS in dBFS (0 dBFS = full scale). Pure, unit-tested.
+fn dbfs_rms(sum_sq: f64, samples: u64) -> f64 {
+    if samples == 0 || sum_sq <= 0.0 {
+        return SILENT_DBFS;
+    }
+    let rms = (sum_sq / samples as f64).sqrt();
+    (20.0 * rms.log10()).max(SILENT_DBFS)
+}
+
+/// A track's aggregate loudness over the whole session: one running sum of squares and
+/// one sample count, reported once at the end as a dBFS RMS.
+///
+/// PRIVACY: this is BEHAVIOUR, not content. It says how loud a track was on average,
+/// which is what separates "we attenuated it" from "the source was quiet"; it cannot
+/// reconstruct, transcribe or identify anything that was captured. The debug log's rule
+/// is "what the app DID, never what the user captured", and a single number per track
+/// per session is on the DID side of it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Loudness {
+    sum_sq: f64,
+    samples: u64,
+}
+
+impl Loudness {
+    /// Accumulate one block. Squaring at 48 kHz is a few nanoseconds per sample and
+    /// does no I/O, so it is safe on the pump's control thread (which must never block).
+    fn add(&mut self, samples: &[f32]) {
+        let mut sum = 0.0f64;
+        for s in samples {
+            sum += (*s as f64) * (*s as f64);
+        }
+        self.sum_sq += sum;
+        self.samples = self.samples.saturating_add(samples.len() as u64);
+    }
+
+    fn dbfs(&self) -> f64 {
+        dbfs_rms(self.sum_sq, self.samples)
+    }
+}
+
+/// The session's audio CONFIGURATION line, written once at pump start. Pure, unit-tested,
+/// because the combination it exposes is easy to misread. A ducker is CONSTRUCTED whenever
+/// the setting is on, but it only actually pulls the system track down while the mic is
+/// LIVE: [`Ducker::feed_sidechain`] gates the sidechain on `mic_live` (seeded from `mic_on0`,
+/// tracked through every toggle), so a mic that reaches no file cannot duck anything. The
+/// note spells that out so `ducking=on` with `mic=off` does not read as a bug. Reading this
+/// line must not require also reading `config.toml`.
+fn audio_config_line(mic: bool, sys: bool, duck: bool) -> String {
+    let on = |b: bool| if b { "on" } else { "off" };
+    let note = if duck && !mic {
+        " NOTE: ducking is enabled but INACTIVE, the mic is off so the sidechain never opens \
+         (the system track is not attenuated)"
+    } else {
+        ""
+    };
+    format!(
+        "media-clock pump audio config: mic={} system={} ducking={}{note}",
+        on(mic),
+        on(sys),
+        on(duck)
+    )
+}
+
+/// The session's audio LEVELS line, written once at pump finish, right after the health
+/// summary. Pure, unit-tested, because it is the whole answer to "was the system track
+/// attenuated by us, or was it quiet at the source": `sys_in` vs `sys_out` differing means
+/// WE pulled it down (by the printed amount), and matching-but-low means the source was
+/// quiet. Anything else would need the delivered file to be measured.
+fn audio_levels_line(mic: &Loudness, sys_in: &Loudness, sys_out: &Loudness, duck: Option<DuckStats>) -> String {
+    let (a, b) = (sys_in.dbfs(), sys_out.dbfs());
+    let attenuation = (a - b).max(0.0);
+    let verdict = if attenuation >= 0.5 {
+        format!("we attenuated the system track by {attenuation:.1}dB")
+    } else {
+        "we did not attenuate the system track (its level is the source's own)".to_string()
+    };
+    let duck_part = match duck {
+        Some(d) => format!(
+            "duck(on sys_frames={} ducked_frames={} min_gain={:.3} sidechain_active={})",
+            d.sys_frames, d.ducked_frames, d.min_gain, d.sidechain_active
+        ),
+        None => "duck(off)".to_string(),
+    };
+    format!(
+        "media-clock pump audio levels: mic={:.1}dBFS sys_in={:.1}dBFS sys_out={:.1}dBFS \
+         {duck_part}: {verdict}",
+        mic.dbfs(),
+        a,
+        b
+    )
 }
 
 /// Shift `base` by `ms` (may be negative) — the one signed-instant-shift idiom every
@@ -917,6 +1014,13 @@ struct MediaClockPump {
     /// muted mic's speech is cut from the file at finalize, so it must not carve
     /// ducks into the system track either.
     mic_live: bool,
+    /// Aggregate loudness of the mic tap as it arrives (post-cleanup), of the system
+    /// track BEFORE the ducker, and of the same system track AFTER it. Reported once
+    /// at [`finish`](Self::finish); see [`Loudness`] for why this is behaviour, not
+    /// captured content.
+    mic_loud: Loudness,
+    sys_loud_in: Loudness,
+    sys_loud_out: Loudness,
 }
 
 impl MediaClockPump {
@@ -947,6 +1051,9 @@ impl MediaClockPump {
             automation: Vec::new(),
             ducker: cfg.duck_system.then(Ducker::new),
             mic_live: cfg.mic_on0,
+            mic_loud: Loudness::default(),
+            sys_loud_in: Loudness::default(),
+            sys_loud_out: Loudness::default(),
         }
     }
 
@@ -960,6 +1067,7 @@ impl MediaClockPump {
             // closed gate feeds silence here — noise can never duck (DRAGON-128).
             d.feed_sidechain(&tap.samples, self.mic_live);
         }
+        self.mic_loud.add(&tap.samples);
         let audible = offset_instant(tap.audible_time, self.audio_offset_ms as f64);
         self.mixer.push_tap(TRACK_MIC, StreamTap::new(tap.samples, tap.capture_time, audible));
     }
@@ -969,9 +1077,13 @@ impl MediaClockPump {
     /// the caller decides, see `run`'s `drain_external`) + the base A/V-sync offset.
     fn push_sys_chunk(&mut self, samples: Vec<f32>, capture_wall: Instant, device_latency_ms: f64) {
         let mut samples = samples;
+        // Measured either side of the ducker, which is the ONE thing between the
+        // capture client and the mixer that can change this track's level.
+        self.sys_loud_in.add(&samples);
         if let Some(d) = self.ducker.as_mut() {
             d.process(&mut samples, 2);
         }
+        self.sys_loud_out.add(&samples);
         let with_device = offset_instant(capture_wall, device_latency_ms);
         let audible = offset_instant(with_device, self.audio_offset_ms as f64);
         self.mixer.push_tap(TRACK_SYS, StreamTap::new(samples, capture_wall, audible));
@@ -1068,6 +1180,18 @@ impl MediaClockPump {
         // `crate::diag` wraps the `log` facade, so this reaches the debug file with no
         // per-call-site opt-in, and so does the discard `error` at the drop site.
         log_audio_health(final_media, &mic_stats, &sys_stats);
+        // The LEVELS line, always `info` and always separate from the health line above:
+        // it answers a different question (how loud was each track, and did we change
+        // it) and must not inherit that line's severity.
+        log::info!(
+            "{}",
+            audio_levels_line(
+                &self.mic_loud,
+                &self.sys_loud_in,
+                &self.sys_loud_out,
+                self.ducker.as_ref().map(|d| d.stats()),
+            )
+        );
         PumpOut { mic_off, sys_off, mic_stats, sys_stats, final_media }
     }
 }
@@ -1452,6 +1576,10 @@ pub(crate) fn spawn<'scope, 'env>(
          video side was ready (that span opens on the first captured frame)",
         opening.as_millis()
     );
+    // What the audio side was actually asked to do, in one line, so a finished
+    // recording's log answers "was the mic even in this file, and could the ducker
+    // have touched the system track" without anyone reading the settings file.
+    log::info!("{}", audio_config_line(cfg.mic_on0, cfg.sys_on0, cfg.duck_system));
     let ticker = VideoTicker { clock: clock.clone(), fps: cfg.fps.max(1), next_tick: 0 };
     let thread_stop = stop;
     #[cfg(not(windows))]
@@ -2386,5 +2514,83 @@ mod pending_rendezvous_tests {
 
         let _ = std::fs::remove_file(&mic_path);
         let _ = std::fs::remove_file(&sys_path);
+    }
+
+    // ── The session's audio observability lines ────────────────────────────
+
+    /// The dBFS mapping the levels line is read through. Wrong here and every "was it
+    /// attenuated" reading off the log is wrong with it.
+    #[test]
+    fn dbfs_rms_maps_full_scale_half_scale_and_silence() {
+        // A constant-magnitude signal's RMS is that magnitude: full scale is 0 dBFS.
+        assert!((dbfs_rms(4.0, 4) - 0.0).abs() < 1e-9, "full scale is 0 dBFS");
+        // Half amplitude is one bit down, ≈ −6.02 dB.
+        assert!((dbfs_rms(0.25 * 4.0, 4) + 6.0206).abs() < 1e-3);
+        // Digital silence and an empty track both report the printable floor, never −inf.
+        assert_eq!(dbfs_rms(0.0, 480), SILENT_DBFS);
+        assert_eq!(dbfs_rms(0.0, 0), SILENT_DBFS);
+        assert!(dbfs_rms(1e-30, 480) >= SILENT_DBFS, "the floor also catches near-zero energy");
+    }
+
+    #[test]
+    fn loudness_accumulates_to_the_same_answer_as_one_block() {
+        let mut split = Loudness::default();
+        split.add(&[0.5; 240]);
+        split.add(&[0.5; 240]);
+        let mut whole = Loudness::default();
+        whole.add(&[0.5; 480]);
+        assert!((split.dbfs() - whole.dbfs()).abs() < 1e-9);
+        assert_eq!(split.samples, 480);
+    }
+
+    /// The combination the config line exists for: ducking enabled with the mic NOT
+    /// recorded. The ducker is inactive then (its sidechain is gated on the mic being live),
+    /// and the note has to say so on its own so the reader does not mistake it for a bug.
+    #[test]
+    fn the_config_line_calls_out_ducking_without_a_recorded_mic() {
+        let line = audio_config_line(false, true, true);
+        assert!(line.contains("mic=off"), "{line}");
+        assert!(line.contains("system=on"), "{line}");
+        assert!(line.contains("ducking=on"), "{line}");
+        assert!(line.contains("NOTE:"), "the odd combination must be named outright: {line}");
+        assert!(line.contains("INACTIVE"), "the note must say the ducker does NOT fire: {line}");
+        // Every ordinary combination stays a plain statement of fact, with no note to
+        // scroll past.
+        assert!(!audio_config_line(true, true, true).contains("NOTE:"));
+        assert!(!audio_config_line(false, true, false).contains("NOTE:"));
+    }
+
+    /// The levels line has to answer "did WE pull the system track down" at a glance,
+    /// which is the whole reason it exists.
+    #[test]
+    fn the_levels_line_separates_our_attenuation_from_a_quiet_source() {
+        let mut mic = Loudness::default();
+        mic.add(&[0.1; 480]);
+        let mut sys_in = Loudness::default();
+        sys_in.add(&[0.4; 480]);
+        // Ducked to a quarter: −12 dB, exactly the ducker's configured gain.
+        let mut sys_out = Loudness::default();
+        sys_out.add(&[0.1; 480]);
+        let stats = DuckStats {
+            sys_frames: 240,
+            ducked_frames: 200,
+            min_gain: 0.25,
+            sidechain_active: 30,
+        };
+        let ducked = audio_levels_line(&mic, &sys_in, &sys_out, Some(stats));
+        assert!(ducked.contains("we attenuated the system track by 12.0dB"), "{ducked}");
+        assert!(ducked.contains("ducked_frames=200"), "{ducked}");
+        assert!(ducked.contains("min_gain=0.250"), "{ducked}");
+        assert!(ducked.contains("sidechain_active=30"), "{ducked}");
+
+        // Same quiet source, nothing applied: the two ends match, so the level is the
+        // source's own.
+        let mut quiet = Loudness::default();
+        quiet.add(&[0.001; 480]);
+        let untouched = audio_levels_line(&mic, &quiet, &quiet, None);
+        assert!(untouched.contains("did not attenuate"), "{untouched}");
+        assert!(untouched.contains("duck(off)"), "{untouched}");
+        assert!(untouched.contains("sys_in=-60.0dBFS"), "{untouched}");
+        assert!(untouched.contains("sys_out=-60.0dBFS"), "{untouched}");
     }
 }

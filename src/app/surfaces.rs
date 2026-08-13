@@ -110,6 +110,12 @@ impl App {
         // disk, which is the single split that halves the search space on a "nothing
         // happened" report. Costs nothing when the log is off.
         crate::diag::session_end("finish_session");
+        // DRAGON-659: a countdown's early-spawned recording worker that nothing promoted is
+        // still capturing. THIS is the lifecycle seam every ending routes through, so one
+        // call here covers the endings the two explicit cancel paths do not: a teardown, a
+        // tray "Cancel countdown", `fail_session`. Idempotent, and a no-op on every session
+        // that never armed a video countdown.
+        self.abandon_warming();
         // DRAGON-174: the per-session status icon lives for the WHOLE session and exits
         // with it — tear it down here (removes an own NSStatusItem / ksni item; reverts a
         // resident relay to idle). Explicit even though the process exits right after, so

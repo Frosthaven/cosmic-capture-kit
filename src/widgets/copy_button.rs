@@ -85,6 +85,12 @@ pub fn copy_button<M: Clone + 'static>(
 /// is the app's one "this worked" colour and an acknowledgement nobody notices is no
 /// acknowledgement. `label` is the resting tooltip ("Copy URL" is [`copy_button`]'s, and is
 /// wrong for anything that is not a link).
+///
+/// A caller whose copy the APP performs, so that nobody is hovering when it lands, should say
+/// so on its own row rather than asking this control to shout: the colour picker's window
+/// puts the word "Copied!" beside the button in `theme::success`, which is the same green
+/// this tints the tick with. See the tombstone below for the pinned card that used to do it
+/// here and why it could not stay.
 pub fn subtle_copy_button<M: Clone + 'static>(
     copied: bool,
     halo: u16,
@@ -94,6 +100,28 @@ pub fn subtle_copy_button<M: Clone + 'static>(
 ) -> Element<'static, M> {
     copy_button_with(copied, halo, tip_pos, label, theme::subtle, press)
 }
+
+// ── The pinned "Copied!" card, and why it is gone (DRAGON-676) ───────────────────────────
+//
+// There was a `pinned_copy_button` here: `subtle_copy_button` with its acknowledgement
+// held OPEN for the flash window, as a popover rebuilt to look exactly like the tooltip
+// card, instead of waiting for a hover that may never come. It existed for a real problem
+// and the problem has not changed: a copy the app performs FOR you has nobody's pointer on
+// the button. The colour picker's window opens with the pick already on the clipboard, so
+// a hover-only "Copied!" says nothing at the one moment there is something to say.
+//
+// What could not work was the CARD, twice over. A card the app pins is a second answer
+// beside any tooltip a neighbouring control offers, so every neighbour on that row had to
+// be silenced for as long as the flash lasted (there was a `subtle_icon_button_untipped`
+// for exactly that, and a `tips` flag threaded through the picker's view to drive it): one
+// control's acknowledgement took the other's tooltip away. And the card is drawn OVER the
+// window, so on the picker's mode row it covered the alpha track above it.
+//
+// DRAGON-676 says the same word as TEXT on the row instead (`color_picker::view`'s
+// `copied_word`, in `theme::success`, the same green this file tints the tick with). Text
+// occupies layout rather than floating over it, so it hides nothing and silences nothing.
+// Do not bring the popover back to "save space": the room it would save is the room the
+// mode dropdown gave up in the same ticket, on purpose.
 
 /// A one-glyph sibling of [`subtle_copy_button`], for controls that sit BESIDE a copy
 /// button and must read as the same family (DRAGON-630's split-inputs toggle): the same
@@ -108,13 +136,17 @@ pub fn subtle_icon_button<M: Clone + 'static>(
     label: &'static str,
     press: M,
 ) -> Element<'static, M> {
-    let button = crate::widgets::arrow_cursor::arrow_cursor(
-        widget::button::icon(crate::widgets::icons::handle(icon))
-            .class(icon_button_class(false, theme::subtle))
-            .padding(halo)
-            .on_press(press),
-    );
-    widget::tooltip(button, widget::text(label).size(12), tip_pos).into()
+    widget::tooltip(
+        crate::widgets::arrow_cursor::arrow_cursor(
+            widget::button::icon(crate::widgets::icons::handle(icon))
+                .class(icon_button_class(false, theme::subtle))
+                .padding(halo)
+                .on_press(press),
+        ),
+        widget::text(label).size(TIP_TEXT_SIZE),
+        tip_pos,
+    )
+    .into()
 }
 
 /// The one body both public copy controls are built from: `tint` is the RESTING glyph colour
@@ -142,11 +174,15 @@ fn copy_button_with<M: Clone + 'static>(
     );
     widget::tooltip(
         button,
-        widget::text(if copied { "Copied!" } else { label }).size(12),
+        widget::text(if copied { "Copied!" } else { label }).size(TIP_TEXT_SIZE),
         tip_pos,
     )
     .into()
 }
+
+/// The text size in a tooltip card here, shared by both controls so the pair cannot end up
+/// with two sizes of the same card.
+const TIP_TEXT_SIZE: f32 = 12.0;
 
 /// The style an accent icon button carries (DRAGON-489): a steady accent tint with a faint hover
 /// highlight, since it has no "at rest, nothing to do" state to grey out the way

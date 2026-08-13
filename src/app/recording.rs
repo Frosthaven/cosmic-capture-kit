@@ -8,6 +8,53 @@ use super::*;
 /// exists (the portal bind in `platform::global_shortcuts`, or a successor).
 pub(super) const PTT_AVAILABLE: bool = false;
 
+/// DRAGON-659: how long a promoted-but-not-yet-warm recording sits before the warming
+/// spinner is REVEALED, when nothing else was covering the warmup. A warmup that finishes
+/// inside this window never shows a spinner at all, which is the point: the DRAGON-657
+/// bring-up is usually a few hundred milliseconds, and a glyph that appears and vanishes
+/// inside one blink reads as a glitch rather than as progress.
+///
+/// DRAGON-673: every promotion uses it, countdown or not. A countdown promotion used to use
+/// `ZERO`, because the countdown had already covered the warmup; media 0 is now gated on the
+/// promotion itself, so the worker settles just AFTER it and a zero delay would flash the
+/// spinner every time. See [`App::warming_spinner`].
+pub(super) const WARM_SPINNER_REVEAL_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(200);
+
+/// DRAGON-659: once revealed, the minimum time the warming spinner stays on screen, so a
+/// warmup that lands just past the reveal cannot flash the glyph on and off.
+///
+/// Both numbers are borrowed from the colour picker's `PICKER_SPINNER_REVEAL_MS` /
+/// `PICKER_SPINNER_MIN_MS` (`app::overlay`) purely so busy states across the app FEEL the
+/// same; nothing about the recording warmup derives them, and they are free to be tuned.
+pub(super) const WARM_SPINNER_MIN_HOLD: std::time::Duration =
+    std::time::Duration::from_millis(300);
+
+/// DRAGON-659: how long [`App::abandon_warming`]'s detached reaper waits for the abandoned
+/// worker to finish unwinding before it deletes whatever that worker produced. Matches the
+/// stop tail's own reap bound (`record::wait_or_kill`'s 30s), which is the longest a worker
+/// asked to stop can legitimately take. DRAGON-118: the wait is bounded, not open-ended.
+const ABANDON_REAP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+// DRAGON-673 deleted `WARM_SPAWN_AT_REMAINING_SECS` and `warm_spawn_at_countdown_start`.
+// They existed to trade warmup cover against recording the countdown: the worker captures
+// continuously once warm, and media 0 used to move with the spawn, so every extra second of
+// runway was another second of countdown in the file. That trade is gone. Media 0 is the
+// settled pipeline (DRAGON-672) gated on the app's own promotion (DRAGON-673,
+// `RecordSettings::start_gate`), so the worker is spawned at countdown START and the file
+// still begins where the UI starts claiming to record. Nothing has to estimate how long
+// warmup takes any more, which is the point: the constant had just been re-tuned 1 -> 2 for
+// Windows and would have needed re-tuning for the next slow audio stack.
+//
+// Nor does anything estimate WHEN the countdown ends. The gate carried the predicted instant
+// of zero first, and the prediction lost to the tick schedule by ~1s; see
+// `record::owned::media_zero`.
+//
+// The measurement that justified the old rule is worth keeping: on a 5 second countdown
+// the pre-flight (media 0 back then) began at +1.92s, so 4.6 of the 5 seconds landed in
+// the file. That is what "defeats what a countdown is FOR on video" meant, and it is now
+// impossible by construction rather than by choosing a spawn tick.
+
 impl App {
     /// Record a live channel toggle against the running recording (timestamped
     /// now, baked in at the finalize pass). Instant — just an in-memory append, so
@@ -231,10 +278,25 @@ impl App {
     /// The encoder a recording will actually use right now — software when hardware
     /// encoding is off, otherwise the preferred encoder (resolved to the best
     /// available when it isn't a concrete id). Drives which preset row the settings
-    /// show.
+    /// show and, since DRAGON-674, whether the codec row may offer HEVC.
+    ///
+    /// `preferred_encoder` is already probe-backed: it resolves the persisted intent
+    /// through the PROBED list (`display_encoder_choice`), and the last-known-good auto
+    /// hint can only reorder that list, never add an encoder to it. What this match
+    /// adds is the pass-through of ids that are real tiers, so a value which is not an
+    /// encoder at all can never be reported as one.
+    ///
+    /// DRAGON-674 completed that list. `amf`, `qsv` and `videotoolbox` were missing, so
+    /// on a Windows or mac box where the user had picked a LOWER-ranked tier this
+    /// answered with the TOP of the probed list instead of their pick: the wrong preset
+    /// row, and, now that the codec row reads the tier's HEVC probe, the wrong codec
+    /// offer too. Linux is byte-identical — its ladder can only ever produce
+    /// nvenc / vaapi / software, so the three added arms are unreachable there.
     pub(super) fn effective_encoder(&self) -> String {
         match self.preferred_encoder().as_str() {
-            id @ ("nvenc" | "vaapi" | "software") => id.to_string(),
+            id @ ("nvenc" | "vaapi" | "amf" | "qsv" | "videotoolbox" | "software") => {
+                id.to_string()
+            }
             _ => self
                 .encoders()
                 .first()
@@ -323,6 +385,17 @@ impl App {
         Task::none()
     }
 
+    /// Promote a recording worker into the app's LIVE recording. This is the one instant
+    /// `self.recording` becomes `Some`, for both the countdown and the no-countdown path,
+    /// exactly as it always was.
+    ///
+    /// DRAGON-659: the worker itself may already have been running for the whole countdown
+    /// ([`App::spawn_record_worker`], parked in `self.warming`); when it has not, it is
+    /// spawned here, synchronously, at the same call boundary as before. Everything in the
+    /// prelude below stays HERE on purpose rather than moving to the early spawn: none of it
+    /// is a device-contention or config hazard, and binding the global stop hotkey at
+    /// countdown start would make "stop recording" live seconds before there is a recording
+    /// to stop.
     pub(super) fn start_recording(&mut self, sel: Selection) -> Task<cosmic::Action<Msg>> {
         // Bind the recording hotkeys (PTT hold + stop) through the portal
         // GlobalShortcuts interface, once per process — they then fire focus-free,
@@ -347,6 +420,134 @@ impl App {
         {
             g.clear();
         }
+        // Close any other instances so only this overlay records. DRAGON-322: a preview
+        // / recording sibling is spared, so this recording can coexist with a concurrent
+        // capture (record a tutorial of the tool in use).
+        crate::instance::close_other_instances();
+        // Recording starts (after any countdown) → restore focus to the window we
+        // expect: the captured window when we picked one (screencopy window mode),
+        // otherwise whatever was focused before we launched (origin_window — also the
+        // value the screenshot path restores). So it records focused and you can type
+        // into it without clicking it again — the overlay is click-through here. Works
+        // for every mode/path (origin_window is ours, not the capture's). Off the UI
+        // thread because activate() waits for the toplevel list to settle.
+        if let Some(id) = sel.window_id.clone().or_else(|| self.origin_window.clone()) {
+            std::thread::spawn(move || crate::platform::compositor::activate(&id));
+        }
+        // DRAGON-659: reuse the worker the countdown started, or start one now. Either way
+        // the spinner's reveal delay gives a warmup that lands inside it room to finish
+        // invisibly (see `warming_spinner`).
+        let warm = match self.warming.take() {
+            Some(warm) => warm,
+            None => self.spawn_record_worker(&sel),
+        };
+        let WarmSpawn { handle, out_path } = warm;
+        self.recording = Some(handle);
+        self.recording_promoted_at = Some(std::time::Instant::now());
+        self.recording_paused_at = None;
+        self.recording_paused_accum = std::time::Duration::ZERO;
+        // The live size readout tracks the temp capture as it grows; the final file
+        // (after the finalize pass) is what `RecordingPoll` reports on `done`.
+        self.arm_session_bound(&out_path);
+        // lab/flatpak: the fallback path has no layer shell, so `recreate_active_overlays`
+        // (below) tears the selection window and `self.outputs` down the moment recording
+        // starts. Resolve the finished recording's editor anchor NOW, while the outputs
+        // are still known; `stop_recording` prefers a fresh stop-time answer and only
+        // falls back to this one. Protocol-keyed (`overlay_fallback_active`), and native
+        // sessions keep their surfaces up and never take this branch, so they stay
+        // byte-identical.
+        if self.overlay_fallback_active() {
+            self.snapshot_preview_anchor(&sel);
+        }
+        // Keep the ORIGINAL selection for the overlay/border + toolbar anchor.
+        self.pending = Some(sel);
+        // DRAGON-673: SAY GO. This is the instant the app begins claiming to record, so it is
+        // the instant a countdown's prewarmed worker is released to stamp media 0 — the file
+        // and the claim then start together by construction, with nothing predicting either.
+        // Raised here rather than at the countdown's zero-tick because the tick only decides
+        // to promote; everything above (the hotkey binds, the sibling sweep, the worker
+        // handoff) still has to happen, and the file must not begin before it has.
+        self.open_countdown_gate();
+        // DRAGON-659: adopt a worker that is ALREADY settled here rather than up to one 100ms
+        // poll later, so the tray and the elapsed anchor never lag a recording that is
+        // already live. It also runs `begin_recording_tray` BEFORE the overlay rebuild below,
+        // so `tray_hides_toolbar` is settled when the input regions are cut.
+        //
+        // DRAGON-673 made that the RARE case rather than the countdown's normal one: the gate
+        // was opened one statement ago and the worker settles a few milliseconds after it, so
+        // a countdown session usually adopts on the next `RecordingPoll`, which handles the
+        // tray rebuild it owes. Nothing here waits for the worker either way.
+        self.adopt_warm_start();
+        // Recreate the overlay click-through except the toolbar's region so the
+        // recorded apps stay usable. (A no-op rebuild from the countdown, which is
+        // already active, but cheap.)
+        self.recreate_active_overlays()
+    }
+
+    /// DRAGON-673: OPEN the countdown's start gate, releasing a prewarmed worker to stamp
+    /// media 0. Idempotent, and a no-op for a session that never ran a countdown (nothing
+    /// was minted, and a worker with no gate never holds).
+    ///
+    /// Called from exactly two places, and both are "this countdown is over": the promotion
+    /// in [`App::start_recording`], where the file must begin, and [`App::abandon_warming`],
+    /// where there will be no file — a worker being thrown away must not sit out the gate's
+    /// whole 30s cap first, with ffmpeg spawned and idle, before it can notice it was
+    /// stopped.
+    ///
+    /// `Relaxed` like every other flag the record path shares (`stop`, `paused`): the only
+    /// thing published is the flag itself, and the worker re-reads it on its own poll.
+    pub(super) fn open_countdown_gate(&self) {
+        if let Some(gate) = &self.countdown_gate {
+            gate.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// DRAGON-659: start a countdown's recording worker EARLY, parked in `self.warming`
+    /// until the countdown's zero-tick promotes it. THE one entry point for the early
+    /// spawn, and since DRAGON-673 there is only one caller: [`App::enter_countdown`],
+    /// for EVERY countdown, at countdown START.
+    ///
+    /// It used to be called from a countdown TICK near the end instead, because the worker
+    /// captures continuously and media 0 moved with the spawn, so every extra second of
+    /// warmup was another second of countdown in the file. Media 0 is now gated on the
+    /// promotion (`RecordSettings::start_gate`), so warming for the whole countdown puts
+    /// nothing in the file and needs no estimate of how long warmup takes.
+    ///
+    /// The gate mirrors `begin`'s recording gate exactly: any other kind, or a session with
+    /// no ffmpeg (which `begin` answers with the install notice, not a recording), must
+    /// behave precisely as it did before this ticket. A second call is a no-op, so the two
+    /// call sites can never double-spawn.
+    ///
+    /// `self.recording` deliberately stays `None` for the whole countdown; only
+    /// `self.warming` is filled. See its doc for the two if/else-if chains that would
+    /// otherwise take the wrong branch.
+    pub(super) fn arm_warm_spawn(&mut self, sel: &Selection) {
+        if self.warming.is_some() || self.kind != Kind::Video || !self.ffmpeg_available {
+            return;
+        }
+        self.warming = Some(self.spawn_record_worker(sel));
+    }
+
+    /// Start the recording WORKER for `sel` and hand back its handle plus the output path
+    /// computed for it. THE one place a recording worker is spawned: either early, from
+    /// [`App::arm_warm_spawn`], so the WHOLE countdown covers the DRAGON-657 warmup
+    /// (DRAGON-673; it used to be only the last second or two), or immediately, from
+    /// [`App::start_recording`], when there is no countdown to hide behind.
+    ///
+    /// Everything below is order-sensitive against the worker's own thread, which is why
+    /// none of it may be left behind at promotion:
+    ///
+    /// * The device releases (a live mic test's capture, the armed-idle system meter) have
+    ///   to happen before the worker opens the same devices.
+    /// * The mic-cleanup and ducking GLOBALS are read by the worker's audio pre-flight, and
+    ///   since DRAGON-657 that pre-flight is gated on the first real captured frame, an
+    ///   instant with no relationship to the countdown timer. A worker whose stream produces
+    ///   a frame quickly reads them while the countdown is still ticking, so setting them at
+    ///   promotion would silently record with whatever the globals last held.
+    /// * `record_output_path` embeds a wall-clock timestamp, so it is computed ONCE, here,
+    ///   and carried forward; recomputing it at promotion would name a second file the
+    ///   worker never wrote a byte to.
+    pub(super) fn spawn_record_worker(&mut self, sel: &Selection) -> WarmSpawn {
         // A live mic test holds its own capture of the same mic + runs the cleanup chain
         // and a vsync waveform loop. Recording opens its own mic capture, so leaving the
         // test running double-captures the device and burns CPU on a preview nobody is
@@ -364,46 +565,38 @@ impl App {
         // Same idiom for the system-track ducking flag (DRAGON-128): the pump reads
         // this global when it's configured.
         crate::audio::config::set_recording_duck_system(self.duck_system_audio);
-        // Close any other instances so only this overlay records. DRAGON-322: a preview
-        // / recording sibling is spared, so this recording can coexist with a concurrent
-        // capture (record a tutorial of the tool in use).
-        crate::instance::close_other_instances();
-        // Recording starts (after any countdown) → restore focus to the window we
-        // expect: the captured window when we picked one (screencopy window mode),
-        // otherwise whatever was focused before we launched (origin_window — also the
-        // value the screenshot path restores). So it records focused and you can type
-        // into it without clicking it again — the overlay is click-through here. Works
-        // for every mode/path (origin_window is ours, not the capture's). Off the UI
-        // thread because activate() waits for the toplevel list to settle.
-        if let Some(id) = sel.window_id.clone().or_else(|| self.origin_window.clone()) {
-            std::thread::spawn(move || crate::platform::compositor::activate(&id));
-        }
-        // A portal stream granted at commit (held across any countdown) → record it;
-        // otherwise direct screencopy.
-        if let Some(held) = self.pw_held.take() {
-            return self.start_held_pipewire_recording(held, sel);
-        }
-        self.start_screencopy_recording(sel)
-    }
-
-    /// Begin recording the already-granted portal stream `held`.
-    fn start_held_pipewire_recording(
-        &mut self,
-        held: HeldStream,
-        sel: Selection,
-    ) -> Task<cosmic::Action<Msg>> {
-        let out_path = self.record_output_path(&sel);
+        let out_path = self.record_output_path(sel);
         // DRAGON-421: reap whatever a crashed session left behind BEFORE this one creates
         // anything of its own — an orphaned muxer still holding a temp, its stale FIFOs,
         // an abandoned take. Only provably-dead wreckage is touched; a concurrent
         // recording's files are spared (DRAGON-322/351).
         crate::record::recover::sweep_wreckage(out_path.parent());
+        // A portal stream granted at commit (held across any countdown) → record it;
+        // otherwise direct screencopy.
+        let handle = match self.pw_held.take() {
+            Some(held) => self.spawn_held_pipewire_worker(held, &out_path),
+            None => self.spawn_screencopy_worker(sel, &out_path),
+        };
+        // DRAGON-322: advertise the live recording cross-process so a fresh capture
+        // overlay disables its video kind and the sibling sweep spares us. Set at SPAWN
+        // rather than at promotion since DRAGON-659: the capture is genuinely running from
+        // here, so a sibling that starts during the countdown must already see it.
+        crate::instance::set_recording_marker(true);
+        WarmSpawn { handle, out_path }
+    }
+
+    /// Spawn the worker for the already-granted portal stream `held`.
+    fn spawn_held_pipewire_worker(
+        &mut self,
+        held: HeldStream,
+        out_path: &std::path::Path,
+    ) -> crate::record::RecordHandle {
         let (max_w, max_h) = self.res_limit();
         // DRAGON-571: the request travels verbatim ("auto" stays "auto", with its
         // last-known-good hint), so the worker's ladder resolves auto fresh each
         // session instead of this process pinning a one-time answer.
         let (requested_encoder, encoder_hint) = self.encoder_request();
-        let handle = crate::record::start_pipewire_recording(crate::record::PipewireRecordParams {
+        crate::record::start_pipewire_recording(crate::record::PipewireRecordParams {
             fd: held.fd,
             node_id: held.node_id,
             crop: held.crop,
@@ -417,43 +610,26 @@ impl App {
                 system_audio: self.record_system_audio,
                 bitrate_kbps: self.record_bitrate_kbps.value,
                 audio_offset_ms: self.audio_sync_offset_ms.value,
+                // DRAGON-673: the countdown gate, so a prewarmed session still
+                // begins its file exactly where the app promotes the recording.
+                start_gate: self.countdown_gate.clone(),
                 // Auto mode probes + folds in the live device latency (system channel
                 // only); manual mode keeps the offset above exactly as set (DRAGON-119).
                 auto_device_compensation: self.audio_sync_auto,
                 max_res: (max_w, max_h),
                 metadata: self.recording_metadata(),
-                out_path: out_path.clone(),
+                out_path: out_path.to_path_buf(),
             },
-        });
-        self.recording = Some(handle);
-        // DRAGON-322: advertise the live recording cross-process so a fresh capture
-        // overlay disables its video kind and the sibling sweep spares us.
-        crate::instance::set_recording_marker(true);
-        self.recording_started = Some(std::time::Instant::now());
-        self.recording_paused_at = None;
-        self.recording_paused_accum = std::time::Duration::ZERO;
-        self.arm_session_bound(&out_path);
-        // lab/flatpak: the fallback path has no layer shell, so `recreate_active_overlays`
-        // (below) tears the selection window and `self.outputs` down the moment recording
-        // starts. Resolve the finished recording's editor anchor NOW, while the outputs
-        // are still known; `stop_recording` prefers a fresh stop-time answer and only
-        // falls back to this one. Protocol-keyed (`overlay_fallback_active`), and native
-        // sessions keep their surfaces up and never take this branch, so they stay
-        // byte-identical.
-        if self.overlay_fallback_active() {
-            self.snapshot_preview_anchor(&sel);
-        }
-        self.pending = Some(sel);
-        self.begin_recording_tray();
-        self.recreate_active_overlays()
+        })
     }
 
-    /// Direct cosmic-screencopy recording (the default path, and the fallback when
-    /// the portal/PipeWire is unavailable).
-    fn start_screencopy_recording(&mut self, sel: Selection) -> Task<cosmic::Action<Msg>> {
-        let out_path = self.record_output_path(&sel);
-        // DRAGON-421: same start-of-session sweep as the portal path — see there.
-        crate::record::recover::sweep_wreckage(out_path.parent());
+    /// Spawn the worker for a direct cosmic-screencopy recording (the default path, and
+    /// the fallback when the portal/PipeWire is unavailable).
+    fn spawn_screencopy_worker(
+        &mut self,
+        sel: &Selection,
+        out_path: &std::path::Path,
+    ) -> crate::record::RecordHandle {
         // Record only what's inside the visible line: a region is inset by the
         // line width (the outline, drawn on the original rect, then sits just
         // outside the recorded crop); window/monitor record the full target.
@@ -462,7 +638,7 @@ impl App {
         // DRAGON-571: the request travels verbatim ("auto" stays "auto", with its
         // last-known-good hint); the worker's ladder resolves auto fresh each session.
         let (requested_encoder, encoder_hint) = self.encoder_request();
-        let handle = crate::record::start_region_recording(crate::record::RegionRecordParams {
+        crate::record::start_region_recording(crate::record::RegionRecordParams {
             x: rec.x,
             y: rec.y,
             w: rec.width,
@@ -494,38 +670,186 @@ impl App {
                 system_audio: self.record_system_audio,
                 bitrate_kbps: self.record_bitrate_kbps.value,
                 audio_offset_ms: self.audio_sync_offset_ms.value,
+                // DRAGON-673: the countdown gate, so a prewarmed session still
+                // begins its file exactly where the app promotes the recording.
+                start_gate: self.countdown_gate.clone(),
                 // Auto mode probes + folds in the live device latency (system channel
                 // only); manual mode keeps the offset above exactly as set (DRAGON-119).
                 auto_device_compensation: self.audio_sync_auto,
                 max_res: (max_w, max_h),
                 metadata: self.recording_metadata(),
-                out_path: out_path.clone(),
+                out_path: out_path.to_path_buf(),
             },
-        });
-        self.recording = Some(handle);
-        // DRAGON-322: advertise the live recording cross-process so a fresh capture
-        // overlay disables its video kind and the sibling sweep spares us.
-        crate::instance::set_recording_marker(true);
-        self.recording_started = Some(std::time::Instant::now());
-        self.recording_paused_at = None;
-        self.recording_paused_accum = std::time::Duration::ZERO;
-        // The live size readout tracks the temp capture as it grows; the final file
-        // (after the finalize pass) is what `RecordingPoll` reports on `done`.
-        self.arm_session_bound(&out_path);
-        // lab/flatpak: the same record-start anchor snapshot as the portal path (see
-        // there for the why). Reached on the fallback path only when the portal grant
-        // failed into screencopy, but the teardown below is the same, so the anchor
-        // must be taken the same way.
-        if self.overlay_fallback_active() {
-            self.snapshot_preview_anchor(&sel);
+        })
+    }
+
+    /// DRAGON-659/661: adopt the worker's SETTLED signal, once per recording. Returns whether
+    /// this call is the one that made the recording LIVE.
+    ///
+    /// `settled_at` — the end of the worker's opening phase — answers BOTH questions since
+    /// DRAGON-672/673, because it is MEDIA 0:
+    ///
+    /// * it is the LIVE DECLARATION: the tray's "Recording" state, the same claim the record
+    ///   chip's STOP face makes. DRAGON-661 moved that here from `warm_at`, which fires at the
+    ///   START of a bring-up with the audio pre-flight, the ffmpeg spawn and the opening
+    ///   catch-up still to come, so an icon saying "Recording" through 600ms of setup was
+    ///   telling the user something not yet true.
+    /// * it is also the ELAPSED ANCHOR, where the file begins. That half used to read
+    ///   `warm_at`, on the premise that the confirmed first frame is where the file's content
+    ///   starts. It no longer is: media 0 is the settled pipeline (DRAGON-672), and with the
+    ///   worker spawned at countdown START (DRAGON-673) the first frame precedes the file by
+    ///   the WHOLE countdown. The owner saw it immediately: a 10s countdown's recording armed
+    ///   its readout at about 0:10 and he cancelled the take.
+    ///
+    /// The anchor is still the WORKER's own timestamp, never a fresh `Instant::now()`, so the
+    /// readout cannot drift by a poll's cadence.
+    ///
+    /// Each half keeps its own latch and neither waits for the other's. `recording_started`
+    /// latches the anchor. `recording_live_declared` latches the tray, and it has to be its
+    /// own field rather than `self.tray`: a Linux session with no SNI host leaves that
+    /// `None` even though the tray was raised as far as it can be, and keying on it would
+    /// re-run this every 100ms for the whole recording.
+    pub(super) fn adopt_warm_start(&mut self) -> bool {
+        let (anchor, declare_live) = warm_adoption(
+            self.recording_started.is_some(),
+            self.recording_live_declared,
+            self.settled_instant(),
+        );
+        // Both marks land on the SAME timeline as the workers' own (`rec/sck: first frame`,
+        // `rec/sck: opening covered ...`), so one debug log shows the whole start: when the
+        // file's content begins, and when the UI began claiming to be live. That pair is
+        // what DRAGON-661 was diagnosed from, and it is what a re-check needs.
+        if let Some(at) = anchor {
+            self.recording_started = Some(at);
+            crate::util::timing_mark("ui: elapsed anchor adopted (media 0)");
+            // The ONE line that says how much bring-up this recording paid for. `warm_at` is
+            // not what anything counts from any more, but it is still the worker's own
+            // "capture became real" instant, and the span from there to media 0 IS the
+            // opening: the audio pre-flight, the ffmpeg spawn, the opening ticks and, on a
+            // countdown, the hold at the start gate. It is the first number to check a "my
+            // recording is missing the start" report against, and pairing it with
+            // `media_zero`'s own dropped-audio line gives the whole picture from one log.
+            if let Some(warm) = self.warm_instant() {
+                log::debug!(
+                    "recording bring-up: capture was confirmed {:.0}ms before media 0, which \
+                     the countdown or the warming spinner covered; the file begins at media 0",
+                    at.saturating_duration_since(warm).as_secs_f64() * 1000.0,
+                );
+            }
         }
-        // Keep the ORIGINAL selection for the overlay/border + toolbar anchor.
-        self.pending = Some(sel);
-        self.begin_recording_tray();
-        // Recreate the overlay click-through except the toolbar's region so the
-        // recorded apps stay usable. (A no-op rebuild from the countdown, which is
-        // already active, but cheap.)
-        self.recreate_active_overlays()
+        if declare_live {
+            self.recording_live_declared = true;
+            crate::util::timing_mark("ui: recording declared live (settled)");
+            self.begin_recording_tray();
+        }
+        declare_live
+    }
+
+    /// The live recording worker's confirmed first-frame instant (DRAGON-657's
+    /// `RecordHandle::warm_at`), or `None` while it is still warming up. Nothing the UI shows
+    /// is derived from it any more (see [`Self::adopt_warm_start`]); it is read once, for the
+    /// bring-up line in the debug log.
+    fn warm_instant(&self) -> Option<std::time::Instant> {
+        self.recording
+            .as_ref()
+            .and_then(|r| r.warm_at.lock().ok().and_then(|g| *g))
+    }
+
+    /// The live recording worker's SETTLED instant (DRAGON-661's
+    /// `RecordHandle::settled_at`): the end of its opening phase, and so the first moment
+    /// the pipeline is genuinely steady. `None` until then, which is strictly later than
+    /// [`Self::warm_instant`] on every worker.
+    fn settled_instant(&self) -> Option<std::time::Instant> {
+        self.recording
+            .as_ref()
+            .and_then(|r| r.settled_at.lock().ok().and_then(|g| *g))
+    }
+
+    /// DRAGON-659: whether the record chip should be wearing its WARMING face right now.
+    /// The effectful half of [`warm_spinner_visible`], which holds the whole rule.
+    ///
+    /// DRAGON-661: the thing being waited for is the SETTLED instant, not the first frame.
+    ///
+    /// DRAGON-673: ONE reveal delay for every promotion, countdown or not. A countdown
+    /// promotion used to pass `ZERO`, on the reasoning that the countdown had already been
+    /// the warmup's cover so anything still pending at zero was late. Gating media 0 on the
+    /// promotion inverted that: the worker now holds AT the gate and settles a few
+    /// milliseconds AFTER the promotion, every time, so a zero delay would flash the spinner
+    /// on every single countdown recording — the exact "appears and vanishes inside one
+    /// blink" this delay exists to prevent. A worker genuinely late at zero has not reached
+    /// the gate at all and is still tens or hundreds of milliseconds out, so the delay shows
+    /// it just the same.
+    pub(super) fn warming_spinner(&self) -> bool {
+        let Some(promoted_at) = self.recording_promoted_at else {
+            return false;
+        };
+        if self.recording.is_none() {
+            return false;
+        }
+        warm_spinner_visible(
+            promoted_at,
+            self.settled_instant(),
+            WARM_SPINNER_REVEAL_DELAY,
+            WARM_SPINNER_MIN_HOLD,
+            std::time::Instant::now(),
+        )
+    }
+
+    /// DRAGON-659: which face the record chip is wearing right now. The effectful half of
+    /// [`chip_face`], which holds the whole rule; the view matches on the answer rather than
+    /// re-deriving it from three separate questions.
+    ///
+    /// DRAGON-661: the STOP face keys on the SETTLED instant, not the first frame.
+    pub(super) fn record_chip_face(&self) -> ChipFace {
+        chip_face(
+            self.recording.is_some(),
+            self.settled_instant().is_some(),
+            self.warming_spinner(),
+        )
+    }
+
+    /// DRAGON-659: throw away a worker the countdown started but nothing will promote:
+    /// the user cancelled the timer, or the session is ending. Idempotent, and a no-op
+    /// when no countdown ever spawned one (every kind but Video, and every session with no
+    /// ffmpeg).
+    ///
+    /// The files are reaped on a short detached thread rather than here, because a worker
+    /// asked to stop still runs its stop tail: it drains, finalizes and WRITES the output
+    /// file. Deleting before that lands would leave the finished recording behind in the
+    /// user's folder, which is the opposite of cancelling. The wait is bounded (DRAGON-118:
+    /// nothing in the record path waits unboundedly) and the thread is detached, so a
+    /// session that exits first simply dies with it, leaving only the temp that
+    /// `recover::sweep_wreckage` already reaps at the next recording's start.
+    pub(super) fn abandon_warming(&mut self) {
+        let Some(warm) = self.warming.take() else {
+            return;
+        };
+        log::debug!("the countdown's warming recording worker was abandoned before promotion");
+        warm.handle
+            .stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // DRAGON-673: release the start gate too. A worker parked waiting for a promotion
+        // that is never coming would otherwise hold until the gate's own 30s cap before it
+        // could see the stop above, and only then begin the unwind this function's reaper is
+        // already waiting on.
+        self.open_countdown_gate();
+        // DRAGON-322: nothing is recording here after all, so drop the cross-process marker
+        // the spawn raised, before any sibling reads it.
+        crate::instance::set_recording_marker(false);
+        let done = warm.handle.done.clone();
+        let out_path = warm.out_path;
+        std::thread::spawn(move || {
+            let temp = crate::record::recording_temp_path(&out_path);
+            let deadline = std::time::Instant::now() + ABANDON_REAP_BUDGET;
+            while std::time::Instant::now() < deadline {
+                if done.lock().ok().and_then(|g| g.clone()).is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let _ = std::fs::remove_file(&temp);
+            let _ = std::fs::remove_file(&out_path);
+        });
     }
 
     /// The tray glyph tint (DRAGON-179): the app's EFFECTIVE, RESOLVED accent — the same
@@ -794,6 +1118,13 @@ impl App {
         // promptly.
         crate::instance::set_recording_marker(false);
         self.recording_started = None;
+        // DRAGON-659: the promotion instant goes with the recording it timed. Nothing reads
+        // it once `self.recording` is `None` (`warming_spinner` tests that first), but this
+        // is the ONE place that says what "no longer recording" means, so it says all of it.
+        self.recording_promoted_at = None;
+        // DRAGON-661: the live-declaration latch belongs to the recording that raised it, so
+        // the next one declares itself from scratch.
+        self.recording_live_declared = false;
         self.recording_paused_at = None;
         self.recording_paused_accum = std::time::Duration::ZERO;
         self.recording_stopping = false;
@@ -1017,6 +1348,140 @@ fn toolbar_hidden(hide_setting: bool, cant_fit_outside: bool) -> bool {
     hide_setting && cant_fit_outside
 }
 
+/// Whether the record chip wears its WARMING face at `now` (DRAGON-659). Pure,
+/// unit-tested.
+///
+/// * `promoted_at`: when `self.recording` became `Some`.
+/// * `ready_at`: when the thing being waited for happened, or `None` while it still has
+///   not. Since DRAGON-661 that is the worker's SETTLED instant (`RecordHandle::settled_at`,
+///   the end of its opening phase), not its first captured frame: the frame is the START of
+///   a bring-up that still has the audio pre-flight, the ffmpeg spawn and the opening
+///   catch-up to go, and a spinner that clears there clears mid-setup.
+/// * `reveal_delay`: how long to wait before showing anything (`ZERO` after a countdown,
+///   [`WARM_SPINNER_REVEAL_DELAY`] otherwise).
+/// * `min_hold`: how long a revealed spinner stays, [`WARM_SPINNER_MIN_HOLD`].
+///
+/// The rule in one line: a warmup that beat the reveal delay is never shown at all, and one
+/// that did not is shown for at least `min_hold` past the reveal, whether or not it has
+/// landed by then. So the glyph either never appears or is legible, and never blinks.
+///
+/// The boundary is deliberately `<=`, not `<`: a warmup that lands exactly ON the reveal
+/// instant has nothing left to report, and the countdown case (where `reveal_delay` is
+/// `ZERO` and `ready_at` precedes `promoted_at`, saturating to a zero offset) rides that
+/// same comparison rather than needing an arm of its own.
+fn warm_spinner_visible(
+    promoted_at: std::time::Instant,
+    ready_at: Option<std::time::Instant>,
+    reveal_delay: std::time::Duration,
+    min_hold: std::time::Duration,
+    now: std::time::Instant,
+) -> bool {
+    match ready_at {
+        // Still warming: shown from the reveal onward, with no upper bound. A worker that
+        // never settles is a worker that is failing, and its failure ends the recording
+        // through `RecordingPoll`; until then the spinner is the honest face.
+        None => now.saturating_duration_since(promoted_at) >= reveal_delay,
+        Some(ready_at) => {
+            let warm_offset = ready_at.saturating_duration_since(promoted_at);
+            if warm_offset <= reveal_delay {
+                false
+            } else {
+                // Both bounds, not just the upper one. Live, only the upper bound can ever
+                // decide anything (before the reveal, `ready_at` is still in the future, so
+                // the `None` arm above is what answers). Stating the lower bound anyway
+                // keeps the function TOTAL: it gives the right answer for any pair a test
+                // hands it, instead of being right only for the pairs a clock can produce.
+                let reveal = promoted_at + reveal_delay;
+                now >= reveal && now < reveal + min_hold
+            }
+        }
+    }
+}
+
+/// What one recording poll adopts from the worker's SETTLED signal (DRAGON-661, rewritten
+/// by DRAGON-673). Pure, unit-tested.
+///
+/// * `anchor_set` / `live_declared`: the two once-per-recording latches, already taken.
+/// * `settled_at`: the end of the worker's opening phase (`RecordHandle::settled_at`), which
+///   is MEDIA 0 — where the file begins — or `None` while it is still coming up.
+///
+/// Returns the elapsed anchor to adopt (`None` = leave it alone) and whether THIS poll is
+/// the one that declares the recording live.
+///
+/// ONE signal, for both, and that is the fix. It used to take `warm_at` as well and anchor
+/// the elapsed readout there, on the premise that the confirmed first frame is "where the
+/// file's real content begins". DRAGON-672 made that premise false (media 0 became the
+/// settled pipeline, so everything before it is dropped) and DRAGON-673 made it visible: the
+/// worker is spawned at countdown START, so `warm_at` lands a whole countdown early and a 10s
+/// countdown opened its recording at 0:10. The readout must count the file, and the file
+/// begins where the app declares itself live, so the two are the same instant by
+/// construction.
+///
+/// The old guard ("never declared live without an anchor to count from") is now structural
+/// rather than tested: both halves read the same `Option`, so live cannot be declared with no
+/// anchor even in principle.
+fn warm_adoption(
+    anchor_set: bool,
+    live_declared: bool,
+    settled_at: Option<std::time::Instant>,
+) -> (Option<std::time::Instant>, bool) {
+    let anchor = if anchor_set { None } else { settled_at };
+    let declare_live = !live_declared && settled_at.is_some();
+    (anchor, declare_live)
+}
+
+/// Which face the record chip wears. See [`chip_face`] for the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ChipFace {
+    /// No recording: the countdown's remaining seconds, or the idle delay readout.
+    Idle,
+    /// Promoted, but the worker's pipeline has not settled yet. `spinning` is
+    /// whether the wait has run long enough to be worth REVEALING
+    /// ([`warm_spinner_visible`]): revealed, the face is the turning loader; before that it
+    /// is a still record dot, which says "starting" without either claiming to be live or
+    /// flashing loading chrome on a warmup that beats the reveal.
+    Warming { spinning: bool },
+    /// Live: the STOP glyph plus the elapsed readout, and the only face that takes a press.
+    /// Reached ONLY through a settled pipeline.
+    Live,
+}
+
+/// Which face the record chip wears, from the three facts that decide it. Pure, unit-tested.
+///
+/// * `recording` — a worker is PROMOTED (`self.recording` is `Some`).
+/// * `settled` — that worker's opening phase is over (`RecordHandle::settled_at`), so the
+///   pipeline is genuinely steady.
+/// * `spinner` — the warming spinner is past its reveal and inside its hold
+///   ([`warm_spinner_visible`]).
+///
+/// The rule this exists to enforce is the first line of the body: `Live`, the STOP face, is
+/// reachable only through `settled`. The view used to ask `recording` instead, and
+/// `recording` is true from PROMOTION, which is a whole warmup before there is anything to
+/// stop. That read correctly whenever the spinner was up, and wrongly in the gap BEFORE the
+/// spinner is revealed, so a fresh no-countdown recording showed STOP, then the spinner,
+/// then STOP again. Only the no-countdown path could reach it: a countdown promotion reveals
+/// at zero delay, so it has no gap.
+///
+/// DRAGON-661 moved this second fact from the first captured frame to the settled instant.
+/// The frame only proves the capture stream works; the audio pre-flight, the ffmpeg spawn
+/// and the opening catch-up all follow it (600ms on one measured session), and a STOP face
+/// during that span points straight at the part of the recording still being papered over.
+///
+/// `spinner` is tested before `settled` because it outlives the warmup by design:
+/// [`WARM_SPINNER_MIN_HOLD`] keeps a revealed spinner up for a moment after the pipeline
+/// settles, so the glyph cannot blink off the instant it appeared.
+fn chip_face(recording: bool, settled: bool, spinner: bool) -> ChipFace {
+    if !recording {
+        ChipFace::Idle
+    } else if spinner {
+        ChipFace::Warming { spinning: true }
+    } else if settled {
+        ChipFace::Live
+    } else {
+        ChipFace::Warming { spinning: false }
+    }
+}
+
 /// Which preview anchor a stopping recording keeps. Pure, unit-tested (lab/flatpak).
 ///
 /// The STOP-TIME resolution wins whenever it produced one: on the native path the
@@ -1128,6 +1593,252 @@ mod toolbar_visibility_tests {
         // The single hide case: the user asked to hide AND the toolbar can't fit outside
         // (a full-screen / oversized capture). The tray icon carries the controls.
         assert!(toolbar_hidden(true, true));
+    }
+}
+
+/// DRAGON-659: the warming spinner's reveal + hold rule, as a table. The four cases below
+/// are the whole behavior the ticket asks for, and the reason the rule is a pure function
+/// rather than three conditions inlined in a view.
+#[cfg(test)]
+mod warm_spinner_visible_tests {
+    use super::{warm_spinner_visible, WARM_SPINNER_MIN_HOLD, WARM_SPINNER_REVEAL_DELAY};
+    use std::time::{Duration, Instant};
+
+    /// The happy no-countdown case: a warmup faster than the reveal delay never shows a
+    /// spinner, at any point afterwards.
+    #[test]
+    fn a_warmup_that_beats_the_reveal_is_never_shown() {
+        let promoted = Instant::now();
+        let warm = promoted + Duration::from_millis(120);
+        for after in [0, 50, 120, 200, 400, 5_000] {
+            assert!(
+                !warm_spinner_visible(
+                    promoted,
+                    Some(warm),
+                    WARM_SPINNER_REVEAL_DELAY,
+                    WARM_SPINNER_MIN_HOLD,
+                    promoted + Duration::from_millis(after),
+                ),
+                "a 120ms warmup must stay invisible, and it did not at {after}ms"
+            );
+        }
+    }
+
+    /// A slow no-countdown warmup: nothing before the reveal, the spinner from there, and
+    /// it is HELD past the moment the warmup actually landed rather than blinking off with
+    /// it.
+    #[test]
+    fn a_slow_warmup_is_revealed_then_held() {
+        let promoted = Instant::now();
+        let warm = promoted + Duration::from_millis(250);
+        let at = |ms: u64| {
+            warm_spinner_visible(
+                promoted,
+                Some(warm),
+                WARM_SPINNER_REVEAL_DELAY,
+                WARM_SPINNER_MIN_HOLD,
+                promoted + Duration::from_millis(ms),
+            )
+        };
+        assert!(!at(0), "nothing shows before the reveal delay");
+        assert!(!at(199), "nothing shows before the reveal delay");
+        assert!(at(200), "the spinner is revealed at the delay");
+        assert!(at(250), "and stays through the instant the warmup landed");
+        assert!(at(499), "and is held for the full minimum");
+        assert!(!at(500), "then it is gone for good");
+    }
+
+    /// Still warming (`settled_at` unset): shown from the reveal onward. This is also the
+    /// state a worker that never settles sits in, and the spinner is the honest face for it
+    /// until `RecordingPoll` ends the recording.
+    #[test]
+    fn a_recording_that_has_not_warmed_yet_shows_from_the_reveal() {
+        let promoted = Instant::now();
+        let at = |ms: u64| {
+            warm_spinner_visible(
+                promoted,
+                None,
+                WARM_SPINNER_REVEAL_DELAY,
+                WARM_SPINNER_MIN_HOLD,
+                promoted + Duration::from_millis(ms),
+            )
+        };
+        assert!(!at(0));
+        assert!(!at(199));
+        assert!(at(200));
+        assert!(at(10_000), "a worker that never warms keeps the spinner");
+    }
+
+    /// The countdown case (DRAGON-673), which now uses the SAME reveal delay as any other
+    /// promotion. A prewarmed worker holds at the start gate and settles a few milliseconds
+    /// after the promotion opens it, so the settle sits well inside the delay and shows
+    /// nothing. This is why the countdown's old `ZERO` delay had to go: with the gate, that
+    /// zero would flash the spinner on every countdown recording.
+    #[test]
+    fn a_gated_countdown_settle_lands_inside_the_reveal_and_shows_nothing() {
+        let promoted = Instant::now();
+        let gated = promoted + Duration::from_millis(8);
+        for after in [0, 8, 50, 200, 400, 5_000] {
+            assert!(
+                !warm_spinner_visible(
+                    promoted,
+                    Some(gated),
+                    WARM_SPINNER_REVEAL_DELAY,
+                    WARM_SPINNER_MIN_HOLD,
+                    promoted + Duration::from_millis(after),
+                ),
+                "the gated settle must stay invisible, and it did not at {after}ms"
+            );
+        }
+    }
+
+    /// The other half of the countdown case: a worker that had NOT reached the gate at zero
+    /// is genuinely late, and is shown from the reveal exactly like any other slow warmup.
+    #[test]
+    fn a_countdown_worker_that_missed_the_gate_is_still_revealed() {
+        let promoted = Instant::now();
+        let at = |ms: u64| {
+            warm_spinner_visible(
+                promoted,
+                None,
+                WARM_SPINNER_REVEAL_DELAY,
+                WARM_SPINNER_MIN_HOLD,
+                promoted + Duration::from_millis(ms),
+            )
+        };
+        assert!(!at(199), "nothing shows before the reveal delay");
+        assert!(at(200), "a worker still warming at countdown zero shows from the reveal");
+    }
+
+    /// The exact boundary, pinned because it is the one place a `<` would change the
+    /// answer: a warmup landing ON the reveal instant has nothing left to report.
+    #[test]
+    fn a_warmup_landing_exactly_on_the_reveal_is_not_shown() {
+        let promoted = Instant::now();
+        let warm = promoted + WARM_SPINNER_REVEAL_DELAY;
+        assert!(!warm_spinner_visible(
+            promoted,
+            Some(warm),
+            WARM_SPINNER_REVEAL_DELAY,
+            WARM_SPINNER_MIN_HOLD,
+            promoted + WARM_SPINNER_REVEAL_DELAY,
+        ));
+        // One microsecond later it IS shown, so the edge is exactly where it says it is.
+        let warm = promoted + WARM_SPINNER_REVEAL_DELAY + Duration::from_micros(1);
+        assert!(warm_spinner_visible(
+            promoted,
+            Some(warm),
+            WARM_SPINNER_REVEAL_DELAY,
+            WARM_SPINNER_MIN_HOLD,
+            promoted + WARM_SPINNER_REVEAL_DELAY,
+        ));
+    }
+}
+
+/// DRAGON-659: the record chip's face, as a table over the three facts. The first test is
+/// the invariant the whole function exists for; the rest are the states a real session walks
+/// through, in order.
+#[cfg(test)]
+mod chip_face_tests {
+    use super::{chip_face, ChipFace};
+
+    /// THE rule: the STOP face may never show unless the worker's pipeline has SETTLED.
+    /// Every combination that is not settled has to answer something else, whatever the
+    /// other two facts say.
+    #[test]
+    fn the_stop_face_needs_a_settled_pipeline() {
+        for recording in [false, true] {
+            for spinner in [false, true] {
+                assert_ne!(
+                    chip_face(recording, false, spinner),
+                    ChipFace::Live,
+                    "not settled must never read as live (recording={recording}, \
+                     spinner={spinner})"
+                );
+            }
+        }
+    }
+
+    /// A fresh no-countdown recording, tick by tick: promoted with the pipeline still coming
+    /// up and nothing revealed yet (the gap this fix is about), then the revealed spinner,
+    /// then live. The middle step is the one that used to answer `Live`.
+    #[test]
+    fn a_no_countdown_recording_walks_gap_then_spinner_then_live() {
+        assert_eq!(chip_face(true, false, false), ChipFace::Warming { spinning: false });
+        assert_eq!(chip_face(true, false, true), ChipFace::Warming { spinning: true });
+        assert_eq!(chip_face(true, true, false), ChipFace::Live);
+    }
+
+    /// The minimum-hold window: the pipeline has settled but the revealed spinner is still
+    /// being held, so the chip keeps spinning rather than snapping to STOP mid-turn. This is
+    /// why the spinner is asked about before `settled`.
+    #[test]
+    fn a_held_spinner_outlives_the_warmup() {
+        assert_eq!(chip_face(true, true, true), ChipFace::Warming { spinning: true });
+    }
+
+    /// No worker, no chip: the countdown digits and the idle delay readout share this face,
+    /// and neither cares what a stale settled flag says.
+    #[test]
+    fn no_recording_is_always_the_idle_face() {
+        assert_eq!(chip_face(false, false, false), ChipFace::Idle);
+        assert_eq!(chip_face(false, true, false), ChipFace::Idle);
+    }
+}
+
+/// DRAGON-661: what a poll adopts from the worker's two startup signals. The table is the
+/// whole point of the ticket: the elapsed anchor and the live declaration key on DIFFERENT
+/// signals, so a session walks through a state where one has been taken and the other has
+/// not.
+#[cfg(test)]
+mod warm_adoption_tests {
+    use super::warm_adoption;
+    use std::time::{Duration, Instant};
+
+    /// The startup, in order: a worker still coming up gives the poll nothing, and the one
+    /// poll that sees `settled_at` takes BOTH halves — the anchor and the live declaration —
+    /// because they are the same instant.
+    #[test]
+    fn a_session_adopts_nothing_until_it_settles_then_takes_both() {
+        let settled = Instant::now();
+
+        assert_eq!(warm_adoption(false, false, None), (None, false));
+        assert_eq!(warm_adoption(false, false, Some(settled)), (Some(settled), true));
+    }
+
+    /// The DRAGON-673 case, and the reason the anchor moved. A countdown's worker confirms
+    /// its first frame at countdown START and settles a whole countdown later, so anchoring
+    /// on the frame opened a 10s countdown's recording at 0:10. The anchor is the SETTLED
+    /// instant, which is media 0 — the elapsed readout therefore reads 0:00 exactly when the
+    /// file begins.
+    #[test]
+    fn the_anchor_is_media_zero_not_the_first_frame_a_countdown_ago() {
+        let first_frame = Instant::now();
+        let settled = first_frame + Duration::from_secs(10);
+        let (anchor, live) = warm_adoption(false, false, Some(settled));
+        assert_eq!(anchor, Some(settled), "the readout counts the FILE, not the warmup");
+        assert!(live);
+        assert!(
+            anchor.expect("anchored") > first_frame,
+            "a countdown's first frame is long past by the time the file starts"
+        );
+    }
+
+    /// Both latches are once-per-recording: every later poll of a live recording adopts
+    /// nothing, which is what keeps the tray from being re-raised every 100ms.
+    #[test]
+    fn an_already_live_recording_adopts_nothing_further() {
+        let settled = Instant::now();
+        assert_eq!(warm_adoption(true, true, Some(settled)), (None, false));
+    }
+
+    /// The halves still latch INDEPENDENTLY, so a poll that already anchored can still be the
+    /// one that declares live. Unreachable while both read one `Option`, and pinned so a
+    /// future signal split cannot silently re-raise the tray or lose the declaration.
+    #[test]
+    fn an_anchored_but_undeclared_recording_still_declares_live() {
+        let settled = Instant::now();
+        assert_eq!(warm_adoption(true, false, Some(settled)), (None, true));
     }
 }
 

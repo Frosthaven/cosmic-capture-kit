@@ -192,6 +192,66 @@ pub(super) fn menu_hold_release(since_focus_ms: Option<u64>, since_launch_ms: u6
         || since_launch_ms >= MENU_HOLD_BUDGET_MS
 }
 
+// ── The colour picker's countdown (DRAGON-663) ───────────────────────────────
+//
+// The owner's rule is that a configured delay applies to the whole tool, not just to the
+// capture kinds: "anytime we do a countdown it needs to exist in the system tray with the
+// cancel option". The picker was the one launch shape with no relationship to the delay at
+// all, so it opened instantly while every capture waited.
+//
+// It reuses the capture countdown WHOLE: `App::countdown` carries the digits,
+// `CountdownTraySession` carries the tray icon and its Cancel row, `sub_countdown` ticks it,
+// `countdown_view` draws it, and Escape / the chip / the tray row all cancel it. What the
+// picker cannot reuse is `enter_countdown` itself, because that arms a pending `Selection`
+// and a video warm-spawn, and a pick has neither. Both entry points therefore go through
+// `App::arm_countdown`, which is the ONE place the on-screen ticker and the tray digits are
+// armed together, so a future third countdown cannot arm one without the other.
+//
+// **What the delay MEANS here is the whole design.** The picker samples a frozen snapshot
+// (see `app::color_picker`'s `PixelSource`), and a delay exists to let the user change the
+// screen. So the snapshot must be taken when the countdown ENDS, not at launch: a picker
+// that counted down and then reported the screen as it looked before the delay would be
+// worse than no countdown at all. That is why the launch grab is HELD
+// (`super::FlatsPlan::Hold`) instead of taken and thrown away, and why the reveal takes a
+// settle before grabbing.
+
+/// **Pure**, unit-tested: the countdown a COLOUR PICKER launch runs, in seconds.
+///
+/// `None` for every launch that is not a picker, and for a picker with no delay configured,
+/// which keeps the historical "opens immediately" behaviour exactly. `delay_secs` is
+/// [`App::configured_delay_secs`]'s answer, so a CLI `--countdown` applies to the picker for
+/// the same reason it applies to a capture.
+///
+/// Clamped into the `u8` the ticker is, exactly as `proceed_capture` clamps it, so an
+/// arbitrary `--countdown 100000` cannot wrap into a one-second delay.
+pub(super) fn picker_countdown_secs(color_picker: bool, delay_secs: u64) -> Option<u8> {
+    if !color_picker || delay_secs == 0 {
+        return None;
+    }
+    Some(delay_secs.min(u8::MAX as u64) as u8)
+}
+
+/// **Pure**, unit-tested: whether a COLOUR PICKER launch HOLDS its frozen-flats grab
+/// (DRAGON-663). The picker's half of [`super::FlatsPlan::Hold`].
+///
+/// `want_flats` is [`super::launch_flats_needed`]'s answer, and it is a term rather than an
+/// assumption even though a picker launch always wants the flats: this reads as "hold the
+/// grab this launch was going to make", and a hold on a grab that was never going to happen
+/// would leave `frozen_pending` armed for a session with nothing to deliver it.
+pub(super) fn picker_flats_held(want_flats: bool, color_picker: bool, delay_secs: u64) -> bool {
+    want_flats && picker_countdown_secs(color_picker, delay_secs).is_some()
+}
+
+/// **Pure**, unit-tested: whether the pending picker countdown may start NOW.
+///
+/// One term, and it is the reason the arm is deferred at all: the countdown has to make the
+/// overlays click-through so the user can rearrange the screen underneath it, and
+/// `recreate_active_overlays` can only do that to overlays that exist. `outputs` is
+/// `App::outputs.len()`, which is empty at `init` on every platform and fills a beat later.
+pub(super) fn picker_countdown_arms(pending: bool, outputs: usize) -> bool {
+    pending && outputs > 0
+}
+
 impl App {
     /// The keyboard interactivity to MINT a capture overlay with right now:
     /// Exclusive during picking (see [`picking_phase`]), OnDemand otherwise.
@@ -528,26 +588,152 @@ impl App {
         }
     }
 
+    /// Arm the countdown: the on-screen ticker AND the tray digits, together, in ONE place
+    /// (DRAGON-663).
+    ///
+    /// Both entry points call this, and that is the point rather than tidiness. The owner's
+    /// report was that a countdown could run without appearing in the tray, so the two are
+    /// armed by one statement and there is no way to write a third countdown that sets
+    /// `self.countdown` and forgets `self.countdown_tray`. The teardown side is already
+    /// paired at every site (`CaptureMsg::Tick`'s fire, `CancelCapture`,
+    /// `CountdownTrayPoll`, `WindowChromeMsg::Close`).
+    ///
+    /// **[`crate::tray::CountdownTraySession::start`] may still return `None`, and that is
+    /// not a defect.** It is the documented degradation for a session with no tray host
+    /// (no StatusNotifierItem on Linux, off the main thread on macOS, an icon that would
+    /// not create on Windows, a platform with no tray at all). Every normal session keeps
+    /// its on-screen countdown regardless, so the digits are an ADDITION there; the one
+    /// path where they are the only surface is the Linux portal fallback, which
+    /// [`Self::enter_countdown`] warns about by name.
+    fn arm_countdown(&mut self, secs: u8) {
+        self.countdown = Some(secs);
+        // DRAGON-563: the remaining seconds also render IN the tray icon, on EVERY
+        // session (the owner ungated it: "we can have that across the board").
+        self.countdown_tray = crate::tray::CountdownTraySession::start(secs);
+        // BEHAVIOUR, not content, and it earns its line: "the countdown is not in the tray"
+        // is the exact report DRAGON-663 was opened on, and there was no way to tell a
+        // session where the digits were raised from one where the tray host declined
+        // without watching a menu bar with one's own eyes. Now the log says which happened,
+        // on every platform, for every countdown.
+        log::debug!(
+            "countdown armed: {secs}s, tray digits {}",
+            match self.countdown_tray {
+                Some(_) => "raised",
+                None => "unavailable (no tray host answered)",
+            }
+        );
+    }
+
+    /// DRAGON-663: whether this session's frozen-flats grab is HELD for the colour picker's
+    /// countdown, i.e. the picker's arm has not spent itself yet or the digits are still
+    /// counting. Nothing can land in `frozen_slot` while this is true, so the drain poll has
+    /// nothing to drain (`sub_frozen_ready`) and the dim cannot begin to fade.
+    ///
+    /// Derived rather than stored, so it cannot disagree with the two states it reads.
+    pub(in crate::app) fn picker_flats_on_hold(&self) -> bool {
+        self.color_picking()
+            && (self.picker_countdown_pending.is_some() || self.countdown.is_some())
+    }
+
+    /// DRAGON-663: start the COLOUR PICKER's pre-open countdown.
+    ///
+    /// [`Self::enter_countdown`]'s twin, and deliberately not a branch inside it: that one
+    /// takes the `Selection` a capture is about to commit and arms a video warm-spawn and a
+    /// window pre-focus against it, none of which a pick has. What the two share is
+    /// [`Self::arm_countdown`] and everything downstream of it, so the digits, the tray
+    /// session, the tick, the view and all three cancel routes are literally the same code.
+    ///
+    /// `self.pending` is deliberately left `None`. That is what the fire tick reads to tell
+    /// the two countdowns apart, and it is also what makes `countdown_view` draw the plain
+    /// full-screen dim with the timer chip rather than a selection border around a rectangle
+    /// this session does not have.
+    ///
+    /// `recreate_active_overlays` is the same call the capture countdown makes, and it earns
+    /// its place here for a stronger reason: the picker's delay exists so the user can open
+    /// a menu or hover something before the snapshot is taken, which they cannot do through
+    /// an overlay that is eating every click.
+    pub(in crate::app) fn enter_picker_countdown(&mut self, secs: u8) -> Task<cosmic::Action<Msg>> {
+        log::debug!("colour picker: starting the configured {secs}s countdown before the pick");
+        self.arm_countdown(secs);
+        self.recreate_active_overlays()
+    }
+
+    /// DRAGON-663: the colour picker's countdown has run out, so hand the screen back and
+    /// arm the settle that ends in the held flats grab.
+    ///
+    /// Nothing is grabbed HERE, and that is the whole of it. The countdown's dim and timer
+    /// chip were on screen for the frame that just went out; a grab started now photographs
+    /// them, and the picker would then REPORT those pixels as the colour under the cursor.
+    /// Clearing `self.countdown` (the caller does it) makes the very next frame the picker's
+    /// own view, which draws nothing at all while `frozen_pending` holds (no snapshot to
+    /// show, `dim_now` returns zero, no pointer sample yet), so what the settle is waiting
+    /// for is the compositor presenting that blank surface. `sub_picker_reveal` then runs
+    /// the grab, `FrozenReady` drains it, and the picker resamples and fades its dim in
+    /// exactly as it does on an ordinary launch.
+    ///
+    /// This is the same 200ms settle, for the same reason, that `sub_pixel_capture` takes
+    /// after a teardown and the DRAGON-456 scan re-read takes after blanking the marks.
+    pub(in crate::app) fn reveal_color_picker(&mut self) -> Task<cosmic::Action<Msg>> {
+        log::debug!("colour picker: countdown finished, settling before the snapshot grab");
+        self.picker_revealing = true;
+        self.restore_interactive_overlays()
+    }
+
+    /// DRAGON-663: the settle is over, so run the grab the launch held back.
+    ///
+    /// `want_cursor` is a constant `false` here rather than a carried launch value, and it is
+    /// not a shortcut: [`crate::app::cursor_wanted`] answers false for every colour-picker
+    /// launch already (a pick draws no captured cursor), so carrying the flag would only be
+    /// a second way to spell the same constant.
+    pub(in crate::app) fn run_picker_flats_grab(&mut self) {
+        if !self.picker_revealing {
+            return;
+        }
+        self.picker_revealing = false;
+        crate::app::spawn_frozen_flats_grab(self.frozen_slot.clone(), false);
+    }
+
     /// Enter the pre-capture countdown. The overlay is recreated click-through
     /// except for the toolbar's region (so the screen stays usable), and
     /// `view_window` switches to the countdown view. The timer subscription drives
     /// the tick down to the capture.
     pub(super) fn enter_countdown(&mut self, sel: Selection, secs: u8) -> Task<cosmic::Action<Msg>> {
-        self.countdown = Some(secs);
-        // DRAGON-278 follow-up (user spec a): for a WINDOW capture styled ACTIVE, focus the
-        // target the MOMENT the countdown starts — so it is already active while the timer
-        // runs and its title-bar / Mica activation has the whole countdown to settle (the
-        // fire re-focuses in case focus was stolen mid-countdown). No-op for region/monitor
-        // picks and for Inactive-styled window picks (the fire-time defocus handles those).
-        self.focus_target_at_countdown_start(&sel);
+        // DRAGON-659/673: a video countdown starts its recording WORKER right HERE, at
+        // countdown START, so the entire countdown is warmup cover and the record button's
+        // spinner can never appear however slow this platform's bring-up is.
+        //
+        // It used to wait for a tick near the end, because the worker captures continuously
+        // once warm and media 0 moved with the spawn, so starting early put the countdown
+        // itself in the file. DRAGON-672 decoupled them: media 0 is the settled pipeline,
+        // and DRAGON-673 gates it on `countdown_gate` as well, so the file begins exactly
+        // where the app promotes the recording, no matter how early the worker started. The
+        // runway constant that trade needed is gone; warming for longer now costs nothing.
+        //
+        // The gate is a FLAG the promotion raises, not the predicted instant of zero. It was
+        // that instant first (`now + secs`, stamped right here), and it ran ~1s ahead of the
+        // tick that actually fires the capture: the digits tick on `iced::time::every`, whose
+        // messages queue behind everything this method does, and this method now spawns a
+        // recording worker and rebuilds every overlay. The file started before the UI said
+        // "Recording". See `record::owned::media_zero`.
+        //
+        // Minted BEFORE the spawn, because `arm_warm_spawn` reads it when it builds the
+        // session's `RecordSettings`. `arm_warm_spawn` is still a no-op for every non-video
+        // or no-ffmpeg session. `secs` is no longer needed for the gate at all; it is still
+        // what the digits count down.
+        self.countdown_gate =
+            Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        self.arm_warm_spawn(&sel);
         // DRAGON-563: the remaining seconds also render IN the tray icon, on EVERY
         // session (the owner ungated it: "we can have that across the board"). Normal
-        // sessions keep their on-screen countdown and get the digits in addition. On the
-        // `lab/flatpak` fallback path the digits are the ONLY countdown surface: the
-        // plain toplevel counted down over a gray sheet, and window/monitor countdowns
-        // had no surface at all, so `recreate_active_overlays` (below) tears the
-        // fallback window down for the countdown's whole run (its arm keys on
-        // `self.countdown`, set above). There the editor anchor is snapshotted NOW,
+        // sessions keep their on-screen countdown and get the digits in addition. Both
+        // halves are armed by `arm_countdown`, which is the ONE place that pairs them
+        // (DRAGON-663 moved the tray line into it; before that a second countdown entry
+        // point could set the ticker and forget the digits, which is the coverage bug the
+        // owner reported). On the `lab/flatpak` fallback path the digits are the ONLY
+        // countdown surface: the plain toplevel counted down over a gray sheet, and
+        // window/monitor countdowns had no surface at all, so `recreate_active_overlays`
+        // (below) tears the fallback window down for the countdown's whole run (its arm
+        // keys on `self.countdown`, set here). There the editor anchor is snapshotted NOW,
         // while the outputs are still known, the same rule as the fallback record-start
         // snapshot; `begin_capture` keeps it when its fresh resolution comes back empty
         // (`keep_countdown_anchor`).
@@ -560,7 +746,13 @@ impl App {
         // still fires on schedule and Cancel stays possible from any surface that does
         // exist (a resident tray, Escape on a still-open selector); the warn names the
         // condition so the log shows WHY nothing was on screen.
-        self.countdown_tray = crate::tray::CountdownTraySession::start(secs);
+        self.arm_countdown(secs);
+        // DRAGON-278 follow-up (user spec a): for a WINDOW capture styled ACTIVE, focus the
+        // target the MOMENT the countdown starts — so it is already active while the timer
+        // runs and its title-bar / Mica activation has the whole countdown to settle (the
+        // fire re-focuses in case focus was stolen mid-countdown). No-op for region/monitor
+        // picks and for Inactive-styled window picks (the fire-time defocus handles those).
+        self.focus_target_at_countdown_start(&sel);
         if self.overlay_fallback_active() {
             if self.countdown_tray.is_none() {
                 log::warn!(
@@ -2975,28 +3167,12 @@ pub(super) fn keep_countdown_anchor(
     fallback && !fresh_resolved && snapshot_held
 }
 
-/// Pure, unit-tested (`lab/flatpak`, the one-shot countdown round): does a countdown
-/// that just FIRED consume the persisted timer, resetting `delay_idx` to the "No
-/// delay" preset? The owner's rule: the countdown timer is ONE-SHOT. Actually
-/// performing the delayed capture/recording spends it, so the next launch and every
-/// menu title read "Countdown Timer: 00"; it is not saved forever. Consumption
-/// happens at the FIRE instant, whether or not the action then succeeds: the
-/// countdown ran and fired, so it is spent. This is global on purpose: the overlay's
-/// delay chips, the tray radio picks and the fallback tray digits all share
-/// `delay_idx`, so native and fallback sessions get the same one-shot semantic.
-///
-/// Deliberate limits, each here for a reason:
-///
-/// - A CANCELLED countdown keeps the setting: the user did not get their capture, so
-///   the timer they configured is still owed to the retry. (Flagged for owner veto in
-///   the round's report.)
-/// - A CLI `--countdown` override (`cli_override`) drove this fire without reading
-///   the persisted preset, so it must not spend somebody else's setting.
-/// - `delay_idx == 0` has nothing to spend, and skipping it avoids a pointless
-///   config write on every immediate capture.
-pub(super) fn countdown_consumed(fired: bool, cli_override: bool, delay_idx: usize) -> bool {
-    fired && !cli_override && delay_idx != 0
-}
+// `countdown_consumed` lived here: the countdown preset was ONE-SHOT, so firing spent
+// `delay_idx` back to "No delay" and the next launch read "Countdown Timer: 00". The
+// owner reversed that rule. The timer is now remembered across captures and changes
+// only when the user picks a value (an overlay delay chip, a tray radio row, or a CLI
+// `--countdown`, which rides `countdown_override` and was never persisted anyway), so
+// the whole consumption decision and its tests are gone rather than gated.
 
 /// Pure, unit-tested (`lab/flatpak`): does the fallback overlay show the seed-frozen
 /// backdrop during SELECTION? Keyed on region mode and the seed frame being present,
@@ -4292,38 +4468,6 @@ mod keep_countdown_anchor_tests {
 }
 
 #[cfg(test)]
-mod countdown_consumed_tests {
-    use super::countdown_consumed;
-
-    // The owner's one-shot rule: a fired countdown driven by the persisted preset is
-    // spent, whatever the preset was.
-    #[test]
-    fn a_fired_preset_countdown_is_spent() {
-        assert!(countdown_consumed(true, false, 1));
-        assert!(countdown_consumed(true, false, 2));
-        assert!(countdown_consumed(true, false, 3));
-    }
-
-    // A cancelled countdown keeps the setting: the user did not get their capture, so
-    // the configured timer is still owed to the retry. (Owner-vetoable choice; the
-    // round's report flags it.)
-    #[test]
-    fn a_cancelled_countdown_keeps_the_setting() {
-        assert!(!countdown_consumed(false, false, 2));
-        assert!(!countdown_consumed(false, true, 2));
-    }
-
-    // A CLI --countdown override never spends the persisted preset it did not read,
-    // and a zero preset has nothing to spend (no pointless config write).
-    #[test]
-    fn overrides_and_zero_presets_spend_nothing() {
-        assert!(!countdown_consumed(true, true, 2));
-        assert!(!countdown_consumed(true, false, 0));
-        assert!(!countdown_consumed(true, true, 0));
-    }
-}
-
-#[cfg(test)]
 mod fallback_still_tests {
     use super::fallback_still_from_frozen;
 
@@ -4902,5 +5046,90 @@ mod menu_flats_hold_tests {
     fn the_hold_is_bounded_at_both_ends() {
         assert_eq!(MENU_DISMISS_SETTLE_MS, 150);
         assert_eq!(MENU_HOLD_BUDGET_MS, 1200);
+    }
+}
+
+#[cfg(test)]
+mod picker_countdown_tests {
+    use super::*;
+
+    /// The historical behaviour, pinned first: a picker with NO delay opens immediately, and
+    /// no launch that is not a picker ever reaches this decision at all. Between them these
+    /// are every session that existed before DRAGON-663, and all of them must answer `None`.
+    #[test]
+    fn only_a_picker_with_a_delay_counts_down() {
+        assert_eq!(picker_countdown_secs(false, 0), None);
+        assert_eq!(picker_countdown_secs(false, 3), None);
+        assert_eq!(picker_countdown_secs(true, 0), None);
+        assert_eq!(picker_countdown_secs(true, 3), Some(3));
+    }
+
+    /// Every shipped preset survives the trip through the `u8` ticker unchanged. Read off
+    /// `DELAYS` rather than written out, so a preset added later is covered without an edit
+    /// here and a preset that could not be spelled would fail loudly.
+    #[test]
+    fn every_configured_preset_survives_the_ticker() {
+        for (label, secs) in DELAYS {
+            let expected = (secs > 0).then_some(secs as u8);
+            assert_eq!(
+                picker_countdown_secs(true, secs),
+                expected,
+                "the {label} preset must reach the picker's countdown unchanged"
+            );
+        }
+    }
+
+    /// A CLI `--countdown` is an arbitrary `u64`, so the clamp is the same one
+    /// `proceed_capture` applies and for the same reason: the ticker is a `u8`, and a bare
+    /// `as u8` would turn 256 into a countdown of zero, i.e. a picker that opened instantly
+    /// for a user who had asked it to wait.
+    #[test]
+    fn an_arbitrary_cli_value_clamps_instead_of_wrapping() {
+        assert_eq!(picker_countdown_secs(true, 255), Some(255));
+        assert_eq!(picker_countdown_secs(true, 256), Some(255));
+        assert_eq!(picker_countdown_secs(true, u64::MAX), Some(255));
+    }
+
+    /// The hold follows the countdown exactly, with `want_flats` as a veto. A hold placed on
+    /// a grab that was never going to run would leave `frozen_pending` armed for a session
+    /// with nothing to deliver it, which is a launch that shows no dim and never resamples.
+    #[test]
+    fn the_flats_hold_needs_both_a_countdown_and_a_grab_to_hold() {
+        assert!(picker_flats_held(true, true, 3));
+        assert!(!picker_flats_held(false, true, 3));
+        assert!(!picker_flats_held(true, true, 0));
+        assert!(!picker_flats_held(true, false, 3));
+    }
+
+    /// The two states are exact complements for a picker launch that wants its flats: it
+    /// either grabs at launch or holds, never both and never neither. Pinned because the
+    /// `FlatsPlan` the caller builds reads them as a ladder, so a gap would silently become
+    /// `Now` and photograph the countdown.
+    #[test]
+    fn a_picker_launch_either_grabs_now_or_holds() {
+        for delay in [0u64, 3, 5, 10] {
+            let holds = picker_flats_held(true, true, delay);
+            let counts = picker_countdown_secs(true, delay).is_some();
+            assert_eq!(holds, counts, "delay {delay}s must hold exactly when it counts down");
+        }
+    }
+
+    /// The arm waits for somewhere to draw. Without outputs `recreate_active_overlays` has
+    /// nothing to make click-through, so the countdown would run over an overlay still
+    /// eating every click, which is the one thing a delay must not do.
+    #[test]
+    fn the_countdown_waits_for_an_overlay_to_draw_on() {
+        assert!(!picker_countdown_arms(true, 0));
+        assert!(picker_countdown_arms(true, 1));
+        assert!(picker_countdown_arms(true, 3));
+    }
+
+    /// And it never arms without a pending delay, however many outputs exist. This is the
+    /// term that keeps every ordinary capture launch out of the picker's arm entirely.
+    #[test]
+    fn nothing_arms_without_a_pending_delay() {
+        assert!(!picker_countdown_arms(false, 0));
+        assert!(!picker_countdown_arms(false, 1));
+        assert!(!picker_countdown_arms(false, 9));
     }
 }

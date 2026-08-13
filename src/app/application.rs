@@ -260,6 +260,30 @@ impl cosmic::Application for App {
             startup.kind.unwrap_or(Kind::Image),
             startup.color_picker,
         );
+        // DRAGON-663: the delay this launch is configured for, resolved the same way
+        // `App::configured_delay_secs` resolves it once the struct exists (an exact CLI
+        // `--countdown` wins, otherwise the persisted preset). Needed HERE, before the
+        // struct, because it decides whether the colour picker's flats grab is held.
+        let launch_delay_secs = startup
+            .countdown_secs
+            .unwrap_or_else(|| DELAYS[persisted.delay_idx.min(DELAYS.len() - 1)].1);
+        // DRAGON-663: a colour picker with a delay counts down BEFORE it samples, so the
+        // snapshot it will report has to be taken when the countdown ends. Holding the grab
+        // is what makes that true, and it is also what keeps the countdown's own dim out of
+        // the picture: `frozen_pending` stays armed for the hold, so `dim_fade_may_start`
+        // refuses and the picker's overlay paints nothing at all until the real grab lands.
+        let picker_holds_flats = crate::app::capture_flow::picker_flats_held(
+            want_flats,
+            startup.color_picker,
+            launch_delay_secs,
+        );
+        let flats = if !want_flats {
+            crate::app::FlatsPlan::Skip
+        } else if picker_holds_flats || menu_flats_held(want_flats) {
+            crate::app::FlatsPlan::Hold
+        } else {
+            crate::app::FlatsPlan::Now
+        };
         let (precapture, frozen, frozen_slot, wallpaper_slot, cursor_slot) = acquire_scene(
             scene_active,
             launch_mode,
@@ -272,7 +296,11 @@ impl cosmic::Application for App {
             // grab them even with freeze off. DRAGON-582 added the third reader: the
             // colour picker samples them for every pointer move, so it always needs them
             // (`app::color_picker`'s `PixelSource`).
-            want_flats,
+            //
+            // DRAGON-663 folded the "not yet" case in beside it, so the three answers are
+            // one value (`FlatsPlan`) resolved above rather than a `want` flag plus a `hold`
+            // flag that could be written in a combination that means nothing.
+            flats,
             wallpaper_path(),
             radius,
         );
@@ -696,7 +724,7 @@ impl cosmic::Application for App {
                 last_ocr_region: None,
                 scan_shot: ScanShot::Idle,
                 scan_shot_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
-                scan_spin: 0.0,
+                busy_spin: 0.0,
                 code_marks: Vec::new(),
                 marks: Vec::new(),
                 hovered_mark: None,
@@ -707,7 +735,10 @@ impl cosmic::Application for App {
                 code_menu: None,
                 text_drag: None,
                 recording: None,
+                warming: None,
+                recording_promoted_at: None,
                 recording_started: None,
+                recording_live_declared: false,
                 recording_path: None,
                 recording_out_path: None,
                 recording_stopping: false,
@@ -718,6 +749,7 @@ impl cosmic::Application for App {
                 hide_toolbar_fullscreen: persisted.hide_toolbar_fullscreen,
                 tray: None,
                 countdown_tray: None,
+                countdown_gate: None,
                 tray_hides_toolbar: false,
                 push_to_talk: persisted.push_to_talk,
                 ptt_held: false,
@@ -788,6 +820,15 @@ impl cosmic::Application for App {
                 frozen_slot,
                 frozen_pending,
                 menu_hold,
+                // DRAGON-663: a colour picker with a delay counts down before it samples.
+                // `None` for every other launch shape and for a picker with no delay, which
+                // is what keeps "the picker opens instantly" true wherever it always was.
+                // Spent by `sub_picker_countdown_arm` once there are overlays to draw on.
+                picker_countdown_pending: crate::app::capture_flow::picker_countdown_secs(
+                    startup.color_picker && scene_active,
+                    launch_delay_secs,
+                ),
+                picker_revealing: false,
                 // DRAGON-606: no dim until the frozen-flats grab has landed. On a launch
                 // that grabs nothing this clears on the first drain tick; on one that does,
                 // it clears when the grab posts, which is the ordering the fade exists to
@@ -985,7 +1026,20 @@ impl cosmic::Application for App {
             //
             // Do not reintroduce a blank here. It was also the mechanism by which a refresh
             // "hid the region selection", which is the behaviour this ticket removes.
-            if self.color_picking() {
+            if self.color_picking() && self.countdown.is_some() {
+                // DRAGON-663: a picker launch counting down draws the SAME countdown view a
+                // capture does, so the digits, the chip and its cancel press are one
+                // implementation rather than two that could drift. Written as an extra arm
+                // ahead of the picker rather than by reordering the chain below, so every
+                // launch shape that is not a picker keeps its exact historical order.
+                //
+                // The picker's own view must not draw here, and not only because the
+                // countdown should be visible: it renders the frozen snapshot, and during a
+                // picker countdown that snapshot is deliberately not taken yet
+                // (`FlatsPlan::Hold`), so it would be showing the screen as it looked before
+                // the delay the user asked for.
+                self.countdown_view(o)
+            } else if self.color_picking() {
                 // DRAGON-582: a colour-picker launch mints the SAME per-output overlays
                 // a capture does and only draws something else on them.
                 self.color_picker_view(o)

@@ -6,6 +6,13 @@
 //! platform: the picker's correctness lives in this file and the Linux gate proves all
 //! of it on any host. The overlay and the window only feed these numbers in and apply
 //! the answers.
+//!
+//! ONE function reads something other than a number, and it is deterministic in the same
+//! way: [`widest_mode_label`] measures the mode dropdown's labels through
+//! `preview::text_annot`, which sums advances out of an EMBEDDED face's own tables. No
+//! font on the machine is consulted, so it answers identically on every host, and
+//! [`mode_chip_width_for`] keeps the decision that consumes it injectable and testable
+//! without it.
 
 use crate::color::Srgb;
 
@@ -880,19 +887,37 @@ pub fn label_origin(
 
 /// Padding inside the window, per side.
 pub const WINDOW_PADDING: f32 = 16.0;
+/// The window's own frame, per side: the frosted outer container is padded by 1 so its
+/// border draws around everything (`color_picker_window_view`).
+///
+/// It is COUNTED, and the reason is a bug it caused: the size arithmetic used to be
+/// `padding + content`, which is 2pt more content width than the window actually has, and
+/// every section here is laid out at exactly [`CONTENT_W`]. While the value row still had
+/// a flexible spacer in it that shortfall was invisible, absorbed by the spacer; the
+/// moment every part of the row became fixed-width, the 2pt landed on the LAST item and
+/// clipped the copy button's right edge. The history grid and the gradient square were
+/// losing the same 2pt all along, just less visibly.
+pub const WINDOW_BORDER: f32 = 1.0;
 /// The content width every section shares: the SV square's width, and the budget the
 /// value row, the controls row and the recents grid are laid out inside.
 ///
-/// 478, and the number is CHOSEN rather than arrived at: it is what puts the history
-/// grid on whole points now that a row holds ten swatches (DRAGON-649): `478 - 10 * 28`
-/// swatch points splits into nine history gaps of exactly 22 ([`recents_gap`]), which
-/// keeps the flush right edge the owner asked of the history. At eight swatches a row,
-/// 476 satisfied BOTH whole-point demands at once, the history gap AND the value row's
-/// box division; at ten swatches no sane width satisfies both, so the value row keeps
-/// its floor() ([`value_box_width`]) and the sub-point remainder is absorbed by the
-/// fixed-width frame the view already wraps the boxes in (DRAGON-630 rev 4), where it
-/// shifts nothing visible.
-pub const CONTENT_W: f32 = 478.0;
+/// 332, and the number is CHOSEN rather than arrived at: it is what puts the history
+/// grid on whole points now that a row holds NINE swatches: `332 - 9 * 28` swatch points
+/// splits into eight history gaps of exactly 10 ([`recents_gap`]), which keeps the flush
+/// right edge the owner asked of the history. The value boxes then take the whole width
+/// and share it exactly ([`value_box_widths`] hands the floor()'s remainder out a point
+/// at a time), so both bands are flush at both edges.
+///
+/// **What sets the floor is no longer the value row.** It was 478 while that row carried
+/// the boxes AND the mode chip AND both icon buttons side by side. The mode row above
+/// the boxes took the dropdown, then the toggle, then the copy button, until the box row
+/// held nothing but boxes; that is what let this come down by 146pt (the window went 510
+/// wide to 364). What holds it up now is the pair below it: nine history swatches plus
+/// honest gaps (the owner traded the history's cap from 20 to 18 for exactly this), and
+/// a gradient square wide enough to aim a hue in. The next constraint under that is
+/// [`STRIPS_W`]'s assert: the hue and alpha tracks keep 212pt of travel here, and the
+/// gate is 200.
+pub const CONTENT_W: f32 = 332.0;
 /// The saturation/value square's height.
 pub const SV_H: f32 = 180.0;
 /// The gap under the square, before the controls row, and the gap under the controls
@@ -912,32 +937,90 @@ pub const SWATCH_CIRCLE: f32 = 48.0;
 pub const GAP_SWATCH_TRACKS: f32 = 16.0;
 /// The controls row's height.
 pub const CONTROLS_H: f32 = SWATCH_CIRCLE;
-/// One value box's height (the same control height the old rows used).
+/// One value box's height (the same control height the old rows used). Note this is the
+/// BUDGETED height: a text input measures its own font's line height plus its padding,
+/// which lands a shade over 34 at the default scale, so the view centres its neighbours
+/// on the boxes rather than on this number (see `App::value_row`). The remainder is
+/// absorbed by [`LAYOUT_SLACK_H`].
 pub const VALUE_BOX_H: f32 = 34.0;
-/// The caption band under the boxes ("R", "G", "B", "A"), and the gap above it.
+/// The caption band under the boxes ("R", "G", "B", "A"), and the gap around each band
+/// of the value block.
 pub const VALUE_LABEL_H: f32 = 16.0;
 pub const VALUE_LABEL_GAP: f32 = 4.0;
-/// The whole value row: boxes plus their caption band.
-pub const VALUE_ROW_H: f32 = VALUE_BOX_H + VALUE_LABEL_GAP + VALUE_LABEL_H;
-/// The mode picker: ONE dropdown control (the owner's review replaced the two separate
-/// chevron buttons), wide enough for "OKLCH" plus the dropdown's own chevron.
-pub const MODE_PICKER_W: f32 = 84.0;
-/// The copy button beside the value row (a 16pt icon in a standard icon button).
-pub const ROW_COPY_W: f32 = 32.0;
-/// The value row's LAYOUT TOGGLE, left of the copy button (the owner's rev-3 ask):
-/// split channel boxes vs the one whole-value box. Same square as the copy button so
-/// the right-edge cluster reads as one group.
-pub const LAYOUT_TOGGLE_W: f32 = 32.0;
-/// Gap between the value row's parts (boxes block, mode picker, copy button), and
-/// between the pipette and the swatch in the controls row.
+/// The MODE ROW's height: the row ABOVE the boxes carrying the mode dropdown, the layout
+/// toggle and the copy button.
+///
+/// Exactly a value box's height, and defined as it rather than as its own number (the
+/// owner's ask). The dropdown wears the boxes' border and sits directly over them, so any
+/// difference reads as a mistake rather than as a smaller control; the two icon buttons
+/// square up to the same height through [`ROW_ICON_HALO`]. It was 28 while the chip was a
+/// short tag beside the boxes.
+pub const MODE_ROW_H: f32 = VALUE_BOX_H;
+/// The padding around the mode row's 16pt icon glyphs, uniform on all four sides, so each
+/// bare icon button squares up to exactly [`MODE_ROW_H`] and the row's three controls
+/// share one height. The assert below is what keeps it true if the box height moves.
+pub const ROW_ICON_HALO: u16 = 9;
+
+const _: () = assert!(
+    2.0 * ROW_ICON_HALO as f32 + 16.0 == VALUE_BOX_H,
+    "the mode row's icon buttons must square up to a value box's height, or the dropdown \
+     and the two icons beside it are three different heights on one row"
+);
+/// The whole value row: the mode row, the boxes, and the caption band under them.
+///
+/// The gap ABOVE the boxes is [`BOX_GAP`], the same air the boxes keep between each
+/// other (the owner's ask: at the caption gap the two rows read as one crowded block).
+/// The gap BELOW them stays [`VALUE_LABEL_GAP`], because a caption belongs to the box
+/// over it and should sit closer to it than the next control does.
+pub const VALUE_ROW_H: f32 =
+    MODE_ROW_H + BOX_GAP + VALUE_BOX_H + VALUE_LABEL_GAP + VALUE_LABEL_H;
+// There is no icon-button width constant here any more, and that is the point: the
+// layout toggle and the copy button both sit on the MODE row, left-clustered after the
+// dropdown, with nothing to their right that has to fit. So nothing budgets them, they
+// take their natural size, and a constant claiming to describe them would only be a
+// number nobody consults. (`window_size_tests` keeps a test-only one for its
+// does-the-mode-row-fit check, the same way it keeps the permission window's width.)
+//
+// That was written ahead of the fact and DRAGON-676 made it true: a `ROW_ICON_W` lived
+// here until then, because `mode_chip_width` was `CONTENT_W` MINUS the two buttons and
+// therefore had to know their size. The chip is measured from its own longest label now,
+// so nothing in the shipping tree budgets the buttons and the constant moved into
+// `mode_row_tests`, which still checks the row fits.
+
+/// Gap between the mode row's controls, and between the pipette and the swatch in the
+/// controls row.
 pub const ROW_SPACING: f32 = 8.0;
-/// Gap between neighbouring value boxes.
+/// Gap between neighbouring value boxes, and (the owner's ask) between the mode row and
+/// the boxes under it, so the air around a box reads the same in both directions.
 pub const BOX_GAP: f32 = 6.0;
-/// Gap between the window's remaining sections (value row, divider, recents).
-pub const SECTION_GAP: f32 = 12.0;
+/// The gap BELOW the divider, before the colour history.
+///
+/// 24, doubled from 12 on the owner's review: that hairline is the window's one
+/// horizontal rule, and at 12 it read as a line crowded by its neighbours rather than as
+/// the break between the colour you are working on and the colours you kept.
+pub const SECTION_GAP: f32 = 24.0;
+/// The gap ABOVE the divider, after the value block. Deliberately SMALLER than
+/// [`SECTION_GAP`], and the difference is not a fudge: what sits above the line is CAPTION
+/// TEXT, whose line box carries empty descender space under the letters, while what sits
+/// below it is a swatch with a hard top edge. Equal numbers therefore do not read as equal
+/// air, which is exactly what the owner reported; four points of it is the text's own
+/// slack, given back.
+pub const GAP_VALUE_DIVIDER: f32 = 20.0;
 /// The horizontal divider between the value row and the colour history (the owner's
 /// review): one hairline, [`SECTION_GAP`] of air on each side.
 pub const DIVIDER_H: f32 = 1.0;
+/// The BAND the divider occupies in the window column, which is the height of the "Add
+/// color" button centred on the line rather than the line's own hairline.
+///
+/// The button is small on purpose (the owner's ask) and it is the reason this band
+/// exists: a control sitting ON a rule has to be given room by the rule's row, or the
+/// section under it is pushed down by however much the button overhangs. The air the
+/// owner asked for around the divider is measured from the LINE, so half this height eats
+/// into each [`SECTION_GAP`], which is what "centred on the line" looks like.
+pub const DIVIDER_BAND_H: f32 = 24.0;
+/// The plus glyph inside that button: smaller than the row icons, because it sits next to
+/// 12pt text rather than standing alone.
+pub const ADD_COLOR_ICON: u16 = 12;
 /// One recent-colour swatch.
 pub const RECENT_SWATCH: f32 = 28.0;
 /// The pick-again pipette, the LEFT end of the controls row (DRAGON-630; the reference
@@ -961,12 +1044,14 @@ const _: () = assert!(
 
 /// How many recent colours the history holds. Beyond this the OLDEST is dropped.
 ///
-/// TWENTY, as two rows of [`RECENTS_PER_ROW`] (DRAGON-649 widened the rows from eight
-/// to ten so the grid's gaps tighten; the two-row shape is the DRAGON-630 review's,
-/// matching the reference layout, and before that it was one row of ten).
-pub const RECENTS_CAP: usize = 20;
-/// Swatches per history row (ten since DRAGON-649; eight through DRAGON-630).
-pub const RECENTS_PER_ROW: usize = 10;
+/// EIGHTEEN, as two rows of [`RECENTS_PER_ROW`]. It was twenty (DRAGON-649 widened the
+/// rows from eight to ten); the owner traded two entries back for window width when the
+/// value row's controls moved up onto their own line, since the history row is what
+/// holds the window's width up now. The two-row shape is the DRAGON-630 review's,
+/// matching the reference layout, and before that it was one row of ten.
+pub const RECENTS_CAP: usize = 18;
+/// Swatches per history row (nine now; ten through DRAGON-649; eight before that).
+pub const RECENTS_PER_ROW: usize = 9;
 /// The client-side header bar's height (the same chrome the settings and preview windows
 /// draw), which the content has to sit below.
 pub const HEADER_H: f32 = 44.0;
@@ -979,6 +1064,104 @@ pub const HEADER_H: f32 = 44.0;
 /// 16 on the owner's screen (air under the last history row); 8 is the measured rest.
 pub const LAYOUT_SLACK_H: f32 = 8.0;
 
+// ── The mode dropdown's width (DRAGON-676) ───────────────────────────────────
+
+/// The mode chip's label size, and a mode-menu row's. Restated here rather than left as
+/// the view's `.size(13)` because [`widest_mode_label`] has to MEASURE at the size the
+/// label really renders at: two literals a hundred lines apart are two numbers that drift.
+pub const MODE_LABEL_SIZE: f32 = 13.0;
+/// The chip's horizontal padding, per side, shared with every menu row.
+pub const MODE_CHIP_PAD: u16 = 8;
+/// The caret glyph's box at the chip's right edge (`pan-up-down-symbolic`).
+pub const MODE_CARET_ICON: u16 = 14;
+/// The air between the mode's word and that caret.
+const MODE_CARET_GAP: f32 = 6.0;
+
+/// The allowance for the face we MEASURE not being the face that DRAWS.
+///
+/// [`widest_mode_label`] measures through the embedded Inter, the same faces
+/// `preview::chrome::text_font_ctrl_w` sizes its own chip from, because that is the one
+/// measurement this crate can take on any host, headlessly, and get the same answer
+/// everywhere. What actually draws the label is `cosmic::font::default()`: the COSMIC
+/// interface font where there is a COSMIC config to read, and whatever the system
+/// substitutes for it on Windows and macOS. Close relatives, not the same metrics.
+///
+/// 15% is the slack between them, and it buys width ONLY. An over-wide chip is a few
+/// points of air before the icon buttons beside it; an under-wide one clips "OKLCH" or
+/// pushes the caret off its own edge, and only one of those is a defect. It is the same
+/// "measure the worst case, not the developer's machine" move the hex chip's
+/// `view::label_metrics_tests::WIDEST_MONO_ADVANCE_EM` already makes, from the other side.
+const MODE_LABEL_HEADROOM: f32 = 1.15;
+
+/// The widest of the seven notations' labels at [`MODE_LABEL_SIZE`], in points.
+///
+/// MEASURED over `ColorFormat::ALL` rather than assumed to be "OKLCH": the labels are
+/// data, a notation added or renamed moves the answer, and a chip sized for a label the
+/// list no longer carries is exactly the drift a hand-written constant invites.
+///
+/// This is the ONE place in this file that reads anything but plain numbers (see the
+/// module doc). It is still deterministic: `text_annot::measure` sums advances out of an
+/// embedded face's own tables, so it answers identically on every platform and in every
+/// test run.
+fn widest_mode_label() -> f32 {
+    crate::color::ColorFormat::ALL
+        .into_iter()
+        .map(|f| {
+            crate::app::preview::text_annot::measure(
+                crate::app::preview::text_annot::TextFont::Clean,
+                MODE_LABEL_SIZE,
+                f.label(),
+            )
+        })
+        .fold(0.0f32, f32::max)
+}
+
+/// Pure, unit-tested: the mode chip's width, and with it the mode MENU's.
+///
+/// **As wide as its LONGEST option needs, and not a point more** (DRAGON-676, the owner's
+/// ask). It used to be `CONTENT_W` minus the two icon buttons and their gaps, i.e. the
+/// chip STRETCHED across the row with the buttons pushed to the far right; the two icons
+/// sit immediately after the chip now, and what the shrink frees is where the "Copied!"
+/// word lands ([`COPIED_TEXT_SIZE`]).
+///
+/// It stays a function rather than a number the view alone knows, for the reason it always
+/// was: the MENU has to be told the same width. The popup is a fixed-width panel hung off
+/// the chip's left edge, so unless it is the chip's own box wide it reads as hanging off
+/// the LABEL inside the chip rather than off the control (the owner's ask), and its items
+/// then fill that panel so a hover highlight is as wide as the row it highlights.
+pub fn mode_chip_width() -> f32 {
+    mode_chip_width_for(widest_mode_label())
+}
+
+/// Pure, unit-tested: [`mode_chip_width`]'s arithmetic with the measurement injected, so
+/// the DECISION can be exercised at label widths no font on this machine produces.
+///
+/// Rounded UP: the chip and the menu panel are laid out at this number and a fractional
+/// width puts their shared left and right edges on a half pixel, where the chip's 2pt
+/// outline and the panel's 1pt one stop agreeing about where the control is.
+fn mode_chip_width_for(label_w: f32) -> f32 {
+    (label_w * MODE_LABEL_HEADROOM
+        + MODE_CARET_GAP
+        + f32::from(MODE_CARET_ICON)
+        + 2.0 * f32::from(MODE_CHIP_PAD))
+    .ceil()
+}
+
+/// The "Copied!" acknowledgement's text size (DRAGON-676).
+///
+/// 12pt is the tooltip card's own text size, because this word REPLACES a card: it used to
+/// be a "Copied!" tooltip pinned open over the copy button, which said the right thing in
+/// the wrong way. A pinned card had to silence its neighbours' tooltips for as long as it
+/// was up (two cards in one place is two answers to one question), and it covered the alpha
+/// track above the row. Said as text on the row, it silences nothing and covers nothing.
+pub const COPIED_TEXT_SIZE: f32 = 12.0;
+/// The air between that word and the copy button it follows.
+///
+/// Measured from the icon BUTTON's edge, not from the glyph: the button already carries
+/// [`ROW_ICON_HALO`] of its own on that side, so this is only what keeps the word clear of
+/// the button's hover wash.
+pub const COPIED_TEXT_GAP: f32 = 4.0;
+
 /// Pure, unit-tested: the gap of the history GRID, both directions (the owner's rev-3
 /// ask made the row gap equal the column gap). Chosen so a FULL row of
 /// [`RECENTS_PER_ROW`] spans exactly [`CONTENT_W`]: the first swatch sits on the
@@ -988,36 +1171,56 @@ pub fn recents_gap() -> f32 {
     (CONTENT_W - RECENTS_PER_ROW as f32 * RECENT_SWATCH) / (RECENTS_PER_ROW as f32 - 1.0)
 }
 
-/// The budget the value BOXES share: the content minus the dropdown, the layout
-/// toggle, the copy button and the gaps between the four blocks.
+/// The budget the value BOXES share: the WHOLE content width. The mode dropdown, the
+/// layout toggle and the copy button all used to come out of this; they sit on the mode
+/// row above the boxes now, so the box row is nothing but boxes and they get the lot.
 fn value_boxes_total() -> f32 {
     CONTENT_W
-        - ROW_SPACING
-        - MODE_PICKER_W
-        - ROW_SPACING
-        - LAYOUT_TOGGLE_W
-        - ROW_SPACING
-        - ROW_COPY_W
 }
 
-/// Pure, unit-tested: the width of ONE value box when the row holds `boxes` of them
-/// (DRAGON-630).
+/// Pure, unit-tested: the BASE width of one value box when the row holds `boxes` of them
+/// (DRAGON-630), floored to whole points so no box edge lands on a half pixel.
 ///
-/// The row is `[boxes] [mode picker] … [toggle] [copy]` inside [`CONTENT_W`], so the
-/// boxes share what the fixed parts leave. Floored to whole points so a box never sits
-/// on a half-pixel edge; the sub-point remainder joins the flexible space before the
-/// right-edge cluster, which is PINNED there and therefore never shifts (the owner's
-/// ask). The count is the mode's components plus the alpha box: 4 everywhere except
-/// CMYK's 5, and every count must leave a box a number is actually readable in (pinned
-/// by the tests).
+/// This is the floor; [`value_box_widths`] is what the view lays out, because the floor
+/// leaves a remainder and that remainder has to go somewhere visible. The count is the
+/// mode's components plus the alpha box: 4 everywhere except CMYK's 5, and every count
+/// must leave a box a number is actually readable in (pinned by the tests).
 pub fn value_box_width(boxes: usize) -> f32 {
     let boxes = boxes.max(1) as f32;
     ((value_boxes_total() - (boxes - 1.0) * BOX_GAP) / boxes).floor()
 }
 
+/// Pure, unit-tested: the width of EACH value box, left to right.
+///
+/// [`value_box_width`]'s floor leaves up to a few points over, and now that the boxes own
+/// the whole content width that remainder is VISIBLE: dropped, it would end the box row
+/// short of the right edge while the history grid and the slider tracks below it land
+/// flush there, which is the alignment the owner has asked for at every review. So it is
+/// handed out one point at a time from the left. No two boxes then differ by more than a
+/// single point, which nobody can see, and the row is flush at both ends, which anybody
+/// can.
+pub fn value_box_widths(boxes: usize) -> Vec<f32> {
+    let n = boxes.max(1);
+    let base = value_box_width(n);
+    let used = n as f32 * base + (n as f32 - 1.0) * BOX_GAP;
+    // Whole points only: a fractional tail (CONTENT_W is whole, so there is none today)
+    // stays as trailing slack rather than putting an edge back on a half pixel.
+    let mut spare = (value_boxes_total() - used).floor().max(0.0) as usize;
+    (0..n)
+        .map(|_| {
+            if spare > 0 {
+                spare -= 1;
+                base + 1.0
+            } else {
+                base
+            }
+        })
+        .collect()
+}
+
 /// Pure, unit-tested: the WHOLE-VALUE box's width (the layout toggle's collapsed
 /// state, DRAGON-630 rev 3): the entire budget the split boxes would share, so the two
-/// layouts occupy the same span and the right-edge cluster never moves between them.
+/// layouts occupy the same span and the copy button never moves between them.
 pub fn value_whole_width() -> f32 {
     value_boxes_total()
 }
@@ -1028,27 +1231,31 @@ pub fn value_whole_width() -> f32 {
 /// [`super::open_color_picker_window`], DRAGON-587): whatever the layout needs, the
 /// window is, and there is no user resize to absorb a mistake.
 ///
-/// **Width**: `2 * 16` padding + [`CONTENT_W`] = **510pt**. Still inside the ballpark
-/// of the original "about half the permission window, best judgement" brief (the
-/// permission window is 629), and sized by the SQUARE and the value row together.
+/// **Width**: [`WINDOW_BORDER`] + `16` padding, on each side, + [`CONTENT_W`] =
+/// **366pt** (510 while the value row was one line and carried the mode chip and both
+/// icon buttons beside the boxes). Now comfortably under the original "about half the
+/// permission window, best judgement" brief (the permission window is 629), and sized by
+/// the SQUARE and the history grid rather than by the value row.
 ///
-/// **Height** is the sum of the parts: header + padding + the square + the wide gap +
-/// the controls row + the wide gap + the value row + gap + the divider + gap + the two
+/// **Height** is the sum of the parts: the frame + header + padding + the square + the
+/// wide gap + the controls row + the wide gap + the value row (three bands since the
+/// dropdown moved above the boxes) + gap + the divider band + gap + the two
 /// history rows with their grid gap between them + padding. The history gap is
 /// [`recents_gap`] in BOTH directions (the owner's rev-3 ask), which is also why the
 /// height must be a function of it: under-counting it is exactly how the second row
 /// got clamped short once.
 pub fn color_window_size() -> (f32, f32) {
-    let w = 2.0 * WINDOW_PADDING + CONTENT_W;
-    let h = HEADER_H
+    let w = 2.0 * (WINDOW_BORDER + WINDOW_PADDING) + CONTENT_W;
+    let h = 2.0 * WINDOW_BORDER
+        + HEADER_H
         + 2.0 * WINDOW_PADDING
         + SV_H
         + GAP_SQUARE_CONTROLS
         + CONTROLS_H
         + GAP_CONTROLS_VALUE
         + VALUE_ROW_H
-        + SECTION_GAP
-        + DIVIDER_H
+        + GAP_VALUE_DIVIDER
+        + DIVIDER_BAND_H
         + SECTION_GAP
         + 2.0 * RECENT_SWATCH
         + recents_gap()
@@ -2350,26 +2557,54 @@ mod window_size_tests {
     #[test]
     fn the_width_is_the_content_plus_padding() {
         let (w, _) = color_window_size();
-        assert_eq!(w, 510.0);
-        assert_eq!(w, 2.0 * WINDOW_PADDING + CONTENT_W);
+        assert_eq!(w, 366.0);
+        assert_eq!(w, 2.0 * (WINDOW_BORDER + WINDOW_PADDING) + CONTENT_W);
         assert!(w > PERMISSIONS_WINDOW_W / 2.0);
         assert!(w < PERMISSIONS_WINDOW_W, "still smaller than the window it derives from");
+        assert!(
+            w < 510.0,
+            "and narrower than the one-line value row that carried the chip and both \
+             icon buttons beside the boxes"
+        );
     }
 
-    /// CONTENT_W's whole reason for being 478: the history grid lands on whole points,
-    /// so nothing floors away from its flush right edge. The value row's division is no
-    /// longer exact (DRAGON-649: at ten swatches a row no sane width satisfies both),
-    /// and that stopped being load-bearing at rev 4: the view wraps the boxes in a
-    /// fixed-width frame of `value_whole_width`, which absorbs the floor() remainder,
-    /// so the split block only has to FIT the frame, never fill it exactly.
+    /// CONTENT_W's whole reason for being 332: the history grid lands on whole points, so
+    /// nothing floors away from its flush right edge, and the value boxes then span the
+    /// same width exactly.
     #[test]
     fn the_content_width_divides_evenly() {
-        assert_eq!(recents_gap(), 22.0, "nine whole-point history gaps");
-        assert_eq!(value_box_width(5), 56.0, "CMYK's five boxes floor to a readable 56");
-        assert!(
-            5.0 * value_box_width(5) + 4.0 * BOX_GAP <= value_whole_width(),
-            "the split layout fits the fixed-width frame the whole layout defines"
-        );
+        assert_eq!(recents_gap(), 10.0, "eight whole-point history gaps");
+        assert_eq!(value_box_width(5), 61.0, "CMYK's five boxes floor to a readable 61");
+    }
+
+    /// Every box row is FLUSH at both edges: the floor()'s remainder is handed out a
+    /// point at a time rather than dropped, so the last box ends exactly on the content's
+    /// right edge, where the history grid and the slider tracks also end. And no two
+    /// boxes in a row differ by more than that single point.
+    #[test]
+    fn the_box_row_spans_the_content_exactly() {
+        for boxes in 1..=6usize {
+            let widths = value_box_widths(boxes);
+            assert_eq!(widths.len(), boxes);
+            let span: f32 = widths.iter().sum::<f32>() + (boxes as f32 - 1.0) * BOX_GAP;
+            assert_eq!(span, CONTENT_W, "{boxes} boxes span the content");
+            let (min, max) = (
+                widths.iter().cloned().fold(f32::MAX, f32::min),
+                widths.iter().cloned().fold(0.0, f32::max),
+            );
+            assert!(max - min <= 1.0, "{boxes} boxes: {min} vs {max} is a visible step");
+            assert!(widths.iter().all(|w| w.fract() == 0.0), "whole points only");
+        }
+    }
+
+    /// The width came down because the BOX ROW emptied out, not because anything was
+    /// squeezed: the mode dropdown, the layout toggle and the copy button all moved to
+    /// the row above, so the boxes now own the whole content width. Pinned because it is
+    /// the reason 332 is even possible, and putting any of the three back beside the
+    /// boxes silently makes every box narrower.
+    #[test]
+    fn the_box_row_carries_only_the_boxes() {
+        assert_eq!(value_whole_width(), CONTENT_W);
     }
 
     /// The height is the sum of its parts (DRAGON-630's stack, rev 2's gaps, divider
@@ -2378,21 +2613,28 @@ mod window_size_tests {
     #[test]
     fn the_height_is_the_sum_of_the_parts() {
         let (_, h) = color_window_size();
-        let want = HEADER_H
+        let want = 2.0 * WINDOW_BORDER
+            + HEADER_H
             + 2.0 * WINDOW_PADDING
             + SV_H
             + GAP_SQUARE_CONTROLS
             + CONTROLS_H
             + GAP_CONTROLS_VALUE
             + VALUE_ROW_H
-            + SECTION_GAP
-            + DIVIDER_H
+            + GAP_VALUE_DIVIDER
+            + DIVIDER_BAND_H
             + SECTION_GAP
             + 2.0 * RECENT_SWATCH
             + recents_gap()
             + LAYOUT_SLACK_H;
         assert_eq!(h, want);
-        assert_eq!(h, 509.0);
+        assert_eq!(h, 582.0);
+        const {
+            assert!(
+                DIVIDER_BAND_H >= DIVIDER_H,
+                "the divider's band has to hold the line it is named for"
+            )
+        };
     }
 
     /// Every section fits the content width EXACTLY where the owner asked for
@@ -2423,9 +2665,9 @@ mod window_size_tests {
     }
 
     /// Every box count a mode can produce (4 everywhere, CMYK's 5) gets a box a value
-    /// is actually readable in, and the row never overflows the content width. The
-    /// floor means a sub-point of trailing slack, never an overflow; the copy button is
-    /// pinned to the content's right edge by the view, so slack never moves it.
+    /// is actually readable in, and the row never overflows the content width. It is
+    /// exact rather than merely fitting, since the boxes own the row now
+    /// ([`the_box_row_spans_the_content_exactly`] pins that end of it).
     #[test]
     fn value_boxes_stay_readable_at_every_mode() {
         for f in crate::color::ColorFormat::ALL {
@@ -2436,34 +2678,151 @@ mod window_size_tests {
                 "{}: {boxes} boxes of {bw}pt cannot hold a 5-character value",
                 f.id()
             );
-            let row = boxes as f32 * bw
-                + (boxes as f32 - 1.0) * BOX_GAP
-                + ROW_SPACING
-                + MODE_PICKER_W
-                + ROW_SPACING
-                + LAYOUT_TOGGLE_W
-                + ROW_SPACING
-                + ROW_COPY_W;
-            assert!(row <= CONTENT_W, "{}: the row overflows ({row})", f.id());
+            let row: f32 =
+                value_box_widths(boxes).iter().sum::<f32>() + (boxes as f32 - 1.0) * BOX_GAP;
+            assert!(row <= CONTENT_W, "{}: the box row overflows ({row})", f.id());
         }
+        // And the mode row above it. Since DRAGON-676 the dropdown is shrink-fit rather
+        // than stretched, so the row FITS the content instead of filling it; what it
+        // leaves is the room the "Copied!" word lands in (`mode_row_tests`).
+        assert!(
+            mode_chip_width() + 2.0 * (ROW_SPACING + mode_row_tests::ROW_ICON_W) <= CONTENT_W,
+            "the mode row overflows the content ({} + icons > {CONTENT_W})",
+            mode_chip_width()
+        );
         // And the whole-value box fits the longest spelling a mode can produce, at the
         // ~8pt-per-character the original row arithmetic used: `oklch(75.6% 0.176 60.7
         // / 0.502)` is 32 characters with the caret.
         assert!(value_whole_width() >= 32.0 * 8.0 + 24.0);
     }
 
-    /// The cap is TWENTY (two rows of ten since DRAGON-649; two rows of eight through
-    /// DRAGON-630, one row of ten before that), and the twenty-first pick drops the
-    /// oldest.
+    /// The cap is EIGHTEEN (two rows of nine; two rows of ten through DRAGON-649, two of
+    /// eight through DRAGON-630, one row of ten before that), and the nineteenth pick
+    /// drops the oldest.
     #[test]
-    fn the_cap_is_twenty_and_the_twenty_first_pick_drops_the_oldest() {
-        assert_eq!(RECENTS_CAP, 20);
-        let full: Vec<Srgb> = (0..20u8).map(|i| Srgb::new(i, 0, 0)).collect();
+    fn the_cap_is_eighteen_and_the_nineteenth_pick_drops_the_oldest() {
+        assert_eq!(RECENTS_CAP, 18);
+        let full: Vec<Srgb> = (0..18u8).map(|i| Srgb::new(i, 0, 0)).collect();
         let after = push_recent(&full, Srgb::new(200, 0, 0), RECENTS_CAP);
-        assert_eq!(after.len(), 20, "still twenty");
+        assert_eq!(after.len(), 18, "still eighteen");
         assert_eq!(after[0], Srgb::new(200, 0, 0), "the newest leads");
-        assert_eq!(after.last(), Some(&Srgb::new(18, 0, 0)), "the list ends one earlier");
-        assert!(!after.contains(&Srgb::new(19, 0, 0)), "and the oldest fell off entirely");
+        assert_eq!(after.last(), Some(&Srgb::new(16, 0, 0)), "the list ends one earlier");
+        assert!(!after.contains(&Srgb::new(17, 0, 0)), "and the oldest fell off entirely");
+    }
+}
+
+/// DRAGON-676: the mode row's dropdown is sized from its own longest label instead of
+/// stretching across the row, and what that frees is where the "Copied!" word goes.
+#[cfg(test)]
+mod mode_row_tests {
+    use super::*;
+
+    /// One of the row's bare icon buttons: the 16pt glyph inside [`ROW_ICON_HALO`] on each
+    /// side. TEST-ONLY since DRAGON-676, because nothing in the shipping tree budgets these
+    /// buttons any more (see the note beside [`VALUE_ROW_H`]); the row still has to FIT, and
+    /// this is what the fit is checked against.
+    pub(super) const ROW_ICON_W: f32 = 16.0 + 2.0 * ROW_ICON_HALO as f32;
+
+    /// The same measurement the chip is sized from, for a string the chip does not show.
+    fn text_w(size: f32, s: &str) -> f32 {
+        crate::app::preview::text_annot::measure(
+            crate::app::preview::text_annot::TextFont::Clean,
+            size,
+            s,
+        )
+    }
+
+    /// EVERY notation fits, not just the one a person would guess is longest. This is the
+    /// property the owner asked for ("as wide as its longest option"), and it is checked
+    /// against the list rather than against "OKLCH" so that adding an eighth notation
+    /// fails here instead of clipping on screen.
+    #[test]
+    fn the_chip_holds_every_notation_label() {
+        let chip = mode_chip_width();
+        for f in crate::color::ColorFormat::ALL {
+            let need = text_w(MODE_LABEL_SIZE, f.label())
+                + MODE_CARET_GAP
+                + f32::from(MODE_CARET_ICON)
+                + 2.0 * f32::from(MODE_CHIP_PAD);
+            assert!(
+                chip >= need,
+                "{}: the chip is {chip}pt and the label wants {need}pt",
+                f.id()
+            );
+        }
+    }
+
+    /// The chip is sized from the WIDEST label, so it is exactly what that one needs and
+    /// the shorter ones sit inside it. Pinned because "as wide as it needs" is meaningless
+    /// if the widest label is not the one that sets the size.
+    #[test]
+    fn the_widest_label_is_what_sets_the_width() {
+        let widest = widest_mode_label();
+        for f in crate::color::ColorFormat::ALL {
+            assert!(
+                text_w(MODE_LABEL_SIZE, f.label()) <= widest,
+                "{} measures wider than the widest label",
+                f.id()
+            );
+        }
+        assert_eq!(mode_chip_width(), mode_chip_width_for(widest));
+    }
+
+    /// It SHRANK. The chip used to be `CONTENT_W` minus the two icon buttons and their
+    /// gaps, which is the whole row; a chip that still came out that wide would mean the
+    /// owner's ask had been undone while the arithmetic kept its new shape.
+    #[test]
+    fn the_chip_no_longer_stretches_across_the_row() {
+        let stretched = CONTENT_W - 2.0 * (ROW_SPACING + ROW_ICON_W);
+        assert!(
+            mode_chip_width() < stretched,
+            "the chip is {}pt, no narrower than the stretched {stretched}pt it replaced",
+            mode_chip_width()
+        );
+    }
+
+    /// The row still FITS, and the leftover is real: enough for "Copied!" beside the copy
+    /// button, which is the whole reason the chip gave the width back.
+    #[test]
+    fn the_shrink_leaves_room_for_the_copied_word() {
+        let controls = mode_chip_width() + 2.0 * (ROW_SPACING + ROW_ICON_W);
+        assert!(controls <= CONTENT_W, "the mode row overflows at {controls}pt");
+        let word = text_w(COPIED_TEXT_SIZE, "Copied!") * MODE_LABEL_HEADROOM;
+        assert!(
+            CONTENT_W - controls >= COPIED_TEXT_GAP + word,
+            "only {}pt spare, and the word wants {}pt",
+            CONTENT_W - controls,
+            COPIED_TEXT_GAP + word
+        );
+    }
+
+    /// The width TRACKS its input, and the headroom is real slack rather than a rounding
+    /// artefact. Exercised through the injected seam so it is the decision under test and
+    /// not whatever the embedded face happens to measure today.
+    #[test]
+    fn the_width_follows_the_label_it_is_measured_from() {
+        assert!(
+            mode_chip_width_for(80.0) > mode_chip_width_for(40.0),
+            "a wider label must widen the chip"
+        );
+        assert!(
+            mode_chip_width_for(40.0) >= 40.0 * MODE_LABEL_HEADROOM,
+            "the headroom was dropped somewhere in the arithmetic"
+        );
+        const {
+            assert!(
+                MODE_LABEL_HEADROOM > 1.0,
+                "no headroom means the face that DRAWS the label has to match the embedded \
+                 one we MEASURE it with, exactly, on every platform"
+            )
+        };
+        for w in [0.0f32, 12.0, 43.5, 200.0] {
+            assert_eq!(
+                mode_chip_width_for(w).fract(),
+                0.0,
+                "{w}: a fractional chip width lands its edges on half pixels"
+            );
+        }
     }
 }
 

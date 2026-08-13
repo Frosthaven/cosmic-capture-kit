@@ -6,14 +6,16 @@
 # The container and cross-boot BUILD STATE, which deliberately stays OUT of
 # target/ (see scripts/artifacts.sh for the full reasoning). These are scratch,
 # not output: the finished artifact is moved into target/artifacts/ afterwards.
-#   target-appimage/  the AppImage container's CARGO_HOME + CARGO_TARGET_DIR
-#   target-dist/      the Rocky 9 shipping container's output mount (root-owned)
-#   target-win/       the Windows boot's whole cargo tree (dual-boot shared tree)
-#   target-mac/       cross-target mac CHECK artifacts (never a real build)
+#   target-appimage/    the AppImage container's CARGO_HOME + CARGO_TARGET_DIR
+#   target-dist/        the Rocky 9 shipping container's output mount (root-owned)
+#   target-win/         the Windows boot's whole cargo tree (dual-boot shared tree)
+#   target-mac/         cross-target mac CHECK artifacts (never a real build)
+#   target-ffmpeg-win/  the mingw-w64 container's output mount (DRAGON-675)
 /target-appimage/
 /target-dist/
 /target-win/
 /target-mac/
+/target-ffmpeg-win/
 # Vendored static ffmpeg/ffprobe for the mac build, never committed (huge binaries).
 /vendor/
 # `mkdocs build` output for the documentation site (mkdocs.yml + site-src/).

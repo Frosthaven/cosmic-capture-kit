@@ -52,7 +52,7 @@ impl App {
 
 /// The permission window title — also the handle used to find/focus an already-open
 /// permissions window in another instance.
-pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Permissions";
+pub(crate) const WINDOW_TITLE: &str = "CCK Permissions";
 
 /// Open a permission-checker toplevel and a Task reporting its id once mapped.
 /// Mirrors `settings::open_config_window`'s window recipe (CSD, transparent
@@ -227,8 +227,9 @@ pub fn probe_now_fast() -> Probe {
 }
 
 /// A [`probe_now_fast`] STARTED EARLY, on its own thread, and joined where its answer is
-/// first actually needed. Mirrors `record::owned::AudioPreflight` exactly, including the
-/// spawn-failure fallback that runs the work inline rather than losing it.
+/// first actually needed: start it as soon as the process can, do the work that does not
+/// depend on it alongside, and join only at the point the answer is used. That includes
+/// the spawn-failure fallback, which runs the work inline rather than losing it.
 ///
 /// **Why this exists rather than "just move the probe later".** It cannot move later. The
 /// macOS activation policy is boot-time-only (DRAGON-150), and DRAGON-440 hoisted this probe
@@ -245,8 +246,8 @@ pub fn probe_now_fast() -> Probe {
 /// .authorizationStatusForMediaType`, `AXIsProcessTrusted`) are synchronous framework
 /// predicates and the rest is a config read; the ONE query that can block, the notification
 /// settings fetch, is exactly what `_fast` excludes — and is itself `recv_timeout`-bounded
-/// where it is used. The wait is bounded by the work, which is the same argument
-/// `AudioPreflight::join` makes for its own plain `join`.
+/// where it is used. The wait is bounded by the work it is waiting on, which is the only
+/// argument a plain `join` ever gets to make.
 ///
 /// **Why it is sound off the main thread.** Nothing on this path is AppKit. `is_bundled`'s
 /// `NSBundle` read is the only AppKit-adjacent call in `probe_with`, and it sits behind the

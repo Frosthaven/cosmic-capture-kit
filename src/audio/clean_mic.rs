@@ -378,13 +378,16 @@ pub(crate) fn setup_clean_mic_tap(
     // `PR_SET_PDEATHSIG(SIGKILL)` as orphan protection, and Linux binds that signal to
     // the spawning THREAD, not the process: a child spawned from a short-lived thread
     // is SIGKILLed the moment that thread exits, however healthy its process still is.
-    // This function is called from exactly such a thread — the audio pre-flight
-    // (`record::owned::AudioPreflight`), which returns milliseconds after the smoke
-    // check — so a mic child spawned HERE died ~120ms into every Linux recording,
+    // This function used to be called from exactly such a thread: the audio pre-flight,
+    // which ran on its own short-lived thread (`record::owned::AudioPreflight`, retired by
+    // DRAGON-657/658) and returned milliseconds after the smoke check. A mic child spawned
+    // HERE therefore died ~120ms into every Linux recording,
     // silently (SIGKILL writes no stderr), and the mixer wrote an honest all-silence
     // mic track. The reader thread lives for the whole session, so it is the right
     // PDEATHSIG anchor; better than the process, even — a dead reader means nothing is
-    // consuming the capture, at which point killing it is exactly correct.
+    // consuming the capture, at which point killing it is exactly correct. It stays the
+    // anchor now that the pre-flight runs inline on the worker thread: the rule is that
+    // the capture outlives whoever started it, not that some particular caller is safe.
     //
     // The handshake below (one bounded channel) keeps this function's contract
     // unchanged: it still returns `None` when the mic cannot start, and the dedicated
@@ -463,8 +466,18 @@ fn run_tap_reader(
             }
             if let Some(rb) = render_buf.as_ref() {
                 let rf = rb.lock().ok().and_then(|mut q| q.pop_front()).unwrap_or([0.0; FRAME]);
+                // No `catch_unwind` here, deliberately (DRAGON-664): the render feed
+                // reaches nothing but the WebRTC engine, and `filters::aec::WebRtcApm`
+                // contains that engine's panics itself, for every caller and every
+                // platform. This call used to be the ONE unprotected sonora entry point
+                // in the app; a panic out of it would have killed this thread outright,
+                // silencing the mic for the rest of the session (and on Linux killing the
+                // capture child with it, since PDEATHSIG binds to this thread).
                 proc.feed_render(&rf);
             }
+            // The rest of the chain (RNNoise, the VAD, the gate, the AGC) is still
+            // covered here: a debug-build range assert in any of them rebuilds the
+            // processor rather than dropping the reader.
             let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 proc.process(&inp, Some(&mut pcm));
             }))

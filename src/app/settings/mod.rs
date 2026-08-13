@@ -43,7 +43,7 @@ use self::row::{reset_button, severity_caption, severity_title, Severity, Sectio
 /// (`center_settings_window`/`find_by_title`/caption/mica) + the mac titlebar centering match on, and the
 /// title a tiling-WM float rule keys on (see the README) all route through this const. Also used
 /// to find/focus an already-open settings window in another instance.
-pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Settings";
+pub(crate) const WINDOW_TITLE: &str = "CCK Settings";
 
 /// Minimum settings-window size (logical px): the window can never open or resize smaller than
 /// this, on all platforms (DRAGON-268 follow-up). `App::apply_nav_auto_collapse_on_spawn`'s

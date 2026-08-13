@@ -217,11 +217,27 @@ impl crate::app::App {
         }
     }
 
-    /// The video-codec row, filtered to what the active encoder can do: GPU encoders
-    /// get Auto / H.264 / HEVC; software is H.264-only (a dimmed explainer).
+    /// The video-codec row, filtered to what the active encoder can ACTUALLY do
+    /// (DRAGON-674): a tier with a working hardware HEVC encoder gets
+    /// Auto / H.264 / HEVC, and everything else is H.264 only (a dimmed explainer).
+    ///
+    /// The old gate asked whether ffmpeg shipped libx265, which is true nearly
+    /// everywhere and answers the wrong question: libx265 cannot hold a real-time
+    /// capture, so a session that fell back to software with HEVC selected filled with
+    /// dropped frames and was killed by the muxer watchdog (DRAGON-671). We do not
+    /// offer what we cannot deliver.
+    ///
+    /// Both halves of the question are read from the PROBE, never from a persisted
+    /// hint: `effective_encoder` resolves the tier through the probed list, and the
+    /// tier's HEVC fact rides that same list entry. The Windows page has already waited
+    /// for that list (`encoders_ready` in `pages/video.rs`) before this row is built, so
+    /// nothing here blocks the UI thread or re-spawns a probe. A tier absent from the
+    /// list answers "unknown", which `hevc_offerable` deliberately treats as offerable
+    /// rather than failed — see its doc.
     pub(in crate::app::settings) fn codec_item<'a>(&self) -> Item<'a> {
-        // Software can do HEVC only when ffmpeg ships libx265; without it, H.264 only.
-        if self.effective_encoder() == "software" && !crate::encode::software_supports_hevc() {
+        let tier = self.effective_encoder();
+        let hw_hevc = self.encoders().iter().find(|e| e.id == tier).map(|e| e.hevc);
+        if !crate::encode::hevc_offerable(&tier, hw_hevc) {
             // Body size for the same reason as the preset row's "Driver default":
             // it stands in for the dropdown and must not read smaller.
             return Item::new("Video codec", "", widget::text::body("H.264")).dim();
@@ -247,13 +263,17 @@ impl crate::app::App {
     /// a silent switch to HEVC). Only fires when the size is actually KNOWN to exceed —
     /// a fixed preset's dimensions, a Custom size, or the largest known display for
     /// "Original" — so it never false-positives on small screens. `None` otherwise.
-    /// (H.264 ≤ 4096 px, HEVC ≤ 8192 px on NVENC/VAAPI/VideoToolbox; the SOFTWARE x264
+    /// (H.264 ≤ 4096 px, HEVC ≤ 8192 px on every hardware tier; the SOFTWARE x264
     /// path additionally caps to a real-time-sustainable side per frame rate — DRAGON-162.)
     pub(in crate::app::settings) fn codec_size_warning(&self) -> Option<String> {
         let backend = self.effective_encoder();
-        if backend != "nvenc" && backend != "vaapi" && backend != "videotoolbox"
-            && backend != "software"
-        {
+        // Every tier `effective_encoder` can name. AMF and QSV were missing, which was
+        // harmless only while `effective_encoder` could never return them (DRAGON-674);
+        // their plans apply the very same 4096 / 8192 side limits as the rest.
+        if !matches!(
+            backend.as_str(),
+            "nvenc" | "vaapi" | "amf" | "qsv" | "videotoolbox" | "software"
+        ) {
             return None;
         }
         let preset = self.record_res_preset as usize;

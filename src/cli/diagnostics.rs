@@ -1474,6 +1474,9 @@ fn mac_rec_bench(rest: &[String]) {
         max_res: (maxside, maxside),
         metadata: String::new(),
         out_path: out.clone(),
+        // DRAGON-673: the bench has no countdown, so media 0 is the settled pipeline
+        // with no gate to hold for.
+        start_gate: None,
     };
     let params = crate::record::RegionRecordParams {
         x: ox,
@@ -2863,6 +2866,8 @@ fn windows_record_test(rest: &[String]) {
         cursor: true,
         win_target: target,
         settings: crate::record::RecordSettings {
+            // No countdown in the diagnostics harness, so nothing gates media 0.
+            start_gate: None,
             fps: 30,
             preferred_encoder: enc.clone(),
             encoder_hint: None,

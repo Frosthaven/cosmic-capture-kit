@@ -1,30 +1,91 @@
 //! Region/monitor screencopy recording (CPU/readback path): we own the capture —
 //! grab the region's output each frame, crop it, and pipe raw frames to ffmpeg.
 
-use cosmic_client_toolkit::screencopy::{CaptureOptions, CaptureSource, ScreencopySessionData};
-use cosmic_client_toolkit::sctk::shm::slot::SlotPool;
+use cosmic_client_toolkit::screencopy::{
+    CaptureOptions, CaptureSession, CaptureSource, ScreencopySessionData,
+};
+use cosmic_client_toolkit::sctk::shm::slot::{Buffer, SlotPool};
 use crate::screencopy::{ScreencopyClient, connect, grab_cropped, grab_frame, outputs, pick_format};
 use super::ToggleEvent;
-use super::owned::{OwnedAudioStart, make_frame_writer, run_video_stop_tail, try_start_owned_audio, MuteIntervals};
+use super::owned::{
+    OwnedAudioStart, make_frame_writer, mark_first_frame, mark_settled, media_zero,
+    run_video_stop_tail,
+    try_start_owned_audio, MuteIntervals,
+};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use wayland_client::{Connection, EventQueue};
+use std::time::{Duration, Instant};
+use wayland_client::{Connection, EventQueue, QueueHandle};
 #[cfg(feature = "zero-copy")]
 use super::zero_copy::{ZcOutcome, record_screencopy_zero_copy};
 
 // ---------------------------------------------------------------------------
 // Media-clock OWNED path (DRAGON-127; the ONLY recording path — the legacy
-// wallclock+CFR+segments fallback was retired here): `record_screencopy` (the
-// entry point below) tries the audio-side pre-flight check FIRST; only on
-// success does it commit to the owned single-session loop. If the pre-flight
-// check fails, recording fails outright with a named, actionable reason instead
-// of falling back. Structural difference from the PipeWire worker: screencopy
-// GRABS frames on demand rather than receiving a pushed stream, so there is no
-// separate video-consumer thread/channel to fork around — the owned loop owns
-// its video capture directly on the calling thread.
+// wallclock+CFR+segments fallback was retired here). Structural difference from
+// the PipeWire worker: screencopy GRABS frames on demand rather than receiving a
+// pushed stream, so there is no separate video-consumer thread/channel to fork
+// around: the owned loop owns its video capture directly on the calling thread.
+//
+// ORDER (DRAGON-658). `record_screencopy` brings the VIDEO side up first:
+// connect, settle, pick the output, open the capture session, negotiate formats.
+// Only once something has provably captured a real frame does it report that
+// (`owned::mark_first_frame` → `RecordHandle::warm_at`) and start the audio
+// pre-flight, inline, exactly once. If the pre-flight fails, recording fails
+// outright with a named, actionable reason; there is no fallback. The OTHER end of the
+// bring-up, where the opening phase has paid its media debt and the session is steady, is
+// reported separately (`owned::mark_settled` → `RecordHandle::settled_at`, DRAGON-661);
+// that later signal is the one the UI calls "live".
+//
+// That order also COLLAPSES A DOUBLE PRE-FLIGHT this path used to run. The audio
+// pre-flight was the entry point's first statement, before Wayland was even
+// connected, and the GPU zero-copy attempt then ran a SECOND, independent one of
+// its own; every zero-copy DECLINE therefore threw one whole pre-flight away
+// (two mic ffmpegs, two pulse clients, two pairs of FIFOs) before the CPU path
+// carried on with the first. Now each branch confirms its own first frame and
+// starts audio once, so one user action starts exactly one audio session on
+// every route through this file (`owned::preflights_started` counts them, and
+// `zc_fallback_live_tests` asserts on that count).
 // ---------------------------------------------------------------------------
+
+/// A CONFIRMED CPU readback capture: the live Wayland session and buffer state, the crop
+/// rect the first real frame fixed, and that frame's own pixels.
+///
+/// Bundled so the session runner takes one parameter instead of fourteen, and so the
+/// confirm step (everything that must succeed BEFORE any audio exists, DRAGON-658) has
+/// one obvious return value.
+struct CpuCapture {
+    conn: Connection,
+    queue: EventQueue<ScreencopyClient>,
+    data: ScreencopyClient,
+    qh: QueueHandle<ScreencopyClient>,
+    /// ONE persistent capture session for the whole recording (per-frame sessions are
+    /// ~4x slower and cannot hit the target fps).
+    session: CaptureSession,
+    /// ONE reused shm buffer, for the same reason.
+    buffer: Buffer,
+    pool: SlotPool,
+    /// Full capture-buffer width in px (the crop below indexes into it).
+    cw: u32,
+    swizzle: bool,
+    force_opaque: bool,
+    /// The crop rect in buffer px, fixed by the first frame for the whole run.
+    bx: u32,
+    by: u32,
+    bw: u32,
+    bh: u32,
+    /// The first frame, already cropped to the recorded region.
+    first: Vec<u8>,
+}
+
+/// How long the opening phase may spend getting level with the media clock before it hands
+/// over to the steady-state loop. A BOUND, not a target (DRAGON-118: nothing in the record
+/// path waits unboundedly): the phase normally ends within a few hundred milliseconds, the
+/// moment the clock owes it nothing. Deliberately a LOCAL constant with the same value as
+/// the other workers' own: these are independent capture shapes, and hoisting one shared
+/// number would tie their tuning together for nothing.
+const OPENING_COVER_BUDGET: Duration = Duration::from_secs(2);
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_screencopy(
@@ -43,71 +104,26 @@ pub(crate) fn record_screencopy(
     audio_offset_ms: i32,
     auto_device_compensation: bool,
     max_res: (u32, u32),
+    // The countdown gate (DRAGON-673): the app raises it when it promotes the recording, and
+    // media 0 waits for it, so a countdown warms the whole pipeline behind its own digits and
+    // the file still starts where the promotion does.
+    start_gate: Option<Arc<AtomicBool>>,
     out_path: &std::path::Path,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     events: &Mutex<Vec<ToggleEvent>>,
     dims: &Mutex<Option<(u32, u32)>>,
+    warm_at: &Mutex<Option<Instant>>,
+    settled_at: &Mutex<Option<Instant>>,
     metadata: &str,
     zero_copy: bool,
-) -> Result<PathBuf, String> {
-    match try_start_owned_audio() {
-        Ok(owned) => {
-            log::info!("recording pipeline: media-clock owned path (DRAGON-127)");
-            record_screencopy_owned(
-                x, y, w, h, fps, cursor, preferred_encoder, encoder_hint, presets, mic,
-                system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res,
-                out_path, stop, paused, events, dims, metadata, zero_copy, owned,
-            )
-        }
-        Err(reason) => {
-            log::error!("recording pipeline: audio pre-flight failed ({reason}); cannot record");
-            Err(format!("could not start recording audio: {reason}"))
-        }
-    }
-}
-
-/// The media-clock owned screencopy session (DRAGON-127): ONE continuous ffmpeg
-/// for the whole recording (index-stamped video via
-/// [`crate::encode::spawn_ffmpeg_media_clock`], audio rendered by [`super::pump`]'s
-/// `Mixer`-backed engine) — the exact same shape as `pipewire::record_pipewire_owned`,
-/// adapted for on-demand grabs (see the section doc above). Called only once
-/// [`try_start_owned_audio`] has already confirmed both audio sources are alive;
-/// `owned` is consumed here (its FIFOs/tap/monitor become the pump's) UNLESS the
-/// GPU zero-copy attempt below claims the recording first, in which case it's
-/// torn down unused.
-#[allow(clippy::too_many_arguments)]
-fn record_screencopy_owned(
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    fps: u32,
-    cursor: bool,
-    preferred_encoder: &str,
-    encoder_hint: Option<&str>,
-    presets: &crate::encode::Presets,
-    mic: bool,
-    system_audio: bool,
-    bitrate_kbps: u32,
-    audio_offset_ms: i32,
-    auto_device_compensation: bool,
-    max_res: (u32, u32),
-    out_path: &std::path::Path,
-    stop: Arc<AtomicBool>,
-    paused: Arc<AtomicBool>,
-    events: &Mutex<Vec<ToggleEvent>>,
-    dims: &Mutex<Option<(u32, u32)>>,
-    metadata: &str,
-    zero_copy: bool,
-    owned: OwnedAudioStart,
 ) -> Result<PathBuf, String> {
     let (conn, mut queue, mut data) =
         connect(false).ok_or_else(|| "wayland connect failed".to_string())?;
 
     // Let the overlay finish switching into its recording state (dim only, no
     // border lines) before the first frame, so the recorded region is clean.
-    std::thread::sleep(std::time::Duration::from_millis(250));
+    std::thread::sleep(Duration::from_millis(250));
 
     // Output the region overlaps most (region recording stays on one output).
     let (sx0, sy0, sx1, sy1) = (x, y, x + w as i32, y + h as i32);
@@ -119,7 +135,6 @@ fn record_screencopy_owned(
             (ix.max(0) as i64) * (iy.max(0) as i64)
         })
     else {
-        owned.cleanup();
         return Err("no output for region".to_string());
     };
     let src = CaptureSource::Output(output);
@@ -136,33 +151,29 @@ fn record_screencopy_owned(
     let Ok(session) =
         data.screencopy_state.capturer().create_session(&src, options, &qh, ScreencopySessionData::default())
     else {
-        owned.cleanup();
         return Err("screencopy session failed".to_string());
     };
     if let Err(e) = conn.flush() {
-        owned.cleanup();
         return Err(e.to_string());
     }
     let mut guard = 0;
     while data.formats.is_none() {
         if let Err(e) = queue.blocking_dispatch(&mut data) {
-            owned.cleanup();
             return Err(e.to_string());
         }
         guard += 1;
         if guard > 200 {
-            owned.cleanup();
             return Err("capture formats never arrived".to_string());
         }
     }
     let Some(formats) = data.formats.clone() else {
-        owned.cleanup();
         return Err("no capture formats".to_string());
     };
     let (cw, ch) = formats.buffer_size;
 
-    // Full-output (monitor) GPU zero-copy: an opt-in attempt — if it claims the
-    // recording, the owned audio pre-flight above was for nothing; tear it down.
+    // Full-output (monitor) GPU zero-copy: an opt-in attempt. It confirms its OWN first
+    // captured frame and starts its OWN (single) audio pre-flight, so a decline here costs
+    // nothing but the encoder probe: no audio has been started on either side of it.
     #[cfg(feature = "zero-copy")]
     if zero_copy {
         match record_screencopy_zero_copy(
@@ -175,6 +186,7 @@ fn record_screencopy_owned(
             fps,
             &presets.codec,
             max_res,
+            start_gate.clone(),
             mic,
             system_audio,
             bitrate_kbps,
@@ -185,12 +197,11 @@ fn record_screencopy_owned(
             paused.clone(),
             events,
             dims,
+            warm_at,
+            settled_at,
             metadata,
         ) {
-            ZcOutcome::Done(r) => {
-                owned.cleanup();
-                return r;
-            }
+            ZcOutcome::Done(r) => return r,
             ZcOutcome::Fallback(e) => {
                 eprintln!(
                     "screencopy zero-copy unavailable ({e}); using the readback path, \
@@ -203,34 +214,33 @@ fn record_screencopy_owned(
     let _ = zero_copy;
 
     let Some((format, swizzle, force_opaque)) = pick_format(&formats.shm_formats) else {
-        owned.cleanup();
         return Err("no usable shm format".to_string());
     };
     let stride = cw * 4;
     let Ok(mut pool) = SlotPool::new((stride * ch) as usize, &data.shm) else {
-        owned.cleanup();
         return Err("shm pool allocation failed".to_string());
     };
     let Ok((buffer, _)) = pool.create_buffer(cw as i32, ch as i32, stride as i32, format) else {
-        owned.cleanup();
         return Err("shm buffer allocation failed".to_string());
-    };
-    let grab = |conn: &Connection, queue: &mut EventQueue<ScreencopyClient>, data: &mut ScreencopyClient, pool: &mut SlotPool| {
-        grab_frame(conn, queue, data, &qh, &session, &buffer, pool, cw, ch, swizzle, force_opaque)
     };
 
     // First frame fixes the scale + crop rect (in buffer px) for the whole run.
-    let Some(first) = grab(&conn, &mut queue, &mut data, &mut pool) else {
-        owned.cleanup();
+    let Some(first) = grab_frame(
+        &conn, &mut queue, &mut data, &qh, &session, &buffer, &mut pool, cw, ch, swizzle,
+        force_opaque,
+    ) else {
         return Err("initial frame capture failed".to_string());
     };
+    // Stamped AFTER the grab returns, not before it: this is a synchronous on-demand
+    // capture, so the pixels became real when the compositor handed them back, and that is
+    // what the warmup signal must name.
+    let first_at = Instant::now();
     let scale = first.width() as f32 / (ow.max(1)) as f32;
     let gx0 = sx0.max(ox);
     let gy0 = sy0.max(oy);
     let gx1 = sx1.min(ox + ow);
     let gy1 = sy1.min(oy + (first.height() as f32 / scale) as i32);
     if gx1 <= gx0 || gy1 <= gy0 {
-        owned.cleanup();
         return Err("region is off-screen".to_string());
     }
     let bx = (((gx0 - ox) as f32) * scale).round().max(0.0) as u32;
@@ -239,7 +249,6 @@ fn record_screencopy_owned(
     let bw = even((((gx1 - gx0) as f32) * scale).round() as u32).min(even(first.width().saturating_sub(bx)));
     let bh = even((((gy1 - gy0) as f32) * scale).round() as u32).min(even(first.height().saturating_sub(by)));
     if bw < 2 || bh < 2 {
-        owned.cleanup();
         return Err("region is too small to record".to_string());
     }
 
@@ -259,9 +268,93 @@ fn record_screencopy_owned(
         *g = Some((bw, bh));
     }
     let plan = super::resolve_session_plan(preferred_encoder, encoder_hint, ew, eh, presets);
+
+    // WARM (DRAGON-657/658). `first` is a real captured frame, so the compositor has
+    // provably handed us pixels: report that instant, then start audio.
+    //
+    // This is the LAST thing before the pre-flight and nothing may come between them:
+    // everything above is video bring-up that can still fail with no audio started (so
+    // those paths just return), and everything below needs the pre-flight's FIFO paths.
+    mark_first_frame(warm_at, first_at);
+    // The pre-flight runs INLINE here, exactly once per recording. It is bounded by its
+    // own internal budgets (FIFO creation, the capture-chain starts, two
+    // `OWNED_AUDIO_SMOKE_BUDGET` smoke checks), so it adds no unbounded wait
+    // (DRAGON-118). Its entry instant is media 0.
+    let owned = match try_start_owned_audio() {
+        Ok(o) => {
+            log::info!("recording pipeline: media-clock owned path (DRAGON-127)");
+            o
+        }
+        Err(reason) => {
+            log::error!("recording pipeline: audio pre-flight failed ({reason}); cannot record");
+            return Err(format!("could not start recording audio: {reason}"));
+        }
+    };
+
+    let video = CpuCapture {
+        conn,
+        queue,
+        data,
+        qh,
+        session,
+        buffer,
+        pool,
+        cw,
+        swizzle,
+        force_opaque,
+        bx,
+        by,
+        bw,
+        bh,
+        first: image::imageops::crop_imm(&first, bx, by, bw, bh).to_image().into_raw(),
+    };
+    record_screencopy_owned(
+        video, fps, plan, ew, eh, bitrate_kbps, audio_offset_ms, auto_device_compensation,
+        start_gate, mic, system_audio, out_path, stop, paused, events, settled_at, metadata, owned,
+    )
+}
+
+/// The media-clock owned screencopy session (DRAGON-127): ONE continuous ffmpeg
+/// for the whole recording (index-stamped video via
+/// [`crate::encode::spawn_ffmpeg_media_clock`], audio rendered by [`super::pump`]'s
+/// `Mixer`-backed engine) — the exact same shape as `pipewire::record_pipewire_owned`,
+/// adapted for on-demand grabs (see the section doc above).
+///
+/// Called with a `video` capture that has ALREADY produced a real frame and an `owned`
+/// audio pre-flight that has already succeeded, in that order (DRAGON-658). `owned` is
+/// consumed here: its FIFOs/tap/monitor become the pump's. `settled_at` is filled where
+/// the opening phase below hands over to the steady-state loop (DRAGON-661).
+#[allow(clippy::too_many_arguments)]
+fn record_screencopy_owned(
+    video: CpuCapture,
+    fps: u32,
+    plan: crate::encode::EncodePlan,
+    ew: u32,
+    eh: u32,
+    bitrate_kbps: u32,
+    audio_offset_ms: i32,
+    auto_device_compensation: bool,
+    // The countdown gate (DRAGON-673): the app raises it when it promotes the recording, and
+    // media 0 waits for it, so a countdown warms the whole pipeline behind its own digits and
+    // the file still starts where the promotion does.
+    start_gate: Option<Arc<AtomicBool>>,
+    mic: bool,
+    system_audio: bool,
+    out_path: &std::path::Path,
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    events: &Mutex<Vec<ToggleEvent>>,
+    settled_at: &Mutex<Option<Instant>>,
+    metadata: &str,
+    owned: OwnedAudioStart,
+) -> Result<PathBuf, String> {
+    let CpuCapture {
+        conn, mut queue, mut data, qh, session, buffer, mut pool, cw, swizzle, force_opaque,
+        bx, by, bw, bh, first,
+    } = video;
     let nv12 = plan.nv12;
     let is_hevc = plan.is_hevc();
-    let frame_dur = std::time::Duration::from_secs_f64(1.0 / fps as f64);
+    let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
 
     let OwnedAudioStart {
         capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
@@ -289,17 +382,13 @@ fn record_screencopy_owned(
     };
 
     let mut write_frame = make_frame_writer(bw, bh, nv12);
-    // The frame that fixed the crop, cropped to the recorded region — the opening
-    // frame both the legacy path's segment 0 and this owned session start with.
-    let mut last: Vec<u8> = image::imageops::crop_imm(&first, bx, by, bw, bh).to_image().into_raw();
-    // Media time 0 is the instant AUDIO CAPTURE began (the pre-flight), not the
-    // instant the video side finished coming up (DRAGON-417). Everything above —
-    // the capture handshake, the first frame, ffmpeg's spawn — happened while the
-    // mic/system captures were already running and the app's indicator already said
-    // "recording"; anchoring here would place all of that audio at a negative media
-    // position, where the mixer discards it. The opening span is covered on the video
-    // side by the first frame instead (see `capture_start`'s doc).
-    let session_start = capture_start;
+    // The frame that fixed the crop, already cropped to the recorded region: the frame
+    // the CFR contract re-feeds until a fresh grab replaces it.
+    let mut last: Vec<u8> = first;
+    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672): the file begins where
+    // the warming spinner clears, which is the same instant the user is told recording
+    // started. See `owned::media_zero` for the whole argument.
+    let session_start = media_zero(capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
     let pump_cfg = super::pump::PumpConfig {
         fps: fps.max(1),
         audio_offset_ms,
@@ -336,13 +425,63 @@ fn record_screencopy_owned(
         // MuxerWatchdog armed BEFORE the first write, pause-gated for the same
         // reason as the in-loop liveness budget above (DRAGON-118/123/125).
         let watchdog = super::MuxerWatchdog::arm_gated(child.id(), temp.clone(), paused.clone());
-        let opening_ticks = ticker.due_video_ticks(std::time::Instant::now()).max(1);
+        // The OPENING PHASE (DRAGON-658, this path's form of the mac worker's DRAGON-656).
+        // It covers media [0, level] and it is a PHASE, not a fixed-length burst: it writes
+        // a tick, re-asks the clock, and ends only when the clock owes it nothing.
+        //
+        // Why it cannot be a fixed count. The count used to be decided once, up front, and
+        // writing those frames takes real wall time (the first frames of a session are what
+        // ffmpeg's encoder init absorbs). The clock keeps running through that, so the
+        // burst finished owing more ticks, and the steady-state loop paid all of them on
+        // one iteration with the single image it held: a hitch a third of a second in.
+        //
+        // Why it RE-GRABS instead of repeating one buffer. This capture is PULL-model:
+        // nothing was captured during the opening span, so unlike the pushed-stream workers
+        // there is no queue of already-arrived frames to place at their own ticks
+        // (`pipewire::advance_to_tick`). The only two choices are to repeat the one frame
+        // that fixed the crop, which is the frozen opening this ticket exists to remove, or
+        // to grab live for every owed tick, which is what this does. The trade is honest
+        // and worth naming: each opening tick shows content from when it was GRABBED, not
+        // from the media position it occupies, so the opening plays the last few hundred
+        // milliseconds of real motion compressed into the ticks the pre-flight owed. The
+        // tick COUNT is the contract and is unchanged; the pixels are the worker's own call
+        // (see `owned::OwnedAudioStart::capture_start`'s doc).
+        let opening_deadline = Instant::now() + OPENING_COVER_BUDGET;
+        // `.max(1)` keeps the historical guarantee that at least one frame is written here:
+        // ffmpeg must get past its input-0 probe before it will open the FIFOs.
+        let mut owed = ticker.due_video_ticks(Instant::now()).max(1);
+        let mut opening_ticks: u64 = 0;
         let mut opening_ok = true;
-        for _ in 0..opening_ticks {
-            if !write_frame(bw, bh, &last, &mut stdin) {
-                opening_ok = false;
+        'opening: loop {
+            while owed > 0 {
+                // A genuinely fresh capture, not a repeat. A failed grab keeps `last`,
+                // matching the steady-state loop's own handling below.
+                if let Some((buf, _had_damage)) = grab_cropped(
+                    &conn, &mut queue, &mut data, &qh, &session, &buffer, &mut pool, cw, swizzle,
+                    force_opaque, bx, by, bw, bh,
+                ) {
+                    last = buf;
+                }
+                if !write_frame(bw, bh, &last, &mut stdin) {
+                    opening_ok = false;
+                    break 'opening;
+                }
+                opening_ticks += 1;
+                owed -= 1;
+            }
+            // Bounded on both ends (DRAGON-118): the user stopping, and a budget for a
+            // capture or encoder that simply cannot keep up, in which case falling through
+            // to the steady-state loop is the right answer anyway.
+            if stop.load(Ordering::Relaxed) || Instant::now() >= opening_deadline {
                 break;
             }
+            owed = ticker.due_video_ticks(Instant::now());
+            if owed == 0 {
+                break; // level with the clock: the steady-state loop inherits no debt
+            }
+        }
+        if crate::util::timing_on() {
+            crate::util::timing_mark(&format!("rec/sc: opening covered {opening_ticks} ticks"));
         }
 
         // Damage-aware skipping (mirrors the legacy path's identical optimization):
@@ -363,6 +502,12 @@ fn record_screencopy_owned(
         let mut idle_ticks: u32 = 0;
 
         if opening_ok {
+            // SETTLED (DRAGON-661), the same placement as the mac/Windows workers. The
+            // opening phase is over and the clock owes nothing, so this is the first instant
+            // the whole pipeline is steady, and it is what the UI's live declaration waits
+            // for. Inside the `opening_ok` test on purpose: a failed write means ffmpeg is
+            // not taking frames, so that session is dying rather than settling.
+            mark_settled(settled_at, Instant::now());
             'grab: loop {
                 if stop.load(Ordering::Relaxed) {
                     break;

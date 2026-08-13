@@ -4,21 +4,23 @@
 //!
 //! A reader thread decodes scaled raw-RGBA frames from one `ffmpeg` process *ahead* of
 //! playback into a bounded buffer (backpressured when full). The UI [`Playback::poll`]s on
-//! a timer and presents the frame due at the current wall-clock time — dropping late
-//! frames and holding when ahead — so motion is smooth regardless of decode/timer jitter
-//! (a single latest-frame slot dropped/repeated frames and flickered). When the file has
-//! audio, a second `ffmpeg` plays it straight to PulseAudio (the same `-f pulse` path the
-//! recorder uses) — on macOS to the default output device via `-f audiotoolbox` instead —
-//! on its own real-time clock; its `-progress` stream first self-calibrates
-//! the sink's EFFECTIVE buffer (servers treat `-buffer_duration` as a hint — pipewire-pulse
-//! grants roughly double; audiotoolbox has no buffer knob at all), then anchors the picture
-//! to the audio's own reported position
-//! minus that measured buffer — A/V locked on any Pulse server (and CoreAudio), no assumed
-//! latency (see [`AUDIO_LATENCY_MS`] / [`calibrate_effective_buffer`]). On Windows the bundled
-//! ffmpeg has no pulse muxer and no audio-output device at all, so the soundtrack is an
-//! `ffplay` sidecar instead (SDL2 → the default output endpoint); ffplay emits no `-progress`,
-//! so the Windows picture rides the bootstrap epoch clock exactly like a no-audio file
-//! (DRAGON-285) — the `spawn_audio` closure's per-platform arms cover all three.
+//! a timer and presents the frame due NOW against the audio clock — dropping late frames and
+//! holding when ahead — so motion is smooth regardless of decode/timer jitter (a single
+//! latest-frame slot dropped/repeated frames and flickered).
+//!
+//! **The audio clock is the TRUE playout position, the way real players do it** (DRAGON
+//! preview-hitch). When the file has audio, a second `ffmpeg` decodes it to raw f32 PCM on a
+//! pipe and we play it through an output sink WE OWN, then anchor the picture to where that
+//! sink says the audio actually IS: on macOS an AudioQueue (`platform::mac::audio_out`,
+//! `AudioQueueGetCurrentTime`), on Linux a `pa_simple` PulseAudio stream (`audio::pulse_out`,
+//! `pa_simple_get_latency`). No estimating a sink buffer and correcting the estimate, which
+//! was the old approach and which froze the picture ~1s in when the correction landed. The
+//! [`PreviewAudioSink`] trait is the seam; [`audio_pump`] drives it. On Windows the bundled
+//! ffmpeg has no audio-output muxer at all, so the soundtrack is still an `ffplay` sidecar
+//! (SDL2 → the default endpoint) with no position stream, so the Windows picture rides the
+//! bootstrap epoch clock like a no-audio file (DRAGON-285) until it gets its own WASAPI sink.
+//! The [`AUDIO_LATENCY_MS`] bootstrap now only holds the poster for the moments before the
+//! first real anchor lands (mac/linux), or the whole session (Windows).
 //!
 //! Large recordings (4K+) get three defenses, modelled on what real players do:
 //! * **Hardware decode, software-safe**: every decode passes `-hwaccel auto`, which is
@@ -44,7 +46,7 @@
 
 use super::VideoMeta;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -59,41 +61,11 @@ const MAX_PREVIEW_H: u32 = 720;
 /// reports progress the video clock is delayed by this amount (the requested startup latency)
 /// so the picture lines up with the buffered sound. But the request is only a HINT — measured
 /// on pipewire-pulse, `-buffer_duration 200` yields an EFFECTIVE buffer of roughly double — so
-/// the progress reader measures what the sink actually buffers (the burst-to-paced knee,
-/// [`calibrate_effective_buffer`]) and [`Playback::poll`] then anchors the picture to the
-/// audio's OWN reported position (audible ≈ muxed − measured buffer), which tracks the real
-/// per-server latency and any sink-clock drift for free. See [`spawn_progress_reader`].
+/// the anchor lands almost immediately (the sink reports its true position) so this is only
+/// the poster-hold before the first PCM plays. macOS and Linux own the output and read that
+/// true position; Windows rides this bootstrap for the whole session (its ffplay sidecar
+/// reports no position), which is why it never had the anchor step or the hitch.
 const AUDIO_LATENCY_MS: u64 = 200;
-/// Trailing silence padded onto the soundtrack (ms). On end-of-stream ffmpeg writes the last
-/// samples into PulseAudio's buffer and exits WITHOUT draining it, so exactly `AUDIO_LATENCY_MS`
-/// of audio is discarded. Padding a bit MORE than that makes the discarded tail silence, never
-/// the recording's real audio. It must exceed `AUDIO_LATENCY_MS`; the small excess only delays
-/// when the player reports "finished" (the last frame holds that much longer), so keep it tight.
-// Windows renders the soundtrack via an ffplay sidecar with no `-progress` stream, so the
-// whole progress-calibration path below (this pad, the stats/pacing constants, and the
-// reader/calibrator fns) is Linux/macOS-only — honestly gated dead on Windows (DRAGON-285).
-#[cfg_attr(windows, allow(dead_code))]
-const AUDIO_PAD_MS: u64 = AUDIO_LATENCY_MS + 60;
-/// `-stats_period` of the soundtrack's `-progress` stream (seconds): how often ffmpeg reports
-/// its muxed position. Doubles as calibration's mux-start estimate — ffmpeg prints the first
-/// block one period after muxing starts.
-#[cfg_attr(windows, allow(dead_code))]
-const PROGRESS_STATS_PERIOD: f32 = 0.1;
-/// A progress interval advancing `out_time` slower than this multiple of wall time is "paced"
-/// (the sink buffer is full; writes throttle to playout). The startup burst runs at several ×
-/// realtime (audio-only decode is cheap), so the margin is generous in both directions.
-#[cfg_attr(windows, allow(dead_code))]
-const PACED_RATIO_MAX: f32 = 1.3;
-/// Give up calibrating this long after the first progress block (seconds) and settle on the
-/// requested [`AUDIO_LATENCY_MS`] instead — exactly the old fixed-assumption behavior.
-#[cfg_attr(windows, allow(dead_code))]
-const CALIBRATION_DEADLINE_SECS: f32 = 2.5;
-/// Plausibility floor for the calibrated effective buffer (seconds).
-#[cfg_attr(windows, allow(dead_code))]
-const EFFECTIVE_BUFFER_MIN: f32 = 0.05;
-/// Plausibility ceiling for the calibrated effective buffer (seconds).
-#[cfg_attr(windows, allow(dead_code))]
-const EFFECTIVE_BUFFER_MAX: f32 = 1.0;
 /// Decode at most this many frames ahead of the playhead (the smoothing buffer).
 const BUFFER_FRAMES: usize = 16;
 /// Runway (seconds of video) to buffer before the clock + soundtrack start — covers
@@ -106,6 +78,28 @@ const CATCHUP_GAP_SECS: f32 = 1.0;
 /// Minimum running time before a stream declares itself hopeless — spaces catch-up
 /// jumps out (each restart pays decode startup again) and lets a fresh stream settle.
 const CATCHUP_COOLDOWN_SECS: f32 = 3.0;
+
+/// How fast the presentation clock may run away from realtime while unwinding a one-time
+/// anchor correction (a fraction of realtime): the clock advances at 1±this. 0.25 unwinds
+/// the largest correction seen (a -369ms macOS anchor step) in ~1.5s, imperceptibly, where
+/// SNAPPING it froze the picture for the whole 369ms. Must stay < 1.0 so the clock is always
+/// forward: `slew_clock` returns >= its input, so a frame once shown is never re-shown.
+const MAX_SLEW_RATE: f32 = 0.25;
+
+/// Advance the presentation clock ONE poll toward `raw_target` instead of snapping to it.
+/// `pres` is last poll's position, `raw_target` where the (bootstrap or audio-anchored)
+/// clock now says the picture belongs, `dt` wall seconds since the last poll. The result is
+/// always `>= pres` (never rewinds, never freezes) and closes the error at up to
+/// [`MAX_SLEW_RATE`] beyond realtime, so the one-time step when the audio anchor first lands
+/// (measured up to -369ms on macOS) unwinds smoothly over ~1.5s rather than in a single poll
+/// that froze or skipped the picture. Pure, unit-tested.
+fn slew_clock(pres: f32, raw_target: f32, dt: f32) -> f32 {
+    let dt = dt.max(0.0);
+    let advanced = pres + dt; // realtime baseline: the clock always moves forward
+    let err = raw_target - advanced;
+    let corr = err.clamp(-MAX_SLEW_RATE * dt, MAX_SLEW_RATE * dt);
+    advanced + corr
+}
 
 /// Frames to have buffered before the clock + audio start: [`PREBUFFER_SECS`] of video,
 /// floored for low-fps files, capped under [`BUFFER_FRAMES`] so it always fills.
@@ -129,14 +123,24 @@ struct Clock {
     /// soundtrack spawns — so audio and the video clock start together no matter how slow the
     /// decode startup was. `None` while the prebuffer is still filling.
     epoch: Option<Instant>,
-    /// Latest audio-clock anchor parsed from the soundtrack ffmpeg's `-progress` stream:
-    /// `(wall instant the progress block arrived, audible SOURCE position at that instant)`.
-    /// Once present, [`Playback::poll`] extrapolates the picture target as `pos +
-    /// instant.elapsed()`, locking the picture to the real audio clock instead of the
-    /// bootstrap epoch model. `None` until the progress reader has calibrated the sink's
-    /// effective buffer (a few blocks in) — and forever for a file with no audio, which
-    /// rides the bootstrap clock exactly as before.
+    /// Latest audio-clock anchor: `(wall instant it was taken, audible SOURCE position at that
+    /// instant)`. On Linux the progress reader calibrates it from ffmpeg's `-progress`; on
+    /// macOS the audio pump publishes the AudioQueue's TRUE playout position (DRAGON
+    /// preview-hitch). Once present, [`Playback::poll`] extrapolates the picture target as
+    /// `pos + instant.elapsed()`, locking the picture to the audio clock instead of the
+    /// bootstrap epoch. `None` until it lands, and forever for a no-audio file (bootstrap
+    /// clock) or the Windows ffplay path (no progress stream).
     anchor: Option<(Instant, f32)>,
+    /// The SLEWED presentation clock (source seconds): what [`Playback::poll`] selects frames
+    /// against. `None` until the first poll seeds it. Converges to the anchor at up to
+    /// [`MAX_SLEW_RATE`] via [`slew_clock`], so a one-time anchor correction never freezes or
+    /// jumps the picture. Lives here (behind the clock mutex) rather than on `Playback` so it
+    /// does not grow `PreviewKind`'s size past the enum-variant lint.
+    pres: Option<f32>,
+    /// Wall instant of the previous poll, for the slew's `dt`. `None` before the first poll.
+    last_poll: Option<Instant>,
+    /// Observability: set once poll has logged the raw anchor step the slew is absorbing.
+    anchor_step_logged: bool,
 }
 
 /// A running playback worker. A reader thread fills `buffer` ahead of the playhead; the
@@ -265,73 +269,50 @@ impl Playback {
                 // (`out_time_us`) to stdout every period; the progress reader below calibrates
                 // the sink's effective buffer from those blocks, then turns them into the
                 // picture's audio-clock anchor (see `poll`). stdout is PIPED for it — the real
-                // audio output is the sink device (`-f pulse`/`-f audiotoolbox`), not stdout.
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                // audio output is the sink device, not stdout. macOS and Linux both OWN the
+                // output now (`platform::mac::audio_out` / `audio::pulse_out`) and read the
+                // TRUE playout position, which is the whole DRAGON preview-hitch fix; only
+                // Windows still rides the bootstrap clock (its ffplay sidecar reports no
+                // position, so it never had an anchor to step, and never had the hitch).
+                //
+                // Both arms are the SAME shape: decode the soundtrack to raw interleaved f32
+                // PCM, then play it through an owned sink on a pump thread that publishes the
+                // sink's true position as the clock anchor. Only the sink type differs. No
+                // `apad`: the pump drains the sink fully, so there is no clipped tail to pad.
+                // ALL THREE PLATFORMS, one shape: decode the soundtrack to raw f32 PCM (no
+                // ffmpeg output device involved) and play it through the platform's owned sink
+                // on a pump thread that publishes the sink's TRUE position as the clock anchor.
+                // Only the sink type differs. A sink that fails to open degrades to
+                // silent-but-playing (the drain path), never a crash.
                 {
                     let mut acmd = crate::util::ffmpeg_command();
-                    acmd.args(["-v", "error", "-progress", "pipe:1", "-stats_period"])
-                        .arg(PROGRESS_STATS_PERIOD.to_string())
-                        .args(["-ss", &format!("{start_sec:.3}"), "-i"])
-                        .arg(&path)
-                        .args(["-vn", "-af", &format!("apad=pad_dur={:.3}", AUDIO_PAD_MS as f32 / 1000.0)]);
-                    // Audio sink: PulseAudio on Linux; ffmpeg's `audiotoolbox` output device
-                    // on macOS (the trailing arg is the muxer's required-but-unused
-                    // "filename" — playback goes to the default output device). audiotoolbox
-                    // exposes NO buffer-size knob (`-h muxer=audiotoolbox`: only device
-                    // selection), so the `-buffer_duration` REQUEST has no macOS equivalent —
-                    // but the request was only ever a hint anyway: the progress reader's
-                    // burst-to-paced calibration measures whatever CoreAudio actually buffers
-                    // (~0.19s observed, conveniently near the AUDIO_LATENCY_MS
-                    // bootstrap/fallback), so the A/V-sync model below is unchanged.
-                    #[cfg(target_os = "linux")]
-                    acmd.args(["-f", "pulse", "-buffer_duration", &AUDIO_LATENCY_MS.to_string()])
-                        .arg("cosmic-capture-kit");
-                    #[cfg(target_os = "macos")]
-                    acmd.args(["-f", "audiotoolbox", "default"]);
                     let mut child = acmd
+                        .args(["-v", "error", "-ss", &format!("{start_sec:.3}"), "-i"])
+                        .arg(&path)
+                        .args(["-vn", "-ac", "2", "-ar", "48000", "-f", "f32le", "pipe:1"])
                         .stdin(Stdio::null())
                         .stdout(Stdio::piped())
                         .stderr(Stdio::null())
                         .spawn()
                         .ok()?;
-                    // Its own thread drains the progress pipe (so a full pipe can't block ffmpeg's
-                    // audio writes) and keeps the clock's anchor current.
-                    if let Some(progress) = child.stdout.take() {
-                        spawn_progress_reader(progress, start_sec, clock.clone());
+                    if let Some(pcm) = child.stdout.take() {
+                        let clock = clock.clone();
+                        let stop = stop.clone();
+                        let audio_done = audio_done.clone();
+                        std::thread::spawn(move || {
+                            #[cfg(target_os = "macos")]
+                            let sink = crate::platform::mac::audio_out::AudioQueueSink::open(48_000.0, 2);
+                            #[cfg(target_os = "linux")]
+                            let sink = crate::audio::pulse_out::PulseSink::open(48_000, 2);
+                            #[cfg(windows)]
+                            let sink = crate::platform::windows::audio_out::WasapiRenderSink::open(48_000, 2);
+                            match sink {
+                                Some(sink) => audio_pump(pcm, sink, start_sec, clock, &stop, &audio_done),
+                                None => drain_pcm_silently(pcm, &stop, &audio_done),
+                            }
+                        });
                     }
                     Some(child)
-                }
-                // Windows: the bundled ffmpeg has NO pulse muxer and no audio-output device at
-                // all, so it can't be the soundtrack sink (it would exit code 8 instantly). An
-                // `ffplay` sidecar renders to the default output endpoint via SDL2 instead.
-                // ffplay emits no `-progress`, so we wire NO progress reader: `clock.anchor`
-                // stays `None` and the picture rides the bootstrap epoch clock — the exact path
-                // a no-audio file uses, which `poll` already tolerates. A missing ffplay
-                // degrades to silent-but-playing with one warning, never a crash (DRAGON-285).
-                #[cfg(windows)]
-                {
-                    let ffplay = crate::util::ffplay_path();
-                    if !crate::util::tool_available(&ffplay) {
-                        log::warn!(
-                            "ffplay not found ({}) — preview video plays without sound; install \
-                             ffplay or set CCK_FFPLAY to enable preview audio",
-                            ffplay.display()
-                        );
-                        return None;
-                    }
-                    // -nodisp: no SDL window; -vn: audio only; -autoexit: quit at EOF (so the
-                    // generic try_wait drain below reaps it naturally). Routed through
-                    // quiet_command so the console child never flashes/leaves a pane (DRAGON-236).
-                    crate::util::quiet_command(&ffplay)
-                        .args(["-nodisp", "-autoexit", "-vn", "-loglevel", "error", "-ss"])
-                        .arg(format!("{start_sec:.3}"))
-                        .arg("-i")
-                        .arg(&path)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .spawn()
-                        .ok()
                 }
             };
             let mut vcmd = crate::util::ffmpeg_command();
@@ -438,40 +419,69 @@ impl Playback {
     /// dropping frames we're late for and holding when ahead. Returns `None` (keep the
     /// current frame) before the prebuffer fills or when nothing is due.
     pub fn poll(&mut self) -> Option<Frame> {
-        // Read the shared clock once. No epoch yet → the reader is still prebuffering; keep the
-        // current frame. `anchor` is the audio-progress anchor (used below), `None` until it lands.
-        let (t0, anchor) = {
-            let g = self.clock.lock().ok()?;
-            (g.epoch?, g.anchor)
-        };
-        // Bootstrap/fallback clock: epoch + elapsed − the REQUESTED buffer latency. It holds
-        // the poster until the buffer fills (target < start_sec early on), and is the whole
-        // story for a no-audio file (no anchor ever) or until the soundtrack's progress
-        // stream has calibrated the effective buffer.
-        let epoch_target = self.start_sec + t0.elapsed().as_secs_f32() - self.audio_latency;
-        // Once the progress reader has calibrated the sink's effective buffer and reports the
-        // muxed position, lock the picture to the REAL audio clock: extrapolate from the last
-        // anchor (audible position + wall time since). This picks up the true per-server
-        // latency (the buffer request is only a hint) and any sink-clock drift for free.
-        // Sanity-gate the anchor against garbage (a bogus out_time / a seek): only trust it
-        // within a window around the bootstrap clock — never > 1s behind or > 2s ahead. When
-        // the FIRST anchor lands (calibration settles a few hundred ms in), `target` may step
-        // once by the requested-vs-effective buffer error (~200ms on pipewire-pulse); the
-        // frame-drop/hold loop below self-corrects and we deliberately do NOT rewind (buffered
-        // frames are already consumed) — the one-time step is intentional. After `progress=end`
-        // the anchor stops updating but stays valid: `pos + elapsed` keeps advancing by wall
-        // time, matching the apad silence tail draining out of the buffer.
-        let target = match anchor {
-            Some((at, pos)) => {
-                let anchored = pos + at.elapsed().as_secs_f32();
-                if anchored < epoch_target - 1.0 || anchored > epoch_target + 2.0 {
-                    epoch_target
-                } else {
-                    anchored
+        // Compute the presentation target under ONE clock lock. No epoch yet → the reader is
+        // still prebuffering; keep the current frame. The slew state (`pres`, `last_poll`) and
+        // the one-shot diagnostic flag live in the clock too, so `Playback` stays small enough
+        // not to trip `PreviewKind`'s enum-variant size lint.
+        let now = Instant::now();
+        let (target, step_log) = {
+            let mut g = self.clock.lock().ok()?;
+            let t0 = g.epoch?;
+            let anchor = g.anchor;
+            // Bootstrap/fallback clock: epoch + elapsed − the REQUESTED buffer latency. It holds
+            // the poster until the buffer fills, and is the whole story for a no-audio file or
+            // the Windows ffplay path (no anchor ever), and for the moments before the anchor
+            // lands.
+            let epoch_target = self.start_sec + t0.elapsed().as_secs_f32() - self.audio_latency;
+            // Once an anchor is present, lock the picture to the audio clock: extrapolate from
+            // the anchor (audible position + wall time since). Sanity-gate it against garbage (a
+            // bogus position / a seek): only trust it within a window around the bootstrap clock,
+            // never > 1s behind or > 2s ahead.
+            let raw_target = match anchor {
+                Some((at, pos)) => {
+                    let anchored = pos + at.elapsed().as_secs_f32();
+                    if anchored < epoch_target - 1.0 || anchored > epoch_target + 2.0 {
+                        epoch_target
+                    } else {
+                        anchored
+                    }
                 }
-            }
-            None => epoch_target,
+                None => epoch_target,
+            };
+            // Slew toward the raw target instead of snapping. First poll seeds `pres`; after
+            // that it advances by realtime and closes any error at up to MAX_SLEW_RATE, so the
+            // one-time anchor step (up to −369ms measured on the old macOS estimate) is spread
+            // smoothly rather than freezing (backward step) or skipping (forward step) the
+            // picture. With the macOS true-clock anchor there is little to correct, so the slew
+            // stays a harmless safety net.
+            let dt = g.last_poll.map(|p| now.saturating_duration_since(p).as_secs_f32());
+            g.last_poll = Some(now);
+            let target = match (g.pres, dt) {
+                (Some(prev), Some(dt)) => slew_clock(prev, raw_target, dt),
+                _ => raw_target,
+            };
+            g.pres = Some(target);
+            // Observability (DRAGON preview-hitch): capture the FIRST anchored poll's RAW step
+            // so the debug log names how far the audio clock disagreed with the bootstrap. Log
+            // it AFTER releasing the lock.
+            let step_log = if !g.anchor_step_logged && anchor.is_some() {
+                g.anchor_step_logged = true;
+                Some((raw_target - epoch_target) * 1000.0)
+            } else {
+                None
+            };
+            (target, step_log)
         };
+        if let Some(step_ms) = step_log {
+            log::info!(
+                "preview playback: audio anchor landed, raw clock disagreed {step_ms:+.0}ms \
+                 with the {:.0}ms bootstrap; slewing it in over ~{:.1}s at {:.0}% instead of \
+                 snapping (a snap of this size was the visible hitch)",
+                self.audio_latency * 1000.0,
+                (step_ms.abs() / 1000.0) / MAX_SLEW_RATE,
+                MAX_SLEW_RATE * 100.0,
+            );
+        }
         let mut buf = self.buffer.lock().ok()?;
         let mut chosen = None;
         while buf.front().is_some_and(|f| f.pos <= target) {
@@ -556,115 +566,134 @@ pub fn decode_frame_at(path: &Path, meta: VideoMeta, t: f32, accurate: bool) -> 
     Some(Frame { rgba: out.stdout, w, h, pos: t })
 }
 
-/// Read the soundtrack ffmpeg's `-progress` stream and keep the shared clock's anchor current
-/// with the latest audio-clock anchor `(now, audible source position)`. Its own thread (off the
-/// frame path), mirroring the reader's style. First it calibrates the sink's EFFECTIVE buffer
-/// from the opening blocks ([`calibrate_effective_buffer`]), publishing NO anchors until that
-/// settles — the bootstrap epoch clock covers the opening moments — then every block becomes an
-/// anchor. Drains stdout to EOF so a full progress pipe can never block ffmpeg's audio writes,
-/// and stops UPDATING at `progress=end` — the padded tail then plays out under the last
-/// anchor's wall-time extrapolation (see [`Playback::poll`]).
-#[cfg_attr(windows, allow(dead_code))]
-fn spawn_progress_reader(stdout: ChildStdout, start_sec: f32, clock: Arc<Mutex<Clock>>) {
-    std::thread::spawn(move || {
-        let mut cur_us: Option<i64> = None;
-        let mut ended = false;
-        // Calibration history — block arrivals (seconds since the first block) and muxed
-        // positions (seconds) — only grown until the effective buffer settles.
-        let mut first_block: Option<Instant> = None;
-        let (mut wall_offsets, mut out_times) = (Vec::new(), Vec::new());
-        let mut buffer_secs: Option<f32> = None;
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break }; // pipe closed → ffmpeg gone, we're done
-            if let Some(us) = parse_progress_out_time_us(&line) {
-                cur_us = Some(us);
-            } else if let Some(state) = line.trim().strip_prefix("progress=") {
-                // Block terminator: this block's out_time is complete.
-                if !ended && let Some(us) = cur_us.take() {
-                    let now = Instant::now();
-                    if buffer_secs.is_none() {
-                        let t0 = *first_block.get_or_insert(now);
-                        wall_offsets.push(now.duration_since(t0).as_secs_f32());
-                        out_times.push(us as f32 / 1_000_000.0);
-                        buffer_secs = calibrate_effective_buffer(&wall_offsets, &out_times);
-                    }
-                    // No anchor until the buffer estimate settles — the bootstrap clock
-                    // (epoch − AUDIO_LATENCY_MS, see `poll`) covers the opening moments.
-                    if let Some(buffer) = buffer_secs
-                        && let Ok(mut g) = clock.lock()
-                    {
-                        g.anchor = Some((now, audible_pos_from_out_time(us, start_sec, buffer)));
-                    }
-                }
-                // Keep draining after `end` to reach EOF; just stop updating the anchor.
-                ended |= state == "end";
-            }
-        }
-    });
-}
-
-/// Self-calibrate the sink's EFFECTIVE playback buffer (seconds) from the opening progress
-/// blocks. `wall_offsets[i]` / `out_times[i]` are block `i`'s arrival (seconds since block 0)
-/// and muxed position (seconds); pure over those observables so it's unit-testable.
-///
-/// The `-buffer_duration` request is only a hint (pipewire-pulse grants roughly double), so
-/// the amount to subtract from `out_time` must be measured. At startup the audio-only decode
-/// outruns playout, so `out_time` bursts ahead of wall time until the sink buffer fills; from
-/// then on writes are paced by playout and the ratio drops to ≈1. The knee is the first block
-/// whose interval ratio is below [`PACED_RATIO_MAX`], sustained by the next block. At (and
-/// after) the knee the buffer is full, so `buffered = written − played`:
-/// `B̂ = out_time(knee) − (knee_wall − mux_start)`, with `mux_start ≈ first_block_wall −
-/// [`PROGRESS_STATS_PERIOD`]` (ffmpeg prints its first block one period into muxing) and
-/// playout starting ≈ with muxing (the burst fills any prebuffer in a few tens of ms — true
-/// on pipewire-pulse and classic pulse alike, so the estimate is server-agnostic). Clamped to
-/// [`EFFECTIVE_BUFFER_MIN`]..=[`EFFECTIVE_BUFFER_MAX`].
-///
-/// `None` = knee unresolved, keep feeding blocks. Past [`CALIBRATION_DEADLINE_SECS`] without
-/// one (a weird stream) it settles on the requested [`AUDIO_LATENCY_MS`] — exactly the
-/// previous fixed-assumption design, never worse than it.
-#[cfg_attr(windows, allow(dead_code))]
-fn calibrate_effective_buffer(wall_offsets: &[f32], out_times: &[f32]) -> Option<f32> {
-    let n = wall_offsets.len().min(out_times.len());
-    // Pacing ratio of the interval ENDING at block `k` (wall stamps are measured arrivals,
-    // so guard the degenerate zero-width interval: treat it as still bursting).
-    let ratio = |k: usize| {
-        let dw = wall_offsets[k] - wall_offsets[k - 1];
-        if dw > f32::EPSILON { (out_times[k] - out_times[k - 1]) / dw } else { f32::INFINITY }
-    };
-    for knee in 1..n.saturating_sub(1) {
-        if ratio(knee) < PACED_RATIO_MAX && ratio(knee + 1) < PACED_RATIO_MAX {
-            let est = out_times[knee] - wall_offsets[knee] - PROGRESS_STATS_PERIOD;
-            return Some(est.clamp(EFFECTIVE_BUFFER_MIN, EFFECTIVE_BUFFER_MAX));
+/// No output device: drain ffmpeg's PCM so it is not blocked on a full pipe, then report the
+/// audio finished. The silent-but-playing degradation for a machine with no usable audio sink.
+fn drain_pcm_silently(mut pcm: ChildStdout, stop: &AtomicBool, audio_done: &AtomicBool) {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    let mut scratch = [0u8; 16384];
+    while !stop.load(Ordering::Relaxed) {
+        match pcm.read(&mut scratch) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
     }
-    (n > 0 && wall_offsets[n - 1] >= CALIBRATION_DEADLINE_SECS)
-        .then_some(AUDIO_LATENCY_MS as f32 / 1000.0)
+    audio_done.store(true, Ordering::Relaxed);
 }
 
-/// Parse an ffmpeg `-progress` line for the muxed-audio position, in MICROSECONDS. ffmpeg
-/// emits `out_time_us=<n>`; some builds also/only emit `out_time_ms=<n>` carrying the SAME
-/// microsecond value (a long-standing misnomer — it is NOT milliseconds), so accept either
-/// key. Returns `None` for any other line, a non-integer value, or an implausible one
-/// (negative — e.g. the `AV_NOPTS` sentinel before the first sample — or beyond a day).
-#[cfg_attr(windows, allow(dead_code))]
-fn parse_progress_out_time_us(line: &str) -> Option<i64> {
-    let line = line.trim();
-    let v = line
-        .strip_prefix("out_time_us=")
-        .or_else(|| line.strip_prefix("out_time_ms="))?;
-    let us: i64 = v.trim().parse().ok()?;
-    (0..=86_400_000_000).contains(&us).then_some(us)
+/// The small seam the owned-sink audio pump drives, so ONE pump serves the macOS AudioQueue
+/// sink, the Linux PulseAudio sink and the Windows WASAPI sink (DRAGON preview-hitch). Each
+/// platform's sink implements it; the effectful native code stays in its own module.
+trait PreviewAudioSink {
+    /// Play interleaved f32 samples, blocking as backpressure so the pump paces to realtime.
+    fn write(&mut self, interleaved: &[f32], stop: &AtomicBool);
+    /// Seconds the device has actually PLAYED (the true audible position), `None` before start.
+    fn played_secs(&self) -> Option<f64>;
+    /// True once the sink has played out everything written.
+    fn drained(&self) -> bool;
 }
 
-/// The AUDIBLE source position for a muxed-audio timestamp: what has reached the speakers lags
-/// what ffmpeg has WRITTEN by the sink's effective buffer (`buffer_secs` — measured by
-/// [`calibrate_effective_buffer`], or the requested size as its fallback), because ffmpeg's
-/// blocking writes pace against that buffer once it is full. Clamped at `start_sec` through the
-/// startup transient (muxed < buffer ⇒ nothing audible yet).
-#[cfg_attr(windows, allow(dead_code))]
-fn audible_pos_from_out_time(out_time_us: i64, start_sec: f32, buffer_secs: f32) -> f32 {
-    let out_time_secs = out_time_us as f32 / 1_000_000.0;
-    start_sec + (out_time_secs - buffer_secs).max(0.0)
+#[cfg(target_os = "macos")]
+impl PreviewAudioSink for crate::platform::mac::audio_out::AudioQueueSink {
+    fn write(&mut self, s: &[f32], stop: &AtomicBool) {
+        crate::platform::mac::audio_out::AudioQueueSink::write(self, s, stop)
+    }
+    fn played_secs(&self) -> Option<f64> {
+        crate::platform::mac::audio_out::AudioQueueSink::played_secs(self)
+    }
+    fn drained(&self) -> bool {
+        crate::platform::mac::audio_out::AudioQueueSink::drained(self)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PreviewAudioSink for crate::audio::pulse_out::PulseSink {
+    fn write(&mut self, s: &[f32], stop: &AtomicBool) {
+        crate::audio::pulse_out::PulseSink::write(self, s, stop)
+    }
+    fn played_secs(&self) -> Option<f64> {
+        crate::audio::pulse_out::PulseSink::played_secs(self)
+    }
+    fn drained(&self) -> bool {
+        crate::audio::pulse_out::PulseSink::drained(self)
+    }
+}
+
+#[cfg(windows)]
+impl PreviewAudioSink for crate::platform::windows::audio_out::WasapiRenderSink {
+    fn write(&mut self, s: &[f32], stop: &AtomicBool) {
+        crate::platform::windows::audio_out::WasapiRenderSink::write(self, s, stop)
+    }
+    fn played_secs(&self) -> Option<f64> {
+        crate::platform::windows::audio_out::WasapiRenderSink::played_secs(self)
+    }
+    fn drained(&self) -> bool {
+        crate::platform::windows::audio_out::WasapiRenderSink::drained(self)
+    }
+}
+
+/// The owned-sink preview audio pump (DRAGON preview-hitch): read raw f32 PCM from ffmpeg, play
+/// it through the owned `sink`, and publish the sink's TRUE playout position as the clock
+/// anchor after every write. Runs on its own thread for one playback; the sink is created and
+/// dropped on that thread so it never crosses threads. Shared by all three platforms; only the
+/// sink type differs.
+fn audio_pump<S: PreviewAudioSink>(
+    mut pcm: ChildStdout,
+    mut sink: S,
+    start_sec: f32,
+    clock: Arc<Mutex<Clock>>,
+    stop: &AtomicBool,
+    audio_done: &AtomicBool,
+) {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    let publish = |secs: f64| {
+        if let Ok(mut g) = clock.lock() {
+            g.anchor = Some((Instant::now(), start_sec + secs as f32));
+        }
+    };
+    let mut bytes = [0u8; 16384];
+    let mut carry: Vec<u8> = Vec::new();
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let n = match pcm.read(&mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        // Assemble whole f32 samples, carrying any 1-3 trailing bytes into the next read.
+        carry.extend_from_slice(&bytes[..n]);
+        let whole = carry.len() - (carry.len() % 4);
+        if whole == 0 {
+            continue;
+        }
+        let mut samples = Vec::with_capacity(whole / 4);
+        for c in carry[..whole].chunks_exact(4) {
+            samples.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        }
+        carry.drain(..whole);
+        sink.write(&samples, stop);
+        if let Some(secs) = sink.played_secs() {
+            publish(secs);
+        }
+    }
+    // Drain: the device still holds a few enqueued buffers. Let them play out (bounded) so the
+    // video tail stays in step, keeping the anchor current, then report done.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+        match sink.played_secs() {
+            Some(secs) => {
+                publish(secs);
+                if sink.drained() {
+                    break;
+                }
+            }
+            None => break,
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    audio_done.store(true, Ordering::Relaxed);
 }
 
 /// Parse an ffmpeg rational like `30000/1001` or `30/1` (or a bare number) to fps.
@@ -691,6 +720,35 @@ pub(super) fn scaled_dims(w: u32, h: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slew_clock_never_rewinds_or_freezes() {
+        // A large BACKWARD correction (the -369ms macOS anchor step): the clock must still
+        // move FORWARD, just slower than realtime, so the picture never freezes.
+        let dt = 0.033; // one 30fps poll
+        let out = slew_clock(1.000, 1.000 - 0.369, dt);
+        assert!(out > 1.000, "clock went backward/froze: {out}");
+        assert!(out < 1.000 + dt, "a backward correction must run slower than realtime");
+    }
+
+    #[test]
+    fn slew_clock_converges_and_then_tracks_exactly() {
+        // Once the error is within one poll's slew budget, the clock lands ON the target.
+        let dt = 0.033;
+        let tiny = MAX_SLEW_RATE * dt * 0.5; // half a poll's worth of correction
+        let out = slew_clock(5.0, 5.0 + dt + tiny, dt);
+        assert!((out - (5.0 + dt + tiny)).abs() < 1e-6, "should reach the target: {out}");
+    }
+
+    #[test]
+    fn slew_clock_forward_step_runs_at_most_one_plus_rate() {
+        // A forward correction is bounded to (1 + MAX_SLEW_RATE) x realtime — no jump.
+        let dt = 0.033;
+        let out = slew_clock(2.0, 2.0 + 1.0, dt); // 1s ahead: huge error
+        let advanced = out - 2.0;
+        assert!(advanced <= dt * (1.0 + MAX_SLEW_RATE) + 1e-6, "overshot the slew cap: {advanced}");
+        assert!(advanced >= dt * (1.0 + MAX_SLEW_RATE) - 1e-6, "should saturate the cap: {advanced}");
+    }
 
     #[test]
     fn scaled_dims_leaves_short_video_untouched_but_forces_even() {
@@ -755,101 +813,10 @@ mod tests {
     }
 
     #[test]
-    fn progress_out_time_us_line_parses_microseconds() {
-        assert_eq!(parse_progress_out_time_us("out_time_us=1234567"), Some(1_234_567));
-        assert_eq!(parse_progress_out_time_us("out_time_us=0"), Some(0));
-        // Real ffmpeg lines are unindented, but tolerate incidental whitespace.
-        assert_eq!(parse_progress_out_time_us("  out_time_us=250000  "), Some(250_000));
-    }
-
-    #[test]
-    fn progress_out_time_ms_key_is_really_microseconds() {
-        // ffmpeg's `out_time_ms` is a misnomer — it carries microseconds, like `out_time_us`.
-        assert_eq!(parse_progress_out_time_us("out_time_ms=1234567"), Some(1_234_567));
-    }
-
-    #[test]
-    fn progress_unrelated_keys_are_ignored() {
-        // The `out_time=HH:MM:SS.us` string form and every other progress key yield nothing.
-        assert_eq!(parse_progress_out_time_us("out_time=00:00:01.234567"), None);
-        assert_eq!(parse_progress_out_time_us("frame=42"), None);
-        assert_eq!(parse_progress_out_time_us("bitrate= 128.0kbits/s"), None);
-        assert_eq!(parse_progress_out_time_us("progress=continue"), None);
-    }
-
-    #[test]
-    fn progress_garbage_and_out_of_range_values_are_rejected() {
-        assert_eq!(parse_progress_out_time_us("out_time_us=notanumber"), None);
-        assert_eq!(parse_progress_out_time_us("out_time_us="), None);
-        // Negative (the AV_NOPTS sentinel appears before the first sample) and absurdly huge.
-        assert_eq!(parse_progress_out_time_us("out_time_us=-1"), None);
-        assert_eq!(parse_progress_out_time_us("out_time_us=-9223372036854775808"), None);
-        assert_eq!(parse_progress_out_time_us("out_time_us=999999999999999"), None);
-    }
-
-    #[test]
-    fn audible_pos_lags_muxed_by_the_buffer_and_clamps_at_start() {
-        // 0.35s muxed, 0.20s buffer → 0.15s of it is audible past the start point.
-        let p = audible_pos_from_out_time(350_000, 5.0, 0.2);
-        assert!((p - 5.15).abs() < 1e-4, "audible = {p}");
-        // Startup transient (muxed < buffer): nothing audible yet → clamp to the start.
-        let p0 = audible_pos_from_out_time(50_000, 5.0, 0.2);
-        assert!((p0 - 5.0).abs() < 1e-4, "audible = {p0}");
-        // Exactly at the buffer boundary → still the start position.
-        let pboundary = audible_pos_from_out_time(200_000, 5.0, 0.2);
-        assert!((pboundary - 5.0).abs() < 1e-4, "audible = {pboundary}");
-    }
-
-    #[test]
-    fn calibrate_measures_buffer_when_burst_precedes_first_block() {
-        // The shape real pipewire-pulse captures show: the whole burst fits inside the first
-        // stats period (out_time already 450ms at block 0), then paced +100ms per 100ms block.
-        // Knee at block 1: B̂ = 0.550 − 0.100 − PROGRESS_STATS_PERIOD = 0.350.
-        let b = calibrate_effective_buffer(&[0.0, 0.1, 0.2], &[0.45, 0.55, 0.65]).unwrap();
-        assert!((b - 0.35).abs() < 1e-6, "B̂ = {b}");
-    }
-
-    #[test]
-    fn calibrate_measures_buffer_after_visible_burst_blocks() {
-        // Burst 0→450ms across three blocks (ratio 1.5), then paced (+100ms/block).
-        // Knee at block 3: B̂ = 0.550 − 0.300 − PROGRESS_STATS_PERIOD = 0.150.
-        let wall = [0.0, 0.1, 0.2, 0.3, 0.4];
-        let out = [0.15, 0.30, 0.45, 0.55, 0.65];
-        let b = calibrate_effective_buffer(&wall, &out).unwrap();
-        assert!((b - 0.15).abs() < 1e-6, "B̂ = {b}");
-    }
-
-    #[test]
-    fn calibrate_withholds_until_the_knee_is_confirmed() {
-        // Still bursting (ratio 1.5 everywhere) → no estimate; anchors stay unpublished and
-        // the bootstrap clock rules.
-        assert_eq!(calibrate_effective_buffer(&[0.0, 0.1, 0.2], &[0.15, 0.30, 0.45]), None);
-        // One paced ratio alone isn't enough — it must sustain for a second block.
-        assert_eq!(calibrate_effective_buffer(&[0.0, 0.1], &[0.45, 0.55]), None);
-        // A zero-width interval (duplicate wall stamp) counts as bursting, not paced.
-        assert_eq!(calibrate_effective_buffer(&[0.0, 0.0, 0.1], &[0.1, 0.2, 0.3]), None);
-        assert_eq!(calibrate_effective_buffer(&[], &[]), None);
-    }
-
-    #[test]
-    fn calibrate_clamps_the_estimate_to_plausible_buffers() {
-        // Paced from the very start with a near-empty buffer → raw estimate 0.0s, floored.
-        let b = calibrate_effective_buffer(&[0.0, 0.1, 0.2], &[0.1, 0.2, 0.3]).unwrap();
-        assert!((b - EFFECTIVE_BUFFER_MIN).abs() < 1e-6, "B̂ = {b}");
-        // An absurd 1.9s estimate is capped at the ceiling.
-        let b = calibrate_effective_buffer(&[0.0, 0.1, 0.2], &[2.0, 2.1, 2.2]).unwrap();
-        assert!((b - EFFECTIVE_BUFFER_MAX).abs() < 1e-6, "B̂ = {b}");
-    }
-
-    #[test]
-    fn calibrate_falls_back_to_the_requested_buffer_after_the_deadline() {
-        // A stream that never stops bursting (ratio 2.0 throughout) past the deadline settles
-        // on the requested AUDIO_LATENCY_MS — the previous fixed-assumption design.
-        let wall: Vec<f32> = (0..27).map(|i| i as f32 * 0.1).collect();
-        let out: Vec<f32> = (0..27).map(|i| i as f32 * 0.2).collect();
-        let b = calibrate_effective_buffer(&wall, &out).unwrap();
-        assert!((b - 0.2).abs() < 1e-6, "B̂ = {b}");
-        // Same burst but short of the deadline → still waiting.
-        assert_eq!(calibrate_effective_buffer(&wall[..20], &out[..20]), None);
+    fn slew_clock_is_the_bridge_from_bootstrap_to_the_true_anchor() {
+        // Sanity that the surviving clock path is the slew, not the deleted estimation: a
+        // realtime advance with no error just moves forward by dt.
+        let dt = 0.033;
+        assert!((slew_clock(1.0, 1.0 + dt, dt) - (1.0 + dt)).abs() < 1e-6);
     }
 }

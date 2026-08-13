@@ -195,6 +195,23 @@ const DEP_FILE_LEVEL: log::Level = log::Level::Warn;
 /// drops. Anything that gives itself a custom target must be listed here.
 const OWN_EXTRA_TARGETS: [&str; 2] = ["timing", "cck::failure"];
 
+/// The ONE dependency module this log keeps at `info` (DRAGON-666), and the whole reason
+/// [`DEP_FILE_LEVEL`] is not simply the law: `iced_wgpu`'s compositor is where the renderer
+/// announces WHAT IT PICKED — the adapter (name, driver, `device_type`), the surface format,
+/// the alpha modes the surface offered and the one it took.
+///
+/// Those four facts decide whether a capture overlay can be translucent at all, and until
+/// now not one of them reached the file. A customer's black-overlay report therefore arrived
+/// with no way to tell a software adapter from a discrete GPU, or a surface that offered
+/// `PostMultiplied` from one that only ever offered `Opaque` — the exact question the Windows
+/// 10 / Windows 11 split turned on, argued for four tickets on symptoms alone.
+///
+/// It is a MODULE prefix, not the `iced_wgpu` crate: the crate at `info` also carries
+/// per-frame renderer chatter, and this log's whole discipline (see [`DEP_FILE_LEVEL`]) is
+/// that a diagnostic which spends its budget before reaching the subject is worse than none.
+/// Six lines per process, once, at startup.
+const DEP_INFO_TARGET_PREFIX: &str = "iced_wgpu::window::compositor";
+
 /// Whether `target` names a record this crate emitted (rather than a dependency's).
 fn is_own_target(target: &str) -> bool {
     target == OWN_TARGET
@@ -202,9 +219,17 @@ fn is_own_target(target: &str) -> bool {
         || OWN_EXTRA_TARGETS.contains(&target)
 }
 
-/// Whether a record with this `target`/`level` belongs in the file (see [`DEP_FILE_LEVEL`]).
+/// Whether a record with this `target`/`level` belongs in the file (see [`DEP_FILE_LEVEL`]
+/// and [`DEP_INFO_TARGET_PREFIX`]). Pure; unit-tested below.
 fn wanted_in_file(target: &str, level: log::Level) -> bool {
-    level <= if is_own_target(target) { FILE_LEVEL } else { DEP_FILE_LEVEL }
+    let ceiling = if is_own_target(target) {
+        FILE_LEVEL
+    } else if target.starts_with(DEP_INFO_TARGET_PREFIX) {
+        log::Level::Info
+    } else {
+        DEP_FILE_LEVEL
+    };
+    level <= ceiling
 }
 
 // ── Process-wide state ───────────────────────────────────────────────────────
@@ -953,8 +978,49 @@ fn session_header(reason: &str) {
         "package: {}",
         crate::util::package_kind().diag_name(),
     ));
+    log_os_facts();
     log_tool_locations();
     announce_sandbox();
+}
+
+/// The OS facts that decide which platform gates this launch takes (DRAGON-666). Windows
+/// only, because Windows is the only platform here whose BUILD NUMBER changes our behaviour.
+///
+/// It exists because four tickets' worth of Windows overlay diagnosis was argued from
+/// symptoms: every gate in `platform::mod` keys on the build number, the debug log never
+/// recorded it, and a customer report therefore could not even establish which side of
+/// `WIN11_MIN_BUILD` the machine was on — let alone whether the software force or the
+/// caption recipe had actually applied to it. One line, once, at startup.
+///
+/// The renderer's own half of the answer (adapter, surface format, alpha mode) comes from
+/// `iced_wgpu`'s compositor, which this log now keeps at `info` for exactly that reason —
+/// see [`DEP_INFO_TARGET_PREFIX`].
+fn log_os_facts() {
+    #[cfg(windows)]
+    {
+        let build = crate::platform::windows::window::os_build();
+        let dcomp = crate::platform::dcomp_enabled();
+        // `wants_software` is the PLATFORM GATE, not this process's renderer, and the
+        // field is named to say so. The first version called it `software_overlays=`,
+        // and the very first log it produced was misread on sight: a run that had just
+        // announced "the windows 10 software force stands down" still carried
+        // `software_overlays=true`, because the machine is Windows 10 and always will
+        // be. What this process ACTUALLY renders with is decided later, in `app::run`
+        // (after this header is written, so it cannot be reported here), and is stated
+        // by its own INFO line either way -- plus the `iced_wgpu` adapter line, which a
+        // tiny-skia run does not have at all.
+        write_line(&format!(
+            "os: windows build={} win11={} wants_software={} native_captions={} dcomp={} \
+             transparency_effects={}",
+            build.map_or_else(|| "unreadable".to_string(), |b| b.to_string()),
+            build.is_some_and(|b| b >= crate::platform::WIN11_MIN_BUILD),
+            crate::platform::software_overlays(),
+            crate::platform::windows::caption::native_caption_buttons_supported(),
+            dcomp,
+            crate::platform::windows::appearance::transparency_effects_enabled()
+                .map_or_else(|| "unknown".to_string(), |on| on.to_string()),
+        ));
+    }
 }
 
 /// The external binaries this launch would run, and where each one resolved: one line per
@@ -1550,6 +1616,27 @@ mod tests {
         // one feature this log gives for free.
         assert!(wanted_in_file("timing", log::Level::Debug), "timing marks must be kept");
         assert!(wanted_in_file("cck::failure", log::Level::Warn));
+    }
+
+    /// DRAGON-666: the ONE dependency module kept at `info`, and the exact reason it is a
+    /// module and not the crate. `iced_wgpu::window::compositor` is where the renderer
+    /// announces the adapter, the surface format and the ALPHA MODE it selected, which is
+    /// the fact a black-overlay report has never once carried.
+    #[test]
+    fn the_renderers_own_report_reaches_the_file_and_nothing_else_of_its_crate_does() {
+        for level in [log::Level::Info, log::Level::Warn, log::Level::Error] {
+            assert!(
+                wanted_in_file("iced_wgpu::window::compositor", level),
+                "the compositor's {level} report must reach the file"
+            );
+        }
+        // Its DEBUG is still dropped: this is a narrow window for six startup lines, not an
+        // invitation to per-frame renderer chatter.
+        assert!(!wanted_in_file("iced_wgpu::window::compositor", log::Level::Debug));
+        // And the rest of the crate keeps the ordinary dependency rule.
+        assert!(!wanted_in_file("iced_wgpu", log::Level::Info));
+        assert!(!wanted_in_file("iced_wgpu::layer", log::Level::Info));
+        assert!(wanted_in_file("iced_wgpu::layer", log::Level::Warn));
     }
 
     #[test]

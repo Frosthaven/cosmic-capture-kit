@@ -324,7 +324,7 @@ changes with it, which is what forces the re-fetch.
 | Component | Version | Where it comes from | Verified by |
 |---|---|---|---|
 | ffmpeg + ffprobe (macOS arm64) | **9.0** | martin-riedl.de, a permanent per-build URL with a published `.sha256` | SHA-256 |
-| ffmpeg + ffprobe + ffplay (Windows x86_64) | **9.0** | gyan.dev, the `full_build-shared` release at a permanent versioned URL with a published `.sha256` (DRAGON-631 moved off BtbN, which builds no 9.0 branch) | SHA-256 |
+| ffmpeg + ffprobe + ffplay (Windows x86_64) | **9.0** | **built by us** (DRAGON-675): cross-compiled with mingw-w64 in a container, `scripts/ffmpeg-win/`, from the same signed source tarball the Linux artifacts use, then hosted on our own `vendor-mirror` release. Previously gyan.dev's `full_build-shared`, and before that BtbN's | **GPG signature** on the source + SHA-256 on the archive |
 | tesseract (macOS arm64) | **5.5.3** | built from source, with leptonica **1.87.0** and libpng **1.6.50** | SHA-256 |
 | tesseract (Windows x86_64) | **5.5.3** | the official installer published as a GitHub release asset by the tesseract project, unpacked with 7-Zip (never executed) | SHA-256 |
 | `eng.traineddata` | `tessdata_fast` tag **4.1.0** | the same file and hash on both platforms, so OCR results match | SHA-256 |
@@ -346,19 +346,32 @@ project produced them. The build imports the key into a throwaway keyring and
 requires the signature to be made by that exact fingerprint, so a compromised key
 URL supplying both a key and a matching signature still fails.
 
-None of the other upstreams publish signatures (probed 2026-08: martin-riedl.de
-offers `.sha256` only, gyan.dev a `.sha256` beside each package, and the libpng,
-leptonica, tesseract and tessdata downloads none at all), so for those a pinned
-hash is the honest best available rather than an equivalent guarantee.
+The Windows binaries now inherit that guarantee (DRAGON-675). They used to be a
+third-party build verified by a hash we computed ourselves; they are now OUR
+build of that same signed tarball, so the signature covers the Windows package's
+ffmpeg too, one step further up.
 
-**ffmpeg is held at 8.x deliberately.** The recording pipeline is written against
+None of the other upstreams publish signatures (probed 2026-08: martin-riedl.de
+offers `.sha256` only, and the libpng, leptonica, tesseract and tessdata
+downloads none at all), so for those a pinned hash is the honest best available
+rather than an equivalent guarantee.
+
+**A PREBUILT binary's pin is never "just a refresh".** What a binary demands of
+the user's machine is decided when it is compiled, and for someone else's build
+we chose none of that and can read almost none of it back. This is not
+hypothetical: a Windows ffmpeg pin moving 9.0 to 9.0.1 raised the minimum NVIDIA
+driver from ~570 to 610.00, because the newer build had been compiled against
+different nv-codec-headers, and no assertion on the file could have seen it
+(DRAGON-671). Source we build ourselves is different in kind: every floor it
+imposes is one of our own pins. `scripts/pins.env` carries the full rule.
+
+**ffmpeg is held at 9.0 deliberately.** The recording pipeline is written against
 ffmpeg's observed behaviour, including workarounds measured on ffmpeg 8 that
 stay as bounded defenses on 9 (the `MuxerWatchdog`
 exists because ffmpeg 8 could wedge on a session's first video write; a live
 `-itsoffset` is banned because ≥ ~200 ms deterministically stalled ffmpeg 8's
-scheduler). Both upstreams now serve 9.x as their current build, so moving up is
-a real change that needs a recording test pass behind it, not something a version
-bump does quietly.
+scheduler). Moving up is a real change that needs a recording test pass behind
+it, not something a version bump does quietly.
 
 **Why macOS builds tesseract from source.** There is no self-contained arm64
 macOS tesseract to download. Homebrew's links leptonica out of `/opt/homebrew`,

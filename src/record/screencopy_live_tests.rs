@@ -128,6 +128,9 @@ fn live_settings(out_path: std::path::PathBuf) -> RecordSettings {
         max_res: (0, 0),
         metadata: String::new(),
         out_path,
+        // DRAGON-673: no countdown in a live test, so media 0 is the settled
+        // pipeline with no gate to hold for.
+        start_gate: None,
     }
 }
 

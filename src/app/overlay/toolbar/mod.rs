@@ -1,6 +1,7 @@
 pub(super) mod layout;
 
 use super::super::*;
+use crate::app::recording::ChipFace;
 use layout::V_W;
 
 // Icon resolution now lives in the shared Lucide resolver `crate::widgets::icons::handle`
@@ -109,6 +110,18 @@ impl App {
         let recording = self.recording.is_some();
         let rec_paused = self.recording_paused();
         let active = counting || recording;
+        // DRAGON-659: which face the chip wears, decided once (`recording::chip_face`) and
+        // read by all three of the chip's states below: its content, its fill and its press.
+        // `recording` is true from PROMOTION, which is a whole warmup before the worker has
+        // captured anything, so the STOP face and the pressable chip key on `Live`, and
+        // never on `recording` alone. `Live` means the worker's pipeline has SETTLED
+        // (DRAGON-661: its opening phase is over), not merely that a first frame arrived.
+        //
+        // `warming` is the whole promoted-but-not-live window, revealed spinner or not. It is
+        // a strict subset of `recording`, so every LAYOUT decision above and below is
+        // untouched: only the chip's face, its fill and its pressability change.
+        let face = self.record_chip_face();
+        let warming = matches!(face, ChipFace::Warming { .. });
 
         // DRAGON-475: every idle-toolbar option carries a hover tooltip, opened into free
         // space — the bar hugs different edges depending on anchor and drag, so the side
@@ -474,7 +487,7 @@ impl App {
                     widget::container(crate::widgets::icons::sized_rotated(
                         "scan-refresh-symbolic",
                         ICON_BOX,
-                        self.scan_spin,
+                        self.busy_spin,
                         spin_class,
                     ))
                     .width(Length::Fill)
@@ -583,34 +596,73 @@ impl App {
         // While recording the chip is a white stop glyph + mono `MMM:SS` elapsed time
         // (it IS the stop button). Otherwise mono `NN`. Both routes share their
         // format+layout via `render_chip` (see its doc).
-        let chip_inner: Element<'_, Msg> = if recording {
-            // RECORDED time — freezes while paused (wall time minus pauses).
-            let secs = self.recording_elapsed_secs();
-            // MM:SS, minutes space-padded to 3 so the monospace string is a constant
-            // width — minutes grow leftward into the reserved room right after the
-            // icon, while the colon, seconds, icon and cancel button never shift.
-            render_chip(
-                Some(("media-playback-stop-symbolic", 16.0)),
-                format!("{:>3}:{:02}", secs / 60, secs % 60),
-                14,
-                true,
-                None,
-                6.0,
-            )
-        } else {
-            // During a countdown, prepend what it'll do: a check for a photo, a record
-            // dot for a video.
-            let lead = if counting {
-                let cd_icon = if self.kind == Kind::Video {
-                    "media-record-symbolic"
+        let chip_inner: Element<'_, Msg> = match face {
+            // DRAGON-659: the WARMING face. The recording exists but has captured nothing
+            // yet, so there is no elapsed time to show and nothing to stop. The chip is a
+            // progress indicator for this one moment and takes no press (below).
+            //
+            // The glyph rotates rather than being swapped for `indeterminate_circular`, for
+            // the reason `refresh_btn` above spells out: that widget's stylesheet style is
+            // `()`, so it renders at accent and cannot be tinted to sit on the chip's red.
+            // White matches everything else inside this pill (`render_chip`'s own rule),
+            // rather than the subdued wash a DISABLED grey toolbar button wears.
+            ChipFace::Warming { spinning } => {
+                let white = cosmic::theme::Svg::Custom(Rc::new(|_t: &cosmic::Theme| {
+                    cosmic::widget::svg::Style { color: Some(cosmic::iced::Color::WHITE) }
+                }));
+                if spinning {
+                    crate::widgets::icons::sized_rotated(
+                        "media-loading-symbolic",
+                        16.0,
+                        self.busy_spin,
+                        white,
+                    )
                 } else {
-                    "emblem-ok-symbolic"
+                    // BEFORE the reveal (the no-countdown path's first 200ms): the same slot,
+                    // a still record dot. Something has to fill it, because the chip took the
+                    // recording layout the instant the user pressed record, and the other two
+                    // faces are both wrong here: STOP claims a recording that has captured
+                    // nothing, and the idle readout puts a delay numeral and its caret inside
+                    // a red pill. A still dot says "starting" without claiming to be live, and
+                    // it keeps the reveal delay's promise that a warmup which beats it shows no
+                    // loading chrome at all (a loader drawn still and then swapped for the same
+                    // loader turning would break that promise from the other side).
+                    //
+                    // Same 16px centred box as the loader above, so the reveal is a glyph swap
+                    // with no movement, and the same white as everything else in the pill.
+                    crate::widgets::icons::sized("media-record-symbolic", 16.0).class(white).into()
+                }
+            }
+            ChipFace::Live => {
+                // RECORDED time — freezes while paused (wall time minus pauses).
+                let secs = self.recording_elapsed_secs();
+                // MM:SS, minutes space-padded to 3 so the monospace string is a constant
+                // width — minutes grow leftward into the reserved room right after the
+                // icon, while the colon, seconds, icon and cancel button never shift.
+                render_chip(
+                    Some(("media-playback-stop-symbolic", 16.0)),
+                    format!("{:>3}:{:02}", secs / 60, secs % 60),
+                    14,
+                    true,
+                    None,
+                    6.0,
+                )
+            }
+            ChipFace::Idle => {
+                // During a countdown, prepend what it'll do: a check for a photo, a record
+                // dot for a video.
+                let lead = if counting {
+                    let cd_icon = if self.kind == Kind::Video {
+                        "media-record-symbolic"
+                    } else {
+                        "emblem-ok-symbolic"
+                    };
+                    Some((cd_icon, 15.0))
+                } else {
+                    None
                 };
-                Some((cd_icon, 15.0))
-            } else {
-                None
-            };
-            render_chip(lead, format!("{chip_secs:02}"), 18, true, Some(chip_trail), 5.0)
+                render_chip(lead, format!("{chip_secs:02}"), 18, true, Some(chip_trail), 5.0)
+            }
         };
         // The chip matches the base button height (the taller dedicated shutter it
         // once stood in for is gone), so every toolbar group lines up.
@@ -630,7 +682,12 @@ impl App {
                     if recording {
                         // Solid red, brighter on hover. White glyph. Paused: the
                         // countdown's darker red family — clearly "not live".
-                        let base = match (rec_paused, cancel_hovered) {
+                        // DRAGON-659: a WARMING chip is not live either (nothing has been
+                        // captured yet), so it wears that same darker red, and it does not
+                        // brighten under the pointer because it does not press. That covers
+                        // the WHOLE warmup, revealed spinner or not: the fill answers "is
+                        // this live", which the reveal delay has no say in.
+                        let base = match (rec_paused || warming, cancel_hovered && !warming) {
                             (true, true) => crate::app::theme::RECORD_DIM_HOVER,
                             (true, false) => crate::app::theme::RECORD_DIM,
                             (false, true) => crate::app::theme::RECORD_HOVER,
@@ -695,16 +752,26 @@ impl App {
                     }
                 }))),
         )
-        .on_press(if recording {
-            Msg::Recording(RecordingMsg::StopRecording)
-        } else if counting {
-            Msg::Capture(CaptureMsg::CancelCapture)
-        } else {
-            Msg::Capture(CaptureMsg::ToggleDelayMenu)
-        })
         .on_enter(Msg::Capture(CaptureMsg::SetHover(Hover::Cancel)))
         .on_exit(Msg::Capture(CaptureMsg::SetHover(Hover::None)))
         .interaction(cosmic::iced::mouse::Interaction::Idle);
+        // DRAGON-659: the warming chip takes NO press. Disabling by withholding the handler
+        // is the same move `refresh_btn` makes above (and for the same reason: `mouse_area`
+        // has no `on_press_maybe`), and it is not decoration: there is nothing to stop
+        // until the worker has captured a frame, so a chip that looked pressable would
+        // silently do nothing. Held for the whole warmup for that reason, not just for the
+        // part of it the spinner is revealed for.
+        let chip = if warming {
+            chip
+        } else {
+            chip.on_press(if recording {
+                Msg::Recording(RecordingMsg::StopRecording)
+            } else if counting {
+                Msg::Capture(CaptureMsg::CancelCapture)
+            } else {
+                Msg::Capture(CaptureMsg::ToggleDelayMenu)
+            })
+        };
 
         let delay_el: Element<'_, Msg> = if self.delay_menu_open && !active {
             let items: Vec<Element<'_, Msg>> = DELAYS

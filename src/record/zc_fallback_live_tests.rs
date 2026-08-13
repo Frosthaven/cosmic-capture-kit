@@ -81,6 +81,9 @@ fn settings(out: &std::path::Path) -> RecordSettings {
         max_res: (3840, 2160),
         metadata: String::new(),
         out_path: out.to_path_buf(),
+        // DRAGON-673: a live test has no countdown, so media 0 is the settled pipeline
+        // with no gate to hold for.
+        start_gate: None,
     }
 }
 
@@ -159,13 +162,58 @@ fn pulse_available() -> bool {
         .unwrap_or(false)
 }
 
+/// A recording whose VIDEO side can never come up must not start any audio at all
+/// (DRAGON-658).
+///
+/// This is the ordering itself, counted. Every worker now brings its capture up first,
+/// confirms a genuinely real frame, and only then runs the audio pre-flight, so a portal
+/// stream that will never deliver one (here, an fd the PipeWire client refuses outright)
+/// must cost ZERO pre-flights: no mic ffmpeg, no pulse client, no FIFOs, on either the
+/// zero-copy attempt or the CPU path it falls back to. Before the reordering this same
+/// call started one on each of them.
+///
+/// Needs no sound server precisely BECAUSE nothing audio-side should be touched, which is
+/// what makes it a usable everyday net rather than a live test.
+#[test]
+fn a_recording_that_never_captures_starts_no_audio() {
+    let _lock = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = std::env::temp_dir().join(format!("cck-d658-order-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let before = preflights_started();
+    let handle = start_pipewire_recording(PipewireRecordParams {
+        fd: dead_portal_fd(),
+        node_id: 0,
+        crop: None,
+        settings: settings(&dir.join("out.mp4")),
+    });
+
+    let result = wait_done(&handle, Duration::from_secs(60))
+        .expect("a recording that cannot capture must report, not hang");
+    let started = preflights_started() - before;
+
+    assert!(result.is_err(), "nothing was captured, so this must not report success: {result:?}");
+    assert_eq!(
+        started, 0,
+        "the video side never delivered a frame, so no audio pre-flight may have run; \
+         {started} did, which means a worker still starts audio before it knows it can capture"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A failed audio pre-flight is the RECORDING's failure, not an invitation to try the
 /// whole thing again.
 ///
-/// The CPU path's first act is the very same pre-flight, against the very same sound
-/// server, so falling back to it can only fail the same way — one whole recording later,
-/// with a second set of capture processes started and torn down on the way. Needs
+/// The CPU path's first act used to be the very same pre-flight, against the very same
+/// sound server, so falling back to it could only fail the same way, one whole recording
+/// later, with a second set of capture processes started and torn down on the way. Needs
 /// nothing but the forced-failure seam, so it runs everywhere.
+///
+/// Since DRAGON-658 the pre-flight runs only AFTER a real frame is confirmed, so on this
+/// dead-fd fixture it is never reached at all and the honest count is 0 rather than 1 (the
+/// sibling test above pins that directly). The claim this one makes is the DRAGON-422 one
+/// and it is unchanged: one user action starts AT MOST one recording session, whatever
+/// fails and wherever it fails.
 #[test]
 fn a_failed_audio_preflight_does_not_start_a_second_session() {
     let _lock = test_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -190,10 +238,10 @@ fn a_failed_audio_preflight_does_not_start_a_second_session() {
     let started = preflights_started() - before;
 
     assert!(result.is_err(), "the recording must fail, not appear to succeed: {result:?}");
-    assert_eq!(
-        started, 1,
-        "one user action must start ONE recording session; {started} audio pre-flights ran, \
-         which means the failed attempt was answered by starting the whole recording again"
+    assert!(
+        started <= 1,
+        "one user action must start AT MOST one recording session; {started} audio pre-flights \
+         ran, which means the failed attempt was answered by starting the whole recording again"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

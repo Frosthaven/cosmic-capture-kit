@@ -13,9 +13,10 @@ macOS and Windows. `src/widgets/icons.rs` is the one resolver.
 
 ## Lucide (the UI set, DRAGON-324)
 
-96 glyphs, chosen by what each control DOES rather than by an old freedesktop
+100 glyphs, chosen by what each control DOES rather than by an old freedesktop
 name. (The count is the number of `.svg` files in `lucide/`; it read 90 against
-93 files until DRAGON-614, so re-count rather than trusting the line.) The SVGs
+93 files until DRAGON-614, and 96 against 99 until DRAGON-659, so re-count
+rather than trusting the line.) The SVGs
 stroke with `currentColor`, so they are marked symbolic and tinted with the
 active foreground or accent color like a native symbolic icon.
 `timer.svg` (DRAGON-574, the tray menu's Countdown Timer entry), `trash.svg`
@@ -24,10 +25,13 @@ active foreground or accent color like a native symbolic icon.
 (DRAGON-588, the Keyboard Shortcuts page's Global tab), `binary.svg` +
 `file-archive.svg` (DRAGON-591, the About page's release-kind line, one glyph
 per package kind), `apple.svg` + `grid-2x2.svg` (DRAGON-614, the same line's
-macOS and Windows kinds, the glyphs the owner named) and `key.svg` (DRAGON-412,
-the macOS tray menu's Manage Permissions entry, the glyph the owner named) are
+macOS and Windows kinds, the glyphs the owner named), `key.svg` (DRAGON-412,
+the macOS tray menu's Manage Permissions entry, the glyph the owner named) and
+`loader-circle.svg` (DRAGON-659, the record chip's warming spinner, the glyph
+the owner named) are
 verbatim copies of the official Lucide `timer`, `trash`, `pipette`, `globe`,
-`binary`, `file-archive`, `apple`, `grid-2x2` and `key` icons, fetched from
+`binary`, `file-archive`, `apple`, `grid-2x2`, `key` and `loader-circle` icons,
+fetched from
 upstream and already in the set's house format (24-unit viewBox, `currentColor`
 strokes, stroke-width 2).
 

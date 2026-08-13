@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.31.0"
+version = "0.32.0"
 edition = "2024"
 description = "Quickly capture your screen/audio to the clipboard for sharing with others. Supports QR/barcode/OCR scanning, cloud upload with automatic sharing links, and post-capture annotations."
 license = "GPL-3.0-only"

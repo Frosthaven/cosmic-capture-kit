@@ -217,6 +217,11 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "media-playback-start-symbolic" => "play",
         "media-playback-pause-symbolic" => "pause",
         "media-playback-stop-symbolic" => "square", // stop
+        // DRAGON-659: the record chip's WARMING face, the open arc that reads as a spinner the
+        // moment it turns. A sibling of the four `media-*` transport names above because it is
+        // the same control's face, one state earlier: the worker is up but has not confirmed a
+        // real captured frame yet, so there is nothing to stop and no elapsed time to show.
+        "media-loading-symbolic" => "loader-circle",
         "emblem-ok-symbolic" => "check", // confirm / finish
         // The CROP session's ACCEPT mark (DRAGON-392). It is lucide `check`'s exact geometry and
         // the set's exact stroke weight — the ONE thing it changes is that the tick is TWO
@@ -355,6 +360,11 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "video-x-generic-symbolic" => "film", // video placeholder
         "pan-down-symbolic" => "chevron-down",
         "pan-up-symbolic" => "chevron-up", // vendored for DRAGON-630's first stepper; kept bundled
+        // The SELECTOR caret: one chevron up over one chevron down, the glyph a control that
+        // cycles a list of values wears. The colour picker's mode activator took it when the
+        // mode label moved above the value boxes: a lone `chevron-down` reads as "opens
+        // downward", and that menu opens UPWARD as often as not.
+        "pan-up-down-symbolic" => "chevrons-up-down",
         // The picker value row's layout toggle (DRAGON-630): split channel boxes vs the
         // one whole-value box. Outward chevrons say "expand into channels", inward say
         // "collapse into one".
@@ -451,6 +461,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "play" => svg!("play"),
         "pause" => svg!("pause"),
         "square" => svg!("square"),
+        "loader-circle" => svg!("loader-circle"),
         "check" => svg!("check"),
         "check-split" => svg!("check-split"),
         "trash-2" => svg!("trash-2"),
@@ -510,6 +521,7 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "film" => svg!("film"),
         "chevron-down" => svg!("chevron-down"),
         "chevron-up" => svg!("chevron-up"),
+        "chevrons-up-down" => svg!("chevrons-up-down"),
         "list-chevrons-up-down" => svg!("list-chevrons-up-down"),
         "list-chevrons-down-up" => svg!("list-chevrons-down-up"),
         "folder-open" => svg!("folder-open"),
@@ -548,7 +560,8 @@ mod tests {
             "screenshot-screen-symbolic", "object-move-symbolic", "input-mouse-symbolic",
             "camera-photo-symbolic", "camera-video-symbolic", "media-record-symbolic",
             "media-playback-start-symbolic", "media-playback-pause-symbolic",
-            "media-playback-stop-symbolic", "emblem-ok-symbolic", "edit-delete-symbolic",
+            "media-playback-stop-symbolic", "media-loading-symbolic",
+            "emblem-ok-symbolic", "edit-delete-symbolic",
             "user-trash-symbolic",
             "window-close-symbolic", "process-stop-symbolic", "emblem-system-symbolic", "document-properties-symbolic",
             "preferences-system-symbolic", "audio-input-microphone-symbolic",
@@ -572,6 +585,7 @@ mod tests {
             "image-filter-symbolic", "edit-cut-symbolic", "view-timeline-symbolic",
             "minus-1", "minus-2", "minus-4", "minus-6", "minus-8", "minus-10", "minus-12",
             "video-x-generic-symbolic", "pan-down-symbolic", "pan-up-symbolic",
+            "pan-up-down-symbolic",
             "list-expand-symbolic", "list-collapse-symbolic",
             "folder-open-symbolic",
             // The cloud setup step's two destination tabs and its album rows (DRAGON-485, tab

@@ -882,15 +882,26 @@ fn write_seed_ledger(path: &Path, seeded: &std::collections::HashMap<String, u64
     }
 }
 
-/// Locate the `ffplay` binary (`CCK_FFPLAY` override → exe-adjacent sidecar → PATH, the
-/// same resolution order as [`ffmpeg_path`]). Windows-only: the preview soundtrack renders
-/// through ffplay (SDL2 → default output endpoint) because the bundled Windows ffmpeg has
-/// no pulse muxer and no audio-output device at all, so it can't be the sink (DRAGON-285).
-/// Linux/macOS use `ffmpeg -f pulse`/`-f audiotoolbox` and never call this.
-#[cfg(windows)]
-pub fn ffplay_path() -> PathBuf {
-    locate_tool("ffplay", "CCK_FFPLAY")
-}
+// `ffplay_path` is GONE, and the reason matters more than the deletion.
+//
+// It existed because the bundled Windows ffmpeg has no pulse muxer and no audio-output
+// device at all, so ffmpeg could not be the preview soundtrack's sink there and an
+// `ffplay` sidecar (SDL2 → default endpoint) was (DRAGON-285). That sidecar reported no
+// position, which is why the Windows preview rode a bootstrap clock for the whole session
+// instead of a real playout clock.
+//
+// The WASAPI render sink (`platform::windows::audio_out`) replaced it: we own the output,
+// so `IAudioClock::GetPosition` gives the true audible position and Windows gets the same
+// playout clock the other platforms have. Its last caller went with it.
+//
+// If you are re-adding an ffplay path, re-read that: the problem was never locating the
+// binary, it was that a sidecar we do not own cannot tell us where playback actually is.
+//
+// NOTE FOR PACKAGING: `scripts/fetch-win-vendor.ps1` still fetches and asserts
+// `ffplay.exe`, and the MSI still ships it, on the strength of a comment there calling it
+// "NOT optional ... the preview editor's audio sink on Windows". That statement is now
+// false. Dropping it is a packaging decision (it is ~2MB of the bundle), deliberately left
+// out of the change that made it unused.
 
 /// Locate the `proton-drive` binary, Proton's own official Drive command-line tool
 /// (DRAGON-485), with the same resolution order as [`ffmpeg_path`]: the `CCK_PROTON_DRIVE`

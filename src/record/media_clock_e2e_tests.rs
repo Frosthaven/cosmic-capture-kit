@@ -1383,6 +1383,23 @@ fn run_marked_session(
 /// Every assertion here is on decoded CONTENT (the chirp's own frequency, the frames'
 /// own marker levels) or on the mixer's own discard counters — never on duration
 /// alone, which is exactly the class of check that passed throughout this bug's life.
+///
+/// STALE PREMISE (DRAGON-672), READ BEFORE TRUSTING THIS TEST. Its harness still anchors
+/// the clock at `capture_start`, which is what every worker did when it was written. The
+/// workers now anchor at `owned::media_zero()` (the settled pipeline) instead, so this no
+/// longer describes the shipped startup: the app does NOT claim to be recording from
+/// `capture_start` any more, and the warmup span this test asserts is PRESENT is, in
+/// production, deliberately discarded as `pre_start_chunks`.
+///
+/// What it still pins honestly is the MIXER contract underneath — signed placement
+/// (`media_at_signed`) keeping a chunk's post-0 tail, and content landing at the media
+/// position matching its capture instant — which DRAGON-672 relies on MORE, not less,
+/// since the whole warmup is now pre-0. So it stays, and it stays green.
+///
+/// OWED: a companion E2E for the new contract (the warmup span is discarded, counted
+/// `pre_start`, `lost` stays 0.000s, and media 0 lands within a frame of `settled_at`).
+/// It has to be written on Linux, where this file's pulse-bound harness actually runs;
+/// DRAGON-672 was verified on Windows by instrumented live recordings instead.
 #[test]
 fn media_clock_recording_opening_survives_a_slow_start_e2e() {
     require_e2e_tools!("media_clock_recording_opening_survives_a_slow_start_e2e");
@@ -1785,50 +1802,14 @@ fn media_clock_opening_prime_reaches_the_muxer_promptly_e2e() {
     }
 }
 
-/// DRAGON-554: the [`super::owned::AudioPreflight`] seam both the PipeWire and the SCK
-/// workers overlap their video bring-up with. A forced pre-flight failure must come
-/// back through `join()` with the same named, actionable reason the inline call
-/// reports, promptly (the seam adds no wait of its own), and `abandon()` on a failed
-/// pre-flight must be a quiet no-op — the video-side failure paths call it blind.
-#[test]
-fn audio_preflight_thread_reports_the_named_failure() {
-    let _lock = test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let _guard = GlobalStateGuard;
-    // SAFETY: `test_lock()` is held for this whole test.
-    unsafe {
-        std::env::set_var("CCK_TEST_FORCE_OWNED_FAILURE", "1");
-    }
-
-    let started = Instant::now();
-    let result = super::owned::AudioPreflight::start().join();
-    let elapsed = started.elapsed();
-    match result {
-        Ok(owned) => {
-            owned.cleanup();
-            panic!("the forced-failure seam must fail through the threaded pre-flight too");
-        }
-        Err(reason) => assert_eq!(
-            reason, "forced failure (test seam)",
-            "the threaded pre-flight must carry the same named reason the inline call reports"
-        ),
-    }
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "the seam must add no wait of its own (took {elapsed:?})"
-    );
-
-    // The blind-teardown path the video-side failures use.
-    super::owned::AudioPreflight::start().abandon();
-}
-
-
 /// DRAGON-647: the capture children carry `PR_SET_PDEATHSIG(SIGKILL)` as orphan
 /// protection, and Linux binds that signal to the spawning THREAD, not the process.
-/// The audio pre-flight runs on a short-lived worker thread (`AudioPreflight`), so a
-/// mic child spawned from it was SIGKILLed ~120ms into every Linux recording the
-/// moment that thread returned — silently (SIGKILL writes no stderr), leaving an
-/// honest all-silence mic track and a "source stopped delivering" pump summary. The
-/// fix spawns the captures on the session-long READER thread instead.
+/// The audio pre-flight ran on a short-lived worker thread at the time (`AudioPreflight`,
+/// retired by DRAGON-657/658), so a mic child spawned from it was SIGKILLed ~120ms into
+/// every Linux recording the moment that thread returned, silently (SIGKILL writes no
+/// stderr), leaving an honest all-silence mic track and a "source stopped delivering" pump
+/// summary. The fix spawns the captures on the session-long READER thread instead, which
+/// is what still holds today whoever calls the pre-flight.
 ///
 /// This drives the real tap from a spawner thread that exits immediately — the exact
 /// production shape — and asserts the capture SURVIVES its spawner by well over the

@@ -30,21 +30,28 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1
 /// only (no region crop — those use the CPU path) and the A/V auto-calibration isn't
 /// updated (the saved offset still applies). VAAPI only.
 ///
-/// Two pre-flights run before this function touches the portal `fd`/`node_id` at all, in
-/// this order:
+/// THREE things happen before any audio exists, in this order:
 ///
 /// 1. The NODE pre-flight ([`preflight_vaapi_node`], DRAGON-425): can this box's VAAPI
 ///    hardware import what this session renders? A no means zero-copy is impossible here,
-///    and declining now costs nothing at all — no audio capture has been started, no pump
-///    exists, and media 0 has not been anchored.
-/// 2. The AUDIO pre-flight ([`super::owned::try_start_owned_audio`]), so a failure there
-///    never risks the portal handles either — it fails the recording outright with a named,
-///    actionable reason instead of falling back (DRAGON-127 retired the legacy
-///    wallclock+CFR+segments recorder this used to fall back to).
+///    and declining now costs nothing at all, nothing has been started.
+/// 2. The portal stream is connected and a genuinely real first dmabuf FRAME is confirmed
+///    (DRAGON-658), which is also where the frame's own modifier gets the second opinion
+///    on which GPU produced it. A stream that never delivers, or delivers something this
+///    box cannot import, declines here, still free.
+/// 3. Only then is the warm instant reported ([`super::owned::mark_first_frame`]) and the
+///    AUDIO pre-flight ([`super::owned::try_start_owned_audio`]) run, inline and exactly
+///    once. A failure there fails the recording outright with a named, actionable reason.
 ///
-/// The order matters: the audio pre-flight starts real capture streams, so asking the
-/// cheap, answerable question first is what keeps a box that can never do zero-copy from
-/// paying for a session it cannot run.
+/// The other end of the bring-up, where the encoder and the muxer are built and the session
+/// goes READY, is reported separately ([`super::owned::mark_settled`], DRAGON-661); that
+/// later signal is the one the UI calls "live".
+///
+/// The order matters twice over: the audio pre-flight starts real capture streams, so
+/// asking the cheap, answerable questions first is what keeps a box that can never do
+/// zero-copy from paying for a session it cannot run; and it anchors media 0, so starting
+/// it before a pixel has been seen means the app says "recording" with no proof that
+/// anything is (DRAGON-657's reason for the whole reordering).
 ///
 /// Returns a [`ZcOutcome`], like its screencopy sibling
 /// ([`record_screencopy_zero_copy`]) — NOT a bare `Result` (DRAGON-422). The caller has
@@ -53,11 +60,10 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::zwp_linux_buffer_params_v1
 /// here — including a failed audio pre-flight, which is documented above as fatal — sent
 /// the caller off to start a whole second recording session.
 ///
-/// The two siblings classify their audio pre-flight differently, on purpose: the
-/// screencopy one reports `Fallback` because its caller ALREADY holds a working
-/// `OwnedAudioStart` of its own, so the CPU path it falls back to needs no second
-/// pre-flight. This one's caller has nothing in hand, so a failed pre-flight is the
-/// recording's failure and is reported as `Done(Err(..))`.
+/// Both siblings classify a failed audio pre-flight the same way since DRAGON-658, as
+/// `Done(Err(..))`: neither caller holds an `OwnedAudioStart` any more, and the CPU path
+/// would only run the same pre-flight against the same sound server and fail the same way,
+/// one whole recording later.
 #[cfg(feature = "zero-copy")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_pipewire_zero_copy(
@@ -66,6 +72,10 @@ pub(crate) fn record_pipewire_zero_copy(
     fps: u32,
     codec: &str,
     max_res: (u32, u32),
+    // The countdown gate (DRAGON-673): the app raises it when it promotes the recording, and
+    // media 0 waits for it, so a countdown warms the whole pipeline behind its own digits and
+    // the file still starts where the promotion does.
+    start_gate: Option<Arc<AtomicBool>>,
     mic: bool,
     system_audio: bool,
     bitrate_kbps: u32,
@@ -76,9 +86,11 @@ pub(crate) fn record_pipewire_zero_copy(
     paused: Arc<AtomicBool>,
     events: &Mutex<Vec<ToggleEvent>>,
     dims: Arc<Mutex<Option<(u32, u32)>>>,
+    warm_at: &Mutex<Option<std::time::Instant>>,
+    settled_at: &Mutex<Option<std::time::Instant>>,
     metadata: &str,
 ) -> ZcOutcome {
-    // DRAGON-425 PRE-FLIGHT — before the audio pre-flight, the pump, and media 0.
+    // DRAGON-425 PRE-FLIGHT, before the stream, the audio pre-flight, the pump and media 0.
     //
     // The node this path encodes on used to be a GUESS (`default_vaapi_node`: the first
     // amdgpu/i915/xe render node, alphabetically) with no idea what the session renders on.
@@ -92,29 +104,36 @@ pub(crate) fn record_pipewire_zero_copy(
     // should render on. Ask it here, decide, and on a decline give the CPU path the whole
     // recording immediately — nothing has been started, so this genuinely costs nothing.
     match preflight_vaapi_node() {
-        PreflightNode::Use(node) => {
-            match super::owned::try_start_owned_audio() {
-                Ok(owned) => {
-                    log::info!("zero-copy pipeline: media-clock owned path (DRAGON-127)");
-                    record_pipewire_zero_copy_owned(
-                        fd, node_id, fps, codec, max_res, mic, system_audio, bitrate_kbps,
-                        audio_offset_ms, auto_device_compensation, out_path, stop, paused,
-                        events, dims, metadata, owned, node,
-                    )
-                }
-                Err(reason) => {
-                    log::error!(
-                        "zero-copy pipeline: audio pre-flight failed ({reason}); cannot record"
-                    );
-                    // Fatal, not `Fallback` (see the fn doc): the CPU path would only run the
-                    // SAME pre-flight again and fail the same way, one whole recording later.
-                    ZcOutcome::Done(Err(format!("could not start recording audio: {reason}")))
-                }
-            }
-        }
+        // The audio pre-flight now runs INSIDE the owned session, after its first real
+        // frame is confirmed (DRAGON-658); this level only answers "can this box do it".
+        PreflightNode::Use(node) => record_pipewire_zero_copy_owned(
+            fd, node_id, fps, codec, max_res, start_gate, mic, system_audio, bitrate_kbps,
+            audio_offset_ms, auto_device_compensation, out_path, stop, paused, events, dims,
+            warm_at, settled_at, metadata, node,
+        ),
         PreflightNode::Decline(reason) => ZcOutcome::Fallback(reason),
     }
 }
+
+/// What the capture thread's FIRST real dmabuf frame tells the session thread
+/// (DRAGON-658). Sent once, through a bounded channel, because the frame's own planes die
+/// with its callback: only these cheap facts can outlive it.
+#[cfg(feature = "zero-copy")]
+struct FirstDmabuf {
+    width: u32,
+    height: u32,
+    /// The render node the frame's own DRM modifier confirmed, which may differ from the
+    /// one [`preflight_vaapi_node`] chose (see the DRAGON-425 belt-two comment).
+    node: String,
+    /// The wall instant the frame was delivered, for `owned::mark_first_frame`.
+    at: std::time::Instant,
+}
+
+/// The confirmation message, or a classified decline: `true` means the CPU path can still
+/// cover the whole recording ([`ZcOutcome::Fallback`]), `false` that this is the
+/// recording's own failure.
+#[cfg(feature = "zero-copy")]
+type ConfirmMsg = Result<FirstDmabuf, (bool, String)>;
 
 /// What the DRAGON-425 pre-flight decided, before any recording machinery is started.
 #[cfg(feature = "zero-copy")]
@@ -207,8 +226,7 @@ fn set_libva_driver_for(nodes: &[(std::path::PathBuf, String)], node: &std::path
 /// simply stops feeding the encoder (never resets it, never reopens the muxer), so
 /// video's total encoded length is naturally "wall time minus paused time" — the
 /// same media-time invariant the pump's clock also converges to, with no extra
-/// reconciliation math needed. `owned` is consumed here (its FIFOs/tap/monitor
-/// become the pump's).
+/// reconciliation math needed.
 ///
 /// Residual A/V length mismatch: unlike the CPU owned paths (which can duplicate
 /// their last raw frame to cover any gap — see `pump::VideoTicker::ticks_to_cover`),
@@ -223,17 +241,39 @@ fn set_libva_driver_for(nodes: &[(std::path::PathBuf, String)], node: &std::path
 /// keeps a small pool of its OWN dmabuf targets alive for the whole session and can
 /// re-submit the pool's last-used target to close this exact gap.)
 ///
+/// ## Two threads, and why (DRAGON-658)
+///
+/// `consume_dmabuf` runs the PipeWire mainloop on the thread that calls it and only
+/// returns at stop, so this used to BE the capture loop: the whole session ran inside that
+/// one blocking call, and everything else (the audio pre-flight, the pump, the encoder,
+/// the muxer) had to be up before it started. The reordering needs the opposite: the
+/// stream must be RUNNING and have delivered a frame before the audio pre-flight may
+/// start. So the capture now gets a dedicated thread (the same shape
+/// `record::pipewire`'s CPU path already uses for `consume_frames`), this thread waits a
+/// BOUNDED [`FIRST_FRAME_BUDGET`] for its confirmation, and the session state moved from
+/// `Rc<RefCell<..>>` to `Arc<Mutex<..>>` because it is now genuinely shared.
+///
+/// The callback's first invocation sends the cheap facts a `DmabufFrame` can outlive
+/// ([`FirstDmabuf`]) and returns WITHOUT encoding: there is no encoder yet, and its planes
+/// die with the call. Every frame after that, until this thread has built the encoder and
+/// the muxer, is dropped and counted (`dropped_warmup`). That widens a gap this path
+/// already had and already documents: the video stream carries nothing for the warmup
+/// span, so the content after it leads the audio by that much. Before the reordering the
+/// gap was the stream connect + negotiate + encoder build (which sat after media 0);
+/// now it is the audio pre-flight + encoder build. Same constant lead, different cause,
+/// and `-shortest` still keeps both streams the same length.
+///
 /// ## The muxer is spawned LAZILY, and what that costs (DRAGON-422)
 ///
 /// Unlike the screencopy sibling — which knows its frame size from `formats.buffer_size`
 /// and so spawns encoder + muxer BEFORE the pump — a PipeWire dmabuf frame's dimensions
-/// are only known when the first frame arrives, so both are created inside the callback.
+/// are only known when the first frame arrives, so both are created after the pump.
 /// The pump is therefore already waiting at its FIFO write-end rendezvous for an ffmpeg
-/// that does not exist yet, and if no frame ever arrives (the compositor declining dmabuf
-/// on a cross-vendor GPU) it never will. That is fine — both sides are bounded — but it
-/// means the pump's timeout here is NOT evidence of a wedged ffmpeg, and this attempt
-/// failing is NOT evidence that the session should be restarted. See [`super::pump::spawn`]'s
-/// rendezvous arm for the first, and [`ZcOutcome`] for the second.
+/// that does not exist yet, and if the encoder or muxer cannot come up it never will. That
+/// is fine, both sides are bounded, but it means the pump's timeout here is NOT evidence
+/// of a wedged ffmpeg, and this attempt failing is NOT evidence that the session should be
+/// restarted. See [`super::pump::spawn`]'s rendezvous arm for the first, and [`ZcOutcome`]
+/// for the second.
 #[cfg(feature = "zero-copy")]
 #[allow(clippy::too_many_arguments)]
 fn record_pipewire_zero_copy_owned(
@@ -242,6 +282,10 @@ fn record_pipewire_zero_copy_owned(
     fps: u32,
     codec: &str,
     max_res: (u32, u32),
+    // The countdown gate (DRAGON-673): the app raises it when it promotes the recording, and
+    // media 0 waits for it, so a countdown warms the whole pipeline behind its own digits and
+    // the file still starts where the promotion does.
+    start_gate: Option<Arc<AtomicBool>>,
     mic: bool,
     system_audio: bool,
     bitrate_kbps: u32,
@@ -252,27 +296,24 @@ fn record_pipewire_zero_copy_owned(
     paused: Arc<AtomicBool>,
     events: &Mutex<Vec<ToggleEvent>>,
     dims: Arc<Mutex<Option<(u32, u32)>>>,
+    warm_at: &Mutex<Option<std::time::Instant>>,
+    settled_at: &Mutex<Option<std::time::Instant>>,
     metadata: &str,
-    owned: super::owned::OwnedAudioStart,
-    // DRAGON-425: chosen by `preflight_vaapi_node` BEFORE the audio pre-flight ran, so a box
+    // DRAGON-425: chosen by `preflight_vaapi_node` before the stream was touched, so a box
     // where zero-copy cannot work never reaches this function at all.
     node: String,
 ) -> ZcOutcome {
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let super::owned::OwnedAudioStart {
-        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
-    } =
-        owned;
     let temp = super::recording_temp_path(out_path);
 
-    // State shared between the (single-threaded, 'static-bound — see
-    // `consume_dmabuf`'s signature) PipeWire callback and this function. Much
+    // State shared between the PipeWire capture thread's callback and this one. Much
     // simpler than the legacy path's `Zc`: ONE encoder + ONE muxer for the whole
     // session (no segment restart on pause — see the fn doc), and no
     // mic/system-relay/monitor-probe bookkeeping at all (the pump owns all of
-    // that now).
+    // that now). `enc` being `Some` is also the READY flag: until this thread has built
+    // the encoder and the muxer, the callback drops what arrives.
     struct Session {
         node: String,
         fps: u32,
@@ -287,14 +328,80 @@ fn record_pipewire_zero_copy_owned(
         writer: Option<std::thread::JoinHandle<()>>,
         is_hevc: bool,
         frames: u64,
+        /// Frames the stream delivered while the session was still warming up (the audio
+        /// pre-flight and the encoder build), which there was nothing to encode with.
+        /// Diagnostic only; see the fn doc for what their absence costs.
+        dropped_warmup: u64,
         /// The session's fatal error, and whether it is a zero-copy DECLINE the CPU
         /// path can still cover (`true` → [`ZcOutcome::Fallback`]) or this recording's
         /// own failure (`false` → [`ZcOutcome::Done`]). Only consulted when nothing was
         /// encoded; once frames exist the session owns the outcome either way.
         error: Option<(bool, String)>,
     }
-    let sess = std::rc::Rc::new(std::cell::RefCell::new(Session {
-        node,
+
+    /// Build the session's encoder and muxer from the confirmed first frame, and publish
+    /// them into `z`, which is also what tells the capture thread's callback it may start
+    /// encoding. Runs on the session thread, once, with the lock held, so the callback can
+    /// never observe a half-built session. `Err` carries the same (can-fall-back, reason)
+    /// classification the callback's own failures use.
+    fn start_encoding(
+        z: &mut Session,
+        first: &FirstDmabuf,
+        mic_fifo: &std::path::Path,
+        sys_fifo: &std::path::Path,
+        paused: &Arc<AtomicBool>,
+    ) -> Result<(), (bool, String)> {
+        z.node = first.node.clone();
+        let (mw, mh) = crate::encode::codec_capped_resolution(z.max_res, &z.codec);
+        let (dw, dh) = crate::encode::fit_within(first.width, first.height, mw, mh);
+        let hevc = match z.codec.as_str() {
+            "h264" => false,
+            "hevc" => true,
+            _ => dw.max(dh) > 4096,
+        };
+        // Cross-vendor import is exactly what the CPU readback path exists for, and
+        // nothing has been encoded: a decline.
+        let enc = crate::encode::gpu::Encoder::new(
+            &z.node, hevc, first.width, first.height, dw, dh, z.fps, z.bitrate,
+        )
+        .map_err(|e| (true, format!("encoder init: {e}")))?;
+        // ffmpeg itself, not the GPU path: the CPU path would meet the same failure
+        // (mirrors the screencopy sibling).
+        let mut child =
+            crate::encode::spawn_ffmpeg_encoded_media_clock(hevc, z.fps, &z.temp, mic_fifo, sys_fifo)
+                .map_err(|e| (false, format!("muxer spawn: {e}")))?;
+        let Some(mut stdin) = child.stdin.take() else {
+            return Err((false, "muxer stdin unavailable".to_string()));
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let writer = std::thread::spawn(move || {
+            while let Ok(bytes) = rx.recv() {
+                if stdin.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        });
+        // Armed BEFORE the muxer can be handed any bytes: a startup scheduler wedge
+        // (DRAGON-118/123) never reads stdin, and the pause gate matches the CPU owned
+        // paths' reasoning (this session-long muxer is fed nothing while paused).
+        z.watchdog =
+            Some(super::MuxerWatchdog::arm_gated(child.id(), z.temp.clone(), paused.clone()));
+        z.tx = Some(tx);
+        z.writer = Some(writer);
+        z.child = Some(child);
+        z.is_hevc = hevc;
+        z.enc = Some(enc); // LAST: this is the ready flag
+        Ok(())
+    }
+
+    /// The shared session, recovering rather than panicking on a poisoned lock: a
+    /// recording never dies of a lock (the same rule every slot write here follows).
+    fn lock(sess: &Arc<Mutex<Session>>) -> std::sync::MutexGuard<'_, Session> {
+        sess.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    let sess = Arc::new(Mutex::new(Session {
+        node: node.clone(),
         fps: fps.max(1),
         bitrate: bitrate_kbps,
         codec: codec.to_string(),
@@ -307,18 +414,19 @@ fn record_pipewire_zero_copy_owned(
         writer: None,
         is_hevc: false,
         frames: 0,
+        dropped_warmup: 0,
         error: None,
     }));
 
     // This attempt's OWN stop flag (DRAGON-422). The session's `stop` belongs to the
     // USER — `App::stop_recording` sets it, and it is the only record that a stop was
     // ever asked for. Everything internal here (the first-frame watchdog below, an
-    // encoder or muxer failure in the callback, the stop tail) trips `zc_stop` instead,
-    // so after we return the caller can still tell "the user stopped" apart from
-    // "zero-copy gave up". It could not before: the internal watchdog set the shared
-    // flag, so the caller had to CLEAR it to retry on the CPU path — which erased a
-    // stop the user had already made and started a second recording behind the preview
-    // spinner, with nothing left in the UI able to stop it.
+    // encoder or muxer failure, the stop tail) trips `zc_stop` instead, so after we
+    // return the caller can still tell "the user stopped" apart from "zero-copy gave up".
+    // It could not before: the internal watchdog set the shared flag, so the caller had to
+    // CLEAR it to retry on the CPU path, which erased a stop the user had already made
+    // and started a second recording behind the preview spinner, with nothing left in the
+    // UI able to stop it.
     let zc_stop = Arc::new(AtomicBool::new(false));
 
     // First-frame watchdog AND the inward mirror of the session's stop, in one thread:
@@ -327,6 +435,10 @@ fn record_pipewire_zero_copy_owned(
     // user stop into `zc_stop` (the only way it reaches the capture loop and the pump
     // now that they read the private flag). Exits as soon as `zc_stop` is set — which
     // the stop tail always does — so it never outlives the attempt.
+    //
+    // It is also what unblocks the confirmation wait below: either trip drops the
+    // callback (and with it the confirm channel's sender), so a `recv_timeout` still
+    // waiting sees `Disconnected` promptly.
     let got_frame = Arc::new(AtomicBool::new(false));
     {
         let session_stop = stop.clone();
@@ -355,59 +467,20 @@ fn record_pipewire_zero_copy_owned(
         });
     }
 
-    let pump_cfg = super::pump::PumpConfig {
-        fps: fps.max(1),
-        audio_offset_ms,
-        auto_device_compensation,
-        mic_on0: mic,
-        sys_on0: system_audio,
-        duck_system: crate::audio::config::recording_duck_system(),
-    };
-    // Media time 0 is the instant AUDIO CAPTURE began (the pre-flight), not the
-    // instant the video side finished coming up (DRAGON-417). Everything above —
-    // the capture handshake, the first frame, ffmpeg's spawn — happened while the
-    // mic/system captures were already running and the app's indicator already said
-    // "recording"; anchoring here would place all of that audio at a negative media
-    // position, where the mixer discards it. The opening span is covered on the video
-    // side by the first frame instead (see `capture_start`'s doc).
-    let session_start = capture_start;
-
-    // The pump thread borrows `events`/`stop`/`paused` for its own lifetime (see
-    // `pump::spawn`'s doc) — `std::thread::scope` is what makes that sound, exactly
-    // like the CPU owned paths.
-    /// One channel's mute intervals plus the session's frame/codec facts — named
-    /// so the `std::thread::scope` return type below doesn't trip clippy's
-    /// `type_complexity` (mirrors `pipewire::MuteIntervals`'s same reason).
-    type OwnedZcResult = (Vec<(f64, f64)>, Vec<(f64, f64)>, u64, bool);
-    /// A failed session, and whether it is a zero-copy decline the caller may still
-    /// cover with the CPU path (`true`) or this recording's own failure (`false`) —
-    /// the scope's error half of the [`ZcOutcome`] split.
-    type OwnedZcError = (bool, String);
-    let scope_result: Result<OwnedZcResult, OwnedZcError> = std::thread::scope(|scope| {
-            let (pump_handle, _ticker) = match super::pump::spawn(
-                scope, session_start, pump_cfg, mic_fifo_path.clone(), sys_fifo_path.clone(),
-                mic_tap, mic_rx, monitor, sys_rx, &zc_stop, &paused, events,
-            ) {
-                Ok(v) => v,
-                // The audio captures are gone with the failed spawn (see `pump::spawn`'s
-                // own note) and nothing was recorded; the CPU path starts clean.
-                Err(e) => return Err((true, e)),
-            };
-
-            let cb_sess = sess.clone();
-            let cb_stop = zc_stop.clone();
-            let cb_got = got_frame.clone();
-            let cb_paused = paused.clone();
-            let cb_paused_watchdog = paused.clone();
-            let cb_mic_fifo = mic_fifo_path.clone();
-            let cb_sys_fifo = sys_fifo_path.clone();
-            let cb_dims = dims.clone();
-            let run = crate::platform::pipewire::consume_dmabuf(fd, node_id, zc_stop.clone(), move |frame| {
+    // The capture thread. It owns the PipeWire mainloop for the whole session (see the fn
+    // doc's "Two threads"); `consume_dmabuf` returns within `MIRROR_POLL` of `zc_stop`.
+    let (confirm_tx, confirm_rx) = std::sync::mpsc::sync_channel::<ConfirmMsg>(1);
+    let capture = {
+        let cb_sess = sess.clone();
+        let cb_stop = zc_stop.clone();
+        let cb_got = got_frame.clone();
+        let cb_paused = paused.clone();
+        let cb_zc_stop = zc_stop.clone();
+        let pre_node = node;
+        let mut confirm_tx = Some(confirm_tx);
+        std::thread::spawn(move || {
+            crate::platform::pipewire::consume_dmabuf(fd, node_id, cb_zc_stop, move |frame| {
                 cb_got.store(true, Ordering::Relaxed);
-                let mut z = cb_sess.borrow_mut();
-                if z.error.is_some() {
-                    return;
-                }
                 // Paused (DRAGON-111/127): feed the encoder NOTHING — never close
                 // or restart the session (unlike the legacy per-segment model);
                 // the pump's clock freezes for the identical span (both read the
@@ -416,7 +489,7 @@ fn record_pipewire_zero_copy_owned(
                 if cb_paused.load(Ordering::Relaxed) {
                     return;
                 }
-                if z.enc.is_none() {
+                if let Some(tx) = confirm_tx.take() {
                     // DRAGON-425 belt two — CONFIRMATION. The node was already chosen by
                     // `preflight_vaapi_node`, from the compositor's own statement of which
                     // GPU this session renders on. This frame is the second opinion: its DRM
@@ -424,16 +497,14 @@ fn record_pipewire_zero_copy_owned(
                     // compositor whose frames contradict its own feedback is still caught.
                     //
                     // What each belt saves is different, and only the pre-flight saves the
-                    // expensive part. Declining THERE costs nothing: no audio pre-flight, no
-                    // pump, no media-0 anchor, no capture handshake. Declining HERE happens
-                    // after all of that is already paid for — it saves only the encoder, the
-                    // muxer and the doomed rest of the session, and the CPU path then starts
-                    // a second recording from scratch. That is why the pre-flight exists and
-                    // why this is a backstop, not the mechanism.
+                    // expensive part. Declining THERE costs nothing: no stream, no audio
+                    // pre-flight, no pump, no media-0 anchor. Declining HERE now costs only
+                    // the stream's own bring-up, because since DRAGON-658 no audio has been
+                    // started at this point either.
                     //
-                    // Runs exactly once per session: `enc` is set immediately below, and
-                    // every failure path here sets `error`, which returns early at the top of
-                    // this callback.
+                    // Runs exactly once per session: the sender is taken here, and this
+                    // frame is NOT encoded: there is no encoder yet, and its planes die
+                    // with this call.
                     let vendor = crate::encode::vendor_from_modifier(frame.modifier);
                     let nodes = crate::encode::gpu::vaapi_nodes_with_drivers();
                     let decision = crate::encode::resolve_vaapi_node_for_vendor(&nodes, vendor);
@@ -442,91 +513,44 @@ fn record_pipewire_zero_copy_owned(
                     log::info!(
                         "{}",
                         crate::encode::decision_log_line(
-                            std::path::Path::new(&z.node),
+                            std::path::Path::new(&pre_node),
                             vendor,
                             &decision
                         )
                     );
-                    match decision {
-                        crate::encode::NodeDecision::KeepDefault => {}
+                    let node = match decision {
+                        crate::encode::NodeDecision::KeepDefault => pre_node.clone(),
                         crate::encode::NodeDecision::SwitchTo(path) => {
                             set_libva_driver_for(&nodes, &path);
-                            z.node = path.to_string_lossy().into_owned();
+                            path.to_string_lossy().into_owned()
                         }
                         crate::encode::NodeDecision::Decline { user, .. } => {
                             // A zero-copy DECLINE (`true`), not this recording's failure:
                             // nothing has been encoded and the CPU path can do it all. The
                             // USER half of the reason, because a fallback reason can reach a
                             // failure dialog verbatim.
-                            z.error = Some((true, user));
+                            let _ = tx.send(Err((true, user)));
                             cb_stop.store(true, Ordering::Relaxed);
                             return;
                         }
-                    }
-                    let (mw, mh) = crate::encode::codec_capped_resolution(z.max_res, &z.codec);
-                    let (dw, dh) = crate::encode::fit_within(frame.width, frame.height, mw, mh);
-                    if let Ok(mut g) = cb_dims.lock() {
-                        *g = Some((frame.width, frame.height));
-                    }
-                    let hevc = match z.codec.as_str() {
-                        "h264" => false,
-                        "hevc" => true,
-                        _ => dw.max(dh) > 4096,
                     };
-                    match crate::encode::gpu::Encoder::new(
-                        &z.node, hevc, frame.width, frame.height, dw, dh, z.fps, z.bitrate,
-                    ) {
-                        Ok(e) => z.enc = Some(e),
-                        Err(e) => {
-                            // Cross-vendor import is exactly what the CPU readback path
-                            // exists for, and nothing has been encoded — a decline.
-                            z.error = Some((true, format!("encoder init: {e}")));
-                            cb_stop.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                    }
-                    match crate::encode::spawn_ffmpeg_encoded_media_clock(
-                        hevc, z.fps, &z.temp, &cb_mic_fifo, &cb_sys_fifo,
-                    ) {
-                        Ok(mut c) => {
-                            let Some(mut stdin) = c.stdin.take() else {
-                                z.enc = None;
-                                // ffmpeg itself, not the GPU path: the CPU path would
-                                // meet the same failure (mirrors the screencopy sibling).
-                                z.error = Some((false, "muxer stdin unavailable".to_string()));
-                                cb_stop.store(true, Ordering::Relaxed);
-                                return;
-                            };
-                            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-                            let writer = std::thread::spawn(move || {
-                                while let Ok(bytes) = rx.recv() {
-                                    if stdin.write_all(&bytes).is_err() {
-                                        break;
-                                    }
-                                }
-                            });
-                            // Armed BEFORE the muxer can be handed any bytes: a
-                            // startup scheduler wedge (DRAGON-118/123) never reads
-                            // stdin, and the pause gate matches the CPU owned
-                            // paths' reasoning (this session-long muxer is fed
-                            // nothing while paused, by design).
-                            z.watchdog = Some(super::MuxerWatchdog::arm_gated(
-                                c.id(), z.temp.clone(), cb_paused_watchdog.clone(),
-                            ));
-                            z.tx = Some(tx);
-                            z.writer = Some(writer);
-                            z.child = Some(c);
-                            z.is_hevc = hevc;
-                        }
-                        Err(e) => {
-                            z.enc = None;
-                            // Same reasoning as the stdin arm above: an ffmpeg that will
-                            // not spawn is not a zero-copy problem.
-                            z.error = Some((false, format!("muxer spawn: {e}")));
-                            cb_stop.store(true, Ordering::Relaxed);
-                            return;
-                        }
-                    }
+                    let _ = tx.send(Ok(FirstDmabuf {
+                        width: frame.width,
+                        height: frame.height,
+                        node,
+                        at: std::time::Instant::now(),
+                    }));
+                    return;
+                }
+                let mut z = lock(&cb_sess);
+                if z.error.is_some() {
+                    return;
+                }
+                if z.enc.is_none() {
+                    // Still warming up (audio pre-flight / encoder build): there is nothing
+                    // to encode with. Counted, not silent.
+                    z.dropped_warmup += 1;
+                    return;
                 }
                 let outcome: Result<(), String> = {
                     let Session { enc, tx, .. } = &mut *z;
@@ -552,7 +576,134 @@ fn record_pipewire_zero_copy_owned(
                         cb_stop.store(true, Ordering::Relaxed);
                     }
                 }
-            });
+            })
+        })
+    };
+
+    /// Stop the attempt and join its capture thread, for the paths that give up before the
+    /// session's own stop tail exists.
+    fn abandon_capture(
+        zc_stop: &Arc<AtomicBool>,
+        capture: std::thread::JoinHandle<Result<(), String>>,
+    ) {
+        zc_stop.store(true, Ordering::Relaxed);
+        let _ = capture.join();
+    }
+
+    // BOUNDED confirmation wait (DRAGON-118). The watchdog above independently trips
+    // `zc_stop` on its own timeout and on a user stop, which drops the callback and
+    // disconnects this channel, so the two bounds agree rather than stacking.
+    let first = match confirm_rx.recv_timeout(FIRST_FRAME_BUDGET) {
+        Ok(Ok(f)) => f,
+        Ok(Err((can_fall_back, reason))) => {
+            abandon_capture(&zc_stop, capture);
+            return if can_fall_back {
+                ZcOutcome::Fallback(reason)
+            } else {
+                ZcOutcome::Done(Err(reason))
+            };
+        }
+        // THE field case (DRAGON-422): the compositor never handed us a dmabuf frame. With
+        // the DRAGON-658 ordering nothing was recorded AND no audio was ever started, so
+        // this is a clean decline and the CPU readback path is exactly the answer.
+        Err(_) => {
+            abandon_capture(&zc_stop, capture);
+            return ZcOutcome::Fallback(
+                "zero-copy: no dmabuf frames (compositor declined dmabuf?)".to_string(),
+            );
+        }
+    };
+    if let Ok(mut g) = dims.lock() {
+        *g = Some((first.width, first.height));
+    }
+
+    // WARM (DRAGON-657/658): the stream has provably delivered a real frame. Report it,
+    // then start audio, and nothing may come between the two.
+    super::owned::mark_first_frame(warm_at, first.at);
+    let owned = match super::owned::try_start_owned_audio() {
+        Ok(o) => {
+            log::info!("zero-copy pipeline: media-clock owned path (DRAGON-127)");
+            o
+        }
+        Err(reason) => {
+            log::error!("zero-copy pipeline: audio pre-flight failed ({reason}); cannot record");
+            abandon_capture(&zc_stop, capture);
+            // Fatal, not `Fallback` (see the fn doc): the CPU path would only run the
+            // SAME pre-flight again and fail the same way, one whole recording later.
+            return ZcOutcome::Done(Err(format!("could not start recording audio: {reason}")));
+        }
+    };
+    let super::owned::OwnedAudioStart {
+        capture_start, mic_fifo_path, sys_fifo_path, mic_tap, mic_rx, monitor, sys_rx,
+    } =
+        owned;
+
+    let pump_cfg = super::pump::PumpConfig {
+        fps: fps.max(1),
+        audio_offset_ms,
+        auto_device_compensation,
+        mic_on0: mic,
+        sys_on0: system_audio,
+        duck_system: crate::audio::config::recording_duck_system(),
+    };
+    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672): the file begins where
+    // the warming spinner clears, which is the same instant the user is told recording
+    // started. See `owned::media_zero` for the whole argument.
+    let session_start =
+        super::owned::media_zero(capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
+
+    // The pump thread borrows `events`/`stop`/`paused` for its own lifetime (see
+    // `pump::spawn`'s doc) — `std::thread::scope` is what makes that sound, exactly
+    // like the CPU owned paths.
+    /// One channel's mute intervals plus the session's frame/codec facts — named
+    /// so the `std::thread::scope` return type below doesn't trip clippy's
+    /// `type_complexity` (mirrors `pipewire::MuteIntervals`'s same reason).
+    type OwnedZcResult = (Vec<(f64, f64)>, Vec<(f64, f64)>, u64, bool);
+    /// A failed session, and whether it is a zero-copy decline the caller may still
+    /// cover with the CPU path (`true`) or this recording's own failure (`false`) —
+    /// the scope's error half of the [`ZcOutcome`] split.
+    type OwnedZcError = (bool, String);
+    let scope_result: Result<OwnedZcResult, OwnedZcError> = std::thread::scope(|scope| {
+            let (pump_handle, _ticker) = match super::pump::spawn(
+                scope, session_start, pump_cfg, mic_fifo_path.clone(), sys_fifo_path.clone(),
+                mic_tap, mic_rx, monitor, sys_rx, &zc_stop, &paused, events,
+            ) {
+                Ok(v) => v,
+                // The audio captures are gone with the failed spawn (see `pump::spawn`'s
+                // own note) and nothing was recorded; the CPU path starts clean.
+                Err(e) => {
+                    abandon_capture(&zc_stop, capture);
+                    return Err((true, e));
+                }
+            };
+
+            // Now legally on the scope-owning thread: build the encoder and the muxer from
+            // the confirmed metadata, which also flips the session to READY. A failure is
+            // recorded and stopped rather than returned, so the shared stop tail below
+            // still tears the pump and the capture thread down exactly as it always did.
+            let build = {
+                let mut z = lock(&sess);
+                start_encoding(&mut z, &first, &mic_fifo_path, &sys_fifo_path, &paused)
+            };
+            if let Err(err) = build {
+                lock(&sess).error = Some(err);
+                zc_stop.store(true, Ordering::Relaxed);
+            } else {
+                // SETTLED (DRAGON-661). This arm has no opening catch-up phase to end (see
+                // `record_screencopy_zero_copy_owned`'s doc for why that was deliberately
+                // left alone), so its equivalent instant is the one right here: the encoder
+                // and the muxer exist, the session is READY, and the capture callback stops
+                // dropping what arrives. Everything the UI's live declaration is waiting on
+                // has happened, and nothing further is bring-up.
+                super::owned::mark_settled(settled_at, std::time::Instant::now());
+            }
+
+            // The capture thread runs the session from here; it returns once `zc_stop` is
+            // set (by the user's stop through the mirror thread, by the build failure
+            // above, or by a live encode failure in the callback).
+            let run = capture
+                .join()
+                .unwrap_or_else(|_| Err("the zero-copy capture thread panicked".to_string()));
 
             // Stop: the pump IS the audio drain — join its control thread first
             // (mirrors every other owned path's stop tail exactly). The PRIVATE flag —
@@ -572,15 +723,23 @@ fn record_pipewire_zero_copy_owned(
 
             // Log the residual A/V length gap this model can't close (see the fn
             // doc) — informational only; `-shortest` already makes it safe.
-            let mut z = sess.borrow_mut();
+            let mut z = lock(&sess);
             let covered = z.frames as f64 / z.fps.max(1) as f64;
             let residual = pump_out.final_media - covered;
             if residual > 0.0 {
                 log::info!(
                     "zero-copy owned session: video covers {covered:.3}s vs audio media \
-                     {:.3}s (residual {residual:.3}s, expected ≤ ~1/{} frame period — see \
-                     record_pipewire_zero_copy_owned's doc)",
+                     {:.3}s (residual {residual:.3}s, expected ≤ ~1/{} frame period plus the \
+                     warmup gap, see record_pipewire_zero_copy_owned's doc)",
                     pump_out.final_media, z.fps.max(1),
+                );
+            }
+            if z.dropped_warmup > 0 {
+                log::info!(
+                    "zero-copy owned session: {} frame(s) arrived while the session was still \
+                     warming up (audio pre-flight + encoder build) and had nothing to be \
+                     encoded with",
+                    z.dropped_warmup
                 );
             }
 
@@ -616,13 +775,14 @@ fn record_pipewire_zero_copy_owned(
                 log::warn!("zero-copy error after recording started ({e}); keeping what's recorded");
             }
             if frames == 0 {
-                // THE field case (DRAGON-422): the compositor never handed us a dmabuf
-                // frame, so the muxer was never spawned and the pump's rendezvous had
-                // nothing to meet. Nothing was recorded — a decline, and the CPU
+                // A frame WAS confirmed (this session got past the wait above), so the
+                // stream declining outright is no longer what this means: nothing survived
+                // the warmup. Nothing was recorded either way: a decline, and the CPU
                 // readback path is exactly the answer, IF the session is still wanted.
                 return Err((
                     true,
-                    "zero-copy: no dmabuf frames (compositor declined dmabuf?)".to_string(),
+                    "zero-copy: no frames were encoded after the first one was confirmed"
+                        .to_string(),
                 ));
             }
             match wait_result {
@@ -1251,6 +1411,13 @@ pub(crate) enum ZcOutcome {
 #[cfg(feature = "zero-copy")]
 const FIRST_FRAME_BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 
+/// How many capture buffers the screencopy zero-copy session cycles, so the compositor
+/// never overwrites one the GPU is still encoding (single-buffer reuse would tear). Named
+/// (DRAGON-658) because the confirm step and the steady loop now live in different
+/// functions and must agree on it.
+#[cfg(feature = "zero-copy")]
+const ZC_POOL: usize = 3;
+
 /// Poll interval of the watchdog/mirror thread — the most a user's stop can be delayed
 /// on its way into the zero-copy session's private stop flag. Far below one frame at any
 /// supported rate, so a stop still costs at most a frame of extra recording.
@@ -1279,16 +1446,27 @@ fn trailing_frames_needed(frames_encoded: u64, fps: u32, final_media: f64) -> u6
 /// We cycle a small pool of buffers so the compositor never overwrites one the GPU
 /// is still encoding (single-buffer reuse would tear).
 ///
-/// Runs its own audio pre-flight check ([`super::owned::try_start_owned_audio`])
-/// before committing to the owned zero-copy session; a failure there reports as
-/// [`ZcOutcome::Fallback`] so the caller (`record::screencopy`'s owned loop, which by
-/// construction already holds its OWN successfully-started `OwnedAudioStart`) simply
-/// continues with its CPU readback path instead — this function never gets to touch
-/// that outer one. `stop`/`paused` take owned `Arc<AtomicBool>` (not a bare
-/// `&AtomicBool`, unlike this file's other zero-copy caller convention) because the
-/// owned variant needs a genuine `Arc` to hand to [`super::MuxerWatchdog::arm_gated`]
-/// (its own background thread isn't scoped) — `record::screencopy`'s caller already
-/// holds a real `Arc`, so this costs it nothing.
+/// ORDER (DRAGON-658): this CONFIRMS its own capture first (allocate the pool, open the
+/// encoder, capture ONE real frame and encode it), and only then reports the warm instant
+/// ([`super::owned::mark_first_frame`]) and runs the audio pre-flight
+/// ([`super::owned::try_start_owned_audio`]), inline, exactly once. Every decline is
+/// therefore free: nothing audio-side has been started on either side of it, and the
+/// caller (`record::screencopy`) simply carries on with its CPU readback path, which then
+/// runs the session's ONE pre-flight itself.
+///
+/// That is a change of shape from the arrangement this replaces, where the caller already
+/// held an `OwnedAudioStart` before this was called and this ran a SECOND one: a decline
+/// then threw a whole pre-flight away (two mic ffmpegs, two pulse clients, two pairs of
+/// FIFOs) on every zero-copy fallback. Both zero-copy siblings now classify a failed
+/// pre-flight the same way, as this recording's FAILURE ([`ZcOutcome::Done`]) rather than
+/// a fallback, because the CPU path would only run the same pre-flight against the same
+/// sound server and fail the same way, one whole recording later.
+///
+/// `stop`/`paused` take owned `Arc<AtomicBool>` (not a bare `&AtomicBool`, unlike this
+/// file's other zero-copy caller convention) because the owned variant needs a genuine
+/// `Arc` to hand to [`super::MuxerWatchdog::arm_gated`] (its own background thread isn't
+/// scoped). `record::screencopy`'s caller already holds a real `Arc`, so this costs it
+/// nothing.
 #[cfg(feature = "zero-copy")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_screencopy_zero_copy(
@@ -1301,6 +1479,10 @@ pub(crate) fn record_screencopy_zero_copy(
     fps: u32,
     codec: &str,
     max_res: (u32, u32),
+    // The countdown gate (DRAGON-673): the app raises it when it promotes the recording, and
+    // media 0 waits for it, so a countdown warms the whole pipeline behind its own digits and
+    // the file still starts where the promotion does.
+    start_gate: Option<Arc<AtomicBool>>,
     mic: bool,
     system_audio: bool,
     bitrate_kbps: u32,
@@ -1311,21 +1493,129 @@ pub(crate) fn record_screencopy_zero_copy(
     paused: Arc<AtomicBool>,
     events: &Mutex<Vec<ToggleEvent>>,
     dims: &Mutex<Option<(u32, u32)>>,
+    warm_at: &Mutex<Option<std::time::Instant>>,
+    settled_at: &Mutex<Option<std::time::Instant>>,
     metadata: &str,
 ) -> ZcOutcome {
+    let confirmed = match confirm_screencopy_zero_copy(
+        conn, queue, data, qh, session, formats, fps, codec, max_res, bitrate_kbps, dims,
+    ) {
+        Ok(c) => c,
+        // Nothing was started, on either side: the caller's CPU path can have the whole
+        // recording, including the session's one and only audio pre-flight.
+        Err(e) => return ZcOutcome::Fallback(e),
+    };
+    // WARM (DRAGON-657/658): a real frame has been captured AND encoded, so the GPU path
+    // is proven end to end. Report it, then start audio, and nothing may come between.
+    super::owned::mark_first_frame(warm_at, confirmed.first_at);
     match super::owned::try_start_owned_audio() {
         Ok(owned) => {
             log::info!("screencopy zero-copy pipeline: media-clock owned path (DRAGON-127)");
             record_screencopy_zero_copy_owned(
-                conn, queue, data, qh, session, formats, fps, codec, max_res, mic, system_audio,
-                bitrate_kbps, audio_offset_ms, auto_device_compensation, out_path, stop, paused,
-                events, dims, metadata, owned,
+                conn, queue, data, qh, session, start_gate, mic, system_audio, audio_offset_ms,
+                auto_device_compensation, out_path, stop, paused, events, settled_at, metadata,
+                confirmed, owned,
             )
         }
-        Err(reason) => ZcOutcome::Fallback(format!(
-            "zero-copy audio pre-flight failed ({reason})"
-        )),
+        Err(reason) => {
+            log::error!(
+                "zero-copy pipeline: audio pre-flight failed ({reason}); cannot record"
+            );
+            ZcOutcome::Done(Err(format!("could not start recording audio: {reason}")))
+        }
     }
+}
+
+/// A CONFIRMED screencopy zero-copy capture (DRAGON-658): the buffer pool, the open
+/// encoder, and the FIRST real frame already captured and encoded.
+///
+/// The first frame's compressed bytes are carried as a plain `Vec<u8>`, not as a borrowed
+/// handle, which is what makes the ordering safe: they sit here across the whole audio
+/// pre-flight and are written to the muxer the moment it exists.
+#[cfg(feature = "zero-copy")]
+struct ZcConfirmed {
+    targets: Vec<DmabufTarget>,
+    enc: ZcEncoder,
+    hevc: bool,
+    fps: u32,
+    /// The compressed bytes of the first real captured frame (possibly empty: the encoder
+    /// may hold the packet back, exactly as in the steady loop).
+    first_bytes: Vec<u8>,
+    /// The instant the compositor handed back that first frame.
+    first_at: std::time::Instant,
+    /// The pool index the steady loop starts from (the confirm used index 0).
+    next_idx: usize,
+}
+
+/// Bring the GPU zero-copy capture up and PROVE it works, before any audio exists: the
+/// dmabuf pool, the encode geometry, the encoder itself, and one real capture+encode
+/// round trip. Every failure is a `Err(reason)` the caller turns into
+/// [`ZcOutcome::Fallback`], and every one of them is free, because this touches nothing
+/// but the compositor and the GPU.
+///
+/// Split out of the owned session (DRAGON-658) precisely so the confirm can happen BEFORE
+/// the audio pre-flight rather than after it.
+#[cfg(feature = "zero-copy")]
+#[allow(clippy::too_many_arguments)]
+fn confirm_screencopy_zero_copy(
+    conn: &Connection,
+    queue: &mut EventQueue<ScreencopyClient>,
+    data: &mut ScreencopyClient,
+    qh: &QueueHandle<ScreencopyClient>,
+    session: &CaptureSession,
+    formats: &Formats,
+    fps: u32,
+    codec: &str,
+    max_res: (u32, u32),
+    bitrate_kbps: u32,
+    dims: &Mutex<Option<(u32, u32)>>,
+) -> Result<ZcConfirmed, String> {
+    // We cycle a small pool of buffers so the compositor never overwrites one the GPU is
+    // still encoding (single-buffer reuse would tear).
+    let mut targets: Vec<DmabufTarget> = Vec::with_capacity(ZC_POOL);
+    for _ in 0..ZC_POOL {
+        targets.push(DmabufTarget::new(formats, &data.dmabuf_state, qh)?);
+    }
+    let (cw, ch) = formats.buffer_size;
+    let fps = fps.max(1);
+    let (mw, mh) = crate::encode::codec_capped_resolution(max_res, codec);
+    let (ew, eh) = crate::encode::fit_within(cw, ch, mw, mh);
+    if let Ok(mut g) = dims.lock() {
+        *g = Some((cw, ch));
+    }
+    let hevc = match codec {
+        "h264" => false,
+        "hevc" => true,
+        _ => ew.max(eh) > 4096,
+    };
+    let mut enc = ZcEncoder::new(&targets[0].render_node, hevc, cw, ch, ew, eh, fps, bitrate_kbps)
+        .map_err(|e| format!("encoder init: {e}"))?;
+
+    // ONE real capture + encode. This is the confirmation the whole ordering rests on: an
+    // encoder that opened but cannot import the compositor's buffers (cross-vendor) fails
+    // HERE, where declining still costs nothing.
+    let damage = [Rect { x: 0, y: 0, width: cw as i32, height: ch as i32 }];
+    data.result = None;
+    session.capture(&targets[0].buffer, &damage, qh, ScreencopyFrameData::default());
+    conn.flush().map_err(|e| format!("zero-copy first capture: {e}"))?;
+    let mut guard = 0;
+    while data.result.is_none() {
+        if queue.blocking_dispatch(data).is_err() {
+            break;
+        }
+        guard += 1;
+        if guard > 400 {
+            break;
+        }
+    }
+    if !matches!(data.result.clone(), Some(Ok(_))) {
+        return Err("the compositor never filled the first zero-copy buffer".to_string());
+    }
+    // The pixels became real when the compositor handed the buffer back, which is what the
+    // warmup signal must name.
+    let first_at = std::time::Instant::now();
+    let first_bytes = enc.encode(&targets[0]).map_err(|e| format!("gpu encode: {e}"))?;
+    Ok(ZcConfirmed { targets, enc, hevc, fps, first_bytes, first_at, next_idx: 1 })
 }
 
 /// The media-clock owned GPU zero-copy screencopy session (DRAGON-127): ONE
@@ -1340,6 +1630,25 @@ pub(crate) fn record_screencopy_zero_copy(
 /// exactly: at stop, it re-submits the last-used pool target through the encoder as
 /// many extra times as needed to cover the audio's measured media length (the
 /// dmabuf-frame analogue of `pump::VideoTicker::ticks_to_cover`).
+///
+/// Called with a `confirmed` capture that has already produced and encoded a real frame
+/// and an `owned` audio pre-flight that has already succeeded, in that order (DRAGON-658).
+/// `confirmed.first_bytes` is written to the muxer as soon as it is spawned.
+///
+/// One consequence of that order is worth naming: the confirmed frame is captured just
+/// BEFORE media 0 and the next one only after the pre-flight and the muxer spawn, so the
+/// video stream carries no frame for the pre-flight's span and the content after it leads
+/// the audio by that much. This is the same constant lead the path had before the
+/// reordering (where the whole GPU bring-up sat AFTER media 0 instead), not a new one, and
+/// `-shortest` plus the trailing coverage below still keep the two streams the same
+/// length. Covering the span properly would mean an opening burst of re-encoded copies of
+/// the confirmed frame, the dmabuf analogue of the RGBA workers' opening phase; that is
+/// deliberately NOT done here (DRAGON-658 kept its scope to the ordering).
+///
+/// With no such phase to end, DRAGON-661's `settled_at` reports at the first write below,
+/// where the confirmed frame reaches the muxer and the steady grab loop takes over. That is
+/// this path's equivalent instant, and every successful session must reach it, so the UI's
+/// live declaration cannot be left waiting on a signal a whole worker never sends.
 #[cfg(feature = "zero-copy")]
 #[allow(clippy::too_many_arguments)]
 fn record_screencopy_zero_copy_owned(
@@ -1348,64 +1657,27 @@ fn record_screencopy_zero_copy_owned(
     data: &mut ScreencopyClient,
     qh: &QueueHandle<ScreencopyClient>,
     session: &CaptureSession,
-    formats: &Formats,
-    fps: u32,
-    codec: &str,
-    max_res: (u32, u32),
+    // The countdown gate (DRAGON-673): the app raises it when it promotes the recording, and
+    // media 0 waits for it, so a countdown warms the whole pipeline behind its own digits and
+    // the file still starts where the promotion does.
+    start_gate: Option<Arc<AtomicBool>>,
     mic: bool,
     system_audio: bool,
-    bitrate_kbps: u32,
     audio_offset_ms: i32,
     auto_device_compensation: bool,
     out_path: &std::path::Path,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     events: &Mutex<Vec<ToggleEvent>>,
-    dims: &Mutex<Option<(u32, u32)>>,
+    settled_at: &Mutex<Option<std::time::Instant>>,
     metadata: &str,
+    confirmed: ZcConfirmed,
     owned: super::owned::OwnedAudioStart,
 ) -> ZcOutcome {
-    const POOL: usize = 3;
-    // --- init: any failure here means "fall back to the CPU path" (identical to
-    // the legacy path's own init section) ---
-    let mut targets: Vec<DmabufTarget> = Vec::with_capacity(POOL);
-    for _ in 0..POOL {
-        match DmabufTarget::new(formats, &data.dmabuf_state, qh) {
-            Ok(t) => targets.push(t),
-            Err(e) => {
-                owned.cleanup();
-                return ZcOutcome::Fallback(e);
-            }
-        }
-    }
-    let (cw, ch) = formats.buffer_size;
-    let fps = fps.max(1);
-    let (mw, mh) = crate::encode::codec_capped_resolution(max_res, codec);
-    let (ew, eh) = crate::encode::fit_within(cw, ch, mw, mh);
-    if let Ok(mut g) = dims.lock() {
-        *g = Some((cw, ch));
-    }
-    let hevc = match codec {
-        "h264" => false,
-        "hevc" => true,
-        _ => ew.max(eh) > 4096,
-    };
-    let mut enc = match ZcEncoder::new(
-        &targets[0].render_node,
-        hevc,
-        cw,
-        ch,
-        ew,
-        eh,
-        fps,
-        bitrate_kbps,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            owned.cleanup();
-            return ZcOutcome::Fallback(format!("encoder init: {e}"));
-        }
-    };
+    let ZcConfirmed { targets, mut enc, hevc, fps, first_bytes, first_at: _, next_idx } =
+        confirmed;
+    // The pool's buffers ARE the capture size (see `DmabufTarget::new`).
+    let (cw, ch) = (targets[0].width, targets[0].height);
     if let Some(parent) = out_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -1450,15 +1722,13 @@ fn record_screencopy_zero_copy_owned(
         sys_on0: system_audio,
         duck_system: crate::audio::config::recording_duck_system(),
     };
-    // Media time 0 is the instant AUDIO CAPTURE began (the pre-flight), not the
-    // instant the video side finished coming up (DRAGON-417). Everything above —
-    // the capture handshake, the first frame, ffmpeg's spawn — happened while the
-    // mic/system captures were already running and the app's indicator already said
-    // "recording"; anchoring here would place all of that audio at a negative media
-    // position, where the mixer discards it. The opening span is covered on the video
-    // side by the first frame instead (see `capture_start`'s doc).
-    let session_start = capture_start;
-    let mut last_idx: usize = 0;
+    // Media 0 is HERE, not at the audio pre-flight (DRAGON-672): the file begins where
+    // the warming spinner clears, which is the same instant the user is told recording
+    // started. See `owned::media_zero` for the whole argument.
+    let session_start =
+        super::owned::media_zero(capture_start, start_gate.as_deref(), &mic_rx, &sys_rx);
+    // The confirm used pool index 0, so the steady loop picks up from the next one.
+    let mut last_idx: usize = next_idx;
 
     type OwnedZcResult = (Vec<(f64, f64)>, Vec<(f64, f64)>);
     let scope_result: Result<OwnedZcResult, String> = std::thread::scope(|scope| {
@@ -1479,71 +1749,86 @@ fn record_screencopy_zero_copy_owned(
         let watchdog = super::MuxerWatchdog::arm_gated(child.id(), temp.clone(), paused.clone());
         let mut next = std::time::Instant::now() + frame_dur;
         let mut muxer_wedged = false;
-        let mut frames: u64 = 0;
+        // The confirmed first frame (DRAGON-658): captured and encoded before the audio
+        // pre-flight, held as bytes across it, and written the moment the muxer exists.
+        // Empty bytes still count as a frame, exactly as in the steady loop below: the
+        // encoder may hold the packet back, but the frame WAS fed.
+        let mut frames: u64 = 1;
+        let opening_ok = first_bytes.is_empty() || stdin.write_all(&first_bytes).is_ok();
 
-        'grab: loop {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            // Paused: feed the encoder NOTHING (mirrors the PipeWire owned
-            // sibling) — idle with the capture session open, a periodic
-            // roundtrip keeping the wayland socket drained.
-            if paused.load(Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(15));
-                if queue.roundtrip(data).is_err() {
-                    break 'grab;
-                }
-                next = std::time::Instant::now() + frame_dur;
-                continue;
-            }
-            let now = std::time::Instant::now();
-            if now < next {
-                std::thread::sleep(next - now);
-            }
-            next += frame_dur;
-            if next < now {
-                next = now + frame_dur;
-            }
-            if stop.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
-                continue;
-            }
-            let idx = last_idx % POOL;
-            last_idx = last_idx.wrapping_add(1);
-            let target = &targets[idx];
-            data.result = None;
-            session.capture(&target.buffer, &damage, qh, ScreencopyFrameData::default());
-            if conn.flush().is_err() {
-                break 'grab;
-            }
-            let mut guard = 0;
-            while data.result.is_none() {
-                if queue.blocking_dispatch(data).is_err() {
+        if opening_ok {
+            // SETTLED (DRAGON-661). This arm has no opening catch-up phase to end (see this
+            // function's own doc for why that was deliberately left alone), so its
+            // equivalent instant is the one right here: the confirmed frame has reached the
+            // muxer and the steady grab loop takes over from the next line. Everything the
+            // UI's live declaration is waiting on has happened. Inside the `opening_ok` test
+            // for the same reason as every other worker: a muxer that would not take the
+            // first write is dying, not settling.
+            super::owned::mark_settled(settled_at, std::time::Instant::now());
+            'grab: loop {
+                if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                guard += 1;
-                if guard > 400 {
-                    break;
-                }
-            }
-            match data.result.clone() {
-                Some(Ok(_)) => match enc.encode(target) {
-                    Ok(bytes) => {
-                        if !bytes.is_empty() && stdin.write_all(&bytes).is_err() {
-                            break 'grab;
-                        }
-                        frames += 1;
-                    }
-                    Err(e) => {
-                        log::error!("zero-copy owned session: gpu encode failed ({e}); stopping");
-                        stop.store(true, Ordering::Relaxed);
+                // Paused: feed the encoder NOTHING (mirrors the PipeWire owned
+                // sibling) — idle with the capture session open, a periodic
+                // roundtrip keeping the wayland socket drained.
+                if paused.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    if queue.roundtrip(data).is_err() {
                         break 'grab;
                     }
-                },
-                Some(Err(())) | None => {
-                    // A single missed/failed capture isn't fatal to a whole
-                    // session the way it was to a segment — keep going; the
-                    // muxer-liveness watchdog catches a truly wedged compositor.
+                    next = std::time::Instant::now() + frame_dur;
                     continue;
+                }
+                let now = std::time::Instant::now();
+                if now < next {
+                    std::thread::sleep(next - now);
+                }
+                next += frame_dur;
+                if next < now {
+                    next = now + frame_dur;
+                }
+                if stop.load(Ordering::Relaxed) || paused.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let idx = last_idx % ZC_POOL;
+                last_idx = last_idx.wrapping_add(1);
+                let target = &targets[idx];
+                data.result = None;
+                session.capture(&target.buffer, &damage, qh, ScreencopyFrameData::default());
+                if conn.flush().is_err() {
+                    break 'grab;
+                }
+                let mut guard = 0;
+                while data.result.is_none() {
+                    if queue.blocking_dispatch(data).is_err() {
+                        break;
+                    }
+                    guard += 1;
+                    if guard > 400 {
+                        break;
+                    }
+                }
+                match data.result.clone() {
+                    Some(Ok(_)) => match enc.encode(target) {
+                        Ok(bytes) => {
+                            if !bytes.is_empty() && stdin.write_all(&bytes).is_err() {
+                                break 'grab;
+                            }
+                            frames += 1;
+                        }
+                        Err(e) => {
+                            log::error!("zero-copy owned session: gpu encode failed ({e}); stopping");
+                            stop.store(true, Ordering::Relaxed);
+                            break 'grab;
+                        }
+                    },
+                    Some(Err(())) | None => {
+                        // A single missed/failed capture isn't fatal to a whole
+                        // session the way it was to a segment — keep going; the
+                        // muxer-liveness watchdog catches a truly wedged compositor.
+                        continue;
+                    }
                 }
             }
         }
@@ -1585,7 +1870,7 @@ fn record_screencopy_zero_copy_owned(
             let _nb = super::owned::NonblockingStdin::new(&stdin);
             if !muxer_wedged && frames > 0 {
                 let extra = trailing_frames_needed(frames, fps, pump_out.final_media);
-                let last_target = &targets[last_idx.wrapping_sub(1) % POOL];
+                let last_target = &targets[last_idx.wrapping_sub(1) % ZC_POOL];
                 for _ in 0..extra {
                     match enc.encode(last_target) {
                         Ok(bytes) => {

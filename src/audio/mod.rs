@@ -33,6 +33,10 @@ pub(crate) mod meters;
 // so the whole file is gated right here rather than per-item inside it.
 #[cfg(target_os = "linux")]
 mod pulse_ffi;
+/// The preview player's owned PulseAudio playback sink (DRAGON preview-hitch): the Linux
+/// analogue of the macOS AudioQueue sink, used by `app::preview::playback`.
+#[cfg(target_os = "linux")]
+pub(crate) mod pulse_out;
 // Live device-latency probe for the system-audio A/V-sync fix (DRAGON-119): samples
 // the SIGNED monitor record-stream latency via libpulse's async client API (the
 // value ffmpeg's pa_simple input clamps to 0). Reached as `crate::audio::MonitorLatencyProbe`.

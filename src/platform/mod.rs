@@ -447,8 +447,27 @@ pub const WIN11_MIN_BUILD: u32 = 22000;
 /// Below the gate the toplevels keep their own CSD min/max/close instead (the pre-DRAGON-284
 /// Windows path, still wired: those messages route to the native `toggle_maximize` /
 /// `minimize` helpers). Win11 is unaffected — it takes the exact path it ships today.
+///
+/// **Windows 10 was tried with a composited surface (DRAGON-666) and it is REFUSED, on
+/// measurement.** The two mechanisms above are one mechanism, and it is not "the buttons do
+/// not paint": they paint exactly where our chrome is TRANSPARENT, and on Windows 10 the
+/// strip they paint into has no backdrop material behind it, so that is where the window
+/// shows solid BLACK. The A/B, same build, same machine (Windows 10 19045, settings window):
+///
+/// | chrome | caption strip | buttons |
+/// | --- | --- | --- |
+/// | glass (transparent) | a black band across the titlebar | visible |
+/// | `CCK_NO_GLASS=1` (opaque) | no band, chrome is uniform | GONE |
+///
+/// So on Windows 10 native buttons and a black titlebar are the same fact, and the trade is
+/// not worth taking. Windows 11 is unaffected because Mica fills that strip.
+///
+/// What would change the answer is giving the strip a material on Windows 10 — the
+/// blur-behind accent policy we already apply for the client area does NOT reach the
+/// extended frame region, which is what this measured. Until something does, Windows 10
+/// keeps the CSD buttons, and it now keeps them over chrome that is finally translucent.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn win_build_paints_native_caption_buttons(build: u32) -> bool {
+pub fn win_build_paints_native_caption_buttons(build: u32, _dcomp: bool) -> bool {
     build >= WIN11_MIN_BUILD
 }
 
@@ -548,9 +567,14 @@ pub fn win_build_is_windows_10(build: u32) -> bool {
 ///
 /// Windows 11 stays on wgpu, byte-identical: it is translucent there today and moving it to
 /// a CPU rasterizer would cost frame rate for nothing.
+///
+/// `dcomp` (DRAGON-666) is the way OUT of this: a DirectComposition surface has real
+/// per-pixel alpha on Windows 10 too — measured, translucent, GPU-rendered — so the CPU
+/// rasterizer has nothing left to fix and this returns false. The force survives only as the
+/// fallback for a run that turned DComp off.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn win_build_software_overlays(build: u32) -> bool {
-    win_build_is_windows_10(build)
+pub fn win_build_software_overlays(build: u32, dcomp: bool) -> bool {
+    win_build_is_windows_10(build) && !dcomp
 }
 
 /// Pure: may the preview EDITOR be the fullscreen OVERLAY on this OS `build` (DRAGON-427)?
@@ -562,9 +586,14 @@ pub fn win_build_software_overlays(build: u32) -> bool {
 /// the setting that offers the choice is disabled there rather than merely hidden: a user
 /// whose config already says `preview_windowed = false` must land on the window, not on a
 /// broken overlay.
+///
+/// `dcomp` (DRAGON-666) lifts it on Windows 10: the ban exists only because the software
+/// rasterizer cannot draw the editor's shader layers, and with a DirectComposition surface
+/// that process keeps wgpu. So the editor's overlay shape, its settings row and its toolbar
+/// toggle all come back on Windows 10, which is the whole reason this parameter exists.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn win_build_has_overlay_preview(build: u32) -> bool {
-    !win_build_is_windows_10(build)
+pub fn win_build_has_overlay_preview(build: u32, dcomp: bool) -> bool {
+    !win_build_software_overlays(build, dcomp)
 }
 
 /// Runtime seam: must THIS machine software-render its overlays? Windows 10 only; `false`
@@ -576,7 +605,9 @@ pub fn software_overlays() -> bool {
         // An UNREADABLE build number reads as "not Windows 10" — the safe side: we keep the
         // GPU renderer that works on every OS we ship for rather than silently degrading a
         // machine we could not identify. Same convention as `native_caption_buttons_supported`.
-        crate::platform::windows::window::os_build().is_some_and(win_build_software_overlays)
+        let dcomp = dcomp_enabled();
+        crate::platform::windows::window::os_build()
+            .is_some_and(|b| win_build_software_overlays(b, dcomp))
     }
     #[cfg(not(windows))]
     {
@@ -606,8 +637,9 @@ pub fn overlay_preview_available() -> bool {
         // An unreadable build keeps the overlay editor — the same safe side as
         // `software_overlays` (the two must agree, or a process could end up software-rendered
         // WITH an overlay editor, which is the one combination that cannot draw).
+        let dcomp = dcomp_enabled();
         crate::platform::windows::window::os_build()
-            .is_none_or(win_build_has_overlay_preview)
+            .is_none_or(|b| win_build_has_overlay_preview(b, dcomp))
     }
     #[cfg(target_os = "linux")]
     {
@@ -913,6 +945,106 @@ pub fn portal_fallback_session() -> bool {
 /// (DRAGON-408). Temporary — see [`win_overlay_is_layered`].
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const WIN10_LAYERED_ENV: &str = "CCK_WIN10_LAYERED";
+
+// ── DRAGON-666: the DirectComposition presentation experiment ────────────────
+//
+// The question every Windows overlay bug since DRAGON-403 has actually been asking, asked
+// properly for once.
+//
+// What we do today: wgpu presents the overlay from a `CreateSwapChainForHwnd` surface,
+// which reports `composite_alpha_modes = [Opaque]` and nothing else, so iced's alpha
+// selection falls through to `Auto`. The window is translucent anyway ONLY because winit
+// calls `DwmEnableBlurBehindWindow` with an empty region at creation
+// (`winit-win32/src/window.rs`), which makes DWM honour the alpha channel of the window's
+// REDIRECTION SURFACE. That holds exactly as long as DWM composites the window through
+// that surface — and a fullscreen, topmost, monitor-sized window (ours, precisely) is the
+// prime candidate for the driver to promote onto its own hardware plane, where nothing
+// applies the alpha and the raw RGB shows: transparent black, i.e. the black overlay.
+//
+// That is one mechanism for FOUR reports we treated as three different bugs: Windows 10
+// hardware (DRAGON-403/427), the WARP adapter in a VM (DRAGON-408's void measurement), and
+// now a Windows 11 NVIDIA desktop. The variable was never the OS version. It was whether
+// this machine's composition path shows per-pixel alpha at all.
+//
+// The supported alternative is a DirectComposition swapchain. `wgpu-hal`'s DX12 backend
+// already builds one from a plain HWND (`Dx12SwapchainKind::DxgiFromVisual`), and that
+// surface reports `PostMultiplied` + `PreMultiplied`, which iced's selection already
+// prefers over `Auto`. So the whole change is one environment variable — plus the one-line
+// iced-fork commit that makes iced read the environment at all (see `FORKED_CHANGES.md`).
+//
+// It is an EXPERIMENT and it is opt-in, because it must be measured on machines nobody
+// here owns: a Windows 11 box that is black today, and a Windows 10 box (which currently
+// takes the tiny-skia force instead, and would never reach a swapchain to configure).
+// Delete it the moment the answer is known — an experiment left in the tree becomes a
+// configuration surface nobody can remove later.
+
+/// The env var that turns the DRAGON-666 DirectComposition experiment on.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WIN_DCOMP_ENV: &str = "CCK_WIN_DCOMP";
+
+/// The value `WGPU_DX12_PRESENTATION_SYSTEM` takes when the experiment is on: wgpu's own
+/// spelling for "present through a DirectComposition visual built from the HWND".
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WGPU_DCOMP_VALUE: &str = "DxgiFromVisual";
+
+/// The wgpu env var that selects the DX12 presentation system.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WGPU_PRESENTATION_ENV: &str = "WGPU_DX12_PRESENTATION_SYSTEM";
+
+/// The wgpu env var that picks the BACKEND, and the value that pins it to DX12.
+///
+/// **Setting the presentation system without this does nothing on most real hardware**,
+/// which is how the first build reached a customer and rendered every window solid: wgpu
+/// picked VULKAN on her GTX 1080 Ti, `WGPU_DX12_PRESENTATION_SYSTEM` is a DX12-only option,
+/// and the Vulkan surface reports `composite_alpha_modes = [Opaque]` exactly as the HWND one
+/// does. Her log named it in one line — `backend: Vulkan` — which is the whole reason that
+/// line is now captured (see `diag::DEP_INFO_TARGET_PREFIX`).
+///
+/// The two VMs never showed it because WARP has no Vulkan at all (their logs carry
+/// `Returned GL context is 1.1` beside it), so they fell to DX12 and the option applied.
+/// A VM is not a GPU; this is the second time that has cost a wrong conclusion here.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WGPU_BACKEND_ENV: &str = "WGPU_BACKEND";
+/// wgpu's own spelling for the DX12 backend (`Backends::from_comma_list`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const WGPU_BACKEND_DX12: &str = "dx12";
+
+/// Pure, unit-tested: does this run present through a DirectComposition visual, given the
+/// raw value of [`WIN_DCOMP_ENV`]?
+///
+/// **DEFAULT ON**, and only the exact value `"0"` turns it off. It shipped as an opt-in
+/// experiment and became the default the moment it was measured, on both Windows versions:
+///
+/// * Windows 10 19045 and Windows 11 26200, region overlay, control arm: 97.8% and 99.1% of
+///   the frame PURE BLACK, the app's own UI drawn correctly over it. The customer's report,
+///   reproduced with no NVIDIA hardware anywhere near it.
+/// * The same two machines with this on: translucent, the desktop visible through the dim.
+/// * The same two machines' logs: an HWND surface offers `[Opaque]` and NOTHING else, so the
+///   alpha selection falls through to `Auto`; a composition surface offers `PostMultiplied`
+///   and `PreMultiplied`, and the renderer takes one.
+///
+/// The escape hatch is the exact `"0"` and it exists because this is the presentation path
+/// for every Windows window we own: if some driver hates it, a customer can get the old
+/// behaviour back in one environment variable while we fix it, rather than downgrading.
+/// Anything else — unset, `"1"`, empty, junk — is on.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn win_dcomp_enabled(env: Option<&str>) -> bool {
+    env != Some("0")
+}
+
+/// Runtime seam: is THIS process presenting through a DirectComposition visual? The env read
+/// behind [`win_dcomp_enabled`], for the gates below that have to ask.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn dcomp_enabled() -> bool {
+    #[cfg(windows)]
+    {
+        win_dcomp_enabled(std::env::var(WIN_DCOMP_ENV).ok().as_deref())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
 
 /// Pure: should the capture overlay carry `WS_EX_LAYERED` on this OS `build`, given the
 /// raw value of [`WIN10_LAYERED_ENV`]?
@@ -1544,22 +1676,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_caption_buttons_are_windows_11_only() {
-        // Win11 21H2 (the first 22000 build) and everything after it: the DRAGON-284
-        // native DWM caption buttons stay exactly as they ship today.
-        assert!(win_build_paints_native_caption_buttons(22000)); // 21H2
-        assert!(win_build_paints_native_caption_buttons(22621)); // 22H2 (the Mica floor)
-        assert!(win_build_paints_native_caption_buttons(22631)); // 23H2
-        assert!(win_build_paints_native_caption_buttons(26100)); // 24H2
-        assert!(win_build_paints_native_caption_buttons(u32::MAX)); // future builds
-        // Windows 10 (any servicing level) and older: CSD buttons instead (DRAGON-403).
-        assert!(!win_build_paints_native_caption_buttons(19045)); // 22H2, the last Win10
-        assert!(!win_build_paints_native_caption_buttons(19041)); // 2004
-        assert!(!win_build_paints_native_caption_buttons(10240)); // Win10 RTM
-        assert!(!win_build_paints_native_caption_buttons(9600)); // Win8.1
-        // A build number that could not be read at all reads as 0 → treated as Win10,
-        // i.e. the SAFE side: we draw our own buttons rather than trust DWM to.
-        assert!(!win_build_paints_native_caption_buttons(0));
+    fn native_caption_buttons_need_windows_11_or_a_composited_windows_10() {
+        // Win11 21H2 and everything after it: unchanged, and unchanged WHATEVER dcomp says.
+        for dcomp in [true, false] {
+            assert!(win_build_paints_native_caption_buttons(22000, dcomp)); // 21H2
+            assert!(win_build_paints_native_caption_buttons(22621, dcomp)); // 22H2 (Mica floor)
+            assert!(win_build_paints_native_caption_buttons(22631, dcomp)); // 23H2
+            assert!(win_build_paints_native_caption_buttons(26100, dcomp)); // 24H2
+            assert!(win_build_paints_native_caption_buttons(u32::MAX, dcomp));
+            // Windows 8.1 and older never had the recipe, dcomp or not.
+            assert!(!win_build_paints_native_caption_buttons(9600, dcomp));
+            // An unreadable build reads as 0: the SAFE side is our own buttons, which
+            // always render, over DWM's, which may not.
+            assert!(!win_build_paints_native_caption_buttons(0, dcomp));
+        }
+        // WINDOWS 10 stays on its own buttons at EITHER setting, and that is a measurement,
+        // not caution (DRAGON-666): a composited Windows 10 does paint the DWM cluster, but
+        // only into a strip that renders solid BLACK there for want of a backdrop material,
+        // so the buttons and a black titlebar arrive together. The A/B is in the doc above.
+        for build in [10240, 19041, 19045, 21999] {
+            for dcomp in [true, false] {
+                assert!(
+                    !win_build_paints_native_caption_buttons(build, dcomp),
+                    "{build} dcomp={dcomp}: Windows 10 keeps its CSD buttons"
+                );
+            }
+        }
     }
 
     // DRAGON-408 deleted `layered_per_pixel_alpha_is_windows_11_only` along with the gate it
@@ -1630,6 +1772,29 @@ mod tests {
         }
     }
 
+    /// DRAGON-666. The DirectComposition experiment is OFF unless asked for by the exact
+    /// value, and it is deliberately NOT build-keyed: the whole point is that the thing it
+    /// fixes was never the OS version, so a Windows 10 tester and a Windows 11 tester run
+    /// the same switch and their answers are comparable.
+    #[test]
+    fn the_dcomp_experiment_needs_an_exact_one_and_asks_nothing_about_the_os() {
+        // DEFAULT ON: unset is the composited path, because that is the supported one and
+        // the HWND path is measured broken on both Windows versions.
+        assert!(win_dcomp_enabled(None));
+        assert!(win_dcomp_enabled(Some("1")));
+        // The escape hatch is the EXACT "0" and nothing else -- a customer with a driver
+        // that hates this gets the old behaviour back in one variable.
+        assert!(!win_dcomp_enabled(Some("0")));
+        for junk in ["", " ", "0 ", "00", "false", "no", "off", "O"] {
+            assert!(win_dcomp_enabled(Some(junk)), "{junk:?} must not read as off");
+        }
+        // The value we hand wgpu is its own spelling, not ours — a typo here is a silent
+        // no-op inside wgpu (it falls back to the default), which is the one failure mode
+        // a tester could not distinguish from "the experiment did not help".
+        assert_eq!(WGPU_DCOMP_VALUE, "DxgiFromVisual");
+        assert_eq!(WGPU_PRESENTATION_ENV, "WGPU_DX12_PRESENTATION_SYSTEM");
+    }
+
     #[test]
     fn the_layered_experiment_covers_exactly_the_windows_10_band() {
         // Same band as every other Win10 predicate — one definition of "this is Windows 10",
@@ -1675,31 +1840,38 @@ mod tests {
     #[test]
     fn the_software_renderer_gate_is_exactly_the_windows_10_band() {
         for build in [0, 9600, 10240, 19041, 19045, 21999, 22000, 22621, 26100, u32::MAX] {
+            // WITHOUT a composited surface the old rule stands, exactly.
             assert_eq!(
-                win_build_software_overlays(build),
+                win_build_software_overlays(build, false),
                 win_build_is_windows_10(build),
                 "build {build}: software overlays must be exactly the Win10 band"
             );
-            // The overlay EDITOR is the complement: available everywhere the software
-            // rasterizer is not forced.
-            assert_eq!(
-                win_build_has_overlay_preview(build),
-                !win_build_software_overlays(build),
-                "build {build}: the two gates must stay exact complements"
-            );
+            // The overlay EDITOR is the complement, at either setting: available everywhere
+            // the software rasterizer is not forced.
+            for dcomp in [true, false] {
+                assert_eq!(
+                    win_build_has_overlay_preview(build, dcomp),
+                    !win_build_software_overlays(build, dcomp),
+                    "build {build} dcomp={dcomp}: the two gates must stay exact complements"
+                );
+            }
+            // WITH one, nothing anywhere is forced to the CPU rasterizer -- that is the
+            // point of DRAGON-666, and it is what gives Windows 10 its overlay editor back.
+            assert!(!win_build_software_overlays(build, true), "build {build} composited");
+            assert!(win_build_has_overlay_preview(build, true), "build {build} composited");
         }
         // Spelled out at the edges, so a future band edit has to break a named assertion.
-        assert!(!win_build_software_overlays(10239)); // Windows 8.1 and older
-        assert!(win_build_software_overlays(10240)); // Win10 RTM
-        assert!(win_build_software_overlays(19045)); // Win10 22H2, the last one
-        assert!(win_build_software_overlays(21999)); // just under the Win11 floor
-        assert!(!win_build_software_overlays(22000)); // Win11 21H2 — wgpu, as today
-        assert!(!win_build_software_overlays(26100)); // Win11 24H2 — wgpu, as today
+        assert!(!win_build_software_overlays(10239, false)); // Windows 8.1 and older
+        assert!(win_build_software_overlays(10240, false)); // Win10 RTM
+        assert!(win_build_software_overlays(19045, false)); // Win10 22H2, the last one
+        assert!(win_build_software_overlays(21999, false)); // just under the Win11 floor
+        assert!(!win_build_software_overlays(22000, false)); // Win11 21H2 — wgpu, as today
+        assert!(!win_build_software_overlays(26100, false)); // Win11 24H2 — wgpu, as today
         // An unreadable build reads as "not Windows 10", i.e. keep the GPU renderer and the
         // overlay editor. That is the SAFE side: a machine we cannot identify keeps the
         // path that works on every OS we ship for, rather than being silently degraded.
-        assert!(!win_build_software_overlays(0));
-        assert!(win_build_has_overlay_preview(0));
+        assert!(!win_build_software_overlays(0, false));
+        assert!(win_build_has_overlay_preview(0, false));
     }
 
     #[test]
@@ -1746,10 +1918,14 @@ mod tests {
         // Mica also gets the native caption buttons — never the reverse (22000..22621 is
         // Win11 without Mica: buttons yes, Mica no). DRAGON-408: the layered-alpha gate that
         // used to be asserted alongside is gone; the overlay is layered on every build.
-        for build in [22621_u32, 22631, 26100] {
-            assert!(win_build_paints_native_caption_buttons(build));
+        // At either dcomp setting: the Win11 term does not depend on it (DRAGON-666 only
+        // ADDED a Windows 10 term).
+        for dcomp in [true, false] {
+            for build in [22621_u32, 22631, 26100] {
+                assert!(win_build_paints_native_caption_buttons(build, dcomp));
+            }
+            assert!(win_build_paints_native_caption_buttons(22000, dcomp));
         }
-        assert!(win_build_paints_native_caption_buttons(22000));
     }
 
     // ── DRAGON-426: the backdrop seating predicate ────────────────────────────

@@ -92,7 +92,9 @@ pub enum ColorPickerMsg {
     /// the strips and the swatch follow it the moment it parses.
     BoxEdited(usize, String),
     /// The edited box was submitted (Enter). Drops the draft, so the box re-renders in
-    /// its canonical spelling.
+    /// its canonical spelling, AND files the colour into the history exactly as
+    /// [`Self::AddToHistory`] does (the owner's ask): Enter in a value box is the one
+    /// gesture here that says "this is the colour I meant".
     BoxCommitted,
     /// DRAGON-630 rev 3: the value row's layout toggle, between the split per-channel
     /// boxes and the one whole-value box. Persisted like the mode: the picker is
@@ -113,6 +115,17 @@ pub enum ColorPickerMsg {
     /// Load the recent colour at this index. LOADS only: it never reorders, promotes or
     /// re-adds (see `color_picker::geom::writes_recents`).
     LoadRecent(usize),
+    /// File the colour the window is showing into the history, from the "Add color"
+    /// button on the divider (the owner's ask).
+    ///
+    /// It exists because the history is written by PICKS only, and everything the window
+    /// can do to a colour after the pick (the square, the strips, the value boxes, a
+    /// loaded recent) deliberately does not write it. That rule is right, and it left no
+    /// way at all to keep a colour you MADE. This is that way, and it is the only one:
+    /// the button files the shown colour under exactly the rule a pick files one
+    /// (`geom::push_recent`, same de-duplication, same cap), and changes nothing else
+    /// about the window.
+    AddToHistory,
     /// Clear the transient "Copied" note.
     ClearCopied,
     /// DRAGON-587: the bounded wait for the result window's keyboard focus is over. A no-op

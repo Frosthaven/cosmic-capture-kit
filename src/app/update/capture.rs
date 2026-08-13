@@ -241,7 +241,7 @@ impl App {
                 }
                 Task::none()
             }
-            CaptureMsg::ScanSpinTick => {
+            CaptureMsg::BusySpinTick => {
                 // One step per ~33ms tick; a full turn takes about a second. Wrapped so the
                 // float cannot drift upward over a long scan.
                 //
@@ -250,7 +250,7 @@ impl App {
                 // have to point the way the icon actually moves, or the motion reads as an
                 // animation bug rather than as a spinner.
                 const STEP: f32 = std::f32::consts::TAU / 30.0;
-                self.scan_spin = (self.scan_spin + STEP) % std::f32::consts::TAU;
+                self.busy_spin = (self.busy_spin + STEP) % std::f32::consts::TAU;
                 Task::none()
             }
             // DRAGON-460: the frame without the marks is on screen, so take the region shot.
@@ -261,6 +261,21 @@ impl App {
             // DRAGON-600: the tray dropdown may be gone by now, so maybe run the held grab.
             CaptureMsg::MenuHoldTick => {
                 self.tick_menu_hold();
+                Task::none()
+            }
+            // DRAGON-663: this picker launch now has overlays, so its configured delay can
+            // become a countdown on them. `take` is the latch: the subscription's gate reads
+            // the same field, so spending it here is what stops a second arm.
+            CaptureMsg::PickerCountdownArm => match self.picker_countdown_pending.take() {
+                Some(secs) => self.enter_picker_countdown(secs),
+                None => Task::none(),
+            },
+            // DRAGON-663: the blank frame is up, so run the flats grab the launch held back.
+            // `run_picker_flats_grab` clears the flag, so the repeat ticks this 200ms
+            // subscription would otherwise produce are no-ops, exactly as `DoPixelCapture`'s
+            // second fire is.
+            CaptureMsg::PickerReveal => {
+                self.run_picker_flats_grab();
                 Task::none()
             }
             // DRAGON-606: one frame of the dim's fade-in. The tick exists only to force the
@@ -410,6 +425,12 @@ impl App {
                     if let Some(tray) = &self.countdown_tray {
                         tray.set_remaining(n - 1);
                     }
+                    // DRAGON-673: nothing to arm here any more. The worker is spawned at
+                    // countdown START (`enter_countdown`), so the whole countdown is warmup
+                    // cover, and `RecordSettings::start_gate` holds the file's media 0 back
+                    // until the app promotes the recording. This tick used to spawn it late,
+                    // because media 0 moved with the spawn and an early start recorded the
+                    // countdown itself.
                     Task::none()
                 }
                 Some(_) => {
@@ -417,22 +438,20 @@ impl App {
                     // DRAGON-563: the digits come down the moment the capture fires (a
                     // recording mints its own tray next; a still delivers and exits).
                     self.countdown_tray = None;
-                    // The one-shot countdown (owner rule; `countdown_consumed` carries
-                    // the full why): firing SPENDS the persisted preset, so the next
-                    // launch and every menu title read "Countdown Timer: 00". Cancels
-                    // keep it; a CLI --countdown never spends it. Written through the
-                    // app's own save path, the same one `PickDelay` uses, so the
-                    // in-memory chip and the config file move together.
-                    if capture_flow::countdown_consumed(
-                        true,
-                        self.countdown_override.is_some(),
-                        self.delay_idx,
-                    ) {
-                        self.delay_idx = 0;
-                        self.save_state();
-                    }
+                    // Firing does NOT touch `delay_idx`. It used to: the countdown preset
+                    // was one-shot, and a fire spent it back to "No delay" (the retired
+                    // `capture_flow::countdown_consumed`). The owner reversed that rule,
+                    // so the timer is remembered always and only an explicit pick (an
+                    // overlay delay chip, a tray radio row) ever changes it.
                     match self.pending.take() {
                         Some(sel) => self.begin(sel),
+                        // DRAGON-663: a COLOUR PICKER countdown carries no `Selection` (a
+                        // pick has no rectangle), so an empty `pending` here is what tells
+                        // the two countdowns apart rather than a flag that could disagree
+                        // with the state it describes. Reveal the picker instead of ending
+                        // the session; `teardown` stays the answer for a capture countdown
+                        // whose selection went missing, which is a real loss.
+                        None if self.color_picking() => self.reveal_color_picker(),
                         None => self.teardown(),
                     }
                 }
@@ -462,9 +481,28 @@ impl App {
             CaptureMsg::CancelCapture => {
                 // Abort the countdown and return to region select (don't quit),
                 // restoring the fully-interactive selection overlay.
+                // DRAGON-659: a video countdown past its last-second spawn has a recording
+                // worker running behind it. Stop it and reap what it wrote. Runs before
+                // `self.pw_held = None` below, which the spawn has already emptied in that
+                // case; a cancel EARLIER in the countdown finds nothing to abandon and the
+                // held stream is still there for that line to drop, exactly as before.
+                self.abandon_warming();
                 self.countdown = None;
                 // DRAGON-563: a countdown abort takes the digits down too.
                 self.countdown_tray = None;
+                // DRAGON-663: a COLOUR PICKER countdown has nothing to step back TO. The
+                // selection overlay this restores is a capture surface the picker never
+                // showed, and "return to region select" in a picker process would leave the
+                // user staring at a tool they did not ask for. Cancel means END here, which
+                // is also what the tray's own Cancel row already did (`CountdownTrayPoll`),
+                // so all three cancel routes agree.
+                if self.color_picking() {
+                    crate::diag::note_failure(
+                        crate::diag::Failure::Cancelled,
+                        "the user cancelled the colour picker's countdown",
+                    );
+                    return self.teardown();
+                }
                 self.pending = None;
                 self.capture_live = false;
                 // Drop any granted-but-unused portal stream (closes the fd).

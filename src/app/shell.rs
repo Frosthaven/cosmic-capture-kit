@@ -245,7 +245,7 @@ pub(super) fn overlay_window(
 /// `show_centered`/caption/mica), and the title a tiling-WM float rule keys on (see the README)
 /// all route through this const. Shared so the open path and the native finalize match the SAME
 /// window by title.
-pub(super) const PREVIEW_WINDOW_TITLE: &str = "Cosmic Capture Kit - Preview Editor";
+pub(super) const PREVIEW_WINDOW_TITLE: &str = "CCK Preview Editor";
 
 /// The fullscreen OVERLAY preview's (hidden) window title — distinct from both
 /// [`PREVIEW_WINDOW_TITLE`] and the capture overlays' display-name titles, so the
@@ -256,7 +256,7 @@ pub(super) const PREVIEW_WINDOW_TITLE: &str = "Cosmic Capture Kit - Preview Edit
 /// "… - Preview" prefix with the renamed editor title, but title matching is EXACT (or the
 /// annotation-tolerant `title_matches`), so the two never cross-resolve.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-pub(super) const PREVIEW_OVERLAY_TITLE: &str = "Cosmic Capture Kit - Preview Overlay";
+pub(super) const PREVIEW_OVERLAY_TITLE: &str = "CCK Preview Overlay";
 
 /// macOS: the fullscreen OVERLAY preview — the layer-shell `preview_surface`'s
 /// PlainWindows counterpart. Same recipe as [`overlay_window`] (the capture

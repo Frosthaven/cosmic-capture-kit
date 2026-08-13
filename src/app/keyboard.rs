@@ -434,7 +434,13 @@ impl App {
         // launch mints no capture toolbar, has no region and no recording. Fixed rather than
         // bindable, for the reason `shortcuts::magnifier_zoom_step` documents. Gated on
         // `color_picking`, so no other launch shape sees any change at all.
+        //
+        // DRAGON-663 added the countdown term. A picker launch with a configured delay
+        // shows the countdown view on these same overlays, and while it does there is no
+        // magnifier to zoom. Additive: no picker session could have a countdown before, so
+        // every existing launch answers exactly as it did.
         if self.color_picking()
+            && self.countdown.is_none()
             && let Some(steps) = crate::shortcuts::magnifier_zoom_step(&key, location)
         {
             return self.update(Msg::ColorPicker(ColorPickerMsg::Zoom(steps)));
@@ -589,7 +595,13 @@ impl App {
             // The picker first, because `color_picking` is also the term that keeps the region
             // lane out of a pick (`region_nudge_fires`): the two are exclusive by construction
             // rather than by ordering, and reading them in this order just says so out loud.
-            if self.color_picking() {
+            //
+            // DRAGON-663 added the countdown term, the same one the region lane below already
+            // carries through its `busy` argument: there is no sample to nudge while the
+            // picker is counting down, and a nudge applied then would be a displacement the
+            // user set before they could see what they were aiming at. Additive, since no
+            // picker session could have a countdown before this ticket.
+            if self.color_picking() && self.countdown.is_none() {
                 return self.update(Msg::ColorPicker(ColorPickerMsg::Nudge(dir)));
             }
             if region_nudge_fires(

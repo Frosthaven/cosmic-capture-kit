@@ -424,11 +424,16 @@ settings window, the color picker's result window, and (macOS only) the
 permission checker window will not by default. You can change this behavior
 using the information below.
 
-* Settings window: title `Cosmic Capture Kit - Settings`
-* Preview editor window: title `Cosmic Capture Kit - Preview Editor`
-* Color picker window: title `Cosmic Capture Kit - Color Picker`
-* Permission checker window (macOS only): title `Cosmic Capture Kit - Permissions`
+* Settings window: title `CCK Settings`
+* Preview editor window: title `CCK Preview Editor`
+* Color picker window: title `CCK Color Picker`
+* Permission checker window (macOS only): title `CCK Permissions`
 * All four share application id `dev.thedragon.CosmicCaptureKit`
+
+> **These titles changed in v0.32.0.** They used to be spelled
+> `Cosmic Capture Kit - Settings` and so on. If you wrote window rules against
+> the old names, update them to the `CCK ` titles above, or your windows will
+> silently go back to being tiled.
 
 Each snippet below is an addition to your existing config, not a replacement
 for it.
@@ -444,19 +449,19 @@ for it.
 
 ```toml
 [[on-window-detected]]
-if.window-title-regex-substring = 'Cosmic Capture Kit - Settings'
+if.window-title-regex-substring = 'CCK Settings'
 run = ['layout floating']
 
 [[on-window-detected]]
-if.window-title-regex-substring = 'Cosmic Capture Kit - Preview Editor'
+if.window-title-regex-substring = 'CCK Preview Editor'
 run = ['layout floating']
 
 [[on-window-detected]]
-if.window-title-regex-substring = 'Cosmic Capture Kit - Color Picker'
+if.window-title-regex-substring = 'CCK Color Picker'
 run = ['layout floating']
 
 [[on-window-detected]]
-if.window-title-regex-substring = 'Cosmic Capture Kit - Permissions'
+if.window-title-regex-substring = 'CCK Permissions'
 run = ['layout floating']
 ```
 
@@ -473,10 +478,10 @@ insensitive substring.
 ```
 
 ```sh
-yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Settings$" manage=off
-yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Preview Editor$" manage=off
-yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Color Picker$" manage=off
-yabai -m rule --add app="^Cosmic Capture Kit$" title="^Cosmic Capture Kit - Permissions$" manage=off
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Settings$" manage=off
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Preview Editor$" manage=off
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Color Picker$" manage=off
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Permissions$" manage=off
 ```
 
 The regex is POSIX extended and unanchored, hence the `^` and `$`. `app` matches
@@ -499,9 +504,9 @@ open. `manage` needs no SIP changes.
 window_rules:
   - commands: ["set-floating"]
     match:
-      - window_title: { equals: "Cosmic Capture Kit - Settings" }
-      - window_title: { equals: "Cosmic Capture Kit - Preview Editor" }
-      - window_title: { equals: "Cosmic Capture Kit - Color Picker" }
+      - window_title: { equals: "CCK Settings" }
+      - window_title: { equals: "CCK Preview Editor" }
+      - window_title: { equals: "CCK Color Picker" }
 ```
 
 This is the v3 config format. Reload with `wm-reload-config` (`alt+shift+r` by
@@ -522,9 +527,9 @@ Merge this key into your existing `komorebi.json`; it is not the whole file:
 ```json
 {
   "floating_applications": [
-    { "kind": "Title", "id": "Cosmic Capture Kit - Settings", "matching_strategy": "Equals" },
-    { "kind": "Title", "id": "Cosmic Capture Kit - Preview Editor", "matching_strategy": "Equals" },
-    { "kind": "Title", "id": "Cosmic Capture Kit - Color Picker", "matching_strategy": "Equals" }
+    { "kind": "Title", "id": "CCK Settings", "matching_strategy": "Equals" },
+    { "kind": "Title", "id": "CCK Preview Editor", "matching_strategy": "Equals" },
+    { "kind": "Title", "id": "CCK Color Picker", "matching_strategy": "Equals" }
   ]
 }
 ```
@@ -546,9 +551,9 @@ Apply it with `komorebic replace-configuration <path>`. Note that
 
 ```
 [
-  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "Cosmic Capture Kit - Settings"),
-  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "Cosmic Capture Kit - Preview Editor"),
-  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "Cosmic Capture Kit - Color Picker"),
+  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "CCK Settings"),
+  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "CCK Preview Editor"),
+  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "CCK Color Picker"),
 ]
 ```
 
@@ -568,17 +573,17 @@ on your version. Check with `hyprctl version`.
 
 ```lua
 hl.window_rule({
-  match = { title = "Cosmic Capture Kit - Settings" },
+  match = { title = "CCK Settings" },
   float = true,
 })
 
 hl.window_rule({
-  match = { title = "Cosmic Capture Kit - Preview Editor" },
+  match = { title = "CCK Preview Editor" },
   float = true,
 })
 
 hl.window_rule({
-  match = { title = "Cosmic Capture Kit - Color Picker" },
+  match = { title = "CCK Color Picker" },
   float = true,
 })
 ```
@@ -586,9 +591,9 @@ hl.window_rule({
 **0.52 and older**, `~/.config/hypr/hyprland.conf`:
 
 ```
-windowrule = float, title:Cosmic Capture Kit - Settings
-windowrule = float, title:Cosmic Capture Kit - Preview Editor
-windowrule = float, title:Cosmic Capture Kit - Color Picker
+windowrule = float, title:CCK Settings
+windowrule = float, title:CCK Preview Editor
+windowrule = float, title:CCK Color Picker
 ```
 
 0.53 and 0.54 use an intermediate form; the 0.54 wiki has it. Matching is RE2
@@ -608,9 +613,9 @@ firing, match `class:dev\.thedragon\.CosmicCaptureKit` instead.
 
 ```kdl
 window-rule {
-    match title=r#"^Cosmic Capture Kit - Settings$"#
-    match title=r#"^Cosmic Capture Kit - Preview Editor$"#
-    match title=r#"^Cosmic Capture Kit - Color Picker$"#
+    match title=r#"^CCK Settings$"#
+    match title=r#"^CCK Preview Editor$"#
+    match title=r#"^CCK Color Picker$"#
     open-floating true
 }
 ```
@@ -633,9 +638,9 @@ On **river-classic** (the maintained 0.3.x line), in `~/.config/river/init`,
 which must be executable:
 
 ```sh
-riverctl rule-add -title 'Cosmic Capture Kit - Settings' float
-riverctl rule-add -title 'Cosmic Capture Kit - Preview Editor' float
-riverctl rule-add -title 'Cosmic Capture Kit - Color Picker' float
+riverctl rule-add -title 'CCK Settings' float
+riverctl rule-add -title 'CCK Preview Editor' float
+riverctl rule-add -title 'CCK Color Picker' float
 ```
 
 Matching here is glob, not regex, so there is no alternation and each title needs
@@ -652,9 +657,9 @@ its own rule. The rules apply to windows opened after they are added, and
 ```
 
 ```
-for_window [title="^Cosmic Capture Kit - Settings$"] floating enable
-for_window [title="^Cosmic Capture Kit - Preview Editor$"] floating enable
-for_window [title="^Cosmic Capture Kit - Color Picker$"] floating enable
+for_window [title="^CCK Settings$"] floating enable
+for_window [title="^CCK Preview Editor$"] floating enable
+for_window [title="^CCK Color Picker$"] floating enable
 ```
 
 Criteria are PCRE2 and unanchored, so the `^` and `$` are doing real work.
@@ -677,7 +682,7 @@ float action at all:
 
 ```ini
 [simple-tile]
-tile_by_default = !((title is "Cosmic Capture Kit - Settings") | ((title is "Cosmic Capture Kit - Preview Editor") | (title is "Cosmic Capture Kit - Color Picker")))
+tile_by_default = !((title is "CCK Settings") | ((title is "CCK Preview Editor") | (title is "CCK Color Picker")))
 ```
 
 Criteria here are not regex: `is` is exact and `contains` is a substring.

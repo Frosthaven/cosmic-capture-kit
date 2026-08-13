@@ -260,6 +260,13 @@ impl App {
                 // Drop the draft so every box, including this one, re-renders in its
                 // canonical spelling.
                 self.color_picker.draft = None;
+                // And FILE the colour, exactly as the Add button would (the owner's ask).
+                // Enter in a value box is the one gesture in this window that says "this
+                // is the colour I meant", so it is the natural second way to reach the
+                // same rule; there is no third, because everything else here is a drag or
+                // a keystroke mid-edit and would fill the history with the colours you
+                // passed through on the way.
+                self.add_shown_color_to_history();
                 Task::none()
             }
             // DRAGON-630 rev 3: the split-vs-whole layout toggle. Persisted like the
@@ -321,6 +328,10 @@ impl App {
                 if let Some(c) = self.color_picker.recents.get(index).copied() {
                     self.set_picker_color(c, geom::ColorSource::RecentClick);
                 }
+                Task::none()
+            }
+            ColorPickerMsg::AddToHistory => {
+                self.add_shown_color_to_history();
                 Task::none()
             }
             ColorPickerMsg::ClearCopied => {
@@ -684,7 +695,12 @@ impl App {
         match crate::share::copy_step(crate::share::copy_route(), false, false) {
             // A detached worker owns the selection and outlives us: spawn it now, exactly as
             // before. `copy_text_task` returns an empty task on this route.
-            crate::share::CopyStep::Detached => cmds.push(crate::share::copy_text_task(&value)),
+            crate::share::CopyStep::Detached => {
+                cmds.push(crate::share::copy_text_task(&value));
+                // The window is about to open with the pick already on the clipboard, so
+                // it opens wearing the tick and the word (the owner's ask).
+                cmds.push(self.flash_copied());
+            }
             // The window route: arm the latch and bound the wait. `flush_deferred_pick_copy`
             // writes it the moment the result window takes the keyboard, which is also the
             // input event whose serial the selection needs.
@@ -865,6 +881,7 @@ impl App {
         match crate::share::copy_step(crate::share::copy_route(), focused, false) {
             crate::share::CopyStep::Detached | crate::share::CopyStep::ThroughWindow => {
                 cmds.push(crate::share::copy_text_task(&value));
+                cmds.push(self.flash_copied());
             }
             // Our window exists but is not focused. The `gain_focus` above is the request
             // that fixes that, and `flush_deferred_pick_copy` writes the hex when it lands.
@@ -910,7 +927,11 @@ impl App {
         // Re-derived from the live state rather than stored twice (and in the remembered
         // mode's spelling, DRAGON-630). Nothing can have changed it between the pick and
         // this focus: the window is only now becoming interactive.
-        crate::share::copy_text_task(&self.color_picker.value_text())
+        let write = crate::share::copy_text_task(&self.color_picker.value_text());
+        // THIS is the moment the pick reaches the clipboard on the window route, so this
+        // is where the flash belongs: the window has just appeared and taken the
+        // keyboard, which is exactly the "opened the panel" instant the owner means.
+        Task::batch([write, self.flash_copied()])
     }
 
     /// Set the colour the window shows, and write the recents only when the SOURCE says
@@ -990,24 +1011,60 @@ impl App {
         ));
     }
 
+    /// File the colour the window is SHOWING into the history: the shared tail of the
+    /// "Add color" button on the divider and of Enter in a value box.
+    ///
+    /// The colour is already the one on screen, so nothing about the window changes. This
+    /// is deliberately NOT `apply_picker_color`, whose non-Edit sources reset the alpha
+    /// and drop the draft: right for a colour that just ARRIVED, wrong for one the user
+    /// built and is now keeping. What it borrows from a pick is the part that matters,
+    /// `geom::push_recent`'s rule: the colour goes to the front, any earlier copy of it is
+    /// removed rather than duplicated, and the list is capped. Filing a colour that
+    /// already leads the history is therefore a no-op, which is what has to happen for a
+    /// gesture that cannot know whether you made it twice.
+    ///
+    /// The save is the one a pick performs, for the same reason: an entry that vanished
+    /// when this one-shot window closed would not be history.
+    fn add_shown_color_to_history(&mut self) {
+        self.color_picker.recents = geom::push_recent(
+            &self.color_picker.recents,
+            self.color_picker.color,
+            geom::RECENTS_CAP,
+        );
+        self.save_state();
+        log::debug!("color picker: added the shown color to the history");
+    }
+
     /// Copy the current mode's whole value and flash the copy affordance: the shared
     /// tail of the copy button and the mode stepper (DRAGON-630).
     fn copy_picker_value(&mut self) -> Task<cosmic::Action<Msg>> {
         let value = self.color_picker.value_text();
-        self.color_picker.copied =
-            Some((self.color_picker.mode, std::time::Instant::now()));
         log::debug!("color picker: copied the {} value", self.color_picker.mode.id());
-        Task::batch([
-            crate::share::copy_text_task(&value),
-            // One delayed clear, rather than a subscription ticking for two
-            // seconds: the flash needs exactly one redraw, at its end.
-            Task::perform(
-                async {
-                    tokio::time::sleep(crate::widgets::copy_button::COPIED_FLASH).await;
-                },
-                |()| cosmic::Action::App(Msg::ColorPicker(ColorPickerMsg::ClearCopied)),
-            ),
-        ])
+        Task::batch([crate::share::copy_text_task(&value), self.flash_copied()])
+    }
+
+    /// Raise the "Copied!" flash: the copy button's tick plus the word beside it, for
+    /// [`crate::widgets::copy_button::COPIED_FLASH`].
+    ///
+    /// Called from every path that ACTUALLY writes the clipboard, which is why it is its
+    /// own function rather than two lines inside the Copy button's handler. The window's
+    /// own opening copy is one of those paths (the owner's ask: the flash should be up
+    /// the moment the window appears, because by then the pick is already on the
+    /// clipboard), and on the deferred route that moment is when the window takes focus
+    /// and the write goes out, NOT when the pick happened. A copy that misses its
+    /// deadline raises nothing: the flash says "this worked", so it may only appear where
+    /// something did.
+    ///
+    /// The returned task is one delayed clear rather than a subscription ticking for two
+    /// seconds: the flash needs exactly one redraw, at its end.
+    fn flash_copied(&mut self) -> Task<cosmic::Action<Msg>> {
+        self.color_picker.copied = Some((self.color_picker.mode, std::time::Instant::now()));
+        Task::perform(
+            async {
+                tokio::time::sleep(crate::widgets::copy_button::COPIED_FLASH).await;
+            },
+            |()| cosmic::Action::App(Msg::ColorPicker(ColorPickerMsg::ClearCopied)),
+        )
     }
 
     /// Finish the result window natively once its async-set title has landed: the mac
@@ -1088,6 +1145,26 @@ impl App {
                 // Chrome, not glass: the caption buttons are installed unconditionally,
                 // exactly as the preview window does.
                 crate::platform::windows::caption::install_native_caption_buttons(title);
+                // ...and that install is what makes the window narrower than its own layout
+                // (DRAGON-668). The subclass carves a non-client frame OUT OF THE CLIENT
+                // (`caption::calc_frame`), 16x8 physical px measured here, while leaving the
+                // OUTER rect alone. The picker is pinned `min_size == max_size ==
+                // color_window_size()`, so unlike every other window it cannot grow to absorb
+                // that: its 366pt of sections were being laid out into a 350pt client, and the
+                // shortfall lands entirely on the last element of each row — the copy button,
+                // and the fourth of the four component boxes.
+                //
+                // `enforce_client_floor` is the settings window's existing answer and it fits
+                // exactly: it takes a LOGICAL client size, measures the live non-client band
+                // rather than predicting it, and returns without touching anything once the
+                // client is already at or above the floor, so re-running it on a DPI change
+                // cannot make the window creep. The floor here IS the window's fixed size,
+                // which is the one size the layout is built for.
+                let (cw, ch) = crate::app::color_picker::geom::color_window_size();
+                crate::platform::windows::window::enforce_client_floor(
+                    title,
+                    (cw.round().max(1.0) as u32, ch.round().max(1.0) as u32),
+                );
                 if self.glass.is_some_and(|g| g.frosted_windows) {
                     crate::platform::windows::window::apply_window_glass(title);
                 }

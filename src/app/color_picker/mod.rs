@@ -267,7 +267,7 @@ mod view;
 /// The picker window's title: the OS title, the CSD header title, the handle the native
 /// finalize helpers match on, and the title a tiling-WM float rule keys on (see the
 /// README's window-rules section). One const, like `shell::PREVIEW_WINDOW_TITLE`.
-pub(crate) const WINDOW_TITLE: &str = "Cosmic Capture Kit - Color Picker";
+pub(crate) const WINDOW_TITLE: &str = "CCK Color Picker";
 
 /// Which preview editor this pick belongs to, as a pid, set by the editor that launched it
 /// (DRAGON-587).

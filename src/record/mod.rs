@@ -22,9 +22,9 @@
 //!
 //! - [`DoneGuard`] guarantees the single `done` post even if the worker thread panics or
 //!   returns early (DRAGON-106): its `Drop` fills an error if nothing was posted.
-//! - [`RecordShared`] mints the stop/paused/done/events/measured/dims Arc quartet once
-//!   and hands the worker its clone — there is no other way to build a [`RecordHandle`],
-//!   so every entry point wires the same lifecycle.
+//! - [`RecordShared`] mints the stop/paused/done/events/measured/dims/warm_at/settled_at
+//!   Arc set once and hands the worker its clone — there is no other way to build a
+//!   [`RecordHandle`], so every entry point wires the same lifecycle.
 //! - [`wait_or_kill`] / [`MuxerWatchdog`] make every wait BOUNDED (DRAGON-118): nothing
 //!   in a stop tail can hang the recorder (and the preview spinner) forever.
 //! - `owned::run_video_stop_tail` is the SINGLE stop-tail
@@ -430,6 +430,45 @@ pub struct RecordHandle {
     /// full-monitor recording previews monitor-sized even when it encodes at
     /// 1080p. `None` only if stopped before the first frame.
     pub dims: Arc<Mutex<Option<(u32, u32)>>>,
+    /// The wall instant the worker confirmed a genuinely real first captured frame, which is
+    /// also the instant it starts its audio pre-flight. `None` if stopped before that point.
+    ///
+    /// DRAGON-657: the WARMUP signal. A recording is not truly under way until the
+    /// capture stream has actually delivered a frame, so the workers do their video bring-up
+    /// FIRST and start audio only once this is filled. The strict order costs the bring-up's
+    /// latency (roughly 250-600ms) at every start, deliberately: it is what makes "recording"
+    /// mean recording. Filled by EVERY worker on every platform since DRAGON-658 brought the
+    /// three Linux ones (screencopy, PipeWire and both zero-copy arms) onto the same shape.
+    ///
+    /// It is NOT media 0 and it is NOT what the UI reads. It was both, once: media 0 until
+    /// DRAGON-672 (which moved it to [`Self::settled_at`]) and the elapsed anchor until
+    /// DRAGON-673 (which moved that to the same place, because the worker now starts at
+    /// countdown START and this fires a whole countdown before the file does). What remains
+    /// here is the worker's own account of when capture became real, which is the first half
+    /// of every bring-up investigation this pair has been used for. Its ONE reader is the
+    /// app's bring-up log line (`App::adopt_warm_start`), which reports the span from here to
+    /// media 0: the pre-flight, the ffmpeg spawn, the opening ticks and any countdown hold.
+    pub warm_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// The wall instant the worker's OPENING PHASE ended: the first moment the whole
+    /// pipeline is genuinely up and level with the media clock, with capture confirmed, the
+    /// audio pre-flight done, ffmpeg spawned, the pump running and the opening's media debt
+    /// paid. `None` if the session ended before that point.
+    ///
+    /// DRAGON-661: the SETTLED signal, the later of this pair. [`Self::warm_at`] fires at
+    /// the START of the bring-up and real work still follows it. On one measured mac
+    /// session the first frame landed at +1651ms and this at +2251ms, with the mic device
+    /// setup (~190ms), the ffmpeg spawn and the opening catch-up filling the 600ms between
+    /// them; up to a third of that opening's ticks were repeats of one frame, because
+    /// capture cannot keep pace with a loop that is racing the clock. A UI that says "live"
+    /// at `warm_at` is therefore pointing straight at the span still being papered over.
+    ///
+    /// This one IS media 0 (DRAGON-672): the worker takes it immediately after
+    /// `owned::media_zero`, so the file's own timeline begins here. Everything the UI says
+    /// about the recording therefore reads THIS instant — the LIVE DECLARATION (the record
+    /// chip's STOP face, the tray's "Recording" state) and, since DRAGON-673, the elapsed
+    /// readout's anchor as well. Filled by every worker on every platform; see
+    /// `owned::mark_settled` for each call site.
+    pub settled_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 /// Guarantees a recording's `done` slot is filled even if the worker thread unwinds
@@ -691,6 +730,8 @@ struct RecordShared {
     events: Arc<Mutex<Vec<ToggleEvent>>>,
     measured_offset_ms: Arc<Mutex<Option<i32>>>,
     dims: Arc<Mutex<Option<(u32, u32)>>>,
+    warm_at: Arc<Mutex<Option<std::time::Instant>>>,
+    settled_at: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 impl RecordShared {
@@ -702,10 +743,12 @@ impl RecordShared {
             events: Arc::new(Mutex::new(Vec::new())),
             measured_offset_ms: Arc::new(Mutex::new(None)),
             dims: Arc::new(Mutex::new(None)),
+            warm_at: Arc::new(Mutex::new(None)),
+            settled_at: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// A second Arc clone of the quartet, moved into the worker thread's closure.
+    /// A second Arc clone of the set, moved into the worker thread's closure.
     fn clone_for_worker(&self) -> Self {
         Self {
             stop: self.stop.clone(),
@@ -714,6 +757,8 @@ impl RecordShared {
             events: self.events.clone(),
             measured_offset_ms: self.measured_offset_ms.clone(),
             dims: self.dims.clone(),
+            warm_at: self.warm_at.clone(),
+            settled_at: self.settled_at.clone(),
         }
     }
 
@@ -726,6 +771,8 @@ impl RecordShared {
             events: self.events,
             measured_offset_ms: self.measured_offset_ms,
             dims: self.dims,
+            warm_at: self.warm_at,
+            settled_at: self.settled_at,
         }
     }
 }
@@ -755,6 +802,17 @@ pub struct RecordSettings {
     pub max_res: (u32, u32),
     pub metadata: String,
     pub out_path: PathBuf,
+    /// The COUNTDOWN GATE (DRAGON-673): a flag the app RAISES when it promotes the
+    /// recording, i.e. at the instant the UI starts claiming to record, or `None` when there
+    /// is no countdown. The worker holds media 0 until it is raised, so a countdown warms
+    /// the whole pipeline behind its own digits and the file still starts exactly where the
+    /// promotion does.
+    ///
+    /// A flag rather than the countdown-zero INSTANT, which is what this carried first: the
+    /// app's prediction of zero (stamped as the countdown began) ran ~1s ahead of the tick
+    /// that actually fires the capture, so the file started before the UI said "Recording".
+    /// See `owned::media_zero` for the measurement and why a signal cannot drift.
+    pub start_gate: Option<Arc<AtomicBool>>,
 }
 
 /// Resolve a recording session's encode plan through the DRAGON-571 hint-first auto
@@ -902,7 +960,7 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
     let RegionRecordParams { x, y, w, h, cursor, mac_target, settings } = params;
     let RecordSettings {
         fps, preferred_encoder, encoder_hint, presets, zero_copy, mic, system_audio,
-        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path, start_gate,
     } = settings;
     // No GPU zero-copy path on macOS: h264_videotoolbox encodes inside ffmpeg from
     // the RGBA feed, so there is nothing for the (Linux DRM/DMA-BUF) zero-copy path
@@ -913,14 +971,15 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
         // `measured_offset_ms` is intentionally not passed to `record_sck`: the SCK
         // worker feeds ffmpeg synchronously on its own thread with no delivery
         // channel to measure lag on (same reasoning as the Linux screencopy path).
-        let RecordShared { stop, paused, done, events, dims, .. } = shared.clone_for_worker();
+        let RecordShared { stop, paused, done, events, dims, warm_at, settled_at, .. } =
+            shared.clone_for_worker();
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
             let result = sck::record_sck(
                 x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
                 &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
-                auto_device_compensation, max_res, &out_path, stop, paused, &events, &dims,
-                &metadata, mac_target,
+                auto_device_compensation, max_res, start_gate, &out_path, stop, paused, &events, &dims,
+                &warm_at, &settled_at, &metadata, mac_target,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -951,7 +1010,7 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
     let RegionRecordParams { x, y, w, h, cursor, win_target, settings } = params;
     let RecordSettings {
         fps, preferred_encoder, encoder_hint, presets, zero_copy, mic, system_audio,
-        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path, start_gate,
     } = settings;
     // No GPU zero-copy path on Windows: libx264 encodes inside ffmpeg from the RGBA feed
     // (the Linux DRM/DMA-BUF zero-copy path has no Windows analog).
@@ -961,14 +1020,15 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
         // `measured_offset_ms` is intentionally not passed to `record_wgc`: the worker feeds
         // ffmpeg synchronously on its own thread with no delivery channel to measure lag on
         // (same reasoning as the Linux screencopy / mac SCK paths).
-        let RecordShared { stop, paused, done, events, dims, .. } = shared.clone_for_worker();
+        let RecordShared { stop, paused, done, events, dims, warm_at, settled_at, .. } =
+            shared.clone_for_worker();
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
             let result = wgc::record_wgc(
                 x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
                 &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
-                auto_device_compensation, max_res, &out_path, stop, paused, &events, &dims,
-                &metadata, win_target,
+                auto_device_compensation, max_res, start_gate, &out_path, stop, paused, &events, &dims,
+                &warm_at, &settled_at, &metadata, win_target,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -985,21 +1045,22 @@ pub fn start_region_recording(params: RegionRecordParams) -> RecordHandle {
     let RegionRecordParams { x, y, w, h, cursor, settings } = params;
     let RecordSettings {
         fps, preferred_encoder, encoder_hint, presets, zero_copy, mic, system_audio,
-        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path, start_gate,
     } = settings;
     let shared = RecordShared::new();
     {
         // `measured_offset_ms` is intentionally not passed to `record_screencopy`: the
         // owned screencopy loop grabs and writes synchronously with no delivery channel,
         // so it has no lag figure to measure (see `record_screencopy_owned`'s doc).
-        let RecordShared { stop, paused, done, events, dims, .. } = shared.clone_for_worker();
+        let RecordShared { stop, paused, done, events, dims, warm_at, settled_at, .. } =
+            shared.clone_for_worker();
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
             let result = screencopy::record_screencopy(
                 x, y, w, h, fps.max(1), cursor, &preferred_encoder, encoder_hint.as_deref(),
                 &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
-                auto_device_compensation, max_res, &out_path, stop, paused, &events, &dims,
-                &metadata, zero_copy,
+                auto_device_compensation, max_res, start_gate, &out_path, stop, paused, &events, &dims,
+                &warm_at, &settled_at, &metadata, zero_copy,
             );
             if let Ok(mut g) = done.lock() {
                 *g = Some(result);
@@ -1070,7 +1131,7 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
     let PipewireRecordParams { fd, node_id, crop, settings } = params;
     let RecordSettings {
         fps, preferred_encoder, encoder_hint, presets, zero_copy, mic, system_audio,
-        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path,
+        bitrate_kbps, audio_offset_ms, auto_device_compensation, max_res, metadata, out_path, start_gate,
     } = settings;
     let shared = RecordShared::new();
     // The opt-in GPU zero-copy path applies only to a full (uncropped) stream with
@@ -1083,25 +1144,34 @@ pub fn start_pipewire_recording(params: PipewireRecordParams) -> RecordHandle {
     #[cfg(not(feature = "zero-copy"))]
     let _ = zero_copy;
     {
-        let RecordShared { stop, paused, done, events, measured_offset_ms: measured, dims } =
-            shared.clone_for_worker();
+        let RecordShared {
+            stop, paused, done, events, measured_offset_ms: measured, dims, warm_at, settled_at,
+        } = shared.clone_for_worker();
         std::thread::spawn(move || {
             let _done_guard = DoneGuard(done.clone());
             let paused_cpu = paused.clone();
+            let warm_cpu = warm_at.clone();
+            let settled_cpu = settled_at.clone();
+            // The countdown gate is shared, not consumed: a zero-copy attempt that declines
+            // hands the whole recording to the CPU path, which must hold for the same
+            // promotion (by then the gate is normally already open, and reading it again
+            // costs nothing).
+            let start_gate_cpu = start_gate.clone();
             let cpu = |fd: OwnedFd, stop: Arc<AtomicBool>| {
                 pipewire::record_pipewire(
                     fd, node_id, crop, fps.max(1), &preferred_encoder, encoder_hint.as_deref(),
                     &presets, mic, system_audio, bitrate_kbps, audio_offset_ms,
-                    auto_device_compensation, max_res, &out_path, stop, paused_cpu, &events,
-                    &measured, &dims, &metadata,
+                    auto_device_compensation, max_res, start_gate_cpu, &out_path, stop, paused_cpu, &events,
+                    &measured, &dims, &warm_cpu, &settled_cpu, &metadata,
                 )
             };
             #[cfg(feature = "zero-copy")]
             let result = if try_zero_copy {
                 match zero_copy::record_pipewire_zero_copy(
-                    fd, node_id, fps.max(1), &presets.codec, max_res, mic, system_audio,
-                    bitrate_kbps, audio_offset_ms, auto_device_compensation, &out_path,
-                    stop.clone(), paused.clone(), &events, dims.clone(), &metadata,
+                    fd, node_id, fps.max(1), &presets.codec, max_res, start_gate, mic,
+                    system_audio, bitrate_kbps, audio_offset_ms, auto_device_compensation,
+                    &out_path, stop.clone(), paused.clone(), &events, dims.clone(), &warm_at,
+                    &settled_at, &metadata,
                 ) {
                     // The session ran (or failed on its own terms): its result IS the
                     // recording's result. Never retried — see `ZcOutcome`.

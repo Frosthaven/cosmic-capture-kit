@@ -605,6 +605,99 @@ appimage:
     Remove-Item $src -Force
     Write-CckArtifact $dst
 
+# Cross-compile the WINDOWS ffmpeg, from Linux, macOS or Windows (DRAGON-675).
+#
+# Like `just appimage`, all three arms drive the SAME container and only the
+# docker runtime differs. Unlike it, the container is not here to fix a glibc
+# floor: it cross-compiles PE binaries with mingw-w64, so the host distro is
+# irrelevant and the image is Debian. See scripts/ffmpeg-win/Dockerfile.
+#
+# WHY WE BUILD SOMEBODY ELSE'S PROGRAM AT ALL: because when the Windows ffmpeg
+# was a prebuilt, the NVIDIA driver version our users needed was a property we
+# INHERITED, and a patch-level pin refresh moved it from ~570 to 610.00 without
+# a word (DRAGON-671). Nothing in the finished binary reports that number, so no
+# fetch-time check could have caught it. Building it makes the floor
+# `NVCODEC_URL` in scripts/pins.env, the same pin the Linux AppImage uses.
+#
+# THIS IS A PRODUCER, run once per pin move. Nothing else here ever builds
+# ffmpeg: CI, `just dev` and the MSI all FETCH the published archive through
+# scripts/fetch-win-vendor.ps1, so the dev loop runs the exact bytes a customer
+# installs. It does NOT publish either: the archive lands in target/artifacts/
+# and the build prints the `gh release upload` line plus the two pins.env lines
+# to paste, because putting a binary in front of users is a human's decision.
+[doc("Cross-compile the Windows ffmpeg in a mingw-w64 container (needs docker)")]
+[linux]
+[macos]
+ffmpeg-win:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v docker >/dev/null 2>&1 || { echo "==> docker is required to build the Windows ffmpeg"; exit 1; }
+    OUT="$PWD/target-ffmpeg-win"
+    mkdir -p "$OUT"
+    # NOT `-q`: the first run compiles x264, x265, SDL2 and oneVPL for several
+    # minutes, and a silent terminal for that long reads as a hang.
+    echo "==> Preparing the build image (cached after the first run)..."
+    docker build -f scripts/ffmpeg-win/Dockerfile -t cck-ffmpeg-win scripts
+    # As the CALLING user on Linux, so nothing in target-ffmpeg-win/ comes back
+    # root-owned. macOS virtualises the bind mount's uid already.
+    #
+    # An `if`, not `[ … ] && USER_ARGS=(…)`: under `set -e` a false test as a
+    # bare command is a failing command, so the one-liner would exit the recipe
+    # on macOS before docker ever ran.
+    USER_ARGS=()
+    if [ "$(uname -s)" = "Linux" ]; then
+        USER_ARGS=(--user "$(id -u):$(id -g)")
+    fi
+    docker run --rm "${USER_ARGS[@]+"${USER_ARGS[@]}"}" \
+        -v "$PWD:/src:ro" -v "$OUT:/out" \
+        cck-ffmpeg-win bash /src/scripts/ffmpeg-win/build.sh
+    # The script reports the artifact's NAME; the path is the host's, not the
+    # container's (they are the same file under two different roots).
+    . "$OUT/ffmpeg-win.env"
+    . scripts/artifacts.sh
+    # The ARCHIVE only. Its sha256 stays in target-ffmpeg-win/ beside the build
+    # log: target/artifacts/ holds one finished artifact per recipe, and the
+    # hash's real home is the pins.env line the build just printed.
+    ARCHIVE="$(cck_publish_move "$OUT/$CCK_FFMPEG_WIN_ARCHIVE")"
+    echo "==> NVENC API: $CCK_FFMPEG_WIN_NVENC_API (the NVIDIA driver floor this build declares)"
+    # The stable path is deliberately untouched: this is not the app, and on two
+    # of the three hosts it is not even a runnable binary.
+    cck_say_artifact "$ARCHIVE"
+
+[doc("Cross-compile the Windows ffmpeg in a mingw-w64 container (needs docker)")]
+[windows]
+[extension('.ps1')]
+ffmpeg-win:
+    #!pwsh.exe
+    $ErrorActionPreference = 'Stop'
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        Write-Error 'docker is required to build the Windows ffmpeg (Docker Desktop)'
+    }
+    # The dual-boot rule: this tree is SHARED with the Linux boot and `target/`
+    # holds the Linux cargo state, so the container's scratch goes to
+    # target-ffmpeg-win/, which is git-excluded like target-win/. Only the
+    # finished archive moves into target/artifacts/ afterwards.
+    $out = Join-Path $PWD 'target-ffmpeg-win'
+    New-Item -ItemType Directory -Force -Path $out | Out-Null
+    Write-Host '==> Preparing the build image (cached after the first run)...'
+    docker build -f scripts/ffmpeg-win/Dockerfile -t cck-ffmpeg-win scripts
+    if ($LASTEXITCODE -ne 0) { Write-Error 'docker build failed' }
+    docker run --rm -v "${PWD}:/src:ro" -v "${out}:/out" `
+        cck-ffmpeg-win bash /src/scripts/ffmpeg-win/build.sh
+    if ($LASTEXITCODE -ne 0) { Write-Error 'the ffmpeg cross-build failed' }
+    # NOT named `$env`: that is the automatic environment drive, and shadowing it
+    # is the kind of thing that works until something in the recipe reads $env:.
+    $report = @{}
+    Get-Content (Join-Path $out 'ffmpeg-win.env') |
+        ForEach-Object { $k, $v = $_ -split '=', 2; $report[$k] = $v }
+    . scripts/artifacts.ps1
+    # The ARCHIVE only; see the bash arm for why the .sha256 stays behind.
+    $src = Join-Path $out $report['CCK_FFMPEG_WIN_ARCHIVE']
+    $dst = Publish-CckArtifact -Path $src
+    Remove-Item $src -Force
+    Write-Host "==> NVENC API: $($report['CCK_FFMPEG_WIN_NVENC_API']) (the NVIDIA driver floor this build declares)"
+    Write-CckArtifact $dst
+
 # Update the RUNNING resident daemon to the freshly built binary, on any
 # platform: build, stop the old daemon, start the new one, and print the
 # binary's full path (paste it into a system-level hotkey, e.g. COSMIC's
@@ -740,8 +833,10 @@ dev:
     $rel = 'target-win\release'
     $vendorFfmpeg = 'vendor\ffmpeg\windows-x86_64'
     $vendorTess = 'vendor\tesseract\windows-x86_64'
-    # The exes AND their DLLs: BtbN's shared ffmpeg build is stubs beside the
-    # libav DLLs, so the exes alone cannot start.
+    # The exes AND their DLLs: the shared ffmpeg build is stubs beside the
+    # libav DLLs, so the exes alone cannot start. Since DRAGON-675 that ffmpeg
+    # is OURS, cross-compiled against the pinned nv-codec-headers, so this dev
+    # daemon exercises the same NVENC floor a customer's MSI will.
     Get-ChildItem $vendorFfmpeg -File | Where-Object { $_.Extension -in '.exe', '.dll' } |
         ForEach-Object { Copy-Item $_.FullName (Join-Path $rel $_.Name) -Force }
     Copy-Item (Join-Path $vendorTess 'tesseract.exe') $rel -Force

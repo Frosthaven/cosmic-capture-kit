@@ -362,13 +362,19 @@ fn backend_env_override(existing: Option<&str>, want_software: bool) -> Option<&
 /// Unverified on real Windows 10 hardware (nobody on the project has any): this is
 /// implemented on the alpha-hypothesis reasoning above, and the worst case is a
 /// picker-only regression there, reversible by deleting the `!color_picker` term.
+/// `dcomp` is the DRAGON-666 experiment (`platform::win_dcomp_requested`): a run that
+/// presents through a DirectComposition visual has REAL per-pixel alpha from the surface
+/// itself, so the software rasterizer has nothing left to fix and must stand down —
+/// otherwise a Windows 10 tester would take tiny-skia before wgpu ever saw the option, and
+/// the experiment could not answer the question it exists to ask.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn wants_software_backend(
     opens_overlays: bool,
     color_picker: bool,
     platform_software: bool,
+    dcomp: bool,
 ) -> bool {
-    opens_overlays && !color_picker && platform_software
+    opens_overlays && !color_picker && platform_software && !dcomp
 }
 
 /// DRAGON-650: whether THIS process was actually FORCED onto the software rasterizer by the
@@ -715,10 +721,67 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
     // reasoning and the tests.
     #[cfg(windows)]
     {
+        // DRAGON-666, the DirectComposition experiment, decided BEFORE the software force
+        // because it overrules it: a DComp surface has real per-pixel alpha, so tiny-skia
+        // has nothing left to fix, and a Windows 10 tester who took the force would never
+        // reach a swapchain to configure. The variable it writes is wgpu's own; ours only
+        // says whether to write it (`platform::win_dcomp_requested`).
+        //
+        // A user who has already set `WGPU_DX12_PRESENTATION_SYSTEM` themselves keeps it,
+        // the same courtesy `backend_env_override` extends to a hand-set `ICED_BACKEND`.
+        // Children inherit `CCK_WIN_DCOMP` and decide for themselves, which is what we
+        // want: the editor and the picker should present the same way the overlay does.
+        let dcomp = crate::platform::dcomp_enabled();
+        if dcomp {
+            // The BACKEND first: `WGPU_DX12_PRESENTATION_SYSTEM` is a DX12-only option, and
+            // wgpu's default order picks VULKAN on plenty of real hardware (a customer's
+            // GTX 1080 Ti did, and every window went solid because the Vulkan surface
+            // reports `[Opaque]` just like the HWND one). Asking for a composition visual
+            // while running Vulkan asks for nothing at all.
+            //
+            // A user who pinned `WGPU_BACKEND` themselves keeps it, the same courtesy the
+            // presentation system and `ICED_BACKEND` get; they may be working around a
+            // driver bug of their own, and we would rather present the old way than fight
+            // them for it.
+            let backend_env = crate::platform::WGPU_BACKEND_ENV;
+            match std::env::var(backend_env) {
+                Ok(v) if !v.trim().is_empty() => log::info!(
+                    "dcomp experiment: {backend_env}={v:?} is already set — honouring it \
+                     (a composition visual needs the dx12 backend)"
+                ),
+                _ => {
+                    // SAFETY: single-threaded here, as for every other write in this block.
+                    unsafe {
+                        std::env::set_var(backend_env, crate::platform::WGPU_BACKEND_DX12);
+                    }
+                }
+            }
+            let wgpu_env = crate::platform::WGPU_PRESENTATION_ENV;
+            match std::env::var(wgpu_env) {
+                Ok(v) if !v.trim().is_empty() => log::info!(
+                    "dcomp experiment: {wgpu_env}={v:?} is already set — honouring it"
+                ),
+                _ => {
+                    log::info!(
+                        "dcomp experiment: presenting through a DirectComposition visual \
+                         ({wgpu_env}={} on the {} backend); the windows 10 software force \
+                         stands down",
+                        crate::platform::WGPU_DCOMP_VALUE,
+                        crate::platform::WGPU_BACKEND_DX12,
+                    );
+                    // SAFETY: single-threaded here, same as the writes around it — the
+                    // runtime and renderer threads are spawned by `cosmic::app::run` below.
+                    unsafe {
+                        std::env::set_var(wgpu_env, crate::platform::WGPU_DCOMP_VALUE);
+                    }
+                }
+            }
+        }
         let want_software = wants_software_backend(
             startup.opens_overlays(),
             startup.color_picker,
             crate::platform::software_overlays(),
+            dcomp,
         );
         let existing = std::env::var("ICED_BACKEND").ok();
         if let Some(backend) = backend_env_override(existing.as_deref(), want_software) {
@@ -744,6 +807,17 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
                 existing.unwrap_or_default()
             );
         }
+        // ONE line that answers "what is this process rendering with", so a reader
+        // never has to infer it from the presence or absence of somebody else's log
+        // line. The header's `wants_software=` states the platform GATE and is
+        // written before this decision exists; the arms above each explain a
+        // particular choice; this states the choice itself, on every Windows launch.
+        log::info!(
+            "renderer: {} (overlays={}, dcomp={})",
+            if want_software { "tiny-skia (software)" } else { "wgpu (gpu)" },
+            startup.opens_overlays(),
+            dcomp,
+        );
     }
     // DRAGON-354: register the two embedded annotation faces (Excalifont / Inter) with the
     // GLOBAL cosmic-text font system SYNCHRONOUSLY, here — BEFORE `cosmic::app::run` below
@@ -1452,19 +1526,50 @@ fn scan_press_refreshes(current: Kind, pressed: Kind) -> bool {
 // at all. Scan refreshes no longer write through the flats slot — a failed live region shot
 // is handled where it lands, in `MarksPoll`, by leaving the previous answer standing.
 
+/// What THIS launch does about the frozen-flats grab, resolved by `App::init` from the
+/// launch gates and handed to [`acquire_scene`] as ONE value (DRAGON-663).
+///
+/// One parameter rather than a `want` flag plus a `hold` flag, for two reasons. The states
+/// are not independent (a launch that holds necessarily wants them, so the fourth
+/// combination has no meaning and could still be written), and [`acquire_scene`] is already
+/// at clippy's argument budget, which is what the `want_flats` doc below is about.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FlatsPlan {
+    /// Nothing on this launch can read the flats ([`launch_flats_needed`] false: the common
+    /// freeze-off, non-scanner, non-picker screenshot). An EMPTY result is parked so the
+    /// very first drain tick clears `frozen_pending` and stops the poll.
+    Skip,
+    /// Grab them now, on the deferred thread. Every ordinary freeze / scanner / picker
+    /// launch, and the historical behaviour of `want_flats == true`.
+    Now,
+    /// Wanted, but NOT YET, because something of ours is on screen that the grab would
+    /// photograph. Nothing is spawned and nothing is parked, so `frozen_pending` stays
+    /// armed and the dim cannot begin to fade (`overlay::dim_fade_may_start`); whoever
+    /// armed the hold runs [`spawn_frozen_flats_grab`] once its own condition clears.
+    ///
+    /// TWO arming reasons today, and they release on different signals:
+    /// [`capture_flow::menu_flats_hold_needed`] holds a Linux tray-menu launch until our
+    /// overlay has taken keyboard focus and retired the dropdown (DRAGON-600), and
+    /// [`capture_flow::picker_flats_held`] holds a colour-picker launch until its countdown
+    /// has fired and its digits have left the screen (DRAGON-663).
+    Hold,
+}
+
 /// `want_flats` is [`launch_flats_needed`]'s answer, resolved by the CALLER rather than
 /// re-derived here from a kind plus two flags. That keeps the decision visible next to the
 /// other launch gates in `App::init`, and keeps this signature inside clippy's argument
-/// budget now that the colour picker is a third reader of the flats.
+/// budget now that the colour picker is a third reader of the flats. Since DRAGON-663 it
+/// arrives as a [`FlatsPlan`], which carries the "not yet" case the boolean could not.
 fn acquire_scene(
     active: bool,
     launch_mode: Mode,
     want_cursor: bool,
     want_freeze: bool,
-    want_flats: bool,
+    flats: FlatsPlan,
     wallpaper: Option<std::path::PathBuf>,
     radius: f32,
 ) -> (PrecaptureSlot, HashMap<String, FrozenOutput>, FrozenSlot, WallpaperSlot, CursorSlot) {
+    let want_flats = flats != FlatsPlan::Skip;
     // The window pre-capture runs on a DEDICATED OS thread (never the UI thread) and
     // deposits its result into a shared slot the UI polls each loading tick. It costs
     // ~1s of SCK-serialized work that ONLY window mode needs, so DRAGON-204 defers it
@@ -1550,7 +1655,10 @@ fn acquire_scene(
                 // them (freeze off + not a scanner launch). The deferred per-output
                 // WALLPAPER resolve below still runs on this same thread exactly as
                 // before — the window picker needs it regardless of freeze.
-                if want_flats {
+                // DRAGON-663: `Hold` skips it here too, and for the opposite reason: this
+                // launch DOES read them, just not from the screen as it looks right now.
+                // `spawn_frozen_flats_grab` runs the identical grab when the hold releases.
+                if flats == FlatsPlan::Now {
                     let flats = grab_frozen_flats(want_cursor);
                     crate::util::timing_mark("acquire_scene: frozen all_outputs (deferred thread done)");
                     if let Ok(mut g) = slot.lock() {
@@ -1580,20 +1688,19 @@ fn acquire_scene(
     // screencopy already runs off-thread for window capture. `init` returns an EMPTY map.
     #[cfg(not(target_os = "macos"))]
     let frozen: HashMap<String, FrozenOutput> = {
-        // DRAGON-336: `want_flats` (not bare `active`) — a freeze-off, non-scanner launch
+        // DRAGON-336: the plan (not bare `active`). A freeze-off, non-scanner launch
         // has no reader for the flats, so it neither grabs nor retains them.
-        if want_flats {
-            // DRAGON-600 (Linux, tray-menu launches only): HOLD the grab. The host's
-            // dropdown is still on screen and is dismissed by THIS process taking keyboard
-            // focus, which has not happened yet, so grabbing now photographs the menu.
-            // `App::tick_menu_hold` runs the identical grab once the overlay has focus.
-            if menu_flats_held(want_flats) {
-                crate::util::timing_mark(
-                    "acquire_scene: frozen all_outputs (HELD for the tray dropdown)",
-                );
-            } else {
-                spawn_frozen_flats_grab(frozen_slot.clone(), want_cursor);
-            }
+        //
+        // `Hold` is the third case (DRAGON-600 for a Linux tray dropdown, DRAGON-663 for a
+        // colour picker counting down): something of ours is on screen that this grab would
+        // photograph, so it is not started here at all. The releaser runs the identical
+        // grab through `spawn_frozen_flats_grab` when its own condition clears.
+        match flats {
+            FlatsPlan::Now => spawn_frozen_flats_grab(frozen_slot.clone(), want_cursor),
+            FlatsPlan::Hold => crate::util::timing_mark(
+                "acquire_scene: frozen all_outputs (HELD, see FlatsPlan::Hold)",
+            ),
+            FlatsPlan::Skip => {}
         }
         HashMap::new()
     };
@@ -1602,13 +1709,22 @@ fn acquire_scene(
 
 /// The DEFERRED frozen-flats grab, on its own thread, depositing into `slot` for
 /// `CaptureMsg::FrozenReady` to drain (DRAGON-212). Safe to thread: `all_outputs` opens
-/// its OWN wayland connection.
+/// its OWN wayland connection, and the macOS arm is the same `grab_frozen_flats` its
+/// launch thread runs.
 ///
-/// Extracted from [`acquire_scene`] by DRAGON-600 because there are now TWO moments it can
-/// start from. The usual one is launch. The other is once a tray-menu child's overlay has
-/// taken keyboard focus and the dropdown that launched it is gone. Both must run the same
-/// grab, so there is one body.
-#[cfg(not(target_os = "macos"))]
+/// Extracted from [`acquire_scene`] by DRAGON-600 because there are now THREE moments it can
+/// start from. The usual one is launch. The second is once a tray-menu child's overlay has
+/// taken keyboard focus and the dropdown that launched it is gone. The third (DRAGON-663) is
+/// once a colour picker's countdown has fired and its digits have left the screen. All three
+/// must run the same grab, so there is one body.
+///
+/// **This was a no-op on macOS until DRAGON-663**, and the tombstone matters because the
+/// reasoning was sound at the time and is no longer. The only caller then was
+/// `tick_menu_hold`, whose one source ([`menu_flats_held`]) is `cfg!(target_os = "linux")`,
+/// so the mac call site was structurally unreachable and the stub existed purely so the
+/// portable call in `update/capture.rs` needed no `cfg` of its own. The picker's reveal is a
+/// caller that DOES run on macOS, so an empty body there would mean a picker with a delay
+/// never got any pixels at all.
 fn spawn_frozen_flats_grab(slot: FrozenSlot, want_cursor: bool) {
     crate::util::timing_mark("acquire_scene: frozen all_outputs (kick DEFERRED thread)");
     std::thread::spawn(move || {
@@ -1619,16 +1735,6 @@ fn spawn_frozen_flats_grab(slot: FrozenSlot, want_cursor: bool) {
         }
     });
 }
-
-/// macOS: the ONLY caller, `update::capture::tick_menu_hold`, is gated behind
-/// `App::menu_hold` being `Some`, and [`menu_flats_held`] (its one source) is
-/// `cfg!(target_os = "linux")`-gated to answer `false` everywhere else — mac has its own
-/// synchronous flats grab inline in [`acquire_scene`], never this deferred one. So this call
-/// site is structurally unreachable here; it still needs to exist so the portable call in
-/// `update/capture.rs` compiles with no `cfg` of its own, matching the shape `menu_flats_held`
-/// itself uses.
-#[cfg(target_os = "macos")]
-fn spawn_frozen_flats_grab(_slot: FrozenSlot, _want_cursor: bool) {}
 
 /// Whether this process was launched by activating a tray-menu row
 /// ([`crate::recording_ui::MENU_LAUNCH_ENV`], set by the Linux resident and recording
@@ -3086,9 +3192,47 @@ pub struct App {
     text_drag: Option<(usize, bool, std::collections::BTreeSet<usize>)>,
     /// In-progress region recording (worker handle), if any.
     recording: Option<crate::record::RecordHandle>,
+    /// DRAGON-659: a worker spawned EARLY, during the countdown's last second, but not yet
+    /// promoted into `self.recording`. Live only between [`App::arm_warm_spawn`] and the
+    /// countdown's zero-tick; `None` for a no-countdown capture, where spawn and promotion
+    /// collapse into the one `start_recording` call they have always been.
+    ///
+    /// `self.recording` deliberately stays `None` for the whole countdown, which is what
+    /// keeps this additive: two if/else-if chains test `recording` BEFORE `countdown`
+    /// (`view_window`'s view pick and Escape's `WindowChromeMsg::Close`), so an early
+    /// `Some` there would render the recording view over the countdown and turn Escape
+    /// into "stop and save" instead of "cancel the timer".
+    warming: Option<WarmSpawn>,
+    /// DRAGON-659: when `self.recording` became `Some` (the promotion instant). Drives ONLY
+    /// the warmup spinner's reveal/hold timing, which is why it is separate from
+    /// `recording_started`: that one anchors the RECORDED elapsed time and is not set until
+    /// the worker reports its pipeline settled.
+    recording_promoted_at: Option<std::time::Instant>,
     /// When the current recording started + its output path (for the chip's
     /// elapsed-time / size readout).
+    ///
+    /// DRAGON-659: `recording_started` is the WORKER's own instant, not the promotion
+    /// instant, so the elapsed readout counts real recorded content and cannot drift by a
+    /// poll's cadence. It is also the once-per-recording latch for that adoption: `None`
+    /// while a promoted recording is still warming.
+    ///
+    /// DRAGON-673: which instant, though, is `RecordHandle::settled_at` — MEDIA 0, where the
+    /// file begins. It was the confirmed first frame (`warm_at`) from DRAGON-659 until here,
+    /// on the premise that the frame is where the file's content starts; media 0 moved to the
+    /// settled pipeline (DRAGON-672) and the worker moved to countdown START (DRAGON-673),
+    /// which left that premise a whole countdown out. A 10s countdown armed its readout at
+    /// about 0:10.
     recording_started: Option<std::time::Instant>,
+    /// DRAGON-661: has this recording DECLARED ITSELF LIVE yet, i.e. has the tray been
+    /// raised for it? The once-per-recording latch for that transition. It reads the same
+    /// `RecordHandle::settled_at` as `recording_started` since DRAGON-673, so the two now
+    /// flip on the same poll; they keep separate latches because they are separate state
+    /// (an instant, and whether the tray was raised).
+    ///
+    /// A field of its own rather than a test of `self.tray`: a Linux session with no SNI
+    /// host leaves that `None` even though the tray was raised as far as it can be, and
+    /// keying on it would re-run the transition on every 100ms poll.
+    recording_live_declared: bool,
     recording_path: Option<std::path::PathBuf>,
     /// Where the finished recording is being written — the file `finalize` produces from
     /// `recording_path`. Kept only so the session-level bound (DRAGON-423) can see a stop
@@ -3156,6 +3300,21 @@ pub struct App {
     /// answered (Linux without an SNI host keeps the historical window countdown on
     /// the fallback path).
     countdown_tray: Option<crate::tray::CountdownTraySession>,
+    /// The running countdown's START GATE (DRAGON-673), or `None` for a capture with no
+    /// countdown. Minted false in `enter_countdown` and RAISED in `App::start_recording`,
+    /// the one instant the app begins claiming to record.
+    ///
+    /// Handed to the recording session as `RecordSettings::start_gate`: the worker is
+    /// spawned at countdown START so the whole countdown is warmup cover, and this is what
+    /// still holds the FILE's media 0 back, so warming early can never put countdown time in
+    /// the recording.
+    ///
+    /// It carried the PREDICTED countdown-zero instant first (`now + secs`, stamped as the
+    /// countdown began), and that is why it is a flag now: the prediction ran ~1s ahead of
+    /// the tick that actually fires the capture, so the file began before the UI said
+    /// "Recording". A signal the app raises where it promotes cannot drift from the
+    /// promotion, because it IS the promotion.
+    countdown_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Whether the active tray/daemon control surface REPLACES the in-frame toolbar
     /// (DRAGON-172). Decoupled from `tray.is_some()`: on macOS a daemon relay can be
     /// attached (the daemon menu is live) while the in-frame toolbar STAYS visible in
@@ -3341,11 +3500,17 @@ pub struct App {
     /// crop that only the scan passes read. Sharing a slot is what would let a scan shot
     /// overwrite the pixels a capture is about to commit.
     scan_shot_slot: std::sync::Arc<std::sync::Mutex<Option<Option<image::RgbaImage>>>>,
-    /// DRAGON-460: the refresh button's spin angle, in radians. Advanced by `ScanSpinTick`
-    /// while the scanner is busy and left where it stopped otherwise — the glyph resting at
+    /// DRAGON-460: a busy glyph's spin angle, in radians. Advanced by `BusySpinTick`
+    /// while something is busy and left where it stopped otherwise — the glyph resting at
     /// an arbitrary angle is invisible for a symmetric refresh arrow, and resetting it to 0
     /// would make every scan start with a visible snap back.
-    scan_spin: f32,
+    ///
+    /// DRAGON-659 renamed it from `scan_spin`: it now drives TWO glyphs, the scanner's
+    /// refresh button and the record chip's warming spinner. They are never DRAWN at the
+    /// same time (the toolbar shows either the kind row or the chip, never both), so one
+    /// angle is enough; only the tick's gate has to name both, or the angle would freeze
+    /// under a still-visible spinner the moment the other consumer went idle.
+    busy_spin: f32,
     /// The deferred flats grab hasn't landed yet. Drives the poll subscription that
     /// drains `frozen_slot`.
     frozen_pending: bool,
@@ -3353,6 +3518,29 @@ pub struct App {
     /// launched this child is gone. `None` on every launch with no menu on screen and on
     /// every other platform, so nothing but a tray launch pays for it.
     menu_hold: Option<MenuFlatsHold>,
+    /// DRAGON-663: the configured delay for a COLOUR PICKER launch, waiting for somewhere to
+    /// draw its digits. `None` on every launch that is not a picker with a delay set, which
+    /// leaves every other launch shape byte-identical.
+    ///
+    /// It is a two-step arm rather than one because [`App::enter_picker_countdown`] has to
+    /// call `recreate_active_overlays`, and at `init` there are no overlays yet: on Linux
+    /// they arrive per output from the Wayland registry, on macOS and Windows from
+    /// `seed_outputs_mac`. Arming before they exist would mint them fully interactive and
+    /// input-blocking, which is the one thing a countdown must not be: the delay exists so
+    /// the user can rearrange the screen. `sub_picker_countdown_arm` waits for
+    /// `self.outputs` and then spends this, so it is also the latch that keeps the countdown
+    /// from being armed twice.
+    picker_countdown_pending: Option<u8>,
+    /// DRAGON-663: a colour picker's countdown has FIRED and the overlay has gone blank, so
+    /// the held flats grab runs on the next settle tick (`sub_picker_reveal`).
+    ///
+    /// The settle is the same one `sub_pixel_capture` and the DRAGON-456 scan re-read take,
+    /// and for the same reason: the countdown's dim and timer chip were on screen a frame
+    /// ago, and a grab that starts before the compositor has presented the blank surface
+    /// photographs them. For a capture that would put our own chrome in the shot; for the
+    /// picker it is worse, because the picker REPORTS the pixel it reads, so a dim baked
+    /// into the snapshot is returned to the user as the colour they picked.
+    picker_revealing: bool,
     /// DRAGON-606: how far the capture overlay's dim has faded in. Starts `Waiting`, which
     /// paints NO dim, becomes `Armed` when the frozen-flats grab has landed
     /// (`overlay::dim_fade_may_start`), and only starts its clock on the first painted
@@ -3645,6 +3833,18 @@ struct HeldStream {
     window_grant: Option<PortalWindowGrant>,
 }
 
+/// DRAGON-659: a recording worker that is RUNNING but not yet the app's recording, the
+/// early spawn a countdown covers. Held in `App::warming` until the countdown's zero-tick
+/// promotes it, or [`App::abandon_warming`] throws it away.
+///
+/// The `out_path` is carried rather than recomputed because `record_output_path` embeds a
+/// wall-clock timestamp (`capture_timestamp`): asking twice yields two different files, and
+/// the second one would be bookkeeping for a file the worker never wrote to.
+struct WarmSpawn {
+    handle: crate::record::RecordHandle,
+    out_path: std::path::PathBuf,
+}
+
 mod message;
 pub use message::{
     BorderColorTarget, CaptureMsg, CloudSettingsMsg, ColorPickerMsg, RecordingMsg, DetectMsg,
@@ -3834,22 +4034,52 @@ mod tests {
     #[test]
     fn the_colour_picker_never_asks_for_the_software_renderer() {
         // THE new case: a Windows 10 picker launch keeps wgpu.
-        assert!(!wants_software_backend(true, true, true));
+        assert!(!wants_software_backend(true, true, true, false));
         // A Windows 10 capture launch is forced exactly as before — the exemption must
         // reach nothing but the picker.
-        assert!(wants_software_backend(true, false, true));
+        assert!(wants_software_backend(true, false, true, false));
         // Windows 11 / Linux / macOS (`platform_software` false): nobody is forced, picker
         // or not.
-        assert!(!wants_software_backend(true, false, false));
-        assert!(!wants_software_backend(true, true, false));
+        assert!(!wants_software_backend(true, false, false, false));
+        assert!(!wants_software_backend(true, true, false, false));
         // A launch with no overlays never was, whatever the other flags say.
         for (picker, platform) in [(false, false), (false, true), (true, false), (true, true)] {
-            assert!(!wants_software_backend(false, picker, platform));
+            assert!(!wants_software_backend(false, picker, platform, false));
         }
         // And the picker still OPENS overlays (`Startup::opens_overlays` is untouched):
         // the narrowing lives at the renderer decision only, because the flats grab, the
         // boot policy and the surface routing all still need the true answer.
         assert!(Startup { color_picker: true, ..Default::default() }.opens_overlays());
+    }
+
+    /// DRAGON-666: the DirectComposition experiment OVERRULES the Windows 10 software
+    /// force, and that ordering is the whole reason the experiment can answer anything.
+    ///
+    /// A DComp surface reports real per-pixel alpha modes, so tiny-skia has nothing left to
+    /// fix. If the force still won, a Windows 10 tester would land on the software
+    /// rasterizer before wgpu ever saw the option — they would report "no change", and we
+    /// would read that as "DirectComposition does not work on Windows 10" when in fact it
+    /// was never asked.
+    #[test]
+    fn the_dcomp_experiment_stands_the_windows_10_force_down() {
+        // THE case the Windows 10 tester runs: the force would fire, and does not.
+        assert!(wants_software_backend(true, false, true, false));
+        assert!(!wants_software_backend(true, false, true, true));
+        // It changes nothing anywhere the force was never going to fire, so a Windows 11
+        // tester's run differs from today in the presentation path alone.
+        for (overlays, picker, platform) in [
+            (true, true, true),
+            (true, false, false),
+            (false, false, true),
+            (false, true, false),
+        ] {
+            assert!(!wants_software_backend(overlays, picker, platform, true));
+            assert_eq!(
+                wants_software_backend(overlays, picker, platform, false),
+                wants_software_backend(overlays, picker, platform, true),
+                "dcomp may only change the one case the force owns"
+            );
+        }
     }
 
     /// DRAGON-650: the forced-backend predicate answers false wherever the force never ran.

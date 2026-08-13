@@ -55,8 +55,18 @@ impl App {
             .filter(|_| active)
             .filter(|s| s.window_id.is_some())
             .map(|s| (s.x, s.y, s.width, s.height));
+        // DRAGON-663: a COLOUR PICKER session declines the region anchor. `self.region` is
+        // PERSISTED, so a picker launch carries the last rectangle the user drew in some
+        // earlier capture session, and it never draws it. Anchoring to it would park the
+        // countdown chip against an invisible box, in a corner the user has no way to
+        // account for. A pick has no selection at all, so it takes the same centred-bottom
+        // anchor monitor captures and the window picker take.
+        //
+        // The term is exact rather than broad: a picker session reaches this function ONLY
+        // through the countdown view (its own overlay draws no toolbar), so nothing that
+        // existed before this ticket changes.
         let region_sel = window_rect.or_else(|| {
-            if self.mode == Mode::Region {
+            if self.mode == Mode::Region && !self.color_picking() {
                 self.normalized_region()
             } else {
                 None

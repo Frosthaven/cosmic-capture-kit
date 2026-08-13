@@ -794,11 +794,48 @@ mod sck {
         /// mirroring the Linux sidecar's `asetnsamples=4800` (0.1s) cadence.
         meter_sq_sum: f64,
         meter_samples: usize,
+        /// Whole-session level accounting (observability only, no behaviour change): the
+        /// sum of squares and sample count over the ENTIRE capture, plus the peak absolute
+        /// sample. Logged once at capture end as dBFS RMS + dBFS peak.
+        ///
+        /// WHY WE MEASURE IT, and why we do NOT try to correct it: recordings come back
+        /// quieter than the source, and this diagnosed WHY. It is not our capture, our
+        /// mixer, or the system volume (measured: a 100% and a 50% take were byte-identical,
+        /// and the mic-session status makes no difference). It is a KNOWN, unfixed macOS
+        /// ScreenCaptureKit bug present since 14.2: SCK reduces captured desktop audio by a
+        /// DEVICE-DEPENDENT amount (reported −14 dB / −6 dB / 0 dB across output devices,
+        /// measured ~−12 dB here). Apple ships no API or SCStreamConfiguration setting to
+        /// disable it, and it hits every SCK app (OBS included). A fixed make-up gain would
+        /// be WRONG on a device the bug does not touch, so we deliberately do not apply one;
+        /// the level log stays purely so the next report can be recognised on sight.
+        /// See https://developer.apple.com/forums/thread/743156
+        session_sq_sum: f64,
+        session_samples: u64,
+        session_peak: f32,
     }
 
     /// Samples per published meter window: 0.1s of interleaved stereo at 48 kHz
     /// (4800 frames × 2 channels) — the Linux meter sidecar's cadence.
     const METER_WINDOW_SAMPLES: usize = 4800 * 2;
+
+    impl Drop for AudioAccum {
+        fn drop(&mut self) {
+            if self.session_samples == 0 {
+                return;
+            }
+            let rms = (self.session_sq_sum / self.session_samples as f64).sqrt();
+            let to_dbfs = |x: f64| if x <= 0.0 { -120.0 } else { 20.0 * x.log10() };
+            log::info!(
+                "system-audio (SCK) session level: rms={:.1}dBFS peak={:.1}dBFS over {:.1}s; \
+                 a low level here is the known macOS SCK device-dependent capture-volume bug \
+                 (14.2+, developer.apple.com/forums/thread/743156), not our capture — no fix on \
+                 our side is possible without a per-device workaround we deliberately avoid",
+                to_dbfs(rms),
+                to_dbfs(self.session_peak as f64),
+                self.session_samples as f64 / 2.0 / 48_000.0,
+            );
+        }
+    }
 
     impl AudioAccum {
         /// Stamp + deliver one converted interleaved-stereo chunk — the exact shape of
@@ -839,6 +876,13 @@ mod sck {
                     (lag * 1000.0).round()
                 );
             }
+            // Whole-session level (observability only): fold this chunk's energy and peak in
+            // before the windowed meter consumes it, so the session line survives every reset.
+            self.session_sq_sum += samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
+            self.session_samples += samples.len() as u64;
+            self.session_peak = samples
+                .iter()
+                .fold(self.session_peak, |m, s| m.max(s.abs()));
             // Feed the overlay's system-audio button meter (struct doc): accumulate
             // this chunk into the running 0.1s window and publish its RMS when full.
             self.meter_sq_sum += samples.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>();
@@ -918,6 +962,9 @@ mod sck {
             warned: false,
             meter_sq_sum: 0.0,
             meter_samples: 0,
+            session_sq_sum: 0.0,
+            session_samples: 0,
+            session_peak: 0.0,
         };
         // Fresh session → fresh meter (a stale level from a prior capture in this
         // process must not linger on the overlay's button).

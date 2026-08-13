@@ -469,6 +469,9 @@ fn run_opening_proof(count_on: CountOn, shape: Shape) {
             auto_device_compensation: true,
             metadata: String::new(),
             out_path: out_path.clone(),
+            // DRAGON-673: no countdown in a live test, so media 0 is the settled
+            // pipeline with no gate to hold for.
+            start_gate: None,
         },
     };
 

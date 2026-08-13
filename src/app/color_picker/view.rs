@@ -350,9 +350,26 @@ impl App {
     pub(in crate::app) fn color_picker_window_view(&self) -> Element<'_, Msg> {
         let focused = self.core.focused_window() == self.color_picker.window;
         let header = widget::header_bar()
-            .title(WINDOW_TITLE)
             .focused(focused)
             .on_drag(Msg::WindowChrome(WindowChromeMsg::ColorPickerWindowDrag));
+        // DRAGON-676: the title is CENTRED only where something else owns the top-left
+        // corner, and only macOS does. There the native traffic lights are drawn OVER our
+        // header at exactly that corner (the window opens with a transparent titlebar, see
+        // `open_color_picker_window`), so a flush-left title would sit under them. Windows
+        // and Linux have nothing there: Windows' native caption cluster is top-RIGHT
+        // (DRAGON-284, and `WIN_CAPTION_INSET` below already reserves its width at the END
+        // of the header), and Linux draws our own close/minimize at the same end. So on
+        // both of those the title goes where a window title belongs, flush left.
+        //
+        // Mechanically, left-aligning is not a flag on the title: `header_bar`'s `title`
+        // IS its CENTER region (libcosmic builds it there as `widget::text::heading` and
+        // centres it between the start and end slots). So the same heading goes in the
+        // START region instead and the title is left unset, which is why the two arms look
+        // like different calls rather than one call with a parameter.
+        #[cfg(target_os = "macos")]
+        let header = header.title(WINDOW_TITLE);
+        #[cfg(not(target_os = "macos"))]
+        let header = header.start(header_title());
         // DRAGON-649: minimize, but NEVER maximize. The window is deliberately
         // fixed-size (`min_size == max_size`, see `open_color_picker_window`), so a
         // maximize button would offer an operation the window refuses; minimize is the
@@ -401,14 +418,11 @@ impl App {
             self.controls_row(),
             vspace(geom::GAP_CONTROLS_VALUE),
             self.value_row(),
-            vspace(geom::SECTION_GAP),
-            // Wrapped at exactly DIVIDER_H: the divider widget carries its own padding,
-            // and un-counted height here is what once clamped the second history row
-            // short (iced clamps Fixed children to whatever room is left).
-            widget::container(widget::divider::horizontal::default())
-                .width(Length::Fill)
-                .height(Length::Fixed(geom::DIVIDER_H))
-                .into(),
+            // The two gaps around the divider differ by design: see
+            // `geom::GAP_VALUE_DIVIDER`, which gives back the empty descender space the
+            // caption band above the line carries and the swatches below it do not.
+            vspace(geom::GAP_VALUE_DIVIDER),
+            divider_band(),
             vspace(geom::SECTION_GAP),
             self.recent_colors_grid(),
         ];
@@ -430,7 +444,10 @@ impl App {
         // flat, which the owner warned is the usual first-try mac mistake.
         let glass = self.glass;
         widget::container(stacked)
-            .padding(1)
+            // COUNTED in `geom::color_window_size` as `WINDOW_BORDER`: this padding is
+            // real content width the sections below never got, and every one of them is
+            // laid out at exactly CONTENT_W.
+            .padding(geom::WINDOW_BORDER)
             .width(Length::Fill)
             .height(Length::Fill)
             .class(cosmic::theme::Container::custom(move |theme| {
@@ -539,95 +556,171 @@ impl App {
         .into()
     }
 
-    /// The value row (DRAGON-630): the current mode's component boxes with their
-    /// captions beneath, the mode DROPDOWN, and the copy button pinned to the content's
-    /// right edge (the tracks' own right edge, the owner's alignment ask, held by the
-    /// flexible spacer so it can never shift when the box count changes). Each box
-    /// shows the live DRAFT while it is the one being typed into, and the canonical
-    /// spelling otherwise, so a half-typed value is never rewritten under the caret
-    /// (see `ColorPickerState::draft`).
+    /// The value row (DRAGON-630), THREE BANDS stacked:
+    ///
+    /// 1. the MODE row: the mode dropdown (its name plus the up/down caret), sized to its
+    ///    own longest option, then the split-inputs toggle and the copy button
+    ///    IMMEDIATELY after it, then the word "Copied!" while a copy is fresh. Both icons'
+    ///    tooltips drop UPWARD and are always available (DRAGON-676: the acknowledgement
+    ///    used to be a tooltip card pinned open over the copy button, which had to silence
+    ///    the neighbour's tooltip for as long as it was up);
+    /// 2. the BOX row: the current mode's component boxes and nothing else, spanning the
+    ///    whole content width, flush at both edges;
+    /// 3. the CAPTION band: "R", "G", "B", "A", its cells the same widths and gaps as the
+    ///    boxes above, so each caption lands under its own box.
+    ///
+    /// Each box shows the live DRAFT while it is the one being typed into, and the
+    /// canonical spelling otherwise, so a half-typed value is never rewritten under the
+    /// caret (see `ColorPickerState::draft`).
+    ///
+    /// **Why three bands and not one row.** It was one row of per-box COLUMNS, each
+    /// `[control, caption]`, with the chip and both icon buttons in their own fixed
+    /// [`geom::VALUE_BOX_H`] boxes beside them, and it cost two things the owner named:
+    ///
+    /// * The fixed boxes silently assumed a text input measures exactly `VALUE_BOX_H`,
+    ///   and it does not: it measures its font's line height plus its own padding, a
+    ///   shade more at the default scale and further out at a larger one. Everything that
+    ///   was NOT a text input sat a point or two high. Now nothing is measured against a
+    ///   constant: within a band, the boxes are the tallest thing and their neighbours
+    ///   centre on THEM.
+    /// * The chip and the two icon buttons were eating 156pt of the row that the boxes,
+    ///   and through them the window's whole width, were sized around. Lifting all three
+    ///   onto their own row is what let [`geom::CONTENT_W`] come down by 146pt, and the
+    ///   room it left up there is where "Copied!" now goes.
     fn value_row(&self) -> Element<'_, Msg> {
         let cp = &self.color_picker;
         // Split channel boxes, or the ONE whole-value box, by the remembered layout
-        // toggle (DRAGON-630 rev 3). Both spans are the same budget, so the right-edge
-        // cluster never moves between them.
-        let boxes: Element<'_, Msg> = if cp.split_inputs {
-            let bw = geom::value_box_width(cp.box_count());
+        // toggle (DRAGON-630 rev 3). Both spans are the same budget, so the copy button
+        // never moves between them. The boxes and their captions are collected as two
+        // PARALLEL lists, one cell each, so the two bands line up column by column
+        // without either one being nested inside the other.
+        let mut inputs: Vec<Element<'_, Msg>> = Vec::new();
+        let mut captions: Vec<Element<'_, Msg>> = Vec::new();
+        if cp.split_inputs {
+            // Per-box widths, not one width times the count: the boxes span the whole
+            // content width now, so the floor()'s remainder is handed out a point at a
+            // time and the row lands flush on both edges (`geom::value_box_widths`).
+            let widths = geom::value_box_widths(cp.box_count());
             // Single letters everywhere, hex included (the owner's call): the hex boxes
             // hold pairs like `FF`, and the content is what says which dialect this is.
             let mut labels = cp.mode.component_labels().to_vec();
             labels.push("A");
-            let mut cells: Vec<Element<'_, Msg>> = Vec::new();
-            for (i, label) in labels.iter().enumerate() {
-                let input = widget::text_input("", cp.box_text(i))
-                    .on_input(move |s| Msg::ColorPicker(ColorPickerMsg::BoxEdited(i, s)))
-                    .on_submit(|_| Msg::ColorPicker(ColorPickerMsg::BoxCommitted))
-                    .width(Length::Fixed(bw));
-                cells.push(value_cell(input.into(), label, bw));
+            // Zipped, so the widths and the labels cannot disagree about the count even
+            // if `box_count` and `component_labels` ever drift apart.
+            for (i, (label, bw)) in labels.iter().zip(widths).enumerate() {
+                inputs.push(
+                    widget::text_input("", cp.box_text(i))
+                        .on_input(move |s| Msg::ColorPicker(ColorPickerMsg::BoxEdited(i, s)))
+                        .on_submit(|_| Msg::ColorPicker(ColorPickerMsg::BoxCommitted))
+                        .width(Length::Fixed(bw))
+                        .style(value_box_style())
+                        .into(),
+                );
+                captions.push(caption_cell(label, bw));
             }
-            widget::row(cells).spacing(geom::BOX_GAP).into()
         } else {
             let w = geom::value_whole_width();
-            let input = widget::text_input("", cp.box_text(crate::app::color_picker::WHOLE_VALUE_BOX))
-                .on_input(|s| {
-                    Msg::ColorPicker(ColorPickerMsg::BoxEdited(
-                        crate::app::color_picker::WHOLE_VALUE_BOX,
-                        s,
-                    ))
-                })
-                .on_submit(|_| Msg::ColorPicker(ColorPickerMsg::BoxCommitted))
-                .width(Length::Fixed(w));
-            value_cell(input.into(), cp.mode.label(), w)
-        };
-        // A FIXED-width frame around whichever layout is showing, so toggling between
-        // them can never move the mode chip or anything right of it (the owner's ask;
-        // the split block's floor() had been coming out a couple of points narrower
-        // than the whole box).
-        let boxes: Element<'_, Msg> = widget::container(boxes)
-            .width(Length::Fixed(geom::value_whole_width()))
-            .into();
-        // ONE mode control (the owner's review; a chevron pair stood here first, then
-        // the stock dropdown widget, which could not take the icon-button hover, a
-        // fixed text span or our own caret): the hand-built chip + flyout below.
-        let picker_cell = value_cell(
-            mode_picker(cp.mode, cp.mode_menu_open),
-            "",
-            geom::MODE_PICKER_W,
-        );
+            inputs.push(
+                widget::text_input("", cp.box_text(crate::app::color_picker::WHOLE_VALUE_BOX))
+                    .on_input(|s| {
+                        Msg::ColorPicker(ColorPickerMsg::BoxEdited(
+                            crate::app::color_picker::WHOLE_VALUE_BOX,
+                            s,
+                        ))
+                    })
+                    .on_submit(|_| Msg::ColorPicker(ColorPickerMsg::BoxCommitted))
+                    .width(Length::Fixed(w))
+                    .style(value_box_style())
+                    .into(),
+            );
+            captions.push(caption_cell(cp.mode.label(), w));
+        }
+        // A FIXED-width frame around whichever layout is showing, so the two lay out
+        // identically and the band is the same width either way. The caption band takes
+        // the same frame, so the two stay aligned to the same left and right edges.
+        let boxes = widget::container(widget::row(inputs).spacing(geom::BOX_GAP))
+            .width(Length::Fixed(geom::value_whole_width()));
+        let captions = widget::container(widget::row(captions).spacing(geom::BOX_GAP))
+            .width(Length::Fixed(geom::value_whole_width()));
         let copied = cp
             .copied
             .is_some_and(|(_, at)| crate::widgets::copy_button::copied_recently(Some(at)));
-        let copy = widget::container(crate::widgets::copy_button::subtle_copy_button(
+        // The app's ordinary copy control: a green tick for the flash window, and a hover
+        // tooltip. Both tooltips on this row drop UPWARD, over the slider tracks, because
+        // below them are the value boxes the row is about.
+        //
+        // It was `pinned_copy_button` until DRAGON-676, which held a "Copied!" tooltip
+        // card open over the button on the app's own initiative, because the window opens
+        // with the pick already on the clipboard and a hover-only acknowledgement says
+        // nothing at the one moment there is something to say. That reasoning still holds
+        // and the WORD is still here; only its container changed. The card cost two things
+        // a word on the row does not: it had to silence the neighbouring tooltip for as
+        // long as it was up (two cards in one place is two answers to one question), and
+        // it covered the alpha track above the row.
+        let copy = crate::widgets::copy_button::subtle_copy_button(
             copied,
-            4,
-            widget::tooltip::Position::Bottom,
+            geom::ROW_ICON_HALO,
+            widget::tooltip::Position::Top,
             "Copy",
             Msg::ColorPicker(ColorPickerMsg::CopyValue),
-        ))
-        .height(Length::Fixed(geom::VALUE_BOX_H))
-        .align_y(Alignment::Center);
-        let toggle = widget::container(layout_toggle_button(cp.split_inputs))
-            .height(Length::Fixed(geom::VALUE_BOX_H))
-            .align_y(Alignment::Center);
-        widget::row(vec![
-            boxes,
+        );
+        // Band 1, the mode row: the mode dropdown at its own width, then the layout toggle
+        // and the copy button IMMEDIATELY after it (DRAGON-676, the owner's ask), then the
+        // "Copied!" word while a copy is fresh.
+        //
+        // ONE mode control (the owner's review; a chevron pair stood here first, then the
+        // stock dropdown widget, which could not take the icon-button hover, a fixed text
+        // span or our own caret). All three controls are a VALUE BOX tall
+        // (`geom::MODE_ROW_H`, which is defined as that height, and
+        // `geom::ROW_ICON_HALO`, which squares the two icon buttons up to it), so the row
+        // reads as one band of equals over the boxes rather than as smaller furniture.
+        //
+        // The chip used to STRETCH across everything the two icon buttons did not need,
+        // which pushed them to the content's right edge. The argument for that was that a
+        // full-width chip reads as the row's INPUT, the way the value boxes below own
+        // their whole row. What it also did was spend the row on nothing: the chip's own
+        // word is five characters at most, so the stretch was empty chip, and the width it
+        // held is exactly what the acknowledgement needed. The chip keeps the boxes'
+        // border either way, which is what still marks it as the thing carrying a value.
+        let mut controls: Vec<Element<'_, Msg>> = vec![
+            mode_picker(cp.mode, cp.mode_menu_open),
             hspace(geom::ROW_SPACING),
-            picker_cell,
-            // The flexible spacer that pins the toggle + copy cluster to the right edge.
-            widget::space::Space::new().width(Length::Fill).into(),
-            toggle.into(),
+            layout_toggle_button(cp.split_inputs),
             hspace(geom::ROW_SPACING),
-            copy.into(),
+            copy,
+        ];
+        // The acknowledgement, in the SAME success green as the tick it follows, read from
+        // the same `theme::success` the copy button's own glyph is tinted with rather than
+        // spelled out again here. It is absent, not blank, while nothing has been copied:
+        // an empty text widget would still take a line box on a row measured in points.
+        if copied {
+            controls.push(hspace(geom::COPIED_TEXT_GAP));
+            controls.push(copied_word());
+        }
+        let mode_row = widget::row(controls)
+            .align_y(Alignment::Center)
+            .height(Length::Fixed(geom::MODE_ROW_H))
+            .width(Length::Fill);
+        // Band 2, the box row: nothing but the boxes, spanning the whole content width.
+        //
+        // EXPLICIT gaps, not one column spacing, because the two are not the same size
+        // (the owner's ask): the mode row stands off the boxes by the boxes' OWN gap, so
+        // the air around a box reads the same across and down, while a caption stays
+        // tucked under the box it names.
+        widget::column(vec![
+            mode_row.into(),
+            vspace(geom::BOX_GAP),
+            boxes.into(),
+            vspace(geom::VALUE_LABEL_GAP),
+            captions.into(),
         ])
-        .align_y(Alignment::Start)
         .width(Length::Fill)
-        .height(Length::Fixed(geom::VALUE_ROW_H))
         .into()
     }
 
     /// The colour history: TWO rows of [`geom::RECENTS_PER_ROW`] swatches (the two-row
-    /// grid is the owner's rev-2 ask, matching the reference layout; DRAGON-649 widened
-    /// the rows from eight to ten so the gaps tighten; it began as one row of ten). A
+    /// grid is the owner's rev-2 ask, matching the reference layout; the rows have been
+    /// eight, then ten, and are nine now that the window is narrower). A
     /// full row is JUSTIFIED across the content ([`geom::recents_gap`]), so its last swatch
     /// lands flush with the tracks' right edge; a part-filled row keeps the same grid
     /// positions rather than re-spacing itself as picks arrive.
@@ -683,6 +776,26 @@ impl App {
     }
 }
 
+/// The window title as the header's START region: flush left on Windows and Linux
+/// (DRAGON-676; macOS keeps the centred title, see `color_picker_window_view`).
+///
+/// It is libcosmic's OWN construction for a header title, copied out of
+/// `header_bar::view`'s centre arm: `text::heading`, no wrapping, ellipsized to one line.
+/// Copied rather than approximated because the only thing DRAGON-676 changes is WHERE the
+/// title sits; a title that also became a different size or weight on two platforms would
+/// be a second change nobody asked for. The wrapping and ellipsize matter even for a title
+/// this short: the start region is laid out inside what the end region leaves, which on
+/// Windows is the whole 146pt caption inset, and a title allowed to wrap would grow the
+/// header instead of ending in an ellipsis.
+#[cfg(not(target_os = "macos"))]
+fn header_title<'a>() -> Element<'a, Msg> {
+    use cosmic::iced::advanced::text::{Ellipsize, EllipsizeHeightLimit, Wrapping};
+    widget::text::heading(WINDOW_TITLE)
+        .wrapping(Wrapping::None)
+        .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)))
+        .into()
+}
+
 /// A window raster as a fixed-size NEAREST-free image, or an equally-sized blank while
 /// the first refresh has not run (a one-frame state at most; the rasters are built in
 /// the update handler before the window opens). Fixed sizes on both arms, so the layout
@@ -731,25 +844,68 @@ fn gradient_strip<'a>(
     .into()
 }
 
-/// One value-row cell: the control with its caption centred beneath, the reference
-/// layout's "255 over R" shape (DRAGON-630).
-fn value_cell<'a>(control: Element<'a, Msg>, label: &'a str, w: f32) -> Element<'a, Msg> {
-    widget::column(vec![
-        control,
-        widget::container(widget::text::caption(label))
-            .center_x(Length::Fill)
-            .height(Length::Fixed(geom::VALUE_LABEL_H))
-            .into(),
-    ])
-    .spacing(geom::VALUE_LABEL_GAP)
-    .width(Length::Fixed(w))
+/// One cell of the value row's CAPTION band: the channel letter centred in its own box's
+/// width, in a band of fixed height. The reference layout's "255 over R" shape
+/// (DRAGON-630), built as a separate band from the boxes so the controls beside them can
+/// centre on the boxes themselves (see [`App::value_row`]).
+///
+/// SUBTLE text (the owner's ask). These letters name their box; they are not the value,
+/// and at full strength they competed with the numbers above them for the same glance.
+/// `theme::subtle` and not `theme::subdued`, which is the deeper dimming used for the
+/// OUTLINES around these boxes: at that strength a single letter stopped being readable,
+/// which is the same reason the cloud page moved its sentences off it.
+fn caption_cell<'a>(label: &'a str, w: f32) -> Element<'a, Msg> {
+    widget::container(widget::text::caption(label).class(cosmic::theme::Text::Custom(|t| {
+        cosmic::iced::widget::text::Style { color: Some(theme::subtle(t)), ..Default::default() }
+    })))
+    .center_x(Length::Fixed(w))
+    .height(Length::Fixed(geom::VALUE_LABEL_H))
     .into()
 }
 
-/// The mode chip's label span: fixed at what the widest label ("OKLCH") needs, so the
-/// caret sits still when the mode changes (the owner's ask). With the chip's own
-/// padding, gap and caret this comes out to [`geom::MODE_PICKER_W`].
-const MODE_TEXT_W: f32 = 50.0;
+/// The value boxes' style: cosmic's own text input with ONE change, the RESTING border
+/// colour, which becomes `theme::subdued` so the boxes and the mode chip above them are
+/// outlined in the same ink (the owner's ask).
+///
+/// Derived from the stock appearance rather than written out, so everything else about
+/// the field (its fill, its rounding, its placeholder and selection colours, and the 2pt
+/// width the chip matches) stays whatever libcosmic says it is. Hover and focus keep the
+/// theme's ACCENT outline untouched: that is the app-wide "this is the field you are in"
+/// signal and it is not ours to reinvent for one window.
+fn value_box_style() -> cosmic::theme::TextInput {
+    use cosmic::widget::text_input::StyleSheet as _;
+    cosmic::theme::TextInput::Custom {
+        active: Box::new(|t| {
+            let mut a = t.active(&cosmic::theme::TextInput::Default);
+            a.border_color = theme::subdued(t);
+            a
+        }),
+        error: Box::new(|t| t.error(&cosmic::theme::TextInput::Default)),
+        hovered: Box::new(|t| t.hovered(&cosmic::theme::TextInput::Default)),
+        focused: Box::new(|t| t.focused(&cosmic::theme::TextInput::Default)),
+        disabled: Box::new(|t| t.disabled(&cosmic::theme::TextInput::Default)),
+    }
+}
+
+/// The corner radius a VALUE BOX actually draws, which the mode dropdown above them takes
+/// too, closed face and popup menu alike (DRAGON-676, the owner's ask).
+///
+/// The mode row and the box row are one control group, so they have to round together. The
+/// chip used to take `rounding().xl`, libcosmic's BUTTON token, and the menu `rounding().m`,
+/// the panel token; both track the user's "Edge rounding" setting, but they track it to
+/// different numbers than the boxes do, so the dropdown visibly drifted away from the row
+/// beneath it whenever those tokens differed.
+///
+/// **Read, not restated.** This asks [`value_box_style`] itself, so whatever the boxes end up
+/// drawing is by definition what the chip draws: today that resolves through libcosmic's
+/// `TextInput::Default` to the theme's `radius_s`, and if a libcosmic bump moved it, or if
+/// this file ever overrode the radius in `value_box_style` the way it already overrides the
+/// border colour, the chip would follow with no second edit. A literal copied across, or even
+/// a second `theme::rounding(t).s` lookup, is exactly the drift this replaces.
+fn value_box_radius(theme: &cosmic::Theme) -> cosmic::iced::border::Radius {
+    use cosmic::widget::text_input::StyleSheet as _;
+    theme.active(&value_box_style()).border_radius
+}
 
 /// The mode chip and, while open, its menu (DRAGON-630 rev 4).
 ///
@@ -757,37 +913,66 @@ const MODE_TEXT_W: f32 = 50.0;
 /// dropdown widget could meet none of the owner's three asks: its closed face styles
 /// through the theme-global pick_list catalog (no icon-button hover wash), its caret is
 /// whatever the SYSTEM icon theme resolves for `pan-down-symbolic` (not the app's
-/// vendored lucide chevron), and its text span breathes with the selection. The chip is
-/// an ordinary `Button::Icon` (the wash for free), a fixed [`MODE_TEXT_W`] label span,
-/// and the lucide chevron vertically centred beside it; the menu opens UPWARD by a
+/// vendored lucide glyph), and its text span breathes with the selection. The chip is an
+/// icon button's fills under a subdued outline ([`mode_chip_style`]), the mode's name at
+/// the left and the lucide up/down caret at the RIGHT EDGE; the menu opens UPWARD by a
 /// known panel height, exactly like the zoom combo (the history block below leaves no
 /// room down), and a click anywhere else closes it through the flyout's own dismissal.
+///
+/// The caret is pushed there by a flexible spacer rather than following the word. The
+/// label used to carry a fixed span, wide enough for "OKLCH", so that the caret beside it
+/// could not shuffle as the mode changed; the chip's own far edge does not move whatever
+/// the word is, so the spacer alone holds the caret still. Since DRAGON-676 that spacer is
+/// also where [`geom::mode_chip_width`]'s measurement headroom goes: the chip is sized for
+/// the widest label as MEASURED through an embedded face, and whatever the drawing face
+/// does not use of that allowance shows up here as air between the word and the caret.
 fn mode_picker<'a>(mode: ColorFormat, open: bool) -> Element<'a, Msg> {
-    let label = widget::container(widget::text(mode.label()).size(13))
-        .width(Length::Fixed(MODE_TEXT_W))
+    let label = widget::container(widget::text(mode.label()).size(geom::MODE_LABEL_SIZE))
         .align_y(Alignment::Center);
-    // Lucide chevron-down IS chevron-up flipped (the owner's spec named the flip); one
-    // vendored glyph serves both spellings.
+    // The SELECTOR caret, up over down (the owner's ask). A lone chevron-down says "this
+    // opens downward" and this menu opens UPWARD, since the history block below leaves no
+    // room; the pair says "this cycles a list", which is what the control does.
     let caret = widget::container(
-        widget::icon(crate::widgets::icons::handle("pan-down-symbolic")).size(14),
+        widget::icon(crate::widgets::icons::handle("pan-up-down-symbolic"))
+            .size(geom::MODE_CARET_ICON),
     )
     .align_y(Alignment::Center);
     // The row is wrapped in a CENTRING fill container because a cosmic button
     // positions its content at its padding rather than centring it (the same quirk
     // `chrome::dropdown_chip_tall` documents): the bare row sat top-aligned in the
-    // 34pt chip.
+    // chip.
     let chip = widget::button::custom(
         widget::container(
-            widget::row(vec![label.into(), caret.into()])
-                .spacing(4.0)
-                .align_y(Alignment::Center),
+            widget::row(vec![
+                label.into(),
+                widget::space::Space::new().width(Length::Fill).into(),
+                caret.into(),
+            ])
+            .align_y(Alignment::Center)
+            // FILL on BOTH the row and the container around it, or the flexible spacer
+            // above resolves to nothing: a shrink-width parent gives a shrink-width row,
+            // and a shrink row has no spare width to give a `Fill` child. That is exactly
+            // how the caret ends up hugging the word instead of sitting at the far edge.
+            .width(Length::Fill),
         )
+        .width(Length::Fill)
         .center_y(Length::Fill),
     )
-    .width(Length::Fixed(geom::MODE_PICKER_W))
-    .height(Length::Fixed(geom::VALUE_BOX_H))
-    .padding([0, 8])
-    .class(cosmic::theme::Button::Icon)
+    // The chip is exactly as wide as its LONGEST option needs (DRAGON-676, the owner's
+    // ask; it spanned the row but for the two icon buttons until then). The mode's name
+    // stays at the left edge and the caret at the right, so neither moves as the mode
+    // changes. Still the EXPLICIT `geom::mode_chip_width()` and never `Shrink`, because
+    // the MENU is a fixed-width panel that has to be the same number, and one function
+    // answering both is the only way they cannot drift apart.
+    .width(Length::Fixed(geom::mode_chip_width()))
+    .height(Length::Fixed(geom::MODE_ROW_H))
+    .padding([0, geom::MODE_CHIP_PAD])
+    .class(cosmic::theme::Button::Custom {
+        active: Box::new(|_f, t| mode_chip_style(t, false, false)),
+        hovered: Box::new(|_f, t| mode_chip_style(t, true, false)),
+        pressed: Box::new(|_f, t| mode_chip_style(t, true, true)),
+        disabled: Box::new(|t| mode_chip_style(t, false, false)),
+    })
     .on_press(Msg::ColorPicker(ColorPickerMsg::ModeMenuToggled));
     let chip: Element<'a, Msg> = crate::widgets::arrow_cursor::arrow_cursor(chip);
     if !open {
@@ -799,41 +984,47 @@ fn mode_picker<'a>(mode: ColorFormat, open: bool) -> Element<'a, Msg> {
         .map(|(i, f)| {
             // The current mode reads accent, like every other menu in the app.
             let text = if f == mode {
-                widget::text(f.label()).size(13).class(cosmic::theme::Text::Custom(|t| {
-                    cosmic::iced::widget::text::Style {
+                widget::text(f.label()).size(geom::MODE_LABEL_SIZE).class(
+                    cosmic::theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
                         color: Some(theme::accent(t)),
                         ..Default::default()
-                    }
-                }))
+                    }),
+                )
             } else {
-                widget::text(f.label()).size(13)
+                widget::text(f.label()).size(geom::MODE_LABEL_SIZE)
             };
             crate::widgets::arrow_cursor::arrow_cursor(
-                widget::button::custom(text)
-                    .width(Length::Fill)
-                    .class(cosmic::theme::Button::Text)
-                    .on_press(Msg::ColorPicker(ColorPickerMsg::ModeSelected(i))),
+                // FIXED height, and the centring container that goes with it (a cosmic
+                // button lays its content out at its padding rather than centring it).
+                // The height is not cosmetic: `mode_menu_panel_h` has to know the panel's
+                // exact height to place it, and a row left to its own natural size is a
+                // number this file can only guess at.
+                widget::button::custom(
+                    widget::container(text).center_y(Length::Fill),
+                )
+                .width(Length::Fill)
+                .height(Length::Fixed(MODE_MENU_ITEM_H))
+                .padding([0, geom::MODE_CHIP_PAD])
+                .class(cosmic::theme::Button::Text)
+                .on_press(Msg::ColorPicker(ColorPickerMsg::ModeSelected(i))),
             )
         })
         .collect();
-    let menu = widget::container(widget::column(items).spacing(2.0))
-        .width(Length::Fixed(geom::MODE_PICKER_W))
-        .padding(4)
-        .class(cosmic::theme::Container::custom(|t| {
-            // The opaque menu surface every editor dropdown wears (see
-            // `chrome::menu_container`): component base at full alpha, divider outline,
-            // panel rounding.
-            let c = t.cosmic();
-            cosmic::iced::widget::container::Style {
-                background: Some(Background::Color(c.background(false).component.base.into())),
-                border: Border {
-                    radius: theme::rounding(t).m.into(),
-                    width: 1.0,
-                    color: c.background(false).component.divider.into(),
-                },
-                ..Default::default()
-            }
-        }));
+    // The panel is exactly the CHIP's width, and its item column FILLS it, so the popup
+    // lines up with the control on both edges and each row highlights across the whole
+    // panel (the owner's ask). That is the same call it always was, and it is what carries
+    // DRAGON-676's shrink through to the menu: the chip is measured from the longest
+    // option, so the panel is too, and the two cannot part company. `mode_menu_tests`
+    // pins that a row still fits inside it. The `Fill` on the column is load-bearing, not
+    // decoration: a shrink-width column would hand its `Fill` buttons nothing to fill, and
+    // every item would collapse to the width of its own word, which is what made the menu
+    // look like it hung off the lettering rather than off the chip.
+    let menu = widget::container(
+        widget::column(items).spacing(MODE_MENU_GAP).width(Length::Fill),
+    )
+    .width(Length::Fixed(geom::mode_chip_width()))
+    .padding(MODE_MENU_PAD)
+    .class(cosmic::theme::Container::custom(mode_menu_style));
     crate::app::preview::chrome::flyout(
         chip,
         menu.into(),
@@ -842,13 +1033,194 @@ fn mode_picker<'a>(mode: ColorFormat, open: bool) -> Element<'a, Msg> {
     )
 }
 
-/// The mode menu's on-screen height, for the upward flyout's fixed offset: seven text
-/// rows at their ~27pt natural height, the 2pt gaps, and the panel's 4pt inset — the
-/// zoom combo's own arithmetic over this menu's row count. A small over-estimate only
-/// lifts the menu a hair clear of the chip; an under-estimate overlaps it.
+/// The mode chip's look: an icon button's own fills (transparent at rest, a wash on
+/// hover, a firmer one on press) under a border in the app's SUBDUED text colour, at the
+/// VALUE BOXES' own border width (the owner's ask, both parts).
+///
+/// The border is what separates this control from the two bare icon buttons beside it.
+/// They are one glyph each and read as actions; this one carries a VALUE you can change,
+/// so it wants the outline the boxes below it have. `theme::subdued` is the app's one
+/// subdued-text token, the same one the slider thumbs are ringed with, so the outline
+/// tracks the theme rather than being a colour invented here.
+///
+/// The ROUNDING is [`value_box_radius`], the boxes' own (DRAGON-676). It was
+/// `rounding().xl`, libcosmic's button token, on the argument that a chip is a button and
+/// the user's "Edge rounding" setting should reach it. It does reach it either way; the
+/// mistake was WHICH corner it reached, because the chip sits directly on top of the value
+/// boxes and the two rows are one control group. On a theme whose button and input tokens
+/// differ, the chip visibly rounded away from the row under it. Same reasoning as the two
+/// swatch sizes sharing [`swatch_radius`], one row down.
+fn mode_chip_style(
+    theme: &cosmic::Theme,
+    hovered: bool,
+    pressed: bool,
+) -> cosmic::widget::button::Style {
+    let comp = &theme.cosmic().icon_button;
+    let fill: cosmic::iced::Color = if pressed {
+        comp.pressed.into()
+    } else if hovered {
+        comp.hover.into()
+    } else {
+        comp.base.into()
+    };
+    let mut s = cosmic::widget::button::Style::new();
+    s.background = Some(Background::Color(fill));
+    s.border_radius = value_box_radius(theme);
+    s.border_width = INPUT_BORDER_W;
+    s.border_color = theme::subdued(theme);
+    s.icon_color = Some(theme.cosmic().background(false).on.into());
+    s
+}
+
+/// The mode MENU panel's look: the opaque menu surface every editor dropdown wears (see
+/// `chrome::menu_container`), component base at full alpha under a divider outline, with the
+/// CHIP's corner radius rather than the panel token's.
+///
+/// A named function and not the inline closure it used to be, so `mode_menu_tests` can hold
+/// it against [`mode_chip_style`]: the closed face and the popup are one control, they are
+/// already one WIDTH ([`geom::mode_chip_width`]), and DRAGON-676 makes them one rounding too.
+/// A popup that rounded differently from the chip it hangs off reads as a second, unrelated
+/// surface, which is the same complaint from the other direction.
+fn mode_menu_style(theme: &cosmic::Theme) -> cosmic::iced::widget::container::Style {
+    let c = theme.cosmic();
+    cosmic::iced::widget::container::Style {
+        background: Some(Background::Color(c.background(false).component.base.into())),
+        border: Border {
+            radius: value_box_radius(theme),
+            width: 1.0,
+            color: c.background(false).component.divider.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// The border width a value box draws, which the mode chip above them now matches.
+///
+/// Restated rather than read, because libcosmic hard-codes it in its own theme
+/// (`theme::style::iced`'s `TextInput::Default`) and exposes no token for it. If a
+/// libcosmic bump ever changes it, this is the one line that has to follow, and the chip
+/// looking a hair thinner or fatter than the boxes under it is the symptom.
+///
+/// Its sibling [`value_box_radius`] does not have to be restated, because the RADIUS is on
+/// the same `Appearance` and can simply be asked for. This width could be read the same way
+/// (`theme.active(&value_box_style()).border_width`) and probably should be, next time
+/// something here changes; DRAGON-676 left it alone rather than move a second property in a
+/// ticket about rounding.
+const INPUT_BORDER_W: f32 = 2.0;
+
+/// One mode-menu row, the gap between rows, and the panel's own inset. All three are
+/// FIXED so [`mode_menu_panel_h`] can be exact instead of an estimate.
+const MODE_MENU_ITEM_H: f32 = 28.0;
+const MODE_MENU_GAP: f32 = 2.0;
+const MODE_MENU_PAD: u16 = 4;
+
+/// The mode menu's on-screen height, for the upward flyout's fixed offset.
+///
+/// The flyout places the panel's TOP exactly this far above the chip's top
+/// (`chrome::FlyoutDir::Up`), so this number decides where the panel's BOTTOM lands: right,
+/// and the menu sits flush on the chip's top edge; under-counted, and the menu slides down
+/// INTO the chip. It used to assume a "~27pt natural height" per row and the rows measured
+/// more than that, which is what the owner saw as the menu bottoming out at the top of the
+/// chip's lettering instead of at the chip. Every part of the panel now has a fixed height
+/// and this sum is the panel exactly.
 fn mode_menu_panel_h() -> f32 {
     let n = crate::color::ColorFormat::ALL.len() as f32;
-    n * 27.0 + (n - 1.0) * 2.0 + 2.0 * 4.0
+    n * MODE_MENU_ITEM_H + (n - 1.0) * MODE_MENU_GAP + 2.0 * f32::from(MODE_MENU_PAD)
+}
+
+/// The divider BAND: the hairline between the value block and the colour history, with
+/// the "Add color" button centred on it (the owner's ask).
+///
+/// A stack rather than a row of line-gap-button-gap-line, because the button is meant to
+/// sit ON the rule the way a slider's thumb sits on its track, which is also where it
+/// takes its look from: the line runs behind it and its opaque fill hides the crossing.
+///
+/// The line keeps its old construction exactly, a divider wrapped at [`geom::DIVIDER_H`],
+/// because the divider widget carries its own padding and un-counted height here is what
+/// once clamped the second history row short. That 1pt wrapper is then centred in the
+/// band, so the visible rule stays where the section gaps say it is however tall the
+/// button gets.
+fn divider_band<'a>() -> Element<'a, Msg> {
+    let line = widget::container(
+        widget::container(widget::divider::horizontal::default())
+            .width(Length::Fill)
+            .height(Length::Fixed(geom::DIVIDER_H)),
+    )
+    .width(Length::Fill)
+    .center_y(Length::Fill);
+    let button = widget::container(add_color_button())
+        .center_x(Length::Fill)
+        .center_y(Length::Fill);
+    cosmic::iced::widget::stack(vec![line.into(), button.into()])
+        .width(Length::Fill)
+        .height(Length::Fixed(geom::DIVIDER_BAND_H))
+        .into()
+}
+
+/// The "Add color" button on the divider: file the colour the window is showing into the
+/// history (`ColorPickerMsg::AddToHistory`).
+///
+/// It is dressed as a SLIDER THUMB (the owner's ask): the window's own background under a
+/// subdued-text hairline, which is `gradient_strip`'s marker exactly. That is the right
+/// borrow rather than a coincidence, because it is the same idea in a different place, a
+/// small control sitting ON a track. The plus is the app's lucide glyph at
+/// [`geom::ADD_COLOR_ICON`], deliberately smaller than the mode row's icons since it
+/// stands beside 12pt text rather than alone.
+fn add_color_button<'a>() -> Element<'a, Msg> {
+    let content = widget::row(vec![
+        widget::icon(crate::widgets::icons::handle("list-add-symbolic"))
+            .size(geom::ADD_COLOR_ICON)
+            .into(),
+        widget::text("Add color").size(12).into(),
+    ])
+    .spacing(4.0)
+    .align_y(Alignment::Center);
+    // The centring container is the cosmic-button quirk the mode chip documents: a button
+    // lays its content out at its padding rather than centring it, so a bare row sits
+    // top-aligned in a fixed-height button. No tooltip: the button says what it does.
+    let button = widget::button::custom(widget::container(content).center_y(Length::Fill))
+        .height(Length::Fixed(geom::DIVIDER_BAND_H))
+        .padding([0, 10])
+        .class(cosmic::theme::Button::Custom {
+            active: Box::new(|_f, t| add_color_style(t, false, false)),
+            hovered: Box::new(|_f, t| add_color_style(t, true, false)),
+            pressed: Box::new(|_f, t| add_color_style(t, true, true)),
+            disabled: Box::new(|t| add_color_style(t, false, false)),
+        })
+        .on_press(Msg::ColorPicker(ColorPickerMsg::AddToHistory));
+    crate::widgets::arrow_cursor::arrow_cursor(button)
+}
+
+/// The add-colour button's look, and the reason it is a custom class: it has to be the
+/// SLIDER THUMB's dress (`gradient_strip`'s `marker_style`), which no button class in the
+/// theme is, since a thumb is opaque window background under a subdued-text hairline
+/// while every stock button is a component fill.
+///
+/// Only the FILL moves between states, to the component's own hover and pressed colours,
+/// so the control still answers a pointer without breaking the borrowed look. The
+/// rounding is `rounding().xl`, the button token, so the user's "Edge rounding" setting
+/// reaches it like every other button here.
+fn add_color_style(
+    theme: &cosmic::Theme,
+    hovered: bool,
+    pressed: bool,
+) -> cosmic::widget::button::Style {
+    let bg = theme.cosmic().background(false);
+    let fill: cosmic::iced::Color = if pressed {
+        bg.component.pressed.into()
+    } else if hovered {
+        bg.component.hover.into()
+    } else {
+        bg.base.into()
+    };
+    let mut s = cosmic::widget::button::Style::new();
+    s.background = Some(Background::Color(fill));
+    s.border_radius = theme::rounding(theme).xl.into();
+    s.border_width = 1.0;
+    s.border_color = theme::subdued(theme);
+    s.icon_color = Some(bg.on.into());
+    s.text_color = Some(bg.on.into());
+    s
 }
 
 /// A fixed vertical gap, for the window column whose section gaps the owner sized
@@ -863,23 +1235,51 @@ fn hspace<'a>(w: f32) -> Element<'a, Msg> {
 }
 
 /// The value row's layout toggle (DRAGON-630 rev 3), left of the copy button: the
-/// lucide list-chevrons pair, SHOWING the remembered state — chevrons pointing outward
+/// lucide list-chevrons pair, SHOWING the remembered state, chevrons pointing outward
 /// while the channels are split apart, inward while they are collapsed into the one
 /// whole-value box. Dressed as a bare icon button like its copy neighbour.
+///
+/// It took a `tips` flag until DRAGON-676, and lost it with the thing that needed it: the
+/// copy button beside it used to pin a "Copied!" tooltip card open, so this button had to
+/// go SILENT for the flash window, because a hover card popping up next to a card the app
+/// pinned reads as two answers to one question. The acknowledgement is a word on the row
+/// now and covers nothing, so this button keeps its tooltip at all times and the caller
+/// has one fewer state to get right.
 fn layout_toggle_button<'a>(split: bool) -> Element<'a, Msg> {
     // The copy button's own construction, one glyph (`copy_button::subtle_icon_button`,
     // same halo, same tint, same tooltip mechanics), so the pair beside each other read
     // as one family: the first version hand-rolled a bigger button and the owner
     // called the padding mismatch out. One tooltip either way (the owner's wording):
-    // the icon carries the state, the tooltip names the control.
+    // the icon carries the state, the tooltip names the control. The halo is the row's
+    // own (`geom::ROW_ICON_HALO`), uniform on four sides, which is what squares both
+    // buttons up to the dropdown beside them.
     let icon = if split { "list-expand-symbolic" } else { "list-collapse-symbolic" };
     crate::widgets::copy_button::subtle_icon_button(
         icon,
-        4,
-        widget::tooltip::Position::Bottom,
+        geom::ROW_ICON_HALO,
+        // Upward, like its copy-button neighbour: below this row are the value boxes the
+        // row is about, and a card dropped over them hides the answer.
+        widget::tooltip::Position::Top,
         "Toggle split inputs",
         Msg::ColorPicker(ColorPickerMsg::InputLayoutToggled),
     )
+}
+
+/// The "Copied!" acknowledgement beside the copy button (DRAGON-676), in the flash's own
+/// success green.
+///
+/// The colour is `theme::success`, which is where `copy_button::icon_button_style` reads
+/// the tick's tint from too, so the word and the glyph beside it cannot end up two
+/// different greens: that helper's own test calls it "the app's one 'this worked' colour",
+/// and a hex picked to match it here would be a second one the moment the theme moves.
+fn copied_word<'a>() -> Element<'a, Msg> {
+    widget::text("Copied!")
+        .size(geom::COPIED_TEXT_SIZE)
+        .class(cosmic::theme::Text::Custom(|t| cosmic::iced::widget::text::Style {
+            color: Some(theme::success(t)),
+            ..Default::default()
+        }))
+        .into()
 }
 
 /// The pick-again pipette: start a new pick, exactly as launching the tool does. It
@@ -1256,6 +1656,101 @@ mod label_ink_tests {
     #[test]
     fn the_flip_actually_flips() {
         assert_ne!(ink(Srgb::new(255, 255, 255)), ink(Srgb::new(0, 0, 0)));
+    }
+}
+
+/// DRAGON-676: the mode chip shrank to its longest label, and the MENU is hung off that
+/// same number. The panel's own inset and its rows' padding live in this file, not in
+/// `geom`, so this is the only place the two halves can be checked against each other.
+#[cfg(test)]
+mod mode_menu_tests {
+    use super::*;
+
+    /// The label measurement the chip is sized from (`geom::widest_mode_label`), restated
+    /// here because that one is private to `geom` and this test needs the same face.
+    fn label_w(s: &str) -> f32 {
+        crate::app::preview::text_annot::measure(
+            crate::app::preview::text_annot::TextFont::Clean,
+            geom::MODE_LABEL_SIZE,
+            s,
+        )
+    }
+
+    /// Every menu row's word fits inside the panel, with the panel's inset and the row's
+    /// own padding taken off first. The chip is sized for the label PLUS a caret; a menu
+    /// row has no caret, so it should fit with room to spare, and this is what would fail
+    /// if the caret ever stopped being part of the chip's arithmetic.
+    #[test]
+    fn every_menu_row_fits_the_panel_the_chip_sizes() {
+        let row_w = geom::mode_chip_width()
+            - 2.0 * f32::from(MODE_MENU_PAD)
+            - 2.0 * f32::from(geom::MODE_CHIP_PAD);
+        for f in crate::color::ColorFormat::ALL {
+            assert!(
+                row_w >= label_w(f.label()),
+                "{}: {row_w}pt of row for a {}pt word",
+                f.id(),
+                label_w(f.label())
+            );
+        }
+    }
+
+    /// The dropdown rounds like the VALUE BOXES it sits on, in every state and on both
+    /// sides of the control (DRAGON-676, the owner's ask): the mode row and the box row
+    /// are one group, and the chip used to take the BUTTON token while the boxes took the
+    /// input one, so the two drifted apart on any theme where those differ.
+    ///
+    /// Checked on the dark and the light themes rather than only on `default()`, because
+    /// the corner radii are a THEME field: a regression that read the right token on one
+    /// and the wrong one on the other would pass a single-theme test.
+    #[test]
+    fn the_chip_and_its_menu_round_like_the_value_boxes() {
+        for (name, t) in
+            [("dark", cosmic::theme::Theme::dark()), ("light", cosmic::theme::Theme::light())]
+        {
+            let want = value_box_radius(&t);
+            for (hovered, pressed) in [(false, false), (true, false), (true, true)] {
+                assert_eq!(
+                    mode_chip_style(&t, hovered, pressed).border_radius,
+                    want,
+                    "{name}: the closed chip (hovered={hovered} pressed={pressed}) drifted \
+                     from the boxes"
+                );
+            }
+            assert_eq!(
+                mode_menu_style(&t).border.radius,
+                want,
+                "{name}: the popup drifted from the chip it hangs off"
+            );
+        }
+    }
+
+    /// And it really is a DIFFERENT number from the tokens it used to read, or the test
+    /// above would pass on an unchanged file. Guarded by the tokens actually differing on
+    /// this theme, since a theme is free to make every corner the same.
+    #[test]
+    fn the_boxes_radius_is_not_the_button_or_panel_token() {
+        let t = cosmic::theme::Theme::dark();
+        let want = value_box_radius(&t);
+        let button = cosmic::iced::border::Radius::from(theme::rounding(&t).xl);
+        let panel = cosmic::iced::border::Radius::from(theme::rounding(&t).m);
+        assert!(
+            want != button && want != panel,
+            "the input, button and panel corners are all {want:?} on this theme, so nothing \
+             here distinguishes the old derivation from the new one"
+        );
+    }
+
+    /// The panel's height is still the exact sum of its parts, which is what the upward
+    /// flyout's offset is. Nothing in DRAGON-676 touched it, and that is the point: the
+    /// chip's WIDTH moved and the menu's placement did not.
+    #[test]
+    fn the_panel_height_is_still_the_sum_of_its_rows() {
+        let n = crate::color::ColorFormat::ALL.len() as f32;
+        assert_eq!(
+            mode_menu_panel_h(),
+            n * MODE_MENU_ITEM_H + (n - 1.0) * MODE_MENU_GAP + 2.0 * f32::from(MODE_MENU_PAD)
+        );
     }
 }
 

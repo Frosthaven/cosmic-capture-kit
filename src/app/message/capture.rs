@@ -117,13 +117,26 @@ pub enum CaptureMsg {
     /// clean of our own UI now, so run the re-grab. The twin of `DoPixelCapture` for a
     /// session that CONTINUES (nothing was torn down; the overlay just stopped painting).
     ScanShotTick,
-    /// DRAGON-460: advance the refresh button's spin while a scan is in flight. Carries no
-    /// data — the angle lives on the App and this only says "another frame".
-    ScanSpinTick,
+    /// DRAGON-460: advance a busy glyph's spin. Carries no data — the angle lives on the
+    /// App (`busy_spin`) and this only says "another frame".
+    ///
+    /// DRAGON-659 renamed it from `ScanSpinTick`: the scan refresh button and the record
+    /// chip's warming spinner share the one angle, so the tick no longer belongs to either.
+    BusySpinTick,
     /// DRAGON-600 (Linux, tray-menu launches): poll the held frozen-flats grab. Carries no
     /// data; the two clocks it consults live on `App::menu_hold`. Fires only while the
     /// hold is up, and the hold ends the first time it releases the grab.
     MenuHoldTick,
+    /// DRAGON-663: the colour picker's configured delay now has overlays to draw its digits
+    /// on, so start the countdown. Carries no data; the seconds live on
+    /// `App::picker_countdown_pending`, which this arm spends. Fires only while that is
+    /// `Some` and `App::outputs` is non-empty, so a picker with no delay never sees it.
+    PickerCountdownArm,
+    /// DRAGON-663: the blank frame after a colour picker's countdown has been presented, so
+    /// run the flats grab the launch held back. The picker's twin of [`Self::ScanShotTick`],
+    /// and the same reasoning: nothing was torn down, the overlay just stopped painting, so
+    /// one short tick is what the compositor needs to present the empty surface.
+    PickerReveal,
     /// DRAGON-606: advance the dim's fade-in by one frame. Carries no data; the start
     /// instant lives on `App::dim_fade`. Fires only while the fade is actually running and
     /// stops for good when it completes, so a finished animation idles no timer.

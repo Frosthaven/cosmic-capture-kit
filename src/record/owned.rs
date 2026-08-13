@@ -342,26 +342,20 @@ pub(super) struct OwnedAudioStart {
     /// (`App::start_screencopy_recording` / `start_held_pipewire_recording` set
     /// `recording_started` in the same breath as spawning the worker).
     ///
-    /// This is the session's MEDIA TIME 0 (DRAGON-417). Every owned worker passes it
-    /// straight to [`super::pump::spawn`] rather than stamping a fresh `Instant::now()`
-    /// once its own video side is ready: audio is already being captured from this
-    /// instant, and anything captured before media 0 is silently thrown away by the
-    /// mixer (it lands at a negative media position). Anchoring at the later
-    /// video-ready instant is exactly what discarded the opening seconds of a
-    /// recording — the user speaks into a live-looking indicator while the pipeline
-    /// quietly drops what it hears. The video side COVERS the resulting opening span
-    /// instead: `VideoTicker::due_video_ticks` already returns however many ticks the
-    /// span is worth, and the worker writes that many, so the recording is honest in
-    /// both streams.
+    /// This is when the AUDIO CAPTURE began, and since DRAGON-672 that is all it is.
+    /// It is NO LONGER media time 0 — see [`media_zero`], which every owned worker now
+    /// takes once its ffmpeg exists and passes to [`super::pump::spawn`] instead.
     ///
-    /// WHAT those covering ticks show is the worker's own call, and it is not free
-    /// (DRAGON-628). The Linux workers repeat the first captured frame, which reads
-    /// as a frozen opening; `record::sck` on macOS (DRAGON-628) and `record::wgc` on
-    /// Windows (DRAGON-652) instead spend them on the frames their captures had
-    /// already delivered and were discarding, which halved the measured frozen head.
-    /// If you touch a worker's covering burst, the rule is that the tick COUNT is the
-    /// contract and the pixels are not: changing the count changes media time,
-    /// changing the pixels does not.
+    /// It was media 0 from DRAGON-417 until DRAGON-672, because audio is captured from
+    /// this instant and the indicator claimed to be recording from it too, so throwing
+    /// that audio away lost real speech. DRAGON-659/661 made the indicator honest (a
+    /// warming spinner until the pipeline settles), which removed the reason, and the
+    /// span between the two was left in every file: nothing had promised it, the video
+    /// side had no frames for it, and the audio side rendered it as silence. Read
+    /// [`media_zero`]'s doc for the whole argument before moving this back.
+    ///
+    /// The audio captured between this instant and media 0 is dropped by the mixer,
+    /// silently and by design (`mixer::Track::push` counts it `pre_start_chunks`).
     pub(super) capture_start: std::time::Instant,
     pub(super) mic_fifo_path: PathBuf,
     pub(super) sys_fifo_path: PathBuf,
@@ -421,6 +415,212 @@ pub(super) fn preflights_started() -> u32 {
     PREFLIGHTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Report that the worker has confirmed a genuinely real first captured frame, at `at`
+/// (the frame's OWN delivery instant, not the moment the worker got round to it). Fills
+/// [`super::RecordHandle::warm_at`], the DRAGON-657 warmup signal.
+///
+/// Call it as the LAST thing before [`try_start_owned_audio`] and nowhere else. Earlier
+/// would report a candidate the worker has not confirmed, and the whole point of the
+/// signal is that it cannot lie about when capture became real; later would leave the
+/// slot empty across the pre-flight, which is the longest part of the bring-up and the
+/// span the UI most needs to know about.
+///
+/// Poison-tolerant like every other slot write here: a recording never dies of a lock.
+///
+/// Every worker on every platform calls this now (DRAGON-658 moved the three Linux ones
+/// onto the same shape), so there is no `allow(dead_code)` left to carry.
+pub(super) fn mark_first_frame(
+    slot: &std::sync::Mutex<Option<std::time::Instant>>,
+    at: std::time::Instant,
+) {
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(at);
+    }
+}
+
+/// Report that the session's OPENING PHASE is over, at `at`: the pipeline is up and level
+/// with the media clock, so from here the recording is steady-state. Fills
+/// [`super::RecordHandle::settled_at`], the DRAGON-661 settled signal.
+///
+/// Call it where each worker's opening phase ENDS, next to the "opening covered N ticks"
+/// mark, and nowhere else. That point is the honest one because everything before it is
+/// still bring-up: [`mark_first_frame`] only says the capture stream has proven itself, and
+/// the audio pre-flight, the ffmpeg spawn, the pump spawn and the catch-up ticks all follow
+/// it. On the two zero-copy arms, which have no catch-up phase (see
+/// `record_screencopy_zero_copy_owned`'s doc for why that was left alone), the equivalent
+/// point is where the confirmed first frame reaches the muxer and the steady loop takes
+/// over; their own call sites say so.
+///
+/// EVERY successful path must reach one of those calls, including a session whose clock
+/// owed it nothing. A recording that never fills this slot is a recording whose chip never
+/// offers STOP, so "the phase covered zero ticks" and "the phase never happened" must not
+/// look the same to the UI.
+///
+/// Unlike `warm_at`, the instant is not tied to a particular frame's own timestamp: what
+/// this names is when the PIPELINE became steady, which is simply now. Poison-tolerant
+/// like every other slot write here, and kept a separate function from
+/// [`mark_first_frame`] rather than a shared `fill` because the two slots' contracts differ
+/// and each doc has to be able to say where its own call belongs.
+pub(super) fn mark_settled(
+    slot: &std::sync::Mutex<Option<std::time::Instant>>,
+    at: std::time::Instant,
+) {
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(at);
+    }
+}
+
+/// MEDIA TIME 0: the instant the whole pipeline is ready, which every owned worker takes
+/// immediately before spawning [`super::pump`] and after its ffmpeg exists (DRAGON-672).
+///
+/// The file begins HERE, and the point is that this is the same instant the user is told
+/// recording began. The warming spinner is on screen for everything before it
+/// (`App::adopt_warm_start` declares live on `settled_at`, which lands a few milliseconds
+/// after this), so nothing captured before this instant was ever promised to the user, and
+/// nothing captured before it is kept.
+///
+/// WHY THIS MOVED, because it used to be [`OwnedAudioStart::capture_start`] and the reason
+/// it was matters. DRAGON-417 anchored media 0 at the audio pre-flight's ENTRY, and its
+/// justification was explicit: audio is captured from that instant while "the user speaks
+/// into a live-looking indicator", so discarding it would lose real speech. That was true
+/// when the indicator went live as the worker was spawned. DRAGON-659/661 then made the
+/// indicator honest — it shows a warming spinner and does not claim to be recording until
+/// the pipeline settles — and the anchor never followed. The result was a file that began
+/// ~370ms (macOS) to ~830ms (Windows) before the spinner cleared, so every recording opened
+/// with a span that nothing had promised and neither stream could fill: the video side had
+/// no frames for it (DRAGON-628/652/667 are all attempts to paper over exactly this) and
+/// the audio side rendered it as silence (`leading_gap_samples`, measured at 804ms).
+///
+/// The same principle is already written down for the countdown, in
+/// the countdown's own runway rule: content landing in the file ahead of
+/// what the user was shown "defeats what a countdown is FOR on video". This is that rule,
+/// applied to the span the spinner covers instead of the span the digits cover.
+///
+/// NOTHING ELSE NEEDS TO CHANGE FOR THE AUDIO, and that is worth saying so nobody adds a
+/// guard for it. `mixer::Track::push` already places chunks through
+/// `MediaClock::media_at_signed`, so a chunk captured before media 0 reads as negative
+/// rather than colliding at frame 0, and one lying wholly before 0 is counted
+/// `pre_start_chunks` and dropped SILENTLY — its doc says "predates the session, so it
+/// loses nothing". The pre-flight's audio is exactly that case. DRAGON-411's "DISCARDING
+/// captured audio" `error` is measured on the post-0 part only, so it stays quiet.
+///
+/// Takes `audio_capture_start` ([`OwnedAudioStart::capture_start`]) only to REPORT the span
+/// being dropped. That number is the warmup the user was shown a spinner for, it is the
+/// single figure that says whether this platform's pre-flight has grown, and it is what a
+/// "my recording is missing the first moment" report should be checked against first.
+///
+/// `start_gate` is the COUNTDOWN GATE (DRAGON-673): a flag the app RAISES at the instant it
+/// promotes the recording, which is the instant the UI starts claiming to record. `None` for
+/// a capture with no countdown. Media 0 is then where the promotion is, by construction, so
+/// a countdown warms the whole pipeline behind its own digits and the file still begins
+/// exactly where the digits run out. This is what lets the worker be spawned at countdown
+/// START: the runway constant it used to need is gone, because a gate on the real event needs
+/// no estimate of how long warmup takes.
+///
+/// IT IS A SIGNAL, NOT A DEADLINE, and that distinction is the whole of the fix that
+/// followed. The first version of this gate carried the app's PREDICTION of countdown zero
+/// (`Instant::now() + secs`, stamped as the countdown began) and held until that instant.
+/// The prediction drifts from the tick schedule that actually fires the capture, because the
+/// app is BUSY at countdown start: it spawns the recording worker and rebuilds every overlay
+/// there, and `iced::time::every` hands its ticks to a queue that has all of that in front of
+/// them. Measured on a 10s countdown, the file began 992ms before the UI said "Recording"
+/// (media 0 at +37.516s, `ui: recording declared live (settled)` at +38.508s). Waiting for
+/// the app to SAY GO removes the whole class of error: there is no estimate left to be wrong,
+/// on any platform, at any countdown length, however slow the launch.
+///
+/// The wait is BOUNDED (DRAGON-118) by [`START_GATE_MAX_WAIT`]. The flag is raised by the
+/// app's UI thread, so a bug there (or a session that ends without ever promoting) must not
+/// be able to park a worker forever; hitting the cap is logged at `warn` and the session
+/// starts anyway. The app also OPENS the gate when it abandons a warming worker, so an
+/// ordinary countdown cancel never reaches that cap.
+pub(super) fn media_zero(
+    audio_capture_start: std::time::Instant,
+    start_gate: Option<&std::sync::atomic::AtomicBool>,
+    mic_rx: &std::sync::mpsc::Receiver<StreamTap>,
+    sys_rx: &std::sync::mpsc::Receiver<CaptureChunk>,
+) -> std::time::Instant {
+    if let Some(gate) = start_gate
+        && !gate.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        log::debug!(
+            "media-clock session: warm and holding for the countdown to reach zero; the file \
+             begins where the app promotes the recording (DRAGON-673)"
+        );
+        // DRAIN BOTH AUDIO TAPS WHILE HOLDING, and throw the chunks away. They are all
+        // pre-media-0 by construction, so none of them belongs in the file — but the
+        // captures do not stop for the hold, and nothing else is reading them until the
+        // pump spawns AFTER media 0. Left alone they queue for the whole countdown, and
+        // the pump then starts life several thousand chunks behind: it renders forward
+        // in real time, so it never catches up, and the audio arriving while it chews
+        // through the backlog lands behind the render horizon and IS destroyed. Measured
+        // on the first draft of this hold, a 10s countdown: `mic(late=759 lost=4.951s)` —
+        // five seconds of real speech gone, and correctly reported as an `error` by
+        // DRAGON-411's counter.
+        //
+        // Discarding here rather than letting the mixer drop them as `pre_start` is also
+        // simply cheaper, and it is sound: the taps stamp CONTIGUOUSLY at the source
+        // (`StreamAnchor` anchors once at first delivery and counts samples from there),
+        // so dropping chunks off the channel cannot disturb the timestamps of the ones
+        // that follow.
+        //
+        // The flag is polled on that same drain cadence: the gate opens on another thread,
+        // so the file starts within one poll of the promotion, which is far inside the
+        // frame the promoted UI is drawn in.
+        let deadline = std::time::Instant::now() + START_GATE_MAX_WAIT;
+        loop {
+            if gate.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                log::warn!(
+                    "media-clock session: the countdown never opened the start gate within \
+                     {:.0}s — starting the file now instead of holding any longer \
+                     (DRAGON-673)",
+                    START_GATE_MAX_WAIT.as_secs_f64(),
+                );
+                break;
+            }
+            while mic_rx.try_recv().is_ok() {}
+            while sys_rx.try_recv().is_ok() {}
+            std::thread::sleep(GATE_POLL_INTERVAL);
+        }
+        // One last sweep, so the pump inherits genuinely empty channels.
+        while mic_rx.try_recv().is_ok() {}
+        while sys_rx.try_recv().is_ok() {}
+    }
+    let now = std::time::Instant::now();
+    log::debug!(
+        "media-clock session: media 0 is the settled pipeline; dropping {:.0}ms of audio \
+         captured before it, which the user was shown a spinner or a countdown for \
+         (DRAGON-672/673)",
+        now.saturating_duration_since(audio_capture_start).as_secs_f64() * 1000.0,
+    );
+    now
+}
+
+/// The ceiling on [`media_zero`]'s countdown hold (DRAGON-118: nothing in the record path
+/// waits unboundedly). Comfortably past the longest countdown the UI offers, so it never
+/// fires on a real capture; it exists because the gate is raised by the app and a bug there
+/// would otherwise park the worker with ffmpeg already spawned and idle.
+const START_GATE_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How often [`media_zero`]'s hold drains the audio taps and re-reads the start gate. One
+/// number for both because they are the same loop: the drain has to be frequent enough that
+/// the taps never build a backlog, and the gate read is free, so the file starts within one
+/// of these of the app's promotion.
+const GATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Called INLINE by every worker, as the first thing after it has confirmed a genuinely
+/// real captured frame and reported it through [`mark_first_frame`].
+///
+/// It used to be startable on its OWN thread (`AudioPreflight`, DRAGON-554) so a worker's
+/// video bring-up overlapped it and the session's opening span was the MAX of the two
+/// rather than their sum. That seam is GONE (DRAGON-657 on macOS/Windows, DRAGON-658 on
+/// Linux) and should not come back: overlapping meant audio capture, and so media 0, and
+/// so the app's own "recording" state, all began before anything proved the capture
+/// stream would ever deliver a pixel. The strict order costs the video bring-up's latency
+/// (roughly 250-600ms) at every recording start, knowingly, because a warmup the UI can
+/// show is worth more than an opening span the file has to paper over.
 pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
     // Media time 0 (DRAGON-417) — see `OwnedAudioStart::capture_start`. Taken before
     // anything is started so no part of the capture predates the anchor.
@@ -560,78 +760,6 @@ pub(super) fn try_start_owned_audio() -> Result<OwnedAudioStart, String> {
     }
     crate::util::timing_mark("rec/pre: sys smoke ok (preflight done)");
     Ok(started)
-}
-
-/// The audio pre-flight, STARTED on its own thread (DRAGON-554) so a worker's
-/// video-side bring-up — the PipeWire connect + format negotiation + first frame on
-/// Linux, the SCK target resolution + stream build/start + first frame on macOS, the
-/// D3D device + WGC session bring-up + first frame on Windows (DRAGON-652) —
-/// overlaps it instead of following it. Serialized, those two independent startups
-/// summed into the session's opening span, every millisecond of which the file must
-/// cover on the video side (see [`OwnedAudioStart::capture_start`]'s doc for what a
-/// worker shows there); overlapped, the span is their MAX.
-///
-/// The invariant is untouched: media time 0 is still the pre-flight's own entry
-/// instant (`OwnedAudioStart::capture_start`), and `start()` is the FIRST thing a
-/// worker does, so that instant stays within a millisecond of the worker thread's
-/// start and of the app marking itself "recording" (DRAGON-417). Only the point where
-/// the worker WAITS on the result moved.
-///
-/// [`join`](Self::join) adds no unbounded wait (DRAGON-118): the pre-flight is bounded
-/// by construction (FIFO creation, the capture-chain starts, and two
-/// [`OWNED_AUDIO_SMOKE_BUDGET`] smoke checks), so the thread join it performs is
-/// bounded by those same budgets. A worker whose video side failed first calls
-/// [`abandon`](Self::abandon) instead, which joins and tears down whatever the
-/// pre-flight managed to start.
-pub(super) struct AudioPreflight(PreflightState);
-
-enum PreflightState {
-    Running(std::thread::JoinHandle<Result<OwnedAudioStart, String>>),
-    /// The spawn-failure fallback: the pre-flight already ran inline on the caller's
-    /// thread (an OS that cannot spawn a thread this early is already degraded, but
-    /// the session still gets its ordinary serialized start rather than dying).
-    /// Boxed so this rare arm does not size the whole enum (clippy's
-    /// `large_enum_variant`; `OwnedAudioStart` is ~240 bytes of handles).
-    Done(Box<Result<OwnedAudioStart, String>>),
-}
-
-impl AudioPreflight {
-    /// Start the pre-flight on its own thread. Call FIRST in a worker, before any
-    /// video-side bring-up, so `capture_start` (media 0) stays within a millisecond
-    /// of the worker's start.
-    pub(super) fn start() -> Self {
-        match std::thread::Builder::new()
-            .name("cck-audio-preflight".to_string())
-            .spawn(try_start_owned_audio)
-        {
-            Ok(thread) => AudioPreflight(PreflightState::Running(thread)),
-            Err(e) => {
-                log::warn!(
-                    "audio pre-flight: could not spawn its thread ({e}); running it inline"
-                );
-                AudioPreflight(PreflightState::Done(Box::new(try_start_owned_audio())))
-            }
-        }
-    }
-
-    /// Wait for the pre-flight's result (bounded by its own internal budgets; see the
-    /// type doc). A panicked pre-flight thread reports as an ordinary named failure.
-    pub(super) fn join(self) -> Result<OwnedAudioStart, String> {
-        match self.0 {
-            PreflightState::Running(thread) => thread.join().unwrap_or_else(|_| {
-                Err("the audio pre-flight thread panicked".to_string())
-            }),
-            PreflightState::Done(result) => *result,
-        }
-    }
-
-    /// Join and tear down: for a worker whose VIDEO side already failed, so whatever
-    /// the pre-flight started (captures, FIFOs) never leaks past the failed session.
-    pub(super) fn abandon(self) {
-        if let Ok(owned) = self.join() {
-            owned.cleanup();
-        }
-    }
 }
 
 #[cfg(test)]

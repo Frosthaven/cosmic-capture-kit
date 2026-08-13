@@ -38,6 +38,11 @@ pub const DEFAULT_VAAPI_CL: i32 = 3;
 /// HEVC above — for VAAPI, HEVC when available); `h264`/`hevc` force one. H.264 is
 /// the maximum-compatibility choice (plays everywhere); HEVC makes smaller files /
 /// sharper text at the same bitrate but isn't as universally playable.
+///
+/// HEVC is a HARDWARE-ONLY option (DRAGON-674). The software tier encodes H.264
+/// whatever this value says, and the settings row only OFFERS HEVC while the tier a
+/// recording would actually run on has a working hardware HEVC encoder. See
+/// [`hevc_offerable`] for the rule and why it is written that way.
 pub const CODEC_VALUES: [&str; 3] = ["auto", "h264", "hevc"];
 pub const CODEC_LABELS: [&str; 3] = [
     "Auto (by resolution)",
@@ -102,10 +107,107 @@ pub(crate) fn valid_vaapi_cl(cl: i32) -> i32 {
     }
 }
 
-/// Whether ffmpeg has the software HEVC encoder (libx265). Cached — used by the UI.
-pub fn software_supports_hevc() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| super::ffmpeg_encoders().contains("libx265"))
+// DRAGON-674 removed `software_supports_hevc()`, which answered
+// `ffmpeg_encoders().contains("libx265")`. That is "is libx265 in this build", and the
+// question the UI and the resolver were both asking it is "can this machine RECORD in
+// HEVC". libx265 is in essentially every ffmpeg build and cannot hold 1080p in real
+// time in any of them, so the old answer was true exactly when it should have been
+// false. Do not reintroduce it: the software tier's HEVC answer is a constant `false`
+// (see [`hevc_encoder_for`]), and no probe can change that.
+
+/// The ffmpeg HEVC encoder belonging to an encoder tier id, or `None` for a tier with
+/// no HARDWARE HEVC encoder behind it.
+///
+/// `software` is deliberately absent even though ffmpeg ships `libx265`: the software
+/// tier's HEVC answer is a constant no, for the reason [`hevc_offerable`] records. An
+/// id that is not a tier at all (a hand-edited config, a retired encoder) answers
+/// `None` the same way, so an unrecognised value can never be treated as capable.
+///
+/// Pure, unit-tested.
+pub fn hevc_encoder_for(tier: &str) -> Option<&'static str> {
+    match tier {
+        "nvenc" => Some("hevc_nvenc"),
+        "amf" => Some("hevc_amf"),
+        "qsv" => Some("hevc_qsv"),
+        "vaapi" => Some("hevc_vaapi"),
+        "videotoolbox" => Some("hevc_videotoolbox"),
+        _ => None,
+    }
+}
+
+/// Whether the video-codec setting may OFFER HEVC, given `tier` (the encoder a
+/// recording would actually run on right now) and `hw_hevc_ok`, that tier's probed
+/// hardware-HEVC answer: `Some(true)` it works here, `Some(false)` it does not,
+/// `None` nobody has asked yet.
+///
+/// The rule is "offer only what we can deliver" (DRAGON-674). Offering a codec we then
+/// silently swap is dishonest; offering one that KILLS the recording is worse, and that
+/// is what the old gate did. Measured in the field (DRAGON-671): a tester's NVENC probe
+/// failed, so the plan fell to software while her codec setting still said HEVC. The
+/// session logged `chosen=software … hevc=true`, then `encoder backlog - 660 frames
+/// dropped`, then the DRAGON-118 muxer watchdog correctly killed a recording that had
+/// written nothing for 12s. The settings row had gone on offering HEVC throughout,
+/// because the only thing it checked was whether libx265 was in the ffmpeg build.
+///
+/// Two deliberate decisions live here, and both are load-bearing:
+///
+/// - **Software is never offerable**, whatever `hw_hevc_ok` says. Real-time screen
+///   capture is the only thing this setting configures, and libx265 cannot sustain
+///   1080p at capture frame rates on a CPU that is also running the machine. There is
+///   no probe that would make this true, so it is not probed.
+/// - **Unknown means OFFER, not hide.** "The probe has not run yet" is not "the probe
+///   failed", and collapsing the two would quietly strip HEVC from perfectly capable
+///   machines — a capability regression that reads to the user exactly like a bug,
+///   with no message to explain it. Hiding a working option is the more expensive
+///   mistake here, because the failure this gate exists to stop needs a CONFIRMED
+///   `Some(false)` to happen at all. In practice the settings page resolves the probe
+///   before it builds the row (`pages/video.rs` waits on `encoders_ready`), so `None`
+///   is the rare case of a tier absent from the probed list, not the normal path.
+///
+/// The gate is DYNAMIC on purpose. A failing hardware HEVC encoder is a state of the
+/// machine (a driver mid-update, an ffmpeg build missing the encoder, every NVENC
+/// session held by a game), never a property of the platform, so nothing here is a
+/// per-OS ban: the moment the tier's probe passes again, HEVC comes back with no code
+/// change and no migration.
+///
+/// Pure, unit-tested.
+pub fn hevc_offerable(tier: &str, hw_hevc_ok: Option<bool>) -> bool {
+    if hevc_encoder_for(tier).is_none() {
+        return false;
+    }
+    hw_hevc_ok.unwrap_or(true)
+}
+
+/// Whether `tier` can ACTUALLY encode HEVC on this machine: its HEVC encoder is in the
+/// ffmpeg build and, on Windows, a real probe-encode initialises it (the same honest
+/// gate the H.264 tier check uses there — Windows has no `/dev` node to sniff).
+///
+/// `encoders` is the already-fetched `ffmpeg -encoders` text rather than something this
+/// re-reads: `ffmpeg_encoders()` is an UNCACHED spawn and the caller enumerating the
+/// tiers is holding its output already, so injecting it keeps the cost at one spawn per
+/// enumeration instead of one per question. The DECISION this feeds is the pure,
+/// unit-tested pair above ([`hevc_encoder_for`] + [`hevc_offerable`]); all that is left
+/// here is the effectful lookup, which is why this lives on the syscall side of the seam.
+///
+/// The caller must already have established that `tier` itself is usable (device node,
+/// driver state, H.264 probe). This answers only the narrower HEVC question on top, and
+/// off Windows that question IS the ffmpeg build: NVENC/VAAPI/VideoToolbox gate their
+/// H.264 side the same way, with no probe-encode to run.
+pub(crate) fn hardware_hevc_ok_with(encoders: &str, tier: &str) -> bool {
+    let Some(name) = hevc_encoder_for(tier) else {
+        return false;
+    };
+    if !encoders.contains(name) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        super::plan::hw_encoder_probe_ok(name)
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +276,89 @@ mod tests {
         assert_eq!(valid_nvenc_preset(DEFAULT_NVENC_PRESET), DEFAULT_NVENC_PRESET);
         assert_eq!(valid_x264_preset(DEFAULT_X264_PRESET), DEFAULT_X264_PRESET);
         assert_eq!(valid_vaapi_cl(DEFAULT_VAAPI_CL), DEFAULT_VAAPI_CL);
+    }
+}
+
+// DRAGON-674: "offer only what we can deliver", pinned as its own island. The probe is
+// injected as a plain `Option<bool>`, so every arm — including the not-yet-known one —
+// is provable on any host even though the probes themselves are per-platform.
+#[cfg(test)]
+mod hevc_offer_tests {
+    use super::{hevc_encoder_for, hevc_offerable};
+
+    /// Every hardware tier this build can resolve to names its own HEVC encoder, and
+    /// nothing else does. A missing row here is a tier that would silently lose HEVC.
+    #[test]
+    fn each_hardware_tier_names_its_hevc_encoder() {
+        for (tier, encoder) in [
+            ("nvenc", "hevc_nvenc"),
+            ("amf", "hevc_amf"),
+            ("qsv", "hevc_qsv"),
+            ("vaapi", "hevc_vaapi"),
+            ("videotoolbox", "hevc_videotoolbox"),
+        ] {
+            assert_eq!(hevc_encoder_for(tier), Some(encoder), "{tier}");
+        }
+    }
+
+    #[test]
+    fn software_and_foreign_ids_have_no_hevc_encoder() {
+        assert_eq!(hevc_encoder_for("software"), None);
+        assert_eq!(hevc_encoder_for(""), None);
+        assert_eq!(hevc_encoder_for("x265"), None);
+    }
+
+    /// The DRAGON-671 field failure, in one assertion: libx265 IS in the ffmpeg build
+    /// (so the old `software_supports_hevc()` gate said yes), and the answer is still
+    /// no, because "the encoder exists" was never the question.
+    #[test]
+    fn software_never_offers_hevc_however_the_probe_answers() {
+        for probe in [Some(true), Some(false), None] {
+            assert!(!hevc_offerable("software", probe), "probe={probe:?}");
+        }
+    }
+
+    #[test]
+    fn a_hardware_tier_with_a_working_probe_offers_hevc() {
+        // The whole point of the ticket is that this stays true: HEVC is worth having
+        // wherever it can actually be recorded, and mac VideoToolbox most of all.
+        for tier in ["nvenc", "amf", "qsv", "vaapi", "videotoolbox"] {
+            assert!(hevc_offerable(tier, Some(true)), "{tier}");
+        }
+    }
+
+    #[test]
+    fn a_hardware_tier_with_a_failing_probe_hides_hevc() {
+        for tier in ["nvenc", "amf", "qsv", "vaapi", "videotoolbox"] {
+            assert!(!hevc_offerable(tier, Some(false)), "{tier}");
+        }
+    }
+
+    /// UNKNOWN is not FAILED. A probe that has not answered must not strip HEVC from a
+    /// capable machine: that is a silent capability regression with no message
+    /// attached, and the failure this gate exists to prevent needs a confirmed
+    /// `Some(false)` to occur at all.
+    #[test]
+    fn an_unresolved_probe_still_offers_hevc() {
+        for tier in ["nvenc", "amf", "qsv", "vaapi", "videotoolbox"] {
+            assert!(hevc_offerable(tier, None), "{tier}");
+        }
+    }
+
+    /// The gate is a state of the machine, never a platform ban: the SAME tier flips
+    /// back to offerable the moment its probe passes, with no code change.
+    #[test]
+    fn a_recovered_probe_brings_hevc_straight_back() {
+        assert!(!hevc_offerable("nvenc", Some(false)));
+        assert!(hevc_offerable("nvenc", Some(true)));
+    }
+
+    #[test]
+    fn an_unrecognised_tier_is_never_offered_hevc() {
+        // A hand-edited or foreign encoder id cannot be assumed capable.
+        for probe in [Some(true), Some(false), None] {
+            assert!(!hevc_offerable("wxyz", probe), "probe={probe:?}");
+            assert!(!hevc_offerable("", probe), "probe={probe:?}");
+        }
     }
 }

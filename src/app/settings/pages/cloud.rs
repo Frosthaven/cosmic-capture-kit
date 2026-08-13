@@ -324,7 +324,7 @@ pub struct CloudAdd {
     /// living here.
     ///
     /// An angle rather than a start-instant, mirroring the app's other spinning glyph
-    /// (`App::scan_spin`, the scanner's re-read button): it needs no reset when a listing
+    /// (`App::busy_spin`, the scanner's re-read button): it needs no reset when a listing
     /// starts, because where the wheel happens to be pointing carries no meaning.
     pub folder_spin: f32,
     /// Set when this dialog is RECONNECTING an existing account rather than adding one, so
@@ -4243,7 +4243,7 @@ impl crate::app::App {
             CloudSettingsMsg::FolderSpinTick => {
                 // One step of the refresh glyph's rotation (DRAGON-514). The same constant and
                 // the same wrap the scanner's spinning re-read uses
-                // (`update::capture`'s `ScanSpinTick`): a full turn in 30 ticks, at the ~30fps
+                // (`update::capture`'s `BusySpinTick`): a full turn in 30 ticks, at the ~30fps
                 // the subscription ticks, so one revolution a second.
                 const STEP: f32 = std::f32::consts::TAU / 30.0;
                 if let Some(add) = self.settings.cloud.add.as_mut() {

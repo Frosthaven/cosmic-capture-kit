@@ -84,22 +84,69 @@ impl FarEndFeeder {
 /// The combined AEC3 + WebRTC-NS engine, present only when at least one of
 /// `noise_suppression` / `echo_cancellation` is enabled (`None` otherwise — a pure
 /// passthrough, exactly like the `Option` this replaces on `InputProcessor`).
+///
+/// # This type CONTAINS sonora's panics, and that is load-bearing (DRAGON-664)
+///
+/// `sonora-aec3` panics, in normal operation, on any recording long enough for the
+/// adaptive filter to leave its initial state. `adaptive_fir_filter::zero_filter`
+/// clears the partitions in `old_size..new_size` by SLICING (`&mut h[old..new]`),
+/// while the WebRTC C++ it is ported from writes `for (k = old; k < new; ++k)`, which
+/// is simply an empty loop when the filter SHRINKS. In Rust that same shrink is an
+/// inverted range, so it aborts the frame with
+/// `slice index starts at 13 but ends at 12`.
+///
+/// The shrink is not exotic, it is the design: `exit_initial_state` grows the refined
+/// filter from `refined_initial.length_blocks` (12) to `refined.length_blocks` (13)
+/// after ~2.5 s, and a later delay change (a new detected echo-path delay, or a render
+/// buffer flush) makes `Subtractor::handle_echo_path_change` reset it straight back to
+/// 12. Measured on a synthetic echo path, that lands every 15-30 s of audio, which
+/// matches the field reports of 8-31 s.
+///
+/// We cannot dodge it from the call site. The only knob that would prevent the shrink
+/// is the AEC3 filter length itself, and changing that is a DSP RETUNE, which
+/// CLAUDE.md's audio CAUTION section forbids. So both sonora entry points run inside a
+/// `catch_unwind` and a panicking engine is REBUILT FROM THE SAME `InputConfig`, never
+/// a different one: this is crash recovery, not a configuration change.
+///
+/// Containment lives HERE, in the one module that owns the `sonora::AudioProcessing`
+/// instance, rather than in each caller's frame loop. That way every caller is covered
+/// by construction (the recording mic tap, the settings mic test, and anything added
+/// later), on every platform, and a caller cannot half-cover it: the recording loop
+/// wrapped its capture pass but not its render feed, while the mic test wrapped both.
+/// It also keeps the blast radius to the failing stage. The callers' own
+/// `catch_unwind`s rebuild the WHOLE `InputProcessor`, so a sonora panic used to throw
+/// away the gate, the AGC, RNNoise and the VAD as well, every 15-30 s, on every
+/// recording with echo cancellation on.
 pub(crate) struct WebRtcApm {
     apm: sonora::AudioProcessing,
+    /// The config the engine was built from, kept so [`Self::recover`] can rebuild a
+    /// BYTE-IDENTICAL engine after a panic. `InputConfig` is `Copy`, so this is a plain
+    /// value, not a borrow of the caller's settings.
+    cfg: InputConfig,
     /// Scratch output buffer `process_render_f32` requires but whose contents nothing
     /// reads (the render call's job is to update the AEC's internal alignment state, not
     /// to produce a signal) — moved here verbatim from `InputProcessor` (DRAGON-124).
     rdest: [f32; FRAME],
+    /// How many times this engine has panicked and been rebuilt. Counted so the reset is
+    /// never silent: the first one is a `warn`, the rest are `debug` with the count.
+    resets: u32,
 }
 
 impl WebRtcApm {
     /// Build the engine per `cfg`, or `None` when both noise suppression and echo
     /// cancellation are off.
     pub(crate) fn new(cfg: &InputConfig) -> Option<Self> {
+        let apm = Self::engine(cfg)?;
+        Some(Self { apm, cfg: *cfg, rdest: [0.0; FRAME], resets: 0 })
+    }
+
+    /// The engine builder, shared by [`Self::new`] and [`Self::recover`] so a rebuilt
+    /// engine cannot drift from the original one's configuration.
+    fn engine(cfg: &InputConfig) -> Option<sonora::AudioProcessing> {
         use sonora::{AudioProcessing, Config, StreamConfig};
         let sc = StreamConfig::new(48_000, 1);
         // First pass: AEC + noise suppression (NO gain — that's applied last, in agc.rs).
-        let apm = (cfg.noise_suppression || cfg.echo_cancellation).then(|| {
+        (cfg.noise_suppression || cfg.echo_cancellation).then(|| {
             use sonora::config::{
                 EchoCanceller, HighPassFilter, NoiseSuppression, NoiseSuppressionLevel,
             };
@@ -119,19 +166,71 @@ impl WebRtcApm {
                 ..Default::default()
             };
             AudioProcessing::builder().config(config).capture_config(sc).render_config(sc).build()
-        })?;
-        Some(Self { apm, rdest: [0.0; FRAME] })
+        })
     }
 
     /// Feed the far-end (speaker monitor) reference for this frame, so AEC3 can align and
     /// subtract the echo path. Call before the capture pass each frame when echo is on.
     pub(crate) fn feed_render(&mut self, render: &[f32; FRAME]) {
-        let _ = self.apm.process_render_f32(&[&render[..]], &mut [&mut self.rdest[..]]);
+        let apm = &mut self.apm;
+        let rdest = &mut self.rdest;
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = apm.process_render_f32(&[&render[..]], &mut [&mut rdest[..]]);
+        }))
+        .is_ok();
+        if !ok {
+            self.recover();
+        }
     }
 
     /// Run the capture-side pass (AEC + NS + high-pass, one WebRTC call) into `out`.
+    ///
+    /// On a panic `out` is silenced and the engine rebuilt, so the frame the engine could
+    /// not finish reaches the recording as 10 ms of silence. That is exactly what the
+    /// callers' own recovery already wrote for such a frame; what changes is that the
+    /// stages after this one keep their state instead of being rebuilt with it.
     pub(crate) fn process_capture(&mut self, capture: &[f32; FRAME], out: &mut [f32; FRAME]) {
-        let _ = self.apm.process_capture_f32(&[&capture[..]], &mut [&mut out[..]]);
+        let apm = &mut self.apm;
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = apm.process_capture_f32(&[&capture[..]], &mut [&mut out[..]]);
+        }))
+        .is_ok();
+        if !ok {
+            out.fill(0.0);
+            self.recover();
+        }
+    }
+
+    /// Replace an engine that panicked mid-frame with a fresh one on the SAME config.
+    ///
+    /// Unwinding out of a `&mut self` method leaves the old engine logically
+    /// inconsistent, so it is dropped rather than reused. sonora is pure Rust with no
+    /// FFI and no global state, so dropping it is an ordinary drop; nothing leaks and
+    /// nothing else in the process is affected. A rebuild measured 0.23 ms, so even the
+    /// pathological case (an input that panics on every 10 ms frame) degrades to
+    /// continuous silence at a few percent of one core, never to a crash or a stall.
+    fn recover(&mut self) {
+        self.resets = self.resets.saturating_add(1);
+        if self.resets == 1 {
+            log::warn!(
+                "mic cleanup: the WebRTC AEC/NS engine panicked mid-frame and was rebuilt \
+                 (a known sonora-aec3 defect on adaptive-filter shrink, DRAGON-664); that \
+                 frame is 10 ms of silence and echo cancellation re-converges from here"
+            );
+        } else {
+            log::debug!(
+                "mic cleanup: WebRTC AEC/NS engine rebuilt after a panic (#{})",
+                self.resets
+            );
+        }
+        match Self::engine(&self.cfg) {
+            Some(apm) => self.apm = apm,
+            // Unreachable in practice: `new` already built an engine from this exact
+            // config, and `engine` only declines when both stages are off. Kept honest
+            // rather than unwrapped: the old engine stays, so the next frame is caught
+            // and silenced the same way instead of taking the thread down.
+            None => log::warn!("mic cleanup: could not rebuild the WebRTC AEC/NS engine"),
+        }
     }
 }
 
@@ -172,6 +271,76 @@ mod tests {
         apm.feed_render(&render);
         apm.process_capture(&capture, &mut out);
         assert_eq!(out.len(), FRAME);
+    }
+
+    // ---- DRAGON-664: sonora's panics are contained here, not at the call sites ----
+
+    /// The recovery contract, pinned deterministically on every platform: a rebuilt
+    /// engine works, carries the SAME config, and processing after a rebuild does not
+    /// keep resetting. `recover` is driven directly because whether sonora's delay
+    /// estimator trips its own defect depends on the SIMD backend and the signal, and
+    /// this contract must hold everywhere regardless.
+    #[test]
+    fn recover_rebuilds_a_working_engine_and_counts_the_reset() {
+        let c = cfg(true, true);
+        let mut apm = WebRtcApm::new(&c).expect("both stages on");
+        apm.recover();
+        assert_eq!(apm.resets, 1, "the reset is counted, never silent");
+        assert!(apm.cfg.noise_suppression && apm.cfg.echo_cancellation, "config is kept");
+
+        let mut out = [0.0f32; FRAME];
+        apm.feed_render(&[0.0; FRAME]);
+        apm.process_capture(&[0.01; FRAME], &mut out);
+        assert!(out.iter().all(|s| s.is_finite()), "the rebuilt engine still processes");
+        assert_eq!(apm.resets, 1, "a healthy frame after a rebuild must not reset again");
+    }
+
+    /// The live one: drive a real echo path whose DELAY CHANGES, which is what makes
+    /// AEC3 shrink its adaptive filter and panic inside `zero_filter`. The assertion is
+    /// that the caller survives every frame, because that is the whole contract; the
+    /// engine reset count is reported, not asserted, since whether the estimator
+    /// re-detects depends on sonora's SIMD backend.
+    ///
+    /// If this ever panics, the `catch_unwind` in `feed_render` / `process_capture` has
+    /// been removed or bypassed, and every recording with echo cancellation on is losing
+    /// its mic thread. About 0.4 s of wall time for 14 s of synthetic audio.
+    #[test]
+    fn a_shrinking_adaptive_filter_cannot_escape_as_a_panic() {
+        let mut apm = WebRtcApm::new(&cfg(true, true)).expect("both stages on");
+        let mut out = [0.0f32; FRAME];
+        // Deterministic wideband far end, so the delay estimator has something to lock
+        // onto; a long history so the near end can be a delayed copy of it.
+        let mut st: u32 = 0x1234_5678;
+        let mut rng = move || {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            (st as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let mut history = vec![0.0f32; 48_000 * 4];
+        let mut hpos = 0usize;
+        for i in 0..1400 {
+            // The echo path moves once, AFTER the filter has left its initial state
+            // (~2.5 s) and grown, which is the shrink's precondition.
+            let delay = if i <= 500 { 480 } else { 3400 };
+            let mut render = [0.0f32; FRAME];
+            let mut capture = [0.0f32; FRAME];
+            for k in 0..FRAME {
+                let t = (i * FRAME + k) as f32 / 48_000.0;
+                let s = 0.35 * rng() + 0.25 * (2.0 * std::f32::consts::PI * 440.0 * t).sin();
+                render[k] = s * (0.6 + 0.4 * (2.0 * std::f32::consts::PI * 0.7 * t).sin());
+                history[hpos] = render[k];
+                let src = (hpos + history.len() - delay) % history.len();
+                capture[k] = 0.5 * history[src]
+                    + 0.05 * (2.0 * std::f32::consts::PI * 210.0 * t).sin()
+                    + 0.01 * rng();
+                hpos = (hpos + 1) % history.len();
+            }
+            apm.feed_render(&render);
+            apm.process_capture(&capture, &mut out);
+            assert!(out.iter().all(|s| s.is_finite()), "frame {i} produced a non-finite sample");
+        }
+        println!("engine resets over 14 s of audio: {}", apm.resets);
     }
 
     // ---- FarEndFeeder (DRAGON-128): stereo chunks → mono FRAME blocks ----

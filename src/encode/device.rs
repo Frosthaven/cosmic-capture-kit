@@ -12,6 +12,12 @@ use super::*;
 pub struct EncoderInfo {
     pub id: String,
     pub label: String,
+    /// Whether this tier can ACTUALLY encode HEVC here (DRAGON-674), probed in the
+    /// same pass that decided the tier is usable at all — so the settings codec row
+    /// reads a fact rather than re-spawning a probe on the UI thread, and the whole
+    /// answer travels with the list (including across the Windows off-thread probe's
+    /// `SettingsMsg`). Always `false` for `software`: see `encode::hevc_offerable`.
+    pub hevc: bool,
 }
 
 impl AsRef<str> for EncoderInfo {
@@ -33,6 +39,7 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
         v.push(EncoderInfo {
             id: "videotoolbox".into(),
             label: format!("{} (VideoToolbox)", chip_name()),
+            hevc: hardware_hevc_ok_with(&enc, "videotoolbox"),
         });
     }
     // Windows hardware tier (DRAGON-238): NVENC > AMF > QSV, each offered only when the
@@ -52,6 +59,7 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
                     "{} (NVENC)",
                     adapter_name_for_vendor(0x10DE).unwrap_or_else(|| "NVIDIA".into())
                 ),
+                hevc: hardware_hevc_ok_with(&enc, "nvenc"),
             });
         }
         if enc.contains("h264_amf") && hw_encoder_probe_ok("h264_amf") {
@@ -61,6 +69,7 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
                     "{} (AMF)",
                     adapter_name_for_vendor(0x1002).unwrap_or_else(|| "AMD".into())
                 ),
+                hevc: hardware_hevc_ok_with(&enc, "amf"),
             });
         }
         if enc.contains("h264_qsv") && hw_encoder_probe_ok("h264_qsv") {
@@ -70,6 +79,7 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
                     "{} (Intel Quick Sync (QSV))",
                     adapter_name_for_vendor(0x8086).unwrap_or_else(|| "Intel".into())
                 ),
+                hevc: hardware_hevc_ok_with(&enc, "qsv"),
             });
         }
     }
@@ -79,6 +89,7 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
         v.push(EncoderInfo {
             id: "nvenc".into(),
             label: format!("{} (NVENC)", nvidia_name()),
+            hevc: hardware_hevc_ok_with(&enc, "nvenc"),
         });
     }
     if let Some((dev, _)) = vaapi_device()
@@ -86,6 +97,7 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
             v.push(EncoderInfo {
                 id: "vaapi".into(),
                 label: format!("{} (VAAPI)", vaapi_name(&dev)),
+                hevc: hardware_hevc_ok_with(&enc, "vaapi"),
             });
         }
     // The CPU model rides the software label for parity with the GPU tiers (DRAGON-252):
@@ -98,6 +110,10 @@ pub fn available_encoders() -> Vec<EncoderInfo> {
     v.push(EncoderInfo {
         id: "software".into(),
         label: format!("{cpu} (Software x264)"),
+        // Not probed, and never will be (DRAGON-674): libx265 is in the build on almost
+        // every machine and cannot hold a real-time capture on any of them, so there is
+        // no probe whose answer would change this.
+        hevc: false,
     });
     v
 }

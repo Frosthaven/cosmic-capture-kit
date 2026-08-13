@@ -57,6 +57,29 @@ pub(crate) fn mode_wants_dark(mode: u8) -> bool {
     }
 }
 
+/// Whether the chrome this app is CURRENTLY PAINTING is dark (DRAGON-666).
+///
+/// [`mode_wants_dark`] answers for a mode byte a caller already holds; this answers for the
+/// live window, reading the persisted appearance itself. Its one caller is native and has
+/// no `App` in reach: the Windows caption installer, which has to tell DWM whether the
+/// header under its caption buttons is dark or it paints black glyphs on black chrome
+/// (`platform::windows::caption`).
+///
+/// System Default (`appearance_use_system`) follows the system, exactly as
+/// `resolve_appearance_theme` does with the same flag; otherwise the persisted mode decides,
+/// with Automatic deferring to the system through the same [`system_is_dark`] seam. So this
+/// cannot disagree with the theme actually applied unless that function's rule changes, and
+/// then both change together.
+///
+/// Windows-only in practice (macOS asks AppKit for its own traffic lights, Linux draws its
+/// own captions), so it is honestly dead everywhere else rather than hidden behind a
+/// crate-wide allow.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn window_chrome_is_dark() -> bool {
+    let p = crate::state::load();
+    if p.appearance_use_system { system_is_dark() } else { mode_wants_dark(p.appearance_mode) }
+}
+
 /// Whether the SYSTEM is currently in dark mode — the ONE portable dark/light
 /// probe this feature uses (for Mode = Automatic and the base-theme fallback).
 ///
