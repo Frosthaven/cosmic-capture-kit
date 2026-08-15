@@ -9,15 +9,69 @@
 #
 # Requires `just` (https://github.com/casey/just). On Windows, requires
 # PowerShell 7+ (`pwsh`), same as scripts/win-package.ps1 already does.
-
-set unstable
+#
+# The Windows recipes call PowerShell via a checked-in `.ps1` wrapper so the
+# file parses under older `just` releases as well as current ones. This avoids
+# the temp-file path that `just` creates for shebang recipes and keeps the
+# recipe syntax portable across distro-packaged `just` builds.
+#
+# Plain (non-shebang) `[windows]` recipe lines run through the default shell.
+# Force that shell to PowerShell so Windows hosts without `sh` on PATH still run.
+set windows-shell := ['pwsh.exe', '-NoLogo', '-NoProfile', '-Command']
 
 # Bare `just` lists recipes instead of running the first one by surprise.
 default:
     @just --list
 
+[linux]
+build:
+    just build-linux
+
+[macos]
+build:
+    just build-macos
+
+[windows]
+build:
+    just build-windows
+
+[linux]
+appimage arch="x86_64":
+    just appimage-linux
+
+[macos]
+appimage arch="x86_64":
+    just appimage-macos {{arch}}
+
+[windows]
+appimage arch="x86_64":
+    just appimage-windows
+
+[linux]
+ffmpeg-win:
+    just ffmpeg-win-linux
+
+[macos]
+ffmpeg-win:
+    just ffmpeg-win-linux
+
+[windows]
+ffmpeg-win:
+    just ffmpeg-win-windows
+
+[linux]
+dev:
+    just dev-linux
+
+[macos]
+dev:
+    just dev-macos
+
+[windows]
+dev:
+    just dev-windows
+
 # Documentation site: serve it locally with live reload, on every platform.
-[doc("Serve the documentation site locally with live reload")]
 docs:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -34,9 +88,7 @@ docs:
     .venv-docs/bin/mkdocs serve
 
 # macOS: build + bundle the .app (signed if a Developer ID identity is available).
-[doc("Build this platform's own artifact (app/msi on mac/Windows, binary on Linux)")]
-[macos]
-build:
+build-macos:
     #!/usr/bin/env bash
     set -euo pipefail
     # Signs with a Developer ID identity if one is in the login keychain,
@@ -86,56 +138,17 @@ build:
 
 # Windows: build the MSI via scripts/win-package.ps1.
 #
-# Two Windows-only quirks, both hit on first run (DRAGON-524):
-# - `[extension('.ps1')]`: just saves a shebang recipe to an EXTENSIONLESS temp file, and
-#   `pwsh -File` refuses anything not named `*.ps1`. The attribute renames the temp.
-# - `#!pwsh.exe`, not `#!/usr/bin/env pwsh`: a shebang containing `/` makes just translate
-#   the path through `cygpath`, which only exists inside a Git-Bash/Cygwin PATH. A bare
-#   Windows program name skips the translation, so this runs from plain PowerShell too.
-#   This recipe is `[windows]`-gated, so the unix-style shebang buys nothing here.
-[doc("Build this platform's own artifact (app/msi on mac/Windows, binary on Linux)")]
-[windows]
-[extension('.ps1')]
-build:
-    #!pwsh.exe
-    # win-package.ps1 does build + bundle in one step, including setting
-    # CARGO_TARGET_DIR=target-win itself (the dual-boot rule: never touch
-    # target/, that is the shared tree's live Linux build). Ships unsigned,
-    # same as win-package.ps1 always has, since no code-signing cert exists yet.
-    #
-    # Bake the cloud client ids from the same GitHub repository variables
-    # release.yml uses (see the Linux recipe's comment for the full why).
-    # Needs an authenticated `gh`; silently unbaked without one.
-    if ((Get-Command gh -ErrorAction SilentlyContinue) -and ($(gh auth status 2>$null; $?))) {
-        foreach ($v in @('CCK_BAKED_GDRIVE_CLIENT_ID','CCK_BAKED_GDRIVE_CLIENT_SECRET','CCK_BAKED_ONEDRIVE_CLIENT_ID','CCK_BAKED_DROPBOX_CLIENT_ID')) {
-            if (-not (Get-Item "env:$v" -ErrorAction SilentlyContinue)) {
-                $val = (gh variable get $v 2>$null)
-                if ($val) { Set-Item "env:$v" $val }
-            }
-        }
-        Write-Host '==> Baked cloud ids from GitHub repository variables'
-    }
-    # Pull the SAME sidecars CI ships, rather than packaging whatever happens to
-    # be on PATH (DRAGON-531). Pinned + checksummed, and idempotent, so this is
-    # free once vendor\ is populated. The mac recipe above calls its own analog.
-    pwsh scripts/fetch-win-vendor.ps1
-    pwsh scripts/win-package.ps1
-    # Into the shared output dir (DRAGON-590), so the MSI sits beside whatever the
-    # other recipes and the other boot produced. The STABLE PATH is deliberately
-    # NOT repointed here: an MSI is an installer, not the app, so "use this path
-    # for shortcuts" would be false. `just dev` is the recipe that produces a
-    # runnable Windows build, and that is the one that moves the stable path.
-    . scripts/artifacts.ps1
-    $msi = Get-ChildItem 'target-win\CosmicCaptureKit-*.msi' |
-        Sort-Object LastWriteTime | Select-Object -Last 1
-    if (-not $msi) { Write-Error 'win-package.ps1 produced no msi' }
-    $out = Publish-CckArtifact -Path $msi.FullName
-    Write-CckArtifact $out
+# Keep these entries as plain `just` recipes that shell out to a checked-in
+# PowerShell script. Older `just` releases do not understand
+# `[extension('.ps1')]`, and the shebang temp-file route breaks on
+# extensionless files when `pwsh -File` is used. Calling `pwsh` directly keeps
+# the file compatible with both older and newer `just` while retaining the
+# Windows, Wayland and X11 paths described in the README.
+build-windows:
+    pwsh -NoLogo -NoProfile -File ./scripts/just-win.ps1 build
 
 # Linux: plain release build, retrying without zero-copy if the first attempt fails.
-[doc("Build this platform's own artifact (app/msi on mac/Windows, binary on Linux)")]
-[linux]
-build:
+build-linux:
     #!/usr/bin/env bash
     set -euo pipefail
     # There is no packaged install yet (build from source per README). Tries
@@ -192,7 +205,6 @@ build:
 # glibc is far newer than the floor we ship against, so a local build would
 # only run on other bleeding-edge distros. Rocky 9 floors it at GLIBC_2.34,
 # which reaches Ubuntu 22.04 and everything newer.
-[doc("Build the SHIPPING Linux binary in the release container (needs docker)")]
 [linux]
 dist:
     #!/usr/bin/env bash
@@ -333,7 +345,6 @@ dist:
 # Build state lives under ~/.cache/cck-flatpak, never in the repo and never in
 # /var/tmp: flatpak-builder's bwrap sandbox cannot chdir into /var/tmp, which
 # fails as a confusing "No such file or directory" on the first module.
-[doc("EXPERIMENTAL: build the Flatpak, stop every running instance, and restart the resident as the Flatpak")]
 [linux]
 flatpak:
     #!/usr/bin/env bash
@@ -430,9 +441,7 @@ flatpak:
     cck_link cosmic-capture-kit-flatpak "$EXPORT" >/dev/null
     cck_stable "$EXPORT"
 
-[doc("Build the AppImage, restart the daemon on it, and print its glibc floor (needs docker)")]
-[linux]
-appimage:
+appimage-linux:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v docker >/dev/null 2>&1 || { echo "==> docker is required to build the AppImage"; exit 1; }
@@ -494,9 +503,7 @@ appimage:
     echo "==> size:        $CCK_SIZE"
     cck_stable "$APPIMAGE"
 
-[doc("Build the AppImage and print its glibc floor (needs docker). Pass aarch64 to build the ARM one, which is NATIVE and fast on Apple Silicon.")]
-[macos]
-appimage arch="x86_64":
+appimage-macos arch="x86_64":
     #!/usr/bin/env bash
     set -euo pipefail
     # Same container, different runtime. OrbStack and Docker Desktop both provide
@@ -562,48 +569,8 @@ appimage arch="x86_64":
     echo "==> size:        $CCK_SIZE"
     cck_say_artifact "$APPIMAGE"
 
-[doc("Build the AppImage, restart the daemon on it, and print its glibc floor (needs docker)")]
-[windows]
-[extension('.ps1')]
-appimage:
-    #!pwsh.exe
-    $ErrorActionPreference = 'Stop'
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Write-Error 'docker is required to build the AppImage (Docker Desktop)'
-    }
-    # The dual-boot rule: this tree is SHARED with the Linux boot, and `target/`
-    # holds the Linux cargo tree plus the live binaries its PrintScreen shortcut
-    # launches. The CONTAINER still writes only to target-appimage/, which is
-    # git-excluded like target-win/; the finished .AppImage is moved into
-    # target/artifacts/ afterwards (DRAGON-590, see scripts/artifacts.ps1).
-    $out = Join-Path $PWD 'target-appimage'
-    New-Item -ItemType Directory -Force -Path $out | Out-Null
-    $envArgs = @()
-    if ((Get-Command gh -ErrorAction SilentlyContinue) -and ($(gh auth status 2>$null; $?))) {
-        foreach ($v in @('CCK_BAKED_GDRIVE_CLIENT_ID','CCK_BAKED_GDRIVE_CLIENT_SECRET','CCK_BAKED_ONEDRIVE_CLIENT_ID','CCK_BAKED_DROPBOX_CLIENT_ID')) {
-            $val = (Get-Item "env:$v" -ErrorAction SilentlyContinue).Value
-            if (-not $val) { $val = (gh variable get $v 2>$null) }
-            if ($val) { $envArgs += @('-e', "$v=$val") }
-        }
-        Write-Host '==> Baked cloud ids from GitHub repository variables'
-    }
-    # ONE source of truth for the compiler: rust-toolchain.toml. See the bash arm.
-    $rustToolchain = (Select-String -Path 'rust-toolchain.toml' -Pattern '^\s*channel\s*=\s*"(.*)"').Matches[0].Groups[1].Value
-    if (-not $rustToolchain) { Write-Error 'could not read channel from rust-toolchain.toml'; exit 1 }
-    Write-Host '==> Preparing the build image (cached after the first run)...'
-    docker build --build-arg "RUST_TOOLCHAIN=$rustToolchain" -f scripts/appimage/Dockerfile -t cck-appimage-base scripts
-    docker run --rm -v "${PWD}:/src:ro" -v "${out}:/work" @envArgs `
-        cck-appimage-base bash /src/scripts/appimage/build.sh
-    # No launch step: a Windows host cannot run a Linux binary. For the same
-    # reason the stable path is left alone.
-    Get-Content (Join-Path $out 'appimage.env') | ForEach-Object { Write-Host "==> $_" }
-    . scripts/artifacts.ps1
-    $name = (Get-Content (Join-Path $out 'appimage.env') |
-        Select-String '^CCK_APPIMAGE_NAME=(.*)$').Matches[0].Groups[1].Value
-    $src = Join-Path $out $name
-    $dst = Publish-CckArtifact -Path $src
-    Remove-Item $src -Force
-    Write-CckArtifact $dst
+appimage-windows:
+    pwsh -NoLogo -NoProfile -File ./scripts/just-win.ps1 appimage
 
 # Cross-compile the WINDOWS ffmpeg, from Linux, macOS or Windows (DRAGON-675).
 #
@@ -625,10 +592,7 @@ appimage:
 # installs. It does NOT publish either: the archive lands in target/artifacts/
 # and the build prints the `gh release upload` line plus the two pins.env lines
 # to paste, because putting a binary in front of users is a human's decision.
-[doc("Cross-compile the Windows ffmpeg in a mingw-w64 container (needs docker)")]
-[linux]
-[macos]
-ffmpeg-win:
+ffmpeg-win-linux:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v docker >/dev/null 2>&1 || { echo "==> docker is required to build the Windows ffmpeg"; exit 1; }
@@ -664,50 +628,19 @@ ffmpeg-win:
     # of the three hosts it is not even a runnable binary.
     cck_say_artifact "$ARCHIVE"
 
-[doc("Cross-compile the Windows ffmpeg in a mingw-w64 container (needs docker)")]
-[windows]
-[extension('.ps1')]
-ffmpeg-win:
-    #!pwsh.exe
-    $ErrorActionPreference = 'Stop'
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Write-Error 'docker is required to build the Windows ffmpeg (Docker Desktop)'
-    }
-    # The dual-boot rule: this tree is SHARED with the Linux boot and `target/`
-    # holds the Linux cargo state, so the container's scratch goes to
-    # target-ffmpeg-win/, which is git-excluded like target-win/. Only the
-    # finished archive moves into target/artifacts/ afterwards.
-    $out = Join-Path $PWD 'target-ffmpeg-win'
-    New-Item -ItemType Directory -Force -Path $out | Out-Null
-    Write-Host '==> Preparing the build image (cached after the first run)...'
-    docker build -f scripts/ffmpeg-win/Dockerfile -t cck-ffmpeg-win scripts
-    if ($LASTEXITCODE -ne 0) { Write-Error 'docker build failed' }
-    docker run --rm -v "${PWD}:/src:ro" -v "${out}:/out" `
-        cck-ffmpeg-win bash /src/scripts/ffmpeg-win/build.sh
-    if ($LASTEXITCODE -ne 0) { Write-Error 'the ffmpeg cross-build failed' }
-    # NOT named `$env`: that is the automatic environment drive, and shadowing it
-    # is the kind of thing that works until something in the recipe reads $env:.
-    $report = @{}
-    Get-Content (Join-Path $out 'ffmpeg-win.env') |
-        ForEach-Object { $k, $v = $_ -split '=', 2; $report[$k] = $v }
-    . scripts/artifacts.ps1
-    # The ARCHIVE only; see the bash arm for why the .sha256 stays behind.
-    $src = Join-Path $out $report['CCK_FFMPEG_WIN_ARCHIVE']
-    $dst = Publish-CckArtifact -Path $src
-    Remove-Item $src -Force
-    Write-Host "==> NVENC API: $($report['CCK_FFMPEG_WIN_NVENC_API']) (the NVIDIA driver floor this build declares)"
-    Write-CckArtifact $dst
+ffmpeg-win-windows:
+    pwsh -NoLogo -NoProfile -File ./scripts/just-win.ps1 ffmpeg-win
 
 # Update the RUNNING resident daemon to the freshly built binary, on any
 # platform: build, stop the old daemon, start the new one, and print the
 # binary's full path (paste it into a system-level hotkey, e.g. COSMIC's
 # custom shortcut, and it survives rebuilds because the path never changes).
-[doc("Build, stop every running instance, and restart the resident daemon on it")]
-[linux]
-dev:
+dev-linux:
     #!/usr/bin/env bash
     set -euo pipefail
-    just build
+    # Build first, but suppress build's stable-path banner: this recipe prints the
+    # same banner after daemon restart as its final line.
+    CCK_SUPPRESS_USE_LINE=1 just build
     # EVERY process of this app, of EVERY build (DRAGON-590): one shared sweep, not
     # a per-recipe copy. This recipe used to stop only its OWN target/release
     # binary, so building here after building the AppImage or the Flatpak left the
@@ -728,12 +661,12 @@ dev:
     . scripts/artifacts.sh
     cck_stable "$PWD/target/release/cosmic-capture-kit"
 
-[doc("Build, stop every running instance, and restart the resident daemon on it")]
-[macos]
-dev:
+dev-macos:
     #!/usr/bin/env bash
     set -euo pipefail
-    just build
+    # Build first, but suppress build's stable-path banner: this recipe prints the
+    # same banner after daemon restart as its final line.
+    CCK_SUPPRESS_USE_LINE=1 just build
     # EVERY process of this app, of EVERY build (DRAGON-590): one shared sweep, not
     # a per-recipe copy. macOS has only two shapes (the bare `target/release`
     # binary an earlier version of this recipe launched directly, and the .app
@@ -763,109 +696,5 @@ dev:
     . scripts/artifacts.sh
     cck_stable_launcher "$PWD/target/release/bundle/Cosmic Capture Kit.app/Contents/MacOS/cosmic-capture-kit"
 
-[doc("Build, stop every running instance, and restart the resident daemon on it")]
-[windows]
-[extension('.ps1')]
-dev:
-    #!pwsh.exe
-    $ErrorActionPreference = 'Stop'
-    # A dev-loop build, NOT the msi packaging: plain release into target-win
-    # (the dual-boot rule: never touch target/, that is the Linux boot's live
-    # build), with the same baked-id fetch the packaged build performs.
-    if ((Get-Command gh -ErrorAction SilentlyContinue) -and ($(gh auth status 2>$null; $?))) {
-        foreach ($v in @('CCK_BAKED_GDRIVE_CLIENT_ID','CCK_BAKED_GDRIVE_CLIENT_SECRET','CCK_BAKED_ONEDRIVE_CLIENT_ID','CCK_BAKED_DROPBOX_CLIENT_ID')) {
-            if (-not (Get-Item "env:$v" -ErrorAction SilentlyContinue)) {
-                $val = (gh variable get $v 2>$null)
-                if ($val) { Set-Item "env:$v" $val }
-            }
-        }
-        Write-Host '==> Baked cloud ids from GitHub repository variables'
-    }
-    $env:CARGO_TARGET_DIR = 'target-win'
-    # Windows locks a RUNNING exe against deletion, and the daemon this recipe
-    # started last time is still running from target-win\release, so a build
-    # that needs to relink dies with "failed to remove file ... .exe". Windows
-    # DOES allow renaming a running exe, so the old binary is moved aside
-    # before the build and the aside copies are cleaned up after the stop
-    # below. The old daemon keeps serving from the renamed file for the whole
-    # build, the same no-downtime property the Linux and mac recipes get for
-    # free from their filesystems. The `.old-$PID` fallback covers an aside
-    # file still locked by a daemon from an earlier failed run.
-    $exeFile = 'target-win\release\cosmic-capture-kit.exe'
-    if (Test-Path $exeFile) {
-        Remove-Item "$exeFile.old*" -Force -ErrorAction SilentlyContinue
-        $aside = "$exeFile.old"
-        if (Test-Path $aside) { $aside = "$exeFile.old-$PID" }
-        Move-Item $exeFile $aside -Force
-    }
-    cargo build --release --no-default-features
-    if ($LASTEXITCODE -ne 0) {
-        Write-Error '==> build failed; the running daemon is untouched (still on the renamed old exe)'
-    }
-    # The pinned ffmpeg/tesseract sidecars, fetched once (stamped, so a later
-    # run is free) and staged NEXT TO the exe. util::locate_tool prefers an
-    # exe-adjacent sidecar over PATH, so the dev daemon exercises the same
-    # bundled tools a shipped MSI carries instead of whatever the machine
-    # happens to have installed (the DRAGON-531 reasoning; the copy mirrors
-    # win-dev-install.ps1, which does the identical staging for the installed
-    # QA build). Without this, a bare dev build has no OCR and no recording on
-    # a machine with nothing on PATH, which mac's `dev` never suffers because
-    # its recipe builds the sidecar-carrying .app.
-    pwsh scripts/fetch-win-vendor.ps1
-    if ($LASTEXITCODE -ne 0) { Write-Error 'scripts/fetch-win-vendor.ps1 failed' }
-    # EVERY process of this app, of EVERY build: a preview editor, settings window
-    # or stale overlay left from the previous binary keeps running against the old
-    # exe and goes on serving the old code.
-    #
-    # Windows keeps its own sweep rather than calling scripts/stop-all.sh, and it
-    # is already the exhaustive one (DRAGON-590): filtering on the process NAME
-    # matches an instance whatever path it was launched from, so it needs none of
-    # the per-artifact patterns the unix arms do. It also has fewer artifacts to
-    # miss: there is no AppImage and no Flatpak here, which is where the unix
-    # recipes' partial sweeps were leaving a second tray icon behind.
-    Get-CimInstance Win32_Process -Filter "Name='cosmic-capture-kit.exe'" |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 300
-    # Nothing runs from the aside copies anymore, so they can go.
-    Remove-Item "$exeFile.old*" -Force -ErrorAction SilentlyContinue
-    # Stop first, copy second: a capture child mid-scan holds its tesseract or
-    # ffmpeg open, and copying over a running exe fails on Windows.
-    $rel = 'target-win\release'
-    $vendorFfmpeg = 'vendor\ffmpeg\windows-x86_64'
-    $vendorTess = 'vendor\tesseract\windows-x86_64'
-    # The exes AND their DLLs: the shared ffmpeg build is stubs beside the
-    # libav DLLs, so the exes alone cannot start. Since DRAGON-675 that ffmpeg
-    # is OURS, cross-compiled against the pinned nv-codec-headers, so this dev
-    # daemon exercises the same NVENC floor a customer's MSI will.
-    Get-ChildItem $vendorFfmpeg -File | Where-Object { $_.Extension -in '.exe', '.dll' } |
-        ForEach-Object { Copy-Item $_.FullName (Join-Path $rel $_.Name) -Force }
-    Copy-Item (Join-Path $vendorTess 'tesseract.exe') $rel -Force
-    Get-ChildItem (Join-Path $vendorTess '*.dll') | ForEach-Object { Copy-Item $_.FullName $rel -Force }
-    # The WHOLE tessdata dir: it carries `configs/` as well as the language
-    # file, and the OCR path passes `tsv`, which tesseract resolves as a
-    # CONFIG FILE NAME. Language data alone leaves OCR silently empty.
-    Copy-Item (Join-Path $vendorTess 'tessdata') $rel -Recurse -Force
-    Write-Host '==> Sidecars staged next to the exe (ffmpeg + tesseract)'
-    # Win32_Process.Create, NOT Start-Process: Windows Terminal wraps each
-    # tab's process tree in a kill-on-close Job Object, a Start-Process child
-    # inherits that job, and closing the terminal window then kills the
-    # daemon with it. WMI creates the process from the WMI provider host,
-    # outside the terminal's job and ancestry entirely. Same class of problem
-    # and same shape of fix as the macOS recipe's `open -a` handoff to
-    # launchd (see that recipe's comment). The exe is GUI-subsystem, so no
-    # console window appears and no ShowWindow plumbing is needed.
-    $exe = (Resolve-Path 'target-win\release\cosmic-capture-kit.exe').Path
-    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
-        CommandLine = "`"$exe`" resident"; CurrentDirectory = "$PWD" }
-    if ($r.ReturnValue -ne 0) { Write-Error "==> ERROR: daemon launch failed (Win32_Process.Create returned $($r.ReturnValue))" }
-    Start-Sleep -Seconds 1
-    if (-not (Get-Process -Id $r.ProcessId -ErrorAction SilentlyContinue)) {
-        Write-Error '==> ERROR: daemon did not come up'
-    }
-    Write-Host '==> Daemon restarted on the fresh binary'
-    # The stable path (DRAGON-590). This is the Windows recipe that produces a
-    # RUNNABLE build (it stages the ffmpeg + tesseract sidecars next to the exe a
-    # few lines up), so it is the one that moves the stable path; `just build`
-    # makes an installer and leaves it alone.
-    . scripts/artifacts.ps1
-    Set-CckStablePath $exe
+dev-windows:
+    pwsh -NoLogo -NoProfile -File ./scripts/just-win.ps1 dev

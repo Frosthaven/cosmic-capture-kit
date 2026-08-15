@@ -132,6 +132,21 @@ pub struct Startup {
     /// portal-fallback / PlainWindows / Windows-10-software-rasterizer routing without a
     /// second copy of any of it.
     pub color_picker: bool,
+    /// DRAGON-680: this launch is the PALETTE VIEWER (`--palette-viewer`): the colour
+    /// picker's result window on its own, with no overlay and no pick.
+    ///
+    /// The deliberate opposite of [`Self::color_picker`] in the one respect that matters
+    /// here. That flag is overlay-FIRST and answers [`Startup::opens_overlays`] true; this
+    /// one is window-ONLY and answers it false, so it takes the settings window's routing
+    /// (the GPU renderer, no permission probe, no capture surfaces) rather than a
+    /// capture's. It never sets `color_picker`: `App::color_picking()` gates the picker
+    /// OVERLAY's view, keyboard and flats grab, none of which this launch has.
+    ///
+    /// The window itself is opened a message-drain later, through
+    /// `WindowChromeMsg::OpenPaletteViewer`, for the same reason `--settings` defers its
+    /// own open: the appearance `set_theme` has to land first or the first paint flashes
+    /// libcosmic's default accent.
+    pub palette_viewer: bool,
     /// Launch straight into this capture mode (`--region`/`--window`/`--monitor`);
     /// `None` uses the default (Region).
     pub mode: Option<Mode>,
@@ -223,13 +238,16 @@ impl Startup {
     /// run, `--active-window`'s picker-free capture — answers it the same way, from this
     /// process's OWN flags rather than from anything it inherited.
     ///
-    /// The three launches that show only ordinary WINDOWS answer `false` and keep wgpu:
+    /// The launches that show only ordinary WINDOWS answer `false` and keep wgpu:
     /// `--settings` (whose live mic level-meter starves under a CPU rasterizer — the
-    /// DRAGON-336 finding), the macOS `--permissions` checker, and either preview flavour
-    /// (`--preview <file>` cold, or `--preview-handoff` as a capture's editor child).
+    /// DRAGON-336 finding), the macOS `--permissions` checker, either preview flavour
+    /// (`--preview <file>` cold, or `--preview-handoff` as a capture's editor child), and
+    /// since DRAGON-680 `--palette-viewer`, which opens the colour picker's result window
+    /// with no overlay phase at all.
     pub fn opens_overlays(&self) -> bool {
         !self.settings_only
             && !self.permissions_only
+            && !self.palette_viewer
             && self.preview.is_none()
             && self.preview_handoff.is_none()
     }
@@ -776,6 +794,16 @@ pub fn run(startup: Startup) -> cosmic::iced::Result {
                     }
                 }
             }
+            // DRAGON-685: do NOT reach for `WGPU_DX12_USE_FRAME_LATENCY_WAITABLE_OBJECT`
+            // here. Both non-default values were tried on device and both are worse than
+            // the bug they fix: `Wait` (the default) stalled the first frame acquires
+            // after every `ResizeBuffers` for 1s each (the palette viewer's panel toggle
+            // froze on a stale frame for 1 to 3 seconds), but `DontWait` and `None`
+            // remove the only backpressure pacing presents to the display, so a drag's
+            // redraw storm queued frames until the ghost trailed the pointer by up to a
+            // second. The stall is fixed where it lives instead: the wgpu-hal fork bounds
+            // the waitable wait once after an in-place `ResizeBuffers` (see
+            // FORKED_CHANGES.md), and every mode keeps its meaning.
         }
         let want_software = wants_software_backend(
             startup.opens_overlays(),
@@ -2545,9 +2573,18 @@ pub struct App {
     /// DRAGON-221 follow-up (both platforms): a WINDOWED window-pick's cover→window swap
     /// is DEFERRED from `WindowGrabbed` to `present_capture` (ShotSaved), where the
     /// COMPOSED image dims are in hand — the window then opens at its correct size once
-    /// (padding/shadow/wallpaper margins change the composed size vs the selection, and a
-    /// post-open `window::resize` is not honored on COSMIC). Set when `WindowGrabbed`
-    /// would have swapped; consumed by `present_capture`; reset at `begin_capture`.
+    /// (padding/shadow/wallpaper margins change the composed size vs the selection).
+    /// Set when `WindowGrabbed` would have swapped; consumed by `present_capture`; reset
+    /// at `begin_capture`.
+    ///
+    /// This line used to add "and a post-open `window::resize` is not honored on COSMIC",
+    /// which was WRONG about the cause, and cost an hour when the next resize bug was
+    /// diagnosed against it (DRAGON-684). cosmic-comp never saw those requests: winit's
+    /// Wayland backend skipped any client resize while the last configure was tiled, and
+    /// cosmic-comp marks ordinary floating windows tiled. Our winit fork opens that gate
+    /// (see FORKED_CHANGES.md, patch 4), so a post-open resize DOES work now. Opening at
+    /// the right size is still the better shape here and stays, but it is now a choice
+    /// rather than a workaround.
     windowed_swap_pending: bool,
     /// DRAGON-216 (Linux windowed only): the focus-neutral OVERLAY spinner id kept alive,
     /// still painting its loading cover (`grab_cover_view`), after `WindowGrabbed` swapped
@@ -2900,6 +2937,15 @@ pub struct App {
     /// Whether this is a `--preview` / `--preview-handoff` launch — suppresses the capture
     /// overlays entirely.
     preview_mode: bool,
+    /// DRAGON-680: whether this is a `--palette-viewer` launch, which suppresses the capture
+    /// overlays for the same reason [`Self::preview_mode`] does, and is carried on the App
+    /// for the same reason too: BOTH output seeds (`seed_outputs_mac` off Linux, `on_output`
+    /// on it) have to refuse, and they run long after `Startup` is gone.
+    ///
+    /// It also gates the scene acquisition in `init`. Without that a viewer launch with the
+    /// freeze capture extra on would grab every display's pixels for a window that shows
+    /// none of them, and would need the macOS Screen Recording grant to do it.
+    palette_viewer: bool,
     /// DRAGON-295 (macOS/Windows): an IMMEDIATE picker-free capture requested at launch
     /// (`--active-window` / `--active-monitor`). Consumed by `seed_outputs_mac` instead of
     /// minting the capture overlays — the target is resolved and captured straight through.
@@ -3997,9 +4043,16 @@ mod tests {
             .opens_overlays(),
             "--active-window still shows a fullscreen loader before its editor"
         );
-        // The three window-only launches keep the GPU renderer.
+        // The window-only launches keep the GPU renderer.
         assert!(!Startup { settings_only: true, ..Default::default() }.opens_overlays());
         assert!(!Startup { permissions_only: true, ..Default::default() }.opens_overlays());
+        // DRAGON-680: the palette viewer is one of them. It is the picker's window with
+        // no overlay phase, so it must not take the capture routing its `--color-picker`
+        // sibling does.
+        assert!(
+            !Startup { palette_viewer: true, ..Default::default() }.opens_overlays(),
+            "--palette-viewer opens the picker window and nothing else"
+        );
         assert!(
             !Startup {
                 preview: Some(std::path::PathBuf::from("/tmp/a.png")),

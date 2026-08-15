@@ -947,12 +947,77 @@ impl App {
                 title_task
             }
             WindowChromeMsg::ColorPickerWindowOpened(id, attempt) => {
-                self.finalize_color_picker_window(id, attempt)
+                let finalize = self.finalize_color_picker_window(id, attempt);
+                // DRAGON-680: the first value box starts focused (the owner's ask), and
+                // `select_on_focus` means its whole value is selected, so typing replaces
+                // it. Only on the FIRST report: the Windows arm re-sends this message
+                // while it waits for the window to match its title, and a re-focus there
+                // would pull the caret back to box 0 while the user is already typing.
+                //
+                // Safe to issue now rather than a frame later: the toolkit BUILDS the
+                // window's widget tree before it resolves the open task that publishes
+                // this message, so the focus operation finds a real text input.
+                if attempt == 0 {
+                    // DRAGON-680: this window owns its own Tab ring (the value boxes, the
+                    // mode activator, the colour history), so libcosmic's blanket keyboard
+                    // navigation is turned off for the process that shows it. That
+                    // subscription drives iced's `focus_next` / `focus_previous`, which
+                    // visit every focusable widget, and a cosmic BUTTON is focusable: its
+                    // cycle walked the pipette, the copy button, Add to recents and up to
+                    // eighteen history swatches, which is what the owner saw as focus
+                    // vanishing after the last input instead of coming back to the first.
+                    //
+                    // Process-wide is honest here rather than sloppy: a `--color-picker`
+                    // launch opens this window and nothing else. What else the flag carries
+                    // costs nothing we use — Escape and Ctrl+F route to `on_escape` /
+                    // `on_search`, which this app does not implement (its own `handle_key`
+                    // owns both), and F11 toggles maximize on a window that is deliberately
+                    // fixed-size and refuses it.
+                    self.core_mut().set_keyboard_nav(false);
+                    // The tab strip's model is the toolkit's copy of the persisted tab
+                    // (DRAGON-682 item 12); this is the moment it can first be seen, so it
+                    // is the moment the two are put in step.
+                    self.color_picker.sync_panel_tab_model();
+                    return Task::batch([finalize, self.focus_first_value_box()]);
+                }
+                finalize
             }
-            WindowChromeMsg::ColorPickerWindowDrag => match self.color_picker.window {
-                Some(id) => window::drag(id),
-                None => Task::none(),
-            },
+            WindowChromeMsg::ColorPickerWindowDrag => {
+                // Windows (DRAGON-680): clear any drag winit still believes is running on
+                // this window before asking for a new one. This window is the app's only
+                // `resizable: false` toplevel, so it is the only one Windows refuses to run
+                // an interactive SIZE loop for, and a refused loop never sends the
+                // `WM_EXITSIZEMOVE` that is winit's ONLY reset for its internal drag latch.
+                // With the latch stuck, `window::drag` posts nothing and the title area
+                // stops dragging for good. `end_stale_window_drag` is inert on a healthy
+                // window; its doc carries the whole mechanism.
+                #[cfg(windows)]
+                crate::platform::windows::window::end_stale_window_drag(
+                    color_picker::WINDOW_TITLE,
+                );
+                match self.color_picker.window {
+                    Some(id) => window::drag(id),
+                    None => Task::none(),
+                }
+            }
+            // DRAGON-680: the `--palette-viewer` launch's deferred window open. The whole
+            // decision lives in `color_picker::viewer`; this arm only drains it.
+            WindowChromeMsg::OpenPaletteViewer => self.open_palette_viewer(),
+            #[cfg(windows)]
+            WindowChromeMsg::ColorPickerWindowFloor => {
+                // The floor is the window's own new size; `enforce_client_floor` measures
+                // the live non-client band rather than predicting it and returns without
+                // touching anything once the client already clears the floor, so running
+                // it after a shrink is a no-op rather than a fight.
+                let (cw, ch) = crate::app::color_picker::geom::color_window_size_for(
+                    self.color_picker.expanded,
+                );
+                crate::platform::windows::window::enforce_client_floor(
+                    crate::app::color_picker::WINDOW_TITLE,
+                    (cw.round().max(1.0) as u32, ch.round().max(1.0) as u32),
+                );
+                Task::none()
+            }
             WindowChromeMsg::ColorPickerWindowMinimize => {
                 // Windows (DRAGON-258's lesson, same as the settings and preview arms):
                 // iced's `window::minimize` is a no-op for a frameless natively-managed

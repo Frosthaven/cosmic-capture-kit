@@ -87,14 +87,16 @@ because it goes on the clipboard as a file reference rather than as pixels.)
 | `--account <id>` | With `--cloud-upload`: which connected account to use. The id is the one in `cloud_accounts.toml`, minted when the account was connected in Settings |
 | `--auto-share` | With `--cloud-upload`: also ask the provider for a share link and copy it. Ignored for a provider that cannot make one |
 | `--color-picker` | Open the color picker: the screen dims, a magnifier follows the pointer, and a click copies the color's hex and opens a window with its HEX / RGB / HSL / HSV / OKLCH / CMYK / LAB values |
+| `--palette-viewer` | Open the palette viewer: the same window the color picker opens, on its own, with no dim, no magnifier and no pick. It loads your most recent color (white if you have never picked one) so you can read and reuse the palette you already have. If a picker window is already open anywhere, that one comes forward instead |
 | `--permissions` | **macOS only** — open the permission-checker window (Screen Recording / Microphone / Notifications) with live status and Request / Open System Settings / Relaunch actions. On other platforms the flag is inert (there are no TCC grants) and falls through to a normal launch |
 | `-h`, `--help` | Show the usage summary |
 
 ## The color picker
 
 `--color-picker` is its own tool rather than a capture. It writes no file and it
-takes no screenshot. The tray entry, the preview editor's pipette button and the
-Color Picker global shortcut all run exactly this flag.
+takes no screenshot. The tray menu's **Colors > Color Picker** entry, the preview
+editor's pipette button and the Color Picker global shortcut all run exactly this
+flag.
 
 While the overlay is up: move the pointer to aim, click to take the color under
 it, and press Esc or right-click to leave with nothing. The arrow keys and `h`
@@ -125,6 +127,24 @@ moves it back to the front rather than adding a second copy.
 **Only one picker window is ever open.** Pick again, from that window's own
 pipette or from anywhere else, and the window you already have takes the new
 color and puts it at the head of its recents. A second window never appears.
+
+## The palette viewer
+
+`--palette-viewer` opens that same window on its own, so you can get at the
+colors you already saved without picking a new one first. There is no dim, no
+magnifier and no click to make: the window opens straight away, loaded with your
+most recent color, or white if you have never picked one. The tray menu's
+**Colors > Palette Viewer** entry runs exactly this flag.
+
+Everything the window does is the same as after a pick: every notation, every
+copy button, the editable rows and the recents row. Opening it does not change
+your palette and does not touch the clipboard, so looking is free. Its window
+title is `CCK Palette Viewer`, which is the name tiling window manager rules
+should match on (see the README).
+
+The one-window rule above covers this too. If a picker window is already open,
+asking for the palette viewer brings that window forward rather than opening a
+second one, and the color it is showing is left exactly as it was.
 
 Three limits are worth knowing:
 

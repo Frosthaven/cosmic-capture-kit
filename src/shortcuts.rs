@@ -861,6 +861,20 @@ impl Shortcut {
         }
     }
 
+    /// [`Self::primary_char`] for a NAMED key (DRAGON-680's primary+Enter): Ctrl+key on
+    /// Linux and Windows, Cmd+key on macOS. Same platform rule, same one place to change
+    /// it, for the keys that are not characters.
+    fn primary_named(k: NamedKey) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Shortcut { logo: true, ..Shortcut::named(k) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Shortcut { ctrl: true, ..Shortcut::named(k) }
+        }
+    }
+
     /// A default binding on the primary command modifier PLUS Shift (e.g. the
     /// "Save As" / "Redo" chords): Ctrl+Shift on Linux, Cmd+Shift on macOS.
     fn primary_shift_char(c: char) -> Self {
@@ -1635,6 +1649,144 @@ pub fn fixed_scanner_action(modifiers: Modifiers, key: &Key) -> Option<FixedScan
 pub fn region_copy_chord_label() -> &'static str {
     static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LABEL.get_or_init(|| Shortcut::primary_char('c').label()).as_str()
+}
+
+/// **Pure**, unit-tested: is this press the colour picker window's "keep this colour"
+/// chord (DRAGON-680)? Cmd+Enter on macOS, Ctrl+Enter on Linux and Windows.
+///
+/// **Why it is a chord at all.** Filing the shown colour into the history used to be plain
+/// ENTER in a value box (DRAGON-665, on the argument that Enter is the one gesture saying
+/// "this is the colour I meant"). Enter is also what you press when you finish typing a
+/// number, so in practice it wrote history nobody asked for. The owner moved it onto a
+/// deliberate chord and left plain Enter its other job, committing the draft so the box
+/// re-renders canonically.
+///
+/// **FIXED rather than bindable**, the same call [`is_region_copy_chord`] makes and for the
+/// same reasons: it belongs to one window rather than to a context the keymap models, and
+/// primary+Enter is not a default of any [`Action`], so there is nothing to arbitrate.
+/// [`Shortcut::matches`] compares all four modifier flags, so Shift+Ctrl+Enter and friends
+/// fall through untouched.
+pub fn is_add_color_chord(modifiers: Modifiers, key: &Key) -> bool {
+    add_color_chord().matches(modifiers, key)
+}
+
+/// The chord [`is_add_color_chord`] matches and [`add_color_chord_label`] renders. ONE
+/// definition, so the key handler and the button's tooltip cannot describe different keys.
+fn add_color_chord() -> Shortcut {
+    Shortcut::primary_named(NamedKey::Enter)
+}
+
+/// **Pure**, unit-tested: is this press the colour picker window's COPY chord (DRAGON-680)?
+/// Cmd+Shift+C on macOS, Ctrl+Shift+C on Linux and Windows.
+///
+/// **Shift is what makes it ours, and that is the whole design.** A value box is a real
+/// text input, and libcosmic's own copy-the-selection binding inside it is the BARE primary
+/// chord (Cmd+C / Ctrl+C). Claiming that would mean a user who selected part of a value and
+/// pressed the copy chord got the whole colour instead of the characters they had
+/// highlighted. [`Shortcut::matches`] compares all four modifier flags exactly, so the bare
+/// chord never reaches this and keeps doing what every text field in every app does.
+///
+/// FIXED rather than bindable, for [`is_region_copy_chord`]'s reasons: it belongs to one
+/// window rather than to a context the keymap models. It does collide with nothing: the
+/// only primary+C default is `Action::PreviewCopy`, which has no Shift, and the region-copy
+/// chord is bare primary+C too.
+pub fn is_copy_value_chord(modifiers: Modifiers, key: &Key) -> bool {
+    copy_value_chord().matches(modifiers, key)
+}
+
+/// The chord [`is_copy_value_chord`] matches and [`copy_value_chord_label`] renders.
+fn copy_value_chord() -> Shortcut {
+    Shortcut::primary_shift_char('c')
+}
+
+/// [`copy_value_chord`]'s DISPLAY form, for the copy button's tooltip: `"Ctrl+Shift+C"` on
+/// Linux and Windows, `"⇧⌘C"` on macOS. Memoized, like its two siblings.
+pub fn copy_value_chord_label() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| copy_value_chord().label()).as_str()
+}
+
+/// **Pure**, unit-tested: does this press step a window's own focus ring, and which way
+/// (DRAGON-680)? `Some(true)` for a bare Tab, `Some(false)` for Shift+Tab.
+///
+/// Any OTHER modifier declines: Cmd+Tab and Alt+Tab belong to the desktop, and a window
+/// that swallowed them would be taking the window switcher away. Ctrl+Tab declines here
+/// too, and since DRAGON-687 it is not the desktop's either: it is [`tab_cycle_step`]'s
+/// tab-strip cycle, a separate predicate so the two meanings of the Tab key can never
+/// claim one press.
+///
+/// It exists because a window can need its OWN Tab order. libcosmic drives Tab through
+/// `keyboard_nav::subscription` into iced's `focus_next` / `focus_previous`, which visit
+/// every focusable widget, and in libcosmic a BUTTON is focusable; a window whose Tab ring
+/// must skip its buttons (the colour picker's, see `color_picker::geom::next_focus`) has to
+/// turn that blanket navigation off and answer Tab itself. This is the key half of that.
+pub fn tab_step(modifiers: Modifiers, key: &Key) -> Option<bool> {
+    if !matches!(key, Key::Named(Named::Tab)) {
+        return None;
+    }
+    if modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    Some(!modifiers.shift())
+}
+
+/// **Pure**, unit-tested: does this press CYCLE a window's tab strip, and which way
+/// (DRAGON-687)? `Some(true)` for Ctrl+Tab, `Some(false)` for Ctrl+Shift+Tab.
+///
+/// **The modifier is CONTROL on every platform, macOS included.** This is the browser
+/// convention, and browsers use Control for it on the Mac too (Cmd+Tab is the system's
+/// own app switcher and can never reach us). So unlike the app's primary-command chords,
+/// which map to Cmd on macOS, this one deliberately does not: `modifiers.control()`,
+/// never `logo`.
+///
+/// Alt declines (Alt+Tab belongs to the desktop on two platforms), and the bare and
+/// Shift-only forms are [`tab_step`]'s, the focus ring's own keys. The two predicates are
+/// disjoint by construction: `tab_step` refuses Control and this requires it.
+///
+/// ONE predicate for both consumers, the colour picker's panel tabs and the settings
+/// window's in-page strips, so the chord cannot come to mean different keys in the two
+/// windows that answer it.
+pub fn tab_cycle_step(modifiers: Modifiers, key: &Key) -> Option<bool> {
+    if !matches!(key, Key::Named(Named::Tab)) {
+        return None;
+    }
+    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    Some(!modifiers.shift())
+}
+
+/// **Pure**, unit-tested: the four ARROW keys as a [`Direction`], and nothing else
+/// (DRAGON-680).
+///
+/// Deliberately narrower than [`nudge_direction`], which also accepts the vim letters `h`
+/// `j` `k` `l`. This one answers presses inside a WINDOW that carries text inputs, where a
+/// letter is a letter: `l` typed into a value box must insert an `l`, not move a selection.
+/// Any modifier declines for the same reason a chord is not a bare key.
+pub fn arrow_direction(modifiers: Modifiers, key: &Key) -> Option<Direction> {
+    if modifiers.control() || modifiers.alt() || modifiers.shift() || modifiers.logo() {
+        return None;
+    }
+    match key {
+        Key::Named(Named::ArrowLeft) => Some(Direction::Left),
+        Key::Named(Named::ArrowRight) => Some(Direction::Right),
+        Key::Named(Named::ArrowUp) => Some(Direction::Up),
+        Key::Named(Named::ArrowDown) => Some(Direction::Down),
+        _ => None,
+    }
+}
+
+/// [`add_color_chord`]'s DISPLAY form, for the picker window's "Add to recents" button:
+/// `"Ctrl+Enter"` on Linux and Windows, `"⌘Enter"` on macOS.
+///
+/// Rendered by [`Shortcut::label`], the ONE in-app chord formatter (the same one
+/// `action_tip` and [`region_copy_chord_label`] use), which is what puts the mac symbol
+/// glyph there rather than the word "Cmd" and drops the `+` on that platform, per the
+/// house style. Memoized into a `&'static str` for the same reason its sibling is: the
+/// button rebuilds with the view.
+pub fn add_color_chord_label() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| add_color_chord().label()).as_str()
 }
 
 /// macOS (DRAGON-294): render a daemon "Start Capture" hotkey SPEC string (the form
@@ -3332,6 +3484,253 @@ mod nudge_cadence_tests {
                 nudge_step_allowed(true, held, compositor_period),
                 "a steady 25/s hold dropped a step at {held:?}"
             );
+        }
+    }
+}
+
+/// DRAGON-680: the colour picker window's "keep this colour" chord. It TOOK an action away
+/// from plain Enter, so what these pin is both halves: the chord fires, and the bare key it
+/// replaced does not.
+#[cfg(test)]
+mod add_color_chord_tests {
+    use super::*;
+
+    /// The primary command modifier on this platform: Cmd on macOS, Ctrl elsewhere. The
+    /// same rule every other in-app default follows (`Shortcut::primary_char`).
+    fn primary() -> Modifiers {
+        #[cfg(target_os = "macos")]
+        {
+            Modifiers::LOGO
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Modifiers::CTRL
+        }
+    }
+
+    /// The chord fires on the primary modifier plus Enter, and on nothing else.
+    #[test]
+    fn the_primary_enter_chord_fires() {
+        let enter = Key::Named(Named::Enter);
+        assert!(is_add_color_chord(primary(), &enter));
+        // The OTHER platform's modifier must not: a Linux config carried to a Mac (or the
+        // reverse) would otherwise give one machine two ways to file a colour and the
+        // other none.
+        let other = if primary() == Modifiers::CTRL { Modifiers::LOGO } else { Modifiers::CTRL };
+        assert!(!is_add_color_chord(other, &enter), "the other platform's modifier declines");
+    }
+
+    /// **BARE Enter does not file a colour**, which is the whole reason this chord exists
+    /// (DRAGON-680 took that off plain Enter, which is pressed while typing). Plain Enter
+    /// still commits the draft, but that is the text input's own `on_submit` and never
+    /// reaches this predicate.
+    #[test]
+    fn bare_enter_never_files_a_colour() {
+        assert!(!is_add_color_chord(Modifiers::empty(), &Key::Named(Named::Enter)));
+    }
+
+    /// No STRAY modifiers: `Shortcut::matches` compares all four flags, so a chord with
+    /// Shift or Alt added belongs to somebody else and falls through untouched.
+    #[test]
+    fn a_stray_modifier_declines() {
+        let enter = Key::Named(Named::Enter);
+        for extra in [Modifiers::SHIFT, Modifiers::ALT] {
+            assert!(!is_add_color_chord(primary() | extra, &enter), "{extra:?}");
+        }
+    }
+
+    /// And no other KEY fires it, including the near misses on that window: Escape closes
+    /// it, and Space is the accept key on the picker's overlays.
+    #[test]
+    fn no_other_key_files_a_colour() {
+        for key in [
+            Key::Named(Named::Escape),
+            Key::Named(Named::Tab),
+            Key::Character(" ".into()),
+            Key::Character("a".into()),
+            Key::Character("c".into()),
+        ] {
+            assert!(!is_add_color_chord(primary(), &key), "{key:?}");
+        }
+    }
+
+    /// The LABEL on the "Add to recents" button describes the chord the handler matches, and it
+    /// is rendered in the app's house style: mac symbols with no separator, readable words
+    /// with `+` elsewhere. One `Shortcut`, so the two can never describe different keys.
+    #[test]
+    fn the_label_matches_the_chord_in_the_house_style() {
+        let label = add_color_chord_label();
+        assert!(label.contains("Enter"), "the key is named: {label}");
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(label, "⌘Enter");
+            assert!(!label.contains("Cmd"), "macOS shows the SYMBOL, never the word");
+            assert!(!label.contains('+'), "macOS joins symbols without a separator");
+        }
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(label, "Ctrl+Enter");
+        // Memoized, so the button can borrow it every frame.
+        assert_eq!(label.as_ptr(), add_color_chord_label().as_ptr());
+    }
+
+    /// It is not a KEYMAP entry, and it must not collide with one: no configurable action
+    /// ships with primary+Enter as its default, so there is nothing to arbitrate and the
+    /// lane can sit outside the keymap (the `is_region_copy_chord` reasoning).
+    #[test]
+    fn no_configurable_action_claims_this_chord() {
+        let enter = Key::Named(Named::Enter);
+        for action in Action::ALL {
+            if let Some(sc) = action.default_shortcut() {
+                assert!(
+                    !sc.matches(primary(), &enter),
+                    "{:?} defaults to the add-color chord",
+                    action
+                );
+            }
+        }
+    }
+}
+
+/// DRAGON-680: the colour picker window's COPY chord, and the two key helpers its own Tab
+/// ring and arrow navigation are built on. What matters about all three is what they do NOT
+/// claim: the text inputs in that window own the bare copy chord, the desktop owns the
+/// modified Tabs, and a value box owns its own arrows.
+#[cfg(test)]
+mod picker_window_key_tests {
+    use super::*;
+
+    /// The primary command modifier on this platform: Cmd on macOS, Ctrl elsewhere.
+    fn primary() -> Modifiers {
+        #[cfg(target_os = "macos")]
+        {
+            Modifiers::LOGO
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Modifiers::CTRL
+        }
+    }
+
+    fn ch(c: &str) -> Key {
+        Key::Character(c.into())
+    }
+
+    /// The copy chord fires on primary+Shift+C, and its LABEL says so in the house style.
+    #[test]
+    fn the_copy_chord_fires_and_reads_correctly() {
+        assert!(is_copy_value_chord(primary() | Modifiers::SHIFT, &ch("c")));
+        assert!(is_copy_value_chord(primary() | Modifiers::SHIFT, &ch("C")), "case-blind");
+        let label = copy_value_chord_label();
+        #[cfg(target_os = "macos")]
+        assert_eq!(label, "⇧⌘C");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(label, "Ctrl+Shift+C");
+        assert_eq!(label.as_ptr(), copy_value_chord_label().as_ptr(), "memoized");
+    }
+
+    /// **The BARE primary+C is not ours**, which is the whole reason the chord carries
+    /// Shift: that is the text inputs' own copy-the-selection binding, and a user who
+    /// highlighted three characters of a value and pressed it must get those three
+    /// characters, not the whole colour.
+    #[test]
+    fn the_bare_copy_chord_belongs_to_the_text_inputs() {
+        assert!(!is_copy_value_chord(primary(), &ch("c")));
+        assert!(!is_copy_value_chord(Modifiers::empty(), &ch("c")));
+        // And it is still the region-copy chord and `PreviewCopy`'s default, neither of
+        // which gains a Shift.
+        assert!(is_region_copy_chord(primary(), &ch("c")));
+        assert!(!is_region_copy_chord(primary() | Modifiers::SHIFT, &ch("c")));
+        let copy = Action::PreviewCopy.default_shortcut().expect("PreviewCopy ships bound");
+        assert!(!copy.matches(primary() | Modifiers::SHIFT, &ch("c")));
+    }
+
+    /// No configurable action claims the copy chord either, so the lane can sit outside
+    /// the keymap without arbitrating anything.
+    #[test]
+    fn no_configurable_action_claims_the_copy_chord() {
+        for action in Action::ALL {
+            if let Some(sc) = action.default_shortcut() {
+                assert!(
+                    !sc.matches(primary() | Modifiers::SHIFT, &ch("c")),
+                    "{action:?} defaults to the copy chord"
+                );
+            }
+        }
+    }
+
+    /// Tab steps forward, Shift+Tab backward, and every OTHER modifier declines: Ctrl+Tab
+    /// and Cmd+Tab belong to the desktop's window switcher, and a window that swallowed
+    /// them would be taking that away.
+    #[test]
+    fn tab_steps_both_ways_and_leaves_the_desktops_tabs_alone() {
+        let tab = Key::Named(Named::Tab);
+        assert_eq!(tab_step(Modifiers::empty(), &tab), Some(true));
+        assert_eq!(tab_step(Modifiers::SHIFT, &tab), Some(false));
+        for m in [Modifiers::CTRL, Modifiers::ALT, Modifiers::LOGO] {
+            assert_eq!(tab_step(m, &tab), None, "{m:?}");
+            assert_eq!(tab_step(m | Modifiers::SHIFT, &tab), None, "{m:?}+Shift");
+        }
+        assert_eq!(tab_step(Modifiers::empty(), &ch("a")), None, "only the Tab key");
+    }
+
+    /// The tab-CYCLE chord (DRAGON-687): Ctrl+Tab forward, Ctrl+Shift+Tab backward, on
+    /// EVERY platform including macOS (the browser convention uses Control there, never
+    /// Command), and nothing else. Disjoint from `tab_step` by construction, pinned here
+    /// so the focus ring's keys and the strip-cycling keys can never claim one press.
+    #[test]
+    fn ctrl_tab_cycles_and_nothing_else_does() {
+        let tab = Key::Named(Named::Tab);
+        assert_eq!(tab_cycle_step(Modifiers::CTRL, &tab), Some(true));
+        assert_eq!(tab_cycle_step(Modifiers::CTRL | Modifiers::SHIFT, &tab), Some(false));
+        // The focus ring's own keys are not a cycle.
+        assert_eq!(tab_cycle_step(Modifiers::empty(), &tab), None);
+        assert_eq!(tab_cycle_step(Modifiers::SHIFT, &tab), None);
+        // Alt+Tab and Cmd+Tab still belong to the desktop, with or without Control.
+        for extra in [Modifiers::ALT, Modifiers::LOGO] {
+            assert_eq!(tab_cycle_step(Modifiers::CTRL | extra, &tab), None, "{extra:?}");
+            assert_eq!(tab_cycle_step(extra, &tab), None, "{extra:?}");
+        }
+        assert_eq!(tab_cycle_step(Modifiers::CTRL, &ch("a")), None, "only the Tab key");
+        // Disjoint with `tab_step` over the whole modifier space this window can see.
+        for m in [
+            Modifiers::empty(),
+            Modifiers::SHIFT,
+            Modifiers::CTRL,
+            Modifiers::CTRL | Modifiers::SHIFT,
+            Modifiers::ALT,
+            Modifiers::LOGO,
+        ] {
+            assert!(
+                tab_step(m, &tab).is_none() || tab_cycle_step(m, &tab).is_none(),
+                "{m:?}: one press must never mean both a ring step and a strip cycle"
+            );
+        }
+    }
+
+    /// The four arrows, and ONLY the arrows: the vim letters `nudge_direction` accepts are
+    /// deliberately absent, because this predicate answers presses in a window full of
+    /// text inputs where `l` is a letter someone is typing.
+    #[test]
+    fn only_the_bare_arrows_navigate() {
+        for (key, dir) in [
+            (Named::ArrowLeft, Direction::Left),
+            (Named::ArrowRight, Direction::Right),
+            (Named::ArrowUp, Direction::Up),
+            (Named::ArrowDown, Direction::Down),
+        ] {
+            assert_eq!(arrow_direction(Modifiers::empty(), &Key::Named(key)), Some(dir));
+            // A modifier makes it somebody else's press.
+            assert_eq!(arrow_direction(Modifiers::SHIFT, &Key::Named(key)), None);
+            assert_eq!(arrow_direction(primary(), &Key::Named(key)), None);
+        }
+        for letter in ["h", "j", "k", "l"] {
+            assert_eq!(
+                arrow_direction(Modifiers::empty(), &ch(letter)),
+                None,
+                "{letter} is a letter here, not a direction"
+            );
+            // …and it really is the difference from the overlay's own lane.
+            assert!(nudge_direction(Modifiers::empty(), &ch(letter)).is_some());
         }
     }
 }

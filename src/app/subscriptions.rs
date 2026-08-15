@@ -49,6 +49,12 @@ impl App {
                 self.sub_cloud_browser_countdown(),
                 self.sub_cloud_folder_spin(),
                 self.sub_health_copy_flash(),
+                // DRAGON-682 items 35 to 40: the colour picker window's drag and drop.
+                self.sub_picker_drag_pointer(),
+                self.sub_picker_release_watch(),
+                // DRAGON-687: the drag auto-scroll's tick, alive only while a live drag
+                // sits in one of the panel's edge bands.
+                self.sub_picker_drag_autoscroll(),
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.sub_hotkey_suspend_ping(),
                 #[cfg(windows)]
@@ -711,6 +717,94 @@ impl App {
         } else {
             None
         }
+    }
+
+    // **Tombstone: `sub_picker_drag_press`** (DRAGON-682 item 41). It listened for every left
+    // press in the picker window and let the update handler work out WHAT had been pressed
+    // from the window's hover bookkeeping. Both halves were wrong: hover flags leak (see
+    // `color_picker::geom`'s tombstone at `drag_source` for the toolkit reason), and a
+    // press-happened message that carries no target can arm a drag from anywhere. The three
+    // swatch widgets now publish `ColorPickerMsg::DragPressed(source)` themselves.
+
+    /// The pointer's MOTION, while a drag is armed (DRAGON-682 item 35): where it is.
+    ///
+    /// A SEPARATE subscription from the presses, and only alive while there is a drag,
+    /// because this is the high-volume one: it publishes a message per pointer sample, which
+    /// is a redraw per sample, and that is a price worth paying only while something is
+    /// being dragged. Positions are the platform's own, in window coordinates, which is what
+    /// `geom::drop_zone` hit-tests and what lets a release PAST the frame still be located
+    /// (item 38's drag-off-to-forget).
+    ///
+    /// The RELEASE lived here too, and that was the lost-release bug (DRAGON-687): this
+    /// subscription is minted BY the press it must then observe the release of, and
+    /// subscriptions reconcile only after the update pass, so a fast tap's release,
+    /// arriving in the same event batch as its press, was dispatched before the listener
+    /// existed. The widget's own `on_release` still fired (the click applied), nothing
+    /// cleared the armed machine, and the next idle mouse move walked it over the
+    /// threshold into a buttonless drag. Releases are
+    /// [`Self::sub_picker_release_watch`]'s now, which PREDATES any press by existing
+    /// for the window's whole life.
+    fn sub_picker_drag_pointer(&self) -> Option<Subscription<Msg>> {
+        self.color_picker.drag.as_ref()?;
+        Some(event::listen_with(|e, _status, _id| match e {
+            Event::Mouse(cosmic::iced::mouse::Event::CursorMoved { position }) => Some(
+                Msg::ColorPicker(ColorPickerMsg::DragMoved(position.x, position.y)),
+            ),
+            _ => None,
+        }))
+    }
+
+    /// Every LEFT-BUTTON RELEASE, at the window level, for the picker window's whole
+    /// life (DRAGON-687, the lost-release fix): the drag machine's global disarm.
+    ///
+    /// The invariant this buys: a release ANYWHERE, seen here regardless of which widget
+    /// captured it, ends whatever the machine is doing (`DragReleased`: an armed press
+    /// disarms, a live drag drops), with no widget cooperation required. It must be
+    /// ALWAYS-ON rather than drag-gated, because a drag-gated listener starts one
+    /// reconciliation too late to see a release batched with its own press (the doc
+    /// above carries the trace). Cheap by nature: left releases are a handful of events
+    /// a minute, not a motion stream, and a release with no machine armed is one
+    /// no-op message (`DragReleased` returns immediately on `drag: None`).
+    fn sub_picker_release_watch(&self) -> Option<Subscription<Msg>> {
+        self.color_picker.window?;
+        Some(event::listen_with(|e, _status, _id| match e {
+            Event::Mouse(cosmic::iced::mouse::Event::ButtonReleased(
+                cosmic::iced::mouse::Button::Left,
+            )) => Some(Msg::ColorPicker(ColorPickerMsg::DragReleased)),
+            _ => None,
+        }))
+    }
+
+    /// The drag AUTO-SCROLL's drive (DRAGON-687, the owner's addendum): a 16ms tick that
+    /// exists only while a LIVE drag's pointer is actually inside one of the panel's edge
+    /// bands, because the thing being driven (a pointer sitting still in a band) produces
+    /// no events of its own to ride.
+    ///
+    /// A timer rather than the redraw, deliberately, and it does not contradict the
+    /// resample tombstone below: that lesson is about a CADENCE that must match the
+    /// display (the lens), where a fixed clock under-samples a 120Hz panel. A scroll
+    /// velocity is display-independent (the travel is `v * dt`, so a slower tick takes
+    /// bigger steps), and the pinch poll two functions up is the same shape with the same
+    /// interval. The gate is the pure velocity itself: the subscription vanishes the
+    /// moment the ramp answers zero, so nothing ticks while the pointer is merely
+    /// dragging around the middle of the window.
+    fn sub_picker_drag_autoscroll(&self) -> Option<Subscription<Msg>> {
+        // Armed as well as live (DRAGON-687's drag-scroll round): the bands scroll only
+        // for a drag that ENTERED them, never one born inside one
+        // (`geom::autoscroll_arms` carries the owner's bug).
+        let drag = self.color_picker.drag.as_ref().filter(|d| d.live && d.autoscroll_armed)?;
+        let v = crate::app::color_picker::geom::drag_autoscroll_velocity(
+            drag.at,
+            self.color_picker.window_size(),
+            &self.color_picker.panel_shape(),
+        );
+        if v == 0.0 {
+            return None;
+        }
+        Some(
+            cosmic::iced::time::every(crate::app::color_picker::geom::AUTOSCROLL_TICK)
+                .map(|_| Msg::ColorPicker(ColorPickerMsg::DragAutoScroll)),
+        )
     }
 
     // DRAGON-TBD deleted `sub_color_picker_resample` from here, and the reason is worth keeping

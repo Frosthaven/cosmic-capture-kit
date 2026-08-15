@@ -13,10 +13,21 @@ pub mod copy_button;
 pub mod crop_canvas;
 pub mod crop_window;
 pub mod drag_area;
+/// One forced mouse cursor for a subtree (DRAGON-682 item 40): the colour picker's drag
+/// sources wear the open grab hand, and a live drag wears the closed one everywhere.
+pub mod force_cursor;
+/// Absolute placement that allows NEGATIVE coordinates (DRAGON-682 item 41): the colour
+/// picker's drag ghost follows the pointer past the top and left edges instead of clamping.
+pub mod positioned;
 /// What the GPU will accept for a shader primitive's viewport (DRAGON-401) — observed from
 /// the shader `prepare`s that are handed a `wgpu::Device`, read by the preview's zoom ceiling.
 pub mod gpu;
 pub mod hide_when_clipped;
+/// Requests the frame a hover move earned (DRAGON-681): wraps the settings tab
+/// strips and the nav rail, whose `segmented_button` moves its own hover field
+/// without ever asking for the frame that would paint it, so a move from one tab
+/// straight to the next left the highlight where it was.
+pub mod hover_redraw;
 pub mod icons;
 pub mod notched_slider;
 pub mod output_selection;
@@ -25,15 +36,18 @@ pub mod output_selection;
 /// and would otherwise wait for the next mouse move to paint on Wayland.
 pub mod press_redraw;
 pub mod region_selection;
+pub mod search_input;
 pub mod upload_stripes;
 pub mod zoom_pan;
 
 pub use drag_area::DragArea;
 pub use hide_when_clipped::hide_when_clipped;
+pub use hover_redraw::hover_redraw;
 pub use notched_slider::notched_slider;
 pub use output_selection::OutputSelection;
 pub use press_redraw::press_redraw;
 pub use region_selection::RegionSelection;
+pub use search_input::search_input;
 pub use crop_window::CropWindow;
 pub use zoom_pan::ZoomPan;
 

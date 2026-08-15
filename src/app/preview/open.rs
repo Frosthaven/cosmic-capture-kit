@@ -1151,6 +1151,10 @@ impl App {
                 crate::preview_ipc::Request::Color {
                     to: crate::preview_ipc::ColorDest::Editor,
                     rgb: [r, g, b],
+                    // The parser rejects an editor line carrying a palette target, so
+                    // this is always `None`; destructured rather than ignored so a
+                    // loosened parser would fail here instead of silently dropping it.
+                    palette: None,
                 } => match self.focused_preview_id() {
                     Some(target) => {
                         // The colour itself is user content and is never logged.
@@ -1170,19 +1174,58 @@ impl App {
                 // this window's own pipette) belongs to THE colour picker window, and this
                 // process has it. Apply it exactly as a local pick and ack; with no picker
                 // window here we refuse, and the sender opens its own rather than losing it.
+                // An editor line with a palette target cannot be PARSED (the wire rejects
+                // it), so this arm is unreachable through the transport; it exists because
+                // the match must cover the type, and refusing is the only honest answer
+                // to a request shape nothing defines.
+                crate::preview_ipc::Request::Color {
+                    to: crate::preview_ipc::ColorDest::Editor,
+                    palette: Some(_),
+                    ..
+                } => {
+                    log::warn!("preview: refusing a color with an impossible destination shape");
+                    handoff.reject(crate::preview_ipc::RejectReason::Busy);
+                }
                 crate::preview_ipc::Request::Color {
                     to: crate::preview_ipc::ColorDest::PickerWindow,
                     rgb,
-                } => match self.apply_handoff_pick(rgb) {
+                    palette,
+                } => {
+                    // DRAGON-687: a palette-tagged pick files into the named group; an
+                    // untagged one applies exactly as a local pick. Both ack only once
+                    // the colour is in our state, and both refuse with no window here.
+                    let applied = match palette {
+                        Some(nonce) => self.apply_handoff_palette_pick(rgb, nonce),
+                        None => self.apply_handoff_pick(rgb),
+                    };
+                    match applied {
+                        Some(task) => {
+                            tasks.push(task);
+                            // Only NOW may the sender exit — the colour is in our state.
+                            handoff.accept();
+                        }
+                        None => {
+                            log::info!(
+                                "color picker: a picked color arrived but this process has \
+                                 no picker window; the sender keeps it"
+                            );
+                            handoff.reject(crate::preview_ipc::RejectReason::Busy);
+                        }
+                    }
+                }
+                // DRAGON-680: a PALETTE VIEWER launch found this process's picker window
+                // and is asking for it instead of opening a second one. Raise it and ack;
+                // with no picker window here we refuse, and the sender opens its own.
+                crate::preview_ipc::Request::Raise => match self.raise_picker_window() {
                     Some(task) => {
                         tasks.push(task);
-                        // Only NOW may the sender exit — the colour is in our state.
+                        // Only NOW may the sender exit: the window is coming forward.
                         handoff.accept();
                     }
                     None => {
                         log::info!(
-                            "color picker: a picked color arrived but this process has no \
-                             picker window; the sender keeps it"
+                            "color picker: a raise arrived but this process has no picker \
+                             window; the sender opens its own"
                         );
                         handoff.reject(crate::preview_ipc::RejectReason::Busy);
                     }

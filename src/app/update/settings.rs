@@ -198,6 +198,50 @@ impl App {
                 self.settings.rebinding = None;
                 Task::none()
             }
+            // Ctrl+Tab / Ctrl+Shift+Tab (DRAGON-687): the ACTIVE page's in-page strip,
+            // cycled by re-dispatching the strip's own activation message for the
+            // neighbouring entity, so the chord IS a click (the Audio tab's mic-meter
+            // lifecycle and the Shortcuts tab's rebind drop ride along for free). The
+            // wrap is `keynav::step`, the same rule the colour picker's panel cycle
+            // takes.
+            SettingsMsg::CycleTabStrip(forward) => {
+                // Mid-search the strips are not rendered at all (`config_window_view`
+                // renders the filtered list instead), so cycling one would move state
+                // nobody can see.
+                if self.settings.search_active {
+                    return Task::none();
+                }
+                let page = self.settings.active();
+                let model = match page {
+                    ConfigTab::General => &self.settings.general_tab,
+                    ConfigTab::CaptureModes => &self.settings.capture_tab,
+                    ConfigTab::AudioVideo => &self.settings.audio_video_tab,
+                    ConfigTab::Shortcuts => &self.settings.shortcuts_tab,
+                    // A page with no strip: the chord does nothing, and the pure
+                    // predicate the test pins must agree with this match.
+                    _ => {
+                        debug_assert!(!crate::app::settings::page_has_tab_strip(page));
+                        return Task::none();
+                    }
+                };
+                debug_assert!(crate::app::settings::page_has_tab_strip(page));
+                let entities: Vec<_> = model.iter().collect();
+                let active = model.active();
+                let at = entities.iter().position(|e| *e == active);
+                let Some(next) =
+                    crate::keynav::step(at, if forward { 1 } else { -1 }, entities.len())
+                else {
+                    return Task::none();
+                };
+                let entity = entities[next];
+                let msg = match page {
+                    ConfigTab::General => SettingsMsg::SetGeneralTab(entity),
+                    ConfigTab::CaptureModes => SettingsMsg::SetCaptureTab(entity),
+                    ConfigTab::AudioVideo => SettingsMsg::SetAudioVideoTab(entity),
+                    _ => SettingsMsg::SetShortcutsTab(entity),
+                };
+                self.update_settings(msg)
+            }
             #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
             SettingsMsg::SetResident(b) => {
                 // Residency is a SEPARATE tray/menu-bar RESIDENT process (macOS

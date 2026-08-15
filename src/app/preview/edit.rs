@@ -821,13 +821,16 @@ pub fn accounts_for_kind(
 
 impl FlyoutNav {
     /// Move the highlight by `delta`, wrapping. From "no highlight", +1 → first, −1 → last.
+    ///
+    /// The arithmetic is `keynav::step` since DRAGON-680, not because this needed changing
+    /// but because the colour picker window grew the same behaviour on its mode control and
+    /// the owner asked for it to be reusable. The rules (both ends wrap, an empty highlight
+    /// enters from the end you pressed from, an empty list changes nothing) are unchanged
+    /// and are now stated in one place with one set of tests.
     pub fn nav(&mut self, delta: i32) {
-        if self.len == 0 {
-            return;
+        if let Some(at) = crate::keynav::step(self.selected, delta, self.len) {
+            self.selected = Some(at);
         }
-        let n = self.len as i32;
-        let base = self.selected.map(|s| s as i32).unwrap_or(if delta >= 0 { -1 } else { 0 });
-        self.selected = Some(((base + delta).rem_euclid(n)) as usize);
     }
 }
 

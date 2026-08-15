@@ -445,6 +445,224 @@ impl App {
         {
             return self.update(Msg::ColorPicker(ColorPickerMsg::Zoom(steps)));
         }
+        // ── The colour picker WINDOW's own keyboard (DRAGON-680) ──────────────────
+        //
+        // Everything in this block is gated on the press being DELIVERED to that window,
+        // which is the honest signal here: the window carries text inputs, these keys are
+        // meant to work while one of them has the caret, and `sub_global_events` forwards
+        // presses with no `Status` filter, so the input having handled the key first is not
+        // observable. It sits beside the picker's other window-scoped lane above rather
+        // than in the bare-key fall-through, because the ORDER inside it matters: Tab, then
+        // the two chords, then the arrows, and only the arrows are conditional on where
+        // focus is.
+        if Some(window) == self.color_picker.window {
+            // A live DRAG owns the keyboard for as long as it lasts (DRAGON-682 items 35
+            // and 37). Escape cancels it, and every other key is SWALLOWED rather than
+            // acted on: the alternative is a Backspace deleting the swatch the pointer
+            // happens to be over mid-drag, or an arrow moving a cursor whose grid the drop
+            // is about to change. One rule, and it needs no per-key exceptions.
+            if self.color_picker.drag.is_some() {
+                if matches!(key, Key::Named(Named::Escape)) {
+                    return self
+                        .update(Msg::ColorPicker(ColorPickerMsg::DragCancelled));
+                }
+                return Task::none();
+            }
+            // The DELETE-PALETTE confirmation owns the keyboard while it is up
+            // (DRAGON-687), the drag's own rule one modal along: Escape answers "keep it"
+            // and everything else is swallowed, because a dialog that lets Backspace
+            // delete a recent behind it is not modal.
+            if self.color_picker.pending_group_delete.is_some() {
+                if matches!(key, Key::Named(Named::Escape)) {
+                    return self
+                        .update(Msg::ColorPicker(ColorPickerMsg::ConfirmDeleteGroup(false)));
+                }
+                return Task::none();
+            }
+            // Ctrl+Tab / Ctrl+Shift+Tab cycles the PANEL's tabs (DRAGON-687, the owner's
+            // addendum), before the ring's own Tab below and before any text input can
+            // matter: this is a modifier chord, not typing, and the two predicates are
+            // disjoint by construction (`shortcuts::tab_cycle_step`). The collapsed-panel
+            // no-op lives in the pure decision the handler asks.
+            if let Some(forward) = crate::shortcuts::tab_cycle_step(modifiers, &key) {
+                return self.update(Msg::ColorPicker(ColorPickerMsg::CyclePanelTab(forward)));
+            }
+            // ESCAPE closes an open MENU before it can close the window (DRAGON-680 item
+            // 24). This window's menus are `chrome::flyout`s, which dismiss on a
+            // click elsewhere but never see the keyboard, and Escape falling through to the
+            // window's baked Close while a menu is up would take the whole window with it.
+            // Same shape as the preview editor's flyout lane, which owns Escape for exactly
+            // as long as its panel is open.
+            if matches!(key, Key::Named(Named::Escape))
+                && (self.color_picker.mode_menu_open
+                    || self.color_picker.recents_menu.is_some()
+                    || self.color_picker.panel_menu.is_some()
+                    || self.color_picker.palette_menu.is_some()
+                    || self.color_picker.group_menu.is_some()
+                    || self.color_picker.sort_menu_open
+                    || self.color_picker.main_menu)
+            {
+                self.color_picker.mode_menu_open = false;
+                self.color_picker.recents_menu = None;
+                self.color_picker.panel_menu = None;
+                self.color_picker.palette_menu = None;
+                self.color_picker.group_menu = None;
+                // The toolbar's sort flyout (item six) and the main swatch's menu (item
+                // seven): same family, same Escape.
+                self.color_picker.sort_menu_open = false;
+                self.color_picker.main_menu = false;
+                // Hygiene, not the guarantee: the page invariant lives at menu OPEN
+                // (`geom::menu_page_on_open`), so a close path that forgets this cannot
+                // resurrect a stale submenu page anyway.
+                self.color_picker.menu_page = crate::app::color_picker::geom::MenuPage::Root;
+                return Task::none();
+            }
+            // The palette SEARCH (DRAGON-687 item six): Escape clears the filter and
+            // collapses the field, before Escape can close the window, the settings
+            // header's own key (its `search_active` handler). After the menus above: an
+            // open flyout is the nearer transient.
+            if matches!(key, Key::Named(Named::Escape))
+                && self.color_picker.palette_search_active
+            {
+                return self.update(Msg::ColorPicker(ColorPickerMsg::PaletteSearchClear));
+            }
+            // The inline RENAME's own two keys (DRAGON-687): Escape REVERTS it, before it
+            // can close the window, and Tab COMMITS it and is swallowed, so the next Tab
+            // enters the ring cleanly instead of stepping it while an editor still held
+            // the caret. Enter commits through the editor's own `on_submit`; every other
+            // key belongs to the text input and falls through to it untouched (the
+            // Backspace lane below carries its own rename guard).
+            if self.color_picker.rename.is_some() {
+                if matches!(key, Key::Named(Named::Escape)) {
+                    return self.update(Msg::ColorPicker(ColorPickerMsg::RenameCancelled));
+                }
+                if crate::shortcuts::tab_step(modifiers, &key).is_some() {
+                    return self.update(Msg::ColorPicker(ColorPickerMsg::RenameCommitted));
+                }
+            }
+            // SPACE or ENTER, at the stop that holds the ring. The arrows only move a
+            // cursor now, so this is the whole of "take this one", and what "take" means
+            // differs by stop: the history APPLIES its swatch (DRAGON-682 item 7), the
+            // panel COPIES its swatch (item 32, which amended item 9's do-nothing rule).
+            // `geom::accept_action` is that whole decision, asymmetry and all, and its doc
+            // says why the two are not the same. Everywhere else these two keys keep
+            // whatever meaning they already had.
+            if crate::shortcuts::is_accept_key(modifiers, &key) {
+                match crate::app::color_picker::geom::accept_action(
+                    self.color_picker.focus,
+                    self.color_picker.recent_cursor.is_some(),
+                    self.color_picker.panel_cursor.is_some(),
+                ) {
+                    Some(crate::app::color_picker::geom::AcceptAction::ApplyRecent) => {
+                        return self.update(Msg::ColorPicker(ColorPickerMsg::HistoryApply));
+                    }
+                    Some(crate::app::color_picker::geom::AcceptAction::CopySwatch) => {
+                        return self
+                            .update(Msg::ColorPicker(ColorPickerMsg::CopyPanelCursor));
+                    }
+                    None => {}
+                }
+            }
+            // BACKSPACE / DELETE forgets a history swatch (DRAGON-680 item 24), but only
+            // where the target is unambiguous and never while a value box has the caret:
+            // `geom::remove_target` is that whole decision, and its doc carries the owner's
+            // ordering (the hovered swatch first, then the selected one while the history
+            // holds the focus ring, and nothing at all while an input is focused).
+            //
+            // A press that finds no target falls through untouched, which is what leaves
+            // Backspace to the text inputs.
+            if matches!(key, Key::Named(Named::Backspace | Named::Delete))
+                && !modifiers.control()
+                && !modifiers.alt()
+                && !modifiers.logo()
+                // Never while the RENAME editor is typing (DRAGON-687): its Backspaces
+                // are edits, exactly the value boxes' own guard, which `remove_target`
+                // cannot see because the rename is not a ring stop.
+                && self.color_picker.rename.is_none()
+                // And never while the palette SEARCH field is up (item six), the same
+                // not-a-ring-stop blind spot: its Backspaces edit the query.
+                && !self.color_picker.palette_search_active
+                && let Some(i) = crate::app::color_picker::geom::remove_target(
+                    self.color_picker.hovered_recent,
+                    // The keyboard's fallback target is the NAVIGATED cursor, not the
+                    // loaded swatch (DRAGON-682 item 7): once the arrows stopped applying
+                    // what they passed, the cursor is what the user is pointing at with
+                    // the keyboard, and deleting the loaded colour instead would be
+                    // deleting something they are not looking at.
+                    self.color_picker.recent_cursor,
+                    self.color_picker.focus,
+                    self.color_picker.recents.len(),
+                )
+            {
+                return self.update(Msg::ColorPicker(ColorPickerMsg::RemoveRecent(i)));
+            }
+            // TAB moves the window's own focus ring (`geom::next_focus`): the value boxes,
+            // then the mode activator, then the whole colour history, then round again.
+            // The toolkit's blanket Tab navigation is turned OFF for this window
+            // (`App::finalize_color_picker_window`) precisely so this lane owns it; a
+            // cosmic BUTTON is focusable, so libcosmic's own cycle walked the pipette, the
+            // copy button, Add to recents and eighteen history swatches, which is what the owner
+            // saw as focus vanishing after the last input.
+            if let Some(forward) = crate::shortcuts::tab_step(modifiers, &key) {
+                return self.update(Msg::ColorPicker(ColorPickerMsg::FocusStep(forward)));
+            }
+            // The "keep this colour" chord, primary+Enter (⌘Enter on macOS, Ctrl+Enter
+            // elsewhere), which the "Add to recents" button's tooltip advertises. It files the
+            // shown colour, with its alpha, into the history.
+            if crate::shortcuts::is_add_color_chord(modifiers, &key) {
+                return self.update(Msg::ColorPicker(ColorPickerMsg::AddToHistory));
+            }
+            // The COPY chord, primary+SHIFT+C. Shift is what keeps it clear of the text
+            // inputs' own bare primary+C copy-the-selection binding
+            // (`shortcuts::is_copy_value_chord` carries that reasoning).
+            if crate::shortcuts::is_copy_value_chord(modifiers, &key) {
+                return self.update(Msg::ColorPicker(ColorPickerMsg::CopyValue));
+            }
+            // The ARROWS, and only where a stop is listening for them. A value box owns its
+            // own arrows (they move the caret), so `Box` and "nothing focused" fall
+            // straight through to the lanes below, exactly as they did before this block.
+            if let Some(dir) = crate::shortcuts::arrow_direction(modifiers, &key) {
+                match self.color_picker.focus {
+                    // The mode activator: up is the previous notation, down the next.
+                    Some(crate::app::color_picker::geom::PickerFocus::Mode) => {
+                        let steps = match dir {
+                            crate::shortcuts::Direction::Up => -1,
+                            crate::shortcuts::Direction::Down => 1,
+                            // Sideways means nothing to a one-dimensional list; swallowed
+                            // rather than passed on, because this control has focus and a
+                            // key that reached another consumer from here would be a
+                            // surprise.
+                            _ => return Task::none(),
+                        };
+                        return self
+                            .update(Msg::ColorPicker(ColorPickerMsg::ModeStepped(steps)));
+                    }
+                    // The history: all four arrows move the navigation cursor through the
+                    // grid. They do NOT load anything (DRAGON-682 item 7).
+                    Some(crate::app::color_picker::geom::PickerFocus::History) => {
+                        return self
+                            .update(Msg::ColorPicker(ColorPickerMsg::HistoryArrow(dir)));
+                    }
+                    // The panel: the same, through its own ragged grid of cards.
+                    Some(crate::app::color_picker::geom::PickerFocus::Panel) => {
+                        return self
+                            .update(Msg::ColorPicker(ColorPickerMsg::PanelCursor(dir)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Ctrl+Tab / Ctrl+Shift+Tab in the SETTINGS window (DRAGON-687, the owner's
+        // addendum): cycle the ACTIVE page's in-page tab strip, wrapping, exactly as
+        // clicking the next tab would. The same `tab_cycle_step` chord the colour picker's
+        // panel answers, gated on the press being DELIVERED to the settings window, which
+        // is the same honest signal the picker lane uses. A page with no strip, and a
+        // window mid-search (the strips are not rendered then), no-op in the handler.
+        if Some(window) == self.settings.window
+            && let Some(forward) = crate::shortcuts::tab_cycle_step(modifiers, &key)
+        {
+            return self.update(Msg::Settings(SettingsMsg::CycleTabStrip(forward)));
+        }
         // The mic key does double duty: in push-to-talk mode, while recording, it's
         // HOLD-to-talk — the first press un-mutes the mic (auto-repeat presses ignored;
         // the release handler re-mutes). Otherwise it toggles the mic like the toolbar

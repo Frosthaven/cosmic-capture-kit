@@ -354,11 +354,17 @@ pub enum MenuIcon {
     /// named. Vendored for this feature like `timer` and `trash`; see
     /// `res/icons/ATTRIBUTION.md`.
     ColorPicker,
+    /// Lucide `palette`, the "Colors" submenu that holds the two colour entries
+    /// (DRAGON-680), the glyph the owner named. Vendored like `pipette` was.
+    Colors,
+    /// Lucide `swatch-book`, the "Palette Viewer" entry (DRAGON-680), the glyph the
+    /// owner named. Vendored like `pipette` was.
+    PaletteViewer,
     /// Lucide `camera` — the settings window's Screenshots tab glyph
-    /// (`camera-photo-symbolic`).
+    /// (`camera-photo-symbolic`). The "Capture" submenu's glyph.
     Capture,
     /// Lucide `video` — the settings window's Screen Recordings tab glyph
-    /// (`camera-video-symbolic`).
+    /// (`camera-video-symbolic`). The "Record" submenu's glyph.
     Record,
     /// Lucide `timer` — owner-picked for the Countdown Timer submenu (vendored by
     /// DRAGON-574; see `res/icons/ATTRIBUTION.md`).
@@ -416,6 +422,8 @@ impl MenuIcon {
         match self {
             MenuIcon::Scanner => include_str!("../res/icons/lucide/view.svg"),
             MenuIcon::ColorPicker => include_str!("../res/icons/lucide/pipette.svg"),
+            MenuIcon::Colors => include_str!("../res/icons/lucide/palette.svg"),
+            MenuIcon::PaletteViewer => include_str!("../res/icons/lucide/swatch-book.svg"),
             MenuIcon::Capture => include_str!("../res/icons/lucide/camera.svg"),
             MenuIcon::Record => include_str!("../res/icons/lucide/video.svg"),
             MenuIcon::Countdown => include_str!("../res/icons/lucide/timer.svg"),
@@ -491,9 +499,13 @@ pub fn menu_icon_svg_tinted(icon: MenuIcon, rgb: [u8; 3]) -> String {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureAction {
     /// The colour picker tool (DRAGON-582). Not a capture: it spawns a child that shows
-    /// the dimmed magnifier overlay and opens the result window. It sits FIRST in the
-    /// menu, before Scanner, which is the owner's placement.
+    /// the dimmed magnifier overlay and opens the result window. Since DRAGON-680 it is
+    /// the first row INSIDE the "Colors" submenu, which itself sits first in the menu.
     ColorPicker,
+    /// The palette viewer (DRAGON-680): the picker's result window on its own, with no
+    /// overlay and no pick, so the saved palette can be read and reused. It spawns
+    /// `--palette-viewer`, the launch shape that skips straight to the window.
+    PaletteViewer,
     /// Scanner (forces Region + scan).
     Scan,
     /// Region capture.
@@ -533,15 +545,32 @@ pub struct CaptureItem {
     pub icon: Option<MenuIcon>,
 }
 
+// DRAGON-680 item 22 gave this struct a `separator_before` flag, so the recording rows
+// could sit inside the capture submenu below a divider. Item 25 reversed the fold, the
+// two submenus are separate again, and no row in the model opens a block any more, so the
+// flag and the five walker arms that drew it are gone with it. If a submenu ever needs an
+// internal divider again, the flag is the shape to bring back: every walker maps over
+// `Vec<CaptureItem>`, so a separator VARIANT would break all five at once, while a flag
+// one of them has not learned yet still renders the rows in the right order.
+
 /// Which LAUNCHER submenu a [`TrayItem::Launchers`] row opens (DRAGON-574).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LauncherSubmenu {
-    /// "Capture" — the three still-capture launchers. Fully enabled while recording
-    /// (stills during a recording are fine).
+    /// "Colors": the two colour entries (DRAGON-680), the Color Picker tool and the
+    /// Palette Viewer. Enabled in both states, like the two rows it holds: neither takes
+    /// a capture connection, so neither can disturb a running recording.
+    Colors,
+    /// "Capture" ([`CAPTURE_LABEL`]): the three still-capture launchers.
+    /// Fully enabled while recording (stills during a recording are fine).
     Capture,
-    /// "Record" — the three recording launchers. Disabled while recording: a session
+    /// "Record": the three recording launchers. Disabled while recording: a session
     /// records ONE child at a time (the resident's control socket serves one recording;
     /// a second would supersede the first's controls).
+    ///
+    /// Item 22 folded these rows into the capture submenu behind a divider and removed
+    /// this row; item 25 reversed that at the owner's word, so the two submenus are
+    /// separate again and the one-recording-at-a-time rule is back HERE, on the parent,
+    /// where `enabled` can express it. Nothing else about item 22 moved back.
     Record,
 }
 
@@ -549,15 +578,18 @@ impl LauncherSubmenu {
     /// The submenu row's label (the owner's verbatim wording).
     pub fn label(self) -> &'static str {
         match self {
-            LauncherSubmenu::Capture => "Capture",
+            LauncherSubmenu::Colors => "Colors",
+            LauncherSubmenu::Capture => CAPTURE_LABEL,
             LauncherSubmenu::Record => "Record",
         }
     }
 
-    /// The submenu row's icon (the settings tabs' glyphs, owner's mapping).
+    /// The submenu row's icon (the settings tabs' glyphs, owner's mapping; `palette` for
+    /// Colors, DRAGON-680).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // consumed natively off-Linux
     pub fn icon(self) -> MenuIcon {
         match self {
+            LauncherSubmenu::Colors => MenuIcon::Colors,
             LauncherSubmenu::Capture => MenuIcon::Capture,
             LauncherSubmenu::Record => MenuIcon::Record,
         }
@@ -631,69 +663,90 @@ pub enum TrayItem {
     Separator,
 }
 
-/// The three Capture launcher rows (also the shape test's fixture). Split out of
-/// [`tray_menu`] so the icon mapping is written once.
-fn capture_launcher_items() -> Vec<CaptureItem> {
+/// The scanner row's label (DRAGON-680 item 20, the owner's wording): it names what the
+/// tool finds rather than the category it belongs to.
+///
+/// A const because the label reaches the user through several surfaces from this ONE
+/// model (the Linux resident and recording trays, the macOS menu bar and its child status
+/// item, the Windows notification area), and the tests that pin the menu shape should
+/// break on a re-wording rather than agree with whatever the model happens to say. No
+/// em/en-dashes, project rule. The slashes are the owner's spelling.
+pub const SCAN_LABEL: &str = "Scan OCR/QR/Barcode";
+
+/// The capture submenu's label, the owner's wording.
+///
+/// It read "Screen Capture" for one round: item 22 folded the recording launchers into
+/// this submenu, so the one-word label named half its contents, and item 27 reversed the
+/// name once item 25 had given the recordings their own row back. The const stays, since
+/// what it holds is the point, not the value it happens to hold.
+///
+/// A const for the same reason [`SCAN_LABEL`] is one: the string reaches the user from
+/// this ONE model on every platform, and the shape tests should break on a re-wording
+/// rather than agree with it.
+pub const CAPTURE_LABEL: &str = "Capture";
+
+/// One menu row. Every row in this file is built through it, so the struct's field list
+/// lives in exactly one place.
+fn row(label: &'static str, action: CaptureAction, icon: MenuIcon) -> CaptureItem {
+    CaptureItem { label, action, icon: Some(icon) }
+}
+
+/// The two Colors rows (DRAGON-680), in the owner's order: the pick TOOL first, then the
+/// window that shows what has already been picked.
+fn colors_launcher_items() -> Vec<CaptureItem> {
     vec![
-        CaptureItem {
-            label: "Capture Region",
-            action: CaptureAction::Region,
-            icon: Some(MenuIcon::Region),
-        },
-        CaptureItem {
-            label: "Capture Window",
-            action: CaptureAction::Window,
-            icon: Some(MenuIcon::Window),
-        },
-        CaptureItem {
-            label: "Capture Monitor",
-            action: CaptureAction::Monitor,
-            icon: Some(MenuIcon::Monitor),
-        },
+        row("Color Picker", CaptureAction::ColorPicker, MenuIcon::ColorPicker),
+        row("Palette Viewer", CaptureAction::PaletteViewer, MenuIcon::PaletteViewer),
     ]
 }
 
-/// The three Record launcher rows. The icons are the SAME target glyphs as the capture
-/// trio's (owner's rule: the target is the icon's meaning, the verb comes from the
-/// submenu).
+/// The three "Capture" rows (also the shape test's fixture). Split out of
+/// [`tray_menu`] so the icon mapping is written once.
+fn capture_launcher_items() -> Vec<CaptureItem> {
+    vec![
+        row("Capture Region", CaptureAction::Region, MenuIcon::Region),
+        row("Capture Window", CaptureAction::Window, MenuIcon::Window),
+        row("Capture Monitor", CaptureAction::Monitor, MenuIcon::Monitor),
+    ]
+}
+
+/// The three "Record" rows. The icons are the SAME target glyphs as the capture trio's
+/// (owner's rule: the target is the icon's meaning, the verb comes from the submenu).
 fn record_launcher_items() -> Vec<CaptureItem> {
     vec![
-        CaptureItem {
-            label: "Record Region",
-            action: CaptureAction::RecordRegion,
-            icon: Some(MenuIcon::Region),
-        },
-        CaptureItem {
-            label: "Record Window",
-            action: CaptureAction::RecordWindow,
-            icon: Some(MenuIcon::Window),
-        },
-        CaptureItem {
-            label: "Record Monitor",
-            action: CaptureAction::RecordMonitor,
-            icon: Some(MenuIcon::Monitor),
-        },
+        row("Record Region", CaptureAction::RecordRegion, MenuIcon::Region),
+        row("Record Window", CaptureAction::RecordWindow, MenuIcon::Window),
+        row("Record Monitor", CaptureAction::RecordMonitor, MenuIcon::Monitor),
     ]
 }
 
 /// **Pure**, unit-tested: THE tray dropdown, both states, one function (DRAGON-574, the
 /// owner's restructure).
 ///
-/// Idle (`recording == false`): Color Picker, Scanner, the "Capture" submenu, the "Record" submenu,
-/// the "Countdown Timer: NN" radio submenu, the "Audio Recording: <state>" radio
-/// submenu, a separator, "Settings...", Quit — everything enabled.
+/// THREE BLOCKS, in this order, since DRAGON-680 item 22 (the owner's restructure):
+/// the LAUNCHERS, then the two per-capture SETTINGS submenus, then the app tail.
+///
+/// Idle (`recording == false`): the scan row ([`SCAN_LABEL`]), the "Colors" submenu, the
+/// "Capture" submenu, the "Record" submenu, a separator, the "Countdown Timer: NN"
+/// radio submenu, the "Audio Recording: <state>" radio submenu, a separator,
+/// "Settings...", Quit, and everything enabled.
 ///
 /// While recording: the "Audio Recording" radio submenu leads the WHOLE menu (the
 /// owner's recolour-round amendment; a pick applies to the recording LIVE, so the
 /// most-adjusted control sits on top), then the three controls ([`recording_menu`],
-/// Pause/Resume leading) and a separator, then the SAME group with the per-state
-/// flags the owner specified: Color Picker, Scanner and Capture stay enabled (stills while
-/// recording are fine), Record and the Countdown Timer are flagged OFF (one
-/// recording at a time; a countdown pick has nothing to apply to), Settings stays
-/// enabled, Quit is flagged OFF (quitting would orphan the recording child's control
-/// surface). The audio submenu is MOVED to the top while recording, not copied: the
-/// launcher group emits its row only while idle, so the same control never appears
-/// twice in one menu.
+/// Pause/Resume leading) and a separator, then the SAME three blocks with the per-state
+/// flags the owner specified: the scan row, Colors and Capture stay enabled
+/// (stills while recording are fine, and neither colour entry touches a capture
+/// connection), Record is flagged OFF (one recording at a time) and the Countdown Timer
+/// too (a countdown pick has nothing to apply to), Settings stays enabled, and Quit is
+/// flagged OFF (quitting would orphan the recording child's control surface). The audio
+/// submenu is MOVED to the top, not copied: the middle block emits its audio row only
+/// while idle, so the same control never appears twice in one menu.
+///
+/// The middle block is therefore EMPTY while recording, and the divider that introduces it
+/// is still emitted here. [`visible_tray_menu`] is what drops it, along with every other
+/// separator the hide round strands, so this function stays a plain statement of the shape
+/// and the collapse rule lives in exactly one place.
 ///
 /// This is the full STATE model: a false flag documents WHY a row is unusable in that
 /// state. What a surface actually renders is [`visible_tray_menu`], which OMITS the
@@ -714,53 +767,63 @@ pub fn tray_menu(recording: bool, paused: bool) -> Vec<TrayItem> {
         }
         items.push(TrayItem::Separator);
     }
-    // DRAGON-582: the colour picker leads the launcher group, BEFORE Scanner (the
-    // owner's placement). Enabled while recording like Scanner is: picking a colour
-    // takes no capture connection and cannot disturb a running recording.
+    // DRAGON-680 item 20: the row reads "Scan OCR/QR/Barcode" rather than the bare
+    // "Scanner" it carried since DRAGON-574. The owner's wording, and it says what the
+    // tool finds instead of naming a category the user has to already know. The label
+    // is the ONLY thing that changed: the action, the icon and the `--scan` argv are
+    // untouched, so nothing about what the row DOES moved with it.
     items.push(TrayItem::Action {
-        item: CaptureItem {
-            label: "Color Picker",
-            action: CaptureAction::ColorPicker,
-            icon: Some(MenuIcon::ColorPicker),
-        },
+        item: row(SCAN_LABEL, CaptureAction::Scan, MenuIcon::Scanner),
         enabled: true,
     });
-    items.push(TrayItem::Action {
-        item: CaptureItem {
-            label: "Scanner",
-            action: CaptureAction::Scan,
-            icon: Some(MenuIcon::Scanner),
-        },
+    // The colour entries, before the capture launchers (DRAGON-680 item 22, the owner's
+    // order). Enabled while recording, like the scan row is: neither picking a colour nor
+    // reading the palette takes a capture connection, so neither can disturb a live
+    // recording.
+    //
+    // Item 19 had just moved this row to its own block above Settings, and item 22 moved
+    // it back up into the launchers. Both are recorded because the round trip is the
+    // history: what the owner settled on is a launcher block that reads scan, colours,
+    // captures, recordings.
+    items.push(TrayItem::Launchers {
+        menu: LauncherSubmenu::Colors,
         enabled: true,
+        items: colors_launcher_items(),
     });
     items.push(TrayItem::Launchers {
         menu: LauncherSubmenu::Capture,
         enabled: true,
         items: capture_launcher_items(),
     });
+    // Item 22 folded these rows into the submenu above and item 25 put them back at the
+    // owner's word. The fold is a real option, and its one cost is recorded so the choice
+    // is not re-litigated blind: with one submenu, the DRAGON-559 one-recording-at-a-time
+    // rule cannot live on `enabled` (the parent has to stay usable for stills), so it
+    // becomes a row omission instead of a flag, and the two trios share their target
+    // glyphs inside one list.
     items.push(TrayItem::Launchers {
         menu: LauncherSubmenu::Record,
         enabled: !recording,
         items: record_launcher_items(),
     });
+    // Block two: the two things that CONFIGURE a capture rather than starting one. The
+    // owner asked for them below the launchers and above the app tail.
+    items.push(TrayItem::Separator);
     items.push(TrayItem::Radio { menu: RadioSubmenu::Countdown, enabled: !recording });
     if !recording {
-        // Idle keeps the audio submenu here, in the group; while recording it
+        // Idle keeps the audio submenu here, in the block; while recording it
         // already leads the menu (above), so emitting it here too would put the
         // same control in two places of one dropdown.
         items.push(TrayItem::Radio { menu: RadioSubmenu::Audio, enabled: true });
     }
+    // Block three: the app tail.
     items.push(TrayItem::Separator);
     items.push(TrayItem::Action {
-        item: CaptureItem {
-            label: "Settings...",
-            action: CaptureAction::Settings,
-            icon: Some(MenuIcon::Settings),
-        },
+        item: row("Settings...", CaptureAction::Settings, MenuIcon::Settings),
         enabled: true,
     });
     items.push(TrayItem::Action {
-        item: CaptureItem { label: "Quit", action: CaptureAction::Quit, icon: Some(MenuIcon::Quit) },
+        item: row("Quit", CaptureAction::Quit, MenuIcon::Quit),
         enabled: !recording,
     });
     items
@@ -776,22 +839,51 @@ pub fn tray_menu(recording: bool, paused: bool) -> Vec<TrayItem> {
 /// same on all platforms". Linux forces hide, so hide is the uniform answer
 /// everywhere; mac and Windows mirror it by omission simply by walking this list.
 ///
+/// It ALSO collapses the separators the hide round strands (DRAGON-680 item 22). A
+/// separator introduces the block under it, so one whose whole block was hidden has
+/// nothing left to introduce, and a dropdown with two rules in a row (or a rule at either
+/// end) reads as a rendering bug on every platform. That is not hypothetical: while
+/// recording, the middle block is exactly the Countdown Timer (flagged off) and the Audio
+/// Recording submenu (emitted at the top instead), so it is always empty. Item 25 restored
+/// the Record submenu and this stayed, because it is a property of the hide round rather
+/// than of any one row: the middle block is still empty in that state.
+///
+/// Doing it HERE rather than in [`tray_menu`] keeps the model a plain statement of the
+/// shape, with its flags still documenting why each row is unusable, and keeps the rule in
+/// ONE place instead of at every site that emits a separator.
+///
 /// While recording the dropdown is therefore: the Audio Recording submenu,
-/// Pause/Resume, Finish & Save, Cancel & Delete, a separator, Color Picker, Scanner,
-/// the Capture submenu, a separator, Settings... — no Record, no Countdown Timer, no Quit. Idle
+/// Pause/Resume, Finish & Save, Cancel & Delete, a separator, the scan row, Colors, the
+/// Capture submenu, a separator, Settings..., and no Record, no Countdown Timer,
+/// no Quit. Idle
 /// hides nothing. The full model ([`tray_menu`]) keeps expressing state through its
 /// flags, so the reasons stay documented and a future host that CAN subdue uniformly
 /// could return to rendering the full list.
 pub fn visible_tray_menu(recording: bool, paused: bool) -> Vec<TrayItem> {
-    tray_menu(recording, paused)
-        .into_iter()
-        .filter(|entry| match entry {
-            TrayItem::Control(_) | TrayItem::Separator => true,
-            TrayItem::Action { enabled, .. }
-            | TrayItem::Launchers { enabled, .. }
-            | TrayItem::Radio { enabled, .. } => *enabled,
-        })
-        .collect()
+    let kept = tray_menu(recording, paused).into_iter().filter(|entry| match entry {
+        TrayItem::Control(_) | TrayItem::Separator => true,
+        TrayItem::Action { enabled, .. }
+        | TrayItem::Launchers { enabled, .. }
+        | TrayItem::Radio { enabled, .. } => *enabled,
+    });
+    let mut out: Vec<TrayItem> = Vec::new();
+    for entry in kept {
+        // A separator with nothing before it, or with another separator before it, has no
+        // block to introduce.
+        if matches!(entry, TrayItem::Separator)
+            && matches!(out.last(), None | Some(TrayItem::Separator))
+        {
+            continue;
+        }
+        out.push(entry);
+    }
+    // And one with nothing after it introduces nothing either. A loop rather than a single
+    // pop: two trailing separators cannot survive the pass above, but a future model that
+    // ends with a hidden block plus its rule would leave one, and this costs nothing.
+    while matches!(out.last(), Some(TrayItem::Separator)) {
+        out.pop();
+    }
+    out
 }
 
 // ── The "Countdown Timer" radio submenu (DRAGON-574) ─────────────────────────
@@ -1128,6 +1220,7 @@ impl CaptureAction {
     pub fn spawn_args(self) -> Option<&'static [&'static str]> {
         match self {
             CaptureAction::ColorPicker => Some(&["--color-picker"]),
+            CaptureAction::PaletteViewer => Some(&["--palette-viewer"]),
             CaptureAction::Scan => Some(&["--scan"]),
             CaptureAction::Region => Some(&["--region"]),
             CaptureAction::Window => Some(&["--window"]),
@@ -1523,10 +1616,17 @@ mod tests {
         }
     }
 
-    /// The owner's IDLE shape (DRAGON-574, plus DRAGON-582's Color Picker at the
-    /// head): Color Picker, Scanner, the Capture and Record submenus, the
-    /// Countdown Timer and Audio Recording radio submenus, a separator, Settings...,
-    /// Quit — everything enabled.
+    /// The owner's IDLE shape, as of DRAGON-680 item 25: THREE blocks, the launchers
+    /// (the scan row, Colors, Capture, Record), the two per-capture settings
+    /// submenus (Countdown Timer, Audio Recording), and the app tail (Settings...,
+    /// Quit), each pair separated by one divider, everything enabled.
+    ///
+    /// Two rows have moved more than once inside DRAGON-680 alone, so what SETTLED is
+    /// recorded here and the middle steps are not mistaken for the intent. The colour
+    /// entry: item 12 made it the "Colors" submenu at the head of the launchers, item 19
+    /// moved it to its own block above Settings, item 22 brought it back into the
+    /// launchers before the captures. The recording launchers: item 22 folded them into
+    /// the capture submenu, item 25 gave them their own row again.
     #[test]
     fn idle_tray_menu_is_the_owners_shape() {
         let items = tray_menu(false, false);
@@ -1534,10 +1634,11 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("Color Picker".to_string(), true),
-                ("Scanner".to_string(), true),
-                ("Capture".to_string(), true),
+                (SCAN_LABEL.to_string(), true),
+                ("Colors".to_string(), true),
+                (CAPTURE_LABEL.to_string(), true),
                 ("Record".to_string(), true),
+                (String::new(), true), // separator
                 ("Countdown Timer".to_string(), true),
                 ("Audio Recording".to_string(), true),
                 (String::new(), true), // separator
@@ -1549,13 +1650,17 @@ mod tests {
         assert!(!items.iter().any(|i| matches!(i, TrayItem::Control(_))));
     }
 
-    /// The owner's WHILE-RECORDING shape of the full STATE model (DRAGON-574 plus the
-    /// recolour-round amendment): the Audio Recording submenu leads the WHOLE menu,
-    /// then the three controls and a separator, then the same group with Record,
-    /// Countdown Timer and Quit flagged OFF (rendered as HIDDEN since the hide round;
-    /// see [`visible_tray_menu`]) while Scanner, Capture and Settings stay on. The
-    /// audio submenu is MOVED to the top, not copied: the group emits its row only
+    /// The owner's WHILE-RECORDING shape of the full STATE model: the Audio Recording
+    /// submenu leads the WHOLE menu, then the three controls and a separator, then the
+    /// same three blocks with Record, the Countdown Timer and Quit flagged OFF (rendered
+    /// as HIDDEN since the hide round; see [`visible_tray_menu`]) while the scan row,
+    /// Colors, Capture and Settings stay on. The
+    /// audio submenu is MOVED to the top, not copied: the middle block emits its row only
     /// while idle.
+    ///
+    /// The middle block therefore holds nothing a user can reach here, and its divider is
+    /// still present in the MODEL. That is deliberate: the state model says what the menu
+    /// is and why, and `visible_tray_menu` is what turns it into something to render.
     #[test]
     fn recording_tray_menu_is_the_owners_shape() {
         let items = tray_menu(true, false);
@@ -1568,10 +1673,11 @@ mod tests {
                 ("Finish & Save Recording".to_string(), true),
                 ("Cancel & Delete Recording".to_string(), true),
                 (String::new(), true), // separator
-                ("Color Picker".to_string(), true),
-                ("Scanner".to_string(), true),
-                ("Capture".to_string(), true),
-                ("Record".to_string(), false),    // flagged off: one recording at a time
+                (SCAN_LABEL.to_string(), true),
+                ("Colors".to_string(), true),
+                (CAPTURE_LABEL.to_string(), true),
+                ("Record".to_string(), false), // flagged off: one recording at a time
+                (String::new(), true), // separator, introducing an empty block
                 ("Countdown Timer".to_string(), false), // flagged off while recording
                 (String::new(), true), // separator
                 ("Settings...".to_string(), true),
@@ -1591,6 +1697,9 @@ mod tests {
     /// `enabled=false` and dbusmenu has no text-colour property, so subdued text
     /// cannot be guaranteed on Linux; hide is the one uniform answer. No Record, no
     /// Countdown Timer, no Quit.
+    ///
+    /// And no orphaned rule: the middle block is empty in this state, so the divider that
+    /// introduced it goes with it (DRAGON-680 item 22).
     #[test]
     fn the_rendered_recording_menu_omits_the_flagged_off_rows() {
         let got: Vec<(String, bool)> =
@@ -1603,13 +1712,41 @@ mod tests {
                 ("Finish & Save Recording".to_string(), true),
                 ("Cancel & Delete Recording".to_string(), true),
                 (String::new(), true), // separator
-                ("Color Picker".to_string(), true),
-                ("Scanner".to_string(), true),
-                ("Capture".to_string(), true),
+                (SCAN_LABEL.to_string(), true),
+                ("Colors".to_string(), true),
+                (CAPTURE_LABEL.to_string(), true),
                 (String::new(), true), // separator
                 ("Settings...".to_string(), true),
             ]
         );
+    }
+
+    /// THE separator invariant, over every state the model has: a rendered dropdown never
+    /// shows two rules in a row, and never opens or ends with one.
+    ///
+    /// Written as a property rather than folded into the shape tests above, because those
+    /// pin ONE list each and this has to hold for any list the hide round can produce. It
+    /// is the net under `visible_tray_menu`'s collapse pass.
+    #[test]
+    fn the_rendered_menu_never_shows_an_orphaned_divider() {
+        for (recording, paused) in [(false, false), (true, false), (true, true)] {
+            let rendered = visible_tray_menu(recording, paused);
+            let is_rule = |i: &TrayItem| matches!(i, TrayItem::Separator);
+            assert!(
+                !rendered.first().is_some_and(is_rule),
+                "a leading divider ({recording}, {paused})"
+            );
+            assert!(
+                !rendered.last().is_some_and(is_rule),
+                "a trailing divider ({recording}, {paused})"
+            );
+            for pair in rendered.windows(2) {
+                assert!(
+                    !(is_rule(&pair[0]) && is_rule(&pair[1])),
+                    "two dividers in a row ({recording}, {paused})"
+                );
+            }
+        }
     }
 
     /// Idle hides nothing: the rendered list IS the full model, so the hide rule can
@@ -1619,34 +1756,154 @@ mod tests {
         assert_eq!(visible_tray_menu(false, false), tray_menu(false, false));
     }
 
-    /// The two launcher submenus: the capture trio and the record trio, full labels,
-    /// with the toolbar's TARGET glyphs — the SAME icon for Capture Region and Record
-    /// Region (the target is the icon's meaning, the verb comes from the submenu).
+    /// The Colors submenu (DRAGON-680): the pick TOOL then the Palette Viewer, each with
+    /// the glyph the owner named, enabled in BOTH states (neither takes a capture
+    /// connection, so a live recording changes nothing about them).
     #[test]
-    fn launcher_submenus_carry_the_trios_with_the_target_icons() {
-        for (recording, expect_enabled) in [(false, true), (true, false)] {
+    fn the_colors_submenu_carries_both_entries_in_every_state() {
+        for recording in [false, true] {
             let items = tray_menu(recording, false);
-            let capture = items.iter().find_map(|i| match i {
-                TrayItem::Launchers { menu: LauncherSubmenu::Capture, enabled, items } => {
+            let colors = items.iter().find_map(|i| match i {
+                TrayItem::Launchers { menu: LauncherSubmenu::Colors, enabled, items } => {
                     Some((*enabled, items.clone()))
                 }
                 _ => None,
             });
-            let record = items.iter().find_map(|i| match i {
-                TrayItem::Launchers { menu: LauncherSubmenu::Record, enabled, items } => {
-                    Some((*enabled, items.clone()))
-                }
-                _ => None,
-            });
-            let (cap_enabled, cap_items) = capture.expect("a Capture submenu in every state");
-            let (rec_enabled, rec_items) = record.expect("a Record submenu in every state");
-            assert!(cap_enabled, "Capture stays enabled in both states");
-            assert_eq!(rec_enabled, expect_enabled, "Record is disabled exactly while recording");
+            let (enabled, rows) = colors.expect("a Colors submenu in every state");
+            assert!(enabled, "Colors stays enabled while recording");
             assert_eq!(
-                cap_items
-                    .iter()
-                    .map(|i| (i.label, i.action, i.icon))
-                    .collect::<Vec<_>>(),
+                rows.iter().map(|i| (i.label, i.action, i.icon)).collect::<Vec<_>>(),
+                vec![
+                    ("Color Picker", CaptureAction::ColorPicker, Some(MenuIcon::ColorPicker)),
+                    (
+                        "Palette Viewer",
+                        CaptureAction::PaletteViewer,
+                        Some(MenuIcon::PaletteViewer)
+                    ),
+                ]
+            );
+        }
+    }
+
+    /// DRAGON-680 item 22, the owner's placement: the launchers read scan row, Colors,
+    /// Capture, with NO divider among them, in BOTH states.
+    ///
+    /// Pinned as RELATIVE positions rather than indices, so what was asked for (Colors
+    /// after the scan row and before the captures, the whole set in one unbroken block)
+    /// survives a later row being added above. The whole-list shape tests above pin the
+    /// exact order; this one pins the reason.
+    ///
+    /// Item 19 put Colors in its own block above Settings and this test pinned that; item
+    /// 22 replaced it. Both are the owner's, days apart, which is why the assertion is
+    /// about the launcher block rather than about dividers around one row.
+    #[test]
+    fn the_launcher_block_reads_scan_colors_captures_recordings() {
+        for recording in [false, true] {
+            let rendered = visible_tray_menu(recording, false);
+            let at = |want: &TrayItem| {
+                rendered.iter().position(|i| i == want).unwrap_or_else(|| {
+                    panic!("{want:?} is missing while recording={recording}")
+                })
+            };
+            let scan = rendered
+                .iter()
+                .position(|i| matches!(
+                    i,
+                    TrayItem::Action { item: CaptureItem { action: CaptureAction::Scan, .. }, .. }
+                ))
+                .expect("a scan row in every state");
+            let colors = at(&TrayItem::Launchers {
+                menu: LauncherSubmenu::Colors,
+                enabled: true,
+                items: colors_launcher_items(),
+            });
+            let captures = at(&TrayItem::Launchers {
+                menu: LauncherSubmenu::Capture,
+                enabled: true,
+                items: capture_launcher_items(),
+            });
+            assert_eq!(
+                (colors, captures),
+                (scan + 1, scan + 2),
+                "the launchers are one unbroken block (recording={recording})"
+            );
+            // Record closes the block, and only while idle: the hide round takes it out
+            // for the session, which is the DRAGON-559 rule made visible.
+            let record = rendered.iter().position(|i| {
+                matches!(i, TrayItem::Launchers { menu: LauncherSubmenu::Record, .. })
+            });
+            assert_eq!(
+                record,
+                (!recording).then_some(scan + 3),
+                "Record sits last in the launchers, and only while idle"
+            );
+        }
+    }
+
+    /// DRAGON-680 item 20: the scan row's label, pinned literally because it is the
+    /// owner's exact wording and it reaches the user on every platform from this one
+    /// model. The row's action and icon are unchanged by the rename, which is the half a
+    /// label test can otherwise miss.
+    #[test]
+    fn the_scan_row_carries_the_owners_label() {
+        assert_eq!(SCAN_LABEL, "Scan OCR/QR/Barcode");
+        for recording in [false, true] {
+            let row = tray_menu(recording, false)
+                .into_iter()
+                .find_map(|i| match i {
+                    TrayItem::Action { item, .. } if item.action == CaptureAction::Scan => {
+                        Some(item)
+                    }
+                    _ => None,
+                })
+                .expect("a scan row in every state");
+            assert_eq!(row.label, SCAN_LABEL);
+            assert_eq!(row.icon, Some(MenuIcon::Scanner), "the rename left the glyph alone");
+            assert_eq!(
+                row.action.spawn_args(),
+                Some(&["--scan"][..]),
+                "the rename left the argv alone"
+            );
+        }
+    }
+
+    /// The two capture launcher submenus: the still trio and the recording trio, full
+    /// labels, with the toolbar's TARGET glyphs. The SAME icon serves Capture Region and
+    /// Record Region (the target is the icon's meaning, the verb comes from the submenu),
+    /// which is exactly why the two live under separate parents: the parent IS what tells
+    /// them apart.
+    ///
+    /// The enabled flags are the halves' one real difference. Capture stays on in
+    /// both states (stills during a recording are fine); Record is flagged off exactly
+    /// while recording, which is the DRAGON-559 rule (one recording at a time; the
+    /// resident's control socket serves one, and a second would supersede the first's
+    /// controls) expressed where a rendered menu can act on it.
+    #[test]
+    fn the_capture_and_record_submenus_carry_the_trios() {
+        let fields = |rows: &[CaptureItem]| {
+            rows.iter().map(|i| (i.label, i.action, i.icon)).collect::<Vec<_>>()
+        };
+        let submenu = |recording: bool, want: LauncherSubmenu| {
+            tray_menu(recording, false)
+                .into_iter()
+                .find_map(|i| match i {
+                    TrayItem::Launchers { menu, enabled, items } if menu == want => {
+                        Some((enabled, items))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{want:?} is missing while recording={recording}"))
+        };
+        for (recording, record_enabled) in [(false, true), (true, false)] {
+            let (cap_enabled, cap_rows) = submenu(recording, LauncherSubmenu::Capture);
+            let (rec_enabled, rec_rows) = submenu(recording, LauncherSubmenu::Record);
+            assert!(cap_enabled, "Capture stays enabled in both states");
+            assert_eq!(
+                rec_enabled, record_enabled,
+                "Record is disabled exactly while recording"
+            );
+            assert_eq!(
+                fields(&cap_rows),
                 vec![
                     ("Capture Region", CaptureAction::Region, Some(MenuIcon::Region)),
                     ("Capture Window", CaptureAction::Window, Some(MenuIcon::Window)),
@@ -1654,10 +1911,7 @@ mod tests {
                 ]
             );
             assert_eq!(
-                rec_items
-                    .iter()
-                    .map(|i| (i.label, i.action, i.icon))
-                    .collect::<Vec<_>>(),
+                fields(&rec_rows),
                 vec![
                     ("Record Region", CaptureAction::RecordRegion, Some(MenuIcon::Region)),
                     ("Record Window", CaptureAction::RecordWindow, Some(MenuIcon::Window)),
@@ -1676,7 +1930,6 @@ mod tests {
             match item {
                 TrayItem::Action { item, .. } => {
                     let expected = match item.action {
-                        CaptureAction::ColorPicker => MenuIcon::ColorPicker,
                         CaptureAction::Scan => MenuIcon::Scanner,
                         CaptureAction::Settings => MenuIcon::Settings,
                         CaptureAction::Quit => MenuIcon::Quit,
@@ -1686,6 +1939,7 @@ mod tests {
                 }
                 TrayItem::Launchers { menu, .. } => {
                     let expected = match menu {
+                        LauncherSubmenu::Colors => MenuIcon::Colors,
                         LauncherSubmenu::Capture => MenuIcon::Capture,
                         LauncherSubmenu::Record => MenuIcon::Record,
                     };
@@ -1740,6 +1994,9 @@ mod tests {
         assert_ne!(SUCCESS_GREEN_RGB, RECORDING_RED_RGB);
         for icon in [
             MenuIcon::Scanner,
+            MenuIcon::ColorPicker,
+            MenuIcon::Colors,
+            MenuIcon::PaletteViewer,
             MenuIcon::Capture,
             MenuIcon::Record,
             MenuIcon::Countdown,
@@ -1772,6 +2029,9 @@ mod tests {
     fn every_menu_icon_embeds_and_tints() {
         let all = [
             MenuIcon::Scanner,
+            MenuIcon::ColorPicker,
+            MenuIcon::Colors,
+            MenuIcon::PaletteViewer,
             MenuIcon::Capture,
             MenuIcon::Record,
             MenuIcon::Countdown,
@@ -1807,6 +2067,9 @@ mod tests {
         // `--countdown` flag, so a tray-launched recording reads the persisted arms and
         // countdown the tray's own submenus manage.
         assert_eq!(CaptureAction::ColorPicker.spawn_args(), Some(&["--color-picker"][..]));
+        // DRAGON-680: the Palette Viewer's own launch shape, the flag that skips the
+        // overlay and the pick and opens the window straight away.
+        assert_eq!(CaptureAction::PaletteViewer.spawn_args(), Some(&["--palette-viewer"][..]));
         assert_eq!(CaptureAction::Scan.spawn_args(), Some(&["--scan"][..]));
         assert_eq!(CaptureAction::Region.spawn_args(), Some(&["--region"][..]));
         assert_eq!(CaptureAction::Window.spawn_args(), Some(&["--window"][..]));
@@ -1952,6 +2215,7 @@ mod menu_dismiss_tests {
     fn every_launching_entry_is_named_and_waits() {
         for action in [
             CaptureAction::ColorPicker,
+            CaptureAction::PaletteViewer,
             CaptureAction::Scan,
             CaptureAction::Region,
             CaptureAction::Window,

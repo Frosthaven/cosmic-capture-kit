@@ -711,8 +711,12 @@ pub(super) fn num_input<'a>(
     value: impl Into<std::borrow::Cow<'a, str>>,
     on_input: impl Fn(String) -> Msg + 'a,
 ) -> Element<'a, Msg> {
-    let input =
-        widget::text_input(placeholder, value).width(Length::Fixed(80.0)).on_input(on_input);
+    let input = widget::text_input(placeholder, value)
+        .width(Length::Fixed(80.0))
+        .on_input(on_input)
+        // DRAGON-680: the app's softened text-selection fill. Every numeric settings row
+        // is built here, so this one call covers all of them.
+        .style(crate::app::theme::input_style(crate::app::theme::InputBase::Default));
     // Hide the input's glyphs cleanly when it scrolls under the pinned tab strip
     // (text_input leaks its value text past the scroll clip; see the wrapper doc).
     crate::widgets::hide_when_clipped(input)

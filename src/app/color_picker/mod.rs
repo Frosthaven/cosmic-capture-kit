@@ -76,6 +76,16 @@
 //! than a source so the next consumer added does not have to be special-cased everywhere a
 //! pick is handled.
 //!
+//! # Opening the window WITHOUT picking: the palette viewer (DRAGON-680)
+//!
+//! `--palette-viewer` is the second launch shape of this feature: the same result window,
+//! opened directly, with no overlay and no pick, so the saved palette can be read and
+//! reused without sampling a pixel first. It reuses the one-window rule above rather than
+//! sitting beside it, and asks for a RAISE instead of sending a colour, because a colour
+//! send would change what the live window is showing. [`viewer`]'s module doc carries the
+//! whole shape, including which colour the window loads and why the load may not write the
+//! recents.
+//!
 //! # A pick that belongs to a preview editor (DRAGON-587)
 //!
 //! The editor's toolbar pipette exists so you can take a colour off the screen and draw with
@@ -263,11 +273,12 @@ use crate::color::{ColorFormat, Srgb};
 
 pub mod geom;
 mod view;
+pub mod viewer;
 
 /// The picker window's title: the OS title, the CSD header title, the handle the native
 /// finalize helpers match on, and the title a tiling-WM float rule keys on (see the
 /// README's window-rules section). One const, like `shell::PREVIEW_WINDOW_TITLE`.
-pub(crate) const WINDOW_TITLE: &str = "CCK Color Picker";
+pub(crate) const WINDOW_TITLE: &str = "CCK Palette Viewer";
 
 /// Which preview editor this pick belongs to, as a pid, set by the editor that launched it
 /// (DRAGON-587).
@@ -277,6 +288,37 @@ pub(crate) const WINDOW_TITLE: &str = "CCK Color Picker";
 /// `CCK_SETTINGS_TAB`), and because it is not a user-facing option: a person running
 /// `--color-picker` from a terminal has no editor to name.
 pub const COLOR_TO_PID_ENV: &str = "CCK_COLOR_TO_PID";
+
+/// Which SAVED PALETTE this pick is for, as the NONCE the picker window minted for its
+/// pipette-to-palette launch (DRAGON-687 follow-up), set by the palette row's pipette
+/// button. An environment variable for [`COLOR_TO_PID_ENV`]'s exact reasons; `0` is the
+/// explicit "no palette" spelling, needed because a child inherits its parent's
+/// environment and the window spawning it may itself have been born with a nonce set
+/// (a palette-destined pick whose delivery failed becomes a window, and its pipette's
+/// children must not inherit the dead target).
+///
+/// A NONCE, not the group's index or name: the group can be renamed, re-sorted or
+/// deleted while the pick is out, so the launch carries a token only the minting window
+/// can interpret (against the `(index, name)` snapshot it kept), and the palette's NAME,
+/// which is user content, stays out of the child's environment and off `ps e`.
+pub const COLOR_TO_PALETTE_ENV: &str = "CCK_COLOR_TO_PALETTE";
+
+/// The most pipette-to-palette target snapshots the window keeps (see
+/// `ColorPickerState::palette_pick_targets`): cancelled picks send nothing back, so the
+/// list is pruned to the newest few rather than grown for the session's life. Eight is
+/// far past any real number of picks genuinely in flight at once.
+pub const PALETTE_PICK_CAP: usize = 8;
+
+/// Pure, unit-tested: the palette-pick nonce in [`COLOR_TO_PALETTE_ENV`]'s raw value.
+///
+/// `None` for absent, empty, junk and ZERO: zero is the explicit "no palette" every
+/// ordinary launch of a pipette-spawned window writes (the [`color_target_pid`] rule,
+/// applied to this variable), and the window's mint counter starts at 1 so a real nonce
+/// can never be zero.
+pub fn palette_pick_nonce(raw: Option<&str>) -> Option<u64> {
+    let nonce: u64 = raw?.trim().parse().ok()?;
+    (nonce > 0).then_some(nonce)
+}
 
 /// Pure, unit-tested: the editor pid this pick should be delivered to, from
 /// [`COLOR_TO_PID_ENV`]'s raw value.
@@ -304,22 +346,52 @@ pub enum PickDestination {
     /// [`COLOR_TO_PID_ENV`] on the launch, so the target is part of the LAUNCH and can never
     /// be guessed later from whichever editor happens to be open.
     Editor(u32),
+    /// A SAVED PALETTE in the picker window, named by the nonce that window minted
+    /// (DRAGON-687 follow-up): the palette row's pipette button. The colour is APPENDED
+    /// to that group and nothing else moves; see [`PickDestination::files_pick_ordinarily`].
+    PickerPalette(u64),
     /// The colour picker's own result window: the value becomes the colour it shows and the
-    /// newest entry in its recents. Every launch that is not an editor's, which is the
-    /// common case: the tray, the CLI, a global shortcut, and the picker window's own
-    /// pipette.
+    /// newest entry in its recents. Every launch that is not an editor's or a palette
+    /// row's, which is the common case: the tray, the CLI, a global shortcut, and the
+    /// picker window's own pipette.
     PickerWindow,
 }
 
-/// **Pure**, unit-tested: the destination for a pick, from [`COLOR_TO_PID_ENV`]'s raw value.
+impl PickDestination {
+    /// **Pure**, unit-tested: does a pick for this destination FILE ordinarily in the
+    /// child, i.e. become the active colour, write the recents and take the clipboard
+    /// (DRAGON-687 follow-up)?
+    ///
+    /// `false` for exactly the palette destination, the owner's spec: "it should directly
+    /// add to the palette instead of going to the main tool swatch". This is the one
+    /// place that exception is stated, and [`geom::writes_recents`]'s and
+    /// [`geom::CopySource`]'s docs point here, so the who-writes-what rules stay one
+    /// table: those two govern the WINDOW's own colour changes and copies, and this
+    /// governs which pick launches reach them at all. A palette-destined pick whose
+    /// tagged delivery FAILS re-enters the ordinary flow, where this answers true again
+    /// by construction (the fallback re-resolves as [`Self::PickerWindow`] behaviour).
+    pub fn files_pick_ordinarily(self) -> bool {
+        !matches!(self, Self::PickerPalette(_))
+    }
+}
+
+/// **Pure**, unit-tested: the destination for a pick, from [`COLOR_TO_PID_ENV`]'s and
+/// [`COLOR_TO_PALETTE_ENV`]'s raw values.
 ///
 /// TOTAL, which is the point: every launch has a destination, so no caller has to handle an
-/// "unknown consumer" case that cannot exist. Anything that is not a usable editor pid is
-/// the picker window, because a colour shown in the picker's own window is always a correct
-/// outcome, while a colour delivered to a guessed pid is not.
-pub fn pick_destination(raw: Option<&str>) -> PickDestination {
-    match color_target_pid(raw) {
-        Some(pid) => PickDestination::Editor(pid),
+/// "unknown consumer" case that cannot exist. Anything that is not a usable editor pid or a
+/// usable palette nonce is the picker window, because a colour shown in the picker's own
+/// window is always a correct outcome, while a colour delivered to a guessed pid is not.
+///
+/// The EDITOR wins where both are somehow set: no launch of ours mints both (the palette
+/// pipette writes pid `0` explicitly), so the precedence only ever decides an inherited or
+/// hand-built environment, and there it keeps DRAGON-587's behaviour byte-identical.
+pub fn pick_destination(raw: Option<&str>, palette_raw: Option<&str>) -> PickDestination {
+    if let Some(pid) = color_target_pid(raw) {
+        return PickDestination::Editor(pid);
+    }
+    match palette_pick_nonce(palette_raw) {
+        Some(nonce) => PickDestination::PickerPalette(nonce),
         None => PickDestination::PickerWindow,
     }
 }
@@ -486,6 +558,48 @@ pub struct Hover {
 ///
 /// `Default` is hand-written rather than derived because the magnifier's zoom opens at
 /// [`geom::MAGNIFIER_ZOOM_DEFAULT`], and a derived `0` would be an invalid magnification.
+/// A drag in flight (DRAGON-682 items 35 to 40).
+///
+/// Armed by a press over a source, promoted to LIVE by movement past
+/// `geom::DRAG_THRESHOLD`, and resolved by the release. Every position in here is in WINDOW
+/// coordinates, which is what the platform's own pointer events report and what
+/// `geom::drop_zone` hit-tests against: nothing in this machine works in a widget's local
+/// space, because the panel's content scrolls and a scrolled offset would silently move
+/// every zone.
+#[derive(Clone, Copy, Debug)]
+pub struct DragState {
+    /// What was picked up, as the pressed widget named itself.
+    pub source: geom::DragSource,
+    /// The colour and alpha this drag is CARRYING, read ONCE at the press from the swatch
+    /// that was pressed (DRAGON-682 item 41).
+    ///
+    /// Captured rather than resolved per frame, and that is the fix for the ghost showing
+    /// the wrong colour: anything resolved later can be resolved from a window that has
+    /// moved on. The ghost draws this, the drop files this, and the two are the same value.
+    pub payload: (Srgb, u8),
+    /// The zone the pointer is over that is VALID for this source, if any: the one being
+    /// highlighted. Kept so the update handler can tell when it CHANGES, which is when the
+    /// highlight's dashed outline needs rastering.
+    pub zone: Option<geom::DropZone>,
+    /// Where the pointer was when the drag was armed, or `None` until the first move is
+    /// seen.
+    ///
+    /// A press event carries no position of its own, so the first move after the press IS
+    /// the origin. In practice that is the same frame the pointer starts to travel, which
+    /// costs one sample of the threshold and nothing the user can feel.
+    pub origin: Option<(f32, f32)>,
+    /// Where the pointer is now.
+    pub at: (f32, f32),
+    /// Whether the threshold has been passed. A press-release that never gets here is an
+    /// ordinary click and must behave like one.
+    pub live: bool,
+    /// Whether the edge AUTO-SCROLL is armed (DRAGON-687's drag-scroll round): false
+    /// until some live sample lands OUTSIDE both bands ([`geom::autoscroll_arms`]), so a
+    /// drag born inside one (grabbing the topmost visible title, the owner's bug) cannot
+    /// scroll the tab it started on; a band must be ENTERED to scroll.
+    pub autoscroll_armed: bool,
+}
+
 pub struct ColorPickerState {
     /// This process IS a colour-picker launch. Drives the overlay view, the overlay's
     /// keyboard grab, and the frozen-flats grab the sample needs.
@@ -501,20 +615,263 @@ pub struct ColorPickerState {
     pub window: Option<window::Id>,
     /// The colour the window is showing.
     pub color: Srgb,
+    /// The mode activator's menu is open (DRAGON-630 rev 4). Transient view state, never
+    /// persisted: a menu that reopened itself on the next launch would be a bug.
+    ///
+    /// DRAGON-680 deleted this for one revision, while the activator was read as a two
+    /// button stepper, and the owner put the menu back: the chevrons "were still supposed
+    /// to together act as a single hoverable unit that triggers the dropdown menu".
+    pub mode_menu_open: bool,
     /// The notation the value row currently shows (DRAGON-630). PERSISTED
     /// (`state::schema::color_picker_mode`): the picker is a one-shot process, so an
     /// in-memory mode would reset on every launch, and the owner asked for the
     /// remembered one. It is also the spelling the pick's own clipboard copy takes.
     pub mode: ColorFormat,
-    /// Whether the value row shows SPLIT per-channel boxes (`true`, the original
-    /// layout) or ONE whole-value box holding the full spelling exactly as the copy
-    /// button would take it (DRAGON-630 rev 3). PERSISTED
-    /// (`state::schema::color_picker_split_inputs`), toggled by the list button beside
-    /// the copy button.
-    pub split_inputs: bool,
-    /// The mode chip's menu is open (DRAGON-630 rev 4). Transient view state, never
-    /// persisted: a menu that reopened itself on the next launch would be a bug.
-    pub mode_menu_open: bool,
+    /// One stable widget id per value-box POSITION, minted once (DRAGON-680).
+    ///
+    /// [`geom::MAX_VALUE_BOXES`] of them, because the count varies with the mode (one for
+    /// hex, four or five for the rest) and an id has to survive a mode change and every
+    /// rebuild of the view. Two things need them, and neither can work with ids minted
+    /// per frame: the window FOCUSES box 0 on open and after a mode change
+    /// (`text_input::focus`), and a click into a box asks for its own text to be selected
+    /// (`text_input::select_all`).
+    ///
+    /// Not persisted, and not a `Vec` that grows: a widget id is a runtime handle, and a
+    /// fixed list indexed by position is what makes "the first box" a thing the update
+    /// handler can name without consulting the view.
+    pub box_ids: Vec<widget::Id>,
+    /// The panel's SCROLLABLE, so the keyboard cursor can scroll itself into view
+    /// (DRAGON-682 item 9). Minted once, like the value boxes' own ids.
+    pub panel_scroll_id: widget::Id,
+    /// An id NO widget carries, for CLEARING toolkit focus (DRAGON-680).
+    ///
+    /// iced's focus operation focuses the widget whose id matches and UNFOCUSES every other
+    /// focusable it visits (`core::widget::operation::focusable::focus`), so aiming it at an
+    /// id nobody has is the only way this toolkit offers to say "nothing is focused". The
+    /// window needs that whenever Tab leaves the value boxes for the mode activator or the
+    /// history: those two draw their own focus frame from [`Self::focus`], and a text input
+    /// left holding the caret behind them would swallow the arrow keys they need.
+    pub blur_id: widget::Id,
+    /// Which history swatch a CONTEXT MENU is open over (DRAGON-680 item 24), by index.
+    ///
+    /// Transient view state like [`Self::mode_menu_open`], and one `Option` rather than a
+    /// bool beside an index because "open, over that one" is a single fact: two fields
+    /// could represent "open over nothing", which the view would have to invent an answer
+    /// for.
+    pub recents_menu: Option<usize>,
+    /// Which harmony segment just had its colour COPIED from its menu, and WHEN
+    /// (DRAGON-682 item 30), for the local "Copied!" card.
+    ///
+    /// Per segment, because the card is anchored at the segment the user copied from, and
+    /// stamped, because it expires by the clock exactly as the copy button's own flash does
+    /// (`copy_button::copied_recently`, the same window). It is CLEARED when the colour
+    /// changes: the harmonies are recalculated from the current colour, so a stamp that
+    /// survived would put the card on a segment holding a different colour than the one that
+    /// was copied.
+    pub swatch_copied: Option<((usize, usize), std::time::Instant)>,
+    /// Which harmony swatch a context menu is open over (DRAGON-682), as
+    /// `(group, swatch)`. Transient view state, like [`Self::recents_menu`].
+    pub panel_menu: Option<(usize, usize)>,
+    /// Which history swatch the POINTER is over (DRAGON-680 item 24), by index.
+    ///
+    /// Tracked because Backspace and Delete remove what you are POINTING at
+    /// (`geom::remove_target`), and a key press carries no position. Enter sets it and the
+    /// matching exit clears it; the exit names its own index so an enter that arrives
+    /// before its neighbour's exit cannot be cancelled by it.
+    pub hovered_recent: Option<usize>,
+    /// The drag in flight, if any (DRAGON-682 items 35 to 40).
+    ///
+    /// ONE machine for all three sources: what differs between them is what a drop MEANS,
+    /// and that is `geom::drop_action`'s table, not a second state.
+    pub drag: Option<DragState>,
+    /// The tab the panel was showing before a drag started (DRAGON-682 item 39).
+    ///
+    /// A live drag switches the panel to Saved Palettes, TRANSIENTLY: nothing is persisted
+    /// and the drag's end puts this back, whether it ended in a drop, a cancel or Escape.
+    pub drag_prev_tab: Option<geom::PanelTab>,
+    // `palette_notice` sat here (DRAGON-682 item 39): the colour a drop left on the
+    // then-placeholder Saved Palettes tab, so the "coming soon" card could name what
+    // WOULD have been filed. DRAGON-687 built the real tab, a drop files the colour into
+    // a real group, and the notice went with the placeholder it explained.
+    /// The SAVED PALETTES (DRAGON-687): named, ordered colour groups, loaded from and
+    /// persisted to `state::schema::saved_palettes` on every mutation's own save. The
+    /// ORDER is state (groups drag-sort and menu-sort), so nothing here re-sorts on load.
+    pub palettes: Vec<geom::Palette>,
+    /// The group name being RENAMED inline, with its live draft (DRAGON-687): `Some`
+    /// while the mostly-transparent editor is up. The index is REAL (the full list's),
+    /// item six's rule for anything that must survive the search filter changing. Enter and the interactions that move
+    /// focus COMMIT it, Escape reverts it; the draft rule is the value boxes' own (the
+    /// half-typed text is never rewritten under the caret).
+    pub rename: Option<(usize, String)>,
+    /// The rename editor's stable widget id, minted once like the value boxes' ids: what
+    /// lets a rename start focus the input and select its whole text
+    /// (`select_on_focus`), on create and on every later click into the name.
+    pub rename_id: widget::Id,
+    /// Which group NAME a context menu is open over (DRAGON-687). Transient view state,
+    /// one `Option` for the same reason [`Self::recents_menu`] is one. A visible ROW
+    /// (item six), like every transient position: the menu hangs where the user sees
+    /// it, and the handlers resolve the real group when a row acts.
+    pub group_menu: Option<usize>,
+    /// Which PALETTE swatch a context menu is open over, as `(visible row, index)`
+    /// (DRAGON-687). Transient, like [`Self::panel_menu`]; row space, item six.
+    pub palette_menu: Option<(usize, usize)>,
+    /// Which PAGE the open context menu is showing (DRAGON-687): the root rows or one of
+    /// the submenu lists. ONE field for every menu in the window, reset to Root whenever
+    /// any menu opens, because only one menu is ever open at a time.
+    pub menu_page: geom::MenuPage,
+    /// The pointer's position over the WINDOW, in window coordinates (DRAGON-687): the
+    /// ONE source of truth the hover pencil derives from
+    /// ([`geom::hovered_palette_title_at`]), tracked unconditionally by a root-level
+    /// `on_move` while the result window is up.
+    ///
+    /// Twice hardened, and the second lesson is the one to keep. The pencil was first a
+    /// per-title enter/exit FLAG, which stranded exactly as `geom`'s `drag_source`
+    /// tombstone warns (one mouse_area's enter starves another's exit). The first fix
+    /// made it a POSITION, but reported by the scrolled CONTENT's own area, and the
+    /// owner's repro named that hole: moving UP off the first title exits the reporting
+    /// region entirely, so no further report arrives and the stale position sits inside
+    /// the title rect forever. Level-triggered only self-heals while reports keep
+    /// coming, so the source must cover EVERYWHERE the pointer can go: the whole
+    /// window, where motion is reported wherever the pointer is, and every position
+    /// outside the scroll viewport maps to no title by construction.
+    pub window_pointer: Option<(f32, f32)>,
+    /// The panel scrollable's current offset, in points: the window's MIRROR of the
+    /// widget's own truth, written by its `on_scroll` and by the auto-scroll's own moves
+    /// (DRAGON-687). The drop machine hit-tests through it, which is why it has to exist:
+    /// the widget does not answer questions, it only reports.
+    pub panel_scroll_y: f32,
+    /// Each tab's REMEMBERED offset, indexed by [`geom::PanelTab::index`] (DRAGON-687's
+    /// UX round, the owner: "the palette tab should remember where we scrolled to when
+    /// activating"). Session-scoped, never persisted: it is where the user was, not a
+    /// preference. Written and restored ONLY through `App::switch_panel_scroll`
+    /// (`geom::scroll_exchange`), so the mirror above and the widget always move
+    /// together and a stale offset clamps to the tab's current extent.
+    pub panel_tab_scroll: [f32; 2],
+    /// A group DELETION waiting on its confirmation (DRAGON-687): the group index the
+    /// dialog is asking about. Both delete gestures (the menu entry and the name dragged
+    /// off the window) arm this; nothing is removed until the dialog's Delete.
+    pub pending_group_delete: Option<usize>,
+    // `checker_palette_raster` sat here (DRAGON-687): the harmony bars' board at the
+    // narrower width the bar-row buttons left the palette bars. The UX round moved the
+    // pipette and plus into the title row, a palette bar is a harmony bar's exact size
+    // again, and the palette bars draw `checker_bar_raster` itself.
+    /// The dotted outline an EMPTY palette group's bar wears (DRAGON-687 follow-up, the
+    /// owner: the same dotted outline the empty history slots get): ONE raster shared by
+    /// every empty group, `color::dotted_outline_rgba` at the bar's own width, height and
+    /// outer rounding. Dress only: the empty bar keeps its size, its plus button and its
+    /// drop behaviour, and this just says "nothing here yet" in the history's own voice.
+    pub empty_palette_raster: Option<widget::image::Handle>,
+    /// The pipette-to-palette picks currently OUT (DRAGON-687 follow-up), as
+    /// `(nonce, group index at launch, group name at launch)`.
+    ///
+    /// The nonce is what the child echoes back over the IPC (see [`COLOR_TO_PALETTE_ENV`]
+    /// for why the wire carries a token rather than the group); the snapshot beside it is
+    /// what [`geom::resolve_palette_target`] resolves against when the colour arrives,
+    /// so a re-sort mid-pick still files into the right group and a rename or deletion
+    /// degrades to the ordinary delivery instead of guessing. Pruned to the newest
+    /// [`PALETTE_PICK_CAP`]: a cancelled pick sends nothing and would otherwise leave its
+    /// entry forever, and nobody has that many pipette picks genuinely in flight.
+    pub palette_pick_targets: Vec<(u64, usize, String)>,
+    /// The nonce mint counter, starting at 1 (`0` is the explicit "no palette" spelling
+    /// in the launch environment, so a real nonce is never zero).
+    pub palette_pick_seq: u64,
+    /// Whether the create row's SEARCH is expanded into its field (DRAGON-687 item six).
+    /// Transient view state, never persisted: a filter is a moment's question, not a
+    /// preference, exactly the settings window's own `search_active` rule.
+    pub palette_search_active: bool,
+    /// The live palette-name filter (item six): case-insensitive substring over the
+    /// group NAMES, applied per keystroke through [`geom::visible_palettes`]. Blank
+    /// means unfiltered. Cleared by the clear button, by Escape, by collapsing, and by
+    /// Create (a new palette must be visible to be named).
+    pub palette_search: String,
+    /// The search field's stable widget id, minted once like the rename editor's: what
+    /// lets expanding the field focus it in the same turn.
+    pub palette_search_id: widget::Id,
+    /// Whether the create row's SORT flyout is open (item six): the six sorts moved
+    /// here from the group-name menus, so this is its own one-window flag beside the
+    /// swatch menus', closed by the same `close_swatch_menus` sweep.
+    pub sort_menu_open: bool,
+    /// Whether the MAIN round swatch's context menu is open (item seven). Same
+    /// transient shape as the other menus; [`geom::main_swatch_menu_labels`] pins its
+    /// rows.
+    pub main_menu: bool,
+    /// The GHOST's picture, for a translucent colour: the same split swatch a translucent
+    /// history entry wears. `None` for an opaque one, which is painted as a flat fill.
+    pub drag_raster: Option<widget::image::Handle>,
+    /// The DASHED outline of the zone currently highlighted (DRAGON-682 item 41), rastered
+    /// when the highlight moves rather than per frame: it is one image the size of a whole
+    /// region, and a drag crosses at most a few zones. Carried WITH the size it was built
+    /// at, which is the cache key (the drag-jump round's item three,
+    /// [`geom::zone_raster_size`]): the zone's identity was the key once, and a
+    /// viewport-clipped group rect grows under scrolling while its identity stands, so
+    /// the outline froze at the clipped size while the wash tracked the live rect.
+    pub zone_raster: Option<((u32, u32), widget::image::Handle)>,
+    /// The side PANEL is open, doubling the window's width (DRAGON-682).
+    /// PERSISTED (`state::schema::color_picker_expanded`), like the value row's notation:
+    /// the picker is a one-shot process, so an in-memory flag would collapse the panel on
+    /// every launch and the owner asked for it to be remembered.
+    pub expanded: bool,
+    /// Which panel TAB is showing (DRAGON-682). PERSISTED
+    /// (`state::schema::color_picker_panel_tab`), for the same reason.
+    ///
+    /// This is the SOURCE OF TRUTH; [`Self::panel_tab_model`] is the toolkit's own copy of
+    /// it, kept in step by [`Self::sync_panel_tab_model`].
+    pub panel_tab: geom::PanelTab,
+    /// The tab strip's `segmented_button` model (DRAGON-682 item 12).
+    ///
+    /// **The strip is libcosmic's `tab_bar::horizontal`, which is what the settings window
+    /// uses**, and that widget draws from a model rather than from a flag. A hand-built pair
+    /// of buttons stood here for one commit and the owner rejected it on sight: matching the
+    /// settings strip "including icons" means BEING the settings strip, and every attempt to
+    /// approximate a toolkit widget's shape, spacing, active indication and hover is a
+    /// promise to keep approximating it after the next libcosmic bump.
+    ///
+    /// So the window owns both: the enum, which is what persists and what the rest of the
+    /// code reasons about, and this, which is what the widget draws. They are synced at the
+    /// two moments the enum can change without the widget knowing (a persisted load, and the
+    /// window opening), and the widget's own activation is what moves them the other way.
+    pub panel_tab_model: widget::segmented_button::SingleSelectModel,
+    /// The history's navigation CURSOR: which swatch the arrow keys are on (DRAGON-682
+    /// item 7), which is NOT the same thing as which swatch is loaded.
+    ///
+    /// The two were one thing until the owner split them: arrowing the history used to
+    /// apply each swatch as it passed, and now it moves a highlight that Space or Enter
+    /// applies. So the window has a SELECTED entry (derived, `selected_recent`: the one
+    /// whose colour and alpha the window is showing) and a NAVIGATED one (this), and they
+    /// can point at different swatches. The view draws them differently.
+    ///
+    /// Transient, never persisted: it is where the keyboard is, not a preference. It is
+    /// seeded when the History stop takes focus and cleared when focus leaves.
+    pub recent_cursor: Option<usize>,
+    /// The panel's navigation cursor, `(group, swatch)` (DRAGON-682 item 9).
+    ///
+    /// Transient like [`Self::recent_cursor`], and the same lifecycle: seeded when the
+    /// Panel stop takes focus, cleared when focus leaves. There is no "selected" swatch to
+    /// distinguish it from here, because a panel swatch has no primary action at all.
+    pub panel_cursor: Option<(usize, usize)>,
+    /// The CHECKERBOARD every harmony bar is drawn over (DRAGON-682 item 19): ONE raster,
+    /// the width of a bar and a swatch tall, with the bar's own outer rounding.
+    ///
+    /// Shared by every card because every bar is the same size, and because a board that
+    /// restarted per segment would draw a grid of little boards and make the seams the
+    /// loudest thing in the panel. It depends on nothing but the size, the rounding token
+    /// and the checker's own greys, so it is built beside the other rasters and never
+    /// rebuilt for a colour change.
+    pub checker_bar_raster: Option<widget::image::Handle>,
+    /// The RASTER every empty history slot draws (DRAGON-682 item 8): one dotted outline,
+    /// shared by all of them because they are the same size and the same ink.
+    ///
+    /// Built beside the swatch rasters (`refresh_recent_rasters`), so it follows the theme's
+    /// subdued tone and the "Edge rounding" setting exactly as the filled swatches do.
+    pub empty_slot_raster: Option<widget::image::Handle>,
+    /// Which of the window's focus STOPS has focus (DRAGON-680): a value box, the mode
+    /// activator, or the whole colour history. `None` before the window opens, and after a
+    /// click lands somewhere that is not a stop.
+    ///
+    /// This is the app's own focus model, not the toolkit's, and it has to be because the
+    /// toolkit's Tab cycle visits every button in the window (see [`geom::next_focus`] for
+    /// why that is wrong here). Only the `Box` stop is mirrored into real toolkit focus.
+    pub focus: Option<geom::PickerFocus>,
     /// The window's alpha (DRAGON-630), `255` = opaque. A PICK (and a recent-click)
     /// resets it: a screen pixel is opaque, and the alpha is an authoring control for
     /// the value being copied out, not a property of anything sampled.
@@ -540,8 +897,23 @@ pub struct ColorPickerState {
     /// mid-keystroke. So the edited box renders its draft and every OTHER box renders
     /// the derived value.
     pub draft: Option<(ColorFormat, usize, String)>,
-    /// Recent colours, newest first. Only a PICK writes this (see [`geom::writes_recents`]).
-    pub recents: Vec<Srgb>,
+    /// Recent colours, newest first, each with its ALPHA (DRAGON-680). A PICK writes this
+    /// (see [`geom::writes_recents`]) and so does the explicit "Add to recents", which is the
+    /// only path that can file a translucent entry: a pick is opaque by construction.
+    pub recents: Vec<geom::Recent>,
+    /// One raster per recents entry, or `None` where the entry is OPAQUE (DRAGON-680).
+    ///
+    /// A translucent swatch is drawn as a picture (left half the colour, right half the
+    /// colour at its alpha over the checkerboard, `color::recent_swatch_rgba`); an opaque
+    /// one is still the button's own flat background, exactly as before this ticket, so
+    /// the common case allocates nothing. Built in the update handler
+    /// (`App::refresh_recent_rasters`) and never in `view`, the same rule the magnifier
+    /// and the window's other rasters follow: a handle minted per frame churns iced's
+    /// texture atlas, and this one would mint up to [`geom::RECENTS_CAP`] of them.
+    ///
+    /// Indexed in step with [`Self::recents`]. A missing or short list is not a bug to
+    /// panic on: the view falls back to the flat fill for that entry.
+    pub recent_rasters: Vec<Option<widget::image::Handle>>,
     /// The row whose Copy button was last pressed, and WHEN, for the transient
     /// "Copied" tick (`widgets::copy_button::copied_recently`).
     pub copied: Option<(ColorFormat, std::time::Instant)>,
@@ -638,9 +1010,49 @@ impl Default for ColorPickerState {
             hover: None,
             unavailable: false,
             window: None,
-            color: Srgb::default(),
+            // The window never opens on this in the ordinary flows (a pick delivers a
+            // colour and the viewer loads one through `viewer::viewer_color`), but it is
+            // what a window with nothing to load would show, so it is the SAME constant
+            // rather than a second opinion about "no colour yet" (DRAGON-682 item 10).
+            color: viewer::DEFAULT_COLOR,
             mode: ColorFormat::Hex,
-            split_inputs: true,
+            box_ids: (0..geom::MAX_VALUE_BOXES).map(|_| widget::Id::unique()).collect(),
+            drag: None,
+            drag_prev_tab: None,
+            palettes: Vec::new(),
+            rename: None,
+            rename_id: widget::Id::unique(),
+            group_menu: None,
+            palette_menu: None,
+            menu_page: geom::MenuPage::default(),
+            window_pointer: None,
+            panel_scroll_y: 0.0,
+            panel_tab_scroll: [0.0; 2],
+            pending_group_delete: None,
+            empty_palette_raster: None,
+            palette_pick_targets: Vec::new(),
+            palette_pick_seq: 0,
+            palette_search_active: false,
+            palette_search: String::new(),
+            palette_search_id: widget::Id::unique(),
+            sort_menu_open: false,
+            main_menu: false,
+            drag_raster: None,
+            zone_raster: None,
+            panel_scroll_id: widget::Id::unique(),
+            blur_id: widget::Id::unique(),
+            focus: None,
+            recents_menu: None,
+            panel_menu: None,
+            swatch_copied: None,
+            hovered_recent: None,
+            expanded: false,
+            panel_tab: geom::PanelTab::default(),
+            panel_tab_model: geom::PanelTab::model(),
+            recent_cursor: None,
+            panel_cursor: None,
+            empty_slot_raster: None,
+            checker_bar_raster: None,
             mode_menu_open: false,
             alpha: u8::MAX,
             hsv: [0.0, 0.0, 0.0],
@@ -650,6 +1062,7 @@ impl Default for ColorPickerState {
             swatch_raster: None,
             draft: None,
             recents: Vec::new(),
+            recent_rasters: Vec::new(),
             copied: None,
             pick_output: None,
             copy_waiting: false,
@@ -664,25 +1077,31 @@ impl Default for ColorPickerState {
     }
 }
 
-/// The value row's WHOLE-VALUE box, as a component index (DRAGON-630 rev 3): the
-/// layout toggle's collapsed state edits the full spelling through the same draft and
-/// message plumbing the channel boxes use, and this sentinel is how the handlers tell
-/// the two apart. `usize::MAX` can never collide with a real component index (the
-/// widest mode has five).
+/// The value row's WHOLE-VALUE box, as a component index (DRAGON-630 rev 3): hex's one
+/// unified box edits the full spelling through the same draft and message plumbing the
+/// channel boxes use, and this sentinel is how the handlers tell the two apart.
+/// `usize::MAX` can never collide with a real component index (the widest mode has five).
+///
+/// It named the layout TOGGLE's collapsed state until DRAGON-680; the sentinel outlived
+/// the toggle because what it marks is a real difference in what the box HOLDS (a whole
+/// spelling, parsed by `parse_with_alpha`) rather than which layout is switched on.
 pub const WHOLE_VALUE_BOX: usize = usize::MAX;
 
 impl ColorPickerState {
     /// The current mode's whole value in its canonical spelling, alpha included: what
-    /// the copy button, the mode dropdown and the pick's own copy put on the clipboard
-    /// (DRAGON-630).
+    /// the copy button and the pick's own copy put on the clipboard (DRAGON-630), and
+    /// what hex's one unified box shows.
+    ///
+    /// The mode STEPPER is deliberately not in that list any more (DRAGON-680): changing
+    /// the notation no longer copies anything (see `update_color_picker`'s `ModeStepped`).
     pub fn value_text(&self) -> String {
         self.mode.format_with_alpha(self.color, self.alpha)
     }
 
     /// The text box `idx` shows: the live draft for the box being edited, the canonical
     /// component text for every other box (DRAGON-630; the draft rule is DRAGON-582's,
-    /// per box now instead of per row). [`WHOLE_VALUE_BOX`] is the collapsed layout's
-    /// single box and shows the full spelling.
+    /// per box now instead of per row). [`WHOLE_VALUE_BOX`] is hex's single box and shows
+    /// the full spelling.
     pub fn box_text(&self, idx: usize) -> String {
         match &self.draft {
             Some((m, i, text)) if *m == self.mode && *i == idx => text.clone(),
@@ -691,11 +1110,260 @@ impl ColorPickerState {
         }
     }
 
-    /// How many BOXES the current mode's value row shows: the mode's own components
-    /// plus the shared alpha box. Hex included: the owner split its one wide box into
-    /// per-channel hex pairs, so it counts like everyone else.
+    /// How many BOXES the current mode's value row shows (DRAGON-680): ONE for hex, the
+    /// mode's own components plus the shared alpha box for everything else.
+    ///
+    /// It reads [`geom::splits_components`] rather than restating the rule, so the count,
+    /// the widths and the view can never disagree about which layout a mode is in. Hex
+    /// counted like everyone else for one ticket, while a persisted toggle decided the
+    /// layout for ALL modes at once; the owner replaced that with the per-mode rule.
     pub fn box_count(&self) -> usize {
-        self.mode.component_labels().len() + 1
+        if geom::splits_components(self.mode) {
+            self.mode.component_labels().len() + 1
+        } else {
+            1
+        }
+    }
+
+    /// The widget id of the value box at POSITION `pos` in the row (DRAGON-680), for the
+    /// focus and select-all tasks. `None` past the last box a mode can have.
+    ///
+    /// Positional, not the draft's component index: hex's one box is [`WHOLE_VALUE_BOX`]
+    /// to the draft plumbing and position 0 here, which is what lets "focus the first
+    /// box" mean the same thing in every mode.
+    pub fn box_id(&self, pos: usize) -> Option<widget::Id> {
+        self.box_ids.get(pos).cloned()
+    }
+
+    /// **Pure**, unit-tested: every raster this window can draw that is NOT built yet, by
+    /// name (DRAGON-682 item 25).
+    ///
+    /// **This is an INVENTORY, and it exists because the old pattern could not stop
+    /// failing.** Each raster used to be built by whichever handler happened to change its
+    /// inputs, so "is everything ready" was answered by a scatter of call sites that a new
+    /// raster had to remember to join. It did not: the harmony checkerboard and the empty
+    /// slots' dots were built only by the recents-CHANGED path, so a window opened from the
+    /// palette viewer showed neither until the user removed a history entry, which is
+    /// exactly what the owner reported twice.
+    ///
+    /// So the question is asked in ONE place instead. `App::ensure_all_rasters` builds them
+    /// all and then asserts this list is empty, and this list is what a test can check
+    /// without a GPU, a theme or a window: an `image::Handle` is plain data, so a test can
+    /// fill every field and prove the inventory covers exactly the fields that exist.
+    ///
+    /// A recents raster is only REQUIRED for a translucent entry: an opaque swatch is drawn
+    /// as the button's own flat fill and legitimately has none (see `view::recent_swatch`).
+    pub fn missing_rasters(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        for (name, present) in [
+            ("sv square", self.sv_raster.is_some()),
+            ("hue strip", self.hue_raster.is_some()),
+            ("alpha strip", self.alpha_raster.is_some()),
+            ("round swatch", self.swatch_raster.is_some()),
+            ("empty history slot", self.empty_slot_raster.is_some()),
+            ("harmony checkerboard", self.checker_bar_raster.is_some()),
+            ("empty palette outline", self.empty_palette_raster.is_some()),
+        ] {
+            if !present {
+                missing.push(name);
+            }
+        }
+        let translucent_needs_one = self
+            .recents
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.alpha != u8::MAX)
+            .any(|(i, _)| self.recent_rasters.get(i).and_then(|r| r.as_ref()).is_none());
+        if translucent_needs_one {
+            missing.push("a translucent history swatch");
+        }
+        missing
+    }
+
+    /// Point the tab strip's model at [`Self::panel_tab`] (DRAGON-682 item 12).
+    ///
+    /// Called wherever the enum moves WITHOUT the widget's help: a persisted load, and the
+    /// window opening (the panel cannot be seen before that, so syncing there is early
+    /// enough). The other direction needs nothing: an activation in the widget publishes the
+    /// message that sets the enum, and the widget has already moved itself.
+    pub fn sync_panel_tab_model(&mut self) {
+        let want = self.panel_tab;
+        let entity = self
+            .panel_tab_model
+            .iter()
+            .find(|e| self.panel_tab_model.data::<geom::PanelTab>(*e) == Some(&want));
+        if let Some(entity) = entity {
+            self.panel_tab_model.activate(entity);
+        }
+    }
+
+    /// The colour a press picks up, read at the PRESS (DRAGON-682 item 41).
+    ///
+    /// Every source resolves its own way and all of them resolve HERE, once, so the ghost
+    /// and the drop can never carry different values: a harmony swatch is computed from the
+    /// window's colour at that instant, a history entry is that entry with its own alpha,
+    /// the active swatch is what the window is showing, and a palette colour is the saved
+    /// entry itself (DRAGON-687). `None` names a source the window no longer has, which
+    /// arms nothing.
+    pub fn press_payload(&self, source: geom::DragSource) -> Option<(Srgb, u8)> {
+        match source {
+            geom::DragSource::Active => Some((self.color, self.alpha)),
+            geom::DragSource::Recent(i) => self.recents.get(i).map(|e| (e.color, e.alpha)),
+            // A harmony swatch is resolved by the caller through [`Self::panel_swatch`],
+            // since its identity IS its position in the grid.
+            geom::DragSource::Harmony(..) => None,
+            // A palette colour carries itself, alpha included (DRAGON-687).
+            geom::DragSource::PaletteSwatch(g, i) => self.palette_swatch_at((g, i)),
+            // A group NAME carries no colour at all; the ghost draws the name instead
+            // (`view::drag_ghost`'s name arm). The payload slot still has to hold
+            // SOMETHING because the machine is one struct for every source; black-opaque
+            // is a placeholder nothing ever draws or files.
+            geom::DragSource::PaletteName(g) => {
+                // ROW space (item six): valid while the filtered list has this row.
+                (g < self.visible_palettes().len()).then_some((Srgb::new(0, 0, 0), u8::MAX))
+            }
+        }
+    }
+
+    /// The VISIBLE palette rows, as REAL indices in display order (DRAGON-687 item six):
+    /// the whole list while the filter is blank, the name matches under it. Every
+    /// row-indexed surface (the drop machine, the keyboard cursor, the menus, the
+    /// virtualized view) walks this list; every mutation resolves through it back to the
+    /// real index first.
+    pub fn visible_palettes(&self) -> Vec<usize> {
+        geom::visible_palettes(&self.palettes, &self.palette_search)
+    }
+
+    /// The REAL palette a visible ROW names, or `None` for a row the filtered list no
+    /// longer has (item six): the one row-to-real seam the handlers resolve through.
+    pub fn real_palette(&self, row: usize) -> Option<usize> {
+        self.visible_palettes().get(row).copied()
+    }
+
+    /// The palette colour at `(visible row, index)`, with its own alpha (DRAGON-687), or
+    /// `None` for an identity that no longer names anything. ROW space (item six): the
+    /// drag machine and the keyboard cursor both live on the filtered list.
+    pub fn palette_swatch_at(&self, at: (usize, usize)) -> Option<(Srgb, u8)> {
+        let real = self.real_palette(at.0)?;
+        let e = self.palettes.get(real)?.colors.get(at.1)?;
+        Some((e.color, e.alpha))
+    }
+
+    /// The panel facts the drop machine reads ([`geom::PanelShape`]), assembled in ONE
+    /// place so no call site can pair a stale scroll with a fresh group list. The groups
+    /// are the VISIBLE rows' lengths (item six): geometry only ever describes what is on
+    /// screen.
+    pub fn panel_shape(&self) -> geom::PanelShape {
+        geom::PanelShape {
+            palettes: self.palette_drop_open(),
+            scroll: self.panel_scroll_y,
+            groups: self
+                .visible_palettes()
+                .into_iter()
+                .filter_map(|g| self.palettes.get(g).map(|p| p.colors.len()))
+                .collect(),
+        }
+    }
+
+    /// The ragged rows the PANEL's keyboard cursor walks, for whichever tab is showing
+    /// (DRAGON-687): the harmony cards' lengths, or the VISIBLE saved palettes' own
+    /// (item six: the cursor walks what is drawn).
+    pub fn panel_rows(&self) -> Vec<usize> {
+        match self.panel_tab {
+            geom::PanelTab::Harmonies => geom::harmony_card_lengths(),
+            geom::PanelTab::Palettes => self
+                .visible_palettes()
+                .into_iter()
+                .filter_map(|g| self.palettes.get(g).map(|p| p.colors.len()))
+                .collect(),
+        }
+    }
+
+    /// The swatch the panel CURSOR names, on whichever tab is showing (DRAGON-687): a
+    /// harmony position resolves through [`Self::panel_swatch`] and a palette position
+    /// through [`Self::palette_swatch_at`]. What the keyboard's copy reads.
+    pub fn panel_cursor_swatch(&self, at: (usize, usize)) -> Option<(Srgb, u8)> {
+        match self.panel_tab {
+            geom::PanelTab::Harmonies => self.panel_swatch(at),
+            geom::PanelTab::Palettes => self.palette_swatch_at(at),
+        }
+    }
+
+    /// The window's own size, from its LAYOUT (DRAGON-682 item 35).
+    ///
+    /// Drop zones are hit-tested against this. It is the size the window was asked to be,
+    /// which is the size it has except for the few frames a toggle is in flight, and nothing
+    /// is being dragged in those (a drag holds the pointer down; a toggle needs a click).
+    /// It read the live reported width until item 42, and that was part of the jitter
+    /// machinery rather than anything the drag needed.
+    pub fn window_size(&self) -> (f32, f32) {
+        geom::color_window_size_for(self.expanded)
+    }
+
+    /// Whether the panel is showing SAVED PALETTES right now, which is the only tab that
+    /// takes a drop (DRAGON-682 item 39).
+    pub fn palette_drop_open(&self) -> bool {
+        self.panel_mounted() && self.panel_tab == geom::PanelTab::Palettes
+    }
+
+    /// Whether a drag has passed its threshold and is being drawn (DRAGON-682 item 35).
+    ///
+    /// THE question the view asks: an armed press that has not moved is not a drag, shows no
+    /// ghost, silences no tooltip and swallows no click.
+    pub fn dragging(&self) -> bool {
+        self.drag.as_ref().is_some_and(|d| d.live)
+    }
+
+    /// Whether the panel is DRAWN (DRAGON-682, simplified by item 42).
+    ///
+    /// It IS the persisted flag now, and this is kept as a named question rather than
+    /// inlined because three unrelated things ask it: the view mounts the subtree on it, the
+    /// focus ring offers its panel stop on it, and a drag will not pick up a harmony swatch
+    /// without it. It was a width-and-clock rule for items 33 and 34; `geom`'s tombstone
+    /// beside `picker_column_w` says why that went.
+    pub fn panel_mounted(&self) -> bool {
+        self.expanded
+    }
+
+    /// The harmony swatch at a PANEL CURSOR position, with the alpha it is drawn at
+    /// (DRAGON-682 item 32), or `None` for a position no card holds.
+    ///
+    /// Derived, never stored: the cards are recomputed from [`Self::color`] on every frame,
+    /// so the keyboard's copy has to resolve its cursor the same way the view resolves it,
+    /// at the moment the key is pressed. The alpha is the WINDOW's (item 19), which is what
+    /// the segment is painted with.
+    pub fn panel_swatch(&self, at: (usize, usize)) -> Option<(Srgb, u8)> {
+        let (group, index) = at;
+        let h = *crate::color::Harmony::ALL.get(group)?;
+        Some((*h.swatches(self.color).get(index)?, self.alpha))
+    }
+
+    /// The clipboard spelling for ANY swatch in this window (DRAGON-682): the remembered
+    /// notation, at the swatch's OWN alpha.
+    ///
+    /// Deliberately the same formatter [`Self::value_text`] uses, so a colour copied from a
+    /// menu and the same colour copied from the copy button are spelled identically. The
+    /// alpha is a parameter because the two swatch kinds carry different ones: a history
+    /// entry has the alpha it was filed at, and a harmony segment is drawn at the window's
+    /// current alpha (item 19). An opaque one spells with no alpha digits at all, which is
+    /// `format_with_alpha`'s own rule and is what keeps an opaque copy byte-identical.
+    pub fn swatch_copy_text(&self, c: Srgb, alpha: u8) -> String {
+        self.mode.format_with_alpha(c, alpha)
+    }
+
+    /// Which history entry the window is currently SHOWING, if any (DRAGON-680).
+    ///
+    /// DERIVED rather than stored, and that is what keeps it honest: `geom::push_recent`
+    /// cannot hold two identical entries, so a colour-and-alpha match is unique, and any
+    /// path that changes the shown colour (a pick, a typed edit, a strip drag, a loaded
+    /// swatch) moves this answer with it for free. A colour that is not in the history is
+    /// `None`, which the grid's arrow keys read as "enter at the first swatch".
+    ///
+    /// It is what the history's focus ring navigates from AND what the grid draws its
+    /// selection outline on, so the two cannot disagree about which swatch is current.
+    pub fn selected_recent(&self) -> Option<usize> {
+        let showing = geom::Recent::new(self.color, self.alpha);
+        self.recents.iter().position(|e| *e == showing)
     }
 }
 
@@ -760,9 +1428,17 @@ impl App {
 /// background. That is the mistake the owner warned is usually made on the first mac
 /// attempt, so it is copied deliberately rather than reinvented.
 ///
-/// **The window is exactly [`geom::color_window_size`] and cannot be resized** (DRAGON-587,
-/// the owner's instruction). Every part of it is a fixed size and nothing scrolls, so a
-/// larger window would only add empty space and a smaller one would clip rows.
+/// **The window is exactly [`geom::color_window_size_for`] and cannot be resized BY THE
+/// USER** (DRAGON-587, the owner's instruction). Every part of the picker's own column is a
+/// fixed size, so a larger window would only add empty space and a smaller one would clip
+/// rows.
+///
+/// It has TWO such sizes since DRAGON-682: the base window, and twice its width with the
+/// panel open. `expanded` is the persisted state the launch opens at, so the window
+/// appears at the size it was left rather than opening narrow and jumping. Toggling later
+/// goes through `App::resize_color_picker_window`, which has to RELEASE the min/max lock
+/// below before it can resize and re-pin it after: with equal floor and ceiling, a resize
+/// request is otherwise clamped straight back.
 ///
 /// The lock is `min_size == max_size` on EVERY platform, which is what actually pins it: it
 /// is the hint the compositor and the window server both honour, and it is portable.
@@ -783,8 +1459,28 @@ impl App {
 /// What is left on mac is cosmetic: the resize CURSOR can still appear at the frame edge,
 /// because that affordance belongs to the style bit we are deliberately not clearing. A
 /// cursor that does nothing is a much smaller cost than the crash.
-pub(super) fn open_color_picker_window() -> (window::Id, Task<cosmic::Action<Msg>>) {
-    let (w, h) = geom::color_window_size();
+///
+/// **Windows has its own lesson, and it is the mirror image of the mac one** (DRAGON-680).
+/// `resizable: false` there is real: winit leaves `WS_SIZEBOX` off the HWND, so this is the
+/// only window in the app that Windows will not run an interactive SIZE loop for. That is the
+/// whole point, and it is also what broke dragging the window by its title. Windows sends
+/// `WM_EXITSIZEMOVE` only when it actually ENTERED a move/size loop, and that message is the
+/// ONLY thing that clears the private latch winit sets in its `drag_window` before posting the
+/// `WM_NCLBUTTONDOWN`. So a size request Windows declined, on a window with no sizing border,
+/// left the latch stuck on, and from then on every header drag posted nothing: the title area
+/// stopped dragging for the life of the window. The owner's words: "if I try to resize the
+/// window I can't, which is good, but then I can't drag the color picker window by its title
+/// anymore."
+///
+/// The fix does NOT go here, and that is the point worth remembering. Handing the window a
+/// sizing border to keep the loops running would trade a dead drag for a live resize handle on
+/// a window whose whole contract is that it has exactly one size, and it would still not cover
+/// the other ways Windows can decline a drag. The drag path itself is what heals instead: the
+/// `ColorPickerWindowDrag` arm calls `platform::windows::window::end_stale_window_drag` right
+/// before `window::drag`, which is inert unless a latch is actually stuck. That function's doc
+/// carries the mechanism in full.
+pub(super) fn open_color_picker_window(expanded: bool) -> (window::Id, Task<cosmic::Action<Msg>>) {
+    let (w, h) = geom::color_window_size_for(expanded);
     let fixed = cosmic::iced::Size::new(w, h);
     #[cfg(not(windows))]
     let blur = crate::app::theme::glass_windows_enabled();
@@ -1001,11 +1697,11 @@ mod pick_destination_tests {
     use super::*;
 
     /// An editor's launch names its own pid, and that is the ONLY thing that sends a colour
-    /// somewhere other than the picker window.
+    /// somewhere other than the picker window or one of its palettes.
     #[test]
     fn only_an_editors_pid_targets_an_editor() {
-        assert_eq!(pick_destination(Some("4242")), PickDestination::Editor(4242));
-        assert_eq!(pick_destination(Some("  4242 ")), PickDestination::Editor(4242));
+        assert_eq!(pick_destination(Some("4242"), None), PickDestination::Editor(4242));
+        assert_eq!(pick_destination(Some("  4242 "), None), PickDestination::Editor(4242));
     }
 
     /// Every general launch, which is the common case and the one DRAGON-613 is about: the
@@ -1014,8 +1710,44 @@ mod pick_destination_tests {
     #[test]
     fn every_general_launch_targets_the_picker_window() {
         for raw in [None, Some(""), Some("   ")] {
-            assert_eq!(pick_destination(raw), PickDestination::PickerWindow, "{raw:?}");
+            assert_eq!(pick_destination(raw, None), PickDestination::PickerWindow, "{raw:?}");
+            // The explicit "no palette" every pipette-spawned window's own children carry.
+            assert_eq!(pick_destination(raw, Some("0")), PickDestination::PickerWindow);
         }
+    }
+
+    /// The palette destination (DRAGON-687 follow-up): a usable nonce and no editor pid.
+    /// Zero and junk are the picker window (zero is the explicit "no palette"), and an
+    /// editor pid WINS over a nonce, keeping DRAGON-587 byte-identical for any inherited
+    /// or hand-built environment that somehow carries both.
+    #[test]
+    fn a_palette_nonce_targets_the_palette_and_the_editor_still_wins() {
+        assert_eq!(pick_destination(None, Some("7")), PickDestination::PickerPalette(7));
+        assert_eq!(pick_destination(Some("0"), Some(" 7 ")), PickDestination::PickerPalette(7));
+        for raw in ["0", "", "abc", "-1", "1.5"] {
+            assert_eq!(
+                pick_destination(None, Some(raw)),
+                PickDestination::PickerWindow,
+                "{raw}"
+            );
+        }
+        assert_eq!(pick_destination(Some("4242"), Some("7")), PickDestination::Editor(4242));
+        // The nonce parser's own vocabulary, pinned beside the pid parser's.
+        assert_eq!(palette_pick_nonce(Some("1")), Some(1));
+        assert_eq!(palette_pick_nonce(Some(&u64::MAX.to_string())), Some(u64::MAX));
+        for raw in [None, Some(""), Some("0"), Some("junk"), Some("-2")] {
+            assert_eq!(palette_pick_nonce(raw), None, "{raw:?}");
+        }
+    }
+
+    /// The owner's exception, stated as the table it is (DRAGON-687 follow-up): a
+    /// palette-destined pick files NOTHING ordinarily (no active colour, no recents, no
+    /// clipboard in the child), and every other destination is untouched.
+    #[test]
+    fn only_a_palette_pick_skips_the_ordinary_filing() {
+        assert!(!PickDestination::PickerPalette(1).files_pick_ordinarily());
+        assert!(PickDestination::PickerWindow.files_pick_ordinarily());
+        assert!(PickDestination::Editor(4242).files_pick_ordinarily());
     }
 
     /// TOTAL, and it falls the safe way. Anything unclear is the picker window, because a
@@ -1025,11 +1757,11 @@ mod pick_destination_tests {
     #[test]
     fn nonsense_falls_back_to_the_window_rather_than_guessing_a_pid() {
         for raw in ["0", "-1", "abc", "12x", "3.5", "99999999999999999999", "1 2"] {
-            assert_eq!(pick_destination(Some(raw)), PickDestination::PickerWindow, "{raw}");
+            assert_eq!(pick_destination(Some(raw), None), PickDestination::PickerWindow, "{raw}");
         }
         // Including our own pid, which would otherwise address a socket we do not own.
         assert_eq!(
-            pick_destination(Some(&std::process::id().to_string())),
+            pick_destination(Some(&std::process::id().to_string()), None),
             PickDestination::PickerWindow
         );
     }
@@ -1047,7 +1779,7 @@ mod pick_destination_tests {
                 Some(pid) => PickDestination::Editor(pid),
                 None => PickDestination::PickerWindow,
             };
-            assert_eq!(pick_destination(raw), expected, "{raw:?}");
+            assert_eq!(pick_destination(raw, None), expected, "{raw:?}");
         }
     }
 }
@@ -1102,13 +1834,18 @@ mod box_text_tests {
         assert_eq!(st.value_text(), "#FF8800CC");
     }
 
-    /// The box counts the layout depends on: every mode's components plus the shared
-    /// alpha box, hex included since its split into channel pairs.
+    /// The box counts the layout depends on (DRAGON-680): hex is ONE unified box, and
+    /// every other mode is its own components plus the shared alpha box.
+    ///
+    /// Hex was four channel-pair boxes for one ticket, while a persisted toggle chose
+    /// the layout for every mode at once. The owner's rule is per mode now, and this is
+    /// the state-side half of it (`geom::splits_components` is the decision).
     #[test]
     fn box_counts_match_the_modes() {
         let mut st = ColorPickerState::default();
-        assert_eq!(st.box_count(), 4, "hex is four channel-pair boxes");
+        assert_eq!(st.box_count(), 1, "hex is ONE unified box");
         for (mode, want) in [
+            (ColorFormat::Hex, 1),
             (ColorFormat::Rgb, 4),
             (ColorFormat::Hsl, 4),
             (ColorFormat::Hsv, 4),
@@ -1118,6 +1855,123 @@ mod box_text_tests {
         ] {
             st.mode = mode;
             assert_eq!(st.box_count(), want, "{}", mode.id());
+            assert_eq!(
+                st.box_count() > 1,
+                geom::splits_components(mode),
+                "{}: the count and the layout decision disagree",
+                mode.id()
+            );
         }
+    }
+
+    /// DRAGON-682: a swatch menu's COPY spells the colour in the remembered notation, at
+    /// the alpha it was drawn at. Pinned across every mode, because "respecting the chosen mode" is the whole
+    /// of the owner's ask and a single-mode test would pass on a hard-coded hex.
+    #[test]
+    fn a_swatch_copies_in_the_remembered_mode_and_opaque() {
+        let mut st = ColorPickerState::default();
+        let c = Srgb::new(255, 136, 0);
+        for (mode, want) in [
+            (ColorFormat::Hex, "#FF8800"),
+            (ColorFormat::Rgb, "rgb(255, 136, 0)"),
+            (ColorFormat::Hsl, "hsl(32, 100%, 50%)"),
+        ] {
+            st.mode = mode;
+            assert_eq!(st.swatch_copy_text(c, u8::MAX), want, "{}", mode.id());
+        }
+        // The window's own alpha does NOT reach a swatch copy: a harmony swatch has no
+        // transparency of its own, and copying one as half transparent would be inventing a
+        // value the panel never showed.
+        st.mode = ColorFormat::Hex;
+        st.alpha = 128;
+        st.color = c;
+        // A swatch spells the alpha IT is drawn at (DRAGON-682 item 19): a harmony segment
+        // takes the window's, a history entry takes its own, and an opaque one spells with
+        // no alpha digits at all.
+        assert_eq!(st.swatch_copy_text(c, 128), "#FF880080");
+        assert_eq!(st.swatch_copy_text(c, u8::MAX), "#FF8800");
+        assert_eq!(st.value_text(), "#FF880080", "the window's OWN value still carries it");
+    }
+
+    /// DRAGON-682 item 25: the window's raster INVENTORY is complete, and it is what
+    /// `App::ensure_all_rasters` asserts against before a window opens.
+    ///
+    /// This is the test that replaces a bug that shipped twice: rasters were built by
+    /// whichever handler changed their inputs, so a window opened from the palette viewer
+    /// had no history swatches, no empty-slot dots and no harmony checkerboard until the
+    /// user removed a recent. An `image::Handle` is plain data with no GPU behind it, so a
+    /// test can fill every field and prove the inventory names exactly the fields that
+    /// exist: a raster added to the state without a line here leaves this test passing on a
+    /// fresh state and failing on a full one.
+    #[test]
+    fn a_fresh_state_is_missing_every_raster_and_a_full_one_is_missing_none() {
+        // A colour with transparency, which is the one history entry that NEEDS a raster.
+        let mut st = ColorPickerState {
+            recents: vec![
+                geom::Recent::opaque(Srgb::new(1, 2, 3)),
+                geom::Recent::new(Srgb::new(4, 5, 6), 128),
+            ],
+            ..Default::default()
+        };
+        let missing = st.missing_rasters();
+        for want in [
+            "sv square",
+            "hue strip",
+            "alpha strip",
+            "round swatch",
+            "empty history slot",
+            "harmony checkerboard",
+            "empty palette outline",
+            "a translucent history swatch",
+        ] {
+            assert!(missing.contains(&want), "the inventory does not name {want:?}");
+        }
+        assert_eq!(missing.len(), 8, "the inventory named something unexpected: {missing:?}");
+
+        // Fill every one, the way `ensure_all_rasters` does.
+        let handle = || widget::image::Handle::from_rgba(1, 1, vec![0u8; 4]);
+        st.sv_raster = Some(handle());
+        st.hue_raster = Some(handle());
+        st.alpha_raster = Some(handle());
+        st.swatch_raster = Some(handle());
+        st.empty_slot_raster = Some(handle());
+        st.checker_bar_raster = Some(handle());
+        st.empty_palette_raster = Some(handle());
+        st.recent_rasters = vec![None, Some(handle())];
+        assert!(st.missing_rasters().is_empty(), "still missing {:?}", st.missing_rasters());
+
+        // An OPAQUE entry legitimately has no raster of its own, so a `None` beside it is
+        // not a gap; a translucent one's `None` is.
+        st.recent_rasters = vec![None, None];
+        assert_eq!(st.missing_rasters(), vec!["a translucent history swatch"]);
+        // A recents list longer than the raster list is the same gap by another route,
+        // which is exactly what a stale refresh leaves behind.
+        st.recent_rasters = vec![None];
+        assert_eq!(st.missing_rasters(), vec!["a translucent history swatch"]);
+    }
+
+    /// Every box a mode can show has its OWN focus id, and the ids are stable
+    /// (DRAGON-680). Tab moves between the boxes by focusing these, and the window
+    /// focuses the first one on open and after a mode change, so two boxes sharing an id
+    /// would silently stop the cycle.
+    #[test]
+    fn every_box_has_its_own_stable_focus_id() {
+        let mut st = ColorPickerState::default();
+        assert_eq!(st.box_ids.len(), geom::MAX_VALUE_BOXES);
+        // Stable across reads: the same box answers the same id twice, which is what
+        // makes a focus task issued in `update` land on the box the next `view` builds.
+        assert_eq!(st.box_id(0), st.box_id(0), "the same box answers the same id twice");
+        for mode in ColorFormat::ALL {
+            st.mode = mode;
+            for pos in 0..st.box_count() {
+                assert!(st.box_id(pos).is_some(), "{}: box {pos} has no id", mode.id());
+            }
+        }
+        // And they are distinct, or "the next box" would be "this box".
+        let ids: Vec<String> = st.box_ids.iter().map(|i| format!("{i:?}")).collect();
+        let mut uniq = ids.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "two boxes share a focus id: {ids:?}");
     }
 }

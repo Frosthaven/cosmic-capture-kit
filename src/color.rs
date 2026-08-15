@@ -380,6 +380,17 @@ pub fn srgb_from_hsv(hsv: [f64; 3]) -> Srgb {
     Srgb::from_unit_clamped(hsv_to_unit(hsv))
 }
 
+/// Pure, unit-tested: a colour's own HSV, `[hue degrees, saturation, value]`
+/// (DRAGON-687). The plain forward conversion, published for the palette sorts' warmth
+/// measure, which needs the hue and the saturation of a STORED colour rather than the
+/// window's tracked triple ([`hsv_tracking`] answers a different question: what the
+/// controls should show, with the previous hue surviving an achromatic colour). An
+/// achromatic colour answers hue 0 and saturation 0, exactly as the internal conversion
+/// always has.
+pub fn srgb_to_hsv(color: Srgb) -> [f64; 3] {
+    unit_to_hsv(color.to_unit())
+}
+
 /// Pure, unit-tested: the HSV the window should TRACK after `color` changed under it
 /// (DRAGON-630).
 ///
@@ -395,6 +406,231 @@ pub fn hsv_tracking(prev: [f64; 3], color: Srgb) -> [f64; 3] {
     let h = if now[1] <= f64::EPSILON { prev[0] } else { now[0] };
     let s = if now[2] <= f64::EPSILON { prev[1] } else { now[1] };
     [h, s, now[2]]
+}
+
+// ── Colour HARMONIES (DRAGON-682) ────────────────────────────────────────────
+//
+// The compare panel's maths: given the colour the picker window is showing, the classic
+// wheel relationships people reach for when they need a second colour that goes with the
+// first. Pure, and here rather than in the panel's view because they are colour model,
+// not layout, and because a harmony is exactly the kind of thing a test can pin exactly.
+//
+// **They rotate HUE in HSV, keeping saturation and value.** Two reasons, and the second is
+// the one that would be re-argued: HSV is the model this window already thinks in (the
+// gradient square's axes, the hue strip, the tracked `ColorPickerState::hsv`), so a
+// harmony swatch is the same colour the hue strip would land on if you dragged it that
+// far; and keeping S and V means every swatch in a card is as vivid and as bright as the
+// colour it came from, which is what makes a harmony read as a SET. HSL rotation is the
+// other common choice and produces slightly different swatches for the same angles; it is
+// not more correct, and switching would move every card at once.
+//
+// **The hue is the same number in both models** (`hue_of` serves HSL and HSV alike), so
+// the ANGLES below are the textbook ones whichever model a reader has in mind.
+
+/// **Pure**, unit-tested: the MONOCHROMATIC ramp for a colour, as HSV `hsv` (DRAGON-682
+/// item 24): [`MONOCHROME_STEPS`] segments of one hue, ordered DARK to LIGHT, with the base
+/// colour itself at its natural place among them.
+///
+/// # The rule
+///
+/// 1. The base takes the SLOT its own value earns, `round(v * (n - 1))`, so a dark colour
+///    sits near the dark end and a light one near the light end. That is the part a user
+///    can predict by eye.
+/// 2. The step is then whatever FITS on both sides: the smaller of the room below the base
+///    and the room above it, per slot. So the ramp always stays inside `0..=1`, is evenly
+///    spaced, and contains the base exactly, at full precision, rather than near it.
+///
+/// # Why not the obvious two
+///
+/// A ladder of FIXED values (0.25, 0.5, 0.75, 1.0) is what shipped first: it always spreads
+/// nicely, but the base is not on it, so the card had to show the base separately and read
+/// as one odd segment followed by an unrelated gradient. Fixed OFFSETS from the base
+/// (`v ± 0.2`, `v ± 0.4`) put the base in the middle but collapse at the ends: a colour near
+/// black or white clamps two or three steps onto the same value and the card shows duplicate
+/// segments. Choosing the step from the room available is what avoids both, and it is why an
+/// extreme base gives a ramp that reaches away from its own end rather than a shorter one.
+///
+/// Saturation and hue are the base's throughout: this is a ramp of shades and tints, and
+/// desaturating the light end would make it a different harmony.
+fn monochrome_ramp(hsv: [f64; 3]) -> Vec<Srgb> {
+    let n = MONOCHROME_STEPS;
+    let last = (n - 1) as f64;
+    let v = hsv[2].clamp(0.0, 1.0);
+    // The base's own slot, and therefore how many segments sit below and above it.
+    let k = (v * last).round().clamp(0.0, last) as usize;
+    let below = k as f64;
+    let above = last - below;
+    // The largest even step that keeps every segment inside `0..=1`. A base at either end
+    // has room on one side only, and takes that side's step; a base with no room at all
+    // (a one-segment ramp, which `MONOCHROME_STEPS` never produces) answers a flat ramp
+    // rather than dividing by zero.
+    let step = match (below > 0.0, above > 0.0) {
+        (true, true) => (v / below).min((1.0 - v) / above),
+        (true, false) => v / below,
+        (false, true) => (1.0 - v) / above,
+        (false, false) => 0.0,
+    };
+    (0..n)
+        .map(|i| {
+            let value = (v + (i as f64 - below) * step).clamp(0.0, 1.0);
+            srgb_from_hsv([hsv[0], hsv[1], value])
+        })
+        .collect()
+}
+
+/// One colour HARMONY: a named relationship on the colour wheel (DRAGON-682).
+///
+/// The order of [`Self::ALL`] is the order the compare panel lists them in, and it runs
+/// from the tightest relationship to the loosest: the one opposite colour, then its two
+/// neighbours, then the sets that spread further round the wheel, then the one that does
+/// not rotate at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Harmony {
+    /// The colour directly opposite: one rotation of 180 degrees.
+    Complementary,
+    /// The two immediate neighbours, 30 degrees either side.
+    Analogous,
+    /// The three-way split of the wheel: 120 and 240 degrees.
+    Triadic,
+    /// The four-way split: 90, 180 and 270 degrees.
+    Tetradic,
+    /// No rotation at all: the same hue at an ordered ramp of VALUES.
+    Monochromatic,
+}
+
+// SPLIT COMPLEMENTARY (150 and 210 degrees) lived here for one build and the owner cut the
+// GROUP, not the maths: DRAGON-682 item 20 fixed the panel's list at exactly these five, in
+// this order. Adding it back is two lines here and one variant above; nothing else in the
+// panel is a list of harmonies.
+//
+// The names lost their "Colors" suffix in the same pass, and `Companion` became
+// `Complementary`, which is the textbook name for the same 180-degree rotation.
+
+/// How many segments [`Harmony::Monochromatic`]'s ramp holds, the base's own among them.
+///
+/// Five, which is the widest any other card is (tetradic's four rotations plus its base),
+/// so the panel's bars stay a family rather than one long card among short ones.
+const MONOCHROME_STEPS: usize = 5;
+
+impl Harmony {
+    /// Every harmony the compare panel shows, in panel order.
+    /// Every harmony the panel shows, in PANEL ORDER, which is also this enum's own
+    /// declaration order (DRAGON-682 items 20 and 29): the code and the screen list them the
+    /// same way round, so neither can be read as the other's shuffle.
+    ///
+    /// The order is the owner's twice over: the five were fixed by item 20, and item 29
+    /// moved Complementary to the front and Monochromatic to the back. It runs tightest
+    /// relationship first and ends with the one that is not a rotation at all.
+    pub const ALL: [Self; 5] = [
+        Self::Complementary,
+        Self::Analogous,
+        Self::Triadic,
+        Self::Tetradic,
+        Self::Monochromatic,
+    ];
+
+    /// The group's title, as the panel prints it (DRAGON-682 item 20: the owner's exact
+    /// names, with no "Colors" suffix on any of them).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Complementary => "Complementary",
+            Self::Analogous => "Analogous",
+            Self::Triadic => "Triadic",
+            Self::Tetradic => "Tetradic",
+            Self::Monochromatic => "Monochromatic",
+        }
+    }
+
+    /// ONE very short sentence saying what this harmony IS, for the group heading's hover
+    /// explainer (DRAGON-682 item 23).
+    ///
+    /// Plain language, no jargon beyond "hue", and US spelling like every other string in
+    /// this app ("color wheel", not "colour wheel"). Short because it is a tooltip: it has
+    /// to be readable in the moment a pointer rests, and a second sentence would be a
+    /// paragraph nobody finishes.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Complementary => "Opposite hues on the color wheel.",
+            Self::Analogous => "Neighboring hues on the color wheel.",
+            Self::Triadic => "Three hues evenly spaced around the wheel.",
+            Self::Tetradic => "Four hues evenly spaced around the wheel.",
+            Self::Monochromatic => "One hue at different lightness levels.",
+        }
+    }
+
+    /// A stable identifier for logs and tests. Never user-facing, so it can never move.
+    ///
+    /// No production caller today: the panel prints [`Self::label`] and the messages carry
+    /// colours rather than harmonies. It stays because a harmony is exactly the kind of
+    /// thing a log line will want to name the day one misbehaves, and because the tests
+    /// below identify their cases with it.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Complementary => "complementary",
+            Self::Analogous => "analogous",
+            Self::Triadic => "triadic",
+            Self::Tetradic => "tetradic",
+            Self::Monochromatic => "monochromatic",
+        }
+    }
+
+    /// The hue rotations this harmony applies, in degrees, EXCLUDING the base's own zero.
+    ///
+    /// Empty for [`Self::Monochromatic`], which is the one relationship that is not a
+    /// rotation; [`Self::swatches`] is where that difference is handled, so no caller has
+    /// to know which is which.
+    pub fn offsets(self) -> &'static [f64] {
+        match self {
+            Self::Complementary => &[180.0],
+            Self::Analogous => &[-30.0, 30.0],
+            Self::Triadic => &[120.0, 240.0],
+            Self::Tetradic => &[90.0, 180.0, 270.0],
+            Self::Monochromatic => &[],
+        }
+    }
+
+    /// **Pure**, unit-tested: the card's swatches for `base`, the BASE FIRST and then the
+    /// colours this harmony derives from it.
+    ///
+    /// The base leads every ROTATION card deliberately (the owner's ask: a card "shows
+    /// swatches that include our current color and calculated companion color"). A harmony
+    /// is a relationship, and a set of derived colours with nothing to relate them to is a
+    /// row of colours the user has to hold the original in their head to read.
+    ///
+    /// **MONOCHROMATIC is the exception, and the asymmetry is deliberate** (DRAGON-682 item
+    /// 24). It is not a set of rotations at all, it is one ORDERED RAMP, so the base belongs
+    /// at its own place in the sequence rather than in front of it: leading with it put the
+    /// chosen colour first and out of order, and the owner read the card as "the bright
+    /// colour we chose and then a smooth gradient" with no relation between them. See
+    /// [`monochrome_ramp`] for the rule. Do not unify the two conventions: for a rotation
+    /// card the base leading IS the relationship, and for a ramp it breaks one.
+    ///
+    /// **The swatches carry no alpha of their own, and the PANEL draws them at the window's
+    /// current one** (DRAGON-682 item 19). `Srgb` has no alpha field, so a harmony is a
+    /// statement about hue alone and stays one; what changed is the presentation, which the
+    /// owner asked for: a translucent current colour makes a translucent card, over the same
+    /// checkerboard the history swatches use, so a harmony of a half transparent colour looks
+    /// like what it is.
+    ///
+    /// It shipped OPAQUE for one build on the argument that a relationship holds at any
+    /// transparency. That is true and was beside the point: the panel is showing you colours
+    /// you might USE, and a preview that quietly drops the alpha is previewing something
+    /// else. Everything downstream follows the same alpha: taking a swatch as the active
+    /// colour takes that alpha with it, the copy spells it, and the tooltip shows it.
+    pub fn swatches(self, base: Srgb) -> Vec<Srgb> {
+        let hsv = unit_to_hsv(base.to_unit());
+        if self == Self::Monochromatic {
+            return monochrome_ramp(hsv);
+        }
+        let mut out = vec![base];
+        out.extend(
+            self.offsets()
+                .iter()
+                .map(|d| srgb_from_hsv([hsv[0] + d, hsv[1], hsv[2]])),
+        );
+        out
+    }
 }
 
 // ── CMYK (naive, device-agnostic; see the module doc) ────────────────────────
@@ -593,6 +829,13 @@ impl ColorFormat {
     /// Pure, unit-tested: parse a value written in this notation, or `None`. The
     /// alpha-blind form of [`Self::parse_with_alpha`]: an alpha component is ACCEPTED
     /// and discarded, so a pasted `rgba(…)` still loads its colour.
+    ///
+    /// **No production caller since DRAGON-680**, and it stays because the alpha-blind
+    /// question is a real one that this module should be able to answer: the picker's
+    /// persisted history was its last user, and that now keeps the alpha
+    /// (`color_picker::geom::Recent`). Its tests are the ones that pin the whole tolerant
+    /// parsing surface, so deleting it would take that coverage with it.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn parse(self, s: &str) -> Option<Srgb> {
         self.parse_with_alpha(s).map(|(c, _)| c)
     }
@@ -696,9 +939,26 @@ impl ColorFormat {
         Self::ALL.into_iter().find(|f| f.id() == id)
     }
 
-    // `cycled(steps)` briefly lived here for a chevron-pair mode stepper; the owner's
-    // review replaced that control with a dropdown that selects by index, so the
-    // wrapping walk had no caller left and was removed rather than allowed to rot.
+    /// Pure, unit-tested: the notation `steps` places away in [`Self::ALL`], wrapping at
+    /// both ends (DRAGON-630, restored by DRAGON-680). The window's mode stepper walks the
+    /// list with this, so the order the user cycles through is the one owner-chosen row
+    /// order and nothing re-derives it.
+    ///
+    /// It lived here for DRAGON-630's first chevron pair, was deleted when the owner's
+    /// review replaced that control with an index-selecting dropdown, and is back because
+    /// DRAGON-680 reversed the dropdown: the mode control is a bare up/down chevron pair
+    /// again. The walk is kept HERE, beside [`Self::ALL`], rather than in the picker's
+    /// `geom`, because the ORDER being walked is this list's own property.
+    pub fn cycled(self, steps: i32) -> Self {
+        let at = Self::ALL.iter().position(|f| *f == self);
+        // The wrap arithmetic is `keynav::step`, shared with the preview editor's toolbar
+        // flyouts, so every keyboard-navigable list in the app wraps by one rule. What
+        // stays here is the LIST being walked, which is this type's own property.
+        match crate::keynav::step(at, steps, Self::ALL.len()) {
+            Some(i) => Self::ALL[i],
+            None => self,
+        }
+    }
 
     /// The labels of this notation's own component boxes, in box order, WITHOUT the
     /// alpha box (every mode shows one, and the caller appends its "A").
@@ -868,12 +1128,31 @@ impl ColorFormat {
 /// and a dark theme alike. Nine-pixel cells: the owner sized them by eye at rev 3
 /// ("about 50% too small" at the original six).
 const CHECKER_CELL: u32 = 9;
+/// The cell size on the HISTORY swatches (DRAGON-680 item 26).
+///
+/// FOUR, about half the shared cell, because the same board reads twice too coarse on a
+/// swatch a fraction of the size: the owner's "the checkerboard size on the small swatches
+/// needs to be zoomed out by about 2x. its good on the main swatch and transparency line
+/// though". At 9 a 28px swatch holds barely three cells, which reads as two grey BLOCKS
+/// rather than as the "transparent here" texture the board is; at 4 it holds seven.
+///
+/// It is a SECOND constant rather than a smaller shared one precisely because the owner
+/// approved the other two at 9: the round swatch and the alpha strip are much larger, and
+/// moving the shared value would have fixed one complaint by creating another.
+const RECENT_CHECKER_CELL: u32 = 4;
 const CHECKER_LIGHT: [u8; 3] = [190, 190, 190];
 const CHECKER_DARK: [u8; 3] = [122, 122, 122];
 
-/// The checker grey under pixel `(x, y)`.
+/// The checker grey under pixel `(x, y)`, at the shared [`CHECKER_CELL`] size.
 fn checker_at(x: u32, y: u32) -> [u8; 3] {
-    if ((x / CHECKER_CELL) + (y / CHECKER_CELL)).is_multiple_of(2) {
+    checker_at_cell(x, y, CHECKER_CELL)
+}
+
+/// The checker grey under pixel `(x, y)` at an explicit cell size, for a raster whose
+/// board has to be a different size from everybody else's (DRAGON-680 item 26).
+fn checker_at_cell(x: u32, y: u32, cell: u32) -> [u8; 3] {
+    let cell = cell.max(1);
+    if ((x / cell) + (y / cell)).is_multiple_of(2) {
         CHECKER_LIGHT
     } else {
         CHECKER_DARK
@@ -893,14 +1172,24 @@ fn rounded_rect_coverage(x: u32, y: u32, w: u32, h: u32, r: f64) -> f64 {
     if r <= 0.0 {
         return 1.0;
     }
-    let r = r.min(w as f64 / 2.0).min(h as f64 / 2.0);
+    (0.5 - rounded_rect_sd(x, y, w, h, r)).clamp(0.0, 1.0)
+}
+
+/// The SIGNED DISTANCE from pixel `(x, y)`'s centre to that rounded rectangle's edge:
+/// negative inside, positive outside, in pixels.
+///
+/// Split out of [`rounded_rect_coverage`] by DRAGON-682, because a RING needs the distance
+/// itself rather than one coverage value: the dotted placeholder outline is the difference
+/// between the shape's coverage and the coverage of the same shape one pixel smaller, and
+/// computing that from two independent evaluations is the same arithmetic twice.
+fn rounded_rect_sd(x: u32, y: u32, w: u32, h: u32, r: f64) -> f64 {
+    let r = r.max(0.0).min(w as f64 / 2.0).min(h as f64 / 2.0);
     let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
     let (hw, hh) = (w as f64 / 2.0, h as f64 / 2.0);
     let qx = (px - hw).abs() - (hw - r);
     let qy = (py - hh).abs() - (hh - r);
     let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
-    let sd = outside + qx.max(qy).min(0.0) - r;
-    (0.5 - sd).clamp(0.0, 1.0)
+    outside + qx.max(qy).min(0.0) - r
 }
 
 /// Pure, unit-tested: the saturation/value square for `hue`, `w` x `h`, straight RGBA,
@@ -979,29 +1268,65 @@ pub fn alpha_strip_rgba(color: Srgb, w: u32, h: u32, radius: f64) -> Vec<u8> {
     out
 }
 
+/// The rim's thickness as a fraction of the swatch's DIAMETER, so a disc rastered at any
+/// resolution keeps the same visible hairline (DRAGON-680).
+///
+/// 1/32, which is the 1.5px the rim always was at the shipped 48pt disc. It has to be a
+/// fraction rather than a constant now that the raster is built SUPERSAMPLED: a fixed 1.5
+/// pixels in a 3x buffer would draw a rim a third of its intended weight, and the owner
+/// would have reported the opposite problem.
+const SWATCH_RIM_FRACTION: f64 = 1.0 / 32.0;
+
 /// Pure, unit-tested: a round swatch of `color` at `alpha`, `d` x `d`, straight RGBA:
 /// the colour over the checkerboard (so a translucent colour shows AS translucent),
 /// inside an anti-aliased circular mask with a thin rim in `rim` so the disc holds its
 /// shape over any window background. The rim is a parameter (DRAGON-630, the owner's
 /// "subdued, not white/black") so the caller can hand in the live theme's subdued tone.
-pub fn swatch_circle_rgba(color: Srgb, alpha: u8, d: u32, rim: [u8; 3]) -> Vec<u8> {
+///
+/// # The rim: this raster does NOT draw the visible edge (DRAGON-680)
+///
+/// The disc's silhouette is a QUAD RING stacked over this raster by the view
+/// (`color_picker::geom::SWATCH_RING_W`), because the renderer anti-aliases a rounded quad
+/// analytically at the display's real resolution and a raster cannot. Two raster-side
+/// attempts at the owner's "super blocky around the rim" failed first, and
+/// `SWATCH_RING_W`'s doc carries why; the short version is that a one-pixel coverage ramp
+/// cannot hide a 24px-radius curve, and supersampling into iced's mip-less image sampler
+/// decimates the feather instead of averaging it.
+///
+/// So what this function draws is the disc's INTERIOR, which is the part a quad cannot
+/// express: the colour composited over the checkerboard at its own alpha. Its edge stops
+/// `inset` pixels short of the buffer's own radius, so the raster's stepped boundary and
+/// its ramp both end up UNDER the ring's opaque band and are never seen. It keeps painting
+/// its own rim band in `rim` for the same reason it keeps the ramp: whatever peeks past the
+/// ring's inner edge is then the same colour as the ring, so the join is invisible.
+///
+/// Every pixel is WRITTEN, including the fully transparent ones outside the disc, and those
+/// carry the RIM's colour rather than zeroed black. That is the fringe guard: this buffer is
+/// STRAIGHT alpha (like every raster in this module), and any filtered resample averages the
+/// RGB of neighbouring texels regardless of their alpha, so transparent black outside the
+/// edge would be averaged into it and draw a dark halo.
+pub fn swatch_circle_rgba(color: Srgb, alpha: u8, d: u32, rim: [u8; 3], inset: f64) -> Vec<u8> {
     let mut out = vec![0u8; (d as usize) * (d as usize) * 4];
     let radius = d as f64 / 2.0;
+    // Where the RASTER's own disc ends: inside the buffer's radius by the mask, so the
+    // ring drawn over it covers this boundary completely.
+    let outer = (radius - inset.max(0.0)).max(0.0);
     let af = alpha as f64 / 255.0;
+    // The rim band, in THIS buffer's pixels: a constant share of the diameter, so the band
+    // reads the same at any raster size.
+    let rim_w = (d as f64 * SWATCH_RIM_FRACTION).max(1.0);
     for y in 0..d {
         for x in 0..d {
             let (dx, dy) = (x as f64 + 0.5 - radius, y as f64 + 0.5 - radius);
             let dist = (dx * dx + dy * dy).sqrt();
-            // One-pixel anti-alias band at the rim; fully outside stays transparent.
-            let cover = (radius - dist + 0.5).clamp(0.0, 1.0);
-            if cover <= 0.0 {
-                continue;
-            }
+            // One-pixel anti-alias band at the raster's edge; fully outside is transparent,
+            // but is still written in the rim's own colour (see the doc's fringe guard).
+            let cover = (outer - dist + 0.5).clamp(0.0, 1.0);
             let under = checker_at(x, y);
             let mix = |c: u8, u: u8| -> f64 { c as f64 * af + u as f64 * (1.0 - af) };
             let mut px = [mix(color.r, under[0]), mix(color.g, under[1]), mix(color.b, under[2])];
-            // The rim: the outermost ~1px of the disc.
-            if dist >= radius - 1.5 {
+            // The rim: the outermost band of the raster's disc, and everything beyond it.
+            if dist >= outer - rim_w {
                 px = [rim[0] as f64, rim[1] as f64, rim[2] as f64];
             }
             let idx = ((y as usize) * (d as usize) + x as usize) * 4;
@@ -1011,6 +1336,191 @@ pub fn swatch_circle_rgba(color: Srgb, alpha: u8, d: u32, rim: [u8; 3]) -> Vec<u
                 px[2].round().clamp(0.0, 255.0) as u8,
                 (cover * 255.0).round() as u8,
             ]);
+        }
+    }
+    out
+}
+
+/// Pure, unit-tested: a HISTORY swatch, `w` x `h`, straight RGBA, `radius`-rounded
+/// (DRAGON-680): the colour SPLIT down the middle, opaque on the left, at its real
+/// `alpha` over the checkerboard on the right.
+///
+/// The owner's design, and the reason for it is that a translucent swatch alone is
+/// ambiguous: a 30%-alpha red over a checkerboard is a pale pink-grey, and nothing on
+/// screen says whether the entry is "pale pink" or "red, mostly transparent". Showing the
+/// colour at full strength beside it answers that in one glance, and the checkerboard
+/// answers "how transparent" the same way it does under the round current-colour swatch
+/// and along the alpha strip. Same greys, so the three read as one vocabulary, but a
+/// SMALLER cell ([`RECENT_CHECKER_CELL`]): the shared size reads twice too coarse on a
+/// swatch this small, which is the owner's item 26.
+///
+/// **An OPAQUE entry is a flat fill of the colour**, on both halves, with the board
+/// invisible behind it: the split is not drawn, because there is nothing to compare.
+/// (Callers may skip this raster entirely for an opaque entry and paint the flat colour,
+/// which is what the picker window does; the two agree by construction, since at
+/// `alpha == 255` the mix below is the colour itself on both sides.)
+///
+/// The split is at the exact half, `x < w / 2`, so an odd width gives the extra column to
+/// the transparent side. That is the right way round: the LEFT half is a reference the eye
+/// only compares against, while the right half is the value being judged.
+pub fn recent_swatch_rgba(color: Srgb, alpha: u8, w: u32, h: u32, radius: f64) -> Vec<u8> {
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    let af = alpha as f64 / 255.0;
+    let half = w / 2;
+    for y in 0..h {
+        for x in 0..w {
+            let cover = rounded_rect_coverage(x, y, w, h, radius);
+            // Every pixel is written, the transparent corners included, and each carries
+            // the colour it would have had if it were inside. Same fringe guard
+            // `swatch_circle_rgba`'s doc spells out: this is a STRAIGHT-alpha buffer drawn
+            // at a fixed logical size from a supersampled raster, and a filtered downscale
+            // averages neighbouring RGB whatever their alpha, so a zeroed corner would
+            // darken the rounded edge beside it.
+            //
+            // Left: the colour with no transparency at all. Right: the colour at its own
+            // alpha over the board, at the HISTORY's own finer cell (DRAGON-680 item 26:
+            // the shared cell reads twice too coarse at this size).
+            let a = if x < half { 1.0 } else { af };
+            let under = checker_at_cell(x, y, RECENT_CHECKER_CELL);
+            let mix = |c: u8, u: u8| -> u8 {
+                (c as f64 * a + u as f64 * (1.0 - a)).round().clamp(0.0, 255.0) as u8
+            };
+            let idx = ((y as usize) * (w as usize) + x as usize) * 4;
+            out[idx..idx + 4].copy_from_slice(&[
+                mix(color.r, under[0]),
+                mix(color.g, under[1]),
+                mix(color.b, under[2]),
+                (cover * 255.0).round() as u8,
+            ]);
+        }
+    }
+    out
+}
+
+/// The dotted placeholder outline's dash period, in raster pixels: `on` then `off`.
+///
+/// Two and two, which reads as dots rather than as a dashed line at the sizes this draws
+/// at (a 28pt swatch has room for seven of them along an edge) and is coarse enough to
+/// survive being drawn at 1:1 on a 1x display.
+const DOT_ON: u32 = 2;
+const DOT_OFF: u32 = 2;
+
+/// Pure, unit-tested: a 1px DOTTED rounded-rect outline in `ink`, `w` x `h`, straight RGBA
+/// (DRAGON-682): the empty slots in the colour history, so the grid's full extent is
+/// visible before it fills up.
+///
+/// **A raster because a quad cannot dash.** iced draws a container's border as a solid
+/// signed-distance ring with no dash pattern, and the alternatives are worse: a ring of
+/// little quads is a dozen widgets per empty slot (there can be eighteen of them), and a
+/// baked image would freeze one theme's ink into an asset. This takes the colour as a
+/// parameter and the caller hands it the live `theme::subdued`, so it follows the theme
+/// exactly as the swatch rims and the slider hairlines do.
+///
+/// The dash phase is measured along whichever EDGE a pixel is nearest, which keeps the
+/// dots evenly spaced along the straight runs where the eye reads them. At the corners the
+/// two phases meet and a dot can land a pixel early or late; that is invisible at a 1px
+/// stroke and is the price of not carrying an arc-length parameterisation for a
+/// placeholder.
+///
+/// Everything outside the ring is transparent, and every pixel carries the INK's own
+/// colour so a resample cannot fringe it (the same guard [`swatch_circle_rgba`] documents).
+pub fn dotted_outline_rgba(w: u32, h: u32, radius: f64, ink: [u8; 3]) -> Vec<u8> {
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    let period = (DOT_ON + DOT_OFF).max(1);
+    for y in 0..h {
+        for x in 0..w {
+            // The 1px ring: the shape's own coverage MINUS the coverage of the same shape
+            // one pixel smaller, which is 1 for a pixel straddling the edge and 0 for one
+            // safely inside or outside it.
+            let sd = rounded_rect_sd(x, y, w, h, radius);
+            let outer = (0.5 - sd).clamp(0.0, 1.0);
+            let inner = (0.5 - (sd + 1.0)).clamp(0.0, 1.0);
+            let ring = (outer - inner).clamp(0.0, 1.0);
+            // The dash phase, measured along whichever pair of edges this pixel is nearer,
+            // so the dots march evenly across a top and down a side.
+            let dx = x.min(w.saturating_sub(1).saturating_sub(x));
+            let dy = y.min(h.saturating_sub(1).saturating_sub(y));
+            let t = if dy <= dx { x } else { y };
+            let on = t % period < DOT_ON;
+            let a = if on { ring } else { 0.0 };
+            let idx = ((y as usize) * (w as usize) + x as usize) * 4;
+            out[idx..idx + 4].copy_from_slice(&[
+                ink[0],
+                ink[1],
+                ink[2],
+                (a * 255.0).round() as u8,
+            ]);
+        }
+    }
+    out
+}
+
+/// A drop zone's dash, in pixels on and pixels off (DRAGON-682 item 41).
+///
+/// Far longer than [`DOT_ON`]'s two, because the shape is far bigger: the same two-on
+/// two-off that reads as dots around a 28pt swatch reads as a fuzzy line around a 388pt
+/// region. Eight and six is a dash you can see the rhythm of at arm's length.
+const DASH_ON: u32 = 8;
+const DASH_OFF: u32 = 6;
+
+/// Pure, unit-tested: a DASHED rounded-rect outline in `ink`, `w` x `h`, straight RGBA
+/// (DRAGON-682 item 41): the boundary of the drop zone a drag is currently over.
+///
+/// [`dotted_outline_rgba`]'s bigger sibling, and deliberately the same construction (the
+/// same ring, the same edge-measured dash phase, the same fully-coloured transparent
+/// pixels), so the two cannot diverge in how they look; what differs is the dash period and
+/// the stroke WIDTH, since a hairline around a whole region disappears.
+///
+/// The ink is a parameter, as it is there, and the caller hands it the live accent, so the
+/// highlight follows the user's accent colour and their light or dark theme.
+pub fn dashed_outline_rgba(w: u32, h: u32, radius: f64, stroke: f64, ink: [u8; 3]) -> Vec<u8> {
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    let period = (DASH_ON + DASH_OFF).max(1);
+    for y in 0..h {
+        for x in 0..w {
+            // The stroke-wide ring: the shape's coverage minus the coverage of the same
+            // shape `stroke` pixels smaller.
+            let sd = rounded_rect_sd(x, y, w, h, radius);
+            let outer = (0.5 - sd).clamp(0.0, 1.0);
+            let inner = (0.5 - (sd + stroke.max(1.0))).clamp(0.0, 1.0);
+            let ring = (outer - inner).clamp(0.0, 1.0);
+            let dx = x.min(w.saturating_sub(1).saturating_sub(x));
+            let dy = y.min(h.saturating_sub(1).saturating_sub(y));
+            let t = if dy <= dx { x } else { y };
+            let on = t % period < DASH_ON;
+            let a = if on { ring } else { 0.0 };
+            let idx = ((y as usize) * (w as usize) + x as usize) * 4;
+            out[idx..idx + 4].copy_from_slice(&[
+                ink[0],
+                ink[1],
+                ink[2],
+                (a * 255.0).round() as u8,
+            ]);
+        }
+    }
+    out
+}
+
+/// Pure, unit-tested: a plain CHECKERBOARD, `w` x `h`, straight RGBA, `radius`-rounded
+/// (DRAGON-682 item 19): the board a translucent swatch bar is drawn over.
+///
+/// The TRANSPARENCY SLIDER's own cell size (DRAGON-682 item 26, the owner: "the
+/// checkerboard size on the items in the tabs should be the same size we use in the
+/// transparency slider"), which is the shared [`CHECKER_CELL`] that [`alpha_strip_rgba`]
+/// draws with. Reading the same constant is what stops the two drifting; it shipped at the
+/// history swatches' finer cell for one build, and the owner matched it to the strip
+/// instead. The history swatches and the strip are both unchanged.
+///
+/// No colour at all, which is what makes it shareable: the colours are drawn OVER it as
+/// translucent quads, one per segment, so one board serves every bar and every colour.
+pub fn checkerboard_rgba(w: u32, h: u32, radius: f64) -> Vec<u8> {
+    let mut out = vec![0u8; (w as usize) * (h as usize) * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let cover = rounded_rect_coverage(x, y, w, h, radius);
+            let c = checker_at(x, y);
+            let idx = ((y as usize) * (w as usize) + x as usize) * 4;
+            out[idx..idx + 4].copy_from_slice(&[c[0], c[1], c[2], (cover * 255.0).round() as u8]);
         }
     }
     out
@@ -1520,6 +2030,224 @@ mod alpha_format_tests {
 }
 
 /// DRAGON-630: the persisted mode's plumbing, `from_id` and the stepper's `cycled`.
+/// DRAGON-682: the colour HARMONIES the compare panel draws. What is pinned is the ANGLES
+/// (a harmony is defined by them, so a wrong one is a wrong feature, not a wrong pixel) and
+/// the properties that hold whatever the angles are.
+#[cfg(test)]
+mod harmony_tests {
+    use super::*;
+
+    /// A vivid orange, chromatic enough that its hue is unambiguous.
+    const BASE: Srgb = Srgb { r: 255, g: 136, b: 0 };
+
+    /// The hue of a colour, in degrees, for comparing what a rotation actually produced.
+    fn hue(c: Srgb) -> f64 {
+        unit_to_hsv(c.to_unit())[0]
+    }
+
+    /// The textbook angles, one harmony at a time. These ARE the feature: everything else
+    /// here is a property that would hold for a wrong set just as well.
+    #[test]
+    fn every_harmony_rotates_by_its_own_textbook_angles() {
+        assert_eq!(Harmony::Complementary.offsets(), &[180.0]);
+        assert_eq!(Harmony::Analogous.offsets(), &[-30.0, 30.0]);
+        assert_eq!(Harmony::Triadic.offsets(), &[120.0, 240.0]);
+        assert_eq!(Harmony::Tetradic.offsets(), &[90.0, 180.0, 270.0]);
+        assert!(Harmony::Monochromatic.offsets().is_empty(), "it does not rotate at all");
+    }
+
+    /// And the angles reach the COLOURS: every derived swatch really is its offset away
+    /// from the base on the wheel. Checked in degrees rather than in bytes, because that is
+    /// what the harmony means; a byte comparison would pass on a table of literals.
+    #[test]
+    fn the_derived_swatches_land_on_their_own_angles() {
+        for h in Harmony::ALL {
+            let swatches = h.swatches(BASE);
+            for (offset, got) in h.offsets().iter().zip(swatches.iter().skip(1)) {
+                let want = (hue(BASE) + offset).rem_euclid(360.0);
+                let delta = (hue(*got) - want).abs().min(360.0 - (hue(*got) - want).abs());
+                assert!(
+                    delta < 1.5,
+                    "{}: {offset} degrees landed on {} rather than {want}",
+                    h.id(),
+                    hue(*got)
+                );
+            }
+        }
+    }
+
+    /// The BASE leads every ROTATION card (the owner's ask), and a card is never just the
+    /// base. Monochromatic is deliberately not in this rule (item 24): it is a ramp, and
+    /// the base sits at its own place inside it.
+    #[test]
+    fn every_rotation_card_leads_with_the_current_colour() {
+        for h in Harmony::ALL.into_iter().filter(|h| *h != Harmony::Monochromatic) {
+            let swatches = h.swatches(BASE);
+            assert_eq!(swatches[0], BASE, "{}", h.id());
+            assert!(swatches.len() >= 2, "{}: a card with nothing to compare", h.id());
+            assert_eq!(swatches.len(), 1 + h.offsets().len(), "{}", h.id());
+        }
+        assert_eq!(Harmony::Monochromatic.swatches(BASE).len(), MONOCHROME_STEPS);
+    }
+
+    /// A rotation keeps the colour's SATURATION and VALUE: that is what makes a card read
+    /// as one family rather than as five unrelated colours, and it is the whole reason
+    /// these rotate in HSV.
+    #[test]
+    fn a_rotation_keeps_the_vividness_it_started_with() {
+        let hsv = unit_to_hsv(BASE.to_unit());
+        for h in Harmony::ALL.into_iter().filter(|h| *h != Harmony::Monochromatic) {
+            for got in h.swatches(BASE).into_iter().skip(1) {
+                let got = unit_to_hsv(got.to_unit());
+                assert!((got[1] - hsv[1]).abs() < 0.02, "{}: saturation moved", h.id());
+                assert!((got[2] - hsv[2]).abs() < 0.02, "{}: value moved", h.id());
+            }
+        }
+    }
+
+    /// The companion of the companion is the colour you started with. Pinned because it is
+    /// the one relationship a user can check by eye, and a sign error in the rotation
+    /// survives every other test here.
+    #[test]
+    fn the_companion_of_the_companion_comes_home() {
+        let companion = Harmony::Complementary.swatches(BASE)[1];
+        let back = Harmony::Complementary.swatches(companion)[1];
+        for (a, b) in [(back.r, BASE.r), (back.g, BASE.g), (back.b, BASE.b)] {
+            assert!(a.abs_diff(b) <= 2, "{back:?} is not {BASE:?} again");
+        }
+    }
+
+    /// The values of a monochromatic card, in order, for the tests below.
+    fn ramp(base: Srgb) -> Vec<f64> {
+        Harmony::Monochromatic
+            .swatches(base)
+            .into_iter()
+            .map(|c| unit_to_hsv(c.to_unit())[2])
+            .collect()
+    }
+
+    /// MONOCHROMATIC is ONE ORDERED RAMP of the base's hue (DRAGON-682 item 24): same hue,
+    /// same saturation, values climbing dark to light, no duplicates, and the BASE itself
+    /// among the segments rather than in front of them.
+    #[test]
+    fn monochromatic_is_one_ordered_ramp_containing_its_base() {
+        let swatches = Harmony::Monochromatic.swatches(BASE);
+        assert_eq!(swatches.len(), MONOCHROME_STEPS);
+        let base_hsv = unit_to_hsv(BASE.to_unit());
+        for got in &swatches {
+            let hsv = unit_to_hsv(got.to_unit());
+            // A segment at value 0 is BLACK, which has no hue or saturation to compare:
+            // `unit_to_hsv` answers 0 for both, honestly. The ramp reaching black at its
+            // dark end is the feature, so the check is on the segments that have a colour.
+            if hsv[2] <= f64::EPSILON {
+                continue;
+            }
+            assert!((hsv[0] - base_hsv[0]).abs() < 1.5, "the hue moved to {}", hsv[0]);
+            assert!((hsv[1] - base_hsv[1]).abs() < 0.02, "the saturation moved");
+        }
+        let values = ramp(BASE);
+        assert!(
+            values.windows(2).all(|w| w[1] > w[0] + 0.01),
+            "the ramp must climb without repeating: {values:?}"
+        );
+        // The BASE is one of the segments, at its own value, not near it.
+        assert!(
+            values.iter().any(|v| (v - base_hsv[2]).abs() < 0.005),
+            "{values:?} does not contain the base's own value {}",
+            base_hsv[2]
+        );
+        // …and it sits where its value earns, not always first or always middle.
+        let at = values
+            .iter()
+            .position(|v| (v - base_hsv[2]).abs() < 0.005)
+            .expect("the base is in the ramp");
+        let want = (base_hsv[2] * (MONOCHROME_STEPS - 1) as f64).round() as usize;
+        assert_eq!(at, want, "the base sits at slot {at}, not the {want} its value earns");
+    }
+
+    /// The EDGES, which is where the two rules this replaced fell over: a base at black,
+    /// at white, and in the middle. Every one must give a climbing ramp with no duplicate
+    /// segments, inside the range, still containing its base.
+    #[test]
+    fn the_ramp_degrades_sensibly_at_black_white_and_grey() {
+        for (name, base) in [
+            ("black", Srgb::new(0, 0, 0)),
+            ("white", Srgb::new(255, 255, 255)),
+            ("mid grey", Srgb::new(128, 128, 128)),
+            ("near black", Srgb::new(12, 0, 0)),
+            ("near white", Srgb::new(255, 240, 240)),
+        ] {
+            let values = ramp(base);
+            let v = unit_to_hsv(base.to_unit())[2];
+            assert_eq!(values.len(), MONOCHROME_STEPS, "{name}");
+            assert!(
+                values.windows(2).all(|w| w[1] > w[0] + 0.01),
+                "{name}: {values:?} repeats or falls"
+            );
+            assert!(values.iter().all(|v| (0.0..=1.0).contains(v)), "{name}: out of range");
+            assert!(
+                values.iter().any(|got| (got - v).abs() < 0.005),
+                "{name}: {values:?} lost its own base value {v}"
+            );
+        }
+        // Black starts the ramp and white ends it, which is what "dark to light with the
+        // base at its own slot" means at the two extremes.
+        let black = ramp(Srgb::new(0, 0, 0));
+        assert!(black[0].abs() < 0.005, "black must be the first segment");
+        let white = ramp(Srgb::new(255, 255, 255));
+        assert!((white[MONOCHROME_STEPS - 1] - 1.0).abs() < 0.005, "white must be the last");
+    }
+
+    /// A GREY has no hue to rotate, so every rotation answers a grey: the harmonies are
+    /// honest about it rather than inventing a colour. Monochromatic still works, which is
+    /// the one that means anything there.
+    #[test]
+    fn an_achromatic_colour_has_no_hue_to_rotate() {
+        let grey = Srgb::new(128, 128, 128);
+        for h in Harmony::ALL.into_iter().filter(|h| *h != Harmony::Monochromatic) {
+            for got in h.swatches(grey).into_iter().skip(1) {
+                assert_eq!(got.r, got.g, "{}: a rotated grey is still grey", h.id());
+                assert_eq!(got.g, got.b, "{}", h.id());
+            }
+        }
+        let mono = Harmony::Monochromatic.swatches(grey);
+        assert!(mono[0] != mono[MONOCHROME_STEPS - 1], "the ramp still spreads a grey");
+    }
+
+    /// The labels are USER COPY and the ids are not: one may change, the other may not,
+    /// and neither may carry a dash the house style bans.
+    #[test]
+    fn the_names_are_distinct_and_house_style() {
+        let mut ids: Vec<&str> = Harmony::ALL.iter().map(|h| h.id()).collect();
+        ids.sort_unstable();
+        let n = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "two harmonies share an id");
+        for h in Harmony::ALL {
+            assert!(!h.label().is_empty(), "{}", h.id());
+            for text in [h.label(), h.hint()] {
+                assert!(!text.contains('\u{2014}'), "em dash in {}", h.id());
+                assert!(!text.contains('\u{2013}'), "en dash in {}", h.id());
+            }
+            // The HINT is a tooltip, so it is one short sentence and says so (item 23).
+            let hint = h.hint();
+            assert!(hint.ends_with('.'), "{}: {hint:?} is not a sentence", h.id());
+            assert_eq!(hint.matches('.').count(), 1, "{}: more than one sentence", h.id());
+            assert!(hint.len() <= 48, "{}: {} characters is not VERY short", h.id(), hint.len());
+            assert!(!hint.contains("colour"), "{}: US spelling, like the rest of the app", h.id());
+        }
+        // The owner's exact list, in the owner's order, with no "Colors" suffix anywhere
+        // (items 20 and 29).
+        assert_eq!(
+            Harmony::ALL.map(|h| h.label()),
+            ["Complementary", "Analogous", "Triadic", "Tetradic", "Monochromatic"]
+        );
+        for h in Harmony::ALL {
+            assert!(!h.label().contains("Colors"), "{} kept its suffix", h.id());
+        }
+    }
+}
+
 #[cfg(test)]
 mod mode_tests {
     use super::*;
@@ -1536,6 +2264,31 @@ mod mode_tests {
         }
     }
 
+    /// The stepper walks the owner's row order, wraps at both ends, and a full lap of
+    /// either sign comes home. That is the whole contract of the ARROW KEYS on the mode
+    /// activator (DRAGON-680, and DRAGON-630's first chevron pair).
+    #[test]
+    fn cycling_walks_the_owned_order_and_wraps() {
+        assert_eq!(ColorFormat::Hex.cycled(1), ColorFormat::Rgb);
+        assert_eq!(ColorFormat::Hex.cycled(-1), ColorFormat::Lab, "wraps backwards");
+        assert_eq!(ColorFormat::Lab.cycled(1), ColorFormat::Hex, "wraps forwards");
+        for f in ColorFormat::ALL {
+            assert_eq!(f.cycled(ColorFormat::ALL.len() as i32), f, "a full lap is home");
+            assert_eq!(f.cycled(0), f);
+        }
+    }
+
+    /// One step up and one step down are inverses, everywhere in the list. ArrowUp and
+    /// ArrowDown on the focused activator are one control with two directions, so a user
+    /// who overshoots by one press and corrects with the other has to land exactly where
+    /// they were.
+    #[test]
+    fn the_two_chevrons_undo_each_other() {
+        for f in ColorFormat::ALL {
+            assert_eq!(f.cycled(1).cycled(-1), f, "{}", f.id());
+            assert_eq!(f.cycled(-1).cycled(1), f, "{}", f.id());
+        }
+    }
 }
 
 /// DRAGON-630: the per-component boxes. What is pinned is the agreement between what a
@@ -1812,14 +2565,243 @@ mod gradient_raster_tests {
     fn the_swatch_circle_is_round_and_honest_about_alpha() {
         let c = Srgb::new(200, 10, 10);
         let d = 32;
-        let solid = swatch_circle_rgba(c, 255, d, [128, 128, 128]);
+        let solid = swatch_circle_rgba(c, 255, d, [128, 128, 128], 0.0);
         assert_eq!(px(&solid, d, 0, 0)[3], 0, "corners are outside the circle");
         assert_eq!(px(&solid, d, d / 2, d / 2), [200, 10, 10, 255]);
-        let seethrough = swatch_circle_rgba(c, 128, d, [128, 128, 128]);
+        let seethrough = swatch_circle_rgba(c, 128, d, [128, 128, 128], 0.0);
         assert_ne!(
             px(&seethrough, d, d / 2, d / 2),
             [200, 10, 10, 255],
             "half alpha mixes the board in"
+        );
+    }
+
+    /// DRAGON-680: the raster's own disc stops INSIDE the buffer, so the analytic ring the
+    /// view stacks over it covers the raster's edge completely.
+    ///
+    /// This is the property the whole fix rests on, and it is invisible on screen when it
+    /// is right (you see the ring) and invisible in the source when it is wrong (you see a
+    /// staircase, exactly as the owner did twice). So it is pinned as pixels: the last ring
+    /// of the buffer has to be fully transparent, and by at least the mask.
+    #[test]
+    fn the_raster_stops_inside_the_ring_that_masks_it() {
+        let c = Srgb::new(200, 10, 10);
+        let rim = [90u8, 90, 90];
+        // The size the window really rasters it at, with the mask it really passes.
+        let (d, inset) = (48u32, 1.0);
+        let buf = swatch_circle_rgba(c, 255, d, rim, inset);
+        // The INTERIOR is untouched: a solid colour, fully opaque.
+        assert_eq!(px(&buf, d, d / 2, d / 2), [200, 10, 10, 255]);
+        // The buffer's own outermost pixels, on the four axes where a circle reaches
+        // furthest, are transparent: the raster ends before the ring's outer edge.
+        for (x, y) in [(0, d / 2), (d - 1, d / 2), (d / 2, 0), (d / 2, d - 1)] {
+            assert_eq!(
+                px(&buf, d, x, y)[3],
+                0,
+                "({x}, {y}) is painted, so the raster reaches the ring's outer edge"
+            );
+        }
+        // With NO mask the same pixels would be painted, or the check above would pass on
+        // a raster that never had an edge there to begin with.
+        let flush = swatch_circle_rgba(c, 255, d, rim, 0.0);
+        assert!(px(&flush, d, 0, d / 2)[3] > 0, "a flush raster does reach the wall");
+        // And the fringe guard: a transparent pixel carries the rim's own colour rather
+        // than zeroed black, so any resample of this buffer cannot average a dark halo
+        // into the edge.
+        let corner = px(&buf, d, 0, 0);
+        assert_eq!(corner[3], 0, "the corner is outside the disc");
+        assert_eq!(&corner[..3], &rim[..], "a transparent pixel must carry the edge colour");
+    }
+
+    /// The mask really does eat into the disc rather than into the middle: a bigger mask
+    /// leaves a smaller painted disc, and the interior is the same colour either way.
+    #[test]
+    fn the_mask_only_takes_from_the_edge() {
+        let c = Srgb::new(200, 10, 10);
+        let rim = [90u8, 90, 90];
+        let painted = |inset: f64| -> usize {
+            let buf = swatch_circle_rgba(c, 255, 48, rim, inset);
+            (0..48u32)
+                .flat_map(|y| (0..48u32).map(move |x| (x, y)))
+                .filter(|(x, y)| px(&buf, 48, *x, *y)[3] > 0)
+                .count()
+        };
+        assert!(painted(2.0) < painted(1.0), "a wider mask must paint less");
+        assert!(painted(1.0) < painted(0.0));
+        for inset in [0.0, 1.0, 2.0] {
+            let buf = swatch_circle_rgba(c, 255, 48, rim, inset);
+            assert_eq!(px(&buf, 48, 24, 24), [200, 10, 10, 255], "inset {inset} moved the fill");
+        }
+    }
+
+    /// The rim band keeps its WEIGHT at any raster size: it is a fraction of the diameter,
+    /// so the band under the ring reads the same whatever resolution the buffer is built
+    /// at. (It is hidden by the ring in the shipped window; what it must not do is show a
+    /// DIFFERENT colour peeking past the ring's inner edge.)
+    #[test]
+    fn the_rim_weight_follows_the_raster_size() {
+        let c = Srgb::new(200, 10, 10);
+        let rim = [90u8, 90, 90];
+        // The share of a horizontal radius that is rim-coloured must match across sizes.
+        let rim_share = |d: u32| -> f64 {
+            let buf = swatch_circle_rgba(c, 255, d, rim, 0.0);
+            let n = (0..d)
+                .filter(|x| {
+                    let p = px(&buf, d, *x, d / 2);
+                    p[3] > 0 && p[..3] == rim[..]
+                })
+                .count();
+            n as f64 / d as f64
+        };
+        let (small, large) = (rim_share(48), rim_share(144));
+        assert!(small > 0.0 && large > 0.0, "both sizes draw a rim at all");
+        assert!(
+            (small - large).abs() < 0.05,
+            "the rim is {small:.3} of the disc at 48px and {large:.3} at 144px"
+        );
+    }
+
+    /// DRAGON-682 item 26: the panel's board is the TRANSPARENCY SLIDER's board, cell for
+    /// cell, so the two cannot drift. Compared by sampling both rather than by reading the
+    /// constant twice: what matters is that the same pixel is the same grey.
+    #[test]
+    fn the_panel_board_matches_the_transparency_sliders() {
+        let (w, h) = (120u32, 28u32);
+        let board = checkerboard_rgba(w, h, 0.0);
+        // A fully OPAQUE alpha strip is its own board with the colour laid over it at full
+        // strength, so its left edge (alpha 0) is pure board and is what to compare against.
+        let strip = alpha_strip_rgba(Srgb::new(0, 0, 0), w, h, 0.0);
+        for y in [0, 5, 9, 13, 20, 27] {
+            assert_eq!(
+                &px(&board, w, 0, y)[..3],
+                &px(&strip, w, 0, y)[..3],
+                "row {y}: the panel's board and the strip's differ"
+            );
+        }
+        // …and it really is the COARSER cell, not the history swatches': one fine cell
+        // along, the board has NOT flipped, which it would have on the old size.
+        assert_eq!(
+            px(&board, w, 0, 0)[..3],
+            px(&board, w, RECENT_CHECKER_CELL, 0)[..3],
+            "the board flipped at the history swatches' cell, so it is still the fine one"
+        );
+        assert_ne!(
+            px(&board, w, 0, 0)[..3],
+            px(&board, w, CHECKER_CELL, 0)[..3],
+            "one SHARED cell along must be the other grey"
+        );
+        assert_eq!(
+            px(&board, w, 0, 0)[..3],
+            px(&board, w, 2 * CHECKER_CELL, 0)[..3],
+            "two shared cells along is the same grey again"
+        );
+    }
+
+    /// DRAGON-682: the empty history slot's DOTTED outline. What matters is that it is a
+    /// ring (nothing in the middle), that it really dashes, and that it carries the ink it
+    /// was handed rather than a baked colour.
+    #[test]
+    fn the_empty_slot_outline_is_a_dotted_ring() {
+        let ink = [90u8, 90, 90];
+        let (w, h) = (28u32, 28u32);
+        let buf = dotted_outline_rgba(w, h, 6.0, ink);
+        // The MIDDLE is empty: this is an outline, not a fill.
+        for (x, y) in [(w / 2, h / 2), (w / 2, h / 2 + 3), (w / 3, h / 2)] {
+            assert_eq!(px(&buf, w, x, y)[3], 0, "({x}, {y}) is inside the ring");
+        }
+        // The top edge really alternates: some pixels are painted and some are not.
+        let top: Vec<u8> = (0..w).map(|x| px(&buf, w, x, 0)[3]).collect();
+        assert!(top.iter().any(|a| *a > 0), "the outline never paints");
+        assert!(top.contains(&0), "the outline is solid, not dotted");
+        // …with the ink it was given, so the caller's theme colour is what shows.
+        let lit = (0..w).map(|x| px(&buf, w, x, 0)).find(|p| p[3] > 0).expect("a lit dot");
+        assert_eq!(&lit[..3], &ink[..], "the outline invented its own colour");
+        // And a transparent pixel carries that ink too (the fringe guard every raster in
+        // this module follows).
+        assert_eq!(&px(&buf, w, w / 2, h / 2)[..3], &ink[..]);
+    }
+
+    /// The dash PERIOD is the same on the vertical runs as on the horizontal ones, which
+    /// is what makes it read as one dotted outline rather than as two different dashes
+    /// meeting at the corners.
+    #[test]
+    fn the_dots_march_at_one_period_on_both_axes() {
+        let (w, h) = (28u32, 28u32);
+        let buf = dotted_outline_rgba(w, h, 0.0, [90, 90, 90]);
+        let lit_run = |vals: Vec<u8>| -> usize { vals.iter().filter(|a| **a > 0).count() };
+        let top = lit_run((0..w).map(|x| px(&buf, w, x, 0)[3]).collect());
+        let left = lit_run((0..h).map(|y| px(&buf, w, 0, y)[3]).collect());
+        // Within one pixel: the two runs share a period but not a phase origin, because
+        // each corner is where the x-phase and the y-phase meet (the function's doc says
+        // so), and the tie there can hand one run a dot the other starts a pixel later.
+        assert!(
+            top.abs_diff(left) <= DOT_ON as usize,
+            "the two runs paint {top} and {left} dots, which is more than a corner's worth"
+        );
+        // Roughly the on/off ratio, not every other pixel.
+        let want = (w * DOT_ON / (DOT_ON + DOT_OFF)) as usize;
+        assert!(top.abs_diff(want) <= 2, "{top} dots along {w}px, expected about {want}");
+    }
+
+    /// DRAGON-680's HISTORY swatch: the left half is the colour with no transparency and
+    /// the right half is the colour at its real alpha over the checkerboard, so a
+    /// translucent entry says both "which colour" and "how transparent" at once.
+    #[test]
+    fn a_translucent_history_swatch_splits_down_the_middle() {
+        let c = Srgb::new(200, 10, 10);
+        let (w, h) = (28u32, 28u32);
+        let buf = recent_swatch_rgba(c, 128, w, h, 0.0);
+        let left = px(&buf, w, w / 4, h / 2);
+        let right = px(&buf, w, 3 * w / 4, h / 2);
+        assert_eq!(left, [200, 10, 10, 255], "the left half is the colour itself");
+        assert_ne!(right, left, "the right half shows the transparency");
+        // And the right half really is the board mixing through, not a flat dimming: two
+        // rows a checker cell apart differ, because the board's own squares differ. The
+        // cell is the HISTORY's own (DRAGON-680 item 26), read from the constant so the
+        // test cannot pass by accident on a different board.
+        let a = px(&buf, w, 3 * w / 4, 1);
+        let b = px(&buf, w, 3 * w / 4, 1 + RECENT_CHECKER_CELL);
+        assert_ne!(a, b, "the checkerboard shows through the transparent half");
+        // The history's board really is FINER than the shared one, or item 26 changed
+        // nothing: a swatch this size holds about seven cells instead of three.
+        const {
+            assert!(
+                RECENT_CHECKER_CELL * 2 <= CHECKER_CELL,
+                "item 26: the history's board must be about half the shared one"
+            )
+        };
+        assert!(w / RECENT_CHECKER_CELL >= 6, "the swatch holds too few cells to read");
+    }
+
+    /// An OPAQUE entry is a flat fill on both halves: nothing to compare, so no split is
+    /// drawn and the swatch looks exactly as it did before alpha entered the history.
+    #[test]
+    fn an_opaque_history_swatch_has_no_visible_split() {
+        let c = Srgb::new(200, 10, 10);
+        let (w, h) = (28u32, 28u32);
+        let buf = recent_swatch_rgba(c, 255, w, h, 0.0);
+        for x in [1, w / 4, w / 2, 3 * w / 4, w - 2] {
+            assert_eq!(
+                px(&buf, w, x, h / 2),
+                [200, 10, 10, 255],
+                "x={x} is not the flat colour"
+            );
+        }
+    }
+
+    /// A FULLY transparent entry is pure checkerboard on the right and the pure colour on
+    /// the left, which is the extreme the design has to survive: the swatch still says
+    /// which colour it is.
+    #[test]
+    fn a_fully_transparent_entry_still_names_its_colour() {
+        let c = Srgb::new(200, 10, 10);
+        let (w, h) = (28u32, 28u32);
+        let buf = recent_swatch_rgba(c, 0, w, h, 0.0);
+        assert_eq!(px(&buf, w, w / 4, h / 2), [200, 10, 10, 255]);
+        let right = px(&buf, w, 3 * w / 4, h / 2);
+        assert!(
+            right[0] == right[1] && right[1] == right[2],
+            "a zero-alpha half is the neutral board, got {right:?}"
         );
     }
 }

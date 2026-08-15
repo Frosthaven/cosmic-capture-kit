@@ -280,6 +280,107 @@ points to.
   verb (`preview_ipc::Request::Color`, addressed by pid from `CCK_COLOR_TO_PID`) and
   opens no window at all.
 
+  **The result window's own layout is DRAGON-630's, as revised by DRAGON-680** (the
+  owner's polish pass; every part of it is a fixed size, so `geom::color_window_size`
+  derives the whole window, 366 x 542): the saturation/value square, a controls row
+  (pipette, copy button, round current-colour swatch, hue and alpha strips), one value
+  row (the boxes with the mode stepper at their right end, then their caption band), a
+  divider carrying the "Add color" button, and two rows of history swatches. What
+  DRAGON-680 changed, all of it owner-driven, with the reasons kept as tombstones in
+  `geom` and `view`: the value row's split-vs-unified LAYOUT is a property of the mode (hex
+  is one unified box, everything else per-component) rather than a persisted toggle, so
+  `color_picker_split_inputs` left the schema; the mode dropdown's CHIP became a bare
+  up/down chevron unit beside the boxes (its MENU is unchanged and still opens upward, now
+  right-aligned through `chrome::FlyoutDir::UpRight`), which deleted the whole mode ROW and
+  40pt of window height; changing the mode no longer copies to the clipboard (only the copy
+  button and the pick do); the copy button ended up at the HEAD of the value input row at
+  the pipette's 48pt size, which is what widened the content to 388 (so CMYK's five boxes
+  keep their 55pt) and made the box band 48 tall; and the slider thumbs went 90% opaque.
+  The history keeps a right-click menu with one entry, "Remove from recents", and
+  Backspace or Delete does the same to the hovered swatch, or to the selected one while the
+  history holds the focus ring, and NEVER while a value box has the caret
+  (`geom::remove_target`).
+
+  **The window owns its own Tab ring** (`geom::PickerFocus` / `geom::next_focus`): the
+  value boxes in order, then the mode activator, then the whole colour history as ONE
+  stop, then round again, forwards and backwards. It has to, because libcosmic's
+  `keyboard_nav` drives iced's `focus_next` over every `operation.focusable` widget and a
+  cosmic BUTTON is one, so the toolkit's cycle walked the pipette, the copy button, Add
+  color and eighteen swatches; the picker turns that off for its own process
+  (`Core::set_keyboard_nav(false)`) and answers Tab in `keyboard.rs`. Only the boxes take
+  real toolkit focus; the other two stops draw the same accent frame from app state, with
+  the toolkit's focus parked on an id no widget carries. Arrows then belong to whichever
+  stop holds focus: up/down step the notation on the activator, and all four move the
+  selected swatch through the history, loading each as a click does. The pure list and
+  grid rules live in `src/keynav.rs`, shared with the preview editor's flyouts.
+
+  **The side PANEL** (DRAGON-682): a toggle in the header's end region doubles the window's
+  width, and the second half is the settings window's own `tab_bar` strip (Harmonies, Saved
+  Palettes, each with its icon) over a scrollable. The Harmonies tab lists five relationship
+  cards, recalculated from the current colour on every redraw: monochromatic, analogous,
+  complementary (180 degrees), triadic (120/240) and tetradic (90/180/270), all pure in
+  `color::Harmony`. The rotations keep the base's saturation and value and lead with the base;
+  MONOCHROMATIC is deliberately different, one ordered dark-to-light ramp of the base's hue
+  with the base at the slot its own value earns and the step sized to the room on both sides
+  (`color::monochrome_ramp`). Each card's swatches are ONE full-width segmented bar, no gaps,
+  rounded at the bar's two ends only, drawn at the window's current alpha over a single shared
+  checkerboard. Clicking a segment APPLIES it as the current colour (DRAGON-687's
+  follow-up run reversed the original click-does-nothing rule), and every discrete
+  replacement of the active colour first FILES the outgoing colour into the recents if
+  the history does not hold it (`geom::files_outgoing`, the one bump inside
+  `apply_picker_color`; continuous edits are exempt). Segments carry the shared adaptive
+  hex card (`view::swatch_card`: the overlay chip's own dress, ink and border flipped by
+  `Srgb::wants_dark_text`, one builder for hover tooltips and keyboard-pinned cards
+  alike) and a right-click menu ("Set as active color", the click's exact path, and
+  "Copy" in the remembered notation, which deliberately does NOT light the main copy
+  button). The main round swatch wears the same card and its own menu (add to
+  recents / add to palette / copy, and pointedly no set-active). Expanding RESIZES a window pinned by `min_size == max_size`, so the
+  lock is released, the window resized and the lock re-applied at the new size, chained
+  rather than batched; the picker's own column is laid out at a FIXED width in both states
+  so nothing in it moves. Both the expanded flag and the active tab are persisted
+  (`color_picker_expanded`, `color_picker_panel_tab`).
+
+  **The Saved Palettes tab** (DRAGON-687) is the panel's second tab made real: named,
+  ordered colour groups (`geom::Palette`, colours in the recents' own hex spelling),
+  persisted in their OWN `palettes.toml` beside the config (`state::palettes`: same
+  `app_config_dir` rule, same test sandboxing, same last-writer-wins write), so a factory
+  reset never touches them; a fresh install starts with the Catppuccin Latte and
+  Mocha palettes (MIT-licensed values, provenance at the constant; all four flavours
+  until the owner's trim), the default applying only
+  while the FILE is absent so deleting them sticks. Each group also carries a pipette
+  button whose pick files STRAIGHT into that group across the process gap (the `color`
+  verb's `palette=` nonce, protocol v5; the window keeps the `(index, name)` snapshot and
+  degrades to an ordinary pick when the group is gone). The pinned create row is the tab's TOOLBAR: a sort icon (the
+  six sorts' flyout, moved here from the group menus) and a search icon that expands
+  into the app's one search field (`widgets::search_input`, the settings header's own,
+  filtering group names live; `geom::visible_palettes`), then "New Palette", which
+  clears any filter, PREPENDS a group at the top and opens its name inline in a mostly
+  transparent editor (Enter or focus loss commits, Escape reverts). Each group is a
+  heading (hover pencil, drag to reorder or off-window to delete, right-click for
+  Delete palette) over a full-width palette bar, with the pipette and a plus button
+  ("Add current color") in the title row. Every colour add APPENDS at the end and
+  duplicates are no-ops; an intra-group drag reorders (analytic insertion line) and a
+  cross-group drag COPIES (the menus keep the explicit Move). Under a filter,
+  geometry and gestures live in visible-ROW space and every mutation resolves back to
+  REAL indices in the handlers; the LIST view is virtualized
+  (`geom::visible_row_window`: only the viewport's rows plus a small buffer become
+  widgets, spacers carry the rest, an open rename's row is always kept built). The
+  drop machine's palette hit tests go through the panel scrollable's mirrored offset
+  (`geom::PanelShape`, visible rows), and a live drag near the scroll viewport's edges
+  auto-scrolls the list on a bounded ramp (`geom::drag_autoscroll_velocity`), armed
+  only once the pointer has been outside the bands so a drag born in one moves
+  nothing. Group deletion always confirms, through the
+  settings window's own `stack_dialog` modal; palette COLOURS never do. Ctrl+Tab and
+  Ctrl+Shift+Tab cycle the panel's tabs (and the settings window's in-page strips), on
+  Control on every platform (`shortcuts::tab_cycle_step`).
+
+  Filing a colour into the history moved off plain Enter onto primary+Enter
+  (`shortcuts::is_add_color_chord`) and copying gained primary+Shift+C
+  (`is_copy_value_chord`, Shift-qualified so the boxes keep their own bare copy binding);
+  both chords are named in their buttons' tooltips. The history keeps ALPHA
+  (`geom::Recent`), drawing a translucent entry as a split swatch, opaque colour on the
+  left and the colour over a checkerboard on the right.
+
   **Four entry points, one argv.** The tray / menu-bar entry
   (`recording_ui::CaptureAction::ColorPicker`, first in the idle menu, before
   Scanner), the preview editor's toolbar pipette (`PreviewMsg::OpenColorPicker`,
@@ -326,8 +427,12 @@ points to.
   the field's doc says why so it is not re-argued), `selection_box_thickness` (the
   magnifier's accent ring, the same width the region box uses, which is what DRAGON-582
   asked for), and the theme's rounding token (every swatch in the window, one lookup, so
-  they cannot drift). `recent_colors` is the one field it WRITES: `#RRGGBB` strings,
-  newest first, capped at `geom::RECENTS_CAP` (20, two rows of ten since DRAGON-649).
+  they cannot drift). `recent_colors` is the one field it WRITES: hex strings, newest
+  first, capped at `geom::RECENTS_CAP` (18, two rows of nine since DRAGON-676 traded
+  width for it; 20 through DRAGON-649). Since DRAGON-680 an entry carries its ALPHA, so
+  it is written `#RRGGBBAA` when translucent and `#RRGGBB` when not, and both shapes are
+  read back (`geom::Recent::parse`), which is also the migration: every entry any older
+  build wrote loads opaque.
   It is persisted because the app is
   one-shot, so an in-memory list would be empty at every window open and the feature
   would do nothing. It is also user CONTENT, so it goes to the config and never to the

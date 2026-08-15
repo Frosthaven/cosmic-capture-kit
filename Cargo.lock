@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-capture-kit"
-version = "0.32.0"
+version = "0.33.0"
 dependencies = [
  "arboard",
  "ashpd 0.12.3",
@@ -1736,7 +1736,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 
 [[package]]
 name = "drm"
@@ -7094,8 +7094,7 @@ dependencies = [
 [[package]]
 name = "wgpu-hal"
 version = "28.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44d6cb474beb218824dcc9e1ce679d973f719262789bfb27407da560cac20eeb"
+source = "git+https://github.com/Frosthaven/wgpu-hal.git?branch=cck-dx12-resize-latency#1df0db3731292285ab70fc68dc0a8a4966258810"
 dependencies = [
  "android_system_properties",
  "arrayvec",
@@ -7631,7 +7630,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 [[package]]
 name = "winit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "bitflags 2.13.0",
  "cfg_aliases",
@@ -7657,7 +7656,7 @@ dependencies = [
 [[package]]
 name = "winit-android"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "android-activity",
  "bitflags 2.13.0",
@@ -7672,7 +7671,7 @@ dependencies = [
 [[package]]
 name = "winit-appkit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "bitflags 2.13.0",
  "block2 0.6.2",
@@ -7694,7 +7693,7 @@ dependencies = [
 [[package]]
 name = "winit-common"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "memmap2 0.9.11",
  "objc2 0.6.4",
@@ -7709,7 +7708,7 @@ dependencies = [
 [[package]]
 name = "winit-core"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "bitflags 2.13.0",
  "cursor-icon",
@@ -7723,7 +7722,7 @@ dependencies = [
 [[package]]
 name = "winit-orbital"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "bitflags 2.13.0",
  "dpi",
@@ -7739,7 +7738,7 @@ dependencies = [
 [[package]]
 name = "winit-uikit"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "bitflags 2.13.0",
  "block2 0.6.2",
@@ -7759,7 +7758,7 @@ dependencies = [
 [[package]]
 name = "winit-wayland"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "ahash",
  "bitflags 2.13.0",
@@ -7785,7 +7784,7 @@ dependencies = [
 [[package]]
 name = "winit-web"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "atomic-waker",
  "bitflags 2.13.0",
@@ -7807,7 +7806,7 @@ dependencies = [
 [[package]]
 name = "winit-win32"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "bitflags 2.13.0",
  "cursor-icon",
@@ -7823,7 +7822,7 @@ dependencies = [
 [[package]]
 name = "winit-x11"
 version = "0.31.0-beta.2"
-source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#465c8fecf42cf35b8991b2a6c1f1bf52d2f0205e"
+source = "git+https://github.com/Frosthaven/winit.git?branch=cck-corner-fix#b97378f505662e769dc2eba60b49681c9302446b"
 dependencies = [
  "bitflags 2.13.0",
  "bytemuck",

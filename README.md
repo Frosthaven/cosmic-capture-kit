@@ -420,13 +420,13 @@ and `--countdown`.
 
 Cosmic Capture Kit makes an effort to play nicely with popular tiling window
 managers. The overlay tools will bypass tiling, while the preview editor, the
-settings window, the color picker's result window, and (macOS only) the
-permission checker window will not by default. You can change this behavior
-using the information below.
+settings window, the palette viewer (the color picker's result window), and
+(macOS only) the permission checker window will not by default. You can change
+this behavior using the information below.
 
 * Settings window: title `CCK Settings`
 * Preview editor window: title `CCK Preview Editor`
-* Color picker window: title `CCK Color Picker`
+* Palette viewer window: title `CCK Palette Viewer`
 * Permission checker window (macOS only): title `CCK Permissions`
 * All four share application id `dev.thedragon.CosmicCaptureKit`
 
@@ -457,7 +457,7 @@ if.window-title-regex-substring = 'CCK Preview Editor'
 run = ['layout floating']
 
 [[on-window-detected]]
-if.window-title-regex-substring = 'CCK Color Picker'
+if.window-title-regex-substring = 'CCK Palette Viewer'
 run = ['layout floating']
 
 [[on-window-detected]]
@@ -480,7 +480,7 @@ insensitive substring.
 ```sh
 yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Settings$" manage=off
 yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Preview Editor$" manage=off
-yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Color Picker$" manage=off
+yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Palette Viewer$" manage=off
 yabai -m rule --add app="^Cosmic Capture Kit$" title="^CCK Permissions$" manage=off
 ```
 
@@ -506,7 +506,7 @@ window_rules:
     match:
       - window_title: { equals: "CCK Settings" }
       - window_title: { equals: "CCK Preview Editor" }
-      - window_title: { equals: "CCK Color Picker" }
+      - window_title: { equals: "CCK Palette Viewer" }
 ```
 
 This is the v3 config format. Reload with `wm-reload-config` (`alt+shift+r` by
@@ -529,7 +529,7 @@ Merge this key into your existing `komorebi.json`; it is not the whole file:
   "floating_applications": [
     { "kind": "Title", "id": "CCK Settings", "matching_strategy": "Equals" },
     { "kind": "Title", "id": "CCK Preview Editor", "matching_strategy": "Equals" },
-    { "kind": "Title", "id": "CCK Color Picker", "matching_strategy": "Equals" }
+    { "kind": "Title", "id": "CCK Palette Viewer", "matching_strategy": "Equals" }
   ]
 }
 ```
@@ -553,7 +553,7 @@ Apply it with `komorebic replace-configuration <path>`. Note that
 [
   (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "CCK Settings"),
   (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "CCK Preview Editor"),
-  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "CCK Color Picker"),
+  (enabled: true, appid: "dev.thedragon.CosmicCaptureKit", title: "CCK Palette Viewer"),
 ]
 ```
 
@@ -583,7 +583,7 @@ hl.window_rule({
 })
 
 hl.window_rule({
-  match = { title = "CCK Color Picker" },
+  match = { title = "CCK Palette Viewer" },
   float = true,
 })
 ```
@@ -593,7 +593,7 @@ hl.window_rule({
 ```
 windowrule = float, title:CCK Settings
 windowrule = float, title:CCK Preview Editor
-windowrule = float, title:CCK Color Picker
+windowrule = float, title:CCK Palette Viewer
 ```
 
 0.53 and 0.54 use an intermediate form; the 0.54 wiki has it. Matching is RE2
@@ -615,7 +615,7 @@ firing, match `class:dev\.thedragon\.CosmicCaptureKit` instead.
 window-rule {
     match title=r#"^CCK Settings$"#
     match title=r#"^CCK Preview Editor$"#
-    match title=r#"^CCK Color Picker$"#
+    match title=r#"^CCK Palette Viewer$"#
     open-floating true
 }
 ```
@@ -640,7 +640,7 @@ which must be executable:
 ```sh
 riverctl rule-add -title 'CCK Settings' float
 riverctl rule-add -title 'CCK Preview Editor' float
-riverctl rule-add -title 'CCK Color Picker' float
+riverctl rule-add -title 'CCK Palette Viewer' float
 ```
 
 Matching here is glob, not regex, so there is no alternation and each title needs
@@ -659,7 +659,7 @@ its own rule. The rules apply to windows opened after they are added, and
 ```
 for_window [title="^CCK Settings$"] floating enable
 for_window [title="^CCK Preview Editor$"] floating enable
-for_window [title="^CCK Color Picker$"] floating enable
+for_window [title="^CCK Palette Viewer$"] floating enable
 ```
 
 Criteria are PCRE2 and unanchored, so the `^` and `$` are doing real work.
@@ -682,7 +682,7 @@ float action at all:
 
 ```ini
 [simple-tile]
-tile_by_default = !((title is "CCK Settings") | ((title is "CCK Preview Editor") | (title is "CCK Color Picker")))
+tile_by_default = !((title is "CCK Settings") | ((title is "CCK Preview Editor") | (title is "CCK Palette Viewer")))
 ```
 
 Criteria here are not regex: `is` is exact and `contains` is a substring.

@@ -1182,8 +1182,10 @@ impl App {
                         );
                         // Only when meaningfully off — the open-time size is composed-
                         // dims-exact on the deferred-swap path, so this is a belt for
-                        // the hidpi/external cases (note: window::resize is dropped on
-                        // COSMIC for these windows — the deferred swap is the real fix).
+                        // the hidpi/external cases. (This said "window::resize is
+                        // dropped on COSMIC for these windows"; that cause was wrong,
+                        // it was winit skipping client resizes while tiled, and our
+                        // fork fixes it. See FORKED_CHANGES.md patch 4, DRAGON-684.)
                         ((want.0 - p.monitor.0 as f32).abs() > 2.0
                             || (want.1 - p.monitor.1 as f32).abs() > 2.0)
                             .then(|| {

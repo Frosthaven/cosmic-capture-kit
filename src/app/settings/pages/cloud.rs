@@ -1981,7 +1981,8 @@ impl crate::app::App {
             CloudAddStep::Failed { message, retry } => cloud_failed_step(spec, message, *retry),
             CloudAddStep::Setup => cloud_setup_step(add, spec),
         };
-        let stacked = stack_dialog(window, card.max_width(560.0).into(), None);
+        let stacked =
+            stack_dialog(window, card.max_width(560.0).into(), None, Msg::WindowChrome(WindowChromeMsg::ConfigWindowDrag));
         // The folder delete confirmation (DRAGON-506) is stacked over the step that raised it,
         // by handing the whole composition back in as this one's "window". The step underneath
         // keeps its INERT backdrop and this one gets a DISMISSING one, which is the same split
@@ -2016,6 +2017,7 @@ impl crate::app::App {
             stacked,
             card.max_width(480.0).into(),
             Some(cm(CloudSettingsMsg::FolderDeleteCancel)),
+            Msg::WindowChrome(WindowChromeMsg::ConfigWindowDrag),
         )
     }
 
@@ -2053,6 +2055,7 @@ impl crate::app::App {
             window,
             card.max_width(480.0).into(),
             Some(cm(CloudSettingsMsg::DisconnectCancel)),
+            Msg::WindowChrome(WindowChromeMsg::ConfigWindowDrag),
         )
     }
 
@@ -2821,7 +2824,9 @@ fn cloud_setup_step<'a>(add: &'a CloudAdd, spec: &'static ProviderSpec) -> widge
             add.account.as_ref().map(|a| a.label.clone()).unwrap_or_default(),
         )
         .on_input(|text| cm(CloudSettingsMsg::AccountLabelInput(text)))
-        .width(Length::Fill),
+        .width(Length::Fill)
+        // DRAGON-680: the app's softened text-selection fill.
+        .style(crate::app::theme::input_style(crate::app::theme::InputBase::Default)),
     );
     if let Some(note) = add.folder_note.as_deref() {
         control = control.push(warning_caption(note));
@@ -3565,7 +3570,9 @@ fn new_folder_row<'a>(
         widget::text_input(words.name_placeholder, typed)
             .on_input(|text| cm(CloudSettingsMsg::FolderCreateInput(text)))
             .on_submit(|_| cm(CloudSettingsMsg::FolderCreateSubmit))
-            .width(Length::Fill),
+            .width(Length::Fill)
+            // DRAGON-680: the app's softened text-selection fill.
+            .style(crate::app::theme::input_style(crate::app::theme::InputBase::Default)),
     );
     for (icon, tooltip, message) in [
         ("emblem-ok-symbolic", words.create_submit, CloudSettingsMsg::FolderCreateSubmit),

@@ -45,6 +45,15 @@ fn legacy_ron_path() -> Option<PathBuf> {
 pub fn load() -> Persisted {
     let mut p = load_raw().unwrap_or_else(defaults);
     migrate(&mut p);
+    // DRAGON-687: a config still carrying the legacy palettes key gets its list into
+    // `palettes.toml` HERE, not only on the picker's own load path. Every `save` drops
+    // the key (`skip_serializing`), and some savers never load palettes at all (the
+    // resident daemons, `note_encoder_auto_hint`), so without this a load-modify-save
+    // from one of them could orphan a config-era list before any picker process moved
+    // it. Idempotent, and free for every post-migration config (the key is absent).
+    if let Some(legacy) = &p.saved_palettes {
+        super::palettes::migrate_legacy_palettes(legacy);
+    }
     p
 }
 
@@ -760,6 +769,22 @@ record_fps = 60\n";
         assert!(!old.win_login_item_seeded, "an old config without the key loads false");
     }
 
+    // DRAGON-683: the Linux first-run autostart seed marker, the same one-time-marker rules
+    // as the Windows one above: starts unset (which IS the one-time trigger), survives a save
+    // round trip (so the seed never re-runs and re-overrides an explicit removal), and loads
+    // false from an old config that predates the field, no config_version bump.
+    #[test]
+    fn linux_seed_marker_round_trips() {
+        assert!(!defaults().linux_login_item_seeded, "the seed marker starts unset");
+        let mut p = defaults();
+        p.linux_login_item_seeded = true;
+        let s = toml::to_string(&p).expect("serialize");
+        let q: Persisted = toml::from_str(&s).expect("parse back");
+        assert!(q.linux_login_item_seeded, "a set marker survives a save round trip");
+        let old: Persisted = toml::from_str("record_dir = \"~/Videos\"").expect("parse");
+        assert!(!old.linux_login_item_seeded, "an old config without the key loads false");
+    }
+
     // The remembered STEP-MARKER side is persisted (it used to be session-only): a set value
     // must survive a save so a later launch spawns markers at it, and an old config that
     // predates the key must load as UNSET (0.0) — which the reader turns into
@@ -1280,6 +1305,151 @@ config_version = 8\n";
         let q: super::Persisted =
             ron::from_str(ron_on_disk).expect("a legacy RON preview_float_cosmic key must not fail");
         assert_eq!(q.record_dir, "~/Videos", "other settings survive in RON too");
+    }
+
+    #[test]
+    fn old_color_picker_split_inputs_key_is_ignored_on_load() {
+        // DRAGON-680 removed the `color_picker_split_inputs` setting: the picker's value
+        // row layout is a property of the MODE now (hex is one unified box, everything
+        // else splits), so there is nothing to remember. Every config written by a build
+        // that had the toggle carries the key (it was always serialized, both values), so
+        // serde must silently DROP it: an unknown key must never fail the parse, because
+        // `load()` answers a failed parse with `defaults()`, which would wipe the user's
+        // recents, their remembered mode and every other setting. Same treatment as the
+        // retired `recording_tray` / `preview_float_cosmic` / `allow_multiple` keys, and
+        // both on-disk formats are covered.
+        for value in ["true", "false"] {
+            let toml_on_disk = format!(
+                "record_dir = \"~/Videos\"\ncolor_picker_split_inputs = {value}\n\
+                 color_picker_mode = \"oklch\"\n"
+            );
+            let p: super::Persisted = toml::from_str(&toml_on_disk).unwrap_or_else(|e| {
+                panic!("a retired color_picker_split_inputs = {value} must not fail: {e}")
+            });
+            assert_eq!(p.record_dir, "~/Videos", "other settings survive the retired key");
+            assert_eq!(
+                p.color_picker_mode, "oklch",
+                "the picker's OWN surviving settings come through too"
+            );
+        }
+
+        let ron_on_disk =
+            "(record_dir: \"~/Videos\", color_picker_split_inputs: true, color_picker_mode: \"rgb\")";
+        let q: super::Persisted = ron::from_str(ron_on_disk)
+            .expect("a legacy RON color_picker_split_inputs key must not fail");
+        assert_eq!(q.record_dir, "~/Videos", "other settings survive in RON too");
+        assert_eq!(q.color_picker_mode, "rgb");
+
+        // And the key is never WRITTEN again: a fresh save carries no trace of it.
+        let s = toml::to_string(&defaults()).expect("serialize");
+        assert!(
+            !s.contains("color_picker_split_inputs"),
+            "the retired key came back into the written config: {s}"
+        );
+    }
+
+    /// DRAGON-680: the recents keep their ALPHA, and a history written by any older build
+    /// still loads. The SCHEMA side is just strings, so what this pins is that both
+    /// spellings survive a round trip through the config and come back as the same
+    /// entries.
+    #[test]
+    fn recent_colors_carry_alpha_and_legacy_entries_still_load() {
+        use crate::app::color_picker::geom::Recent;
+        use crate::color::Srgb;
+        // A config written by an older build: six-digit entries only.
+        let legacy = "recent_colors = [\"#FF8800\", \"#0000FF\"]\n";
+        let p: super::Persisted = toml::from_str(legacy).expect("a legacy history must load");
+        let entries: Vec<Recent> =
+            p.recent_colors.iter().filter_map(|s| Recent::parse(s)).collect();
+        assert_eq!(
+            entries,
+            vec![
+                Recent::opaque(Srgb::new(255, 136, 0)),
+                Recent::opaque(Srgb::new(0, 0, 255))
+            ],
+            "an alpha-less entry loads OPAQUE"
+        );
+        // And this build's own shape, mixed, round-trips through the file.
+        let mine = vec![Recent::new(Srgb::new(255, 136, 0), 128), Recent::opaque(Srgb::new(1, 2, 3))];
+        let mut wrote = defaults();
+        wrote.recent_colors = mine.iter().map(|e| e.hex()).collect();
+        let s = toml::to_string(&wrote).expect("serialize");
+        let back: super::Persisted = toml::from_str(&s).expect("parse back");
+        let read: Vec<Recent> =
+            back.recent_colors.iter().filter_map(|s| Recent::parse(s)).collect();
+        assert_eq!(read, mine, "alpha survives the config");
+        assert!(
+            s.contains("#FF880080") && s.contains("#010203"),
+            "the opaque entry must still be written with SIX digits: {s}"
+        );
+    }
+
+    /// DRAGON-687: the LEGACY in-config palettes key (one merge window; the palettes live
+    /// in `palettes.toml` now, `state::palettes`). What is pinned here is exactly what
+    /// the migration needs: absent and present-empty read as DIFFERENT values (a
+    /// config-era deletion migrates as a deletion), a present list still parses whole so
+    /// the owner's QA palettes survive the move, and the key is never WRITTEN again.
+    #[test]
+    fn the_legacy_config_palettes_key_reads_for_migration_and_never_writes() {
+        // A config with no key: `None`, which the migration reads as "nothing to move".
+        let old: super::Persisted =
+            toml::from_str("record_dir = \"~/Videos\"\n").expect("an old config must load");
+        assert_eq!(old.saved_palettes, None, "absent key reads as None");
+        // A config-era config with palettes: the list parses whole, order and all.
+        let qa: super::Persisted = toml::from_str(
+            "[[saved_palettes]]\nname = \"Sunset\"\ncolors = [\"#FF8800\", \"#FF880080\"]\n\
+             [[saved_palettes]]\nname = \"Empty\"\ncolors = []\n",
+        )
+        .expect("a config-era config must load");
+        let list = qa.saved_palettes.expect("present key reads as Some");
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].name, "Sunset");
+        assert_eq!(list[0].colors, vec!["#FF8800".to_string(), "#FF880080".to_string()]);
+        // A config-era DELETION: present and empty is `Some([])`, not `None`.
+        let deleted: super::Persisted =
+            toml::from_str("saved_palettes = []\n").expect("an emptied config must load");
+        assert_eq!(deleted.saved_palettes, Some(Vec::new()));
+        // And the key is retired from every future write (`skip_serializing`).
+        let mut wrote = defaults();
+        wrote.saved_palettes = Some(vec![crate::state::SavedPalette {
+            name: "Sunset".into(),
+            colors: vec!["#FF8800".into()],
+        }]);
+        let text = toml::to_string(&wrote).expect("serialize");
+        assert!(
+            !text.contains("saved_palettes"),
+            "the legacy key must never be written again: {text}"
+        );
+    }
+
+    /// DRAGON-682: the colour picker's panel remembers whether it is open and
+    /// which tab it is on. Both are new keys, so what this pins is the round trip and the
+    /// two defaults an EXISTING config falls back to: closed, on Harmonies.
+    #[test]
+    fn the_picker_panel_state_round_trips_and_defaults_safely() {
+        use crate::app::color_picker::geom::PanelTab;
+        // A config written before this ticket carries neither key.
+        let old: super::Persisted =
+            toml::from_str("record_dir = \"~/Videos\"\n").expect("an old config must load");
+        assert!(!old.color_picker_expanded, "an existing window opens collapsed");
+        assert_eq!(
+            PanelTab::from_id(&old.color_picker_panel_tab),
+            PanelTab::Harmonies,
+            "and on the tab that has content"
+        );
+        // And this build's own shape survives the file.
+        let mut wrote = defaults();
+        wrote.color_picker_expanded = true;
+        wrote.color_picker_panel_tab = PanelTab::Palettes.id().to_string();
+        let text = toml::to_string(&wrote).expect("serialize");
+        let back: super::Persisted = toml::from_str(&text).expect("parse back");
+        assert!(back.color_picker_expanded);
+        assert_eq!(PanelTab::from_id(&back.color_picker_panel_tab), PanelTab::Palettes);
+        // A hand-edited tab nobody recognises falls back rather than opening a tab that
+        // does not exist.
+        let junk: super::Persisted =
+            toml::from_str("color_picker_panel_tab = \"nope\"\n").expect("parse");
+        assert_eq!(PanelTab::from_id(&junk.color_picker_panel_tab), PanelTab::Harmonies);
     }
 
     #[test]

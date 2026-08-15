@@ -2421,6 +2421,24 @@ pub(in crate::app) enum FlyoutDir {
     /// room-below auto-flip (which fails on the fullscreen overlay, where there is always
     /// room below the bottom bar). Requires a FIXED-height panel so the offset is exact.
     Up(f32),
+    /// [`Self::Up`], but RIGHT-aligned: the panel's right edge lands on the anchor's instead of
+    /// its left edge on the anchor's left (DRAGON-680). `dx` is how far LEFT of the anchor's own
+    /// left edge the panel starts, i.e. the panel's width minus the anchor's.
+    ///
+    /// It exists for an anchor that sits at the RIGHT EDGE of its container, where left-aligning
+    /// would run the panel off the window and get it clipped: the colour picker window's mode
+    /// activator is at the end of its row with only the window padding beyond it. Same exact
+    /// upward offset and the same fixed-height requirement as `Up`; only the horizontal
+    /// alignment differs, so a caller that has room on the right should keep using `Up`.
+    UpRight { panel_h: f32, dx: f32 },
+    /// A FITTED placement (DRAGON-687 follow-up): the exact `Position::Point` offsets,
+    /// already computed by the caller from the CURRENT page's measured size
+    /// (`color_picker::geom::menu_fit`, which prefers the historical upward placement and
+    /// flips or slides only when that would clip the window). It exists because the
+    /// colour picker's page-swapping menus change size after opening, so no fixed
+    /// direction can promise to fit; the fixed variants stay for every anchor whose panel
+    /// has one known size.
+    At { x: f32, y: f32 },
     /// Anchor on the TOP toolbar → expand DOWNWARD (DRAGON-357 item 14). Uses the popover's own
     /// `Position::Bottom` (the popup's top at the anchor button's bottom, centered under it), so
     /// the top-bar dropdowns (text SIZE + text FONT) open DOWN into the canvas — no reliance on a
@@ -2452,6 +2470,16 @@ pub(in crate::app) fn flyout<'a>(
     let position = match dir {
         FlyoutDir::Up(panel_h) => {
             widget::popover::Position::Point(cosmic::iced::Point::new(0.0, -panel_h))
+        }
+        // The same `Point` placement, moved left by the panel's overhang so its RIGHT edge
+        // lands on the anchor's (DRAGON-680; see the variant's doc for the anchor that needs
+        // it). Negative x is left, exactly as negative y is up.
+        FlyoutDir::UpRight { panel_h, dx } => {
+            widget::popover::Position::Point(cosmic::iced::Point::new(-dx, -panel_h))
+        }
+        // The caller's own fitted offsets, verbatim (see the variant's doc).
+        FlyoutDir::At { x, y } => {
+            widget::popover::Position::Point(cosmic::iced::Point::new(x, y))
         }
         FlyoutDir::Down => widget::popover::Position::Bottom,
     };

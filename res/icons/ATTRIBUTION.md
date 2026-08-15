@@ -13,10 +13,21 @@ macOS and Windows. `src/widgets/icons.rs` is the one resolver.
 
 ## Lucide (the UI set, DRAGON-324)
 
-100 glyphs, chosen by what each control DOES rather than by an old freedesktop
+106 glyphs, chosen by what each control DOES rather than by an old freedesktop
 name. (The count is the number of `.svg` files in `lucide/`; it read 90 against
-93 files until DRAGON-614, and 96 against 99 until DRAGON-659, so re-count
-rather than trusting the line.) The SVGs
+93 files until DRAGON-614, 96 against 99 until DRAGON-659, 100 against 103
+until DRAGON-680, and 103 against 106 until DRAGON-682, so re-count rather than
+trusting the line.)
+
+**Three of the 106 are DERIVED rather than copied** (DRAGON-682), and the
+distinction is worth keeping honest. `panel-right-open.svg` and
+`panel-right-close.svg` are the exact mirror of the vendored `panel-left-*`
+pair, which is a deterministic reflection of upstream geometry.
+`circle-dot-dashed.svg` is GENERATED: eight equal arcs of a radius-10 circle
+around a centre dot, in lucide's own 24x24 viewBox and stroke conventions, drawn
+to the design the owner linked rather than copied byte for byte from upstream.
+All three carry the same license as the set they sit in and are stylistically
+identical to it; none is passed off as an upstream file. The SVGs
 stroke with `currentColor`, so they are marked symbolic and tinted with the
 active foreground or accent color like a native symbolic icon.
 `timer.svg` (DRAGON-574, the tray menu's Countdown Timer entry), `trash.svg`
@@ -26,11 +37,14 @@ active foreground or accent color like a native symbolic icon.
 `file-archive.svg` (DRAGON-591, the About page's release-kind line, one glyph
 per package kind), `apple.svg` + `grid-2x2.svg` (DRAGON-614, the same line's
 macOS and Windows kinds, the glyphs the owner named), `key.svg` (DRAGON-412,
-the macOS tray menu's Manage Permissions entry, the glyph the owner named) and
+the macOS tray menu's Manage Permissions entry, the glyph the owner named),
 `loader-circle.svg` (DRAGON-659, the record chip's warming spinner, the glyph
-the owner named) are
+the owner named) and `palette.svg` + `swatch-book.svg` (DRAGON-680, the tray
+menu's Colors submenu and its Palette Viewer entry, the glyphs the owner named)
+are
 verbatim copies of the official Lucide `timer`, `trash`, `pipette`, `globe`,
-`binary`, `file-archive`, `apple`, `grid-2x2`, `key` and `loader-circle` icons,
+`binary`, `file-archive`, `apple`, `grid-2x2`, `key`, `loader-circle`,
+`palette` and `swatch-book` icons,
 fetched from
 upstream and already in the set's house format (24-unit viewBox, `currentColor`
 strokes, stroke-width 2).
@@ -42,7 +56,7 @@ name the macOS build the way the `package` box names the Flatpak one.
 
 **This attribution is not optional, and it cannot be dropped while the SVGs are
 here.** ISC grants use "provided that the above copyright notice and this
-permission notice appear in all copies", and we ship 95 copies: in the repo, and
+permission notice appear in all copies", and we ship 103 copies: in the repo, and
 compiled into every binary. Eighteen of them (`check`, `chevron-down`, `circle`,
 `search`, `x`, `zoom-in` and twelve more) are derived from Feather and carry
 Cole Bemis's MIT notice on top, which asks the same thing.

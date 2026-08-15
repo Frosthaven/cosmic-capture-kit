@@ -31,3 +31,6 @@ dependencies.pdf
 /audit.md
 /audit-recovery.md
 /audit/
+
+# do not commit ide/editor config files, which are personal and not relevant to the project
+/.idea/

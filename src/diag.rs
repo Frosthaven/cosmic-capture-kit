@@ -395,6 +395,13 @@ pub fn component_from_args<S: AsRef<str>>(args: &[S]) -> Component {
         // lines said `app`, which is the tag a BARE launch wears, and that mislabel is
         // exactly what made the real bug (the picker being treated as bare) hard to see.
         "--color-picker",
+        // DRAGON-680: the palette viewer opens the picker's own window and grabs nothing,
+        // so it is not a capture in the ordinary sense. It reads as `capture` anyway,
+        // deliberately, for the reason the picker's own line above gives: the tag is what
+        // groups a feature's processes for someone reading the shared file, and the two
+        // launches are one feature. Falling through to `app` would ALSO be the tag a bare
+        // launch wears, which is exactly the mislabel that hid DRAGON-586.
+        "--palette-viewer",
     ];
     if CAPTURE_FLAGS.iter().any(|f| has(f)) {
         return Component::Capture;
@@ -2038,6 +2045,8 @@ mod tests {
         // bare launch wears. It read as `app` while the launch itself was mis-sorted as
         // bare, so the log agreed with the bug instead of exposing it.
         assert_eq!(c(&["cck", "--color-picker"]), Component::Capture);
+        // DRAGON-680: the palette viewer shares that tag on purpose (see the flag list).
+        assert_eq!(c(&["cck", "--palette-viewer"]), Component::Capture);
         assert_eq!(c(&["cck", "--settings"]), Component::Settings);
         assert_eq!(c(&["cck", "--preview", "/x/y.png"]), Component::Preview);
         assert_eq!(c(&["cck", "--permissions"]), Component::Permissions);

@@ -83,6 +83,9 @@ impl cosmic::Application for App {
         // "this touches the disk, get it off the loop" worker in the app.
         std::thread::spawn(crate::util::sweep_transient_recordings);
         let settings_only = startup.settings_only;
+        // DRAGON-680: `--palette-viewer`, the colour picker's result window on its own.
+        // Read into a local here because the struct literal below moves `startup`.
+        let palette_viewer = startup.palette_viewer;
         // `--permissions` (macOS): open only the permission-checker window; like
         // `--settings`/`--preview` it captures nothing. On Linux the flag is inert
         // (there is no permission window), so this stays false there and the launch
@@ -223,8 +226,11 @@ impl cosmic::Application for App {
         // on this latch before minting overlays, so they still land into a paused WM. Only
         // for real capture launches (the same guard the scene grab and seed use); a
         // no-AeroSpace machine returns fast and the latch signals immediately.
+        // DRAGON-680: a `--palette-viewer` launch joins the same suppression. It mints no
+        // overlay, so there is no tiling WM to step out of the way of.
         #[cfg(target_os = "macos")]
-        if !settings_only && !preview_mode && !open_permissions && !unsupported_os {
+        if !settings_only && !preview_mode && !palette_viewer && !open_permissions && !unsupported_os
+        {
             crate::util::timing_mark("App::init -> early_pause_tiling_wm (detached, overlaps scene grab)");
             crate::platform::mac::window::early_pause_tiling_wm();
         }
@@ -232,8 +238,15 @@ impl cosmic::Application for App {
         // DRAGON-431: `unsupported_os` joins the same suppression a permission-routed launch
         // uses. Nothing this gates is optional on macOS 13 — every one of the scene threads
         // reaches ScreenCaptureKit, and reaching it there aborts the process.
-        let scene_active =
-            !settings_only && !preview_mode && !open_permissions && !unsupported_os;
+        // DRAGON-680: `--palette-viewer` captures nothing either, so it suppresses the scene
+        // exactly as `--settings` does. Left out, a viewer launch would grab the wallpaper,
+        // the cursor and (with the freeze extra on) every display's pixels, for a window that
+        // shows none of them, and on macOS would ask ScreenCaptureKit for the privilege.
+        let scene_active = !settings_only
+            && !preview_mode
+            && !palette_viewer
+            && !open_permissions
+            && !unsupported_os;
         // The launch capture mode, resolved from the CLI overrides (Scanner forces
         // Region). Computed HERE (before the App struct) so `acquire_scene` can gate the
         // ~1s window pre-capture on a WINDOW-mode launch (DRAGON-204) — every other mode
@@ -548,11 +561,34 @@ impl cosmic::Application for App {
                 // any entry that no longer parses rather than failing the whole load.
                 color_picker: color_picker::ColorPickerState {
                     active: startup.color_picker,
+                    // DRAGON-680: `Recent::parse` reads both the alpha-carrying
+                    // `#RRGGBBAA` this build writes and the `#RRGGBB` every older one
+                    // did, the latter as opaque.
                     recents: persisted
                         .recent_colors
                         .iter()
-                        .filter_map(|s| crate::color::ColorFormat::Hex.parse(s))
+                        .filter_map(|s| color_picker::geom::Recent::parse(s))
                         .take(color_picker::geom::RECENTS_CAP)
+                        .collect(),
+                    // DRAGON-687: the saved palettes, from their OWN file beside the
+                    // config (`state::load_palettes`, which also runs the one-time
+                    // migration of a config-era list into it). The same tolerant read as
+                    // the recents (unparseable colours drop, empty groups keep), THROUGH
+                    // the one duplicate rule (`geom::palette_from_saved`, the
+                    // duplicate-guard audit's fix): the load is an insertion path too,
+                    // and a byte-equal pair already in the file used to bypass every
+                    // interactive guard, showing forever as the duplicate nothing else
+                    // could create; deduped here, the next save rewrites the file clean.
+                    palettes: crate::state::load_palettes(persisted.saved_palettes.as_deref())
+                        .iter()
+                        .map(|sp| {
+                            color_picker::geom::palette_from_saved(
+                                sp.name.clone(),
+                                sp.colors
+                                    .iter()
+                                    .filter_map(|s| color_picker::geom::Recent::parse(s)),
+                            )
+                        })
                         .collect(),
                     // DRAGON-615: the lens opens where the user last left it, clamped into
                     // this build's bounds rather than applied as stored. This is the launch
@@ -560,11 +596,19 @@ impl cosmic::Application for App {
                     // only in `apply_persisted`, which runs for a reset or a reload.
                     zoom: color_picker::geom::zoom_from_persisted(persisted.color_picker_zoom),
                     // DRAGON-630: the remembered value mode, same launch-path reasoning.
-                    // Junk resolves to hex, the tool's historical copy. The value row's
-                    // split-vs-whole layout is remembered the same way.
+                    // Junk resolves to hex, the tool's historical copy. What the row's
+                    // LAYOUT is no longer comes from here: DRAGON-680 made it a property
+                    // of the mode (`color_picker::geom::splits_components`).
                     mode: crate::color::ColorFormat::from_id(&persisted.color_picker_mode)
                         .unwrap_or(crate::color::ColorFormat::Hex),
-                    split_inputs: persisted.color_picker_split_inputs,
+                    // DRAGON-682: the compare panel's remembered state, on the same
+                    // launch-path reasoning. The window is OPENED at the size this
+                    // implies (`geom::color_window_size_for`), so it has to be known
+                    // before the first window::open rather than applied after it.
+                    expanded: persisted.color_picker_expanded,
+                    panel_tab: color_picker::geom::PanelTab::from_id(
+                        &persisted.color_picker_panel_tab,
+                    ),
                     ..Default::default()
                 },
                 keymap,
@@ -626,6 +670,7 @@ impl cosmic::Application for App {
                 startup_preview,
                 startup_handoff,
                 preview_mode,
+                palette_viewer,
                 startup_immediate: startup.immediate,
                 #[cfg(target_os = "linux")]
                 immediate_kicked: false,
@@ -928,6 +973,16 @@ impl cosmic::Application for App {
                             .unwrap_or(false);
                     tasks.push(Task::done(cosmic::Action::App(Msg::WindowChrome(
                         super::WindowChromeMsg::OpenSettingsAtStartup { about },
+                    ))));
+                }
+                // `--palette-viewer` (DRAGON-680): mint the colour picker's result window
+                // and nothing else. Deferred exactly like the settings open above, and for
+                // the same reason: the appearance `set_theme` queued a few lines up has to
+                // land before the window's first paint. The single-window rule was already
+                // answered in `main`, before this process paid for a GUI at all.
+                if palette_viewer {
+                    tasks.push(Task::done(cosmic::Action::App(Msg::WindowChrome(
+                        super::WindowChromeMsg::OpenPaletteViewer,
                     ))));
                 }
                 // `--permissions` / missing-grant routing: open the permission window.

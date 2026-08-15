@@ -43,6 +43,11 @@ mod detect;
 // and belongs to none of them.
 mod color;
 mod geometry;
+// Keyboard navigation over a list or a grid (DRAGON-680): which entry an arrow key lands on,
+// and what wrapping means at each end. Crate root for the same reason `geometry` is: the
+// preview editor's toolbar flyouts and the colour picker window's mode activator and colour
+// history all navigate with the arrows, and the rules belong to none of them.
+mod keynav;
 // Freehand pen-stroke beautification (DRAGON-342): the pure smoothing / pseudo-pressure /
 // ribbon-outline math the preview's canvas AND its full-res bake both render through. Sits at
 // the crate root (next to `geometry`) because it is shared by `app::preview::annotate` and
@@ -944,6 +949,9 @@ fn main() -> cosmic::iced::Result {
                     // signalled "capture now" and exited: the user got a region overlay
                     // instead of the picker.
                     | "--color-picker"
+                    // DRAGON-680: the palette viewer is a GUI launch too (it opens the
+                    // picker's own window), so it is non-bare for the same reason.
+                    | "--palette-viewer"
                     // DRAGON-559: the per-launch audio-arm override is a capture-launch
                     // modifier (like --no-editor), never a resident trigger.
                     | "--audio"
@@ -1004,6 +1012,9 @@ fn main() -> cosmic::iced::Result {
                     // signalled "capture now" and exited: the user got a region overlay
                     // instead of the picker.
                     | "--color-picker"
+                    // DRAGON-680: the palette viewer is a GUI launch too (it opens the
+                    // picker's own window), so it is non-bare for the same reason.
+                    | "--palette-viewer"
                     // DRAGON-559: the per-launch audio-arm override is a capture-launch
                     // modifier (like --no-editor), never a resident trigger.
                     | "--audio"
@@ -1062,6 +1073,9 @@ fn main() -> cosmic::iced::Result {
                     // signalled "capture now" and exited: the user got a region overlay
                     // instead of the picker.
                     | "--color-picker"
+                    // DRAGON-680: the palette viewer is a GUI launch too (it opens the
+                    // picker's own window), so it is non-bare for the same reason.
+                    | "--palette-viewer"
                     // DRAGON-559: the per-launch audio-arm override is a capture-launch
                     // modifier (like --no-editor), never a resident trigger.
                     | "--audio"
@@ -1255,6 +1269,28 @@ fn main() -> cosmic::iced::Result {
     // Linux needs the flag most (the tray and a COSMIC custom shortcut are the only ways
     // to start it there), but it works identically on every platform.
     let color_picker = has("--color-picker");
+    // DRAGON-680: `--palette-viewer` opens the picker's RESULT WINDOW on its own, with no
+    // overlay and no pick, so the saved palette can be read and reused. It is a window
+    // launch, not a capture: `Startup::opens_overlays` answers false for it, exactly as it
+    // does for `--settings`.
+    //
+    // The single-window rule (DRAGON-613) is CROSS-PROCESS, so it has to be answered before
+    // this process pays for a GUI: if a picker window is already open anywhere, this launch
+    // asks it to come forward and exits, rather than putting a second one on screen. A
+    // refusal (no window, one mid-close, a build with no transport) falls through to the
+    // ordinary launch below, which is the same never-lose-it ladder every pick takes.
+    let palette_viewer = has("--palette-viewer");
+    if palette_viewer {
+        match crate::preview_ipc::send_raise_to_picker() {
+            Ok(pid) => {
+                log::info!("palette viewer: the open picker window at pid {pid} came forward");
+                return Ok(());
+            }
+            Err(e) => log::info!(
+                "palette viewer: no open picker window took it ({e}); opening one here"
+            ),
+        }
+    }
     let kind = if has("--scan") || has("--scanner") {
         Some(app::Kind::Scanner)
     } else if has("--video") {
@@ -1299,9 +1335,12 @@ fn main() -> cosmic::iced::Result {
     // BEFORE `app::run` so a hang inside `App::init` is covered too (an in-app timer
     // could never fire there). `--settings` / `--permissions` are windows the user asked
     // for and keep their historical unbounded life; `--preview <file>` returned above.
+    // DRAGON-680: `--palette-viewer` joins that list rather than the capture one. It mints
+    // NO overlay, so it can present nothing the guard's `Surfaces` snapshot recognises, and
+    // arming it would kill a window the user was reading after 90 seconds.
     // macOS-only, so Linux/Windows stay byte-identical (see the module doc).
     #[cfg(target_os = "macos")]
-    if !settings_only && !permissions_only {
+    if !settings_only && !permissions_only && !palette_viewer {
         startup_guard::arm(startup_guard::budget_from_env(
             std::env::var(startup_guard::BUDGET_ENV).ok().as_deref(),
         ));
@@ -1312,6 +1351,7 @@ fn main() -> cosmic::iced::Result {
         permissions_only,
         preview: None,
         color_picker,
+        palette_viewer,
         mode,
         kind,
         countdown_secs,
@@ -1350,6 +1390,7 @@ Launch (opens the capture overlay by default):\n\
     --video                 Capture a screen recording\n\
     --scan                  Start the QR/OCR scanner (forces region)\n\
     --color-picker          Pick a color from the screen (magnifier overlay)\n\
+    --palette-viewer        Open the palette viewer window (no overlay, no pick)\n\
     --countdown <secs>      Pre-capture countdown in seconds (any value, e.g. 7)\n\
     --audio <channels>      Arm exactly these audio channels for this launch only:\n\
                             both | mic | system | none (persisted arms are untouched)\n\

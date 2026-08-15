@@ -1009,6 +1009,23 @@ pub const WGPU_BACKEND_ENV: &str = "WGPU_BACKEND";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const WGPU_BACKEND_DX12: &str = "dx12";
 
+// **Tombstone: `WGPU_LATENCY_ENV` / `WGPU_LATENCY_DONTWAIT`** (DRAGON-685, same day it
+// added them). The palette viewer's panel toggle froze on a stale frame for 1 to 3
+// seconds after every resize, because wgpu's DX12 swapchain waits on DXGI's frame-latency
+// waitable before each acquire and `ResizeBuffers` leaves that waitable unsignaled until
+// a later `Present`: the first post-resize acquires each blocked for wgpu-core's full 1s
+// frame timeout, UI thread and all. Setting the waitable mode to `DontWait` (via wgpu's
+// `WGPU_DX12_USE_FRAME_LATENCY_WAITABLE_OBJECT`, which iced patch 3 reads from the
+// environment) removed the stall — and introduced a WORSE defect: that wait is the only
+// backpressure pacing presents to the display's rate, so a drag's per-event redraw storm
+// queued frames faster than the compositor drains them and the drag ghost trailed the
+// pointer by up to a second. `None` measured the same. So the variable is not an answer
+// at either value, the constants are gone, and the stall is fixed where it lives: the
+// wgpu-hal fork bounds the waitable wait once after an in-place `ResizeBuffers`
+// (FORKED_CHANGES.md carries the patch and all three measurements — the first cut of
+// that patch SKIPPED the wait instead, which leaked pacing credits on every interactive
+// resize tick and un-paced the settings window the same way).
+
 /// Pure, unit-tested: does this run present through a DirectComposition visual, given the
 /// raw value of [`WIN_DCOMP_ENV`]?
 ///
@@ -1478,6 +1495,40 @@ pub fn autostart_daemon_repair(registration: Option<AutostartRegistration>, want
     want && registration == Some(AutostartRegistration::Stale)
 }
 
+/// **Pure**, unit-tested: should the resident daemon SEED the login item at startup, on
+/// its first Linux run (DRAGON-683)?
+///
+/// [`autostart_daemon_repair`] deliberately leaves an ABSENT registration alone: absent
+/// is somebody's decision, and only the settings toggle may create one. A fresh Linux
+/// install breaks on that rule alone. `resident` and `autostart_on_login` both default
+/// on, but no toggle was ever flipped, so the XDG entry never comes to exist and the
+/// tray daemon never comes back at login. The rule is: the Linux resident tray must
+/// come back at login by default on a fresh install, on every session kind (the
+/// in-progress X11 line carries this same seed; a session kind is deliberately not a
+/// parameter here). macOS and Windows solved the same problem with one-time seeds
+/// (`mac_login_item_seeded` / `win_login_item_seeded`, each in its own daemon); this is
+/// the Linux arm of the same rule, kept here beside the repair predicate it is the ONE
+/// exception to.
+///
+/// True in exactly one situation: an ABSENT registration, both settings on (`want`,
+/// [`autostart_wanted`]), and the seed never having run. `already_seeded` is what keeps
+/// the never-override rule intact afterwards: once the seed has run, an entry the user
+/// removed stays removed. `Stale` never seeds (that is the repair's case), `Live` needs
+/// nothing, and `None` (no readable registration, e.g. the Flatpak portal mechanism)
+/// never seeds either, because writing blind is exactly what the absent-is-a-decision
+/// rule forbids.
+//
+// Compiled everywhere so the Linux gate is not the only prover; wired only into the
+// Linux seed branch below, so it is honestly dead elsewhere outside tests.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn linux_autostart_should_seed(
+    registration: Option<AutostartRegistration>,
+    want: bool,
+    already_seeded: bool,
+) -> bool {
+    registration == Some(AutostartRegistration::Absent) && want && !already_seeded
+}
+
 /// What the OS has on file for launch-at-login, or `None` when this build has no read-only
 /// way to find out (see the note above this function's neighbours).
 ///
@@ -1538,7 +1589,16 @@ pub fn autostart_registration() -> Option<AutostartRegistration> {
 ///
 /// It writes in exactly ONE case, [`autostart_daemon_repair`]: the registration is present, no
 /// longer resolves, and this build wants one. That is the case that is unambiguously our bug
-/// rather than somebody's decision. Every other case is logged and left alone.
+/// rather than somebody's decision. Every other case is logged and left alone, with ONE
+/// exception, the first-run Linux SEED ([`linux_autostart_should_seed`], DRAGON-683): on a
+/// Linux daemon whose registration is ABSENT, with `resident` + `autostart_on_login` both on
+/// and the one-time `linux_login_item_seeded` marker unset, the entry is CREATED once and
+/// the marker persisted, because the Linux resident tray must come back at login by default
+/// on a fresh install, on every session kind, and no toggle was ever flipped to create the
+/// entry. After the seed the absent-is-a-decision rule holds again in full: a removal is
+/// never overridden twice. Non-Linux platforms are untouched by construction (the seed
+/// branch is `cfg(target_os = "linux")`; macOS and Windows run their own one-time seeds in
+/// their daemons).
 ///
 /// **macOS reaches this and correctly does nothing, which is the honest answer rather than a
 /// gap.** `SMAppService` registers the app's bundle IDENTITY, not a command line, so there is
@@ -1558,6 +1618,36 @@ pub fn autostart_repair_at_daemon_start() {
     let p = crate::state::load();
     let want = autostart_wanted(p.resident, p.autostart_on_login);
     let registration = autostart_registration();
+    // The one-time Linux SEED (DRAGON-683): see the doc above and
+    // `linux_autostart_should_seed` for the full reasoning. The cfg keeps every other
+    // platform byte-identical.
+    #[cfg(target_os = "linux")]
+    {
+        if linux_autostart_should_seed(registration, want, p.linux_login_item_seeded) {
+            match crate::platform::linux_autostart::set(true) {
+                Ok(()) => {
+                    // Load-modify-save through the normal settings write path, the same
+                    // shape the settings handlers use, so nothing else in the config is
+                    // disturbed.
+                    let mut seeded = crate::state::load();
+                    seeded.linux_login_item_seeded = true;
+                    crate::state::save(&seeded);
+                    log::info!(
+                        "autostart: first daemon start with resident + autostart on; \
+                         registering the login item (one-time seed)"
+                    );
+                    // The entry is Live now; there is nothing left to repair or report.
+                    return;
+                }
+                // The marker is deliberately NOT set on failure, so a later start
+                // retries; the ordinary no-op logging below still says the entry is
+                // absent.
+                Err(e) => log::warn!(
+                    "autostart: the one-time seed could not register the login item: {e}"
+                ),
+            }
+        }
+    }
     if !autostart_daemon_repair(registration, want) {
         // Say WHY nothing happened. A silent no-op here is indistinguishable from the hook
         // never having run, and "autostart is still not working" is a question this log has
@@ -1570,7 +1660,9 @@ pub fn autostart_repair_at_daemon_start() {
             Some(AutostartRegistration::Absent) if want => log::info!(
                 "autostart: no login item is registered although the setting asks for one. \
                  Leaving it alone: an absent registration may have been removed on purpose, \
-                 and only the settings toggle may create one"
+                 and only the settings toggle may create one (the one exception is the \
+                 first Linux daemon start, which seeds the entry once; see \
+                 linux_autostart_should_seed)"
             ),
             Some(AutostartRegistration::Stale) => log::debug!(
                 "autostart: the login item is stale but this build does not want one, so it \
@@ -2291,6 +2383,58 @@ mod autostart_daemon_repair_tests {
         assert!(!autostart_wanted(true, false));
         assert!(!autostart_wanted(false, true));
         assert!(!autostart_wanted(false, false));
+    }
+}
+
+/// DRAGON-683: the ONE exception to "an absent registration is never recreated", the
+/// first-run Linux seed.
+#[cfg(test)]
+mod linux_autostart_seed_tests {
+    use super::*;
+
+    /// The one true combination: an absent entry, both settings on, and a seed that has
+    /// never run.
+    #[test]
+    fn the_first_run_with_everything_on_seeds() {
+        assert!(linux_autostart_should_seed(
+            Some(AutostartRegistration::Absent),
+            true,
+            false
+        ));
+    }
+
+    /// Each condition alone kills the seed: a build that does not want a login item, and
+    /// a seed that has already run (a removal after the seed stays removed, forever).
+    #[test]
+    fn each_condition_alone_kills_the_seed() {
+        assert!(!linux_autostart_should_seed(
+            Some(AutostartRegistration::Absent),
+            false,
+            false
+        ));
+        assert!(!linux_autostart_should_seed(
+            Some(AutostartRegistration::Absent),
+            true,
+            true
+        ));
+    }
+
+    /// Only an ABSENT registration seeds. `Stale` is the repair predicate's case, `Live`
+    /// needs nothing, and `None` (no readable registration, the Flatpak portal mechanism)
+    /// must never provoke a blind write.
+    #[test]
+    fn only_an_absent_registration_seeds() {
+        assert!(!linux_autostart_should_seed(
+            Some(AutostartRegistration::Stale),
+            true,
+            false
+        ));
+        assert!(!linux_autostart_should_seed(
+            Some(AutostartRegistration::Live),
+            true,
+            false
+        ));
+        assert!(!linux_autostart_should_seed(None, true, false));
     }
 }
 

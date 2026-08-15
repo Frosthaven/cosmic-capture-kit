@@ -56,15 +56,19 @@
 //! line, in the plain-words spirit of [`crate::daemon_ipc`]:
 //!
 //! ```text
-//! child -> host: cck-preview 3 open path=<hex> video=<0|1> dims=<WxH|-> scale=<f32> external=<0|1> size=<u64|->
-//! child -> host: cck-preview 3 color to=<editor|picker> rgb=<RRGGBB>
+//! child -> host: cck-preview 5 open path=<hex> video=<0|1> dims=<WxH|-> scale=<f32> external=<0|1> size=<u64|->
+//! child -> host: cck-preview 5 color to=<editor|picker> rgb=<RRGGBB> palette=<u64|->
+//! child -> host: cck-preview 5 raise
 //! host  -> child: ok
 //!                 err version | err parse | err busy
 //! ```
 //!
-//! * **Two verbs** ([`Request`]). `open` hands over a finished capture. `color` (DRAGON-587)
+//! * **Three verbs** ([`Request`]). `open` hands over a finished capture. `color` (DRAGON-587)
 //!   hands a picked colour to whoever it is FOR: every picker launch is its own process, so
 //!   "put this colour where it belongs" is a cross-process message of exactly this shape.
+//!   `raise` (DRAGON-680) asks the one colour picker WINDOW to come forward, which is how a
+//!   palette-viewer launch honours the single-window rule without sending a colour it does
+//!   not mean to apply.
 //! * **`color` carries its DESTINATION** ([`ColorDest`], DRAGON-613), and the two
 //!   destinations are found in opposite ways on purpose. `to=editor` is ADDRESSED
 //!   ([`send_color_to_pid`], the pid rides the launch), so an editor's pick can never reach
@@ -73,7 +77,7 @@
 //!   the colour picker window is a singleton the user thinks of as one thing no matter which
 //!   process owns it. A host handed a destination it cannot serve REFUSES, and the sender's
 //!   answer to a refusal is the same as to every other failure below: do the job itself.
-//! * **Versioned**: the `2` is [`PROTOCOL_VERSION`], checked BEFORE the verb, so a
+//! * **Versioned**: the `4` is [`PROTOCOL_VERSION`], checked BEFORE the verb, so a
 //!   mismatched pair fails cleanly (`err version`) instead of half-parsing a future
 //!   line. Bump it on ANY change to the field set or shape.
 //! * **`path` is hex** (lowercase, raw bytes): a path may contain spaces, newlines, or
@@ -201,7 +205,21 @@ const MAGIC: &str = "cck-preview";
 /// every "not accepted" in this module has exactly one meaning: the sender does the job
 /// itself. So a v2 picker window plus a v3 pick simply opens a second window, which is the
 /// behaviour that shipped before this feature, never a lost colour and never a lost capture.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// `4` since DRAGON-680 added the `raise` verb (the palette viewer asks the one open picker
+/// window to come forward instead of opening a second one). The verb set is part of the
+/// shape, so it takes the bump, and a mixed pair degrades exactly as above: the viewer's
+/// raise is refused and it opens its own window, which is what it would have done anyway
+/// had no window been open.
+///
+/// `5` since DRAGON-687 gave the `color` verb its `palette=` field (a pick launched by a
+/// palette row's pipette is FOR that saved palette, not for the window's active swatch).
+/// The field set is part of the shape, so it takes the bump, and a mixed pair degrades on
+/// the raise verb's exact story: an old window answers the new line `err version`, the
+/// sender reads every "not accepted" as "do the job yourself", and the child runs the
+/// ordinary pick flow (active colour, recents, clipboard, its own window if nothing takes
+/// it). A colour is never lost; only the filing shortcut is.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Longest request/reply line accepted, in bytes. A path is the only unbounded field and
 /// hex-doubles, so 64 KiB is ~32 KiB of path — far past any real one, while keeping a
@@ -372,7 +390,39 @@ pub enum Request {
         to: ColorDest,
         /// The picked colour, straight sRGB.
         rgb: [u8; 3],
+        /// DRAGON-687: the SAVED PALETTE this colour should be filed into, as the opaque
+        /// nonce the picker window minted for its pipette launch, or `None` for every
+        /// ordinary pick. On the wire it is `palette=<u64|->`, a required key with the
+        /// dash spelling `open`'s `dims` and `size` already use for "no value".
+        ///
+        /// A NONCE rather than the group's index or name, deliberately: the group can be
+        /// renamed, re-sorted or deleted while the pick is out, so the wire carries a
+        /// token only the receiving window can interpret (against the snapshot it kept at
+        /// launch), and a token it does not recognise degrades to an ordinary pick rather
+        /// than filing into whichever group drifted under the index. It also keeps the
+        /// palette's NAME, which is user content, off the wire and out of the child's
+        /// environment.
+        ///
+        /// Only meaningful with `to=picker`: an editor line carrying one is MALFORMED
+        /// (enforced in the parser), because an editor has no palettes and a field the
+        /// receiver would have to ignore is exactly what this protocol's closed field
+        /// sets exist to prevent.
+        palette: Option<u64>,
     },
+    /// `raise`: bring the colour picker window forward (DRAGON-680). Carries nothing.
+    ///
+    /// The palette viewer's launch is the only sender: at most ONE picker window exists
+    /// (DRAGON-613), so a second "show me my palette" must raise the live one rather than
+    /// put a duplicate on screen. It is a verb of its own rather than a re-send of the
+    /// current colour through `color`, because a colour SEND has effects a raise must not
+    /// have: it would replace what the live window is showing with this process's stale
+    /// front recent, promote that entry, and rewrite the clipboard.
+    ///
+    /// **No `to=` field, deliberately.** `color` needs one because a colour has two
+    /// possible consumers; there is exactly one raisable singleton, so a destination here
+    /// would be a field with one legal value. A second raisable surface would add the field
+    /// and a version bump, exactly as `color` did in v3.
+    Raise,
 }
 
 /// Who a picked colour is FOR (DRAGON-613): the wire form of
@@ -418,12 +468,18 @@ impl Request {
     pub fn encode(&self) -> String {
         match self {
             Request::Open(r) => r.encode(),
-            Request::Color { to, rgb: [r, g, b] } => {
+            Request::Color { to, rgb: [r, g, b], palette } => {
+                let palette = match palette {
+                    Some(nonce) => nonce.to_string(),
+                    None => "-".to_string(),
+                };
                 format!(
-                    "{MAGIC} {PROTOCOL_VERSION} color to={} rgb={r:02x}{g:02x}{b:02x}\n",
+                    "{MAGIC} {PROTOCOL_VERSION} color to={} rgb={r:02x}{g:02x}{b:02x} \
+                     palette={palette}\n",
                     to.as_str()
                 )
             }
+            Request::Raise => format!("{MAGIC} {PROTOCOL_VERSION} raise\n"),
         }
     }
 
@@ -452,6 +508,7 @@ impl Request {
                 // consumer is precisely the silent wrongness this protocol exists to avoid.
                 let mut to: Option<ColorDest> = None;
                 let mut rgb: Option<[u8; 3]> = None;
+                let mut palette: Option<Option<u64>> = None;
                 for tok in it {
                     let (key, val) = tok.split_once('=').ok_or(WireError::Malformed)?;
                     match key {
@@ -463,14 +520,42 @@ impl Request {
                             };
                             set(&mut rgb, [r, g, b])?
                         }
+                        // DRAGON-687: the palette nonce, `-` for the ordinary pick. A
+                        // ZERO nonce is malformed rather than a value: the picker never
+                        // mints one (its counter starts at 1, `0` is its own "no target"
+                        // spelling in the launch environment), so a zero on the wire is a
+                        // constructed line, not a pick.
+                        "palette" => match val {
+                            "-" => set(&mut palette, None)?,
+                            _ => {
+                                let nonce: u64 =
+                                    val.parse().map_err(|_| WireError::Malformed)?;
+                                if nonce == 0 {
+                                    return Err(WireError::Malformed);
+                                }
+                                set(&mut palette, Some(nonce))?
+                            }
+                        },
                         _ => return Err(WireError::Malformed),
                     }
                 }
-                Ok(Request::Color {
-                    to: to.ok_or(WireError::Malformed)?,
-                    rgb: rgb.ok_or(WireError::Malformed)?,
-                })
+                let to = to.ok_or(WireError::Malformed)?;
+                let palette = palette.ok_or(WireError::Malformed)?;
+                // A palette target on an editor line is malformed, not ignored: an editor
+                // has no palettes, and a field the receiver would have to skip is what
+                // this protocol's closed field sets exist to prevent.
+                if to == ColorDest::Editor && palette.is_some() {
+                    return Err(WireError::Malformed);
+                }
+                Ok(Request::Color { to, rgb: rgb.ok_or(WireError::Malformed)?, palette })
             }
+            // DRAGON-680: a fieldless verb, so the field set is closed by there being
+            // nothing after it. A trailing token is malformed rather than ignored, the same
+            // strictness the other two verbs apply to an unknown key.
+            Some("raise") => match it.next() {
+                None => Ok(Request::Raise),
+                Some(_) => Err(WireError::Malformed),
+            },
             _ => Err(WireError::Malformed),
         }
     }
@@ -1013,7 +1098,7 @@ pub fn send_color_to_pid(pid: u32, rgb: [u8; 3]) -> Result<(), HandoffError> {
     if !std::path::Path::new(&path).exists() {
         return Err(HandoffError::NoHost);
     }
-    send_to_socket(&path, &Request::Color { to: ColorDest::Editor, rgb })
+    send_to_socket(&path, &Request::Color { to: ColorDest::Editor, rgb, palette: None })
         .map_err(HandoffError::NotAccepted)
 }
 
@@ -1025,7 +1110,7 @@ pub fn send_color_to_pid(pid: u32, rgb: [u8; 3]) -> Result<(), HandoffError> {
 pub fn send_color_to_pid(pid: u32, rgb: [u8; 3]) -> Result<(), HandoffError> {
     use crate::platform::windows::preview_pipe::SendError;
     let addr = crate::instance::preview_host_address(pid);
-    match send_to_pipe(&addr, &Request::Color { to: ColorDest::Editor, rgb }) {
+    match send_to_pipe(&addr, &Request::Color { to: ColorDest::Editor, rgb, palette: None }) {
         Ok(()) => Ok(()),
         Err(SendError::NoListener) => Err(HandoffError::NoHost),
         Err(SendError::Failed(why)) => Err(HandoffError::NotAccepted(why)),
@@ -1049,13 +1134,18 @@ pub fn send_color_to_pid(_pid: u32, _rgb: [u8; 3]) -> Result<(), HandoffError> {
 /// Returns the pid that took it. `Err` for every failure, including the ordinary ones where
 /// no window is open or the open one is mid-close, and the caller's only correct response is
 /// the same in all of them: open a window of its own, exactly as it did before this existed.
+///
+/// `palette` (DRAGON-687) is the pipette-to-palette launch's nonce, `None` for the
+/// ordinary pick; see [`Request::Color`]'s field for why it is a nonce. On any failure of
+/// a TAGGED send the caller degrades to the ordinary pick flow, so the tag can only ever
+/// lose the filing shortcut, never the colour.
 #[cfg(unix)]
-pub fn send_color_to_picker(rgb: [u8; 3]) -> Result<u32, HandoffError> {
+pub fn send_color_to_picker(rgb: [u8; 3], palette: Option<u64>) -> Result<u32, HandoffError> {
     let windows = crate::instance::live_color_picker_windows();
     if windows.is_empty() {
         return Err(HandoffError::NoHost);
     }
-    let req = Request::Color { to: ColorDest::PickerWindow, rgb };
+    let req = Request::Color { to: ColorDest::PickerWindow, rgb, palette };
     let mut last: Option<String> = None;
     for pid in windows {
         let path = crate::instance::color_picker_socket_path(pid);
@@ -1083,13 +1173,13 @@ pub fn send_color_to_picker(rgb: [u8; 3]) -> Result<u32, HandoffError> {
 /// named pipe. A "nobody listening" connect is skipped without counting as a refusal,
 /// exactly the skip the unix arm gives a marker with no socket file beside it.
 #[cfg(windows)]
-pub fn send_color_to_picker(rgb: [u8; 3]) -> Result<u32, HandoffError> {
+pub fn send_color_to_picker(rgb: [u8; 3], palette: Option<u64>) -> Result<u32, HandoffError> {
     use crate::platform::windows::preview_pipe::SendError;
     let windows = crate::instance::live_color_picker_windows();
     if windows.is_empty() {
         return Err(HandoffError::NoHost);
     }
-    let req = Request::Color { to: ColorDest::PickerWindow, rgb };
+    let req = Request::Color { to: ColorDest::PickerWindow, rgb, palette };
     let mut last: Option<String> = None;
     for pid in windows {
         match send_to_pipe(&crate::instance::color_picker_host_address(pid), &req) {
@@ -1114,7 +1204,79 @@ pub fn send_color_to_picker(rgb: [u8; 3]) -> Result<u32, HandoffError> {
 /// own window there. Deliberately a stub and not a pretend success — see
 /// [`HandoffError::Unsupported`].
 #[cfg(not(any(unix, windows)))]
-pub fn send_color_to_picker(_rgb: [u8; 3]) -> Result<u32, HandoffError> {
+pub fn send_color_to_picker(_rgb: [u8; 3], _palette: Option<u64>) -> Result<u32, HandoffError> {
+    Err(HandoffError::Unsupported)
+}
+
+/// Ask the EXISTING colour picker window to come forward (DRAGON-680), wherever it is.
+///
+/// The palette viewer's answer to the single-window rule, and the same SEARCHED discovery
+/// [`send_color_to_picker`] uses, over the same per-pid sockets, because it is the same
+/// singleton being addressed. Returns the pid that took it.
+///
+/// `Err` for every failure, including the ordinary ones (no window open, one mid-close, an
+/// older build that does not know the verb), and the caller's response is the same in all of
+/// them: open a window of its own. Nothing here may be treated as a lost request; a viewer
+/// launch that raises nothing and opens nothing would simply look broken.
+#[cfg(unix)]
+pub fn send_raise_to_picker() -> Result<u32, HandoffError> {
+    let windows = crate::instance::live_color_picker_windows();
+    if windows.is_empty() {
+        return Err(HandoffError::NoHost);
+    }
+    let mut last: Option<String> = None;
+    for pid in windows {
+        let path = crate::instance::color_picker_socket_path(pid);
+        // A marker with no socket is not a listening window at all, so skip it without counting
+        // it as a refusal, exactly as the colour sender does.
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        match send_to_socket(&path, &Request::Raise) {
+            Ok(()) => return Ok(pid),
+            Err(why) => {
+                log::info!("raise of the picker window at pid {pid} failed: {why}");
+                last = Some(why);
+            }
+        }
+    }
+    match last {
+        Some(why) => Err(HandoffError::NotAccepted(why)),
+        None => Err(HandoffError::NoHost),
+    }
+}
+
+/// The Windows arm of [`send_raise_to_picker`]: the same searched discovery over each
+/// candidate's per-pid named pipe, with a "nobody listening" connect skipped rather than
+/// counted as a refusal.
+#[cfg(windows)]
+pub fn send_raise_to_picker() -> Result<u32, HandoffError> {
+    use crate::platform::windows::preview_pipe::SendError;
+    let windows = crate::instance::live_color_picker_windows();
+    if windows.is_empty() {
+        return Err(HandoffError::NoHost);
+    }
+    let mut last: Option<String> = None;
+    for pid in windows {
+        match send_to_pipe(&crate::instance::color_picker_host_address(pid), &Request::Raise) {
+            Ok(()) => return Ok(pid),
+            Err(SendError::NoListener) => continue,
+            Err(SendError::Failed(why)) => {
+                log::info!("raise of the picker window at pid {pid} failed: {why}");
+                last = Some(why);
+            }
+        }
+    }
+    match last {
+        Some(why) => Err(HandoffError::NotAccepted(why)),
+        None => Err(HandoffError::NoHost),
+    }
+}
+
+/// No-transport stub: the palette viewer opens its own window there, exactly as it does
+/// when nothing is listening.
+#[cfg(not(any(unix, windows)))]
+pub fn send_raise_to_picker() -> Result<u32, HandoffError> {
     Err(HandoffError::Unsupported)
 }
 
@@ -1345,54 +1507,84 @@ mod tests {
         }
     }
 
-    /// DRAGON-587's verb, carrying DRAGON-613's destination: it round-trips for BOTH
-    /// consumers, and its field set is as closed as `open`'s.
+    /// DRAGON-587's verb, carrying DRAGON-613's destination and DRAGON-687's palette
+    /// target: it round-trips for BOTH consumers, tagged and untagged, and its field set
+    /// is as closed as `open`'s.
     #[test]
     fn the_color_verb_round_trips_and_is_strict() {
         for to in [ColorDest::Editor, ColorDest::PickerWindow] {
             for rgb in [[0, 0, 0], [255, 255, 255], [255, 136, 0], [1, 2, 3]] {
-                let req = Request::Color { to, rgb };
+                let req = Request::Color { to, rgb, palette: None };
                 let line = req.encode();
                 assert!(line.ends_with('\n'));
                 assert_eq!(Request::parse(&line), Ok(req.clone()), "round trip {to:?} {rgb:?}");
                 assert_eq!(Request::parse(line.trim_end()), Ok(req));
             }
         }
+        // The palette tag round-trips too, at both ends of its range.
+        for nonce in [1u64, u64::MAX] {
+            let req = Request::Color {
+                to: ColorDest::PickerWindow,
+                rgb: [255, 136, 0],
+                palette: Some(nonce),
+            };
+            assert_eq!(Request::parse(&req.encode()), Ok(req), "nonce {nonce}");
+        }
         assert_eq!(
-            Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0] }.encode().trim_end(),
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=editor rgb=ff8800")
+            Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0], palette: None }
+                .encode()
+                .trim_end(),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=editor rgb=ff8800 palette=-")
         );
         assert_eq!(
-            Request::Color { to: ColorDest::PickerWindow, rgb: [255, 136, 0] }.encode().trim_end(),
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800")
+            Request::Color {
+                to: ColorDest::PickerWindow,
+                rgb: [255, 136, 0],
+                palette: Some(7)
+            }
+            .encode()
+            .trim_end(),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 palette=7")
         );
         // Order-independent, exactly like `open`.
         assert_eq!(
-            Request::parse(&format!("{MAGIC} {PROTOCOL_VERSION} color rgb=ff8800 to=picker")),
-            Ok(Request::Color { to: ColorDest::PickerWindow, rgb: [255, 136, 0] })
+            Request::parse(&format!(
+                "{MAGIC} {PROTOCOL_VERSION} color palette=- rgb=ff8800 to=picker"
+            )),
+            Ok(Request::Color { to: ColorDest::PickerWindow, rgb: [255, 136, 0], palette: None })
         );
         for bad in [
             format!("{MAGIC} {PROTOCOL_VERSION} color"),
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker"),          // no colour
-            format!("{MAGIC} {PROTOCOL_VERSION} color rgb=ff8800"),         // no destination
-            format!("{MAGIC} {PROTOCOL_VERSION} color to= rgb=ff8800"),
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=nobody rgb=ff8800"), // unknown dest
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=Editor rgb=ff8800"), // case matters
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb="),
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff88"), // too few bytes
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800ff"), // too many
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=gg8800"), // not hex
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker hex=ff8800"), // wrong key
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 rgb=000000"), // dup
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=editor to=picker rgb=ff8800"), // dup
-            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 extra=1"), // unknown
-            format!("{MAGIC} {PROTOCOL_VERSION} colour to=picker rgb=ff8800"), // unknown verb
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker palette=-"), // no colour
+            format!("{MAGIC} {PROTOCOL_VERSION} color rgb=ff8800 palette=-"), // no destination
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800"), // no palette key
+            format!("{MAGIC} {PROTOCOL_VERSION} color to= rgb=ff8800 palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=nobody rgb=ff8800 palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=Editor rgb=ff8800 palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb= palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff88 palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800ff palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=gg8800 palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker hex=ff8800 palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 rgb=000000 palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=editor to=picker rgb=ff8800 palette=-"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 palette=- extra=1"),
+            format!("{MAGIC} {PROTOCOL_VERSION} colour to=picker rgb=ff8800 palette=-"),
+            // The palette tag's own strictness (DRAGON-687): a zero nonce is a constructed
+            // line (the window never mints one), junk is junk, duplicates are duplicates,
+            // and an EDITOR line carrying a target is malformed rather than ignored (an
+            // editor has no palettes).
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 palette=0"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 palette=abc"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 palette=-1"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=picker rgb=ff8800 palette=1 palette=2"),
+            format!("{MAGIC} {PROTOCOL_VERSION} color to=editor rgb=ff8800 palette=1"),
         ] {
             assert_eq!(Request::parse(&bad), Err(WireError::Malformed), "should reject {bad:?}");
         }
         // The version is still checked FIRST, before the verb.
         assert_eq!(
-            Request::parse(&format!("{MAGIC} 99 color to=picker rgb=ff8800")),
+            Request::parse(&format!("{MAGIC} 99 color to=picker rgb=ff8800 palette=-")),
             Err(WireError::Version(99))
         );
     }
@@ -1409,10 +1601,38 @@ mod tests {
         assert_eq!(Request::parse(&v2), Err(WireError::Version(2)));
         // And the reverse direction: a v2 host reading our v3 line sees the same shape, so
         // pin that our line still carries a plain integer version a v2 parser can read.
-        let v3 = Request::Color { to: ColorDest::PickerWindow, rgb: [255, 136, 0] }.encode();
+        let v3 = Request::Color { to: ColorDest::PickerWindow, rgb: [255, 136, 0], palette: None }
+            .encode();
         let mut it = v3.split_whitespace();
         assert_eq!(it.next(), Some(MAGIC));
         assert_eq!(it.next().and_then(|v| v.parse::<u32>().ok()), Some(PROTOCOL_VERSION));
+    }
+
+    /// DRAGON-680: the `raise` verb round-trips, carries nothing, and stays strict.
+    ///
+    /// The strictness is the part worth pinning. A fieldless verb has no key parser to
+    /// reject an unknown key, so the only thing standing between it and silently accepting
+    /// `raise rgb=ff8800` is the trailing-token check. A host that ignored the extra would
+    /// be exactly the half-understood line the version discipline exists to prevent.
+    #[test]
+    fn the_raise_verb_round_trips_and_carries_nothing() {
+        let line = Request::Raise.encode();
+        assert_eq!(line, format!("{MAGIC} {PROTOCOL_VERSION} raise\n"));
+        assert_eq!(Request::parse(&line), Ok(Request::Raise));
+        assert_eq!(Request::parse(line.trim_end()), Ok(Request::Raise));
+        for bad in [
+            format!("{MAGIC} {PROTOCOL_VERSION} raise to=picker"),
+            format!("{MAGIC} {PROTOCOL_VERSION} raise rgb=ff8800"),
+            format!("{MAGIC} {PROTOCOL_VERSION} raise junk"),
+        ] {
+            assert_eq!(Request::parse(&bad), Err(WireError::Malformed), "should reject {bad:?}");
+        }
+        // The version is checked before the verb here too, so an older host answers a
+        // raise with `err version` and the viewer opens its own window.
+        assert_eq!(
+            Request::parse(&format!("{MAGIC} 3 raise")),
+            Err(WireError::Version(3))
+        );
     }
 
     /// The destination words are the wire, so they are pinned literally: changing one
@@ -1437,7 +1657,8 @@ mod tests {
         assert_eq!(Request::parse(&line), Ok(Request::Open(sample())));
         assert_eq!(OpenRequest::parse(&line), Ok(sample()));
         // And a `color` line is not an `open` one.
-        let colour = Request::Color { to: ColorDest::Editor, rgb: [1, 2, 3] }.encode();
+        let colour =
+            Request::Color { to: ColorDest::Editor, rgb: [1, 2, 3], palette: None }.encode();
         assert_eq!(OpenRequest::parse(&colour), Err(WireError::Malformed));
     }
 
@@ -1533,7 +1754,7 @@ mod tests {
     /// colour without repeating the literal at both ends of the socket.
     #[cfg(unix)]
     const COLOR_TO_EDITOR: Request =
-        Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0] };
+        Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0], palette: None };
 
     /// DRAGON-587 end to end: a picked colour crosses the SAME socket and is acknowledged
     /// the same way, so the editor's pipette reaches the editor that asked.
@@ -1575,7 +1796,10 @@ mod tests {
 
         let child_path = path.clone();
         let child = std::thread::spawn(move || {
-            send_to_socket(&child_path, &Request::Color { to: ColorDest::Editor, rgb: [1, 2, 3] })
+            send_to_socket(
+                &child_path,
+                &Request::Color { to: ColorDest::Editor, rgb: [1, 2, 3], palette: None },
+            )
         });
         rx.recv_timeout(Duration::from_secs(5))
             .expect("the colour arrives")
@@ -1817,7 +2041,7 @@ mod tests {
     /// One sample colour message for the pipe tests, like the unix `COLOR_TO_EDITOR`.
     #[cfg(windows)]
     const COLOR_TO_EDITOR: Request =
-        Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0] };
+        Request::Color { to: ColorDest::Editor, rgb: [255, 136, 0], palette: None };
 
     /// A refusal crosses the pipe as a refusal — never as a delivery.
     #[cfg(windows)]

@@ -64,11 +64,34 @@ use super::*;
 /// an INERT one (right for a flow that must not be lost to a stray click: the cloud
 /// add/reconnect dialog, the update dialog, the mic test). Either way the top strip is a
 /// drag surface and never a dismiss.
-pub(in crate::app::settings) fn stack_dialog<'a>(
+///
+/// `on_drag` is which window the strip moves (DRAGON-687): the settings dialogs pass
+/// their own `ConfigWindowDrag`, and the colour picker's delete-palette confirmation
+/// passes `ColorPickerWindowDrag`. A parameter rather than a second helper, because this
+/// function is the ONE place that knows what a modal looks like and a picker copy would
+/// start drifting the moment either changed.
+pub(in crate::app) fn stack_dialog<'a>(
     window: Element<'a, Msg>,
     card: Element<'a, Msg>,
     on_backdrop: Option<Msg>,
+    on_drag: Msg,
 ) -> Element<'a, Msg> {
+    let mut layers = vec![window];
+    layers.extend(dialog_layers(card, on_backdrop, on_drag));
+    cosmic::iced::widget::stack(layers).into()
+}
+
+/// The modal's three stack LAYERS (scrim, drag strip, centred card) WITHOUT the window
+/// underneath: what [`stack_dialog`] composes, split out for a caller that must keep its
+/// own outermost stack PERMANENT and only append these (the colour picker window, whose
+/// drag-jump root cause was exactly a root that changed shape when a wrapper came and
+/// went; its view doc carries the whole story). One composition either way, so the two
+/// forms cannot drift.
+pub(in crate::app) fn dialog_layers<'a>(
+    card: Element<'a, Msg>,
+    on_backdrop: Option<Msg>,
+    on_drag: Msg,
+) -> Vec<Element<'a, Msg>> {
     let backdrop: Element<'a, Msg> = widget::mouse_area(
         widget::container(widget::Space::new().width(Length::Fill).height(Length::Fill))
             .width(Length::Fill)
@@ -88,17 +111,15 @@ pub(in crate::app::settings) fn stack_dialog<'a>(
     .into();
     // The drag strip (DRAGON-502): the window's title area stays a window handle while the
     // dialog is up. Bare, so it is exactly the header's height and draws nothing over the
-    // scrim's dim; `on_drag`, so it issues the SAME `ConfigWindowDrag` the real header does.
+    // scrim's dim; `on_drag`, so it issues the SAME drag message the real header does.
     // The window BUTTONS underneath stay blocked, which is ordinary modal behaviour: only
     // the drag is given back.
-    let drag_strip: Element<'a, Msg> = widget::header_bar()
-        .on_drag(Msg::WindowChrome(WindowChromeMsg::ConfigWindowDrag))
-        .into();
+    let drag_strip: Element<'a, Msg> = widget::header_bar().on_drag(on_drag).into();
     let centered: Element<'a, Msg> = widget::container(card)
         .center_x(Length::Fill)
         .center_y(Length::Fill)
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
-    cosmic::iced::widget::stack(vec![window, backdrop, drag_strip, centered]).into()
+    vec![backdrop, drag_strip, centered]
 }

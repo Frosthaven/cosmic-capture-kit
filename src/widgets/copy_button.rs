@@ -86,11 +86,12 @@ pub fn copy_button<M: Clone + 'static>(
 /// acknowledgement. `label` is the resting tooltip ("Copy URL" is [`copy_button`]'s, and is
 /// wrong for anything that is not a link).
 ///
-/// A caller whose copy the APP performs, so that nobody is hovering when it lands, should say
-/// so on its own row rather than asking this control to shout: the colour picker's window
-/// puts the word "Copied!" beside the button in `theme::success`, which is the same green
-/// this tints the tick with. See the tombstone below for the pinned card that used to do it
-/// here and why it could not stay.
+/// A caller whose copy the APP performs, so that nobody is hovering when it lands, gets the
+/// TICK and nothing else, and that is the settled answer: the flash is raised by whatever
+/// performed the copy, so it is already up when the window appears. Two richer
+/// acknowledgements have been tried and both were reversed, a pinned "Copied!" card
+/// (DRAGON-676) and a "Copied!" word on the row beside the button (DRAGON-680); the
+/// tombstones below carry why.
 pub fn subtle_copy_button<M: Clone + 'static>(
     copied: bool,
     halo: u16,
@@ -117,36 +118,61 @@ pub fn subtle_copy_button<M: Clone + 'static>(
 // control's acknowledgement took the other's tooltip away. And the card is drawn OVER the
 // window, so on the picker's mode row it covered the alpha track above it.
 //
-// DRAGON-676 says the same word as TEXT on the row instead (`color_picker::view`'s
+// DRAGON-676 said the same word as TEXT on the row instead (`color_picker::view`'s
 // `copied_word`, in `theme::success`, the same green this file tints the tick with). Text
-// occupies layout rather than floating over it, so it hides nothing and silences nothing.
-// Do not bring the popover back to "save space": the room it would save is the room the
-// mode dropdown gave up in the same ticket, on purpose.
+// occupies layout rather than floating over it, so it hid nothing and silenced nothing.
+//
+// DRAGON-680 then deleted the word too, with the ROW it sat on: the picker's copy button
+// moved up into the controls row at the pipette's size, where there is no spare width for
+// a word, and the mode row that had held both is gone. So the acknowledgement is the tick
+// again, which is what every other copy control in the app has always shown. Do not bring
+// the popover back to "save space", and do not read the word's deletion as a decision that
+// the tick alone is enough for a copy nobody initiated: it is a decision that THAT window
+// had nowhere to put the word.
 
-/// A one-glyph sibling of [`subtle_copy_button`], for controls that sit BESIDE a copy
-/// button and must read as the same family (DRAGON-630's split-inputs toggle): the same
-/// `button::icon` construction, the same subtle resting tint, the same halo and tooltip
-/// mechanics, just no copied state. Built here rather than at the call site so the
-/// paddings cannot drift apart again — the toggle's first version was a hand-rolled
-/// 32pt button beside the copy's 24pt halo, which the owner called out.
-pub fn subtle_icon_button<M: Clone + 'static>(
-    icon: &'static str,
-    halo: u16,
-    tip_pos: widget::tooltip::Position,
-    label: &'static str,
-    press: M,
-) -> Element<'static, M> {
-    widget::tooltip(
-        crate::widgets::arrow_cursor::arrow_cursor(
-            widget::button::icon(crate::widgets::icons::handle(icon))
-                .class(icon_button_class(false, theme::subtle))
-                .padding(halo)
-                .on_press(press),
-        ),
-        widget::text(label).size(TIP_TEXT_SIZE),
-        tip_pos,
-    )
-    .into()
+// ── `subtle_icon_button`, and why it is gone (DRAGON-680) ────────────────────
+//
+// There was a one-glyph sibling of `subtle_copy_button` here: the same `button::icon`
+// construction, the same subtle resting tint, the same halo and tooltip mechanics, no
+// copied state. It existed for the colour picker's split-inputs toggle, which sat beside
+// the copy button and had to read as the same family (its first version hand-rolled a
+// bigger button and the owner called the padding mismatch out).
+//
+// That toggle is gone: the picker's value row layout is a property of the mode now, so
+// the button was deleted and this helper lost its only caller. The LESSON is worth
+// keeping if a second small icon button ever lands next to a copy control: build it from
+// the same construction rather than by eye, because the padding is what gives the pair
+// away.
+
+/// THE word every copy acknowledgement in this app says (DRAGON-682 item 30).
+///
+/// One constant because there are now two renderers for it: this module's tooltip card, and
+/// the colour picker panel's own pinned card on a swatch that was copied from its menu. Two
+/// spellings of one acknowledgement would read as two features.
+pub const COPIED_LABEL: &str = "Copied!";
+
+/// THE copy control's two glyph names, by flash state (DRAGON-680).
+///
+/// Public because a caller can need this control's LOOK at a size this module does not
+/// build: the colour picker window's copy button is the pipette's twin (a 24pt glyph in a
+/// 48pt square) rather than the 16pt bare icon button everything here mints, so it
+/// constructs its own button and asks for the glyph. That keeps the one thing that must
+/// not fork, the pair of names, in one place; the flash WINDOW ([`copied_recently`]) and
+/// the success green are shared the same way.
+///
+/// Do not add a size parameter to the buttons above to serve that case: their whole job is
+/// the small control, and libcosmic's `button::icon` sizes its glyph through named presets
+/// (`extra_small`, `medium`, …) that also rewrite the padding, which is exactly the
+/// "everything else about it stays whatever libcosmic says" property those helpers exist to
+/// keep.
+pub fn glyph_name(copied: bool) -> &'static str {
+    if copied {
+        // The same tick the folder list's chosen level wears, so "this worked" looks the
+        // same everywhere in the app.
+        "emblem-ok-symbolic"
+    } else {
+        "document-copy-symbolic"
+    }
 }
 
 /// The one body both public copy controls are built from: `tint` is the RESTING glyph colour
@@ -161,20 +187,14 @@ fn copy_button_with<M: Clone + 'static>(
     press: M,
 ) -> Element<'static, M> {
     let button = crate::widgets::arrow_cursor::arrow_cursor(
-        widget::button::icon(crate::widgets::icons::handle(if copied {
-            // The same tick the folder list's chosen level wears, so "this worked" looks the
-            // same everywhere in the app.
-            "emblem-ok-symbolic"
-        } else {
-            "document-copy-symbolic"
-        }))
-        .class(icon_button_class(copied, tint))
-        .padding(halo)
-        .on_press(press),
+        widget::button::icon(crate::widgets::icons::handle(glyph_name(copied)))
+            .class(icon_button_class(copied, tint))
+            .padding(halo)
+            .on_press(press),
     );
     widget::tooltip(
         button,
-        widget::text(if copied { "Copied!" } else { label }).size(TIP_TEXT_SIZE),
+        widget::text(if copied { COPIED_LABEL } else { label }).size(TIP_TEXT_SIZE),
         tip_pos,
     )
     .into()

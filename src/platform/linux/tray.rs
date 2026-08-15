@@ -15,10 +15,11 @@
 //! while paused) and its menu is the ONE portable
 //! [`crate::recording_ui::visible_tray_menu`] model, both states: while recording the
 //! three controls lead (Pause / Resume Recording, Finish & Save Recording, Cancel &
-//! Delete Recording), then the shared launcher group — Scanner, the "Capture" submenu,
-//! the "Audio Recording: <state>" radio submenu, Settings... — with the flagged-off
-//! rows HIDDEN (no Record, no Countdown Timer, no Quit while recording; the hide
-//! round's why is on `visible_tray_menu`). This mirrors the resident's menu — labels, order, icons, and the
+//! Delete Recording), then the shared launcher block (the scan row, the "Colors"
+//! submenu, the "Capture" submenu) and Settings..., with the flagged-off rows
+//! HIDDEN (no Record, no Countdown Timer, no Quit while recording; the hide round's why
+//! is on `visible_tray_menu`) and the empty middle block's divider collapsed with it.
+//! This mirrors the resident's menu: labels, order, icons, and the
 //! three-state icon all come from the ONE portable source (`crate::recording_ui`) so the
 //! surfaces can never drift. The recording actions AND the radio picks send the same
 //! [`TrayEvent`]s the app dispatches (on a child-owned surface the app process owns the
@@ -140,8 +141,9 @@ impl ksni::Tray for RecordingTray {
     }
 
     /// The control menu: the ONE portable [`visible_tray_menu`] model (DRAGON-574 +
-    /// the hide round), both states. While NOT recording (the idle session icon):
-    /// Scanner, the Capture and Record submenus, the Countdown Timer and Audio
+    /// the hide round), both states. While NOT recording (the idle session icon): the
+    /// scan row, the Colors / Capture / Record submenus, a separator, the
+    /// Countdown Timer and Audio
     /// Recording radio submenus, a separator, Settings..., Quit (a child-owned idle
     /// icon quits the session/app). While recording: the three controls and a
     /// separator lead, then the same group with the flagged-off rows HIDDEN (no
@@ -265,8 +267,11 @@ fn build_menu_items(state: TrayState, accent: [u8; 3]) -> Vec<ksni::MenuItem<Rec
                                 // still gets inert rows.
                                 enabled,
                                 icon_data: menu_icon_png(row.icon, accent),
-                                // Every launcher row grabs pixels, so every one is tagged
-                                // as menu-launched (DRAGON-574, DRAGON-600).
+                                // Tagged as menu-launched (DRAGON-574, DRAGON-600), the
+                                // same set-wide rule `spawn_waits_for_menu_dismiss`
+                                // states: a row that spawns a child carries the tag, and
+                                // a child with no pixels to grab (the DRAGON-680 Palette
+                                // Viewer) simply has nothing to hold back.
                                 activate: Box::new(move |_t: &mut RecordingTray| {
                                     crate::recording_ui::spawn_capture_child_args_from_menu(
                                         args,
@@ -986,11 +991,13 @@ mod tests {
 
     #[test]
     fn idle_menu_is_the_owners_shape_with_quit_enabled() {
-        // DRAGON-574: while NOT recording, the session icon shows the owner's idle shape
-        // (Scanner, the Capture / Record submenus, the Countdown Timer and Audio
-        // Recording radio submenus, Settings..., Quit ENABLED — a child-owned idle icon
-        // quits the capture session/app). The radio submenu titles come from the
-        // app-reported state (mic-only arms + preset index 2 here).
+        // DRAGON-574, re-laid-out by DRAGON-680 items 20, 22 and 25: while NOT recording,
+        // the session icon shows the owner's idle shape in three blocks. The launchers
+        // (the scan row, Colors, Capture, Record), a separator, the two
+        // per-capture settings submenus (Countdown Timer, Audio Recording), a separator,
+        // then Settings... and Quit ENABLED, since a child-owned idle icon quits the
+        // capture session/app. The radio submenu titles come from the app-reported state
+        // (mic-only arms + preset index 2 here).
         let t = tray(TrayState {
             recording: false,
             paused: false,
@@ -1002,10 +1009,11 @@ mod tests {
         assert_eq!(
             top_shapes(&menu),
             vec![
-                ("Color Picker".to_string(), true),
-                ("Scanner".to_string(), true),
-                ("Capture".to_string(), true),
+                (crate::recording_ui::SCAN_LABEL.to_string(), true),
+                ("Colors".to_string(), true),
+                (crate::recording_ui::CAPTURE_LABEL.to_string(), true),
                 ("Record".to_string(), true),
+                (String::new(), true), // separator
                 ("Countdown Timer: 05".to_string(), true),
                 ("Audio Recording: Mic Only".to_string(), true),
                 (String::new(), true), // separator
@@ -1013,10 +1021,13 @@ mod tests {
                 ("Quit Cosmic Capture Kit".to_string(), true),
             ]
         );
-        // The Capture / Record submenus hold the full-label trios, all enabled.
-        // Indices 2 and 3: Color Picker leads the group since DRAGON-582.
+        // The launcher submenus hold their full-label rows, all enabled: Colors at index
+        // 1, Capture at 2, Record at 3 (DRAGON-680 item 25 gave the recordings
+        // their own parent back, which is also what tells them apart from the stills:
+        // the same target glyph serves "Capture Region" and "Record Region").
         for (i, expected) in [
-            (2usize, vec!["Capture Region", "Capture Window", "Capture Monitor"]),
+            (1usize, vec!["Color Picker", "Palette Viewer"]),
+            (2, vec!["Capture Region", "Capture Window", "Capture Monitor"]),
             (3, vec!["Record Region", "Record Window", "Record Monitor"]),
         ] {
             let sub = match &menu[i] {
@@ -1031,7 +1042,7 @@ mod tests {
         }
         // The audio entry is a real submenu holding the one radio group, current row
         // marked with the DRAGON-574 labels.
-        let audio = match &menu[5] {
+        let audio = match &menu[6] {
             ksni::MenuItem::SubMenu(s) => s,
             _ => panic!("Audio Recording is a submenu"),
         };
@@ -1043,7 +1054,7 @@ mod tests {
         assert_eq!(row_labels, vec!["Mic + System", "Mic Only", "System Only", "None"]);
         assert_eq!(radio.selected, 1, "mic-only marks the second row");
         // The countdown entry holds the zero-padded presets with index 2 marked.
-        let countdown = match &menu[4] {
+        let countdown = match &menu[5] {
             ksni::MenuItem::SubMenu(s) => s,
             _ => panic!("Countdown Timer is a submenu"),
         };
@@ -1059,12 +1070,13 @@ mod tests {
     #[test]
     fn recording_menu_leads_with_audio_then_the_controls() {
         // DRAGON-574 (superseding the DRAGON-558/559 recording shape) + the hide
-        // round + the recolour-round amendment: the Audio Recording submenu (live
-        // arms) leads the WHOLE menu, then the three controls and a separator, then
-        // the same group with the flagged-off rows HIDDEN — no Record, no Countdown
-        // Timer, no Quit — while Scanner, Capture and Settings remain. (The COSMIC
-        // applet cannot gray or subdue a dbusmenu row, so the uniform answer
-        // everywhere is omission; see `visible_tray_menu`.)
+        // round + the recolour-round amendment, re-laid-out by DRAGON-680 item 22: the
+        // Audio Recording submenu (live arms) leads the WHOLE menu, then the three
+        // controls and a separator, then the launcher block, then Settings. The
+        // flagged-off rows are HIDDEN, so there is no Countdown Timer and no Quit, and
+        // with the middle block empty its divider goes too. (The COSMIC applet cannot
+        // gray or subdue a dbusmenu row, so the uniform answer everywhere is omission;
+        // see `visible_tray_menu`.)
         let t = tray(TrayState {
             recording: true,
             paused: false,
@@ -1081,12 +1093,31 @@ mod tests {
                 ("Finish & Save Recording".to_string(), true),
                 ("Cancel & Delete Recording".to_string(), true),
                 (String::new(), true), // separator
-                ("Color Picker".to_string(), true),
-                ("Scanner".to_string(), true),
-                ("Capture".to_string(), true),
+                (crate::recording_ui::SCAN_LABEL.to_string(), true),
+                ("Colors".to_string(), true),
+                (crate::recording_ui::CAPTURE_LABEL.to_string(), true),
                 (String::new(), true), // separator
                 ("Settings...".to_string(), true),
             ]
+        );
+        // Capture keeps its trio and stays usable (stills during a recording are
+        // fine), while the Record submenu is gone entirely: one recording at a time
+        // (DRAGON-559's rule, back on the parent row since item 25).
+        let capture = match &menu[7] {
+            ksni::MenuItem::SubMenu(s) => s,
+            _ => panic!("Capture is a submenu"),
+        };
+        assert_eq!(
+            top_shapes(&capture.submenu),
+            vec![
+                ("Capture Region".to_string(), true),
+                ("Capture Window".to_string(), true),
+                ("Capture Monitor".to_string(), true),
+            ]
+        );
+        assert!(
+            !top_shapes(&menu).iter().any(|(label, _)| label == "Record"),
+            "the Record submenu is hidden while a child records"
         );
         // Paused flips the first CONTROL (the row under the audio submenu) to Resume.
         let paused = tray(TrayState {
@@ -1110,9 +1141,10 @@ mod tests {
             tx,
             icon_cache: std::cell::RefCell::new(None),
         };
-        // Index 4: Color Picker, Scanner, Capture, Record, THEN Countdown Timer
-        // (DRAGON-582 put the picker at the head of the launcher group).
-        let countdown = match t.menu().swap_remove(4) {
+        // Index 5: the launcher block (the scan row, Colors, Capture, Record)
+        // and its trailing divider, THEN the Countdown Timer that opens the middle
+        // block (DRAGON-680 items 22 and 25).
+        let countdown = match t.menu().swap_remove(5) {
             ksni::MenuItem::SubMenu(s) => s,
             _ => panic!("Countdown Timer is a submenu"),
         };

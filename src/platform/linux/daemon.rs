@@ -22,14 +22,15 @@
 //!   paused, all from [`crate::recording_ui`]) and a menu built from the ONE portable
 //!   [`crate::recording_ui::visible_tray_menu`] model (DRAGON-574 + the hide round),
 //!   so the surfaces can never
-//!   drift. Idle: Scanner, the "Capture" and "Record" submenus (Region / Window /
-//!   Monitor trios), the "Countdown Timer: NN" radio submenu (persisting `delay_idx`,
-//!   the same field every capture launch reads), the "Audio Recording: <state>" radio
-//!   submenu (the DRAGON-558 persistent audio-arm control), separator, Settings...,
+//!   drift. Idle, in three blocks (DRAGON-680 items 22 and 25): the launchers (the scan
+//!   row, the "Colors" submenu, the "Capture" submenu, the "Record" submenu), a
+//!   separator, the "Countdown Timer: NN" radio submenu (persisting `delay_idx`, the
+//!   same field every capture launch reads) and the "Audio Recording: <state>" radio
+//!   submenu (the DRAGON-558 persistent audio-arm control), a separator, Settings...,
 //!   Quit. While a child records: the three controls lead (Pause/Resume Recording,
-//!   Finish & Save Recording, Cancel & Delete Recording), then the same group with the
-//!   flagged-off rows HIDDEN — no Record, no Countdown Timer, no Quit; Scanner /
-//!   Capture / Audio Recording (live arms) / Settings remain.
+//!   Finish & Save Recording, Cancel & Delete Recording), then the launcher block and
+//!   Settings, with the flagged-off rows HIDDEN (no Record, no Countdown Timer, no Quit)
+//!   and the empty middle block's divider collapsed with it.
 //! * The recording-control IPC socket ([`crate::daemon_ipc::socket_path`]): a recording
 //!   child connects at start, streams its [`RecordingState`], and receives the menu's
 //!   [`Command`]s back — identical wire protocol to the mac daemon.
@@ -402,8 +403,11 @@ fn build_menu_items(
                                 // still gets inert rows.
                                 enabled,
                                 icon_data: menu_icon(row.icon),
-                                // Every launcher row grabs pixels, so every one is tagged
-                                // as menu-launched (DRAGON-574, DRAGON-600).
+                                // Tagged as menu-launched (DRAGON-574, DRAGON-600), the
+                                // same set-wide rule `spawn_waits_for_menu_dismiss`
+                                // states: a row that spawns a child carries the tag, and
+                                // a child with no pixels to grab (the DRAGON-680 Palette
+                                // Viewer) simply has nothing to hold back.
                                 activate: Box::new(move |_t: &mut ResidentTray| {
                                     crate::recording_ui::spawn_capture_child_args_from_menu(
                                         args,
@@ -971,19 +975,21 @@ mod tests {
 
     #[test]
     fn idle_menu_is_the_owners_shape() {
-        // No child recording (DRAGON-574, plus DRAGON-582's Color Picker at the
-        // head): Color Picker, Scanner, the Capture / Record submenus, the
-        // Countdown Timer and Audio Recording radio submenus, a separator, Settings...,
-        // Quit — everything enabled. The radio titles carry the CACHED persisted state
-        // (mic-only arms, preset index 1) so both read without opening.
+        // No child recording (DRAGON-574, as re-laid-out by DRAGON-680 items 20, 22 and
+        // 25): three blocks, the launchers (the scan row, Colors, Capture,
+        // Record), a separator, the Countdown Timer and Audio Recording radio submenus,
+        // a separator, Settings..., Quit, everything enabled. The radio titles carry the
+        // CACHED persisted state (mic-only arms, preset index 1) so both read without
+        // opening.
         let shapes = resident_menu_shapes(&rec(false, false, false, false), (true, false), 1);
         assert_eq!(
             shapes,
             vec![
-                ("Color Picker".to_string(), true),
-                ("Scanner".to_string(), true),
-                ("Capture".to_string(), true),
+                (crate::recording_ui::SCAN_LABEL.to_string(), true),
+                ("Colors".to_string(), true),
+                (crate::recording_ui::CAPTURE_LABEL.to_string(), true),
                 ("Record".to_string(), true),
+                (String::new(), true), // separator
                 ("Countdown Timer: 03".to_string(), true),
                 ("Audio Recording: Mic Only".to_string(), true),
                 (String::new(), true), // separator
@@ -996,12 +1002,14 @@ mod tests {
     #[test]
     fn recording_menu_leads_with_audio_then_the_controls() {
         // While a child records (DRAGON-574 + the recolour-round amendment; hide
-        // round): the Audio Recording submenu leads the WHOLE menu, then the three
-        // controls and a separator, then the same group with the flagged-off rows
-        // HIDDEN — no Record, no Countdown Timer, no Quit (the COSMIC applet cannot
-        // gray or subdue a dbusmenu row, so the uniform answer everywhere is
-        // omission; see `visible_tray_menu`). The audio title carries the LIVE arms
-        // (system-only here), not the persisted ones, and a radio pick applies live.
+        // round; re-laid-out by DRAGON-680 items 22 and 25): the Audio Recording submenu
+        // leads the WHOLE menu, then the three controls and a separator, then the
+        // launcher block and Settings. The flagged-off rows are HIDDEN, so no Record, no
+        // Countdown Timer and no Quit, and the empty middle block takes its divider with
+        // it (the COSMIC applet cannot gray or subdue a dbusmenu row, so the uniform
+        // answer everywhere is omission; see `visible_tray_menu`). The audio title
+        // carries the LIVE arms (system-only here), not the persisted ones, and a radio
+        // pick applies live.
         let shapes = resident_menu_shapes(&rec(true, false, false, true), (true, false), 2);
         assert_eq!(
             shapes,
@@ -1011,9 +1019,9 @@ mod tests {
                 ("Finish & Save Recording".to_string(), true),
                 ("Cancel & Delete Recording".to_string(), true),
                 (String::new(), true), // separator
-                ("Color Picker".to_string(), true),
-                ("Scanner".to_string(), true),
-                ("Capture".to_string(), true),
+                (crate::recording_ui::SCAN_LABEL.to_string(), true),
+                ("Colors".to_string(), true),
+                (crate::recording_ui::CAPTURE_LABEL.to_string(), true),
                 (String::new(), true), // separator
                 ("Settings...".to_string(), true),
             ]

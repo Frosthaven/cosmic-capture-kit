@@ -248,6 +248,12 @@ impl App {
         if self.settings.only {
             return Task::none();
         }
+        // DRAGON-680: so is `--palette-viewer`, the colour picker's result window with no
+        // overlay phase behind it. Its own window is opened from `init` (through
+        // `WindowChromeMsg::OpenPaletteViewer`), so there is nothing to do here but refuse.
+        if self.palette_viewer {
+            return Task::none();
+        }
         // DRAGON-431: a macOS too old to capture. `App::init` already suppressed the scene
         // grab and the tiling-WM pause, so nothing has touched ScreenCaptureKit — this is
         // where the session ENDS, because it is the first point that has both a `&mut self`
@@ -1717,6 +1723,12 @@ impl App {
     pub(super) fn on_output(&mut self, ev: OutputEvent, output: OutputHandle) -> Task<cosmic::Action<Msg>> {
         // `--settings` is a standalone window with no capture overlays.
         if self.settings.only {
+            return Task::none();
+        }
+        // DRAGON-680: `--palette-viewer` likewise. The same guard as the `seed_outputs_mac`
+        // twin above, wired at BOTH seeds so the flag cannot mean different things per
+        // platform (the rule `preview_mode` already follows here).
+        if self.palette_viewer {
             return Task::none();
         }
         match ev {

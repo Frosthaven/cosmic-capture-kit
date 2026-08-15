@@ -483,6 +483,93 @@ pub(crate) fn accent(theme: &Theme) -> Color {
     theme.cosmic().accent_color().into()
 }
 
+// ── The text SELECTION fill (DRAGON-680) ─────────────────────────────────────
+
+/// How much of the accent's opacity a text SELECTION keeps.
+///
+/// A third, and the owner sized it by eye on the shipped build, twice: first "the text
+/// selection color being our trim color is good, but we need it to be half as opaque
+/// otherwise text is hard to read" (0.5), then DRAGON-687's follow-up run took it down
+/// again: "lets make this 33% opacity instead of 50% opacity."
+const SELECTION_ALPHA: f32 = 0.33;
+
+/// The fill painted behind SELECTED text in every text input in this app: the user's
+/// accent at [`SELECTION_ALPHA`] of its opacity.
+///
+/// **Why the full-strength accent is unreadable, stated properly, because it looks like it
+/// should be fine.** libcosmic's `text_input::Appearance` carries a `selected_text_color`
+/// beside its `selected_fill`, so the obvious reading is that selected text is drawn in an
+/// ink chosen to sit on that fill. It is not: the widget never reads that field (grep
+/// `selected_text_color` in libcosmic's `text_input/input.rs` and every hit is the theme
+/// setting it). The selection quad is painted and then the value is drawn over it in its
+/// ORDINARY colour, so at full opacity a saturated accent sits directly under body text
+/// that was never chosen to contrast with it. Cutting the alpha lets the input's own
+/// background back through, which is what restores the contrast the text was designed for,
+/// and it keeps the accent recognisably the accent, which is the balance the owner liked.
+///
+/// It is a FRACTION of the live accent rather than a colour of its own, so it follows the
+/// user's accent setting exactly as everything else does, and a theme whose accent already
+/// carries alpha is scaled from whatever it really is rather than from an assumed 1.0.
+pub(crate) fn selection_fill(theme: &Theme) -> Color {
+    let mut c = accent(theme);
+    c.a *= SELECTION_ALPHA;
+    c
+}
+
+/// Apply [`selection_fill`] to a text input appearance. THE one place the override is
+/// made, so every input in the app softens by the same rule.
+pub(crate) fn soften_selection(
+    mut appearance: cosmic::widget::text_input::Appearance,
+    theme: &Theme,
+) -> cosmic::widget::text_input::Appearance {
+    appearance.selected_fill = selection_fill(theme);
+    appearance
+}
+
+/// Which STOCK appearance an input starts from, for [`input_style`]. A tiny `Copy` enum
+/// rather than the real `cosmic::theme::TextInput`, because that one owns boxed closures
+/// in its `Custom` variant and so cannot be copied into the five style closures below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum InputBase {
+    /// libcosmic's ordinary field: every settings input, the picker's value boxes.
+    Default,
+    /// The rounded search field (the settings search bar).
+    Search,
+}
+
+impl InputBase {
+    fn stock(self) -> cosmic::theme::TextInput {
+        match self {
+            Self::Default => cosmic::theme::TextInput::Default,
+            Self::Search => cosmic::theme::TextInput::Search,
+        }
+    }
+}
+
+/// A stock text input with the app's own SELECTION fill (DRAGON-680): everything about the
+/// field stays whatever libcosmic says it is, and only `selected_fill` is overridden.
+///
+/// **Every text input in the app takes this**, which is why it lives here in the appearance
+/// seam rather than beside any one of them. libcosmic offers no theme-level hook for the
+/// selection colour, only the per-widget style, so a shared helper the sites call IS the
+/// one mechanism available; what it buys is that the rule is written once and a new input
+/// inherits it by using the helper instead of by remembering a number.
+///
+/// A caller that also overrides something else (the colour picker's value boxes change the
+/// resting border) should derive from the stock appearance and finish with
+/// [`soften_selection`] rather than reaching for this, so the two overrides compose instead
+/// of one replacing the other.
+pub(crate) fn input_style(base: InputBase) -> cosmic::theme::TextInput {
+    use cosmic::widget::text_input::StyleSheet as _;
+    cosmic::theme::TextInput::Custom {
+        active: Box::new(move |t| soften_selection(t.active(&base.stock()), t)),
+        error: Box::new(move |t| soften_selection(t.error(&base.stock()), t)),
+        hovered: Box::new(move |t| soften_selection(t.hovered(&base.stock()), t)),
+        focused: Box::new(move |t| soften_selection(t.focused(&base.stock()), t)),
+        disabled: Box::new(move |t| soften_selection(t.disabled(&base.stock()), t)),
+    }
+}
+
 /// The foreground drawn ON an accent fill: labels AND glyphs, one value for both.
 ///
 /// THE one source of truth for on-accent ink (DRAGON-607). It is `accent_button.on`,
@@ -2117,5 +2204,86 @@ mod on_accent_ink_tests {
             ),
             "a neutral button's content must keep the toolkit default wrapper"
         );
+    }
+}
+
+/// DRAGON-680: the text SELECTION fill. The owner's report was that selected text is hard
+/// to read at the full-strength accent, so what these pin is the RELATION (a third of the
+/// live accent since the DRAGON-687 follow-up run, tracking it) rather than any colour
+/// literal.
+#[cfg(test)]
+mod selection_fill_tests {
+    use super::*;
+
+    /// A THIRD of the accent's opacity (the owner's second sizing, DRAGON-687 item
+    /// eleven; it was half from DRAGON-680), and the accent's own hue: both halves
+    /// matter. Dropping the accent would lose the look the owner said was good; keeping
+    /// full alpha is the defect.
+    #[test]
+    fn the_selection_is_the_accent_at_a_third_opacity() {
+        for t in [cosmic::theme::Theme::dark(), cosmic::theme::Theme::light()] {
+            let a = accent(&t);
+            let s = selection_fill(&t);
+            assert_eq!((s.r, s.g, s.b), (a.r, a.g, a.b), "the selection is still the accent");
+            assert!((s.a - a.a * 0.33).abs() < 1e-6, "expected a third of {}, got {}", a.a, s.a);
+            assert!(s.a < a.a, "the selection must be softer than the accent itself");
+        }
+    }
+
+    /// It is a FRACTION of whatever the accent's alpha really is, not a hard-coded 0.33.
+    /// A theme whose accent already carries transparency must be scaled from there, or
+    /// the override would silently make some accents MORE opaque than they were.
+    #[test]
+    fn it_scales_the_live_alpha_rather_than_assuming_one() {
+        let mut c = Color::from_rgb(0.2, 0.4, 0.9);
+        c.a = 0.6;
+        let scaled = Color { a: c.a * SELECTION_ALPHA, ..c };
+        assert!((scaled.a - 0.6 * 0.33).abs() < 1e-6);
+    }
+
+    /// Every input the app builds through the shared helper really does carry the
+    /// override, in every state a field can be in. This is the half that would rot: the
+    /// helper existing is not the same as the states using it.
+    #[test]
+    fn the_shared_input_style_softens_every_state() {
+        use cosmic::widget::text_input::StyleSheet as _;
+        for base in [InputBase::Default, InputBase::Search] {
+            let style = input_style(base);
+            for t in [cosmic::theme::Theme::dark(), cosmic::theme::Theme::light()] {
+                let want = selection_fill(&t);
+                for (name, got) in [
+                    ("active", t.active(&style).selected_fill),
+                    ("error", t.error(&style).selected_fill),
+                    ("hovered", t.hovered(&style).selected_fill),
+                    ("focused", t.focused(&style).selected_fill),
+                    ("disabled", t.disabled(&style).selected_fill),
+                ] {
+                    assert_eq!(got, want, "{base:?}/{name} kept the stock selection fill");
+                }
+                // And it really is a CHANGE: the stock appearance it derives from paints
+                // the accent at full strength, or this test proves nothing.
+                assert_ne!(
+                    t.active(&base.stock()).selected_fill,
+                    want,
+                    "{base:?}: the stock fill already matches, so nothing is being overridden"
+                );
+            }
+        }
+    }
+
+    /// The helper changes ONLY the selection: a field that softened its own background or
+    /// border would be a second, unasked-for change riding along.
+    #[test]
+    fn nothing_but_the_selection_moves() {
+        use cosmic::widget::text_input::StyleSheet as _;
+        let t = cosmic::theme::Theme::dark();
+        let stock = t.active(&cosmic::theme::TextInput::Default);
+        let ours = t.active(&input_style(InputBase::Default));
+        assert_eq!(ours.background, stock.background);
+        assert_eq!(ours.border_color, stock.border_color);
+        assert_eq!(ours.border_width, stock.border_width);
+        assert_eq!(ours.border_radius, stock.border_radius);
+        assert_eq!(ours.placeholder_color, stock.placeholder_color);
+        assert_eq!(ours.text_color, stock.text_color);
     }
 }

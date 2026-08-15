@@ -230,7 +230,9 @@ impl crate::app::App {
                         crate::widgets::hide_when_clipped(
                             widget::text_input("CONFIGURE TEXT IN SETTINGS", &self.covermark_text)
                                 .on_input(|a0| Msg::Settings(SettingsMsg::SetCovermarkText(a0)))
-                                .width(Length::Fixed(280.0)),
+                                .width(Length::Fixed(280.0))
+                                // DRAGON-680: the app's softened text-selection fill.
+                                .style(theme::input_style(theme::InputBase::Default)),
                         ),
                     )
                     .reset_with(

@@ -1561,9 +1561,11 @@ impl App {
         if self.preview_windowed || self.overlay_barred(Some(id)) {
             // DEFER the swap to `present_capture` (DRAGON-221 follow-up): the composed
             // image's dims aren't known until ShotSaved (padding/shadow/wallpaper
-            // margins grow it past the selection), and a post-open `window::resize` is
-            // not honored on COSMIC — so the cover stays up through compose/save and
-            // the window opens ONCE at its correct size.
+            // margins grow it past the selection), so the cover stays up through
+            // compose/save and the window opens ONCE at its correct size.
+            // (This used to also cite "a post-open `window::resize` is not honored on
+            // COSMIC". That cause was wrong and is fixed in our winit fork; see
+            // `App::windowed_swap_pending`'s doc and FORKED_CHANGES.md patch 4.)
             self.windowed_swap_pending = true;
             Task::none()
         } else {

@@ -2,8 +2,10 @@
 //! selection and the chosen pre-capture delay. Stored as RON in
 //! `$XDG_STATE_HOME/cosmic-capture-kit/state.ron` (falling back to the cache dir).
 
+mod palettes;
 mod schema;
 mod store;
 
+pub use self::palettes::*;
 pub use self::schema::*;
 pub use self::store::*;

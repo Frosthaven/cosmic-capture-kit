@@ -15,6 +15,33 @@ pub struct CovermarkPref {
     pub opacity: f32,
 }
 
+/// One SAVED PALETTE (DRAGON-687): a named, ordered group of colours in the colour
+/// picker window's Saved Palettes tab. The entry shape of `palettes.toml`
+/// (`state::palettes`, its own file beside the config so factory resets spare it), and of
+/// the legacy in-config key that file replaced.
+///
+/// The colours are hex strings in the recents' own on-disk spelling (`#RRGGBB` opaque,
+/// `#RRGGBBAA` translucent, both read back through `color_picker::geom::Recent::parse`),
+/// so the two lists can never disagree about what a persisted colour looks like. The
+/// NAME is user content, like the colours: it is written to the config and never to the
+/// debug log.
+///
+/// Tolerant on the way in, like every other persisted picker value: a colour entry that
+/// no longer parses is dropped rather than failing the palette, and a palette whose
+/// colour list is empty is KEPT, because an empty group the user just created and named
+/// is still theirs. Both fields carry serde defaults so a hand-edited entry missing one
+/// loads instead of wiping the config (`load()` falls back to `defaults()` on any parse
+/// error).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedPalette {
+    /// The group's display name, editable inline in the window.
+    #[serde(default)]
+    pub name: String,
+    /// The group's colours, in the user's own order (drops and the add button APPEND).
+    #[serde(default)]
+    pub colors: Vec<String>,
+}
+
 /// Container-level `#[serde(default)]` (belt-and-suspenders against settings RESETS):
 /// `load()` parses the whole config all-or-nothing and silently falls back to `defaults()`
 /// on ANY deserialize error, so one field missing from an older config would wipe every
@@ -308,6 +335,18 @@ pub struct Persisted {
     /// old configs load without a store-version bump. macOS/Linux never read it.
     #[serde(default)]
     pub win_login_item_seeded: bool,
+    /// Linux (DRAGON-683): the Linux analog of `mac_login_item_seeded`. The first Linux
+    /// daemon startup with `resident` and `autostart_on_login` both on registers the XDG
+    /// autostart entry and sets this; after that the OS entry and the settings toggle own
+    /// the state, so an explicit removal is never overridden twice. Needed because the
+    /// daemon-start repair deliberately leaves an ABSENT registration alone (only the
+    /// settings toggle may create one), while the resident tray must come back at login
+    /// by default on a fresh install, on every session kind. An additive serde-defaulted
+    /// field (absent key reads `false`, which is exactly the one-time trigger), so old
+    /// configs load without a `config_version` bump, the same treatment
+    /// `win_login_item_seeded` got. macOS/Windows never read it.
+    #[serde(default)]
+    pub linux_login_item_seeded: bool,
     /// macOS/Windows (DRAGON-130 / DRAGON-295): the global "Capture All In One" hotkey
     /// the resident daemon registers, as a spec string (e.g. "PrintScreen", "F13",
     /// "Cmd+Shift+2"). Opens the full capture overlay (region/window/monitor picker).
@@ -435,7 +474,13 @@ pub struct Persisted {
     /// a configuration choice, so a settings row would be a second way to say the same thing.
     #[serde(default = "default_color_picker_zoom")]
     pub color_picker_zoom: u32,
-    /// DRAGON-582: recently PICKED colours, newest first, as `#RRGGBB` strings.
+    /// DRAGON-582: recently PICKED colours, newest first, as hex strings.
+    ///
+    /// **`#RRGGBB` when opaque and `#RRGGBBAA` when not** (DRAGON-680, which let the
+    /// history keep transparency). BOTH shapes are read (`color_picker::geom::Recent`),
+    /// and an alpha-less entry loads opaque, which is what every entry any older build
+    /// wrote; an opaque entry is still WRITTEN with six digits, so a history that carries
+    /// no transparency is byte-identical on disk before and after that ticket.
     ///
     /// Persisted because the app is one-shot: the picker process exits when its window
     /// closes, so an in-memory list would be empty every single time the window opened
@@ -460,12 +505,48 @@ pub struct Persisted {
     /// config cannot invent a notation.
     #[serde(default = "default_color_picker_mode")]
     pub color_picker_mode: String,
-    /// DRAGON-630: whether the picker window's value row shows SPLIT per-channel boxes
-    /// (`true`, the default and the original layout) or ONE whole-value box holding the
-    /// full spelling exactly as the copy button would take it. The row's list toggle
-    /// writes it; remembered because the picker is one-shot, like the mode above.
-    #[serde(default = "default_true")]
-    pub color_picker_split_inputs: bool,
+    /// DRAGON-682: the colour picker window's panel is OPEN, which doubles the
+    /// window's width.
+    ///
+    /// Persisted for the reason the mode above is: the picker is a ONE-SHOT process, so an
+    /// in-memory flag would close the panel on every launch and the owner asked for "if the
+    /// window is expanded" to be remembered. Defaults to CLOSED, which is the window every
+    /// existing user has.
+    #[serde(default)]
+    pub color_picker_expanded: bool,
+    /// DRAGON-682: which panel tab that window shows, as a `PanelTab::id` string
+    /// (`harmonies`, `palettes`).
+    ///
+    /// Never trusted as read: `PanelTab::from_id` resolves it and anything unrecognised
+    /// falls back to Harmonies, the tab with content in it, so a hand-edited config cannot
+    /// open the picker on a tab that does not exist.
+    #[serde(default = "default_color_picker_panel_tab")]
+    pub color_picker_panel_tab: String,
+    /// LEGACY (DRAGON-687): the Saved Palettes tab's groups, while they lived INSIDE the
+    /// config (one merge window, never a shipped release). They live in their own file
+    /// beside the config now (`state::palettes`, `palettes.toml`), so a factory reset,
+    /// which rewrites the config, cannot take the user's palettes with it.
+    ///
+    /// READ ONCE for migration and never written again (`skip_serializing`, the retired
+    /// keys' own treatment): `state::load_palettes` moves a config-era list into the
+    /// file the first time it loads with the file absent, and the next config save drops
+    /// the key. An `Option` rather than a bare `Vec` because absent and present-empty
+    /// mean different things to the migration: a config-era user who deleted every group
+    /// carried `saved_palettes = []`, and that deletion must migrate as a deletion
+    /// rather than resurrecting the default.
+    #[serde(default, skip_serializing)]
+    pub saved_palettes: Option<Vec<SavedPalette>>,
+    // `color_picker_split_inputs` sat here (DRAGON-630 rev 3): whether the picker's value
+    // row showed split per-channel boxes or one whole-value box, for EVERY mode, toggled
+    // by a button on the row. DRAGON-680 deleted it, on the owner's ask: the layout is a
+    // property of the notation now (hex is one unified box, everything else splits, see
+    // `color_picker::geom::splits_components`), so there is nothing left to remember and
+    // the button that wrote it is gone too.
+    //
+    // Nothing has to migrate. `Persisted` has no `deny_unknown_fields`, so serde silently
+    // drops the retired key from an existing config, and the next save stops writing it;
+    // `store::tests::old_color_picker_split_inputs_key_is_ignored_on_load` proves both
+    // on-disk formats.
     /// Video recording frame rate (fps).
     #[serde(default = "default_record_fps")]
     pub record_fps: u32,
@@ -838,6 +919,11 @@ fn default_color_picker_zoom() -> u32 {
 /// always copied before modes existed, so an untouched config behaves byte-identically.
 fn default_color_picker_mode() -> String {
     crate::color::ColorFormat::Hex.id().to_string()
+}
+
+/// The picker panel's default tab: the one with content in it (DRAGON-682).
+fn default_color_picker_panel_tab() -> String {
+    crate::app::color_picker::geom::PanelTab::default().id().to_string()
 }
 
 /// The customize-mode corner-rounding default (used when `appearance_use_system` is

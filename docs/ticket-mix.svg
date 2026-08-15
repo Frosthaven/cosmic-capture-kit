@@ -10,7 +10,7 @@
 <text x="106" y="52" font-size="21" font-weight="650" fill="#F7F8F8">AI Disclosure</text>
 <text x="106" y="74" font-size="14" fill="#B8BEC8">This project is managed by a seasoned developer in collaboration with LLMs.</text>
 <text x="48" y="124" font-size="16" font-weight="650" fill="#E8EAED">Share of completed tickets by label</text>
-<text x="48" y="164" font-size="15" font-weight="600" fill="#D0D6E0">Project lifetime <tspan fill="#697077" font-weight="400">&#183; 518 tickets</tspan></text>
+<text x="48" y="164" font-size="15" font-weight="600" fill="#D0D6E0">Project lifetime <tspan fill="#697077" font-weight="400">&#183; 522 tickets</tspan></text>
 <line x1="48" y1="332" x2="395" y2="332" stroke="#2A2E36" stroke-width="1"/>
 <text x="38" y="336" font-size="11" fill="#6B7280" text-anchor="end">0%</text>
 <line x1="48" y1="285.33" x2="395" y2="285.33" stroke="#1B1E23" stroke-width="1"/>
@@ -19,25 +19,25 @@
 <text x="38" y="242.67" font-size="11" fill="#6B7280" text-anchor="end">40%</text>
 <line x1="48" y1="192" x2="395" y2="192" stroke="#1B1E23" stroke-width="1"/>
 <text x="38" y="196" font-size="11" fill="#6B7280" text-anchor="end">60%</text>
-<g><title>Bugs Caught: 273 of 518 tickets (52.7%)</title>
-<path d="M93.83,332 L93.83,213.03 Q93.83,209.03 97.83,209.03 L113.83,209.03 Q117.83,209.03 117.83,213.03 L117.83,332 Z" fill="#EB5757" filter="url(#glow-bug)"/>
-<text x="105.83" y="199.03" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">52.7%</text>
+<g><title>Bugs Caught: 275 of 522 tickets (52.7%)</title>
+<path d="M93.83,332 L93.83,213.08 Q93.83,209.08 97.83,209.08 L113.83,209.08 Q117.83,209.08 117.83,213.08 L117.83,332 Z" fill="#EB5757" filter="url(#glow-bug)"/>
+<text x="105.83" y="199.08" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">52.7%</text>
 <text x="105.83" y="360" font-size="12.5" fill="#C9CED6" text-anchor="middle">Bugs Caught</text>
-<text x="105.83" y="379" font-size="11" fill="#697077" text-anchor="middle">273</text>
+<text x="105.83" y="379" font-size="11" fill="#697077" text-anchor="middle">275</text>
 </g>
-<g><title>Feature: 176 of 518 tickets (34%)</title>
-<path d="M209.5,332 L209.5,256.72 Q209.5,252.72 213.5,252.72 L229.5,252.72 Q233.5,252.72 233.5,256.72 L233.5,332 Z" fill="#BB87FC" filter="url(#glow-feature)"/>
-<text x="221.5" y="242.72" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">34%</text>
+<g><title>Feature: 177 of 522 tickets (33.9%)</title>
+<path d="M209.5,332 L209.5,256.88 Q209.5,252.88 213.5,252.88 L229.5,252.88 Q233.5,252.88 233.5,256.88 L233.5,332 Z" fill="#BB87FC" filter="url(#glow-feature)"/>
+<text x="221.5" y="242.88" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">33.9%</text>
 <text x="221.5" y="360" font-size="12.5" fill="#C9CED6" text-anchor="middle">Feature</text>
-<text x="221.5" y="379" font-size="11" fill="#697077" text-anchor="middle">176</text>
+<text x="221.5" y="379" font-size="11" fill="#697077" text-anchor="middle">177</text>
 </g>
-<g><title>Task: 69 of 518 tickets (13.3%)</title>
-<path d="M325.17,332 L325.17,304.92 Q325.17,300.92 329.17,300.92 L345.17,300.92 Q349.17,300.92 349.17,304.92 L349.17,332 Z" fill="#5e6ad2" filter="url(#glow-task)"/>
-<text x="337.17" y="290.92" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">13.3%</text>
+<g><title>Task: 70 of 522 tickets (13.4%)</title>
+<path d="M325.17,332 L325.17,304.71 Q325.17,300.71 329.17,300.71 L345.17,300.71 Q349.17,300.71 349.17,304.71 L349.17,332 Z" fill="#5e6ad2" filter="url(#glow-task)"/>
+<text x="337.17" y="290.71" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">13.4%</text>
 <text x="337.17" y="360" font-size="12.5" fill="#C9CED6" text-anchor="middle">Task</text>
-<text x="337.17" y="379" font-size="11" fill="#697077" text-anchor="middle">69</text>
+<text x="337.17" y="379" font-size="11" fill="#697077" text-anchor="middle">70</text>
 </g>
-<text x="443" y="164" font-size="15" font-weight="600" fill="#D0D6E0">Jul 14 - Aug 13, 2026 (30 days) <tspan fill="#697077" font-weight="400">&#183; 409 tickets</tspan></text>
+<text x="443" y="164" font-size="15" font-weight="600" fill="#D0D6E0">Jul 16 - Aug 15, 2026 (30 days) <tspan fill="#697077" font-weight="400">&#183; 383 tickets</tspan></text>
 <line x1="443" y1="332" x2="790" y2="332" stroke="#2A2E36" stroke-width="1"/>
 <text x="433" y="336" font-size="11" fill="#6B7280" text-anchor="end">0%</text>
 <line x1="443" y1="285.33" x2="790" y2="285.33" stroke="#1B1E23" stroke-width="1"/>
@@ -46,26 +46,26 @@
 <text x="433" y="242.67" font-size="11" fill="#6B7280" text-anchor="end">40%</text>
 <line x1="443" y1="192" x2="790" y2="192" stroke="#1B1E23" stroke-width="1"/>
 <text x="433" y="196" font-size="11" fill="#6B7280" text-anchor="end">60%</text>
-<g><title>Bugs Caught: 238 of 409 tickets (58.2%)</title>
-<path d="M488.83,332 L488.83,200.22 Q488.83,196.22 492.83,196.22 L508.83,196.22 Q512.83,196.22 512.83,200.22 L512.83,332 Z" fill="#EB5757" filter="url(#glow-bug)"/>
-<text x="500.83" y="186.22" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">58.2%</text>
+<g><title>Bugs Caught: 225 of 383 tickets (58.7%)</title>
+<path d="M488.83,332 L488.83,198.92 Q488.83,194.92 492.83,194.92 L508.83,194.92 Q512.83,194.92 512.83,198.92 L512.83,332 Z" fill="#EB5757" filter="url(#glow-bug)"/>
+<text x="500.83" y="184.92" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">58.7%</text>
 <text x="500.83" y="360" font-size="12.5" fill="#C9CED6" text-anchor="middle">Bugs Caught</text>
-<text x="500.83" y="379" font-size="11" fill="#697077" text-anchor="middle">238</text>
+<text x="500.83" y="379" font-size="11" fill="#697077" text-anchor="middle">225</text>
 </g>
-<g><title>Feature: 119 of 409 tickets (29.1%)</title>
-<path d="M604.5,332 L604.5,268.11 Q604.5,264.11 608.5,264.11 L624.5,264.11 Q628.5,264.11 628.5,268.11 L628.5,332 Z" fill="#BB87FC" filter="url(#glow-feature)"/>
-<text x="616.5" y="254.11" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">29.1%</text>
+<g><title>Feature: 107 of 383 tickets (27.9%)</title>
+<path d="M604.5,332 L604.5,270.81 Q604.5,266.81 608.5,266.81 L624.5,266.81 Q628.5,266.81 628.5,270.81 L628.5,332 Z" fill="#BB87FC" filter="url(#glow-feature)"/>
+<text x="616.5" y="256.81" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">27.9%</text>
 <text x="616.5" y="360" font-size="12.5" fill="#C9CED6" text-anchor="middle">Feature</text>
-<text x="616.5" y="379" font-size="11" fill="#697077" text-anchor="middle">119</text>
+<text x="616.5" y="379" font-size="11" fill="#697077" text-anchor="middle">107</text>
 </g>
-<g><title>Task: 52 of 409 tickets (12.7%)</title>
-<path d="M720.17,332 L720.17,306.33 Q720.17,302.33 724.17,302.33 L740.17,302.33 Q744.17,302.33 744.17,306.33 L744.17,332 Z" fill="#5e6ad2" filter="url(#glow-task)"/>
-<text x="732.17" y="292.33" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">12.7%</text>
+<g><title>Task: 51 of 383 tickets (13.3%)</title>
+<path d="M720.17,332 L720.17,304.93 Q720.17,300.93 724.17,300.93 L740.17,300.93 Q744.17,300.93 744.17,304.93 L744.17,332 Z" fill="#5e6ad2" filter="url(#glow-task)"/>
+<text x="732.17" y="290.93" font-size="13" font-weight="600" fill="#F7F8F8" text-anchor="middle">13.3%</text>
 <text x="732.17" y="360" font-size="12.5" fill="#C9CED6" text-anchor="middle">Task</text>
-<text x="732.17" y="379" font-size="11" fill="#697077" text-anchor="middle">52</text>
+<text x="732.17" y="379" font-size="11" fill="#697077" text-anchor="middle">51</text>
 </g>
 <text x="48" y="414" font-size="12" fill="#EB5757" xml:space="preserve">LLMs write bugs. A thorough human QA process keeps <tspan font-style="italic">most</tspan> of these bugs from hitting production.</text>
 <g transform="translate(686, 402) scale(0.6667)" opacity="0.9"><title>Linear</title><path d="M2.886 4.18A11.982 11.982 0 0 1 11.99 0C18.624 0 24 5.376 24 12.009c0 3.64-1.62 6.903-4.18 9.105L2.887 4.18ZM1.817 5.626l16.556 16.556c-.524.33-1.075.62-1.65.866L.951 7.277c.247-.575.537-1.126.866-1.65ZM.322 9.163l14.515 14.515c-.71.172-1.443.282-2.195.322L0 11.358a12 12 0 0 1 .322-2.195Zm-.17 4.862 9.823 9.824a12.02 12.02 0 0 1-9.824-9.824Z" fill="#5E6AD2"/></g>
 <text x="790" y="414" font-size="11" fill="#697077" text-anchor="end">Source: Linear</text>
-<text x="790" y="432" font-size="11" fill="#4C525B" text-anchor="end">github.com/Frosthaven/cosmic-capture-kit &#183; generated 2026-08-13</text>
+<text x="790" y="432" font-size="11" fill="#4C525B" text-anchor="end">github.com/Frosthaven/cosmic-capture-kit &#183; generated 2026-08-15</text>
 </svg>

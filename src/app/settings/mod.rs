@@ -21,7 +21,7 @@ mod pages;
 // and sub-module reaches it through the same `use super::*` glob they already carry. One
 // helper, because the drag strip it stacks has to be on EVERY dialog's scrim or the window
 // stays pinned behind whichever one still hand-rolled its own.
-pub(in crate::app::settings) use dialog::stack_dialog;
+pub(in crate::app) use dialog::{dialog_layers, stack_dialog};
 
 // Re-export at the settings:: level so `super::settings::MIC_WAVE_COLUMNS` in
 // actions.rs keeps resolving without any path change.
@@ -151,6 +151,45 @@ impl ConfigTab {
         ConfigTab::Health,
         ConfigTab::About,
     ];
+}
+
+/// **Pure**, unit-tested: whether `page` renders an in-page tab strip, which is exactly
+/// where the Ctrl+Tab cycle chord has something to cycle (DRAGON-687). The nav rail is
+/// deliberately NOT a strip: the chord cycles tabs WITHIN a page, never the page list.
+///
+/// The `CycleTabStrip` handler's match is the effectful twin (it needs the models), and
+/// its debug asserts keep the two agreeing; this predicate exists so the no-op set is a
+/// tested fact rather than a fall-through.
+pub(crate) fn page_has_tab_strip(page: ConfigTab) -> bool {
+    matches!(
+        page,
+        ConfigTab::General | ConfigTab::CaptureModes | ConfigTab::AudioVideo | ConfigTab::Shortcuts
+    )
+}
+
+/// DRAGON-687: which settings pages the Ctrl+Tab chord can cycle.
+#[cfg(test)]
+mod tab_strip_cycle_tests {
+    use super::*;
+
+    /// The four strip pages answer and the four flat pages do not, over the WHOLE page
+    /// list, so a page added later has to take a side here on purpose.
+    #[test]
+    fn exactly_the_strip_pages_cycle() {
+        for page in ConfigTab::ALL {
+            let want = matches!(
+                page,
+                ConfigTab::General
+                    | ConfigTab::CaptureModes
+                    | ConfigTab::AudioVideo
+                    | ConfigTab::Shortcuts
+            );
+            assert_eq!(page_has_tab_strip(page), want, "{page:?}");
+        }
+        // The no-op cases the owner named: a page without tabs answers false.
+        assert!(!page_has_tab_strip(ConfigTab::About));
+        assert!(!page_has_tab_strip(ConfigTab::PreviewEditor));
+    }
 }
 
 /// The General page's in-page tabs (DRAGON-138): a horizontal strip splitting the
@@ -1075,38 +1114,21 @@ impl App {
         .height(Length::Fill)
         .align_y(cosmic::iced::Alignment::Start);
         let search: Element<'_, Msg> = if self.settings.search_active {
-            // A plain text_input reproducing libcosmic's `search_input` styling (Search style,
-            // `[0, space_xxs]` padding, 16px leading magnifier + trailing clear) but drawing
-            // the glyphs through OUR Lucide icon set (`icons::handle`) rather than the
-            // libcosmic built-ins: `system-search-symbolic` → Lucide `search`,
-            // `window-close-symbolic` → Lucide `x`. The trailing clear button carries the same
-            // `ConfigSearchClear` action libcosmic's `on_clear` wires up.
-            let spacing = cosmic::theme::active().cosmic().space_xxs();
-            widget::text_input("Search settings", &self.settings.search)
-                .padding([0, spacing])
-                .style(cosmic::theme::TextInput::Search)
-                .leading_icon(
-                    widget::container(
-                        widget::icon::icon(crate::widgets::icons::handle("system-search-symbolic"))
-                            .size(16),
-                    )
-                    .padding(8)
-                    .into(),
-                )
-                .trailing_icon(
-                    widget::button::custom(
-                        widget::icon::icon(crate::widgets::icons::handle("window-close-symbolic"))
-                            .size(16),
-                    )
-                    .class(cosmic::theme::Button::Icon)
-                    .on_press(Msg::WindowChrome(WindowChromeMsg::ConfigSearchClear))
-                    .padding(8)
-                    .into(),
-                )
-                .width(Length::Fixed(240.0))
-                .id(self.settings.search_id.clone())
-                .on_input(|a0| Msg::WindowChrome(WindowChromeMsg::ConfigSearchInput(a0)))
-                .into()
+            // The app's ONE search-field construction (`widgets::search_input`, extracted
+            // from right here by DRAGON-687 item six when the palette panel grew the same
+            // field): libcosmic's search_input styling over OUR Lucide glyphs, with the
+            // clear button carrying the same `ConfigSearchClear` libcosmic's `on_clear`
+            // would.
+            crate::widgets::search_input(
+                "Search settings",
+                &self.settings.search,
+                self.settings.search_id.clone(),
+                240.0,
+                |a0| Msg::WindowChrome(WindowChromeMsg::ConfigSearchInput(a0)),
+                Msg::WindowChrome(WindowChromeMsg::ConfigSearchClear),
+                // This field stays up until Escape or its clear button: no unfocus rule.
+                None,
+            )
         } else {
             let btn = widget::button::icon(crate::widgets::icons::handle("system-search-symbolic"))
                 .on_press(Msg::WindowChrome(WindowChromeMsg::ConfigSearchActivate));
@@ -1386,24 +1408,30 @@ impl App {
             // (user decision 2026-07-19; see `theme::frost_component`).
             let nav_widget = widget::nav_bar(&self.settings.nav, |a0| Msg::WindowChrome(WindowChromeMsg::SetConfigTab(a0)));
             // Wrapped in `arrow_cursor` so the rail's page items show the arrow, not the
-            // hand, on hover (house style: only URL links get the hand).
+            // hand, on hover (house style: only URL links get the hand), and inside that
+            // in `hover_redraw` (DRAGON-681) because the rail is the same
+            // `segmented_button` as the tab strips and shares their missing frame
+            // request. The rail's `spacing(space_xxs)` normally hides it, since a slow
+            // move lands in the gap between items and the interaction change buys a
+            // frame; a quick flick that jumps the gap in one motion event starves.
+            let nav_rail = nav_widget
+                .into_container()
+                .class(cosmic::theme::Container::custom(move |theme| {
+                    let cosmic = theme.cosmic();
+                    cosmic::iced::widget::container::Style {
+                        icon_color: Some(cosmic.on_bg_color().into()),
+                        text_color: Some(cosmic.on_bg_color().into()),
+                        background: Some(Background::Color(cosmic::iced::Color::TRANSPARENT)),
+                        border: Border {
+                            width: 0.0,
+                            color: cosmic::iced::Color::TRANSPARENT,
+                            radius: cosmic.corner_radii.radius_s.into(),
+                        },
+                        ..Default::default()
+                    }
+                }));
             let nav_list: Element<'_, Msg> = crate::widgets::arrow_cursor::arrow_cursor(
-                nav_widget
-                    .into_container()
-                    .class(cosmic::theme::Container::custom(move |theme| {
-                        let cosmic = theme.cosmic();
-                        cosmic::iced::widget::container::Style {
-                            icon_color: Some(cosmic.on_bg_color().into()),
-                            text_color: Some(cosmic.on_bg_color().into()),
-                            background: Some(Background::Color(cosmic::iced::Color::TRANSPARENT)),
-                            border: Border {
-                                width: 0.0,
-                                color: cosmic::iced::Color::TRANSPARENT,
-                                radius: cosmic.corner_radii.radius_s.into(),
-                            },
-                            ..Default::default()
-                        }
-                    })),
+                crate::widgets::hover_redraw(nav_rail),
             );
             widget::container(
                 widget::column(vec![
@@ -1635,6 +1663,7 @@ impl App {
             window,
             card.into(),
             Some(Msg::WindowChrome(WindowChromeMsg::CancelReset)),
+            Msg::WindowChrome(WindowChromeMsg::ConfigWindowDrag),
         )
     }
 
@@ -1673,7 +1702,7 @@ impl App {
             ));
         // Unlike the reset modal, an outside click does NOT dismiss (the user must choose an
         // explicit action so the checkbox decision is deliberate), so the backdrop is inert.
-        stack_dialog(window, card.into(), None)
+        stack_dialog(window, card.into(), None, Msg::WindowChrome(WindowChromeMsg::ConfigWindowDrag))
     }
 
     /// Render a page's sections to elements, dropping items (and then empty
@@ -1944,18 +1973,24 @@ impl App {
     /// `on_activate` routes the selection to its settings-domain message. Shared by
     /// the General (Settings/Appearance) and Capture Modes (Scanner/Screenshots/
     /// Screen Recordings) pages.
+    ///
+    /// Wrapped in `hover_redraw` (DRAGON-681) because `segmented_button` moves its
+    /// own hover field on a pointer move but never requests the frame that paints
+    /// it, and adjacent tabs are contiguous (`tab_bar` leaves the between-button
+    /// spacing at 0), so a move straight from one tab to the next changed no
+    /// `mouse::Interaction` and nothing scheduled a frame. See that module's doc.
     fn tab_strip<'a>(
         &self,
         model: &'a widget::segmented_button::SingleSelectModel,
         on_activate: fn(widget::segmented_button::Entity) -> Msg,
     ) -> Element<'a, Msg> {
         let gap = cosmic::theme::active().cosmic().space_xxs();
-        crate::widgets::arrow_cursor::arrow_cursor(
+        crate::widgets::arrow_cursor::arrow_cursor(crate::widgets::hover_redraw(
             widget::tab_bar::horizontal(model)
                 .button_alignment(Alignment::Center)
                 .button_spacing(gap)
                 .on_activate(on_activate),
-        )
+        ))
     }
 
     /// The hand-rolled custom-accent colour-picker sidebar (DRAGON-139) — a

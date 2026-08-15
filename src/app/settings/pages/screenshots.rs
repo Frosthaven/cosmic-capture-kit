@@ -17,7 +17,9 @@ impl crate::app::App {
                     crate::widgets::hide_when_clipped(
                         widget::text_input("~/Capture", &self.screenshot_dir)
                             .on_input(|a0| Msg::Settings(SettingsMsg::SetScreenshotDir(a0)))
-                            .width(Length::Fixed(280.0)),
+                            .width(Length::Fixed(280.0))
+                            // DRAGON-680: the app's softened text-selection fill.
+                            .style(theme::input_style(theme::InputBase::Default)),
                     ),
                     folder_btn(DirTarget::Screenshot),
                 ])

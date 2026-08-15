@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-capture-kit"
-version = "0.32.0"
+version = "0.33.0"
 edition = "2024"
 description = "Quickly capture your screen/audio to the clipboard for sharing with others. Supports QR/barcode/OCR scanning, cloud upload with automatic sharing links, and post-capture annotations."
 license = "GPL-3.0-only"
@@ -653,6 +653,20 @@ iced_tiny_skia = { git = "https://github.com/Frosthaven/iced.git", branch = "cck
 iced_wgpu = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
 iced_widget = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
 iced_winit = { git = "https://github.com/Frosthaven/iced.git", branch = "cck-layer-hide-cursor" }
+
+# DRAGON-685: one DX12-only fix on stock wgpu-hal 28.0.1 — bound the frame-latency
+# waitable wait once (a ~16ms cap, timeout tolerated) after an in-place `ResizeBuffers`,
+# which can leave that semaphore unsignaled until a later Present. Without it the first
+# post-resize frame acquire blocks for wgpu-core's full 1s timeout and a self-resizing
+# window (the palette viewer's panel toggle) freezes on a stale frame for seconds; and
+# BOUNDED rather than skipped, because a skip leaks a pacing credit whenever the resize
+# did not drain the semaphore, which an interactive resize turns into permanently unpaced
+# presentation. See FORKED_CHANGES.md; every other backend is byte-identical to
+# crates.io. The fork's base is the PUBLISHED 28.0.1 crate, not the gfx-rs v28.0.1 tag —
+# the tag does not compile against the dependency set the published crate resolves with
+# (FORKED_CHANGES.md has the measurement).
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/Frosthaven/wgpu-hal.git", branch = "cck-dx12-resize-latency" }
 
 # Optimize dependencies even in dev builds. The capture pipeline leans hard on
 # dependency crates (image/png/miniz_oxide PNG decode+encode, fast_blur for the

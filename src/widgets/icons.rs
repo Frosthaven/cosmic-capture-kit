@@ -76,6 +76,34 @@ pub fn handle(name: &str) -> Handle {
     }
 }
 
+/// An icon widget whose colour is set AT THE LEAF, from the live theme (DRAGON-680).
+///
+/// **Use this wherever the tint matters and the glyph is not a direct child of the thing
+/// that sets the colour.** A symbolic icon inherits the RENDERER's icon colour only when
+/// nothing nearer has resolved one, and in libcosmic plenty of things do: the default
+/// container class (`Container::Transparent`) answers `Some(component.on)` for both ink
+/// fields, so an ordinary centring container between a button and its glyph silently
+/// replaces whatever ink the button was passing down. That is how the colour picker's copy
+/// tick came to swap to a checkmark and stay the ordinary foreground instead of turning
+/// success green, and it is the same shape as the DRAGON-601 bug where a hex label ignored
+/// its chip's `text_color`.
+///
+/// The closure takes the live `&Theme`, so a caller can key the colour off a theme token
+/// (which is what every tint in this app does) rather than freezing a colour at build time.
+///
+/// A BRAND mark must never come through here: those are drawn in the brand's own colours
+/// and a class would override them (see [`brand`]). Nothing stops it structurally, because
+/// this is a plain wrapper over the widget, so the rule stays where the rest of the brand
+/// reasoning is.
+pub fn tinted(
+    handle: Handle,
+    ink: impl Fn(&cosmic::Theme) -> cosmic::iced::Color + 'static,
+) -> icon::Icon {
+    icon::icon(handle).class(cosmic::theme::Svg::custom(move |theme| {
+        cosmic::iced::widget::svg::Style { color: Some(ink(theme)) }
+    }))
+}
+
 /// The handle for a BRAND mark, in the brand's own colours (DRAGON-482). Pure; unit-tested.
 ///
 /// `None` for every other name, which is what lets a caller hand over a name it did not pick
@@ -358,16 +386,24 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         // Keyboard Shortcuts page's "Preview Editor" tab both wear it, so the two agree.
         "view-timeline-symbolic" => "timeline",
         "video-x-generic-symbolic" => "film", // video placeholder
+        // The colour picker's MODE STEPPER (DRAGON-680): one button per direction, up for
+        // the previous notation and down for the next. They were vendored for DRAGON-630's
+        // first stepper, went unused while that control was a dropdown, and are the control
+        // again.
         "pan-down-symbolic" => "chevron-down",
-        "pan-up-symbolic" => "chevron-up", // vendored for DRAGON-630's first stepper; kept bundled
-        // The SELECTOR caret: one chevron up over one chevron down, the glyph a control that
-        // cycles a list of values wears. The colour picker's mode activator took it when the
-        // mode label moved above the value boxes: a lone `chevron-down` reads as "opens
-        // downward", and that menu opens UPWARD as often as not.
+        "pan-up-symbolic" => "chevron-up",
+        // The SELECTOR caret: one chevron up over one chevron down, the glyph a control
+        // that cycles a list of values wears. It was the colour picker mode dropdown's
+        // caret (DRAGON-676), and DRAGON-680 deleted that dropdown; kept bundled, because
+        // it is the right glyph for the next control of that shape and the picker's own
+        // stepper is now the PAIR of separate chevrons above.
         "pan-up-down-symbolic" => "chevrons-up-down",
         // The picker value row's layout toggle (DRAGON-630): split channel boxes vs the
-        // one whole-value box. Outward chevrons say "expand into channels", inward say
-        // "collapse into one".
+        // one whole-value box. Outward chevrons said "expand into channels", inward
+        // "collapse into one". DRAGON-680 deleted that toggle (the layout is a property of
+        // the mode now), so these two are unused today; kept bundled and mapped, since a
+        // split/collapse control is a shape this app is likely to want again and the pair
+        // costs nothing but a match arm.
         "list-expand-symbolic" => "list-chevrons-up-down",
         "list-collapse-symbolic" => "list-chevrons-down-up",
         // Settings + misc.
@@ -386,6 +422,33 @@ fn lucide_name(name: &str) -> Option<&'static str> {
         "system-search-symbolic" => "search",
         "navbar-open-symbolic" => "panel-left-open",
         "navbar-closed-symbolic" => "panel-left-close",
+        // The MIRROR of that pair (DRAGON-682): the colour picker window's compare panel
+        // opens on the RIGHT, so its toggle wears the right-handed glyph. Same rule as the
+        // settings nav toggle, which is the control this one is modelled on: the icon
+        // names the ACTION the click performs, not the state the window is in, so a
+        // collapsed window shows "open" and an expanded one shows "close".
+        //
+        // Both files are vendored beside the left-handed pair: lucide ships them, the set
+        // here simply had no caller for them until now, and they are the upstream
+        // geometry rather than a transform wrapper so they render identically to their
+        // siblings at every size.
+        // The colour picker panel's two TAB icons (DRAGON-682 item 12, the owner's own
+        // picks): a dashed circle with a dot for the harmony relationships, and the
+        // swatch book the tray's "Palette Viewer" entry already wears, so the same idea
+        // carries the same mark in both places.
+        // The harmony groups' one-sentence explainer (DRAGON-682 item 23, the owner's own
+        // pick): hover-only chrome beside each group's name. Its own name rather than
+        // `help-about-symbolic`, which is already the About page's `info` mark: two
+        // different glyphs for two different jobs, and the mapping is by what the control
+        // DOES, so the one that asks a question gets the question mark.
+        "help-hint-symbolic" => "circle-question-mark",
+        "color-harmonies-symbolic" => "circle-dot-dashed",
+        "color-palettes-symbolic" => "swatch-book",
+        // The Saved Palettes tab's sort flyout anchor (DRAGON-687, the owner's own pick:
+        // Lucide `list-sort-descending`).
+        "sort-palettes-symbolic" => "list-sort-descending",
+        "panel-open-right-symbolic" => "panel-right-open",
+        "panel-close-right-symbolic" => "panel-right-close",
         "accessories-screenshot-symbolic" => "camera", // capture-modes tab
         "applications-multimedia-symbolic" => "clapperboard", // audio/video tab
         "applications-graphics-symbolic" => "image",
@@ -531,6 +594,12 @@ fn lucide_bytes(file: &str) -> &'static [u8] {
         "search" => svg!("search"),
         "panel-left-open" => svg!("panel-left-open"),
         "panel-left-close" => svg!("panel-left-close"),
+        "circle-question-mark" => svg!("circle-question-mark"),
+        "circle-dot-dashed" => svg!("circle-dot-dashed"),
+        "swatch-book" => svg!("swatch-book"),
+        "list-sort-descending" => svg!("list-sort-descending"),
+        "panel-right-open" => svg!("panel-right-open"),
+        "panel-right-close" => svg!("panel-right-close"),
         "clapperboard" => svg!("clapperboard"),
         "image" => svg!("image"),
         "activity" => svg!("activity"),
@@ -592,6 +661,9 @@ mod tests {
             // marks added by DRAGON-522).
             "book-image-symbolic", "inbox-symbolic",
             "list-add-symbolic", "system-search-symbolic", "navbar-open-symbolic",
+            "panel-open-right-symbolic", "panel-close-right-symbolic",
+            "color-harmonies-symbolic", "color-palettes-symbolic", "help-hint-symbolic",
+            "sort-palettes-symbolic",
             "navbar-closed-symbolic", "accessories-screenshot-symbolic",
             "applications-multimedia-symbolic", "applications-graphics-symbolic",
             "image-x-generic-symbolic", "video-display-symbolic",

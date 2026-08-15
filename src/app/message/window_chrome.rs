@@ -195,6 +195,14 @@ pub enum WindowChromeMsg {
     /// attempt)` because the native finalize is TITLE-matched and the set-title task can
     /// land a frame or two later, exactly like the preview window's.
     ColorPickerWindowOpened(window::Id, u8),
+    /// DRAGON-680: startup-only. Mint the PALETTE VIEWER's window (`--palette-viewer`),
+    /// the colour picker's result window opened with no overlay and no pick.
+    ///
+    /// Deferred a message-drain past `init` for exactly the reason
+    /// [`Self::OpenSettingsAtStartup`] is: the launch appearance `set_theme` is queued from
+    /// the same `init`, and a window minted before it lands paints libcosmic's default
+    /// accent for a frame.
+    OpenPaletteViewer,
     /// Colour-picker window titlebar: drag to move.
     ColorPickerWindowDrag,
     /// Colour-picker window titlebar: minimize (DRAGON-649). There is deliberately no
@@ -205,6 +213,11 @@ pub enum WindowChromeMsg {
     /// DWM cluster, so neither constructs it.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     ColorPickerWindowMinimize,
+    /// Windows (DRAGON-682): re-assert the colour picker window's CLIENT FLOOR after its
+    /// size changed, because the native caption cluster carves its frame out of the client
+    /// (DRAGON-668) and a new width is a new floor. Sent by the expand toggle's resize.
+    #[cfg(windows)]
+    ColorPickerWindowFloor,
     /// macOS (DRAGON-135): apply the empty-toolbar tweak that vertically centres
     /// the native traffic lights over the CSD header. Title-matched (the async
     /// set-title task must land first), so it polls: (window title, attempt).

@@ -682,6 +682,11 @@ pub enum SettingsMsg {
     /// Settings: switch the Keyboard Shortcuts page's in-page tab (Capture /
     /// Recording / Preview; DRAGON-142). Same domain rationale as `SetGeneralTab`.
     SetShortcutsTab(cosmic::widget::segmented_button::Entity),
+    /// Settings (DRAGON-687): Ctrl+Tab / Ctrl+Shift+Tab cycles the ACTIVE page's in-page
+    /// tab strip, `true` forward, wrapping. The handler re-dispatches the strip's own
+    /// `Set*Tab` message for the neighbouring entity, so the chord IS a click by
+    /// construction; a page with no strip, and a window mid-search, answer nothing.
+    CycleTabStrip(bool),
     /// Settings: preview editor appearance (windowed vs overlay).
     SetPreviewWindowed(bool),
     /// Settings: draw the group captions under the preview editor's top toolbar

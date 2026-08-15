@@ -541,6 +541,6 @@ impl App {
         // The backdrop swallows clicks (so the settings page behind stays inert) but does
         // NOT dismiss: only the Close button closes the test, so it can't be lost with a
         // stray click.
-        stack_dialog(window, card.into(), None)
+        stack_dialog(window, card.into(), None, Msg::WindowChrome(WindowChromeMsg::ConfigWindowDrag))
     }
 }

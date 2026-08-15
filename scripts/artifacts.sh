@@ -171,6 +171,12 @@ cck_stable_launcher() {
 # "$@").
 cck_say_use() {
     local link="$1"
+    # `just dev-*` shells through `just build` first, then prints this banner at
+    # the end after daemon handoff. Let the first print be suppressed so one
+    # command emits one "Use this path..." block.
+    if [ "${CCK_SUPPRESS_USE_LINE:-0}" = "1" ]; then
+        return 0
+    fi
     local c='' r=''
     if [ -t 1 ]; then c=$'\033[1;36m'; r=$'\033[0m'; fi
     printf '%s==> Use this path for shortcuts and CLI commands:%s\n' "$c" "$r"

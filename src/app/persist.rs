@@ -87,6 +87,7 @@ impl App {
             mac_permission_nag_spent: crate::state::load().mac_permission_nag_spent,
             mac_login_item_seeded: crate::state::load().mac_login_item_seeded,
             win_login_item_seeded: crate::state::load().win_login_item_seeded,
+            linux_login_item_seeded: crate::state::load().linux_login_item_seeded,
             region_overlay_opacity: self.region_overlay_opacity,
             active_overlay_opacity: self.active_overlay_opacity,
             preview_overlay_opacity: self.preview_overlay_opacity,
@@ -107,13 +108,30 @@ impl App {
                 .recents
                 .iter()
                 .take(crate::app::color_picker::geom::RECENTS_CAP)
-                .map(|c| c.hex())
+                // `#RRGGBB` for an opaque entry and `#RRGGBBAA` for a translucent one
+                // (DRAGON-680, `geom::Recent::hex`), so a history that carries no
+                // transparency is written exactly as every older build wrote it.
+                .map(|e| e.hex())
                 .collect(),
-            // DRAGON-630: the remembered value mode, as its stable id, and the value
-            // row's split-vs-whole layout. Their writers (the dropdown, the list
-            // toggle) each save as they change.
+            // DRAGON-687: the saved palettes do NOT ride the config any more. They live
+            // in their own file beside it (`state::palettes`, written by
+            // `App::save_palettes`), so a factory reset, which rewrites the config
+            // through this snapshot, cannot touch them. The legacy in-config key is
+            // `skip_serializing` and read only by the one-time migration, so `None` here
+            // is both the only honest value and what keeps the key from ever being
+            // written again.
+            saved_palettes: None,
+            // DRAGON-630: the remembered value mode, as its stable id. Its one writer is
+            // the mode stepper, which saves as it steps.
+            //
+            // `color_picker_split_inputs` rode along here until DRAGON-680 deleted it:
+            // the split-vs-unified layout is a property of the MODE now
+            // (`color_picker::geom::splits_components`), so there is nothing to remember.
             color_picker_mode: self.color_picker.mode.id().to_string(),
-            color_picker_split_inputs: self.color_picker.split_inputs,
+            // DRAGON-682: the compare panel's own two remembered facts. Their writer is the
+            // expand toggle and the tab strip, each saving as it changes.
+            color_picker_expanded: self.color_picker.expanded,
+            color_picker_panel_tab: self.color_picker.panel_tab.id().to_string(),
             record_fps: self.record_fps.value,
             record_bitrate_kbps: self.record_bitrate_kbps.value,
             // The INTENT ("auto" or the user's pick), never the display resolution
@@ -238,17 +256,40 @@ impl App {
         // DRAGON-582: a factory reset (which routes through here with the DEFAULTS) must
         // clear the recents, because they are user content and "reset everything" has to
         // mean it. Unparseable entries are dropped rather than failing the whole load.
+        //
+        // DRAGON-680: through `geom::Recent::parse`, which takes BOTH the `#RRGGBBAA`
+        // form this build writes for a translucent entry and the `#RRGGBB` form every
+        // older build wrote. An alpha-less entry loads OPAQUE, so an existing history
+        // survives the upgrade intact rather than being dropped as unparseable.
         self.color_picker.recents = p
             .recent_colors
             .iter()
-            .filter_map(|s| crate::color::ColorFormat::Hex.parse(s))
+            .filter_map(|s| crate::app::color_picker::geom::Recent::parse(s))
             .take(crate::app::color_picker::geom::RECENTS_CAP)
             .collect();
+        // DRAGON-687: the saved palettes are deliberately NOT touched here. They are
+        // user CONTENT in their own file beside the config (`state::palettes`), and this
+        // function is the reset path: the owner's rule is that a factory reset must not
+        // impact saved palettes, so neither the in-memory list nor `palettes.toml` moves
+        // when the config is reset or reloaded. (`state::palettes`'s tests pin the
+        // store-side half: the config's serialized defaults carry no palette key at all.)
+        // The history's swatch RASTERS are indexed in step with that list, so they are
+        // rebuilt here rather than left pointing at the entries that were there before
+        // (DRAGON-680). A factory reset makes the list shorter, which the view survives on
+        // its own; a RELOAD can replace it entry for entry, which it would not.
+        self.refresh_recent_rasters();
         // DRAGON-630: the remembered value mode; junk (or a factory reset's default)
-        // resolves to hex, the tool's historical copy. The layout toggle rides along.
+        // resolves to hex, the tool's historical copy.
         self.color_picker.mode = crate::color::ColorFormat::from_id(&p.color_picker_mode)
             .unwrap_or(crate::color::ColorFormat::Hex);
-        self.color_picker.split_inputs = p.color_picker_split_inputs;
+        // DRAGON-682: the panel's remembered state. The tab resolves through `from_id`,
+        // which answers Compare for anything it does not recognise.
+        self.color_picker.expanded = p.color_picker_expanded;
+        self.color_picker.panel_tab =
+            crate::app::color_picker::geom::PanelTab::from_id(&p.color_picker_panel_tab);
+        // …and the strip's own model with it (DRAGON-682 item 12), or the widget would keep
+        // drawing the tab the enum has just stopped naming.
+        self.color_picker.sync_panel_tab_model();
         self.record_fps.set_value(p.record_fps.clamp(1, 240));
         self.record_bitrate_kbps.set_value(p.record_bitrate_kbps.clamp(100, 500_000));
         self.record_res_preset = p.record_res_preset.min(RES_CUSTOM as u8);
