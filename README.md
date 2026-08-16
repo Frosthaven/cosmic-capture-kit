@@ -717,6 +717,7 @@ Building from source or hacking on it? [DEVELOPERS.md](DEVELOPERS.md) covers the
 
 ## 🙏 Contributions & Credits
 
+- Code contributors are listed in [CONTRIBUTORS.md](CONTRIBUTORS.md).
 - Brand icon by [Ashley Ball](https://ashleythedesigner.com/).
 - UI icons from [Lucide](https://lucide.dev) (ISC). The cloud provider marks are
   each provider's own. Details in
