@@ -1,0 +1,2569 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Screenshots, screen recordings and an on-screen QR / barcode / OCR scanner for COSMIC Linux, macOS and Windows.">
+      
+      
+      
+        <link rel="canonical" href="https://cck.thedragon.dev/cloud-accounts/">
+      
+      
+        <link rel="prev" href="../cli/">
+      
+      
+        <link rel="next" href="../releases/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Cloud accounts - Cosmic Capture Kit</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/custom.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+  
+
+
+  
+  
+
+<script id="__analytics">function __md_analytics(){function e(){dataLayer.push(arguments)}window.dataLayer=window.dataLayer||[],e("js",new Date),e("config","G-GFF8C5BGTC"),document.addEventListener("DOMContentLoaded",(function(){document.forms.search&&document.forms.search.query.addEventListener("blur",(function(){this.value&&e("event","search",{search_term:this.value})}));document$.subscribe((function(){var t=document.forms.feedback;if(void 0!==t)for(var a of t.querySelectorAll("[type=submit]"))a.addEventListener("click",(function(a){a.preventDefault();var n=document.location.pathname,d=this.getAttribute("data-md-value");e("event","feedback",{page:n,data:d}),t.firstElementChild.disabled=!0;var r=t.querySelector(".md-feedback__note [data-md-value='"+d+"']");r&&(r.hidden=!1)})),t.hidden=!1})),location$.subscribe((function(t){e("config","G-GFF8C5BGTC",{page_path:t.pathname})}))}));var t=document.createElement("script");t.async=!0,t.src="https://www.googletagmanager.com/gtag/js?id=G-GFF8C5BGTC",document.getElementById("__analytics").insertAdjacentElement("afterEnd",t)}</script>
+  
+    <script>if("undefined"!=typeof __md_analytics){var consent=__md_get("__consent");consent&&consent.analytics&&__md_analytics()}</script>
+  
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#setting-up-cloud-accounts-google-drive-onedrive-dropbox-youtube-proton-drive" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Cosmic Capture Kit" class="md-header__button md-logo" aria-label="Cosmic Capture Kit" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Cosmic Capture Kit
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Cloud accounts
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/Frosthaven/cosmic-capture-kit" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Frosthaven/cosmic-capture-kit
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Cosmic Capture Kit" class="md-nav__button md-logo" aria-label="Cosmic Capture Kit" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    Cosmic Capture Kit
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/Frosthaven/cosmic-capture-kit" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Frosthaven/cosmic-capture-kit
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capturing
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Capturing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The capture overlay
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capture modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/screenshots/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Screenshots
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/recording/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Recording
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/scanner/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The scanner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/color-picker/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The colour picker
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/keyboard/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Keyboard shortcuts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The preview editor
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    The preview editor
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The preview editor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/annotating/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Annotating
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/crop/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Crop and covermark
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/video/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Editing a recording
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/sharing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Saving, copying and uploading
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Settings
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/general/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    General
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/capture-modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capture Modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/preview-editor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Preview Editor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/audio-video/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Audio & Video
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/shortcuts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Keyboard Shortcuts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/cloud/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud Accounts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/health/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Health
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/about/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    About
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Command line
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud accounts
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud accounts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#why-this-extra-step-exists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why this extra step exists
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-general-idea" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The general idea
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#one-folder-on-every-provider" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One folder, on every provider
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="One folder, on every provider">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#organising-inside-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Organising inside it
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#google-drive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Google Drive
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#microsoft-onedrive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Microsoft OneDrive
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#dropbox" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dropbox
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#youtube" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        YouTube
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#proton-drive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Proton Drive
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Proton Drive">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-download-the-tool" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Download the tool
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-put-it-somewhere-your-computer-can-find-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Put it somewhere your computer can find it
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-connect-the-account" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Connect the account
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#4-choose-where-captures-go" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Choose where captures go
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#one-proton-account-at-a-time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One Proton account at a time
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#two-things-worth-knowing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two things worth knowing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#setting-the-environment-variable" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setting the environment variable
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Setting the environment variable">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#linux_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Linux
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#macos_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        macOS
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#windows_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Windows
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Troubleshooting
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../releases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../privacy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Privacy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../terms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Terms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#why-this-extra-step-exists" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why this extra step exists
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-general-idea" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The general idea
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#one-folder-on-every-provider" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One folder, on every provider
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="One folder, on every provider">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#organising-inside-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Organising inside it
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#google-drive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Google Drive
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#microsoft-onedrive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Microsoft OneDrive
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#dropbox" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Dropbox
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#youtube" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        YouTube
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#proton-drive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Proton Drive
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Proton Drive">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-download-the-tool" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Download the tool
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-put-it-somewhere-your-computer-can-find-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Put it somewhere your computer can find it
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-connect-the-account" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Connect the account
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#4-choose-where-captures-go" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Choose where captures go
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#one-proton-account-at-a-time" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        One Proton account at a time
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#two-things-worth-knowing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Two things worth knowing
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#setting-the-environment-variable" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Setting the environment variable
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Setting the environment variable">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#linux_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Linux
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#macos_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        macOS
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#windows_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Windows
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#troubleshooting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Troubleshooting
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<!--
+This page has no copy of its own on purpose.
+
+`CLOUD_ACCOUNTS.md` in the repository root is the single source of truth for
+the per-provider setup steps, and the include below pulls it in whole at build
+time. Edit that file, never this one. If the include ever breaks, the build
+fails loudly, because `pymdownx.snippets` runs with `check_paths: true`.
+-->
+
+<h1 id="setting-up-cloud-accounts-google-drive-onedrive-dropbox-youtube-proton-drive">Setting up Cloud Accounts (Google Drive, OneDrive, Dropbox, YouTube, Proton Drive)</h1>
+<p><strong>Do you need this guide?</strong></p>
+<ul>
+<li><strong>Google Drive, OneDrive and Dropbox, official build</strong>: no. They work out of
+  the box. Open Settings, go to Cloud Accounts, and press Connect.</li>
+<li><strong>YouTube, any build</strong>: yes. YouTube needs your own registration even in the
+  official app, for a quota reason explained in its section below.</li>
+<li><strong>Proton Drive, any build</strong>: yes, but it is a different kind of step. Proton
+  has no app registration to make. Instead you install Proton's own free
+  command-line tool once, and the app uses it. The Proton Drive section below
+  has the download and the steps. The Flatpak build is the one exception: it
+  ships the tool inside the app, so there is nothing to install there.</li>
+<li><strong>Any provider, a build you made yourself from source</strong>: yes, for each
+  provider you want to use.</li>
+</ul>
+<p><strong>Why the app might not list a provider at all.</strong> The Add cloud account dialog
+offers a provider only once this build has a registration for it. So a build
+from source with nothing set up shows a short page pointing at this guide
+instead of a list, and each provider appears in the list as soon as its
+environment variable is set and the app is restarted. Nothing is hidden
+permanently, and there is no setting to toggle: a provider is listed exactly
+when it can actually be connected.</p>
+<p>Proton Drive is the one exception, and it is listed differently on purpose. It
+is always in the list, whatever your build. If its tool is not installed yet,
+the row says "Install proton-drive CLI" underneath the name, and clicking it
+opens the download page instead of starting a sign-in. Install the tool, open
+the list again, and the row becomes an ordinary one you can connect. Nothing
+about your build decides this, so nothing about it could be hidden from you.</p>
+<h2 id="why-this-extra-step-exists">Why this extra step exists</h2>
+<p>Cloud services like Google Drive will not let just any program sign someone in.
+Before an app can show the "sign in with Google" screen, it has to be registered
+with Google as an app first. That registration produces an id (a short string of
+letters and numbers) that tells Google which app is asking.</p>
+<p>The official, downloadable build of this app carries that registration for
+Google Drive, OneDrive and Dropbox, so those three just work. A copy you build
+yourself from source carries none of them, because those registrations belong to
+one project owner, not to everyone who builds the code. So if you are building
+from source and want to connect a cloud account, you need to register your own,
+which is free and takes a few minutes per provider.</p>
+<p>YouTube is the one provider nobody gets for free, official build included. Its
+daily upload allowance belongs to the registration rather than to the person
+using it, so one shared registration would run out within a handful of uploads
+a day across everybody. Registering your own gives you the whole allowance to
+yourself. The YouTube section below has the steps.</p>
+<p>This id is not a secret you need to protect closely. It is closer to a name tag
+than a password. You still register your own instead of using someone else's,
+the same way you would not want to run a website under someone else's name.</p>
+<h2 id="the-general-idea">The general idea</h2>
+<p>For each provider you want to use, you will:</p>
+<ol>
+<li>Go to that provider's developer site and create a small, private "app"
+   registration under your own account.</li>
+<li>Copy the id it gives you.</li>
+<li>Tell Cosmic Capture Kit that id, using an environment variable (a small
+   piece of text your computer can hand to a program when it starts).</li>
+<li>Restart the app and try Connect again.</li>
+</ol>
+<p>Below are the exact steps for each provider. Proton Drive does not work this
+way at all (there is no id to copy and no variable to set), so it has its own
+section further down. iCloud is still not supported: Apple offers no official
+way for outside apps to connect to it, so the app does not offer it either.</p>
+<h2 id="one-folder-on-every-provider">One folder, on every provider</h2>
+<p>Whichever provider you connect, this app can only see and write to a single
+folder called "Cosmic Capture Kit". Everything it uploads lands there, or in a
+folder you make inside it, and nothing else in your drive is reachable at all.
+Each provider enforces that a different way, which is why the steps below differ:</p>
+<ul>
+<li><strong>Google Drive</strong>: the <code>drive.file</code> permission only ever grants access to files
+  this app itself created. The app finds or creates the folder for you the first
+  time you connect, in your My Drive.</li>
+<li><strong>OneDrive</strong>: the <code>Files.ReadWrite.AppFolder</code> permission grants access to one
+  app folder and nothing else. Microsoft creates it for you, under <code>Apps/</code>, and
+  names it after your app registration.</li>
+<li><strong>Dropbox</strong>: the app is registered with "App folder" access, so the folder
+  under <code>Apps/</code> IS the whole of what its sign-in can reach.</li>
+<li><strong>YouTube</strong>: no folders exist there, so there is nothing to sandbox. It has
+  its own scope, covered in its section.</li>
+<li><strong>Proton Drive</strong>: the app creates the folder itself, in My files, and only
+  ever writes there. Proton Drive also lets you send captures to a photo album
+  instead; see its section below.</li>
+</ul>
+<p>Because two of the three name that folder after your app REGISTRATION, name
+your registrations "Cosmic Capture Kit" as you create them if you want the
+folder to match what the app calls it on screen. Any name works; only the
+folder's own name changes.</p>
+<h3 id="organising-inside-it">Organising inside it</h3>
+<p>You do not have to leave your drive to arrange that folder. The step that
+appears after you connect an account, and the gear button on the account's row
+afterwards, is a small folder manager for it:</p>
+<ul>
+<li><strong>Where you are is where your captures go.</strong> The path above the list names the
+  folder you are looking inside, and that is where this account uploads. There
+  is nothing separate to select.</li>
+<li>The list shows what is inside that folder. Click a folder to go into it, which
+  also makes it the destination, and click any part of the path to come back out,
+  which moves the destination back out with you.</li>
+<li>Press Done to save it. The account's row on the settings page then shows the
+  full path. Cancel leaves the account's folder exactly as it was.</li>
+<li>Opening this step again later starts you inside the folder the account is
+  already using, so you can see where you are before changing anything.</li>
+<li>The plus button beside the path makes a new folder at the level you are
+  looking at. Type its name and press Enter.</li>
+<li>The bin button on a folder's row deletes it. It asks first, because the
+  folder's contents go with it. The folder this account uploads to cannot be
+  deleted, nor can one that contains it; move somewhere else and press Done
+  first.</li>
+</ul>
+<p>Everything here stays inside the one folder above. There is no way to reach the
+rest of your drive from this app, and there is no way to point an account
+outside it.</p>
+<h2 id="google-drive">Google Drive</h2>
+<ol>
+<li>Go to <a href="https://console.cloud.google.com">console.cloud.google.com</a> and sign
+   in with the Google account you want to upload to.</li>
+<li>If you do not already have a project, create one. Any name is fine, this is
+   just a container for the next steps.</li>
+<li>In the left menu, go to <strong>APIs &amp; Services &gt; Library</strong>. Search for
+   <strong>Google Drive API</strong> and click <strong>Enable</strong>.</li>
+<li>Go to <strong>APIs &amp; Services &gt; OAuth consent screen</strong>. Google calls this whole
+   area "Google Auth Platform", with its own tabs on the left (Overview,
+   Branding, Audience, Clients, Data Access, Verification Center).</li>
+<li>Choose <strong>External</strong>.</li>
+<li>Fill in an app name (anything, like "My Screenshot Uploader"), your email
+     as the support email, and your email again under developer contact.</li>
+<li>Save. This takes you to an Overview page. You do not need to publish the
+     app or ask Google to review it.</li>
+<li>Click the <strong>Audience</strong> tab on the left. Scroll to <strong>Test users</strong>, click
+   <strong>+ Add users</strong>, and add your own Google account's email address. Save.</li>
+<li>Click the <strong>Data Access</strong> tab on the left, then <strong>Add or remove scopes</strong>.
+   In the filter box, search for <code>drive.file</code>, and check the box for
+   <code>.../auth/drive.file</code> ("See, edit, create, and delete only the specific
+   Google Drive files you use with this app"). Click <strong>Update</strong>, then <strong>Save</strong>.
+   (If it does not show up in the list, go back to step 3: this scope only
+   appears once the Drive API is enabled for the project.)
+   This step is easy to miss and matters: without it, signing in can succeed
+   and still leave the app unable to actually use Drive, failing the first
+   time it tries to list your folders with an error like "the cloud service
+   refused this account's permission to list folders". If you connected
+   before adding this scope, disconnect the account in the app and connect it
+   again afterward.</li>
+<li>Click the <strong>Clients</strong> tab on the left (or the <strong>Create OAuth Client</strong>
+   button on the Overview page).</li>
+<li>Application type: <strong>Desktop app</strong>. (Not "TVs and Limited Input devices".
+     That type needs something this app cannot provide.)</li>
+<li>Give it any name and click <strong>Create</strong>.</li>
+<li>You will be shown a <strong>Client ID</strong> and a <strong>Client Secret</strong>. Copy both. Despite the
+   name, Google's own documentation notes that this "secret" is not treated as
+   sensitive here: it ships inside the app the same way the client id does, since
+   PKCE (not the secret) is what actually protects the sign-in. Google's "Desktop
+   app" client type is the one that issues a secret at all; Microsoft's and
+   Dropbox's setups below do not need one.</li>
+<li>Set the environment variable <code>CCK_GDRIVE_CLIENT_ID</code> to the Client ID, and
+   <code>CCK_GDRIVE_CLIENT_SECRET</code> to the Client Secret (see "Setting the environment
+   variable" below), then restart the app. Google Drive then appears in the Add
+   cloud account list; press Connect on it.</li>
+</ol>
+<p>There is nothing to set up on the Drive side for the folder. The first time you
+connect (and the first time you open the gear on an account connected before
+this app worked this way), it looks for a folder called "Cosmic Capture Kit" in
+your My Drive and creates one if there is none. It looks before it creates, so
+reconnecting the same account never leaves you with two of them. The folder is
+an ordinary Drive folder: you can open it, move it, or move things out of it,
+and the app carries on using the one it made.</p>
+<h2 id="microsoft-onedrive">Microsoft OneDrive</h2>
+<p>Microsoft no longer lets a plain personal account create an app registration
+on its own. It needs a "directory" (Microsoft's name for an organization)
+behind it first. This sounds bigger than it is, and the steps below create
+one for free. You will still sign in and upload with your normal personal
+Microsoft/OneDrive account afterward. The directory is only a place to park
+the app registration.</p>
+<p>You might be tempted to try the "Microsoft 365 Developer Program" for this,
+since it also offers a free sandbox directory. As of this writing it often
+refuses personal accounts with a message like "you don't currently qualify",
+a real restriction on Microsoft's side, not something you did wrong. Skip
+straight to the Azure signup below instead, which uses a different,
+more reliable path to the same thing.</p>
+<ol>
+<li>Go to <a href="https://azure.microsoft.com/free">azure.microsoft.com/free</a> and
+   sign up for a free account, signing in with your Microsoft account.</li>
+<li>It will ask for a <strong>credit card</strong>, for identity verification only. As of
+     this writing, it does not charge anything unless you later create a
+     billable resource (a virtual machine, a storage account, and so on),
+     which nothing in these steps does.</li>
+<li>Finishing signup automatically creates a Microsoft Entra ID directory
+     for you. There is no separate "create a directory" step.</li>
+<li>Go to <a href="https://entra.microsoft.com">entra.microsoft.com</a> and sign in with
+   the same account. You should land in (or be able to switch into) the new
+   directory.</li>
+<li>On the directory's Overview page, open the <strong>"+ Add"</strong> dropdown near the
+   top and choose <strong>App registration</strong>. (This is not under a separate
+   "Applications" menu; it lives in this dropdown.)</li>
+<li>Name it anything.</li>
+<li>Under "Supported account types", it starts on <strong>"Single tenant only -
+     Default Directory"</strong>. Click it to open the full picker, and choose the
+     option whose description mentions <strong>personal Microsoft accounts</strong>
+     (wording varies, look for that phrase specifically). This is the
+     setting that lets your normal, everyday Microsoft account sign in
+     later, even though the app itself lives in this new directory.</li>
+<li>Under Redirect URI, click <strong>"Select a platform"</strong>, choose <strong>Mobile and
+     desktop applications</strong>, and enter <code>http://localhost</code> as the URI.</li>
+<li>Click <strong>Register</strong>.</li>
+<li>On the app's overview page:</li>
+<li>Copy the <strong>Application (client) ID</strong>.</li>
+<li>You should see <strong>"Redirect URIs: 0 web, 0 spa, 1 public client"</strong> ,
+     confirming the redirect URI registered correctly.</li>
+<li>Ignore <strong>"Application ID URI"</strong> and leave it blank. That is for an app
+     exposing its own API for others to call, which does not apply here.</li>
+<li>Open the app's <strong>API permissions</strong> page, click <strong>Add a permission</strong>, choose
+   <strong>Microsoft Graph</strong>, then <strong>Delegated permissions</strong>, and add
+   <code>Files.ReadWrite.AppFolder</code>. (Search the list for "AppFolder": the entry
+   reads "Have full access to the application's folder".) You do not need to
+   add <code>offline_access</code> by hand, and you do not need an administrator to grant
+   anything: the app asks for both by name when you sign in, and you consent to
+   them there.</li>
+</ol>
+<p>This is the permission that limits the app to one folder. Its wider sibling,
+   <code>Files.ReadWrite</code>, would give read and write access to everything in your
+   OneDrive, and this app deliberately does not ask for it. Microsoft creates
+   the folder itself, under <code>Apps/</code>, named after this app registration.
+6. Set the environment variable <code>CCK_ONEDRIVE_CLIENT_ID</code> to the client id you
+   copied, then restart the app. OneDrive then appears in the Add cloud account
+   list; press Connect on it. Sign in with
+   your normal Microsoft/OneDrive account (not the Azure account, unless they
+   happen to be the same one).</p>
+<p>One caveat worth knowing before you sign in with a WORK or SCHOOL account:
+Microsoft's own documentation disagrees with itself about whether app folders
+work there. One page says the permission is for personal accounts only, another
+says app folders work on OneDrive for work or school as well. Personal accounts
+are the tested path. If a work account signs in and then cannot list folders,
+that is this, not something you configured wrongly.</p>
+<h2 id="dropbox">Dropbox</h2>
+<ol>
+<li>Go to <a href="https://www.dropbox.com/developers/apps">dropbox.com/developers/apps</a>
+   and sign in.</li>
+<li>Click <strong>Create app</strong>.</li>
+<li>Choose <strong>Scoped access</strong>.</li>
+<li>Choose <strong>App folder</strong>, not Full Dropbox. This limits the app to its own
+     dedicated folder (under <code>Apps/</code> in your Dropbox) instead of your whole
+     account, the same least-privilege idea as Google Drive's setup above,
+     which only ever grants access to files this app itself creates. Choose
+     carefully: Dropbox fixes the access type when the app is created, and
+     changing it later means deleting the app and making a new one, with a new
+     App key to set.</li>
+<li>Give it any name. It becomes the folder's name under <code>Apps/</code>.</li>
+<li>Open the new app's <strong>Settings</strong> tab.</li>
+<li>Under <strong>OAuth 2</strong>, check <strong>"Allow public clients (Implicit Grant &amp;
+     PKCE)"</strong>. This one is easy to miss and required: without it, sign-in
+     fails, since this app has no client secret to authenticate with here
+     (Dropbox's public-client setting, and Microsoft's app registration above,
+     both work this way; Google is the one exception, its Desktop app client
+     type issues a secret too, which the Google Drive steps above cover).</li>
+<li>Under <strong>OAuth 2 &gt; Redirect URIs</strong>, add all four of these, exactly as
+     written, one per line:<ul>
+<li><code>http://localhost:47821/</code></li>
+<li><code>http://localhost:47822/</code></li>
+<li><code>http://localhost:47823/</code></li>
+<li><code>http://localhost:47824/</code></li>
+</ul>
+</li>
+<li>Dropbox checks these exactly, including the ending slash, so copy them
+     as they are.</li>
+<li>Under the <strong>Permissions</strong> tab, turn on: <code>files.content.write</code>,
+   <code>files.metadata.read</code>, <code>sharing.write</code>, and <code>sharing.read</code>. Click
+   <strong>Submit</strong> to save.</li>
+<li>Back on the Settings tab, copy the <strong>App key</strong>. That is your client id.
+   Ignore <strong>App secret</strong>; it is not needed.</li>
+<li>Set the environment variable <code>CCK_DROPBOX_CLIENT_ID</code> to that value, then
+   restart the app. Dropbox then appears in the Add cloud account list; press
+   Connect on it.</li>
+</ol>
+<h2 id="youtube">YouTube</h2>
+<p>YouTube is a video destination, not a file-storage drive: it only appears in the
+app's Upload list when you are editing a recording, never a screenshot, and it
+lets you choose a visibility (Public, Unlisted or Private) for what you upload.</p>
+<p><strong>This one needs your own registration even in the official app</strong>, unlike the
+three above. YouTube's upload API works on a daily allowance that belongs to the
+app registration and is shared by everyone using it: a project gets 10,000 units
+a day and a single upload costs about 1,600 of them. A registration shipped with
+the app would therefore give every user of that build about six uploads a day
+between them, and the seventh person to record something would be turned away
+with nothing they could do about it. Your own registration gives you the whole
+allowance. That is why YouTube is missing from the Add cloud account list until
+you set the variables below, in every build.</p>
+<p>It uses the same Google Cloud project as Google Drive, just with one more API
+enabled and one more scope requested. If you already did the Google Drive
+setup above, skip straight to step 3. If you are on the official build and have
+never done any of this, you will be creating a project of your own for the first
+time here, so start at step 1.</p>
+<ol>
+<li>Go to <a href="https://console.cloud.google.com">console.cloud.google.com</a> and sign
+   in with the Google account you want to upload to. If you do not already
+   have a project, create one first (any name is fine).</li>
+<li>In the left menu, go to <strong>APIs &amp; Services &gt; Library</strong>. Search for
+   <strong>YouTube Data API v3</strong> and click <strong>Enable</strong>.</li>
+<li>Go to <strong>APIs &amp; Services &gt; OAuth consent screen</strong> ("Google Auth Platform").
+   If you have not set this up yet (you would have for Google Drive already if
+   you did that section first), choose <strong>External</strong>, fill in an app name and
+   your email as the support/developer contact, and save. You do not need to
+   publish the app or ask Google to review it for this step to work.</li>
+<li>Click the <strong>Audience</strong> tab, scroll to <strong>Test users</strong>, click <strong>+ Add
+   users</strong>, and add your own Google account's email address, if it is not
+   there already. Save.</li>
+<li>Click the <strong>Data Access</strong> tab, then <strong>Add or remove scopes</strong>. Search for
+   <code>youtube.force-ssl</code>, and check the box for the scope that mentions
+   managing your YouTube account (viewing, editing and permanently deleting
+   your videos). Click <strong>Update</strong>, then <strong>Save</strong>. This is the ONE scope this
+   app asks for; it is broader than "upload only" because the app has to be
+   able to take a video back off your channel when you cancel an upload that
+   has already gone through, or press Undo just after one finishes, and
+   YouTube's narrower upload-only scope cannot delete a video at all.</li>
+<li>Click the <strong>Clients</strong> tab. If you already created a Desktop app client for
+   Google Drive, you can reuse the SAME Client ID and Client Secret for
+   YouTube; this scope is just added to the same client's consent. Otherwise,
+   create one the same way the Google Drive steps above do (Application type
+   <strong>Desktop app</strong>), and copy the Client ID and Client Secret it gives you.</li>
+<li>Set the environment variable <code>CCK_YOUTUBE_CLIENT_ID</code> to the Client ID, and
+   <code>CCK_YOUTUBE_CLIENT_SECRET</code> to the Client Secret (see "Setting the
+   environment variable" below: these are separate variables from Drive's,
+   even if you reused the same underlying client), then restart the app. YouTube
+   then appears in the Add cloud account list; press Connect on it.</li>
+</ol>
+<p><strong>A real Google-side limitation to know about before you test this</strong>: a
+project Google has not audited yet forces every video uploaded through this
+API to Private, no matter which visibility you pick in the app. This applies
+to any Google Cloud project created after 2020-07-28 that has not completed
+Google's review process for this API (search for "YouTube API Services Audit
+and Quota Extension Form" in Google's own documentation). A fresh project you
+just created for this falls into that bucket. This is not a bug in the app;
+it is Google's own restriction on unverified projects, and community reports
+put the review turnaround at several weeks. Until your project is reviewed,
+test with Private/Unlisted expectations in mind, or ask a teammate with an
+already-reviewed project to set up the client for you.</p>
+<h2 id="proton-drive">Proton Drive</h2>
+<p>Proton Drive is the one provider that needs no registration, no id and no
+environment variable. It also does not have a public API for other apps to use.
+What it has instead is an official, free command-line tool that Proton
+publishes and maintains, called <code>proton-drive</code>. You install that once, and this
+app talks to it.</p>
+<p>That is the whole difference. Once the tool is installed, connecting is the
+same two clicks as any other provider.</p>
+<p>One honest note, which the app also shows on Proton Drive's row in the picker:
+this integration is <strong>not officially supported by Proton</strong>. The command-line
+tool is Proton's own, but Proton offers no API for outside apps and has not
+endorsed this app's use of the tool. If Proton changes or withdraws the tool,
+this integration follows it.</p>
+<p>If you installed this app as a <strong>Flatpak</strong>, skip the download entirely: the
+Flatpak bundles the tool inside the app, and the store updates the bundled
+copy along with the app. That is not only a convenience: a sandboxed app
+cannot see a tool installed on the host, so a copy inside the package is the
+only one it could ever find. Jump straight to "Connect the account" below.</p>
+<h3 id="1-download-the-tool">1. Download the tool</h3>
+<p>Go to <a href="https://proton.me/support/drive-cli">proton.me/support/drive-cli</a> and
+download the build for your computer. It is a single file, about 120 MB,
+because everything it needs is inside it.</p>
+<h3 id="2-put-it-somewhere-your-computer-can-find-it">2. Put it somewhere your computer can find it</h3>
+<p>Your computer finds programs by looking through a list of folders called your
+PATH. The tool has to be in one of them, under the name <code>proton-drive</code>, or this
+app cannot start it.</p>
+<h4 id="linux">Linux</h4>
+<p>On Arch and Arch-based systems (including CachyOS and EndeavourOS), the easiest
+route is the AUR package <code>proton-drive-cli-bin</code>, which installs Proton's own
+official checksummed build for you and puts it on your PATH:</p>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>yay<span class="w"> </span>-S<span class="w"> </span>proton-drive-cli-bin
+</span></code></pre></div>
+<p>Use whichever AUR helper you have; <code>paru -S proton-drive-cli-bin</code> does the same.</p>
+<p>Anywhere else, download the Linux build and install it by hand. <code>~/.local/bin</code>
+is on the PATH on most modern distributions:</p>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>mkdir<span class="w"> </span>-p<span class="w"> </span>~/.local/bin
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>mv<span class="w"> </span>~/Downloads/proton-drive<span class="w"> </span>~/.local/bin/proton-drive
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>chmod<span class="w"> </span>+x<span class="w"> </span>~/.local/bin/proton-drive
+</span></code></pre></div>
+<p>That <code>chmod +x</code> line is not optional. A downloaded file arrives without
+permission to run, and without it the app will keep saying the tool is not
+installed. Check it worked by opening a new terminal and running
+<code>proton-drive version</code>.</p>
+<h4 id="macos">macOS</h4>
+<p>Download the macOS build, then in Terminal:</p>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>mkdir<span class="w"> </span>-p<span class="w"> </span>~/.local/bin
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>mv<span class="w"> </span>~/Downloads/proton-drive<span class="w"> </span>~/.local/bin/proton-drive
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>chmod<span class="w"> </span>+x<span class="w"> </span>~/.local/bin/proton-drive
+</span></code></pre></div>
+<p>If <code>~/.local/bin</code> is not on your PATH, add it by putting this line in
+<code>~/.zshrc</code> and opening a new terminal:</p>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">PATH</span><span class="o">=</span><span class="s2">"</span><span class="nv">$HOME</span><span class="s2">/.local/bin:</span><span class="nv">$PATH</span><span class="s2">"</span>
+</span></code></pre></div>
+<p>macOS will refuse to run a downloaded program the first time. If you see a
+warning about an unidentified developer, open <strong>System Settings &gt; Privacy &amp;
+Security</strong>, scroll to the bottom, and click <strong>Open Anyway</strong> next to the message
+about <code>proton-drive</code>.</p>
+<h4 id="windows">Windows</h4>
+<p>First, make sure you have the right file. The CLI download is a bare
+<code>proton-drive.exe</code>, and running it does nothing visible: it is not an
+installer, it IS the tool. If the file you downloaded is called something like
+<code>Proton Drive Setup 3.0.4.exe</code>, that is Proton's desktop sync app, a different
+product from the same site. Installing it will not give you the <code>proton-drive</code>
+command this app needs.</p>
+<p>Make a folder for it, for example <code>C:\Tools</code>, and put <code>proton-drive.exe</code> in it.
+Then add that folder to your PATH: open Settings, go to <strong>System &gt; About &gt;
+Advanced system settings &gt; Environment Variables</strong>, select <strong>Path</strong> under <strong>User
+variables</strong>, click <strong>Edit</strong>, click <strong>New</strong>, and type <code>C:\Tools</code>.</p>
+<p>Close and reopen any terminal you had open. Check it worked by running
+<code>proton-drive version</code> in a new one.</p>
+<p>If you would rather skip the PATH edit, you can instead drop <code>proton-drive.exe</code>
+into the folder this app's own exe lives in; the app checks there first.</p>
+<h3 id="3-connect-the-account">3. Connect the account</h3>
+<p>Open Settings, go to Cloud Accounts, press <strong>Add cloud account</strong>, and choose
+<strong>Proton Drive</strong>. There is no need to restart the app after installing the
+tool: it looks for it each time you open that list, so if the row still says
+"Install proton-drive CLI", close the list and open it again. If it still says
+it, the tool is not on your PATH yet; go back to step 2.</p>
+<p>Press <strong>Connect</strong>. The app asks the tool to start a sign-in, and the tool opens
+your browser at Proton's own sign-in page. If no browser appears, the app also
+shows the address as a link you can click or copy. Sign in as you normally
+would, including any two-factor step, then come back to the app. Proton handles
+the whole sign-in itself; this app never sees your password, and nothing about
+your sign-in is stored by this app: the tool keeps it, in your system keyring.</p>
+<h3 id="4-choose-where-captures-go">4. Choose where captures go</h3>
+<p>The setup step that follows has two tabs:</p>
+<ul>
+<li><strong>Files</strong> is the ordinary folder browser, exactly like the other providers.
+  Where you are is where your captures go.</li>
+<li><strong>Photos</strong> sends captures to a photo album instead, so screenshots land in
+  Proton Drive's photo section rather than as loose files. Albums do not have
+  folders inside them, so this tab is a flat list: click an album to choose it,
+  and a tick appears on the row. The + button makes a new album.</li>
+</ul>
+<p>Whichever tab you are on when you press Done is the one the account uses. An
+album called "Cosmic Capture Kit" is made for you the first time, so there is
+always something chosen. You can come back and change any of this later with
+the gear button on the account's row, which reopens on the tab you were using.</p>
+<h3 id="one-proton-account-at-a-time">One Proton account at a time</h3>
+<p>This app allows one connected Proton Drive account, and that is a limit of the
+tool rather than a choice. The tool stores a single sign-in, so signing in as a
+second account would replace the first one, and the first account would quietly
+stop working with nothing on screen explaining why. So while you have a Proton
+account connected, its row in the Add cloud account list says "Already
+connected" and cannot be picked. Disconnect the one you have if you want to use
+a different account.</p>
+<p>Reconnecting an account you already have is unaffected, and is what to press if
+the row ever asks for it.</p>
+<h3 id="two-things-worth-knowing">Two things worth knowing</h3>
+<p><strong>There is no upload percentage.</strong> The tool does not report progress when
+another program is driving it, so the app shows a spinner for a Proton upload
+instead of a bar filling up. Everything else behaves the same: it still tells
+you when it finishes, still copies the link, and the undo still works.</p>
+<p><strong>The tool has crash reporting built in.</strong> Proton's official builds of
+<code>proton-drive</code> include Sentry crash reporting, switched off unless telemetry is
+turned on, which the current release never does. That is Proton's own tool
+making its own choice about its own program; this app neither enables nor uses
+it, and sends nothing itself.</p>
+<h2 id="setting-the-environment-variable">Setting the environment variable</h2>
+<p>An environment variable is just a named piece of text your computer keeps
+around and hands to a program when it starts. This section uses YouTube's pair
+as the worked example, since YouTube is the one provider you set up yourself
+whichever build you are on:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>CCK_YOUTUBE_CLIENT_ID       = the Client ID from your Google Cloud project
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>CCK_YOUTUBE_CLIENT_SECRET   = the Client Secret from the same client
+</span></code></pre></div>
+<p>Every other variable in this guide goes in exactly the same place, so once you
+have done one you can add the rest beside it. Drive uses
+<code>CCK_GDRIVE_CLIENT_ID</code> and <code>CCK_GDRIVE_CLIENT_SECRET</code>, while
+<code>CCK_ONEDRIVE_CLIENT_ID</code> and <code>CCK_DROPBOX_CLIENT_ID</code> need no matching secret at
+all (the Google-based providers are the ones that do). Drive's and YouTube's
+values can be identical if you reused one Google Cloud project for both; they
+are still separate variables.</p>
+<p>Set them somewhere PERMANENT rather than typing them before a command. This app
+is normally started from a keyboard shortcut, a launcher or the tray icon, and
+none of those go through a terminal, so a variable that only exists in one
+terminal window is a variable this app will usually never see.</p>
+<p><strong>Restart the app after any change.</strong> Variables are read once at startup. If
+the app is already running in the background (the tray or menu bar icon), quit
+it first, then start it again.</p>
+<h3 id="linux_1">Linux</h3>
+<p>For launches from a terminal, add <code>export</code> lines to your shell's startup file,
+<code>~/.bashrc</code> for bash or <code>~/.zshrc</code> for zsh, or the equivalent in your shell,
+then open a new terminal:</p>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">CCK_YOUTUBE_CLIENT_ID</span><span class="o">=</span><span class="s2">"123456789-abcdefg.apps.googleusercontent.com"</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="nb">export</span><span class="w"> </span><span class="nv">CCK_YOUTUBE_CLIENT_SECRET</span><span class="o">=</span><span class="s2">"GOCSPX-abcdefghijklmnopqrstuvwxyz"</span>
+</span></code></pre></div>
+<p>That covers terminals and nothing else. <strong>For the keyboard shortcut, the app
+launcher and the tray icon, the variables have to be in the SESSION
+environment</strong>, which on a systemd-based system means a small <code>.conf</code> file in
+<code>~/.config/environment.d/</code>. Create the folder if it is not there, and put plain
+<code>KEY=value</code> lines in it, with no <code>export</code> and no quotes:</p>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>mkdir<span class="w"> </span>-p<span class="w"> </span>~/.config/environment.d
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>cat<span class="w"> </span>&gt;<span class="w"> </span>~/.config/environment.d/cosmic-capture-kit.conf<span class="w"> </span><span class="s">&lt;&lt;'EOF'</span>
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="s">CCK_YOUTUBE_CLIENT_ID=123456789-abcdefg.apps.googleusercontent.com</span>
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="s">CCK_YOUTUBE_CLIENT_SECRET=GOCSPX-abcdefghijklmnopqrstuvwxyz</span>
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="s">EOF</span>
+</span></code></pre></div>
+<p>Log out and back in for the session to pick it up. On a system without
+systemd, your login profile (<code>~/.profile</code>) is the equivalent place, read the
+same once-per-session way.</p>
+<h3 id="macos_1">macOS</h3>
+<p>Shell startup files (<code>~/.zshrc</code> and friends) work exactly as on Linux, and they
+work for terminal launches only. <strong>An app started from the Dock, from Spotlight
+or from the menu bar icon never reads them</strong>, which covers almost every way you
+will actually start this app.</p>
+<p>The practical route is a per-user LaunchAgent that runs <code>launchctl setenv</code> when
+you log in. Create
+<code>~/Library/LaunchAgents/dev.thedragon.cck-env.plist</code> with this content,
+replacing the values with your own:</p>
+<div class="language-xml highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="cp">&lt;?xml version="1.0" encoding="UTF-8"?&gt;</span>
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="cp">&lt;!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"</span>
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="cp">  "http://www.apple.com/DTDs/PropertyList-1.0.dtd"&gt;</span>
+</span><span id="__span-7-4"><a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a><span class="nt">&lt;plist</span><span class="w"> </span><span class="na">version=</span><span class="s">"1.0"</span><span class="nt">&gt;</span>
+</span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="nt">&lt;dict&gt;</span>
+</span><span id="__span-7-6"><a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a><span class="w">  </span><span class="nt">&lt;key&gt;</span>Label<span class="nt">&lt;/key&gt;</span>
+</span><span id="__span-7-7"><a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a><span class="w">  </span><span class="nt">&lt;string&gt;</span>dev.thedragon.cck-env<span class="nt">&lt;/string&gt;</span>
+</span><span id="__span-7-8"><a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a><span class="w">  </span><span class="nt">&lt;key&gt;</span>ProgramArguments<span class="nt">&lt;/key&gt;</span>
+</span><span id="__span-7-9"><a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a><span class="w">  </span><span class="nt">&lt;array&gt;</span>
+</span><span id="__span-7-10"><a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a><span class="w">    </span><span class="nt">&lt;string&gt;</span>/bin/sh<span class="nt">&lt;/string&gt;</span>
+</span><span id="__span-7-11"><a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a><span class="w">    </span><span class="nt">&lt;string&gt;</span>-c<span class="nt">&lt;/string&gt;</span>
+</span><span id="__span-7-12"><a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a><span class="w">    </span><span class="nt">&lt;string&gt;</span>launchctl<span class="w"> </span>setenv<span class="w"> </span>CCK_YOUTUBE_CLIENT_ID<span class="w"> </span>123456789-abcdefg.apps.googleusercontent.com;<span class="w"> </span>launchctl<span class="w"> </span>setenv<span class="w"> </span>CCK_YOUTUBE_CLIENT_SECRET<span class="w"> </span>GOCSPX-abcdefghijklmnopqrstuvwxyz<span class="nt">&lt;/string&gt;</span>
+</span><span id="__span-7-13"><a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a><span class="w">  </span><span class="nt">&lt;/array&gt;</span>
+</span><span id="__span-7-14"><a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a><span class="w">  </span><span class="nt">&lt;key&gt;</span>RunAtLoad<span class="nt">&lt;/key&gt;</span>
+</span><span id="__span-7-15"><a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a><span class="w">  </span><span class="nt">&lt;true/&gt;</span>
+</span><span id="__span-7-16"><a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a><span class="nt">&lt;/dict&gt;</span>
+</span><span id="__span-7-17"><a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a><span class="nt">&lt;/plist&gt;</span>
+</span></code></pre></div>
+<p>Then load it once, so you do not have to log out to try it:</p>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>launchctl<span class="w"> </span>load<span class="w"> </span>~/Library/LaunchAgents/dev.thedragon.cck-env.plist
+</span></code></pre></div>
+<p>It runs at every login from then on. Quit and restart the app afterwards.</p>
+<h3 id="windows_1">Windows</h3>
+<p>The easiest of the three, and the GUI route covers every way the app can be
+started, shortcuts included. Open Settings, go to <strong>System &gt; About &gt; Advanced
+system settings &gt; Environment Variables</strong>, and under <strong>User variables</strong> click
+<strong>New</strong>. Add one variable per line of the list above, name on the left and
+value on the right.</p>
+<p>If you prefer a terminal, <code>setx</code> writes the same permanent user variable:</p>
+<div class="language-powershell highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="n">setx</span> <span class="n">CCK_YOUTUBE_CLIENT_ID</span> <span class="s2">"123456789-abcdefg.apps.googleusercontent.com"</span>
+</span><span id="__span-9-2"><a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="n">setx</span> <span class="n">CCK_YOUTUBE_CLIENT_SECRET</span> <span class="s2">"GOCSPX-abcdefghijklmnopqrstuvwxyz"</span>
+</span></code></pre></div>
+<p>Either way, close and reopen any terminal you had open, and quit and restart
+the app, before the new value is visible.</p>
+<h2 id="troubleshooting">Troubleshooting</h2>
+<ul>
+<li><strong>A provider is missing from the Add cloud account list</strong>: this build has no
+  registration for it, which for YouTube is normal and expected on every build.
+  Set its variable somewhere permanent (see "Setting the environment variable"
+  above), restart the app, and it appears in the list. Proton Drive is never
+  missing; see the next entry.</li>
+<li><strong>Proton Drive says "Install proton-drive CLI"</strong>: the app cannot find the
+  tool. Either it is not installed, or it is not on your PATH under the name
+  <code>proton-drive</code>, or (on macOS and Linux) it does not have permission to run.
+  Open a new terminal and run <code>proton-drive version</code>: if that fails, the app
+  will fail the same way. Go back to the Proton Drive section, step 2, and
+  check the <code>chmod +x</code> line in particular. Open the provider list again
+  afterwards and the app rechecks; you do not have to restart it.</li>
+<li><strong>Proton Drive says "Already connected" and cannot be picked</strong>: this is
+  working as intended. The tool holds one sign-in, so a second account would
+  replace the first. Disconnect the account you have if you want a different
+  one, or press Reconnect on its row if that is what you meant.</li>
+<li><strong>A Proton upload shows a spinner instead of a percentage</strong>: also working as
+  intended. The tool reports no progress to another program, so a made-up
+  percentage would be worse than an honest spinner.</li>
+<li><strong>"No cloud drives are set up" instead of a list</strong>: none of the variables are
+  visible to the app, which is the usual state of a build made from source
+  before any setup. The dialog links to this guide. If you HAVE set them, they
+  are almost certainly in a shell startup file while the app is being launched
+  from a shortcut, launcher, Dock or tray icon: those never read a shell startup
+  file, so move the variables to the per-platform location above.</li>
+<li><strong>"needs an app registration"</strong>: the environment variable is not set, or is
+  not being seen by the app. Check it is in the permanent location for your
+  platform rather than one terminal window, and restart the app afterwards.</li>
+<li><strong>"redirect_uri_mismatch" or similar, right after signing in</strong>: the redirect
+  URI you registered does not match what is expected. Go back and check it
+  is typed exactly as shown above, including <code>http://</code> and any trailing
+  slashes.</li>
+<li><strong>The sign-in page does not open on its own</strong>: Connect no longer opens a
+  browser automatically. Instead it shows a clickable link; click it to
+  continue.</li>
+<li><strong>The browser says you signed in, but the app then says the account
+  "could not be connected"</strong>: for Google Drive or YouTube specifically, check
+  that you set the matching <code>_CLIENT_SECRET</code> as well as the <code>_CLIENT_ID</code>.
+  Google's Desktop app client type issues both, and the sign-in fails right
+  after the browser step if only the id is set.</li>
+<li><strong>"Reconnect needed: ... refused this account's permission to list
+  folders"</strong> (Google Drive): see step 6 above (the Data Access scope). If you
+  connected before adding it, disconnect and reconnect the account afterward.</li>
+<li><strong>"Reconnect needed" on a OneDrive account that worked yesterday</strong>: this app
+  now asks for <code>Files.ReadWrite.AppFolder</code> instead of access to your whole
+  OneDrive. A sign-in from before that change keeps working as a sign-in, it
+  just does not carry the new permission, so the first thing the app tries
+  comes back refused. Press <strong>Reconnect</strong> on the account's row and sign in
+  again; you keep the account, its name and its settings. Add the permission to
+  your app registration first (OneDrive step 5) if you registered your own.
+  Google Drive and Dropbox accounts are unaffected and need no action.</li>
+<li><strong>Every YouTube upload lands Private, whatever visibility you picked</strong>:
+  see the "real Google-side limitation" note in the YouTube section above.
+  This is Google forcing every upload to Private on an unaudited Cloud
+  project, not something this app's Unlisted/Public options are failing to
+  do.</li>
+</ul>
+<p>If the app is already running quietly in the background (the tray icon or menu
+bar icon), quit it first and start it again after any change. It reads these
+variables once, when it starts, so a copy that was already running is still
+using the old values.</p>
+
+
+
+
+
+
+
+  
+  
+
+
+
+  
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../cli/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Command line">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Command line
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../releases/" class="md-footer__link md-footer__link--next" aria-label="Next: Release notes">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Release notes
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      © 2026 Frosthaven
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/Frosthaven/cosmic-capture-kit" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+      <div class="md-consent" data-md-component="consent" id="__consent" hidden>
+        <div class="md-consent__overlay"></div>
+        <aside class="md-consent__inner">
+          <form class="md-consent__form md-grid md-typeset" name="consent">
+            
+
+
+
+  
+
+<h4>Cookie consent</h4>
+<p>This site uses Google Analytics to count visits and downloads, and to see which pages help people. Analytics only runs if you accept. Rejecting changes nothing about how the site works.</p>
+<input class="md-toggle" type="checkbox" id="__settings" checked>
+<div class="md-consent__settings">
+  <ul class="task-list">
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="analytics" checked>
+      <span class="task-list-indicator"></span>
+      Google Analytics
+    </label>
+  </li>
+
+      
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="github" checked>
+      <span class="task-list-indicator"></span>
+      GitHub
+    </label>
+  </li>
+
+      
+    
+    
+  </ul>
+</div>
+<div class="md-consent__controls">
+  
+    
+      <button class="md-button md-button--primary">Accept</button>
+    
+    
+    
+  
+    
+    
+      <button type="reset" class="md-button md-button--primary">Reject</button>
+    
+    
+  
+</div>
+          </form>
+        </aside>
+      </div>
+      <script>var consent=__md_get("__consent");if(consent)for(var input of document.forms.consent.elements)input.name&&(input.checked=consent[input.name]||!1);else"file:"!==location.protocol&&setTimeout((function(){document.querySelector("[data-md-component=consent]").hidden=!1}),250);var form=document.forms.consent;for(var action of["submit","reset"])form.addEventListener(action,(function(e){if(e.preventDefault(),"reset"===e.type)for(var n of document.forms.consent.elements)n.name&&(n.checked=!1);__md_set("__consent",Object.fromEntries(Array.from(new FormData(form).keys()).map((function(e){return[e,!0]})))),location.hash="",location.reload()}))</script>
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.code.select", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.sections", "navigation.footer"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../assets/download.js"></script>
+      
+    
+  </body>
+</html>

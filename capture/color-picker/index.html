@@ -1,0 +1,2044 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Screenshots, screen recordings and an on-screen QR / barcode / OCR scanner for COSMIC Linux, macOS and Windows.">
+      
+      
+      
+        <link rel="canonical" href="https://cck.thedragon.dev/capture/color-picker/">
+      
+      
+        <link rel="prev" href="../scanner/">
+      
+      
+        <link rel="next" href="../keyboard/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>The colour picker - Cosmic Capture Kit</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/custom.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+  
+
+
+  
+  
+
+<script id="__analytics">function __md_analytics(){function e(){dataLayer.push(arguments)}window.dataLayer=window.dataLayer||[],e("js",new Date),e("config","G-GFF8C5BGTC"),document.addEventListener("DOMContentLoaded",(function(){document.forms.search&&document.forms.search.query.addEventListener("blur",(function(){this.value&&e("event","search",{search_term:this.value})}));document$.subscribe((function(){var t=document.forms.feedback;if(void 0!==t)for(var a of t.querySelectorAll("[type=submit]"))a.addEventListener("click",(function(a){a.preventDefault();var n=document.location.pathname,d=this.getAttribute("data-md-value");e("event","feedback",{page:n,data:d}),t.firstElementChild.disabled=!0;var r=t.querySelector(".md-feedback__note [data-md-value='"+d+"']");r&&(r.hidden=!1)})),t.hidden=!1})),location$.subscribe((function(t){e("config","G-GFF8C5BGTC",{page_path:t.pathname})}))}));var t=document.createElement("script");t.async=!0,t.src="https://www.googletagmanager.com/gtag/js?id=G-GFF8C5BGTC",document.getElementById("__analytics").insertAdjacentElement("afterEnd",t)}</script>
+  
+    <script>if("undefined"!=typeof __md_analytics){var consent=__md_get("__consent");consent&&consent.analytics&&__md_analytics()}</script>
+  
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#the-colour-picker" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Cosmic Capture Kit" class="md-header__button md-logo" aria-label="Cosmic Capture Kit" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Cosmic Capture Kit
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              The colour picker
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/Frosthaven/cosmic-capture-kit" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Frosthaven/cosmic-capture-kit
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Cosmic Capture Kit" class="md-nav__button md-logo" aria-label="Cosmic Capture Kit" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    Cosmic Capture Kit
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/Frosthaven/cosmic-capture-kit" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Frosthaven/cosmic-capture-kit
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capturing
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Capturing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The capture overlay
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capture modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../screenshots/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Screenshots
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../recording/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Recording
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../scanner/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The scanner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The colour picker
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The colour picker
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#starting-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Starting it
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#picking-a-colour" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Picking a colour
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-result-window" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The result window
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The result window">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-value-row" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The value row
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#recent-colours" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recent colours
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-side-panel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The side panel
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The side panel">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#harmonies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Harmonies
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#saved-palettes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Saved Palettes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#picking-a-colour-to-draw-with" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Picking a colour to draw with
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-it-cannot-do" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it cannot do
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../keyboard/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Keyboard shortcuts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The preview editor
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    The preview editor
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../editor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The preview editor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../editor/annotating/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Annotating
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../editor/crop/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Crop and covermark
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../editor/video/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Editing a recording
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../editor/sharing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Saving, copying and uploading
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Settings
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/general/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    General
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/capture-modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capture Modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/preview-editor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Preview Editor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/audio-video/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Audio & Video
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/shortcuts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Keyboard Shortcuts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/cloud/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud Accounts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/health/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Health
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../settings/about/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    About
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Command line
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../cloud-accounts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud accounts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../releases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../privacy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Privacy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../terms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Terms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#starting-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Starting it
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#picking-a-colour" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Picking a colour
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-result-window" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The result window
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The result window">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-value-row" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The value row
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#recent-colours" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recent colours
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-side-panel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The side panel
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The side panel">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#harmonies" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Harmonies
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#saved-palettes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Saved Palettes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#picking-a-colour-to-draw-with" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Picking a colour to draw with
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#what-it-cannot-do" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What it cannot do
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="the-colour-picker">The colour picker</h1>
+<p>The colour picker reads a colour off your screen and gives you its value in
+seven notations. It is a tool of its own rather than a capture: it takes no
+screenshot and saves no capture file.</p>
+<h2 id="starting-it">Starting it</h2>
+<table>
+<thead>
+<tr>
+<th>Where</th>
+<th>How</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>The tray or menu bar</td>
+<td><strong>Color &gt; Color Picker</strong>, just under the scan row</td>
+</tr>
+<tr>
+<td>The preview editor</td>
+<td>The pipette button at the left of the image toolbar, just before the colour swatch</td>
+</tr>
+<tr>
+<td>A terminal, or your own shortcut</td>
+<td><code>cosmic-capture-kit color --picker</code></td>
+</tr>
+<tr>
+<td>A global key</td>
+<td>The <strong>Color Picker</strong> row in <a href="../../settings/shortcuts/">Settings, under Shortcuts</a></td>
+</tr>
+</tbody>
+</table>
+<p><strong>The Color Picker shortcut ships with no key set</strong>, like every other global
+shortcut. Give it one if you use the tool often.</p>
+<h2 id="picking-a-colour">Picking a colour</h2>
+<p>The screen dims and a magnifier follows your pointer.</p>
+<p>The magnifier shows the pixels around the pointer as squares, so you can see the
+grid rather than a blur. The pixel you are about to take sits in the middle,
+outlined. A ring in your accent colour runs around the rim. Beside it, a small
+chip is filled with the colour itself and carries its hex value, so you can read
+the answer before you commit to it.</p>
+<p><strong>The pointer itself is hidden while you pick</strong>, on every platform. The arrow
+would otherwise sit on top of the very pixel the lens is reading. The lens is
+centred on where the pointer is, so that is still what you aim with.</p>
+<table>
+<thead>
+<tr>
+<th>What you do</th>
+<th>What happens</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Move the pointer</td>
+<td>Moves the sample</td>
+</tr>
+<tr>
+<td>Arrow keys, or <code>h</code> <code>j</code> <code>k</code> <code>l</code></td>
+<td>Moves the sample one pixel; hold one down to keep moving</td>
+</tr>
+<tr>
+<td>Click, Enter or Space</td>
+<td>Takes the colour the magnifier is showing</td>
+</tr>
+<tr>
+<td>Scroll wheel, or a two-finger trackpad scroll</td>
+<td>Zooms the magnifier</td>
+</tr>
+<tr>
+<td>Numpad + and numpad -</td>
+<td>Zooms the magnifier</td>
+</tr>
+<tr>
+<td>Esc, or right-click</td>
+<td>Leaves without taking anything</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The keys are there so an exact pixel does not need a steady hand.</strong> Nudge with
+the arrows or the vim letters until the outlined pixel is the one you want, then
+press Enter or Space. Reaching back for the mouse to click would undo the aim you
+just made. One tap is always one pixel, whatever your desktop's key-repeat
+settings are, and a held key falls into a steady repeat after a moment.</p>
+<p><strong>Zooming changes how much of the screen the lens holds, not how big the lens
+is.</strong> It opens holding 13 of your screen's pixels across the lens and travels
+both ways: out to 52 when you want to see what is around the sample, in to 6 when
+you need to tell one pixel from its neighbours. It stops a little short of 1:1 at
+the wide end, because a lens showing your pixels at their own size adds nothing
+your eyes do not already give you. The zoom is not remembered: every pick starts
+at the default.</p>
+<p>The ring's thickness is your <strong>Selection box thickness</strong> from
+<a href="../../settings/general/">Settings, under General</a>, the same setting the capture
+region's box uses.</p>
+<p>Near the edge of a screen the magnifier is <strong>cut off by the edge</strong> rather than
+pushed back inland, so it keeps following your pointer instead of stopping at the
+wall, and it is never squashed to fit. The part hanging off the screen shows the
+dimmed backdrop rather than invented pixels. The last row and column of pixels on
+a screen are still reachable.</p>
+<p><strong>How dark the screen goes</strong> is the <strong>During Color Picker</strong> slider in
+<a href="../../settings/general/">Settings, under General</a>. It is 33 percent by default.
+The dim is there to say the tool is armed. It does not change the colour you get,
+because the value is read from a picture of your screen taken before the dim went
+on. See <a href="#what-it-cannot-do">What it cannot do</a>.</p>
+<h2 id="the-result-window">The result window</h2>
+<p>Clicking copies the colour to your clipboard and opens a small window. The window
+is a fixed size and cannot be resized, because nothing in it scrolls: it is
+exactly as big as the parts it holds.</p>
+<table>
+<thead>
+<tr>
+<th>Part, top to bottom</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>The square</td>
+<td>Saturation and value for the current hue. Drag inside it to move the colour</td>
+</tr>
+<tr>
+<td>The controls row</td>
+<td>A pipette that starts another pick, a round swatch of the current colour, and the hue and alpha strips stacked beside it</td>
+</tr>
+<tr>
+<td>The value row</td>
+<td>A copy button, the value boxes, and the notation chooser</td>
+</tr>
+<tr>
+<td>The divider</td>
+<td>A hairline with an <strong>Add to recents</strong> button sitting on it</td>
+</tr>
+<tr>
+<td>The history</td>
+<td>Two rows of the colours you kept</td>
+</tr>
+</tbody>
+</table>
+<h3 id="the-value-row">The value row</h3>
+<p>It is one row whatever the notation, and the chevron pair at its right end is a
+single button: press it and a menu of the seven notations opens, with the current
+one marked.</p>
+<p><strong>Your choice is remembered between launches</strong>, and it is the spelling a pick
+copies to your clipboard. Changing it copies nothing, so you can read through all
+seven without your clipboard changing seven times.</p>
+<p>Each one spells the same colour its own way, and that spelling is what a copy
+gives you:</p>
+<table>
+<thead>
+<tr>
+<th>Notation</th>
+<th>What a copy gives you</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HEX</td>
+<td><code>#FF8800</code></td>
+</tr>
+<tr>
+<td>RGB</td>
+<td><code>rgb(255, 136, 0)</code></td>
+</tr>
+<tr>
+<td>HSL</td>
+<td><code>hsl(32, 100%, 50%)</code></td>
+</tr>
+<tr>
+<td>HSV</td>
+<td><code>hsv(32, 100%, 100%)</code></td>
+</tr>
+<tr>
+<td>OKLCH</td>
+<td><code>oklch(75.6% 0.176 60.7)</code></td>
+</tr>
+<tr>
+<td>CMYK</td>
+<td><code>cmyk(0%, 47%, 100%, 0%)</code></td>
+</tr>
+<tr>
+<td>LAB</td>
+<td><code>lab(70.2% 34.4 76.4)</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>Hex is one box</strong> holding the whole spelling, so you can paste <code>#FF8800CC</code> in as
+one piece. Every other notation splits into a box per component, with its name
+captioned underneath, so you can nudge one number without retyping the rest.</p>
+<p><strong>The boxes are editable, and the colour follows as you type.</strong> A component box
+takes its own number, with the <code>%</code> optional where the number is a percentage, and
+the alpha box takes either a percentage or a figure from 0 to 1. The hex box is
+the forgiving one: the leading <code>#</code> is optional, the letters may be either case,
+and the short forms work too, so <code>f80</code> and <code>#FF8800</code> are the same colour.
+A half-typed value is left alone until it makes sense, so the swatch never
+flashes through nonsense on the way to what you meant, and pressing Enter tidies
+what you typed into its canonical spelling.</p>
+<p>Two notes on the numbers themselves:</p>
+<ul>
+<li><strong>CMYK here is the device-agnostic kind</strong>, the same numbers a design tool
+  shows. It is not an ICC separation for a real press, which would depend on the
+  ink, the paper and the profile.</li>
+<li><strong>LAB and OKLCH can describe colours your screen cannot show.</strong> Type one of
+  those and the value is brought back to the nearest colour sRGB can hold, rather
+  than wrapping round to something unrelated.</li>
+</ul>
+<p>Two chords belong to this window, and Tab walks it: the boxes first, then the
+notation chooser, then the history, then the panel when it is open.</p>
+<table>
+<thead>
+<tr>
+<th>Chord</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ctrl+Enter</code> (<code>Cmd+Enter</code> on macOS)</td>
+<td>Keeps the colour: files it into the history, the same as the <strong>Add to recents</strong> button</td>
+</tr>
+<tr>
+<td><code>Ctrl+Shift+C</code> (<code>Cmd+Shift+C</code> on macOS)</td>
+<td>Copies the value. Plain <code>Ctrl+C</code> is left alone, so it still copies whatever you selected inside a box</td>
+</tr>
+</tbody>
+</table>
+<h3 id="recent-colours">Recent colours</h3>
+<p>The bottom two rows hold the colours you kept, newest first, <strong>eighteen</strong> of them,
+nine to a row. The oldest falls off the end. Each is remembered with its own
+transparency, and a see-through one is drawn as a split swatch so you can tell.
+They are saved between launches, so they are still there the next time you open
+the tool.</p>
+<ul>
+<li><strong>Clicking one loads it</strong> into the swatch and the boxes. It does not move it to
+  the front. The row stays a stable place to look rather than reshuffling itself
+  under your pointer.</li>
+<li><strong>A pick files a colour, and so does swapping the current one out.</strong> Take a
+  colour from the harmonies or from a saved palette and the colour you were
+  holding is filed first, so nothing you had goes missing. The same colour at the
+  same transparency is never filed twice.</li>
+<li><strong>Typing never files anything.</strong> The square, the strips and the boxes are for
+  exploring, so only a pick or the explicit add writes to the row.</li>
+<li><strong>Right-click a swatch</strong> for its menu. What it offers depends on which swatch it
+  is, between making it the current colour, adding it to the history, copying it,
+  removing it, and sending it to one of your saved palettes.</li>
+</ul>
+<p><strong>The pipette at the start of the controls row starts another pick.</strong> The window
+stays open while you do, and the colour you pick lands in the window you already
+have: it becomes the new swatch and the newest entry in the history. There is
+only ever one picker window, so picking again from the tray, a shortcut or the
+command line updates that same window rather than stacking up another.</p>
+<p>Each pick is still a fresh start that dims your screen again, rather than a
+re-read of the picture the window was opened from. That is deliberate: it leaves
+you free to take the next colour off a different monitor.</p>
+<h2 id="the-side-panel">The side panel</h2>
+<p>The button at the right of the window's title bar <strong>doubles the window's width</strong>
+and opens a panel beside the picker. Nothing on the picker's side moves. Both the
+open state and the tab you were last on are remembered, and <code>Ctrl+Tab</code> moves
+between the tabs.</p>
+<h3 id="harmonies">Harmonies</h3>
+<p>Five cards, worked out from the colour the window is showing and recomputed as it
+changes: Complementary, Analogous, Triadic, Tetradic and Monochromatic. Each
+heading carries a one-line explanation of the relationship.</p>
+<p>Click a swatch to make it the current colour, or right-click it for the same menu
+every swatch in the window has.</p>
+<h3 id="saved-palettes">Saved Palettes</h3>
+<p>Your own named groups of colours, kept between launches.</p>
+<ul>
+<li><strong>New Palette</strong>, at the top right of the tab, adds a group at the TOP of the
+  list with its name selected, ready to type over. Click a name at any time to
+  rename it in place.</li>
+<li>Beside that button are a <strong>search field</strong>, which filters the list by name, and a
+  <strong>sort button</strong> offering six one-shot orders: name A to Z or Z to A, lightest or
+  darkest first, warmest or coolest first.</li>
+<li>Each group's title row carries a <strong>pipette</strong>, which starts a pick that lands
+  straight in that group, and a <strong>plus</strong>, which adds the colour the window is
+  showing.</li>
+<li><strong>Dragging</strong> does the rest. Along a group's own bar reorders it. Onto another
+  group <strong>copies</strong> the colour there. Onto the picker's side of the window makes it
+  the current colour. Off the window removes it. A group's NAME drags too, to
+  reorder the groups, or off the window to delete the group, which asks you first.
+  Colours never ask; groups do.</li>
+<li>The swatch menu keeps the verbs a drag does not offer, including <strong>Move to
+  palette</strong>, which takes the colour out of the group it came from.</li>
+<li>Clicking a swatch applies it as the current colour, and a colour already in a
+  group is not added to it twice.</li>
+</ul>
+<p>Palettes are kept in their own file beside your settings, so a factory reset
+leaves them alone. Before you save any of your own, you start with two groups,
+Catppuccin Latte and Mocha.</p>
+<h2 id="picking-a-colour-to-draw-with">Picking a colour to draw with</h2>
+<p>The preview editor's image toolbar has its own pipette, just before the colour
+swatch. It is there so you can take a colour off the screen and draw with it.</p>
+<p>A pick started that way <strong>goes straight into the editor</strong>: it becomes the
+annotation colour, it recolours anything you have selected, and it joins the
+editor's own recent colours, exactly as choosing a colour from the swatch would.
+<strong>No result window opens.</strong> You asked for a colour to draw with, not for a window
+to read and dismiss, and the colour is already showing in the swatch.</p>
+<p>If the editor has closed by the time you click, nothing is lost. The pick falls
+back to the ordinary result window.</p>
+<h2 id="what-it-cannot-do">What it cannot do</h2>
+<p>These are worth knowing before you reach for the tool.</p>
+<p><strong>It reads a picture of your screen taken when the tool opened, not the live
+screen.</strong> So anything that changes after you start picking, a video playing, a
+progress bar, an animation, cannot be picked: you will get the colour it had at
+the moment you opened the tool. This is deliberate. The picker dims your screen
+while you aim, so reading the live screen would read the dim as well and report a
+colour that is darker than the real one. A picker that reports the wrong colour is
+worse than one that shows you a still.</p>
+<p><strong>Under a Flatpak install it covers one monitor, not all of them.</strong> A sandboxed
+app has to ask your desktop for screen access, and that permission covers the one
+monitor you granted. A normal install covers every screen at once.</p>
+<p><strong>The lens never straddles two screens.</strong> It belongs to whichever screen your
+pointer is on, so pushing across the seam between two displays moves the whole
+lens to the other one rather than drawing half on each. Since every screen's own
+last row and column stay reachable from that screen, this is never in your way.</p>
+
+
+
+
+
+
+
+  
+  
+
+
+
+  
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../scanner/" class="md-footer__link md-footer__link--prev" aria-label="Previous: The scanner">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                The scanner
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../keyboard/" class="md-footer__link md-footer__link--next" aria-label="Next: Keyboard shortcuts">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Keyboard shortcuts
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      © 2026 Frosthaven
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/Frosthaven/cosmic-capture-kit" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+      <div class="md-consent" data-md-component="consent" id="__consent" hidden>
+        <div class="md-consent__overlay"></div>
+        <aside class="md-consent__inner">
+          <form class="md-consent__form md-grid md-typeset" name="consent">
+            
+
+
+
+  
+
+<h4>Cookie consent</h4>
+<p>This site uses Google Analytics to count visits and downloads, and to see which pages help people. Analytics only runs if you accept. Rejecting changes nothing about how the site works.</p>
+<input class="md-toggle" type="checkbox" id="__settings" checked>
+<div class="md-consent__settings">
+  <ul class="task-list">
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="analytics" checked>
+      <span class="task-list-indicator"></span>
+      Google Analytics
+    </label>
+  </li>
+
+      
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="github" checked>
+      <span class="task-list-indicator"></span>
+      GitHub
+    </label>
+  </li>
+
+      
+    
+    
+  </ul>
+</div>
+<div class="md-consent__controls">
+  
+    
+      <button class="md-button md-button--primary">Accept</button>
+    
+    
+    
+  
+    
+    
+      <button type="reset" class="md-button md-button--primary">Reject</button>
+    
+    
+  
+</div>
+          </form>
+        </aside>
+      </div>
+      <script>var consent=__md_get("__consent");if(consent)for(var input of document.forms.consent.elements)input.name&&(input.checked=consent[input.name]||!1);else"file:"!==location.protocol&&setTimeout((function(){document.querySelector("[data-md-component=consent]").hidden=!1}),250);var form=document.forms.consent;for(var action of["submit","reset"])form.addEventListener(action,(function(e){if(e.preventDefault(),"reset"===e.type)for(var n of document.forms.consent.elements)n.name&&(n.checked=!1);__md_set("__consent",Object.fromEntries(Array.from(new FormData(form).keys()).map((function(e){return[e,!0]})))),location.hash="",location.reload()}))</script>
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["content.code.copy", "content.code.select", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.sections", "navigation.footer"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../../assets/download.js"></script>
+      
+    
+  </body>
+</html>

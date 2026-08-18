@@ -1,0 +1,2341 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Screenshots, screen recordings and an on-screen QR / barcode / OCR scanner for COSMIC Linux, macOS and Windows.">
+      
+      
+      
+        <link rel="canonical" href="https://cck.thedragon.dev/cli/">
+      
+      
+        <link rel="prev" href="../settings/about/">
+      
+      
+        <link rel="next" href="../cloud-accounts/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>The command line - Cosmic Capture Kit</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/custom.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+  
+
+
+  
+  
+
+<script id="__analytics">function __md_analytics(){function e(){dataLayer.push(arguments)}window.dataLayer=window.dataLayer||[],e("js",new Date),e("config","G-GFF8C5BGTC"),document.addEventListener("DOMContentLoaded",(function(){document.forms.search&&document.forms.search.query.addEventListener("blur",(function(){this.value&&e("event","search",{search_term:this.value})}));document$.subscribe((function(){var t=document.forms.feedback;if(void 0!==t)for(var a of t.querySelectorAll("[type=submit]"))a.addEventListener("click",(function(a){a.preventDefault();var n=document.location.pathname,d=this.getAttribute("data-md-value");e("event","feedback",{page:n,data:d}),t.firstElementChild.disabled=!0;var r=t.querySelector(".md-feedback__note [data-md-value='"+d+"']");r&&(r.hidden=!1)})),t.hidden=!1})),location$.subscribe((function(t){e("config","G-GFF8C5BGTC",{page_path:t.pathname})}))}));var t=document.createElement("script");t.async=!0,t.src="https://www.googletagmanager.com/gtag/js?id=G-GFF8C5BGTC",document.getElementById("__analytics").insertAdjacentElement("afterEnd",t)}</script>
+  
+    <script>if("undefined"!=typeof __md_analytics){var consent=__md_get("__consent");consent&&consent.analytics&&__md_analytics()}</script>
+  
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#the-command-line" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="Cosmic Capture Kit" class="md-header__button md-logo" aria-label="Cosmic Capture Kit" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Cosmic Capture Kit
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              The command line
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/Frosthaven/cosmic-capture-kit" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Frosthaven/cosmic-capture-kit
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="Cosmic Capture Kit" class="md-nav__button md-logo" aria-label="Cosmic Capture Kit" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    Cosmic Capture Kit
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/Frosthaven/cosmic-capture-kit" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    Frosthaven/cosmic-capture-kit
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capturing
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Capturing
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The capture overlay
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capture modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/screenshots/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Screenshots
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/recording/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Recording
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/scanner/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The scanner
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/color-picker/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The colour picker
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../capture/keyboard/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Keyboard shortcuts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The preview editor
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    The preview editor
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    The preview editor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/annotating/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Annotating
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/crop/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Crop and covermark
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/video/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Editing a recording
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../editor/sharing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Saving, copying and uploading
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Settings
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Settings
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/general/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    General
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/capture-modes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Capture Modes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/preview-editor/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Preview Editor
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/audio-video/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Audio & Video
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/shortcuts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Keyboard Shortcuts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/cloud/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud Accounts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/health/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Health
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../settings/about/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    About
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Command line
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Command line
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#the-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The commands
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#a-launch-with-no-command-at-all" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A launch with no command at all
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#taking-a-screenshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Taking a screenshot
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#starting-a-recording" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Starting a recording
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#controlling-the-recording-that-is-already-running" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Controlling the recording that is already running
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scanning-the-screen" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scanning the screen
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-color-picker" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The color picker
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The color picker">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-window-a-pick-opens" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The window a pick opens
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-panel-harmonies-and-saved-palettes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The panel: harmonies and saved palettes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-palette-viewer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The palette viewer
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#opening-a-file-in-the-editor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Opening a file in the editor
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-saved-defaults-timer-and-sound" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The saved defaults: timer and sound
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#settings-permissions-and-the-tray" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Settings, permissions and the tray
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#exit-codes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exit codes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Examples
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#binding-to-keys" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Binding to keys
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cloud-accounts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Cloud accounts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../releases/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../privacy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Privacy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../terms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Terms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#the-commands" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The commands
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#a-launch-with-no-command-at-all" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        A launch with no command at all
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#taking-a-screenshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Taking a screenshot
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#starting-a-recording" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Starting a recording
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#controlling-the-recording-that-is-already-running" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Controlling the recording that is already running
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scanning-the-screen" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scanning the screen
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-color-picker" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The color picker
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The color picker">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#the-window-a-pick-opens" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The window a pick opens
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#the-panel-harmonies-and-saved-palettes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The panel: harmonies and saved palettes
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-palette-viewer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The palette viewer
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#opening-a-file-in-the-editor" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Opening a file in the editor
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-saved-defaults-timer-and-sound" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The saved defaults: timer and sound
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#settings-permissions-and-the-tray" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Settings, permissions and the tray
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#exit-codes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exit codes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#examples" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Examples
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#binding-to-keys" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Binding to keys
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<!--
+This page has no copy of its own on purpose.
+
+`CLI.md` in the repository root is the single source of truth for the command
+list, and the include below pulls it in whole at build time. Edit that file,
+never this one. If the include ever breaks, the build fails loudly, because
+`pymdownx.snippets` runs with `check_paths: true`.
+-->
+
+<h1 id="the-command-line">The command line</h1>
+<p><code>cosmic-capture-kit</code> is a one-shot tool: it opens what you asked for, finishes
+the job, and exits. The commands below let a keybinding, or a script, go straight
+into one flow. Run <code>cosmic-capture-kit --help</code> to print this list from the
+binary.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>cosmic-capture-kit &lt;command&gt; [options]
+</span></code></pre></div>
+<p><strong>One command per launch.</strong> The first word decides what happens, and the options
+after it belong to that command alone. Two commands never combine in one line,
+and nothing is guessed: input the app cannot read is an error, not an overlay.</p>
+<p><code>cosmic-capture-kit</code> here means whichever file you installed. The Linux AppImage
+takes exactly the same commands, so substitute its filename
+(<code>CosmicCaptureKit-x86_64.AppImage capture --region</code>) and everything below
+applies unchanged. The AppImage runtime reserves its own <code>--appimage-*</code> flags,
+which collide with none of ours.</p>
+<h2 id="the-commands">The commands</h2>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>cosmic-capture-kit &lt;command&gt; [options]
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>  scan                          Scan the screen for QR codes / text (region select)
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>      --action &lt;refresh&gt;        retake the screen snapshot in the scanner already open
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>  color                         Color tools
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>      --picker                  pick a color from the screen (magnifier overlay)
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a>      --viewer                  open the palette viewer window
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a>      --timer &lt;0-99&gt;            countdown before the pick (--picker only)
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>
+</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a>  capture                       Take a screenshot
+</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a>      --region                  select a region
+</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>      --window                  select a window
+</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a>      --monitor                 select a monitor
+</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a>      --active-window           capture the active window immediately, no picker
+</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>      --active-monitor          capture the monitor under the cursor immediately
+</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a>      --timer &lt;0-99&gt;            countdown before the capture (this launch only)
+</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a>      --skip-editor             save, copy and notify instead of opening the editor
+</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a>
+</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a>  record                        Start a screen recording, or control the one running
+</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a>    starting one:
+</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a>      --region                  select a region
+</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a>      --window                  select a window
+</span><span id="__span-1-24"><a id="__codelineno-1-24" name="__codelineno-1-24" href="#__codelineno-1-24"></a>      --monitor                 select a monitor
+</span><span id="__span-1-25"><a id="__codelineno-1-25" name="__codelineno-1-25" href="#__codelineno-1-25"></a>      --sound &lt;both|mic|system|none&gt;   arm audio for this launch only
+</span><span id="__span-1-26"><a id="__codelineno-1-26" name="__codelineno-1-26" href="#__codelineno-1-26"></a>      --timer &lt;0-99&gt;            countdown before recording starts (this launch only)
+</span><span id="__span-1-27"><a id="__codelineno-1-27" name="__codelineno-1-27" href="#__codelineno-1-27"></a>      --skip-editor             save, copy and notify instead of opening the editor
+</span><span id="__span-1-28"><a id="__codelineno-1-28" name="__codelineno-1-28" href="#__codelineno-1-28"></a>    controlling the one running (no --region/--window/--monitor):
+</span><span id="__span-1-29"><a id="__codelineno-1-29" name="__codelineno-1-29" href="#__codelineno-1-29"></a>      --action &lt;pause|save|cancel&gt;     pause/resume, finish and save, or discard
+</span><span id="__span-1-30"><a id="__codelineno-1-30" name="__codelineno-1-30" href="#__codelineno-1-30"></a>      --tool &lt;pointer|marker|magic-marker|erase&gt;   live annotation tool; erase clears marks
+</span><span id="__span-1-31"><a id="__codelineno-1-31" name="__codelineno-1-31" href="#__codelineno-1-31"></a>      --sound &lt;both|mic|system|none&gt;   set audio channels on the live recording
+</span><span id="__span-1-32"><a id="__codelineno-1-32" name="__codelineno-1-32" href="#__codelineno-1-32"></a>
+</span><span id="__span-1-33"><a id="__codelineno-1-33" name="__codelineno-1-33" href="#__codelineno-1-33"></a>  editor &lt;file&gt;                 Open an image or video in the editor
+</span><span id="__span-1-34"><a id="__codelineno-1-34" name="__codelineno-1-34" href="#__codelineno-1-34"></a>      --overlay                 fullscreen overlay instead of a window
+</span><span id="__span-1-35"><a id="__codelineno-1-35" name="__codelineno-1-35" href="#__codelineno-1-35"></a>
+</span><span id="__span-1-36"><a id="__codelineno-1-36" name="__codelineno-1-36" href="#__codelineno-1-36"></a>  timer &lt;0-99&gt;                  Set the default countdown for every capture and record
+</span><span id="__span-1-37"><a id="__codelineno-1-37" name="__codelineno-1-37" href="#__codelineno-1-37"></a>                                (0 clears it; bare `timer` prints the current value)
+</span><span id="__span-1-38"><a id="__codelineno-1-38" name="__codelineno-1-38" href="#__codelineno-1-38"></a>
+</span><span id="__span-1-39"><a id="__codelineno-1-39" name="__codelineno-1-39" href="#__codelineno-1-39"></a>  sound &lt;both|mic|system|none&gt;  Set the default audio channels for every recording
+</span><span id="__span-1-40"><a id="__codelineno-1-40" name="__codelineno-1-40" href="#__codelineno-1-40"></a>                                (bare `sound` prints the current value)
+</span><span id="__span-1-41"><a id="__codelineno-1-41" name="__codelineno-1-41" href="#__codelineno-1-41"></a>
+</span><span id="__span-1-42"><a id="__codelineno-1-42" name="__codelineno-1-42" href="#__codelineno-1-42"></a>  settings                      Open the settings window
+</span><span id="__span-1-43"><a id="__codelineno-1-43" name="__codelineno-1-43" href="#__codelineno-1-43"></a>  permissions                   Permission checker (macOS only)
+</span><span id="__span-1-44"><a id="__codelineno-1-44" name="__codelineno-1-44" href="#__codelineno-1-44"></a>  tray                          Run the tray / menu bar resident
+</span><span id="__span-1-45"><a id="__codelineno-1-45" name="__codelineno-1-45" href="#__codelineno-1-45"></a>
+</span><span id="__span-1-46"><a id="__codelineno-1-46" name="__codelineno-1-46" href="#__codelineno-1-46"></a>  --version, -V                 Print the version
+</span><span id="__span-1-47"><a id="__codelineno-1-47" name="__codelineno-1-47" href="#__codelineno-1-47"></a>  --help, -h                    Show this help
+</span></code></pre></div>
+<h2 id="a-launch-with-no-command-at-all">A launch with no command at all</h2>
+<p>From a <strong>terminal</strong>, a bare <code>cosmic-capture-kit</code> prints the list above and exits.
+It takes nothing: a screenshot of your own terminal is never what you meant, and
+a mistyped command must not go and grab the screen instead of saying so.</p>
+<p>From the <strong>desktop</strong>, meaning a login item, Finder, the Start Menu or an
+application-menu entry, there is no terminal to print to. A bare launch there
+starts the tray when the tray setting is on, and opens the settings window when
+it is off. It never captures either way, which is what makes the app safe to put
+in a login item.</p>
+<h2 id="taking-a-screenshot">Taking a screenshot</h2>
+<p><code>capture</code> opens the capture overlay, and it wants <strong>exactly one target</strong>. The
+target says which selector the overlay lands on, and the overlay's own toolbar
+switches between them afterwards without relaunching, so one binding on
+<code>capture --region</code> is enough for everyday use.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>capture --region</code></td>
+<td>The overlay, region selected</td>
+</tr>
+<tr>
+<td><code>capture --window</code></td>
+<td>The overlay, window selected</td>
+</tr>
+<tr>
+<td><code>capture --monitor</code></td>
+<td>The overlay, monitor selected</td>
+</tr>
+<tr>
+<td><code>capture --active-window</code></td>
+<td>Capture the active window immediately, no picker</td>
+</tr>
+<tr>
+<td><code>capture --active-monitor</code></td>
+<td>Capture the monitor under the cursor immediately, no picker</td>
+</tr>
+</tbody>
+</table>
+<p><code>capture</code> on its own, or with two targets, is a usage error rather than a guess.</p>
+<p><code>--active-window</code> and <code>--active-monitor</code> ask the compositor which target is
+active, through protocols a Flatpak sandbox hides. Under Flatpak the two are not
+available: the launch records the failure and exits instead of guessing a target.</p>
+<p><code>--timer &lt;0-99&gt;</code> puts a countdown in front of the capture, for this launch only.
+Any value in that range works, not just the ones the toolbar offers, and the
+saved default is untouched.</p>
+<p>With <code>--active-window</code> or <code>--active-monitor</code>, the timer also postpones the
+choice of target: which window is active, or which monitor holds the cursor, is
+decided when the countdown ends, not when the command starts. Focus a different
+window, or move the cursor to another monitor, and that is what gets captured.
+This applies to the saved <code>timer</code> default the same way.</p>
+<p><code>--skip-editor</code> skips the preview editor. The capture is still saved to the
+capture folder, copied to the clipboard and announced by a notification, exactly
+what happens when no editor can be opened. Only the editor goes away.</p>
+<p>The notification is the whole feedback for such a capture, so it names what it
+delivered, "Region copied to clipboard", "Window saved", "Monitor saved", and
+clicking it opens the capture's folder with the file selected. It says "saved"
+rather than "copied" whenever the clipboard write did not happen, and the body
+then gives the reason. (A still image over 1 GB is not copied automatically; a
+recording is copied at any size, because it goes on the clipboard as a file
+reference rather than as pixels.)</p>
+<h2 id="starting-a-recording">Starting a recording</h2>
+<p><code>record --region</code>, <code>record --window</code> and <code>record --monitor</code> record that target.
+They are exactly what the tray's direct recording entries run, so a keybinding
+can do precisely what the tray does. There is no <code>record --active-window</code>: an
+immediate grab with no picker is a screenshot idea, and <code>record</code> says so rather
+than inventing one.</p>
+<p><code>--timer</code> and <code>--skip-editor</code> mean the same here as they do for a screenshot: a
+countdown before recording starts, and a delivery with no editor at the end.</p>
+<p><code>--sound</code> arms the recording's audio channels for this launch only, overriding
+the saved defaults without writing them back: the next launch without it uses the
+saved arms again. The values are <code>both</code>, <code>mic</code>, <code>system</code> and <code>none</code>, and case
+does not matter. Anything else rejects the launch with an error instead of
+guessing, because a typo must never record a microphone you asked to silence.</p>
+<h2 id="controlling-the-recording-that-is-already-running">Controlling the recording that is already running</h2>
+<p>These launch nothing. Each one reaches the recording in progress, acts on it, and
+exits. They are <strong>Linux only</strong>.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>record --action pause</code></td>
+<td>Pause the recording, or resume it when paused</td>
+</tr>
+<tr>
+<td><code>record --action save</code></td>
+<td>Finish the recording and save it</td>
+</tr>
+<tr>
+<td><code>record --action cancel</code></td>
+<td>Cancel the recording and delete it</td>
+</tr>
+<tr>
+<td><code>record --sound &lt;both\|mic\|system\|none&gt;</code></td>
+<td>Set which audio channels the live recording keeps</td>
+</tr>
+<tr>
+<td><code>record --tool &lt;pointer\|marker\|magic-marker\|erase&gt;</code></td>
+<td>Switch the live annotation tool; <code>erase</code> clears the marks</td>
+</tr>
+</tbody>
+</table>
+<p>They are control options rather than commands of their own because they act on
+the same recording, so they combine in one line and are applied in a fixed order:
+<code>--sound</code> first, then <code>--tool</code>, then <code>--action</code>. That order is what makes
+<code>record --sound none --action save</code> mean "mute the rest of it, then save", and
+never the other way round.</p>
+<p>They exist because on Linux an in-app keyboard shortcut cannot reach
+a recording. Once recording starts, the app hands the keyboard back to the window
+you are recording, so you can keep typing into it, and COSMIC's desktop portal
+has no way to give an app a shortcut that works without focus. A shortcut bound
+in your own desktop settings has no such problem, which is the same reason the
+capture key is bound that way. Point one at each command and you get focus-free
+recording controls. See the "Shortcuts" section of the
+<a href="https://github.com/Frosthaven/cosmic-capture-kit#readme">README</a>.</p>
+<p>They act on whichever recording is running, whether it was started from the
+overlay, the tray or a keybinding. With no recording in progress the command
+prints <code>no recording is in progress</code> and exits with status 1, so a script can
+tell.</p>
+<p>On macOS and Windows these are inert: they print a line saying so and exit. Those
+platforms keep their capture windows through a recording, so the in-app shortcuts
+still work there, and their menu bar or tray item carries the same controls.</p>
+<h2 id="scanning-the-screen">Scanning the screen</h2>
+<p><code>scan</code> opens the scanner. It always works on a region, which is its capture
+invariant, so there is no mode option to give it.</p>
+<p><code>scan --action refresh</code> is the one exception to "these commands launch
+something": it retakes the screen snapshot inside the scanner window you already
+have open, so you can point it at something that changed without closing and
+reopening the tool. With no scanner open there is nothing to refresh, and the
+command says so.</p>
+<h2 id="the-color-picker">The color picker</h2>
+<p><code>color --picker</code> is its own tool rather than a capture. It takes no screenshot and
+saves no capture. The tray menu's <strong>Color &gt; Color Picker</strong> entry, the preview
+editor's pipette button and the Color Picker global shortcut all run exactly this
+command.</p>
+<p>While the overlay is up: move the pointer to aim, click to take the color under
+it, and press Esc or right-click to leave with nothing. The arrow keys and <code>h</code>
+<code>j</code> <code>k</code> <code>l</code> move the sample one pixel per tap, and holding one down keeps it
+moving, so you can land on an exact pixel without the mouse. Enter or Space then
+takes the color the magnifier is showing, which is the point of having them:
+reaching for the mouse to click would undo the aim you just made.</p>
+<p>The mouse wheel, a trackpad scroll and the numpad <code>+</code> / <code>-</code> all zoom the
+magnifier. It opens holding 13 of the screen's pixels across the lens, and goes
+both ways from there: out to 52 when you want context, in to 6 when you need to
+tell one pixel from its neighbors. It stops a little short of 1:1 at the wide
+end, where a loupe would only show you what your eyes already do. The zoom is
+not remembered between runs.</p>
+<p>The dim behind it is the <strong>During Color Picker</strong> slider in Settings, under
+General (33% by default), and the ring around the magnifier is drawn at the
+<strong>Selection box thickness</strong> from the same page.</p>
+<p><code>--timer &lt;0-99&gt;</code> puts a countdown in front of the pick, for this launch only:
+the screen stays yours until the timer runs out, so you can open the menu or
+hover the tooltip you want to sample from, and the picker samples what is on
+screen when the countdown ends. Without the flag the saved <code>timer</code> default
+applies, and <code>--timer 0</code> skips that default for one pick. The viewer takes no
+timer; it opens a window and samples nothing.</p>
+<h3 id="the-window-a-pick-opens">The window a pick opens</h3>
+<p>A click copies the color and opens a small window. It is a fixed size and nothing
+in it scrolls: it is exactly as big as the parts it holds.</p>
+<p>Top to bottom, those parts are a <strong>saturation and value square</strong>; a <strong>controls
+row</strong> carrying the pipette that starts another pick, a round swatch of the current
+color, and the hue and alpha strips stacked beside it; the <strong>value row</strong>; a
+hairline divider with an <strong>Add to recents</strong> button sitting on it; and two rows of
+the colors you kept.</p>
+<p>The value row is one row whatever the notation. A copy button leads it, the boxes
+follow, and a pair of chevrons at the right end is a single button that opens the
+menu of the seven notations: HEX, RGB, HSL, HSV, OKLCH, CMYK and LAB. <strong>Hex is one
+box</strong> holding the whole spelling, <code>#FF8800CC</code> and all, because that is the value
+people paste whole; every other notation splits into a box per component, each
+captioned underneath with what it holds ("R", "G", "B", "A" in RGB). Typing in a
+box moves the swatch, the square and the strips with it.</p>
+<p><strong>The notation is remembered between launches, and it is the spelling a pick
+copies.</strong> Changing it copies nothing, so you can cycle the seven to read them
+without overwriting your clipboard seven times. The copy button, a swatch's own
+Copy and the copy chord are what write to the clipboard.</p>
+<p>Two chords belong to this window, alongside Tab, which walks the boxes, then the
+chevron unit, then the history, then the panel when it is open:</p>
+<table>
+<thead>
+<tr>
+<th>Chord</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Ctrl+Enter</code> (<code>Cmd+Enter</code> on macOS)</td>
+<td>Keep this color: files it into the recents, the same as the Add to recents button</td>
+</tr>
+<tr>
+<td><code>Ctrl+Shift+C</code> (<code>Cmd+Shift+C</code> on macOS)</td>
+<td>Copy the value. Plain <code>Ctrl+C</code> is left to the boxes, so it still copies whatever you selected in one</td>
+</tr>
+</tbody>
+</table>
+<p><strong>The recents hold eighteen colors</strong>, two rows of nine, newest first, each kept
+with the alpha it was filed at. They are persisted, because the app is one-shot
+and an in-memory list would be empty at every launch. Clicking one loads it
+without reordering the row, so the row stays a stable place to look. A pick
+writes to it, and so does any discrete replacement of the current color, which
+files the color you are leaving first, so a color you were holding cannot go
+missing. Typing in a box never writes: exploring with the square, the strips or
+the boxes is free, and only the explicit add files. The same color at the same
+alpha is never filed twice.</p>
+<p>Right-click a swatch for its own menu. What it offers depends on which swatch it
+is, between making it the current color, adding it to the recents, copying it,
+removing it, and sending it to one of your saved palettes.</p>
+<h3 id="the-panel-harmonies-and-saved-palettes">The panel: harmonies and saved palettes</h3>
+<p>The button at the right of the window's header <strong>doubles the window's width</strong> and
+opens a panel beside the picker. The picker's own column does not move. Both the
+open state and the tab you left it on are remembered, and <code>Ctrl+Tab</code> cycles the
+tabs.</p>
+<p><strong>Harmonies</strong> shows five cards worked out from the current color: Complementary,
+Analogous, Triadic, Tetradic and Monochromatic. Clicking a swatch makes it the
+current color, and each card's heading explains in one line what the relationship
+is.</p>
+<p><strong>Saved Palettes</strong> holds your own named groups of colors:</p>
+<ul>
+<li><strong>New Palette</strong> is at the top right of the tab, and a new group lands at the TOP
+  of the list with its name selected, ready to type over. A name is edited in
+  place at any time by clicking it.</li>
+<li>Beside that button, a search field filters the list by name, and a sort button
+  offers six one-shot orders: name A to Z or Z to A, lightest or darkest first,
+  warmest or coolest first.</li>
+<li>Each group's title row carries a <strong>pipette</strong>, which starts a pick that lands
+  straight in that group, and a <strong>plus</strong>, which adds the color the window is
+  showing.</li>
+<li><strong>Dragging</strong> does the rest: along a group's own bar to reorder it, onto another
+  group to COPY the color there, onto the picker's side of the window to make it
+  the current color, and off the window to remove it. A group's NAME drags too, to
+  reorder the groups or, dropped off the window, to delete the group, which asks
+  first. Colors never ask; groups do.</li>
+<li>The swatch menus keep the explicit verbs a drag does not offer, including <strong>Move
+  to palette</strong>, which vacates the group it came from.</li>
+<li>Clicking a swatch applies it as the current color. A color already in a group is
+  not added to it twice.</li>
+</ul>
+<p>Palettes live in their own <code>palettes.toml</code> beside the config file, so a factory
+reset leaves them alone. Before you save anything of your own you start with two
+groups, Catppuccin Latte and Mocha.</p>
+<p><strong>Only one picker window is ever open.</strong> Pick again, from that window's own
+pipette or from anywhere else, and the window you already have takes the new
+color and puts it at the head of its recents. A second window never appears.</p>
+<h2 id="the-palette-viewer">The palette viewer</h2>
+<p><code>color --viewer</code> opens that same window on its own, so you can get at the
+colors you already saved without picking a new one first. There is no dim, no
+magnifier and no click to make: the window opens straight away, loaded with the
+color you picked most recently, with its alpha. With no history yet it opens on a
+vivid pink, <code>#FF06B5</code>, rather than on white, so a first-run window is obviously
+working rather than looking blank. The tray menu's <strong>Color &gt; Palette Viewer</strong>
+entry runs exactly this command.</p>
+<p>Everything the window does is the same as after a pick: the square, the strips,
+the value row, the recents and the panel with your saved palettes in it. Opening
+it does not change your palette and does not touch the clipboard, so looking is
+free. Its window title is <code>CCK Palette Viewer</code>, which is the name tiling window
+manager rules should match on (see the README).</p>
+<p>The one-window rule above covers this too. If a picker window is already open,
+asking for the palette viewer brings that window forward rather than opening a
+second one, and the color it is showing is left exactly as it was.</p>
+<p>Three limits are worth knowing:</p>
+<ul>
+<li><strong>The sample comes from a snapshot taken when the tool launched</strong>, not from live
+  pixels, so content that changes after you open the picker cannot be picked. This
+  is deliberate: the picker's own dim is on screen while it reads, so a live read
+  would report a darkened color.</li>
+<li><strong>Under Flatpak the picker covers only the monitor the portal granted.</strong> A native
+  install covers every screen at once.</li>
+<li><strong>CMYK is the device-agnostic conversion, not a color-managed one.</strong> It is the
+  plain separation a design tool shows, with no ICC profile behind it, so it is a
+  readable approximation rather than a value to hand to a press. LAB and OKLCH can
+  also describe colors sRGB cannot hold; typed values outside it are brought back
+  to the nearest one your screen can show.</li>
+</ul>
+<h2 id="opening-a-file-in-the-editor">Opening a file in the editor</h2>
+<p><code>editor &lt;file&gt;</code> opens an image or a video you already have in the preview editor.
+It captures nothing, so it is a viewer with the editor's tools attached. It opens
+in a resizable <strong>window</strong> by default; <code>editor &lt;file&gt; --overlay</code> uses the
+fullscreen overlay instead.</p>
+<h2 id="the-saved-defaults-timer-and-sound">The saved defaults: <code>timer</code> and <code>sound</code></h2>
+<p>These two write settings rather than doing anything to the screen. They are the
+command-line half of the matching rows in Settings, so a script can set what a
+person would otherwise click.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>timer</code></td>
+<td>Print the saved countdown and change nothing</td>
+</tr>
+<tr>
+<td><code>timer &lt;0-99&gt;</code></td>
+<td>Save that countdown for every capture and every recording</td>
+</tr>
+<tr>
+<td><code>timer 0</code></td>
+<td>Clear the countdown</td>
+</tr>
+<tr>
+<td><code>sound</code></td>
+<td>Print the saved audio channels and change nothing</td>
+</tr>
+<tr>
+<td><code>sound &lt;both\|mic\|system\|none&gt;</code></td>
+<td>Save those channels for every recording</td>
+</tr>
+</tbody>
+</table>
+<p>Keep them apart from the options of the same name on <code>capture</code> and <code>record</code>.
+Those apply to one launch and never write anything down; these write the default
+that every later launch starts from.</p>
+<h2 id="settings-permissions-and-the-tray">Settings, permissions and the tray</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Effect</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>settings</code></td>
+<td>Open the settings window. Only one ever exists; asking again brings it forward</td>
+</tr>
+<tr>
+<td><code>permissions</code></td>
+<td><strong>macOS only.</strong> The permission-checker window (Screen Recording / Microphone / Notifications) with live status and Request / Open System Settings / Relaunch actions. Linux and Windows have no such grants to check</td>
+</tr>
+<tr>
+<td><code>tray</code></td>
+<td>Run the resident: the tray on Linux and Windows, the menu bar on macOS</td>
+</tr>
+</tbody>
+</table>
+<p><code>tray</code> runs the resident whatever the tray setting says, which is what makes it
+useful for testing and for a launcher entry of your own. Turning the setting on
+is still the normal way to get one at login.</p>
+<p>On Linux an autostart entry written by an older version carries the word
+<code>resident</code> instead. It keeps working: the entry is migrated to <code>tray</code> for you the
+first time the new version runs. The setting itself never changed its name, only
+the word on the command line did.</p>
+<h2 id="exit-codes">Exit codes</h2>
+<table>
+<thead>
+<tr>
+<th>Code</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>0</code></td>
+<td>The command did what it said</td>
+</tr>
+<tr>
+<td><code>1</code></td>
+<td>The command was understood and could not be carried out: no recording is running, no scanner is open, the file is not there, or this build does not carry it</td>
+</tr>
+<tr>
+<td><code>2</code></td>
+<td>The command line could not be read at all: an unknown command, an option that command does not have, a missing value, or a value out of range</td>
+</tr>
+</tbody>
+</table>
+<h2 id="examples">Examples</h2>
+<div class="language-sh highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1"># Region recording after a 3-second countdown</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>cosmic-capture-kit<span class="w"> </span>record<span class="w"> </span>--region<span class="w"> </span>--timer<span class="w"> </span><span class="m">3</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1"># Record a monitor with system audio only, whatever the saved arms say</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="c1"># (this launch only; the saved setting is untouched)</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>cosmic-capture-kit<span class="w"> </span>record<span class="w"> </span>--monitor<span class="w"> </span>--sound<span class="w"> </span>system
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="c1"># Record a window with no audio at all</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>cosmic-capture-kit<span class="w"> </span>record<span class="w"> </span>--window<span class="w"> </span>--sound<span class="w"> </span>none
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="c1"># Jump straight to picking a monitor to screenshot</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>cosmic-capture-kit<span class="w"> </span>capture<span class="w"> </span>--monitor
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="c1"># Screenshot the active window and deliver it without the editor</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a>cosmic-capture-kit<span class="w"> </span>capture<span class="w"> </span>--active-window<span class="w"> </span>--skip-editor
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="c1"># Pick a color off the screen</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a>cosmic-capture-kit<span class="w"> </span>color<span class="w"> </span>--picker
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a><span class="c1"># Scan whatever's on screen for a QR code / text</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>cosmic-capture-kit<span class="w"> </span>scan
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a><span class="c1"># Re-open the last capture in the editor, as a fullscreen overlay</span>
+</span><span id="__span-2-24"><a id="__codelineno-2-24" name="__codelineno-2-24" href="#__codelineno-2-24"></a>cosmic-capture-kit<span class="w"> </span>editor<span class="w"> </span>~/Capture/latest.png<span class="w"> </span>--overlay
+</span><span id="__span-2-25"><a id="__codelineno-2-25" name="__codelineno-2-25" href="#__codelineno-2-25"></a>
+</span><span id="__span-2-26"><a id="__codelineno-2-26" name="__codelineno-2-26" href="#__codelineno-2-26"></a><span class="c1"># Mute the microphone on the recording that is already running (Linux)</span>
+</span><span id="__span-2-27"><a id="__codelineno-2-27" name="__codelineno-2-27" href="#__codelineno-2-27"></a>cosmic-capture-kit<span class="w"> </span>record<span class="w"> </span>--sound<span class="w"> </span>system
+</span><span id="__span-2-28"><a id="__codelineno-2-28" name="__codelineno-2-28" href="#__codelineno-2-28"></a>
+</span><span id="__span-2-29"><a id="__codelineno-2-29" name="__codelineno-2-29" href="#__codelineno-2-29"></a><span class="c1"># Finish that recording and save it</span>
+</span><span id="__span-2-30"><a id="__codelineno-2-30" name="__codelineno-2-30" href="#__codelineno-2-30"></a>cosmic-capture-kit<span class="w"> </span>record<span class="w"> </span>--action<span class="w"> </span>save
+</span><span id="__span-2-31"><a id="__codelineno-2-31" name="__codelineno-2-31" href="#__codelineno-2-31"></a>
+</span><span id="__span-2-32"><a id="__codelineno-2-32" name="__codelineno-2-32" href="#__codelineno-2-32"></a><span class="c1"># Make every capture wait 3 seconds from now on</span>
+</span><span id="__span-2-33"><a id="__codelineno-2-33" name="__codelineno-2-33" href="#__codelineno-2-33"></a>cosmic-capture-kit<span class="w"> </span>timer<span class="w"> </span><span class="m">3</span>
+</span></code></pre></div>
+<h2 id="binding-to-keys">Binding to keys</h2>
+<p>Point separate desktop shortcuts at different commands to get one-press capture
+flows (region screenshot on one key, window recording on another, and so on). See
+the "Shortcuts" section of the
+<a href="https://github.com/Frosthaven/cosmic-capture-kit#readme">README</a> for the
+per-desktop setup.</p>
+
+
+
+
+
+
+
+  
+  
+
+
+
+  
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../settings/about/" class="md-footer__link md-footer__link--prev" aria-label="Previous: About">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                About
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../cloud-accounts/" class="md-footer__link md-footer__link--next" aria-label="Next: Cloud accounts">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Cloud accounts
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      © 2026 Frosthaven
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/Frosthaven/cosmic-capture-kit" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+      <div class="md-consent" data-md-component="consent" id="__consent" hidden>
+        <div class="md-consent__overlay"></div>
+        <aside class="md-consent__inner">
+          <form class="md-consent__form md-grid md-typeset" name="consent">
+            
+
+
+
+  
+
+<h4>Cookie consent</h4>
+<p>This site uses Google Analytics to count visits and downloads, and to see which pages help people. Analytics only runs if you accept. Rejecting changes nothing about how the site works.</p>
+<input class="md-toggle" type="checkbox" id="__settings" checked>
+<div class="md-consent__settings">
+  <ul class="task-list">
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="analytics" checked>
+      <span class="task-list-indicator"></span>
+      Google Analytics
+    </label>
+  </li>
+
+      
+    
+    
+      
+        
+  
+  
+    
+    
+  
+  <li class="task-list-item">
+    <label class="task-list-control">
+      <input type="checkbox" name="github" checked>
+      <span class="task-list-indicator"></span>
+      GitHub
+    </label>
+  </li>
+
+      
+    
+    
+  </ul>
+</div>
+<div class="md-consent__controls">
+  
+    
+      <button class="md-button md-button--primary">Accept</button>
+    
+    
+    
+  
+    
+    
+      <button type="reset" class="md-button md-button--primary">Reject</button>
+    
+    
+  
+</div>
+          </form>
+        </aside>
+      </div>
+      <script>var consent=__md_get("__consent");if(consent)for(var input of document.forms.consent.elements)input.name&&(input.checked=consent[input.name]||!1);else"file:"!==location.protocol&&setTimeout((function(){document.querySelector("[data-md-component=consent]").hidden=!1}),250);var form=document.forms.consent;for(var action of["submit","reset"])form.addEventListener(action,(function(e){if(e.preventDefault(),"reset"===e.type)for(var n of document.forms.consent.elements)n.name&&(n.checked=!1);__md_set("__consent",Object.fromEntries(Array.from(new FormData(form).keys()).map((function(e){return[e,!0]})))),location.hash="",location.reload()}))</script>
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["content.code.copy", "content.code.select", "navigation.instant", "navigation.instant.progress", "navigation.tracking", "navigation.sections", "navigation.footer"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../assets/download.js"></script>
+      
+    
+  </body>
+</html>
